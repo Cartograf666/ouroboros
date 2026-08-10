@@ -154,6 +154,25 @@ def _derive_project_name(drive_root: object, task_id: str) -> str:
     return cleaned
 
 
+def _task_workspace_root(drive_root: object, task_id: str) -> str:
+    """The folder a task is (or was) working in — persisted result first, then the
+    live queue snapshot for a conversion clicked mid-flight. Same two sources the
+    name derivation reads, for the same reason: the owner converts a card while the
+    task is still running, when only the snapshot knows. Never raises."""
+    try:
+        from ouroboros.task_results import load_task_result
+
+        result = load_task_result(drive_root, task_id) or {}
+    except Exception:
+        log.debug("_task_workspace_root: load_task_result failed", exc_info=True)
+        result = {}
+    for src in (result, _task_from_live_queue(drive_root, task_id)):
+        value = str((src or {}).get("workspace_root") or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _preset_suggested_name(drive_root: object, task_id: str) -> str:
     """The LLM title the proactive card namer already coined for this task (Cluster B),
     read from the persisted result then the live queue. Reused by turn-into-project so
@@ -269,13 +288,37 @@ def _emit_naming_reason(drive_root: object, task_id: str, name: str, reason: str
 
 
 async def api_projects_list(request: Request) -> JSONResponse:
+    """GET /api/projects — the sidebar's list, optionally WITH archived threads.
+
+    ``?include_archived=1`` is the only way an archived thread ever reaches a
+    surface, and it exists because without it archiving was a ONE-WAY trip:
+    ``projects_summary`` is the only projection that lists threads, so a thread it
+    filtered out could never be shown, which made ``POST …/restore`` and the
+    ``restore`` row in the thread menu unreachable by construction (T3R-8). The
+    default is unchanged, so the sidebar keeps hiding them.
+    """
     try:
+        from ouroboros.gateway.state import live_thread_chat_ids
         from ouroboros.projects_registry import (
             projects_summary,
         )
 
         drive_root = request_drive_root(request)
-        return JSONResponse({"projects": projects_summary(drive_root, limit=200)})
+        include_archived = str(
+            request.query_params.get("include_archived") or ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        # Same visibility rule as /api/state unless the caller ASKS otherwise:
+        # archived threads are hidden unless a task is still live in them (X10).
+        # Two summaries disagreeing about which threads exist would be worse than
+        # either answer alone — so the difference is REQUESTED, never incidental,
+        # and the answer echoes which list this is.
+        return JSONResponse({
+            "projects": projects_summary(
+                drive_root, limit=200, live_chat_ids=live_thread_chat_ids(),
+                include_archived=include_archived,
+            ),
+            "include_archived": include_archived,
+        })
     except Exception as exc:
         return json_exception(exc)
 
@@ -307,6 +350,7 @@ async def api_projects_create(request: Request) -> JSONResponse:
             PROJECT_NAME_MAX,
             create_project,
             ensure_project_workspace,
+            set_working_dir_if_absent,
             update_project,
         )
         from ouroboros.utils import utc_now_iso
@@ -365,14 +409,13 @@ async def api_projects_create(request: Request) -> JSONResponse:
         working_dir, provenance, clone_url = "", "none", ""
         init_git_skipped: list = []
         if attach_path:
-            from ouroboros.project_sources import (
-                attach_snapshot_init,
-                is_git_worktree_root,
-                validate_attach_path,
-            )
+            from ouroboros.project_sources import attach_snapshot_init, validate_attach_path
 
-            resolved, error = validate_attach_path(
-                attach_path, system_repo_dir=repo_dir, drive_root=drive_root
+            # Off the event loop: the guard forks `git` with a 5 s timeout, and a
+            # repository that stalls it would otherwise freeze every other request
+            # for those 5 seconds. The init-git route already runs it this way.
+            resolved, error = await asyncio.to_thread(
+                validate_attach_path, attach_path, system_repo_dir=repo_dir, drive_root=drive_root
             )
             if error:
                 return JSONResponse({"error": error}, status_code=400)
@@ -380,20 +423,13 @@ async def api_projects_create(request: Request) -> JSONResponse:
                 init_error, init_git_skipped = await asyncio.to_thread(attach_snapshot_init, resolved)
                 if init_error:
                     return JSONResponse({"error": f"init_git failed: {init_error}"}, status_code=400)
-            elif not await asyncio.to_thread(is_git_worktree_root, resolved):
-                # Task admission requires a git worktree root — registering a non-git
-                # folder would create a project whose room tasks are born dead
-                # (triad r5). Actionable refusal BEFORE any registry mutation.
-                return JSONResponse(
-                    {
-                        "error": (
-                            f"{resolved} is not a git repository — enable init_git "
-                            "(makes an attach-snapshot commit) or pick a git worktree root"
-                        ),
-                        "error_code": "attach_requires_git",
-                    },
-                    status_code=400,
-                )
+            # A11/A12: an UNTRACKED folder is admitted and stays untracked. Attach used
+            # to refuse it outright because task admission demanded a git worktree root,
+            # which made "designate a place" and "put that place under git" one
+            # inseparable decision taken on the owner's behalf. They are now two: the
+            # project keeps the folder, and admission raises the typed
+            # `git_init_required` offer before the FIRST file task instead. The
+            # remaining validate_attach_path guards are untouched.
             working_dir, provenance = str(resolved), "attached"
         elif git_url:
             from ouroboros.project_sources import clone_project_repo
@@ -417,7 +453,12 @@ async def api_projects_create(request: Request) -> JSONResponse:
                 working_dir, provenance = workspace, "genesis"
         if working_dir and not str(entry.get("working_dir") or "").strip():
             # create_project was idempotent for an existing row — bind the folder now.
-            update_project(drive_root, entry["id"], working_dir=working_dir)
+            # ATOMICALLY: the read above and this write are two separately-locked
+            # operations, so testing `entry` and then overwriting is precisely the
+            # read-then-write race DEVELOPMENT.md forbids. `set_working_dir_if_absent`
+            # re-tests under the same lock that writes, and a concurrent binder keeps
+            # its folder instead of losing it here.
+            set_working_dir_if_absent(drive_root, entry["id"], working_dir)
         if _existing and provenance == "none":
             # Source-less repeat create of an EXISTING project is a pure idempotent
             # lookup: provenance/clone_url/trusted_at are ADDITIVE HISTORICAL FACTS
@@ -467,6 +508,64 @@ async def api_project_update(request: Request) -> JSONResponse:
         entry = update_project(drive_root, project_id, name=name)
         _broadcast_projects_changed(str((entry or {}).get("id") or project_id), (entry or {}).get("chat_id"))
         return JSONResponse({"project": entry})
+    except Exception as exc:
+        return json_exception(exc)
+
+
+async def api_project_init_git(request: Request) -> JSONResponse:
+    """POST /api/projects/{project_id}/init-git — the owner's YES to the typed
+    ``git_init_required`` offer (A12).
+
+    This is the ONLY thing that answer calls, and it runs the SAME
+    ``attach_snapshot_init`` the create dialog's ``init_git`` runs — one snapshot
+    commit of what is already in the folder, credential-shaped files deliberately
+    left untracked and disclosed. Admission never reaches this route by itself:
+    it raises the offer and stops, and the owner decides.
+
+    The attach guards are re-run against the CURRENT working_dir rather than
+    trusted from registration time — the registry is a file on disk, and the one
+    thing this route does is write into a folder, so it re-establishes that the
+    folder is still a real directory outside the Ouroboros repo/data roots first.
+    """
+    try:
+        import asyncio
+
+        from ouroboros.project_sources import attach_snapshot_init, validate_attach_path
+        from ouroboros.projects_registry import get_project
+
+        project_id = str(request.path_params.get("project_id") or "").strip()
+        drive_root = request_drive_root(request)
+        repo_dir = request_repo_dir(request)
+        project = get_project(drive_root, project_id)
+        if project is None:
+            return JSONResponse({"error": f"unknown project: {project_id}"}, status_code=404)
+        working_dir = str(project.get("working_dir") or "").strip()
+        if not working_dir:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"project {project['id']!r} has no working folder to initialise — "
+                        "attach or create one first"
+                    ),
+                    "error_code": "no_working_dir",
+                },
+                status_code=400,
+            )
+        resolved, error = await asyncio.to_thread(
+            validate_attach_path, working_dir, system_repo_dir=repo_dir, drive_root=drive_root
+        )
+        if error:
+            return JSONResponse({"error": f"working folder is unusable: {error}"}, status_code=400)
+        init_error, skipped = await asyncio.to_thread(attach_snapshot_init, resolved)
+        if init_error:
+            return JSONResponse({"error": f"init_git failed: {init_error}"}, status_code=400)
+        payload: dict = {"project": project, "working_dir": str(resolved)}
+        if skipped:
+            # Disclosed omission (P1): credential-shaped files stayed out of the
+            # snapshot and remain untracked via .git/info/exclude.
+            payload["init_git_skipped"] = skipped[:50]
+        _broadcast_projects_changed(str(project["id"]), project.get("chat_id"))
+        return JSONResponse(payload)
     except Exception as exc:
         return json_exception(exc)
 
@@ -534,6 +633,10 @@ async def api_project_thread_create(request: Request) -> JSONResponse:
     thread's chat id rides the `projects_changed` broadcast so every open client
     adds it to its known-chat set BEFORE a live frame for it can arrive.
     """
+    # Imported BEFORE the guard, not inside it: an `except` clause naming an
+    # unbound local would turn any earlier failure into a NameError.
+    from ouroboros.project_threads_registry import ThreadLifecycleError
+
     try:
         from ouroboros.projects_registry import create_thread, get_project, touch_project
 
@@ -553,6 +656,15 @@ async def api_project_thread_create(request: Request) -> JSONResponse:
         touch_project(drive_root, str(project["id"]))
         _broadcast_projects_changed(str(project["id"]), thread.get("chat_id"))
         return JSONResponse({"project_id": str(project["id"]), "thread": thread})
+    except ThreadLifecycleError as exc:
+        # A project on its way out refusing thread changes is a PRECONDITION the
+        # owner can read, not a malformed request and not a crash: it answers 409
+        # with the same typed reason the archive/restore/delete routes use
+        # (T3R-17). Caught BEFORE ValueError because it is one.
+        return JSONResponse(
+            {"ok": False, "reason": exc.reason, "error": str(exc), "message": str(exc)},
+            status_code=409,
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
     except Exception as exc:
@@ -561,6 +673,10 @@ async def api_project_thread_create(request: Request) -> JSONResponse:
 
 async def api_project_thread_update(request: Request) -> JSONResponse:
     """POST /api/projects/{project_id}/threads/{thread_id}/update — rename."""
+    # Imported BEFORE the guard, not inside it: an `except` clause naming an
+    # unbound local would turn any earlier failure into a NameError.
+    from ouroboros.project_threads_registry import ThreadLifecycleError
+
     try:
         from ouroboros.projects_registry import get_project, get_thread, rename_thread
 
@@ -584,6 +700,15 @@ async def api_project_thread_update(request: Request) -> JSONResponse:
             return JSONResponse({"error": f"unknown thread: {thread_id}"}, status_code=404)
         _broadcast_projects_changed(str(project["id"]), thread.get("chat_id"))
         return JSONResponse({"project_id": str(project["id"]), "thread": thread})
+    except ThreadLifecycleError as exc:
+        # A project on its way out refusing thread changes is a PRECONDITION the
+        # owner can read, not a malformed request and not a crash: it answers 409
+        # with the same typed reason the archive/restore/delete routes use
+        # (T3R-17). Caught BEFORE ValueError because it is one.
+        return JSONResponse(
+            {"ok": False, "reason": exc.reason, "error": str(exc), "message": str(exc)},
+            status_code=409,
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
     except Exception as exc:
@@ -596,6 +721,10 @@ async def api_project_thread_fork(request: Request) -> JSONResponse:
     The source thread is UNTOUCHED: the new thread stores a cursor into the
     source's rows, so no history is copied and no row identity is minted twice.
     """
+    # Imported BEFORE the guard, not inside it: an `except` clause naming an
+    # unbound local would turn any earlier failure into a NameError.
+    from ouroboros.project_threads_registry import ThreadLifecycleError
+
     try:
         from ouroboros.projects_registry import fork_thread, get_project, touch_project
 
@@ -614,6 +743,15 @@ async def api_project_thread_fork(request: Request) -> JSONResponse:
         touch_project(drive_root, str(project["id"]))
         _broadcast_projects_changed(str(project["id"]), thread.get("chat_id"))
         return JSONResponse({"project_id": str(project["id"]), "thread": thread})
+    except ThreadLifecycleError as exc:
+        # A project on its way out refusing thread changes is a PRECONDITION the
+        # owner can read, not a malformed request and not a crash: it answers 409
+        # with the same typed reason the archive/restore/delete routes use
+        # (T3R-17). Caught BEFORE ValueError because it is one.
+        return JSONResponse(
+            {"ok": False, "reason": exc.reason, "error": str(exc), "message": str(exc)},
+            status_code=409,
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
     except Exception as exc:
@@ -687,6 +825,7 @@ async def api_project_from_task(request: Request) -> JSONResponse:
         from ouroboros.project_facts import explicit_project_id_ok, sanitize_project_id
         from ouroboros.projects_registry import (
             PROJECT_NAME_MAX,
+            adopt_task_workspace,
             bind_task_to_project,
             create_project,
             touch_project,
@@ -773,6 +912,17 @@ async def api_project_from_task(request: Request) -> JSONResponse:
             name=project_name,
             origin="task_card",
         )
+        # A11: the new project inherits the folder the converted task was already
+        # working in. Without this the project came out folder-less and its NEXT
+        # task auto-provisioned a different empty tree, silently moving the work.
+        adopted, adopt_error = adopt_task_workspace(
+            drive_root,
+            str(project["id"]),
+            _task_workspace_root(drive_root, task_id),
+            system_repo_dir=request_repo_dir(request),
+        )
+        if adopted:
+            project = dict(project, working_dir=adopted)
         # Scope the live task to its new project's one-writer lane BEFORE the durable
         # bind. The lease + assignment read task["project_id"] from the supervisor's
         # in-memory RUNNING map and PENDING list, NOT the durable bindings — so this
@@ -790,11 +940,19 @@ async def api_project_from_task(request: Request) -> JSONResponse:
         # is no live lane to occupy).
         try:
             from ouroboros.project_lease import mark_task_project
+            from ouroboros.projects_registry import project_working_dirs
             from supervisor.queue import _queue_lock, persist_queue_snapshot
             from supervisor.workers import PENDING, RUNNING
 
+            # The project->folder map goes in because marking PINS the lane of a
+            # RUNNING task: pinned without it, a task that named no folder freezes
+            # (pid, "") while every later candidate for the same project resolves to
+            # ("", folder) and is admitted into the same folder alongside it.
             with _queue_lock:
-                marked = mark_task_project(RUNNING, PENDING, task_id, str(project["id"]))
+                marked = mark_task_project(
+                    RUNNING, PENDING, task_id, str(project["id"]),
+                    project_working_dirs(drive_root),
+                )
             # Persist the snapshot so a still-PENDING converted task survives a restart
             # STILL scoped: restore_pending_from_snapshot rebuilds PENDING from
             # state/queue_snapshot.json (assignment reads task['project_id'] from there,
@@ -826,7 +984,21 @@ async def api_project_from_task(request: Request) -> JSONResponse:
             })
         except Exception:
             log.debug("api_project_from_task: projects_changed broadcast failed", exc_info=True)
-        return JSONResponse({"project": project, "binding": binding})
+        # ProjectFromTaskResponse. Both folder facts are TYPED (contract + api_types.js
+        # mirror) because the conversion succeeds either way: an untyped free-text
+        # disclosure no contract described and no client read meant a conversion that
+        # quietly produced a PLACELESS project looked exactly like one that worked.
+        payload: dict = {"project": project, "binding": binding}
+        if adopted:
+            payload["working_dir"] = adopted
+        if adopt_error:
+            # Disclosed, non-fatal (P1): the conversion succeeded, but the folder the
+            # task named is no longer adoptable and the owner should hear it rather
+            # than discover a folder-less project later. Logged as well as returned —
+            # a browser that drops the field must not be the only witness.
+            log.warning("api_project_from_task: %s", adopt_error)
+            payload["working_dir_error"] = adopt_error
+        return JSONResponse(payload)
     except Exception as exc:
         return json_exception(exc)
 
@@ -835,6 +1007,7 @@ __all__ = [
     "api_fs_dirs",
     "api_project_delete",
     "api_project_from_task",
+    "api_project_init_git",
     "api_project_thread_create",
     "api_project_thread_fork",
     "api_project_thread_update",

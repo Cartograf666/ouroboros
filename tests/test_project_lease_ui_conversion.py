@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -41,7 +42,6 @@ def _request(tmp_path, body):
 
 def test_mark_task_project_running_and_pending():
     from ouroboros.project_lease import (
-        WILDCARD_WORKSPACE,
         candidate_is_leasable,
         mark_task_project,
         running_project_ids,
@@ -52,18 +52,19 @@ def test_mark_task_project_running_and_pending():
     pending = [{"id": "t2", "project_id": ""}]  # PENDING holds bare task dicts
     assert running_project_lanes(running.values()) == set()          # no lane yet
 
-    # RUNNING task -> occupies the lane immediately. The lane key is
-    # (project_id, workspace_root): this task names no workspace, so it holds
-    # the project's own-folder lane.
-    assert mark_task_project(running, pending, "t1", "proj-x") is True
+    # RUNNING task -> occupies the lane immediately, and PINS it: the conversion
+    # ACQUIRES a lane rather than drifting out of one, which is the single case
+    # the write-once pin admits.
+    folders = {"proj-x": "/w/proj-x"}
+    assert mark_task_project(running, pending, "t1", "proj-x", folders) is True
     assert running["t1"]["task"]["project_id"] == "proj-x"
-    # It stamps the project id ONLY, so the folder is unknown here; the lane is
-    # the fail-safe wildcard that conflicts with every lane of proj-x rather
-    # than a second lane the project's own folder task could run beside.
-    assert running_project_lanes(running.values()) == {("proj-x", WILDCARD_WORKSPACE)}
+    # It stamps the project id ONLY — the folder comes from the caller's map, so
+    # the converted task takes the SAME folder lane as the room task already
+    # writing there instead of a second lane beside it.
+    assert running_project_lanes(running.values()) == {("", os.path.normcase("/w/proj-x"))}
     assert running_project_ids(running.values()) == {"proj-x"}
     assert candidate_is_leasable(
-        {"id": "z", "project_id": "proj-x"}, {("proj-x", "/w/proj-x")}
+        {"id": "z", "project_id": "proj-x"}, running_project_lanes(running.values()), folders
     ) is False
     # Bare project ids are a MISUSE, not a quietly permissive lease: every
     # candidate would read as leasable and two writers could enter one folder.

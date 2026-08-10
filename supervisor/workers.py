@@ -716,6 +716,7 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
     # working_dir fails LOUDLY here — never a silent workspace-less task that would
     # resolve to the self_modification profile over the system repo.
     from ouroboros.workspace_admission import (
+        GIT_INIT_REQUIRED,
         WORKSPACE_NONE,
         bounded_workspace_preflight,
         compose_workspace_block,
@@ -763,7 +764,7 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
                 # Bind-or-fail (v6.58.0): falling through to a workspace-less
                 # self_modification-profile task over the system repo is exactly
                 # the silent degradation the admission SSOT exists to kill.
-                _fail_promoted_task_loudly(
+                _halt_promoted_task_loudly(
                     ctx, task,
                     f"project {pid!r} has no working folder and auto-provisioning one failed; "
                     "see the supervisor log (ensure_project_workspace)",
@@ -775,15 +776,42 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
                 }
             task.setdefault("metadata", {})["workspace_autoprovisioned"] = True
 
-    resolved_ws, ws_error = resolve_room_workspace(
+    resolved_ws, ws_error, ws_decision = resolve_room_workspace(
         drive_root=DRIVE_ROOT,
         system_repo_dir=REPO_DIR,
         project_id=pid,
         explicit_workspace=str(evt.get("workspace_root") or "").strip(),
         workspace_sentinel=str(evt.get("workspace") or ""),
+        # WHICH thread's room this task was born in (A7). A thread that branched
+        # off works in its own checkout, and its tasks have to be admitted into
+        # THAT folder or they take the project folder's writer lane and queue
+        # behind it — branching would buy the owner a second copy of their files
+        # and no concurrency at all. Read from the EVENT: `task["chat_id"]` is
+        # rewritten to the project's own chat further up when a project is bound
+        # here, so by this point it can no longer name the room.
+        room_chat_id=evt.get("chat_id"),
     )
+    if ws_decision:
+        # A12: the owner's folder is untracked. STOP before queueing (never auto-init
+        # in someone else's folder) and hand the decision up typed, with the same
+        # plain-language offer the gateway surface serves.
+        _halt_promoted_task_loudly(
+            ctx, task, str(ws_decision.get("message") or ""),
+            reason_code=GIT_INIT_REQUIRED,
+            banner="GIT_INIT_REQUIRED",
+            advice=(
+                "Say yes in Projects → this project to start tracking the folder, or "
+                "re-promote with workspace='none' for a folder-less task."
+            ),
+        )
+        return {
+            "status": "needs_manual_target",
+            "reason": GIT_INIT_REQUIRED,
+            "decision": ws_decision,
+            "task_id": tid,
+        }
     if ws_error:
-        _fail_promoted_task_loudly(ctx, task, ws_error)
+        _halt_promoted_task_loudly(ctx, task, ws_error)
         return {"status": "needs_manual_target", "reason": "workspace_unusable", "task_id": tid}
     if resolved_ws:
         task["workspace_root"] = resolved_ws
@@ -834,28 +862,41 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
     return None
 
 
-def _fail_promoted_task_loudly(ctx: Any, task: dict, ws_error: str) -> None:
+def _halt_promoted_task_loudly(
+    ctx: Any,
+    task: dict,
+    ws_error: str,
+    *,
+    reason_code: str = "workspace_unusable",
+    banner: str = "WORKSPACE_UNUSABLE",
+    advice: str = (
+        "Fix the project's working folder (Projects → this project) or re-promote with "
+        "workspace='none' for a folder-less task."
+    ),
+) -> None:
     """v6.58.0 loud-fail invariant: a room task whose workspace is SET-but-unusable
     is terminally FAILED at admission with a visible card + chat message — never
     silently admitted workspace-less (which would run the self_modification profile
-    over the system repo). Never raises."""
+    over the system repo). Never raises.
+
+    The banner/reason are parameters because A12 added a SECOND reason a promoted
+    task legitimately does not start: the folder is untracked and the owner has not
+    answered the git offer yet. That is not a breakage, and labelling it
+    `workspace_unusable` would tell the owner their folder is broken when the only
+    thing missing is their answer."""
     tid = str(task.get("id") or "")
     chat_id = 0
     try:
         chat_id = int(task.get("chat_id") or 0)
     except (TypeError, ValueError):
         chat_id = 0
-    message = (
-        f"⚠️ WORKSPACE_UNUSABLE: task {tid} was NOT started — {ws_error} "
-        "Fix the project's working folder (Projects → this project) or re-promote with "
-        "workspace='none' for a folder-less task."
-    )
+    message = f"⚠️ {banner}: task {tid} was NOT started — {ws_error} {advice}"
     try:
         from ouroboros.task_results import STATUS_FAILED, write_task_result
 
         write_task_result(
             DRIVE_ROOT, tid, STATUS_FAILED,
-            reason_code="workspace_unusable",
+            reason_code=reason_code,
             result=message,
             description=str(task.get("description") or ""),
             chat_id=chat_id,
@@ -868,6 +909,21 @@ def _fail_promoted_task_loudly(ctx: Any, task: dict, ws_error: str) -> None:
             ctx.send_with_budget(chat_id, message)
     except Exception:
         log.debug("promote loud-fail: chat message failed for %s", tid, exc_info=True)
+
+
+def _running_task_workspace(ctx: Any, task_id: str) -> str:
+    """The workspace_root of a LIVE task, read from the supervisor RUNNING map.
+
+    A self-scoping task is by definition still running, so the in-memory record is
+    the authority — its persisted result does not exist yet. Never raises."""
+    try:
+        running = getattr(ctx, "RUNNING", None)
+        row = running.get(task_id) if isinstance(running, dict) else None
+        task = row.get("task") if isinstance(row, dict) else None
+        return str((task or {}).get("workspace_root") or "").strip()
+    except Exception:
+        log.debug("_running_task_workspace failed for %s", task_id, exc_info=True)
+        return ""
 
 
 def ensure_project_scope(evt: dict, ctx: Any) -> None:
@@ -886,6 +942,20 @@ def ensure_project_scope(evt: dict, ctx: Any) -> None:
 
         project = create_project(DRIVE_ROOT, pid, name=name, origin="ensure_project_scope")
         touch_project(DRIVE_ROOT, pid)
+        # A11, mirroring the UI conversion: a task that self-scopes mid-run hands the
+        # new project the folder it is ALREADY working in. Otherwise the project is
+        # born placeless and its next task provisions a different empty tree, which
+        # is the same silent move the card conversion used to make.
+        try:
+            from ouroboros.projects_registry import adopt_task_workspace
+
+            _adopted, _adopt_error = adopt_task_workspace(
+                DRIVE_ROOT, pid, _running_task_workspace(ctx, tid), system_repo_dir=REPO_DIR
+            )
+            if _adopt_error:
+                log.warning("ensure_project_scope: %s", _adopt_error)
+        except Exception:
+            log.debug("ensure_project_scope: workspace adoption failed for %s", pid, exc_info=True)
         try:
             proj_chat = int((project or {}).get("chat_id") or 0)
         except (TypeError, ValueError):
@@ -919,12 +989,19 @@ def ensure_project_scope(evt: dict, ctx: Any) -> None:
         # with the UI api_project_from_task convert path so the two cannot drift.
         try:
             from ouroboros.project_lease import mark_task_project
+            from ouroboros.projects_registry import project_working_dirs
 
             running = getattr(ctx, "RUNNING", None)
             pending = getattr(ctx, "PENDING", None)
             if isinstance(running, dict):
+                # The project->folder map goes in because marking PINS the lane of a
+                # RUNNING task: pinned without it, a task that named no folder freezes
+                # (pid, "") while every later candidate for the same project resolves
+                # to ("", folder) and is admitted alongside it.
                 with _queue_lock:
-                    mark_task_project(running, pending, tid, pid)
+                    mark_task_project(
+                        running, pending, tid, pid, project_working_dirs(DRIVE_ROOT)
+                    )
         except Exception:
             log.debug("ensure_project_scope: RUNNING project_id update failed for %s", tid, exc_info=True)
         if proj_chat:
@@ -2298,7 +2375,7 @@ def assign_tasks() -> None:
                 send_with_budget(int(st["owner_chat_id"]), evo_block)
             queue.persist_queue_snapshot(reason="evolution_blocked_light")
 
-        from ouroboros.project_lease import candidate_is_leasable, running_project_lanes
+        from ouroboros.project_lease import candidate_is_leasable, pin_task_lane, running_project_lanes
         from ouroboros.config import get_max_active_subagents_per_root
 
         # project_id -> registered working_dir, read ONCE per assignment pass.
@@ -2307,8 +2384,9 @@ def assign_tasks() -> None:
         # already writing the SAME project folder, and both would be admitted as
         # top-level writers. The lease itself stays filesystem-free under the
         # queue lock, so the registry read lives here. Fail-open to {} — the
-        # lease then treats an unknown folder as a wildcard conflicting with
-        # every lane of its project (queue, never parallel-by-accident).
+        # lease then keys such a task on its project alone, which is narrower
+        # than a folder lane and is documented as such in project_lease rather
+        # than silently assumed equivalent.
         try:
             from ouroboros.projects_registry import project_working_dirs
 
@@ -2358,11 +2436,11 @@ def assign_tasks() -> None:
             if w.busy_task_id is None and not getattr(w, "reaping", False) and PENDING:
                 # One-writer-per-WORKING-FOLDER lease: recompute per
                 # assignment so a task assigned in THIS loop pass immediately
-                # occupies its lane. The lane key is (project_id,
-                # workspace_root), so two threads of one project in the SAME
-                # folder still serialize while a worktree-branched thread runs
-                # concurrently. A task with no workspace_root of its own
-                # resolves through _project_workspaces to its project's folder.
+                # occupies its lane. The lane key is the FOLDER, so two threads
+                # of one project in the SAME folder still serialize while a
+                # worktree-branched thread runs concurrently. A task with no
+                # workspace_root of its own resolves through
+                # _project_workspaces to its project's registered folder.
                 leased = running_project_lanes(RUNNING.values(), _project_workspaces)
                 # Find first suitable task (skip over-budget evolution tasks
                 # and project-leased candidates)
@@ -2451,8 +2529,19 @@ def assign_tasks() -> None:
                 w.busy_task_id = task["id"]
                 w.in_q.put(task)
                 now_ts = time.time()
+                running_record = dict(task)
+                # PIN the writer lane at the RUNNING transition (T0R2-7). Derived
+                # on demand, a mid-run edit of this record — the post-hoc project
+                # conversion is the live one — silently moved the task into a
+                # different lane, releasing the folder it is still writing in and
+                # admitting a second writer onto it. The SAME project->folder map
+                # the admission check used must be handed to the pin: pinning
+                # without it freezes (project_id, "") for a task that was compared
+                # as ("", registered_folder), so the folder reads as unheld to the
+                # very next candidate and the pin itself admits a second writer.
+                pin_task_lane(running_record, _project_workspaces)
                 RUNNING[task["id"]] = {
-                    "task": dict(task), "worker_id": w.wid,
+                    "task": running_record, "worker_id": w.wid,
                     "started_at": now_ts, "last_heartbeat_at": now_ts,
                     "soft_sent": False, "attempt": int(task.get("_attempt") or 1),
                 }

@@ -1720,6 +1720,12 @@ export function createChatInstance({
             const payload = await apiClient.projectFromTask(taskId, projectId, '', record.objectiveHint || '');
             const project = payload.project || { id: projectId, name: projectId };
             showToast(`Project created: ${project.name || project.id}`, 'ok');
+            // A11 disclosure (ProjectFromTaskResponse.working_dir_error): the project
+            // exists but did NOT inherit the task's folder, so it has no place yet.
+            // Silence here is what let a placeless project look like a working one.
+            if (payload.working_dir_error) {
+                showToast(payload.working_dir_error, 'warn');
+            }
             window.dispatchEvent(new CustomEvent('ouro:project-created', { detail: { project } }));
             markCardConverted(record, project);
         } catch (exc) {

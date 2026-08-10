@@ -12,16 +12,29 @@ from ouroboros.gateway.contracts import (
     OwnerScopeReviewFloorResponse,
     PhotoOutbound,
     ProjectEntry,
+    ProjectFromTaskResponse,
+    ProjectInitGitResponse,
     SkillDeleteResponse,
     SkillLifecycleQueueResponse,
     StateResponse,
     TaskCostBreakdown,
     TaskDetailResponse,
     TaskDiffResponse,
+    ThreadBranchBase,
+    ThreadBranchBasesResponse,
+    ThreadBranchOffRequest,
     ThreadCreateRequest,
+    ThreadDeleteRequest,
+    ThreadDiffResponse,
     ThreadEntry,
+    ThreadLifecycleResponse,
+    ThreadQueueNotice,
+    ThreadLocation,
+    ThreadMergeBackRequest,
     ThreadResponse,
     ThreadUpdateRequest,
+    ThreadWorktreeRemoveRequest,
+    ThreadWorktreeResponse,
     UiPreferencesResponse,
     UpdateApplyErrorResponse,
     UpdateApplyRequest,
@@ -31,6 +44,7 @@ from ouroboros.gateway.contracts import (
     UpdatePreflightResponse,
     UpdateStatusReadyOutbound,
     VideoOutbound,
+    WorkspaceGitInitDecision,
     ClaudexorStatusReads,
     ClaudexorStatusResponse,
 )
@@ -121,6 +135,20 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "ThreadCreateRequest",
         "ThreadUpdateRequest",
         "ThreadResponse",
+        "ThreadLocation",
+        "ThreadBranchBase",
+        "ThreadBranchBasesResponse",
+        "ThreadBranchOffRequest",
+        "ThreadMergeBackRequest",
+        "ThreadWorktreeRemoveRequest",
+        "ThreadDeleteRequest",
+        "ThreadWorktreeResponse",
+        "ThreadDiffResponse",
+        "ThreadLifecycleResponse",
+        "ThreadQueueNotice",
+        "WorkspaceGitInitDecision",
+        "ProjectInitGitResponse",
+        "ProjectFromTaskResponse",
     ):
         assert re.search(rf"@typedef \{{Object\}} {name}\b", text), f"api_types.js missing {name}"
     api_client = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "api_client.js").read_text(
@@ -132,6 +160,19 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     # or the UI phase would hand-roll fetches outside the api_client seam.
     for call in ("projectThreadCreate", "projectThreadUpdate", "projectThreadFork"):
         assert call in api_client, f"api_client.js missing {call}"
+    # T3: branching, the inspected removal and the thread-checkout diff ride the
+    # SAME seam. A UI phase that hand-rolls one of these fetches loses the shared
+    # path builder and, with it, the encoding of an owner-typed project id.
+    for call in (
+        "threadBranchBases", "threadBranchOff", "threadMergeBack",
+        "threadWorktree", "threadWorktreeRemove", "threadDiff",
+        "threadArchive", "threadRestore", "threadDelete",
+    ):
+        assert call in api_client, f"api_client.js missing {call}"
+    # T2: the owner's YES to the git_init_required offer must be reachable through
+    # the one client seam, or the UI phase hand-rolls a fetch for the single route
+    # that writes into the owner's own folder.
+    assert "projectInitGit" in api_client, "api_client.js missing projectInitGit"
     # v6.80.0: the two contracts extended this release join the FIELD-level parity list. The name-level
     # loop above cannot see a new @property, so an ABI field added on the Python side would otherwise
     # never have to appear in the browser's typedef (ARCHITECTURE.md §11.3).
@@ -145,7 +186,13 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
                 UpdateStatusReadyOutbound, TaskCostBreakdown, TaskDetailResponse,
                 ClaudexorStatusReads, ClaudexorStatusResponse, TaskDiffResponse,
                 UiPreferencesResponse, ProjectEntry,
-                ThreadEntry, ThreadCreateRequest, ThreadUpdateRequest, ThreadResponse):
+                ThreadEntry, ThreadCreateRequest, ThreadUpdateRequest, ThreadResponse,
+                ThreadLocation, ThreadBranchBase, ThreadBranchBasesResponse,
+                ThreadBranchOffRequest, ThreadMergeBackRequest, ThreadWorktreeRemoveRequest,
+                ThreadDeleteRequest,
+                ThreadWorktreeResponse, ThreadDiffResponse, ThreadLifecycleResponse, ThreadQueueNotice,
+                WorkspaceGitInitDecision, ProjectInitGitResponse,
+                ProjectFromTaskResponse):
         expected = set(get_type_hints(cls, include_extras=True))
         actual = _js_typedef_fields(text, cls.__name__)
         assert actual == expected, f"{cls.__name__} JSDoc fields drifted: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
@@ -322,3 +369,36 @@ def test_task_detail_cost_breakdown_emission_matches_contract(monkeypatch, tmp_p
     detail_hints = get_type_hints(TaskDetailResponse, include_extras=True)
     assert detail_hints["cost_breakdown"] is TaskCostBreakdown
     assert TaskDetailResponse.__required_keys__ == frozenset()
+
+
+def test_thread_entry_declares_every_field_the_projection_actually_ships(tmp_path):
+    """T3R2-B3: the field-level mirror cannot catch two sides that are equally wrong.
+
+    Live rows carry `lifecycle`, `archived_at` and `delete_error` on `/api/state`,
+    on `GET /api/projects` and inside every `ThreadResponse` — the canonical
+    projection normalises all three onto every row, and the client already reads
+    `thread.lifecycle` to decide what a thread menu may offer. Neither the Python
+    contract nor the JS typedef declared them, and ARCHITECTURE §11.3 asserted
+    that T3 had added them. Parity passed because both mirrors were wrong
+    identically, so this pins the projection ITSELF against the contract.
+    """
+    from ouroboros.project_threads_registry import project_threads
+    from ouroboros.projects_registry import create_project, create_thread
+
+    declared = set(get_type_hints(ThreadEntry, include_extras=True))
+    create_project(tmp_path, "racer", name="Racer")
+    forked_source = create_thread(tmp_path, "racer", name="Tuning")
+    from ouroboros.projects_registry import archive_thread, fork_thread, get_project
+
+    fork_thread(tmp_path, "racer", forked_source["id"])
+    archive_thread(tmp_path, "racer", forked_source["id"])
+    rows = project_threads(get_project(tmp_path, "racer"))
+
+    assert len(rows) >= 3, rows
+    shipped: set = set()
+    for row in rows:
+        shipped |= set(row)
+    assert shipped <= declared, f"ThreadEntry does not declare: {sorted(shipped - declared)}"
+    # And the three the lifecycle actually adds are really on every row.
+    for row in rows:
+        assert {"lifecycle", "archived_at", "delete_error"} <= set(row)

@@ -191,15 +191,45 @@ def _ops_lock(target: Any, mkdir_root: Optional[Any] = None):
 # git helpers
 # --------------------------------------------------------------------------- #
 def _force_rmtree(path: Path) -> None:
-    """Best-effort recursive delete that also removes read-only files.
+    """Best-effort recursive delete that also removes read-only entries.
 
     On Windows git pack/object files under ``.git`` are read-only, and
     ``shutil.rmtree(ignore_errors=True)`` silently FAILS to delete them, leaving
-    the directory behind. The onerror hook clears the read-only bit and retries
-    so genesis-project / worktree teardown actually removes the tree."""
+    the directory behind. The onerror hook restores enough permission to retry
+    so genesis-project / worktree teardown actually removes the tree.
+
+    The permission repair is ADDITIVE (``current | wanted``) and grants a
+    DIRECTORY its ``+x`` back. The previous ``os.chmod(p, stat.S_IWRITE)``
+    replaced the mode outright with ``0o200``: on a directory that is
+    write-only-no-execute, so the very next ``os.listdir``/``os.unlink`` inside
+    it fails with ``EACCES`` — the hook turned a recoverable failure into a
+    permanent one, and a retry (or the owner's own ``rm -rf``) hit the same
+    wall. Directories are the common case here, because a worktree is removed
+    directory-first.
+
+    The failing entry's PARENT is repaired too: ``unlink``/``rmdir`` are checked
+    against the containing directory's write bit, not the child's, so clearing
+    the child alone leaves the exact case this hook exists for unfixed.
+    """
+    def _relax(target: Path, *, directory: bool) -> None:
+        try:
+            mode = stat.S_IMODE(target.lstat().st_mode)
+        except OSError:
+            return
+        want = mode | stat.S_IWRITE | stat.S_IREAD
+        if directory:
+            want |= stat.S_IEXEC
+        if want != mode:
+            try:
+                os.chmod(target, want)
+            except OSError:
+                pass
+
     def _on_error(func, p, _exc):
         try:
-            os.chmod(p, stat.S_IWRITE)
+            target = Path(p)
+            _relax(target, directory=target.is_dir() and not target.is_symlink())
+            _relax(target.parent, directory=True)
             func(p)
         except Exception:
             pass

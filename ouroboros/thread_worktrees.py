@@ -59,9 +59,12 @@ _SCHEMA_VERSION = 1
 _BRANCH_PREFIX = "thread/"
 _LOCK = threading.RLock()
 
-# Not a config.py knob in T0: no owner-facing surface reaches it yet (branch-off
-# is a later phase) and config.py is documented as having no reclaimable line.
-# Env-overridable so a relocated Ouroboros home still works.
+# A PATH, not a numeric knob, so the SSOT gate that governs timeouts does not
+# apply — it is env-overridable exactly so a relocated Ouroboros home still works,
+# and the removal guard now validates the root a row was provisioned under against
+# this one. T0 justified it with "no owner-facing surface reaches it yet
+# (branch-off is a later phase)"; T3 IS that phase, and branch-off, merge-back,
+# the checkout diff and the inspected removal all reach it.
 _ROOT_ENV = "OUROBOROS_THREAD_WORKTREE_ROOT"
 
 
@@ -82,6 +85,12 @@ class ThreadWorktree:
     repo_dir: str
     created_at: float
     created_at_iso: str = ""
+    #: The root this checkout was PROVISIONED under, recorded so removal can
+    #: validate containment against the same boundary that admitted it (T0R2-9).
+    #: Validating against the root resolved at removal time made every existing
+    #: row `path_outside_root` — permanently unremovable through the API — the
+    #: moment `OUROBOROS_THREAD_WORKTREE_ROOT` changed.
+    worktree_root: str = ""
 
 
 def _registry_path(data_dir: Any) -> Path:
@@ -190,28 +199,91 @@ def provision_thread_worktree(
             repo_dir=str(repo),
             created_at=time.time(),
             created_at_iso=utc_now_iso(),
+            worktree_root=str(root),
         )
         _save(data_dir, [*rows, asdict(handle)])
         log.info("Thread worktree provisioned: %s#%s at %s", key[0], key[1], wt_path)
         return handle
 
 
+def _project_head(row: Dict[str, Any]) -> str:
+    """The PROJECT folder's current HEAD sha, or "" when it cannot be read."""
+    repo = Path(str(row.get("repo_dir") or ""))
+    try:
+        if not repo.is_dir():
+            return ""
+        head = run_git(repo, "rev-parse", "HEAD", check=False)
+    except Exception:
+        return ""
+    return (head.stdout or "").strip() if head.returncode == 0 else ""
+
+
 def inspect_thread_worktree(row: Dict[str, Any]) -> Dict[str, Any]:
     """What removing this worktree would DESTROY — the evidence a removal needs.
 
-    Returns ``{exists, dirty, dirty_files, unmerged_commits, error}``. Never
-    raises: an unreadable checkout reports ``error`` and is treated as unsafe
-    (``dirty``), because "cannot tell" must never read as "nothing to lose".
+    Returns ``{exists, dirty, dirty_files, unmerged_commits, unmerged_against,
+    error}``. Never raises: an unreadable checkout reports ``error`` and is
+    treated as unsafe (``dirty``), because "cannot tell" must never read as
+    "nothing to lose".
+
+    IGNORED files are counted as dirty (``--ignored=matching``, the ``!!``
+    entries). ``git status --porcelain`` alone hides exactly the files a thread's
+    checkout is most likely to be the only copy of: a ``.env`` written into that
+    folder, a ``local.db``, a ``build/`` an agent produced. The checkout read
+    ``dirty: false`` and one-click removal force-deleted them with no prompt —
+    the same ``.env`` the snapshot works hard to keep OUT of history is the one
+    this deleted from disk. They are not "changes", but the question this function
+    answers is what removal would DESTROY, and they are destroyed. Counted here,
+    they ride the acknowledgement path that already exists rather than needing a
+    second one.
+
+    ``unmerged_commits`` is counted against the PROJECT's current HEAD, not
+    against the frozen ``base_sha`` this checkout branched from. The question A10
+    asks is "what would the project folder never receive", and the answer moves
+    every time the project's HEAD does: counting against the branch point meant a
+    worktree whose work had ALREADY been merged back still reported every one of
+    those commits as unmerged, so the owner was asked to acknowledge destroying
+    work that was already safe in their folder. Evidence that cries wolf is worse
+    than no evidence, because the owner learns to click through it.
+
+    The base is the FALLBACK, and deliberately the conservative direction: when
+    the project's HEAD cannot be read, counting from the branch point can only
+    over-report, which refuses a removal rather than permitting one.
+
+    Counted from BOTH tips — the checkout's HEAD and the thread's own branch —
+    because those come apart. A checkout standing on a detached HEAD, or moved
+    onto some other branch, has a ``thread/<name>`` branch that still holds every
+    commit made in it; asking only where HEAD points reported ZERO and the owner
+    was told the removal "deletes only the folder". Nothing was actually lost —
+    ``git branch -d`` refuses an unmerged branch, so the commits survived — but
+    A10's evidence has to be true when it is READ, not merely harmless.
     """
     out: Dict[str, Any] = {
-        "exists": False, "dirty": False, "dirty_files": [], "unmerged_commits": 0, "error": "",
+        "exists": False, "dirty": False, "dirty_files": [], "unmerged_commits": 0,
+        "unmerged_against": "", "error": "",
     }
     wt_path = Path(str(row.get("path") or ""))
     if not wt_path.is_dir():
+        # A registered checkout that is not on disk is "cannot tell", not
+        # "nothing to lose" — an unmounted volume, a folder moved out from under
+        # the registry, a `git worktree remove` run by hand. Answering
+        # `{exists: False, dirty: False, unmerged_commits: 0}` was the exact shape
+        # this docstring says must never happen: the removal prompt read it as a
+        # clean checkout and offered one-click removal of something whose contents
+        # nobody could see. It rides the acknowledgement path instead.
+        out["error"] = f"the checkout is not on disk: {wt_path}"
+        out["dirty"] = True
         return out
     out["exists"] = True
     try:
-        status = run_git(wt_path, "status", "--porcelain", check=False)
+        # `core.quotepath=off` so a non-ASCII path arrives as itself. Without it
+        # this listed the C-quoted spelling while `merge_back_thread`'s own status
+        # call — which pins it — listed the real one, and the two surfaces
+        # disagreed about the same file.
+        status = run_git(
+            wt_path, "-c", "core.quotepath=off", "status", "--porcelain",
+            "--ignored=matching", check=False,
+        )
         if status.returncode != 0:
             # Not a checkout any more (or git refused): unsafe by construction.
             out["error"] = (status.stderr or "git status failed").strip()[:500]
@@ -220,9 +292,18 @@ def inspect_thread_worktree(row: Dict[str, Any]) -> Dict[str, Any]:
         files = [line for line in status.stdout.splitlines() if line.strip()]
         out["dirty"] = bool(files)
         out["dirty_files"] = files[:200]
-        base = str(row.get("base_sha") or "")
-        if base:
-            ahead = run_git(wt_path, "rev-list", "--count", f"{base}..HEAD", check=False)
+        reference = _project_head(row) or str(row.get("base_sha") or "")
+        if reference:
+            out["unmerged_against"] = reference
+            tips = ["HEAD"]
+            branch = str(row.get("branch") or "").strip()
+            if branch and run_git(
+                wt_path, "rev-parse", "--verify", "-q", branch, check=False,
+            ).returncode == 0:
+                tips.append(branch)
+            ahead = run_git(
+                wt_path, "rev-list", "--count", *tips, "--not", reference, check=False,
+            )
             if ahead.returncode != 0:
                 out["error"] = (ahead.stderr or "git rev-list failed").strip()[:500]
                 out["dirty"] = True
@@ -234,6 +315,65 @@ def inspect_thread_worktree(row: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+#: ``git status --porcelain`` codes for content git is not tracking. ``!!`` only
+#: appears because :func:`inspect_thread_worktree` asks for ``--ignored=matching``.
+_UNTRACKED_CODE = "??"
+_IGNORED_CODE = "!!"
+
+
+def checkout_work_at_risk(inspection: Dict[str, Any]) -> Dict[str, Any]:
+    """Split what a checkout holds into work that CANNOT be rebuilt, and the rest.
+
+    Returns ``{at_risk, unmerged_commits, tracked_files, untracked_files,
+    ignored_files, unreadable}``. A pure read over an existing inspection — it
+    asks nothing of git and never touches the disk.
+
+    ``inspect_thread_worktree`` deliberately counts an ignored ``node_modules/``
+    as dirt, because REMOVING the checkout destroys it and A10's prompt must say
+    so. But "would be destroyed" and "cannot be rebuilt" are different questions,
+    and only the second one may BLOCK an owner gesture aimed at something else.
+    Thread DELETION asks the second: a checkout whose only dirt is a build
+    directory or a stray log is not work at risk, and refusing the delete over it
+    made "delete the thread and its folder" a three-step detour through merge-back
+    and an acknowledged removal — friction the owner explicitly did not ask for.
+
+    At risk means, exactly:
+
+    * ``unmerged_commits`` — commits the project folder never received. The
+      checkout's branch is their last copy.
+    * ``tracked_files`` — modifications to files git is TRACKING. Their previous
+      contents are in history; these edits are nowhere else.
+    * ``unreadable`` — the inspection could not be taken. "Cannot tell" must never
+      read as "nothing to lose", so it counts as at risk on its own.
+
+    Untracked and ignored files are neither destroyed silently nor treated as
+    unlosable: they are NAMED and go through the same acknowledgement the removal
+    route uses. Acknowledging is a step; being refused is a wall.
+    """
+    files = [str(line) for line in (inspection.get("dirty_files") or []) if str(line).strip()]
+    tracked: List[str] = []
+    untracked: List[str] = []
+    ignored: List[str] = []
+    for line in files:
+        code = line[:2]
+        if code == _IGNORED_CODE:
+            ignored.append(line)
+        elif code == _UNTRACKED_CODE:
+            untracked.append(line)
+        else:
+            tracked.append(line)
+    unreadable = str(inspection.get("error") or "").strip()
+    commits = int(inspection.get("unmerged_commits") or 0)
+    return {
+        "at_risk": bool(commits > 0 or tracked or unreadable),
+        "unmerged_commits": commits,
+        "tracked_files": tracked,
+        "untracked_files": untracked,
+        "ignored_files": ignored,
+        "unreadable": unreadable,
+    }
+
+
 def remove_thread_worktree(
     *,
     data_dir: Any,
@@ -241,102 +381,225 @@ def remove_thread_worktree(
     thread_id: Any,
     acknowledge_unmerged: bool = False,
     worktree_root: Optional[Any] = None,
+    busy: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Remove a thread worktree AFTER inspecting what that would destroy.
 
-    Returns ``{removed, reason, inspection, branch_deleted}``. A dirty tree or
-    commits the base never received refuse the removal unless
-    ``acknowledge_unmerged`` is passed — the caller must have SHOWN the owner
-    the inspection first. There is no silent path and no timer that reaches
-    this function. A checkout that survives the removal attempt reports
-    ``reason="removal_failed"`` and KEEPS its registry row: an orphaned checkout
-    the registry has forgotten can never be re-provisioned or removed again.
+    Returns ``{removed, reason, inspection}``. A dirty tree or commits the base
+    never received refuse the removal unless ``acknowledge_unmerged`` is passed
+    — the caller must have SHOWN the owner the inspection first. There is no
+    silent path and no timer that reaches this function.
 
-    A permitted removal ALSO deletes the thread's ``thread/<name>`` branch.
-    Provisioning deliberately refuses to reuse an existing branch (an owner's
-    work is never clobbered), so leaving the branch behind turned every removal
-    into a permanent block on re-provisioning the same thread — the owner would
-    have to delete a git branch by hand to branch off again. The destructive
-    decision has already been made and shown at this point: the worktree is
-    gone, and its branch is what pointed at it.
+    An ACTIVE project refuses with ``project_busy``, the same reason and the same
+    409 shape merge-back uses, because this deletes a folder something may be
+    writing in. ``project_lease.running_project_ids``,
+    ``thread_branching.project_is_busy`` and ARCHITECTURE all described that
+    precondition, and merge-back was its only caller: a task running in the
+    checkout made merge-back refuse correctly and removal answer ``removed: True``
+    while deleting the folder under the live worker. ``busy`` overrides the live
+    query for tests and for callers that already hold the answer.
+
+    Containment is checked against the root the row was PROVISIONED under
+    (T0R2-9), not against whatever this process resolves today. Resolving it at
+    removal time meant relocating ``OUROBOROS_THREAD_WORKTREE_ROOT`` — or simply
+    passing a different ``worktree_root`` — turned every existing row into
+    ``path_outside_root``: unremovable through the API forever, with the mirror
+    hazard that a moved root would ADMIT a path it should never have admitted.
+    A pre-T3 row carries no provisioning root; it falls back to the resolved one,
+    which is exactly the behaviour it was written under.
+
+    A checkout that SURVIVES the removal attempt reports ``reason="removal_failed"``
+    and KEEPS its registry row. Both deletions run best-effort (``check=False`` and
+    a swallowing rmtree), so a checkout held by a git lock, a read-only parent or a
+    busy file outlives them; reporting that as removed and dropping the row would
+    leave an orphan holding the branch that the registry can no longer see,
+    re-provision or remove.
+
+    A CLEAN removal also deletes the ``thread/<name>`` branch, and that is a
+    decision rather than a tidy-up. ``provision_thread_worktree`` refuses to reuse
+    an existing branch — deliberately, so an owner's work is never clobbered — so
+    leaving the branch behind made branch → merge → remove a ONE-SHOT round trip:
+    the second branch-off of the same thread failed with "branch already exists"
+    and the owner had no surface that could delete it. The alternative considered
+    was suffixing the branch name with a timestamp, which was rejected: it makes
+    every thread's branch name unpredictable to the owner reading `git branch`,
+    and it accumulates dead branches in their repository forever.
+
+    Deleting is safe here precisely because "clean" is checked twice by two
+    independent judges: this module's inspection (no dirty tree, no commits the
+    project's HEAD lacks) AND ``git branch -d``, which refuses on its own account
+    if the branch holds anything unmerged. A removal the owner had to
+    ACKNOWLEDGE keeps its branch — those commits are the last copy of that work,
+    and the acknowledgement was about the checkout, not about the history.
     """
     key = _key(project_id, thread_id)
     root = Path(worktree_root).expanduser().resolve() if worktree_root else thread_worktree_root()
     with _LOCK:
         seen = next((row for row in _load(data_dir) if _matches(row, key)), None)
-        if seen is None:
-            return {"removed": False, "reason": "unknown", "inspection": {}, "branch_deleted": False}
-        # Keyed on the REPO (see provisioning): `git worktree remove/prune`
-        # rewrites the same .git/worktrees the subagent registry mutates.
-        with worktree_ops_lock(str(seen.get("repo_dir") or root), mkdir_root=root):
-            rows = _load(data_dir)
-            match = next((row for row in rows if _matches(row, key)), None)
-            if match is None:
-                return {"removed": False, "reason": "unknown", "inspection": {}, "branch_deleted": False}
-            inspection = inspect_thread_worktree(match)
-            unsafe = bool(inspection["dirty"]) or int(inspection["unmerged_commits"]) > 0
-            if unsafe and not acknowledge_unmerged:
-                return {
-                    "removed": False, "reason": "unmerged_work",
-                    "inspection": inspection, "branch_deleted": False,
-                }
-            wt_path = Path(str(match.get("path") or ""))
-            if not str(wt_path).strip() or not path_is_within(wt_path, root):
-                # A malformed registry row must never delete an arbitrary path.
-                return {
-                    "removed": False, "reason": "path_outside_root",
-                    "inspection": inspection, "branch_deleted": False,
-                }
-            repo = Path(str(match.get("repo_dir") or "."))
-            run_git(repo, "worktree", "remove", "--force", str(wt_path), check=False)
-            if wt_path.exists():
-                force_rmtree(wt_path)
-            run_git(repo, "worktree", "prune", check=False)
-            if wt_path.exists():
-                # Both removals run best-effort (``check=False`` / a swallowing
-                # rmtree), so a checkout held by a git lock, a read-only parent
-                # or a busy file SURVIVES them. Reporting that as removed and
-                # dropping the row would leave an orphan holding the branch that
-                # the registry can no longer see, re-provision or remove. Say so
-                # and KEEP the row — and leave the branch alone, the surviving
-                # checkout is still on it.
-                log.warning(
-                    "Thread worktree %s#%s could not be removed — %s still "
-                    "exists; registry row retained",
-                    key[0], key[1], wt_path,
-                )
-                return {
-                    "removed": False, "reason": "removal_failed",
-                    "inspection": inspection, "branch_deleted": False,
-                }
-            branch = str(match.get("branch") or "")
-            branch_deleted = False
-            if branch.startswith(_BRANCH_PREFIX):
-                # -D, not -d: the acknowledged case is exactly the unmerged one,
-                # and git's merge check would refuse there. The prefix guard
-                # keeps this from ever reaching a branch we did not create.
-                deleted = run_git(repo, "branch", "-D", branch, check=False)
-                branch_deleted = deleted.returncode == 0
-                if not branch_deleted:
-                    log.warning(
-                        "Thread worktree %s#%s removed but branch %s could not be "
-                        "deleted (%s) — re-provisioning will refuse until it is gone",
-                        key[0], key[1], branch,
-                        (deleted.stderr or "").strip()[:200],
-                    )
-            _save(data_dir, [row for row in rows if not _matches(row, key)])
-            log.info(
-                "Thread worktree removed: %s#%s (%s, branch_deleted=%s)",
-                key[0], key[1], wt_path, branch_deleted,
+    if seen is None:
+        return {"removed": False, "reason": "unknown", "inspection": {}}
+    # The git-op lock is keyed on the REPO, exactly as provisioning keys it, and not
+    # on the worktree root: `git worktree remove`/`prune` rewrite the SAME
+    # `<repo>/.git/worktrees` metadata that provisioning and the SUBAGENT registry
+    # mutate. Keying it on the root gave those owners two different lockfiles over
+    # one `.git`, so removal could rewrite that metadata concurrently with a
+    # provisioning it was supposed to serialize against (`_ops_lock_path`).
+    with worktree_ops_lock(str(seen.get("repo_dir") or root), mkdir_root=root):
+        # `_LOCK` covers the registry READ and the final SAVE, nothing between.
+        # Holding it across two `run_git` calls, `force_rmtree`, a prune and a
+        # `git branch -d` blocked every `thread_location`/`get_thread_worktree`
+        # read for the duration — and with `run_git`'s known missing timeout that
+        # duration is unbounded, so one wedged git call froze the sidebar. The
+        # git-op lock still serializes the whole operation per root, which is what
+        # actually needs to be exclusive.
+        with _LOCK:
+            match = next((row for row in _load(data_dir) if _matches(row, key)), None)
+        if match is None:
+            return {"removed": False, "reason": "unknown", "inspection": {}}
+        # Removal deletes a folder a task may be WRITING in. `project_is_busy`,
+        # `running_project_ids` and ARCHITECTURE all said this was guarded; only
+        # merge-back actually asked. Reproduced: a running task in the checkout,
+        # merge-back correctly refuses `project_busy`, and removal answered
+        # `removed: True` and deleted the folder under the live worker.
+        if _project_is_busy(project_id, match) if busy is None else bool(busy):
+            return {"removed": False, "reason": "project_busy", "inspection": {}}
+        inspection = inspect_thread_worktree(match)
+        unsafe = bool(inspection["dirty"]) or int(inspection["unmerged_commits"]) > 0
+        if unsafe and not acknowledge_unmerged:
+            return {"removed": False, "reason": "unmerged_work", "inspection": inspection}
+        wt_path = Path(str(match.get("path") or ""))
+        guard_root = _trusted_guard_root(match, root, data_dir)
+        if (
+            not str(wt_path).strip()
+            or not path_is_within(wt_path, guard_root)
+            or wt_path.name != safe_path_component(f"{key[0]}__{key[1]}")
+        ):
+            # A malformed registry row must never delete an arbitrary path — and
+            # that was exactly what it could do, because the boundary it was
+            # checked against came from the SAME untrusted row (T0R2-9 moved the
+            # root onto the row and the guard moved with it). Two independent
+            # facts are required now: a root this process would itself accept, and
+            # the path this thread's checkout is DERIVED to have.
+            return {"removed": False, "reason": "path_outside_root", "inspection": inspection}
+        repo = Path(str(match.get("repo_dir") or "."))
+        branch = str(match.get("branch") or "").strip()
+        run_git(repo, "worktree", "remove", "--force", str(wt_path), check=False)
+        if wt_path.exists():
+            force_rmtree(wt_path)
+        run_git(repo, "worktree", "prune", check=False)
+        if wt_path.exists():
+            # Both deletions above run best-effort (`check=False` / a swallowing
+            # rmtree), so a checkout held by a git lock, a read-only parent or a
+            # busy file SURVIVES them. Reporting that as removed and dropping the
+            # row would leave an orphan holding the branch that the registry can no
+            # longer see, re-provision or remove. Say so and KEEP the row — and
+            # leave the branch alone, the surviving checkout is still on it.
+            log.warning(
+                "Thread worktree %s#%s could not be removed — %s still exists; "
+                "registry row retained",
+                key[0], key[1], wt_path,
             )
             return {
-                "removed": True, "reason": "",
-                "inspection": inspection, "branch_deleted": branch_deleted,
+                "removed": False,
+                "reason": "removal_failed",
+                "inspection": inspection,
+                "branch": branch,
+                "branch_removed": False,
+                "branch_kept_reason": "the checkout survived removal, so its branch still points at it",
             }
+        # The branch is kept for COMMITS, never merely for dirt. An acknowledged
+        # removal whose only dirt was an ignored `node_modules/` has nothing on
+        # that branch the repository would not still have, and keeping it left a
+        # `thread/<name>` behind that the next branch-off refuses on — and that
+        # nothing can reach at all once the thread it belonged to is tombstoned.
+        # `git branch -d` is still the second judge and still refuses on its own
+        # account, so this only ever ASKS; it never forces.
+        branch_removed, branch_kept_reason = _drop_clean_branch(
+            repo, branch, bool(inspection["error"]) or int(inspection["unmerged_commits"]) > 0,
+        )
+        with _LOCK:
+            _save(data_dir, [row for row in _load(data_dir) if not _matches(row, key)])
+        log.info("Thread worktree removed: %s#%s (%s)", key[0], key[1], wt_path)
+        return {
+            "removed": True,
+            "reason": "",
+            "inspection": inspection,
+            "branch": branch,
+            "branch_removed": branch_removed,
+            "branch_kept_reason": branch_kept_reason,
+        }
+
+
+def _project_is_busy(project_id: Any, row: Dict[str, Any]) -> bool:
+    """Is anything alive in this project, or in the CHECKOUT? — merge-back's judge.
+
+    Imported lazily because ``thread_branching`` imports THIS module; the answer
+    has to be the same one merge-back gets, or the two owner gestures would
+    disagree about whether the folder is safe to touch. The folder asked about is
+    the CHECKOUT — that is the one this deletes — and the project-wide half of the
+    query already covers a task running anywhere else in the project.
+    """
+    from ouroboros.thread_branching import project_is_busy
+
+    return project_is_busy(str(project_id or ""), str(row.get("path") or ""))
+
+
+def _trusted_guard_root(row: Dict[str, Any], fallback: Path, data_dir: Any) -> Path:
+    """The boundary a removal is allowed to delete inside.
+
+    The root recorded at provisioning is preferred (T0R2-9: validating against
+    whatever the process resolves TODAY stranded every existing row as
+    ``path_outside_root`` the moment the configured root moved), but it is a value
+    on an untrusted row, so it is re-checked with the SAME guard provisioning used
+    before it is believed. A stored root that would never have been admitted falls
+    back to this process's own root, where a bogus path simply fails containment.
+    """
+    from ouroboros.config import REPO_DIR
+
+    stored = str(row.get("worktree_root") or "").strip()
+    if not stored:
+        return fallback
+    try:
+        candidate = Path(stored).expanduser().resolve()
+        assert_worktree_root_isolated(candidate, Path(REPO_DIR), Path(data_dir))
+    except Exception:
+        log.warning("Thread worktree row carries an unusable provisioning root: %r", stored)
+        return fallback
+    return candidate
+
+
+def _drop_clean_branch(repo: Path, branch: str, holds_commits: bool) -> tuple:
+    """Delete a thread branch that has nothing left to lose. ``(removed, why_kept)``.
+
+    ``git branch -d`` — never ``-D``. The safe form is the point: it is git's own
+    second opinion on whether the branch holds anything the repository would not
+    still have afterwards, and it refusing means the branch stays. A branch that
+    stays is disclosed with the reason, never silently.
+
+    ``holds_commits`` is about the HISTORY, not about the working tree: commits
+    the project folder never received, or an inspection that could not be taken
+    at all. Uncommitted or ignored files are not on the branch, so keeping it
+    would protect nothing while leaving a `thread/<name>` the next branch-off
+    refuses on.
+    """
+    if not branch or not branch.startswith(_BRANCH_PREFIX):
+        return False, "not a thread branch"
+    if holds_commits:
+        # The owner acknowledged losing the CHECKOUT. Its commits are a separate
+        # thing and this is the last copy of them.
+        return False, "the checkout held unmerged work, so its branch keeps the commits"
+    try:
+        dropped = run_git(repo, "branch", "-d", branch, check=False)
+    except Exception as exc:
+        return False, f"the branch could not be deleted: {type(exc).__name__}: {exc}"
+    if dropped.returncode != 0:
+        return False, (dropped.stderr or dropped.stdout or "git refused to delete the branch").strip()[:300]
+    return True, ""
 
 
 __all__ = [
     "ThreadWorktree",
+    "checkout_work_at_risk",
     "get_thread_worktree",
     "inspect_thread_worktree",
     "list_thread_worktrees",

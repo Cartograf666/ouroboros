@@ -131,6 +131,11 @@ def test_removal_refuses_dirty_or_unmerged_work_until_acknowledged(repo, tmp_pat
     assert done["removed"] is True
     assert not Path(handle.path).exists()
     assert list_thread_worktrees(tmp_path / "data") == []
+    # The owner acknowledged losing the CHECKOUT. Its commits are a separate
+    # thing, and this branch is now the last copy of them (T3R-5).
+    assert done["branch_removed"] is False
+    assert "unmerged work" in done["branch_kept_reason"]
+    assert handle.branch in _git(repo, "branch", "--format=%(refname:short)").stdout.split()
 
 
 def test_clean_fully_merged_worktree_removes_without_ceremony(repo, tmp_path, wt_root):
@@ -148,31 +153,143 @@ def test_clean_fully_merged_worktree_removes_without_ceremony(repo, tmp_path, wt
     assert get_thread_worktree(tmp_path / "data", "racer", 1) is None
 
 
+def test_A10s_evidence_counts_against_the_PROJECTs_HEAD_not_the_branch_point(repo, tmp_path, wt_root):
+    """T3R-4. "Commits the project folder never received" is a question about the
+    PROJECT's HEAD, and the answer moves every time that HEAD does.
+
+    Counted against the frozen ``base_sha`` instead, a checkout whose work had
+    ALREADY been merged back still reported every one of those commits as
+    unmerged — so the owner was asked to acknowledge destroying work that was
+    already safe in their folder. Evidence that cries wolf is worse than none,
+    because the owner learns to click through it.
+    """
+    from pathlib import Path
+
+    handle = _provision(repo, tmp_path, wt_root)
+    checkout = Path(handle.path)
+    _git(checkout, "config", "user.email", "t@example.com")
+    _git(checkout, "config", "user.name", "T")
+    (checkout / "work.txt").write_text("thread work\n", encoding="utf-8")
+    _git(checkout, "add", "-A")
+    _git(checkout, "commit", "-m", "thread work")
+
+    row = get_thread_worktree(tmp_path / "data", "racer", 1)
+    before = inspect_thread_worktree(row)
+    assert before["unmerged_commits"] == 1, "before the merge it really IS unmerged"
+    assert before["unmerged_against"] == _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    _git(repo, "merge", "--no-ff", "--no-edit", handle.branch)
+
+    after = inspect_thread_worktree(row)
+    assert after["unmerged_commits"] == 0, "the project folder HAS this work now"
+    assert after["dirty"] is False
+    # The branch point has not moved, and is no longer what the count is about.
+    assert after["unmerged_against"] != row["base_sha"]
+    assert after["unmerged_against"] == _git(repo, "rev-parse", "HEAD").stdout.strip()
+    # Which is what makes this a CLEAN removal instead of a warning.
+    removed = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1, worktree_root=wt_root,
+    )
+    assert removed["removed"] is True
+    assert removed["reason"] == ""
+
+
+def test_an_unreadable_project_falls_back_to_the_branch_point(repo, tmp_path, wt_root):
+    """The fallback direction is the conservative one: counting from the branch
+    point can only OVER-report, which refuses a removal rather than permitting
+    one."""
+    from pathlib import Path
+
+    handle = _provision(repo, tmp_path, wt_root)
+    checkout = Path(handle.path)
+    _git(checkout, "config", "user.email", "t@example.com")
+    _git(checkout, "config", "user.name", "T")
+    (checkout / "work.txt").write_text("thread work\n", encoding="utf-8")
+    _git(checkout, "add", "-A")
+    _git(checkout, "commit", "-m", "thread work")
+    row = dict(get_thread_worktree(tmp_path / "data", "racer", 1))
+    row["repo_dir"] = str(tmp_path / "gone")
+
+    out = inspect_thread_worktree(row)
+
+    assert out["unmerged_against"] == row["base_sha"]
+    assert out["unmerged_commits"] == 1
+
+
+def test_a_clean_removal_makes_the_branch_round_trip_repeatable(repo, tmp_path, wt_root):
+    """T3R-5. ``provision_thread_worktree`` refuses to reuse an existing branch —
+    deliberately, so an owner's work is never clobbered. Leaving the branch behind
+    after a clean removal therefore made branch → merge → remove a ONE-SHOT trip:
+    the second branch-off failed with "branch already exists" and no owner surface
+    could delete it.
+
+    A clean removal now deletes the branch, and "clean" is judged twice: by this
+    module's inspection AND by ``git branch -d``, which refuses on its own account
+    if the branch holds anything the repository would not still have.
+    """
+    from pathlib import Path
+
+    first = _provision(repo, tmp_path, wt_root)
+    checkout = Path(first.path)
+    _git(checkout, "config", "user.email", "t@example.com")
+    _git(checkout, "config", "user.name", "T")
+    (checkout / "work.txt").write_text("thread work\n", encoding="utf-8")
+    _git(checkout, "add", "-A")
+    _git(checkout, "commit", "-m", "thread work")
+    _git(repo, "merge", "--no-ff", "--no-edit", first.branch)
+
+    removed = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1, worktree_root=wt_root,
+    )
+
+    assert removed["removed"] is True
+    assert removed["branch_removed"] is True
+    assert removed["branch_kept_reason"] == ""
+    assert first.branch not in _git(repo, "branch", "--format=%(refname:short)").stdout.split()
+    # The whole point: the same thread can branch off again.
+    second = _provision(repo, tmp_path, wt_root)
+    assert second.branch == first.branch
+    assert Path(second.path).is_dir()
+    # Deleting the branch destroyed nothing — which is exactly what `git branch -d`
+    # refusing would have told us if it had.
+    assert (repo / "work.txt").read_text(encoding="utf-8") == "thread work\n"
+
+
 def test_removal_of_an_unknown_thread_is_a_typed_no_op(tmp_path):
     result = remove_thread_worktree(
         data_dir=tmp_path / "data", project_id="racer", thread_id=9,
         worktree_root=tmp_path / "thread_worktrees",
     )
-    assert result == {
-        "removed": False, "reason": "unknown", "inspection": {}, "branch_deleted": False,
-    }
+    assert result == {"removed": False, "reason": "unknown", "inspection": {}}
 
 
 def test_a_survived_checkout_is_reported_as_not_removed_and_keeps_its_row(
-    repo, tmp_path, wt_root,
+    repo, tmp_path, wt_root, monkeypatch,
 ):
     """``git worktree remove`` runs with ``check=False`` and ``force_rmtree``
-    swallows its errors, so a checkout that CANNOT be deleted (git lock,
-    read-only parent, busy file) used to be reported ``removed: True`` while its
-    registry row was dropped — an orphaned checkout holding the branch, invisible
-    to the registry, and impossible to re-provision or remove again."""
+    swallows its errors, so a checkout that CANNOT be deleted (git lock, busy
+    file, a filesystem that refuses) used to be reported ``removed: True`` while
+    its registry row was dropped — an orphaned checkout holding the branch,
+    invisible to the registry, and impossible to re-provision or remove again.
+
+    The obstruction is a read-only PARENT (git's own removal fails on it, which
+    is the real observed failure) with the rmtree fallback neutered. Neutering
+    it is not artifice: `_force_rmtree`'s onerror hook now repairs the failing
+    entry's parent permissions and would clear this particular obstruction on
+    its own, so a read-only parent alone no longer reproduces anything. What it
+    cannot repair — a file another process holds open, a refusing filesystem —
+    has no portable spelling in a test, and this stands in for it. The
+    GUARANTEE under test is about what the function reports when the checkout
+    outlives both attempts, not about which obstruction produced that.
+    """
     import os
     import stat
     from pathlib import Path
 
+    import ouroboros.thread_worktrees as twt
+
     handle = _provision(repo, tmp_path, wt_root)
-    # A read-only parent: entries inside it cannot be unlinked, so both git's
-    # removal and the rmtree fallback fail while the checkout stays readable.
+    monkeypatch.setattr(twt, "force_rmtree", lambda _path: None)
     original = stat.S_IMODE(os.stat(wt_root).st_mode)
     os.chmod(wt_root, 0o555)
     try:
@@ -182,10 +299,9 @@ def test_a_survived_checkout_is_reported_as_not_removed_and_keeps_its_row(
         )
     finally:
         os.chmod(wt_root, original)
-        # The failed rmtree left the surviving directory write-only; restoring
-        # it is part of clearing the obstruction, not part of the guarantee.
         if Path(handle.path).exists():
             os.chmod(Path(handle.path), 0o755)
+    monkeypatch.undo()
 
     assert Path(handle.path).exists(), "precondition: the checkout survived"
     assert result["removed"] is False
@@ -238,11 +354,24 @@ def test_inspection_treats_unreadable_as_unsafe(tmp_path):
     assert report["error"]
 
 
-def test_removal_deletes_the_thread_branch_so_reprovisioning_works(repo, tmp_path, wt_root):
-    """Provisioning refuses to reuse an existing branch (an owner's work is
-    never clobbered), so a removal that left ``thread/<name>`` behind turned
-    every removal into a PERMANENT block on branching that thread off again —
-    the owner would have had to delete a git branch by hand."""
+def test_an_acknowledged_removal_KEEPS_the_branch_that_holds_the_commits(
+    repo, tmp_path, wt_root,
+):
+    """A DELIBERATE reversal of T0's "a permitted removal always deletes the
+    branch", decided in T3's round 2 and kept at synthesis.
+
+    T0 deleted the branch with ``-D`` on every permitted removal, reasoning that
+    provisioning refuses to reuse an existing ``thread/<name>`` so leaving one
+    behind blocks branching that thread off again. But an ACKNOWLEDGED removal is
+    exactly the case where the checkout's branch holds commits the project folder
+    never received — its last copy — and ``-D`` destroys them to save the owner a
+    ``git branch -d``. The removal is asked with ``-d``, so git is a second
+    independent judge, and a branch that stays is DISCLOSED rather than silent.
+
+    The cost T0 named is real and stated here rather than hidden: this thread
+    cannot be branched off again until the owner deletes that branch themselves,
+    and the refusal says so by name.
+    """
     from pathlib import Path
 
     handle = _provision(repo, tmp_path, wt_root)
@@ -257,27 +386,35 @@ def test_removal_deletes_the_thread_branch_so_reprovisioning_works(repo, tmp_pat
         acknowledge_unmerged=True, worktree_root=wt_root,
     )
     assert done["removed"] is True
-    assert done["branch_deleted"] is True
+    assert done["branch_removed"] is False
+    assert "unmerged work" in done["branch_kept_reason"]
     listed = subprocess.run(
         ["git", "branch", "--list", handle.branch],
         cwd=str(repo), capture_output=True, text=True, check=True,
     )
-    assert listed.stdout.strip() == ""
+    assert listed.stdout.strip().lstrip("* ") == handle.branch
+    assert (repo / "draft.txt").exists() is False        # the commit is only there
 
-    # ...and the same thread can be branched off again.
-    again = _provision(repo, tmp_path, wt_root)
-    assert Path(again.path).is_dir()
-    assert again.branch == handle.branch
+    # The stated cost: branching this thread off again refuses, by name.
+    with pytest.raises(ValueError, match=handle.branch):
+        _provision(repo, tmp_path, wt_root)
 
 
-def test_a_clean_removal_also_frees_the_branch(repo, tmp_path, wt_root):
+def test_a_clean_removal_frees_the_branch_so_reprovisioning_works(repo, tmp_path, wt_root):
+    """The round trip that must not be one-shot: branch off -> (merge back) ->
+    remove -> branch off again. A CLEAN checkout has nothing on its branch the
+    repository would not still have, so the branch goes with it."""
+    from pathlib import Path
+
     handle = _provision(repo, tmp_path, wt_root)
     result = remove_thread_worktree(
         data_dir=tmp_path / "data", project_id="racer", thread_id=1,
         worktree_root=wt_root,
     )
-    assert result["removed"] is True and result["branch_deleted"] is True
-    assert _provision(repo, tmp_path, wt_root).branch == handle.branch
+    assert result["removed"] is True and result["branch_removed"] is True
+    again = _provision(repo, tmp_path, wt_root)
+    assert Path(again.path).is_dir()
+    assert again.branch == handle.branch
 
 
 def test_worktree_ops_lock_is_keyed_on_the_repo(repo, tmp_path, wt_root):
@@ -322,3 +459,393 @@ def test_subagent_age_sweep_cannot_see_a_thread_worktree(repo, tmp_path, wt_root
     assert Path(handle.path).is_dir()
     assert _registry_path(tmp_path / "data").name == "thread_worktrees.json"
     assert list_thread_worktrees(tmp_path / "data")
+
+
+def test_force_rmtree_repairs_a_directory_instead_of_bricking_it(tmp_path):
+    """The shared teardown hook must not turn a recoverable failure permanent.
+
+    ``os.chmod(p, stat.S_IWRITE)`` REPLACED a directory's mode with ``0o200`` —
+    write-only, no execute — so nothing inside it could be listed or unlinked
+    afterwards. The tree survived the "force" removal AND could no longer be
+    removed by anything, including the owner. The repair must be additive and
+    give a directory its ``+x`` back.
+    """
+    import os
+    import stat as stat_mod
+
+    from ouroboros.subagent_worktrees import force_rmtree
+
+    tree = tmp_path / "brick"
+    (tree / "inner").mkdir(parents=True)
+    (tree / "inner" / "file.txt").write_text("x", encoding="utf-8")
+    # The exact shape the hook exists for: a locked-down directory whose
+    # contents cannot be reached until permission is restored.
+    os.chmod(tree / "inner", 0o500)
+    os.chmod(tree, 0o500)
+    try:
+        force_rmtree(tree)
+        assert not tree.exists(), "force_rmtree left the tree behind"
+    finally:
+        if tree.exists():  # keep tmp_path teardown from failing on our own bricking
+            for path in sorted(tree.rglob("*"), reverse=True):
+                os.chmod(path, stat_mod.S_IRWXU)
+            os.chmod(tree, stat_mod.S_IRWXU)
+
+
+def test_removal_validates_against_the_provisioning_root(repo, tmp_path, wt_root):
+    """T0R2-9: a relocated configuration must not strand a real checkout.
+
+    Containment is checked against the root the row was PROVISIONED under. When
+    it was resolved at removal time instead, moving the configured root turned
+    every existing row into `path_outside_root` — the owner's own worktree
+    became permanently unremovable through the API, with no way back short of
+    editing the registry by hand.
+    """
+    from pathlib import Path
+
+    handle = _provision(repo, tmp_path, wt_root)
+    assert handle.worktree_root == str(Path(wt_root).resolve())
+
+    outcome = remove_thread_worktree(
+        data_dir=tmp_path / "data",
+        project_id="racer",
+        thread_id=1,
+        # The configuration moved after provisioning; the checkout did not.
+        worktree_root=tmp_path / "relocated_worktrees",
+    )
+
+    assert outcome["removed"] is True, outcome
+    assert not Path(handle.path).exists()
+    assert get_thread_worktree(tmp_path / "data", "racer", 1) is None
+
+
+def test_a_row_pointing_outside_its_provisioning_root_is_still_refused(repo, tmp_path, wt_root):
+    """The guard is narrowed to the stored root, never dropped: a hand-edited
+    row must not turn removal into `rm -rf` on an arbitrary path."""
+    from pathlib import Path
+
+    import ouroboros.thread_worktrees as twt
+
+    _provision(repo, tmp_path, wt_root)
+    outsider = tmp_path / "not_a_worktree"
+    outsider.mkdir()
+    (outsider / "precious.txt").write_text("owner data\n", encoding="utf-8")
+    rows = twt._load(tmp_path / "data")
+    rows[0]["path"] = str(outsider)
+    twt._save(tmp_path / "data", rows)
+
+    outcome = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1,
+        acknowledge_unmerged=True,
+    )
+
+    assert outcome["removed"] is False
+    assert outcome["reason"] == "path_outside_root"
+    assert Path(outsider / "precious.txt").exists()
+
+
+def test_a_DETACHED_checkout_does_not_hide_its_branchs_commits(repo, tmp_path, wt_root):
+    """A10's evidence is counted from BOTH tips, because they come apart.
+
+    A checkout standing on a detached HEAD — or moved onto another branch — still
+    has a `thread/<name>` branch holding every commit made in it. Asking only
+    where HEAD points reported ZERO, and the owner was told the removal "deletes
+    only the folder". Nothing was actually lost, because `git branch -d` refuses
+    an unmerged branch, but evidence has to be true when it is READ, not merely
+    harmless.
+    """
+    from pathlib import Path
+
+    handle = _provision(repo, tmp_path, wt_root)
+    checkout = Path(handle.path)
+    _git(checkout, "config", "user.email", "t@example.com")
+    _git(checkout, "config", "user.name", "T")
+    (checkout / "the_only_copy.txt").write_text("thread work\n", encoding="utf-8")
+    _git(checkout, "add", "-A")
+    _git(checkout, "commit", "-m", "the only copy")
+    branch_tip = _git(checkout, "rev-parse", "HEAD").stdout.strip()
+    # Detach onto the project's HEAD: the tree is clean and HEAD is level with
+    # the project, while the branch is one commit ahead of it.
+    _git(checkout, "checkout", "-q", "--detach", _git(repo, "rev-parse", "HEAD").stdout.strip())
+
+    inspection = inspect_thread_worktree(get_thread_worktree(tmp_path / "data", "racer", 1))
+
+    assert inspection["dirty"] is False
+    assert inspection["unmerged_commits"] == 1, "the branch still holds that commit"
+
+    refused = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1, worktree_root=wt_root,
+    )
+
+    assert refused["removed"] is False
+    assert refused["reason"] == "unmerged_work"
+    assert Path(handle.path).is_dir()
+    # And an acknowledged removal keeps the branch, so the commit survives.
+    done = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1,
+        acknowledge_unmerged=True, worktree_root=wt_root,
+    )
+    assert done["removed"] is True
+    assert done["branch_removed"] is False
+    assert _git(repo, "cat-file", "-e", branch_tip).returncode == 0
+
+
+def test_ignored_files_count_as_work_a_removal_would_destroy(repo, tmp_path, wt_root):
+    """T3R2-H3: `git status --porcelain` alone hides exactly the files a thread's
+    checkout is most likely to be the only copy of.
+
+    A `.env`, a `local.db`, a `build/` — all gitignored, none listed, so the
+    checkout read `dirty: false` and one-click removal force-deleted them with no
+    prompt. The same `.env` the branch-off snapshot works hard to keep OUT of
+    history is what this deleted from disk.
+    """
+    from pathlib import Path
+
+    (repo / ".gitignore").write_text(".env\nlocal.db\nbuild/\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "ignore rules")
+    handle = _provision(repo, tmp_path, wt_root)
+    checkout = Path(handle.path)
+    (checkout / ".env").write_text("API_KEY=secret\n", encoding="utf-8")
+    (checkout / "local.db").write_text("rows\n", encoding="utf-8")
+    (checkout / "build").mkdir()
+    (checkout / "build" / "out.js").write_text("built\n", encoding="utf-8")
+
+    report = inspect_thread_worktree({**handle.__dict__})
+
+    assert report["dirty"] is True, "an ignored file is still a file the removal deletes"
+    listed = "\n".join(report["dirty_files"])
+    assert ".env" in listed and "local.db" in listed
+    # ...so removal refuses until the owner has actually been shown them.
+    refused = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1, worktree_root=wt_root,
+    )
+    assert refused["removed"] is False
+    assert refused["reason"] == "unmerged_work"
+    assert (checkout / ".env").exists()
+    # And the acknowledgement is still the way through — nothing became a dead end.
+    allowed = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1,
+        acknowledge_unmerged=True, worktree_root=wt_root,
+    )
+    assert allowed["removed"] is True, allowed
+
+
+def test_a_checkout_that_is_not_on_disk_is_cannot_tell_not_nothing_to_lose(tmp_path):
+    """T3R2-M3: an unmounted volume, a folder moved out from under the registry,
+    a `git worktree remove` run by hand — all answered
+    `{exists: False, dirty: False, unmerged_commits: 0}`, which the removal
+    prompt reads as a clean checkout and offers to delete with one click."""
+    report = inspect_thread_worktree({
+        "path": str(tmp_path / "gone"), "base_sha": "deadbeef", "branch": "thread/x",
+    })
+
+    assert report["exists"] is False
+    assert report["dirty"] is True
+    assert "not on disk" in report["error"]
+
+
+def test_removal_refuses_while_the_project_is_busy(repo, tmp_path, wt_root):
+    """T3R2-H5: removal deletes a folder something may be WRITING in.
+
+    `project_lease.running_project_ids`, `thread_branching.project_is_busy` and
+    ARCHITECTURE all describe this precondition; merge-back was its only caller.
+    Reproduced: a running task in the checkout, merge-back correctly refuses
+    `project_busy`, and removal answered `removed: True` and deleted the folder
+    under the live worker.
+    """
+    from pathlib import Path
+
+    handle = _provision(repo, tmp_path, wt_root)
+
+    refused = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1,
+        worktree_root=wt_root, busy=True,
+    )
+
+    assert refused["removed"] is False
+    assert refused["reason"] == "project_busy"
+    assert Path(handle.path).is_dir()
+    # It is a WAIT, not a dead end.
+    allowed = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1,
+        worktree_root=wt_root, busy=False,
+    )
+    assert allowed["removed"] is True, allowed
+
+
+def test_removal_reads_the_live_activity_query_when_no_answer_is_supplied(repo, tmp_path, wt_root, monkeypatch):
+    """The default is the LIVE query — the same judge merge-back uses — not an
+    argument a caller has to remember to pass."""
+    import ouroboros.thread_branching as branching
+    from pathlib import Path
+
+    handle = _provision(repo, tmp_path, wt_root)
+    monkeypatch.setattr(branching, "project_is_busy", lambda pid, repo=None: pid == "racer")
+
+    refused = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1, worktree_root=wt_root,
+    )
+
+    assert refused["reason"] == "project_busy"
+    assert Path(handle.path).is_dir()
+
+
+def test_a_row_that_nominates_its_own_boundary_cannot_delete_the_owners_folder(
+    repo, tmp_path, wt_root, monkeypatch,
+):
+    """T3R2-M7: T0R2-9 moved the containment boundary onto the row, and the row is
+    untrusted input. A malformed one carrying `worktree_root=<documents>` and
+    `path=<documents>/important_project` passed containment trivially and was
+    deleted with `removed: True` — while the guard's own comment promised the
+    opposite. Two INDEPENDENT facts are required now: a root this process would
+    itself accept, and the path this thread's checkout is derived to have."""
+    from pathlib import Path
+
+    import ouroboros.thread_worktrees as twt
+
+    documents = tmp_path / "Documents"
+    victim = documents / "important_project"
+    victim.mkdir(parents=True)
+    (victim / "thesis.txt").write_text("years of work\n", encoding="utf-8")
+    _provision(repo, tmp_path, wt_root)
+    rows = twt._load(tmp_path / "data")
+    rows[0]["path"] = str(victim)
+    rows[0]["worktree_root"] = str(documents)
+    twt._save(tmp_path / "data", rows)
+
+    outcome = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1,
+        acknowledge_unmerged=True, worktree_root=wt_root,
+    )
+
+    assert outcome["removed"] is False
+    assert outcome["reason"] == "path_outside_root"
+    assert (victim / "thesis.txt").read_text(encoding="utf-8") == "years of work\n"
+    assert Path(documents).is_dir()
+
+
+def test_removal_does_not_hold_the_registry_lock_across_its_git_calls(repo, tmp_path, wt_root, monkeypatch):
+    """T3R2-L2: `_LOCK` guards the registry read and the final save, nothing
+    between. Held across two `run_git` calls, `force_rmtree`, a prune and a
+    `git branch -d`, it blocked every `thread_location`/`get_thread_worktree`
+    read — and with `run_git`'s known missing timeout, for an unbounded time."""
+    import ouroboros.thread_worktrees as twt
+
+    _provision(repo, tmp_path, wt_root)
+    seen = []
+    real_run_git = twt.run_git
+
+    def _probe(*args, **kwargs):
+        # Mid-removal, from THIS thread's point of view the RLock is re-entrant,
+        # so the honest probe is whether the lock is held at all.
+        seen.append(twt._LOCK._is_owned())
+        return real_run_git(*args, **kwargs)
+
+    monkeypatch.setattr(twt, "run_git", _probe)
+
+    outcome = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1,
+        acknowledge_unmerged=True, worktree_root=wt_root,
+    )
+
+    assert outcome["removed"] is True, outcome
+    assert seen, "the removal must actually have called git"
+    assert not any(seen), "the registry lock was held across a git call"
+
+
+def test_checkout_work_at_risk_separates_the_unlosable_from_the_rebuildable():
+    """The question DELETION asks, which is not the question REMOVAL asks.
+
+    `inspect_thread_worktree` answers "what would removing this DESTROY", and an
+    ignored `node_modules/` belongs in that answer (H3). Deletion asks the
+    narrower "what here cannot be rebuilt", because only that may block a gesture
+    aimed at the thread rather than at the folder — refusing a delete over a build
+    directory made "delete the thread and its folder" a three-step detour.
+
+    A pure read over an existing inspection: no git, no disk.
+    """
+    from ouroboros.thread_worktrees import checkout_work_at_risk
+
+    clean = checkout_work_at_risk(
+        {"dirty": False, "dirty_files": [], "unmerged_commits": 0, "error": ""},
+    )
+    assert clean["at_risk"] is False
+    assert clean == {
+        "at_risk": False, "unmerged_commits": 0, "tracked_files": [],
+        "untracked_files": [], "ignored_files": [], "unreadable": "",
+    }
+
+    rebuildable = checkout_work_at_risk({
+        "dirty": True,
+        "dirty_files": ["!! node_modules/", "!! build.log", "?? scratch.txt"],
+        "unmerged_commits": 0,
+        "error": "",
+    })
+    assert rebuildable["at_risk"] is False
+    assert rebuildable["ignored_files"] == ["!! node_modules/", "!! build.log"]
+    assert rebuildable["untracked_files"] == ["?? scratch.txt"]
+    assert rebuildable["tracked_files"] == []
+
+    # A TRACKED modification is at risk: its previous contents are in history,
+    # this edit is nowhere at all. Every porcelain code that is not ?? or !!
+    # counts, including the staged, renamed and conflicted spellings.
+    for line in (" M app.txt", "M  app.txt", "A  new.py", "D  gone.txt",
+                 "R  old.txt -> new.txt", "UU merged.txt", "AM half.txt"):
+        risk = checkout_work_at_risk(
+            {"dirty": True, "dirty_files": [line], "unmerged_commits": 0, "error": ""},
+        )
+        assert risk["at_risk"] is True, line
+        assert risk["tracked_files"] == [line]
+
+    # Commits the project folder never received are at risk on their own, even in
+    # a spotlessly clean tree.
+    commits = checkout_work_at_risk(
+        {"dirty": False, "dirty_files": [], "unmerged_commits": 3, "error": ""},
+    )
+    assert commits["at_risk"] is True
+    assert commits["unmerged_commits"] == 3
+
+    # "Cannot tell" must never read as "nothing to lose".
+    unreadable = checkout_work_at_risk(
+        {"dirty": True, "dirty_files": [], "unmerged_commits": 0,
+         "error": "the checkout is not on disk: /gone"},
+    )
+    assert unreadable["at_risk"] is True
+    assert unreadable["unreadable"].startswith("the checkout is not on disk")
+
+
+def test_an_acknowledged_removal_keeps_the_branch_only_for_COMMITS(repo, tmp_path, wt_root):
+    """A branch is kept because it holds HISTORY, never because a folder was dirty.
+
+    An acknowledged removal whose only dirt was an ignored `node_modules/` has
+    nothing on its branch the repository would not still have, and keeping it left
+    a `thread/<name>` behind that the next branch-off refuses on — and that
+    nothing can reach at all once the thread it belonged to is tombstoned.
+    `git branch -d` is still the second judge, so this only ever asks.
+    """
+    from pathlib import Path
+
+    handle = _provision(repo, tmp_path, wt_root)
+    checkout = Path(handle.path)
+    (repo / ".gitignore").write_text("*.log\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "ignore logs")
+    (checkout / "build.log").write_text("noise\n", encoding="utf-8")
+
+    refused = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1, worktree_root=wt_root,
+    )
+    # A10 is UNCHANGED: removal still refuses over ignored files until acknowledged.
+    assert refused["removed"] is False
+    assert refused["reason"] == "unmerged_work"
+
+    done = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1,
+        acknowledge_unmerged=True, worktree_root=wt_root,
+    )
+
+    assert done["removed"] is True
+    assert done["branch_removed"] is True, done["branch_kept_reason"]
+    assert done["branch_kept_reason"] == ""
+    assert handle.branch not in _git(repo, "branch", "--format=%(refname:short)").stdout.split()

@@ -22,9 +22,39 @@ import threading
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
-from ouroboros.contracts.chat_id_policy import MAIN_THREAD_ID, project_chat_id, thread_chat_id
+from ouroboros.contracts.chat_id_policy import MAIN_THREAD_ID, project_chat_id
 from ouroboros.contracts.schema_versions import with_schema_version
 from ouroboros.project_facts import sanitize_project_id
+
+# The thread block lives in its own module (module-size gate) but stays part of
+# THIS module's public surface: every name below is importable from
+# ``ouroboros.projects_registry`` exactly as before, so no caller moved. The
+# borrow is one-way — project_threads_registry imports the registry's locking/IO
+# primitives inside the functions that need them, never at module level.
+from ouroboros.project_threads_registry import (
+    THREAD_ACTIVE,
+    THREAD_ARCHIVED,
+    THREAD_DELETING,
+    THREAD_TOMBSTONED,
+    ThreadLifecycleError,
+    _chat_id_owners,
+    _normalize_thread_rows,
+    _report_duplicate_chat_ids,
+    _row_chat_ids,
+    archive_thread,
+    begin_thread_deletion,
+    complete_thread_deletion,
+    create_thread,
+    duplicate_chat_ids,
+    fail_thread_deletion,
+    fork_thread,
+    get_thread,
+    project_thread_note_for_task,
+    project_threads,
+    rename_thread,
+    restore_thread,
+    thread_is_visible,
+)
 from ouroboros.utils import atomic_write_json, iter_jsonl_objects, read_json_dict, utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -52,17 +82,10 @@ _DEPRECATED_CHAT_IDS_EVENTS: set[str] = set()
 # from the project's own chat_id/name/timestamps/revision, and the top-level
 # ``chat_id`` stays its compatibility alias. Nothing is rewritten on disk, so a
 # legacy row (and any row minted by reconcile) reads as a one-thread project.
+# The thread members themselves live in ``project_threads_registry``; the bound
+# stays HERE because it is the project name bound (one rule, one constant) and
+# reading it from there would need an import-time borrow in the wrong direction.
 THREAD_NAME_MAX = PROJECT_NAME_MAX
-# Bound the retry walk when a minted thread chat id is already reserved. Each
-# step is a fresh deterministic pre-image, so exhausting this many is a
-# registry-wide alarm, not a routine outcome.
-_THREAD_ID_MINT_ATTEMPTS = 64
-# Registry VERSIONS (path, mtime_ns, size) whose duplicate-chat-id scan already
-# ran — the scan is an alarm, not a per-read log flood, but keying it on the
-# file version means a collision hand-edited in later is still reported. Bounded
-# so a long-lived writer process cannot accumulate one entry per write.
-_DUPLICATE_CHAT_ID_REPORTED: set = set()
-_DUPLICATE_MEMO_MAX = 64
 
 
 @contextmanager
@@ -141,179 +164,6 @@ def _normalize_project_row(value: Dict[str, Any]) -> Dict[str, Any]:
             row["thread0_visible_revision"] = 0
     row["threads"] = _normalize_thread_rows(row.get("threads"))
     return row
-
-
-def _normalize_thread_rows(value: Any) -> List[Dict[str, Any]]:
-    """Normalize the ADDITIVE extra-thread list of a project row (read-only).
-
-    A legacy row has no ``threads`` key at all and normalizes to ``[]`` — i.e.
-    exactly one (projected) thread. Rows are dropped rather than repaired when
-    they carry no usable id/chat_id, and thread id ``0`` is never accepted from
-    storage: thread #0 is synthesized from the project itself, so a stored
-    duplicate would be a second, silently disagreeing truth.
-
-    Like :func:`_normalize_project_row`, each row is built from ``dict(raw)``
-    and only the normalized keys are OVERWRITTEN. Rebuilding a fresh dict of
-    known keys silently DELETED every additive field a later phase adds — the
-    ``worktree`` binding T3 stores on a branched-off thread would have been
-    dropped on the next read of an untouched registry, and normalization runs on
-    every ``_load``, so the loss would look like data that was never written.
-    """
-    out: List[Dict[str, Any]] = []
-    seen_ids: set = set()
-    if not isinstance(value, list):
-        return out
-    for raw in value:
-        if not isinstance(raw, dict):
-            continue
-        try:
-            thread_id = int(raw.get("id"))
-            chat_id = int(raw.get("chat_id"))
-        except (TypeError, ValueError):
-            continue
-        if thread_id <= MAIN_THREAD_ID or not chat_id or thread_id in seen_ids:
-            continue
-        seen_ids.add(thread_id)
-        row: Dict[str, Any] = dict(raw)
-        row["id"] = thread_id
-        row["chat_id"] = chat_id
-        row["name"] = str(raw.get("name") or "").strip() or f"Thread {thread_id}"
-        row["created_at"] = str(raw.get("created_at") or "")
-        try:
-            row["visible_revision"] = max(0, int(raw.get("visible_revision") or 0))
-        except (TypeError, ValueError):
-            row["visible_revision"] = 0
-        # Fork cursor (A3): a pointer into the PARENT's rows, never a copy. A
-        # HALF-written cursor is not a cursor — drop both keys so an ancestry
-        # walk can never inherit a bound without a parent (or the reverse).
-        try:
-            fork_of = int(raw.get("fork_of_chat_id") or 0)
-        except (TypeError, ValueError):
-            fork_of = 0
-        fork_before = str(raw.get("fork_before_ts") or "")
-        if fork_of and fork_before:
-            row["fork_of_chat_id"] = fork_of
-            row["fork_before_ts"] = fork_before
-        else:
-            row.pop("fork_of_chat_id", None)
-            row.pop("fork_before_ts", None)
-        out.append(row)
-    return sorted(out, key=lambda r: int(r["id"]))
-
-
-def project_threads(project: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """CANONICAL thread projection of a project row — thread #0 first.
-
-    Thread #0 is SYNTHESIZED from the project's own ``chat_id``/``name``/
-    ``created_at`` (X7): nothing on disk is rewritten, and the top-level
-    ``chat_id`` remains its compatibility alias. Every consumer that wants "the
-    threads of this project" must read THIS, never the raw ``threads`` list, or
-    it will silently lose the project's main thread.
-
-    Its revision comes from the project's OWN ``thread0_visible_revision``, not
-    from ``visible_revision`` — that one is the project-wide AGGREGATE, so
-    projecting it here made activity in ANY thread read as unread activity in
-    thread #0. A row that predates the split falls back to the aggregate, which
-    is the same number while a project has one thread.
-    """
-    if not isinstance(project, dict):
-        return []
-    pid = str(project.get("id") or "")
-    try:
-        chat_id = int(project.get("chat_id") or 0)
-    except (TypeError, ValueError):
-        chat_id = 0
-    try:
-        own_revision = max(0, int(
-            project.get(
-                "thread0_visible_revision", project.get("visible_revision")
-            ) or 0
-        ))
-    except (TypeError, ValueError):
-        own_revision = 0
-    zero = {
-        "id": MAIN_THREAD_ID,
-        "chat_id": chat_id or project_chat_id(pid),
-        "name": str(project.get("name") or pid),
-        "created_at": str(project.get("created_at") or ""),
-        "visible_revision": own_revision,
-    }
-    return [zero, *_normalize_thread_rows(project.get("threads"))]
-
-
-def _row_chat_ids(project: Dict[str, Any]) -> List[int]:
-    """Every chat id a single project row reserves (thread #0 included)."""
-    return [int(thread["chat_id"]) for thread in project_threads(project)]
-
-
-def _chat_id_owners(projects: List[Dict[str, Any]]) -> Dict[int, List[tuple]]:
-    """chat_id -> [(project_id, thread_id), ...] across EVERY lifecycle state.
-
-    Tombstoned rows keep reserving their ids on purpose: a reused chat id would
-    silently merge a dead project's history into a live one.
-    """
-    owners: Dict[int, List[tuple]] = {}
-    for project in projects:
-        pid = str(project.get("id") or "")
-        for thread in project_threads(project):
-            owners.setdefault(int(thread["chat_id"]), []).append((pid, int(thread["id"])))
-    return owners
-
-
-def duplicate_chat_ids(drive_root: Any) -> Dict[int, List[tuple]]:
-    """Pre-existing chat-id collisions in the registry (X1 load-time detection).
-
-    Returns only ids claimed by more than one (project, thread) pair. A healthy
-    registry returns ``{}``; anything else means two conversations would share
-    one history stream and must be surfaced, never silently tolerated.
-    """
-    with _LOCK:
-        projects = _load(drive_root)["projects"]
-    return {cid: owners for cid, owners in _chat_id_owners(projects).items() if len(owners) > 1}
-
-
-def _report_duplicate_chat_ids(drive_root: Any, projects: List[Dict[str, Any]]) -> None:
-    """Loudly report duplicates once per registry VERSION per drive root.
-
-    Called from ``_load`` so a corrupt registry cannot stay quiet; deliberately
-    non-raising, because refusing to load the registry would take the whole
-    server down over data that is still individually readable. The memo is
-    keyed on the file's (mtime, size) rather than the root alone, so a
-    hand-edited collision introduced AFTER the first load is still reported
-    instead of hiding behind a once-per-process flag.
-    """
-    path = _registry_path(drive_root)
-    try:
-        stat = path.stat()
-        key = (str(path), stat.st_mtime_ns, stat.st_size)
-    except OSError:
-        key = (str(path), 0, 0)
-    if key in _DUPLICATE_CHAT_ID_REPORTED:
-        return
-    clashes = {cid: owners for cid, owners in _chat_id_owners(projects).items() if len(owners) > 1}
-    if len(_DUPLICATE_CHAT_ID_REPORTED) >= _DUPLICATE_MEMO_MAX:
-        _DUPLICATE_CHAT_ID_REPORTED.clear()  # bounded: at worst one extra scan
-    _DUPLICATE_CHAT_ID_REPORTED.add(key)
-    if not clashes:
-        return
-    log.error(
-        "Project registry chat-id COLLISION: %s — these conversations share one "
-        "history stream; rename/recreate one of them",
-        {cid: owners for cid, owners in sorted(clashes.items())},
-    )
-    try:
-        from ouroboros.utils import append_jsonl
-
-        append_jsonl(
-            pathlib.Path(drive_root) / "logs" / "events.jsonl",
-            {
-                "ts": utc_now_iso(),
-                "type": "project_chat_id_collision_detected",
-                "collisions": {str(cid): owners for cid, owners in sorted(clashes.items())},
-            },
-        )
-    except Exception:
-        log.debug("Failed to record chat-id collision event", exc_info=True)
 
 
 def _validated_name(value: Any, fallback: str = "") -> str:
@@ -624,9 +474,9 @@ def project_working_dirs(drive_root: Any) -> Dict[str, str]:
     ``mark_task_project`` carries no ``workspace_root`` of its own; without this
     map its lane would not match the room task already writing the SAME folder
     and two top-level writers would enter it. File-less projects are omitted —
-    the lease treats an unresolvable folder as a wildcard that conflicts with
-    every lane of its project, never as a lane of its own. Fail-open: an
-    unreadable registry yields ``{}``, which is exactly that conservative case.
+    the lease then keys such a task on its project alone, which is narrower than
+    a folder lane and is documented as such rather than assumed equivalent.
+    Fail-open: an unreadable registry yields ``{}``, i.e. that same narrower key.
 
     Values are canonicalized here as well as at write time. New rows are stored
     resolved, but a registry written BEFORE that could hold an unresolved
@@ -771,6 +621,11 @@ def _chat_binding_index(drive_root: Any) -> Dict[int, Dict[str, Any]]:
                 "thread_id": int(thread["id"]),
                 "chat_id": int(thread["chat_id"]),
                 "lifecycle": str(project.get("lifecycle") or PROJECT_ACTIVE),
+                # The THREAD's own lifecycle, beside the project's. Routing must
+                # be able to refuse a fenced or tombstoned thread inside a
+                # perfectly healthy project (X10) — reading only the project's
+                # state would deliver messages into a room the owner deleted.
+                "thread_lifecycle": str(thread.get("lifecycle") or THREAD_ACTIVE),
                 "name": str(thread.get("name") or ""),
                 "project": dict(project),
             })
@@ -781,12 +636,13 @@ def _chat_binding_index(drive_root: Any) -> Dict[int, Dict[str, Any]]:
 def resolve_chat_binding(drive_root: Any, chat_id: Any) -> Dict[str, Any]:
     """THE canonical "who owns this chat id" lookup (R3).
 
-    Returns ``{project_id, thread_id, chat_id, lifecycle, name, project}`` for
-    ANY thread of ANY project in ANY lifecycle state, or ``{}`` for the main
-    chat / an external transport id. Callers that must not resurrect a fenced
-    room filter on ``lifecycle``; they must NOT compare a chat id against
-    ``project["chat_id"]`` themselves — that comparison sees thread #0 only and
-    misroutes every other thread to Main.
+    Returns ``{project_id, thread_id, chat_id, lifecycle, thread_lifecycle,
+    name, project}`` for ANY thread of ANY project in ANY lifecycle state, or
+    ``{}`` for the main chat / an external transport id. Callers that must not
+    resurrect a fenced room filter on BOTH lifecycles — a thread can be fenced or
+    tombstoned inside a perfectly healthy project — and they must NOT compare a
+    chat id against ``project["chat_id"]`` themselves; that comparison sees
+    thread #0 only and misroutes every other thread to Main.
     """
     try:
         cid = int(chat_id or 0)
@@ -800,163 +656,6 @@ def resolve_chat_binding(drive_root: Any, chat_id: Any) -> Dict[str, Any]:
         log.debug("resolve_chat_binding failed", exc_info=True)
         return {}
     return dict(row) if row else {}
-
-
-def get_thread(drive_root: Any, project_id: str, thread_id: Any) -> Optional[Dict[str, Any]]:
-    """One thread of a project by id (thread #0 included), else ``None``."""
-    project = get_reserved_project(drive_root, project_id)
-    if project is None:
-        return None
-    try:
-        want = int(thread_id)
-    except (TypeError, ValueError):
-        return None
-    for thread in project_threads(project):
-        if int(thread["id"]) == want:
-            return dict(thread)
-    return None
-
-
-def _mint_thread(data: Dict[str, Any], entry: Dict[str, Any], existing: List[Dict[str, Any]]) -> tuple:
-    """Pick the next free ``(thread_id, chat_id)`` pair for a project row.
-
-    Thread ids are opaque integers, so a chat-id collision is resolved by simply
-    walking to the next id (X1's "retry thread ids on collision") — no allocator
-    state, no widened hash. Raises when the walk is exhausted, which is a
-    registry-wide alarm rather than a routine outcome.
-
-    The high-water mark is persisted as ``thread_seq`` rather than derived from
-    the live rows alone, so a thread id is NEVER reused once handed out. That
-    matters the moment threads become removable: a reused id would mint a chat
-    id a dead thread's history rows still carry, silently merging two
-    conversations. A legacy row has no ``thread_seq`` and falls back to the
-    live maximum, which is correct while nothing has been removed yet.
-    """
-    pid = str(entry.get("id") or "")
-    reserved = _chat_id_owners(data["projects"])
-    try:
-        high_water = max(0, int(entry.get("thread_seq") or 0))
-    except (TypeError, ValueError):
-        high_water = 0
-    next_id = max(
-        high_water, max((int(row["id"]) for row in existing), default=MAIN_THREAD_ID)
-    ) + 1
-    for candidate in range(next_id, next_id + _THREAD_ID_MINT_ATTEMPTS):
-        chat_id = thread_chat_id(pid, candidate)
-        if chat_id not in reserved:
-            return candidate, chat_id
-    raise ValueError(
-        f"could not mint a free thread chat id for project {pid!r} after "
-        f"{_THREAD_ID_MINT_ATTEMPTS} attempts — the registry has a chat-id collision storm"
-    )
-
-
-def _active_project_row(data: Dict[str, Any], pid: str) -> Dict[str, Any]:
-    for entry in data["projects"]:
-        if entry.get("id") == pid:
-            if entry.get("lifecycle") != PROJECT_ACTIVE:
-                raise ValueError(
-                    f"project {pid!r} is {entry.get('lifecycle')}; it cannot accept thread changes"
-                )
-            return entry
-    raise ValueError(f"unknown project: {pid!r}")
-
-
-def create_thread(
-    drive_root: Any,
-    project_id: str,
-    *,
-    name: str = "",
-    fork_of_chat_id: int = 0,
-    fork_before_ts: str = "",
-) -> Dict[str, Any]:
-    """Append a NEW thread to a project and return its canonical row.
-
-    A thread is an empty chat sharing the project's working folder (A2). The
-    fork variant stores only a CURSOR ``{fork_of_chat_id, fork_before_ts}``
-    (A3) — no history row is copied, so the parent keeps one row identity, one
-    consolidation and one rotation cost. Prefer :func:`fork_thread` for forks;
-    this is the primitive both paths share.
-    """
-    pid = sanitize_project_id(project_id)
-    if not pid:
-        raise ValueError(f"unusable project id: {project_id!r}")
-    title = _validated_name(name, "New thread")
-    with _file_write_lock(_registry_path(drive_root)):
-        data = _load(drive_root)
-        entry = _active_project_row(data, pid)
-        threads = _normalize_thread_rows(entry.get("threads"))
-        thread_id, chat_id = _mint_thread(data, entry, threads)
-        row: Dict[str, Any] = {
-            "id": thread_id,
-            "chat_id": chat_id,
-            "name": title,
-            "created_at": utc_now_iso(),
-            "visible_revision": 0,
-        }
-        if fork_of_chat_id and fork_before_ts:
-            row["fork_of_chat_id"] = int(fork_of_chat_id)
-            row["fork_before_ts"] = str(fork_before_ts)
-        entry["threads"] = [*threads, row]
-        # Monotonic high-water mark: a thread id is never handed out twice.
-        entry["thread_seq"] = thread_id
-        _save(drive_root, data)
-        log.info("Project thread created: %s#%s (chat_id=%s)", pid, thread_id, chat_id)
-        return dict(row)
-
-
-def rename_thread(drive_root: Any, project_id: str, thread_id: Any, name: str) -> Optional[Dict[str, Any]]:
-    """Rename a thread. Thread #0 IS the project, so renaming it renames the
-    project row itself — the projection would otherwise show a name the sidebar
-    never persists."""
-    pid = sanitize_project_id(project_id)
-    if not pid:
-        return None
-    try:
-        want = int(thread_id)
-    except (TypeError, ValueError):
-        return None
-    title = _validated_name(name)
-    if not title:
-        raise ValueError("thread name is required")
-    if want == MAIN_THREAD_ID:
-        updated = update_project(drive_root, pid, name=title)
-        return project_threads(updated)[0] if updated else None
-    with _file_write_lock(_registry_path(drive_root)):
-        data = _load(drive_root)
-        entry = _active_project_row(data, pid)
-        threads = _normalize_thread_rows(entry.get("threads"))
-        for row in threads:
-            if int(row["id"]) == want:
-                row["name"] = title
-                entry["threads"] = threads
-                _save(drive_root, data)
-                return dict(row)
-    return None
-
-
-def fork_thread(drive_root: Any, project_id: str, thread_id: Any) -> Dict[str, Any]:
-    """Fork a thread: a new thread carrying a CURSOR into the source's rows.
-
-    The source is untouched and keeps every row (A3). The cursor reads the
-    parent's rows REGARDLESS of the parent later being archived or deleted
-    (A3a), so a fork can never be orphaned. Auto-name is the plain English
-    ``Copy of …`` with NO model call (D2).
-    """
-    source = get_thread(drive_root, project_id, thread_id)
-    if source is None:
-        raise ValueError(f"unknown thread {thread_id!r} in project {project_id!r}")
-    label = str(source.get("name") or "").strip()
-    auto = f"Copy of {label}" if label else "Copy of thread"
-    return create_thread(
-        drive_root,
-        project_id,
-        name=auto[:THREAD_NAME_MAX],
-        fork_of_chat_id=int(source["chat_id"]),
-        # The fork moment. History treats it INCLUSIVELY (``ts <= cutoff``):
-        # a parent row stamped at exactly this instant existed before the fork.
-        fork_before_ts=utc_now_iso(),
-    )
 
 
 def _canonical_working_dir(raw: Any) -> str:
@@ -1075,6 +774,57 @@ def update_project(drive_root: Any, project_id: str, **updates: Any) -> Optional
             _save(drive_root, data)
             return dict(entry)
     return None
+
+
+def set_working_dir_if_absent(
+    drive_root: Any,
+    project_id: str,
+    working_dir: str,
+    *,
+    provenance: str = "",
+    trusted_at: str = "",
+) -> tuple[str, bool]:
+    """Bind a project's working_dir ONLY if it has none — check and write under ONE lock.
+
+    "Never overwrites an existing working_dir/provenance" was true of the code but
+    not of the timeline: both places that promised it (``adopt_task_workspace``,
+    ``ensure_project_workspace``) read the entry with ``get_project`` and wrote it
+    back with ``update_project``, two separately-locked operations with an unbounded
+    gap between them — a folder validation in one, a whole genesis provisioning in
+    the other. Two writers interleaving there both saw "no working_dir" and both
+    wrote, so the loser's folder was silently replaced; when the loser was
+    ``ensure_project_workspace`` the abandoned genesis tree sits under the durable
+    projects root, which is deliberately never GC-pruned, i.e. it is orphaned for
+    good. Doing the test and the write inside the same ``_file_write_lock`` makes
+    the promise atomic across threads AND processes.
+
+    ``provenance``/``trusted_at`` follow the same historical-fact rule as elsewhere:
+    written only when the row carries nothing (or ``"none"``) yet.
+
+    Returns ``(effective_working_dir, claimed)`` — ``claimed`` is True only for the
+    writer that actually bound the folder, so the loser can report the truth instead
+    of assuming its own value landed. An unknown/inactive project answers ``("", False)``.
+    """
+    pid = sanitize_project_id(project_id)
+    folder = str(working_dir or "").strip()
+    if not pid or not folder:
+        return "", False
+    with _file_write_lock(_registry_path(drive_root)):
+        data = _load(drive_root)
+        for entry in data["projects"]:
+            if entry.get("id") != pid or entry.get("lifecycle") != PROJECT_ACTIVE:
+                continue
+            existing = str(entry.get("working_dir") or "").strip()
+            if existing:
+                return existing, False
+            entry["working_dir"] = folder
+            if provenance and str(entry.get("provenance") or "").strip() in ("", "none"):
+                entry["provenance"] = provenance
+                if trusted_at and not str(entry.get("trusted_at") or "").strip():
+                    entry["trusted_at"] = trusted_at
+            _save(drive_root, data)
+            return folder, True
+    return "", False
 
 
 def begin_project_deletion(drive_root: Any, project_id: str) -> Optional[Dict[str, Any]]:
@@ -1280,6 +1030,10 @@ def reconcile_projects(drive_root: Any) -> int:
 # The scan is a boot-reconcile concern: once per process per root is enough,
 # because everything AFTER the backfill is covered by the registry-facts
 # derivation in projects_summary (visible_revision/bindings/origin).
+# Named "thread activity", but it stays in the REGISTRY on purpose: it touches no
+# thread row at all — it reads the project's own chat_id (thread #0), is driven by
+# reconcile_projects, and writes through update_project. Moving it to the thread
+# module would borrow four registry internals across a seam it never crosses.
 _ACTIVITY_BACKFILL_DONE: set = set()
 
 
@@ -1378,6 +1132,31 @@ def ensure_project_workspace(drive_root: Any, project_id: str, repo_dir: Any) ->
     durable projects root (never GC-pruned, isolated from repo/ and data/).
     Returns the absolute path ("" when provisioning failed). File-less
     projects simply never call this.
+
+    The folder is stamped ``provenance="genesis"`` in the SAME write that binds
+    it (A11). Without that stamp the row said only that the project has SOME
+    working_dir, which is what made the auto-provisioned place invisible: the
+    owner asked for a project, a folder appeared somewhere under the durable
+    projects root, and no surface could tell them Ouroboros had made it rather
+    than that they had pointed at it themselves. An existing provenance is never
+    overwritten — how a folder came to be is a historical fact, and this branch
+    only runs when the project had no usable folder at all.
+
+    Provisioning is slow (a real ``git init`` + seed commit), so a FIRST bind is
+    ATOMIC (``set_working_dir_if_absent``, T2-7) rather than a second unlocked
+    write: if another writer bound a place while this one was digging, the winner's
+    folder is returned untouched and the abandoned genesis tree is LOGGED — it lives
+    under the durable projects root, which is never GC-pruned, so an unreported loss
+    would be an orphan forever.
+
+    A REPLACEMENT is a different write and must stay one. This function also runs
+    when the row already names a folder that has since VANISHED, and there the
+    "only if absent" rule is exactly wrong: it declines, the caller reports a
+    concurrent bind that never happened, and the path handed back is the
+    non-existent one — while the tree just provisioned is orphaned under a root
+    nothing ever prunes. So the empty case claims atomically and the stale case
+    overwrites, deliberately, with ``update_project``. Provenance still follows the
+    historical-fact rule: it is stamped only when the row carries nothing.
     """
     entry = get_project(drive_root, project_id)
     if entry is None:
@@ -1396,15 +1175,134 @@ def ensure_project_workspace(drive_root: Any, project_id: str, repo_dir: Any) ->
             # recognizable shared root (binding identity stays the task_id). (I, v6.39)
             dir_name=str(entry.get("name") or ""),
         )
-        update_project(drive_root, entry["id"], working_dir=str(handle.path))
-        return str(handle.path)
+        if existing:
+            # The row names a folder; it is simply GONE. Replacing it is the whole
+            # point of this call, so the write is unconditional.
+            fields: Dict[str, Any] = {"working_dir": str(handle.path)}
+            if str(entry.get("provenance") or "").strip() in ("", "none"):
+                fields["provenance"] = "genesis"
+            if update_project(drive_root, entry["id"], **fields) is not None:
+                return str(handle.path)
+            log.warning(
+                "Project %s is no longer active; genesis tree %s was not bound",
+                entry["id"], handle.path,
+            )
+            return ""
+        bound, claimed = set_working_dir_if_absent(
+            drive_root, entry["id"], str(handle.path), provenance="genesis"
+        )
+        if claimed:
+            return str(handle.path)
+        if bound:
+            log.warning(
+                "Project %s was given a folder concurrently (%s); the genesis tree "
+                "provisioned here is abandoned and NOT auto-removed: %s",
+                entry["id"], bound, handle.path,
+            )
+            return bound
+        # A project that stopped being active mid-provision: the entry that asked
+        # for the folder is gone, so there is nothing to bind it to.
+        log.warning(
+            "Project %s is no longer active; genesis tree %s was not bound",
+            entry["id"], handle.path,
+        )
+        return ""
     except Exception:
         log.warning("Project workspace provisioning failed for %s", project_id, exc_info=True)
         return ""
 
 
-def projects_summary(drive_root: Any, *, limit: int = 50) -> List[Dict[str, Any]]:
-    """Compact list for /api/state and the sidebar."""
+def adopt_task_workspace(
+    drive_root: Any, project_id: str, workspace_root: Any, *, system_repo_dir: Any
+) -> tuple[str, str]:
+    """Give a project born FROM A TASK the folder that task was already working in.
+
+    A11: a project must have a designated place. Both conversion paths — the UI
+    "turn into project" card and the in-task ``ensure_project_scope`` — used to
+    register a project and drop the task's ``workspace_root`` on the floor, so a
+    project made out of work happening in a real folder came out folder-less and
+    the NEXT task in it auto-provisioned a different, empty tree somewhere else.
+    The task's own folder is the obvious place; nothing else has a better claim.
+
+    Adopting is an ATTACH, so it re-runs the attach guards rather than trusting the
+    task record: the same resolved-realpath checks (exists, real dir, not the home
+    root, disjoint from the Ouroboros repo/data roots, not nested inside another
+    repository), and deliberately NO git requirement (A12 — a plain folder is a
+    legitimate place). An EXISTING working_dir is never overwritten; a project that
+    already has a place keeps it.
+
+    It also applies a rule the attach surfaces do not need. An attach path is typed
+    by the owner; an ADOPTED path arrives from a task record, and a task's workspace
+    is precisely where Ouroboros's own EPHEMERAL checkouts live — an acting
+    subagent's ``self_worktree``, a thread's branch-off worktree. Those are linked
+    worktrees and age-swept roots: adopting one would give the project a place that
+    a ``git worktree remove`` or a retention sweep can delete underneath it. So
+    ``ephemeral_checkout_reason`` refuses them through the same disclosure channel.
+
+    Returns ``(working_dir, error)``. ``error`` is a disclosure, not a failure the
+    caller must abort on: conversion's job is to create the project, and a folder
+    that has since moved is worth reporting rather than either hiding or fatal.
+    """
+    pid = sanitize_project_id(project_id)
+    raw = str(workspace_root or "").strip()
+    if not pid or not raw:
+        return "", ""
+    entry = get_project(drive_root, pid)
+    if entry is None:
+        return "", ""
+    if str(entry.get("working_dir") or "").strip():
+        return str(entry["working_dir"]), ""
+    from ouroboros.project_sources import ephemeral_checkout_reason, validate_attach_path
+
+    resolved, error = validate_attach_path(
+        raw, system_repo_dir=system_repo_dir, drive_root=drive_root
+    )
+    if error or resolved is None:
+        return "", f"the task's workspace {raw} was not adopted as the project folder: {error}"
+    ephemeral = ephemeral_checkout_reason(resolved)
+    if ephemeral:
+        return "", f"the task's workspace {raw} was not adopted as the project folder: {ephemeral}"
+    # The owner chose this folder when they started the work there; the conversion
+    # inherits that grant rather than asking for it a second time. The claim is
+    # ATOMIC (T2-7): the "does it already have a place" check and the write happen
+    # inside ONE registry lock, so a conversion racing an auto-provision cannot
+    # overwrite the winner's folder and orphan a genesis tree nothing ever GCs.
+    bound, claimed = set_working_dir_if_absent(
+        drive_root, pid, str(resolved), provenance="attached", trusted_at=utc_now_iso()
+    )
+    if claimed:
+        return str(resolved), ""
+    if bound:
+        # Another writer bound a place first. That project HAS its place; saying so
+        # is the truth, and overwriting it would be the very race this closes.
+        return bound, ""
+    return "", (
+        f"the task's workspace {raw} was not adopted as the project folder: "
+        f"project {pid!r} is no longer registered as active"
+    )
+
+
+def projects_summary(
+    drive_root: Any, *, limit: int = 50, live_chat_ids: Any = None,
+    include_archived: bool = False,
+) -> List[Dict[str, Any]]:
+    """Compact list for /api/state and the sidebar.
+
+    ``live_chat_ids`` is the set of chat ids with a task running right now, and
+    the ONLY reason this projection takes it: an ARCHIVED thread stays VISIBLE
+    until its task is terminal (X10), because hiding a room that is still
+    emitting output leaves the owner watching nothing while work continues. The
+    caller supplies it because reading the supervisor queue belongs at the
+    gateway, not inside a registry projection that every read path touches;
+    omitting it simply means no archived thread is treated as live.
+
+    ``include_archived`` asks for them ON PURPOSE, and it exists because this is
+    the ONLY projection that lists threads. With archived ones filtered out of it
+    unconditionally, no surface the owner could reach ever carried an archived
+    thread, which made ``POST …/restore`` and the ``restore`` row in the thread
+    menu unreachable BY CONSTRUCTION: archive was a one-way trip. Restoring
+    something requires a surface that can show it, so the caller asks for one.
+    """
     out: List[Dict[str, Any]] = []
     bindings = _load_bindings(drive_root).get("bindings", {})
 
@@ -1445,8 +1343,14 @@ def projects_summary(drive_root: Any, *, limit: int = 50) -> List[Dict[str, Any]
             "has_thread_activity": _has_thread_activity(project),
             # Canonical projection, thread #0 first (X7). ``chat_id`` above stays
             # its compatibility alias, so a client that never learns about
-            # threads keeps working unchanged.
-            "threads": project_threads(project),
+            # threads keeps working unchanged. Archived and tombstoned threads
+            # are FILTERED here rather than at every consumer — a surface that
+            # forgot the filter would show the owner a thread they archived, and
+            # one that hard-coded it would hide a live archived thread (X10).
+            "threads": [
+                thread for thread in project_threads(project)
+                if thread_is_visible(thread, live_chat_ids, include_archived=include_archived)
+            ],
         })
     return out
 
@@ -1457,12 +1361,22 @@ __all__ = [
     "PROJECT_NAME_MAX",
     "PROJECT_TOMBSTONED",
     "THREAD_NAME_MAX",
+    "adopt_task_workspace",
     "all_task_bindings",
     "begin_project_deletion",
     "bind_task_to_project",
     "complete_project_deletion",
     "create_project",
+    "THREAD_ACTIVE",
+    "THREAD_ARCHIVED",
+    "THREAD_DELETING",
+    "THREAD_TOMBSTONED",
+    "ThreadLifecycleError",
+    "archive_thread",
+    "begin_thread_deletion",
+    "complete_thread_deletion",
     "create_thread",
+    "fail_thread_deletion",
     "delete_project",
     "duplicate_chat_ids",
     "ensure_project_workspace",
@@ -1473,6 +1387,8 @@ __all__ = [
     "get_thread",
     "project_threads",
     "rename_thread",
+    "restore_thread",
+    "thread_is_visible",
     "resolve_chat_binding",
     "increment_project_visible_revision",
     "list_projects",
@@ -1488,39 +1404,7 @@ __all__ = [
     "reserved_project_chat_ids",
     "projects_summary",
     "reconcile_projects",
+    "set_working_dir_if_absent",
     "touch_project",
     "update_project",
 ]
-
-
-def project_thread_note_for_task(task: Any) -> str:
-    """One-line pointer to the Project thread when a task is project-bound.
-
-    The raw final answer of a bound task lives in the PROJECT room while the
-    initiating (Main) chat receives only the task summary — twice in one night
-    the owner read that silence as a hung agent. The pointer names where the
-    full result lives (v6.70.0); an unbound task gets no extra text."""
-    try:
-        import pathlib as _pathlib
-
-        from ouroboros.config import DATA_DIR
-
-        chat_id = project_chat_for_task_tree(
-            _pathlib.Path(DATA_DIR),
-            str(task.get("id") or ""),
-            str(task.get("parent_task_id") or ""),
-            str(task.get("root_task_id") or ""),
-        )
-        if not chat_id or int(task.get("chat_id") or 0) == int(chat_id):
-            return ""
-        name = next(
-            (
-                str(project.get("name") or "").strip()
-                for project in list_projects(_pathlib.Path(DATA_DIR))
-                if int(project.get("chat_id") or 0) == int(chat_id)
-            ),
-            "",
-        )
-        return f" Full result in the '{name}' project thread." if name else " Full result in the project thread."
-    except Exception:
-        return ""
