@@ -238,6 +238,164 @@ def test_ui_preferences_prunes_dead_lanes_and_never_evicts_a_live_one(tmp_path):
         assert merged["0"] == 1
 
 
+def test_ui_preferences_read_path_keeps_every_live_thread_cursor(tmp_path):
+    """A lane LARGER than the per-request cap survives GET and the next write.
+
+    `_MAX_THREAD_CURSORS` bounds one REQUEST. Applying it to the STORED document
+    silently turned "keep the last 200" into "keep the first 200 in stored
+    order", and a just-written ACK sits LAST — so the thread the owner had this
+    second finished reading came back unread on the very next GET, was ACK'd
+    again, and was dropped again, forever. Fewer than 201 live threads cannot
+    see any of this, which is why this test insists on more.
+    """
+    from starlette.testclient import TestClient
+
+    from ouroboros.projects_registry import (
+        create_project,
+        create_thread,
+        increment_project_visible_revision,
+    )
+
+    app = Starlette(routes=collect_routes(data_dir=tmp_path))
+    app.state.drive_root = tmp_path
+    create_project(tmp_path, "big", name="Big")
+    increment_project_visible_revision(tmp_path, project_id="big")  # thread #0
+    thread_ids = ["0"]
+    for index in range(205):
+        thread = create_thread(tmp_path, "big", name=f"T{index}")
+        thread_ids.append(str(thread["id"]))
+        increment_project_visible_revision(tmp_path, chat_id=int(thread["chat_id"]))
+    assert len(thread_ids) == 206 > 200
+
+    newest = thread_ids[-1]
+    with TestClient(app) as client:
+        # ACK oldest-first, so the newest thread's lane is the LAST key stored.
+        for thread_id in thread_ids:
+            assert client.post(
+                "/api/ui/preferences", json={"project_seen_revision": {"big": {thread_id: 999}}}
+            ).status_code == 200
+
+        stored = json.loads((tmp_path / "state" / "ui_preferences.json").read_text(encoding="utf-8"))
+        assert len(stored["project_seen_revision"]["big"]) == 206
+
+        lane = client.get("/api/ui/preferences").json()["project_seen_revision"]["big"]
+        assert len(lane) == 206, "the read path bounds nothing; the merge's prune does"
+        assert newest in lane, "the most recently acknowledged thread is not evicted on READ"
+        assert lane[newest] == 1
+        assert lane["0"] == 1
+
+        # ...and the read-modify-write does not quietly shrink it either.
+        after = client.post(
+            "/api/ui/preferences", json={"project_seen_revision": {"big": {"0": 1}}}
+        ).json()["project_seen_revision"]["big"]
+        assert len(after) == 206
+        assert newest in after
+
+        # One REQUEST is still bounded: 300 cursors in one body, only 200 read.
+        flood = client.post(
+            "/api/ui/preferences",
+            json={"project_seen_revision": {"big": {str(i): 1 for i in range(300)}}},
+        )
+        assert flood.status_code == 200
+
+
+def test_ui_preferences_post_heals_a_document_the_normalizer_refuses(tmp_path):
+    """A stored value this normalizer rejects must not make the file unwritable.
+
+    GET already answers a refused document with the WHOLE default set — not just
+    an empty cursor: the sidebar width and the manual project order go with it
+    (see docs/ARCHITECTURE.md §11.4). What must not also happen is a permanent
+    400 on POST, which would mean no owner action could ever replace the bad
+    value: the file would be readable-as-defaults and unwritable forever.
+    """
+    from starlette.testclient import TestClient
+
+    from ouroboros.projects_registry import create_project, increment_project_visible_revision
+    from ouroboros.utils import atomic_write_json
+
+    app = Starlette(routes=collect_routes(data_dir=tmp_path))
+    app.state.drive_root = tmp_path
+    create_project(tmp_path, "twin", name="Twin")
+    increment_project_visible_revision(tmp_path, project_id="twin")
+    atomic_write_json(
+        tmp_path / "state" / "ui_preferences.json",
+        {
+            "project_seen_revision": {"twin": True},  # bool: refused, loudly
+            "sidebar_width": 400,
+            "project_order": ["twin"],
+        },
+        trailing_newline=True,
+    )
+    with TestClient(app) as client:
+        # The documented blast radius: the whole document, not only the cursor.
+        reset = client.get("/api/ui/preferences").json()
+        assert reset["project_seen_revision"] == {}
+        assert reset["sidebar_width"] == 0
+        assert reset["project_order"] == []
+
+        healed = client.post(
+            "/api/ui/preferences", json={"project_seen_revision": {"twin": {"0": 1}}}
+        )
+        assert healed.status_code == 200, "an incoming write heals; it never inherits the 400"
+        assert healed.json()["project_seen_revision"] == {"twin": {"0": 1}}
+        assert client.get("/api/ui/preferences").json()["project_seen_revision"] == {"twin": {"0": 1}}
+
+        # A bad REQUEST body is still rejected loudly — only the disk read falls back.
+        assert client.post(
+            "/api/ui/preferences", json={"project_seen_revision": {"twin": True}}
+        ).status_code == 400
+
+
+def test_ui_preferences_drops_a_tombstoned_projects_cursor_lane(tmp_path):
+    """A deleted project's cursor lane is dropped; a `deleting` one is kept.
+
+    `get_project` is ACTIVE-only, so without a lifecycle-aware second look a
+    tombstoned project's lane survived every write for the life of the file and
+    ate room in the project-cursor bound — a bound that evicts by stored order
+    and could therefore have dropped a LIVE project instead.
+    """
+    from starlette.testclient import TestClient
+
+    from ouroboros.projects_registry import (
+        begin_project_deletion,
+        complete_project_deletion,
+        create_project,
+        increment_project_visible_revision,
+    )
+    from ouroboros.utils import atomic_write_json
+
+    app = Starlette(routes=collect_routes(data_dir=tmp_path))
+    app.state.drive_root = tmp_path
+    for pid in ("keep", "gone", "going"):
+        create_project(tmp_path, pid, name=pid.title())
+        increment_project_visible_revision(tmp_path, project_id=pid)
+    begin_project_deletion(tmp_path, "gone")
+    complete_project_deletion(tmp_path, "gone")
+    begin_project_deletion(tmp_path, "going")
+
+    atomic_write_json(
+        tmp_path / "state" / "ui_preferences.json",
+        {
+            "project_seen_revision": {
+                "gone": {"0": 1},
+                "going": {"0": 1},
+                "stranger": {"0": 1},
+                "keep": {"0": 1},
+            }
+        },
+        trailing_newline=True,
+    )
+    with TestClient(app) as client:
+        merged = client.post(
+            "/api/ui/preferences", json={"project_seen_revision": {p: {"0": 1} for p in
+                                                                   ("keep", "gone", "going", "stranger")}}
+        ).json()["project_seen_revision"]
+        assert "gone" not in merged, "a tombstoned project's lane is pruned"
+        assert merged["going"] == {"0": 1}, "a deleting project is still observable"
+        assert merged["stranger"] == {"0": 1}, "an id we know nothing about is not ours to drop"
+        assert merged["keep"] == {"0": 1}
+
+
 def test_ui_preferences_concurrent_paint_acks_are_monotonic(tmp_path):
     from ouroboros.gateway.ui_preferences import api_ui_preferences_post
     from ouroboros.projects_registry import create_project, increment_project_visible_revision

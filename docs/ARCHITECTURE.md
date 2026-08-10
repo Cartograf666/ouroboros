@@ -2007,15 +2007,30 @@ a version bump + a migration note in the release row.
   compatibility window is one minor; after it the flat branch in
   `gateway/ui_preferences.py::_normalize_seen_revision` is deleted and a flat
   value POSTED by an old client becomes a 400. A flat value already ON DISK does
-  NOT become a 400 — claiming it would be a lie about the code:
+  not produce a 400 either, but the read-path consequence is far BIGGER than the
+  cursor, and the earlier wording here understated it twice.
   `api_ui_preferences_get` wraps the whole read in
-  `except Exception: return DEFAULT_UI_PREFERENCES`, so a stored cursor the
-  normalizer has stopped accepting is silently replaced by an empty one, which
-  marks every thread unread ONCE (the next paint ACK re-establishes it).
-  Whoever closes the window therefore picks one: ship a one-time on-disk rewrite,
-  or accept that single reset and say so in the release notes. This release does
-  neither and needs neither — inside the window the flat branch reads those files
-  correctly. Each thread's ACK now clamps against its OWN
+  `except Exception: return DEFAULT_UI_PREFERENCES` — the WHOLE document. One
+  stored value the normalizer refuses therefore also resets `sidebar_width`,
+  `project_panel_width`, `project_order`, `project_thread_order` and
+  `nested_subagents_expanded`, not just the unread cursor. And the reset is not
+  a ONCE: nothing is rewritten on read, so every subsequent GET repeats it until
+  something writes the file. What makes it survivable is the POST path:
+  `api_ui_preferences_post` normalizes its own disk read inside a `try/except`
+  and falls back to defaults, so an incoming write REPLACES the refused document
+  instead of inheriting its `ValueError`. Without that fallback the file would be
+  permanently unwritable — every POST a 400, including the one write that could
+  have healed it — which is a far worse outcome than a reset and is what the
+  "accept it and say so in the release notes" option used to ship. The honest
+  cost of closing the window is therefore: the owner's whole preferences document
+  reads as defaults, on every read, until the next write makes that permanent —
+  after which the widths and the manual orders are gone for good and only the
+  unread cursors come back, because the next paint ACK re-establishes those.
+  Whoever closes the window picks one: ship a one-time on-disk rewrite, or accept
+  that loss and say so in the release notes, naming the widths and the orders and
+  not only the unread dots. This release does neither and needs neither — inside
+  the window the flat branch reads those files correctly. Each thread's ACK now
+  clamps against its OWN
   `visible_revision` (thread #0 against `thread0_visible_revision`), never the
   project-wide aggregate, so a sibling thread's message can no longer mark the
   project's main thread read. `project_order` / `project_thread_order` were

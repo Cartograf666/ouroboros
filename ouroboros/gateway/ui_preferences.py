@@ -45,10 +45,15 @@ _MAX_PROJECT_CURSORS = 1000
 # are small integers bounded separately by _MAX_THREAD_CURSORS. Revisited and
 # deliberately left at 64 (X6).
 _MAX_PROJECT_ID_LENGTH = 64
-# Per project, PER REQUEST. A project's thread count is owner-driven, so this
-# never bounds what is STORED — the merge prunes a stored lane against the
-# project's live threads instead (see api_ui_preferences_post). It only bounds
-# how many thread cursors one request may carry.
+# Per project, PER REQUEST — and ONLY per request. A project's thread count is
+# owner-driven, so this must never bound what is STORED; the merge prunes a
+# stored lane against the project's live threads instead (see
+# api_ui_preferences_post). Enforcing that distinction takes an argument, not a
+# comment: `_normalize_seen_revision(..., bound_threads=False)` is what both
+# handlers pass for the DISK read, because applying this cap there turned "keep
+# the last 200" into "keep the FIRST 200 in stored order" and evicted the lane
+# an owner had just acknowledged — on the READ path, where nothing else can put
+# it back. Only the request body is bounded here.
 _MAX_THREAD_CURSORS = 200
 _MAX_THREAD_ID_LENGTH = 12
 _MAX_ORDERED_PROJECTS = 1000
@@ -82,8 +87,15 @@ def _normalize_width(value: Any, lo: int, hi: int) -> int:
     return max(lo, min(hi, n))
 
 
-def _normalize_seen_revision(value: Any) -> dict[str, dict[str, int]]:
+def _normalize_seen_revision(value: Any, *, bound_threads: bool = True) -> dict[str, dict[str, int]]:
     """Normalize the read cursor to its NESTED ``{project: {thread: rev}}`` shape.
+
+    ``bound_threads`` selects the LANE. True is the REQUEST lane: one POST body
+    may carry at most ``_MAX_THREAD_CURSORS`` cursors per project. False is the
+    STORED lane, where the document has already been bounded by the merge's
+    existence prune (dead threads dropped) and re-applying a per-request cap
+    would silently discard live cursors in stored order — which is the order a
+    just-written ACK sits LAST in.
 
     BREAKING ABI migration (X6), shipped atomically with the thread UI. The
     compatibility window is the per-entry branch below: a FLAT ``{pid: int}``
@@ -114,7 +126,10 @@ def _normalize_seen_revision(value: Any) -> dict[str, dict[str, int]]:
             raise ValueError("project_seen_revision values must be integers")
         if isinstance(per_thread, dict):
             threads: dict[str, int] = {}
-            for tid, revision in list(per_thread.items())[:_MAX_THREAD_CURSORS]:
+            entries = list(per_thread.items())
+            if bound_threads:
+                entries = entries[:_MAX_THREAD_CURSORS]
+            for tid, revision in entries:
                 thread_key = str(tid if tid is not None else "").strip()[:_MAX_THREAD_ID_LENGTH]
                 if not thread_key or isinstance(revision, bool):
                     if isinstance(revision, bool):
@@ -172,6 +187,7 @@ def _normalize_preferences(
     raw: dict[str, Any] | None,
     *,
     fill_defaults: bool = True,
+    bound_threads: bool = True,
 ) -> dict[str, Any]:
     prefs = dict(DEFAULT_UI_PREFERENCES) if fill_defaults else {}
     if not isinstance(raw, dict):
@@ -204,7 +220,9 @@ def _normalize_preferences(
     if "project_panel_width" in raw:
         prefs["project_panel_width"] = _normalize_width(raw.get("project_panel_width"), _PROJECT_PANEL_WIDTH_MIN, _PROJECT_PANEL_WIDTH_MAX)
     if "project_seen_revision" in raw:
-        prefs["project_seen_revision"] = _normalize_seen_revision(raw.get("project_seen_revision"))
+        prefs["project_seen_revision"] = _normalize_seen_revision(
+            raw.get("project_seen_revision"), bound_threads=bound_threads
+        )
     if "project_order" in raw:
         value = raw.get("project_order")
         if value is None:
@@ -272,7 +290,11 @@ async def api_ui_preferences_get(request: Request) -> JSONResponse:
     path = pathlib.Path(drive_root) / "state" / "ui_preferences.json"
     try:
         raw = read_json_dict(path)
-        prefs = _normalize_preferences(raw)
+        # The STORED lane: reading is not a request, so the per-request cursor cap
+        # must not apply. Bounding here evicted whichever lane the document listed
+        # last — the one the owner's most recent ACK had just written — so the
+        # thread painted unread again, ACK'd again, and was dropped again forever.
+        prefs = _normalize_preferences(raw, bound_threads=False)
         warning = _deprecated_warning(drive_root, _legacy_keys(raw), "stored")
         return JSONResponse({**prefs, **({"warnings": [warning]} if warning else {})})
     except Exception:
@@ -291,10 +313,27 @@ async def api_ui_preferences_post(request: Request) -> JSONResponse:
     incoming_legacy = _legacy_keys(body)
     try:
         with _preferences_lock(path):
-            prefs = _normalize_preferences(read_json_dict(path))
+            try:
+                # STORED lane (see api_ui_preferences_get): no per-request cap.
+                prefs = _normalize_preferences(read_json_dict(path), bound_threads=False)
+            except Exception:
+                # A stored document this normalizer refuses must not WEDGE the
+                # file. Letting its ValueError escape made every POST 400 —
+                # including the very write that would have replaced the bad
+                # value — so the preferences file became permanently unwritable
+                # and no owner action could recover it. Falling back to defaults
+                # means an incoming write HEALS it: the refused document is
+                # replaced by defaults plus whatever this request carries. Only
+                # the DISK read gets this fallback; a bad request body below
+                # still 400s, because rejecting bad input is the loud contract.
+                prefs = dict(DEFAULT_UI_PREFERENCES)
             incoming = _normalize_preferences(body, fill_defaults=False)
             if "project_seen_revision" in incoming:
-                from ouroboros.projects_registry import get_project, project_threads
+                from ouroboros.projects_registry import (
+                    get_project,
+                    get_reserved_project,
+                    project_threads,
+                )
 
                 merged = {
                     pid: dict(threads)
@@ -303,6 +342,17 @@ async def api_ui_preferences_post(request: Request) -> JSONResponse:
                 for project_id, requested in incoming.pop("project_seen_revision").items():
                     project = get_project(drive_root, project_id)
                     if project is None:
+                        # `get_project` is ACTIVE-only, so a tombstoned project
+                        # used to reach `continue` and keep its whole cursor lane
+                        # forever — the project-level twin of the dead-thread lanes
+                        # pruned below. Consult the lifecycle-agnostic lookup and
+                        # drop the lane once the row is genuinely tombstoned.
+                        # `deleting` rows are NOT dropped (the delete can still be
+                        # observed, and their threads are still real), and an
+                        # unknown id is not ours to touch: both keep `continue`.
+                        reserved = get_reserved_project(drive_root, project_id)
+                        if reserved is not None and str(reserved.get("lifecycle") or "") == "tombstoned":
+                            merged.pop(project_id, None)
                         continue
                     # Clamp EACH thread against its OWN durable revision, read
                     # through the canonical projection so thread #0 is clamped by
@@ -337,8 +387,14 @@ async def api_ui_preferences_post(request: Request) -> JSONResponse:
                         lane[thread_id] = max(int(lane.get(thread_id) or 0), acknowledged)
                     merged[project_id] = lane
                 if len(merged) > _MAX_PROJECT_CURSORS:
-                    # Bound retained cursors by insertion order; active-only writes
-                    # ensure tombstones/unknown ids are not newly admitted here.
+                    # Last-resort backstop only. The real bound is the tombstone
+                    # prune above: a deleted project's lane is dropped when it is
+                    # next written to, so delete-churn no longer piles dead lanes
+                    # up against this cap. It stays because nothing guarantees a
+                    # write ever names a given tombstoned project again — but it
+                    # evicts by STORED ORDER, so if it ever fires it can drop a
+                    # live project. Reaching it means 1000+ distinct project ids
+                    # in one owner's cursor, which the prune makes implausible.
                     merged = dict(list(merged.items())[-_MAX_PROJECT_CURSORS:])
                 prefs["project_seen_revision"] = merged
             incoming.pop("project_last_viewed", None)
