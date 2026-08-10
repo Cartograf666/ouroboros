@@ -95,15 +95,16 @@ OBJECTIVE_BEST_EFFORT = "best_effort"
 # deadline_local is the loop-local sibling of finalization_grace (v6.33.0 WS2): a
 # genuinely-extracted answer at a real deadline must land as best_effort, not an
 # agent failure — same as the supervisor finalize_now path.
+# provider_unavailable is deliberately NOT here (it was, until the slime-saga
+# audit): a provider outage interrupts a task with the objective unmet, and the
+# best-effort promotion turned that into "completed" — a lie that hid a real
+# outage from the owner. The rail stamps infra_failed instead (loop.py
+# _handle_provider_unavailable); salvage text still rides the result body.
 BEST_EFFORT_REASON_CODES = frozenset({
     "budget_exhausted",
     "round_limit",
     "finalization_grace",
     "deadline_local",
-    # provider-death terminalization (WA2): a genuinely-extracted final answer
-    # after the same-model reroute + fallback exhausted must land as best_effort,
-    # not a flat failure — the same honest-shelf semantics as deadline/budget.
-    "provider_unavailable",
     "children_unabsorbed",
 })
 
@@ -844,8 +845,16 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
     )
     forced_best_effort_with_deferred_child = bool(
         deferred_child_count
-        and str(delivery_candidate.get("degraded_reason") or "")
-        in BEST_EFFORT_REASON_CODES
+        and (
+            str(delivery_candidate.get("degraded_reason") or "")
+            in BEST_EFFORT_REASON_CODES
+            # provider_unavailable left the best-effort set (2026-08-10 saga:
+            # a provider-killed task is failed, not best-effort), but a forced
+            # provider rail must still not erase the more specific
+            # deferred-child objective below.
+            or str(delivery_candidate.get("degraded_reason") or "")
+            == "provider_unavailable"
+        )
     )
     verification_failures: List[Dict[str, Any]] = []
     for event in llm_trace.get("verification_events") or []:
@@ -931,7 +940,8 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
     # Honest reachability (measured, not asserted): the FORCED-rail bypass reasons
     # cannot arrive here on an OK execution — a bypass is stamped only when the rail
     # already wrote `usage.reason_code`, and every writer of that key also writes
-    # `execution_status='failed'`, so those runs land on the STRONGER failed /
+    # `execution_status='failed'` (the provider rail upgrades it to 'infra_failed'),
+    # so those runs land on the STRONGER failed/infra_failed /
     # best_effort branches above and the owner-visible bypass rides the review axis
     # (see test_forced_rail_axes_are_the_production_shape). What this branch actually
     # decides is the pacing skip (REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE).

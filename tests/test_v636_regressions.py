@@ -80,27 +80,37 @@ def test_create_with_retries_reroutes_once_on_transient_body_error(tmp_path, mon
     assert "allow_fallbacks" not in calls[1].get("extra_body", {}).get("provider", {})
 
 
-# --- WA2: provider-death -> best-effort shelf / salvage -----------------------
-def test_provider_unavailable_salvages_then_best_effort(monkeypatch):
+# --- WA2 (amended by the slime-saga honesty fix): provider-death -> salvage the
+# text, but terminalize as an INFRA FAILURE, never a completion ------------------
+def test_provider_unavailable_salvages_then_terminalizes_as_infra_failure(monkeypatch):
     import ouroboros.loop as loop
+    from ouroboros.outcomes import derive_loop_outcome
+
     ctx = SimpleNamespace(
         messages=[{"role": "user", "content": "do"}, {"role": "assistant", "content": "partial A"}],
         llm=None, active_model="m", active_effort="medium", max_retries=1,
         drive_logs=pathlib.Path("/tmp"), task_id="t", round_idx=1, event_queue=None,
         accumulated_usage={}, task_type="", active_use_local=False, max_rounds=10, deadline_ts=None,
     )
-    # provider stays dead -> final call yields nothing -> salvage last assistant text (NOT best_effort)
+    # provider stays dead -> final call yields nothing -> salvage last assistant text
     monkeypatch.setattr(loop, "call_llm_with_retry", lambda *a, **k: (None, 0.0))
     text, usage, _ = loop._handle_provider_unavailable(ctx)
     assert text == "partial A"
     assert usage.get("reason_code") == "provider_unavailable"
+    assert usage.get("execution_status") == "infra_failed"
     assert not usage.get("_best_effort_extracted")
-    # provider recovers (reroute) -> fresh final answer -> best_effort
+    # provider recovers (reroute) -> the fresh final answer still rides the result
+    # BODY, but the task remains an interruption: infra_failed execution (terminal
+    # status failed), never the old "completed (best effort)" promotion.
     ctx.accumulated_usage = {}
     monkeypatch.setattr(loop, "call_llm_with_retry", lambda *a, **k: ({"content": "FINAL"}, 0.01))
     text2, usage2, _ = loop._handle_provider_unavailable(ctx)
     assert text2 == "FINAL"
-    assert usage2.get("_best_effort_extracted") is True
+    assert usage2.get("execution_status") == "infra_failed"
+    outcome = derive_loop_outcome(text2, usage2, {"tool_calls": [], "reasoning_notes": []})
+    execution = outcome["outcome_axes"]["execution"]
+    assert execution["status"] == "infra_failed"
+    assert execution["reason_code"] == "provider_unavailable"
 
 
 # --- WA3: reviewer-slot SSOT / adaptive quorum --------------------------------
@@ -356,13 +366,16 @@ def test_provider_unavailable_no_salvage_path_does_not_raise(monkeypatch):
     assert isinstance(text, str)
 
 
-def test_provider_unavailable_recovered_answer_lifts_to_best_effort():
-    """claudexor confirm-round finding (WA2): a genuinely-extracted final answer on
-    the provider-death path (reason_code provider_unavailable + _best_effort_extracted)
-    must reduce to best_effort, not a flat failure — provider_unavailable must be in
-    the best-effort reason-code allowlist."""
+def test_provider_unavailable_is_never_a_best_effort_completion():
+    """Slime-saga honesty fix (reverses the WA2 confirm-round decision): a task
+    killed by provider unavailability with an unmet objective must terminalize as
+    an infra failure, never be promoted to "completed (best effort)" — so
+    provider_unavailable must NOT be in the best-effort reason-code allowlist,
+    while benchmark truncation disclosure still covers it explicitly."""
     from ouroboros.outcomes import BEST_EFFORT_REASON_CODES
-    assert "provider_unavailable" in BEST_EFFORT_REASON_CODES
+    from devtools.benchmarks.common.result_index import RUNTIME_TRUNCATION_REASON_CODES
+    assert "provider_unavailable" not in BEST_EFFORT_REASON_CODES
+    assert "provider_unavailable" in RUNTIME_TRUNCATION_REASON_CODES
 
 
 def test_auto_acceptance_capsule_wrapped_review_is_still_ingested():

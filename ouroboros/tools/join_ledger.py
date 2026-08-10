@@ -272,6 +272,59 @@ def _record_child_result_disposition(
     return f"OK: child {tid} marked {disposition} for result {expected[:12]}."
 
 
+def _record_child_result_disposition_batch(
+    ctx: ToolContext,
+    payload: Dict[str, Any],
+    rationale: str,
+) -> str:
+    """Record dispositions for MANY children in ONE tree_note call.
+
+    Each ``children`` entry is validated and recorded exactly like the single
+    form (same exact-hash binding, lineage gates, and idempotency — the batch
+    expands into the same individual authoritative ledger rows, so every
+    existing reader is unchanged). Entries are independent: an invalid entry is
+    rejected with a clear per-entry error naming it, while valid entries still
+    record. The shared tree_note text is the rationale for every entry.
+    """
+
+    envelope_extra = sorted(set(payload) - {"type", "children"})
+    children = payload.get("children")
+    if envelope_extra or not isinstance(children, list) or not children:
+        return (
+            "⚠️ CHILD_RESULT_DISPOSITION_INVALID: the batch form is exactly "
+            "{'type': 'child_result_disposition', 'children': [{'child_task_id', "
+            "'disposition', 'child_result_sha256'}, ...]} with a non-empty array"
+            + (f" (unknown key(s): {', '.join(envelope_extra)})" if envelope_extra else "")
+            + ". Nothing was recorded (atomic no-op)."
+        )
+    lines: list[str] = []
+    recorded = 0
+    for index, entry in enumerate(children):
+        if not isinstance(entry, dict):
+            lines.append(f"[entry {index}] ⚠️ CHILD_RESULT_DISPOSITION_INVALID: entry must be a JSON object.")
+            continue
+        single = dict(entry)
+        single.setdefault("type", CHILD_RESULT_DISPOSITION_TYPE)
+        label = str(entry.get("child_task_id") or f"entry {index}")
+        outcome = _record_child_result_disposition(ctx, single, rationale)
+        if outcome.startswith("OK:"):
+            recorded += 1
+        lines.append(f"[{label}] {outcome}")
+    total = len(children)
+    if recorded == total:
+        header = f"OK: batch child disposition recorded for {recorded} child(ren)."
+    elif recorded:
+        header = (
+            f"⚠️ CHILD_RESULT_DISPOSITION_PARTIAL: {recorded}/{total} entries recorded; "
+            "the failed entries below were rejected individually and must be corrected."
+        )
+    else:
+        header = (
+            f"⚠️ CHILD_RESULT_DISPOSITION_INVALID: 0/{total} batch entries were recorded."
+        )
+    return header + "\n" + "\n".join(lines)
+
+
 def _record_current_child_result_disposition(
     ctx: ToolContext,
     child_task_id: str,

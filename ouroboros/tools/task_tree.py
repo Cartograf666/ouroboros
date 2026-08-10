@@ -32,6 +32,12 @@ def _tree_note(
             )
         # The join ledger is the sole lineage/hash/write authority. Invalid tagged
         # payloads return here and are never downgraded into ordinary text notes.
+        # A `children` array is the batch form: one call, one shared rationale,
+        # expanded into the same per-child authoritative rows as the single form.
+        if "children" in payload:
+            from ouroboros.tools.join_ledger import _record_child_result_disposition_batch
+
+            return _record_child_result_disposition_batch(ctx, payload, text)
         from ouroboros.tools.join_ledger import _record_child_result_disposition
 
         return _record_child_result_disposition(ctx, payload, text)
@@ -96,7 +102,10 @@ def get_tools() -> List[ToolEntry]:
                         "Structured payload. Required for delegation_constraint. For a parent "
                         "decision about a direct child result, set type=child_result_disposition, "
                         "child_task_id, disposition, and the exact SHA-256 shown by child evidence; "
-                        "tree_note text is the rationale."
+                        "tree_note text is the rationale. To disposition MANY children in one call, "
+                        "set type=child_result_disposition and a children array of "
+                        "{child_task_id, disposition, child_result_sha256} entries (one shared "
+                        "rationale; each entry is validated exactly like the single form)."
                     ),
                     "properties": {
                         "type": {"type": "string", "enum": ["child_result_disposition"]},
@@ -106,6 +115,27 @@ def get_tools() -> List[ToolEntry]:
                             "enum": ["integrated", "irrelevant", "deferred"],
                         },
                         "child_result_sha256": {"type": "string"},
+                        "children": {
+                            "type": "array",
+                            "description": (
+                                "Batch child dispositions: entries of {child_task_id, "
+                                "disposition, child_result_sha256}."
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "child_task_id": {"type": "string"},
+                                    "disposition": {
+                                        "type": "string",
+                                        "enum": ["integrated", "irrelevant", "deferred"],
+                                    },
+                                    "child_result_sha256": {"type": "string"},
+                                },
+                                "required": [
+                                    "child_task_id", "disposition", "child_result_sha256",
+                                ],
+                            },
+                        },
                         "constraint_id": {"type": "string"},
                         "directive": {"type": "string", "enum": list(DELEGATION_CONSTRAINT_DIRECTIVES)},
                         "scope": {},

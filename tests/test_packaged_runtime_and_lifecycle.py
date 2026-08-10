@@ -537,6 +537,112 @@ def test_a_spared_task_still_gets_its_whole_grace_window(monkeypatch, tmp_path):
     assert len(_live_finalize_controls(tmp_path, orch)) == 1
 
 
+def test_child_settlement_stamps_parent_activity_and_withdraws_grace(
+    monkeypatch, tmp_path,
+):
+    """Q5 (slime saga): a coordinator waiting on children was idle-killed 120s
+    after its last child DELIVERED its result — delivery did not count as parent
+    activity, so the parent died exactly when integration should start. The
+    child's terminal dispatch now stamps the PARENT's own progress, so a parent
+    inside a finalization-grace episode is spared and the episode is withdrawn
+    whole by the EXISTING spare machinery (own progress answers the request)."""
+    from supervisor import events as events_mod
+    from supervisor import queue as queue_mod
+
+    orch, child = "orch3", "child3"
+    orch_meta = {
+        "task": {"id": orch, "chat_id": 7},
+        "started_at": 1000.0, "last_progress_at": 1000.0, "worker_id": 0,
+    }
+    child_task = {
+        "id": child, "chat_id": 7, "parent_task_id": orch, "root_task_id": orch,
+        "delegation_role": "subagent",
+    }
+    child_meta = {
+        "task": child_task,
+        "started_at": 1000.0, "last_progress_at": 1000.0, "worker_id": 1,
+    }
+    running = {orch: orch_meta, child: child_meta}
+    tick = _enforce_harness(monkeypatch, tmp_path, running, grace=120)
+
+    tick(2000.0)  # both idle: the orchestrator's grace episode opens
+    assert orch_meta["finalization_requested_at"] == 2000.0
+    assert len(_live_finalize_controls(tmp_path, orch)) == 1
+
+    tick(2050.0)  # inside the grace window; also moves the clock the stamp reads
+    # The child's terminal result is DELIVERED — the settled task_done dispatch.
+    ctx = types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path, RUNNING=running, PENDING=[], WORKERS={},
+        send_with_budget=lambda _cid, _text, **_k: None,
+        append_jsonl=lambda *_a, **_k: None,
+        persist_queue_snapshot=lambda **_k: True,
+        bridge=types.SimpleNamespace(push_log=lambda _e: None),
+    )
+    events_mod._finish_task_done_dispatch(
+        {}, ctx, task_id=child, worker_id=1, task=child_task,
+        final_task_result={}, task_done_event={"type": "task_done", "task_id": child},
+    )
+
+    assert child not in running
+    assert orch_meta["last_progress_at"] == 2050.0, "settlement did not stamp the parent"
+
+    tick(2055.0)  # own progress: the episode is withdrawn whole, parent spared
+    assert orch in queue_mod.RUNNING
+    assert "finalization_requested_at" not in orch_meta
+    assert _live_finalize_controls(tmp_path, orch) == []
+
+    tick(3000.0)  # the stamp is one-shot: a genuinely idle parent still reaches
+    assert orch_meta.get("finalization_requested_at") == 3000.0  # a fresh episode
+
+
+def test_provider_outage_root_terminal_notifies_owner_chat(tmp_path):
+    """Q7 (slime saga): a root task terminalized by a provider outage must tell
+    the owner immediately that it was NOT completed — the historical shape was
+    95 minutes of silence behind a result claiming "completed (best effort)"."""
+    from supervisor import events as events_mod
+
+    sent = []
+
+    def _ctx(running):
+        return types.SimpleNamespace(
+            DRIVE_ROOT=tmp_path, RUNNING=running, PENDING=[], WORKERS={},
+            send_with_budget=lambda cid, text, **_k: sent.append((cid, str(text))),
+            append_jsonl=lambda *_a, **_k: None,
+            persist_queue_snapshot=lambda **_k: True,
+            bridge=types.SimpleNamespace(push_log=lambda _e: None),
+        )
+
+    root_task = {"id": "root9", "chat_id": 7}
+    events_mod._finish_task_done_dispatch(
+        {}, _ctx({"root9": {"task": root_task, "worker_id": 0}}),
+        task_id="root9", worker_id=0, task=root_task, final_task_result={},
+        task_done_event={
+            "type": "task_done", "task_id": "root9", "chat_id": 7,
+            "status": "failed", "reason_code": "provider_unavailable",
+        },
+    )
+    outage_lines = [t for _c, t in sent if "provider outage" in t]
+    assert outage_lines and "NOT completed" in outage_lines[0]
+
+    # A CHILD's provider death keeps the ordinary subagent toast only — the
+    # parent absorbs child failures; no second owner ping per child.
+    sent.clear()
+    child_task = {
+        "id": "kid9", "chat_id": 7, "parent_task_id": "root9",
+        "root_task_id": "root9", "delegation_role": "subagent",
+    }
+    events_mod._finish_task_done_dispatch(
+        {"status": "failed"}, _ctx({"kid9": {"task": child_task, "worker_id": 1}}),
+        task_id="kid9", worker_id=1, task=child_task, final_task_result={},
+        task_done_event={
+            "type": "task_done", "task_id": "kid9", "chat_id": 7,
+            "status": "failed", "reason_code": "provider_unavailable",
+        },
+    )
+    assert not [t for _c, t in sent if "provider outage" in t]
+    assert [t for _c, t in sent if "Subagent kid9 failed" in t]
+
+
 def test_every_host_authored_progress_frame_declares_itself():
     """The gate only works if host emitters declare themselves, so make that
     structural rather than a habit: any supervisor-side event-bus frame that

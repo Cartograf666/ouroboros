@@ -31,22 +31,26 @@ def append_result_index(run_dir: pathlib.Path, row: dict[str, Any]) -> None:
 # guard: every literal `reason_code` in `ouroboros/` must have a recorded decision here.
 #
 # Per-code decision for `BEST_EFFORT_REASON_CODES` ("forced finalization may yield a
-# best-effort outcome"). All six are also "must not be read as a capability result", because
+# best-effort outcome"). All are also "must not be read as a capability result", because
 # forced finalization means the attempt was cut short by a rail rather than ended by the
 # agent, so the set is taken whole with no subtraction:
 #   budget_exhausted     loop.py:287   per-task USD reservation rail
 #   round_limit          loop.py:3128  round cap (_handle_round_limit)
 #   finalization_grace   loop.py:3146  supervisor finalize_now grace
 #   deadline_local       loop.py:3220  loop-local deadline
-#   provider_unavailable loop.py:3185  same-model reroute + fallback exhausted
 #   children_unabsorbed  loop.py:4071  forced terminal with child results unabsorbed
 _TRUNCATION_CODES_NOT_BEST_EFFORT = frozenset({
-    # ADDITIVE DELTA, one code. `llm_api_error` (loop_llm_call.py:630) is not a best-effort
-    # code — it terminates without an extracted answer — but it is the same class for an
-    # AUDITOR as provider_unavailable: a transport death, never a fair shot at the task.
-    # Adapters that lack a separate infra channel (the GAIA/OSWorld result rows) would
-    # otherwise publish an affirmative `truncated: false` for it.
+    # ADDITIVE DELTA, two codes that terminate as infra failures rather than
+    # best-effort completions but are the same class for an AUDITOR: the attempt
+    # was cut short by transport/provider death, never a fair shot at the task.
+    # Adapters that lack a separate infra channel (the GAIA/OSWorld result rows)
+    # would otherwise publish an affirmative `truncated: false` for them.
+    # `llm_api_error` (loop_llm_call.py:630) ends without an extracted answer;
+    # `provider_unavailable` (loop.py _handle_provider_unavailable) left
+    # BEST_EFFORT_REASON_CODES in the slime-saga honesty fix — a provider outage
+    # now terminalizes as infra_failed instead of "completed (best effort)".
     "llm_api_error",
+    "provider_unavailable",
 })
 
 RUNTIME_TRUNCATION_REASON_CODES = BEST_EFFORT_REASON_CODES | _TRUNCATION_CODES_NOT_BEST_EFFORT

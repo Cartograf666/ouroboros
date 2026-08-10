@@ -16,7 +16,7 @@ import logging
 from ouroboros.llm import LLMClient, normalize_reasoning_effort, add_usage
 from ouroboros import task_pacing
 from ouroboros.config import adaptive_quorum, get_context_mode, get_light_model, get_review_enforcement, get_task_review_mode, resolve_effort
-from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_BYPASS_REASONS, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
+from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_BYPASS_REASONS, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, REASON_DELIVERY_CONTROL_DEGRADED, RESULT_INFRA_FAILED, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
 from ouroboros.observability import new_call_id, persist_call
 from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools, swarm_router_turn
 from ouroboros.tools.registry import ToolRegistry
@@ -1378,6 +1378,9 @@ ACCEPTANCE_DECISION_REASONS = (
     "review_degraded",
     "fence_reopen_failed",
     "infra_failure",
+    # Owner Q2A: the forced children_unabsorbed rail runs the panel but cannot
+    # grant a requested improvement pass; the dangling revision terminalizes.
+    "revision_unavailable_on_forced_rail",
     REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE,
     # Forced-rail acceptance bypass (closed set, outcomes.py SSOT): stamped by
     # `_record_forced_acceptance_bypass` when the panel was owed but a rail fired.
@@ -1739,7 +1742,7 @@ def _build_host_acceptance_evidence(ctx: _TaskAcceptanceContext) -> Dict[str, An
         and str(call.get("status") or "") == "ok"
         for call in (ctx.llm_trace.get("tool_calls") or [])
     )
-    return build_task_acceptance_evidence(
+    evidence = build_task_acceptance_evidence(
         ctx.tools._ctx,
         llm_trace=ctx.llm_trace,
         drive_root=ctx.drive_root,
@@ -1750,6 +1753,12 @@ def _build_host_acceptance_evidence(ctx: _TaskAcceptanceContext) -> Dict[str, An
         canonical_subject=str(ctx.content or ""),
         subtree_statuses=ctx.subtree_statuses,
     )
+    # Owner Q2A: the forced children_unabsorbed rail stashes the process debt
+    # (undispositioned children) so the panel sees it; part of the binding hash.
+    undecided = getattr(ctx.tools._ctx, "_forced_undispositioned_children", None)
+    if isinstance(undecided, list) and undecided:
+        evidence["undispositioned_children"] = undecided
+    return evidence
 
 
 def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
@@ -3692,13 +3701,14 @@ def _handle_forced_finalization(ctx: _RoundLimitContext, reason: str) -> Tuple[s
 
 
 def _handle_provider_unavailable(ctx: _RoundLimitContext) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Provider-death terminalization (P2 unified best-effort shelf): the model
-    returned no usable response after the transport same-model reroute + retries
-    (+ any configured cross-model fallback). Join the SAME honest best-effort
-    shelf as deadline/budget/round-limit instead of discarding workspace state
-    with a bare error string — one tool-less final answer (which itself benefits
-    from the same-model reroute) and, failing that, the last assistant text
-    already produced."""
+    """Provider-death terminalization: the model returned no usable response
+    after the transport same-model reroute + retries (+ any configured
+    cross-model fallback). SALVAGE like the other forced rails — one tool-less
+    final answer (which itself benefits from the same-model reroute) and,
+    failing that, the last assistant text already produced — but terminalize as
+    an INFRA FAILURE, never as a completion: an outage interrupts the task with
+    the objective unmet, and calling that "completed (best effort)" was a lie
+    that hid a real outage from the owner (95 minutes of silence)."""
     # A stale DeliveryCandidate is still the best complete text available when
     # the provider is dead. _forced_fallback_result preserves its original
     # evidence provenance and adds a host-owned resume disclosure rather than
@@ -3724,10 +3734,23 @@ def _handle_provider_unavailable(ctx: _RoundLimitContext) -> Tuple[str, Dict[str
         )
     prompt = (
         "[PROVIDER_UNAVAILABLE] The model provider failed to return a usable response. "
-        "Produce your best final answer NOW from the verified work so far; clearly mark "
-        "anything unverified or incomplete. An honest best-effort result is expected here, not a failure."
+        "The task is being INTERRUPTED by this outage, not completed. Summarize the "
+        "verified work so far and state plainly what remains undone."
     )
-    return _forced_final_answer(ctx, prompt=prompt, fallback_text=fallback, reason_code="provider_unavailable")
+    text, usage, llm_trace = _forced_final_answer(
+        ctx, prompt=prompt, fallback_text=fallback, reason_code="provider_unavailable",
+    )
+    # Honesty (P1): a provider outage interrupts the task — it never "completes"
+    # it. Stamp the infra-failure execution status so the outcome reducer lands
+    # on infra_failed/provider (terminal task status: failed) instead of the old
+    # best-effort promotion to "completed". The salvage text above still rides
+    # the result body; only the claimed status changes. Skipped when a swarm
+    # routing handoff already cleared the rail (the admitted task owns its own
+    # lifecycle). NOTE: "interrupted" is deliberately NOT used here — in this
+    # codebase STATUS_INTERRUPTED is a pre-requeue, non-terminal state.
+    if str(usage.get("reason_code") or "") == "provider_unavailable":
+        usage["execution_status"] = RESULT_INFRA_FAILED
+    return text, usage, llm_trace
 
 
 def _maybe_deadline_local_finalize(
@@ -4471,9 +4494,11 @@ def _resolve_delivery_control(
         return "fresh", _extract_plain_text_from_content(content)
     raw = _extract_plain_text_from_content(content).strip()
     parsed, duplicate_protocol_key = _parse_delivery_control_object(raw)
+    # ANY parsed object carrying the protocol key is control intent, regardless of
+    # verb/value — an unknown verb is a mangled protocol attempt, never prose (raw
+    # JSON leaked to chat). Verb/shape validity is judged below (repair path).
     is_control_intent = duplicate_protocol_key or (
-        isinstance(parsed, dict)
-        and str(parsed.get("delivery_control") or "") in {"keep", "replace"}
+        isinstance(parsed, dict) and "delivery_control" in parsed
     )
     if not required:
         if _delivery_replace_required(candidate):
@@ -4754,6 +4779,9 @@ def _maybe_enforce_child_absorption_gate(
             f"{listed}. Before a clean final answer, inspect unfinished children or record a "
             "tree_note(kind='decision') payload with type=child_result_disposition, child_task_id, "
             "disposition=integrated|irrelevant|deferred, and the shown child_result_sha256. "
+            "To disposition several children in ONE call, pass a children array instead: "
+            "payload={'type': 'child_result_disposition', 'children': [{'child_task_id': ..., "
+            "'disposition': ..., 'child_result_sha256': ...}, ...]}. "
             "discard_child_result remains the shorthand for irrelevant. This is a bounded reminder; "
             "ignoring it will finalize best_effort, not clean."
         )
@@ -4773,7 +4801,86 @@ def _maybe_enforce_child_absorption_gate(
         reason_code="children_unabsorbed",
     )
     _merge_finalization_trace(llm_trace, forced_trace)
+    _run_forced_children_acceptance(
+        tools, limit_ctx, undecided, text, messages, emit_progress, llm_trace,
+    )
     return text, usage, llm_trace
+
+
+def _run_forced_children_acceptance(
+    tools: ToolRegistry,
+    limit_ctx: _RoundLimitContext,
+    undecided: list[Dict[str, Any]],
+    text: str,
+    messages: List[Dict[str, Any]],
+    emit_progress: Callable[[str], None],
+    llm_trace: Dict[str, Any],
+) -> None:
+    """Content acceptance still runs on the forced children_unabsorbed rail (owner Q2A).
+
+    The panel goes through the ORDINARY entry point (`_run_task_acceptance_review_once`)
+    after the forced answer text exists but BEFORE the loop seals it; the evidence packet
+    carries the undispositioned children via the ctx stash. The forced rail can never take
+    another model round, so a ``True`` return terminalizes here instead of looping: a
+    requested improvement pass is downgraded to ``finalized_unaccepted``, while a WAIT
+    shape that never ran the panel keeps the typed acceptance-bypass verdict already
+    stamped by `_record_forced_finalization`. Never raises — salvage outranks review.
+    """
+    if not str(text or "").strip():
+        return
+    tools_ctx = tools._ctx
+    try:
+        from ouroboros.tools.join_ledger import _child_result_sha256
+
+        debt = [
+            {
+                "task_id": str(c.get("task_id") or c.get("id") or ""),
+                "status": str(c.get("status") or "unknown"),
+                "child_result_sha256": _child_result_sha256(c),
+            }
+            for c in undecided[:20]
+            if isinstance(c, dict)
+        ]
+        if len(undecided) > 20:
+            # Explicit omission marker: a >20-child debt list must not read as complete.
+            debt.append({"omitted": len(undecided) - 20, "total": len(undecided)})
+        tools_ctx._forced_undispositioned_children = debt
+        another_round = _run_task_acceptance_review_once(
+            tools=tools,
+            content=str(text),
+            task_id=limit_ctx.task_id,
+            task_type=limit_ctx.task_type,
+            llm_trace=llm_trace,
+            drive_root=limit_ctx.drive_root,
+            messages=messages,
+            emit_progress=emit_progress,
+        )
+        if not another_round:
+            return
+        tools_ctx._task_acceptance_reviewed = True
+        _end_task_acceptance_fence(tools_ctx, outcome="terminal")
+        decision = llm_trace.get("acceptance_decision")
+        status = str(decision.get("status") or "") if isinstance(decision, dict) else ""
+        if status == ACCEPTANCE_REVISION_REQUESTED:
+            # A panel DID run and asked for an improvement pass; record the honest
+            # terminal state instead of leaving a dangling revision request.
+            _set_acceptance_decision(llm_trace, {
+                "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+                "reason": "revision_unavailable_on_forced_rail",
+                "source": "forced_finalization",
+                "rationale": (
+                    "The acceptance panel requested an improvement pass, but the "
+                    "forced children_unabsorbed rail cannot take another model round."
+                ),
+            })
+            emit_progress(
+                "Task acceptance ran on the forced rail; the requested improvement "
+                "pass is unavailable, finalizing unaccepted."
+            )
+    except Exception:
+        log.debug("Forced children_unabsorbed acceptance run failed", exc_info=True)
+    finally:
+        tools_ctx._forced_undispositioned_children = None
 
 
 def _enforce_swarm_actions(
@@ -5445,6 +5552,123 @@ def _forced_swarm_router_result(
     return candidate.full_text, ctx.accumulated_usage, llm_trace
 
 
+def _resolve_forced_delivery_control(
+    tools_ctx: Any,
+    extracted: str,
+) -> Tuple[str, str]:
+    """PURE, no-retry delivery-control resolution for the forced rail.
+
+    While the delivery-control latch is armed, the model's one forced answer is
+    legitimately allowed to be the protocol object ``{"delivery_control": ...}``
+    instead of prose — shipping it raw leaked protocol JSON into the owner's
+    chat and the durable result. Resolve it here, before suffix composition and
+    publication, without ever re-looping (``_resolve_delivery_control`` can
+    inject a repair round, which a hard forced stop must never do): a valid
+    ``keep`` uses the retained candidate's full text, a valid ``replace`` uses
+    ``full_answer``, and a malformed/duplicate/invalid control falls back to the
+    retained candidate with the typed degraded reason. Protocol intent under the
+    armed latch is ANY parsed object carrying the ``delivery_control`` key
+    (regardless of verb/value) AND any JSON-LOOKING text (stripped text starting
+    with ``{``) that fails to parse — the model was explicitly instructed to
+    answer with the protocol object, so a JSON-looking non-parse is a mangled
+    protocol attempt, never the answer. JSON while NOT armed passes through
+    untouched — legitimate user-facing JSON is never eaten. Disclosed residual:
+    armed PROSE (text not starting with ``{``) is genuinely indistinguishable
+    from an intentional fresh answer and stands as-is, even if the model meant
+    it as a control acknowledgement. Clears the latch. Returns
+    ``(resolved_text, degraded_reason)``.
+    """
+    if tools_ctx is None or not extracted:
+        return extracted, ""
+    candidate = getattr(tools_ctx, "_delivery_candidate", None)
+    candidate = candidate if isinstance(candidate, DeliveryCandidate) else None
+    armed = bool(getattr(tools_ctx, "_delivery_control_required", False)) or (
+        candidate is not None and _delivery_replace_required(candidate)
+    )
+    if not armed:
+        return extracted, ""
+    tools_ctx._delivery_control_required = False
+    parsed, duplicate_protocol_key = _parse_delivery_control_object(extracted)
+    # Protocol intent: any parsed object with the protocol key (unknown verb =
+    # broken control, never prose), or JSON-looking text that fails to parse (a
+    # mangled protocol attempt under the armed latch — the candidate is the answer).
+    protocol_intent = duplicate_protocol_key or (
+        ("delivery_control" in parsed)
+        if isinstance(parsed, dict)
+        else extracted.lstrip().startswith("{")
+    )
+    if not protocol_intent:
+        # An ordinary prose answer under an armed latch: the fresh text stands.
+        return extracted, ""
+    selected = str(parsed.get("delivery_control") or "") if isinstance(parsed, dict) else ""
+    if selected == "replace" and set(parsed) == {"delivery_control", "full_answer"}:
+        replacement = parsed.get("full_answer")
+        if isinstance(replacement, str) and replacement.strip():
+            return replacement, ""
+    elif selected == "keep" and set(parsed) == {"delivery_control"} and candidate is not None:
+        return candidate.full_text, ""
+    # Malformed/duplicate/invalid control: preserve the retained candidate (or,
+    # with none retained, let the caller's fallback text stand) and say so.
+    return (
+        candidate.full_text if candidate is not None else "",
+        REASON_DELIVERY_CONTROL_DEGRADED,
+    )
+
+
+def _forced_delegation_note(tools_ctx: Any, llm_trace: Dict[str, Any]) -> str:
+    """The nanny postcondition's forced-path half, grounded in DURABLE custody.
+
+    A forced finalization may not re-loop, so the substrate fact rides the one final
+    prompt. `delegate_custody.task_execution_evidence` on the custody root (the
+    canonical/budget root — the same split-root rule Phase A fixed in the ordinary
+    path) decides, not just the current execution's trace: succeeded → no note;
+    started-but-unsettled → pending wording (no retry pressure); settled-without-
+    success → truthful failure wording; zero started with readable evidence → the
+    no-delegation wording; unreadable evidence → no accusation."""
+    if not getattr(tools_ctx, "_nanny_route_dispatched", False):
+        return ""
+    try:
+        from ouroboros import delegate_custody
+
+        root = delegate_custody.custody_root(tools_ctx)
+        log_path = delegate_custody.event_log_path(root)
+        if log_path.exists():
+            # _iter_rows swallows OSError, which would misread an unreadable log
+            # as "zero runs" — probe readability so absence of rows is a fact.
+            log_path.open("rb").close()
+        evidence = delegate_custody.task_execution_evidence(
+            root, str(getattr(tools_ctx, "task_id", "") or ""),
+        )
+    except Exception:
+        log.debug("Forced-path custody evidence unreadable; nanny note skipped", exc_info=True)
+        return ""
+    started = int(evidence.get("delegated_runs_started") or 0)
+    settled = int(evidence.get("delegated_runs_settled") or 0)
+    if int(evidence.get("delegated_runs_succeeded") or 0):
+        return ""
+    if started > settled:
+        return (
+            "\nNOTE: this task dispatched delegated run(s) that have not settled "
+            f"yet ({started - settled} of {started} pending). State their status "
+            "in your answer; do not claim the delegated work finished."
+        )
+    if settled:
+        return (
+            f"\nNOTE: this task's delegated run(s) settled WITHOUT success ({settled} "
+            "run(s)). State that failure and its impact honestly in your answer."
+        )
+    if any(str(c.get("tool") or "") == "delegate_start"
+           for c in (llm_trace.get("tool_calls") or []) if isinstance(c, dict)):
+        # The trace shows a dispatch the durable rows have not recorded — never
+        # accuse over evidence that is behind the task's own actions.
+        return ""
+    return (
+        "\nNOTE: this task was dispatched onto the delegated substrate "
+        "(executor=harness) and made no delegate_start calls — the work ran on "
+        "metered API tokens. State why in your answer."
+    )
+
+
 def _forced_final_answer(
     ctx: _RoundLimitContext,
     *,
@@ -5461,19 +5685,7 @@ def _forced_final_answer(
     if router_result is not None:
         return router_result
     tools_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
-    if (getattr(tools_ctx, "_nanny_route_dispatched", False)
-            and not any(str(c.get("tool") or "") == "delegate_start"
-                        for c in (llm_trace.get("tool_calls") or [])
-                        if isinstance(c, dict))):
-        # The nanny postcondition's forced-path half: a forced finalization may not
-        # re-loop (that is its whole point), so the substrate fact rides the one
-        # final prompt instead — the child can still SAY why delegation never
-        # happened, and the parent still sees the decision instead of silence.
-        prompt += (
-            "\nNOTE: this task was dispatched onto the delegated substrate "
-            "(executor=harness) and made no delegate_start calls — the work ran on "
-            "metered API tokens. State why in your answer."
-        )
+    prompt += _forced_delegation_note(tools_ctx, llm_trace)
     _append_or_merge_user_message(ctx.messages, prompt)
     extracted = ""
     for attempt in range(2):
@@ -5509,6 +5721,9 @@ def _forced_final_answer(
             "new complete answer bound to every owner directive now present.",
         )
 
+    extracted, control_degraded = _resolve_forced_delivery_control(
+        getattr(getattr(ctx, "tools", None), "_ctx", None), extracted,
+    )
     if extracted:
         # Typed fact for the best_effort outcome gate: a REAL model answer
         # was extracted (host fallback strings never set this).
@@ -5524,6 +5739,14 @@ def _forced_final_answer(
         candidate = _publish_model_forced_candidate(
             ctx, llm_trace, full_text, reason_code,
         )
+        if control_degraded and candidate is not None:
+            candidate.degraded_reason = control_degraded
+            llm_trace.setdefault("reasoning_notes", []).append(
+                "Forced finalization received an invalid delivery-control object; "
+                "preserved the retained complete answer."
+            )
+            if getattr(ctx, "tools", None) is not None:
+                _publish_delivery_candidate(ctx.tools, candidate, llm_trace)
         _record_forced_finalization(
             ctx,
             llm_trace,
@@ -6807,9 +7030,9 @@ def run_llm_loop(
                     emit_progress=emit_progress, context_fit_plan=context_fit_plan,
                     active_context_mode=active_context_mode)
                 if msg is None:
-                    # Provider-death: join the unified honest best-effort shelf
-                    # (deadline/budget/round-limit) instead of discarding useful
-                    # workspace state with a bare error string.
+                    # Provider-death: salvage the useful workspace state like the
+                    # forced rails do, but terminalize as an infra failure — an
+                    # outage interrupts the task, it never completes it.
                     text, accumulated_usage, forced_trace = _handle_provider_unavailable(limit_ctx)
                     _merge_finalization_trace(llm_trace, forced_trace)
                     return text, accumulated_usage, llm_trace

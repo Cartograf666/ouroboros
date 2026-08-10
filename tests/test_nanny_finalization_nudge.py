@@ -282,10 +282,7 @@ def test_a_delegating_nanny_and_a_native_child_are_not_nudged():
     assert _run(undispatched, [], []) is False
 
 
-def test_forced_finalization_carries_the_nanny_note_instead_of_relooping():
-    """Forced finalization may not re-loop (that is its whole point), so the
-    substrate fact rides the one final prompt instead: a harness-dispatched child
-    that made zero delegate_start calls sees the note and can state why."""
+def _forced_run(tmp_path, nanny, tool_calls):
     import pathlib
     from unittest.mock import patch
 
@@ -294,29 +291,91 @@ def test_forced_finalization_carries_the_nanny_note_instead_of_relooping():
     class _Ctx:
         pass
 
-    class _Tools:
-        def __init__(self, nanny):
-            self._ctx = _Ctx()
-            self._ctx._nanny_route_dispatched = nanny
+    tools = SimpleNamespace(_ctx=_Ctx())
+    tools._ctx._nanny_route_dispatched = nanny
+    tools._ctx.drive_root = tmp_path
+    tools._ctx.task_id = "t"
+    messages: list = []
+    ctx = _RoundLimitContext(
+        messages=messages, llm=None, active_model="m", active_effort="low",
+        max_retries=0, drive_logs=pathlib.Path("."), task_id="t", round_idx=1,
+        event_queue=None, accumulated_usage={}, task_type="task",
+        active_use_local=False, max_rounds=1,
+    )
+    ctx.tools = tools
+    ctx.llm_trace = {"reasoning_notes": [], "tool_calls": tool_calls}
+    with patch("ouroboros.loop._call_forced_model_once", return_value="done"), \
+         patch("ouroboros.loop._finalize_forced_services"), \
+         patch("ouroboros.loop._forced_swarm_router_result", return_value=None), \
+         patch("ouroboros.loop._drain_forced_owner_directives", return_value=False):
+        _forced_final_answer(ctx, prompt="wrap up", fallback_text="fb",
+                             reason_code="round_limit")
+    return "\n".join(m.get("content", "") for m in messages)
 
-    def run(nanny, tool_calls):
-        messages = []
-        ctx = _RoundLimitContext(
-            messages=messages, llm=None, active_model="m", active_effort="low",
-            max_retries=0, drive_logs=pathlib.Path("."), task_id="t", round_idx=1,
-            event_queue=None, accumulated_usage={}, task_type="task",
-            active_use_local=False, max_rounds=1,
-        )
-        ctx.tools = _Tools(nanny)
-        ctx.llm_trace = {"reasoning_notes": [], "tool_calls": tool_calls}
-        with patch("ouroboros.loop._call_forced_model_once", return_value="done"), \
-             patch("ouroboros.loop._finalize_forced_services"), \
-             patch("ouroboros.loop._forced_swarm_router_result", return_value=None), \
-             patch("ouroboros.loop._drain_forced_owner_directives", return_value=False):
-            _forced_final_answer(ctx, prompt="wrap up", fallback_text="fb",
-                                 reason_code="round_limit")
-        return "\n".join(m.get("content", "") for m in messages)
 
-    assert "delegated substrate" in run(True, [])
-    assert "delegated substrate" not in run(False, [])
-    assert "delegated substrate" not in run(True, [{"tool": "delegate_start"}])
+def test_forced_finalization_carries_the_nanny_note_instead_of_relooping(tmp_path):
+    """Forced finalization may not re-loop (that is its whole point), so the
+    substrate fact rides the one final prompt instead: a harness-dispatched child
+    that made zero delegate_start calls sees the note and can state why."""
+    assert "delegated substrate" in _forced_run(tmp_path, True, [])
+    assert "delegated substrate" not in _forced_run(tmp_path, False, [])
+    assert "delegated substrate" not in _forced_run(
+        tmp_path, True, [{"tool": "delegate_start"}],
+    )
+
+
+def _emit_custody(tmp_path, kind, **payload):
+    from ouroboros import delegate_custody as dc
+
+    assert dc.emit(tmp_path, kind, {"task_id": "t", **payload})
+
+
+def test_forced_note_consults_durable_custody_evidence(tmp_path):
+    """The forced-path note is grounded in delegate_custody evidence on the
+    custody root, not just the current trace: succeeded runs silence the note,
+    unsettled runs get pending wording (no retry pressure), settled-without-
+    success gets truthful failure wording."""
+    from ouroboros import delegate_custody as dc
+
+    # A SUCCEEDED run from an earlier execution: no note, no nag.
+    _emit_custody(tmp_path, dc.STARTED, run_id="r1")
+    _emit_custody(tmp_path, dc.SETTLED, run_id="r1", state="succeeded")
+    out = _forced_run(tmp_path, True, [])
+    assert "delegated substrate" not in out and "NOTE:" not in out
+
+    # A started-but-unsettled run: pending wording, never "made no calls".
+    pending_root = tmp_path / "pending"
+    _emit_custody(pending_root, dc.STARTED, run_id="r2")
+    out = _forced_run(pending_root, True, [])
+    assert "not settled yet" in out and "made no delegate_start" not in out
+
+    # A run that settled WITHOUT success (crashed in an earlier execution):
+    # truthful failure wording instead of the false "made no calls" accusation.
+    failed_root = tmp_path / "failed"
+    _emit_custody(failed_root, dc.STARTED, run_id="r3")
+    _emit_custody(failed_root, dc.SETTLED, run_id="r3", state="failed")
+    out = _forced_run(failed_root, True, [])
+    assert "settled WITHOUT success" in out and "made no delegate_start" not in out
+
+
+def test_forced_note_never_accuses_over_unreadable_evidence(tmp_path):
+    """An unreadable custody log must not be misread as 'zero runs': no note."""
+    import os
+    import platform
+
+    import pytest
+
+    from ouroboros import delegate_custody as dc
+
+    if platform.system() == "Windows":
+        pytest.skip("chmod-based permission test not portable to Windows")
+    log_path = dc.event_log_path(tmp_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("", encoding="utf-8")
+    os.chmod(log_path, 0)
+    if os.geteuid() == 0:  # pragma: no cover — only hit in root CI
+        pytest.skip("root user bypasses 0o000 chmod, cannot trigger OSError")
+    try:
+        assert "NOTE:" not in _forced_run(tmp_path, True, [])
+    finally:
+        os.chmod(log_path, 0o644)

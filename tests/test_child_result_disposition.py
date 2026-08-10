@@ -312,6 +312,120 @@ def test_disposition_violations_helper_is_the_normalizer_authority():
         assert normalize_child_result_disposition_payload(bad) is None
 
 
+def test_batch_disposition_records_one_authoritative_row_per_child(tmp_path):
+    """Q2A (slime saga): a fan-out parent needed one bureaucratic tree_note per
+    child (six calls in the incident). One call with a children array now
+    expands into the SAME per-child authoritative rows as the single form, so
+    every existing reader (projection, absorption gate) is unchanged."""
+    from ouroboros.task_status import load_effective_task_result
+    from ouroboros.task_tree_ledger import tree_ledger_rows
+    from ouroboros.tools.join_ledger import _child_result_sha256
+    from ouroboros.tools.task_tree import _tree_note
+
+    entries = []
+    for child_id, disposition in (
+        ("child1", "integrated"), ("child2", "irrelevant"), ("child3", "deferred"),
+    ):
+        _write_child(tmp_path, child_id=child_id)
+        entries.append({
+            "child_task_id": child_id,
+            "disposition": disposition,
+            "child_result_sha256": _child_result_sha256(
+                load_effective_task_result(tmp_path, child_id)
+            ),
+        })
+
+    result = _tree_note(
+        _parent_ctx(tmp_path),
+        "decision",
+        "batch disposition after absorbing all three",
+        payload={"type": "child_result_disposition", "children": entries},
+    )
+
+    assert result.startswith("OK: batch child disposition recorded for 3 child(ren).")
+    rows = tree_ledger_rows("parent1", data_root=tmp_path)
+    assert len(rows) == 3
+    recorded = {row["payload"]["child_task_id"]: row["payload"] for row in rows}
+    for entry in entries:
+        payload = recorded[entry["child_task_id"]]
+        assert payload["disposition"] == entry["disposition"]
+        assert payload["child_result_sha256"] == entry["child_result_sha256"]
+        effective = load_effective_task_result(tmp_path, entry["child_task_id"])
+        assert effective["child_result_disposition"] == entry["disposition"]
+        assert effective["child_result_disposition_source"] == "task_tree_ledger"
+
+
+def test_batch_disposition_rejects_invalid_entries_individually(tmp_path):
+    """Exact-hash binding is preserved PER CHILD: a stale hash or a foreign task
+    rejects only its own entry — the clear error names which entries failed —
+    while valid entries still record."""
+    from ouroboros.task_status import load_effective_task_result
+    from ouroboros.task_tree_ledger import tree_ledger_rows
+    from ouroboros.tools.join_ledger import _child_result_sha256
+    from ouroboros.tools.task_tree import _tree_note
+
+    _write_child(tmp_path)
+    _write_child(tmp_path, child_id="child2")
+    good_hash = _child_result_sha256(load_effective_task_result(tmp_path, "child1"))
+
+    result = _tree_note(
+        _parent_ctx(tmp_path),
+        "decision",
+        "partial batch",
+        payload={
+            "type": "child_result_disposition",
+            "children": [
+                {"child_task_id": "child1", "disposition": "integrated",
+                 "child_result_sha256": good_hash},
+                {"child_task_id": "child2", "disposition": "integrated",
+                 "child_result_sha256": "0" * 64},          # stale hash
+                {"child_task_id": "stranger9", "disposition": "irrelevant",
+                 "child_result_sha256": "1" * 64},          # not our child
+                {"child_task_id": "child2", "disposition": "absorbed",
+                 "child_result_sha256": "bad"},             # enum + sha violations
+                "not-an-object",
+            ],
+        },
+    )
+
+    assert result.startswith("⚠️ CHILD_RESULT_DISPOSITION_PARTIAL: 1/5")
+    assert "[child1] OK:" in result
+    assert "[child2] ⚠️ CHILD_RESULT_STALE" in result
+    assert "[stranger9] ⚠️ CHILD_RESULT_LINEAGE_FORBIDDEN" in result
+    assert "disposition must be one of" in result
+    assert "[entry 4] ⚠️ CHILD_RESULT_DISPOSITION_INVALID: entry must be a JSON object." in result
+    rows = tree_ledger_rows("parent1", data_root=tmp_path)
+    assert [row["payload"]["child_task_id"] for row in rows] == ["child1"]
+
+
+def test_batch_disposition_envelope_is_validated_atomically(tmp_path):
+    """A malformed batch ENVELOPE (empty/non-array children, stray keys mixing
+    the single and batch forms) records nothing."""
+    from ouroboros.task_tree_ledger import tree_ledger_rows
+    from ouroboros.tools.task_tree import _tree_note
+
+    _write_child(tmp_path)
+    for payload in (
+        {"type": "child_result_disposition", "children": []},
+        {"type": "child_result_disposition", "children": "child1"},
+        {"type": "child_result_disposition", "children": [], "child_task_id": "child1"},
+    ):
+        result = _tree_note(_parent_ctx(tmp_path), "decision", "why", payload=payload)
+        assert "CHILD_RESULT_DISPOSITION_INVALID" in result
+        assert "atomic no-op" in result
+    wrong_kind = _tree_note(
+        _parent_ctx(tmp_path),
+        "note",
+        "why",
+        payload={"type": "child_result_disposition", "children": [
+            {"child_task_id": "child1", "disposition": "integrated",
+             "child_result_sha256": "a" * 64},
+        ]},
+    )
+    assert "require kind='decision'" in wrong_kind
+    assert tree_ledger_rows("parent1", data_root=tmp_path) == []
+
+
 def test_orphan_note_claim_detail_is_scoped_to_undecided_children(monkeypatch):
     """The blackboard-derived claim detail belongs ONLY to children the exact-hash
     disposition projection left UNDECIDED. A deferred child IS carried by that

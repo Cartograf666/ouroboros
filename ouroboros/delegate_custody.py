@@ -410,8 +410,10 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
         "delegated_runs_settled": len(settled),
         # The terminal-state axis (F4, 2026-08-10 saga): a run that STARTED and
         # FAILED is an ATTEMPTED route, not a refusal to delegate. Readers (the
-        # nanny nudge, the completion seam) must be able to tell "never tried"
-        # from "tried and the run died" without re-parsing the event log.
+        # nanny nudge, the forced-path note, the completion seam) must be able to
+        # tell "never tried" from "tried and the run died" without re-parsing the
+        # event log; the forced-path nanny note keys on the succeeded count to
+        # stop nagging over finished work.
         "delegated_runs_succeeded": len(succeeded),
         "delegated_run_failure_states": sorted(set(failure_states)),
         # True only when the canonical log EXISTS but could not be opened —

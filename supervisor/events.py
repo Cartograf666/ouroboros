@@ -1393,6 +1393,58 @@ def _handle_evolution_task_done(
         log.debug("Post-task evolution autostop failed", exc_info=True)
 
 
+# Single-shot registry for the provider-death owner notification. The old gate
+# (`and task`, a live RUNNING row) also swallowed every reaper-delivered terminal:
+# the reaper loop pops RUNNING before its task_done dispatches (regression tests:
+# test_supervisor_reaper_notification.py). Process-local: after a restart the
+# worst case is one repeated notification, never a lost one.
+_PROVIDER_DEATH_NOTIFIED: set[str] = set()
+
+
+def _maybe_notify_provider_death(
+    ctx: Any,
+    task_id: Any,
+    task: Dict[str, Any],
+    final_task_result: Dict[str, Any],
+    task_done_event: Dict[str, Any],
+) -> None:
+    """Provider-death honesty (P1): tell the owner a root task terminalized by a
+    provider outage was NOT completed — the historical shape was 95 minutes of
+    silence behind a result claiming "completed". Runs AFTER the task-done
+    bookkeeping (cleanup never depends on chat delivery) and registers the id in
+    the single-shot registry only after a SUCCESSFUL send, so a raising send is
+    retried by a later dispatch instead of being lost. Never raises."""
+    if not (
+        task_id
+        and str(task_id) not in _PROVIDER_DEATH_NOTIFIED
+        and str(
+            task.get("delegation_role") or final_task_result.get("delegation_role") or ""
+        ) != "subagent"
+        and str(task_done_event.get("reason_code") or "") == "provider_unavailable"
+        and str(task_done_event.get("status") or "") == STATUS_FAILED
+    ):
+        return
+    notify_chat = int(task_done_event.get("chat_id") or 0)
+    if not notify_chat:
+        return
+    try:
+        # Promise only what works: the resume endpoint serves budget-paused
+        # PENDING tasks (task_lifecycle.resume_budget_paused_task), never a
+        # failed terminal — "resume" here was a false owner promise.
+        ctx.send_with_budget(
+            notify_chat,
+            f"🔌 Task {task_id} was stopped by a model-provider outage and was "
+            "NOT completed. Partial work and workspace files are preserved; "
+            "re-run the task once the provider recovers.",
+        )
+    except Exception:
+        log.warning(
+            "Provider-death owner notification failed for %s", task_id, exc_info=True,
+        )
+        return
+    _PROVIDER_DEATH_NOTIFIED.add(str(task_id))
+
+
 def _finish_task_done_dispatch(
     evt: Dict[str, Any],
     ctx: Any,
@@ -1486,6 +1538,25 @@ def _finish_task_done_dispatch(
     with _queue_lock:
         if task_id:
             ctx.RUNNING.pop(str(task_id), None)
+            # A child's settled result is the parent's cue to START integrating,
+            # so settlement counts as the PARENT's own progress. Without this
+            # stamp a coordinator blocked in wait_tasks was idle-killed exactly
+            # when its last child delivered (the completed child instantly left
+            # RUNNING, so _subtree_progressing went dark and only the grace
+            # window remained). Own progress also lets the existing spare
+            # machinery (resolve_grace_episode_for_spared_task) withdraw an
+            # outstanding finalization-grace episode on the next enforce tick.
+            # A one-shot event per child terminal — unlike subtree narration,
+            # it cannot re-arm/flicker episodes. `task` is {} for reaper-delivered
+            # terminals (RUNNING popped before dispatch), so fall back to the
+            # durable result for the parent id — same shape the notification
+            # gate handles.
+            parent_meta = ctx.RUNNING.get(str(
+                task.get("parent_task_id")
+                or final_task_result.get("parent_task_id") or ""
+            ))
+            if isinstance(parent_meta, dict):
+                parent_meta["last_progress_at"] = time.time()
         if worker_id in ctx.WORKERS and ctx.WORKERS[worker_id].busy_task_id == task_id:
             # A `reaping` slot is OWNED — by the reaper or by an in-flight
             # cancellation custody. Its owner confirms process death and then
@@ -1512,7 +1583,10 @@ def _finish_task_done_dispatch(
         )
 
     if bool(evt.get("_ephemeral")):
+        # An ephemeral direct-chat decision turn shows its failure inline —
+        # no duplicate provider-outage owner ping.
         return
+    _maybe_notify_provider_death(ctx, task_id, task, final_task_result, task_done_event)
     try:
         results_dir = pathlib.Path(ctx.DRIVE_ROOT) / "task_results"
         results_dir.mkdir(parents=True, exist_ok=True)
