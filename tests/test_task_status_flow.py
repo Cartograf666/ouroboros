@@ -701,6 +701,91 @@ def test_wait_for_tasks_returns_compact_structural_batch(tmp_path):
     )
 
 
+def test_wait_for_tasks_projects_execution_evidence_for_harness_children(tmp_path):
+    # Q1A (2026-08-10 amendments): the batch projection is the surface a fan-out
+    # parent absorbs its children through, and it used to hide whether a
+    # harness-dispatched child ever actually delegated (the e9108a09 shape:
+    # nine "harness" children, zero delegated runs, invisible in the batch).
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools.control import _wait_for_tasks
+
+    write_task_result(
+        tmp_path, "harnesskid", STATUS_COMPLETED, result="done",
+        effective_executor="harness", executor_route="codex",
+        actual_substrate="native_only",
+        subagent_envelope={
+            "actual_substrate": "native_only",
+            "execution_evidence": {
+                "delegated_runs_started": 0, "delegated_runs_settled": 0,
+                "delegated_runs_succeeded": 0, "delegated_run_failure_states": [],
+                "evidence_read_failed": False, "subscription_cost_usd": None,
+                "subscription_cost_estimated": False, "harness_models": [],
+            },
+        },
+    )
+    write_task_result(tmp_path, "nativekid", STATUS_COMPLETED, result="done")
+
+    ctx = SimpleNamespace(drive_root=tmp_path)
+    payload = json.loads(_wait_for_tasks(ctx, ["harnesskid", "nativekid"], timeout_sec=0))
+
+    assert payload["tasks"]["harnesskid"]["execution_evidence"] == {
+        "dispatch_executor": "harness",
+        "actual_substrate": "native_only",
+        "delegated_runs_started": 0,
+        "delegated_runs_succeeded": 0,
+    }
+    # A native child with no custody evidence stays compact — no evidence block.
+    assert "execution_evidence" not in payload["tasks"]["nativekid"]
+
+
+def test_wait_for_tasks_projection_marks_unreadable_evidence(tmp_path):
+    # v6.94.0 landing-gate scope fix: unreadable custody evidence means the
+    # counts are UNKNOWN — the projection carries ONLY dispatch_executor and
+    # the typed evidence_read_failed marker. Emitting the raw zeros beside the
+    # marker fabricated a "no runs" receipt for a log that was never read; the
+    # substrate claim is likewise dropped even when the stored record carries
+    # one (same omission rule subagents.envelope_from_task applies).
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools.control import _wait_for_tasks
+
+    write_task_result(
+        tmp_path, "blindkid", STATUS_COMPLETED, result="done",
+        effective_executor="harness", executor_route="codex",
+        actual_substrate="native_only",
+        subagent_envelope={
+            "actual_substrate": "native_only",
+            "execution_evidence": {
+                "delegated_runs_started": 0, "delegated_runs_succeeded": 0,
+                "evidence_read_failed": True,
+            },
+        },
+    )
+    ctx = SimpleNamespace(drive_root=tmp_path)
+    payload = json.loads(_wait_for_tasks(ctx, ["blindkid"], timeout_sec=0))
+    assert payload["tasks"]["blindkid"]["execution_evidence"] == {
+        "dispatch_executor": "harness",
+        "evidence_read_failed": True,
+    }
+
+
+def test_wait_for_tasks_projection_omits_counts_without_envelope_evidence(tmp_path):
+    # 6c03c24e corrective wave (LOW b): a stored harness child with NO envelope
+    # evidence at all (pre-6.94 records) must not read as a zero-run receipt —
+    # absence means "no evidence yet", so no counts and no substrate claim.
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools.control import _wait_for_tasks
+
+    write_task_result(
+        tmp_path, "oldkid", STATUS_COMPLETED, result="done",
+        effective_executor="harness", executor_route="codex",
+    )
+    ctx = SimpleNamespace(drive_root=tmp_path)
+    payload = json.loads(_wait_for_tasks(ctx, ["oldkid"], timeout_sec=0))
+    assert payload["tasks"]["oldkid"]["execution_evidence"] == {
+        "dispatch_executor": "harness",
+    }
+
+
 def test_wait_for_tasks_any_terminal_early_return_projects_pending_child(tmp_path):
     from ouroboros.task_results import STATUS_COMPLETED, STATUS_SCHEDULED, write_task_result
     from ouroboros.tools.control import _wait_for_tasks

@@ -248,6 +248,21 @@ test('the chip is layered truth: decision before evidence, receipt only from evi
     });
     assert.match(unused.label, /no run recorded/);
     assert.match(unused.title, /no durable record of a delegated run/);
+
+    // Unreadable custody evidence is UNKNOWN, never a "no run" receipt: the
+    // zero counts ride evidence_read_failed and must not render as "recorded".
+    const unreadable = executorChip({
+        executor_route: 'claude',
+        execution_evidence: {
+            delegated_runs_started: 0, delegated_runs_settled: 0,
+            evidence_read_failed: true,
+            subscription_cost_usd: null, harness_models: [],
+        },
+    });
+    assert.match(unreadable.label, /evidence unavailable/);
+    assert.match(unreadable.title, /could not be read/);
+    assert.match(unreadable.title, /unknown/);
+    assert.doesNotMatch(unreadable.label, /no run recorded/);
     // Zero custody rows prove neither non-execution nor the API path
     // (started_uncustodied exists) — the title must assert NEITHER.
     assert.doesNotMatch(unused.title, /natively|ran on the API/);

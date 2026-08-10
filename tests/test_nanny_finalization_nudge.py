@@ -30,9 +30,246 @@ def test_harness_child_finalizing_without_delegation_gets_one_nudge():
     assert _run(ctx, [], []) is False
 
 
+def _tools(ctx_obj, available):
+    return SimpleNamespace(_ctx=ctx_obj, available_tools=lambda: list(available))
+
+
+def _custody_drive(tmp_path):
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    return tmp_path
+
+
+def _run_full(tools, drive, task_id, msgs, tool_calls):
+    return _maybe_inject_finalization_nudges(
+        tools, drive, task_id,
+        {"reasoning_notes": [], "tool_calls": tool_calls}, "done", msgs, lambda *_: None,
+    )
+
+
+def test_no_nudge_when_delegate_verbs_are_policy_hidden(tmp_path):
+    # F4a (2026-08-10 saga): a child whose toolset does not carry the delegate
+    # verbs cannot "choose" to delegate — accusing it is false. No reminder.
+    ctx = SimpleNamespace(_nanny_route_dispatched=True, _nanny_finalization_injected=False)
+    msgs: list = []
+    assert _run_full(_tools(ctx, ["read_file", "web_search"]),
+                     _custody_drive(tmp_path), "t", msgs, []) is False
+    assert not any("NANNY" in m.get("content", "") for m in msgs)
+
+
+def test_failed_delegated_run_gets_the_truthful_reminder(tmp_path):
+    # F4b: a delegated run that STARTED but FAILED is an attempted route. The
+    # durable custody evidence (not the per-execution trace) proves it, and the
+    # reminder speaks the truth instead of accusing of zero attempts.
+    from ouroboros import delegate_custody as custody
+
+    drive = _custody_drive(tmp_path)
+    assert custody.emit(drive, custody.STARTED, {
+        "run_id": "run-1", "task_id": "child-1", "route": "claude", "max_seconds": 300,
+    })
+    assert custody.emit(drive, custody.SETTLED, {
+        "run_id": "run-1", "task_id": "child-1", "route": "claude",
+        "model": "claude-opus-5", "state": "failed", "cost_usd": 0.0,
+        "cost_final": True, "spend_disclosed": True, "spend_estimated": False,
+    })
+    ctx = SimpleNamespace(_nanny_route_dispatched=True, _nanny_finalization_injected=False)
+    msgs: list = []
+    assert _run_full(_tools(ctx, ["delegate_start", "delegate_wait"]),
+                     drive, "child-1", msgs, []) is True
+    joined = "\n".join(m.get("content", "") for m in msgs)
+    assert "NANNY_DELEGATED_RUN_FAILED" in joined
+    assert "failed" in joined
+    assert "NANNY_DID_NOT_DELEGATE" not in joined
+
+
+def test_succeeded_delegated_run_suppresses_the_reminder(tmp_path):
+    # A run that succeeded in an EARLIER execution (continuation reset the trace)
+    # is a kept substrate decision — no reminder at all.
+    from ouroboros import delegate_custody as custody
+
+    drive = _custody_drive(tmp_path)
+    assert custody.emit(drive, custody.STARTED, {
+        "run_id": "run-1", "task_id": "child-1", "route": "claude", "max_seconds": 300,
+    })
+    assert custody.emit(drive, custody.SETTLED, {
+        "run_id": "run-1", "task_id": "child-1", "route": "claude",
+        "model": "claude-opus-5", "state": "succeeded", "cost_usd": 0.0,
+        "cost_final": True, "spend_disclosed": True, "spend_estimated": False,
+    })
+    ctx = SimpleNamespace(_nanny_route_dispatched=True, _nanny_finalization_injected=False)
+    msgs: list = []
+    assert _run_full(_tools(ctx, ["delegate_start", "delegate_wait"]),
+                     drive, "child-1", msgs, []) is False
+    assert not any("NANNY" in m.get("content", "") for m in msgs)
+
+
+def test_failed_run_nudges_even_with_delegate_start_in_this_trace(tmp_path):
+    # Triad finding on e84475f2 (the saga's exact shape, all inside ONE
+    # execution): delegate → the run dies → finish by hand → finalize. The
+    # trace CONTAINS delegate_start, so the old outer guard skipped the nudge
+    # entirely and the failure was never spoken. Custody evidence must win.
+    from ouroboros import delegate_custody as custody
+
+    drive = _custody_drive(tmp_path)
+    assert custody.emit(drive, custody.STARTED, {
+        "run_id": "run-1", "task_id": "child-1", "route": "codex", "max_seconds": 300,
+    })
+    assert custody.emit(drive, custody.SETTLED, {
+        "run_id": "run-1", "task_id": "child-1", "route": "codex",
+        "model": "gpt-5.6-sol", "state": "failed", "cost_usd": 0.0,
+        "cost_final": True, "spend_disclosed": True, "spend_estimated": False,
+    })
+    ctx = SimpleNamespace(_nanny_route_dispatched=True, _nanny_finalization_injected=False)
+    msgs: list = []
+    assert _run_full(_tools(ctx, ["delegate_start", "delegate_wait"]),
+                     drive, "child-1", msgs,
+                     [{"tool": "delegate_start", "args": {}}]) is True
+    joined = "\n".join(m.get("content", "") for m in msgs)
+    assert "NANNY_DELEGATED_RUN_FAILED" in joined
+    assert "NANNY_DID_NOT_DELEGATE" not in joined
+
+
+def _split_root_ctx(parent, child):
+    return SimpleNamespace(
+        _nanny_route_dispatched=True, _nanny_finalization_injected=False,
+        task_metadata={"budget_drive_root": str(parent)}, drive_root=str(child),
+    )
+
+
+def test_split_root_nanny_reads_custody_from_the_canonical_root(tmp_path):
+    # Split-root fix (2026-08-10 amendments): custody rows are WRITTEN to the
+    # canonical (budget) root — delegate_custody.custody_root — while a live
+    # subagent's loop passes its isolated CHILD drive as drive_root. The nanny
+    # read must resolve the same root as the writes: a succeeded run suppresses
+    # the nudge, a started-but-failed run yields the truthful failure message —
+    # both with the child drive passed exactly as production passes it.
+    from ouroboros import delegate_custody as custody
+    from ouroboros.loop import _nanny_finalization_message
+
+    parent, child = tmp_path / "parent", tmp_path / "child"
+    for root in (parent, child):
+        (root / "logs").mkdir(parents=True)
+
+    # (a) succeeded delegated run, rows on the CANONICAL root via the write path
+    ctx = _split_root_ctx(parent, child)
+    root = custody.custody_root(ctx)
+    assert root == parent.resolve()
+    assert custody.emit(root, custody.STARTED, {
+        "run_id": "run-ok", "task_id": "child-ok", "route": "claude", "max_seconds": 300,
+    })
+    assert custody.emit(root, custody.SETTLED, {
+        "run_id": "run-ok", "task_id": "child-ok", "route": "claude",
+        "model": "claude-opus-5", "state": "succeeded", "cost_usd": 0.0,
+        "cost_final": True, "spend_disclosed": True, "spend_estimated": False,
+    })
+    tools = _tools(ctx, ["delegate_start", "delegate_wait"])
+    assert _nanny_finalization_message(tools, child, "child-ok") == ""
+
+    # (b) started-but-failed run: the truthful failure message, not blindness
+    assert custody.emit(root, custody.STARTED, {
+        "run_id": "run-dead", "task_id": "child-dead", "route": "codex", "max_seconds": 300,
+    })
+    assert custody.emit(root, custody.SETTLED, {
+        "run_id": "run-dead", "task_id": "child-dead", "route": "codex",
+        "model": "gpt-5.6-sol", "state": "failed", "cost_usd": 0.0,
+        "cost_final": True, "spend_disclosed": True, "spend_estimated": False,
+    })
+    message = _nanny_finalization_message(tools, child, "child-dead")
+    assert "NANNY_DELEGATED_RUN_FAILED" in message
+    assert "NANNY_DID_NOT_DELEGATE" not in message
+
+
+def _emit_started(drive, run_id, task_id):
+    from ouroboros import delegate_custody as custody
+
+    assert custody.emit(drive, custody.STARTED, {
+        "run_id": run_id, "task_id": task_id, "route": "claude", "max_seconds": 300,
+    })
+
+
+def _emit_settled(drive, run_id, task_id, state):
+    from ouroboros import delegate_custody as custody
+
+    assert custody.emit(drive, custody.SETTLED, {
+        "run_id": run_id, "task_id": task_id, "route": "claude",
+        "model": "claude-opus-5", "state": state, "cost_usd": 0.0,
+        "cost_final": True, "spend_disclosed": True, "spend_estimated": False,
+    })
+
+
+def test_pending_run_gets_the_wait_reminder_not_a_failure_accusation(tmp_path):
+    # PENDING ≠ FAILED (sol review on b49f8192): a STARTED row with no settled
+    # receipt may simply still be executing. The old message called it failed and
+    # told the child to retry — a duplicate concurrent delegated run — while
+    # finalizing over it is exactly the orphan-result failure mode. The reminder
+    # points at delegate_wait and accuses nothing.
+    from ouroboros.loop import _nanny_finalization_message
+
+    drive = _custody_drive(tmp_path)
+    _emit_started(drive, "run-1", "child-1")
+    ctx = SimpleNamespace(_nanny_route_dispatched=True, _nanny_finalization_injected=False)
+    message = _nanny_finalization_message(
+        _tools(ctx, ["delegate_start", "delegate_wait"]), drive, "child-1")
+    assert "NANNY_DELEGATED_RUN_PENDING" in message
+    assert "delegate_wait" in message
+    assert "NANNY_DELEGATED_RUN_FAILED" not in message
+    assert "NANNY_DID_NOT_DELEGATE" not in message
+
+
+def test_mixed_failed_and_pending_runs_prefer_the_pending_reminder(tmp_path):
+    # With one dead sibling AND one still in flight, "retry" is the wrong
+    # instruction: the pending reminder wins, the earlier failure rides along
+    # as a fact instead of being dropped.
+    from ouroboros.loop import _nanny_finalization_message
+
+    drive = _custody_drive(tmp_path)
+    _emit_started(drive, "run-dead", "child-1")
+    _emit_settled(drive, "run-dead", "child-1", "failed")
+    _emit_started(drive, "run-live", "child-1")
+    ctx = SimpleNamespace(_nanny_route_dispatched=True, _nanny_finalization_injected=False)
+    message = _nanny_finalization_message(
+        _tools(ctx, ["delegate_start", "delegate_wait"]), drive, "child-1")
+    assert "NANNY_DELEGATED_RUN_PENDING" in message
+    assert "failed" in message                     # the earlier death is still named
+    assert "NANNY_DELEGATED_RUN_FAILED" not in message
+
+
+def test_all_failed_runs_keep_the_failure_message(tmp_path):
+    # All settled, none succeeded: the terminal non-success message stays.
+    from ouroboros.loop import _nanny_finalization_message
+
+    drive = _custody_drive(tmp_path)
+    for run_id in ("run-1", "run-2"):
+        _emit_started(drive, run_id, "child-1")
+        _emit_settled(drive, run_id, "child-1", "failed")
+    ctx = SimpleNamespace(_nanny_route_dispatched=True, _nanny_finalization_injected=False)
+    message = _nanny_finalization_message(
+        _tools(ctx, ["delegate_start", "delegate_wait"]), drive, "child-1")
+    assert "NANNY_DELEGATED_RUN_FAILED" in message
+    assert "NANNY_DELEGATED_RUN_PENDING" not in message
+
+
+def test_closed_absent_run_counts_as_settled_not_pending(tmp_path):
+    # A run the daemon says it does not have closed custody terminally without a
+    # settlement row; the evidence must not read it as "still executing" forever.
+    from ouroboros import delegate_custody as custody
+
+    drive = _custody_drive(tmp_path)
+    _emit_started(drive, "run-1", "child-1")
+    assert custody.emit(drive, custody.CLOSED_ABSENT, {
+        "run_id": "run-1", "task_id": "child-1", "route": "claude",
+        "project_id": "", "reason": "reconcile_absent",
+    })
+    evidence = custody.task_execution_evidence(drive, "child-1")
+    assert evidence["delegated_runs_settled"] == 1
+    assert evidence["delegated_runs_succeeded"] == 0
+    assert "closed_absent" in evidence["delegated_run_failure_states"]
+    assert evidence["subscription_cost_usd"] is None  # spend undisclosed, never zero
+
+
 def test_a_delegating_nanny_and_a_native_child_are_not_nudged():
-    # A single delegate_start call in the trace IS the receipt — even a refused
-    # one proves the substrate decision was faced rather than ignored.
+    # A delegate_start in the trace with NO custody row yet (pending settlement
+    # or an uncustodied start) is an attempt, not a choice — no accusation, and
+    # the failure case is owned by custody evidence (see the test above).
     delegating = SimpleNamespace(_nanny_route_dispatched=True,
                                  _nanny_finalization_injected=False)
     assert _run(delegating, [], [{"tool": "delegate_start", "args": {}}]) is False

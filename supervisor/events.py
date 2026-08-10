@@ -1464,6 +1464,9 @@ def _finish_task_done_dispatch(
             _envelope = effective_result.get("subagent_envelope")
             if isinstance(_envelope, dict) and isinstance(_envelope.get("execution_evidence"), dict):
                 progress_meta["execution_evidence"] = _envelope["execution_evidence"]
+            if isinstance(_envelope, dict) and _envelope.get("actual_substrate"):
+                # The FACT beside the plan (Q1A): harness_used / harness_attempted / native_only.
+                progress_meta["actual_substrate"] = str(_envelope["actual_substrate"])
             if isinstance(task_done_event.get("outcome_axes"), dict):
                 progress_meta["outcome_axes"] = task_done_event["outcome_axes"]
             if task_done_event.get("reason_code"):

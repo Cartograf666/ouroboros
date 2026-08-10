@@ -112,10 +112,15 @@ class ChatOutbound(TypedDict):
     # `capability_delta`, not by rewriting this field.
     executor_route: NotRequired[str]
     # The completion-seam EVIDENCE the route decision is reconciled against
-    # (subagents.envelope_from_task): delegated runs started/settled, disclosed
-    # subscription spend, engine-reported models. Terminal frames only; its
-    # absence means "no evidence yet", never "ran natively".
+    # (subagents.envelope_from_task): delegated runs started/settled/succeeded,
+    # terminal failure states, disclosed subscription spend (+estimated flag),
+    # engine-reported models. Terminal frames only; its absence means "no
+    # evidence yet", never "ran natively".
     execution_evidence: NotRequired[Dict[str, Any]]
+    # The FACT beside the executor_route plan, from the same custody evidence:
+    # "harness_used" | "harness_attempted" | "native_only". Terminal frames only; absent =
+    # no substrate claim.
+    actual_substrate: NotRequired[str]
     model: NotRequired[str]
     task_group_id: NotRequired[str]
     task_event: NotRequired[str]

@@ -121,6 +121,17 @@ export function executorChip(evt) {
     }
     const started = Number(evidence.delegated_runs_started || 0);
     const settled = Number(evidence.delegated_runs_settled || 0);
+    if (!started && evidence.evidence_read_failed) {
+        // The custody log EXISTS but could not be read: the zero counts above
+        // are UNKNOWN, not an established fact — rendering them as "no run
+        // recorded" would issue a receipt nothing verified (sol finding,
+        // b49f8192 wave).
+        return {
+            ...base,
+            label: `${name} (evidence unavailable)`,
+            title: `The ${name} route was assigned, but the delegated-run evidence could not be read — whether a run happened is unknown, not "none"`,
+        };
+    }
     if (!started) {
         return {
             ...base,

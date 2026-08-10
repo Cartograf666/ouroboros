@@ -683,6 +683,19 @@ _WORKSPACE_ALLOWED_TOOLS = frozenset({
     "ocr_pdf",
     "youtube_transcript",
     "extract_video_frames",
+    # Delegation-and-media gap (2026-08-10 saga): this allowlist predates the
+    # delegate verbs (v6.87.8) and the send_* family, so tasks in external
+    # project workspaces could neither delegate onto the already-paid substrate
+    # nor deliver media the task contract demanded. Both child profiles in
+    # tool_capabilities.py are strict subsets of this set (invariant-tested),
+    # so the workspace AND-intersection is vacuous for delegated children.
+    "delegate_start",
+    "delegate_wait",
+    "delegate_cancel",
+    "switch_model",
+    "send_photo",
+    "send_video",
+    "send_file",
     "list_available_tools",
     "enable_tools",
 })
@@ -1580,6 +1593,43 @@ class ToolRegistry:
 
     def capability_omissions(self) -> List[Dict[str, Any]]:
         return [dict(item) for item in self._capability_omissions]
+
+    def policy_hidden_reason(self, name: str) -> Optional[str]:
+        """Why a REGISTERED built-in tool is invisible to THIS task, or None.
+
+        Read-only companion to get_schema_by_name (same predicates, same order):
+        it distinguishes "hidden by policy" from "does not exist" so discovery
+        answers can stop reporting a policy-filtered tool as nonexistent (F3,
+        2026-08-10 saga). None means visible OR unknown name — callers that got
+        no schema and no reason may honestly say "not found".
+        """
+        requested = str(name or "").strip()
+        if not requested:
+            return None
+        # BEFORE the registration check: the declarative contract policy applies
+        # across ALL discovery sources (get_schema_by_name checks it first for the
+        # same reason), so a contract-disabled extension/MCP name answers with its
+        # reason instead of "not found" (2026-08-10 amendments). Deeper extension/
+        # MCP policy reasons (grants, network) would need new plumbing — disclosed
+        # residual, not built.
+        if requested in _disabled_tools(self._ctx):
+            return "disabled by this task's contract (disabled_tools)"
+        if requested not in self._entries:
+            return None
+        available, reason, _detail = _builtin_tool_availability(requested, self._ctx)
+        if not available:
+            return f"unavailable ({reason})"
+        if getattr(self._ctx, "is_ephemeral_turn", False) and requested not in _EPHEMERAL_ALLOWED_TOOLS:
+            return "hidden on this ephemeral decision turn (allowlist)"
+        acting_subagent = self._is_acting_subagent()
+        workspace_mode = bool(getattr(self._ctx, "is_workspace_mode", lambda: False)()) and not acting_subagent
+        if workspace_mode and requested not in _WORKSPACE_ALLOWED_TOOLS:
+            return "hidden by the workspace tool envelope"
+        if self._is_local_readonly_subagent() and requested not in LOCAL_READONLY_SUBAGENT_TOOL_NAMES:
+            return "hidden by the read-only subagent profile"
+        if acting_subagent and requested not in ACTING_SUBAGENT_TOOL_NAMES:
+            return "hidden by the acting subagent profile"
+        return None
 
     def get_schema_by_name(self, name: str) -> Optional[Dict[str, Any]]:
         """Return the full schema for a specific tool."""

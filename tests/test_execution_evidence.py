@@ -44,10 +44,10 @@ def _emit_started(drive, run_id="run-1", task_id="child-1", model=""):
 
 def _emit_settled(drive, run_id="run-1", task_id="child-1", *,
                   cost_usd=0.0, spend_disclosed=True, model="claude-sonnet",
-                  spend_estimated=False):
+                  spend_estimated=False, state="succeeded"):
     assert custody.emit(drive, custody.SETTLED, {
         "run_id": run_id, "task_id": task_id, "route": "claude", "model": model,
-        "state": "succeeded", "cost_usd": cost_usd,
+        "state": state, "cost_usd": cost_usd,
         "cost_final": spend_disclosed and not spend_estimated,
         "spend_disclosed": spend_disclosed, "spend_estimated": spend_estimated,
     })
@@ -60,6 +60,9 @@ class TestCustodyAggregation:
         assert evidence == {
             "delegated_runs_started": 0,
             "delegated_runs_settled": 0,
+            "delegated_runs_succeeded": 0,
+            "delegated_run_failure_states": [],
+            "evidence_read_failed": False,
             "subscription_cost_usd": None,
             "subscription_cost_estimated": False,
             "harness_models": [],
@@ -105,6 +108,28 @@ class TestCustodyAggregation:
         assert evidence["delegated_runs_settled"] == 1
         assert evidence["subscription_cost_usd"] is None
 
+    def test_failed_run_reads_as_attempted_route_not_zero_attempts(self, tmp_path):
+        # F4 (2026-08-10 saga): a run that STARTED and FAILED is an ATTEMPTED
+        # route. The terminal-state axis lets readers (the nanny nudge) tell
+        # "never tried" from "tried and the run died" without accusing the child.
+        drive = _drive(tmp_path)
+        _emit_started(drive, "run-1")
+        assert custody.emit(drive, custody.SETTLED, {
+            "run_id": "run-1", "task_id": "child-1", "route": "claude",
+            "model": "claude-opus-5", "state": "failed", "cost_usd": 0.0,
+            "cost_final": True, "spend_disclosed": True, "spend_estimated": False,
+        })
+        evidence = custody.task_execution_evidence(drive, "child-1")
+        assert evidence["delegated_runs_started"] == 1
+        assert evidence["delegated_runs_succeeded"] == 0
+        assert evidence["delegated_run_failure_states"] == ["failed"]
+        # A succeeded run counts on the success axis and adds no failure state.
+        _emit_started(drive, "run-2")
+        _emit_settled(drive, "run-2")
+        evidence = custody.task_execution_evidence(drive, "child-1")
+        assert evidence["delegated_runs_succeeded"] == 1
+        assert evidence["delegated_run_failure_states"] == ["failed"]
+
     def test_another_tasks_runs_do_not_leak_in(self, tmp_path):
         drive = _drive(tmp_path)
         _emit_started(drive, "run-9", task_id="other-task")
@@ -126,6 +151,9 @@ class TestEnvelopeReconciliation:
         assert envelope["execution_evidence"] == {
             "delegated_runs_started": 0,
             "delegated_runs_settled": 0,
+            "delegated_runs_succeeded": 0,
+            "delegated_run_failure_states": [],
+            "evidence_read_failed": False,
             "subscription_cost_usd": None,
             "subscription_cost_estimated": False,
             "harness_models": [],
@@ -172,6 +200,112 @@ class TestEnvelopeReconciliation:
         assert envelope["executor_route"] == "claude"
 
 
+class TestActualSubstrate:
+    """Q1A (2026-08-10 amendments): the PLAN (`effective_executor`) and the FACT
+    (`actual_substrate`) are separate fields — a harness-dispatched task that ran
+    everything on metered API must not read as a clean delegated execution."""
+
+    def test_vocabulary_is_purely_factual_from_custody_counts(self):
+        # Custody evidence ONLY — no usage/rounds axis, where polling and real
+        # thinking are indistinguishable and any boundary would be a guess.
+        from ouroboros.subagents import actual_substrate
+
+        assert actual_substrate(None) == "native_only"
+        assert actual_substrate({"delegated_runs_started": 0}) == "native_only"
+        # Started-but-failed is a FAILED ATTEMPT, not "never tried".
+        assert actual_substrate({"delegated_runs_started": 2,
+                                 "delegated_runs_succeeded": 0}) == "harness_attempted"
+        assert actual_substrate({"delegated_runs_started": 1,
+                                 "delegated_runs_succeeded": 1}) == "harness_used"
+
+    def test_attempted_run_classifies_attempted_in_the_envelope(self, tmp_path):
+        drive = _drive(tmp_path)
+        _emit_started(drive, "run-1")
+        _emit_settled(drive, "run-1", state="failed")
+        envelope = envelope_from_task(_subagent_task(drive), status="completed")
+        assert envelope["actual_substrate"] == "harness_attempted"
+
+    def test_envelope_carries_the_fact_beside_the_plan(self, tmp_path):
+        drive = _drive(tmp_path)
+        _emit_started(drive, "run-1")
+        _emit_settled(drive, "run-1")
+        envelope = envelope_from_task(_subagent_task(drive), status="completed",
+                                      usage={"rounds": 4})
+        assert envelope["effective_executor"] == "harness"   # the plan, untouched
+        assert envelope["actual_substrate"] == "harness_used"
+
+    def test_native_only_harness_dispatch_discloses_a_reduced_delta(self, tmp_path):
+        # The e9108a09 shape: dispatched harness, zero delegated runs. The
+        # completion envelope must not present a clean un-reduced execution —
+        # the EXISTING capability_delta disclosure carries it (no new axis).
+        drive = _drive(tmp_path)
+        task = _subagent_task(drive, capability_delta={
+            "requested_executor": "auto", "effective_executor": "harness",
+            "reason": "", "reduced": False,
+        })
+        envelope = envelope_from_task(task, status="completed", usage={"rounds": 9})
+        assert envelope["actual_substrate"] == "native_only"
+        assert envelope["capability_delta"]["reduced"] is True
+        assert "delegated_substrate_unused" in envelope["capability_delta"]["reason"]
+        # The dispatch-time author's dict on the task stays untouched.
+        assert task["capability_delta"]["reduced"] is False
+        # And the batch-projection predicate now discloses it to the parent.
+        from ouroboros.tools.control import disclosable_capability_delta
+
+        assert disclosable_capability_delta({"capability_delta": envelope["capability_delta"]})
+
+    def test_durable_result_fields_carry_the_raw_counts_beside_the_enum(self, tmp_path):
+        from ouroboros.subagents import substrate_result_fields
+
+        drive = _drive(tmp_path)
+        _emit_started(drive, "run-1")
+        envelope = envelope_from_task(_subagent_task(drive), status="completed")
+        assert substrate_result_fields(envelope) == {
+            "actual_substrate": "harness_attempted",
+            "delegated_runs_started": 1,
+            "delegated_runs_succeeded": 0,
+        }
+        assert substrate_result_fields({}) == {}  # no substrate claim, no fields
+
+    def test_unreadable_evidence_makes_no_substrate_claim_anywhere(self, tmp_path):
+        # 6c03c24e corrective wave (both sol lanes + fable): an unreadable
+        # canonical custody log returns zero counts with evidence_read_failed —
+        # those zeros are UNKNOWN, so the envelope must not classify them as
+        # native_only, must not add the delegated_substrate_unused reduction,
+        # and the durable result must carry no top-level substrate fields.
+        from ouroboros import delegate_custody as custody
+        from ouroboros.subagents import substrate_result_fields
+
+        drive = _drive(tmp_path)
+        log_path = custody.event_log_path(drive)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.mkdir()  # a directory where the file should be -> OSError
+        task = _subagent_task(drive, capability_delta={"reduced": False, "reason": ""})
+        envelope = envelope_from_task(task, status="completed")
+        assert envelope["execution_evidence"]["evidence_read_failed"] is True
+        assert "actual_substrate" not in envelope
+        assert envelope["capability_delta"]["reduced"] is False
+        assert "delegated_substrate_unused" not in str(envelope["capability_delta"].get("reason") or "")
+        assert substrate_result_fields(envelope) == {}
+
+    def test_delegated_success_does_not_amend_the_delta(self, tmp_path):
+        drive = _drive(tmp_path)
+        _emit_started(drive, "run-1")
+        _emit_settled(drive, "run-1")
+        task = _subagent_task(drive, capability_delta={"reduced": False, "reason": ""})
+        envelope = envelope_from_task(task, status="completed", usage={"rounds": 4})
+        assert envelope["capability_delta"]["reduced"] is False
+
+    def test_running_and_native_envelopes_carry_no_substrate_claim(self, tmp_path):
+        drive = _drive(tmp_path)
+        running = envelope_from_task(_subagent_task(drive), status="running")
+        assert "actual_substrate" not in running
+        native = envelope_from_task(
+            _subagent_task(drive, executor_route="", effective_executor="native"),
+            status="completed")
+        assert "actual_substrate" not in native
+
+
 def test_terminal_frame_field_rides_the_history_replay_allowlist():
     # The chip's layered truth must survive a reload: the terminal frame carries
     # execution_evidence, and history replay filters progress meta by this list.
@@ -196,3 +330,35 @@ def test_evidence_is_json_serializable(tmp_path):
     _emit_settled(drive, "run-1")
     envelope = envelope_from_task(_subagent_task(drive), status="failed")
     json.dumps(envelope)
+
+
+class TestEvidenceReadHonesty:
+    def test_unreadable_log_is_flagged_not_zero(self, tmp_path):
+        # Scope finding (a2a6253e gate lineage): an EXISTING but unreadable
+        # canonical log must not collapse into "zero attempts established" —
+        # a directory at the log path forces the open() OSError portably.
+        from ouroboros import delegate_custody as custody
+
+        log_path = custody.event_log_path(tmp_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.mkdir()  # a directory where the file should be
+        evidence = custody.task_execution_evidence(tmp_path, "t1")
+        assert evidence["evidence_read_failed"] is True
+        assert evidence["delegated_runs_started"] == 0
+
+    def test_nanny_never_accuses_on_unreadable_evidence(self, tmp_path):
+        from types import SimpleNamespace
+        from ouroboros import delegate_custody as custody
+        from ouroboros.loop import _maybe_inject_finalization_nudges
+
+        log_path = custody.event_log_path(tmp_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.mkdir()
+        ctx = SimpleNamespace(_nanny_route_dispatched=True, _nanny_finalization_injected=False)
+        tools = SimpleNamespace(_ctx=ctx, available_tools=lambda: ["delegate_start"])
+        msgs: list = []
+        assert _maybe_inject_finalization_nudges(
+            tools, tmp_path, "t1",
+            {"reasoning_notes": [], "tool_calls": []}, "done", msgs, lambda *_: None,
+        ) is False
+        assert not any("NANNY" in m.get("content", "") for m in msgs)

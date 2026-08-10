@@ -63,16 +63,25 @@ def _enable_tools(ctx: ToolContext, tools: str = "", **kwargs) -> str:
     if not names:
         return "No tools specified."
     found = []
+    hidden = []
     not_found = []
     for name in names:
         schema = _registry.get_schema_by_name(name)
         if schema:
             found.append(f"{name}: {schema['function'].get('description', '')[:100]}")
+            continue
+        # F3 (2026-08-10 saga): a registered tool filtered by policy used to be
+        # reported as nonexistent — indistinguishable from a typo'd name.
+        reason = _registry.policy_hidden_reason(name) if hasattr(_registry, "policy_hidden_reason") else None
+        if reason:
+            hidden.append(f"{name} — {reason}")
         else:
             not_found.append(name)
     parts = []
     if found:
         parts.append("✅ Tools are registered and already callable in the active envelope:\n" + "\n".join(f"  - {s}" for s in found))
+    if hidden:
+        parts.append("🚫 Hidden by policy (the tool exists but this task cannot use it):\n" + "\n".join(f"  - {s}" for s in hidden))
     if not_found:
         parts.append(f"❌ Not found: {', '.join(not_found)}")
     return "\n".join(parts)

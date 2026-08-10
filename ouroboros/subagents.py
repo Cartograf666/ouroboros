@@ -1082,6 +1082,7 @@ def build_subagent_envelope(
     usage: Dict[str, Any] | None = None,
     cost_usd: float | None = None,
     execution_evidence: Dict[str, Any] | None = None,
+    actual_substrate: str = "",
 ) -> Dict[str, Any]:
     usage_data = dict(usage or {})
     if cost_usd is None:
@@ -1148,6 +1149,10 @@ def build_subagent_envelope(
         # custody rows prove actually ran. Absent means "no evidence yet"
         # (pre-completion), never "ran natively".
         envelope["execution_evidence"] = dict(execution_evidence)
+    if actual_substrate:
+        # The FACT beside the plan (Q1A): harness_used / harness_attempted /
+        # native_only, always beside the execution_evidence counts above.
+        envelope["actual_substrate"] = str(actual_substrate)
     return envelope
 
 
@@ -1155,6 +1160,66 @@ def build_subagent_envelope(
 # so the custody rows are the complete story of its delegated runs. A RUNNING
 # envelope carries no evidence — the neutral "dispatched" reading is the honest one.
 _EVIDENCE_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "interrupted"})
+
+# The substrate FACT vocabulary (owner decision Q1A, 2026-08-10 amendments):
+# `effective_executor`/`executor_route` stay the dispatch PLAN, `actual_substrate`
+# is what the durable custody rows PROVE ran. Derived from custody evidence ONLY —
+# never from usage/rounds, where delegate_wait polling and real native thinking
+# are indistinguishable, so any boundary would be a guess. The raw attested
+# counts always ride beside the enum on every surface that carries it.
+SUBSTRATE_HARNESS_USED = "harness_used"            # >=1 delegated run succeeded
+SUBSTRATE_HARNESS_ATTEMPTED = "harness_attempted"  # >=1 started, none succeeded
+SUBSTRATE_NATIVE_ONLY = "native_only"              # no delegated run ever started
+
+
+def actual_substrate(evidence: Mapping[str, Any] | None) -> str:
+    """Classify what ACTUALLY ran, from durable custody evidence alone (Q1A)."""
+    evidence = evidence if isinstance(evidence, Mapping) else {}
+
+    def _count(key: str) -> int:
+        try:
+            return int(evidence.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    if _count("delegated_runs_succeeded"):
+        return SUBSTRATE_HARNESS_USED
+    if _count("delegated_runs_started"):
+        return SUBSTRATE_HARNESS_ATTEMPTED
+    return SUBSTRATE_NATIVE_ONLY
+
+
+def substrate_result_fields(envelope: Mapping[str, Any]) -> Dict[str, Any]:
+    """Top-level durable-result mirror of the substrate FACT plus its raw counts.
+
+    The enum never travels without the attested counts it was derived from, so
+    a consumer of the durable result sees the full fact, not a classification.
+    """
+    if not envelope.get("actual_substrate"):
+        return {}
+    ev = envelope.get("execution_evidence")
+    ev = ev if isinstance(ev, Mapping) else {}
+    return {
+        "actual_substrate": str(envelope["actual_substrate"]),
+        "delegated_runs_started": int(ev.get("delegated_runs_started") or 0),
+        "delegated_runs_succeeded": int(ev.get("delegated_runs_succeeded") or 0),
+    }
+
+
+def _disclose_native_only_substrate(delta: Dict[str, Any]) -> Dict[str, Any]:
+    """A harness dispatch that never started a delegated run is a REDUCED execution.
+
+    Surfaced through the EXISTING capability_delta disclosure (owner decision:
+    no new axis). Amends a COPY at the completion seam; the dispatch-time
+    author's dict on the live task stays untouched.
+    """
+    amended = dict(delta or {})
+    reason = str(amended.get("reason") or "")
+    if "delegated_substrate_unused" not in reason:
+        amended["reason"] = "; ".join(
+            part for part in (reason, "delegated_substrate_unused") if part)
+    amended["reduced"] = True
+    return amended
 
 
 def _execution_evidence_for_task(task: Mapping[str, Any], status: str) -> Dict[str, Any] | None:
@@ -1203,6 +1268,17 @@ def envelope_from_task(
     than a substituted default.
     """
     usage = usage or {}
+    evidence = _execution_evidence_for_task(task, status)
+    # Unreadable custody log: the zero counts are UNKNOWN, not established
+    # facts — no substrate claim and no reduction amendment (the docs/JSDoc
+    # contract; omission keeps the enum vocabulary closed).
+    claimable = evidence is not None and not evidence.get("evidence_read_failed")
+    substrate = actual_substrate(evidence) if claimable else ""
+    capability_delta = task.get("capability_delta") if isinstance(task.get("capability_delta"), dict) else {}
+    if substrate == SUBSTRATE_NATIVE_ONLY and str(task.get("effective_executor") or "") == "harness":
+        # Q1A: a harness dispatch that ended native_only must not present as a
+        # clean un-reduced execution — the envelope carries the amended copy.
+        capability_delta = _disclose_native_only_substrate(capability_delta)
     return build_subagent_envelope(
         task_id=str(task.get("id") or ""),
         parent_task_id=str(task.get("parent_task_id") or ""),
@@ -1218,7 +1294,7 @@ def envelope_from_task(
         effective_executor=str(task.get("effective_executor") or ""),
         executor_route=str(task.get("executor_route") or ""),
         tool_profile=str(task.get("tool_profile") or ""),
-        capability_delta=task.get("capability_delta") if isinstance(task.get("capability_delta"), dict) else {},
+        capability_delta=capability_delta,
         status=status,
         usage={
             "prompt_tokens": int(usage.get("prompt_tokens") or 0),
@@ -1226,5 +1302,6 @@ def envelope_from_task(
             "rounds": int(usage.get("rounds") or 0),
         },
         cost_usd=cost_usd,
-        execution_evidence=_execution_evidence_for_task(task, status),
+        execution_evidence=evidence,
+        actual_substrate=substrate,
     )

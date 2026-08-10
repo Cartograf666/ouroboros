@@ -95,6 +95,9 @@ _PROGRESS_META_FIELDS = (
     # The completion-seam evidence block (delegated runs started/settled,
     # subscription spend, harness models) — the chip's layered truth on replay.
     "execution_evidence",
+    # The substrate FACT derived from that evidence
+    # (harness_used/harness_attempted/native_only).
+    "actual_substrate",
     "task_group_id",
 )
 

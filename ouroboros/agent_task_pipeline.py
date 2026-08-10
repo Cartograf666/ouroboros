@@ -32,7 +32,7 @@ from ouroboros.outcomes import (
     normalize_outcome_axes,
 )
 from ouroboros.contracts.task_contract import build_task_contract
-from ouroboros.subagents import envelope_from_task
+from ouroboros.subagents import envelope_from_task, substrate_result_fields
 from ouroboros.utils import utc_now_iso, append_jsonl, truncate_review_artifact as _truncate_with_notice
 from ouroboros.post_task_checkpoint import (
     POST_TASK_SYNTHESIS_INFLIGHT as _POST_TASK_SYNTHESIS_INFLIGHT,
@@ -1070,8 +1070,7 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
         swarm_efficiency = _build_swarm_efficiency(env, task)
         subagent_envelope = task.get("subagent_envelope") if isinstance(task.get("subagent_envelope"), dict) else {}
         if str(task.get("delegation_role") or "").lower() == "subagent":
-            subagent_envelope = envelope_from_task(
-                task, status=status, usage=usage, cost_usd=cost_fields.get("cost_usd"))
+            subagent_envelope = envelope_from_task(task, status=status, usage=usage, cost_usd=cost_fields.get("cost_usd"))
             if cost_fields.get("cost_accounting_status") != "available":
                 subagent_envelope.update({
                     "cost_usd": None,
@@ -1146,7 +1145,8 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
             effective_executor=task.get("effective_executor"),
             executor_route=task.get("executor_route"),
             tool_profile=task.get("tool_profile"),
-            capability_delta=task.get("capability_delta"),
+            capability_delta=subagent_envelope.get("capability_delta") or task.get("capability_delta"),  # Q1A: envelope copy carries the native_only amendment
+            **substrate_result_fields(subagent_envelope),  # Q1A: substrate FACT + raw counts
             reasoning_effort=task.get("reasoning_effort"),
             task_group_id=task.get("task_group_id"),
             task_group=task.get("task_group"),

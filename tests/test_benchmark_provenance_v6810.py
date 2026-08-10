@@ -270,6 +270,11 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     # mirrors that tuple — changing the provenance of an already-reported result to
     # describe a code that cannot appear in it.
     "subagent_executor_unavailable": (False, "agent.py executor_blocked_outcome; a subagent terminal, never a trial's"),
+    # Q1A preflight (2026-08-10 amendments): an explicit harness pin whose child toolset
+    # hides the delegate verbs ends the CHILD unrun before any LLM spend — the same
+    # subagent-terminal class as subagent_executor_unavailable, never a trial's code.
+    "delegate_tools_invisible": (False, "agent.py executor_blocked_outcome / preflight_delegate_visibility; a subagent terminal, never a trial's"),
+    "delegate_visibility_unverified": (False, "agent.py preflight_delegate_visibility broken-introspection path; a subagent terminal, never a trial's"),
     "task_exception": (False, "agent.py:777 the attempt ran and crashed; an honest failure"),
     "capability_profile_mismatch": (False, "control_delegation.py:81 rejected delegate call"),
     "delegation_constraint_block_surface": (False, "control_delegation.py:116 rejected call"),

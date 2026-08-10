@@ -410,6 +410,64 @@ def _runtime_budget_info(env: Any, task: Dict[str, Any]) -> Dict[str, Any]:
     return budget_info
 
 
+def _promoted_task_toolset(env: Any) -> Dict[str, Any]:
+    """F6 (2026-08-10 amendments): the LIVE built-in toolset a promoted task will see.
+
+    The first cut projected the static ``_WORKSPACE_ALLOWED_TOOLS`` /
+    ``CORE|META`` union — it advertised credential-gated built-ins that real
+    availability removes (web_search without a backend) and omitted every valid
+    registered non-workspace built-in (get_github_issue, ...), so the router
+    could still author impossible or over-restricted contracts. This projection
+    asks the REGISTRY itself, through the same ``available_tools()`` resolution
+    a running task gets, once per intended target shape (workspace-mode task vs
+    non-workspace). Probe contexts carry a task_id so the credential-gate
+    predicates evaluate LIVE instead of taking the bare-registry structural
+    carve-out. Bounded structural list; no contract text is scanned (P5).
+    """
+    from types import SimpleNamespace
+
+    from ouroboros.tools.registry import ToolRegistry, _builtin_tool_availability
+
+    registry = ToolRegistry(pathlib.Path(env.repo_dir), pathlib.Path(getattr(env, "drive_root", ".")))
+
+    def _probe(workspace: bool) -> Any:
+        return SimpleNamespace(
+            task_id="promote_toolset_probe", task_metadata={}, task_contract={},
+            task_constraint=None, is_workspace_mode=lambda: workspace,
+            is_ephemeral_turn=False,
+        )
+
+    registry.set_context(_probe(workspace=True))
+    workspace_tools = set(registry.available_tools())
+    probe = _probe(workspace=False)
+    registry.set_context(probe)
+    non_workspace_tools = set(registry.available_tools())
+    # Typed omissions: registered built-ins that live availability removes right
+    # now (credential gates). Named with their reason so the router can tell
+    # "does not exist" from "exists but currently unavailable".
+    unavailable = {}
+    for name in registry._entries:
+        available, reason, detail = _builtin_tool_availability(name, probe)
+        if not available:
+            unavailable[name] = f"{reason}: {detail}" if detail else reason
+    return {
+        "workspace_task_tools": sorted(workspace_tools),
+        "non_workspace_extra_tools": sorted(non_workspace_tools - workspace_tools),
+        **({"unavailable_builtin_tools": dict(sorted(unavailable.items()))} if unavailable else {}),
+        "rule": (
+            "LIVE built-in tool availability, evaluated by the real tool "
+            "registry at promote time. A task running in a project workspace "
+            "sees workspace_task_tools ONLY; other tasks additionally see "
+            "non_workspace_extra_tools. unavailable_builtin_tools exist but are "
+            "currently unusable (e.g. missing credentials) — do not demand "
+            "them. Dynamic extension/MCP tools are NOT listed (their "
+            "availability is unknowable at promote time). If an objective/"
+            "expected_output demands specific BUILT-IN tools, demand only names "
+            "listed here."
+        ),
+    }
+
+
 def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) -> str:
     try:
         git_branch, git_sha = get_git_info(env.repo_dir)
@@ -580,6 +638,17 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
             "your judgment picks the target (or none -> answer inline / promote_chat_to_task). A "
             "message in a project room defaults to that project unless it clearly says otherwise."
         )
+    if _swarm_router:
+        # F6 (2026-08-10 saga): the router turn authors objectives/contracts for a
+        # task it will never run, and once wrote a HARD requirement on a tool the
+        # promoted task could not see (send_photo behind the workspace envelope).
+        # Give the turn the bounded LIVE tool-name envelope as a structural fact;
+        # the model still writes the contract itself (P5) — no contract text is
+        # ever scanned or gated.
+        try:
+            runtime_data["promoted_task_toolset"] = _promoted_task_toolset(env)
+        except Exception:
+            log.debug("Failed to build promoted-task toolset digest", exc_info=True)
     if bool(task.get("_ephemeral_turn")) and not _swarm_router:
         runtime_data["decision_turn_rule"] = _DECISION_TURN_OUTCOME_RULE
     _main_manifest = (

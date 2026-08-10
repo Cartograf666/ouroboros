@@ -165,9 +165,19 @@
  *   path; no chip is drawn.
  * @property {Object=} execution_evidence
  *   The completion-seam EVIDENCE the route decision is reconciled against:
- *   {delegated_runs_started, delegated_runs_settled, subscription_cost_usd,
- *   harness_models}. Terminal frames only; absent = "no evidence yet",
- *   never "ran natively".
+ *   {delegated_runs_started, delegated_runs_settled, delegated_runs_succeeded,
+ *   delegated_run_failure_states, evidence_read_failed, subscription_cost_usd,
+ *   subscription_cost_estimated, harness_models}.
+ *   Terminal frames only; absent = "no evidence yet", never "ran natively".
+ *   `evidence_read_failed: true` = the custody log exists but could not be
+ *   read — zero counts are then UNKNOWN, never a "no run" receipt.
+ * @property {string=} actual_substrate
+ *   The FACT beside the executor_route plan, derived from custody evidence
+ *   ONLY (never usage/rounds): "harness_used" (>=1 delegated run succeeded) |
+ *   "harness_attempted" (>=1 started, none succeeded) | "native_only" (none
+ *   started). Always rides beside the raw execution_evidence counts. Terminal
+ *   frames only; absent = no substrate claim (running, no evidence recorded,
+ *   or unreadable evidence — unknown is never classified).
  * @property {string=} model
  * @property {string=} task_group_id
  * @property {string=} task_event
@@ -703,4 +713,4 @@
  * @property {?boolean} check_ok
  */
 
-export const GATEWAY_CONTRACT_VERSION = '6.93.1';
+export const GATEWAY_CONTRACT_VERSION = '6.94.0';

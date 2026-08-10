@@ -347,9 +347,24 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
     tid = str(task_id or "")
     started: set = set()
     settled: set = set()
+    succeeded: set = set()
+    failure_states: List[str] = []
     models: List[str] = []
     cost_total, cost_known, cost_estimated = 0.0, True, False
-    for row in _iter_rows(event_log_path(drive_root)):
+    # Scope finding (a5e59bdf gate): an UNREADABLE log must not collapse into
+    # the same zero-count result as a proven empty one — a reader would then
+    # accuse a nanny of "zero attempts" on evidence it never saw. A missing
+    # file IS a positively-established empty state (no row could exist);
+    # existing-but-unreadable is not, and _iter_rows swallows its own OSError.
+    evidence_read_failed = False
+    _log_path = event_log_path(drive_root)
+    try:
+        if _log_path.exists():
+            with _log_path.open("rb"):
+                pass
+    except OSError:
+        evidence_read_failed = True
+    for row in _iter_rows(_log_path):
         if str(row.get("task_id") or "") != tid:
             continue
         run_id = str(row.get("run_id") or "")
@@ -358,8 +373,21 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
         kind = str(row.get("type") or "")
         if kind == STARTED:
             started.add(run_id)
+        elif kind == CLOSED_ABSENT and run_id not in settled:
+            # Closed-without-settlement is still TERMINAL: leaving it in the
+            # started-minus-settled gap would read as "still executing" to the
+            # pending/settled readers (nanny reminder) forever. No ledger row was
+            # written, so its spend is undisclosed, never zero.
+            settled.add(run_id)
+            failure_states.append("closed_absent")
+            cost_known = False
         elif kind == SETTLED and run_id not in settled:
             settled.add(run_id)
+            state = str(row.get("state") or "")
+            if state in SUCCEEDED_STATES:
+                succeeded.add(run_id)
+            elif state:
+                failure_states.append(state)
             if row.get("spend_disclosed") and row.get("cost_usd") is not None:
                 try:
                     cost_total += float(row.get("cost_usd") or 0.0)
@@ -380,6 +408,15 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
         # A settled row whose started row fell out of the log is still a run that ran.
         "delegated_runs_started": len(started | settled),
         "delegated_runs_settled": len(settled),
+        # The terminal-state axis (F4, 2026-08-10 saga): a run that STARTED and
+        # FAILED is an ATTEMPTED route, not a refusal to delegate. Readers (the
+        # nanny nudge, the completion seam) must be able to tell "never tried"
+        # from "tried and the run died" without re-parsing the event log.
+        "delegated_runs_succeeded": len(succeeded),
+        "delegated_run_failure_states": sorted(set(failure_states)),
+        # True only when the canonical log EXISTS but could not be opened —
+        # zero counts are then "unknown", not "established" (additive key).
+        "evidence_read_failed": evidence_read_failed,
         "subscription_cost_usd": round(cost_total, 6) if (settled and cost_known) else None,
         # The settlement row's own estimated/final distinction, carried instead of
         # dropped: an estimated sum must never render as an exact receipt.

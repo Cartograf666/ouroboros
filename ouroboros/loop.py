@@ -3187,7 +3187,7 @@ def _setup_dynamic_tools(tools_registry, tool_schemas, messages):
 
     def _handle_enable_tools(ctx=None, tools: str = "", **kwargs):
         names = [n.strip() for n in tools.split(",") if n.strip()]
-        enabled, not_found = [], []
+        enabled, hidden, not_found = [], [], []
         for name in names:
             schema = tools_registry.get_schema_by_name(name)
             if schema and name not in active_tool_names:
@@ -3198,12 +3198,26 @@ def _setup_dynamic_tools(tools_registry, tool_schemas, messages):
             elif name in active_tool_names:
                 enabled.append(f"{name} (already active)")
             else:
-                not_found.append(name)
+                # F3 (2026-08-10 saga): a policy-filtered tool is not "Not found" —
+                # answer with the typed reason so the agent stops guessing names.
+                reason = (
+                    tools_registry.policy_hidden_reason(name)
+                    if hasattr(tools_registry, "policy_hidden_reason") else None
+                )
+                if reason:
+                    hidden.append(f"{name} — {reason}")
+                else:
+                    not_found.append(name)
         parts = []
         if enabled:
             parts.append(
                 "✅ Tools are registered in the active capability envelope: "
                 + ", ".join(enabled)
+            )
+        if hidden:
+            parts.append(
+                "🚫 Hidden by policy (the tool exists but this task cannot use it): "
+                + "; ".join(hidden)
             )
         if not_found:
             parts.append(f"❌ Not found: {', '.join(not_found)}")
@@ -5748,6 +5762,103 @@ def _emit_round_progress(content: Any, msg: Dict[str, Any], emit_progress, llm_t
             emit_progress(display_reasoning)
 
 
+def _nanny_finalization_message(
+    tools: ToolRegistry, drive_root: pathlib.Path, task_id: str,
+    trace_attempted: bool = False,
+) -> str:
+    """The honest nanny reminder for a harness-dispatched child at finalization —
+    or '' when no reminder is deserved.
+
+    F4 (2026-08-10 saga): the old reminder accused children whose delegated runs
+    CRASHED of "choosing" not to delegate, and fired even when the delegate verbs
+    were policy-hidden from the task's toolset. Two structural facts fix both:
+    the task's own visible toolset, and the durable custody evidence
+    (delegate_custody.task_execution_evidence), which spans the WHOLE task —
+    the per-execution llm_trace resets on every continuation. `trace_attempted`
+    carries the third fact: a delegate_start in THIS execution's trace. It must
+    not suppress the failure message (triad finding on e84475f2: the saga's own
+    shape — delegate, run dies, finish by hand, finalize — happens inside ONE
+    execution), only the accusation when custody has no rows yet (a pending or
+    uncustodied start is an attempt, not a choice).
+    """
+    try:
+        if "delegate_start" not in set(tools.available_tools()):
+            return ""  # the verbs are invisible here; "you chose not to" would be false
+    except Exception:
+        log.debug("nanny nudge: toolset visibility check failed", exc_info=True)
+    evidence: Dict[str, Any] = {}
+    try:
+        from ouroboros.delegate_custody import custody_root, task_execution_evidence
+
+        # Split-root fix (2026-08-10 amendments): custody WRITES land on the
+        # CANONICAL (budget) root, but this read used the loop's drive_root —
+        # the isolated CHILD drive for a split-root subagent, which carries no
+        # custody rows, leaving the nanny blind. Resolve the SAME root the
+        # writers use; the passed drive_root stays the fallback for contexts
+        # custody_root cannot resolve (e.g. unit-test stubs).
+        try:
+            evidence_root = custody_root(tools._ctx)
+        except Exception:
+            evidence_root = drive_root
+        evidence = task_execution_evidence(evidence_root, str(task_id or ""))
+    except Exception:
+        log.debug("nanny nudge: custody evidence read failed", exc_info=True)
+    if evidence.get("delegated_runs_succeeded"):
+        return ""  # the route WAS used and worked (e.g. in an earlier execution)
+    started = int(evidence.get("delegated_runs_started") or 0)
+    if not started and (evidence.get("evidence_read_failed") or not evidence):
+        # Zero attempts is an ACCUSATION and needs positively-established
+        # evidence: an unreadable custody log (or a failed read above) proves
+        # nothing (scope finding on a5e59bdf).
+        return ""
+    if not started and trace_attempted:
+        # A start this execution's trace saw but custody has no row for: pending
+        # settlement or an uncustodied start. An attempt either way — neither
+        # accusation fits, and the wait/cancel path owns its own disclosure.
+        return ""
+    settled = int(evidence.get("delegated_runs_settled") or 0)
+    failure_states = [str(s) for s in (evidence.get("delegated_run_failure_states") or [])]
+    pending = max(0, started - settled)
+    if pending:
+        # PENDING ≠ FAILED (sol review on b49f8192): a STARTED row with no
+        # settlement may simply still be executing — calling it failed invites a
+        # duplicate concurrent run, and finalizing over it orphans the result.
+        # Takes precedence over the failed message: with a run in flight,
+        # "retry" is the wrong instruction even when an earlier sibling died
+        # (those failures still ride along as a fact).
+        failed_note = (
+            f" {len(failure_states)} earlier run(s) already ended: {', '.join(failure_states)}."
+            if failure_states else ""
+        )
+        return (
+            "⚠️ NANNY_DELEGATED_RUN_PENDING: you routed work onto the delegated "
+            f"substrate and {pending} delegated run(s) have started but not "
+            "settled — they may still be executing. Do not finalize over an "
+            "in-flight delegated run (its result would be orphaned) and do not "
+            "start a duplicate: wait for or check it (delegate_wait) before "
+            "finalizing, or cancel it (delegate_cancel) and say so." + failed_note
+        )
+    if started:
+        states = ", ".join(failure_states) or "settled without a recorded terminal state"
+        return (
+            "⚠️ NANNY_DELEGATED_RUN_FAILED: you DID route work onto the delegated "
+            f"substrate ({started} run(s) started), but none succeeded — your "
+            f"delegated run(s) ended: {states}. Do not finalize as if delegation "
+            "was never attempted: either retry it (delegate_start / delegate_wait) "
+            "or state in your final answer that the delegated run failed and why "
+            "the remaining work ran on metered API tokens."
+        )
+    return (
+        "⚠️ NANNY_DID_NOT_DELEGATE: this task was dispatched onto the delegated "
+        "substrate (executor=harness), but you are finalizing with ZERO "
+        "delegate_start calls — the work would end up billed to metered API "
+        "tokens the parent asked to avoid. Either delegate the remaining work "
+        "now (delegate_start / delegate_wait), or finalize with an explicit "
+        "statement of WHY delegation was not used (route refused, work shape "
+        "unsuited, deadline) so your parent sees the substrate decision."
+    )
+
+
 def _maybe_inject_finalization_nudges(
     tools: ToolRegistry, drive_root: Optional[pathlib.Path], task_id: str,
     llm_trace: Dict[str, Any], content: Optional[str], messages: List[Dict[str, Any]],
@@ -5759,31 +5870,33 @@ def _maybe_inject_finalization_nudges(
     if drive_root is None:
         return False
     if (getattr(tools._ctx, "_nanny_route_dispatched", False)
-            and not getattr(tools._ctx, "_nanny_finalization_injected", False)
-            and not any(str(c.get("tool") or "") == "delegate_start"
-                        for c in (llm_trace.get("tool_calls") or [])
-                        if isinstance(c, dict))):
+            and not getattr(tools._ctx, "_nanny_finalization_injected", False)):
         # Nanny postcondition (owner decision, 2026-08-07): a child dispatched onto
         # the delegated substrate must not finalize as if that decision never
-        # existed. One structural fact (zero delegate_start calls in this task's
-        # trace), one re-loop; the child stays free to delegate now OR to finalize
-        # with a stated typed reason — never a hard gate on its judgment (P5).
-        tools._ctx._nanny_finalization_injected = True
-        _nanny_msg = (
-            "⚠️ NANNY_DID_NOT_DELEGATE: this task was dispatched onto the delegated "
-            "substrate (executor=harness), but you are finalizing with ZERO "
-            "delegate_start calls — the work would end up billed to metered API "
-            "tokens the parent asked to avoid. Either delegate the remaining work "
-            "now (delegate_start / delegate_wait), or finalize with an explicit "
-            "statement of WHY delegation was not used (route refused, work shape "
-            "unsuited, deadline) so your parent sees the substrate decision."
+        # existed. One structural fact, one re-loop; the child stays free to
+        # delegate now OR to finalize with a stated typed reason — never a hard
+        # gate on its judgment (P5). A delegate_start in THIS trace no longer
+        # short-circuits the whole nudge (triad finding on e84475f2): it rides
+        # into the message decision, where custody evidence distinguishes a
+        # failed run (truthful NANNY_DELEGATED_RUN_FAILED) from a pending or
+        # uncustodied attempt (no message). Suppression cases live in
+        # _nanny_finalization_message.
+        _trace_attempted = any(
+            str(c.get("tool") or "") == "delegate_start"
+            for c in (llm_trace.get("tool_calls") or [])
+            if isinstance(c, dict)
         )
-        if content and content.strip():
-            messages.append({"role": "assistant", "content": content})
-        _append_or_merge_user_message(messages, f"[SYSTEM REMINDER]\n{_nanny_msg}")
-        emit_progress(_nanny_msg)
-        llm_trace["reasoning_notes"].append(_nanny_msg)
-        return True
+        tools._ctx._nanny_finalization_injected = True
+        _nanny_msg = _nanny_finalization_message(
+            tools, drive_root, task_id, trace_attempted=_trace_attempted,
+        )
+        if _nanny_msg:
+            if content and content.strip():
+                messages.append({"role": "assistant", "content": content})
+            _append_or_merge_user_message(messages, f"[SYSTEM REMINDER]\n{_nanny_msg}")
+            emit_progress(_nanny_msg)
+            llm_trace["reasoning_notes"].append(_nanny_msg)
+            return True
     finalization_msg = _skill_finalization_message(drive_root, llm_trace)
     if finalization_msg and not getattr(tools._ctx, "_skill_finalization_injected", False):
         tools._ctx._skill_finalization_injected = True

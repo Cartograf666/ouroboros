@@ -2488,6 +2488,38 @@ def _wait_for_tasks(
             _delta = disclosable_capability_delta(data)
             if _delta:
                 projected["capability_delta"] = _delta
+            # Delegation honesty (Q1A, 2026-08-10 amendments): whether a
+            # harness-dispatched child ACTUALLY delegated is a handoff fact the
+            # fan-out parent absorbs here — the e9108a09 incident hid nine
+            # native-only "harness" children behind this very projection.
+            # Compact counts only; the full evidence stays in the envelope.
+            _envelope = data.get("subagent_envelope") if isinstance(data.get("subagent_envelope"), dict) else {}
+            _evidence = _envelope.get("execution_evidence") if isinstance(_envelope.get("execution_evidence"), dict) else {}
+            if _evidence or str(data.get("effective_executor") or "") == "harness":
+                _ee: Dict[str, Any] = {
+                    "dispatch_executor": str(data.get("effective_executor") or ""),
+                }
+                if _evidence.get("evidence_read_failed"):
+                    # Unreadable custody log (v6.94.0 landing-gate scope fix):
+                    # the counts are UNKNOWN — emitting them as 0 beside the
+                    # marker fabricated a "no runs" receipt for a log that was
+                    # never read. The compact projection carries ONLY the typed
+                    # marker; counts AND the substrate claim are omitted, the
+                    # same omission rule subagents.envelope_from_task applies.
+                    _ee["evidence_read_failed"] = True
+                else:
+                    if _evidence:
+                        # Counts only when the envelope actually attested them:
+                        # a result with no evidence recorded (pre-6.94) gets NO
+                        # zero counts — absence means "no evidence yet", not
+                        # "no runs".
+                        _ee["delegated_runs_started"] = int(_evidence.get("delegated_runs_started") or 0)
+                        _ee["delegated_runs_succeeded"] = int(_evidence.get("delegated_runs_succeeded") or 0)
+                    # The substrate claim rides only when the envelope made one.
+                    _substrate = str(data.get("actual_substrate") or _envelope.get("actual_substrate") or "")
+                    if _substrate:
+                        _ee["actual_substrate"] = _substrate
+                projected["execution_evidence"] = _ee
             public_tasks[str(tid)] = projected
         waited["tasks"] = public_tasks
         waited["tasks_note"] = (
