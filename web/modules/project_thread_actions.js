@@ -58,15 +58,18 @@ export function threadActions(thread, location) {
     const isMain = Number(thread?.id ?? 0) === 0;
     const lifecycle = String(thread?.lifecycle || 'active');
     const branched = isBranched(location);
-    const settling = lifecycle === 'deleting';
-    const terminal = lifecycle === 'tombstoned';
-    const fenced = settling || terminal;
+    const deleting = lifecycle === 'deleting';
+    const fenced = deleting || lifecycle === 'tombstoned';
+    // Thread #0 mirrors the PROJECT's lifecycle, so a deleting project makes it
+    // read `deleting` too — and the delete route refuses thread #0 by name.
+    // Offering it a retry would be a button that can only ever fail.
+    const offerRetry = deleting && !isMain;
     // Thread #0 IS the project. Offering it a lifecycle of its own would promise
     // an operation the server refuses by name, so it is disabled with the reason.
     const projectItself = isMain ? 'This thread is the project itself.' : '';
     // A thread on its way out overrides every other explanation: "already works
     // in its own branch" is true but useless when the thread is being deleted.
-    const goingAway = terminal ? 'This thread is deleted.' : 'This thread is being deleted.';
+    const goingAway = deleting ? 'This thread is being deleted.' : 'This thread is deleted.';
     const row = (id, label, allowed, reason) => ({
         id,
         label,
@@ -96,7 +99,7 @@ export function threadActions(thread, location) {
             !isMain,
             projectItself,
         ),
-        settling ? retry : row('delete', 'Delete…', !isMain, projectItself),
+        offerRetry ? retry : row('delete', 'Delete…', !isMain, projectItself),
     ];
 }
 

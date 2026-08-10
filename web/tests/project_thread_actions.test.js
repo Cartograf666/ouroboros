@@ -94,6 +94,15 @@ test('a thread STUCK in deleting can still be told to try again (T3R2-H7)', () =
     assert.match(quiet.delete.reason, /did not finish/);
 });
 
+test('thread #0 of a DELETING project is never offered a retry it cannot win', () => {
+    // Thread #0 mirrors the PROJECT's lifecycle, so a deleting project makes it
+    // read `deleting` — and the delete route refuses thread #0 by name.
+    const zero = byId({ id: 0, lifecycle: 'deleting' }, IN_FOLDER);
+    assert.equal(zero.delete.label, 'Delete…');
+    assert.equal(zero.delete.available, false);
+    assert.match(zero.delete.disabledReason, /being deleted/);
+});
+
 test('a TOMBSTONED thread really is terminal', () => {
     const gone = byId({ id: 2, lifecycle: 'tombstoned' }, IN_FOLDER);
     for (const row of Object.values(gone)) {
