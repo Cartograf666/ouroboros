@@ -257,8 +257,6 @@ def test_case_and_symlink_normalization_boundaries():
     RECORD-WRITE-time job: workspace_admission resolves a task's workspace_root
     and projects_registry resolves a project's working_dir before either is
     stored. Both therefore arrive here already realpath'd."""
-    import sys
-
     room = _task("alpha", tid="t1", workspace_root="/w/Alpha")
     lanes = running_project_lanes([_meta(room)])
     # Spelling equality follows the PLATFORM's filesystem, not `normcase` alone:
@@ -267,12 +265,12 @@ def test_case_and_symlink_normalization_boundaries():
     same_case = _task("alpha", tid="t2", workspace_root="/w/Alpha/")
     assert candidate_is_leasable(same_case, lanes) is False
     other_case = _task("alpha", tid="t3", workspace_root="/w/alpha")
-    # IMPORTED, not re-listed: a second copy of the module's own tuple means a
-    # platform added there without the test's makes this assertion pass
-    # vacuously (I18).
-    from ouroboros.project_lease import _CASE_INSENSITIVE_PLATFORMS
+    # IMPORTED from the PLATFORM LAYER, which owns the fact, not re-listed here:
+    # a second copy means a platform added there without the test's makes this
+    # assertion pass vacuously (I18).
+    from ouroboros.platform_layer import PATH_CASE_INSENSITIVE
 
-    case_insensitive = sys.platform in _CASE_INSENSITIVE_PLATFORMS
+    case_insensitive = PATH_CASE_INSENSITIVE
     assert candidate_is_leasable(other_case, lanes) is not case_insensitive
     # An UNRESOLVED symlink spelling is a different string: the lease cannot
     # resolve it (no FS access under the queue lock), which is exactly why the
@@ -337,21 +335,61 @@ def test_lane_folds_case_on_a_case_insensitive_filesystem():
     and `/Users/x/repo` — the SAME folder — produced two lanes and admitted two
     writers onto it. The docstring claimed a case-insensitive lane it did not
     deliver; now it delivers one wherever the platform's filesystem is."""
-    import sys
-
     upper = _task("alpha", tid="t1", workspace_root="/W/Alpha")
     lower = _task("beta", tid="t2", workspace_root="/w/alpha")
 
     lanes = running_project_lanes([_meta(upper)])
 
-    from ouroboros.project_lease import _CASE_INSENSITIVE_PLATFORMS
+    from ouroboros.platform_layer import PATH_CASE_INSENSITIVE
 
-    if sys.platform in _CASE_INSENSITIVE_PLATFORMS:  # I18: one copy of the tuple
+    if PATH_CASE_INSENSITIVE:  # I18: one copy of the platform fact, in the layer
         assert candidate_is_leasable(lower, lanes) is False
     else:
         # A case-SENSITIVE filesystem genuinely has two folders here, and
         # folding them together would serialize two unrelated writers.
         assert candidate_is_leasable(lower, lanes) is True
+
+
+def test_the_case_fold_fact_lives_in_the_platform_layer():
+    """P3: "which platforms fold path case" is a PLATFORM fact.
+
+    It was answered inside `project_lease.normalize_workspace_root` by reading
+    `sys.platform` against a module-local tuple, i.e. platform-specific behaviour
+    outside the one module that owns platform facts — while `platform_layer`
+    already exported `IS_WINDOWS`/`IS_MACOS` next door. Behaviour is unchanged;
+    the SEAM moves, so a platform added to the fact is added once.
+    """
+    import inspect
+
+    from ouroboros import project_lease
+    from ouroboros.platform_layer import (
+        IS_MACOS,
+        IS_WINDOWS,
+        PATH_CASE_INSENSITIVE,
+        casefold_path,
+    )
+
+    assert PATH_CASE_INSENSITIVE is (IS_MACOS or IS_WINDOWS)
+    # The lane consumes the seam and no longer decides the platform question.
+    # Read from the AST, not from the text: prose EXPLAINING why `sys.platform`
+    # is not consulted here would otherwise fail this assertion.
+    import ast
+
+    tree = ast.parse(inspect.getsource(project_lease))
+    reads_sys_platform = any(
+        isinstance(node, ast.Attribute)
+        and node.attr == "platform"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "sys"
+        for node in ast.walk(tree)
+    )
+    assert not reads_sys_platform
+    assert not hasattr(project_lease, "_CASE_INSENSITIVE_PLATFORMS")
+    assert "casefold_path" in inspect.getsource(project_lease.normalize_workspace_root)
+    # ...and the answer it produces is byte-identical to the old expression.
+    for raw in ("/w/Alpha", "/W/ALPHA/", "/w/alpha", "relative/Path"):
+        expected = casefold_path(os.path.normpath(raw))
+        assert project_lease.normalize_workspace_root(raw) == expected
 
 
 def test_a_running_lane_is_pinned_and_cannot_drift():

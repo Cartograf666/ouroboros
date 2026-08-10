@@ -55,7 +55,8 @@ keeps the honest narrow key for the genuinely file-less project.
 
 **Purity.** These functions run under the supervisor queue lock on every
 assignment pass, so they NEVER touch the filesystem: normalization here is
-``normpath`` + ``normcase`` + a ``casefold`` on case-insensitive platforms.
+``normpath`` + ``platform_layer.casefold_path`` (``normcase`` plus a ``casefold``
+wherever ``PATH_CASE_INSENSITIVE`` holds — the platform layer owns that fact).
 SYMLINK resolution happens at RECORD-WRITE time instead —
 ``workspace_admission.validate_workspace_root`` resolves the path before it is
 stored on a task record, and ``projects_registry.create_project``/
@@ -107,9 +108,10 @@ from __future__ import annotations
 
 import contextlib
 import os
-import sys
 import threading
 from typing import Any, Dict, Iterable, Iterator, Mapping, Optional, Set, Tuple
+
+from ouroboros.platform_layer import casefold_path
 
 # A lane key. Either ("", normalized workspace_root) — a FOLDER lane, held by
 # every writer in that folder — or (project_id, "") for a project-scoped task
@@ -120,11 +122,13 @@ LaneKey = Tuple[str, str]
 #: a plain list so it survives the JSON queue snapshot unchanged.
 LANE_PIN_FIELD = "_lane_key"
 
-#: Platforms whose default filesystem is case-INSENSITIVE. ``os.path.normcase``
-#: lowercases on win32 only, so on macOS ``/Users/x/Repo`` and ``/Users/x/repo``
-#: — the SAME folder — produced two lanes and admitted two writers onto it,
-#: which is precisely what the lane exists to prevent (T0R2-4).
-_CASE_INSENSITIVE_PLATFORMS = ("darwin", "win32")
+#: Whether a path comparison here may ignore case is a PLATFORM fact, and it is
+#: stated in the platform layer (``platform_layer.PATH_CASE_INSENSITIVE``, read
+#: through :func:`~ouroboros.platform_layer.casefold_path`) rather than by reading
+#: ``sys.platform`` in this module. ``os.path.normcase`` lowercases on win32 only,
+#: so on macOS ``/Users/x/Repo`` and ``/Users/x/repo`` — the SAME folder —
+#: produced two lanes and admitted two writers onto it, which is precisely what
+#: the lane exists to prevent (T0R2-4).
 
 
 def _as_task(item: Any) -> Any:
@@ -162,22 +166,21 @@ def _task_workspace_root(task: Any) -> str:
 def normalize_workspace_root(raw: Any) -> str:
     """The comparison form of a folder path — the ONE spelling a lane key uses.
 
-    PURE (``normpath``/``normcase``, plus a ``casefold`` on case-insensitive
-    platforms): this runs under the queue lock on every assignment pass, so it
-    must never touch the filesystem to resolve symlinks or ask the OS what a path
-    really is. Public because anything comparing a folder to the lane set — a
-    merge-back holding a folder, an activity query asking whether something is
-    writing in one — has to spell it the same way or the comparison is theatre.
+    PURE (``normpath`` plus the platform layer's ``casefold_path``): this runs
+    under the queue lock on every assignment pass, so it must never touch the
+    filesystem to resolve symlinks or ask the OS what a path really is. Public
+    because anything comparing a folder to the lane set — a merge-back holding a
+    folder, an activity query asking whether something is writing in one — has to
+    spell it the same way or the comparison is theatre.
+
+    The case question is asked of ``platform_layer``, never of ``sys.platform``
+    here: which platforms fold case is a cross-platform FACT and belongs in the
+    one module that owns those facts.
     """
     text = str(raw or "").strip()
     if not text:
         return ""
-    normalized = os.path.normcase(os.path.normpath(text))
-    if sys.platform in _CASE_INSENSITIVE_PLATFORMS:
-        # normcase already lowercases on win32; on darwin it is a no-op and the
-        # lane would otherwise split one folder into two by capitalization alone.
-        normalized = normalized.casefold()
-    return normalized
+    return casefold_path(os.path.normpath(text))
 
 
 def _computed_lane(
