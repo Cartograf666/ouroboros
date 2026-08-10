@@ -214,6 +214,13 @@ def test_ui_project_threads_create_rename_fork_open_in_centre(direct_server_with
                 assert page.locator("#thread-stage-body .chat-instance-panel").count() == 1
                 assert page.locator("#thread-stage-body .chat-instance-centre").count() == 1
                 assert page.locator("#project-panel").count() == 0
+                # DOM ids are namespaced per THREAD, not per project: the single
+                # live instance has one sanctioned exception (a hidden
+                # pending-work survivor), and two threads of one project sharing
+                # a prefix would then be two live subtrees on the same ids.
+                assert page.locator(
+                    f'[id="panel-pchat-threaded-{created_id}"]'
+                ).count() == 1
                 # A thread carries NO global agent controls (they belong to the one
                 # agent, not to one room) — that is the chrome half of the X8 split.
                 assert page.locator("#page-thread [data-chat-command='panic']").count() == 0
@@ -385,7 +392,9 @@ def test_ui_smoke_project_panel_lifecycle_does_not_leak(direct_server_with_data)
                     page.click(f'.nav-project-row[data-project-id="{project_id}"]')
                     page.wait_for_selector("#page-thread.active", timeout=30_000)
                     page.wait_for_selector(
-                        f'[id="panel-pchat-{project_id}"]:not([hidden])', timeout=30_000
+                        # Instance ids are namespaced per THREAD since T1; a
+                        # project row opens its own thread #0.
+                        f'[id="panel-pchat-{project_id}-0"]:not([hidden])', timeout=30_000
                     )
 
                 def close_project():

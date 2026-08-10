@@ -604,7 +604,12 @@ async function openThread(project, thread, { closeDrawer = true } = {}) {
                 ...ctx,
                 chatId: Number(thread.chat_id) || Number(project.chat_id) || 1,
                 projectId: project.id,
-                idPrefix: `pchat-${project.id}`,
+                // Per THREAD, not per project: the instance namespaces its DOM
+                // ids with this prefix, and the single-live-instance policy has
+                // one sanctioned exception — a hidden pending-work survivor. Two
+                // threads of one project would then be two live subtrees sharing
+                // every `#pchat-<pid>-*` id.
+                idPrefix: `pchat-${project.id}-${thread.id}`,
                 mountEl: threadStage.body,
                 // Thread chrome (no global agent controls) in the CENTRE layout —
                 // the two used to be one `asPanel` flag (X8).
