@@ -327,6 +327,114 @@ def test_as_it_is_now_on_a_clean_tree_makes_no_commit(drive, folder, wt_root):
     assert _git(folder, "rev-parse", "HEAD").stdout.strip() == before
 
 
+def test_a_renamed_tracked_secret_is_disclosed_and_not_reported_as_untouched(drive, folder, wt_root):
+    """T3R2-H1: rename detection made the partition lie about the owner's branch.
+
+    Git detects a staged rename by default and prints it as its DESTINATION alone.
+    A tracked `secrets.env` renamed to `secrets2.env` therefore arrived as ONE path
+    HEAD has never heard of, was classified "absent from HEAD", and was
+    `git rm --cached`-ed — which unstages only the addition. The SOURCE's staged
+    deletion, invisible to the partition, was committed: the owner's tracked file
+    left their branch while `tracked_sensitive: []` asserted nothing tracked was
+    involved. `--no-renames` makes both halves visible as what the index holds.
+    """
+    (folder / "secrets.env").write_text("API_KEY=old\n", encoding="utf-8")
+    _git(folder, "add", "-A")
+    _git(folder, "commit", "-qm", "the owner tracked this months ago")
+    _git(folder, "mv", "secrets.env", "secrets2.env")
+    thread = _project(drive, folder)
+
+    out = _branch(drive, "racer", thread["id"], wt_root, base_ref=BASE_SNAPSHOT)
+
+    assert out["ok"] is True, out
+    snapshot = out["snapshot_commit"]
+    # The tracked side of the rename is NAMED. Before the fix this was [] while the
+    # snapshot commit deleted `secrets.env` from the owner's branch.
+    assert snapshot["tracked_sensitive"] == ["secrets.env"]
+    assert snapshot["skipped_sensitive"] == ["secrets2.env"]
+
+
+def test_a_folder_stopped_mid_merge_refuses_to_snapshot(drive, folder, wt_root):
+    """T3R2-H2: "exactly as it is now" cannot be committed while git holds the
+    folder open.
+
+    A folder stopped part-way through a merge holds conflict markers in tracked
+    files, and MERGE_HEAD is the only record of what was being merged. `git add -A`
+    + `git commit` there bakes the markers in AND clears MERGE_HEAD, so
+    `git merge --abort` stops working and the owner's half-done resolution is gone.
+    """
+    _git(folder, "checkout", "-q", "-b", "side")
+    (folder / "app.txt").write_text("side\n", encoding="utf-8")
+    _git(folder, "commit", "-qam", "side edit")
+    _git(folder, "checkout", "-q", "main")
+    (folder / "app.txt").write_text("main\n", encoding="utf-8")
+    _git(folder, "commit", "-qam", "main edit")
+    _git(folder, "merge", "side", check=False)
+    assert _git(folder, "rev-parse", "--verify", "-q", "MERGE_HEAD", check=False).returncode == 0
+    head_before = _git(folder, "rev-parse", "HEAD").stdout.strip()
+    thread = _project(drive, folder)
+
+    out = _branch(drive, "racer", thread["id"], wt_root, base_ref=BASE_SNAPSHOT)
+
+    assert out["ok"] is False
+    assert out["reason"] == REASON_SNAPSHOT_FAILED
+    assert "stopped part-way through a merge" in out["message"]
+    # The owner's conflict is EXACTLY as they left it: same HEAD, merge still open,
+    # markers still in the file rather than committed as if they were their code.
+    assert _git(folder, "rev-parse", "HEAD").stdout.strip() == head_before
+    assert _git(folder, "rev-parse", "--verify", "-q", "MERGE_HEAD", check=False).returncode == 0
+    assert "<<<<<<<" in (folder / "app.txt").read_text(encoding="utf-8")
+
+
+def test_a_snapshot_that_RAISES_still_hands_the_index_back(drive, folder, wt_root, monkeypatch):
+    """T3R2-M4: the partition's subprocess calls are unguarded, so a TimeoutExpired
+    or an OSError travelled out of `_snapshot_commit` — past a `branch_off_thread`
+    whose try covers only provisioning — with `git add -A` already done. The
+    returned-error path restored the index; only the raised path leaked it."""
+    import subprocess as _subprocess
+
+    import ouroboros.project_sources as sources
+
+    (folder / ".env").write_text("API_KEY=secret\n", encoding="utf-8")
+    (folder / "app.txt").write_text("unsaved\n", encoding="utf-8")
+    thread = _project(drive, folder)
+
+    def _explode(_path):
+        raise _subprocess.TimeoutExpired(cmd=["git", "diff"], timeout=60)
+
+    monkeypatch.setattr(sources, "_staged_sensitive_partition", _explode)
+
+    out = _branch(drive, "racer", thread["id"], wt_root, base_ref=BASE_SNAPSHOT)
+
+    assert out["ok"] is False
+    assert out["reason"] == REASON_SNAPSHOT_FAILED
+    assert "TimeoutExpired" in out["message"]
+    staged = _git(folder, "diff", "--cached", "--name-only").stdout.strip()
+    assert staged == "", f"the owner's index was left staged: {staged!r}"
+    assert (folder / "app.txt").read_text(encoding="utf-8") == "unsaved\n"
+
+
+def test_a_branch_off_that_fails_AFTER_snapshotting_names_the_commit_it_made(drive, folder, wt_root):
+    """T3R2-H4: `_snapshot_aborted` covers failures INSIDE the snapshot, but the
+    commit precedes provisioning and a provisioning refusal rolled nothing back and
+    said nothing. The owner read "branching failed", believed nothing had happened,
+    and their uncommitted work had silently become a commit they did not author."""
+    thread = _project(drive, folder)
+    (folder / "app.txt").write_text("unsaved edit\n", encoding="utf-8")
+    # A REAL provisioning refusal on the real path: the thread's branch exists.
+    _git(folder, "branch", f"thread/racer__{thread['id']}")
+
+    out = _branch(drive, "racer", thread["id"], wt_root, base_ref=BASE_SNAPSHOT)
+
+    assert out["ok"] is False
+    assert out["reason"] == "branch_failed"
+    head = _git(folder, "rev-parse", "HEAD").stdout.strip()
+    assert out["snapshot_commit"]["created"] is True
+    assert out["snapshot_commit"]["sha"] == head
+    assert head[:12] in out["message"]
+    assert "NOT as you left it" in out["message"]
+
+
 def test_branching_twice_is_refused_rather_than_resetting_the_first(drive, folder, wt_root):
     """The durable registry never clobbers an owner's checkout (X3)."""
     thread = _project(drive, folder)
@@ -557,6 +665,68 @@ def test_a_DETACHED_checkout_is_not_described_as_a_branch_named_HEAD(drive, fold
     assert "detached HEAD" in refused["message"]
     assert "'HEAD'" not in refused["message"], "a detached head is not a branch called HEAD"
     assert refused["branch"] in refused["message"]
+
+
+def test_a_merge_onto_a_DETACHED_project_folder_is_refused_not_reported_as_done(
+    drive, folder, wt_root,
+):
+    """T3R2-B1: the blocker. A merge needs a branch to LAND on.
+
+    `git merge --no-ff` onto a detached HEAD succeeds and leaves the merge commit
+    on no branch at all. Both of this phase's safety judges are then fooled by the
+    same wrong reference: `inspect_thread_worktree` counts unmerged commits against
+    the project's HEAD — now that dangling merge — and answers zero, and
+    `git branch -d` agrees the thread branch is merged, because against that HEAD
+    it is. A one-click removal then deletes the checkout AND the branch, and the
+    owner's work survives only in the reflog.
+    """
+    from ouroboros.thread_branching import REASON_PROJECT_HEAD_DETACHED
+    from ouroboros.thread_worktrees import get_thread_worktree, inspect_thread_worktree
+
+    thread = _project(drive, folder)
+    out = _branch(drive, "racer", thread["id"], wt_root)
+    _commit_in(out["path"], "feature.txt", "from the thread\n")
+    _git(folder, "checkout", "-q", "--detach")
+    head_before = _git(folder, "rev-parse", "HEAD").stdout.strip()
+
+    refused = merge_back_thread(drive, "racer", thread["id"], data_dir=drive, busy=False)
+
+    assert refused["ok"] is False
+    assert refused["reason"] == REASON_PROJECT_HEAD_DETACHED
+    assert "not on any branch" in refused["message"]
+    assert refused["branch"] in refused["message"]
+    # Nothing was merged, so the two safety judges still see the work.
+    assert _git(folder, "rev-parse", "HEAD").stdout.strip() == head_before
+    assert not (folder / "feature.txt").exists()
+    row = get_thread_worktree(drive, "racer", thread["id"])
+    assert inspect_thread_worktree(row)["unmerged_commits"] >= 1
+    # Deliberately NOT acknowledgeable: this is not work left behind, it is a
+    # merge with no destination.
+    assert refused.get("acknowledgeable") is None
+    still_refused = merge_back_thread(
+        drive, "racer", thread["id"], data_dir=drive, busy=False,
+        acknowledge_checkout_dirty=True,
+    )
+    assert still_refused["reason"] == REASON_PROJECT_HEAD_DETACHED
+    # And the way OUT is the one the copy names.
+    _git(folder, "checkout", "-q", "main")
+    merged = merge_back_thread(drive, "racer", thread["id"], data_dir=drive, busy=False)
+    assert merged["ok"] is True, merged
+    assert (folder / "feature.txt").read_text(encoding="utf-8") == "from the thread\n"
+
+
+def test_the_bases_list_reports_no_current_branch_on_a_detached_folder(drive, folder):
+    """T3R2-B1, second site. The bases LOOP already guarded `current != "HEAD"`;
+    the returned field did not, so a client read `current_branch: "HEAD"` and had
+    every reason to display it and to branch off from it as a branch name."""
+    _git(folder, "checkout", "-q", "--detach")
+
+    listed = branch_off_bases(folder)
+
+    assert listed["current_branch"] == ""
+    assert "HEAD" not in [row["ref"] for row in listed["bases"]]
+    # The real branch is still offered, just not as "(current)".
+    assert "main" in [row["ref"] for row in listed["bases"]]
 
 
 def test_an_untracked_file_in_the_owners_folder_does_not_block_a_merge(drive, folder, wt_root):

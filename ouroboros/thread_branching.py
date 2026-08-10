@@ -12,16 +12,23 @@ registry in :mod:`ouroboros.thread_worktrees`. Any commit-ish the owner types is
 accepted too — the list is an offer, not a restriction (A8).
 
 "Exactly as it is now" is the only base that does not already exist as a commit,
-so it is made into one: a SNAPSHOT commit on the project's current branch, using
-the same shape as the attach snapshot and the coop checkpoint (local identity, no
-global config touched, credential-shaped files deliberately left out and
-disclosed). Reused rather than reinvented, and never silent — the resulting sha
-and the skipped paths come back in the receipt.
+so it is made into one: a SNAPSHOT commit on whatever the project folder has
+checked out — its current branch, or a detached HEAD, in which case the commit is
+held by the thread's new branch and nothing else — using the same shape as the
+attach snapshot and the coop checkpoint (local identity, no global config
+touched, credential-shaped files deliberately left out and disclosed). It refuses
+outright on a folder git has stopped part-way through a merge, cherry-pick,
+revert or rebase, because committing there would bake conflict markers into
+tracked files and clear the sequencer state the owner was resolving. Reused
+rather than reinvented, and never silent — the resulting sha and the skipped
+paths come back in the receipt.
 
 **MERGE BACK** merges the thread's branch into the project's own checkout under
 A9's preconditions: nothing running anywhere in the project (the project-WIDE
-activity query, NOT the writer lane), a clean local tree, and a checkout whose
-work is actually ON the branch being merged — uncommitted edits and commits made
+activity query, NOT the writer lane), a project folder that is ON a branch (a
+detached HEAD has nothing for the merge commit to land on), a clean local tree,
+and a checkout whose work is actually ON the branch being merged — uncommitted
+edits and commits made
 on some other branch inside that checkout are refusals, because a merge moves
 COMMITS ON A BRANCH and reporting success while the owner's work sits outside it
 is the one failure they cannot see. A conflict is SHOWN and STOPS the operation:
@@ -70,6 +77,7 @@ REASON_MERGE_ABORT_FAILED = "merge_abort_failed"
 REASON_CHECKOUT_DIRTY = "checkout_dirty"
 REASON_CHECKOUT_HEAD_OFF_BRANCH = "checkout_head_off_branch"
 REASON_CHECKOUT_MISSING = "checkout_missing"
+REASON_PROJECT_HEAD_DETACHED = "project_head_detached"
 REASON_THREAD_NOT_LIVE = "thread_not_live"
 
 #: Bounded like every other owner-facing git call on a request path.
@@ -229,6 +237,21 @@ def thread_location(data_dir: Any, project_id: str, thread_id: Any) -> Dict[str,
 # BRANCH OFF
 # --------------------------------------------------------------------------- #
 
+def _current_branch(repo_dir: pathlib.Path) -> str:
+    """The branch a working tree is ON, or ``""`` when it is on none.
+
+    ``rev-parse --abbrev-ref HEAD`` answers the literal string ``"HEAD"`` for a
+    DETACHED head. That is not a branch name, and every caller that treated it as
+    one was wrong in a different way: the bases list quoted it back to the owner
+    as ``current_branch: "HEAD"`` while its own loop knew better, and merge-back
+    would have merged onto nothing. One helper, one answer — a detached head has
+    no branch, and says so by returning nothing.
+    """
+    head = _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD")
+    name = (head.stdout or "").strip() if head.returncode == 0 else ""
+    return "" if name == "HEAD" else name
+
+
 def branch_off_bases(repo_dir: Any) -> Dict[str, Any]:
     """Every base the owner may branch off from, in offer order (A8).
 
@@ -240,13 +263,17 @@ def branch_off_bases(repo_dir: Any) -> Dict[str, Any]:
 
     A commit-ish the owner types instead is accepted by :func:`branch_off_thread`
     and deliberately not enumerated here: listing every commit is not an offer.
+
+    ``current_branch`` is ``""`` for a folder standing on a DETACHED head. It used
+    to be the literal string ``"HEAD"`` — git's spelling for "no branch" — which
+    the bases loop already knew to skip while the field handed it to the client as
+    a branch name to display and to branch off from.
     """
     root = pathlib.Path(str(repo_dir))
-    head = _git(root, "rev-parse", "--abbrev-ref", "HEAD")
-    current = (head.stdout or "").strip() if head.returncode == 0 else ""
+    current = _current_branch(root)
     bases: List[Dict[str, Any]] = []
     seen: set = set()
-    if current and current != "HEAD":
+    if current:
         bases.append({"ref": current, "kind": "branch", "label": f"{current} (current)"})
         seen.add(current)
     for kind, pattern in (("branch", "refs/heads"), ("tag", "refs/tags")):
@@ -272,6 +299,27 @@ def branch_off_bases(repo_dir: Any) -> Dict[str, Any]:
             "creates_commit": dirty,
         },
     }
+
+
+#: The refs git leaves behind while it is holding a working tree open part-way
+#: through a multi-step operation, and the owner-facing name of each. Asked of
+#: git rather than of ``.git/`` on disk, for the same reason :func:`_in_merge` is:
+#: a linked worktree keeps its own per-worktree git dir and the obvious path is
+#: not where the file lives.
+_SEQUENCER_REFS = (
+    ("MERGE_HEAD", "merge"),
+    ("CHERRY_PICK_HEAD", "cherry-pick"),
+    ("REVERT_HEAD", "revert"),
+    ("REBASE_HEAD", "rebase"),
+)
+
+
+def _sequencer_operation(repo_dir: pathlib.Path) -> str:
+    """The multi-step git operation this tree is stopped inside, or ``""``."""
+    for ref, name in _SEQUENCER_REFS:
+        if _git(repo_dir, "rev-parse", "--verify", "-q", ref).returncode == 0:
+            return name
+    return ""
 
 
 def _snapshot_aborted(repo_dir: pathlib.Path, detail: str) -> Dict[str, Any]:
@@ -338,6 +386,26 @@ def _snapshot_commit(repo_dir: pathlib.Path, label: str) -> Dict[str, Any]:
             return {"ok": False, "detail": _detail(head)}
         return {"ok": True, "sha": (head.stdout or "").strip(), "created": False, **extra}
 
+    stopped = _sequencer_operation(repo_dir)
+    if stopped:
+        # Checked FIRST, before `git add -A` has touched anything. A folder git has
+        # stopped part-way through holds the owner's half-resolved conflict: the
+        # overlapping files contain conflict markers, and the sequencer ref is the
+        # only record of what was being merged. Committing there stages those
+        # markers into tracked files AND clears MERGE_HEAD, so `git merge --abort`
+        # stops working and the resolution the owner was in the middle of is gone
+        # with no way back. "Exactly as it is now" is not a thing that can be
+        # committed while git itself is holding the folder open.
+        return {
+            "ok": False,
+            "detail": (
+                f"git has this folder stopped part-way through a {stopped}. Finish it "
+                "or undo it in that folder first — snapshotting now would commit the "
+                "conflict markers as if they were your files and throw away the "
+                f"{stopped} git is still holding open."
+            ),
+        }
+
     status = _git(repo_dir, "status", "--porcelain")
     if status.returncode != 0:
         return {"ok": False, "detail": _detail(status)}
@@ -346,18 +414,27 @@ def _snapshot_commit(repo_dir: pathlib.Path, label: str) -> Dict[str, Any]:
     add = _git(repo_dir, "add", "-A")
     if add.returncode != 0:
         return _snapshot_aborted(repo_dir, _detail(add))
-    skipped, tracked_sensitive, error = _staged_sensitive_partition(repo_dir)
-    if error:
-        # "Which of these does HEAD already have" has no safe default: guessing
-        # ABSENT deletes the owner's tracked file, guessing PRESENT commits a new
-        # secret. Refuse the snapshot and say so.
-        return _snapshot_aborted(
-            repo_dir,
-            f"could not tell which credential-shaped files are already tracked: {error}",
-        )
-    unstage_error = _unstage_staged_paths(repo_dir, skipped)
-    if unstage_error:
-        return _snapshot_aborted(repo_dir, unstage_error)
+    try:
+        skipped, tracked_sensitive, error = _staged_sensitive_partition(repo_dir)
+        if error:
+            # "Which of these does HEAD already have" has no safe default: guessing
+            # ABSENT deletes the owner's tracked file, guessing PRESENT commits a new
+            # secret. Refuse the snapshot and say so.
+            return _snapshot_aborted(
+                repo_dir,
+                f"could not tell which credential-shaped files are already tracked: {error}",
+            )
+        unstage_error = _unstage_staged_paths(repo_dir, skipped)
+        if unstage_error:
+            return _snapshot_aborted(repo_dir, unstage_error)
+    except Exception as exc:  # noqa: BLE001 — includes TimeoutExpired and OSError
+        # These two RAISE as well as return: their subprocess calls are unguarded,
+        # so a timeout or a spawn failure travelled straight out of here — past a
+        # `branch_off_thread` whose try covers only provisioning — with `git add -A`
+        # already done. The owner was left with their entire folder staged, no
+        # commit to explain it, and a 500 instead of a sentence. The returned-error
+        # path always restored the index; the raised one has to do the same.
+        return _snapshot_aborted(repo_dir, f"{type(exc).__name__}: {exc}")
     staged = _git(repo_dir, "diff", "--cached", "--quiet")
     if staged.returncode == 0:
         # Nothing left to commit: every change was a credential-shaped new file
@@ -465,8 +542,18 @@ def branch_off_thread(
             worktree_root=worktree_root,
         )
     except Exception as exc:  # noqa: BLE001 — provisioning refusals are typed answers
+        # The snapshot commit is already MADE by the time provisioning can refuse,
+        # and it is on the owner's own branch. Reporting only "branching failed"
+        # told them nothing happened while their uncommitted work had silently
+        # become a commit they did not author and could not find. The commit is
+        # NOT undone here — a reset is a second mutation on a folder an operation
+        # has just failed in, and this refusal has no way to know the owner has not
+        # already looked. It is NAMED instead, which is lossless and checkable.
         return _refused(
-            REASON_BRANCH_FAILED, str(exc)[:500], project_id=pid, thread_id=tid,
+            REASON_BRANCH_FAILED,
+            _branch_failed_message(str(exc)[:500], snapshot),
+            project_id=pid, thread_id=tid,
+            **({"snapshot_commit": _snapshot_receipt(snapshot)} if snapshot.get("created") else {}),
         )
     out: Dict[str, Any] = {
         "ok": True,
@@ -479,16 +566,34 @@ def branch_off_thread(
         "base_sha": handle.base_sha,
     }
     if snapshot:
-        out["snapshot_commit"] = {
-            "sha": str(snapshot.get("sha") or ""),
-            "created": bool(snapshot.get("created")),
-            # Kept OUT of the commit and still untracked in the owner's folder.
-            "skipped_sensitive": list(snapshot.get("skipped_sensitive") or []),
-            # Credential-shaped but ALREADY tracked, so snapshotted like anything
-            # else git tracks. Disclosed rather than deleted (T3R-1).
-            "tracked_sensitive": list(snapshot.get("tracked_sensitive") or []),
-        }
+        out["snapshot_commit"] = _snapshot_receipt(snapshot)
     return out
+
+
+def _snapshot_receipt(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """What the snapshot did, in the shape both the success and the refusal use."""
+    return {
+        "sha": str(snapshot.get("sha") or ""),
+        "created": bool(snapshot.get("created")),
+        # Kept OUT of the commit and still untracked in the owner's folder.
+        "skipped_sensitive": list(snapshot.get("skipped_sensitive") or []),
+        # Credential-shaped but ALREADY tracked, so snapshotted like anything else
+        # git tracks. Disclosed rather than deleted (T3R-1).
+        "tracked_sensitive": list(snapshot.get("tracked_sensitive") or []),
+    }
+
+
+def _branch_failed_message(detail: str, snapshot: Dict[str, Any]) -> str:
+    """The refusal copy, plus the snapshot commit when one was already made."""
+    if not snapshot.get("created"):
+        return detail
+    sha = str(snapshot.get("sha") or "")
+    return (
+        f"{detail} — and your folder is NOT as you left it: the uncommitted changes "
+        f"were committed first, as {sha[:12] or 'a snapshot commit'}, on the branch "
+        "that folder had checked out. Nothing is lost; if you did not want a commit, "
+        "undo it with a reset in that folder."
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -726,9 +831,19 @@ def merge_back_thread(
 ) -> Dict[str, Any]:
     """Merge a branched thread's work back into the project's own checkout (A9).
 
-    THREE preconditions, each refused with a typed reason and honest copy:
-    nothing alive anywhere in the project, a clean local tree, and a checkout
-    whose work is actually ON the branch being merged. The third exists because a
+    FOUR preconditions, each refused with a typed reason and honest copy:
+    nothing alive anywhere in the project, a project folder standing ON a branch,
+    a clean local tree, and a checkout whose work is actually ON the branch being
+    merged.
+
+    The branch one is about where the merge LANDS: ``git merge --no-ff`` onto a
+    detached HEAD succeeds and leaves the merge commit on no branch, after which
+    both of this phase's safety judges — the unmerged-commit count and ``git
+    branch -d`` — read that dangling commit as the project's HEAD and agree there
+    is nothing left to lose. The work ends up reflog-only. Like the checkout being
+    off its branch, it is deliberately NOT acknowledgeable.
+
+    The last exists because a
     merge moves COMMITS ON A BRANCH: uncommitted edits in the checkout, and
     commits made there on some other branch, do not travel with it, and answering
     ``ok: true`` while they stay behind is the one failure the owner cannot see.
@@ -817,6 +932,27 @@ def merge_back_thread(
             "to go forward.",
             project_id=pid, thread_id=tid, branch=branch,
             folder_left_mid_merge=True, working_dir=str(repo_dir),
+        )
+    # A merge needs somewhere to LAND. `git merge --no-ff` onto a detached head
+    # succeeds — it writes the merge commit and moves HEAD to it — and the commit
+    # belongs to no branch at all: the moment the folder checks anything else out
+    # it is reachable only through the reflog. Both of this phase's safety judges
+    # are fooled by the same wrong reference: `inspect_thread_worktree` counts
+    # unmerged commits against the project's HEAD, which now IS that dangling
+    # merge, so it answers zero; and `git branch -d` agrees the thread branch is
+    # merged, because against that HEAD it is. So a one-click removal deletes the
+    # checkout AND the branch, and the only remaining copy of the work is a reflog
+    # entry. Deliberately NOT acknowledgeable, exactly like a checkout standing off
+    # its branch: this is not work left behind, it is a merge with no destination.
+    if not _current_branch(repo_dir):
+        return _refused(
+            REASON_PROJECT_HEAD_DETACHED,
+            "The project folder is not on any branch (a detached HEAD), so there is "
+            "nothing for this merge to land on: git would make the merge commit and "
+            "no branch would point at it, leaving the work unreachable the moment "
+            "the folder checks something else out. Check a branch out in that folder "
+            f"first, then merge {branch!r} back.",
+            project_id=pid, thread_id=tid, branch=branch, working_dir=str(repo_dir),
         )
     # TRACKED changes only. An untracked file is not part of a merge and cannot
     # blur which work came from where, which is the whole point of this check.
@@ -942,6 +1078,7 @@ __all__ = [
     "REASON_NOT_BRANCHED",
     "REASON_NO_FOLDER",
     "REASON_PROJECT_BUSY",
+    "REASON_PROJECT_HEAD_DETACHED",
     "REASON_SNAPSHOT_FAILED",
     "REASON_THREAD_NOT_LIVE",
     "REASON_UNKNOWN_BASE",

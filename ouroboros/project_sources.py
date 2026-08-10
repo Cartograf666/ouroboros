@@ -407,6 +407,17 @@ def _staged_sensitive_partition(path: pathlib.Path) -> tuple[list[str], list[str
     function exists to prevent, so the caller refuses the whole snapshot instead.
     An UNBORN HEAD is not an error — it is the definitive answer "nothing is
     tracked yet", which is the attach case.
+
+    ``--no-renames`` is load-bearing, not tidiness. Rename detection is git's
+    default, and it prints a staged rename as its DESTINATION alone: a tracked
+    ``secrets.env`` renamed to ``secrets2.env`` arrives here as one path that HEAD
+    has never heard of, so it is classified absent, unstaged, and the SOURCE's
+    staged deletion — invisible to this function — is committed. The owner's
+    tracked file leaves their branch while ``present_in_head`` reports an empty
+    list, which is the one assertion this function exists to make truthfully.
+    Turning detection off makes both halves of a rename visible as what the index
+    actually holds: a deletion of a path HEAD has, and an addition of one it does
+    not.
     """
     from ouroboros.headless import _sensitive_untracked_reason
 
@@ -417,7 +428,7 @@ def _staged_sensitive_partition(path: pathlib.Path) -> tuple[list[str], list[str
             env={**os.environ, "LC_ALL": "C", "GIT_LITERAL_PATHSPECS": "1"},
         )
 
-    staged = _run("diff", "--cached", "--name-only", "-z")
+    staged = _run("diff", "--cached", "--name-only", "--no-renames", "-z")
     if staged.returncode != 0:
         return [], [], (staged.stderr or "git diff --cached failed").strip()[:300]
     flagged = [
