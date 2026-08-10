@@ -445,3 +445,167 @@ def test_a_DETACHED_checkout_does_not_hide_its_branchs_commits(repo, tmp_path, w
     assert done["removed"] is True
     assert done["branch_removed"] is False
     assert _git(repo, "cat-file", "-e", branch_tip).returncode == 0
+
+
+def test_ignored_files_count_as_work_a_removal_would_destroy(repo, tmp_path, wt_root):
+    """T3R2-H3: `git status --porcelain` alone hides exactly the files a thread's
+    checkout is most likely to be the only copy of.
+
+    A `.env`, a `local.db`, a `build/` — all gitignored, none listed, so the
+    checkout read `dirty: false` and one-click removal force-deleted them with no
+    prompt. The same `.env` the branch-off snapshot works hard to keep OUT of
+    history is what this deleted from disk.
+    """
+    from pathlib import Path
+
+    (repo / ".gitignore").write_text(".env\nlocal.db\nbuild/\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "ignore rules")
+    handle = _provision(repo, tmp_path, wt_root)
+    checkout = Path(handle.path)
+    (checkout / ".env").write_text("API_KEY=secret\n", encoding="utf-8")
+    (checkout / "local.db").write_text("rows\n", encoding="utf-8")
+    (checkout / "build").mkdir()
+    (checkout / "build" / "out.js").write_text("built\n", encoding="utf-8")
+
+    report = inspect_thread_worktree({**handle.__dict__})
+
+    assert report["dirty"] is True, "an ignored file is still a file the removal deletes"
+    listed = "\n".join(report["dirty_files"])
+    assert ".env" in listed and "local.db" in listed
+    # ...so removal refuses until the owner has actually been shown them.
+    refused = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1, worktree_root=wt_root,
+    )
+    assert refused["removed"] is False
+    assert refused["reason"] == "unmerged_work"
+    assert (checkout / ".env").exists()
+    # And the acknowledgement is still the way through — nothing became a dead end.
+    allowed = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1,
+        acknowledge_unmerged=True, worktree_root=wt_root,
+    )
+    assert allowed["removed"] is True, allowed
+
+
+def test_a_checkout_that_is_not_on_disk_is_cannot_tell_not_nothing_to_lose(tmp_path):
+    """T3R2-M3: an unmounted volume, a folder moved out from under the registry,
+    a `git worktree remove` run by hand — all answered
+    `{exists: False, dirty: False, unmerged_commits: 0}`, which the removal
+    prompt reads as a clean checkout and offers to delete with one click."""
+    report = inspect_thread_worktree({
+        "path": str(tmp_path / "gone"), "base_sha": "deadbeef", "branch": "thread/x",
+    })
+
+    assert report["exists"] is False
+    assert report["dirty"] is True
+    assert "not on disk" in report["error"]
+
+
+def test_removal_refuses_while_the_project_is_busy(repo, tmp_path, wt_root):
+    """T3R2-H5: removal deletes a folder something may be WRITING in.
+
+    `project_lease.running_project_ids`, `thread_branching.project_is_busy` and
+    ARCHITECTURE all describe this precondition; merge-back was its only caller.
+    Reproduced: a running task in the checkout, merge-back correctly refuses
+    `project_busy`, and removal answered `removed: True` and deleted the folder
+    under the live worker.
+    """
+    from pathlib import Path
+
+    handle = _provision(repo, tmp_path, wt_root)
+
+    refused = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1,
+        worktree_root=wt_root, busy=True,
+    )
+
+    assert refused["removed"] is False
+    assert refused["reason"] == "project_busy"
+    assert Path(handle.path).is_dir()
+    # It is a WAIT, not a dead end.
+    allowed = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1,
+        worktree_root=wt_root, busy=False,
+    )
+    assert allowed["removed"] is True, allowed
+
+
+def test_removal_reads_the_live_activity_query_when_no_answer_is_supplied(repo, tmp_path, wt_root, monkeypatch):
+    """The default is the LIVE query — the same judge merge-back uses — not an
+    argument a caller has to remember to pass."""
+    import ouroboros.thread_branching as branching
+    from pathlib import Path
+
+    handle = _provision(repo, tmp_path, wt_root)
+    monkeypatch.setattr(branching, "project_is_busy", lambda pid: pid == "racer")
+
+    refused = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1, worktree_root=wt_root,
+    )
+
+    assert refused["reason"] == "project_busy"
+    assert Path(handle.path).is_dir()
+
+
+def test_a_row_that_nominates_its_own_boundary_cannot_delete_the_owners_folder(
+    repo, tmp_path, wt_root, monkeypatch,
+):
+    """T3R2-M7: T0R2-9 moved the containment boundary onto the row, and the row is
+    untrusted input. A malformed one carrying `worktree_root=<documents>` and
+    `path=<documents>/important_project` passed containment trivially and was
+    deleted with `removed: True` — while the guard's own comment promised the
+    opposite. Two INDEPENDENT facts are required now: a root this process would
+    itself accept, and the path this thread's checkout is derived to have."""
+    from pathlib import Path
+
+    import ouroboros.thread_worktrees as twt
+
+    documents = tmp_path / "Documents"
+    victim = documents / "important_project"
+    victim.mkdir(parents=True)
+    (victim / "thesis.txt").write_text("years of work\n", encoding="utf-8")
+    _provision(repo, tmp_path, wt_root)
+    rows = twt._load(tmp_path / "data")
+    rows[0]["path"] = str(victim)
+    rows[0]["worktree_root"] = str(documents)
+    twt._save(tmp_path / "data", rows)
+
+    outcome = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1,
+        acknowledge_unmerged=True, worktree_root=wt_root,
+    )
+
+    assert outcome["removed"] is False
+    assert outcome["reason"] == "path_outside_root"
+    assert (victim / "thesis.txt").read_text(encoding="utf-8") == "years of work\n"
+    assert Path(documents).is_dir()
+
+
+def test_removal_does_not_hold_the_registry_lock_across_its_git_calls(repo, tmp_path, wt_root, monkeypatch):
+    """T3R2-L2: `_LOCK` guards the registry read and the final save, nothing
+    between. Held across two `run_git` calls, `force_rmtree`, a prune and a
+    `git branch -d`, it blocked every `thread_location`/`get_thread_worktree`
+    read — and with `run_git`'s known missing timeout, for an unbounded time."""
+    import ouroboros.thread_worktrees as twt
+
+    _provision(repo, tmp_path, wt_root)
+    seen = []
+    real_run_git = twt.run_git
+
+    def _probe(*args, **kwargs):
+        # Mid-removal, from THIS thread's point of view the RLock is re-entrant,
+        # so the honest probe is whether the lock is held at all.
+        seen.append(twt._LOCK._is_owned())
+        return real_run_git(*args, **kwargs)
+
+    monkeypatch.setattr(twt, "run_git", _probe)
+
+    outcome = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1,
+        acknowledge_unmerged=True, worktree_root=wt_root,
+    )
+
+    assert outcome["removed"] is True, outcome
+    assert seen, "the removal must actually have called git"
+    assert not any(seen), "the registry lock was held across a git call"

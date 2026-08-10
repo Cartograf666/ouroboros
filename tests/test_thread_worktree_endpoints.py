@@ -196,6 +196,39 @@ def test_removal_refuses_unmerged_work_until_the_owner_acknowledges_it(wired):
     assert not checkout.exists()
 
 
+def test_removal_refuses_while_a_task_is_running_in_the_project(wired, monkeypatch):
+    """T3R2-H5 at the route: removal deletes a folder a task may be writing in,
+    and the route has a sentence for that reason instead of a bare fallback."""
+    from supervisor import workers
+
+    client, _drive, tid, folder = wired
+    branched = client.post(f"/api/projects/racer/threads/{tid}/branch-off", json={}).json()
+    checkout = pathlib.Path(branched["path"])
+    monkeypatch.setitem(
+        workers.RUNNING, "live",
+        {"task": {"id": "live", "project_id": "racer", "workspace_root": str(checkout)}},
+    )
+    try:
+        refused = client.post(
+            f"/api/projects/racer/threads/{tid}/worktree/remove",
+            json={"acknowledge_unmerged": True},
+        )
+    finally:
+        workers.RUNNING.pop("live", None)
+
+    assert refused.status_code == 409
+    body = refused.json()
+    assert body["removed"] is False
+    assert body["reason"] == "project_busy"
+    assert "until that task finishes" in body["message"]
+    assert checkout.is_dir()
+    # A WAIT, not a dead end: with the task gone it removes.
+    assert client.post(
+        f"/api/projects/racer/threads/{tid}/worktree/remove",
+        json={"acknowledge_unmerged": True},
+    ).json()["removed"] is True
+
+
 def test_a_folderless_project_refuses_with_a_typed_reason_not_a_500(tmp_path):
     drive = tmp_path / "drive"
     create_project(drive, "placeless", name="Placeless")
@@ -275,11 +308,17 @@ def test_archiving_thread_zero_is_a_409_that_says_where_the_operation_lives(tmp_
     assert "project" in body["message"].lower()
 
 
-def test_delete_answers_deleting_and_discloses_what_it_does_not_do(tmp_path, folder, monkeypatch):
-    """X10 + D4: the fence is up, the tombstone is not. And the two things a
-    delete deliberately does NOT do are stated in the answer, not buried."""
-    import ouroboros.gateway.project_threads as gw
+def test_delete_takes_a_CLEAN_checkout_with_it_and_says_so(tmp_path, folder, monkeypatch):
+    """T3R2-M2, owner-directed: deleting a thread must delete its worktree too.
 
+    A tombstoned thread is invisible on every surface, `list_thread_worktrees` has
+    no route and no UI consumer, and branch/merge refuse `thread_not_live` — so a
+    checkout left behind is a folder AND a branch that A10's explicit removal can
+    no longer reach, on durable state exempt from every GC. A CLEAN one (nothing
+    uncommitted, no commit the project folder lacks) is exactly what A10/D4
+    already offer one-click removal for, so it goes with the thread and the answer
+    says it did. X10 is unchanged: the fence is up, the tombstone is not.
+    """
     started: list = []
     monkeypatch.setattr(
         "supervisor.task_lifecycle.start_thread_deletion",
@@ -288,9 +327,7 @@ def test_delete_answers_deleting_and_discloses_what_it_does_not_do(tmp_path, fol
     drive = tmp_path / "drive"
     create_project(drive, "racer", name="Racer", working_dir=str(folder))
     thread = create_thread(drive, "racer", name="Doomed")
-    # Give it a checkout, so the "we did not remove it" disclosure has teeth.
-    branch_client = _client(drive)
-    branched = branch_client.post(
+    branched = _client(drive).post(
         f"/api/projects/racer/threads/{thread['id']}/branch-off", json={},
     ).json()
     assert branched["ok"] is True
@@ -303,10 +340,49 @@ def test_delete_answers_deleting_and_discloses_what_it_does_not_do(tmp_path, fol
     # Fenced, NOT yet tombstoned: its tasks are still being cancelled.
     assert body["lifecycle"] == "deleting"
     assert started and started[0][1] == int(thread["id"])
-    # The two honest disclosures.
     assert body["journal_rows_retained"] is True
-    assert body["worktree_kept"] is True
-    assert pathlib.Path(branched["path"]).is_dir()
+    # The checkout AND its branch went with it — disclosed, never silent.
+    assert body["worktree_removed"] is True
+    assert body["worktree_kept"] is False
+    assert body["branch"] == branched["branch"]
+    assert body["branch_removed"] is True
+    assert not pathlib.Path(branched["path"]).exists()
+    assert branched["branch"] not in _git(folder, "branch", "--list").stdout
+
+
+def test_delete_REFUSES_while_the_checkout_still_holds_work(tmp_path, folder, monkeypatch):
+    """...and only a CLEAN one. Work the owner has not seen is never destroyed by
+    a gesture aimed at something else; the refusal names the explicit route."""
+    started: list = []
+    monkeypatch.setattr(
+        "supervisor.task_lifecycle.start_thread_deletion",
+        lambda drive_root, pid, tid, chat_id: started.append(tid) or True,
+    )
+    drive = tmp_path / "drive"
+    create_project(drive, "racer", name="Racer", working_dir=str(folder))
+    thread = create_thread(drive, "racer", name="Doomed")
+    branched = _client(drive).post(
+        f"/api/projects/racer/threads/{thread['id']}/branch-off", json={},
+    ).json()
+    checkout = pathlib.Path(branched["path"])
+    (checkout / "unsaved.txt").write_text("hours of work\n", encoding="utf-8")
+
+    response = _lifecycle_client(drive).post(
+        f"/api/projects/racer/threads/{thread['id']}/delete", json={},
+    )
+    body = response.json()
+
+    assert response.status_code == 409
+    assert body["ok"] is False
+    assert body["reason"] == "checkout_holds_work"
+    assert "cannot be deleted" in body["message"]
+    assert body["inspection"]["dirty"] is True
+    # Nothing happened: not fenced, not tombstoned, checkout intact.
+    assert started == []
+    assert (checkout / "unsaved.txt").is_file()
+    from ouroboros.projects_registry import get_thread
+
+    assert get_thread(drive, "racer", thread["id"])["lifecycle"] == "active"
 
 
 def test_branch_bases_carries_the_honest_queue_notice(wired, monkeypatch):

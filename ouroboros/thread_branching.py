@@ -80,8 +80,19 @@ REASON_CHECKOUT_MISSING = "checkout_missing"
 REASON_PROJECT_HEAD_DETACHED = "project_head_detached"
 REASON_THREAD_NOT_LIVE = "thread_not_live"
 
-#: Bounded like every other owner-facing git call on a request path.
-_GIT_TIMEOUT_SEC = 120
+def _git_timeout_sec() -> float:
+    """Bounded like every other owner-facing git call on a request path.
+
+    Read from the ONE settings SSOT rather than pinned as a module-local number:
+    DEVELOPMENT.md's gate says a new numeric timeout is a `config.py` setting with
+    a getter and env registration, and the sibling owner-facing git path — the
+    task diff — already uses exactly this one. Two owner-facing git surfaces with
+    two unrelated ceilings is how a repo that is merely large starts timing out on
+    one screen and not on the other, with nothing the owner can turn.
+    """
+    from ouroboros.config import get_task_diff_git_timeout_sec
+
+    return get_task_diff_git_timeout_sec()
 
 
 def _git(root: Any, *args: str) -> subprocess.CompletedProcess:
@@ -112,7 +123,7 @@ def _git(root: Any, *args: str) -> subprocess.CompletedProcess:
             cwd=str(root),
             capture_output=True,
             text=True,
-            timeout=_GIT_TIMEOUT_SEC,
+            timeout=_git_timeout_sec(),
             env={**os.environ, "LC_ALL": "C", "GIT_LITERAL_PATHSPECS": "1"},
         )
     except Exception as exc:  # noqa: BLE001 — includes TimeoutExpired

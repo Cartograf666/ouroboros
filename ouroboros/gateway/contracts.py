@@ -707,9 +707,15 @@ class ThreadLifecycleResponse(TypedDict, total=False):
     owner reads. ``journal_rows_retained`` is always true and says so: the chat
     journal is shared by every chat and nothing here rewrites it, so a deleted
     thread's rows physically remain and claiming erasure would be a lie.
-    ``worktree_kept`` says the thread's checkout was NOT removed — A10 has no
-    exception for deletion, and removing a checkout is always its own inspected
-    act. ``visible_until_terminal`` (archive) says the thread was archived while a
+    ``worktree_kept`` says the thread still has a checkout after the operation.
+    ``worktree_removed`` (delete) says a CLEAN one went with the thread, naming
+    the ``branch`` and whether it went too: a tombstoned thread is invisible on
+    every surface and branch/merge refuse it, so a checkout left behind is a
+    folder and a branch that A10's explicit removal can no longer reach. A
+    checkout holding uncommitted work or unmerged commits REFUSES the deletion
+    instead (``checkout_holds_work``, with the ``inspection`` attached), because
+    nothing here may destroy work the owner has not seen.
+    ``visible_until_terminal`` (archive) says the thread was archived while a
     task was still running, so it stays on screen until that task finishes rather
     than hiding live output.
     """
@@ -725,6 +731,10 @@ class ThreadLifecycleResponse(TypedDict, total=False):
     visible_until_terminal: bool
     journal_rows_retained: bool
     worktree_kept: bool
+    worktree_removed: bool
+    branch: str
+    branch_removed: bool
+    inspection: Dict[str, Any]
     location: ThreadLocation
 
 

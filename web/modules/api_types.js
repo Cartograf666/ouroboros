@@ -555,7 +555,12 @@
  * owner reads. journal_rows_retained is always true and says so: the chat journal
  * is shared by every chat and nothing rewrites it, so a deleted thread's rows
  * physically remain and claiming erasure would be a lie. worktree_kept says the
- * checkout was NOT removed — A10 has no exception for deletion.
+ * thread still has a checkout afterwards; worktree_removed (delete) says a CLEAN
+ * one went with the thread, naming its branch and whether that went too — a
+ * tombstoned thread is invisible on every surface and branch/merge refuse it, so
+ * a checkout left behind is a folder and a branch nothing can reach any more. One
+ * holding uncommitted work or unmerged commits REFUSES the deletion instead
+ * (checkout_holds_work, with its inspection attached).
  * visible_until_terminal (archive) says the thread was archived while a task was
  * still running, so it stays on screen until that task finishes.
  * @typedef {Object} ThreadLifecycleResponse
@@ -570,6 +575,10 @@
  * @property {boolean=} visible_until_terminal
  * @property {boolean=} journal_rows_retained
  * @property {boolean=} worktree_kept
+ * @property {boolean=} worktree_removed
+ * @property {string=} branch
+ * @property {boolean=} branch_removed
+ * @property {Object=} inspection
  * @property {ThreadLocation=} location
  */
 

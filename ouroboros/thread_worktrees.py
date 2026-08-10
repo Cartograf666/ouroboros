@@ -55,9 +55,12 @@ _SCHEMA_VERSION = 1
 _BRANCH_PREFIX = "thread/"
 _LOCK = threading.RLock()
 
-# Not a config.py knob in T0: no owner-facing surface reaches it yet (branch-off
-# is a later phase) and config.py is documented as having no reclaimable line.
-# Env-overridable so a relocated Ouroboros home still works.
+# A PATH, not a numeric knob, so the SSOT gate that governs timeouts does not
+# apply — it is env-overridable exactly so a relocated Ouroboros home still works,
+# and the removal guard now validates the root a row was provisioned under against
+# this one. T0 justified it with "no owner-facing surface reaches it yet
+# (branch-off is a later phase)"; T3 IS that phase, and branch-off, merge-back,
+# the checkout diff and the inspected removal all reach it.
 _ROOT_ENV = "OUROBOROS_THREAD_WORKTREE_ROOT"
 
 
@@ -216,6 +219,17 @@ def inspect_thread_worktree(row: Dict[str, Any]) -> Dict[str, Any]:
     treated as unsafe (``dirty``), because "cannot tell" must never read as
     "nothing to lose".
 
+    IGNORED files are counted as dirty (``--ignored=matching``, the ``!!``
+    entries). ``git status --porcelain`` alone hides exactly the files a thread's
+    checkout is most likely to be the only copy of: a ``.env`` written into that
+    folder, a ``local.db``, a ``build/`` an agent produced. The checkout read
+    ``dirty: false`` and one-click removal force-deleted them with no prompt —
+    the same ``.env`` the snapshot works hard to keep OUT of history is the one
+    this deleted from disk. They are not "changes", but the question this function
+    answers is what removal would DESTROY, and they are destroyed. Counted here,
+    they ride the acknowledgement path that already exists rather than needing a
+    second one.
+
     ``unmerged_commits`` is counted against the PROJECT's current HEAD, not
     against the frozen ``base_sha`` this checkout branched from. The question A10
     asks is "what would the project folder never receive", and the answer moves
@@ -243,6 +257,15 @@ def inspect_thread_worktree(row: Dict[str, Any]) -> Dict[str, Any]:
     }
     wt_path = Path(str(row.get("path") or ""))
     if not wt_path.is_dir():
+        # A registered checkout that is not on disk is "cannot tell", not
+        # "nothing to lose" — an unmounted volume, a folder moved out from under
+        # the registry, a `git worktree remove` run by hand. Answering
+        # `{exists: False, dirty: False, unmerged_commits: 0}` was the exact shape
+        # this docstring says must never happen: the removal prompt read it as a
+        # clean checkout and offered one-click removal of something whose contents
+        # nobody could see. It rides the acknowledgement path instead.
+        out["error"] = f"the checkout is not on disk: {wt_path}"
+        out["dirty"] = True
         return out
     out["exists"] = True
     try:
@@ -250,7 +273,10 @@ def inspect_thread_worktree(row: Dict[str, Any]) -> Dict[str, Any]:
         # this listed the C-quoted spelling while `merge_back_thread`'s own status
         # call — which pins it — listed the real one, and the two surfaces
         # disagreed about the same file.
-        status = run_git(wt_path, "-c", "core.quotepath=off", "status", "--porcelain", check=False)
+        status = run_git(
+            wt_path, "-c", "core.quotepath=off", "status", "--porcelain",
+            "--ignored=matching", check=False,
+        )
         if status.returncode != 0:
             # Not a checkout any more (or git refused): unsafe by construction.
             out["error"] = (status.stderr or "git status failed").strip()[:500]
@@ -289,6 +315,7 @@ def remove_thread_worktree(
     thread_id: Any,
     acknowledge_unmerged: bool = False,
     worktree_root: Optional[Any] = None,
+    busy: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Remove a thread worktree AFTER inspecting what that would destroy.
 
@@ -296,6 +323,15 @@ def remove_thread_worktree(
     never received refuse the removal unless ``acknowledge_unmerged`` is passed
     — the caller must have SHOWN the owner the inspection first. There is no
     silent path and no timer that reaches this function.
+
+    An ACTIVE project refuses with ``project_busy``, the same reason and the same
+    409 shape merge-back uses, because this deletes a folder something may be
+    writing in. ``project_lease.running_project_ids``,
+    ``thread_branching.project_is_busy`` and ARCHITECTURE all described that
+    precondition, and merge-back was its only caller: a task running in the
+    checkout made merge-back refuse correctly and removal answer ``removed: True``
+    while deleting the folder under the live worker. ``busy`` overrides the live
+    query for tests and for callers that already hold the answer.
 
     Containment is checked against the root the row was PROVISIONED under
     (T0R2-9), not against whatever this process resolves today. Resolving it at
@@ -325,20 +361,42 @@ def remove_thread_worktree(
     """
     key = _key(project_id, thread_id)
     root = Path(worktree_root).expanduser().resolve() if worktree_root else thread_worktree_root()
-    with _LOCK, worktree_ops_lock(root):
-        rows = _load(data_dir)
-        match = next((row for row in rows if _matches(row, key)), None)
+    with worktree_ops_lock(root):
+        # `_LOCK` covers the registry READ and the final SAVE, nothing between.
+        # Holding it across two `run_git` calls, `force_rmtree`, a prune and a
+        # `git branch -d` blocked every `thread_location`/`get_thread_worktree`
+        # read for the duration — and with `run_git`'s known missing timeout that
+        # duration is unbounded, so one wedged git call froze the sidebar. The
+        # git-op lock still serializes the whole operation per root, which is what
+        # actually needs to be exclusive.
+        with _LOCK:
+            match = next((row for row in _load(data_dir) if _matches(row, key)), None)
         if match is None:
             return {"removed": False, "reason": "unknown", "inspection": {}}
+        # Removal deletes a folder a task may be WRITING in. `project_is_busy`,
+        # `running_project_ids` and ARCHITECTURE all said this was guarded; only
+        # merge-back actually asked. Reproduced: a running task in the checkout,
+        # merge-back correctly refuses `project_busy`, and removal answered
+        # `removed: True` and deleted the folder under the live worker.
+        if _project_is_busy(project_id) if busy is None else bool(busy):
+            return {"removed": False, "reason": "project_busy", "inspection": {}}
         inspection = inspect_thread_worktree(match)
         unsafe = bool(inspection["dirty"]) or int(inspection["unmerged_commits"]) > 0
         if unsafe and not acknowledge_unmerged:
             return {"removed": False, "reason": "unmerged_work", "inspection": inspection}
         wt_path = Path(str(match.get("path") or ""))
-        stored_root = str(match.get("worktree_root") or "").strip()
-        guard_root = Path(stored_root).expanduser().resolve() if stored_root else root
-        if not str(wt_path).strip() or not path_is_within(wt_path, guard_root):
-            # A malformed registry row must never delete an arbitrary path.
+        guard_root = _trusted_guard_root(match, root, data_dir)
+        if (
+            not str(wt_path).strip()
+            or not path_is_within(wt_path, guard_root)
+            or wt_path.name != safe_path_component(f"{key[0]}__{key[1]}")
+        ):
+            # A malformed registry row must never delete an arbitrary path — and
+            # that was exactly what it could do, because the boundary it was
+            # checked against came from the SAME untrusted row (T0R2-9 moved the
+            # root onto the row and the guard moved with it). Two independent
+            # facts are required now: a root this process would itself accept, and
+            # the path this thread's checkout is DERIVED to have.
             return {"removed": False, "reason": "path_outside_root", "inspection": inspection}
         repo = Path(str(match.get("repo_dir") or "."))
         branch = str(match.get("branch") or "").strip()
@@ -347,7 +405,8 @@ def remove_thread_worktree(
             force_rmtree(wt_path)
         run_git(repo, "worktree", "prune", check=False)
         branch_removed, branch_kept_reason = _drop_clean_branch(repo, branch, unsafe)
-        _save(data_dir, [row for row in rows if not _matches(row, key)])
+        with _LOCK:
+            _save(data_dir, [row for row in _load(data_dir) if not _matches(row, key)])
         log.info("Thread worktree removed: %s#%s (%s)", key[0], key[1], wt_path)
         return {
             "removed": True,
@@ -357,6 +416,42 @@ def remove_thread_worktree(
             "branch_removed": branch_removed,
             "branch_kept_reason": branch_kept_reason,
         }
+
+
+def _project_is_busy(project_id: Any) -> bool:
+    """Is anything alive anywhere in this project? — merge-back's own judge.
+
+    Imported lazily because ``thread_branching`` imports THIS module; the answer
+    has to be the same one merge-back gets, or the two owner gestures would
+    disagree about whether the folder is safe to touch.
+    """
+    from ouroboros.thread_branching import project_is_busy
+
+    return project_is_busy(str(project_id or ""))
+
+
+def _trusted_guard_root(row: Dict[str, Any], fallback: Path, data_dir: Any) -> Path:
+    """The boundary a removal is allowed to delete inside.
+
+    The root recorded at provisioning is preferred (T0R2-9: validating against
+    whatever the process resolves TODAY stranded every existing row as
+    ``path_outside_root`` the moment the configured root moved), but it is a value
+    on an untrusted row, so it is re-checked with the SAME guard provisioning used
+    before it is believed. A stored root that would never have been admitted falls
+    back to this process's own root, where a bogus path simply fails containment.
+    """
+    from ouroboros.config import REPO_DIR
+
+    stored = str(row.get("worktree_root") or "").strip()
+    if not stored:
+        return fallback
+    try:
+        candidate = Path(stored).expanduser().resolve()
+        assert_worktree_root_isolated(candidate, Path(REPO_DIR), Path(data_dir))
+    except Exception:
+        log.warning("Thread worktree row carries an unusable provisioning root: %r", stored)
+        return fallback
+    return candidate
 
 
 def _drop_clean_branch(repo: Path, branch: str, unsafe: bool) -> tuple:

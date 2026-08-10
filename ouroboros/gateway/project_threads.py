@@ -295,6 +295,14 @@ def _removal_message(reason: str, inspection: Dict[str, Any]) -> str:
         )
     if reason == "unknown":
         return "This thread has no checkout to remove."
+    if reason == "project_busy":
+        # The SAME sentence merge-back gives for the same fact, because it is the
+        # same judge: removing a checkout deletes a folder a task may be writing in.
+        return (
+            "A task is running or queued in this project right now. Removing a "
+            "checkout deletes the folder it is working in, so it waits until that "
+            "task finishes."
+        )
     if reason == "path_outside_root":
         return (
             "The registry entry points outside the folder these checkouts live in, "
@@ -452,16 +460,53 @@ async def api_thread_delete(request: Request) -> JSONResponse:
 
     What a tombstone does and does not do, stated plainly because the answer says
     so too: the id and chat id are reserved forever (a reused 28-bit chat id would
-    merge a dead thread's history into a live conversation), the journal rows
+    merge a dead thread's history into a live conversation) and the journal rows
     physically REMAIN — the journal is shared by every chat and nothing here
-    rewrites it — and the thread's git worktree is NOT removed. A10 has no
-    exception for deletion: removing a checkout is always its own inspected act.
+    rewrites it.
+
+    The thread's CHECKOUT goes with it when there is nothing to lose, and only
+    then. A tombstoned thread is invisible on every surface, `list_thread_worktrees`
+    has no route, and branch/merge refuse `thread_not_live` — so leaving the
+    checkout behind orphaned a folder and a branch that A10's "explicit removal"
+    could no longer reach, on durable state that is exempt from every GC. A
+    checkout holding uncommitted work or commits the project folder never received
+    REFUSES the deletion and names the explicit removal route; a clean one is
+    removed here, disclosed on the answer (`worktree_removed`), which is the same
+    one-click removal A10/D4 already offer for a clean, fully merged checkout.
+    Nothing is destroyed silently and nothing is destroyed without evidence.
     """
-    from ouroboros.projects_registry import begin_thread_deletion
+    from ouroboros.projects_registry import begin_thread_deletion, get_thread
     from ouroboros.thread_branching import thread_location
+    from ouroboros.thread_worktrees import get_thread_worktree, remove_thread_worktree
     from supervisor.task_lifecycle import start_thread_deletion
 
     def _run(drive_root, pid, thread_id):
+        thread = get_thread(drive_root, pid, thread_id) or {}
+        tid = int(thread.get("id") or 0)
+        removed: Dict[str, Any] = {}
+        if get_thread_worktree(drive_root, pid, tid):
+            # BEFORE the fence: a refusal must leave the thread exactly as it was,
+            # not fenced-but-undeleted with no way forward.
+            removed = remove_thread_worktree(
+                data_dir=drive_root, project_id=pid, thread_id=tid,
+            )
+            if not removed.get("removed"):
+                reason = str(removed.get("reason") or "")
+                inspection = removed.get("inspection") or {}
+                return JSONResponse({
+                    "ok": False,
+                    "reason": "checkout_holds_work" if reason == "unmerged_work" else reason,
+                    "message": (
+                        f"{_removal_message(reason, inspection)} This thread cannot be "
+                        "deleted while its checkout is in that state, because deleting it "
+                        "would leave the folder and its branch with no surface that can "
+                        "reach them."
+                    ),
+                    "project_id": pid,
+                    "thread_id": tid,
+                    "inspection": inspection,
+                    "location": thread_location(drive_root, pid, tid),
+                }, status_code=_refusal_status(reason))
         fenced = begin_thread_deletion(drive_root, pid, thread_id)
         if fenced is None:
             return JSONResponse(
@@ -478,6 +523,9 @@ async def api_thread_delete(request: Request) -> JSONResponse:
             # rather than in a docstring nobody reading the UI will see.
             journal_rows_retained=True,
             worktree_kept=location["where"] == "worktree",
+            worktree_removed=bool(removed.get("removed")),
+            branch=str(removed.get("branch") or ""),
+            branch_removed=bool(removed.get("branch_removed")),
             location=location,
         )
 
