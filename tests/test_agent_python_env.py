@@ -94,18 +94,7 @@ def test_agent_python_env_var_points_to_usable_python():
     assert "ok" in result.stdout
 
 
-def test_requirements_txt_pins_pytest():
+def test_pyproject_declares_pytest_as_runtime_dependency():
     repo_root = pathlib.Path(__file__).resolve().parent.parent
-    reqs = (repo_root / "requirements.txt").read_text(encoding="utf-8")
-    for raw_line in reqs.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        name = line.split(";", 1)[0].split("[", 1)[0]
-        for sep in (">=", "<=", "==", "~=", ">", "<", "!="):
-            if sep in name:
-                name = name.split(sep, 1)[0]
-                break
-        if name.strip().lower() == "pytest":
-            return
-    raise AssertionError("requirements.txt must include pytest")
+    pyproject = (repo_root / "pyproject.toml").read_text(encoding="utf-8")
+    assert '"pytest>=7.0"' in pyproject

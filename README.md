@@ -171,6 +171,7 @@ Benchmark adapters, run scripts, and per-benchmark methodology live in [`devtool
 ### Requirements
 
 - Python 3.10+
+- [uv 0.12.1](https://docs.astral.sh/uv/getting-started/installation/)
 - macOS, Linux, or Windows
 - Git
 - [GitHub CLI (`gh`)](https://cli.github.com/), optional unless you use GitHub integration
@@ -180,21 +181,15 @@ Benchmark adapters, run scripts, and per-benchmark methodology live in [`devtool
 ```bash
 git clone https://github.com/razzant/ouroboros.git
 cd ouroboros
-python3.11 -m venv .venv      # any Python >= 3.10 is OK
+uv sync --frozen --extra browser --group dev
 source .venv/bin/activate
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -r requirements.txt
-python -m pip install -e . --no-deps
 ```
 
 Windows PowerShell:
 
 ```powershell
-py -3.11 -m venv .venv      # any Python >= 3.10 is OK
+uv sync --frozen --extra browser --group dev
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -r requirements.txt
-python -m pip install -e . --no-deps
 ```
 
 ### Run
@@ -253,6 +248,18 @@ The server binds to `127.0.0.1:8765` by default. Read [`docs/DEPLOYMENT.md`](doc
 
 ```bash
 make test
+```
+
+`pyproject.toml` is the direct-dependency authority and `uv.lock` is the
+cross-platform resolution lock. Release builds install the generated
+`requirements-runtime.lock` and `requirements-build.lock` exports into the
+embedded and build interpreters respectively. After changing dependencies,
+refresh all three files with:
+
+```bash
+uv lock
+uv export --frozen --no-dev --extra browser --no-emit-project --no-hashes --no-annotate --output-file requirements-runtime.lock
+uv export --frozen --no-dev --extra browser --extra desktop --extra build --no-emit-project --no-hashes --no-annotate --output-file requirements-build.lock
 ```
 
 ---

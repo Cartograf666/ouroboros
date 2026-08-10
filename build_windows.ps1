@@ -27,6 +27,10 @@ New-Item -ItemType Directory -Force -Path $env:PYTHONPYCACHEPREFIX | Out-Null
 
 Write-Host "=== Building Ouroboros for Windows (v${Version}) ==="
 
+if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+    throw "uv is required for locked dependency installation. Install it from https://docs.astral.sh/uv/getting-started/installation/"
+}
+
 if (-not (Test-Path "python-standalone\python.exe")) {
     Write-Host "ERROR: python-standalone\ not found."
     Write-Host "Run first: powershell -ExecutionPolicy Bypass -File scripts/download_python_standalone.ps1"
@@ -43,7 +47,7 @@ if (-not (Test-Path "node-standalone\node.exe")) {
 
 Write-Host "--- Installing launcher dependencies ---"
 Invoke-NativeChecked "Launcher dependency installation" {
-    python -m pip install -q -r requirements-launcher.txt
+    uv pip install --python python -q -r requirements-build.lock
 }
 
 if (-not (Test-Path "ripgrep-standalone\rg.exe")) {
@@ -55,7 +59,7 @@ if (-not (Test-Path "ripgrep-standalone\rg.exe")) {
 
 Write-Host "--- Installing agent dependencies into python-standalone ---"
 Invoke-NativeChecked "Agent dependency installation" {
-    & "python-standalone\python.exe" -m pip install -q -r requirements.txt
+    uv pip install --python "python-standalone\python.exe" -q -r requirements-runtime.lock
 }
 
 Write-Host "--- Fetching exact Claudexor runtime seed ---"

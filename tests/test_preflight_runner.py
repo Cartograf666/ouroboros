@@ -62,7 +62,7 @@ _REQUIRE_PLUGINS_ENV = "OUROBOROS_PREFLIGHT_REQUIRE_PLUGINS"
 _REAL_SPAWN_SKIP_REASON = (
     "this interpreter cannot host a real preflight pass, so a nested run can only "
     "return PREFLIGHT_PLUGIN_MISSING — install pytest-xdist>=3.5 and "
-    "pytest-timeout>=2.1 into it (requirements.txt declares both), or set "
+    "pytest-timeout>=2.1 into it (pyproject.toml declares both), or set "
     f"{_REQUIRE_PLUGINS_ENV}=1 to turn this skip into a hard failure: "
     + "; ".join(_PREFLIGHT_PLUGIN_PROBLEMS)
 )
@@ -321,30 +321,24 @@ def test_preflight_plugins_are_declared_dependencies():
     """The gate fails closed on a missing plugin instead of degrading to serial,
     so the plugins must be declared in EVERY place the environment is provisioned.
 
-    `pyproject.toml` is not optional here: `requirements.txt` covers a source
-    checkout, but a wheel or `pip install .` installs `[project].dependencies`
-    alone. Declaring pytest there without pytest-xdist/pytest-timeout produced an
+    `pyproject.toml` is the dependency authority for source, wheel, and packaged
+    installs. Declaring pytest there without pytest-xdist/pytest-timeout produced an
     installation whose every commit hard-blocks with PREFLIGHT_PLUGIN_MISSING.
     """
-    requirements = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
     pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     for pin in ("pytest-xdist>=3.5", "pytest-timeout>=2.1"):
-        assert pin in requirements, f"requirements.txt does not declare {pin}"
         assert pin in pyproject, f"[project].dependencies does not declare {pin}"
 
 
 def test_required_plugin_minimums_match_requirements():
     """The probe's version floors and the declared dependencies are the same
     promise, and a probe that accepts an older xdist than the gate depends on is
-    not a check. Both manifests are checked, so a floor can never be raised in one
-    and left behind in the other."""
+    not a check."""
     from ouroboros.preflight_runner import _REQUIRED_PREFLIGHT_PLUGINS
 
-    requirements = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
     pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     for _module, dist, minimum in _REQUIRED_PREFLIGHT_PLUGINS:
         pin = f"{dist}>=" + ".".join(str(part) for part in minimum)
-        assert pin in requirements, f"the probe requires {pin}, requirements.txt does not"
         assert pin in pyproject, f"the probe requires {pin}, pyproject.toml does not"
 
 
@@ -627,7 +621,7 @@ def test_classify_skips_xdist_diagnoses_on_a_non_parallel_pass():
 
 @pytest.mark.parametrize("returncode,output,label,remediation_marker,body_marker", [
     (4, "pytest: error: unrecognized arguments: -n auto --dist loadscope\n",
-     "PREFLIGHT_PLUGIN_MISSING", "requirements.txt", "unrecognized arguments"),
+     "PREFLIGHT_PLUGIN_MISSING", "pyproject.toml", "unrecognized arguments"),
     (1, "worker gw3 crashed while running 'tests/test_x.py::test_y'\n",
      "PARALLEL_WORKER_CRASH", "@pytest.mark.serial", "worker gw3 crashed"),
 ])
@@ -1110,7 +1104,7 @@ def test_plugins_are_verified_before_the_candidate_tree_exists(tmp_path, two_pas
 
     assert result is not None, "a missing parallel plugin must block, never degrade to serial"
     assert "PREFLIGHT_PLUGIN_MISSING" in result, result
-    assert "requirements.txt" in result, result
+    assert "pyproject.toml" in result, result
     assert "OUROBOROS_PREFLIGHT_SERIAL=1" in result, "the deliberate-rollback lever is the remediation"
     assert [event[0] for event in events].count("pass") == 0, "a pass ran on an unverified interpreter"
     assert not any(args[:2] == ["worktree", "add"] for args in git_calls), (

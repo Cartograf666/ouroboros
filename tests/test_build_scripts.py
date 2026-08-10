@@ -299,12 +299,9 @@ class TestBuildLinuxSh:
         src = _read("build_linux.sh")
         assert 'PORTABLE_PYTHON="python-standalone/bin/python3"' in src
         assert '"$PORTABLE_PYTHON" -m venv "$BUILD_VENV"' in src
-        assert (
-            '"$BUILD_PYTHON" -m pip install -q -r requirements-launcher.txt '
-            '"pyinstaller>=6.0"'
-        ) in src
+        assert 'uv pip install --python "$BUILD_PYTHON" -q -r requirements-build.lock' in src
         assert '"$BUILD_PYTHON" -m PyInstaller Ouroboros.spec' in src
-        assert '"$PORTABLE_PYTHON" -m pip install -q -r requirements-launcher.txt' not in src
+        assert 'uv pip install --python "$PORTABLE_PYTHON" -q -r requirements-runtime.lock' in src
         assert '"$HOST_PYTHON_CMD" -m PyInstaller' not in src
 
     def test_ripgrep_download_before_pyinstaller(self):
@@ -552,26 +549,26 @@ class TestDockerfile:
             "playwright install-deps must appear BEFORE playwright install chromium webkit in Dockerfile"
         )
 
-    def test_pip_install_before_playwright_install_deps(self):
-        """pip install must appear BEFORE playwright install-deps chromium webkit — the
+    def test_uv_sync_before_playwright_install_deps(self):
+        """uv sync must appear BEFORE playwright install-deps chromium webkit — the
         playwright Python package must be importable when install-deps runs."""
         src = _read("Dockerfile")
-        pip_pos = src.find("pip install")
+        sync_pos = src.find("uv sync")
         deps_pos = src.find("playwright install-deps chromium webkit")
-        assert pip_pos != -1, "pip install step not found in Dockerfile"
+        assert sync_pos != -1, "uv sync step not found in Dockerfile"
         assert deps_pos != -1, "playwright install-deps chromium webkit not found in Dockerfile"
-        assert pip_pos < deps_pos, (
-            "pip install must appear BEFORE playwright install-deps chromium webkit in Dockerfile "
-            f"(pip at char {pip_pos}, install-deps at {deps_pos})"
+        assert sync_pos < deps_pos, (
+            "uv sync must appear BEFORE playwright install-deps chromium webkit in Dockerfile "
+            f"(sync at char {sync_pos}, install-deps at {deps_pos})"
         )
 
-    def test_pip_install_before_all_playwright_invocations(self):
-        """pip install must appear BEFORE every ``python3 -m playwright ...`` invocation
+    def test_uv_sync_before_all_playwright_invocations(self):
+        """uv sync must appear BEFORE every ``python3 -m playwright ...`` invocation
         in the Dockerfile — both ``install-deps`` and ``install chromium webkit``.
-        If *any* playwright invocation precedes pip install, ModuleNotFoundError occurs."""
+        If *any* playwright invocation precedes dependency sync, ModuleNotFoundError occurs."""
         src = _read("Dockerfile")
-        pip_pos = src.find("pip install")
-        assert pip_pos != -1, "pip install step not found in Dockerfile"
+        sync_pos = src.find("uv sync")
+        assert sync_pos != -1, "uv sync step not found in Dockerfile"
 
         import re as _re
         playwright_invocations = [
@@ -580,9 +577,9 @@ class TestDockerfile:
         assert playwright_invocations, "No 'python3 -m playwright' invocations found in Dockerfile"
 
         earliest_playwright = min(playwright_invocations)
-        assert pip_pos < earliest_playwright, (
-            "pip install must appear BEFORE the earliest 'python3 -m playwright' invocation "
-            f"in the Dockerfile (pip at char {pip_pos}, earliest playwright at {earliest_playwright}). "
+        assert sync_pos < earliest_playwright, (
+            "uv sync must appear BEFORE the earliest 'python3 -m playwright' invocation "
+            f"in the Dockerfile (sync at char {sync_pos}, earliest playwright at {earliest_playwright}). "
             f"Found {len(playwright_invocations)} playwright invocation(s) at positions: "
             f"{playwright_invocations}"
         )

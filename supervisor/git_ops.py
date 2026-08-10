@@ -1146,7 +1146,10 @@ def sync_runtime_dependencies(reason: str) -> Tuple[bool, str]:
 
     from ouroboros.platform_layer import pip_install_target_args
 
-    req_path = REPO_DIR / "requirements.txt"
+    req_path = REPO_DIR / "requirements-runtime.lock"
+    if not req_path.exists():
+        # Preserve upgrades from managed repositories created before uv locks.
+        req_path = REPO_DIR / "requirements.txt"
     # The sixth and last pip call site. On a packaged install `sys.executable` IS the
     # bundled interpreter, so an unflagged install wrote into the signed bundle.
     cmd: List[str] = [sys.executable, "-m", "pip", "install", "-q",

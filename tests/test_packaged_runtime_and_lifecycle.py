@@ -124,7 +124,7 @@ def test_pip_install_target_args_only_for_the_embedded_interpreter(tmp_path):
 
 def _install_deps_context(tmp_path, interpreter, returncode, sink):
     (tmp_path / "repo").mkdir()
-    (tmp_path / "repo" / "requirements.txt").write_text("anyio\n", encoding="utf-8")
+    (tmp_path / "repo" / "requirements-runtime.lock").write_text("anyio\n", encoding="utf-8")
     calls = []
 
     def _run(command, **kwargs):

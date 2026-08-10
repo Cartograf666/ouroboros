@@ -157,12 +157,7 @@ jobs:
         # The `runner` context is not available in job-level `env` — GitHub rejects
         # the whole workflow file at parse time. RUNNER_TEMP is, via the shell.
         run: echo "OUROBOROS_DATA_DIR=$RUNNER_TEMP/ouroboros-data" >> "$GITHUB_ENV"
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-          cache: 'pip'
-      - name: Install Ouroboros dependencies
-        run: pip install -r requirements.txt
+      - uses: ./.github/actions/setup-python-env
       - name: Install, probe, start, and drive one fake task through the managed runtime
         run: python scripts/claudexor_platform_smoke.py --managed-runtime --lane fixture --max-seconds 300
       - name: Daemon log on failure
@@ -230,16 +225,11 @@ jobs:
         # Same parse-time restriction as the fixture lane: `runner` is not a valid
         # context for job-level `env`; RUNNER_TEMP is available to the shell.
         run: echo "OUROBOROS_DATA_DIR=$RUNNER_TEMP/ouroboros-data" >> "$GITHUB_ENV"
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-          cache: 'pip'
+      - uses: ./.github/actions/setup-python-env
       - uses: actions/setup-node@v4
         with:
           # Lockstep pair: must equal pin.node_version in ouroboros/claudexor_runtime_pin.json.
           node-version: '24.16.0'
-      - name: Install Ouroboros dependencies
-        run: pip install -r requirements.txt
       - name: Stage the host-owned bundled Node layout
         run: |
           set -euo pipefail

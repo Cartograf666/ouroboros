@@ -415,7 +415,11 @@ def install_deps(context: BootstrapContext) -> bool:
     actually succeeded.
     """
     try:
-        requirements = context.repo_dir / "requirements.txt"
+        requirements = context.repo_dir / "requirements-runtime.lock"
+        if not requirements.exists():
+            # Managed repositories from before the uv migration may still use
+            # the legacy filename during an in-place upgrade.
+            requirements = context.repo_dir / "requirements.txt"
         if not requirements.exists():
             return True
         from ouroboros.platform_layer import pip_install_target_args

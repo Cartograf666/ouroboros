@@ -42,12 +42,15 @@ Remove-Item -Recurse -Force "_python_tmp"
 
 echo ""
 Write-Host "=== Installing agent dependencies ==="
-& "${Dest}\python.exe" -m pip install --quiet -r requirements.txt
+if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+    throw "uv is required for locked dependency installation"
+}
+uv pip install --python "${Dest}\python.exe" --quiet -r requirements-runtime.lock
 
 echo ""
 Write-Host "=== Installing optional: local model support ==="
 try {
-    & "${Dest}\python.exe" -m pip install --quiet "llama-cpp-python[server]" 2>&1
+    uv pip install --python "${Dest}\python.exe" --quiet "llama-cpp-python[server]" 2>&1
     Write-Host "llama-cpp-python installed successfully"
 } catch {
     Write-Warning "llama-cpp-python install failed - local model support will not be available"

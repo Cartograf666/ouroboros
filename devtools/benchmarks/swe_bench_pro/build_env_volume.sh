@@ -8,7 +8,7 @@
 # and PYTHONPATH=/obo-repo. So the agent's SOURCE comes from the seeded /obo-repo volume,
 # while the PYTHON INTERPRETER + third-party DEPENDENCIES come from this `oboros-env`
 # volume. The volume was historically hand-built by an external kit; this script makes the
-# devtools self-sufficient: it builds the env from THIS repo's requirements.txt, pinned to
+# devtools self-sufficient: it builds the env from THIS repo's runtime lock, pinned to
 # whatever checkout the script is run from.
 #
 # The env contains DEPENDENCIES ONLY (no `pip install -e .`): Ouroboros itself is imported
@@ -53,8 +53,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-REQ="$SRC/requirements.txt"
-[ -f "$REQ" ] || { echo "error: requirements.txt not found at $REQ (use --src)" >&2; exit 2; }
+REQ="$SRC/requirements-runtime.lock"
+[ -f "$REQ" ] || { echo "error: requirements-runtime.lock not found at $REQ (use --src)" >&2; exit 2; }
 command -v docker >/dev/null 2>&1 || { echo "error: docker not found" >&2; exit 2; }
 
 env_python_ok() {
@@ -88,10 +88,10 @@ docker run --rm --platform "$PLATFORM" \
     conda create -y -p "$PREFIX" "python=$PYVER"
     PIP="$PREFIX/bin/pip"
     "$PIP" install --no-input --upgrade pip setuptools wheel
-    echo "[build-env] installing requirements.txt"
-    if ! "$PIP" install --no-input -r /src/requirements.txt; then
+    echo "[build-env] installing requirements-runtime.lock"
+    if ! "$PIP" install --no-input -r /src/requirements-runtime.lock; then
       echo "[build-env] full requirements install failed; retrying without tree-sitter code-intel deps (lazy runtime import, degrades gracefully)"
-      grep -ivE "tree[-_]sitter" /src/requirements.txt > /tmp/reqs_no_treesitter.txt
+      grep -ivE "tree[-_]sitter" /src/requirements-runtime.lock > /tmp/reqs_no_treesitter.txt
       "$PIP" install --no-input -r /tmp/reqs_no_treesitter.txt
     fi
     # Trim caches that bloat the read-only volume.

@@ -557,7 +557,7 @@ def _preflight_env(temp_root: pathlib.Path, repo_worktree: pathlib.Path) -> dict
 
 
 # (import name, distribution name, minimum version) for the plugins the parallel
-# pass cannot work without. Kept in step with requirements.txt.
+# pass cannot work without. Kept in step with pyproject.toml.
 _REQUIRED_PREFLIGHT_PLUGINS = (
     ("xdist", "pytest-xdist", (3, 5)),
     ("pytest_timeout", "pytest-timeout", (2, 1)),
@@ -674,7 +674,7 @@ def _plugin_missing_remediation(agent_python: str, rejected: str = "") -> str:
     return (
         lead
         + "gate needs pytest-xdist and pytest-timeout installed into THAT interpreter. "
-        "They are declared in requirements.txt (pytest-xdist>=3.5, pytest-timeout>=2.1). "
+        "They are declared in pyproject.toml (pytest-xdist>=3.5, pytest-timeout>=2.1). "
         "The gate does NOT silently fall back to a serial run — a degraded gate is "
         "indistinguishable from a passing one; set OUROBOROS_PREFLIGHT_SERIAL=1 to "
         "take the legacy single serial pass deliberately while you provision."

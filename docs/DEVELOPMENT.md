@@ -1455,6 +1455,18 @@ already preserve the boundary.
 
 ## Build & CI
 
+### Python dependency locks
+
+`pyproject.toml` is the direct-dependency SSOT and `uv.lock` is the reviewed
+cross-platform resolution. Local and CI commands use `uv sync --frozen`; do not
+add an independent hand-written requirements list. Release packaging preserves
+the separate build and embedded interpreters through generated
+`requirements-build.lock` and `requirements-runtime.lock` exports. A dependency
+change updates the project metadata, runs `uv lock`, regenerates both exports
+with the exact commands in README, and leaves their CI clean-diff check green.
+The pinned `tool.uv.required-version` and the digest-pinned `setup-uv` action
+make resolver changes deliberate rather than an ambient CI upgrade.
+
 ### Pytest marker lanes
 
 Default local pytest excludes costly or environment-dependent lanes:
