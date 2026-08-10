@@ -71,7 +71,7 @@ def test_candidate_is_leasable_matrix():
     assert candidate_is_leasable(_task("alpha", role="subagent"), leased) is True
 
 
-def test_lane_is_keyed_on_project_AND_workspace_root():
+def test_lane_is_keyed_on_the_folder_whenever_a_task_names_one():
     """The precondition that makes "branch off for parallel work" real.
 
     Two threads of ONE project in the SAME folder must still serialize; a
@@ -95,6 +95,28 @@ def test_lane_is_keyed_on_project_AND_workspace_root():
     assert running_project_ids([_meta(main_folder), _meta(branched)]) == {"alpha"}
 
 
+def test_two_projects_on_one_folder_share_the_lane():
+    """T0R2-5, a DELIBERATE reversal of T0's `(project_id, workspace_root)` key.
+
+    Folder exclusivity used to hold only WITHIN one project: two projects
+    attached to the same folder each got their own lane and ran at the same
+    time, while the lane docstring and ARCHITECTURE both stated the invariant as
+    "one folder is one writer lane". A named folder is now the lane key on its
+    own, so the claim and the behaviour finally agree.
+    """
+    alpha = _task("alpha", tid="t1", workspace_root="/w/shared")
+    beta = _task("beta", tid="t2", workspace_root="/w/shared")
+
+    lanes = running_project_lanes([_meta(alpha)])
+
+    assert lanes == {("", os.path.normcase("/w/shared"))}
+    assert candidate_is_leasable(beta, lanes) is False
+    # A task that names NO folder is narrower on purpose: nothing at this layer
+    # may read the registry, so it can only serialize within its own project.
+    assert candidate_is_leasable(_task("beta", tid="t3"), lanes) is True
+    assert running_project_lanes([_meta(_task("beta", tid="t3"))]) == {("beta", "")}
+
+
 def test_lane_reads_the_metadata_mirror_and_normalizes_the_path():
     """workspace_root rides both the task record and its metadata mirror; the
     comparison is pure normpath/normcase (no filesystem access under the queue
@@ -103,8 +125,71 @@ def test_lane_reads_the_metadata_mirror_and_normalizes_the_path():
     noisy = _task("alpha", tid="t2", workspace_root="/w/alpha/./")
 
     lanes = running_project_lanes([_meta(mirrored)])
-    assert lanes == {("alpha", os.path.normcase("/w/alpha"))}
+    assert lanes == {("", os.path.normcase("/w/alpha"))}
     assert candidate_is_leasable(noisy, lanes) is False
+
+
+def test_lane_folds_case_on_a_case_insensitive_filesystem():
+    """T0R2-4: `normcase` lowercases on win32 ONLY, so on macOS `/Users/x/Repo`
+    and `/Users/x/repo` — the SAME folder — produced two lanes and admitted two
+    writers onto it. The docstring claimed a case-insensitive lane it did not
+    deliver; now it delivers one wherever the platform's filesystem is."""
+    import sys
+
+    upper = _task("alpha", tid="t1", workspace_root="/W/Alpha")
+    lower = _task("beta", tid="t2", workspace_root="/w/alpha")
+
+    lanes = running_project_lanes([_meta(upper)])
+
+    if sys.platform in ("darwin", "win32"):
+        assert candidate_is_leasable(lower, lanes) is False
+    else:
+        # A case-SENSITIVE filesystem genuinely has two folders here, and
+        # folding them together would serialize two unrelated writers.
+        assert candidate_is_leasable(lower, lanes) is True
+
+
+def test_a_running_lane_is_pinned_and_cannot_drift():
+    """T0R2-7: a live writer must not be moved off the folder it is writing in.
+
+    The lane used to be recomputed from the task record on every assignment
+    pass, so a mid-run mutation (the post-hoc project conversion is the live
+    one) released the lane the task actually held and let a second writer into
+    the same folder.
+    """
+    from ouroboros.project_lease import LANE_PIN_FIELD, pin_task_lane
+
+    running = _task("alpha", tid="t1", workspace_root="/w/alpha")
+    assert pin_task_lane(running) == ("", os.path.normcase("/w/alpha"))
+    assert running[LANE_PIN_FIELD] == ["", os.path.normcase("/w/alpha")]
+
+    # Something edits the live record underneath the writer.
+    running["workspace_root"] = "/w/somewhere-else"
+    running["project_id"] = "beta"
+
+    lanes = running_project_lanes([_meta(running)])
+    assert lanes == {("", os.path.normcase("/w/alpha"))}
+    assert candidate_is_leasable(
+        _task("alpha", tid="t2", workspace_root="/w/alpha"), lanes
+    ) is False
+    # The pin is write-once: re-pinning never overwrites a held lane.
+    assert pin_task_lane(running) == ("", os.path.normcase("/w/alpha"))
+
+
+def test_post_hoc_conversion_pins_the_lane_it_acquires():
+    """A RUNNING task that was never a lane occupant ACQUIRES one when the owner
+    converts it into a project. That is a deliberate take, not drift, so it pins
+    on the spot — otherwise a later registry edit could move a live writer."""
+    from ouroboros.project_lease import LANE_PIN_FIELD, mark_task_project
+
+    unscoped = {"id": "t1", "workspace_root": "/w/alpha"}
+    running = {"t1": {"task": unscoped}}
+    assert running_project_lanes(running.values()) == set()
+
+    assert mark_task_project(running, [], "t1", "alpha") is True
+
+    assert unscoped[LANE_PIN_FIELD] == ["", os.path.normcase("/w/alpha")]
+    assert running_project_lanes(running.values()) == {("", os.path.normcase("/w/alpha"))}
 
 
 def test_project_chat_id_policy():

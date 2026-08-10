@@ -2348,7 +2348,7 @@ def assign_tasks() -> None:
                 send_with_budget(int(st["owner_chat_id"]), evo_block)
             queue.persist_queue_snapshot(reason="evolution_blocked_light")
 
-        from ouroboros.project_lease import candidate_is_leasable, running_project_lanes
+        from ouroboros.project_lease import candidate_is_leasable, pin_task_lane, running_project_lanes
         from ouroboros.config import get_max_active_subagents_per_root
 
         def _running_subagent_count(root_task_id: str) -> int:
@@ -2484,8 +2484,15 @@ def assign_tasks() -> None:
                 w.busy_task_id = task["id"]
                 w.in_q.put(task)
                 now_ts = time.time()
+                running_record = dict(task)
+                # PIN the writer lane at the RUNNING transition (T0R2-7). Derived
+                # on demand, a mid-run edit of this record — the post-hoc project
+                # conversion is the live one — silently moved the task into a
+                # different lane, releasing the folder it is still writing in and
+                # admitting a second writer onto it.
+                pin_task_lane(running_record)
                 RUNNING[task["id"]] = {
-                    "task": dict(task), "worker_id": w.wid,
+                    "task": running_record, "worker_id": w.wid,
                     "started_at": now_ts, "last_heartbeat_at": now_ts,
                     "soft_sent": False, "attempt": int(task.get("_attempt") or 1),
                 }
