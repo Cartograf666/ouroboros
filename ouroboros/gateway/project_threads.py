@@ -479,14 +479,39 @@ async def api_thread_delete(request: Request) -> JSONResponse:
     one-click removal A10/D4 already offer for a clean, fully merged checkout.
     Nothing is destroyed silently and nothing is destroyed without evidence.
     """
+    from ouroboros.contracts.chat_id_policy import MAIN_THREAD_ID
+    from ouroboros.project_threads_registry import (
+        THREAD_ACTIVE,
+        THREAD_ARCHIVED,
+        THREAD_DELETING,
+        ThreadLifecycleError,
+    )
     from ouroboros.projects_registry import begin_thread_deletion, get_thread
     from ouroboros.thread_branching import thread_location
     from ouroboros.thread_worktrees import get_thread_worktree, remove_thread_worktree
     from supervisor.task_lifecycle import start_thread_deletion
 
+    #: The states `begin_thread_deletion` will accept. Asked HERE, before the
+    #: checkout is touched, because the checkout removal now happens first: a
+    #: transition the registry would refuse must not delete a folder on its way to
+    #: a 409. `_set_thread_lifecycle` remains the SSOT for the transition itself —
+    #: this only decides whether to start.
+    _DELETABLE_FROM = frozenset({THREAD_ACTIVE, THREAD_ARCHIVED, THREAD_DELETING})
+
     def _run(drive_root, pid, thread_id):
         thread = get_thread(drive_root, pid, thread_id) or {}
         tid = int(thread.get("id") or 0)
+        lifecycle = str(thread.get("lifecycle") or THREAD_ACTIVE)
+        if tid == MAIN_THREAD_ID:
+            raise ThreadLifecycleError(
+                "thread_zero_is_the_project",
+                "This thread IS the project. Archive or delete the project itself.",
+            )
+        if lifecycle not in _DELETABLE_FROM:
+            raise ThreadLifecycleError(
+                "lifecycle_conflict",
+                f"this thread is {lifecycle}; it cannot become {THREAD_DELETING}",
+            )
         removed: Dict[str, Any] = {}
         if get_thread_worktree(drive_root, pid, tid):
             # BEFORE the fence: a refusal must leave the thread exactly as it was,

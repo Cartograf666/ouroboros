@@ -385,6 +385,30 @@ def test_delete_REFUSES_while_the_checkout_still_holds_work(tmp_path, folder, mo
     assert get_thread(drive, "racer", thread["id"])["lifecycle"] == "active"
 
 
+def test_a_delete_that_will_be_REFUSED_never_removes_the_checkout_first(tmp_path, folder, monkeypatch):
+    """Self-review of the M2 ordering. The checkout is removed BEFORE the fence so
+    a refusal leaves the thread exactly as it was — which means a transition the
+    registry would refuse must be caught HERE, or the folder is destroyed on the
+    way to a 409. Thread #0 is the project (`thread_zero_is_the_project`), and a
+    tombstone is terminal."""
+    started: list = []
+    monkeypatch.setattr(
+        "supervisor.task_lifecycle.start_thread_deletion",
+        lambda drive_root, pid, tid, chat_id: started.append(tid) or True,
+    )
+    drive = tmp_path / "drive"
+    create_project(drive, "racer", name="Racer", working_dir=str(folder))
+    branched = _client(drive).post("/api/projects/racer/threads/0/branch-off", json={}).json()
+    assert branched["ok"] is True, branched
+
+    response = _lifecycle_client(drive).post("/api/projects/racer/threads/0/delete", json={})
+
+    assert response.status_code == 409
+    assert response.json()["reason"] == "thread_zero_is_the_project"
+    assert started == []
+    assert pathlib.Path(branched["path"]).is_dir(), "a refused delete must destroy nothing"
+
+
 def test_branch_bases_carries_the_honest_queue_notice(wired, monkeypatch):
     """A14: the sentence says QUEUED, not rejected, and offers branching."""
     from supervisor import workers
