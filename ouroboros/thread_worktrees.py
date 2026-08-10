@@ -308,6 +308,65 @@ def inspect_thread_worktree(row: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+#: ``git status --porcelain`` codes for content git is not tracking. ``!!`` only
+#: appears because :func:`inspect_thread_worktree` asks for ``--ignored=matching``.
+_UNTRACKED_CODE = "??"
+_IGNORED_CODE = "!!"
+
+
+def checkout_work_at_risk(inspection: Dict[str, Any]) -> Dict[str, Any]:
+    """Split what a checkout holds into work that CANNOT be rebuilt, and the rest.
+
+    Returns ``{at_risk, unmerged_commits, tracked_files, untracked_files,
+    ignored_files, unreadable}``. A pure read over an existing inspection — it
+    asks nothing of git and never touches the disk.
+
+    ``inspect_thread_worktree`` deliberately counts an ignored ``node_modules/``
+    as dirt, because REMOVING the checkout destroys it and A10's prompt must say
+    so. But "would be destroyed" and "cannot be rebuilt" are different questions,
+    and only the second one may BLOCK an owner gesture aimed at something else.
+    Thread DELETION asks the second: a checkout whose only dirt is a build
+    directory or a stray log is not work at risk, and refusing the delete over it
+    made "delete the thread and its folder" a three-step detour through merge-back
+    and an acknowledged removal — friction the owner explicitly did not ask for.
+
+    At risk means, exactly:
+
+    * ``unmerged_commits`` — commits the project folder never received. The
+      checkout's branch is their last copy.
+    * ``tracked_files`` — modifications to files git is TRACKING. Their previous
+      contents are in history; these edits are nowhere else.
+    * ``unreadable`` — the inspection could not be taken. "Cannot tell" must never
+      read as "nothing to lose", so it counts as at risk on its own.
+
+    Untracked and ignored files are neither destroyed silently nor treated as
+    unlosable: they are NAMED and go through the same acknowledgement the removal
+    route uses. Acknowledging is a step; being refused is a wall.
+    """
+    files = [str(line) for line in (inspection.get("dirty_files") or []) if str(line).strip()]
+    tracked: List[str] = []
+    untracked: List[str] = []
+    ignored: List[str] = []
+    for line in files:
+        code = line[:2]
+        if code == _IGNORED_CODE:
+            ignored.append(line)
+        elif code == _UNTRACKED_CODE:
+            untracked.append(line)
+        else:
+            tracked.append(line)
+    unreadable = str(inspection.get("error") or "").strip()
+    commits = int(inspection.get("unmerged_commits") or 0)
+    return {
+        "at_risk": bool(commits > 0 or tracked or unreadable),
+        "unmerged_commits": commits,
+        "tracked_files": tracked,
+        "untracked_files": untracked,
+        "ignored_files": ignored,
+        "unreadable": unreadable,
+    }
+
+
 def remove_thread_worktree(
     *,
     data_dir: Any,
@@ -404,7 +463,16 @@ def remove_thread_worktree(
         if wt_path.exists():
             force_rmtree(wt_path)
         run_git(repo, "worktree", "prune", check=False)
-        branch_removed, branch_kept_reason = _drop_clean_branch(repo, branch, unsafe)
+        # The branch is kept for COMMITS, never merely for dirt. An acknowledged
+        # removal whose only dirt was an ignored `node_modules/` has nothing on
+        # that branch the repository would not still have, and keeping it left a
+        # `thread/<name>` behind that the next branch-off refuses on — and that
+        # nothing can reach at all once the thread it belonged to is tombstoned.
+        # `git branch -d` is still the second judge and still refuses on its own
+        # account, so this only ever ASKS; it never forces.
+        branch_removed, branch_kept_reason = _drop_clean_branch(
+            repo, branch, bool(inspection["error"]) or int(inspection["unmerged_commits"]) > 0,
+        )
         with _LOCK:
             _save(data_dir, [row for row in _load(data_dir) if not _matches(row, key)])
         log.info("Thread worktree removed: %s#%s (%s)", key[0], key[1], wt_path)
@@ -456,17 +524,23 @@ def _trusted_guard_root(row: Dict[str, Any], fallback: Path, data_dir: Any) -> P
     return candidate
 
 
-def _drop_clean_branch(repo: Path, branch: str, unsafe: bool) -> tuple:
+def _drop_clean_branch(repo: Path, branch: str, holds_commits: bool) -> tuple:
     """Delete a thread branch that has nothing left to lose. ``(removed, why_kept)``.
 
     ``git branch -d`` — never ``-D``. The safe form is the point: it is git's own
     second opinion on whether the branch holds anything the repository would not
     still have afterwards, and it refusing means the branch stays. A branch that
     stays is disclosed with the reason, never silently.
+
+    ``holds_commits`` is about the HISTORY, not about the working tree: commits
+    the project folder never received, or an inspection that could not be taken
+    at all. Uncommitted or ignored files are not on the branch, so keeping it
+    would protect nothing while leaving a `thread/<name>` the next branch-off
+    refuses on.
     """
     if not branch or not branch.startswith(_BRANCH_PREFIX):
         return False, "not a thread branch"
-    if unsafe:
+    if holds_commits:
         # The owner acknowledged losing the CHECKOUT. Its commits are a separate
         # thing and this is the last copy of them.
         return False, "the checkout held unmerged work, so its branch keeps the commits"
@@ -481,6 +555,7 @@ def _drop_clean_branch(repo: Path, branch: str, unsafe: bool) -> tuple:
 
 __all__ = [
     "ThreadWorktree",
+    "checkout_work_at_risk",
     "get_thread_worktree",
     "inspect_thread_worktree",
     "list_thread_worktrees",

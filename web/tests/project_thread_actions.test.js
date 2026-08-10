@@ -320,3 +320,78 @@ test('opening a thread checkout goes through the SAME event seam the inspector u
         globalThis.window = original;
     }
 });
+
+test('deleting a thread carries the owner\'s acknowledgement to the server', async () => {
+    // A server-side escape with no client producer is itself a defect (T3R2-H6).
+    // `checkout_holds_rebuildable_files` is the delete route's only answerable
+    // refusal, and nothing could answer it unless the flag travels from here.
+    const { threadOps } = await import('../modules/project_thread_actions.js');
+    const { apiClient } = await import('../modules/api_client.js');
+    const seen = [];
+    const original = apiClient.threadDelete;
+    apiClient.threadDelete = (...args) => { seen.push(args); return Promise.resolve({}); };
+    try {
+        await threadOps.delete('racer', 2);
+        await threadOps.delete('racer', 2, true);
+    } finally {
+        apiClient.threadDelete = original;
+    }
+    assert.deepEqual(seen, [['racer', 2, false], ['racer', 2, true]]);
+});
+
+test('threadDelete puts the acknowledgement in the request BODY', async () => {
+    // The seam only helps if it reaches the wire. Verified end to end: a browser
+    // calling threadOps.delete(..., true) must produce
+    // `{acknowledge_unmerged: true}` on POST .../delete, the field the route
+    // reads — the same consent name threadWorktreeRemove already sends.
+    const { threadOps } = await import('../modules/project_thread_actions.js');
+    const calls = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (url, options) => {
+        calls.push({ url: String(url), body: JSON.parse(options.body) });
+        return Promise.resolve({
+            ok: true, status: 200,
+            headers: { get: () => 'application/json' },
+            json: () => Promise.resolve({ ok: true }),
+            text: () => Promise.resolve('{"ok":true}'),
+        });
+    };
+    try {
+        await threadOps.delete('racer', 2);
+        await threadOps.delete('racer', 2, true);
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+    assert.equal(calls.length, 2);
+    assert.match(calls[0].url, /\/api\/projects\/racer\/threads\/2\/delete$/);
+    assert.deepEqual(calls[0].body, { acknowledge_unmerged: false });
+    assert.deepEqual(calls[1].body, { acknowledge_unmerged: true });
+});
+
+test('the two delete refusals read differently: one is a question, one is a wall', () => {
+    // H3 made the inspection count ignored files; M2 then made ANY unclean
+    // inspection refuse the DELETE, so a checkout holding only node_modules/
+    // needed three steps to remove. The rebuildable case is answerable now, and
+    // the at-risk one deliberately is not — it names the removal route instead.
+    const rebuildable = describeOutcome({
+        ok: false,
+        reason: 'checkout_holds_rebuildable_files',
+        message: 'This thread\'s checkout holds 2 files git was told to ignore — nothing committed.',
+        acknowledgeable: true,
+        inspection: { dirty: true, dirty_files: ['!! node_modules/', '!! build.log'] },
+    });
+    assert.equal(rebuildable.acknowledgeable, true);
+    assert.deepEqual(rebuildable.evidence, ['!! node_modules/', '!! build.log']);
+    assert.match(rebuildable.text, /told to ignore/);
+
+    const atRisk = describeOutcome({
+        ok: false,
+        reason: 'checkout_holds_work',
+        message: 'This thread\'s checkout holds 2 commits that exist nowhere else. Remove checkout…',
+        acknowledgeable: false,
+        inspection: { dirty: false, dirty_files: [] },
+    });
+    assert.equal(atRisk.acknowledgeable, false);
+    assert.match(atRisk.text, /exist nowhere else/);
+    assert.match(atRisk.text, /Remove checkout/);
+});

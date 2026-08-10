@@ -117,7 +117,10 @@ export function threadActions(thread, location) {
  *
  *   - `acknowledgeable` — the server saying this refusal HAS an owner-answerable
  *     flag. Without it nothing could render the second call, so `checkout_dirty`
- *     read as a dead end when it is a question.
+ *     read as a dead end when it is a question. DELETE uses the same field for
+ *     `checkout_holds_rebuildable_files` (a checkout whose only contents are
+ *     ignored or untracked files); its `checkout_holds_work` sibling deliberately
+ *     does not set it, because that one is a wall with a named way around it.
  *   - `decision` — T2's typed `git_init_required` OFFER. `apiClient.projectInitGit`
  *     exists and is the yes to it; a menu that never sees the object cannot
  *     offer the yes.
@@ -309,5 +312,17 @@ export const threadOps = {
     ),
     archive: (projectId, threadId) => apiClient.threadArchive(projectId, threadId),
     restore: (projectId, threadId) => apiClient.threadRestore(projectId, threadId),
-    delete: (projectId, threadId) => apiClient.threadDelete(projectId, threadId),
+    /**
+     * Delete a thread, checkout and all. `acknowledged` is the owner's answer to
+     * `checkout_holds_rebuildable_files` — a checkout whose only contents are
+     * ignored or untracked files — and is the SAME separate-argument shape
+     * `removeWorktree` and `mergeBack` use, so nobody passes it by accident.
+     *
+     * It is not an override: `checkout_holds_work` (unmerged commits, changes to
+     * tracked files, an unreadable checkout) refuses whatever this says, and the
+     * route out of that one is `removeWorktree` or a merge back.
+     */
+    delete: (projectId, threadId, acknowledged = false) => (
+        apiClient.threadDelete(projectId, threadId, acknowledged)
+    ),
 };

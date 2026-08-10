@@ -24,6 +24,7 @@ from ouroboros.gateway.contracts import (
     ThreadBranchBasesResponse,
     ThreadBranchOffRequest,
     ThreadCreateRequest,
+    ThreadDeleteRequest,
     ThreadDiffResponse,
     ThreadEntry,
     ThreadLifecycleResponse,
@@ -140,6 +141,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "ThreadBranchOffRequest",
         "ThreadMergeBackRequest",
         "ThreadWorktreeRemoveRequest",
+        "ThreadDeleteRequest",
         "ThreadWorktreeResponse",
         "ThreadDiffResponse",
         "ThreadLifecycleResponse",
@@ -187,6 +189,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
                 ThreadEntry, ThreadCreateRequest, ThreadUpdateRequest, ThreadResponse,
                 ThreadLocation, ThreadBranchBase, ThreadBranchBasesResponse,
                 ThreadBranchOffRequest, ThreadMergeBackRequest, ThreadWorktreeRemoveRequest,
+                ThreadDeleteRequest,
                 ThreadWorktreeResponse, ThreadDiffResponse, ThreadLifecycleResponse, ThreadQueueNotice,
                 WorkspaceGitInitDecision, ProjectInitGitResponse,
                 ProjectFromTaskResponse):

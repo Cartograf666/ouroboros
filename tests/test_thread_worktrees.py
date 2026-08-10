@@ -609,3 +609,100 @@ def test_removal_does_not_hold_the_registry_lock_across_its_git_calls(repo, tmp_
     assert outcome["removed"] is True, outcome
     assert seen, "the removal must actually have called git"
     assert not any(seen), "the registry lock was held across a git call"
+
+
+def test_checkout_work_at_risk_separates_the_unlosable_from_the_rebuildable():
+    """The question DELETION asks, which is not the question REMOVAL asks.
+
+    `inspect_thread_worktree` answers "what would removing this DESTROY", and an
+    ignored `node_modules/` belongs in that answer (H3). Deletion asks the
+    narrower "what here cannot be rebuilt", because only that may block a gesture
+    aimed at the thread rather than at the folder — refusing a delete over a build
+    directory made "delete the thread and its folder" a three-step detour.
+
+    A pure read over an existing inspection: no git, no disk.
+    """
+    from ouroboros.thread_worktrees import checkout_work_at_risk
+
+    clean = checkout_work_at_risk(
+        {"dirty": False, "dirty_files": [], "unmerged_commits": 0, "error": ""},
+    )
+    assert clean["at_risk"] is False
+    assert clean == {
+        "at_risk": False, "unmerged_commits": 0, "tracked_files": [],
+        "untracked_files": [], "ignored_files": [], "unreadable": "",
+    }
+
+    rebuildable = checkout_work_at_risk({
+        "dirty": True,
+        "dirty_files": ["!! node_modules/", "!! build.log", "?? scratch.txt"],
+        "unmerged_commits": 0,
+        "error": "",
+    })
+    assert rebuildable["at_risk"] is False
+    assert rebuildable["ignored_files"] == ["!! node_modules/", "!! build.log"]
+    assert rebuildable["untracked_files"] == ["?? scratch.txt"]
+    assert rebuildable["tracked_files"] == []
+
+    # A TRACKED modification is at risk: its previous contents are in history,
+    # this edit is nowhere at all. Every porcelain code that is not ?? or !!
+    # counts, including the staged, renamed and conflicted spellings.
+    for line in (" M app.txt", "M  app.txt", "A  new.py", "D  gone.txt",
+                 "R  old.txt -> new.txt", "UU merged.txt", "AM half.txt"):
+        risk = checkout_work_at_risk(
+            {"dirty": True, "dirty_files": [line], "unmerged_commits": 0, "error": ""},
+        )
+        assert risk["at_risk"] is True, line
+        assert risk["tracked_files"] == [line]
+
+    # Commits the project folder never received are at risk on their own, even in
+    # a spotlessly clean tree.
+    commits = checkout_work_at_risk(
+        {"dirty": False, "dirty_files": [], "unmerged_commits": 3, "error": ""},
+    )
+    assert commits["at_risk"] is True
+    assert commits["unmerged_commits"] == 3
+
+    # "Cannot tell" must never read as "nothing to lose".
+    unreadable = checkout_work_at_risk(
+        {"dirty": True, "dirty_files": [], "unmerged_commits": 0,
+         "error": "the checkout is not on disk: /gone"},
+    )
+    assert unreadable["at_risk"] is True
+    assert unreadable["unreadable"].startswith("the checkout is not on disk")
+
+
+def test_an_acknowledged_removal_keeps_the_branch_only_for_COMMITS(repo, tmp_path, wt_root):
+    """A branch is kept because it holds HISTORY, never because a folder was dirty.
+
+    An acknowledged removal whose only dirt was an ignored `node_modules/` has
+    nothing on its branch the repository would not still have, and keeping it left
+    a `thread/<name>` behind that the next branch-off refuses on — and that
+    nothing can reach at all once the thread it belonged to is tombstoned.
+    `git branch -d` is still the second judge, so this only ever asks.
+    """
+    from pathlib import Path
+
+    handle = _provision(repo, tmp_path, wt_root)
+    checkout = Path(handle.path)
+    (repo / ".gitignore").write_text("*.log\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "ignore logs")
+    (checkout / "build.log").write_text("noise\n", encoding="utf-8")
+
+    refused = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1, worktree_root=wt_root,
+    )
+    # A10 is UNCHANGED: removal still refuses over ignored files until acknowledged.
+    assert refused["removed"] is False
+    assert refused["reason"] == "unmerged_work"
+
+    done = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1,
+        acknowledge_unmerged=True, worktree_root=wt_root,
+    )
+
+    assert done["removed"] is True
+    assert done["branch_removed"] is True, done["branch_kept_reason"]
+    assert done["branch_kept_reason"] == ""
+    assert handle.branch not in _git(repo, "branch", "--format=%(refname:short)").stdout.split()

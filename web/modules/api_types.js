@@ -462,6 +462,19 @@
  */
 
 /**
+ * Thread-delete body, entirely optional — a bare POST is the ordinary call.
+ * acknowledge_unmerged IS the owner's consent to delete a thread whose checkout
+ * still holds ignored or untracked files (a node_modules/, a build.log): the
+ * default answers checkout_holds_rebuildable_files naming exactly what is there,
+ * and this flag is the yes. The SAME name the removal route uses — one consent
+ * idiom, not three. It is NOT an override for work at risk: unmerged commits,
+ * changes to tracked files and an unreadable checkout refuse with
+ * checkout_holds_work whatever this says.
+ * @typedef {Object} ThreadDeleteRequest
+ * @property {boolean=} acknowledge_unmerged
+ */
+
+/**
  * ONE envelope for every branch/merge/remove answer, success or refusal. ok is
  * the only field to read first. A refusal carries a typed reason, owner-facing
  * message copy, and whatever evidence that reason has: conflicts for a stopped
@@ -558,9 +571,15 @@
  * thread still has a checkout afterwards; worktree_removed (delete) says a CLEAN
  * one went with the thread, naming its branch and whether that went too — a
  * tombstoned thread is invisible on every surface and branch/merge refuse it, so
- * a checkout left behind is a folder and a branch nothing can reach any more. One
- * holding uncommitted work or unmerged commits REFUSES the deletion instead
- * (checkout_holds_work, with its inspection attached).
+ * a checkout left behind is a folder and a branch nothing can reach any more.
+ *
+ * Two refusals guard that and they are NOT the same answer. Work at risk —
+ * unmerged commits, changes to TRACKED files, an unreadable checkout — refuses
+ * with checkout_holds_work and names the removal route; no flag overrides it. A
+ * checkout holding only ignored or untracked content answers
+ * checkout_holds_rebuildable_files with acknowledgeable true, which is a question
+ * the owner answers by re-sending with acknowledge_unmerged. Both carry the
+ * inspection.
  * visible_until_terminal (archive) says the thread was archived while a task was
  * still running, so it stays on screen until that task finishes.
  * @typedef {Object} ThreadLifecycleResponse
@@ -578,6 +597,9 @@
  * @property {boolean=} worktree_removed
  * @property {string=} branch
  * @property {boolean=} branch_removed
+ * @property {boolean=} acknowledgeable a refusal the owner can ANSWER
+ *   (checkout_holds_rebuildable_files), in the same field name the merge-back
+ *   envelope uses for checkout_dirty; checkout_holds_work never sets it
  * @property {Object=} inspection
  * @property {ThreadLocation=} location
  */

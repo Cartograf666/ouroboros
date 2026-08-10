@@ -232,14 +232,25 @@ export const apiClient = {
     threadRestore: (projectId, threadId) => jsonPost(`${threadPath(projectId, threadId)}/restore`, {}),
     /**
      * Delete a thread: fence routing, cancel its tasks, then tombstone. The id is
-     * never reused and the journal rows honestly remain. A CLEAN checkout goes
-     * with the thread (`worktree_removed`) — a tombstoned thread is invisible on
-     * every surface, so one left behind is a folder and a branch nothing can
-     * reach; one holding work REFUSES the delete with `checkout_holds_work`, and
-     * removing that is still its own inspected act.
+     * never reused and the journal rows honestly remain. The checkout goes with
+     * the thread (`worktree_removed`) — a tombstoned thread is invisible on every
+     * surface, so one left behind is a folder and a branch nothing can reach.
+     *
+     * Two refusals, and only one of them is a question. Work at RISK (unmerged
+     * commits, changes to tracked files, an unreadable checkout) refuses with
+     * `checkout_holds_work` and names the removal route; nothing overrides it. A
+     * checkout holding only ignored or untracked files answers
+     * `checkout_holds_rebuildable_files`, and `acknowledgeUnmerged` is the owner's
+     * yes to exactly that — the same argument shape `threadWorktreeRemove` and
+     * `threadMergeBack` already take. Without a producer here the server's escape
+     * would have no client at all and one `node_modules/` would make deleting a
+     * thread a three-step detour (T3R2-H6 is precisely that class of defect).
      * @returns {Promise<import('./api_types.js').ThreadLifecycleResponse>}
      */
-    threadDelete: (projectId, threadId) => jsonPost(`${threadPath(projectId, threadId)}/delete`, {}),
+    threadDelete: (projectId, threadId, acknowledgeUnmerged = false) => jsonPost(
+        `${threadPath(projectId, threadId)}/delete`,
+        { acknowledge_unmerged: !!acknowledgeUnmerged },
+    ),
     /** @returns {Promise<import('./api_types.js').FsDirsResponse>} */
     fsDirs: (path = '') => fetchJson(`/api/fs/dirs${path ? `?path=${encodeURIComponent(path)}` : ''}`, { cache: 'no-store' }),
     /**

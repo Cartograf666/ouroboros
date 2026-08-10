@@ -468,16 +468,27 @@ async def api_thread_delete(request: Request) -> JSONResponse:
     physically REMAIN — the journal is shared by every chat and nothing here
     rewrites it.
 
-    The thread's CHECKOUT goes with it when there is nothing to lose, and only
-    then. A tombstoned thread is invisible on every surface, `list_thread_worktrees`
-    has no route, and branch/merge refuse `thread_not_live` — so leaving the
-    checkout behind orphaned a folder and a branch that A10's "explicit removal"
-    could no longer reach, on durable state that is exempt from every GC. A
-    checkout holding uncommitted work or commits the project folder never received
-    REFUSES the deletion and names the explicit removal route; a clean one is
-    removed here, disclosed on the answer (`worktree_removed`), which is the same
-    one-click removal A10/D4 already offer for a clean, fully merged checkout.
-    Nothing is destroyed silently and nothing is destroyed without evidence.
+    The thread's CHECKOUT goes with it. A tombstoned thread is invisible on every
+    surface, `list_thread_worktrees` has no route, and branch/merge refuse
+    `thread_not_live` — so leaving the checkout behind orphaned a folder and a
+    branch that A10's "explicit removal" could no longer reach, on durable state
+    that is exempt from every GC.
+
+    What may BLOCK that is only work genuinely at risk (`checkout_work_at_risk`):
+    commits the project folder never received, modifications to files git is
+    TRACKING, or an inspection that could not be taken at all. Those refuse with
+    `checkout_holds_work` and name the explicit removal route, because a gesture
+    aimed at a thread must never destroy the last copy of something.
+
+    A checkout whose only dirt is ignored or untracked content — a
+    `node_modules/`, a `build.log` — does NOT refuse. It rides the same
+    acknowledgement shape the removal route already uses
+    (`acknowledge_unmerged` in the body): the first call answers
+    `checkout_holds_rebuildable_files` naming exactly what is there, and the
+    owner's yes deletes both. Refusing over a build directory made "delete this
+    thread and its folder" a three-step detour through merge-back and an
+    acknowledged removal, which is friction the owner did not ask for; naming it
+    and asking once is two steps and destroys nothing silently.
     """
     from ouroboros.contracts.chat_id_policy import MAIN_THREAD_ID
     from ouroboros.project_threads_registry import (
@@ -488,7 +499,12 @@ async def api_thread_delete(request: Request) -> JSONResponse:
     )
     from ouroboros.projects_registry import begin_thread_deletion, get_thread
     from ouroboros.thread_branching import thread_location
-    from ouroboros.thread_worktrees import get_thread_worktree, remove_thread_worktree
+    from ouroboros.thread_worktrees import (
+        checkout_work_at_risk,
+        get_thread_worktree,
+        inspect_thread_worktree,
+        remove_thread_worktree,
+    )
     from supervisor.task_lifecycle import start_thread_deletion
 
     #: The states `begin_thread_deletion` will accept. Asked HERE, before the
@@ -498,7 +514,22 @@ async def api_thread_delete(request: Request) -> JSONResponse:
     #: this only decides whether to start.
     _DELETABLE_FROM = frozenset({THREAD_ACTIVE, THREAD_ARCHIVED, THREAD_DELETING})
 
-    def _run(drive_root, pid, thread_id):
+    def _refuse(drive_root, pid, tid, reason, message, inspection):
+        return JSONResponse({
+            "ok": False,
+            "reason": reason,
+            "message": message,
+            "project_id": pid,
+            "thread_id": tid,
+            "inspection": inspection,
+            # `checkout_holds_rebuildable_files` is a QUESTION, not a wall, and a
+            # menu can only render the second call if the answer says so — the
+            # same field `checkout_dirty` uses on the merge-back envelope.
+            "acknowledgeable": reason == "checkout_holds_rebuildable_files",
+            "location": thread_location(drive_root, pid, tid),
+        }, status_code=_refusal_status(reason))
+
+    def _run(drive_root, pid, thread_id, acknowledged=False):
         thread = get_thread(drive_root, pid, thread_id) or {}
         tid = int(thread.get("id") or 0)
         lifecycle = str(thread.get("lifecycle") or THREAD_ACTIVE)
@@ -513,29 +544,46 @@ async def api_thread_delete(request: Request) -> JSONResponse:
                 f"this thread is {lifecycle}; it cannot become {THREAD_DELETING}",
             )
         removed: Dict[str, Any] = {}
-        if get_thread_worktree(drive_root, pid, tid):
+        row = get_thread_worktree(drive_root, pid, tid)
+        if row:
             # BEFORE the fence: a refusal must leave the thread exactly as it was,
-            # not fenced-but-undeleted with no way forward.
+            # not fenced-but-undeleted with no way forward. The inspection is read
+            # here rather than left to `remove_thread_worktree` because DELETION
+            # blocks on a narrower fact than removal does — `checkout_work_at_risk`.
+            inspection = inspect_thread_worktree(row)
+            risk = checkout_work_at_risk(inspection)
+            if risk["at_risk"]:
+                return _refuse(
+                    drive_root, pid, tid, "checkout_holds_work",
+                    _delete_refusal_message(risk), inspection,
+                )
+            if (risk["ignored_files"] or risk["untracked_files"]) and not acknowledged:
+                return _refuse(
+                    drive_root, pid, tid, "checkout_holds_rebuildable_files",
+                    _delete_confirm_message(risk), inspection,
+                )
+            # Nothing at risk: the acknowledgement (when one was needed) has been
+            # given, so the checkout goes. `acknowledge_unmerged` is passed because
+            # ignored files make the removal's own judge read "dirty"; the branch
+            # still faces `git branch -d` on its own account.
             removed = remove_thread_worktree(
                 data_dir=drive_root, project_id=pid, thread_id=tid,
+                acknowledge_unmerged=True,
             )
             if not removed.get("removed"):
+                # `project_busy`, `path_outside_root`, or work that appeared
+                # between the inspection and the removal. Not the owner's cue to
+                # confirm anything — the reason says what to do.
                 reason = str(removed.get("reason") or "")
-                inspection = removed.get("inspection") or {}
-                return JSONResponse({
-                    "ok": False,
-                    "reason": "checkout_holds_work" if reason == "unmerged_work" else reason,
-                    "message": (
-                        f"{_removal_message(reason, inspection)} This thread cannot be "
-                        "deleted while its checkout is in that state, because deleting it "
-                        "would leave the folder and its branch with no surface that can "
-                        "reach them."
-                    ),
-                    "project_id": pid,
-                    "thread_id": tid,
-                    "inspection": inspection,
-                    "location": thread_location(drive_root, pid, tid),
-                }, status_code=_refusal_status(reason))
+                late = removed.get("inspection") or inspection
+                return _refuse(
+                    drive_root, pid, tid,
+                    "checkout_holds_work" if reason == "unmerged_work" else reason,
+                    f"{_removal_message(reason, late)} This thread cannot be deleted "
+                    "while its checkout is in that state, because deleting it would "
+                    "leave the folder and its branch with no surface that can reach them.",
+                    late,
+                )
         fenced = begin_thread_deletion(drive_root, pid, thread_id)
         if fenced is None:
             return JSONResponse(
@@ -559,9 +607,65 @@ async def api_thread_delete(request: Request) -> JSONResponse:
         )
 
     try:
-        return await _lifecycle_route(request, _run)
+        body = await _json_body(request)
+        if body is None:
+            return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+        return await _lifecycle_route(
+            request, _run, acknowledged=bool(body.get("acknowledge_unmerged")),
+        )
     except Exception as exc:
         return json_exception(exc)
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+def _delete_refusal_message(risk: Dict[str, Any]) -> str:
+    """Why a deletion will NOT go ahead — naming the work that is actually at stake.
+
+    "Holds work" is not a category the owner can act on. Commits that exist
+    nowhere else and edits to tracked files are different problems with different
+    answers, so they are named separately, and the sentence ends on the route out
+    rather than on the wall.
+    """
+    parts = []
+    if risk["unmerged_commits"]:
+        parts.append(
+            f"{_plural(int(risk['unmerged_commits']), 'commit')} that exist nowhere else — "
+            "the project folder never received them"
+        )
+    if risk["tracked_files"]:
+        parts.append(f"changes to {_plural(len(risk['tracked_files']), 'file')} git is tracking")
+    if risk["unreadable"]:
+        parts.append("a checkout that could not be read, so its contents are unknown")
+    detail = " and ".join(parts) if parts else "work the project folder never received"
+    return (
+        f"This thread's checkout holds {detail}. Deleting the thread would delete that "
+        "folder, and a deleted thread has no surface left that could reach it — so the "
+        "delete stops here. Merge the work back, or remove the checkout explicitly "
+        "(Remove checkout…, which asks you to confirm first), then delete the thread."
+    )
+
+
+def _delete_confirm_message(risk: Dict[str, Any]) -> str:
+    """The one question a deletion asks: this folder holds rebuildable files.
+
+    Named, never merely counted — "some files" teaches nothing about whether the
+    owner cares. Ignored and untracked are kept apart because they mean different
+    things: one is content git was TOLD to ignore, the other is content git has
+    simply never been told about.
+    """
+    parts = []
+    if risk["ignored_files"]:
+        parts.append(f"{_plural(len(risk['ignored_files']), 'file')} git was told to ignore")
+    if risk["untracked_files"]:
+        parts.append(f"{_plural(len(risk['untracked_files']), 'file')} git is not tracking")
+    return (
+        f"This thread's checkout holds {' and '.join(parts)} — nothing committed, and "
+        "nothing changed in a file git is tracking. Deleting the thread deletes that "
+        "folder with them. Confirm to delete both."
+    )
 
 
 # --------------------------------------------------------------------------- #

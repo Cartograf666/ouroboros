@@ -605,6 +605,22 @@ class ThreadWorktreeRemoveRequest(TypedDict, total=False):
     acknowledge_unmerged: bool
 
 
+class ThreadDeleteRequest(TypedDict, total=False):
+    """Thread-delete body, entirely optional — a bare POST is the ordinary call.
+
+    ``acknowledge_unmerged`` IS the owner's consent to delete a thread whose
+    checkout still holds ignored or untracked files (a ``node_modules/``, a
+    ``build.log``): the default answers ``checkout_holds_rebuildable_files``,
+    naming exactly what is there, and this flag is the yes. The SAME name the
+    removal route uses, deliberately — one consent idiom, not three.
+
+    It is NOT an override for work at risk. Unmerged commits, changes to tracked
+    files and an unreadable checkout refuse with ``checkout_holds_work`` whatever
+    this says, and are answered through the explicit removal route."""
+
+    acknowledge_unmerged: bool
+
+
 class ThreadWorktreeResponse(TypedDict, total=False):
     """ONE envelope for every branch/merge/remove answer, success or refusal.
 
@@ -708,13 +724,19 @@ class ThreadLifecycleResponse(TypedDict, total=False):
     journal is shared by every chat and nothing here rewrites it, so a deleted
     thread's rows physically remain and claiming erasure would be a lie.
     ``worktree_kept`` says the thread still has a checkout after the operation.
-    ``worktree_removed`` (delete) says a CLEAN one went with the thread, naming
+    ``worktree_removed`` (delete) says the checkout went with the thread, naming
     the ``branch`` and whether it went too: a tombstoned thread is invisible on
     every surface and branch/merge refuse it, so a checkout left behind is a
-    folder and a branch that A10's explicit removal can no longer reach. A
-    checkout holding uncommitted work or unmerged commits REFUSES the deletion
-    instead (``checkout_holds_work``, with the ``inspection`` attached), because
-    nothing here may destroy work the owner has not seen.
+    folder and a branch that A10's explicit removal can no longer reach.
+
+    Two refusals guard that, and they are NOT the same answer. Work at risk —
+    unmerged commits, changes to TRACKED files, an unreadable checkout — refuses
+    with ``checkout_holds_work`` and names the removal route; there is no flag
+    that overrides it. A checkout holding only ignored or untracked content
+    answers ``checkout_holds_rebuildable_files`` with ``acknowledgeable`` true,
+    which is a question the owner answers by re-sending with
+    ``acknowledge_unmerged`` (``ThreadDeleteRequest``). Both carry the
+    ``inspection``: nothing here may destroy anything the owner has not been shown.
     ``visible_until_terminal`` (archive) says the thread was archived while a
     task was still running, so it stays on screen until that task finishes rather
     than hiding live output.
@@ -734,6 +756,10 @@ class ThreadLifecycleResponse(TypedDict, total=False):
     worktree_removed: bool
     branch: str
     branch_removed: bool
+    #: A refusal the owner can ANSWER (``checkout_holds_rebuildable_files``), in
+    #: the same field name the merge-back envelope uses for ``checkout_dirty``.
+    #: ``checkout_holds_work`` deliberately never sets it: that is not a question.
+    acknowledgeable: bool
     inspection: Dict[str, Any]
     location: ThreadLocation
 

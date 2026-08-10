@@ -351,8 +351,15 @@ def test_delete_takes_a_CLEAN_checkout_with_it_and_says_so(tmp_path, folder, mon
 
 
 def test_delete_REFUSES_while_the_checkout_still_holds_work(tmp_path, folder, monkeypatch):
-    """...and only a CLEAN one. Work the owner has not seen is never destroyed by
-    a gesture aimed at something else; the refusal names the explicit route."""
+    """Work AT RISK still stops the delete dead, and the refusal names the route.
+
+    "At risk" is the narrow set: commits that exist nowhere else, and changes to
+    files git is TRACKING. Both are exercised here — an edited tracked file, then
+    that edit committed onto the thread's branch — because the two are separate
+    causes with separate sentences and only one of them survives a `git commit`.
+    Neither is answerable: `acknowledge_unmerged` must NOT open this door, or the
+    narrowing would have turned into an override for the thing it must not touch.
+    """
     started: list = []
     monkeypatch.setattr(
         "supervisor.task_lifecycle.start_thread_deletion",
@@ -365,24 +372,163 @@ def test_delete_REFUSES_while_the_checkout_still_holds_work(tmp_path, folder, mo
         f"/api/projects/racer/threads/{thread['id']}/branch-off", json={},
     ).json()
     checkout = pathlib.Path(branched["path"])
-    (checkout / "unsaved.txt").write_text("hours of work\n", encoding="utf-8")
+    # A TRACKED file, edited. Its previous contents are in history; this edit is
+    # nowhere else at all.
+    (checkout / "app.txt").write_text("hours of work\n", encoding="utf-8")
 
-    response = _lifecycle_client(drive).post(
+    for body_sent in ({}, {"acknowledge_unmerged": True}):
+        response = _lifecycle_client(drive).post(
+            f"/api/projects/racer/threads/{thread['id']}/delete", json=body_sent,
+        )
+        body = response.json()
+
+        assert response.status_code == 409, body
+        assert body["ok"] is False
+        assert body["reason"] == "checkout_holds_work"
+        # The refusal NAMES what is at stake and where to go next.
+        assert "git is tracking" in body["message"]
+        assert "Remove checkout" in body["message"]
+        # ...and is not a question, so no menu may render a confirm for it.
+        assert body["acknowledgeable"] is False
+        assert body["inspection"]["dirty"] is True
+        # Nothing happened: not fenced, not tombstoned, checkout intact.
+        assert started == []
+        assert (checkout / "app.txt").read_text(encoding="utf-8") == "hours of work\n"
+        from ouroboros.projects_registry import get_thread
+
+        assert get_thread(drive, "racer", thread["id"])["lifecycle"] == "active"
+
+    # Commit it: the tree is clean now, but the commit exists nowhere else.
+    _git(checkout, "config", "user.email", "t@example.com")
+    _git(checkout, "config", "user.name", "T")
+    _git(checkout, "add", "-A")
+    _git(checkout, "commit", "-m", "the only copy")
+
+    committed = _lifecycle_client(drive).post(
+        f"/api/projects/racer/threads/{thread['id']}/delete", json={"acknowledge_unmerged": True},
+    )
+
+    assert committed.status_code == 409
+    assert committed.json()["reason"] == "checkout_holds_work"
+    assert "exist nowhere else" in committed.json()["message"]
+    assert started == []
+    assert checkout.is_dir()
+
+
+def test_delete_takes_a_checkout_holding_only_IGNORED_files_in_TWO_steps(
+    tmp_path, folder, monkeypatch,
+):
+    """T3R2-M2 follow-up, owner-directed: `сложно разве ворктрии снести?`
+
+    H3 made the inspection count ignored files as dirt — correct, a one-click
+    removal was destroying `.env`/`local.db` silently. M2 then made ANY unclean
+    inspection refuse the DELETE. Together, a checkout holding nothing but
+    `node_modules/` and a `build.log` made deleting the thread refuse, with a
+    three-step escape through merge-back and an acknowledged removal. That is
+    friction over files that can be rebuilt by running a command.
+
+    So deletion asks a narrower question, and the rebuildable case rides the same
+    acknowledgement shape the rest of this surface uses: refuse naming the files,
+    then confirm. Two steps, and the checkout goes with the thread.
+    """
+    started: list = []
+    monkeypatch.setattr(
+        "supervisor.task_lifecycle.start_thread_deletion",
+        lambda drive_root, pid, tid, chat_id: started.append(tid) or True,
+    )
+    (folder / ".gitignore").write_text("node_modules/\n*.log\n", encoding="utf-8")
+    _git(folder, "add", "-A")
+    _git(folder, "commit", "-m", "ignore build artefacts")
+
+    drive = tmp_path / "drive"
+    create_project(drive, "racer", name="Racer", working_dir=str(folder))
+    thread = create_thread(drive, "racer", name="Doomed")
+    branched = _client(drive).post(
+        f"/api/projects/racer/threads/{thread['id']}/branch-off", json={},
+    ).json()
+    checkout = pathlib.Path(branched["path"])
+    (checkout / "node_modules").mkdir()
+    (checkout / "node_modules" / "left-pad.js").write_text("//\n", encoding="utf-8")
+    (checkout / "build.log").write_text("ok\n", encoding="utf-8")
+
+    # H3 is untouched: the INSPECTION still sees them, because removal's own
+    # prompt has to say what it would destroy.
+    inspection = _client(drive).get(
+        f"/api/projects/racer/threads/{thread['id']}/worktree",
+    ).json()["inspection"]
+    assert inspection["dirty"] is True
+    assert any("build.log" in line for line in inspection["dirty_files"])
+
+    # STEP ONE — refused, and it says exactly what is in there.
+    first = _lifecycle_client(drive).post(
         f"/api/projects/racer/threads/{thread['id']}/delete", json={},
     )
-    body = response.json()
-
-    assert response.status_code == 409
-    assert body["ok"] is False
-    assert body["reason"] == "checkout_holds_work"
-    assert "cannot be deleted" in body["message"]
+    body = first.json()
+    assert first.status_code == 409
+    assert body["reason"] == "checkout_holds_rebuildable_files"
+    assert "git was told to ignore" in body["message"]
+    assert "nothing committed" in body["message"]
+    # It is a QUESTION, so a menu can render the second call.
+    assert body["acknowledgeable"] is True
     assert body["inspection"]["dirty"] is True
-    # Nothing happened: not fenced, not tombstoned, checkout intact.
     assert started == []
-    assert (checkout / "unsaved.txt").is_file()
-    from ouroboros.projects_registry import get_thread
+    assert checkout.is_dir()
 
-    assert get_thread(drive, "racer", thread["id"])["lifecycle"] == "active"
+    # STEP TWO — the owner's yes, in the same field name the removal route uses.
+    second = _lifecycle_client(drive).post(
+        f"/api/projects/racer/threads/{thread['id']}/delete",
+        json={"acknowledge_unmerged": True},
+    ).json()
+
+    assert second["ok"] is True
+    assert second["lifecycle"] == "deleting"
+    assert started == [int(thread["id"])]
+    assert second["worktree_removed"] is True
+    assert second["worktree_kept"] is False
+    assert not checkout.exists(), "the checkout goes with the thread"
+    # ...and so does the branch: it held no commits, so keeping it would have
+    # left a `thread/<name>` nothing can reach once the thread is tombstoned.
+    assert second["branch_removed"] is True
+    assert branched["branch"] not in _git(folder, "branch", "--list").stdout
+
+
+def test_delete_takes_a_checkout_holding_only_UNTRACKED_files_after_confirming(
+    tmp_path, folder, monkeypatch,
+):
+    """Same door for content git has simply never been told about.
+
+    An untracked file is not on any branch and no history has it, so it cannot be
+    "unmerged" — but it can be the owner's scratch note, so it is NAMED and
+    confirmed rather than either destroyed silently or made a wall.
+    """
+    monkeypatch.setattr(
+        "supervisor.task_lifecycle.start_thread_deletion",
+        lambda drive_root, pid, tid, chat_id: True,
+    )
+    drive = tmp_path / "drive"
+    create_project(drive, "racer", name="Racer", working_dir=str(folder))
+    thread = create_thread(drive, "racer", name="Doomed")
+    branched = _client(drive).post(
+        f"/api/projects/racer/threads/{thread['id']}/branch-off", json={},
+    ).json()
+    checkout = pathlib.Path(branched["path"])
+    (checkout / "scratch.txt").write_text("notes\n", encoding="utf-8")
+
+    refused = _lifecycle_client(drive).post(
+        f"/api/projects/racer/threads/{thread['id']}/delete", json={},
+    ).json()
+    assert refused["reason"] == "checkout_holds_rebuildable_files"
+    assert "git is not tracking" in refused["message"]
+    assert refused["acknowledgeable"] is True
+    assert checkout.is_dir()
+
+    done = _lifecycle_client(drive).post(
+        f"/api/projects/racer/threads/{thread['id']}/delete",
+        json={"acknowledge_unmerged": True},
+    ).json()
+    assert done["ok"] is True
+    assert done["worktree_removed"] is True
+    assert not checkout.exists()
 
 
 def test_a_delete_that_will_be_REFUSED_never_removes_the_checkout_first(tmp_path, folder, monkeypatch):
