@@ -1572,11 +1572,21 @@ nested inside the row button. Both menus mount through
 `project_create.js::openRowMenu`, the one accessible row-menu shell: reachable by
 pointer and keyboard, Enter/Space open, Escape closes, focus order stays logical,
 click-outside closes, placement is viewport-safe. Do not hand-roll a second menu.
+DISCLOSED DEVIATION from that rule, deliberate and scoped: manual drag ordering
+(D3) is POINTER-ONLY. The draggable project/thread rows are non-focusable divs
+and there is no keyboard reorder path — no arrow/modifier move, no reorder entry
+in the row menu. Everything else the sidebar does stays reachable by keyboard;
+only re-ordering is not. A keyboard path is deferred, not forgotten: whoever adds
+it should put the move in the existing row menu rather than inventing a second
+affordance, and must not make the rows focusable without giving them a role and
+an accessible name.
 Name validation uses the backend `PROJECT_NAME_MAX` / `THREAD_NAME_MAX` SSOT
 (80), never a divergent UI constant. Unread is per THREAD —
 `thread.visible_revision > project_seen_revision[project][thread]` — and a
-project row shows the aggregate of its threads; acknowledge only after that
-thread has painted, and make cursor writes monotonic/server-clamped.
+project ROW's dot is thread #0's OWN unread state, never a roll-up of its
+threads; the group aggregate is the `#nav-projects-count` pill in the Projects
+header, the one number that survives collapsing the list. Acknowledge only after
+that thread has painted, and make cursor writes monotonic/server-clamped.
 Routine task heartbeat telemetry must never create a bubble or unread revision.
 Only typed real incidents may enter the live card/Activity plus one deduplicated
 toast.

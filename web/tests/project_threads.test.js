@@ -86,8 +86,10 @@ test('a sibling thread never marks the project main thread read', () => {
     const [zero, side] = projectThreadRows(project());
     assert.equal(isThreadUnread(zero, cursor, 'alpha'), false);
     assert.equal(isThreadUnread(side, cursor, 'alpha'), true);
-    // The project ROW aggregates its threads; it owns no unread number of its
-    // own, so the project-wide `visible_revision` (9) is deliberately unused.
+    // The project ROW's dot is thread #0's own; the group aggregate is the
+    // `#nav-projects-count` pill, which is what `unreadThreadCount` feeds and
+    // what survives the collapse. Either way the project-wide `visible_revision`
+    // (9) is deliberately unused — no dot and no pill is ever computed from it.
     assert.equal(unreadThreadCount(project(), cursor), 1);
 });
 
