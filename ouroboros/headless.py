@@ -21,6 +21,7 @@ from typing import Any, BinaryIO, Dict, Iterable, List, Optional, Sequence, Tupl
 
 from ouroboros.contracts.task_constraint import normalize_task_constraint
 from ouroboros.task_results import (
+    TASK_COST_META_FIELDS,
     cancellation_blocks_child_result, load_task_result, validate_task_id, write_task_result,
 )
 from ouroboros.utils import atomic_write_json, utc_now_iso
@@ -454,6 +455,13 @@ def copy_child_task_result(parent_drive_root: pathlib.Path, task: Dict[str, Any]
         # ``not_required`` value.
         merged_checkpoint["post_task_synthesis"] = existing_post_task
         payload["root_phase_checkpoint"] = merged_checkpoint
+        # F2: the same terminal checkpoint finalized the parent-owned accounting
+        # (task_cost_finalized, exact subtree totals) on the canonical result; a
+        # late copy-back of the child drive's stale root-only cost must not
+        # overwrite it. total_rounds/prompt_tokens/completion_tokens ride the same
+        # finalized record but are not in TASK_COST_META_FIELDS — named explicitly.
+        for key in (*TASK_COST_META_FIELDS, "total_rounds", "prompt_tokens", "completion_tokens"):
+            payload.pop(key, None)
     if isinstance(payload.get("artifacts"), list):
         payload["artifacts"] = _copy_child_artifacts_to_parent(
             parent_drive_root,
@@ -862,7 +870,8 @@ def write_workspace_patch_artifacts(
     tracked_excluded: List[Dict[str, str]] = []
     sensitive: List[Dict[str, str]] = []
     included_untracked: List[str] = []
-    task_base_sha = _acting_base_sha_from_task(task)
+    acting_constraint = _acting_constraint_from_task(task)
+    task_base_sha = str(acting_constraint.base_sha or "").strip() if acting_constraint else ""
     preflight_head = _preflight_head_from_task(task)
     if not task_base_sha and not preflight_head and _preflight_head_present(task):
         preflight_head = _GIT_UNBORN_HEAD
@@ -985,42 +994,34 @@ def write_workspace_patch_artifacts(
         digest = hasher.hexdigest()
 
     head_error: Dict[str, Any] | None = None
-    expected_head = base_head if task_base_sha else _preflight_head_from_task(task)
-    expected_head_present = bool(task_base_sha) or _preflight_head_present(task)
-    enforce_static_head = bool(task_base_sha)
     head_errors: List[Dict[str, Any]] = []
     current_head = _git_stdout(["git", "rev-parse", "--verify", "HEAD"], root, allow_rc={0}, errors=head_errors).strip()
-    if not current_head and base_is_empty_tree:
-        head_errors = []
-    if not enforce_static_head:
-        pass
-    elif expected_head == _GIT_UNBORN_HEAD and not current_head and base_is_empty_tree:
-        pass
-    elif expected_head and not current_head:
-        errors.extend(head_errors)
-        head_error = {
-            "type": "workspace_head_unverified",
-            "message": "workspace HEAD could not be verified at artifact finalization",
-            "expected_head": expected_head,
-            "current_head": "",
-        }
-        errors.append(head_error)
-    elif expected_head_present and not expected_head and current_head:
-        head_error = {
-            "type": "workspace_head_changed",
-            "message": "workspace HEAD changed from unborn during task execution; patch artifact is invalid",
-            "expected_head": _GIT_UNBORN_HEAD,
-            "current_head": current_head,
-        }
-        errors.append(head_error)
-    elif expected_head and current_head != expected_head:
-        head_error = {
-            "type": "workspace_head_changed",
-            "message": "workspace HEAD changed during task execution; patch artifact is invalid",
-            "expected_head": expected_head,
-            "current_head": current_head,
-        }
-        errors.append(head_error)
+    # Q11: the moved-HEAD fail-closed tripwire applies ONLY to a child's private
+    # self_worktree, where a moved HEAD can only mean the worktree itself
+    # rewrote history under the patch (its base is always a real provisioned
+    # commit, never unborn). In a SHARED tree (external_workspace/genesis) the
+    # parent's own legitimate commits move HEAD too — enforcing it there failed
+    # every innocent in-flight sibling; shared-tree integrity is verified by the
+    # reverse-patch check in tools/subagent_integration (verified_shared_workspace),
+    # and base_sha stays the patch BASE so parent-committed work is still captured.
+    if task_base_sha and acting_constraint is not None and acting_constraint.surface == "self_worktree":
+        if not current_head:
+            errors.extend(head_errors)
+            head_error = {
+                "type": "workspace_head_unverified",
+                "message": "workspace HEAD could not be verified at artifact finalization",
+                "expected_head": base_head,
+                "current_head": "",
+            }
+            errors.append(head_error)
+        elif current_head != base_head:
+            head_error = {
+                "type": "workspace_head_changed",
+                "message": "workspace HEAD changed during task execution; patch artifact is invalid",
+                "expected_head": base_head,
+                "current_head": current_head,
+            }
+            errors.append(head_error)
     if head_error:
         try:
             patch_path.unlink()
@@ -1506,7 +1507,8 @@ def _preflight_head_present(task: Dict[str, Any]) -> bool:
     return "head" in git
 
 
-def _acting_base_sha_from_task(task: Dict[str, Any]) -> str:
+def _acting_constraint_from_task(task: Dict[str, Any]):
+    """Normalized acting-subagent constraint carried by ``task``, or None."""
     raw = task.get("task_constraint") if isinstance(task.get("task_constraint"), dict) else {}
     if not raw:
         meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
@@ -1514,10 +1516,8 @@ def _acting_base_sha_from_task(task: Dict[str, Any]) -> str:
     try:
         constraint = normalize_task_constraint(raw)
     except Exception:
-        return ""
-    if not constraint or constraint.mode != "acting_subagent":
-        return ""
-    return str(constraint.base_sha or "").strip()
+        return None
+    return constraint if constraint and constraint.mode == "acting_subagent" else None
 
 
 def _empty_patch_manifest(

@@ -1295,6 +1295,7 @@ class OuroborosAgent:
                 self._pending_events, task, text,
                 usage, llm_trace, start_time, drive_logs,
                 ctx=ctx,
+                event_queue=self._event_queue,
             )
             return list(self._pending_events)
 
@@ -1376,6 +1377,7 @@ class OuroborosAgent:
                 start_time,
                 drive_logs,
                 ctx=self.tools._ctx,
+                event_queue=self._event_queue,
             )
             return list(self._pending_events)
 

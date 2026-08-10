@@ -9,6 +9,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import deque
 from typing import Any, Dict, Optional
 
 from ouroboros.utils import append_jsonl, atomic_write_json, truncate_for_log, utc_now_iso
@@ -939,8 +940,22 @@ def _handle_typing_start(evt: Dict[str, Any], ctx: Any) -> None:
         pass
 
 
+# Delivered final-answer dedupe (mirror of the already_done terminal dedupe, for
+# this one event kind): the worker sends the final send_message BOTH over the
+# live queue (before blocking post-task) AND in the buffered return — queue.put
+# is not a delivery receipt, so neither copy is dropped worker-side; instead
+# both carry the same delivery_id and the second one is suppressed here. The
+# set is in-memory only: a supervisor restart also kills the worker queues, so
+# no duplicate can straddle a restart.
+_DELIVERED_MESSAGE_IDS: "deque[str]" = deque(maxlen=256)
+
+
 def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
     try:
+        delivery_id = str(evt.get("delivery_id") or "")
+        if delivery_id and delivery_id in _DELIVERED_MESSAGE_IDS:
+            log.debug("send_message suppressed as duplicate (delivery_id=%s)", delivery_id)
+            return
         log_text = evt.get("log_text")
         fmt = str(evt.get("format") or "")
         is_progress = bool(evt.get("is_progress"))
@@ -1008,6 +1023,11 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             progress_meta=progress_meta,
             ts=(str(raw_ts) if raw_ts else None),
         )
+        # Registered only AFTER a successful send: if the live copy's send
+        # raises, the buffered copy must NOT be suppressed later — "never
+        # lost" outranks "never doubled".
+        if delivery_id:
+            _DELIVERED_MESSAGE_IDS.append(delivery_id)
     except Exception as e:
         ctx.append_jsonl(
             ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
@@ -2358,6 +2378,10 @@ def _resolve_subagent_constraint(
             f"(requested {requested_base}, current {current_head})."
         )
     constraint["write_root"] = resolved
+    # Pinned as the admission-time PATCH BASE (so work the parent later commits
+    # is still captured in the child's patch) — NOT a moved-HEAD tripwire: in a
+    # shared tree the parent's own commits legitimately move HEAD, and patch
+    # finalization enforces a static HEAD only for self_worktree (Q11).
     constraint["base_sha"] = current_head
     return constraint, resolved, "external_workspace", ""
 

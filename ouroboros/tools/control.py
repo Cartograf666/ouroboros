@@ -785,15 +785,39 @@ def _promote_chat_to_task(
     cached = _cached_swarm_handoff(ctx)
     if cached:
         return cached
-    if swarm_router_turn(ctx):
-        # The model chooses admission; the host-owned room chooses scope.
-        project_id = str(getattr(ctx, "project_id", "") or "")
-        project_name = workspace_root = workspace = source = ""
     from ouroboros.project_facts import (
         explicit_project_id_ok,
         project_id_from_display_name,
         sanitize_project_id,
     )
+
+    scope_override_note = ""
+    if swarm_router_turn(ctx):
+        # The model chooses admission; the host-owned room chooses scope — but
+        # room scope wins only on a GENUINE conflict (room already bound to a
+        # project). In a projectless room an explicitly passed project_name OR
+        # project_id is INHERITED (Q9-A): silently clearing them made the
+        # saga's first root run projectless, so its work landed in an
+        # off-registry tree that no later task could see.
+        room_pid = str(getattr(ctx, "project_id", "") or "")
+        if room_pid:
+            explicit = str(project_name or "").strip() or str(project_id or "").strip()
+            explicit_pid = (
+                project_id_from_display_name(project_name)
+                if str(project_name or "").strip()
+                else sanitize_project_id(project_id or "")
+            )
+            if explicit and explicit_pid != room_pid:
+                # An explicit owner input lost to the room binding — disclose
+                # it in the response, never drop silently (the silent drop was
+                # the saga defect).
+                scope_override_note = (
+                    f" Explicit project {explicit!r} was ignored: this room is "
+                    f"bound to project {room_pid!r}."
+                )
+            project_id = room_pid
+            project_name = ""
+        workspace_root = workspace = source = ""
 
     display_name = str(project_name or "").strip()
     pid = ""
@@ -881,7 +905,7 @@ def _promote_chat_to_task(
             f"OK: task {tid}{scope_note} accepted and durably scheduled ({mode}).{source_confirmation} "
             "The task now runs independently, and follow-up chat can steer it. "
             "Use wait_task/get_task_result if its result "
-            "is needed in this conversation."
+            "is needed in this conversation." + scope_override_note
         )
         return _finish_swarm_handoff(ctx, evt, response, status="scheduled")
     if confirmation_status in {"rejected", "needs_manual_target"}:

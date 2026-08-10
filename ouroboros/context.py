@@ -658,6 +658,16 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
     )
     if _main_manifest:
         runtime_data["main_routing_manifest"] = _main_manifest
+    _last_result = (
+        _meta.get("project_last_task_result")
+        if isinstance(_meta.get("project_last_task_result"), dict)
+        else None
+    )
+    if _last_result:
+        # Host-built ground truth about the thread's most recent task result
+        # (id/status/workspace facts/artifact refs) — read THIS before framing a
+        # "continue" promotion; never reconstruct prior work from chat memory.
+        runtime_data["project_last_task_result"] = _last_result
     _routing_contract = (
         _meta.get("routing_contract")
         if isinstance(_meta.get("routing_contract"), dict)
@@ -862,6 +872,18 @@ def _format_recent_reflections(entries: List[Dict[str, Any]], limit: int = 10) -
         ] if bit]
         header = " | ".join(header_bits) or "unknown reflection"
 
+        if str(entry.get("type", "")) == "project_reflection_pointer":
+            # Bounded canonical pointer row (full text lives on the project
+            # drive) — render one informative line, not an empty block.
+            where = str(entry.get("reflection_path", "")).strip() or "(unknown path)"
+            pid = str(entry.get("project_id", "")).strip() or "(unknown project)"
+            note = " (project write FAILED)" if entry.get("write_failed") else ""
+            blocks.append(
+                f"### {header}\n- Full reflection lives on project drive: "
+                f"{pid} — {where}{note}"
+            )
+            continue
+
         lines = [f"### {header}"]
 
         goal = str(entry.get("goal", "")).strip()
@@ -905,7 +927,8 @@ _PROJECT_THREAD_SCAN = 4000
 
 
 def build_recent_sections(
-    memory: Memory, env: Any, task_id: str = "", thread_chat_id: int = 0
+    memory: Memory, env: Any, task_id: str = "", thread_chat_id: int = 0,
+    project_id: str = "",
 ) -> List[str]:
     sections = []
 
@@ -999,6 +1022,27 @@ def build_recent_sections(
     reflections_text = _format_recent_reflections(reflections_entries, limit=10)
     if reflections_text:
         sections.append("## Execution reflections\n\n" + reflections_text)
+
+    # Read-back of the project's OWN full reflections (F5 wrote them to the
+    # project drive; the canonical tail above carries only pointer rows). Same
+    # bounds as the canonical read: last 20 rows, 10 rendered.
+    _pid = str(project_id or "").strip()
+    if _pid:
+        try:
+            from ouroboros.project_facts import project_reflections_path
+            from ouroboros.utils import iter_jsonl_objects
+
+            project_rows = list(iter_jsonl_objects(
+                project_reflections_path(_pid), max_entries=20,
+            ))
+            project_text = _format_recent_reflections(project_rows, limit=10)
+            if project_text:
+                sections.append(
+                    f"## Project execution reflections (this project's own: {_pid})\n\n"
+                    + project_text
+                )
+        except Exception:
+            log.debug("project reflections read-back failed", exc_info=True)
 
     return sections
 
@@ -1274,8 +1318,17 @@ def _capture_context_core(
         except Exception:
             log.debug("Failed to build advisory review status section", exc_info=True)
 
+    # Same resolver the reflection WRITER uses (append_reflection_routed), so
+    # read-back sees exactly the file the task's own reflections land in.
+    try:
+        from ouroboros.project_facts import resolve_project_id
+
+        _reflections_pid = resolve_project_id(task)
+    except Exception:
+        _reflections_pid = ""
     dynamic_parts.extend(build_recent_sections(
-        memory, env, task_id=task.get("id", ""), thread_chat_id=int(task.get("chat_id") or 0)
+        memory, env, task_id=task.get("id", ""), thread_chat_id=int(task.get("chat_id") or 0),
+        project_id=_reflections_pid,
     ))
 
     return _ContextCore(

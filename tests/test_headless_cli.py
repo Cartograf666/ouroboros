@@ -1633,6 +1633,76 @@ def test_workspace_patch_fails_when_acting_base_sha_head_changed(tmp_path):
     assert not any(item["kind"] == "workspace_patch" for item in artifacts)
 
 
+def test_copy_child_result_cannot_overwrite_finalized_accounting(tmp_path):
+    """F2: once the root's terminal checkpoint has finalized accounting
+    (task_cost_finalized rides the same write as post_task_synthesis), a late
+    headless-mirror copy-back may still enrich the result but the parent-owned
+    cost/round/token fields stay finalized (the saga displayed the $66 root-only
+    mirror cost instead of the $128 finalized subtree total)."""
+    from ouroboros.headless import copy_child_task_result
+    from ouroboros.task_results import STATUS_COMPLETED
+
+    parent = tmp_path / "data"
+    child = tmp_path / "child"
+    parent.mkdir()
+    child.mkdir()
+    task_id = "costfinal"
+    write_task_result(
+        parent, task_id, STATUS_COMPLETED,
+        result="root done",
+        root_phase_checkpoint={"post_task_synthesis": "completed"},
+        cost_usd=127.97, cost_final=True,
+        cost_usd_with_children=127.97, cost_with_children_partial=False,
+        total_rounds=200, prompt_tokens=1000, completion_tokens=500,
+    )
+    write_task_result(
+        child, task_id, STATUS_COMPLETED,
+        result="mirror done",
+        cost_usd=66.30, cost_final=True,
+        cost_usd_with_children=66.30, cost_with_children_partial=True,
+        total_rounds=150, prompt_tokens=700, completion_tokens=300,
+        mirror_only_fact="from-child",
+    )
+
+    merged = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+
+    assert merged is not None
+    assert merged["cost_usd"] == 127.97
+    assert merged["cost_usd_with_children"] == 127.97
+    assert merged["cost_with_children_partial"] is False
+    assert merged["total_rounds"] == 200
+    assert merged["prompt_tokens"] == 1000
+    assert merged["completion_tokens"] == 500
+    # Non-accounting enrichment from the child mirror still lands.
+    assert merged["mirror_only_fact"] == "from-child"
+    assert merged["result"] == "mirror done"
+    assert merged["root_phase_checkpoint"]["post_task_synthesis"] == "completed"
+
+
+def test_copy_child_result_merges_cost_before_finalization(tmp_path):
+    """Before the terminal checkpoint finalizes accounting, the child mirror's
+    cost projection is still the freshest fact and must keep flowing."""
+    from ouroboros.headless import copy_child_task_result
+    from ouroboros.task_results import STATUS_COMPLETED
+
+    parent = tmp_path / "data"
+    child = tmp_path / "child"
+    parent.mkdir()
+    child.mkdir()
+    task_id = "costlive"
+    write_task_result(parent, task_id, STATUS_COMPLETED, result="root running")
+    write_task_result(
+        child, task_id, STATUS_COMPLETED,
+        result="mirror done", cost_usd=12.5, total_rounds=42,
+    )
+
+    merged = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+
+    assert merged is not None
+    assert merged["cost_usd"] == 12.5
+    assert merged["total_rounds"] == 42
+
+
 def test_effective_result_preserves_workspace_artifact_status_with_child_drive(tmp_path):
     from ouroboros.headless import copy_child_task_result
     from ouroboros.task_results import STATUS_COMPLETED

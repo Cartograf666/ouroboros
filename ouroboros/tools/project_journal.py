@@ -86,7 +86,9 @@ def _journal_write(ctx: ToolContext, kind: str, text: str, project_id: str = "")
     return f"OK: journal[{pid}] += {kind_norm} entry ({len(body)} chars)."
 
 
-def append_journal_milestone(project_id: str, kind: str, text: str, task_id: str = "") -> None:
+def append_journal_milestone(
+    project_id: str, kind: str, text: str, task_id: str = "", extra: dict | None = None,
+) -> None:
     """Append an AUTOMATIC project journal milestone (e.g. task-completion 'letters
     home'), enforcing the SAME durable per-row contract as the journal_write tool.
 
@@ -123,6 +125,10 @@ def append_journal_milestone(project_id: str, kind: str, text: str, task_id: str
         "kind": kind_norm,
         "text": body,
         "task_id": str(task_id or ""),
+        # Optional typed payload (e.g. the work-location row's path/sha facts);
+        # the reserved row keys always win.
+        **{k: v for k, v in dict(extra or {}).items()
+           if k not in {"ts", "kind", "text", "task_id"}},
     })
     try:
         from ouroboros.config import DATA_DIR
@@ -131,6 +137,91 @@ def append_journal_milestone(project_id: str, kind: str, text: str, task_id: str
         touch_project(pathlib.Path(DATA_DIR), pid)
     except Exception:
         log.debug("append_journal_milestone touch_project failed", exc_info=True)
+
+
+def _record_work_location(project_id: str, task: dict) -> None:
+    """Q8: ONE typed "work lives at <path> @ <sha>" row when the finished task's
+    effective working tree is NOT the project's registered working_dir (or the
+    registry has none). Continuation promotions read the registry/journal —
+    without this row an off-registry tree is invisible to every later task (the
+    saga rebuilt a finished game because nothing durable said where the first
+    build lived). Uses only facts the task record already holds; never spawns git.
+    The sha, when present, is the admission-time preflight head — a tree
+    identifier, not a claim about the final commit."""
+    meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    workspace = str(task.get("workspace_root") or meta.get("workspace_root") or "").strip()
+    if not workspace:
+        return
+    registered = ""
+    try:
+        from ouroboros.config import DATA_DIR
+        from ouroboros.projects_registry import get_project
+
+        registered = str(
+            (get_project(pathlib.Path(DATA_DIR), sanitize_project_id(project_id)) or {})
+            .get("working_dir") or ""
+        ).strip()
+    except Exception:
+        log.debug("work-location registry lookup failed", exc_info=True)
+    try:
+        same = bool(registered) and (
+            pathlib.Path(registered).resolve(strict=False)
+            == pathlib.Path(workspace).resolve(strict=False)
+        )
+    except (OSError, ValueError):
+        same = registered == workspace
+    if same:
+        return
+    preflight = meta.get("workspace_preflight") if isinstance(meta.get("workspace_preflight"), dict) else {}
+    git = preflight.get("git") if isinstance(preflight.get("git"), dict) else {}
+    sha = str(git.get("head") or "").strip()
+    append_journal_milestone(
+        project_id,
+        "note",
+        f"work lives at {workspace}" + (f" @ {sha}" if sha else ""),
+        task_id=str(task.get("id") or ""),
+        extra={"type": "work_location", "path": workspace, "sha": sha,
+               "registered_working_dir": registered},
+    )
+
+
+def record_task_finalization(
+    project_id: str, task: dict, *, objective: str, kind: str, exec_status: str,
+    drive_root: Any = None,
+) -> None:
+    """One seam for a project root's durable "letters home" at finalization:
+    the task-finished milestone, the off-registry work-location row (Q8), the
+    registry last-result pointer, and — for the swarm ROOT (no parent) — the
+    ephemeral tree-ledger coordination mirror (see
+    mirror_tree_coordination_to_journal). Fail-soft per row."""
+    tid = str(task.get("id") or "")
+    try:
+        append_journal_milestone(
+            project_id, kind, f"Task finished ({exec_status}): {objective}", task_id=tid,
+        )
+    except Exception:
+        log.debug("project journal task-done entry failed", exc_info=True)
+    if drive_root is not None and tid:
+        # Durable last-result pointer (read first by _latest_project_task_result).
+        # A split-drive task's canonical copy-back may land moments later; the
+        # reader validates the pointed file and falls back to the scan.
+        try:
+            from ouroboros.projects_registry import update_project
+
+            update_project(drive_root, project_id, last_task_result_id=tid)
+        except Exception:
+            log.debug("project last-task-result pointer update failed", exc_info=True)
+    try:
+        _record_work_location(project_id, task)
+    except Exception:
+        log.debug("project journal work-location entry failed", exc_info=True)
+    if not str(task.get("parent_task_id") or "").strip():
+        try:
+            mirror_tree_coordination_to_journal(
+                project_id, str(task.get("root_task_id") or tid), task_id=tid,
+            )
+        except Exception:
+            log.debug("project journal swarm-coordination mirror failed", exc_info=True)
 
 
 _TREE_MIRROR_KINDS = {

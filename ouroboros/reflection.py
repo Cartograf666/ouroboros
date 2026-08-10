@@ -163,8 +163,7 @@ I am losing. A concrete forward-looking fix can be a kind=capability_idea backlo
 
 {child_evidence}
 
-{usage_snapshot}
-Write the reflection now. Plain text, no markdown headers except the exact final
+{usage_snapshot}{sealed_final}Write the reflection now. Plain text, no markdown headers except the exact final
 MEMORY_ACTIONS_JSON and BACKLOG_CANDIDATES_JSON lines.
 """
 
@@ -371,6 +370,7 @@ def generate_reflection(
     review_evidence: Optional[Dict[str, Any]] = None,
     child_evidence: str = "",
     usage_snapshot_text: str = "",
+    sealed_final_text: str = "",
 ) -> Dict[str, Any]:
     """Call the light LLM and return a JSONL-ready reflection entry."""
     from ouroboros.config import get_light_model
@@ -404,6 +404,7 @@ def generate_reflection(
         review_evidence=review_evidence_text,
         child_evidence=child_evidence or "(none)",
         usage_snapshot=usage_snapshot_text or "",
+        sealed_final=sealed_final_text or "",
     )
 
     light_model = get_light_model()
@@ -564,6 +565,61 @@ def append_reflection(drive_root: pathlib.Path, entry: Dict[str, Any]) -> None:
             _update_patterns(drive_root, entry)
         except Exception:
             log.debug("Pattern register update failed (non-critical)", exc_info=True)
+
+
+def append_reflection_routed(env: Any, task: Dict[str, Any], entry: Dict[str, Any]) -> None:
+    """Route the FULL reflection to its durable home (P1: process memory must
+    survive drive pruning — ``env.drive_root`` for a headless-mirrored root is a
+    prunable mirror, where the saga's root reflections silently died).
+
+    A project-scoped root reflects on the PROJECT drive (the documented
+    isolation: project work reflects on the project drive) and leaves a BOUNDED
+    pointer row in the canonical ``logs/task_reflections.jsonl`` — never the
+    full text, which feeds future global context and would leak project facts
+    across projects. A non-project root reflects on the canonical budget drive
+    directly. The Pattern Register update stays on the canonical drive in both
+    cases (general error patterns are cross-project cognition)."""
+    canonical = pathlib.Path(str(task.get("budget_drive_root") or "").strip() or str(env.drive_root))
+    try:
+        from ouroboros.project_facts import resolve_project_id
+
+        pid = resolve_project_id(task)
+    except Exception:
+        pid = ""
+    if not pid:
+        append_reflection(canonical, entry)
+        return
+    from ouroboros.project_facts import project_reflections_path
+
+    path = project_reflections_path(pid)
+    project_write_failed = False
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        append_jsonl(path, entry)
+        log.info("Execution reflection saved to project drive (task=%s, project=%s)",
+                 entry.get("task_id", "?"), pid)
+    except Exception:
+        project_write_failed = True
+        log.warning("Failed to save project execution reflection", exc_info=True)
+    if entry.get("key_markers"):
+        try:
+            _update_patterns(canonical, entry)
+        except Exception:
+            log.debug("Pattern register update failed (non-critical)", exc_info=True)
+    try:
+        append_jsonl(canonical / "logs" / REFLECTIONS_FILENAME, {
+            "ts": str(entry.get("ts") or utc_now_iso()),
+            "task_id": str(entry.get("task_id") or ""),
+            "type": "project_reflection_pointer",
+            "project_id": pid,
+            "reflection_path": str(path),
+            # The pointer must never claim a full text that was not written: a
+            # failed project append is stamped instead of silently pointing at
+            # nothing (P1 — the gap is represented as a gap).
+            **({"write_failed": True} if project_write_failed else {}),
+        })
+    except Exception:
+        log.warning("Failed to write canonical reflection pointer", exc_info=True)
 
 _PATTERNS_PROMPT = """\
 You maintain a Pattern Register for Ouroboros, a self-modifying AI agent.

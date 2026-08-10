@@ -420,6 +420,109 @@ def test_project_room_manual_options_are_room_scoped(tmp_path):
     }]
 
 
+def test_project_room_decision_turn_carries_last_task_result_ground_truth(tmp_path):
+    """Q8-A: a project-room decision turn receives the thread's most recent task
+    result as a BOUNDED typed projection (identity/outcome/workspace facts/
+    artifact refs, no raw result text) — the ground truth a 'continue' promotion
+    must read instead of chat memory."""
+    import server
+    from ouroboros.projects_registry import create_project
+    from ouroboros.task_results import write_task_result
+
+    project = create_project(tmp_path, "racer", name="Racer")
+    write_task_result(
+        tmp_path, "old1", "completed", project_id="racer",
+        objective="scaffold the racer", result="RAW TEXT MUST NOT LEAK",
+        ts="2026-08-10T00:00:01Z",
+    )
+    write_task_result(
+        tmp_path, "new1", "completed", project_id="racer",
+        objective="build the racer", result="RAW TEXT MUST NOT LEAK",
+        reason_code="", workspace_root=str(tmp_path / "racer-tree"),
+        workspace_mode="external",
+        metadata={"workspace_preflight": {"git": {"head": "abc123", "branch": "main", "dirty": False}}},
+        artifact_bundle={"artifacts": [{"path": str(tmp_path / "racer-tree" / "index.html")}]},
+        ts="2026-08-10T00:00:02Z",
+    )
+    write_task_result(
+        tmp_path, "other1", "completed", project_id="boat",
+        objective="unrelated", ts="2026-08-10T00:00:03Z",
+    )
+    ctx = _ctx(tmp_path)
+
+    metadata = server._decision_turn_metadata(
+        ctx, int(project["chat_id"]), "project-1", {"project_id": "racer"},
+    )
+
+    last = metadata["project_last_task_result"]
+    assert last["task_id"] == "new1"  # most recent for THIS project, not "boat"
+    assert last["status"] == "completed"
+    assert last["workspace_root"] == str(tmp_path / "racer-tree")
+    assert last["workspace_mode"] == "external"
+    assert last["workspace_git_at_start"]["head"] == "abc123"
+    assert last["artifact_refs"] == [str(tmp_path / "racer-tree" / "index.html")]
+    assert "result" not in last and "RAW TEXT" not in str(last)
+
+
+def test_project_last_task_result_lookup_is_bounded(tmp_path, monkeypatch):
+    """Finding 1: the one-row query parses newest-first by mtime and STOPS at
+    the first project match — never a full task_results replay per interaction
+    (projection over replay)."""
+    import os
+
+    import server
+    import ouroboros.utils as utils
+    from ouroboros.projects_registry import create_project
+    from ouroboros.task_results import task_result_path, write_task_result
+
+    create_project(tmp_path, "racer", name="Racer")
+    write_task_result(tmp_path, "oldracer1", "completed", project_id="racer", objective="v1")
+    write_task_result(tmp_path, "newracer1", "completed", project_id="racer", objective="v2")
+    write_task_result(tmp_path, "boat1", "completed", project_id="boat", objective="x")
+    # Deterministic mtime order regardless of filesystem timestamp granularity.
+    for name, mtime in (("oldracer1", 100), ("newracer1", 200), ("boat1", 300)):
+        os.utime(task_result_path(tmp_path, name, create=False), (mtime, mtime))
+
+    opened: list = []
+    real_read = utils.read_json_dict
+
+    def _counting_read(path):
+        opened.append(path.stem)
+        return real_read(path)
+
+    monkeypatch.setattr(utils, "read_json_dict", _counting_read)
+
+    row = server._latest_project_task_result(_ctx(tmp_path), "racer")
+
+    assert str(row.get("task_id") or row.get("id")) == "newracer1"
+    # Newest-first, stop at the match: boat1 examined, oldracer1 NEVER opened.
+    assert opened == ["boat1", "newracer1"]
+
+
+def test_main_manifest_carries_working_dir_and_workspace_facts(tmp_path):
+    """Q8-A: Main-lane router ground truth — registry working_dir on project rows
+    and workspace facts on the recent-result projections."""
+    import server
+    from ouroboros.projects_registry import create_project, update_project
+    from ouroboros.task_results import write_task_result
+
+    create_project(tmp_path, "racer", name="Racer")
+    update_project(tmp_path, "racer", working_dir=str(tmp_path / "racer-tree"))
+    write_task_result(
+        tmp_path, "done1", "completed", project_id="racer",
+        objective="build the racer", workspace_root=str(tmp_path / "racer-tree"),
+        workspace_mode="external", ts="2026-08-10T00:00:01Z",
+    )
+    ctx = _ctx(tmp_path)
+
+    manifest = server._main_routing_manifest(ctx)
+
+    assert manifest["projects"][0]["working_dir"] == str(tmp_path / "racer-tree")
+    final = next(row for row in manifest["final_results"] if row["task_id"] == "done1")
+    assert final["workspace_root"] == str(tmp_path / "racer-tree")
+    assert final["workspace_mode"] == "external"
+
+
 def test_project_swarm_keeps_host_scope_when_registry_recheck_is_unavailable(
     tmp_path, monkeypatch,
 ):

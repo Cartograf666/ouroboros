@@ -183,3 +183,9 @@ def project_journal_path(project_id: str) -> pathlib.Path:
 def project_workpad_path(project_id: str) -> pathlib.Path:
     """Free-form per-project working notes (markdown scratchpad)."""
     return _project_store_root(project_id) / "workpad.md"
+
+
+def project_reflections_path(project_id: str) -> pathlib.Path:
+    """Durable per-project execution reflections (full text lives HERE for
+    project-scoped roots; the canonical log carries a bounded pointer row)."""
+    return _project_store_root(project_id) / "logs" / "task_reflections.jsonl"

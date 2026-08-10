@@ -978,9 +978,14 @@ def test_external_workspace_rejects_stale_base_sha(tmp_path, monkeypatch):
     assert "base_sha is stale" in detail
 
 
-def test_external_workspace_acting_base_sha_blocks_moved_head_artifact(tmp_path, monkeypatch):
+def test_external_workspace_moved_head_does_not_fail_artifact(tmp_path, monkeypatch):
+    """Q11: a moved HEAD in a SHARED tree is NOT an artifact failure — the parent's
+    own legitimate commits move HEAD too, which used to fail every innocent
+    in-flight sibling. base_sha stays the patch BASE (committed work is still
+    captured); shared-tree integrity belongs to the reverse-patch verifier in
+    tools/subagent_integration, not a moved-HEAD tripwire."""
     from supervisor.events import _resolve_subagent_constraint
-    from ouroboros.headless import ARTIFACT_STATUS_FAILED, write_workspace_patch_artifacts
+    from ouroboros.headless import write_workspace_patch_artifacts
 
     monkeypatch.setenv("OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS", "true")
     repo = tmp_path / "repo"
@@ -999,21 +1004,23 @@ def test_external_workspace_acting_base_sha_blocks_moved_head_artifact(tmp_path,
     )
     assert detail == "" and c["base_sha"]
 
-    (proj / "x.txt").write_text("committed by child\n", encoding="utf-8")
+    (proj / "x.txt").write_text("committed mid-flight\n", encoding="utf-8")
     _git(proj, "add", "x.txt")
-    _git(proj, "commit", "-q", "-m", "child commit")
+    _git(proj, "commit", "-q", "-m", "parent commit moves HEAD")
     artifacts, manifest = write_workspace_patch_artifacts(proj, tmp_path / "artifacts", task={"task_constraint": c})
 
     assert wr == str(proj) and wm == "external_workspace"
-    assert manifest["status"] == ARTIFACT_STATUS_FAILED
-    assert manifest["errors"][-1]["type"] == "workspace_head_changed"
-    assert manifest["errors"][-1]["expected_head"] == c["base_sha"]
-    assert not any(item["kind"] == "workspace_patch" for item in artifacts)
+    assert manifest["status"] == "ready_with_changes"
+    assert manifest["errors"] == []
+    assert manifest["base_ref"] == c["base_sha"]  # committed delta captured vs admission base
+    assert any(item["kind"] == "workspace_patch" for item in artifacts)
 
 
-def test_external_workspace_unborn_base_sha_blocks_first_commit_artifact(tmp_path, monkeypatch):
+def test_external_workspace_unborn_first_commit_keeps_artifact(tmp_path, monkeypatch):
+    """Q11: a first commit in a shared unborn tree is captured against the empty
+    tree, not failed as a moved HEAD (the tripwire is self_worktree-only)."""
     from supervisor.events import _resolve_subagent_constraint
-    from ouroboros.headless import ARTIFACT_STATUS_FAILED, write_workspace_patch_artifacts
+    from ouroboros.headless import write_workspace_patch_artifacts
 
     monkeypatch.setenv("OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS", "true")
     repo = tmp_path / "repo"
@@ -1042,10 +1049,9 @@ def test_external_workspace_unborn_base_sha_blocks_first_commit_artifact(tmp_pat
     _git(proj, "commit", "-q", "-m", "first commit")
     artifacts, manifest = write_workspace_patch_artifacts(proj, tmp_path / "artifacts", task={"task_constraint": c})
 
-    assert manifest["status"] == ARTIFACT_STATUS_FAILED
-    assert manifest["errors"][-1]["type"] == "workspace_head_changed"
-    assert manifest["errors"][-1]["expected_head"] == "(unborn)"
-    assert not any(item["kind"] == "workspace_patch" for item in artifacts)
+    assert manifest["status"] == "ready_with_changes"
+    assert manifest["errors"] == []
+    assert any(item["kind"] == "workspace_patch" for item in artifacts)
 
 
 def test_mutative_toggle_self_change_detected():

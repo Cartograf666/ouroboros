@@ -526,6 +526,10 @@ def update_project(drive_root: Any, project_id: str, **updates: Any) -> Optional
         # Write-once legacy-activity fact seeded by the boot-reconcile backfill
         # (_backfill_thread_activity); read by projects_summary's derivation.
         "thread_activity_seen",
+        # Durable pointer to the project's newest finalized task result
+        # (stamped by record_task_finalization; read first by
+        # server._latest_project_task_result before its bounded scan).
+        "last_task_result_id",
     }
     with _file_write_lock(_registry_path(drive_root)):
         data = _load(drive_root)

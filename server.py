@@ -499,6 +499,107 @@ def _chat_running_tasks(ctx: Any, chat_id: int) -> list:
     return [row for row in _addressable_root_tasks(ctx, chat_id) if row.get("status") == "running"]
 
 
+def _task_result_ground_truth(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Bounded typed projection of one task result for a routing/promote turn:
+    identity, outcome, and WHERE THE WORK LIVES (workspace facts + artifact refs).
+    Never raw result text — a router turn that reconstructs prior work from chat
+    memory instead of these facts invents false premises (the saga's "continue"
+    promotion rebuilt a finished game from scratch)."""
+    bundle = row.get("artifact_bundle") if isinstance(row.get("artifact_bundle"), dict) else {}
+    artifacts = bundle.get("artifacts") if isinstance(bundle.get("artifacts"), list) else []
+    meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    preflight = meta.get("workspace_preflight") if isinstance(meta.get("workspace_preflight"), dict) else {}
+    git = preflight.get("git") if isinstance(preflight.get("git"), dict) else {}
+    out = {
+        "task_id": str(row.get("task_id") or row.get("id") or ""),
+        "status": str(row.get("status") or ""),
+        "title": _clip_marked(row.get("title"), 120),
+        "objective": _clip_marked(row.get("objective") or row.get("description"), 300),
+        "project_id": str(row.get("project_id") or ""),
+        "reason_code": str(row.get("reason_code") or ""),
+        "workspace_root": str(row.get("workspace_root") or ""),
+        "workspace_mode": str(row.get("workspace_mode") or ""),
+        "artifact_status": str(row.get("artifact_status") or ""),
+        "artifact_refs": [
+            str(item.get("path") or item.get("name") or "")
+            for item in artifacts[:8] if isinstance(item, dict)
+        ],
+    }
+    if git:
+        out["workspace_git_at_start"] = {
+            "head": str(git.get("head") or ""),
+            "branch": str(git.get("branch") or ""),
+            "dirty": bool(git.get("dirty")),
+        }
+    return out
+
+
+def _latest_project_task_result(ctx: Any, project_id: str) -> Optional[Dict[str, Any]]:
+    """Newest task result bound to ``project_id`` WITHOUT replaying the whole
+    store (DEVELOPMENT "Projection over replay"). The registry row's durable
+    ``last_task_result_id`` pointer (stamped at project-task finalization) is
+    read FIRST — one direct file fetch, immune to how many newer foreign
+    results exist. Only when the pointer is absent or stale (missing/
+    unparseable/foreign file) does the fallback run: the bounded newest-64
+    mtime scan, then — for pre-pointer projects only — a disclosed full scan
+    of the store (the lazy self-heal for rows finalized before the pointer
+    existed; with zero matching results nothing is written back, so it repeats
+    per lookup until a matching result exists). Only the ABSENT-pointer case
+    writes the pointer back: a non-empty pointer that failed to resolve is
+    usually a split-drive result in flight (finalization stamps the pointer
+    before the canonical copy-back lands), so overwriting it from the scan
+    would permanently regress it to an older result — serve the scan hit and
+    let the pointer resolve itself. The steady state needs no
+    ouroboros/context_budget.py threshold enrollment (that table guards
+    recurring full-store replays)."""
+    from ouroboros.projects_registry import get_project, update_project
+    from ouroboros.task_results import load_task_result, task_results_dir
+    from ouroboros.utils import read_json_dict
+
+    try:
+        pointer = str((get_project(ctx.DRIVE_ROOT, project_id) or {}).get(
+            "last_task_result_id") or "").strip()
+    except Exception:
+        pointer = ""
+    if pointer:
+        pointed = load_task_result(ctx.DRIVE_ROOT, pointer)
+        if isinstance(pointed, dict) and str(pointed.get("project_id") or "") == project_id:
+            return pointed
+        log.debug(
+            "project last-task-result pointer for %r is stale (%s); "
+            "falling back to the bounded scan", project_id, pointer,
+        )
+
+    paths = list(task_results_dir(ctx.DRIVE_ROOT, create=False).glob("*.json"))
+    try:
+        paths.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        paths.sort(key=lambda path: path.name, reverse=True)
+    row = None
+    for path in paths[:64]:
+        candidate = read_json_dict(path)
+        if candidate is not None and str(candidate.get("project_id") or "") == project_id:
+            row = candidate
+            break
+    if row is None and len(paths) > 64:
+        log.info(
+            "project last-task-result: %r missed the bounded scan; running the "
+            "full-store self-heal scan (%d files)", project_id, len(paths),
+        )
+        for path in paths[64:]:
+            candidate = read_json_dict(path)
+            if candidate is not None and str(candidate.get("project_id") or "") == project_id:
+                row = candidate
+                break
+    if row is not None and not pointer:
+        try:
+            update_project(ctx.DRIVE_ROOT, project_id, last_task_result_id=str(
+                row.get("task_id") or row.get("id") or ""))
+        except Exception:
+            log.debug("project last-task-result pointer write-back failed", exc_info=True)
+    return row
+
+
 def _main_routing_manifest(ctx: Any) -> Dict[str, Any]:
     """Bounded canonical facts for one Main-chat LLM routing decision."""
     from ouroboros.projects_registry import list_projects
@@ -510,27 +611,15 @@ def _main_routing_manifest(ctx: Any) -> Dict[str, Any]:
         "name": _clip_marked(row.get("name"), 120),
         "chat_id": int(row.get("chat_id") or 0),
         "lifecycle": str(row.get("lifecycle") or "active"),
+        # Registry-canonical working folder: the router turn's ground truth for
+        # where a project's work lives (Q8-A).
+        "working_dir": str(row.get("working_dir") or ""),
     } for row in list_projects(ctx.DRIVE_ROOT)]
     roots = _addressable_root_tasks(ctx, None)
 
     all_results = list_task_results(ctx.DRIVE_ROOT)
     all_results.sort(key=lambda row: str(row.get("ts") or row.get("updated_at") or ""), reverse=True)
-    finals: list = []
-    for row in all_results[:16]:
-        bundle = row.get("artifact_bundle") if isinstance(row.get("artifact_bundle"), dict) else {}
-        artifacts = bundle.get("artifacts") if isinstance(bundle.get("artifacts"), list) else []
-        finals.append({
-            "task_id": str(row.get("task_id") or row.get("id") or ""),
-            "status": str(row.get("status") or ""),
-            "title": _clip_marked(row.get("title"), 120),
-            "objective": _clip_marked(row.get("objective") or row.get("description"), 300),
-            "project_id": str(row.get("project_id") or ""),
-            "artifact_status": str(row.get("artifact_status") or ""),
-            "artifact_refs": [
-                str(item.get("path") or item.get("name") or "")
-                for item in artifacts[:8] if isinstance(item, dict)
-            ],
-        })
+    finals = [_task_result_ground_truth(row) for row in all_results[:16]]
 
     dialogue_rows: list = []
     chat_paths = sorted(
@@ -601,6 +690,16 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
         }
     if main_manifest:
         md["main_routing_manifest"] = main_manifest
+    if project_id:
+        # Ground truth for a project-room "continue" decision (Q8-A): the thread's
+        # most recent task result as a bounded typed projection. Without it the
+        # router turn has only chat memory about where prior work lives.
+        try:
+            row = _latest_project_task_result(ctx, project_id)
+            if row is not None:
+                md["project_last_task_result"] = _task_result_ground_truth(row)
+        except Exception:
+            log.debug("project last-task-result projection failed", exc_info=True)
     if client_message_id:
         md["client_message_id"] = client_message_id
     option_roots = (

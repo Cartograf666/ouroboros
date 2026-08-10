@@ -449,7 +449,8 @@ def test_startup_recovery_reuses_pending_root_result_checkpoint(tmp_path, monkey
     )
     calls = []
 
-    def fake_run(env, task, usage, trace, evidence, drive_logs, *, blocking=False):
+    def fake_run(env, task, usage, trace, evidence, drive_logs, *, blocking=False,
+                 sealed_final=None):
         calls.append((env.drive_root, task, usage, trace, evidence, drive_logs, blocking))
         pipeline._set_root_post_task_checkpoint(env, task, "completed")
 

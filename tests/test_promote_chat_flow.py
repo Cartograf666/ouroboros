@@ -85,7 +85,117 @@ def test_ephemeral_swarm_promotion_carries_intent_and_pins_host_scope(tmp_path, 
     assert evt["force_plan_source"] == "swarm"
     assert evt["project_id"] == "alpha"
     assert evt["project_name"] == evt["workspace_root"] == evt["workspace"] == evt["source"] == ""
+    # The override of an explicit owner input is DISCLOSED, never silent.
+    assert "Explicit project 'Injected Project' was ignored" in out
+    assert "bound to project 'alpha'" in out
     assert ctx._swarm_handoff_attempt["status"] == "scheduled"
+
+
+def test_ephemeral_swarm_projectless_room_inherits_explicit_project_name(tmp_path, monkeypatch):
+    """Q9-A: in a PROJECTLESS room the router turn INHERITS an explicitly passed
+    project_name — room scope wins only on a genuine conflict (room already bound
+    to a project). Clearing the name here made the saga's first root run
+    projectless and strand its work in an off-registry tree."""
+    from ouroboros.project_facts import project_id_from_display_name
+    from ouroboros.tools.control import _promote_chat_to_task
+
+    _confirm_promote(monkeypatch)
+    ctx = _swarm_ctx(tmp_path)  # project_id="" — projectless main chat
+
+    out = _promote_chat_to_task(
+        ctx,
+        "Build the slime lab escape game",
+        project_name="Slime Lab Escape",
+        workspace_root="/tmp/foreign",
+        source="https://example.invalid/repo.git",
+    )
+
+    assert out.startswith("OK: task")
+    assert "new project 'Slime Lab Escape'" in out
+    evt = ctx.pending_events[0]
+    assert evt["project_name"] == "Slime Lab Escape"
+    assert evt["project_id"] == project_id_from_display_name("Slime Lab Escape")
+    # The host still owns the rest of the scope surface on a router turn.
+    assert evt["workspace_root"] == evt["workspace"] == evt["source"] == ""
+
+
+def test_ephemeral_swarm_projectless_room_inherits_explicit_project_id(tmp_path, monkeypatch):
+    """Q9-A sibling parameter: in a PROJECTLESS room an explicitly passed
+    project_id is honored, not silently dropped (the same saga failure shape as
+    the project_name drop)."""
+    from ouroboros.tools.control import _promote_chat_to_task
+
+    _confirm_promote(monkeypatch)
+    ctx = _swarm_ctx(tmp_path)  # project_id="" — projectless main chat
+
+    out = _promote_chat_to_task(ctx, "Continue the racer build", project_id="racer")
+
+    assert out.startswith("OK: task")
+    assert "in project 'racer'" in out
+    assert "ignored" not in out
+    evt = ctx.pending_events[0]
+    assert evt["project_id"] == "racer"
+
+
+def test_ephemeral_swarm_room_scope_override_matrix(tmp_path, monkeypatch):
+    """Room=A + explicit project B (id or name): A wins WITH a disclosure
+    sentence in the response; explicit input equal to the room binding is not a
+    conflict and produces no disclosure."""
+    from ouroboros.tools.control import _promote_chat_to_task
+
+    _confirm_promote(monkeypatch)
+    for kwargs, shown in (
+        ({"project_id": "beta"}, "beta"),
+        ({"project_name": "Beta Project"}, "Beta Project"),
+    ):
+        ctx = _swarm_ctx(tmp_path, project_id="alpha")
+        out = _promote_chat_to_task(ctx, "Audit the issue", **kwargs)
+        assert out.startswith("OK: task")
+        assert ctx.pending_events[0]["project_id"] == "alpha"
+        assert f"Explicit project {shown!r} was ignored" in out
+        assert "bound to project 'alpha'" in out
+
+    ctx = _swarm_ctx(tmp_path, project_id="alpha")
+    out = _promote_chat_to_task(ctx, "Audit the issue", project_id="alpha")
+    assert out.startswith("OK: task")
+    assert ctx.pending_events[0]["project_id"] == "alpha"
+    assert "ignored" not in out
+
+
+def test_promoted_named_project_from_projectless_chat_provisions_workspace(tmp_path, monkeypatch):
+    """Q9-A worker side: the promote event carrying the inherited name creates and
+    binds the project BEFORE the root launches, and the file-less project gets its
+    workspace auto-provisioned (Q10-A) — the root never runs projectless."""
+    import pathlib
+
+    import supervisor.workers as workers
+    from ouroboros.projects_registry import get_project
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    enqueued = []
+    ctx = types.SimpleNamespace(
+        enqueue_task=lambda task: enqueued.append(task),
+        persist_queue_snapshot=lambda **_kwargs: True,
+        load_state=lambda: {"owner_chat_id": 1},
+    )
+    outcome = workers.promote_chat_to_task({
+        "type": "promote_chat_to_task",
+        "task_id": "slime0001",
+        "objective": "Build the slime lab escape game",
+        "project_id": "slime-lab-escape",
+        "project_name": "Slime Lab Escape",
+        "chat_id": 0,
+    }, ctx)
+
+    assert outcome["status"] == "scheduled"
+    project = get_project(tmp_path, "slime-lab-escape")
+    assert project is not None and project["name"] == "Slime Lab Escape"
+    task = enqueued[0]
+    assert task["project_id"] == "slime-lab-escape"
+    workspace_root = str(task.get("workspace_root") or "")
+    assert workspace_root, "file-less named project must get an auto-provisioned workspace"
+    assert (pathlib.Path(workspace_root) / ".git").exists()
+    assert str(project.get("working_dir") or "") == workspace_root
 
 
 def test_ephemeral_swarm_unconfirmed_promotion_reuses_one_task_id(tmp_path, monkeypatch):
