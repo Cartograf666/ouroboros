@@ -485,7 +485,11 @@ export function initChanges(ctx = {}) {
     function paintFileList() {
         fileMetaEl.textContent = view.diff ? diffSummaryMeta(view.diff, view.parsed) : '';
         fileListEl.textContent = '';
-        if (!view.taskId) {
+        // "Nothing selected" is a question about the SOURCE, not about the task
+        // id: a thread checkout has no task id at all, so reading the emptiness
+        // off `taskId` alone left every thread diff showing "pick a task" in
+        // place of its own file list.
+        if (!view.taskId && !view.threadRef) {
             const row = document.createElement('div');
             row.className = 'changes-empty';
             row.textContent = 'Pick a task to review its changes.';
