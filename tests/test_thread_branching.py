@@ -1165,3 +1165,42 @@ def test_a_failed_merge_still_releases_the_folder_it_held(drive, folder, wt_root
 
     assert refused["ok"] is False
     assert reserved_folder_lanes() == set()
+
+
+def test_the_git_timeout_is_the_settings_SSOT_not_a_module_local_number(monkeypatch):
+    """T3R2-L6: DEVELOPMENT.md's gate says a new numeric timeout is a `config.py`
+    setting with a getter and env registration. This module pinned its own 120,
+    while the sibling owner-facing git path — the task diff — already read the
+    settings getter. Two owner-facing git surfaces with two unrelated ceilings is
+    how a repo that is merely large times out on one screen and not the other,
+    with nothing the owner can turn."""
+    import ouroboros.config as config
+    import ouroboros.thread_branching as branching
+
+    assert not hasattr(branching, "_GIT_TIMEOUT_SEC")
+    assert branching._git_timeout_sec() == config.get_task_diff_git_timeout_sec()
+    monkeypatch.setenv("OUROBOROS_TASK_DIFF_GIT_TIMEOUT_SEC", "77")
+    assert branching._git_timeout_sec() == 77.0
+
+
+def test_the_busy_docs_no_longer_claim_that_every_PENDING_task_counts():
+    """T3R2-M8 (BIBLE P6): `733b41b8` changed what "busy" means — a budget-paused
+    PENDING task no longer counts, because it waits for the owner, possibly
+    forever — and touched no doc. `project_is_busy.__doc__` still said a queued
+    task "can be assigned at any instant" with no exception, and DEVELOPMENT.md
+    still said "so subagents and PENDING work count"."""
+    import pathlib
+
+    import ouroboros.thread_branching as branching
+
+    doc = branching.project_is_busy.__doc__ or ""
+    assert "BUDGET-PAUSED" in doc
+    assert "already taken" in doc
+    # ...and the folder half the lane key made necessary.
+    assert "FOLDER half" in doc
+
+    development = (
+        pathlib.Path(__file__).resolve().parent.parent / "docs" / "DEVELOPMENT.md"
+    ).read_text(encoding="utf-8")
+    assert "so subagents and PENDING work count" not in development
+    assert "EXCEPT what cannot start without the owner" in development
