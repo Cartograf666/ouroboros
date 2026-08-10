@@ -1171,16 +1171,43 @@ def test_the_git_timeout_is_the_settings_SSOT_not_a_module_local_number(monkeypa
     """T3R2-L6: DEVELOPMENT.md's gate says a new numeric timeout is a `config.py`
     setting with a getter and env registration. This module pinned its own 120,
     while the sibling owner-facing git path — the task diff — already read the
-    settings getter. Two owner-facing git surfaces with two unrelated ceilings is
-    how a repo that is merely large times out on one screen and not the other,
-    with nothing the owner can turn."""
+    settings getter.
+
+    The gate is satisfied by HAVING a key, not by borrowing the neighbour's: the
+    first fix pointed this at `get_task_diff_git_timeout_sec()` and silently
+    narrowed branch-off's ceiling from 120s to 30s, on a path that runs
+    `git add -A` and `git commit` over a working tree of unknown size. It owns
+    `OUROBOROS_THREAD_GIT_TIMEOUT_SEC` now, and the last block is the assertion
+    that fails if anyone re-points it at the diff getter.
+    """
     import ouroboros.config as config
     import ouroboros.thread_branching as branching
 
+    monkeypatch.delenv("OUROBOROS_THREAD_GIT_TIMEOUT_SEC", raising=False)
+    monkeypatch.delenv("OUROBOROS_TASK_DIFF_GIT_TIMEOUT_SEC", raising=False)
+
     assert not hasattr(branching, "_GIT_TIMEOUT_SEC")
-    assert branching._git_timeout_sec() == config.get_task_diff_git_timeout_sec()
-    monkeypatch.setenv("OUROBOROS_TASK_DIFF_GIT_TIMEOUT_SEC", "77")
+    assert config.SETTINGS_DEFAULTS["OUROBOROS_THREAD_GIT_TIMEOUT_SEC"] == 120
+    assert branching._git_timeout_sec() == config.get_thread_git_timeout_sec() == 120.0
+
+    # Env-overridable and clamped like every sibling reader in `config.py`.
+    monkeypatch.setenv("OUROBOROS_THREAD_GIT_TIMEOUT_SEC", "77")
     assert branching._git_timeout_sec() == 77.0
+    monkeypatch.setenv("OUROBOROS_THREAD_GIT_TIMEOUT_SEC", "0")
+    assert branching._git_timeout_sec() == 5.0
+    monkeypatch.setenv("OUROBOROS_THREAD_GIT_TIMEOUT_SEC", "100000")
+    assert branching._git_timeout_sec() == 300.0
+    monkeypatch.setenv("OUROBOROS_THREAD_GIT_TIMEOUT_SEC", "not-a-number")
+    assert branching._git_timeout_sec() == 120.0
+
+    # NOT the task diff's ceiling: that one bounds a READ against one commit.
+    # Turning the diff's knob must not move this path at all.
+    monkeypatch.delenv("OUROBOROS_THREAD_GIT_TIMEOUT_SEC", raising=False)
+    monkeypatch.setenv("OUROBOROS_TASK_DIFF_GIT_TIMEOUT_SEC", "30")
+    assert config.get_task_diff_git_timeout_sec() == 30.0
+    assert branching._git_timeout_sec() == 120.0
+    monkeypatch.setenv("OUROBOROS_TASK_DIFF_GIT_TIMEOUT_SEC", "17")
+    assert branching._git_timeout_sec() == 120.0
 
 
 def test_the_busy_docs_no_longer_claim_that_every_PENDING_task_counts():

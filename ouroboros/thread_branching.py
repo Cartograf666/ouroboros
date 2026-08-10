@@ -87,14 +87,20 @@ def _git_timeout_sec() -> float:
 
     Read from the ONE settings SSOT rather than pinned as a module-local number:
     DEVELOPMENT.md's gate says a new numeric timeout is a `config.py` setting with
-    a getter and env registration, and the sibling owner-facing git path — the
-    task diff — already uses exactly this one. Two owner-facing git surfaces with
-    two unrelated ceilings is how a repo that is merely large starts timing out on
-    one screen and not on the other, with nothing the owner can turn.
-    """
-    from ouroboros.config import get_task_diff_git_timeout_sec
+    a getter and env registration, so this path has its OWN key,
+    ``OUROBOROS_THREAD_GIT_TIMEOUT_SEC``, clamped like every sibling.
 
-    return get_task_diff_git_timeout_sec()
+    It is deliberately not the task diff's key. Reusing that one satisfied the
+    same gate but narrowed this ceiling from 120s to 30s, and the two paths are
+    not the same kind of work: the diff endpoint runs one bounded READ against a
+    commit, while :func:`_snapshot_commit` runs ``git add -A`` and ``git commit``
+    over a working tree of unknown size. A snapshot that times out is exactly the
+    failure the branch-off refusals exist to contain, so the WRITE does not
+    inherit the READ's ceiling — it gets a knob the owner can turn on its own.
+    """
+    from ouroboros.config import get_thread_git_timeout_sec
+
+    return get_thread_git_timeout_sec()
 
 
 def _git(root: Any, *args: str) -> subprocess.CompletedProcess:
