@@ -78,6 +78,12 @@ class ThreadWorktree:
     repo_dir: str
     created_at: float
     created_at_iso: str = ""
+    #: The root this checkout was PROVISIONED under, recorded so removal can
+    #: validate containment against the same boundary that admitted it (T0R2-9).
+    #: Validating against the root resolved at removal time made every existing
+    #: row `path_outside_root` — permanently unremovable through the API — the
+    #: moment `OUROBOROS_THREAD_WORKTREE_ROOT` changed.
+    worktree_root: str = ""
 
 
 def _registry_path(data_dir: Any) -> Path:
@@ -183,6 +189,7 @@ def provision_thread_worktree(
             repo_dir=str(repo),
             created_at=time.time(),
             created_at_iso=utc_now_iso(),
+            worktree_root=str(root),
         )
         _save(data_dir, [*rows, asdict(handle)])
         log.info("Thread worktree provisioned: %s#%s at %s", key[0], key[1], wt_path)
@@ -241,6 +248,15 @@ def remove_thread_worktree(
     never received refuse the removal unless ``acknowledge_unmerged`` is passed
     — the caller must have SHOWN the owner the inspection first. There is no
     silent path and no timer that reaches this function.
+
+    Containment is checked against the root the row was PROVISIONED under
+    (T0R2-9), not against whatever this process resolves today. Resolving it at
+    removal time meant relocating ``OUROBOROS_THREAD_WORKTREE_ROOT`` — or simply
+    passing a different ``worktree_root`` — turned every existing row into
+    ``path_outside_root``: unremovable through the API forever, with the mirror
+    hazard that a moved root would ADMIT a path it should never have admitted.
+    A pre-T3 row carries no provisioning root; it falls back to the resolved one,
+    which is exactly the behaviour it was written under.
     """
     key = _key(project_id, thread_id)
     root = Path(worktree_root).expanduser().resolve() if worktree_root else thread_worktree_root()
@@ -254,7 +270,9 @@ def remove_thread_worktree(
         if unsafe and not acknowledge_unmerged:
             return {"removed": False, "reason": "unmerged_work", "inspection": inspection}
         wt_path = Path(str(match.get("path") or ""))
-        if not str(wt_path).strip() or not path_is_within(wt_path, root):
+        stored_root = str(match.get("worktree_root") or "").strip()
+        guard_root = Path(stored_root).expanduser().resolve() if stored_root else root
+        if not str(wt_path).strip() or not path_is_within(wt_path, guard_root):
             # A malformed registry row must never delete an arbitrary path.
             return {"removed": False, "reason": "path_outside_root", "inspection": inspection}
         repo = Path(str(match.get("repo_dir") or "."))

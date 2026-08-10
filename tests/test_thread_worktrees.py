@@ -240,3 +240,55 @@ def test_force_rmtree_repairs_a_directory_instead_of_bricking_it(tmp_path):
             for path in sorted(tree.rglob("*"), reverse=True):
                 os.chmod(path, stat_mod.S_IRWXU)
             os.chmod(tree, stat_mod.S_IRWXU)
+
+
+def test_removal_validates_against_the_provisioning_root(repo, tmp_path, wt_root):
+    """T0R2-9: a relocated configuration must not strand a real checkout.
+
+    Containment is checked against the root the row was PROVISIONED under. When
+    it was resolved at removal time instead, moving the configured root turned
+    every existing row into `path_outside_root` — the owner's own worktree
+    became permanently unremovable through the API, with no way back short of
+    editing the registry by hand.
+    """
+    from pathlib import Path
+
+    handle = _provision(repo, tmp_path, wt_root)
+    assert handle.worktree_root == str(Path(wt_root).resolve())
+
+    outcome = remove_thread_worktree(
+        data_dir=tmp_path / "data",
+        project_id="racer",
+        thread_id=1,
+        # The configuration moved after provisioning; the checkout did not.
+        worktree_root=tmp_path / "relocated_worktrees",
+    )
+
+    assert outcome["removed"] is True, outcome
+    assert not Path(handle.path).exists()
+    assert get_thread_worktree(tmp_path / "data", "racer", 1) is None
+
+
+def test_a_row_pointing_outside_its_provisioning_root_is_still_refused(repo, tmp_path, wt_root):
+    """The guard is narrowed to the stored root, never dropped: a hand-edited
+    row must not turn removal into `rm -rf` on an arbitrary path."""
+    from pathlib import Path
+
+    import ouroboros.thread_worktrees as twt
+
+    _provision(repo, tmp_path, wt_root)
+    outsider = tmp_path / "not_a_worktree"
+    outsider.mkdir()
+    (outsider / "precious.txt").write_text("owner data\n", encoding="utf-8")
+    rows = twt._load(tmp_path / "data")
+    rows[0]["path"] = str(outsider)
+    twt._save(tmp_path / "data", rows)
+
+    outcome = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1,
+        acknowledge_unmerged=True,
+    )
+
+    assert outcome["removed"] is False
+    assert outcome["reason"] == "path_outside_root"
+    assert Path(outsider / "precious.txt").exists()
