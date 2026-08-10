@@ -7212,13 +7212,6 @@ textarea.chat-input {
     border-color: var(--accent);
 }
 
-.project-panel-body {
-    display: flex;
-    flex-direction: column;
-    flex: 1;
-    min-height: 0;
-}
-
 /* ---------------------------------------------------------------------------
    The CENTRE thread stage (project threads, T1).
    A thread is a conversation, so it takes the centre column exactly like Main

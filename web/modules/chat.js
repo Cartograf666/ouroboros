@@ -1772,10 +1772,10 @@ export function createChatInstance({
     // registered that right-panel kind decides what to mount. No listener ⇒ the
     // click is a no-op, so the action can never point at a missing surface.
     //
-    // MAIN chat only in v1: the inspector is a right panel that is mutually
-    // exclusive with the project panel, so offering the action from inside a
-    // project thread would advertise a surface that closes the thread it was
-    // clicked in. Project cards keep every other action.
+    // MAIN chat only in v1. Since a thread moved to the CENTRE, the inspector's
+    // right panel no longer competes with it, so extending the action to thread
+    // cards is a SCOPING decision — it is not in this phase's scope — rather
+    // than a layout constraint. Project cards keep every other action.
     function syncInspectButton(record) {
         if (!record?.root) return;
         const groupId = String(record.groupId || '').trim();

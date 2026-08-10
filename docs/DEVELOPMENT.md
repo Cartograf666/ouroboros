@@ -1718,6 +1718,7 @@ The sidebar budget bar is the second sanctioned instance: `app.js` writes
 `.style.width` assignment.
 Existing classes (`.stat-card`, `.page-header`, `.app-page-*`, `.app-tab-*`, `.about-*`, `.costs-*`) cover common layouts.
 For new top-level pages, prefer `web/modules/page_header.js` over bespoke header/tab markup.
+Recorded deviation (project threads, T1): the top-level `#page-thread` deliberately wears the lean panel bar (`.thread-stage-bar.project-panel-bar`) instead of a `page_header.js` header, because a thread stage is one room's chrome — nav toggle, project/thread title, thread menu, close — not a screen with a title, tabs and page actions.
 Add new classes to `web/style.css` when needed.
 Before staging any `web/modules/*.js` file: `grep -n "\.style\." web/modules/*.js`
 and fix any hits.

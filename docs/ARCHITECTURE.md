@@ -2006,7 +2006,16 @@ a version bump + a migration note in the release row.
   lost, and a mixed flat/nested document is accepted during the window. The
   compatibility window is one minor; after it the flat branch in
   `gateway/ui_preferences.py::_normalize_seen_revision` is deleted and a flat
-  value becomes a 400. Each thread's ACK now clamps against its OWN
+  value POSTED by an old client becomes a 400. A flat value already ON DISK does
+  NOT become a 400 — claiming it would be a lie about the code:
+  `api_ui_preferences_get` wraps the whole read in
+  `except Exception: return DEFAULT_UI_PREFERENCES`, so a stored cursor the
+  normalizer has stopped accepting is silently replaced by an empty one, which
+  marks every thread unread ONCE (the next paint ACK re-establishes it).
+  Whoever closes the window therefore picks one: ship a one-time on-disk rewrite,
+  or accept that single reset and say so in the release notes. This release does
+  neither and needs neither — inside the window the flat branch reads those files
+  correctly. Each thread's ACK now clamps against its OWN
   `visible_revision` (thread #0 against `thread0_visible_revision`), never the
   project-wide aggregate, so a sibling thread's message can no longer mark the
   project's main thread read. `project_order` / `project_thread_order` were
