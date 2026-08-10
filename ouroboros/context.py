@@ -867,10 +867,10 @@ def _shared_past_beyond_scan(lens: Any, scanned: List[Dict[str, Any]]) -> str:
     were not READ, never that rows existed, so the wording says the shared past is
     not in this view rather than asserting a loss.
 
-    * The scan hit its CAP, so rows older than its oldest exist and were not looked
-      at. Every ancestor's window extends below that edge by construction, which is
-      why the tail size alone is enough. This is the case a real install reaches:
-      the fork happens, then 4000 rows accumulate after it.
+    * The scan hit its CAP, so anything older than its oldest row was not read at
+      all, and every ancestor's admitted window extends below that edge by
+      construction — which is why the tail size alone is enough. This is the case a
+      real install reaches: the fork happens, then 4000 rows accumulate after it.
     * The oldest scanned row is NEWER than an ancestor's cutoff. Rows are appended
       in timestamp order, so nothing of that ancestor's window is in the scan at
       all — and if the live file was not even capped, those rows are in the rotated
@@ -884,28 +884,29 @@ def _shared_past_beyond_scan(lens: Any, scanned: List[Dict[str, Any]]) -> str:
     except (TypeError, ValueError):
         own = 0
     ancestors = []
-    cutoffs = getattr(lens, "cutoffs", None) or {}
-    for chat in cutoffs:
+    for chat, cutoff in (getattr(lens, "cutoffs", None) or {}).items():
         try:
             other = int(chat)
         except (TypeError, ValueError):
             continue
         if other != own:
-            ancestors.append(other)
+            ancestors.append((other, str(cutoff or "")))
     if not ancestors:
         return ""
     oldest = str((scanned[0] or {}).get("ts") or "")
     capped = len(scanned) >= _PROJECT_THREAD_SCAN
     wholly_out = bool(oldest) and any(
-        oldest > str(cutoffs.get(chat) or "") for chat in ancestors
-        if str(cutoffs.get(chat) or "")
+        bound and oldest > bound for _chat, bound in ancestors
     )
     if not capped and not wholly_out:
         return ""
-    named = ", ".join(str(chat) for chat in sorted(ancestors))
+    named = ", ".join(str(chat) for chat, _bound in sorted(ancestors))
     why = (
-        f"the {len(scanned)}-row window scanned here is full, so older rows exist "
-        "that it never looked at"
+        # Deliberately NOT "older rows exist": a live file of exactly the cap length
+        # with no archive behind it has none, and a disclosure must not assert what
+        # it cannot see. "Anything older was not read" is true either way.
+        f"the {len(scanned)}-row window scanned here is full, so anything older than "
+        "it was not read"
         if capped else
         f"this window begins at {oldest}, after the point the fork was taken"
     )

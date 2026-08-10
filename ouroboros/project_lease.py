@@ -127,13 +127,13 @@ LaneKey = Tuple[str, str]
 #: a plain list so it survives the JSON queue snapshot unchanged.
 LANE_PIN_FIELD = "_lane_key"
 
-#: Whether a path comparison here may ignore case is a PLATFORM fact, and it is
-#: stated in the platform layer (``platform_layer.PATH_CASE_INSENSITIVE``, read
-#: through :func:`~ouroboros.platform_layer.casefold_path`) rather than by reading
-#: ``sys.platform`` in this module. ``os.path.normcase`` lowercases on win32 only,
-#: so on macOS ``/Users/x/Repo`` and ``/Users/x/repo`` — the SAME folder —
-#: produced two lanes and admitted two writers onto it, which is precisely what
-#: the lane exists to prevent (T0R2-4).
+# Whether a path comparison here may ignore case is a PLATFORM fact, so it is
+# stated in the platform layer (`platform_layer.PATH_CASE_INSENSITIVE`, consumed
+# through `casefold_path`) and NOT by reading `sys.platform` against a tuple in
+# this module. `os.path.normcase` lowercases on win32 only, so on macOS
+# `/Users/x/Repo` and `/Users/x/repo` — the SAME folder — produced two lanes and
+# admitted two writers onto it, which is precisely what the lane exists to
+# prevent (T0R2-4).
 
 
 def _as_task(item: Any) -> Any:

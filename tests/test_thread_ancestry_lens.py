@@ -725,7 +725,7 @@ def test_a_forks_shared_past_beyond_the_scan_is_disclosed_to_the_agent(tmp_path)
     assert str(parent_chat) in gaps[0]
     assert "FORK" in gaps[0]
     assert "may not be complete below" in gaps[0]
-    assert "never looked at" in gaps[0]
+    assert "anything older than it was not read" in gaps[0]
 
 
 def test_a_fork_whose_shared_past_IS_in_the_scan_says_nothing(tmp_path):
