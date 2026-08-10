@@ -36,6 +36,10 @@ lane: it released the lane it actually held and admitted a second writer into
 the same folder (T0R2-7). The pin is WRITE-ONCE: acquiring a lane a task never
 had is a deliberate act, drifting out of one it holds is not.
 
+Only OCCUPANCY reads the pin. A pending CANDIDATE holds nothing, so it is always
+compared by what its fields describe — which is also why a crash retry that
+carries a stale pin back into the queue can never be mis-compared.
+
 ``running_project_ids`` remains as the project-WIDE activity query (is anything
 running anywhere in this project?), which merge/remove preconditions need. It
 is deliberately NOT the lease key — do not reintroduce it as one.
@@ -146,10 +150,13 @@ def pin_task_lane(task: Any) -> Optional[LaneKey]:
     return lane
 
 
-def _task_lane(task: Any) -> LaneKey:
-    """The lane a task holds: the pinned key if it has one, else the computed one.
+def _held_lane(task: Any) -> LaneKey:
+    """The lane a RUNNING task HOLDS: its pin if it has one, else the computed key.
 
-    PENDING candidates have no pin yet — they are compared by what they describe.
+    Only occupancy reads the pin. A CANDIDATE is by definition not running and
+    holds nothing, so it is always compared by what it describes
+    (:func:`_computed_lane`) — which is also why a crash retry or a snapshot
+    restore carrying a stale pin back into PENDING cannot mis-compare it.
     """
     return _pinned_lane(task) or _computed_lane(task)
 
@@ -173,7 +180,7 @@ def running_project_lanes(running: Iterable[Any]) -> Set[LaneKey]:
     out: Set[LaneKey] = set()
     for task in running or ():
         if _is_lane_occupant(task):
-            out.add(_task_lane(task))
+            out.add(_held_lane(task))
     return out
 
 
@@ -208,7 +215,7 @@ def candidate_is_leasable(candidate: Dict[str, Any], running_lanes: Set[LaneKey]
                 "candidate_is_leasable expects lane keys from running_project_lanes "
                 f"((project_id, workspace_root) tuples), got {lane!r}"
             )
-    return _task_lane(candidate) not in running_lanes
+    return _computed_lane(candidate) not in running_lanes
 
 
 def mark_task_project(running: Any, pending: Any, tid: Any, pid: Any) -> bool:

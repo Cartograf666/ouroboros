@@ -275,3 +275,25 @@ def test_journal_and_workpad_roundtrip(tmp_path, monkeypatch):
     # Unscoped ctx without explicit id refuses honestly.
     bare = types.SimpleNamespace(project_id="", task_id="t", drive_root=tmp_path)
     assert "no project scope" in tools["journal_write"].handler(bare, kind="note", text="x")
+
+
+def test_a_candidate_is_compared_by_what_it_DESCRIBES_never_by_a_stale_pin():
+    """Only OCCUPANCY reads the pin. A pending candidate holds nothing.
+
+    A crash retry re-enqueues the very dict the pin was stamped on, so if a
+    candidate were compared by its pin it would be matched against a lane it no
+    longer holds — over-serializing at best, and under-serializing the moment
+    the record legitimately named a different folder.
+    """
+    from ouroboros.project_lease import pin_task_lane
+
+    retried = _task("alpha", tid="t1", workspace_root="/w/alpha")
+    pin_task_lane(retried)
+    # The retry will write in a DIFFERENT folder than the run that was pinned.
+    retried["workspace_root"] = "/w/beta"
+
+    busy_beta = running_project_lanes([_meta(_task("alpha", tid="t9", workspace_root="/w/beta"))])
+
+    assert candidate_is_leasable(retried, busy_beta) is False
+    stale_alpha = running_project_lanes([_meta(_task("alpha", tid="t9", workspace_root="/w/alpha"))])
+    assert candidate_is_leasable(retried, stale_alpha) is True
