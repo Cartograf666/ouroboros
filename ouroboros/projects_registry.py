@@ -465,7 +465,7 @@ def list_sidebar_projects(drive_root: Any) -> List[Dict[str, Any]]:
 _WORKING_DIR_INDEX: Dict[str, tuple] = {}
 
 
-def project_working_dirs(drive_root: Any) -> Dict[str, str]:
+def project_working_dirs(drive_root: Any) -> Optional[Dict[str, str]]:
     """``project_id -> registered working_dir`` for every RESERVED project.
 
     The writer-lease lane resolver (``ouroboros.project_lease``) needs this and
@@ -476,7 +476,19 @@ def project_working_dirs(drive_root: Any) -> Dict[str, str]:
     and two top-level writers would enter it. File-less projects are omitted —
     the lease then keys such a task on its project alone, which is narrower than
     a folder lane and is documented as such rather than assumed equivalent.
-    Fail-open: an unreadable registry yields ``{}``, i.e. that same narrower key.
+
+    ``None`` means the folders are UNKNOWN, and it is a different fact from an
+    empty map. ``{}`` says "no project has a registered folder", which the lane
+    is entitled to act on: it keys those tasks on their project alone and
+    serializes them against each other. An unreadable registry says nothing at
+    all — and collapsing the two made a truncated write, a partial
+    ``atomic_write`` on a full disk or a hand-edit read as "no project has a
+    folder", after which a folder-bearing candidate was compared against a
+    narrow lane, matched nothing, and a SECOND writer entered the folder (I3).
+    No exception is required to reach that: the parse simply yields no
+    ``projects`` list. So an existing registry path that does not parse into one,
+    and any failure while reading it, answer ``None``; a registry that is not
+    there yet answers ``{}``, because "this install has no projects" is a fact.
 
     Values are canonicalized here as well as at write time. New rows are stored
     resolved, but a registry written BEFORE that could hold an unresolved
@@ -484,7 +496,8 @@ def project_working_dirs(drive_root: Any) -> Dict[str, str]:
     is a DIFFERENT string, i.e. a second concrete lane and the very split this
     map exists to close. The resolve is memoized on the registry file's version
     stamp, so the filesystem is touched once per registry write rather than once
-    per assignment pass.
+    per assignment pass. ``None`` is deliberately NOT memoized: it describes a
+    file this process could not read, and the next caller should look again.
     """
     path = _registry_path(drive_root)
     key = str(path)
@@ -498,6 +511,13 @@ def project_working_dirs(drive_root: Any) -> Dict[str, str]:
         return dict(cached[1])
     out: Dict[str, str] = {}
     try:
+        raw = read_json_dict(path)
+        if path.exists() and not (isinstance(raw, dict) and isinstance(raw.get("projects"), list)):
+            # The file is THERE and holds no project list. `_load` fails open to
+            # `{"projects": []}` for every other reader, which is right for them
+            # and wrong for the lane: see the docstring.
+            log.warning("project_working_dirs: %s holds no readable projects list", path)
+            return None
         for project in list_reserved_projects(drive_root):
             pid = str(project.get("id") or "")
             folder = _canonical_working_dir(project.get("working_dir"))
@@ -505,7 +525,7 @@ def project_working_dirs(drive_root: Any) -> Dict[str, str]:
                 out[pid] = folder
     except Exception:
         log.debug("project_working_dirs failed", exc_info=True)
-        return {}
+        return None
     _WORKING_DIR_INDEX[key] = (stamp, dict(out))
     return out
 

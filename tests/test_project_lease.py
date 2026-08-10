@@ -85,14 +85,19 @@ def test_running_project_lanes_unwraps_production_meta_shape():
 
 def test_candidate_is_leasable_matrix():
     leased = {("alpha", "")}
+    # `{}` is the EMPTY map — "no project has a registered folder" — and is a
+    # different argument from omitting it, which means "the folders are unknown"
+    # and queues (I3, exercised in test_an_unreadable_folder_map_never_admits_a_
+    # second_writer).
+    folders: dict = {}
     # Unscoped tasks never serialize.
-    assert candidate_is_leasable(_task(""), leased) is True
+    assert candidate_is_leasable(_task(""), leased, folders) is True
     # A second writer for a leased project's own folder waits.
-    assert candidate_is_leasable(_task("alpha"), leased) is False
+    assert candidate_is_leasable(_task("alpha"), leased, folders) is False
     # A different project proceeds in parallel.
-    assert candidate_is_leasable(_task("beta"), leased) is True
+    assert candidate_is_leasable(_task("beta"), leased, folders) is True
     # The leased project's OWN subagents must not deadlock the swarm.
-    assert candidate_is_leasable(_task("alpha", role="subagent"), leased) is True
+    assert candidate_is_leasable(_task("alpha", role="subagent"), leased, folders) is True
 
 
 def test_lane_is_keyed_on_the_folder_whenever_a_task_names_one():
@@ -137,7 +142,9 @@ def test_two_projects_on_one_folder_share_the_lane():
     assert candidate_is_leasable(beta, lanes) is False
     # A task that names NO folder is narrower on purpose: nothing at this layer
     # may read the registry, so it can only serialize within its own project.
-    assert candidate_is_leasable(_task("beta", tid="t3"), lanes) is True
+    # `{}` says the registry HAS no folder for it; omitting the map would say the
+    # registry could not be read, which queues instead (I3).
+    assert candidate_is_leasable(_task("beta", tid="t3"), lanes, {}) is True
     assert running_project_lanes([_meta(_task("beta", tid="t3"))]) == {("beta", "")}
 
 
@@ -169,8 +176,12 @@ def test_a_post_hoc_scoped_task_shares_the_project_folder_lane():
     assert lanes == {("", os.path.normcase("/w/alpha"))}
     # The absent workspace resolves to the project's registered working_dir.
     assert candidate_is_leasable(converted, lanes, folders) is False
-    # ...and it would NOT have, read without the map: this is the whole point.
-    assert candidate_is_leasable(converted, lanes) is True
+    # ...and it would NOT have, read against an EMPTY map: this is the whole
+    # point. `{}` means "the registry says no folder", which is an answer the
+    # narrow key may act on; a MISSING map means "the registry could not be read"
+    # and is the separate, conservative case in
+    # test_an_unreadable_folder_map_never_admits_a_second_writer (I3).
+    assert candidate_is_leasable(converted, lanes, {}) is True
     # A thread branched into its OWN worktree still runs concurrently.
     branched = _task("alpha", tid="t3", workspace_root="/w/alpha-thread-2")
     assert candidate_is_leasable(branched, lanes, folders) is True
@@ -256,7 +267,12 @@ def test_case_and_symlink_normalization_boundaries():
     same_case = _task("alpha", tid="t2", workspace_root="/w/Alpha/")
     assert candidate_is_leasable(same_case, lanes) is False
     other_case = _task("alpha", tid="t3", workspace_root="/w/alpha")
-    case_insensitive = sys.platform in ("darwin", "win32")
+    # IMPORTED, not re-listed: a second copy of the module's own tuple means a
+    # platform added there without the test's makes this assertion pass
+    # vacuously (I18).
+    from ouroboros.project_lease import _CASE_INSENSITIVE_PLATFORMS
+
+    case_insensitive = sys.platform in _CASE_INSENSITIVE_PLATFORMS
     assert candidate_is_leasable(other_case, lanes) is not case_insensitive
     # An UNRESOLVED symlink spelling is a different string: the lease cannot
     # resolve it (no FS access under the queue lock), which is exactly why the
@@ -328,7 +344,9 @@ def test_lane_folds_case_on_a_case_insensitive_filesystem():
 
     lanes = running_project_lanes([_meta(upper)])
 
-    if sys.platform in ("darwin", "win32"):
+    from ouroboros.project_lease import _CASE_INSENSITIVE_PLATFORMS
+
+    if sys.platform in _CASE_INSENSITIVE_PLATFORMS:  # I18: one copy of the tuple
         assert candidate_is_leasable(lower, lanes) is False
     else:
         # A case-SENSITIVE filesystem genuinely has two folders here, and

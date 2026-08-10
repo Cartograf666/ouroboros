@@ -37,6 +37,22 @@ lanes to be conservative against (a folder lane does not carry the project it
 belongs to), so a "conflicts with everything in this project" key would have had
 nothing to match; the resolution map is what closes that hole instead.
 
+**"No project has a folder" and "the folders are unknown" are different facts,
+and the narrow key is only honest for the first.** ``project_workspaces={}`` is
+an answer: every project is file-less, so keying on the project alone serializes
+exactly the tasks that need it. ``project_workspaces=None`` is the ABSENCE of an
+answer — an unreadable registry — and it reaches here without any exception
+being raised, because the parse simply yields no ``projects`` list. Narrowing the
+key for that admitted a second writer in BOTH directions: a folder-bearing
+candidate compared against a narrow held lane matched nothing and entered the
+folder, and a placeless RUNNING holder stopped blocking a folder-bearing
+candidate. So a project-scoped candidate whose folder is UNRESOLVABLE
+(:func:`_folder_unresolvable`) is not leasable while any lane is held, and while
+the map is missing a candidate that names a folder still queues behind a narrow
+lane of its OWN project. An unknown folder queues; it never runs parallel by
+accident (I3). Everything else is unchanged: a real map — even an empty one —
+keeps the honest narrow key for the genuinely file-less project.
+
 **Purity.** These functions run under the supervisor queue lock on every
 assignment pass, so they NEVER touch the filesystem: normalization here is
 ``normpath`` + ``normcase`` + a ``casefold`` on case-insensitive platforms.
@@ -67,6 +83,19 @@ as free to the very next candidate.
 Only OCCUPANCY reads the pin. A pending CANDIDATE holds nothing, so it is always
 compared by what its fields describe — which is also why a crash retry that
 carries a stale pin back into the queue can never be mis-compared.
+
+And the pin is STRIPPED on the way back into PENDING, in the enqueue SSOT
+(``supervisor.queue.enqueue_task``), so every requeue path is covered at once. A
+task in PENDING holds no lane, so a pin from a previous attempt is not a claim —
+it is a stale fact about a run that is over. The in-process crash retry
+(``ensure_workers_healthy``) re-enqueues the very dict ``assign_tasks`` stamped,
+and ``enqueue_task``'s field-stripping allowlist did not include the pin: the next
+assignment pass found one, the write-once pin returned it unchanged, and attempt 2
+held a lane it does not write in. With the folder attached between attempts it
+froze ``(pid, "")`` while writing the registered folder, and the very next
+candidate for that folder read it as free (I4). The queue-SNAPSHOT path was
+already safe — ``persist_queue_snapshot`` is an allowlist that omits the pin —
+which is why only the in-process retry carried it.
 
 ``running_project_ids`` remains as the project-WIDE ACTIVITY query (is anything
 happening anywhere in this project?), which merge/remove preconditions need. It
@@ -160,7 +189,9 @@ def _computed_lane(
     supplied by the CALLER (the supervisor reads it from the registry; this
     module stays FS-free). A task whose record carries no ``workspace_root``
     resolves to its project's folder through that map, so a post-hoc-scoped task
-    takes the same FOLDER lane as the room task already writing there.
+    takes the same FOLDER lane as the room task already writing there. ``None``
+    means the map could not be read at all — see :func:`_folder_unresolvable`,
+    which is what stops that narrowing from admitting a second writer.
     """
     root = _task_workspace_root(task)
     pid = _task_project_id(task)
@@ -169,6 +200,19 @@ def _computed_lane(
     # A known folder is the lane, across projects and threads alike; a task whose
     # folder is unknown can only be serialized against its own project.
     return ("", root) if root else (pid, "")
+
+
+def _folder_unresolvable(
+    task: Any, project_workspaces: Optional[Mapping[str, str]] = None
+) -> bool:
+    """Is this task's FOLDER unknowable right now, as opposed to absent?
+
+    True only when the task names no folder of its own AND the caller could not
+    supply the project->folder map at all (``None``). With a real map — even an
+    empty one — a task that names no folder has an ANSWER: its project has no
+    registered folder, and ``(project_id, "")`` is the honest lane for it.
+    """
+    return project_workspaces is None and not _task_workspace_root(task)
 
 
 def _pinned_lane(task: Any) -> Optional[LaneKey]:
@@ -198,8 +242,20 @@ def pin_task_lane(
     ``("", registered_folder)``, so the folder would read as unheld to the very
     next candidate — two writers, admitted by the pin itself.
 
+    A lane that cannot be RESOLVED is not pinned at all
+    (:func:`_folder_unresolvable`), and that is the point of the write-once rule
+    rather than an exception to it: freezing ``(project_id, "")`` because the
+    registry happened to be unreadable at this instant would OUTLIVE the outage.
+    Once the map is readable again the candidate check has a real answer and stops
+    applying the conservative rule, while the holder still carries the narrow key —
+    so a folder-bearing candidate would match nothing and become a second writer.
+    Left unpinned, occupancy falls back to what the record describes and resolves
+    to the correct folder the moment the registry can be read. Nothing is lost: the
+    pin exists to stop a live writer DRIFTING out of a lane it holds, and a task
+    whose lane was never determined has no such lane.
+
     The caller MUST hold the queue lock. Returns the pinned key, or ``None`` when
-    the task holds no lane.
+    the task holds no lane, or when its lane cannot be resolved.
     """
     task = _as_task(task)
     if not isinstance(task, dict):
@@ -208,6 +264,8 @@ def pin_task_lane(
     if existing is not None:
         return existing
     if not _is_lane_occupant(task):
+        return None
+    if _folder_unresolvable(task, project_workspaces):
         return None
     lane = _computed_lane(task, project_workspaces)
     task[LANE_PIN_FIELD] = list(lane)
@@ -244,6 +302,20 @@ def _is_lane_occupant(task: Any) -> bool:
 _RESERVED_LANES: Dict[LaneKey, int] = {}
 _RESERVED_LOCK = threading.Lock()
 
+#: The reservations THIS thread is holding, so an operation can ask whether a
+#: folder is held by anyone ELSE. Without it the holder's own precondition check
+#: sees its own claim and refuses itself: merge-back takes the reservation and
+#: then asks ``project_is_busy``, which after I5 consults this set.
+_OWN_RESERVED = threading.local()
+
+
+def _own_reserved() -> Dict[LaneKey, int]:
+    counts = getattr(_OWN_RESERVED, "counts", None)
+    if counts is None:
+        counts = {}
+        _OWN_RESERVED.counts = counts
+    return counts
+
 
 @contextlib.contextmanager
 def reserved_folder_lane(workspace_root: Any) -> Iterator[Optional[LaneKey]]:
@@ -264,9 +336,16 @@ def reserved_folder_lane(workspace_root: Any) -> Iterator[Optional[LaneKey]]:
         return
     with _RESERVED_LOCK:
         _RESERVED_LANES[key] = _RESERVED_LANES.get(key, 0) + 1
+    own = _own_reserved()
+    own[key] = own.get(key, 0) + 1
     try:
         yield key
     finally:
+        mine = own.get(key, 0) - 1
+        if mine > 0:
+            own[key] = mine
+        else:
+            own.pop(key, None)
         with _RESERVED_LOCK:
             remaining = _RESERVED_LANES.get(key, 0) - 1
             if remaining > 0:
@@ -275,10 +354,21 @@ def reserved_folder_lane(workspace_root: Any) -> Iterator[Optional[LaneKey]]:
                 _RESERVED_LANES.pop(key, None)
 
 
-def reserved_folder_lanes() -> Set[LaneKey]:
-    """Folder lanes currently reserved by a non-task operation."""
+def reserved_folder_lanes(*, include_own: bool = True) -> Set[LaneKey]:
+    """Folder lanes currently reserved by a non-task operation.
+
+    ``include_own=False`` drops the reservations THIS thread is holding, which is
+    what an operation's own precondition needs: a merge-back takes the folder and
+    then asks whether the folder is busy, and it must not be refused by its own
+    claim. Two genuine concurrent holders each see the other's and both stop,
+    which is the fail-closed direction and the one the lane exists for.
+    """
     with _RESERVED_LOCK:
-        return set(_RESERVED_LANES)
+        counts = dict(_RESERVED_LANES)
+    if include_own:
+        return set(counts)
+    own = _own_reserved()
+    return {key for key, held in counts.items() if held > own.get(key, 0)}
 
 
 def running_project_lanes(
@@ -400,6 +490,15 @@ def candidate_is_leasable(
     ``project_workspaces`` must be the SAME map given to
     :func:`running_project_lanes`, or the two sides spell the same folder
     differently and the comparison decides nothing.
+
+    ``project_workspaces=None`` means the folders could not be READ (an
+    unreadable registry), which is not the same as "no project has one" and must
+    not narrow the key: see the module docstring. While the map is missing, a
+    project-scoped candidate that names no folder is not leasable at all if
+    anything holds a lane, and one that DOES name a folder still queues behind a
+    narrow lane of its own project — the placeless holder may be writing in
+    exactly that folder. "Cannot tell" queues; it never runs in parallel by
+    accident.
     """
     for lane in running_lanes or ():
         if not (isinstance(lane, tuple) and len(lane) == 2):
@@ -409,6 +508,11 @@ def candidate_is_leasable(
             )
     if not _is_lane_occupant(candidate):
         return True
+    if project_workspaces is None:
+        if _folder_unresolvable(candidate, project_workspaces):
+            return not bool(running_lanes)
+        if (_task_project_id(candidate), "") in (running_lanes or ()):
+            return False
     return _computed_lane(candidate, project_workspaces) not in running_lanes
 
 

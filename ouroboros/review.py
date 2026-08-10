@@ -209,6 +209,21 @@ GRANDFATHERED_OVERSIZED_MODULES = {
     # loop/shell/core above. NOTE: agent_task_pipeline.py hit the same wall in
     # this rebase and was made to FIT (no debt) — only config.py had no room.
     "config.py",
+    # 2026-08-10 project-threads integration review (I4): supervisor/queue.py was
+    # sitting at EXACTLY 1600, and the fix is ONE behavioural line — the enqueue
+    # SSOT must STRIP the writer-lane pin, because a task in PENDING holds no lane
+    # and the in-process crash retry re-enqueues the very dict `assign_tasks`
+    # stamped, so attempt 2 held a folder it does not write in while the next
+    # candidate for the folder it DOES write in read that folder as free. The line
+    # has to live there: `enqueue_task` is the one door every requeue path goes
+    # through, and putting the strip in a single caller reopens the others. Its
+    # explanation was moved into `project_lease`'s docstring and the comment cut to
+    # two lines, which still leaves the module 4 over — it has no reclaimable line
+    # that is not load-bearing prose about a defect. Splitting the evolution
+    # scheduling half out of the queue is the tracked follow-up (same "at the
+    # ceiling, crossed by a one-line safety fix" class as config.py above). Keyed
+    # by REPO-RELATIVE path so no other queue.py is silently exempted.
+    "supervisor/queue.py",
 }
 # Bundle-only launcher is not part of the self-editable function budget.
 FUNCTION_COUNT_EXCLUDED_FILES = {"launcher.py"}

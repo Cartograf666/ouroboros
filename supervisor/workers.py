@@ -2383,17 +2383,18 @@ def assign_tasks() -> None:
         # its own; without this map its lane would not match the room task
         # already writing the SAME project folder, and both would be admitted as
         # top-level writers. The lease itself stays filesystem-free under the
-        # queue lock, so the registry read lives here. Fail-open to {} — the
-        # lease then keys such a task on its project alone, which is narrower
-        # than a folder lane and is documented as such in project_lease rather
-        # than silently assumed equivalent.
+        # queue lock, so the registry read lives here. An unreadable registry is None, NOT {}: "no project has a
+        # folder" is an answer the lane may narrow on, "the folders are unknown" is not, and collapsing the two let a
+        # folder-bearing candidate slip past a narrow lane and a second writer into the folder (I3).
+        # project_working_dirs answers None for a registry that EXISTS and does not parse — no exception is raised on
+        # that path — so this arm only covers a raise on the way there.
         try:
             from ouroboros.projects_registry import project_working_dirs
 
             _project_workspaces = project_working_dirs(DRIVE_ROOT)
         except Exception:
             log.debug("assign_tasks: project working_dir map unavailable", exc_info=True)
-            _project_workspaces = {}
+            _project_workspaces = None
 
         def _running_subagent_count(root_task_id: str) -> int:
             if not root_task_id:

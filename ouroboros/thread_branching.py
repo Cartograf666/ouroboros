@@ -755,7 +755,9 @@ def queue_notice(
         # no folder of its own keys on ("", registered_folder) in assign_tasks; read
         # without the map it would key on (project_id, "") here, and this notice
         # would promise "no wait" for the very folder the queue is about to make the
-        # owner wait on.
+        # owner wait on. It can be None — an unreadable registry — which the lease
+        # reads as "the folder is unknown" rather than "there is none" (I3), so this
+        # notice stays in agreement with the scheduler in that case too.
         from ouroboros.projects_registry import project_working_dirs
 
         folders = project_working_dirs(data_root)

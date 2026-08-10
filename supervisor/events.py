@@ -2970,7 +2970,11 @@ def _project_lane_wait_suffix(task: Any, running_ref: Any, drive_root: Any = Non
 
         if not isinstance(task, dict) or not str(task.get("project_id") or "").strip():
             return ""
-        folders: Dict[str, str] = {}
+        # None, never {}: the lane treats "the folders are unknown" differently
+        # from "no project has one" (I3), and this notice has to reach the same
+        # verdict the scheduler will — that is the whole reason it is handed the
+        # same map. No drive_root means unknown, not empty.
+        folders: Optional[Dict[str, str]] = None
         if drive_root is not None:
             try:
                 from ouroboros.projects_registry import project_working_dirs
