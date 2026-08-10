@@ -1298,7 +1298,14 @@ def run_thread_deletion(
                 )
     except Exception as exc:
         q.log.exception("Thread deletion failed for %s#%s", project_id, thread_id)
-        fail_thread_deletion(drive_root, project_id, thread_id, f"{type(exc).__name__}: {exc}")
+        try:
+            # Recording WHY must not itself raise out of a daemon thread. The
+            # project row can have moved between the fence and here (its own
+            # deletion started), and losing this note is better than losing the
+            # traceback that explains what actually went wrong.
+            fail_thread_deletion(drive_root, project_id, thread_id, f"{type(exc).__name__}: {exc}")
+        except Exception:
+            q.log.debug("Could not record the thread-deletion failure", exc_info=True)
         _broadcast_projects_changed(project_id, chat_id)
     finally:
         if worker_key is not None:
