@@ -40,9 +40,10 @@ Only OCCUPANCY reads the pin. A pending CANDIDATE holds nothing, so it is always
 compared by what its fields describe — which is also why a crash retry that
 carries a stale pin back into the queue can never be mis-compared.
 
-``running_project_ids`` remains as the project-WIDE activity query (is anything
-running anywhere in this project?), which merge/remove preconditions need. It
-is deliberately NOT the lease key — do not reintroduce it as one.
+``running_project_ids`` remains as the project-WIDE ACTIVITY query (is anything
+happening anywhere in this project?), which merge/remove preconditions need. It
+is deliberately NOT the lease key — do not reintroduce it as one — and it counts
+what the lane deliberately ignores: subagents, and queued work.
 """
 
 from __future__ import annotations
@@ -184,18 +185,35 @@ def running_project_lanes(running: Iterable[Any]) -> Set[LaneKey]:
     return out
 
 
-def running_project_ids(running: Iterable[Any]) -> Set[str]:
-    """Project ids with ANY running writer — the project-WIDE activity query.
+def running_project_ids(running: Iterable[Any], pending: Iterable[Any] = ()) -> Set[str]:
+    """Project ids with ANY task alive in them — the project-WIDE ACTIVITY query.
 
-    NOT the lease key (that is :func:`running_project_lanes`). This answers
-    "is anything running anywhere in this project?", which is the precondition
-    a merge-back or a worktree removal needs: those touch the project as a
-    whole, not one folder.
+    NOT the lease key (that is :func:`running_project_lanes`). This answers "is
+    anything happening anywhere in this project?", which is the precondition a
+    merge-back or a worktree removal needs: those touch the project as a whole,
+    not one folder.
+
+    Two deliberate differences from the lane query, both because the question is
+    different (T3R-14):
+
+    * SUBAGENTS COUNT here. The lane exempts them so a swarm cannot deadlock
+      against its own parent — a SCHEDULING rule, about who may be assigned. A
+      subagent still runs commands and writes files in the project, so for "is
+      anything happening here" it is as real as any other task, and exempting it
+      let a merge rewrite a folder while a swarm member was mid-write.
+    * PENDING COUNTS, stated plainly rather than left to be inferred: a queued
+      task for this project can be assigned at ANY instant, including the one
+      right after this returns, and the callers hold no lock against the
+      scheduler. Counting it costs the owner a wait; not counting it costs a
+      folder rewritten under a task that has just started. ``pending`` is a
+      separate argument because the supervisor keeps the two collections apart
+      and a caller that can only see one must still get a true answer about it.
     """
     out: Set[str] = set()
-    for task in running or ():
-        if _is_lane_occupant(task):
-            out.add(_task_project_id(task))
+    for task in (*(running or ()), *(pending or ())):
+        pid = _task_project_id(task)
+        if pid:
+            out.add(pid)
     return out
 
 

@@ -491,22 +491,36 @@ def branch_off_thread(
 # --------------------------------------------------------------------------- #
 
 def project_is_busy(project_id: str) -> bool:
-    """Is ANY task running anywhere in this project? (A9's first precondition.)
+    """Is ANYTHING alive anywhere in this project? (A9's first precondition.)
 
-    Reads the project-WIDE activity query, deliberately NOT the writer lane: a
-    merge touches the project as a whole, so a task running in a DIFFERENT folder
-    of the same project still blocks it. Fail-CLOSED — if the queue cannot be
-    read, the project counts as busy, because "cannot tell" must never license a
-    merge into a folder something might be writing in.
+    Reads the project-WIDE ACTIVITY query, deliberately NOT the writer lane: a
+    merge touches the project as a whole, so a task in a DIFFERENT folder of the
+    same project still blocks it. Which means it counts the two things the lane
+    deliberately ignores, and both are stated here because "any task running
+    anywhere in this project" was not what the code actually asked (T3R-14):
+
+    * SUBAGENTS count. The lane exempts them so a swarm cannot deadlock against
+      its own parent; that is a scheduling rule about who may be ASSIGNED. A
+      subagent still writes files in the project, and exempting it here let a
+      merge rewrite the folder while a swarm member was mid-write.
+    * PENDING counts. A queued task for this project can be assigned at any
+      instant, including the one right after this returns, and a merge holds no
+      lock against the scheduler. Counting it costs the owner a wait; not
+      counting it costs a folder rewritten under a task that has just started.
+
+    Fail-CLOSED — if the queue cannot be read, the project counts as busy,
+    because "cannot tell" must never license a merge into a folder something
+    might be writing in.
     """
     try:
         from ouroboros.project_lease import running_project_ids
         from supervisor.queue import _queue_lock
-        from supervisor.workers import RUNNING
+        from supervisor.workers import PENDING, RUNNING
 
         with _queue_lock:
             running = list(RUNNING.values())
-        return str(project_id) in running_project_ids(running)
+            pending = list(PENDING)
+        return str(project_id) in running_project_ids(running, pending)
     except Exception:
         log.debug("project_is_busy could not read the queue for %s", project_id, exc_info=True)
         return True
@@ -517,8 +531,14 @@ def project_is_busy(project_id: str) -> bool:
 #: running one and will run when it finishes. It is not rejected, not dropped,
 #: and not silently reordered. The remedy is offered in the same breath, because
 #: "you have to wait" without "here is how not to" is a dead end.
+#:
+#: It names the FOLDER and not the project, because after T0R2-5 the lane is
+#: keyed on the folder alone: whatever is holding it may belong to another
+#: thread, another project, or no project at all. "Another thread in this
+#: project" was a guess about the occupant, and a wrong guess sends the owner
+#: looking for a room that is not the one making them wait (T3R-15).
 QUEUE_NOTICE = (
-    "Another thread in this project is working in the same folder right now. "
+    "Another task is working in this folder right now. "
     "A task you start here will be QUEUED behind it and will run as soon as that "
     "one finishes — it is not rejected. Branching this thread off gives it its "
     "own copy of the folder, so both can run at the same time."
@@ -554,22 +574,30 @@ def queue_notice(
     Fail-OPEN, unlike the merge precondition: if the queue cannot be read this
     says nothing rather than warning about a wait that may not exist. A false
     warning here costs trust; a missing one costs a few seconds of surprise.
-    """
-    from ouroboros.project_lease import candidate_is_leasable, running_project_lanes
 
-    data_root = data_dir if data_dir is not None else drive_root
+    ALL of the work is inside that guard, which it was not (T3R-13): the lease
+    import and the two resolver calls sat outside it, so a `project_lease` that
+    would not import, a registry read that raised, or a folder probe that threw
+    turned a decorative advisory into a 500 for the whole branch-bases route —
+    taking the owner's list of bases down with it. This notice is the least
+    important thing on that answer; nothing about it may be able to remove the
+    rest.
+    """
     quiet = {"queued": False, "reason": "", "message": "", "remedy": ""}
-    resolved = resolve_project_repo(drive_root, project_id)
-    location = thread_location(data_root, project_id, thread_id)
-    if location["where"] == "worktree":
-        workspace = str(location.get("path") or "")
-    elif resolved.get("ok"):
-        workspace = str(resolved.get("repo_dir") or "")
-    else:
-        # No usable folder means no folder lane to contend for; whatever else is
-        # wrong with this project, waiting is not it.
-        return quiet
     try:
+        from ouroboros.project_lease import candidate_is_leasable, running_project_lanes
+
+        data_root = data_dir if data_dir is not None else drive_root
+        resolved = resolve_project_repo(drive_root, project_id)
+        location = thread_location(data_root, project_id, thread_id)
+        if location["where"] == "worktree":
+            workspace = str(location.get("path") or "")
+        elif resolved.get("ok"):
+            workspace = str(resolved.get("repo_dir") or "")
+        else:
+            # No usable folder means no folder lane to contend for; whatever else
+            # is wrong with this project, waiting is not it.
+            return quiet
         if running is None:
             from supervisor.queue import _queue_lock
             from supervisor.workers import RUNNING
@@ -577,13 +605,13 @@ def queue_notice(
             with _queue_lock:
                 running = list(RUNNING.values())
         lanes = running_project_lanes(running)
+        candidate = {"id": "", "project_id": str(project_id), "workspace_root": workspace}
+        if candidate_is_leasable(candidate, lanes):
+            return quiet
+        own = location["where"] == "worktree"
     except Exception:
-        log.debug("queue_notice could not read the queue for %s", project_id, exc_info=True)
+        log.debug("queue_notice could not be computed for %s", project_id, exc_info=True)
         return quiet
-    candidate = {"id": "", "project_id": str(project_id), "workspace_root": workspace}
-    if candidate_is_leasable(candidate, lanes):
-        return quiet
-    own = location["where"] == "worktree"
     return {
         "queued": True,
         "reason": "folder_busy",

@@ -572,6 +572,33 @@ def test_project_is_busy_reads_the_project_WIDE_activity_query(monkeypatch):
         workers.RUNNING.pop("t1", None)
 
 
+def test_the_activity_query_sees_subagents_and_queued_work(monkeypatch):
+    """T3R-14. "Any task running anywhere in this project" was not what the code
+    asked: the lane's SUBAGENT exemption came along for the ride and PENDING was
+    never read at all.
+
+    The exemption exists so a swarm cannot deadlock against its own parent — a
+    scheduling rule about who may be ASSIGNED. A subagent still writes files, and
+    a queued task can start the instant after the answer is read, while a merge
+    holds no lock against the scheduler.
+    """
+    import ouroboros.thread_branching as branching
+    from supervisor import workers
+
+    member = {"id": "s1", "project_id": "racer", "delegation_role": "subagent",
+              "workspace_root": "/w/racer"}
+    monkeypatch.setitem(workers.RUNNING, "s1", {"task": member})
+    try:
+        assert branching.project_is_busy("racer") is True
+    finally:
+        workers.RUNNING.pop("s1", None)
+
+    assert branching.project_is_busy("racer") is False
+    monkeypatch.setattr(workers, "PENDING", [{"id": "q1", "project_id": "racer"}])
+    assert branching.project_is_busy("racer") is True
+    assert branching.project_is_busy("other") is False
+
+
 def test_project_is_busy_fails_closed(monkeypatch):
     """"Cannot tell" must never license a merge into a folder something may be
     writing in."""

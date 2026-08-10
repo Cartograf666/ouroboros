@@ -46,9 +46,30 @@ def test_running_project_lanes_counts_top_level_scoped_tasks_only():
         None,
     ]
     assert running_project_lanes(running) == {("alpha", ""), ("beta", "")}
-    # The project-WIDE activity query (merge/remove preconditions) is a
-    # SEPARATE answer and is deliberately not the lease key.
-    assert running_project_ids(running) == {"alpha", "beta"}
+    # The project-WIDE ACTIVITY query (merge/remove preconditions) is a SEPARATE
+    # answer, deliberately not the lease key — and it counts the SUBAGENT the
+    # lane exempts (T3R-14). That exemption is a SCHEDULING rule, so a swarm
+    # cannot deadlock against its own parent; a subagent still runs commands and
+    # writes files, so "is anything happening in this project" must see it.
+    # Exempting it here let a merge rewrite the folder mid-swarm-write.
+    assert running_project_ids(running) == {"alpha", "beta", "gamma"}
+
+
+def test_the_activity_query_counts_QUEUED_work_too():
+    """T3R-14, stated plainly rather than left to be inferred: a PENDING task for
+    this project can be assigned at ANY instant, including the one right after
+    this answer is read, and a merge holds no lock against the scheduler.
+
+    Counting it costs the owner a wait. Not counting it costs a folder rewritten
+    under a task that has just started.
+    """
+    running = [_meta(_task("alpha"))]
+    pending = [_task("beta", tid="queued"), _task("", tid="unscoped")]
+
+    assert running_project_ids(running, pending) == {"alpha", "beta"}
+    # Omitted, the answer is about running work alone — a caller that can only
+    # see one collection still gets a true answer about that one.
+    assert running_project_ids(running) == {"alpha"}
 
 
 def test_running_project_lanes_unwraps_production_meta_shape():

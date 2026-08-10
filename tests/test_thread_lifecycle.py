@@ -214,6 +214,13 @@ def test_the_scheduled_notice_says_QUEUED_not_rejected(monkeypatch):
     assert "QUEUED" in suffix
     assert "not rejected" in suffix
     assert "branching this thread off" in suffix.lower()
+    # T3R-9: it IS the one sentence, imported — not a second copy of it. A14's
+    # whole point is that one wording exists and is true; two copies drift the
+    # moment either is edited, and the surfaces then explain the same wait in
+    # different words.
+    from ouroboros.thread_branching import QUEUE_NOTICE
+
+    assert suffix == f" ({QUEUE_NOTICE})"
     # A thread with its OWN checkout is not waiting on that folder at all.
     branched = {"id": "t3", "project_id": "racer", "workspace_root": "/w/racer-thread-2"}
     assert _project_lane_wait_suffix(branched, busy) == ""

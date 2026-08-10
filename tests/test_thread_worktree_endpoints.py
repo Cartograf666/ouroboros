@@ -334,3 +334,89 @@ def test_branch_bases_carries_the_honest_queue_notice(wired, monkeypatch):
     assert "rejected" in notice["message"]  # ...as the thing it explicitly is NOT
     assert "is not rejected" in notice["message"]
     assert notice["remedy"] == "branch_off"
+
+
+def test_the_queue_notice_names_the_FOLDER_not_a_guess_about_who_holds_it(wired, monkeypatch):
+    """T3R-15. After T0R2-5 the writer lane is keyed on the FOLDER alone, across
+    projects and threads alike — so whatever is holding it may belong to another
+    thread, another project, or no project at all.
+
+    "Another thread in this project" was a guess about the occupant, and a wrong
+    guess sends the owner looking for a room that is not the one making them wait.
+    """
+    from ouroboros.thread_branching import QUEUE_NOTICE
+    from supervisor import workers
+
+    client, _drive, tid, folder = wired
+    # The occupant belongs to a DIFFERENT project, in the same folder.
+    monkeypatch.setitem(
+        workers.RUNNING, "other",
+        {"task": {"id": "other", "project_id": "someone-else", "workspace_root": str(folder)}},
+    )
+    try:
+        notice = client.get(
+            f"/api/projects/racer/threads/{tid}/branch-bases"
+        ).json()["queue_notice"]
+    finally:
+        workers.RUNNING.pop("other", None)
+
+    assert notice["queued"] is True
+    assert notice["message"] == QUEUE_NOTICE
+    assert "Another task is working in this folder" in notice["message"]
+    assert "this project" not in notice["message"], "the occupant's project is not known here"
+
+
+def test_a_broken_queue_notice_never_takes_the_BASES_LIST_down_with_it(wired, monkeypatch):
+    """T3R-13. The notice is the least important thing on this answer — an
+    advisory beside the list of bases the owner actually came for.
+
+    Its fail-open guard covered only the queue READ. The `project_lease` import
+    and the `candidate_is_leasable` call sat OUTSIDE it — and that call raises
+    TypeError by contract on a malformed lane — so anything wrong there 500'd the
+    whole route and the owner lost their bases list to a sentence about waiting.
+    """
+    import ouroboros.project_lease as lease
+
+    client, _drive, tid, folder = wired
+    monkeypatch.setitem(
+        workers_module().RUNNING, "t1",
+        {"task": {"id": "t1", "project_id": "racer", "workspace_root": str(folder)}},
+    )
+
+    def _explode(*_a, **_kw):
+        raise TypeError("candidate_is_leasable expects lane keys")
+
+    monkeypatch.setattr(lease, "candidate_is_leasable", _explode)
+    try:
+        response = client.get(f"/api/projects/racer/threads/{tid}/branch-bases")
+    finally:
+        workers_module().RUNNING.pop("t1", None)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["queue_notice"] == {"queued": False, "reason": "", "message": "", "remedy": ""}
+    # The answer the owner came for is intact.
+    assert body["current_branch"] == "main"
+    assert body["snapshot"]["ref"] == "@snapshot"
+
+
+def test_a_queue_notice_whose_own_IMPORT_fails_is_still_only_a_missing_sentence(wired, monkeypatch):
+    """The import itself was outside the guard too, so a `project_lease` that
+    would not load took the route with it."""
+    import sys
+
+    from ouroboros.thread_branching import queue_notice
+
+    client, drive, tid, _folder = wired
+    monkeypatch.setitem(sys.modules, "ouroboros.project_lease", None)
+
+    assert queue_notice(drive, "racer", tid) == {
+        "queued": False, "reason": "", "message": "", "remedy": "",
+    }
+    assert client.get(f"/api/projects/racer/threads/{tid}/branch-bases").status_code == 200
+
+
+def workers_module():
+    from supervisor import workers
+
+    return workers

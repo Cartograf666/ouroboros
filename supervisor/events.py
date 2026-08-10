@@ -2943,10 +2943,11 @@ def _reject_if_no_chat_target(
 def _project_lane_wait_suffix(task: Any, running_ref: Any) -> str:
     """The honest "this will WAIT" sentence for a task whose folder is busy (A14).
 
-    Says the TRUE thing: the task is QUEUED behind the running one and starts as
-    soon as it finishes. It is NOT rejected — the writer lane serializes and has
-    never refused anything — and the remedy is named in the same breath, because
-    "you have to wait" without "here is how not to" is a dead end.
+    The sentence itself is ``thread_branching.QUEUE_NOTICE`` — IMPORTED, never
+    re-authored (T3R-9). A14's whole point is that one wording exists and is
+    true; a second copy here drifted the moment either was edited, and the two
+    surfaces then explained the same wait in different words. This function
+    decides WHETHER to say it. It does not get to decide what it says.
 
     Never raises and never guesses: an unreadable queue answers "" rather than
     warning about a wait that may not exist. A false warning here costs trust; a
@@ -2954,6 +2955,7 @@ def _project_lane_wait_suffix(task: Any, running_ref: Any) -> str:
     """
     try:
         from ouroboros.project_lease import candidate_is_leasable, running_project_lanes
+        from ouroboros.thread_branching import QUEUE_NOTICE
 
         if not isinstance(task, dict) or not str(task.get("project_id") or "").strip():
             return ""
@@ -2963,11 +2965,7 @@ def _project_lane_wait_suffix(task: Any, running_ref: Any) -> str:
     except Exception:
         log.debug("Could not read the writer lane for a scheduled task", exc_info=True)
         return ""
-    return (
-        " (another thread is working in the same folder, so this is QUEUED behind it "
-        "and starts as soon as that one finishes — it is not rejected; branching this "
-        "thread off gives it its own copy of the folder so both can run at once)"
-    )
+    return f" ({QUEUE_NOTICE})"
 
 
 def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
