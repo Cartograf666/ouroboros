@@ -186,6 +186,22 @@ export function queueNoticeOffersBranching(notice) {
 // has to remember which routes take a body.
 // ---------------------------------------------------------------------------
 
+/**
+ * Open a branched thread's checkout in the Changes screen (A13).
+ *
+ * Dispatches the same kind of window event the task inspector already uses to
+ * open a task diff, so a thread menu needs no reference to the Changes
+ * controller. Returns false when the thread has no checkout to show, which is a
+ * STATE the caller should explain, not an error to swallow.
+ */
+export function openThreadChanges({ projectId, threadId, label = '', branch = '', filePath = '' } = {}) {
+    if (!projectId || threadId === undefined || threadId === null || threadId === '') return false;
+    window.dispatchEvent(new CustomEvent('ouro:open-thread-changes', {
+        detail: { projectId: String(projectId), threadId: String(threadId), label, branch, filePath },
+    }));
+    return true;
+}
+
 export const threadOps = {
     bases: (projectId, threadId) => apiClient.threadBranchBases(projectId, threadId),
     branchOff: (projectId, threadId, baseRef) => apiClient.threadBranchOff(projectId, threadId, baseRef),

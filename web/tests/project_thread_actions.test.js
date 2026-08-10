@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
     describeOutcome,
     isBranched,
+    openThreadChanges,
     queueNoticeOffersBranching,
     queueNoticeText,
     removalPrompt,
@@ -144,4 +145,26 @@ test('the queue notice is the server\'s sentence, and it offers branching', () =
     // A thread waiting on its OWN checkout is not offered a second branch-off:
     // that advice would not work.
     assert.equal(queueNoticeOffersBranching({ queued: true, remedy: '' }), false);
+});
+
+test('opening a thread checkout goes through the SAME event seam the inspector uses', () => {
+    // The menu must not need a handle on the Changes controller: one page owns
+    // Changes, and both ways in land on its two source-mode entry points.
+    const seen = [];
+    const original = globalThis.window;
+    globalThis.window = { dispatchEvent: (event) => seen.push(event) };
+    try {
+        assert.equal(openThreadChanges({ projectId: 'racer', threadId: 2, branch: 'thread/racer__2' }), true);
+        assert.equal(seen.length, 1);
+        assert.equal(seen[0].type, 'ouro:open-thread-changes');
+        assert.deepEqual(seen[0].detail, {
+            projectId: 'racer', threadId: '2', label: '', branch: 'thread/racer__2', filePath: '',
+        });
+        // Thread 0 is a legitimate id; only a MISSING one is refused.
+        assert.equal(openThreadChanges({ projectId: 'racer', threadId: 0 }), true);
+        assert.equal(openThreadChanges({ projectId: '', threadId: 2 }), false);
+        assert.equal(openThreadChanges({ projectId: 'racer' }), false);
+    } finally {
+        globalThis.window = original;
+    }
 });

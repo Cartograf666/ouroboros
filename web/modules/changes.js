@@ -1076,6 +1076,23 @@ export function initChanges(ctx = {}) {
         await selectTask(taskId, { filePath: String(event?.detail?.filePath || '') });
     });
 
+    // ...and the thread-checkout equivalent, so a thread menu can open its own
+    // diff without holding a reference to this controller. Same shape as the
+    // task event on purpose: one page owns Changes, and both ways in land on the
+    // same two source-mode entry points rather than a third code path.
+    window.addEventListener('ouro:open-thread-changes', async (event) => {
+        const detail = event?.detail || {};
+        const projectId = String(detail.projectId || '');
+        const threadId = String(detail.threadId ?? '');
+        if (!projectId || threadId === '') return;
+        if (typeof showPage === 'function') await showPage('changes');
+        await selectThreadCheckout(projectId, threadId, {
+            label: String(detail.label || ''),
+            branch: String(detail.branch || ''),
+            filePath: String(detail.filePath || ''),
+        });
+    });
+
     paintAll();
     loadTasks();
 
