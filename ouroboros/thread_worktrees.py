@@ -530,6 +530,21 @@ def remove_thread_worktree(
         }
 
 
+def project_thread_worktrees(data_dir: Any, project_id: Any) -> List[Dict[str, Any]]:
+    """Every registered checkout belonging to ONE project.
+
+    The project-delete precondition needs this and had no way to ask: the registry
+    is keyed by ``(project_id, thread_id)`` but only ``list_thread_worktrees``
+    (whole file) and ``get_thread_worktree`` (one thread) were exposed, so
+    ``api_project_delete`` never looked and tombstoned the project with N
+    checkouts and N ``thread/*`` branches still on disk (I1).
+    """
+    pid = str(project_id or "").strip()
+    if not pid:
+        return []
+    return [row for row in list_thread_worktrees(data_dir) if str(row.get("project_id") or "") == pid]
+
+
 def _project_is_busy(project_id: Any, row: Dict[str, Any]) -> bool:
     """Is anything alive in this project, or in the CHECKOUT? — merge-back's judge.
 
@@ -537,11 +552,22 @@ def _project_is_busy(project_id: Any, row: Dict[str, Any]) -> bool:
     has to be the same one merge-back gets, or the two owner gestures would
     disagree about whether the folder is safe to touch. The folder asked about is
     the CHECKOUT — that is the one this deletes — and the project-wide half of the
-    query already covers a task running anywhere else in the project.
+    query already covers a TASK running anywhere else in the project.
+
+    The PROJECT folder is asked about as well, because a non-task holder is not a
+    task and the project-wide half cannot see it (I5). A merge-back reserves the
+    project folder while it rewrites it, and this removal rewrites the same
+    repository's ``.git/worktrees`` and deletes the very ``thread/<name>`` branch
+    that merge is reading — so "nothing is happening in the project" has to
+    include the gesture that is happening in it.
     """
     from ouroboros.thread_branching import project_is_busy
 
-    return project_is_busy(str(project_id or ""), str(row.get("path") or ""))
+    pid = str(project_id or "")
+    if project_is_busy(pid, str(row.get("path") or "")):
+        return True
+    repo_dir = str(row.get("repo_dir") or "")
+    return bool(repo_dir) and project_is_busy(pid, repo_dir)
 
 
 def _trusted_guard_root(row: Dict[str, Any], fallback: Path, data_dir: Any) -> Path:

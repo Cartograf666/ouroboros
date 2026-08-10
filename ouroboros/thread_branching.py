@@ -530,7 +530,29 @@ def branch_off_thread(
     wanted = str(base_ref or "").strip()
     snapshot: Dict[str, Any] = {}
     if wanted == BASE_SNAPSHOT:
-        snapshot = _snapshot_commit(repo_dir, str(thread.get("name") or f"thread {tid}"))
+        # The ONE arm of branch-off that WRITES the owner's folder: `git add -A`
+        # plus a commit, in the project folder itself. Merge-back guards its write
+        # twice — it holds the folder's lane and then asks `project_is_busy` — and
+        # this one asked neither, so a live task's half-written scratch file became
+        # a commit on the owner's branch while `project_is_busy` was answering True
+        # for that exact folder one line earlier (I6). Guarded the same way, and
+        # only here: every other base reads a commit-ish and writes nothing to the
+        # project folder, so branching off a branch or a tag must keep working
+        # while a task runs.
+        from ouroboros.project_lease import reserved_folder_lane
+        with reserved_folder_lane(repo_dir):
+            if project_is_busy(pid, repo_dir):
+                return _refused(
+                    REASON_PROJECT_BUSY,
+                    "A task is running or queued in this project right now. "
+                    "\"Exactly as it is now\" commits everything in the project "
+                    "folder, so it would bake that task's half-written files into "
+                    "your history — it waits until that task finishes. Branching "
+                    "off a branch, a tag or a commit does not touch the folder and "
+                    "works now.",
+                    project_id=pid, thread_id=tid,
+                )
+            snapshot = _snapshot_commit(repo_dir, str(thread.get("name") or f"thread {tid}"))
         if not snapshot.get("ok"):
             return _refused(
                 REASON_SNAPSHOT_FAILED,
@@ -648,6 +670,15 @@ def project_is_busy(project_id: str, repo_dir: Any = None) -> bool:
     ``workspace_root`` with no ``project_id`` at all — which holds no lane and is
     still in the folder.
 
+    A non-TASK holder counts too. ``reserved_folder_lane`` is how a merge-back
+    holds the folder it is rewriting, and it was unioned into
+    ``running_project_lanes`` so the SCHEDULER sees it — but this function, the
+    SSOT behind every owner gesture's precondition, read only the two task
+    queries. So during a merge-back the scheduler correctly saw the folder held
+    while a second merge-back, a checkout removal and a thread delete were all
+    told IDLE, and a second holder was admitted into the folder mid-merge. There
+    must be ONE answer to "is this folder occupied", and it is this one (I5).
+
     Fail-CLOSED — if the queue cannot be read, the project counts as busy,
     because "cannot tell" must never license a merge into a folder something
     might be writing in.
@@ -655,6 +686,7 @@ def project_is_busy(project_id: str, repo_dir: Any = None) -> bool:
     try:
         from ouroboros.project_lease import (
             normalize_workspace_root,
+            reserved_folder_lanes,
             running_project_ids,
             running_workspace_roots,
         )
@@ -667,7 +699,16 @@ def project_is_busy(project_id: str, repo_dir: Any = None) -> bool:
         if str(project_id) in running_project_ids(running, pending):
             return True
         folder = normalize_workspace_root(repo_dir)
-        return bool(folder) and folder in running_workspace_roots(running, pending)
+        if not folder:
+            return False
+        # The reservation set keys on the SAME normalization this line already
+        # applied, so the comparison is a real one rather than theatre.
+        # `include_own=False`: the caller may BE a holder (merge-back asks this
+        # from inside its own reservation), and an operation refused by its own
+        # claim would never run at all.
+        if ("", folder) in reserved_folder_lanes(include_own=False):
+            return True
+        return folder in running_workspace_roots(running, pending)
     except Exception:
         log.debug("project_is_busy could not read the queue for %s", project_id, exc_info=True)
         return True
