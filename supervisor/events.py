@@ -2940,6 +2940,36 @@ def _reject_if_no_chat_target(
     return False
 
 
+def _project_lane_wait_suffix(task: Any, running_ref: Any) -> str:
+    """The honest "this will WAIT" sentence for a task whose folder is busy (A14).
+
+    Says the TRUE thing: the task is QUEUED behind the running one and starts as
+    soon as it finishes. It is NOT rejected — the writer lane serializes and has
+    never refused anything — and the remedy is named in the same breath, because
+    "you have to wait" without "here is how not to" is a dead end.
+
+    Never raises and never guesses: an unreadable queue answers "" rather than
+    warning about a wait that may not exist. A false warning here costs trust; a
+    missing one costs a few seconds of surprise.
+    """
+    try:
+        from ouroboros.project_lease import candidate_is_leasable, running_project_lanes
+
+        if not isinstance(task, dict) or not str(task.get("project_id") or "").strip():
+            return ""
+        lanes = running_project_lanes(list(running_ref.values()) if hasattr(running_ref, "values") else running_ref)
+        if candidate_is_leasable(task, lanes):
+            return ""
+    except Exception:
+        log.debug("Could not read the writer lane for a scheduled task", exc_info=True)
+        return ""
+    return (
+        " (another thread is working in the same folder, so this is QUEUED behind it "
+        "and starts as soon as that one finishes — it is not rejected; branching this "
+        "thread off gives it its own copy of the folder so both can run at once)"
+    )
+
+
 def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
     st = ctx.load_state()
     owner_chat_id = st.get("owner_chat_id")
@@ -3365,6 +3395,11 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             suffix = (
                 f" (queued behind active subagent cap {max_active}; it will start when a slot frees)"
             )
+        elif not suffix and delegation_role != "subagent":
+            # A14, said at the moment it becomes true. Reuses THIS notice rather
+            # than the assignment loop, so it costs one lane read per scheduled
+            # task instead of one per pass, and adds no ABI field.
+            suffix = _project_lane_wait_suffix(admitted, running_ref)
         # A subagent's scheduled notice routes to its root project thread by lineage (C4.4); else its own chat; a headless subagent (chat_id=0, no bound root) still skips.
         _notice_chat = (_bound_project_chat_id(ctx, tid, parent_id, root_task_id)
                         if delegation_role == "subagent" else 0) or chat_id

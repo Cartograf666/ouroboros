@@ -194,3 +194,41 @@ def test_live_thread_task_ids_selects_by_EXACT_chat_id(monkeypatch):
     assert set(live) == {"t1", "t3"}, "the sibling thread's task must survive"
     # Children first, so a cascade cancels from the leaves up.
     assert live[0] == "t3"
+
+
+def test_the_scheduled_notice_says_QUEUED_not_rejected(monkeypatch):
+    """A14 at the moment it becomes true.
+
+    The earlier copy claimed a second thread's task was REJECTED. It never was —
+    the writer lane serializes and has refused nothing — and telling an owner
+    their work was thrown away when it is sitting in the queue is the kind of
+    wrong that makes people stop trusting the queue entirely.
+    """
+    from supervisor.events import _project_lane_wait_suffix
+
+    busy = {"t1": {"task": {"id": "t1", "project_id": "racer", "workspace_root": "/w/racer"}}}
+    waiting = {"id": "t2", "project_id": "racer", "workspace_root": "/w/racer"}
+
+    suffix = _project_lane_wait_suffix(waiting, busy)
+
+    assert "QUEUED" in suffix
+    assert "not rejected" in suffix
+    assert "branching this thread off" in suffix.lower()
+    # A thread with its OWN checkout is not waiting on that folder at all.
+    branched = {"id": "t3", "project_id": "racer", "workspace_root": "/w/racer-thread-2"}
+    assert _project_lane_wait_suffix(branched, busy) == ""
+    # An unscoped task never serializes, so it is never warned.
+    assert _project_lane_wait_suffix({"id": "t4", "workspace_root": "/w/racer"}, busy) == ""
+
+
+def test_the_queue_warning_stays_silent_when_the_queue_cannot_be_read():
+    """A false "your work will wait" costs trust; a missing one costs surprise."""
+    from supervisor.events import _project_lane_wait_suffix
+
+    class Unreadable:
+        def values(self):
+            raise RuntimeError("queue unavailable")
+
+    assert _project_lane_wait_suffix(
+        {"id": "t1", "project_id": "racer", "workspace_root": "/w/racer"}, Unreadable(),
+    ) == ""
