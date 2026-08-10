@@ -178,10 +178,16 @@ def _project_history_context(
 
         lens = thread_ancestry_lens(data_dir, thread_id)
     except Exception:
-        log.debug("Failed to build the thread ancestry lens", exc_info=True)
+        log.warning("Failed to build the thread ancestry lens", exc_info=True)
         from ouroboros.thread_history import ThreadLens
 
-        lens = ThreadLens(chat_id=thread_id, cutoffs={thread_id: ""}, order=[thread_id])
+        # DISCLOSED, never substituted. This fallback used to be an own-thread lens
+        # indistinguishable from a genuine non-fork thread, so a fork that had lost
+        # its whole ancestry was still reported as a COMPLETE window.
+        lens = ThreadLens(
+            chat_id=thread_id, cutoffs={thread_id: ""}, order=[thread_id],
+            truncated=True, lens_unavailable=True,
+        )
     try:
         from ouroboros.project_dialogue import latest_chat_annotations
 
@@ -950,7 +956,15 @@ def _window_metadata(
     claims was NOT read. The lens set that flag from the start; not threading
     it here meant the shared past could be cut while the response still called
     itself complete — a silent gap ARCHITECTURE already promised was
-    disclosed."""
+    disclosed.
+
+    ``lens_unavailable`` is the narrower, worse case: the lens could not be BUILT
+    at all (the registry was unreadable), so whether this thread even HAS ancestors
+    is unknown. It rides its own cause rather than only ``ancestry_depth`` because
+    the two need different sentences — one says part of a known past was not read,
+    the other says the past could not be looked up. Both are also ``truncated``, so
+    a consumer that only knows the older cause still stops calling the window
+    complete."""
     truncated_by: list[str] = []
     for cause in (
         "quota" if human_rows_dropped else None,
@@ -964,6 +978,7 @@ def _window_metadata(
         ),
         "lineage_cap" if lineage_truncated else None,
         "ancestry_depth" if bool(getattr(lens, "truncated", False)) else None,
+        "lens_unavailable" if bool(getattr(lens, "lens_unavailable", False)) else None,
     ):
         if cause and cause not in truncated_by:
             truncated_by.append(cause)

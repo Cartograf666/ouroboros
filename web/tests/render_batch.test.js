@@ -176,6 +176,23 @@ test('load-older control follows the SERVER window verdict', () => {
     assert.equal(cappedFork.mode, 'notice');
     assert.match(cappedFork.label, /shared past/i);
     assert.match(cappedFork.label, /archive/i);
+    // P6: `lens_unavailable` is a THIRD boundary — the lens could not be BUILT, so
+    // whether this thread has a shared past is unknown rather than known-and-cut.
+    // The server sets it together with `ancestry_depth`; it must add its own
+    // clause and must NOT fall through to the archive/lineage wording.
+    const unavailable = loadOlderControlState(
+        { complete: false, truncated_by: ['ancestry_depth', 'lens_unavailable'] }, null,
+    );
+    assert.equal(unavailable.mode, 'notice');
+    assert.match(unavailable.label, /shared past/i);
+    assert.match(unavailable.label, /could not be looked up/i);
+    assert.doesNotMatch(unavailable.label, /archive/i);
+    // On its own it still says the right thing rather than borrowing the archive text.
+    const alone = loadOlderControlState(
+        { complete: false, truncated_by: ['lens_unavailable'] }, null,
+    );
+    assert.match(alone.label, /could not be looked up/i);
+    assert.doesNotMatch(alone.label, /archive/i);
 });
 
 // ─────────────── source pins: routine path & sticky boundary ───────────────

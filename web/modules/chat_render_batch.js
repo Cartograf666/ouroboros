@@ -136,6 +136,9 @@ export function nextQuotaEscalation(current = null) {
  * A larger quota cannot recover it, and the archive/lineage wording would
  * misname where the missing conversation is, so it gets its own sentence
  * (plan A3b: a shared past out of reach is disclosed, never a silent gap).
+ * `lens_unavailable` is narrower still: the lens could not be BUILT (the registry
+ * was unreadable), so whether this thread HAS a shared past is unknown. It rides
+ * alongside `ancestry_depth` and adds its own clause.
  * Causes accumulate: a notice carries ONE sentence per present cause, because
  * a window can be cut by the fork chain and the archive floor at once.
  */
@@ -161,7 +164,19 @@ export function loadOlderControlState(windowInfo = null, quota = null) {
             + 'chain is too deep, or one of its parent threads is unavailable.',
         );
     }
-    const others = causes.filter((cause) => cause !== 'ancestry_depth');
+    // A DIFFERENT fact from `ancestry_depth`, and it must not borrow the
+    // archive/lineage wording: the lens could not be BUILT at all, so whether this
+    // thread even HAS a shared past is unknown rather than known-and-cut. The
+    // server sets both causes together, so this refines the sentence.
+    if (causes.includes('lens_unavailable')) {
+        sentences.push(
+            'Its fork history could not be looked up just now, so a shared past '
+            + 'may be missing from this view rather than absent.',
+        );
+    }
+    const others = causes.filter(
+        (cause) => cause !== 'ancestry_depth' && cause !== 'lens_unavailable',
+    );
     if (others.length || !sentences.length) {
         sentences.push(
             'Older messages stay in on-disk archives, and deep subagent lineage '

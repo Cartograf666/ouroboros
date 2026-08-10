@@ -517,3 +517,146 @@ def test_ancestor_origin_rows_come_from_one_bindings_read(tmp_path):
     assert reads["n"] == 1, "one bucketed bindings read for the whole chain"
     # ONE row despite two ancestor bindings holding the same origin identity.
     assert [row["text"] for row in synthesized] == [text]
+
+
+# --------------------------------------------------------------------------- #
+# P6 — "could not read the binding" is a THIRD state, and it is disclosed
+# --------------------------------------------------------------------------- #
+
+def test_an_unreadable_registry_is_disclosed_on_both_surfaces(tmp_path, monkeypatch):
+    """P6: a fork could lose its entire ancestry and be told the window is complete.
+
+    The reviewer blamed the outer `except` in `history.py` / `context.py`. Those
+    are near-unreachable: `_chat_binding` ALREADY swallowed a registry failure to
+    `{}`, and an empty binding for the REQUESTED chat took the degenerate
+    own-thread early return with `truncated=False`. No exception was raised at all,
+    so the silent path had nothing to catch. Reproduced: healthy lens sees the
+    parent, registry made unreadable -> lens sees only itself, `truncated=False`,
+    and `_window_metadata` answered `{'complete': True, 'truncated_by': []}`.
+    """
+    import ouroboros.projects_registry as reg
+    from ouroboros.gateway import history as gw
+    from ouroboros import thread_history
+
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    create_project(tmp_path, "alpha", name="Alpha", working_dir=str(folder))
+    parent = create_thread(tmp_path, "alpha", name="Parent")
+    forked = fork_thread(tmp_path, "alpha", parent["id"])
+    fork_chat = int(forked["chat_id"])
+
+    healthy = thread_ancestry_lens(tmp_path, fork_chat)
+    assert healthy.has_ancestors is True
+    assert healthy.truncated is False
+    assert healthy.lens_unavailable is False
+
+    def unreadable(*a, **k):
+        raise OSError("Input/output error")
+
+    monkeypatch.setattr(reg, "_chat_binding_index", unreadable)
+
+    degraded = thread_ancestry_lens(tmp_path, fork_chat)
+    assert degraded.has_ancestors is False, "the whole ancestry is gone"
+    assert degraded.lens_unavailable is True, "and it says so"
+    assert degraded.truncated is True, "so every existing consumer already reacts"
+
+    meta = gw._window_metadata(
+        chat_quota_rows=10, progress_quota_rows=10, n_human=10, n_progress=10,
+        chat_path=tmp_path / "chat.jsonl", progress_path=tmp_path / "progress.jsonl",
+        archive_dir=tmp_path / "archive", human_rows_dropped=False,
+        lineage_truncated=False, lens=degraded,
+    )
+    assert meta["complete"] is False
+    assert "lens_unavailable" in meta["truncated_by"]
+    assert "ancestry_depth" in meta["truncated_by"]
+
+    # `_chat_binding` now has THREE answers, and only the failure is `None`.
+    assert thread_history._chat_binding(tmp_path, fork_chat) is None
+    monkeypatch.undo()
+    assert thread_history._chat_binding(tmp_path, 1) == {}
+
+
+def test_a_genuine_non_project_chat_is_still_complete(tmp_path):
+    """The distinction has to cut both ways: Main and an external transport really
+    have no ancestry, and marking THOSE truncated would cry wolf on every read."""
+    from ouroboros.gateway import history as gw
+
+    lens = thread_ancestry_lens(tmp_path, 1)
+    assert lens.has_ancestors is False
+    assert lens.truncated is False
+    assert lens.lens_unavailable is False
+    meta = gw._window_metadata(
+        chat_quota_rows=10, progress_quota_rows=10, n_human=10, n_progress=10,
+        chat_path=tmp_path / "chat.jsonl", progress_path=tmp_path / "progress.jsonl",
+        archive_dir=tmp_path / "archive", human_rows_dropped=False,
+        lineage_truncated=False, lens=lens,
+    )
+    assert meta == {"complete": True, "truncated_by": []}
+
+
+def test_an_unreadable_ancestor_binding_is_unavailable_not_merely_refused(tmp_path, monkeypatch):
+    """Mid-chain, the same two facts stay apart: an ancestor the registry REFUSES
+    (unbound, or another project's) is `truncated` alone; an ancestor whose binding
+    could not be READ is also `lens_unavailable`, because it may be recoverable."""
+    from ouroboros import thread_history
+
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    create_project(tmp_path, "alpha", name="Alpha", working_dir=str(folder))
+    parent = create_thread(tmp_path, "alpha", name="Parent")
+    forked = fork_thread(tmp_path, "alpha", parent["id"])
+    fork_chat = int(forked["chat_id"])
+    parent_chat = int(parent["chat_id"])
+
+    real = thread_history._chat_binding
+
+    def only_the_parent_is_unreadable(drive_root, chat_id):
+        if int(chat_id) == parent_chat:
+            return None
+        return real(drive_root, chat_id)
+
+    monkeypatch.setattr(thread_history, "_chat_binding", only_the_parent_is_unreadable)
+
+    lens = thread_history.thread_ancestry_lens(tmp_path, fork_chat)
+    assert lens.has_ancestors is False
+    assert lens.truncated is True
+    assert lens.lens_unavailable is True
+
+
+def test_the_agent_context_discloses_an_unavailable_lens(tmp_path, monkeypatch):
+    """The context half. Degrading to own-thread rows is the right NARROWING; doing
+    it silently handed the agent a view that looked complete."""
+    from ouroboros import context as ctx
+    from ouroboros.memory import Memory
+
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    create_project(tmp_path, "alpha", name="Alpha", working_dir=str(folder))
+    parent = create_thread(tmp_path, "alpha", name="Parent")
+    forked = fork_thread(tmp_path, "alpha", parent["id"])
+    fork_chat = int(forked["chat_id"])
+
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "chat.jsonl").write_text(
+        json.dumps({"chat_id": fork_chat, "ts": "2026-01-02T00:00:00Z",
+                    "role": "user", "content": "own turn"}) + "\n",
+        encoding="utf-8",
+    )
+
+    import ouroboros.thread_history as th
+
+    def boom(*a, **k):
+        raise OSError("registry unreadable")
+
+    monkeypatch.setattr(th, "thread_ancestry_lens", boom)
+
+    sections = ctx.build_recent_sections(Memory(tmp_path), env=None, thread_chat_id=fork_chat)
+    gaps = [s for s in sections if s.startswith("## Conversation gaps in this view")]
+    assert gaps, sections
+    assert "fork history could not be read" in gaps[0]
+    # ...and the caveat is read BEFORE the conversation it qualifies.
+    chat_index = next(
+        (i for i, s in enumerate(sections) if s.startswith("## Recent chat")), len(sections)
+    )
+    assert sections.index(gaps[0]) < chat_index

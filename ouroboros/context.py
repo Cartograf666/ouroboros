@@ -866,6 +866,11 @@ def build_recent_sections(
 
     _context_mode = get_context_mode()
     _chat_tail = MAX_RECENT_CHAT_TAIL
+    #: What this focused thread view could NOT cover, in the agent's own words.
+    #: A3b applied to the agent surface: the history window has `truncated_by`, and
+    #: the context had no equivalent at all, so every degradation on this path was
+    #: silent to the one reader who acts on it.
+    _thread_omissions: list = []
 
     if thread_chat_id and thread_chat_id in _project_chat_ids:
         # Project task: a FOCUSED working view of its OWN thread (reduces
@@ -897,8 +902,20 @@ def build_recent_sections(
                 memory.drive_root, thread_chat_id, with_source_refs=True
             )
         except Exception:
-            log.debug("Thread ancestry lens unavailable; own thread only", exc_info=True)
+            log.warning("Thread ancestry lens unavailable; own thread only", exc_info=True)
             _lens = None
+        if _lens is None or bool(getattr(_lens, "lens_unavailable", False)):
+            # The AGENT half of the same disclosure the history window makes as its
+            # `lens_unavailable` cause. Degrading to own-thread rows is the right
+            # narrowing, but doing it SILENTLY meant a fork whose registry had just
+            # become unreadable was handed a context that looked complete — no
+            # exception, no marker, the shared past simply absent (BIBLE P1).
+            _thread_omissions.append(
+                "This thread's fork history could not be read just now. If it is a "
+                "fork, the shared past it inherits from its parent thread is NOT "
+                "included below. Treat the conversation here as incomplete, say so if "
+                "the task depends on that history, and do not reconstruct it by guessing."
+            )
         recent = memory.read_jsonl_tail("chat.jsonl", _PROJECT_THREAD_SCAN)
         if _lens is not None:
             from ouroboros.thread_history import admits_row, bound_chat_for_row
@@ -947,6 +964,13 @@ def build_recent_sections(
         )
     # Pass the same tail intent down: summarize_chat's internal default cap
     # would silently re-cut the low-mode full-window read to 1000 lines.
+    if _thread_omissions:
+        # BEFORE the conversation, not after it: a caveat the agent reads only once
+        # it has already treated the rows as the whole story is not a disclosure.
+        sections.append(
+            "## Conversation gaps in this view\n\n"
+            + "\n".join(f"- {line}" for line in _thread_omissions)
+        )
     chat_summary = memory.summarize_chat(chat_entries, limit=_chat_tail)
     if chat_summary:
         sections.append("## Recent chat\n\n" + chat_summary)

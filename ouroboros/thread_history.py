@@ -38,6 +38,12 @@ Semantics pinned by this module:
   cycle, or at an unbound ancestor and sets ``truncated`` — the caller
   discloses it (``/api/chat/history`` reports it as the ``ancestry_depth``
   window cause) rather than quietly serving a short history.
+* **Unreadable is its own state.** "The registry could not be read" is neither
+  "this chat is genuinely Main" nor "the walk lost an ancestor it could see". It
+  sets ``lens_unavailable`` (and ``truncated`` with it, so every existing
+  disclosure consumer already reacts), reported as the ``lens_unavailable``
+  window cause. Folding it into the ancestor-less answer is how a fork lost its
+  whole shared past while the window still called itself complete.
 
 The module also owns the ONE row-classification pair both readers share —
 :func:`bound_chat_for_row` (a post-hoc bound task's owning project chat, by task
@@ -84,6 +90,19 @@ class ThreadLens:
     # project's thread would lose it without carrying the ancestor's refs too.
     source_refs: Dict[int, List[Dict[str, Any]]] = field(default_factory=dict)
     truncated: bool = False
+    #: The lens could not be BUILT — the registry could not be read at all, so
+    #: whether this chat has ancestors is unknown. A THIRD state, distinct from
+    #: both "this is genuinely Main / an external transport" (where an
+    #: ancestor-less lens with ``truncated=False`` is the correct answer) and
+    #: "the walk lost an ancestor it could see" (``truncated`` alone).
+    #:
+    #: Collapsing the first two is how a fork could lose its ENTIRE ancestry and
+    #: still be reported as a complete window: ``_chat_binding`` swallowed the
+    #: registry failure to ``{}``, the empty binding took the degenerate
+    #: own-thread early return, and no exception was ever raised for the outer
+    #: handlers to catch. Whenever this is true, ``truncated`` is true as well, so
+    #: every existing disclosure consumer already reacts; this only says WHY.
+    lens_unavailable: bool = False
 
     @property
     def chat_ids(self) -> set:
@@ -224,6 +243,16 @@ def thread_ancestry_lens(
 
     A non-project chat (Main, an external transport) yields a degenerate lens
     over itself alone, so callers can use one code path.
+
+    "Could not READ the binding" is a THIRD state and never wears that answer's
+    clothes. ``_chat_binding`` fails closed to ``None`` (as opposed to ``{}``,
+    which means the registry answered and this chat has no binding), and a
+    ``None`` for the REQUESTED chat produces the same degenerate lens with
+    ``truncated`` AND ``lens_unavailable`` set. Without that distinction a fork
+    whose registry had just become unreadable lost its whole ancestry with
+    ``truncated=False``, so ``_window_metadata`` answered ``complete: True`` and
+    the agent's context silently narrowed to its own rows — no exception, no
+    disclosure, BIBLE P1's no-silent-truncation broken on both surfaces.
     """
     try:
         cid = int(chat_id or 0)
@@ -231,12 +260,19 @@ def thread_ancestry_lens(
         cid = 0
     binding = _chat_binding(drive_root, cid)
     if not binding:
-        return ThreadLens(chat_id=cid, cutoffs={cid: ""} if cid else {}, order=[cid] if cid else [])
+        return ThreadLens(
+            chat_id=cid,
+            cutoffs={cid: ""} if cid else {},
+            order=[cid] if cid else [],
+            truncated=binding is None,
+            lens_unavailable=binding is None,
+        )
 
     cutoffs: Dict[int, str] = {cid: ""}
     order: List[int] = [cid]
     own_project = str(binding.get("project_id") or "")
     truncated = False
+    unavailable = False
     current: Optional[Dict[str, Any]] = binding
     effective = ""
     depth = 0
@@ -283,6 +319,18 @@ def thread_ancestry_lens(
         # whole foreign conversation into this thread. Refuse BEFORE it enters
         # the cutoffs, and disclose the refusal.
         parent_binding = _chat_binding(drive_root, parent_chat)
+        if parent_binding is None:
+            # The registry could not be READ for this ancestor. Distinct from the
+            # ancestor genuinely having no binding: one is a refusal, the other is
+            # ignorance, and only the second may be recoverable later.
+            truncated = True
+            unavailable = True
+            log.warning(
+                "Thread ancestry of chat %s could not read the binding of its "
+                "parent chat %s — ancestry incomplete",
+                cid, parent_chat,
+            )
+            break
         if not parent_binding:
             truncated = True
             log.warning(
@@ -315,20 +363,37 @@ def thread_ancestry_lens(
         order=order,
         source_refs=source_refs,
         truncated=truncated,
+        lens_unavailable=unavailable,
     )
 
 
-def _chat_binding(drive_root: Any, chat_id: int) -> Dict[str, Any]:
-    """``resolve_chat_binding`` with the walk's fail-closed error handling."""
+def _chat_binding(drive_root: Any, chat_id: int) -> Optional[Dict[str, Any]]:
+    """``resolve_chat_binding`` with the walk's fail-closed error handling.
+
+    THREE answers, and the third is the point: a binding dict, ``{}`` when the
+    registry answered and this chat owns no thread (Main, an external transport),
+    and ``None`` when the registry could not be READ at all. Returning ``{}`` for
+    the failure made an unreadable registry indistinguishable from a non-project
+    chat, so a fork silently became ancestor-less with nothing marked truncated.
+
+    ``strict=True`` is what makes the third answer reachable: ``resolve_chat_binding``
+    fails closed to ``{}`` on its own account, which is right for ROUTING (an
+    unplaceable message belongs in Main) and wrong here, so this asks the same seam
+    for the honest error instead of building a second lookup that could drift.
+    """
     if not chat_id:
         return {}
     try:
         from ouroboros.projects_registry import resolve_chat_binding
 
-        return resolve_chat_binding(drive_root, chat_id) or {}
+        return resolve_chat_binding(drive_root, chat_id, strict=True) or {}
     except Exception:
-        log.debug("thread_ancestry_lens binding lookup failed", exc_info=True)
-        return {}
+        log.warning(
+            "thread_ancestry_lens could not read the binding for chat %s — the "
+            "lens is degraded and will be disclosed as unavailable",
+            chat_id, exc_info=True,
+        )
+        return None
 
 
 def _thread_row(binding: Dict[str, Any]) -> Dict[str, Any]:

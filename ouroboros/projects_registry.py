@@ -653,7 +653,9 @@ def _chat_binding_index(drive_root: Any) -> Dict[int, Dict[str, Any]]:
     return index
 
 
-def resolve_chat_binding(drive_root: Any, chat_id: Any) -> Dict[str, Any]:
+def resolve_chat_binding(
+    drive_root: Any, chat_id: Any, *, strict: bool = False
+) -> Dict[str, Any]:
     """THE canonical "who owns this chat id" lookup (R3).
 
     Returns ``{project_id, thread_id, chat_id, lifecycle, thread_lifecycle,
@@ -663,6 +665,15 @@ def resolve_chat_binding(drive_root: Any, chat_id: Any) -> Dict[str, Any]:
     tombstoned inside a perfectly healthy project — and they must NOT compare a
     chat id against ``project["chat_id"]`` themselves; that comparison sees
     thread #0 only and misroutes every other thread to Main.
+
+    ``strict=True`` makes an unreadable registry RAISE instead of answering ``{}``,
+    and nothing else changes. Routing wants the fail-closed ``{}`` — a message that
+    cannot be placed belongs in Main. But ``thread_history.thread_ancestry_lens``
+    reads this to decide whether a chat HAS ancestors, and there ``{}`` for a read
+    failure is a lie with consequences: an unreadable registry made a fork
+    indistinguishable from Main, so its whole shared past vanished and the window
+    still called itself complete (P6). One seam, two honest answers, rather than a
+    second lookup that could drift from this one.
     """
     try:
         cid = int(chat_id or 0)
@@ -673,6 +684,8 @@ def resolve_chat_binding(drive_root: Any, chat_id: Any) -> Dict[str, Any]:
     try:
         row = _chat_binding_index(drive_root).get(cid)
     except Exception:
+        if strict:
+            raise
         log.debug("resolve_chat_binding failed", exc_info=True)
         return {}
     return dict(row) if row else {}
