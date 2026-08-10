@@ -222,6 +222,45 @@ export function insertTimelineNode(messages, node, typing = null, { stickToBotto
 
 const CHAT_STORAGE_KEY = 'ouro_chat';
 const CHAT_DRAFT_KEY = 'ouro_chat_draft';
+
+/**
+ * The per-thread transcript cache key — the same scoping `storeKey` applies
+ * inside an instance, spelled once so a caller outside the instance can name it.
+ */
+export function threadTranscriptCacheKey(chatId) {
+    const id = Number(chatId) || 0;
+    return !id || id === 1 ? CHAT_STORAGE_KEY : `${CHAT_STORAGE_KEY}:${id}`;
+}
+
+/**
+ * Forget a destroyed thread's cached transcript.
+ *
+ * sessionStorage is one small shared quota, these entries are per THREAD, and
+ * nothing ever removed them — so a long session that opens many threads fills
+ * it and from then on EVERY write throws and is swallowed. The draft write is
+ * one of them, which quietly breaks the promise that typed-but-unsent text
+ * survives. Of the three per-thread keys the transcript cache is the only one
+ * the server can rebuild (it exists to make the next open paint instantly); the
+ * draft and the input recall hold text nobody else has. So the accelerator is
+ * what a destroy drops, and the irreplaceable text is what it keeps.
+ *
+ * Main (chat #1) is never dropped: it is not a thread and it is never destroyed.
+ * Returns whether anything was removed; storage is injectable for tests.
+ */
+export function forgetThreadTranscriptCache(chatId, storage = undefined) {
+    const id = Number(chatId) || 0;
+    if (!id || id === 1) return false;
+    const store = storage !== undefined
+        ? storage
+        : (typeof sessionStorage === 'undefined' ? null : sessionStorage);
+    if (!store) return false;
+    try {
+        store.removeItem(threadTranscriptCacheKey(id));
+        return true;
+    } catch {
+        return false;
+    }
+}
 const CHAT_INPUT_HISTORY_KEY = 'ouro_chat_input_history';
 const CHAT_SESSION_ID_KEY = 'ouro_chat_session_id';
 const MAX_PENDING_ATTACHMENTS = 10;

@@ -429,6 +429,12 @@ export function openThreadRowMenu(project, thread, { apiClient, anchorEl, onChan
                             body: `Rename failed: ${e?.body?.error || e?.message || e}`,
                             alert: true,
                         });
+                        // A failure is a reason to RE-READ, not to stop. The
+                        // commonest one is a 404 for a thread another tab just
+                        // deleted, i.e. the sidebar is painting a row the server no
+                        // longer has; without this the stale row survives the alert
+                        // and stays clickable until the next poll tick.
+                        onChanged?.({ authoritative: true });
                     }
                 }
             } else if (action === 'fork') {
@@ -444,6 +450,7 @@ export function openThreadRowMenu(project, thread, { apiClient, anchorEl, onChan
                         body: `Fork failed: ${e?.body?.error || e?.message || e}`,
                         alert: true,
                     });
+                    onChanged?.({ authoritative: true });  // same reason as rename
                 }
             }
             if (anchorEl.isConnected) anchorEl.focus();

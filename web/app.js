@@ -3,7 +3,12 @@
 import { createWS } from './modules/ws.js';
 import { apiFetch, fetchJson } from './modules/api_client.js';
 import { loadVersion } from './modules/utils.js';
-import { initChat, createChatInstance, headerBudgetPresentation } from './modules/chat.js';
+import {
+    initChat,
+    createChatInstance,
+    forgetThreadTranscriptCache,
+    headerBudgetPresentation,
+} from './modules/chat.js';
 import { initFiles } from './modules/files.js';
 import { apiClient } from './modules/api_client.js';
 import { openNewProjectDialog, openProjectRowMenu } from './modules/project_create.js';
@@ -495,6 +500,13 @@ function destroyProjectInstance(key) {
     }
     const scroll = inst.getScrollState?.();
     if (scroll) projectScrollStash.set(key, scroll);
+    // Release this thread's transcript cache with its instance. It is a paint
+    // accelerator the server can rebuild, not durable state — but it is per
+    // THREAD and nothing else ever removes it, so leaving it behind lets a long
+    // session exhaust the sessionStorage quota, after which every write throws
+    // and is swallowed, the DRAFT write included. Dropping the rebuildable copy
+    // is what keeps the unrebuildable one (typed-but-unsent text) working.
+    forgetThreadTranscriptCache(inst.chatId);
     inst.destroy?.();
     projectInstances.delete(key);
     projectPaintRequests.delete(key);
@@ -815,6 +827,14 @@ function onProjectsMutated(change = {}) {
         paintProjectsNav();
         return;
     }
+    // A fork hands us the new thread's canonical row. Learn its chat_id
+    // SYNCHRONOUSLY, before the refresh: `chat.js::isMyThread` routes an inbound
+    // frame by this set, so a thread missing from it has its FIRST frame
+    // misrouted to Main — and the refresh below (let alone the poll behind it) is
+    // too late to prevent that. The `+ new thread` path already does this inline;
+    // fork passed `change.thread` here and had it dropped on the floor.
+    const newChatId = Number(change.thread?.chat_id);
+    if (newChatId) state.projectChatIds.add(newChatId);
     knownProjectsJson = '';
     refreshProjectsNav();
 }

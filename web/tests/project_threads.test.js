@@ -17,6 +17,7 @@ import {
     threadKey,
     unreadThreadCount,
 } from '../modules/project_threads.js';
+import { forgetThreadTranscriptCache, threadTranscriptCacheKey } from '../modules/chat.js';
 
 // ---------------------------------------------------------------------------
 // The nested read cursor (X6) — the browser half of a BREAKING ABI migration.
@@ -174,4 +175,47 @@ test('reorderIds produces the FULL new order for a drop above or below', () => {
 test('threadKey separates two threads of the same project', () => {
     assert.equal(threadKey('alpha', 0), 'alpha#0');
     assert.notEqual(threadKey('alpha', 0), threadKey('alpha', 1));
+});
+
+// ---------------------------------------------------------------------------
+// Destroying a thread releases its REBUILDABLE session storage
+// ---------------------------------------------------------------------------
+
+test('a destroyed thread drops its transcript cache and keeps its draft', () => {
+    const store = new Map();
+    const storage = {
+        setItem: (k, v) => store.set(k, v),
+        getItem: (k) => (store.has(k) ? store.get(k) : null),
+        removeItem: (k) => store.delete(k),
+    };
+    storage.setItem(threadTranscriptCacheKey(7), '[{"id":1}]');
+    storage.setItem('ouro_chat_draft:7', 'half a sentence');
+    storage.setItem('ouro_chat_input_history:7', '["earlier"]');
+
+    assert.equal(threadTranscriptCacheKey(7), 'ouro_chat:7');
+    assert.equal(forgetThreadTranscriptCache(7, storage), true);
+    assert.equal(storage.getItem('ouro_chat:7'), null, 'the paint accelerator goes');
+    // The two keys holding text nobody can rebuild stay. Dropping the cache is
+    // what buys them the quota they need to keep being writable.
+    assert.equal(storage.getItem('ouro_chat_draft:7'), 'half a sentence');
+    assert.equal(storage.getItem('ouro_chat_input_history:7'), '["earlier"]');
+});
+
+test('the MAIN chat transcript is never dropped — Main is not a thread', () => {
+    const store = new Map([['ouro_chat', '[]']]);
+    const storage = {
+        getItem: (k) => (store.has(k) ? store.get(k) : null),
+        removeItem: (k) => store.delete(k),
+    };
+    assert.equal(threadTranscriptCacheKey(1), 'ouro_chat');
+    assert.equal(forgetThreadTranscriptCache(1, storage), false);
+    assert.equal(forgetThreadTranscriptCache(0, storage), false);
+    assert.equal(forgetThreadTranscriptCache(undefined, storage), false);
+    assert.equal(storage.getItem('ouro_chat'), '[]');
+});
+
+test('a storage that throws is survivable — the drop is best-effort', () => {
+    const hostile = { removeItem() { throw new DOMException('QuotaExceededError'); } };
+    assert.equal(forgetThreadTranscriptCache(9, hostile), false);
+    assert.equal(forgetThreadTranscriptCache(9, null), false);  // no sessionStorage at all
 });

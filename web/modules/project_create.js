@@ -311,6 +311,11 @@ async function runProjectRowAction(action, project, { apiClient, anchorEl, onCha
                     body: `Rename failed: ${e?.body?.error || e?.message || e}`,
                     alert: true,
                 });
+                // A failure is a reason to RE-READ, not to stop: the commonest one
+                // is a 404 for a project another tab just deleted, so the row we
+                // are painting no longer exists. Without this it survives the alert
+                // and stays clickable until the next poll tick.
+                onChanged?.({ authoritative: true });
             }
         }
         if (anchorEl.isConnected) anchorEl.focus();
@@ -347,6 +352,7 @@ async function runProjectRowAction(action, project, { apiClient, anchorEl, onCha
                 body: `Fork failed: ${e?.body?.error || e?.message || e}`,
                 alert: true,
             });
+            onChanged?.({ authoritative: true });  // same reason as rename
         }
         if (anchorEl.isConnected) anchorEl.focus();
     }

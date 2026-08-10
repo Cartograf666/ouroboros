@@ -235,6 +235,29 @@ def test_project_sidebar_and_menu_static_contracts():
     assert "newName.length > maxNameLength" in menu
     assert 'maxlength="${maxNameLength}"' in menu
 
+    # A FORKED thread's chat_id is learned synchronously by the same mutation
+    # funnel that already learns a created one. `chat.js::isMyThread` routes an
+    # inbound frame by `state.projectChatIds`, so a fork whose id arrives only
+    # with the next poll has its FIRST frame delivered to Main.
+    assert "const newChatId = Number(change.thread?.chat_id);" in app
+    assert "if (newChatId) state.projectChatIds.add(newChatId);" in app
+
+    # Destroying a thread releases the ONE per-thread session-storage key the
+    # server can rebuild, so the two it cannot (draft, input recall) keep the
+    # quota they need. Every sessionStorage write is swallowed, so exhaustion is
+    # silent and would break "typed but unsent text survives" with no error.
+    assert "export function forgetThreadTranscriptCache(" in chat
+    assert "forgetThreadTranscriptCache(inst.chatId);" in app
+    assert "store.removeItem(threadTranscriptCacheKey(id));" in chat
+
+    # A row/thread action that FAILS re-reads authoritative truth instead of only
+    # alerting: the commonest failure is a 404 for a row another tab just
+    # deleted, and without this the stale row stays painted until the next poll.
+    for source_name, source in (("project_threads.js", threads), ("project_create.js", menu)):
+        for failure in ("Rename failed", "Fork failed"):
+            after = source[source.index(f"title: '{failure}'"):][:700]
+            assert "onChanged?.({ authoritative: true })" in after, (source_name, failure)
+
 
 def test_project_main_mirror_never_creates_second_unread_static_contract():
     from pathlib import Path
