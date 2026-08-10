@@ -1209,12 +1209,12 @@ def _fit_triad_prompt(api_models: list, assemble, current_files_section: str,
         )
         prompt, stable_prefix_len = assemble(fit_note, diff_text)
         if input_limit and estimate_tokens(prompt) > input_limit:
-            try:
-                compact_diff = run_cmd(
-                    ["git", "diff", "--cached", "-U0"], cwd=target_repo
-                )
-            except Exception:
-                compact_diff = ""
+            from ouroboros.tools.review_binary_context import (
+                StagedDiffUnavailable, capture_staged_diff)
+            try:  # the SAME hardened capture as the primary diff, at zero context
+                compact_diff = capture_staged_diff(target_repo, unified=0)
+            except StagedDiffUnavailable:
+                compact_diff = ""  # keep the hardened full diff; the gate below blocks if it still overflows
             if compact_diff.strip():
                 prompt, stable_prefix_len = assemble(fit_note, compact_diff)
     prompt_tokens = estimate_tokens(prompt)
@@ -1270,6 +1270,36 @@ def _triad_session_task(ctx: ToolContext, *, goal_section: str, scope_section: s
     ] if str(part or "").strip())
 
 
+def _capture_triad_staged_diff(
+    ctx: ToolContext, target_repo, blocking_review: bool
+) -> tuple[Optional[str], Optional[str]]:
+    """Capture the triad's staged-diff evidence, or route a capture failure.
+
+    Returns ``(diff_text, None)`` on success and ``(None, block_result)`` on
+    failure — the fail-closed message in blocking mode, ``None`` (advisory skip)
+    otherwise. The diff is the triad's primary change evidence, so it is taken
+    byte-exact and hardened against operator diff config (the same
+    ``capture_staged_diff`` the scope reviewer uses); a genuine failure fails
+    closed rather than reviewing a placeholder that would yield authoritative
+    findings about a diff nobody has.
+    """
+    from ouroboros.tools.review_binary_context import (
+        StagedDiffUnavailable, capture_staged_diff)
+
+    try:
+        return capture_staged_diff(target_repo), None
+    except StagedDiffUnavailable as exc:
+        ctx._last_review_block_reason = "infra_failure"
+        return None, _handle_review_block_or_warning(
+            ctx, blocking_review,
+            "⚠️ REVIEW_BLOCKED: Cannot capture the staged diff — commit cannot "
+            f"proceed.\nError: {exc}\n"
+            "Ensure git is available and the repository is in a valid state.",
+            "Review enforcement=Advisory: staged diff capture failed; triad "
+            "review skipped rather than run against a placeholder. ",
+        )
+
+
 def _run_unified_review(ctx: ToolContext, commit_message: str,
                         review_rebuttal: str = "",
                         repo_dir=None,
@@ -1286,11 +1316,9 @@ def _run_unified_review(ctx: ToolContext, commit_message: str,
     review_enforcement = _cfg.get_review_enforcement()
     blocking_review = review_enforcement == "blocking"
 
-    try:
-        diff_text = run_cmd(["git", "diff", "--cached"], cwd=target_repo)
-    except Exception:
-        diff_text = "(failed to get staged diff)"
-
+    diff_text, capture_block = _capture_triad_staged_diff(ctx, target_repo, blocking_review)
+    if diff_text is None:  # capture failed: block (blocking) or advisory-skip (None)
+        return capture_block
     if not diff_text.strip():
         return None
 

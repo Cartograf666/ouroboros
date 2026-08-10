@@ -553,6 +553,8 @@ def test_last_triad_raw_results_reset_at_start_of_run_unified_review(tmp_path):
     })
 
     with patch.object(review_mod, "run_cmd", return_value="some diff content"), \
+         patch("ouroboros.tools.review_binary_context.capture_staged_diff",
+               return_value="some diff content"), \
          patch.object(review_mod, "_handle_multi_model_review", return_value=mock_review_output), \
          patch.object(review_mod, "_load_checklist_section", return_value="## checklist"), \
          patch.object(review_mod, "_preflight_check", return_value=None), \

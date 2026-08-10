@@ -291,6 +291,8 @@ def test_run_unified_review_obligation_loading_uses_drive_root_and_make_repo_key
         review_mod, "run_cmd",
         lambda cmd, *args, **kw: ("M\tfile.py" if "--name-only" in cmd else "+ change"),
     )
+    import ouroboros.tools.review_binary_context as _rbc
+    monkeypatch.setattr(_rbc, "capture_staged_diff", lambda _repo, *, unified=3: "+ change")
     monkeypatch.setattr(review_mod, "build_touched_file_pack", lambda *a, **k: ("(pack)", []))
     monkeypatch.setattr(review_mod, "_load_checklist_section", lambda: "(checklists)")
     monkeypatch.setattr(

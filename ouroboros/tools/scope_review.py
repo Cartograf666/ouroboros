@@ -39,6 +39,8 @@ from ouroboros.tools.scope_review_contract import (
     ladder_terminal_cause as _ladder_terminal_cause,
     normalize_scope_items as _normalize_scope_items,
 )
+from ouroboros.tools.review_binary_context import (
+    StagedDiffUnavailable, capture_staged_diff, staged_path_is_binary)
 from ouroboros.tools.review_synthesis import build_scope_review_prompt
 from ouroboros.tools.review_helpers import (
     build_goal_section,
@@ -71,27 +73,21 @@ from ouroboros.utils import (
 log = logging.getLogger(__name__)
 _SCOPE_REQUIRED_ITEMS = SCOPE_REQUIRED_ITEMS  # compatibility export used by tests/review tooling
 
-# Shipped designated scope reviewer (v6.82.0). Window evidence, checked 2026-07-29:
-# OpenAI's own model guide AND OpenRouter /models both state gpt-5.6-terra
-# context_length=1,050,000 — a MODEL property documented by the provider itself, not
-# inferred from one router — so the >=1M BIBLE P3 floor holds on the direct and the
-# routed spelling alike, exactly as the sentinel spanned spellings for the previous
-# designated default (v6.55.0-v6.81: anthropic/claude-fable-5). The sentinel still
-# grants only the conservative 1M figure, and a real probe/owner-ack supersedes it.
+# Shipped designated scope reviewer (v6.82.0). Window evidence checked 2026-07-29:
+# provider docs AND OpenRouter /models both state gpt-5.6-terra context_length
+# 1,050,000 — a documented MODEL property, so the >=1M BIBLE P3 floor holds on both
+# spellings; the sentinel grants only 1M, a real probe/owner-ack supersedes.
 from ouroboros.tools.scope_window import SCOPE_MODEL_DEFAULT as _SCOPE_MODEL_DEFAULT  # noqa: E402
 _SCOPE_MAX_TOKENS = 100_000  # 100K output tokens
 _SCOPE_REVIEW_SLOT_TIMEOUT_SEC = 900
 from ouroboros.tools.review_helpers import REVIEW_PROMPT_TOKEN_BUDGET as _SCOPE_BUDGET_TOKEN_LIMIT
 
-# The shared prompt-size SSOT (920K) governs INPUT only, but the reviewer also
-# reserves _SCOPE_MAX_TOKENS for OUTPUT inside that same 1M window. 920K input +
-# 100K output exceeds 1M, and provider tokenizers can exceed estimate_tokens by
-# tens of thousands of tokens on atlas-heavy prompts. Gate assembled INPUT on a
-# conservative effective cap and retry once with a compact atlas prompt before
-# applying the configured blocking/advisory scope authority.
-# The 1M constitutional window, the conservative sub-floor for unevidenced
-# routes, and the shipped default reviewer identity live in `tools/scope_window`
-# (the window-authority SSOT); imported here under the historical names.
+# The shared prompt-size SSOT (920K) governs INPUT only; the reviewer also reserves
+# _SCOPE_MAX_TOKENS of OUTPUT inside the same 1M window, and provider tokenizers can
+# exceed estimate_tokens on atlas-heavy prompts — so gate assembled INPUT on a
+# conservative effective cap and retry once with a compact atlas before applying the
+# blocking/advisory scope authority. The 1M constitutional window, unevidenced-route
+# sub-floor, and default reviewer identity live in `tools/scope_window` (the SSOT).
 from ouroboros.tools.scope_window import (  # noqa: E402
     SCOPE_FAILCLOSED_WINDOW as _SCOPE_FAILCLOSED_WINDOW,
     SCOPE_MODEL_CONTEXT_WINDOW as _SCOPE_MODEL_CONTEXT_WINDOW,
@@ -102,13 +98,10 @@ _SCOPE_INPUT_TOKEN_LIMIT = min(
     _SCOPE_MODEL_CONTEXT_WINDOW - _SCOPE_MAX_TOKENS - _SCOPE_OUTPUT_MARGIN_TOKENS,
 )
 
-# Tokenizer-density calibration (rationale + SSOT in
-# review_helpers.calibrated_input_token_limit + the capability_evidence
-# ``token_density`` namespace). The density is MEASURED per model, so the limit is
-# computed PER CALL — an import-time constant froze the pre-measurement value for the
-# whole process and no observation could ever reach it. The calibration shrinks the
-# PROMPT for the same pinned reviewer — never the reviewer model or the >=1M window
-# floor (BIBLE P3).
+# Tokenizer-density calibration (SSOT: review_helpers.calibrated_input_token_limit +
+# capability_evidence ``token_density``). Density is MEASURED per model, so the limit
+# is computed PER CALL (an import-time constant froze the pre-measurement value). The
+# calibration shrinks the PROMPT — never the reviewer or the >=1M floor (BIBLE P3).
 from ouroboros.reviewer_window import (
     ReviewerWindow,
     window_scaled_reserves as _shared_window_scaled_reserves,
@@ -134,9 +127,8 @@ def _scope_review_skipped_in_low_context() -> bool:
         return False
 
 
-# Window authority moved to `tools/scope_window.py` (module-size gate at
-# synthesis); re-imported under the old private aliases so every caller and
-# test keeps one patch point on THIS module.
+# Window authority moved to `tools/scope_window.py` (module-size gate); re-imported
+# under the old private aliases so callers/tests keep one patch point on THIS module.
 from ouroboros.tools.scope_window import (  # noqa: E402
     WINDOW_ASSERTED as _WINDOW_ASSERTED,  # noqa: F401 (test-read re-export)
     WINDOW_CONFIRMED as _WINDOW_CONFIRMED,  # noqa: F401 (test-read re-export)
@@ -239,9 +231,8 @@ _DELETED_INLINE_MAX_BYTES = 1_048_576  # 1 MB
 
 _SCOPE_CONTEXT_MANIFEST = contextvars.ContextVar("scope_context_manifest", default={})
 # Stable-prefix boundary (chars) of the last assembled scope prompt: everything
-# before it (instructions + checklist + canonical docs) is byte-stable across
-# commits and carries the provider cache marker at dispatch. A contextvar keeps
-# the existing (prompt, status) builder contract intact for all callers.
+# before it (instructions + checklist + canonical docs) is byte-stable across commits
+# and carries the provider cache marker at dispatch; contextvar keeps the builder contract.
 _SCOPE_STABLE_PREFIX_LEN = contextvars.ContextVar("scope_stable_prefix_len", default=0)
 
 
@@ -325,6 +316,9 @@ def _load_canonical_context_docs(repo_dir: pathlib.Path) -> str:
 
 
 def _should_skip_current_touched_context(path: str) -> bool:
+    """Touched paths whose full snapshots the fixed part omits by design: canonical
+    docs (injected whole elsewhere) and tests/ paths (changes ride the staged diff;
+    full atlas anchors, ladder-degradable — but never canonical docs)."""
     norm = str(path or "").replace("\\", "/").lstrip("./")
     return (
         norm in _CANONICAL_CONTEXT_DOCS
@@ -377,10 +371,41 @@ def _classify_deleted_for_inline(path: str, repo_dir: pathlib.Path) -> Optional[
         return "sensitive (env/credential/key)"
     if suffix_lower in BINARY_EXTENSIONS:
         return "binary extension"
-    from ouroboros.tools.review_binary_context import staged_path_is_binary
-    if staged_path_is_binary(repo_dir, path):
-        return "binary content"
-    return None
+    return "binary content" if staged_path_is_binary(repo_dir, path) else None
+
+
+def _degradable_diff_only_paths(repo_dir: pathlib.Path, current: list,
+                                skipped: list, deleted: list,
+                                renamed: frozenset = frozenset()) -> list:
+    """Touched paths the ladder may hand to the diff-only tier. Current paths join
+    freely, exactly as before (atlas-required ones degrade only after -U0). Touched
+    TESTS — skipped-by-design current ones and deleted ones — join the free tier too,
+    with cheap conservative guards: atlas-required tests never degrade; binary and
+    RENAMED paths keep their snapshot/metadata (the staged text diff may not carry
+    their change); an oversized/sensitive deletion keeps its suppression marker."""
+
+    def _degradable_test(p: str, is_deleted: bool) -> bool:
+        if atlas_required_beyond_diff(p.replace("\\", "/").lstrip("./")):
+            return False
+        if p in renamed or staged_path_is_binary(repo_dir, p):
+            return False
+        if is_deleted:
+            try:
+                head_bytes = int(run_cmd(["git", "cat-file", "-s", f"HEAD:{p}"], cwd=repo_dir))
+            except Exception:
+                return False
+            return (
+                head_bytes <= _DELETED_INLINE_MAX_BYTES
+                and _should_skip_current_touched_context(p)
+                and _classify_deleted_for_inline(p, repo_dir) is None
+            )
+        return True
+
+    return (
+        list(current)
+        + [p for p in skipped if _degradable_test(p, False)]
+        + [p for p in deleted if _degradable_test(p, True)]
+    )
 
 
 def _inline_deleted_file_pack(
@@ -389,14 +414,24 @@ def _inline_deleted_file_pack(
     repo_dir: pathlib.Path,
     *,
     represent_binary: bool = False,
+    diff_only_paths: Optional[list] = None,
 ) -> str:
-    """Append deleted-file HEAD content or explicit suppression markers."""
+    """Append deleted-file HEAD content or explicit suppression markers;
+    ``diff_only_paths`` members skip the HEAD inline (ladder-degraded): a text
+    deletion's complete content is the staged diff's own minus-lines."""
     if not deleted_paths:
         return current_files_section
 
     notes: list[str] = []
     for dp in deleted_paths:
         suffix = pathlib.Path(dp).suffix.lstrip(".") or "text"
+        if dp in (diff_only_paths or ()):
+            notes.append(
+                f"### {dp}\n\n*(DELETED — full HEAD snapshot omitted to fit the "
+                "reviewer input budget; the complete removal is visible in the "
+                "staged diff below)*\n"
+            )
+            continue
         suppress_reason = _classify_deleted_for_inline(dp, repo_dir)
         if suppress_reason is not None:
             if represent_binary and suppress_reason.startswith("binary"):
@@ -404,9 +439,7 @@ def _inline_deleted_file_pack(
 
                 metadata = render_staged_binary_metadata(repo_dir, dp)
                 if metadata is None:
-                    raise RuntimeError(
-                        f"deleted binary {dp} has no exact staged Git metadata"
-                    )
+                    raise RuntimeError(f"deleted binary {dp} has no exact staged Git metadata")
                 notes.append(f"### {dp}\n\n{metadata}\n")
                 continue
             notes.append(
@@ -415,9 +448,7 @@ def _inline_deleted_file_pack(
             continue
 
         try:
-            head_content = run_cmd(
-                ["git", "show", f"HEAD:{dp}"], cwd=repo_dir
-            )
+            head_content = run_cmd(["git", "show", f"HEAD:{dp}"], cwd=repo_dir)
         except Exception:
             head_content = ""
 
@@ -458,13 +489,11 @@ def _gather_scope_packs(
     snapshot_included_paths: Optional[frozenset] = None,
 ) -> str:
     """Collect the bounded wider repository atlas, failing closed on git errors."""
-    # WHICH snapshots the fixed part actually holds is the assembler's fact,
-    # never re-derived from the touched LIST: `all_touched_paths` also names
-    # files the fixed part omits by design (touched tests) or suppresses (a
-    # sensitive/oversized deletion), and claiming those as "included in fixed
-    # prompt context" is a false coverage claim (BIBLE P1) that also hides them
-    # from the atlas's own requiredness classification. Unclaimed paths are
-    # classified by the atlas; a canonical doc is claimed only if it exists.
+    # WHICH snapshots the fixed part holds is the assembler's fact, never re-derived
+    # from the touched LIST: `all_touched_paths` also names files the fixed part
+    # omits by design (touched tests) or suppresses (sensitive/oversized deletion) —
+    # claiming those would be a false coverage claim (BIBLE P1) that also hides them
+    # from requiredness classification. A canonical doc is claimed only if it exists.
     already_included = frozenset(
         set(snapshot_included_paths or frozenset())
         | {doc for doc in _CANONICAL_CONTEXT_DOCS if (repo_dir / doc).is_file()}
@@ -486,8 +515,7 @@ def _gather_scope_packs(
                 compact_manifest=compact,
             )
         )
-        # Set the manifest FIRST: disclosure accompanies the refusal below, it
-        # never replaces it (BIBLE P3).
+        # Set the manifest FIRST: disclosure accompanies the refusal, never replaces it (P3).
         _SCOPE_CONTEXT_MANIFEST.set(atlas.manifest)
         if atlas_assembly_failed(atlas):
             raise _ScopeAtlasNotAssembled(atlas.manifest, atlas_assembly_failure_reason(atlas))
@@ -520,52 +548,49 @@ def _render_touched_section(
 ) -> tuple:
     """Build the touched-files prompt section.
 
-    ``diff_only_paths`` are degraded to an explicit disclosed note (their
-    changes stay fully visible in the staged diff) — the guaranteed-fit
-    ladder's step for oversized fixed parts.
-
-    Returns ``(section, pack_omitted, snapshot_included)``. ``snapshot_included``
-    is the CONSERVATIVE set of paths whose full snapshot this section really
-    carries — the atlas is told that and nothing more, so no coverage row can
-    claim content the pack does not hold (BIBLE P1).
-    """
+    ``diff_only_paths`` are degraded to an explicit disclosed note (changes stay
+    fully visible in the staged diff) — the guaranteed-fit ladder's step.
+    Returns ``(section, pack_omitted, snapshot_included)``; the latter is the
+    CONSERVATIVE set of paths whose full snapshot this section really carries, so
+    no coverage row can claim content the pack does not hold (BIBLE P1)."""
     kept = [path for path in current_context_paths if path not in diff_only_paths]
     section, pack_omitted = build_touched_file_pack(
         repo_dir, kept, represent_binary=represent_binary
     )
     section = _inline_deleted_file_pack(
-        section,
-        deleted_paths,
-        repo_dir,
-        represent_binary=represent_binary,
+        section, deleted_paths, repo_dir,
+        represent_binary=represent_binary, diff_only_paths=diff_only_paths,
     )
-    if skipped_by_design:
+    # A ladder-degraded touched test moves to the degradation note below; listing
+    # it HERE too would claim an atlas snapshot the pack no longer holds.
+    skip_listed = [p for p in skipped_by_design if p not in diff_only_paths]
+    if skip_listed:
         skip_note = (
             "## CURRENT FILE CONTEXT DEDUPLICATION NOTE\n"
             "The following touched files are not duplicated as full current-file "
             "snapshots HERE because they are either canonical docs injected above "
             "or tests whose exact changes are visible in the staged diff below. "
-            "A touched test is an atlas anchor, so its full snapshot appears once "
-            "in the generated atlas when the atlas selects it:\n"
-            + "\n".join(f"- {path}" for path in skipped_by_design)
+            "A touched test listed here is delegated to the generated atlas (full "
+            "snapshot, or a typed binary/oversize row); tests degraded to diff-only "
+            "under budget pressure move to the degradation note instead:\n"
+            + "\n".join(f"- {path}" for path in skip_listed)
             + "\n"
         )
         section = section + "\n\n" + skip_note if section.strip() else skip_note
     if diff_only_paths:
         degrade_note = (
             "## TOUCHED FILE BUDGET DEGRADATION NOTE\n"
-            "The full post-change snapshots of the following touched files were "
-            "OMITTED to fit the budget (freely degradable first, largest per tier). "
-            "Their complete changes are still visible in the staged diff below; "
-            "treat this as an explicit, disclosed omission of unchanged "
-            "surrounding context, not a hidden gap:\n"
+            "The full snapshots (post-change; HEAD content for deletions) of the "
+            "following touched files were OMITTED to fit the budget (freely "
+            "degradable first, largest per tier). Their complete changes are still "
+            "visible in the staged diff below; treat this as an explicit, disclosed "
+            "omission of unchanged surrounding context, not a hidden gap:\n"
             + "\n".join(f"- {path}" for path in diff_only_paths)
             + "\n"
         )
         section = section + "\n\n" + degrade_note if section.strip() else degrade_note
-    # Only paths that CANNOT be absent: kept, not omitted by the pack builder,
-    # and a real file on disk (the builder can emit nothing else). Deleted paths
-    # are never claimed — they leave the index, so the atlas has no row for them.
+    # Only paths that CANNOT be absent: kept, not omitted by the pack builder, and a
+    # real file on disk. Deleted paths are never claimed — they leave the index.
     snapshot_included = frozenset(
         path for path in kept
         if path not in set(pack_omitted) and (repo_dir / path).is_file()
@@ -675,33 +700,27 @@ def _build_scope_prompt(
             else ""
         ) + f"**IMPORTANT: {_CONVERGENCE_RULE_TEXT}**\n"
 
-    try:
-        diff_text = run_cmd(["git", "diff", "--cached"], cwd=repo_dir)
-    except Exception:
-        diff_text = "(failed to get staged diff)"
+    # Hardened, byte-exact, fail-closed: it raises rather than yield a placeholder.
+    diff_text = capture_staged_diff(repo_dir)
 
     touched_entries = _parse_staged_name_status(repo_dir)
     current_paths = [ep[1] for ep in touched_entries if ep[0] != "D"]
     deleted_paths = [ep[1] for ep in touched_entries if ep[0] == "D"]
     all_touched_paths = [ep[1] for ep in touched_entries]
+    renamed_paths = frozenset(
+        ep[1] for ep in touched_entries if str(ep[0]).upper().startswith("R"))
 
     current_context_paths = [
-        path for path in current_paths
-        if not _should_skip_current_touched_context(path)
+        p for p in current_paths if not _should_skip_current_touched_context(p)
     ]
     current_skipped_by_design = [
-        path for path in current_paths
-        if _should_skip_current_touched_context(path)
+        p for p in current_paths if _should_skip_current_touched_context(p)
     ]
 
     def _render_current_section(diff_only_paths: list) -> tuple:
         return _render_touched_section(
-            repo_dir,
-            current_context_paths,
-            deleted_paths,
-            current_skipped_by_design,
-            diff_only_paths,
-            represent_binary=represent_binary,
+            repo_dir, current_context_paths, deleted_paths,
+            current_skipped_by_design, diff_only_paths, represent_binary=represent_binary,
         )
 
     current_files_section, omitted, snapshot_included = _render_current_section([])
@@ -731,45 +750,43 @@ def _build_scope_prompt(
 
     gather_signature = inspect.signature(_gather_scope_packs)
     gather_accepts_kwargs = any(
-        param.kind is inspect.Parameter.VAR_KEYWORD
-        for param in gather_signature.parameters.values()
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in gather_signature.parameters.values()
     )
     gather_accepted = set(gather_signature.parameters)
 
     def _atlas_section(fixed_tokens: int, compact: bool) -> str:
         gather_kwargs = {
-            "fixed_prompt_tokens": fixed_tokens,
-            "drive_root": drive_root,
-            "scope_model": scope_model,
-            "compact": compact,
+            "fixed_prompt_tokens": fixed_tokens, "drive_root": drive_root,
+            "scope_model": scope_model, "compact": compact,
             # The ladder owns which snapshots survived; the atlas is TOLD.
             "diff_only_paths": list(diff_only_paths),
             "snapshot_included_paths": snapshot_included,
         }
         return _gather_scope_packs(
-            repo_dir,
-            all_touched_paths,
-            **(
-                gather_kwargs
-                if gather_accepts_kwargs
-                else {key: value for key, value in gather_kwargs.items() if key in gather_accepted}
-            ),
+            repo_dir, all_touched_paths,
+            **(gather_kwargs if gather_accepts_kwargs
+               else {k: v for k, v in gather_kwargs.items() if k in gather_accepted}),
         )
 
     def _touched_token_estimate(path: str) -> int:
         try:
             return int((repo_dir / path).stat().st_size) // 4 + 64
-        except OSError:
-            return 0
+        except OSError:  # deleted: the fixed part inlines the HEAD blob instead
+            try:
+                return int(run_cmd(["git", "cat-file", "-s", f"HEAD:{path}"], cwd=repo_dir)) // 4 + 64
+            except Exception:
+                return 0
 
-    # Guaranteed-fit ladder: 1) full atlas; 2) compact atlas; 3) degrade freely degradable touched
-    # files to diff-only, largest first (disclosed; changes stay visible in the staged diff);
-    # 4) drop unchanged diff context; 5) artifacts owed in full, last resort. Else fails CLOSED.
+    # Guaranteed-fit ladder: full atlas; compact atlas; degrade degradable touched files
+    # to diff-only (largest first); drop unchanged diff context; artifacts last. Else CLOSED.
     input_limit = _effective_scope_input_limit(scope_model=scope_model)
     _atlas_min_allowance = 35_000  # manifest reserve + hard headroom, see review_context_atlas
     diff_only_paths: list = []
+    # FREE tier includes touched tests and eligible deletions (guards in the helper).
     degradable = sorted(
-        current_context_paths,
+        _degradable_diff_only_paths(
+            repo_dir, current_context_paths, current_skipped_by_design, deleted_paths,
+            renamed_paths),
         key=lambda path: (atlas_required_beyond_diff(path), -_touched_token_estimate(path)),
     )
     compact = False
@@ -777,9 +794,7 @@ def _build_scope_prompt(
     last_known_tokens = 0
     unassembled_required: list = []
     atlas_overflowed = False
-    # One AGGREGATED record of the guaranteed-fit ladder (RS5): a per-step event
-    # stream would be noise, but a silent ladder makes an oversized pack
-    # unexplainable after the fact (BIBLE P1).
+    # One AGGREGATED ladder record (RS5); a silent ladder is unexplainable (BIBLE P1).
     ladder_steps: list = []
     while True:
         prompt = _assemble_prompt(current_files_section)
@@ -797,14 +812,11 @@ def _build_scope_prompt(
                     refusal = compact_exc
             if atlas_text is None:
                 last_known_tokens = int(refusal.manifest.get("estimated_total_tokens") or 0)
-                # The atlas manifest stays the ONE carrier of what did not assemble,
-                # and a refusal is a ladder STEP with a trace row exactly like the
-                # assembly branch below (an empty trace explains nothing — P1).
+                # The atlas manifest is the ONE carrier of what did not assemble; a
+                # refusal is a ladder STEP (P1) that can carry TWO causes — capture both.
                 unassembled_required = [
                     str(row.get("path") or "?") for row in atlas_unassembled_required(refusal.manifest)
                 ]
-                # The refusal can carry TWO causes at once (missing required
-                # artifact AND hard-budget overflow) — capture both facts.
                 atlas_overflowed = atlas_hard_budget_overflowed(refusal.manifest)
                 ladder_steps.append({
                     "step": "atlas_refused", "compact": compact, "reason": str(refusal),
@@ -812,6 +824,7 @@ def _build_scope_prompt(
                     "atlas_overflowed": atlas_overflowed,
                     "tokens_after": last_known_tokens,
                     "diff_only_files": len(diff_only_paths),
+                    "diff_only_paths": list(diff_only_paths),
                     "zero_context_diff": compact_diff_attempted,
                 })
 
@@ -829,6 +842,7 @@ def _build_scope_prompt(
                 "tokens_before": last_known_tokens,
                 "tokens_after": prompt_tokens,
                 "diff_only_files": len(diff_only_paths),
+                "diff_only_paths": list(diff_only_paths),
                 "zero_context_diff": compact_diff_attempted,
                 "deficit": max(0, prompt_tokens - input_limit),
             })
@@ -842,8 +856,7 @@ def _build_scope_prompt(
                 continue
             deficit = prompt_tokens - input_limit
         else:
-            # Even the atlas manifest cannot fit beside the fixed part: shrink
-            # the fixed part enough to give the manifest its minimum room.
+            # Even the manifest cannot fit beside the fixed part: shrink it for room.
             deficit = max(50_000, fixed_prompt_tokens + _atlas_min_allowance - input_limit)
 
         def can_degrade() -> bool:  # required tier only after -U0
@@ -853,19 +866,16 @@ def _build_scope_prompt(
             if not compact_diff_attempted:  # every +/- line, no unchanged context
                 compact_diff_attempted = True
                 try:
-                    compact_diff = run_cmd(["git", "diff", "--cached", "-U0"], cwd=repo_dir)
-                except Exception:
-                    compact_diff = ""
+                    compact_diff = capture_staged_diff(repo_dir, unified=0)
+                except StagedDiffUnavailable:
+                    compact_diff = ""  # the full capture above stays the evidence
                 if compact_diff.strip() and compact_diff != diff_text:
                     diff_text = compact_diff
                     continue
                 if can_degrade():  # -U0 gave nothing, but the required tier is open now
                     continue
-            # Terminal pack status: >=1M authority is fixed_overflow; a sub-floor
-            # pack is budget_exceeded here and the authority policy turns it into
-            # a block unless the owner explicitly selected advisory scope. The
-            # CAUSE travels separately — both branches report the real one. The
-            # window is the evidence-resolved sizing window, never a hardcoded table.
+            # Terminal pack status: >=1M authority is fixed_overflow; a sub-floor pack is
+            # budget_exceeded (blocked unless owner advisory). CAUSE travels separately.
             _record_ladder_steps(ladder_steps)
             known = _scope_window(
                 scope_model or _get_scope_model()
@@ -881,9 +891,8 @@ def _build_scope_prompt(
             path = degradable.pop(0)
             diff_only_paths.append(path)
             freed += _touched_token_estimate(path)
-        # Re-render AND re-read what the shrunken section now holds: a path just
-        # degraded to diff-only has stopped being a survivor, so the next atlas
-        # build must not be told otherwise.
+        # Re-render AND re-read what the shrunken section now holds: a freshly
+        # degraded path is no survivor, and the next atlas build must know that.
         current_files_section, _, snapshot_included = _render_current_section(diff_only_paths)
 
 
@@ -959,9 +968,8 @@ def _call_scope_llm(
     if delegated:
         messages: Any = []
     else:
-        # Split at the recorded stable/dynamic boundary so the byte-stable prefix
-        # (instructions + checklist + canonical docs) carries the provider cache
-        # marker while the per-commit tail (diff/atlas/history) stays unmarked.
+        # Split at the recorded stable/dynamic boundary: the byte-stable prefix
+        # carries the provider cache marker, the per-commit tail stays unmarked.
         from ouroboros.tools.review_helpers import cached_prompt_blocks
 
         _stable_len = int(_SCOPE_STABLE_PREFIX_LEN.get() or 0)
@@ -994,9 +1002,8 @@ def _call_scope_llm(
             no_proxy=True,
             session_task=session_task if delegated else "",
             session_root=session_root if delegated else "",
-            # The extraction fallback canonicalizes to the SCOPE contract: the
-            # required-matrix shape with the eight verbatim item ids (D19 — the
-            # light model follows the review's own contract, never a looser one).
+            # The extraction fallback canonicalizes to the SCOPE contract: required-
+            # matrix shape, eight verbatim item ids (D19 — never a looser contract).
             policy=(
                 {
                     "output_contract": (
@@ -1018,9 +1025,8 @@ def _call_scope_llm(
             max_tokens=_scope_output_tokens,
             temperature=0.2,
             # ROUTE is CARRIED, never re-derived: the one-element slot list above
-            # re-reads ROUTES **row 1**, which sent a mixed config's api row as
-            # agent_session (pack, no task) — the caller's fanned-out route is the
-            # authority (p5x XG fix, kept through the 6.1 threading).
+            # re-reads ROUTES row 1, which sent a mixed config's api row as
+            # agent_session — the caller's fanned-out route is the authority (p5x XG).
             route=ReviewRouteKind.AGENT_SESSION if delegated else ReviewRouteKind.API_CHAT,
             # The fanned-out row's own session target (6.1); '' keeps the
             # shared session-route fallback.
@@ -1166,9 +1172,8 @@ def _handle_prompt_signals(
                 "scope gate has no authoritative verdict."
             ),
             status="sub_floor",
-            # No prompt string exists on this path (the fit ladder returned a
-            # sentinel), so the char count is DERIVED from the token estimate and
-            # labelled as such instead of masquerading as a measurement.
+            # No prompt string exists on this path (ladder sentinel): the char count
+            # is DERIVED from the token estimate and labelled as such.
             prompt_chars=token_count * 4,
             prompt_chars_source="estimated_from_tokens",
             advisory_findings=[{
@@ -1184,11 +1189,10 @@ def _handle_prompt_signals(
         )
 
     if context_status.status == "fixed_overflow":
-        # The guaranteed-fit ladder exhausted every degradation step. TWO failures
-        # land here — an irreducible prompt that overflows, and a REQUIRED artifact
-        # that never assembled — and they can COINCIDE, so the cause(s) are READ
-        # from the status, not assumed, and every one that applies is rendered.
-        # Either way: a structural condition the owner must see, failing CLOSED.
+        # The ladder exhausted every degradation step. TWO failures land here — an
+        # irreducible overflowing prompt, and a REQUIRED artifact that never
+        # assembled — and they can COINCIDE, so the cause(s) are READ from the
+        # status and every one that applies is rendered. Fails CLOSED either way.
         token_count = context_status.token_count
         cause, remedy = _ladder_terminal_cause(context_status, input_limit)
         return ScopeReviewResult(
@@ -1277,9 +1281,8 @@ def _apply_scope_authority(
 
         # EVIDENCE, never the sizing fallback: the session floor is gated on SOURCED
         # provenance, and a fail-closed sizing number handed over as a window would
-        # read as evidence for exactly the number the session floor sits at. A STALE
-        # record sizes a prompt but authorises nothing (same rule as the api row), so
-        # its provenance is blanked before the session predicate reads it.
+        # read as evidence for exactly the session-floor number. A STALE record sizes
+        # a prompt but authorises nothing (api-row rule): provenance blanked first.
         return session_scope_authority(
             critical_findings, advisory_findings, scope_model=scope_model_id,
             window=int(resolved.window_tokens or 0),
@@ -1426,10 +1429,9 @@ def run_scope_review(
     _cost_usd = float(_usage.get("cost", 0.0) or 0.0)
     if llm_error:
         if _is_provider_oversize_error(llm_error):
-            # The estimate-based budget gate passed but the provider's REAL
-            # tokenizer rejected the prompt as oversize: there is no authoritative
-            # verdict, so the >=1M gate fails CLOSED (since v6.80.0 no setting can
-            # make this non-blocking; the owner's only control is the context mode).
+            # The estimate-based gate passed but the provider's REAL tokenizer called
+            # the prompt oversize: no authoritative verdict, so the >=1M gate fails
+            # CLOSED (v6.80.0: not configurable; owner controls only context mode).
             log.warning(
                 "Scope reviewer rejected the prompt as oversize "
                 "(estimate-gate passed; real tokenizer denser). Failing the "
@@ -1457,19 +1459,16 @@ def run_scope_review(
             response_ref=_response_ref,
         )
     # Usage emission happens ONCE, inside the shared review substrate
-    # (source="review_substrate:scope_review", carrying ledger_attempt_ids).
-    # The former job-level re-emit here duplicated every scope call in the
-    # llm_usage telemetry without attempt ids, so the pair could not be
-    # deduplicated against the monetary ledger (v6.69.0).
+    # (source="review_substrate:scope_review", carrying ledger_attempt_ids). The old
+    # job-level re-emit duplicated every scope call without attempt ids, so the pair
+    # could not be deduplicated against the monetary ledger (v6.69.0).
 
     if _provider_error_is_oversize(_usage, _prompt_tokens_est, scope_model_id):
         # Gateway route (openai-compatible/OpenRouter): a real oversize 400 arrives as
-        # an EMPTY body + usage['provider_error']{code:400}, NOT a raised error carrying
-        # the "prompt is too long" text — so the llm_error oversize branch above never
-        # fires and the empty body would otherwise hard-block as empty_response. With
-        # INDEPENDENT size evidence (see _provider_error_is_oversize), route through
-        # the same fail-closed oversize result as the raised-error path. A
-        # non-size 400 (auth/param/policy) stays blocking below.
+        # an EMPTY body + usage['provider_error']{code:400}, not a raised "prompt is
+        # too long" error — the llm_error branch above never fires and the empty body
+        # would hard-block as empty_response. With INDEPENDENT size evidence, route
+        # through the same fail-closed oversize result; non-size 400 stays blocking.
         _pe_msg = str((_usage.get("provider_error") or {}).get("message") or "")
         log.warning(
             "Scope reviewer hit provider_error code=400 oversize (empty body; "

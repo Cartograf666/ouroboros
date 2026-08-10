@@ -1470,9 +1470,10 @@ wider repository pack as omission.
 ## Current touched files (post-change — what the file looks like NOW)
 
 Files deleted by this diff appear here with an explicit `DELETED` marker and
-their HEAD content inlined; other removed lines are visible via the staged
-diff below. HEAD versions of modified files are not sent as a separate
-section — the staged diff below already shows every `-` line.
+their HEAD content inlined unless a typed marker states otherwise (suppressed
+content, or a budget-degraded snapshot); other removed lines are visible via
+the staged diff below. HEAD versions of modified files are not sent as a
+separate section — the staged diff below already shows every `-` line.
 
 {current_files_section}
 
