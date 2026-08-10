@@ -9,6 +9,7 @@ import {
     queueNoticeText,
     removalPrompt,
     snapshotReceipt,
+    successText,
     threadActions,
 } from '../modules/project_thread_actions.js';
 
@@ -94,6 +95,46 @@ test('a successful merge says the checkout survives (A10)', () => {
     const outcome = describeOutcome({ ok: true, merged: true, worktree_kept: true });
     assert.equal(outcome.tone, 'ok');
     assert.match(outcome.text, /keeps its checkout until you remove it/);
+});
+
+test('a removal says whether the branch went with it (T3R-5)', () => {
+    // The disclosure has to REACH the owner: a branch that survived is exactly
+    // what the next branch-off refuses on, and meeting that later as a bare
+    // "branch already exists" is what this sentence prevents.
+    assert.match(
+        successText({ removed: true, branch: 'thread/racer__1', branch_removed: true }),
+        /branch thread\/racer__1 with it — this thread can branch off again/,
+    );
+    const kept = successText({
+        removed: true,
+        branch: 'thread/racer__1',
+        branch_removed: false,
+        branch_kept_reason: 'the checkout held unmerged work, so its branch keeps the commits',
+    });
+    assert.match(kept, /was kept — the checkout held unmerged work/);
+    assert.match(kept, /Branching off again will refuse/);
+    // Nothing known about the branch: no invented claim either way.
+    assert.equal(successText({ removed: true }), 'Checkout removed.');
+});
+
+test('an acknowledged merge still says what stayed in the checkout', () => {
+    // Acknowledging that work is left behind is not the same as forgetting it was.
+    const base = successText({ merged: true, worktree_kept: true });
+    assert.ok(!/stayed in the checkout/.test(base));
+
+    const withLeftovers = successText({
+        merged: true,
+        worktree_kept: true,
+        checkout_left_behind: ['?? scratch.log', ' M feature.txt'],
+    });
+    assert.match(withLeftovers, /keeps its checkout until you remove it/);
+    assert.match(withLeftovers, /2 uncommitted changes stayed in the checkout/);
+    assert.match(withLeftovers, /a merge brings commits only/);
+
+    assert.match(
+        successText({ merged: true, checkout_left_behind: ['?? one.log'] }),
+        /1 uncommitted change stayed/,
+    );
 });
 
 test('a snapshot receipt names the credential files it left out', () => {

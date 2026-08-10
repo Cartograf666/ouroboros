@@ -246,7 +246,11 @@ def inspect_thread_worktree(row: Dict[str, Any]) -> Dict[str, Any]:
         return out
     out["exists"] = True
     try:
-        status = run_git(wt_path, "status", "--porcelain", check=False)
+        # `core.quotepath=off` so a non-ASCII path arrives as itself. Without it
+        # this listed the C-quoted spelling while `merge_back_thread`'s own status
+        # call — which pins it — listed the real one, and the two surfaces
+        # disagreed about the same file.
+        status = run_git(wt_path, "-c", "core.quotepath=off", "status", "--porcelain", check=False)
         if status.returncode != 0:
             # Not a checkout any more (or git refused): unsafe by construction.
             out["error"] = (status.stderr or "git status failed").strip()[:500]

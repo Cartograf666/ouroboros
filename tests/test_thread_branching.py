@@ -47,8 +47,8 @@ from ouroboros.thread_branching import (
 )
 
 
-def _git(cwd, *args):
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True)
+def _git(cwd, *args, check=True):
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=check)
 
 
 @pytest.fixture()
@@ -557,6 +557,124 @@ def test_a_DETACHED_checkout_is_not_described_as_a_branch_named_HEAD(drive, fold
     assert "detached HEAD" in refused["message"]
     assert "'HEAD'" not in refused["message"], "a detached head is not a branch called HEAD"
     assert refused["branch"] in refused["message"]
+
+
+def test_an_untracked_file_in_the_owners_folder_does_not_block_a_merge(drive, folder, wt_root):
+    """"Clean local tree" is about TRACKED changes.
+
+    An untracked file is not part of a merge and cannot blur which work came from
+    where, which is what this precondition protects. Counting it meant a project
+    holding one stray `.env` or build artifact could never merge anything back —
+    forever — with copy telling the owner to commit or stash a file they
+    deliberately keep out of git. It surfaced as collateral of T3R-1: the snapshot
+    used to hide such a file by writing the owner's `.git/info/exclude`, which is
+    exactly the write T3R-1 stopped.
+    """
+    (folder / ".env").write_text("API_KEY=secret\n", encoding="utf-8")
+    thread = _project(drive, folder)
+    out = _branch(drive, "racer", thread["id"], wt_root, base_ref=BASE_SNAPSHOT)
+    assert out["ok"] is True, out
+    assert out["snapshot_commit"]["skipped_sensitive"] == [".env"]
+    _commit_in(out["path"], "feature.txt", "from the thread\n")
+
+    merged = merge_back_thread(drive, "racer", thread["id"], data_dir=drive, busy=False)
+
+    assert merged["ok"] is True, merged
+    assert merged["merged"] is True
+    assert (folder / "feature.txt").read_text(encoding="utf-8") == "from the thread\n"
+    # The owner's file is untouched and still theirs, still untracked.
+    assert (folder / ".env").read_text(encoding="utf-8") == "API_KEY=secret\n"
+    assert ".env" not in _git(folder, "ls-files").stdout.split()
+    # A TRACKED edit still refuses, because that one really would blur it.
+    (folder / "app.txt").write_text("owner is mid-edit\n", encoding="utf-8")
+    refused = merge_back_thread(drive, "racer", thread["id"], data_dir=drive, busy=False)
+    assert refused["reason"] == REASON_LOCAL_TREE_DIRTY
+
+
+def test_a_dirty_checkout_can_be_merged_ANYWAY_and_the_answer_says_what_stayed(drive, folder, wt_root):
+    """A checkout an agent worked in almost always holds something untracked — a
+    log, a build artifact, a scratch file. A refusal with no way past it would
+    make merge-back unreachable for exactly the threads that did work, so
+    `checkout_dirty` carries A10's consent shape.
+
+    And the success NAMES what stayed: acknowledging that work is left behind is
+    not the same as forgetting it was.
+    """
+    from pathlib import Path
+
+    thread = _project(drive, folder)
+    out = _branch(drive, "racer", thread["id"], wt_root)
+    _commit_in(out["path"], "feature.txt", "committed\n")
+    Path(out["path"], "scratch.log").write_text("agent scratch\n", encoding="utf-8")
+
+    refused = merge_back_thread(drive, "racer", thread["id"], data_dir=drive, busy=False)
+    assert refused["reason"] == REASON_CHECKOUT_DIRTY
+    assert refused["acknowledgeable"] is True
+    assert "merge anyway" in refused["message"]
+
+    merged = merge_back_thread(
+        drive, "racer", thread["id"], data_dir=drive, busy=False,
+        acknowledge_checkout_dirty=True,
+    )
+
+    assert merged["ok"] is True, merged
+    assert merged["merged"] is True
+    assert (folder / "feature.txt").read_text(encoding="utf-8") == "committed\n"
+    assert any("scratch.log" in row for row in merged["checkout_left_behind"])
+    # The acknowledgement does not cover the WRONG BRANCH case: that is not work
+    # left behind, it is a merge that would do nothing while reporting success.
+    _git(out["path"], "checkout", "-q", "-b", "elsewhere")
+    still = merge_back_thread(
+        drive, "racer", thread["id"], data_dir=drive, busy=False,
+        acknowledge_checkout_dirty=True,
+    )
+    assert still["reason"] == REASON_CHECKOUT_HEAD_OFF_BRANCH
+
+
+def test_a_folder_left_MID_MERGE_is_not_told_to_commit_or_stash(drive, folder, wt_root):
+    """After a `merge_abort_failed`, the folder has MERGE_HEAD set and conflict
+    markers in the files. The next attempt used to hit the local-tree check and
+    answer "commit or stash them first" — advice for a folder with edits in it,
+    not one stopped part-way through a merge, and following it would only make
+    the state harder to unpick."""
+    thread = _project(drive, folder)
+    out = _branch(drive, "racer", thread["id"], wt_root)
+    _commit_in(out["path"], "app.txt", "the thread's version\n")
+    (folder / "app.txt").write_text("the owner's version\n", encoding="utf-8")
+    _git(folder, "commit", "-qam", "owner edit")
+    # Put the folder mid-merge for real, and leave it there.
+    _git(folder, "-c", "user.name=T", "-c", "user.email=t@example.com",
+         "merge", "--no-ff", "--no-edit", out["branch"], check=False)
+    assert (folder / ".git" / "MERGE_HEAD").exists()
+
+    refused = merge_back_thread(drive, "racer", thread["id"], data_dir=drive, busy=False)
+
+    assert refused["reason"] == REASON_MERGE_ABORT_FAILED
+    assert refused["folder_left_mid_merge"] is True
+    assert "stash" not in refused["message"]
+    assert "git merge --abort" in refused["message"]
+    _git(folder, "merge", "--abort")
+
+
+def test_a_budget_paused_task_does_not_block_merge_back_forever(monkeypatch):
+    """T3R-14's PENDING rule, bounded. A budget-exhausted task is parked in
+    PENDING with `auto_resume: False` and waits for the owner — possibly forever,
+    and across a queue-snapshot restore. Counting it made "this project is busy"
+    permanently true, so ONE paused task locked the owner out of merging their own
+    work back with nothing on screen to explain why."""
+    import ouroboros.thread_branching as branching
+    from supervisor import workers
+
+    parked = {
+        "id": "p1", "project_id": "racer",
+        "_budget_pause": {"status": "paused_before_dispatch", "auto_resume": False},
+    }
+    monkeypatch.setattr(workers, "PENDING", [parked])
+    assert branching.project_is_busy("racer") is False
+
+    # A queued task that CAN still start is a real wait, and still counts.
+    monkeypatch.setattr(workers, "PENDING", [{"id": "p2", "project_id": "racer"}])
+    assert branching.project_is_busy("racer") is True
 
 
 def test_an_unbranched_thread_has_nothing_to_merge(drive, folder, wt_root):

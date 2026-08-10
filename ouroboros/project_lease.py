@@ -208,13 +208,36 @@ def running_project_ids(running: Iterable[Any], pending: Iterable[Any] = ()) -> 
       folder rewritten under a task that has just started. ``pending`` is a
       separate argument because the supervisor keeps the two collections apart
       and a caller that can only see one must still get a true answer about it.
+
+      EXCEPT a pending task that cannot start on its own. A budget-exhausted task
+      is parked in PENDING with ``auto_resume: False`` and waits for the owner —
+      possibly forever, and across a queue-snapshot restore. Counting those made
+      "this project is busy" permanently true, so a single paused task locked the
+      owner out of merging their own work back, with nothing on screen to explain
+      why. Work only the owner can release is not activity to wait behind; it is
+      the owner's own decision, already taken.
     """
     out: Set[str] = set()
-    for task in (*(running or ()), *(pending or ())):
+    startable = [task for task in (pending or ()) if _can_still_start(task)]
+    for task in (*(running or ()), *startable):
         pid = _task_project_id(task)
         if pid:
             out.add(pid)
     return out
+
+
+def _can_still_start(task: Any) -> bool:
+    """Could the SCHEDULER still pick this pending task up without the owner?
+
+    Parked-for-the-owner is not queued: a budget-exhausted task carries a
+    ``_budget_pause`` whose ``auto_resume`` is false and will not move again until
+    the owner resumes or cancels it.
+    """
+    unwrapped = _as_task(task)
+    if not isinstance(unwrapped, dict):
+        return True
+    pause = unwrapped.get("_budget_pause")
+    return not (isinstance(pause, dict) and not pause.get("auto_resume"))
 
 
 def candidate_is_leasable(candidate: Dict[str, Any], running_lanes: Set[LaneKey]) -> bool:

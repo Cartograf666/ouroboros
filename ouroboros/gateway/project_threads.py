@@ -155,13 +155,23 @@ async def api_thread_merge_back(request: Request) -> JSONResponse:
     409s. A conflict comes back as ``merge_conflict`` WITH its paths: the merge is
     already aborted by then, so the owner's folder is untouched and the thread
     still holds every commit in its branch.
+
+    ``acknowledge_checkout_dirty`` in the body is the owner's answer to
+    ``checkout_dirty`` — A10's consent shape, reused: the refusal names the flag,
+    the owner re-sends with it, and the files that stayed behind are named again
+    on the success. A body is optional here so the plain merge-back call is
+    unchanged.
     """
     from ouroboros.thread_branching import merge_back_thread
 
     try:
         project_id, thread_id = _route_ids(request)
         drive_root = request_drive_root(request)
-        outcome = await asyncio.to_thread(merge_back_thread, drive_root, project_id, thread_id)
+        body = await _json_body(request) or {}
+        outcome = await asyncio.to_thread(
+            merge_back_thread, drive_root, project_id, thread_id,
+            acknowledge_checkout_dirty=bool(body.get("acknowledge_checkout_dirty")),
+        )
         if outcome.get("ok"):
             _broadcast_thread_change(drive_root, str(outcome["project_id"]), outcome["thread_id"])
         return _answer(outcome)

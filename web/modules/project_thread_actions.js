@@ -105,9 +105,32 @@ export function successText(outcome) {
     if (outcome?.merged === false) return 'Nothing new to merge — the folder already has this work.';
     if (outcome?.merged) {
         // A10 is stated at the moment it matters: the checkout is still there.
-        return 'Merged into the project folder. The thread keeps its checkout until you remove it.';
+        const base = 'Merged into the project folder. The thread keeps its checkout until you remove it.';
+        const behind = Array.isArray(outcome.checkout_left_behind)
+            ? outcome.checkout_left_behind.filter(Boolean)
+            : [];
+        // Acknowledging that work stays behind is not the same as forgetting it
+        // did, so the SUCCESS says it again rather than leaving the owner to
+        // rediscover it in a folder they have stopped looking at.
+        if (!behind.length) return base;
+        const n = behind.length;
+        return `${base} ${n} uncommitted change${n === 1 ? '' : 's'} stayed in the checkout — a merge brings commits only.`;
     }
-    if (outcome?.removed) return 'Checkout removed.';
+    if (outcome?.removed) {
+        // T3R-5's disclosure has to REACH the owner: a branch that survived is
+        // exactly what the next branch-off refuses on, and meeting that later as
+        // a bare "branch already exists" is what this sentence prevents.
+        const branch = String(outcome.branch || '').trim();
+        if (outcome.branch_removed) {
+            return branch
+                ? `Checkout removed, and its branch ${branch} with it — this thread can branch off again.`
+                : 'Checkout removed.';
+        }
+        const why = String(outcome.branch_kept_reason || '').trim();
+        if (!why) return 'Checkout removed.';
+        return `Checkout removed. Its branch ${branch || ''} was kept — ${why}. Branching off again will refuse until it is gone.`
+            .replace(/\s{2,}/g, ' ');
+    }
     if (outcome?.branch) return `Branched off into ${outcome.branch}.`;
     return 'Done.';
 }

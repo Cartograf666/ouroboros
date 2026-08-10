@@ -281,8 +281,13 @@ def _snapshot_aborted(repo_dir: pathlib.Path, detail: str) -> Dict[str, Any]:
     fail. Returning the failure without undoing that leaves the owner in a
     repository they did not ask for and would not recognise — every file staged,
     ``git status`` unrecognisable, and no commit to explain it. A MIXED reset puts
-    the index back to HEAD and touches NO file in the working tree, so the folder
-    is byte-for-byte what it was before the attempt.
+    the index back to HEAD and touches NO file in the working tree, so every file
+    the owner has is exactly as they left it.
+
+    Their INDEX is not: a mixed reset also discards a curated one (an owner
+    mid-``git add -p``). ``git add -A`` had already destroyed that staging before
+    this point, so the reset cannot restore it and does not pretend to — this is
+    the least-wrong end state, not a lossless one.
     """
     reset = _git(repo_dir, "reset", "-q")
     if reset.returncode != 0:
@@ -632,7 +637,8 @@ def _in_merge(repo_dir: pathlib.Path) -> bool:
 
 
 def _checkout_ahead_refusal(
-    row: Dict[str, Any], pid: str, tid: int, branch: str,
+    row: Dict[str, Any], pid: str, tid: int, branch: str, inspection: Dict[str, Any],
+    *, acknowledged: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Refuse a merge that would silently leave the thread's work behind.
 
@@ -650,10 +656,18 @@ def _checkout_ahead_refusal(
     Both are refusals, not warnings: an owner who is told "merged" stops looking.
     The evidence is the SAME ``inspect_thread_worktree`` the removal prompt uses,
     so the two surfaces cannot disagree about what a checkout is holding.
-    """
-    from ouroboros.thread_worktrees import inspect_thread_worktree
 
-    inspection = inspect_thread_worktree(row)
+    The DIRTY one is acknowledgeable, on A10's existing consent shape. A checkout
+    an agent has actually worked in almost always holds something untracked — a
+    log, a build artifact, a scratch file — and a refusal with no way past it
+    would make merge-back unreachable for exactly the threads that did work. The
+    branch being WRONG is not acknowledgeable: that is not work left behind, it
+    is a merge that would do nothing while reporting success.
+
+    ``inspection`` is passed IN — the caller needs it again to name what stayed
+    behind on a successful merge, and inspecting a checkout twice could answer
+    twice.
+    """
     checkout = pathlib.Path(str(row.get("path") or ""))
     head_ref = _git(checkout, "rev-parse", "--abbrev-ref", "HEAD")
     on = (head_ref.stdout or "").strip() if head_ref.returncode == 0 else ""
@@ -675,6 +689,10 @@ def _checkout_ahead_refusal(
             project_id=pid, thread_id=tid, branch=branch,
             checkout_branch=on, path=str(checkout), inspection=inspection,
         )
+    if acknowledged:
+        # The owner has SEEN this and said merge anyway. Nothing is hidden: the
+        # files that will stay behind ride the successful answer too.
+        return None
     if inspection.get("dirty") or inspection.get("error"):
         detail = (
             "could not be read, so what it is holding is unknown"
@@ -685,10 +703,14 @@ def _checkout_ahead_refusal(
             REASON_CHECKOUT_DIRTY,
             f"This thread's checkout {detail}. Merging brings its COMMITS home and "
             "nothing else, so that work would stay behind while the answer said "
-            "the merge was done. Commit it in the checkout first, or discard it.",
+            "the merge was done. Commit it in the checkout first, discard it, or "
+            "merge anyway knowing it stays in the checkout.",
             project_id=pid, thread_id=tid, branch=branch,
             path=str(checkout), inspection=inspection,
             dirty_files=list(inspection.get("dirty_files") or [])[:200],
+            # A10's consent shape, reused: the refusal names the flag that
+            # answers it, so the owner is never stuck with only "no".
+            acknowledgeable=True,
         )
     return None
 
@@ -700,6 +722,7 @@ def merge_back_thread(
     *,
     data_dir: Optional[Any] = None,
     busy: Optional[bool] = None,
+    acknowledge_checkout_dirty: bool = False,
 ) -> Dict[str, Any]:
     """Merge a branched thread's work back into the project's own checkout (A9).
 
@@ -709,6 +732,16 @@ def merge_back_thread(
     merge moves COMMITS ON A BRANCH: uncommitted edits in the checkout, and
     commits made there on some other branch, do not travel with it, and answering
     ``ok: true`` while they stay behind is the one failure the owner cannot see.
+    ``acknowledge_checkout_dirty`` is the owner's answer to that first case, in
+    A10's existing consent shape — and the files that stay behind are named on
+    the successful answer too, so acknowledging it is not the same as forgetting.
+
+    "Clean local tree" means TRACKED changes. Untracked files in the owner's
+    folder are not part of a merge and do not blur which work came from where,
+    which is what that precondition is actually protecting; counting them meant a
+    project holding one stray `.env` or build artifact could never merge anything
+    back, forever, with copy telling the owner to commit or stash a file they
+    deliberately keep out of git.
 
     A conflict is SHOWN with its paths and STOPS the operation — the merge is
     aborted, so the owner's folder is left byte-for-byte as it was and the thread
@@ -764,12 +797,30 @@ def merge_back_thread(
     if project_is_busy(pid) if busy is None else bool(busy):
         return _refused(
             REASON_PROJECT_BUSY,
-            "A task is running in this project right now. Merging while something "
-            "is writing could mix half-finished work into the folder, so it waits "
-            "until that task finishes.",
+            "A task is running or queued in this project right now. Merging while "
+            "something is writing could mix half-finished work into the folder, so "
+            "it waits until that task finishes.",
             project_id=pid, thread_id=tid, branch=branch,
         )
-    status = _git(repo_dir, "status", "--porcelain")
+    # A folder already stopped part-way through a merge cannot be merged into,
+    # and it must not be told to "commit or stash" — that is advice for a folder
+    # with edits in it, not one with MERGE_HEAD set and conflict markers in the
+    # files. Without this, the retry after `merge_abort_failed` sent the owner
+    # somewhere that could only make it worse.
+    if _in_merge(repo_dir):
+        return _refused(
+            REASON_MERGE_ABORT_FAILED,
+            "The project folder is stopped part-way through an earlier merge: git "
+            "still has that merge in progress. Nothing here is lost and the thread "
+            "keeps its branch, but the folder has to come out of it first — in that "
+            "folder, `git merge --abort` goes back, or resolve the files and commit "
+            "to go forward.",
+            project_id=pid, thread_id=tid, branch=branch,
+            folder_left_mid_merge=True, working_dir=str(repo_dir),
+        )
+    # TRACKED changes only. An untracked file is not part of a merge and cannot
+    # blur which work came from where, which is the whole point of this check.
+    status = _git(repo_dir, "status", "--porcelain", "--untracked-files=no")
     if status.returncode != 0:
         return _refused(
             REASON_MERGE_FAILED, _detail(status), project_id=pid, thread_id=tid, branch=branch,
@@ -787,9 +838,18 @@ def merge_back_thread(
     # branch about to be merged actually where the thread's work IS? Checked here,
     # after the cheap preconditions and BEFORE anything is merged, so a refusal
     # leaves nothing half-done.
-    ahead = _checkout_ahead_refusal(row, pid, tid, branch)
+    from ouroboros.thread_worktrees import inspect_thread_worktree
+
+    inspection = inspect_thread_worktree(row)
+    ahead = _checkout_ahead_refusal(
+        row, pid, tid, branch, inspection,
+        acknowledged=bool(acknowledge_checkout_dirty),
+    )
     if ahead is not None:
         return ahead
+    # Named on the SUCCESS too: acknowledging work stays behind is not the same
+    # as forgetting it did.
+    left_behind = list(inspection.get("dirty_files") or [])[:200]
 
     before = _git(repo_dir, "rev-parse", "HEAD")
     head_before = (before.stdout or "").strip() if before.returncode == 0 else ""
@@ -855,6 +915,10 @@ def merge_back_thread(
         "head_after": head_after,
         # A10: merging never removes the checkout. The owner removes it, or not.
         "worktree_kept": True,
+        # What the merge did NOT bring, named on the success. Only ever non-empty
+        # when the owner acknowledged it, and said out loud there rather than left
+        # for them to rediscover in a folder they have stopped looking at.
+        "checkout_left_behind": left_behind,
         "location": thread_location(data_root, pid, tid),
     }
 

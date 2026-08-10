@@ -572,6 +572,18 @@ class ThreadBranchOffRequest(TypedDict, total=False):
     base_ref: str
 
 
+class ThreadMergeBackRequest(TypedDict, total=False):
+    """Merge-back body, entirely optional — a bare POST is the ordinary call.
+
+    ``acknowledge_checkout_dirty`` IS the owner's consent to merge while the
+    thread's checkout still holds uncommitted work: that work does not travel
+    with the merge, so the default refuses (``checkout_dirty``) and the files are
+    named again on the success. The same shape as the removal's
+    ``acknowledge_unmerged`` — one consent idiom, not two."""
+
+    acknowledge_checkout_dirty: bool
+
+
 class ThreadWorktreeRemoveRequest(TypedDict, total=False):
     """Worktree-removal body. ``acknowledge_unmerged`` IS the owner's consent
     (A10): a checkout holding unmerged commits or uncommitted edits refuses
@@ -628,6 +640,16 @@ class ThreadWorktreeResponse(TypedDict, total=False):
     #: folder was left as it was.
     folder_left_mid_merge: bool
     abort_detail: str
+    #: ``checkout_dirty``: this refusal has an owner-answerable flag
+    #: (``acknowledge_checkout_dirty`` in the merge-back body), so the owner is
+    #: never stuck with only "no". ``checkout_head_off_branch`` deliberately does
+    #: NOT set it: that is not work left behind, it is a merge that would do
+    #: nothing while reporting success.
+    acknowledgeable: bool
+    #: Named on a SUCCESSFUL merge: what the checkout still holds and the merge
+    #: did not bring. Only ever non-empty when the owner acknowledged it —
+    #: acknowledging is not the same as forgetting.
+    checkout_left_behind: List[str]
     inspection: Dict[str, Any]
     error: str
 
@@ -1363,6 +1385,7 @@ __all__ = [
     "ThreadLifecycleResponse",
     "ThreadLocation",
     "ThreadQueueNotice",
+    "ThreadMergeBackRequest",
     "ThreadWorktreeRemoveRequest",
     "ThreadWorktreeResponse",
     "ThreadResponse",

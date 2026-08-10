@@ -490,8 +490,23 @@
  *   could neither complete NOR be undone, so the project folder is stopped
  *   part-way through it and says so rather than claiming it was untouched
  * @property {string=} abort_detail
+ * @property {boolean=} acknowledgeable checkout_dirty carries an owner-answerable
+ *   flag (acknowledge_checkout_dirty), so the owner is never stuck with only "no";
+ *   checkout_head_off_branch deliberately does not set it
+ * @property {string[]=} checkout_left_behind named on a SUCCESSFUL merge: what the
+ *   checkout still holds and the merge did not bring — non-empty only when the
+ *   owner acknowledged it, because acknowledging is not forgetting
  * @property {Object=} inspection
  * @property {string=} error
+ */
+
+/**
+ * POST /api/projects/{project_id}/threads/{thread_id}/merge-back body. Entirely
+ * optional — a bare POST is the ordinary call. acknowledge_checkout_dirty is the
+ * owner's consent to merge while the checkout still holds uncommitted work, in
+ * the same shape as the removal's acknowledge_unmerged.
+ * @typedef {Object} ThreadMergeBackRequest
+ * @property {boolean=} acknowledge_checkout_dirty
  */
 
 /**
