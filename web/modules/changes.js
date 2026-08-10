@@ -1101,9 +1101,11 @@ export function initChanges(ctx = {}) {
         dock,
         selectTask,
         /**
-         * Open a branched thread's own checkout diff (A13). Synthesis wires the
-         * T1 thread menu to THIS — it is the only supported way in, so the two
-         * source modes cannot be entered by two different code paths.
+         * Open a branched thread's own checkout diff (A13), for a caller that
+         * already holds this controller. A caller that does not — the T1 thread
+         * menu — dispatches `ouro:open-thread-changes` instead
+         * (`project_thread_actions.openThreadChanges`). Both land here: there is
+         * one entry point per source mode and no third path.
          */
         selectThreadCheckout,
         refresh: loadTasks,
