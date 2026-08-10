@@ -31,5 +31,4 @@ runs:
       shell: bash
       run: |
         uv export --frozen --no-dev --extra browser --no-emit-project --no-hashes --no-annotate --output-file requirements-runtime.lock
-        uv export --frozen --no-dev --extra browser --extra desktop --extra build --no-emit-project --no-hashes --no-annotate --output-file requirements-build.lock
-        git diff --exit-code -- requirements-runtime.lock requirements-build.lock
+        git diff --exit-code -- requirements-runtime.lock

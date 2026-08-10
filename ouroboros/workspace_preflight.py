@@ -49,7 +49,6 @@ _MANIFEST_NAMES = (
     "setup.cfg",
     "requirements.txt",
     "requirements-runtime.lock",
-    "requirements-build.lock",
     "uv.lock",
     "tox.ini",
     "go.mod",

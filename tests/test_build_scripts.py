@@ -299,7 +299,8 @@ class TestBuildLinuxSh:
         src = _read("build_linux.sh")
         assert 'PORTABLE_PYTHON="python-standalone/bin/python3"' in src
         assert '"$PORTABLE_PYTHON" -m venv "$BUILD_VENV"' in src
-        assert 'uv pip install --python "$BUILD_PYTHON" -q -r requirements-build.lock' in src
+        assert "uv export --frozen --no-dev --extra browser --extra desktop --extra build" in src
+        assert 'uv pip install --python "$BUILD_PYTHON" -q -r "$BUILD_REQUIREMENTS"' in src
         assert '"$BUILD_PYTHON" -m PyInstaller Ouroboros.spec' in src
         assert 'uv pip install --python "$PORTABLE_PYTHON" -q -r requirements-runtime.lock' in src
         assert '"$HOST_PYTHON_CMD" -m PyInstaller' not in src

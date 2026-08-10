@@ -123,7 +123,6 @@ a = Analysis(
         ('BIBLE.md', '.'),
         ('README.md', '.'),
         ('requirements-runtime.lock', '.'),
-        ('requirements-build.lock', '.'),
         ('uv.lock', '.'),
         ('pyproject.toml', '.'),
         ('Makefile', '.'),

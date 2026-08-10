@@ -1964,10 +1964,11 @@ runtime/desktop/browser/build group membership live in `pyproject.toml`, while
 `uv.lock` records the universal cross-platform solution under the pinned
 `tool.uv.required-version`. Source and CI environments sync that lock with
 `--frozen`. Packaging keeps its deliberate two-interpreter boundary through
-generated projections: `requirements-build.lock` supplies the PyInstaller host
-and desktop launcher, while `requirements-runtime.lock` supplies the embedded
-`python-standalone` agent. CI regenerates both exports and requires a clean diff,
-so they cannot become independent dependency authorities.
+projections: build scripts export their temporary PyInstaller/desktop input
+directly from `uv.lock`, while the committed `requirements-runtime.lock`
+supplies embedded `python-standalone` and managed updates that intentionally
+use pip without bundling uv. CI regenerates that compatibility export and
+requires a clean diff, so it cannot become an independent dependency authority.
 
 Platform builds precompile bundled Python with unchecked-hash bytecode. Sealing valid bytecode prevents runtime `__pycache__` writes from invalidating a macOS signature; runtime children also route caches outside the bundle. When signing is enabled, hardened runtime, notarization, xattr hygiene, and strict verification remain part of the stable-release path. Prerelease artifacts may intentionally be unsigned, and their evidence must report the actual signing state rather than imply notarization. Linux and Windows use the same precompile for startup parity without a macOS seal.
 

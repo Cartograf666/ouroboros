@@ -50,7 +50,11 @@ if [ ! -f "ripgrep-standalone/bin/rg" ]; then
 fi
 
 echo "--- Installing launcher dependencies ---"
-uv pip install --python python3 -q -r requirements-build.lock
+BUILD_REQUIREMENTS="$(mktemp "${TMPDIR:-/tmp}/ouroboros-build-requirements.XXXXXX")"
+trap 'rm -f "$BUILD_REQUIREMENTS"' EXIT
+uv export --frozen --no-dev --extra browser --extra desktop --extra build \
+    --no-emit-project --no-hashes --no-annotate --output-file "$BUILD_REQUIREMENTS"
+uv pip install --python python3 -q -r "$BUILD_REQUIREMENTS"
 
 echo "--- Installing agent dependencies into python-standalone ---"
 uv pip install --python python-standalone/bin/python3 -q -r requirements-runtime.lock

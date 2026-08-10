@@ -50,7 +50,10 @@ echo "--- Creating portable-Python launcher build environment ---"
 BUILD_VENV="build/linux-pyinstaller-venv"
 "$PORTABLE_PYTHON" -m venv "$BUILD_VENV"
 BUILD_PYTHON="$BUILD_VENV/bin/python"
-uv pip install --python "$BUILD_PYTHON" -q -r requirements-build.lock
+BUILD_REQUIREMENTS="$BUILD_VENV/build-requirements.txt"
+uv export --frozen --no-dev --extra browser --extra desktop --extra build \
+    --no-emit-project --no-hashes --no-annotate --output-file "$BUILD_REQUIREMENTS"
+uv pip install --python "$BUILD_PYTHON" -q -r "$BUILD_REQUIREMENTS"
 
 echo "--- Installing agent dependencies into python-standalone ---"
 uv pip install --python "$PORTABLE_PYTHON" -q -r requirements-runtime.lock

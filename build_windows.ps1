@@ -46,8 +46,17 @@ if (-not (Test-Path "node-standalone\node.exe")) {
 }
 
 Write-Host "--- Installing launcher dependencies ---"
-Invoke-NativeChecked "Launcher dependency installation" {
-    uv pip install --python python -q -r requirements-build.lock
+$BuildRequirements = Join-Path ([IO.Path]::GetTempPath()) "ouroboros-build-requirements-$PID.txt"
+Invoke-NativeChecked "Build dependency export" {
+    uv export --frozen --no-dev --extra browser --extra desktop --extra build `
+        --no-emit-project --no-hashes --no-annotate --output-file $BuildRequirements
+}
+try {
+    Invoke-NativeChecked "Launcher dependency installation" {
+        uv pip install --python python -q -r $BuildRequirements
+    }
+} finally {
+    Remove-Item -Force -ErrorAction SilentlyContinue $BuildRequirements
 }
 
 if (-not (Test-Path "ripgrep-standalone\rg.exe")) {

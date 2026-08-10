@@ -1460,10 +1460,11 @@ already preserve the boundary.
 `pyproject.toml` is the direct-dependency SSOT and `uv.lock` is the reviewed
 cross-platform resolution. Local and CI commands use `uv sync --frozen`; do not
 add an independent hand-written requirements list. Release packaging preserves
-the separate build and embedded interpreters through generated
-`requirements-build.lock` and `requirements-runtime.lock` exports. A dependency
-change updates the project metadata, runs `uv lock`, regenerates both exports
-with the exact commands in README, and leaves their CI clean-diff check green.
+the separate build and embedded interpreters by exporting build requirements
+ephemerally and committing only `requirements-runtime.lock` for embedded pip
+and managed-update compatibility. A dependency change updates the project
+metadata, runs `uv lock`, regenerates the runtime export with the exact command
+in README, and leaves its CI clean-diff check green.
 The pinned `tool.uv.required-version` and the digest-pinned `setup-uv` action
 make resolver changes deliberate rather than an ambient CI upgrade.
 

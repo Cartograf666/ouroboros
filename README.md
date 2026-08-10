@@ -252,14 +252,14 @@ make test
 
 `pyproject.toml` is the direct-dependency authority and `uv.lock` is the
 cross-platform resolution lock. Release builds install the generated
-`requirements-runtime.lock` and `requirements-build.lock` exports into the
-embedded and build interpreters respectively. After changing dependencies,
-refresh all three files with:
+`requirements-runtime.lock` compatibility export into embedded interpreters
+that intentionally ship pip rather than uv. Build-only requirements are
+exported ephemerally from `uv.lock` and are not committed. After changing
+dependencies, refresh the reviewed lock and runtime export with:
 
 ```bash
 uv lock
 uv export --frozen --no-dev --extra browser --no-emit-project --no-hashes --no-annotate --output-file requirements-runtime.lock
-uv export --frozen --no-dev --extra browser --extra desktop --extra build --no-emit-project --no-hashes --no-annotate --output-file requirements-build.lock
 ```
 
 ---

@@ -28,7 +28,6 @@ on:
       - 'docs/**'
       - 'assets/**'
       - 'requirements-runtime.lock'
-      - 'requirements-build.lock'
       - 'uv.lock'
       - 'pyproject.toml'
       - '.github/workflows/**'
