@@ -271,18 +271,49 @@ async def api_thread_worktree_remove(request: Request) -> JSONResponse:
             "branch": str(outcome.get("branch") or ""),
             "branch_removed": bool(outcome.get("branch_removed")),
             "branch_kept_reason": str(outcome.get("branch_kept_reason") or ""),
+            # `unmerged_work` HAS an owner-answerable flag — `acknowledge_unmerged`
+            # in this route's own body — and never declared it, so a client that
+            # reads `acknowledgeable` (the shared envelope's field, which every
+            # other answerable refusal sets) bailed on the one refusal whose
+            # message ends "or confirm you want it gone" (I9). The sentence
+            # offered a confirmation the gesture could not give.
+            "acknowledgeable": str(outcome.get("reason") or "") == "unmerged_work",
         }
         if payload["ok"]:
             _broadcast_thread_change(drive_root, project_id, tid)
             return JSONResponse(payload)
-        payload["message"] = _removal_message(payload["reason"], payload["inspection"])
+        payload["message"] = _removal_message(payload["reason"], payload["inspection"], payload)
         return JSONResponse(payload, status_code=_refusal_status(payload["reason"]))
     except Exception as exc:
         return json_exception(exc)
 
 
-def _removal_message(reason: str, inspection: Dict[str, Any]) -> str:
+def _removal_message(
+    reason: str, inspection: Dict[str, Any], outcome: Dict[str, Any] | None = None,
+) -> str:
     """Owner-facing copy for a refused removal — what is at stake, in plain words."""
+    if reason == "removal_failed":
+        # The one refusal that fell through to "something went wrong", which this
+        # module's docstring forbids (I17). The cause is in the log and nowhere the
+        # owner can see it, while `branch_kept_reason` already carries a usable
+        # sentence that `describeOutcome` never reads on a refusal. Both go here.
+        detail = str((inspection or {}).get("error") or "").strip()
+        kept = str((outcome or {}).get("branch_kept_reason") or "").strip()
+        parts = [
+            "The checkout is still on disk, so nothing was removed and its registry "
+            "entry was kept — a folder the registry can no longer see could not be "
+            "re-provisioned or removed at all."
+        ]
+        if detail:
+            parts.append(f"Reading it reported: {detail}.")
+        parts.append(
+            "Something is usually holding it: a shell or editor open in that folder, "
+            "a git lock, or a read-only parent. Close whatever is using it and try "
+            "again — the removal is safe to retry."
+        )
+        if kept:
+            parts.append(f"Its branch was left alone — {kept}.")
+        return " ".join(parts)
     if reason == "unmerged_work":
         parts = []
         commits = int(inspection.get("unmerged_commits") or 0)
@@ -579,7 +610,7 @@ async def api_thread_delete(request: Request) -> JSONResponse:
                 return _refuse(
                     drive_root, pid, tid,
                     "checkout_holds_work" if reason == "unmerged_work" else reason,
-                    f"{_removal_message(reason, late)} This thread cannot be deleted "
+                    f"{_removal_message(reason, late, removed)} This thread cannot be deleted "
                     "while its checkout is in that state, because deleting it would "
                     "leave the folder and its branch with no surface that can reach them.",
                     late,

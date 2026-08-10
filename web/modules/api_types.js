@@ -513,9 +513,12 @@
  *   could neither complete NOR be undone, so the project folder is stopped
  *   part-way through it and says so rather than claiming it was untouched
  * @property {string=} abort_detail
- * @property {boolean=} acknowledgeable checkout_dirty carries an owner-answerable
- *   flag (acknowledge_checkout_dirty), so the owner is never stuck with only "no";
- *   checkout_head_off_branch deliberately does not set it
+ * @property {boolean=} acknowledgeable this refusal carries an owner-answerable
+ *   flag, so the owner is never stuck with only "no": checkout_dirty is answered
+ *   by acknowledge_checkout_dirty (merge-back body), unmerged_work by
+ *   acknowledge_unmerged (removal body). checkout_head_off_branch deliberately
+ *   does not set it — that is not work left behind, it is a merge that would do
+ *   nothing while reporting success
  * @property {string[]=} checkout_left_behind named on a SUCCESSFUL merge: what the
  *   checkout still holds and the merge did not bring — non-empty only when the
  *   owner acknowledged it, because acknowledging is not forgetting

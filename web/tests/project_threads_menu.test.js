@@ -121,7 +121,7 @@ test('merge back RENDERS the checkout_dirty retry and re-sends with the flag', a
     assert.equal(described.tone, 'ok');
 });
 
-test('declining the retry sends NOTHING and leaves the refusal on screen', async () => {
+test('declining the retry sends NOTHING and does not replay the sentence', async () => {
     const calls = [];
     const ops = {
         mergeBack: async (pid, tid, acknowledged) => {
@@ -139,7 +139,12 @@ test('declining the retry sends NOTHING and leaves the refusal on screen', async
     });
 
     assert.deepEqual(calls, [false]);
-    assert.equal(ask.seen.at(-1).alert, true);
+    // I14: the owner has just READ this exact sentence and answered no. Following
+    // it with the identical text as an alert is the dialog answering itself — the
+    // last thing they saw is the question, and nothing follows it.
+    assert.equal(ask.seen.length, 1);
+    assert.equal(ask.seen.at(-1).confirmLabel, 'Merge anyway');
+    assert.notEqual(ask.seen.at(-1).alert, true);
 });
 
 test('merge_abort_failed gets its OWN banner, not a generic refusal', async () => {

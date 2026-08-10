@@ -669,11 +669,15 @@ class ThreadWorktreeResponse(TypedDict, total=False):
     #: folder was left as it was.
     folder_left_mid_merge: bool
     abort_detail: str
-    #: ``checkout_dirty``: this refusal has an owner-answerable flag
-    #: (``acknowledge_checkout_dirty`` in the merge-back body), so the owner is
-    #: never stuck with only "no". ``checkout_head_off_branch`` deliberately does
-    #: NOT set it: that is not work left behind, it is a merge that would do
-    #: nothing while reporting success.
+    #: This refusal has an owner-answerable flag, so the owner is never stuck with
+    #: only "no": ``checkout_dirty`` is answered by ``acknowledge_checkout_dirty``
+    #: in the merge-back body, and ``unmerged_work`` by ``acknowledge_unmerged`` in
+    #: the removal body. Documenting it for ``checkout_dirty`` alone was how the
+    #: removal route came to build its refusal without the field at all, while its
+    #: own sentence ended "or confirm you want it gone" and the client had no way
+    #: to (I9). ``checkout_head_off_branch`` deliberately does NOT set it: that is
+    #: not work left behind, it is a merge that would do nothing while reporting
+    #: success.
     acknowledgeable: bool
     #: Named on a SUCCESSFUL merge: what the checkout still holds and the merge
     #: did not bring. Only ever non-empty when the owner acknowledged it —

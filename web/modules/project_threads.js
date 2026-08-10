@@ -340,6 +340,13 @@ export function renderThreadList(project, {
         row.dataset.threadId = String(thread.id);
         row.dataset.threadKey = key;
         row.title = paint.title;
+        // The rule this presentation states ("a thread on its way out is not a
+        // thread to open") was implemented for `draggable` and `showsUnread` and
+        // NOT for the click, so a tombstoning room stayed openable, the admission
+        // fence answered it, and the chat annotated it as an unavailable PROJECT.
+        // The project row does this correctly with `btn.disabled`; so does this one
+        // now, off the same derived flag (I12).
+        row.disabled = !paint.draggable;
         const label = document.createElement('span');
         label.className = 'nav-row-label nav-thread-label';
         label.textContent = thread.name;
@@ -645,7 +652,7 @@ async function announce(ask, title, described) {
 }
 
 /**
- * A refusal the owner can ANSWER, answered — or `false` when they declined.
+ * A refusal the owner can ANSWER, answered — and it says WHICH one they answered.
  *
  * Two typed follow-ups, and both were unreachable before this existed:
  *
@@ -654,6 +661,21 @@ async function announce(ask, title, described) {
  *   - `decision` (`git_init_required`) — T2's OFFER. `apiClient.projectInitGit`
  *     is the yes; a menu that never renders it leaves a folder the owner is
  *     perfectly happy to track blocking every file operation in the project.
+ *
+ * Returning a bare `true` for either laundered one consent into a different one:
+ * ANY answered refusal was retried with `run(true)`, so answering the
+ * `git_init_required` offer ("yes, start tracking this folder") was sent as
+ * `acknowledge_checkout_dirty: true` — a flag the owner never saw a sentence for
+ * and never said "Merge anyway" to (I10). `'decision'` means the offer was taken
+ * and the plain call should simply be retried; `'acknowledged'` means the owner
+ * acknowledged THIS refusal and its flag is theirs to set.
+ *
+ * `'declined'` and `false` are different facts too: the owner SAW a question and
+ * said no, versus this refusal had nothing to ask. Only the first means the
+ * sentence has already been read, which is what stops it being replayed as an
+ * alert one line later (I14).
+ *
+ * @returns {'decision'|'acknowledged'|'declined'|false}
  */
 async function answerRefusal(described, { title, confirmLabel, project, apiClient, ask }) {
     const decision = described.decision;
@@ -665,17 +687,19 @@ async function answerRefusal(described, { title, confirmLabel, project, apiClien
             }. Nothing is committed by Ouroboros without you.`,
             confirmLabel: 'Start tracking',
         });
-        if (ok !== true) return false;
+        if (ok !== true) return 'declined';
         try {
             await apiClient.projectInitGit(project.id);
-            return true;
+            return 'decision';
         } catch (e) {
             await ask({
                 title: 'Could not start tracking',
                 body: `Could not start tracking that folder: ${e?.body?.error || e?.message || e}`,
                 alert: true,
             });
-            return false;
+            // The owner said yes and it failed; they have just read why. Their
+            // consent was not withdrawn, so this is not a decline.
+            return 'declined';
         }
     }
     if (!described.acknowledgeable) return false;
@@ -685,10 +709,18 @@ async function answerRefusal(described, { title, confirmLabel, project, apiClien
         confirmLabel,
         danger: true,
     });
-    return ok === true;
+    return ok === true ? 'acknowledged' : 'declined';
 }
 
-/** One call plus its owner-answerable retry. `run(acknowledged)` does the work. */
+/**
+ * One call plus its owner-answerable retry. `run(acknowledged)` does the work.
+ *
+ * The retry passes `true` ONLY when the owner acknowledged THIS refusal. An
+ * answered `git_init_required` offer is a different consent about a different
+ * thing, so it re-runs the plain call (I10). `declined` is reported so the caller
+ * can stay quiet: replaying the identical sentence as an alert after the owner has
+ * just said no is the dialog answering itself (I14).
+ */
 async function withAcknowledgement(run, { title, confirmLabel, project, apiClient, ask }) {
     let outcome = await run(false);
     let described = describeOutcome(outcome);
@@ -696,12 +728,14 @@ async function withAcknowledgement(run, { title, confirmLabel, project, apiClien
         const answered = await answerRefusal(described, {
             title, confirmLabel, project, apiClient, ask,
         });
-        if (!answered) return { outcome, described, retried: false };
-        outcome = await run(true);
+        if (answered === false || answered === 'declined') {
+            return { outcome, described, retried: false, declined: answered === 'declined' };
+        }
+        outcome = await run(answered === 'acknowledged');
         described = describeOutcome(outcome);
-        return { outcome, described, retried: true };
+        return { outcome, described, retried: true, declined: false };
     }
-    return { outcome, described, retried: false };
+    return { outcome, described, retried: false, declined: false };
 }
 
 /**
@@ -779,10 +813,15 @@ async function branchOff(project, thread, { apiClient, refresh, ask, ops }) {
         // A folder-less or untracked project answers HERE, before any base list
         // exists, and `git_init_required` is answerable — so the offer is made at
         // the moment the owner asked to branch, not two refusals later.
-        if (await answerRefusal(described, {
+        const answered = await answerRefusal(described, {
             title: 'Branch off', confirmLabel: 'Continue', project, apiClient, ask,
-        })) return branchOff(project, thread, { apiClient, refresh, ask, ops });
-        await announce(ask, 'Branch off', described);
+        });
+        if (answered === 'decision' || answered === 'acknowledged') {
+            return branchOff(project, thread, { apiClient, refresh, ask, ops });
+        }
+        // A question the owner has just answered "no" to is not re-read to them
+        // as an alert (I14); a refusal nothing could ask about still is.
+        if (answered !== 'declined') await announce(ask, 'Branch off', described);
         return described;
     }
     // A14, at the one moment it is both true and actionable.
@@ -791,9 +830,19 @@ async function branchOff(project, thread, { apiClient, refresh, ask, ops }) {
     const snapshot = listed?.snapshot;
     const offer = [...bases, ...(snapshot ? [snapshot] : [])];
     const labels = offer.map((base, index) => `${index + 1}. ${base.label || base.ref}`).join('  ');
+    // I8: for thread #0 `thread.name` IS the project name, and this dialog is
+    // reached from a menu titled "Actions for <project>" alongside Rename…/Delete
+    // project…. "Base for Alpha's own checkout" then reads as an operation on the
+    // project, when what it moves is the project's CHAT. Branching thread #0 is
+    // coherent — its siblings keep the project folder and this branch merges back
+    // into it — but the row could not say so.
+    const isProjectChat = Number(thread.id) === MAIN_THREAD_ID;
+    const preface = isProjectChat
+        ? `This is ${project.name || project.id}'s own chat. Branching it gives THAT chat its own copy of the folder; the project's other threads keep working in the folder itself, and this branch merges back into it. `
+        : '';
     const res = await ask({
         title: 'Branch off',
-        body: `${notice?.queued ? `${notice.message} ` : ''}Base for ${thread.name}'s own checkout — type a number, a branch, a tag or a commit. ${labels}`,
+        body: `${preface}${notice?.queued ? `${notice.message} ` : ''}Base for ${thread.name}'s own checkout — type a number, a branch, a tag or a commit. ${labels}`,
         input: true,
         initialValue: String(listed?.current_branch || ''),
         confirmLabel: 'Branch off',
@@ -805,11 +854,12 @@ async function branchOff(project, thread, { apiClient, refresh, ask, ops }) {
     // owner types goes to the server as a commit-ish and is resolved there.
     const picked = /^\d+$/.test(typed) ? offer[Number(typed) - 1] : null;
     const baseRef = picked ? String(picked.ref || '') : typed;
-    const { outcome, described } = await withAcknowledgement(
+    const { outcome, described, declined } = await withAcknowledgement(
         () => ops.branchOff(project.id, thread.id, baseRef),
         { title: 'Branch off', confirmLabel: 'Continue', project, apiClient, ask },
     );
     refresh();
+    if (declined) return described;
     // The snapshot receipt is the only surface `tracked_sensitive` has: which
     // credential-shaped files were LEFT OUT of the commit (still untracked, still
     // in the folder) and which were already tracked and therefore committed with
@@ -824,7 +874,7 @@ async function branchOff(project, thread, { apiClient, refresh, ask, ops }) {
 
 /** MERGE BACK (A9), including the `checkout_dirty` retry the server offers. */
 async function mergeBack(project, thread, { apiClient, refresh, ask, ops }) {
-    const { outcome, described } = await withAcknowledgement(
+    const { outcome, described, declined } = await withAcknowledgement(
         (acknowledged) => ops.mergeBack(project.id, thread.id, acknowledged),
         {
             title: 'Merge back',
@@ -851,11 +901,24 @@ async function mergeBack(project, thread, { apiClient, refresh, ask, ops }) {
         });
         return described;
     }
-    await announce(ask, 'Merge back', described);
+    // The owner was OFFERED this refusal and said no. Announcing it now replays
+    // the identical sentence they just dismissed (I14).
+    if (!declined) await announce(ask, 'Merge back', described);
     return described;
 }
 
-/** Remove a checkout (A10): the inspection is SHOWN before anything is removed. */
+/**
+ * Remove a checkout (A10): the inspection is SHOWN before anything is removed.
+ *
+ * The prompt above is a PRE-FLIGHT read — the inspection captured when the menu
+ * was opened — and the checkout can go dirty in that window, which for a thread an
+ * agent is working in is the normal case. It then went out with
+ * `acknowledged: false`, the server refused `unmerged_work`, and the gesture had
+ * no way to answer its own "or confirm you want it gone": recovery was closing and
+ * reopening the menu, which nothing disclosed. So the call rides
+ * `withAcknowledgement` exactly like merge-back and delete, and the server's
+ * refusal — now declaring `acknowledgeable` — is answered in the same gesture (I9).
+ */
 async function removeCheckout(project, thread, { apiClient, refresh, inspection, ask, ops }) {
     const prompt = removalPrompt(inspection);
     const ok = await ask({
@@ -865,11 +928,20 @@ async function removeCheckout(project, thread, { apiClient, refresh, inspection,
         danger: prompt.needsAcknowledgement,
     });
     if (ok !== true) return null;
-    const described = describeOutcome(
-        await ops.removeWorktree(project.id, thread.id, prompt.needsAcknowledgement),
+    const { described, declined } = await withAcknowledgement(
+        (acknowledged) => ops.removeWorktree(
+            project.id, thread.id, prompt.needsAcknowledgement || acknowledged,
+        ),
+        {
+            title: 'Remove checkout',
+            confirmLabel: 'Remove anyway',
+            project,
+            apiClient,
+            ask,
+        },
     );
     refresh();
-    await announce(ask, 'Remove checkout', described);
+    if (!declined) await announce(ask, 'Remove checkout', described);
     return described;
 }
 
@@ -896,7 +968,7 @@ async function deleteThread(project, thread, { apiClient, refresh, ask, ops }) {
         danger: true,
     });
     if (ok !== true) return null;
-    const { described } = await withAcknowledgement(
+    const { described, declined } = await withAcknowledgement(
         (acknowledged) => ops.delete(project.id, thread.id, acknowledged),
         {
             title: 'Delete thread',
@@ -907,7 +979,7 @@ async function deleteThread(project, thread, { apiClient, refresh, ask, ops }) {
         },
     );
     refresh();
-    if (described.tone !== 'ok') await announce(ask, 'Delete thread', described);
+    if (described.tone !== 'ok' && !declined) await announce(ask, 'Delete thread', described);
     return described;
 }
 
@@ -949,8 +1021,13 @@ export async function openArchivedThreadsMenu(project, {
     openMenu({
         anchorEl,
         ariaLabel: `Archived threads in ${project.name || project.id}`,
+        // Restore is the ONLY action here, deliberately — but the row said nothing
+        // about that, so an archived thread looked as though it simply had no
+        // delete, no merge back and no way to reach its checkout, even though the
+        // server accepts all three on an archived thread. A branched-then-archived
+        // thread's checkout was two undisclosed steps from any A10 surface (I13).
         itemsHtml: rows.map((row) => (
-            `<button type="button" role="menuitem" data-prm="restore:${escapeHtml(row.id)}" title="Restore this thread">${escapeHtml(row.name)}</button>`
+            `<button type="button" role="menuitem" data-prm="restore:${escapeHtml(row.id)}" title="Restore this thread — restore it to act on it">${escapeHtml(row.name)}</button>`
         )).join('\n'),
         onSelect: async (action) => {
             const id = String(action || '').startsWith('restore:') ? action.slice(8) : '';
