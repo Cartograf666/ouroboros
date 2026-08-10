@@ -32,17 +32,28 @@ from ouroboros.project_facts import sanitize_project_id
 # borrow is one-way — project_threads_registry imports the registry's locking/IO
 # primitives inside the functions that need them, never at module level.
 from ouroboros.project_threads_registry import (
+    THREAD_ACTIVE,
+    THREAD_ARCHIVED,
+    THREAD_DELETING,
+    THREAD_TOMBSTONED,
+    ThreadLifecycleError,
     _chat_id_owners,
     _normalize_thread_rows,
     _report_duplicate_chat_ids,
     _row_chat_ids,
+    archive_thread,
+    begin_thread_deletion,
+    complete_thread_deletion,
     create_thread,
     duplicate_chat_ids,
+    fail_thread_deletion,
     fork_thread,
     get_thread,
     project_thread_note_for_task,
     project_threads,
     rename_thread,
+    restore_thread,
+    thread_is_visible,
 )
 from ouroboros.utils import atomic_write_json, iter_jsonl_objects, read_json_dict, utc_now_iso
 
@@ -529,6 +540,11 @@ def _chat_binding_index(drive_root: Any) -> Dict[int, Dict[str, Any]]:
                 "thread_id": int(thread["id"]),
                 "chat_id": int(thread["chat_id"]),
                 "lifecycle": str(project.get("lifecycle") or PROJECT_ACTIVE),
+                # The THREAD's own lifecycle, beside the project's. Routing must
+                # be able to refuse a fenced or tombstoned thread inside a
+                # perfectly healthy project (X10) — reading only the project's
+                # state would deliver messages into a room the owner deleted.
+                "thread_lifecycle": str(thread.get("lifecycle") or THREAD_ACTIVE),
                 "name": str(thread.get("name") or ""),
                 "project": dict(project),
             })
@@ -539,12 +555,13 @@ def _chat_binding_index(drive_root: Any) -> Dict[int, Dict[str, Any]]:
 def resolve_chat_binding(drive_root: Any, chat_id: Any) -> Dict[str, Any]:
     """THE canonical "who owns this chat id" lookup (R3).
 
-    Returns ``{project_id, thread_id, chat_id, lifecycle, name, project}`` for
-    ANY thread of ANY project in ANY lifecycle state, or ``{}`` for the main
-    chat / an external transport id. Callers that must not resurrect a fenced
-    room filter on ``lifecycle``; they must NOT compare a chat id against
-    ``project["chat_id"]`` themselves — that comparison sees thread #0 only and
-    misroutes every other thread to Main.
+    Returns ``{project_id, thread_id, chat_id, lifecycle, thread_lifecycle,
+    name, project}`` for ANY thread of ANY project in ANY lifecycle state, or
+    ``{}`` for the main chat / an external transport id. Callers that must not
+    resurrect a fenced room filter on BOTH lifecycles — a thread can be fenced or
+    tombstoned inside a perfectly healthy project — and they must NOT compare a
+    chat id against ``project["chat_id"]`` themselves; that comparison sees
+    thread #0 only and misroutes every other thread to Main.
     """
     try:
         cid = int(chat_id or 0)
@@ -1143,8 +1160,19 @@ def adopt_task_workspace(
     )
 
 
-def projects_summary(drive_root: Any, *, limit: int = 50) -> List[Dict[str, Any]]:
-    """Compact list for /api/state and the sidebar."""
+def projects_summary(
+    drive_root: Any, *, limit: int = 50, live_chat_ids: Any = None,
+) -> List[Dict[str, Any]]:
+    """Compact list for /api/state and the sidebar.
+
+    ``live_chat_ids`` is the set of chat ids with a task running right now, and
+    the ONLY reason this projection takes it: an ARCHIVED thread stays VISIBLE
+    until its task is terminal (X10), because hiding a room that is still
+    emitting output leaves the owner watching nothing while work continues. The
+    caller supplies it because reading the supervisor queue belongs at the
+    gateway, not inside a registry projection that every read path touches;
+    omitting it simply means no archived thread is treated as live.
+    """
     out: List[Dict[str, Any]] = []
     bindings = _load_bindings(drive_root).get("bindings", {})
 
@@ -1185,8 +1213,14 @@ def projects_summary(drive_root: Any, *, limit: int = 50) -> List[Dict[str, Any]
             "has_thread_activity": _has_thread_activity(project),
             # Canonical projection, thread #0 first (X7). ``chat_id`` above stays
             # its compatibility alias, so a client that never learns about
-            # threads keeps working unchanged.
-            "threads": project_threads(project),
+            # threads keeps working unchanged. Archived and tombstoned threads
+            # are FILTERED here rather than at every consumer — a surface that
+            # forgot the filter would show the owner a thread they archived, and
+            # one that hard-coded it would hide a live archived thread (X10).
+            "threads": [
+                thread for thread in project_threads(project)
+                if thread_is_visible(thread, live_chat_ids)
+            ],
         })
     return out
 
@@ -1203,7 +1237,16 @@ __all__ = [
     "bind_task_to_project",
     "complete_project_deletion",
     "create_project",
+    "THREAD_ACTIVE",
+    "THREAD_ARCHIVED",
+    "THREAD_DELETING",
+    "THREAD_TOMBSTONED",
+    "ThreadLifecycleError",
+    "archive_thread",
+    "begin_thread_deletion",
+    "complete_thread_deletion",
     "create_thread",
+    "fail_thread_deletion",
     "delete_project",
     "duplicate_chat_ids",
     "ensure_project_workspace",
@@ -1214,6 +1257,8 @@ __all__ = [
     "get_thread",
     "project_threads",
     "rename_thread",
+    "restore_thread",
+    "thread_is_visible",
     "resolve_chat_binding",
     "increment_project_visible_revision",
     "list_projects",

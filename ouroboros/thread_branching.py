@@ -399,6 +399,86 @@ def project_is_busy(project_id: str) -> bool:
         return True
 
 
+#: A14's copy, in ONE place. Every surface that tells the owner their work will
+#: wait says exactly this, and says the true thing: the task is QUEUED behind the
+#: running one and will run when it finishes. It is not rejected, not dropped,
+#: and not silently reordered. The remedy is offered in the same breath, because
+#: "you have to wait" without "here is how not to" is a dead end.
+QUEUE_NOTICE = (
+    "Another thread in this project is working in the same folder right now. "
+    "A task you start here will be QUEUED behind it and will run as soon as that "
+    "one finishes — it is not rejected. Branching this thread off gives it its "
+    "own copy of the folder, so both can run at the same time."
+)
+#: The same fact for a thread already in its own checkout, where waiting means
+#: something is running in THAT checkout — branching again would not help.
+QUEUE_NOTICE_OWN_CHECKOUT = (
+    "This thread already has a task running in its own checkout. A new task here "
+    "will be QUEUED behind it and will run as soon as that one finishes."
+)
+
+
+def queue_notice(
+    drive_root: Any,
+    project_id: str,
+    thread_id: Any,
+    *,
+    data_dir: Optional[Any] = None,
+    running: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Would a task started in THIS thread wait, and what should the owner hear?
+
+    Returns ``{queued, reason, message, remedy}``. ``remedy`` is ``branch_off``
+    only when branching would actually help — a thread already working in its own
+    checkout is waiting on ITSELF, and offering to branch again there would be
+    advice that does not work.
+
+    A14 exists because the earlier copy said a second thread's task was rejected.
+    It never was: the writer lane SERIALIZES, it does not refuse, and telling an
+    owner their work was thrown away when it is sitting in the queue is the kind
+    of wrong that makes people stop trusting the queue entirely.
+
+    Fail-OPEN, unlike the merge precondition: if the queue cannot be read this
+    says nothing rather than warning about a wait that may not exist. A false
+    warning here costs trust; a missing one costs a few seconds of surprise.
+    """
+    from ouroboros.project_lease import candidate_is_leasable, running_project_lanes
+
+    data_root = data_dir if data_dir is not None else drive_root
+    quiet = {"queued": False, "reason": "", "message": "", "remedy": ""}
+    resolved = resolve_project_repo(drive_root, project_id)
+    location = thread_location(data_root, project_id, thread_id)
+    if location["where"] == "worktree":
+        workspace = str(location.get("path") or "")
+    elif resolved.get("ok"):
+        workspace = str(resolved.get("repo_dir") or "")
+    else:
+        # No usable folder means no folder lane to contend for; whatever else is
+        # wrong with this project, waiting is not it.
+        return quiet
+    try:
+        if running is None:
+            from supervisor.queue import _queue_lock
+            from supervisor.workers import RUNNING
+
+            with _queue_lock:
+                running = list(RUNNING.values())
+        lanes = running_project_lanes(running)
+    except Exception:
+        log.debug("queue_notice could not read the queue for %s", project_id, exc_info=True)
+        return quiet
+    candidate = {"id": "", "project_id": str(project_id), "workspace_root": workspace}
+    if candidate_is_leasable(candidate, lanes):
+        return quiet
+    own = location["where"] == "worktree"
+    return {
+        "queued": True,
+        "reason": "folder_busy",
+        "message": QUEUE_NOTICE_OWN_CHECKOUT if own else QUEUE_NOTICE,
+        "remedy": "" if own else "branch_off",
+    }
+
+
 def merge_back_thread(
     drive_root: Any,
     project_id: str,
@@ -521,6 +601,8 @@ def merge_back_thread(
 
 __all__ = [
     "BASE_SNAPSHOT",
+    "QUEUE_NOTICE",
+    "QUEUE_NOTICE_OWN_CHECKOUT",
     "REASON_ALREADY_BRANCHED",
     "REASON_BRANCH_FAILED",
     "REASON_CHECKOUT_MISSING",
@@ -541,6 +623,7 @@ __all__ = [
     "branch_off_thread",
     "merge_back_thread",
     "project_is_busy",
+    "queue_notice",
     "resolve_project_repo",
     "thread_location",
 ]

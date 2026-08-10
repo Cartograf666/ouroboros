@@ -202,6 +202,22 @@ export const apiClient = {
     threadDiff: (projectId, threadId) => fetchJson(
         `${threadPath(projectId, threadId)}/diff`, { cache: 'no-store' },
     ),
+    /**
+     * Archive a thread: HIDE it. Nothing is removed and `threadRestore` puts it
+     * back. A thread with a task still running stays visible until that task is
+     * terminal — the answer says so via `visible_until_terminal`.
+     * @returns {Promise<import('./api_types.js').ThreadLifecycleResponse>}
+     */
+    threadArchive: (projectId, threadId) => jsonPost(`${threadPath(projectId, threadId)}/archive`, {}),
+    /** @returns {Promise<import('./api_types.js').ThreadLifecycleResponse>} */
+    threadRestore: (projectId, threadId) => jsonPost(`${threadPath(projectId, threadId)}/restore`, {}),
+    /**
+     * Delete a thread: fence routing, cancel its tasks, then tombstone. The id is
+     * never reused, the journal rows honestly remain, and the thread's checkout
+     * is NOT removed — that stays its own inspected act.
+     * @returns {Promise<import('./api_types.js').ThreadLifecycleResponse>}
+     */
+    threadDelete: (projectId, threadId) => jsonPost(`${threadPath(projectId, threadId)}/delete`, {}),
     /** @returns {Promise<import('./api_types.js').FsDirsResponse>} */
     fsDirs: (path = '') => fetchJson(`/api/fs/dirs${path ? `?path=${encodeURIComponent(path)}` : ''}`, { cache: 'no-store' }),
     /**

@@ -289,12 +289,18 @@ def _emit_naming_reason(drive_root: object, task_id: str, name: str, reason: str
 
 async def api_projects_list(request: Request) -> JSONResponse:
     try:
+        from ouroboros.gateway.state import live_thread_chat_ids
         from ouroboros.projects_registry import (
             projects_summary,
         )
 
         drive_root = request_drive_root(request)
-        return JSONResponse({"projects": projects_summary(drive_root, limit=200)})
+        # Same visibility rule as /api/state: archived threads are hidden unless
+        # a task is still live in them (X10). Two summaries disagreeing about
+        # which threads exist would be worse than either answer alone.
+        return JSONResponse({"projects": projects_summary(
+            drive_root, limit=200, live_chat_ids=live_thread_chat_ids(),
+        )})
     except Exception as exc:
         return json_exception(exc)
 

@@ -221,3 +221,116 @@ def test_an_unknown_base_is_a_400(wired):
 
     assert response.status_code == 400
     assert response.json()["reason"] == "unknown_base"
+
+
+# --------------------------------------------------------------------------- #
+# Lifecycle (D4 / X10) over HTTP
+# --------------------------------------------------------------------------- #
+
+def _lifecycle_client(drive_root: pathlib.Path) -> TestClient:
+    from ouroboros.gateway.project_threads import (
+        api_thread_archive,
+        api_thread_delete,
+        api_thread_restore,
+    )
+
+    base = "/api/projects/{project_id}/threads/{thread_id}"
+    app = Starlette(routes=[
+        Route(f"{base}/archive", api_thread_archive, methods=["POST"]),
+        Route(f"{base}/restore", api_thread_restore, methods=["POST"]),
+        Route(f"{base}/delete", api_thread_delete, methods=["POST"]),
+    ])
+    app.state.drive_root = drive_root
+    app.state.repo_dir = drive_root
+    return TestClient(app)
+
+
+def test_archive_and_restore_round_trip_over_http(tmp_path):
+    drive = tmp_path / "drive"
+    create_project(drive, "racer", name="Racer")
+    thread = create_thread(drive, "racer", name="Side quest")
+    client = _lifecycle_client(drive)
+
+    archived = client.post(f"/api/projects/racer/threads/{thread['id']}/archive", json={}).json()
+    assert archived["ok"] is True
+    assert archived["lifecycle"] == "archived"
+    assert archived["archived_at"]
+    # Nothing is running, so nothing is being kept visible against the owner's wish.
+    assert archived["visible_until_terminal"] is False
+
+    restored = client.post(f"/api/projects/racer/threads/{thread['id']}/restore", json={}).json()
+    assert restored["lifecycle"] == "active"
+
+
+def test_archiving_thread_zero_is_a_409_that_says_where_the_operation_lives(tmp_path):
+    drive = tmp_path / "drive"
+    create_project(drive, "racer", name="Racer")
+    client = _lifecycle_client(drive)
+
+    response = client.post("/api/projects/racer/threads/0/archive", json={})
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["reason"] == "thread_zero_is_the_project"
+    assert "project" in body["message"].lower()
+
+
+def test_delete_answers_deleting_and_discloses_what_it_does_not_do(tmp_path, folder, monkeypatch):
+    """X10 + D4: the fence is up, the tombstone is not. And the two things a
+    delete deliberately does NOT do are stated in the answer, not buried."""
+    import ouroboros.gateway.project_threads as gw
+
+    started: list = []
+    monkeypatch.setattr(
+        "supervisor.task_lifecycle.start_thread_deletion",
+        lambda drive_root, pid, tid, chat_id: started.append((pid, tid, chat_id)) or True,
+    )
+    drive = tmp_path / "drive"
+    create_project(drive, "racer", name="Racer", working_dir=str(folder))
+    thread = create_thread(drive, "racer", name="Doomed")
+    # Give it a checkout, so the "we did not remove it" disclosure has teeth.
+    branch_client = _client(drive)
+    branched = branch_client.post(
+        f"/api/projects/racer/threads/{thread['id']}/branch-off", json={},
+    ).json()
+    assert branched["ok"] is True
+
+    body = _lifecycle_client(drive).post(
+        f"/api/projects/racer/threads/{thread['id']}/delete", json={},
+    ).json()
+
+    assert body["ok"] is True
+    # Fenced, NOT yet tombstoned: its tasks are still being cancelled.
+    assert body["lifecycle"] == "deleting"
+    assert started and started[0][1] == int(thread["id"])
+    # The two honest disclosures.
+    assert body["journal_rows_retained"] is True
+    assert body["worktree_kept"] is True
+    assert pathlib.Path(branched["path"]).is_dir()
+
+
+def test_branch_bases_carries_the_honest_queue_notice(wired, monkeypatch):
+    """A14: the sentence says QUEUED, not rejected, and offers branching."""
+    from supervisor import workers
+
+    client, _drive, tid, folder = wired
+
+    quiet = client.get(f"/api/projects/racer/threads/{tid}/branch-bases").json()
+    assert quiet["queue_notice"]["queued"] is False
+    assert quiet["queue_notice"]["message"] == ""
+
+    monkeypatch.setitem(
+        workers.RUNNING, "t1",
+        {"task": {"id": "t1", "project_id": "racer", "workspace_root": str(folder)}},
+    )
+    try:
+        busy = client.get(f"/api/projects/racer/threads/{tid}/branch-bases").json()
+    finally:
+        workers.RUNNING.pop("t1", None)
+
+    notice = busy["queue_notice"]
+    assert notice["queued"] is True
+    assert "QUEUED" in notice["message"]
+    assert "rejected" in notice["message"]  # ...as the thing it explicitly is NOT
+    assert "is not rejected" in notice["message"]
+    assert notice["remedy"] == "branch_off"

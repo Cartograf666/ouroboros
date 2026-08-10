@@ -108,10 +108,13 @@ def collect_routes(
         api_projects_list,
     )
     from ouroboros.gateway.project_threads import (
+        api_thread_archive,
         api_thread_branch_bases,
         api_thread_branch_off,
+        api_thread_delete,
         api_thread_diff,
         api_thread_merge_back,
+        api_thread_restore,
         api_thread_worktree_inspect,
         api_thread_worktree_remove,
     )
@@ -231,6 +234,9 @@ def collect_routes(
         Route("/api/projects/{project_id}/threads/{thread_id}/worktree", endpoint=api_thread_worktree_inspect, methods=["GET"]),
         Route("/api/projects/{project_id}/threads/{thread_id}/worktree/remove", endpoint=api_thread_worktree_remove, methods=["POST"]),
         Route("/api/projects/{project_id}/threads/{thread_id}/diff", endpoint=api_thread_diff, methods=["GET"]),
+        Route("/api/projects/{project_id}/threads/{thread_id}/archive", endpoint=api_thread_archive, methods=["POST"]),
+        Route("/api/projects/{project_id}/threads/{thread_id}/restore", endpoint=api_thread_restore, methods=["POST"]),
+        Route("/api/projects/{project_id}/threads/{thread_id}/delete", endpoint=api_thread_delete, methods=["POST"]),
         Route("/api/fs/dirs", endpoint=api_fs_dirs, methods=["GET"]),
         Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"]),
         Route("/api/tasks", endpoint=api_tasks_list, methods=["GET"]),

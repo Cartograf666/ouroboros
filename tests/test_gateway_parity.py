@@ -26,6 +26,8 @@ from ouroboros.gateway.contracts import (
     ThreadCreateRequest,
     ThreadDiffResponse,
     ThreadEntry,
+    ThreadLifecycleResponse,
+    ThreadQueueNotice,
     ThreadLocation,
     ThreadResponse,
     ThreadUpdateRequest,
@@ -138,6 +140,8 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "ThreadWorktreeRemoveRequest",
         "ThreadWorktreeResponse",
         "ThreadDiffResponse",
+        "ThreadLifecycleResponse",
+        "ThreadQueueNotice",
         "WorkspaceGitInitDecision",
         "ProjectInitGitResponse",
         "ProjectFromTaskResponse",
@@ -158,6 +162,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     for call in (
         "threadBranchBases", "threadBranchOff", "threadMergeBack",
         "threadWorktree", "threadWorktreeRemove", "threadDiff",
+        "threadArchive", "threadRestore", "threadDelete",
     ):
         assert call in api_client, f"api_client.js missing {call}"
     # T2: the owner's YES to the git_init_required offer must be reachable through
@@ -180,7 +185,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
                 ThreadEntry, ThreadCreateRequest, ThreadUpdateRequest, ThreadResponse,
                 ThreadLocation, ThreadBranchBase, ThreadBranchBasesResponse,
                 ThreadBranchOffRequest, ThreadWorktreeRemoveRequest,
-                ThreadWorktreeResponse, ThreadDiffResponse,
+                ThreadWorktreeResponse, ThreadDiffResponse, ThreadLifecycleResponse, ThreadQueueNotice,
                 WorkspaceGitInitDecision, ProjectInitGitResponse,
                 ProjectFromTaskResponse):
         expected = set(get_type_hints(cls, include_extras=True))

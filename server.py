@@ -874,11 +874,22 @@ def _project_id_for_registered_chat(ctx: Any, chat_id: int) -> str:
     thread of a project is recognized, not only thread #0 — comparing a chat id
     against ``project["chat_id"]`` here is what would misroute a non-primary
     thread's messages to Main.
+
+    BOTH lifecycles are checked (X10). A thread can be fenced for deletion or
+    already tombstoned inside a perfectly healthy project, and reading only the
+    project's state would keep delivering messages into a room the owner deleted
+    — which is exactly the fence the thread-deletion flow raises FIRST, before it
+    cancels anything.
     """
-    from ouroboros.projects_registry import PROJECT_ACTIVE
+    from ouroboros.projects_registry import PROJECT_ACTIVE, THREAD_ACTIVE, THREAD_ARCHIVED
 
     binding = _chat_binding(ctx, chat_id)
     if str(binding.get("lifecycle") or "") != PROJECT_ACTIVE:
+        return ""
+    # An ARCHIVED thread still routes: archiving hides a thread from the list, it
+    # does not close it, and an owner who opens an archived thread can keep
+    # talking in it. Only `deleting` and `tombstoned` are fenced.
+    if str(binding.get("thread_lifecycle") or THREAD_ACTIVE) not in {THREAD_ACTIVE, THREAD_ARCHIVED}:
         return ""
     return str(binding.get("project_id") or "").strip()
 
@@ -1527,9 +1538,13 @@ def _periodic_zombie_reconcile() -> None:
 
 def _resume_interrupted_project_deletions() -> None:
     try:
-        from supervisor.task_lifecycle import resume_project_deletions
+        from supervisor.task_lifecycle import resume_project_deletions, resume_thread_deletions
 
         resume_project_deletions(DATA_DIR)
+        # THREAD deletions resume for the same reason: a restart between the
+        # fence and the tombstone would leave a thread fenced forever — closed to
+        # routing, still on screen, never finishing.
+        resume_thread_deletions(DATA_DIR)
     except Exception:
         log.debug("Project deletion recovery failed", exc_info=True)
 

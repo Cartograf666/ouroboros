@@ -86,7 +86,12 @@ async def api_thread_branch_bases(request: Request) -> JSONResponse:
     instead is accepted by the branch-off route — this list is an offer.
     """
     from ouroboros.projects_registry import get_thread
-    from ouroboros.thread_branching import branch_off_bases, resolve_project_repo, thread_location
+    from ouroboros.thread_branching import (
+        branch_off_bases,
+        queue_notice,
+        resolve_project_repo,
+        thread_location,
+    )
 
     try:
         project_id, thread_id = _route_ids(request)
@@ -106,6 +111,11 @@ async def api_thread_branch_bases(request: Request) -> JSONResponse:
             "project_id": pid,
             "thread_id": int(thread["id"]),
             "location": thread_location(drive_root, pid, thread["id"]),
+            # A14: the honest queue sentence rides the answer the owner is
+            # already reading when they decide whether to branch — that is the
+            # ONE moment where "your task would wait, and here is how not to" is
+            # both true and actionable.
+            "queue_notice": await asyncio.to_thread(queue_notice, drive_root, pid, thread["id"]),
             **listed,
         })
     except Exception as exc:
@@ -311,6 +321,155 @@ async def api_thread_diff(request: Request) -> JSONResponse:
 
 
 # --------------------------------------------------------------------------- #
+# Lifecycle: archive / restore / delete (D4 with X10's admission fencing)
+# --------------------------------------------------------------------------- #
+
+def _lifecycle_answer(
+    drive_root: Any, project_id: str, thread_id: Any, thread: Dict[str, Any], **extra: Any,
+) -> JSONResponse:
+    _broadcast_thread_change(drive_root, project_id, thread_id)
+    return JSONResponse({
+        "ok": True,
+        "project_id": str(project_id),
+        "thread_id": int(thread.get("id") or 0),
+        "chat_id": int(thread.get("chat_id") or 0),
+        "lifecycle": str(thread.get("lifecycle") or ""),
+        **extra,
+    })
+
+
+async def _lifecycle_route(request: Request, operation, **kwargs: Any) -> JSONResponse:
+    """Shared shell for archive / restore / delete: resolve, run, answer typed."""
+    from ouroboros.project_threads_registry import ThreadLifecycleError
+    from ouroboros.projects_registry import get_project, get_thread
+
+    project_id, thread_id = _route_ids(request)
+    drive_root = request_drive_root(request)
+    project = get_project(drive_root, project_id)
+    if project is None:
+        return JSONResponse(
+            {"ok": False, "reason": "unknown_project", "message": f"unknown project: {project_id}"},
+            status_code=404,
+        )
+    pid = str(project["id"])
+    if get_thread(drive_root, pid, thread_id) is None:
+        return JSONResponse(
+            {"ok": False, "reason": "unknown_thread", "message": f"unknown thread: {thread_id}"},
+            status_code=404,
+        )
+    try:
+        return operation(drive_root, pid, thread_id, **kwargs)
+    except ThreadLifecycleError as exc:
+        return JSONResponse(
+            {"ok": False, "reason": exc.reason, "message": str(exc), "project_id": pid},
+            status_code=409,
+        )
+
+
+async def api_thread_archive(request: Request) -> JSONResponse:
+    """POST /api/projects/{project_id}/threads/{thread_id}/archive.
+
+    HIDE, and nothing else (D4). History rows, task bindings, the fork cursors of
+    this thread's children and its git worktree are all left exactly as they are,
+    and `restore` puts it back. Archiving thread #0 is refused: that thread IS the
+    project, and the project has its own operations.
+
+    X10, decided explicitly: archiving does NOT refuse while a task is running,
+    and the thread stays VISIBLE until that task is terminal. Refusing would make
+    the owner babysit a run they have already finished caring about; hiding it
+    immediately would leave live output arriving in a room they cannot open. The
+    answer reports `visible_until_terminal` so the surface can say which of the
+    two just happened.
+    """
+    from ouroboros.gateway.state import live_thread_chat_ids
+    from ouroboros.projects_registry import archive_thread
+
+    def _run(drive_root, pid, thread_id):
+        thread = archive_thread(drive_root, pid, thread_id)
+        if thread is None:
+            return JSONResponse(
+                {"ok": False, "reason": "unknown_thread", "message": "unknown thread"},
+                status_code=404,
+            )
+        live = int(thread.get("chat_id") or 0) in live_thread_chat_ids()
+        return _lifecycle_answer(
+            drive_root, pid, thread_id, thread,
+            archived_at=str(thread.get("archived_at") or ""),
+            visible_until_terminal=live,
+        )
+
+    try:
+        return await _lifecycle_route(request, _run)
+    except Exception as exc:
+        return json_exception(exc)
+
+
+async def api_thread_restore(request: Request) -> JSONResponse:
+    """POST /api/projects/{project_id}/threads/{thread_id}/restore — un-archive."""
+    from ouroboros.projects_registry import restore_thread
+
+    def _run(drive_root, pid, thread_id):
+        thread = restore_thread(drive_root, pid, thread_id)
+        if thread is None:
+            return JSONResponse(
+                {"ok": False, "reason": "unknown_thread", "message": "unknown thread"},
+                status_code=404,
+            )
+        return _lifecycle_answer(drive_root, pid, thread_id, thread)
+
+    try:
+        return await _lifecycle_route(request, _run)
+    except Exception as exc:
+        return json_exception(exc)
+
+
+async def api_thread_delete(request: Request) -> JSONResponse:
+    """POST /api/projects/{project_id}/threads/{thread_id}/delete.
+
+    X10's three steps, in this order and no other: FENCE routing, then cancel and
+    quiesce the tasks selected by EXACT thread chat id, then tombstone. Fencing
+    first is what stops a message landing in a room already on its way out;
+    selecting by exact chat id is what stops a sibling thread's work being
+    cancelled along with it.
+
+    What a tombstone does and does not do, stated plainly because the answer says
+    so too: the id and chat id are reserved forever (a reused 28-bit chat id would
+    merge a dead thread's history into a live conversation), the journal rows
+    physically REMAIN — the journal is shared by every chat and nothing here
+    rewrites it — and the thread's git worktree is NOT removed. A10 has no
+    exception for deletion: removing a checkout is always its own inspected act.
+    """
+    from ouroboros.projects_registry import begin_thread_deletion
+    from ouroboros.thread_branching import thread_location
+    from supervisor.task_lifecycle import start_thread_deletion
+
+    def _run(drive_root, pid, thread_id):
+        fenced = begin_thread_deletion(drive_root, pid, thread_id)
+        if fenced is None:
+            return JSONResponse(
+                {"ok": False, "reason": "unknown_thread", "message": "unknown thread"},
+                status_code=404,
+            )
+        tid = int(fenced.get("id") or 0)
+        chat_id = int(fenced.get("chat_id") or 0)
+        location = thread_location(drive_root, pid, tid)
+        start_thread_deletion(drive_root, pid, tid, chat_id)
+        return _lifecycle_answer(
+            drive_root, pid, tid, fenced,
+            # Every honest disclosure this operation owes the owner, in the answer
+            # rather than in a docstring nobody reading the UI will see.
+            journal_rows_retained=True,
+            worktree_kept=location["where"] == "worktree",
+            location=location,
+        )
+
+    try:
+        return await _lifecycle_route(request, _run)
+    except Exception as exc:
+        return json_exception(exc)
+
+
+# --------------------------------------------------------------------------- #
 # Broadcast
 # --------------------------------------------------------------------------- #
 
@@ -334,10 +493,13 @@ def _broadcast_thread_change(drive_root: Any, project_id: str, thread_id: Any) -
 
 
 __all__ = [
+    "api_thread_archive",
     "api_thread_branch_bases",
     "api_thread_branch_off",
+    "api_thread_delete",
     "api_thread_diff",
     "api_thread_merge_back",
+    "api_thread_restore",
     "api_thread_worktree_inspect",
     "api_thread_worktree_remove",
 ]

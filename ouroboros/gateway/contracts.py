@@ -532,6 +532,24 @@ class ThreadBranchBase(TypedDict, total=False):
     creates_commit: bool
 
 
+class ThreadQueueNotice(TypedDict, total=False):
+    """Would a task started in this thread WAIT, and what should be said (A14)?
+
+    ``queued`` is the fact; ``message`` is the ONE sentence every surface uses,
+    and it says the TRUE thing — the task is queued behind the running one and
+    will run when it finishes. It is not rejected. Earlier copy claimed rejection,
+    which is the kind of wrong that teaches an owner to stop trusting the queue.
+    ``remedy`` is ``branch_off`` only where branching would actually help: a
+    thread already working in its own checkout is waiting on ITSELF, and offering
+    to branch again there would be advice that does not work.
+    """
+
+    queued: bool
+    reason: str
+    message: str
+    remedy: str
+
+
 class ThreadBranchBasesResponse(TypedDict, total=False):
     """``GET /api/projects/{project_id}/threads/{thread_id}/branch-bases``."""
 
@@ -541,6 +559,7 @@ class ThreadBranchBasesResponse(TypedDict, total=False):
     bases: List[ThreadBranchBase]
     snapshot: ThreadBranchBase
     location: ThreadLocation
+    queue_notice: ThreadQueueNotice
     ok: bool
     reason: str
     message: str
@@ -622,6 +641,39 @@ class ThreadDiffResponse(TypedDict, total=False):
     patch: str
     patch_sha256: str
     error: str
+
+
+class ThreadLifecycleResponse(TypedDict, total=False):
+    """Archive / restore / delete answer (D4 with X10's admission fencing).
+
+    ``lifecycle`` is ``active | archived | deleting | tombstoned``. Delete answers
+    ``deleting``, not ``tombstoned``: the fence is up and routing into the thread
+    is already closed, but its tasks are still being cancelled and the thread
+    stays VISIBLE until they quiesce — the same shape a deleting PROJECT has.
+
+    The three disclosures ride the response rather than living in a docstring no
+    owner reads. ``journal_rows_retained`` is always true and says so: the chat
+    journal is shared by every chat and nothing here rewrites it, so a deleted
+    thread's rows physically remain and claiming erasure would be a lie.
+    ``worktree_kept`` says the thread's checkout was NOT removed — A10 has no
+    exception for deletion, and removing a checkout is always its own inspected
+    act. ``visible_until_terminal`` (archive) says the thread was archived while a
+    task was still running, so it stays on screen until that task finishes rather
+    than hiding live output.
+    """
+
+    ok: bool
+    reason: str
+    message: str
+    project_id: str
+    thread_id: int
+    chat_id: int
+    lifecycle: str
+    archived_at: str
+    visible_until_terminal: bool
+    journal_rows_retained: bool
+    worktree_kept: bool
+    location: ThreadLocation
 
 
 class ProjectDeleteResponse(TypedDict):
@@ -1176,6 +1228,9 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "GET /api/projects/{project_id}/threads/{thread_id}/worktree",
     "POST /api/projects/{project_id}/threads/{thread_id}/worktree/remove",
     "GET /api/projects/{project_id}/threads/{thread_id}/diff",
+    "POST /api/projects/{project_id}/threads/{thread_id}/archive",
+    "POST /api/projects/{project_id}/threads/{thread_id}/restore",
+    "POST /api/projects/{project_id}/threads/{thread_id}/delete",
     "GET /api/fs/dirs",
     "GET /api/chat/history",
     "GET /api/logs/{name}",
@@ -1288,7 +1343,9 @@ __all__ = [
     "ThreadBranchOffRequest",
     "ThreadDiffResponse",
     "ThreadEntry",
+    "ThreadLifecycleResponse",
     "ThreadLocation",
+    "ThreadQueueNotice",
     "ThreadWorktreeRemoveRequest",
     "ThreadWorktreeResponse",
     "ThreadResponse",

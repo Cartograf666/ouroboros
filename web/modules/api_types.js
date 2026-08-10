@@ -408,6 +408,20 @@
  */
 
 /**
+ * Would a task started in this thread WAIT, and what should be said (A14)?
+ * queued is the fact; message is the ONE sentence every surface uses, and it says
+ * the TRUE thing — the task is queued behind the running one and will run when it
+ * finishes. It is not rejected. remedy is 'branch_off' only where branching would
+ * actually help: a thread already working in its own checkout is waiting on
+ * ITSELF, and offering to branch again there would be advice that does not work.
+ * @typedef {Object} ThreadQueueNotice
+ * @property {boolean=} queued
+ * @property {string=} reason
+ * @property {string=} message
+ * @property {string=} remedy
+ */
+
+/**
  * GET /api/projects/{project_id}/threads/{thread_id}/branch-bases.
  * @typedef {Object} ThreadBranchBasesResponse
  * @property {string=} project_id
@@ -416,6 +430,7 @@
  * @property {ThreadBranchBase[]=} bases
  * @property {ThreadBranchBase=} snapshot
  * @property {ThreadLocation=} location
+ * @property {ThreadQueueNotice=} queue_notice
  * @property {boolean=} ok
  * @property {string=} reason
  * @property {string=} message
@@ -489,6 +504,35 @@
  * @property {string=} patch
  * @property {string=} patch_sha256
  * @property {string=} error
+ */
+
+/**
+ * Archive / restore / delete answer (D4 with X10's admission fencing). lifecycle
+ * is 'active' | 'archived' | 'deleting' | 'tombstoned'. Delete answers
+ * 'deleting', not 'tombstoned': the fence is up and routing into the thread is
+ * already closed, but its tasks are still being cancelled and the thread stays
+ * VISIBLE until they quiesce — the same shape a deleting project has.
+ *
+ * The three disclosures ride the response rather than living in a docstring no
+ * owner reads. journal_rows_retained is always true and says so: the chat journal
+ * is shared by every chat and nothing rewrites it, so a deleted thread's rows
+ * physically remain and claiming erasure would be a lie. worktree_kept says the
+ * checkout was NOT removed — A10 has no exception for deletion.
+ * visible_until_terminal (archive) says the thread was archived while a task was
+ * still running, so it stays on screen until that task finishes.
+ * @typedef {Object} ThreadLifecycleResponse
+ * @property {boolean=} ok
+ * @property {string=} reason
+ * @property {string=} message
+ * @property {string=} project_id
+ * @property {number=} thread_id
+ * @property {number=} chat_id
+ * @property {string=} lifecycle
+ * @property {string=} archived_at
+ * @property {boolean=} visible_until_terminal
+ * @property {boolean=} journal_rows_retained
+ * @property {boolean=} worktree_kept
+ * @property {ThreadLocation=} location
  */
 
 /**

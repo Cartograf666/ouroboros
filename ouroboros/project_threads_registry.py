@@ -29,6 +29,27 @@ from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
 
+# Thread lifecycle (D4/X10). The project pattern, one level down:
+#   active      the ordinary state
+#   archived    hidden, RESTORABLE, and everything — history, worktree, bindings
+#               — left exactly as it was. An archived thread whose task is still
+#               running stays VISIBLE until that task is terminal (the owner-
+#               locked reading of X10): hiding live output would leave work
+#               emitting into a room nobody can see.
+#   deleting    fenced against routing, its live tasks cancelling; still visible
+#               while it quiesces, exactly as a deleting PROJECT is
+#   tombstoned  terminal. The id and chat id are never reused, and the journal
+#               rows physically remain — stated honestly rather than claimed
+#               erased, because nothing here rewrites the shared journal.
+THREAD_ACTIVE = "active"
+THREAD_ARCHIVED = "archived"
+THREAD_DELETING = "deleting"
+THREAD_TOMBSTONED = "tombstoned"
+THREAD_LIFECYCLES = frozenset({THREAD_ACTIVE, THREAD_ARCHIVED, THREAD_DELETING, THREAD_TOMBSTONED})
+#: Lifecycles a thread may be seen in at all. A tombstone is never shown; whether
+#: an ARCHIVED thread is shown depends on whether it is still live (X10).
+_SIDEBAR_LIFECYCLES = frozenset({THREAD_ACTIVE, THREAD_DELETING})
+
 # Bound the retry walk when a minted thread chat id is already reserved. Each
 # step is a fresh deterministic pre-image, so exhausting this many is a
 # registry-wide alarm, not a routine outcome.
@@ -65,11 +86,17 @@ def _normalize_thread_rows(value: Any) -> List[Dict[str, Any]]:
         if thread_id <= MAIN_THREAD_ID or not chat_id or thread_id in seen_ids:
             continue
         seen_ids.add(thread_id)
+        lifecycle = str(raw.get("lifecycle") or THREAD_ACTIVE).strip().lower()
         row: Dict[str, Any] = {
             "id": thread_id,
             "chat_id": chat_id,
             "name": str(raw.get("name") or "").strip() or f"Thread {thread_id}",
             "created_at": str(raw.get("created_at") or ""),
+            # A legacy row has no lifecycle at all and reads as active — the only
+            # state that existed when it was written.
+            "lifecycle": lifecycle if lifecycle in THREAD_LIFECYCLES else THREAD_ACTIVE,
+            "archived_at": str(raw.get("archived_at") or ""),
+            "delete_error": str(raw.get("delete_error") or ""),
         }
         try:
             row["visible_revision"] = max(0, int(raw.get("visible_revision") or 0))
@@ -110,8 +137,54 @@ def project_threads(project: Dict[str, Any]) -> List[Dict[str, Any]]:
         "name": str(project.get("name") or pid),
         "created_at": str(project.get("created_at") or ""),
         "visible_revision": max(0, int(project.get("visible_revision") or 0)),
+        # Thread #0 IS the project, so it has no lifecycle of its own to hold: it
+        # mirrors the project's, and archiving or deleting it is refused in
+        # favour of the project's own operations. A synthesized state that could
+        # disagree with the project row would be a second truth about one thing.
+        "lifecycle": _thread_zero_lifecycle(project),
+        "archived_at": "",
+        "delete_error": str(project.get("delete_error") or ""),
     }
     return [zero, *_normalize_thread_rows(project.get("threads"))]
+
+
+def _thread_zero_lifecycle(project: Dict[str, Any]) -> str:
+    """The project's own lifecycle, spoken in the thread vocabulary."""
+    from ouroboros.projects_registry import (
+        PROJECT_ACTIVE,
+        PROJECT_DELETING,
+        PROJECT_TOMBSTONED,
+    )
+
+    return {
+        PROJECT_ACTIVE: THREAD_ACTIVE,
+        PROJECT_DELETING: THREAD_DELETING,
+        PROJECT_TOMBSTONED: THREAD_TOMBSTONED,
+    }.get(str(project.get("lifecycle") or PROJECT_ACTIVE), THREAD_ACTIVE)
+
+
+def thread_is_visible(thread: Dict[str, Any], live_chat_ids: Any = None) -> bool:
+    """Should this thread be SHOWN? (D4 + X10's owner-locked reading.)
+
+    ``active`` and ``deleting`` are always visible — a deleting thread stays on
+    screen while it quiesces, exactly as a deleting project does. ``archived`` is
+    hidden UNLESS a task is still live in it: archiving is a filing gesture, not a
+    kill switch, and hiding a room that is still emitting output would leave the
+    owner watching nothing while work continues. ``tombstoned`` is never shown.
+
+    ``live_chat_ids`` is supplied by the CALLER (the gateway reads the queue).
+    This module stays pure: a registry projection that reached into the supervisor
+    queue would make every read of the sidebar depend on the queue lock.
+    """
+    lifecycle = str(thread.get("lifecycle") or THREAD_ACTIVE)
+    if lifecycle in _SIDEBAR_LIFECYCLES:
+        return True
+    if lifecycle != THREAD_ARCHIVED:
+        return False
+    try:
+        return int(thread.get("chat_id") or 0) in set(live_chat_ids or ())
+    except (TypeError, ValueError):
+        return False
 
 
 def _row_chat_ids(project: Dict[str, Any]) -> List[int]:
@@ -347,6 +420,170 @@ def rename_thread(drive_root: Any, project_id: str, thread_id: Any, name: str) -
     return None
 
 
+class ThreadLifecycleError(ValueError):
+    """A lifecycle transition that must be REFUSED, with a typed ``reason``."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        self.reason = reason
+        super().__init__(message)
+
+
+def _set_thread_lifecycle(
+    drive_root: Any,
+    project_id: str,
+    thread_id: Any,
+    *,
+    to: str,
+    allowed_from: frozenset,
+    stamp_archived: bool = False,
+    clear_archived: bool = False,
+    delete_error: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """The ONE writer of a thread's lifecycle field.
+
+    Every transition goes through here so the guards — thread #0 is the project,
+    a tombstone is terminal, an unexpected source state is refused rather than
+    overwritten — are written once and cannot drift between archive, restore,
+    fence and tombstone.
+    """
+    from ouroboros.projects_registry import _file_write_lock, _load, _registry_path, _save
+
+    pid = sanitize_project_id(project_id)
+    if not pid:
+        return None
+    try:
+        want = int(thread_id)
+    except (TypeError, ValueError):
+        return None
+    if want == MAIN_THREAD_ID:
+        raise ThreadLifecycleError(
+            "thread_zero_is_the_project",
+            "This thread IS the project. Archive or delete the project itself.",
+        )
+    with _file_write_lock(_registry_path(drive_root)):
+        data = _load(drive_root)
+        entry = _active_project_row(data, pid)
+        threads = _normalize_thread_rows(entry.get("threads"))
+        for row in threads:
+            if int(row["id"]) != want:
+                continue
+            current = str(row.get("lifecycle") or THREAD_ACTIVE)
+            if current == to:
+                return dict(row)  # idempotent: the caller may have retried
+            if current not in allowed_from:
+                raise ThreadLifecycleError(
+                    "lifecycle_conflict",
+                    f"this thread is {current}; it cannot become {to}",
+                )
+            row["lifecycle"] = to
+            if stamp_archived:
+                row["archived_at"] = utc_now_iso()
+            if clear_archived:
+                row["archived_at"] = ""
+            if delete_error is not None:
+                row["delete_error"] = str(delete_error)
+            entry["threads"] = threads
+            _save(drive_root, data)
+            log.info("Project thread %s#%s -> %s", pid, want, to)
+            return dict(row)
+    return None
+
+
+def archive_thread(drive_root: Any, project_id: str, thread_id: Any) -> Optional[Dict[str, Any]]:
+    """Hide a thread. NOTHING is removed and everything is restorable (D4).
+
+    History rows, task bindings, the fork cursors of its children and its git
+    worktree all stay exactly as they are — archiving is a filing gesture, so the
+    only thing it changes is whether the thread appears in the list. An archived
+    thread with a task still running stays VISIBLE until that task is terminal
+    (:func:`thread_is_visible`), because hiding a room that is still emitting
+    output is how an owner ends up watching nothing while work continues.
+    """
+    return _set_thread_lifecycle(
+        drive_root, project_id, thread_id,
+        to=THREAD_ARCHIVED,
+        allowed_from=frozenset({THREAD_ACTIVE}),
+        stamp_archived=True,
+    )
+
+
+def restore_thread(drive_root: Any, project_id: str, thread_id: Any) -> Optional[Dict[str, Any]]:
+    """Un-archive. The inverse of :func:`archive_thread`, and nothing more."""
+    return _set_thread_lifecycle(
+        drive_root, project_id, thread_id,
+        to=THREAD_ACTIVE,
+        allowed_from=frozenset({THREAD_ARCHIVED}),
+        clear_archived=True,
+    )
+
+
+def begin_thread_deletion(drive_root: Any, project_id: str, thread_id: Any) -> Optional[Dict[str, Any]]:
+    """FENCE a thread for deletion — the first of X10's three steps.
+
+    Marking ``deleting`` is what closes routing into the thread's chat before any
+    cancellation starts (``resolve_chat_binding`` reports it, and the routing
+    classifier refuses a non-active thread). Doing it in the other order would let
+    a message land in a room that is on its way out.
+
+    An ARCHIVED thread may be deleted directly — the owner filing something away
+    and then discarding it is one flow, not two.
+    """
+    return _set_thread_lifecycle(
+        drive_root, project_id, thread_id,
+        to=THREAD_DELETING,
+        allowed_from=frozenset({THREAD_ACTIVE, THREAD_ARCHIVED}),
+        delete_error="",
+    )
+
+
+def complete_thread_deletion(drive_root: Any, project_id: str, thread_id: Any) -> Optional[Dict[str, Any]]:
+    """TOMBSTONE a fenced thread once its tasks have quiesced (X10's third step).
+
+    The row STAYS. Its id and chat id keep their reservation forever — with 28-bit
+    chat ids a reused one would silently merge a dead thread's history into a live
+    conversation — and the journal rows physically remain, which is stated rather
+    than dressed up as erasure: the journal is shared by every chat and nothing
+    here rewrites it. What a tombstone buys is that the thread is gone from every
+    surface and can never come back.
+    """
+    return _set_thread_lifecycle(
+        drive_root, project_id, thread_id,
+        to=THREAD_TOMBSTONED,
+        allowed_from=frozenset({THREAD_DELETING}),
+        delete_error="",
+    )
+
+
+def fail_thread_deletion(
+    drive_root: Any, project_id: str, thread_id: Any, error: str,
+) -> Optional[Dict[str, Any]]:
+    """Record WHY a deletion could not quiesce, leaving the thread fenced.
+
+    Deliberately not a rollback to ``active``: routing stays closed, because the
+    owner asked for this thread to go and a silent un-fence would put messages
+    back into a room they had written off. The error is stored so the surface can
+    say what is stuck instead of showing a thread that never finishes vanishing.
+    """
+    from ouroboros.projects_registry import _file_write_lock, _load, _registry_path, _save
+
+    pid = sanitize_project_id(project_id)
+    try:
+        want = int(thread_id)
+    except (TypeError, ValueError):
+        return None
+    with _file_write_lock(_registry_path(drive_root)):
+        data = _load(drive_root)
+        entry = _active_project_row(data, pid)
+        threads = _normalize_thread_rows(entry.get("threads"))
+        for row in threads:
+            if int(row["id"]) == want and str(row.get("lifecycle")) == THREAD_DELETING:
+                row["delete_error"] = str(error or "")[:500]
+                entry["threads"] = threads
+                _save(drive_root, data)
+                return dict(row)
+    return None
+
+
 def fork_thread(drive_root: Any, project_id: str, thread_id: Any) -> Dict[str, Any]:
     """Fork a thread: a new thread carrying a CURSOR into the source's rows.
 
@@ -408,11 +645,23 @@ def project_thread_note_for_task(task: Any) -> str:
 
 
 __all__ = [
+    "THREAD_ACTIVE",
+    "THREAD_ARCHIVED",
+    "THREAD_DELETING",
+    "THREAD_LIFECYCLES",
+    "THREAD_TOMBSTONED",
+    "ThreadLifecycleError",
+    "archive_thread",
+    "begin_thread_deletion",
+    "complete_thread_deletion",
     "create_thread",
+    "fail_thread_deletion",
     "duplicate_chat_ids",
     "fork_thread",
     "get_thread",
     "project_thread_note_for_task",
     "project_threads",
     "rename_thread",
+    "restore_thread",
+    "thread_is_visible",
 ]

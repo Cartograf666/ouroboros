@@ -84,6 +84,11 @@ def test_legacy_row_without_threads_projects_one_thread(tmp_path):
         "name": "Legacy",
         "created_at": "2026-01-01T00:00:00+00:00",
         "visible_revision": 7,
+        # T3: thread #0 IS the project, so its lifecycle MIRRORS the project row
+        # rather than being a second state that could disagree with it.
+        "lifecycle": "active",
+        "archived_at": "",
+        "delete_error": "",
     }
     # Compatibility alias preserved.
     assert rows[0]["chat_id"] == threads[0]["chat_id"]
