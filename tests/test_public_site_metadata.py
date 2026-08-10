@@ -134,6 +134,9 @@ def test_install_manifest_discovers_releases_without_future_asset_hashes():
     expected = {
         "Ouroboros-{version}.dmg": ("macos", "arm64"),
         "Ouroboros-{version}-linux-x86_64.tar.gz": ("linux", "x86_64"),
+        "ouroboros_{version}_amd64.deb": ("linux", "x86_64"),
+        "ouroboros-{version}-1.x86_64.rpm": ("linux", "x86_64"),
+        "ouroboros-{version}-1.red80.x86_64.rpm": ("linux", "x86_64"),
         "Ouroboros-{version}-windows-x64.zip": ("windows", "x64"),
     }
     artifacts = {

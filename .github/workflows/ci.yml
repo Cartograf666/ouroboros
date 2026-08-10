@@ -787,7 +787,96 @@ jobs:
           subject-path: ${{ steps.release_asset.outputs.path }}
           sbom-path: dist/sbom-${{ matrix.proof_id }}.cdx.json
 
-      # Upload the archive and its exact proof companions.
+      # —— Linux native packages ——
+      # The .deb and .rpm wrap the same dist/Ouroboros payload the tarball
+      # smoke above already proved, so they reuse its SBOM: the bytes under
+      # /opt/ouroboros are identical to the ones inside the archive. Each
+      # package still earns its own smoke receipt, from a real install in a
+      # stock Ubuntu and Fedora container.
+      - name: Build Linux .deb and .rpm packages
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rpm
+          bash scripts/build_linux_packages.sh
+
+      # Release-gating lane only: Docker Hub images. The Astra Linux and RED OS
+      # runs live in the informational vendor-package-smoke job, so a vendor
+      # registry outage cannot hold back a tagged release.
+      - name: Smoke Linux packages in Ubuntu and Fedora containers
+        id: linux_packages
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          DEB="dist/ouroboros_${VERSION}_amd64.deb"
+          RPM="dist/ouroboros-${VERSION}-1.x86_64.rpm"
+          RPM_RED80="dist/ouroboros-${VERSION}-1.red80.x86_64.rpm"
+          bash scripts/smoke_linux_packages.sh official "$DEB" "$RPM" "$RPM_RED80"
+          echo "deb=$DEB" >> "$GITHUB_OUTPUT"
+          echo "rpm=$RPM" >> "$GITHUB_OUTPUT"
+          echo "rpm_red80=$RPM_RED80" >> "$GITHUB_OUTPUT"
+
+      - name: Record Linux package smoke and SBOMs
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          SBOM_PATH: ${{ steps.smoke_linux.outputs.sbom_path }}
+        run: |
+          set -euo pipefail
+          record() {
+            python scripts/release_proof.py record-smoke \
+              --proof-id "$1" \
+              --artifact "$2" \
+              --output "dist/release-smoke-$1.json" \
+              --commit "$GITHUB_SHA" \
+              --tag "$GITHUB_REF_NAME" \
+              --check package_install \
+              --check packaged_cli_help \
+              --check desktop_entry
+            "${{ steps.syft.outputs.path }}" "dir:$SBOM_PATH" \
+              --output "cyclonedx-json=dist/sbom-$1.cdx.json"
+          }
+          record linux-deb-amd64 "${{ steps.linux_packages.outputs.deb }}"
+          record linux-rpm-x86_64 "${{ steps.linux_packages.outputs.rpm }}"
+          record linux-rpm-red80-x86_64 "${{ steps.linux_packages.outputs.rpm_red80 }}"
+
+      - name: Attest Linux package provenance
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: |
+            ${{ steps.linux_packages.outputs.deb }}
+            ${{ steps.linux_packages.outputs.rpm }}
+            ${{ steps.linux_packages.outputs.rpm_red80 }}
+
+      - name: Attest .deb SBOM
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: ${{ steps.linux_packages.outputs.deb }}
+          sbom-path: dist/sbom-linux-deb-amd64.cdx.json
+
+      - name: Attest .rpm SBOM
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: ${{ steps.linux_packages.outputs.rpm }}
+          sbom-path: dist/sbom-linux-rpm-x86_64.cdx.json
+
+      - name: Attest RED OS .rpm SBOM
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: ${{ steps.linux_packages.outputs.rpm_red80 }}
+          sbom-path: dist/sbom-linux-rpm-red80-x86_64.cdx.json
+
+      # Upload the archive and its exact proof companions. The .deb/.rpm lines
+      # match nothing on macOS and Windows, which is fine — `error` fires only
+      # when the whole path set is empty.
       - name: Upload build artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -796,8 +885,72 @@ jobs:
             ${{ steps.release_asset.outputs.path }}
             dist/release-smoke-${{ matrix.proof_id }}.json
             dist/sbom-${{ matrix.proof_id }}.cdx.json
+            dist/ouroboros_*_amd64.deb
+            dist/ouroboros-*-1.x86_64.rpm
+            dist/ouroboros-*-1.red80.x86_64.rpm
+            dist/release-smoke-linux-deb-amd64.json
+            dist/release-smoke-linux-rpm-x86_64.json
+            dist/release-smoke-linux-rpm-red80-x86_64.json
+            dist/sbom-linux-deb-amd64.cdx.json
+            dist/sbom-linux-rpm-x86_64.cdx.json
+            dist/sbom-linux-rpm-red80-x86_64.cdx.json
           if-no-files-found: error
           retention-days: 30
+
+  # ──────────────────────────────────────────────────────────────────
+  # Vendor distro smoke: informational, never blocks a release.
+  #
+  # Astra Linux and RED OS install the same .deb/.rpm the release-gating lane
+  # already proved on Ubuntu and Fedora. What this adds is confirmation on the
+  # vendor OS itself — worth having, but it reaches two third-party registries
+  # whose availability from GitHub runners is outside this project's control.
+  # Gating a tagged release on that would trade a real publication failure for
+  # someone else's outage, so the job runs alongside `release` rather than
+  # ahead of it, and `continue-on-error` keeps a red result informational.
+  # ──────────────────────────────────────────────────────────────────
+  vendor-package-smoke:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download Linux build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ouroboros-ubuntu-latest
+          path: linux-artifacts/
+
+      - name: Smoke packages on Astra Linux and RED OS
+        id: vendor_smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          bash scripts/smoke_linux_packages.sh vendor \
+            "linux-artifacts/ouroboros_${VERSION}_amd64.deb" \
+            "linux-artifacts/ouroboros-${VERSION}-1.x86_64.rpm" \
+            "linux-artifacts/ouroboros-${VERSION}-1.red80.x86_64.rpm"
+
+      # Without this, a non-blocking failure is easy to miss in the run list.
+      - name: Report vendor smoke outcome
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.vendor_smoke.outcome }}" = "success" ]; then
+            echo "Vendor package smoke passed on Astra Linux 1.8 and RED OS 8." >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "Vendor package smoke did not pass on Astra Linux 1.8 / RED OS 8."
+              echo ""
+              echo "This lane is informational and does not block the release."
+              echo "Check whether registry.astralinux.ru and registry.red-soft.ru were"
+              echo "reachable before treating this as a packaging defect."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   # ──────────────────────────────────────────────────────────────────
   # Release: Create GitHub Release with all artifacts
@@ -853,6 +1006,9 @@ jobs:
           set -euo pipefail
           for file in release-artifacts/Ouroboros-*.dmg \
                       release-artifacts/Ouroboros-*-linux-x86_64.tar.gz \
+                      release-artifacts/ouroboros_*_amd64.deb \
+                      release-artifacts/ouroboros-*-1.x86_64.rpm \
+                      release-artifacts/ouroboros-*-1.red80.x86_64.rpm \
                       release-artifacts/Ouroboros-*-windows-x64.zip; do
             SOURCE_ARGS=(
               --repo "$GITHUB_REPOSITORY"
@@ -921,12 +1077,21 @@ jobs:
           files: |
             release-artifacts/Ouroboros-*.dmg
             release-artifacts/Ouroboros-*-linux-x86_64.tar.gz
+            release-artifacts/ouroboros_*_amd64.deb
+            release-artifacts/ouroboros-*-1.x86_64.rpm
+            release-artifacts/ouroboros-*-1.red80.x86_64.rpm
             release-artifacts/Ouroboros-*-windows-x64.zip
             release-artifacts/release-smoke-macos-arm64.json
             release-artifacts/release-smoke-linux-x86_64.json
+            release-artifacts/release-smoke-linux-deb-amd64.json
+            release-artifacts/release-smoke-linux-rpm-x86_64.json
+            release-artifacts/release-smoke-linux-rpm-red80-x86_64.json
             release-artifacts/release-smoke-windows-x64.json
             release-artifacts/sbom-macos-arm64.cdx.json
             release-artifacts/sbom-linux-x86_64.cdx.json
+            release-artifacts/sbom-linux-deb-amd64.cdx.json
+            release-artifacts/sbom-linux-rpm-x86_64.cdx.json
+            release-artifacts/sbom-linux-rpm-red80-x86_64.cdx.json
             release-artifacts/sbom-windows-x64.cdx.json
             release-artifacts/SHA256SUMS
             release-artifacts/release-evidence.json
