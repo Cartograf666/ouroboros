@@ -3376,7 +3376,12 @@ export function createChatInstance({
             if (optionLabels.length) return `Choose a target · ${optionLabels.join(' / ')}`;
             return target ? `Choose a target · ${target}` : 'Choose a target';
         }
-        if (status === 'project_unavailable') return 'Project is unavailable';
+        // TWO different facts wear this one status, and naming only the project
+        // told the owner the wrong one: `server.py`'s own comment says a THREAD
+        // can be fenced for deletion or tombstoned inside a perfectly healthy
+        // project, and that is the commoner case now (I12). The sentence has to be
+        // true of both.
+        if (status === 'project_unavailable') return 'This room is no longer available';
         const labels = {
             mailbox_delivery: 'Delivered to task',
             steer_task: 'Steered task',

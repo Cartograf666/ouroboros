@@ -11,12 +11,19 @@ export async function apiFetch(url, init = {}) {
 export async function fetchJson(url, init = {}, options = {}) {
     const response = await apiFetch(url, init);
     let data = null;
+    let unparseable = false;
     try {
         data = await response.json();
     } catch {
         data = { error: `non-json response (HTTP ${response.status})` };
+        // A 2xx whose body cannot be parsed is NOT an answer, and returning it as
+        // one made `{error: …}` look like a payload: `threadOps.bases` handed that
+        // object back, `listed.ok` was false, and branch-off rendered an EMPTY base
+        // offer and asked the owner to type one (I16). A body we could not read is
+        // a transport failure whatever the status line says.
+        unparseable = true;
     }
-    if (!response.ok || (options.rejectOkFalse && data && data.ok === false)) {
+    if (unparseable || !response.ok || (options.rejectOkFalse && data && data.ok === false)) {
         const message = (data && (data.error || data.message)) || `HTTP ${response.status}`;
         const error = new Error(message);
         error.status = response.status;

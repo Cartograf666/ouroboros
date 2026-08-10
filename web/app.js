@@ -737,9 +737,16 @@ function renderProjectsNav(projects, projectChatIds) {
         closeProjectPanel();
         showPage('chat');
     }
+    // The per-thread tuple carries `lifecycle` and `delete_error` because the
+    // paint READS them: `threadRowPresentation` greys a `deleting` row, disables
+    // its click and drops its unread dot, and the `Retry delete` menu row shows
+    // `delete_error` as the reason it is on offer. Omitted from the fingerprint,
+    // both changed invisibly — a rewritten `delete_error` never reached the menu,
+    // and an `active -> deleting` transition from another tab or a resumed worker
+    // left this tab painting an ordinary full-menu row (I11).
     const json = JSON.stringify(rows.map(p => [
         p.id, p.name, p.chat_id, p.lifecycle, p.visible_revision, p._unread, p._mainUnread, p.delete_error,
-        projectThreadRows(p).map(t => [t.id, t.name, t.visible_revision]),
+        projectThreadRows(p).map(t => [t.id, t.name, t.visible_revision, t.lifecycle, t.delete_error]),
     ]));
     if (json === knownProjectsJson) return;
     knownProjectsJson = json;
@@ -753,6 +760,14 @@ function renderProjectsNav(projects, projectChatIds) {
     // the open stage's title has to follow it too; otherwise the header keeps
     // showing the old name until the thread is closed and reopened.
     if (openThreadRow) threadStage.setTitle(active, openThreadRow);
+    else if (active && navState.activeThreadId !== null) {
+        // The open thread left the projection — tombstoned, or archived with
+        // nothing live in it. Nothing closed the stage, so the owner was left
+        // looking at a room with no row, whose kebab now finds no thread and does
+        // nothing at all (I12). The project row does this already, one branch up.
+        closeProjectPanel();
+        showPage('chat');
+    }
     if (openThreadRow && active.lifecycle === 'active'
         && isThreadUnread(openThreadRow, state.projectSeenRevision, active.id)) {
         acknowledgeProjectAfterPaint(active, openThreadRow);

@@ -210,6 +210,14 @@ def _force_rmtree(path: Path) -> None:
     The failing entry's PARENT is repaired too: ``unlink``/``rmdir`` are checked
     against the containing directory's write bit, not the child's, so clearing
     the child alone leaves the exact case this hook exists for unfixed.
+
+    The repair is PERMANENT, not scoped to the retry: nothing restores the previous
+    mode, so a parent directory that survives this call (the containment check
+    stops the delete on a path outside the allowed root, and the retry itself can
+    fail) keeps the relaxed permissions — an observed ``0o555`` worktree root came
+    back ``0o755``. That is deliberate here, since the tree is being deleted and a
+    restore would have to happen on a path that may no longer exist, but it is a
+    side effect on the owner's filesystem and is stated rather than implied (I19).
     """
     def _relax(target: Path, *, directory: bool) -> None:
         try:
