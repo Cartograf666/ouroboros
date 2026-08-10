@@ -131,6 +131,11 @@ def test_removal_refuses_dirty_or_unmerged_work_until_acknowledged(repo, tmp_pat
     assert done["removed"] is True
     assert not Path(handle.path).exists()
     assert list_thread_worktrees(tmp_path / "data") == []
+    # The owner acknowledged losing the CHECKOUT. Its commits are a separate
+    # thing, and this branch is now the last copy of them (T3R-5).
+    assert done["branch_removed"] is False
+    assert "unmerged work" in done["branch_kept_reason"]
+    assert handle.branch in _git(repo, "branch", "--format=%(refname:short)").stdout.split()
 
 
 def test_clean_fully_merged_worktree_removes_without_ceremony(repo, tmp_path, wt_root):
@@ -146,6 +151,108 @@ def test_clean_fully_merged_worktree_removes_without_ceremony(repo, tmp_path, wt
     assert result["inspection"]["unmerged_commits"] == 0
     assert not Path(handle.path).exists()
     assert get_thread_worktree(tmp_path / "data", "racer", 1) is None
+
+
+def test_A10s_evidence_counts_against_the_PROJECTs_HEAD_not_the_branch_point(repo, tmp_path, wt_root):
+    """T3R-4. "Commits the project folder never received" is a question about the
+    PROJECT's HEAD, and the answer moves every time that HEAD does.
+
+    Counted against the frozen ``base_sha`` instead, a checkout whose work had
+    ALREADY been merged back still reported every one of those commits as
+    unmerged — so the owner was asked to acknowledge destroying work that was
+    already safe in their folder. Evidence that cries wolf is worse than none,
+    because the owner learns to click through it.
+    """
+    from pathlib import Path
+
+    handle = _provision(repo, tmp_path, wt_root)
+    checkout = Path(handle.path)
+    _git(checkout, "config", "user.email", "t@example.com")
+    _git(checkout, "config", "user.name", "T")
+    (checkout / "work.txt").write_text("thread work\n", encoding="utf-8")
+    _git(checkout, "add", "-A")
+    _git(checkout, "commit", "-m", "thread work")
+
+    row = get_thread_worktree(tmp_path / "data", "racer", 1)
+    before = inspect_thread_worktree(row)
+    assert before["unmerged_commits"] == 1, "before the merge it really IS unmerged"
+    assert before["unmerged_against"] == _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    _git(repo, "merge", "--no-ff", "--no-edit", handle.branch)
+
+    after = inspect_thread_worktree(row)
+    assert after["unmerged_commits"] == 0, "the project folder HAS this work now"
+    assert after["dirty"] is False
+    # The branch point has not moved, and is no longer what the count is about.
+    assert after["unmerged_against"] != row["base_sha"]
+    assert after["unmerged_against"] == _git(repo, "rev-parse", "HEAD").stdout.strip()
+    # Which is what makes this a CLEAN removal instead of a warning.
+    removed = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1, worktree_root=wt_root,
+    )
+    assert removed["removed"] is True
+    assert removed["reason"] == ""
+
+
+def test_an_unreadable_project_falls_back_to_the_branch_point(repo, tmp_path, wt_root):
+    """The fallback direction is the conservative one: counting from the branch
+    point can only OVER-report, which refuses a removal rather than permitting
+    one."""
+    from pathlib import Path
+
+    handle = _provision(repo, tmp_path, wt_root)
+    checkout = Path(handle.path)
+    _git(checkout, "config", "user.email", "t@example.com")
+    _git(checkout, "config", "user.name", "T")
+    (checkout / "work.txt").write_text("thread work\n", encoding="utf-8")
+    _git(checkout, "add", "-A")
+    _git(checkout, "commit", "-m", "thread work")
+    row = dict(get_thread_worktree(tmp_path / "data", "racer", 1))
+    row["repo_dir"] = str(tmp_path / "gone")
+
+    out = inspect_thread_worktree(row)
+
+    assert out["unmerged_against"] == row["base_sha"]
+    assert out["unmerged_commits"] == 1
+
+
+def test_a_clean_removal_makes_the_branch_round_trip_repeatable(repo, tmp_path, wt_root):
+    """T3R-5. ``provision_thread_worktree`` refuses to reuse an existing branch —
+    deliberately, so an owner's work is never clobbered. Leaving the branch behind
+    after a clean removal therefore made branch → merge → remove a ONE-SHOT trip:
+    the second branch-off failed with "branch already exists" and no owner surface
+    could delete it.
+
+    A clean removal now deletes the branch, and "clean" is judged twice: by this
+    module's inspection AND by ``git branch -d``, which refuses on its own account
+    if the branch holds anything the repository would not still have.
+    """
+    from pathlib import Path
+
+    first = _provision(repo, tmp_path, wt_root)
+    checkout = Path(first.path)
+    _git(checkout, "config", "user.email", "t@example.com")
+    _git(checkout, "config", "user.name", "T")
+    (checkout / "work.txt").write_text("thread work\n", encoding="utf-8")
+    _git(checkout, "add", "-A")
+    _git(checkout, "commit", "-m", "thread work")
+    _git(repo, "merge", "--no-ff", "--no-edit", first.branch)
+
+    removed = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1, worktree_root=wt_root,
+    )
+
+    assert removed["removed"] is True
+    assert removed["branch_removed"] is True
+    assert removed["branch_kept_reason"] == ""
+    assert first.branch not in _git(repo, "branch", "--format=%(refname:short)").stdout.split()
+    # The whole point: the same thread can branch off again.
+    second = _provision(repo, tmp_path, wt_root)
+    assert second.branch == first.branch
+    assert Path(second.path).is_dir()
+    # Deleting the branch destroyed nothing — which is exactly what `git branch -d`
+    # refusing would have told us if it had.
+    assert (repo / "work.txt").read_text(encoding="utf-8") == "thread work\n"
 
 
 def test_removal_of_an_unknown_thread_is_a_typed_no_op(tmp_path):

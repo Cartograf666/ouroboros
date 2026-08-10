@@ -196,15 +196,42 @@ def provision_thread_worktree(
         return handle
 
 
+def _project_head(row: Dict[str, Any]) -> str:
+    """The PROJECT folder's current HEAD sha, or "" when it cannot be read."""
+    repo = Path(str(row.get("repo_dir") or ""))
+    try:
+        if not repo.is_dir():
+            return ""
+        head = run_git(repo, "rev-parse", "HEAD", check=False)
+    except Exception:
+        return ""
+    return (head.stdout or "").strip() if head.returncode == 0 else ""
+
+
 def inspect_thread_worktree(row: Dict[str, Any]) -> Dict[str, Any]:
     """What removing this worktree would DESTROY — the evidence a removal needs.
 
-    Returns ``{exists, dirty, dirty_files, unmerged_commits, error}``. Never
-    raises: an unreadable checkout reports ``error`` and is treated as unsafe
-    (``dirty``), because "cannot tell" must never read as "nothing to lose".
+    Returns ``{exists, dirty, dirty_files, unmerged_commits, unmerged_against,
+    error}``. Never raises: an unreadable checkout reports ``error`` and is
+    treated as unsafe (``dirty``), because "cannot tell" must never read as
+    "nothing to lose".
+
+    ``unmerged_commits`` is counted against the PROJECT's current HEAD, not
+    against the frozen ``base_sha`` this checkout branched from. The question A10
+    asks is "what would the project folder never receive", and the answer moves
+    every time the project's HEAD does: counting against the branch point meant a
+    worktree whose work had ALREADY been merged back still reported every one of
+    those commits as unmerged, so the owner was asked to acknowledge destroying
+    work that was already safe in their folder. Evidence that cries wolf is worse
+    than no evidence, because the owner learns to click through it.
+
+    The base is the FALLBACK, and deliberately the conservative direction: when
+    the project's HEAD cannot be read, counting from the branch point can only
+    over-report, which refuses a removal rather than permitting one.
     """
     out: Dict[str, Any] = {
-        "exists": False, "dirty": False, "dirty_files": [], "unmerged_commits": 0, "error": "",
+        "exists": False, "dirty": False, "dirty_files": [], "unmerged_commits": 0,
+        "unmerged_against": "", "error": "",
     }
     wt_path = Path(str(row.get("path") or ""))
     if not wt_path.is_dir():
@@ -220,9 +247,10 @@ def inspect_thread_worktree(row: Dict[str, Any]) -> Dict[str, Any]:
         files = [line for line in status.stdout.splitlines() if line.strip()]
         out["dirty"] = bool(files)
         out["dirty_files"] = files[:200]
-        base = str(row.get("base_sha") or "")
-        if base:
-            ahead = run_git(wt_path, "rev-list", "--count", f"{base}..HEAD", check=False)
+        reference = _project_head(row) or str(row.get("base_sha") or "")
+        if reference:
+            out["unmerged_against"] = reference
+            ahead = run_git(wt_path, "rev-list", "--count", f"{reference}..HEAD", check=False)
             if ahead.returncode != 0:
                 out["error"] = (ahead.stderr or "git rev-list failed").strip()[:500]
                 out["dirty"] = True
@@ -257,6 +285,23 @@ def remove_thread_worktree(
     hazard that a moved root would ADMIT a path it should never have admitted.
     A pre-T3 row carries no provisioning root; it falls back to the resolved one,
     which is exactly the behaviour it was written under.
+
+    A CLEAN removal also deletes the ``thread/<name>`` branch, and that is a
+    decision rather than a tidy-up. ``provision_thread_worktree`` refuses to reuse
+    an existing branch — deliberately, so an owner's work is never clobbered — so
+    leaving the branch behind made branch → merge → remove a ONE-SHOT round trip:
+    the second branch-off of the same thread failed with "branch already exists"
+    and the owner had no surface that could delete it. The alternative considered
+    was suffixing the branch name with a timestamp, which was rejected: it makes
+    every thread's branch name unpredictable to the owner reading `git branch`,
+    and it accumulates dead branches in their repository forever.
+
+    Deleting is safe here precisely because "clean" is checked twice by two
+    independent judges: this module's inspection (no dirty tree, no commits the
+    project's HEAD lacks) AND ``git branch -d``, which refuses on its own account
+    if the branch holds anything unmerged. A removal the owner had to
+    ACKNOWLEDGE keeps its branch — those commits are the last copy of that work,
+    and the acknowledgement was about the checkout, not about the history.
     """
     key = _key(project_id, thread_id)
     root = Path(worktree_root).expanduser().resolve() if worktree_root else thread_worktree_root()
@@ -276,13 +321,45 @@ def remove_thread_worktree(
             # A malformed registry row must never delete an arbitrary path.
             return {"removed": False, "reason": "path_outside_root", "inspection": inspection}
         repo = Path(str(match.get("repo_dir") or "."))
+        branch = str(match.get("branch") or "").strip()
         run_git(repo, "worktree", "remove", "--force", str(wt_path), check=False)
         if wt_path.exists():
             force_rmtree(wt_path)
         run_git(repo, "worktree", "prune", check=False)
+        branch_removed, branch_kept_reason = _drop_clean_branch(repo, branch, unsafe)
         _save(data_dir, [row for row in rows if not _matches(row, key)])
         log.info("Thread worktree removed: %s#%s (%s)", key[0], key[1], wt_path)
-        return {"removed": True, "reason": "", "inspection": inspection}
+        return {
+            "removed": True,
+            "reason": "",
+            "inspection": inspection,
+            "branch": branch,
+            "branch_removed": branch_removed,
+            "branch_kept_reason": branch_kept_reason,
+        }
+
+
+def _drop_clean_branch(repo: Path, branch: str, unsafe: bool) -> tuple:
+    """Delete a thread branch that has nothing left to lose. ``(removed, why_kept)``.
+
+    ``git branch -d`` — never ``-D``. The safe form is the point: it is git's own
+    second opinion on whether the branch holds anything the repository would not
+    still have afterwards, and it refusing means the branch stays. A branch that
+    stays is disclosed with the reason, never silently.
+    """
+    if not branch or not branch.startswith(_BRANCH_PREFIX):
+        return False, "not a thread branch"
+    if unsafe:
+        # The owner acknowledged losing the CHECKOUT. Its commits are a separate
+        # thing and this is the last copy of them.
+        return False, "the checkout held unmerged work, so its branch keeps the commits"
+    try:
+        dropped = run_git(repo, "branch", "-d", branch, check=False)
+    except Exception as exc:
+        return False, f"the branch could not be deleted: {type(exc).__name__}: {exc}"
+    if dropped.returncode != 0:
+        return False, (dropped.stderr or dropped.stdout or "git refused to delete the branch").strip()[:300]
+    return True, ""
 
 
 __all__ = [

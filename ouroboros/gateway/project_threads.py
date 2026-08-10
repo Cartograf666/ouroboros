@@ -249,6 +249,14 @@ async def api_thread_worktree_remove(request: Request) -> JSONResponse:
             "reason": str(outcome.get("reason") or ""),
             "inspection": outcome.get("inspection") or {},
             "location": thread_location(drive_root, project_id, tid),
+            # A clean removal deletes the thread branch too, so the round trip
+            # branch → merge → remove → branch again is repeatable (T3R-5). A
+            # branch that SURVIVED says why, because it is what stops the next
+            # branch-off and the owner would otherwise meet that as a bare
+            # "branch already exists".
+            "branch": str(outcome.get("branch") or ""),
+            "branch_removed": bool(outcome.get("branch_removed")),
+            "branch_kept_reason": str(outcome.get("branch_kept_reason") or ""),
         }
         if payload["ok"]:
             _broadcast_thread_change(drive_root, project_id, tid)

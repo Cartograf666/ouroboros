@@ -615,6 +615,19 @@ class ThreadWorktreeResponse(TypedDict, total=False):
     head_after: str
     worktree_kept: bool
     removed: bool
+    #: A CLEAN removal deletes the ``thread/<name>`` branch too, so the same
+    #: thread can branch off again; a branch that SURVIVED reports why, because it
+    #: is exactly what the next branch-off would refuse on.
+    branch_removed: bool
+    branch_kept_reason: str
+    #: ``checkout_head_off_branch``: the branch the thread's checkout is actually
+    #: standing on, which is not the one being merged.
+    checkout_branch: str
+    #: ``merge_abort_failed``: a merge that could neither complete NOR be undone
+    #: left the project folder mid-merge, and says so rather than claiming the
+    #: folder was left as it was.
+    folder_left_mid_merge: bool
+    abort_detail: str
     inspection: Dict[str, Any]
     error: str
 
