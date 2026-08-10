@@ -14,9 +14,9 @@ import sys
 import time
 from typing import Any, Optional, Sequence
 
-from ouroboros.platform_layer import pid_lock_acquire as _compat_pid_lock_acquire
-from ouroboros.platform_layer import pid_lock_release as _compat_pid_lock_release
+from ouroboros.platform_layer import pid_lock_acquire as _compat_pid_lock_acquire, pid_lock_release as _compat_pid_lock_release
 from ouroboros.provider_models import compute_direct_review_models_fallback, local_only_review_route_env, migrate_model_value, review_model_uses_local as review_model_uses_local
+from ouroboros.secret_masking import strip_masked_secrets
 from ouroboros.update_channels import UPDATE_SETTINGS_DEFAULTS, normalize_update_channel
 
 
@@ -1145,7 +1145,7 @@ def prepare_settings_for_persist(settings: dict, *, authored_keys: Sequence[str]
         and str(v) == str(SETTINGS_DEFAULTS.get(k, "")))}
     _guard_context_mode_lowering(prepared, allow_context_lowering=allow_context_lowering)
     _guard_safety_mode_lowering(prepared, allow_safety_lowering=allow_safety_lowering)
-    return prepared
+    return strip_masked_secrets(prepared, known_setting_keys=SETTINGS_DEFAULTS)
 
 
 _SAFETY_MODE_RANK = {"full": 2, "light": 1, "off": 0}
@@ -1382,7 +1382,7 @@ def load_settings_lock_held() -> dict:
         loaded.pop(_retired, None)
     migrate_legacy_slot_keys(loaded)
     settings = dict(SETTINGS_DEFAULTS)
-    settings.update(loaded)
+    settings.update(strip_masked_secrets(loaded, known_setting_keys=SETTINGS_DEFAULTS))
     for key in SETTINGS_DEFAULTS:
         raw_env = os.environ.get(key)
         if raw_env is None or key in _DISK_AUTHORED_SETTINGS or key in ENDPOINT_AUTHORED_SETTINGS:  # DISK-authored

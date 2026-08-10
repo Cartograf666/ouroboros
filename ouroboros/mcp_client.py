@@ -23,6 +23,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from ouroboros.secret_masking import (
+    looks_masked_secret as looks_masked_secret,
+    mask_prefixed_secret,
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -331,25 +336,12 @@ def redact_servers_for_status(configs: List[MCPServerConfig]) -> List[Dict[str, 
                 "transport": cfg.transport,
                 "url": cfg.url,
                 "auth_header": cfg.auth_header,
-                "auth_token": _mask_token(cfg.auth_token),
+                "auth_token": mask_prefixed_secret(cfg.auth_token, visible_chars=4),
                 "auth_configured": cfg.has_auth(),
                 "allowed_tools": list(cfg.allowed_tools),
             }
         )
     return out
-
-
-def _mask_token(value: str) -> str:
-    text = str(value or "")
-    if not text:
-        return ""
-    return text[:4] + "..." if len(text) > 4 else "***"
-
-
-def looks_masked_secret(value: Any) -> bool:
-    text = str(value or "").strip()
-    return text in ("***", "***set***") or text.endswith("...")
-
 
 def _redact_error_text(text: Any, cfg: Optional[MCPServerConfig] = None) -> str:
     """Redact MCP secrets before surfacing transport errors to UI/LLM/logs."""

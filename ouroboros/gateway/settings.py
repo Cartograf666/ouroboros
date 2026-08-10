@@ -6,7 +6,6 @@ import asyncio
 import logging
 import os
 import pathlib
-import re
 import socket
 import sys
 from typing import Any, Dict, Optional
@@ -36,6 +35,13 @@ from ouroboros.gateway.owner_settings import (
 from ouroboros.onboarding_wizard import build_onboarding_html
 from ouroboros.platform_layer import is_container_env
 from ouroboros.provider_models import MINIMAX_REGION_ENDPOINTS, resolve_minimax_base_url
+from ouroboros.secret_masking import (
+    is_custom_secret_setting_key,
+    looks_masked_mcp_secret,
+    looks_masked_settings_secret,
+    mask_prefixed_secret,
+    mask_settings_secret,
+)
 from ouroboros.server_runtime import (
     apply_runtime_provider_defaults,
     classify_runtime_provider_change,
@@ -52,7 +58,6 @@ from ouroboros.utils import append_jsonl, utc_now_iso
 log = logging.getLogger(__name__)
 DEFAULT_PORT = int(os.environ.get("OUROBOROS_SERVER_PORT", "8765"))
 
-_CUSTOM_SECRET_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
 
 def _get_lan_ip() -> str:
     """Return LAN IP via UDP socket trick; no packet is sent."""
@@ -120,28 +125,6 @@ def _build_network_meta(bind_host: str, bind_port: int) -> dict:
     }
 
 
-# Password-class secrets are usually short human-chosen strings: an 8-char
-# prefix can BE most of the password. They mask to a constant placeholder;
-# long machine-generated API keys keep the recognizable 8-char prefix.
-_PASSWORD_CLASS_KEYS = {
-    "OUROBOROS_NETWORK_PASSWORD",
-    "GIGACHAT_PASSWORD",
-    "GIGACHAT_CREDENTIALS",
-}
-
-
-def _mask_password_class(value: Any) -> str:
-    return "***set***" if str(value or "").strip() else ""
-
-
-def _mask_secret_value(value: Any) -> str:
-    text = str(value or "")
-    return text[:8] + "..." if len(text) > 8 else "***"
-
-
-from ouroboros.mcp_client import looks_masked_secret as _looks_masked_secret
-
-
 def _mask_mcp_servers_payload(servers: Any) -> list:
     if not isinstance(servers, list):
         return []
@@ -158,7 +141,7 @@ def _mask_mcp_servers_payload(servers: Any) -> list:
             clone["id"] = _mcp_canonical_id(clone.get("id"))
         token = str(clone.get("auth_token") or "")
         if token:
-            clone["auth_token"] = _mask_secret_value(token)
+            clone["auth_token"] = mask_prefixed_secret(token, visible_chars=8)
             clone["auth_configured"] = True
         else:
             clone["auth_token"] = ""
@@ -190,7 +173,7 @@ def _rehydrate_mcp_servers_payload(incoming: Any, current: Any) -> list:
         if clone.get("id"):
             clone["id"] = _mcp_canonical_id(clone.get("id"))
         token = str(clone.get("auth_token") or "")
-        if _looks_masked_secret(token):
+        if looks_masked_mcp_secret(token):
             existing = current_by_id.get(_mcp_canonical_id(clone.get("id")))
             clone["auth_token"] = str((existing or {}).get("auth_token") or "")
         out.append(clone)
@@ -295,22 +278,21 @@ def _merge_settings_payload(current: Dict[str, Any], body: Dict[str, Any]) -> Di
             continue
         if key not in body:
             continue
-        # A mask means "keep the stored secret", so with nothing stored it is
-        # DROPPED: a client echoing back what it was served (the wizard does
-        # exactly that) must not be able to write the marker in as a credential.
-        if key in SECRET_SETTING_KEYS and _looks_masked_secret(body[key]):
+        # A placeholder means "field untouched", never a new secret — and never a
+        # credential worth persisting even when nothing is stored yet. Clearing
+        # stays explicit: the UI sends "" for its Clear action.
+        if key in SECRET_SETTING_KEYS and looks_masked_settings_secret(key, body[key]):
             continue
         merged[key] = body[key]
     for key, value in body.items():
         text_key = str(key or "").strip().upper()
         if text_key in _SETTINGS_DEFAULTS or text_key == "OUROBOROS_RUNTIME_MODE":
             continue
-        if not _CUSTOM_SECRET_KEY_RE.match(text_key):
+        if not is_custom_secret_setting_key(
+            text_key, known_setting_keys=_SETTINGS_DEFAULTS
+        ):
             continue
-        if text_key.startswith("OUROBOROS_"):
-            continue
-        # Same rule for owner-defined custom secret keys.
-        if _looks_masked_secret(value):
+        if looks_masked_settings_secret(text_key, value):
             continue
         merged[text_key] = value
     return merged
@@ -1108,17 +1090,15 @@ async def api_settings_get(request: Request) -> JSONResponse:
     safe = {k: v for k, v in settings.items()}
     for key in SECRET_SETTING_KEYS:
         if safe.get(key):
-            safe[key] = (
-                _mask_password_class(safe[key])
-                if key in _PASSWORD_CLASS_KEYS
-                else _mask_secret_value(safe[key])
-            )
+            safe[key] = mask_settings_secret(key, safe[key])
     safe["MCP_SERVERS"] = _mask_mcp_servers_payload(safe.get("MCP_SERVERS") or [])
     for key, value in list(safe.items()):
         if key in SECRET_SETTING_KEYS or key in _SETTINGS_DEFAULTS:
             continue
-        if _CUSTOM_SECRET_KEY_RE.match(str(key)) and value:
-            safe[key] = _mask_secret_value(value)
+        if is_custom_secret_setting_key(
+            key, known_setting_keys=_SETTINGS_DEFAULTS
+        ) and value:
+            safe[key] = mask_settings_secret(key, value)
     try:
         port = int(_port_file(request).read_text().strip()) if _port_file(request).exists() else _default_port(request)
     except (ValueError, OSError):
@@ -1128,7 +1108,7 @@ async def api_settings_get(request: Request) -> JSONResponse:
         key for key in settings
         if key not in SECRET_SETTING_KEYS
         and key not in _SETTINGS_DEFAULTS
-        and _CUSTOM_SECRET_KEY_RE.match(str(key))
+        and is_custom_secret_setting_key(key, known_setting_keys=_SETTINGS_DEFAULTS)
         and settings.get(key)
     )
     meta["setup_contract"] = build_setup_contract("web")
