@@ -210,7 +210,9 @@ def test_thread_minting_retries_past_a_reserved_chat_id(tmp_path):
     # Reserve exactly the chat id thread #1 would take, on another project.
     taken = thread_chat_id("racer", 1)
 
-    import ouroboros.projects_registry as registry
+    # The mint lives in the thread module, so that is where the contract call
+    # this test bends is resolved.
+    import ouroboros.project_threads_registry as registry
 
     real = registry.thread_chat_id
     thread = create_thread(tmp_path, "racer", name="first")
@@ -253,7 +255,7 @@ def test_duplicate_chat_ids_detected_on_load(tmp_path, caplog):
         {"id": "b", "name": "B", "chat_id": shared, "lifecycle": "active"},
     ]}), encoding="utf-8")
 
-    import ouroboros.projects_registry as registry
+    import ouroboros.project_threads_registry as registry
 
     registry._DUPLICATE_CHAT_ID_REPORTED.clear()
     with caplog.at_level("ERROR"):
