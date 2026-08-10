@@ -403,6 +403,16 @@ class ThreadEntry(TypedDict, total=False):
     stored; the project's top-level ``chat_id`` stays its compatibility alias.
     ``fork_of_chat_id`` + ``fork_before_ts`` are a CURSOR into the source
     thread's rows (rows are never copied) and appear together or not at all.
+
+    ``lifecycle``/``archived_at``/``delete_error`` are D4's thread lifecycle, and
+    they were SHIPPED on ``/api/state``, ``GET /api/projects`` and every
+    ``ThreadResponse`` before they were declared here: the canonical projection
+    normalises all three onto every row, and the client already reads
+    ``thread.lifecycle`` to decide what a thread menu may offer. Field-level
+    parity passed because both sides were equally wrong, which is the one failure
+    mode a mirror cannot catch on its own — so the projection's own key set is
+    pinned against this class as well. Thread #0 mirrors the PROJECT's lifecycle
+    (it IS the project) and never carries an ``archived_at`` of its own.
     """
 
     id: int
@@ -412,6 +422,9 @@ class ThreadEntry(TypedDict, total=False):
     visible_revision: int
     fork_of_chat_id: int
     fork_before_ts: str
+    lifecycle: Literal["active", "archived", "deleting", "tombstoned"]
+    archived_at: str
+    delete_error: str
 
 
 class ProjectEntry(TypedDict, total=False):

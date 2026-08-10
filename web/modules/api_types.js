@@ -301,6 +301,13 @@
  * chat_id stays its compatibility alias. fork_of_chat_id + fork_before_ts are a
  * CURSOR into the source thread's rows (rows are never copied) and appear
  * together or not at all.
+ *
+ * lifecycle/archived_at/delete_error are D4's thread lifecycle. They were SHIPPED
+ * on /api/state, GET /api/projects and every ThreadResponse before either side
+ * declared them — the canonical projection normalises all three onto every row,
+ * and project_thread_actions.js already reads thread.lifecycle — so field parity
+ * passed with both sides equally wrong. Thread #0 mirrors the PROJECT's lifecycle
+ * (it IS the project) and never carries an archived_at of its own.
  * @typedef {Object} ThreadEntry
  * @property {number=} id
  * @property {number=} chat_id
@@ -309,6 +316,9 @@
  * @property {number=} visible_revision
  * @property {number=} fork_of_chat_id
  * @property {string=} fork_before_ts
+ * @property {"active"|"archived"|"deleting"|"tombstoned"=} lifecycle
+ * @property {string=} archived_at
+ * @property {string=} delete_error
  */
 
 /**

@@ -364,3 +364,36 @@ def test_task_detail_cost_breakdown_emission_matches_contract(monkeypatch, tmp_p
     detail_hints = get_type_hints(TaskDetailResponse, include_extras=True)
     assert detail_hints["cost_breakdown"] is TaskCostBreakdown
     assert TaskDetailResponse.__required_keys__ == frozenset()
+
+
+def test_thread_entry_declares_every_field_the_projection_actually_ships(tmp_path):
+    """T3R2-B3: the field-level mirror cannot catch two sides that are equally wrong.
+
+    Live rows carry `lifecycle`, `archived_at` and `delete_error` on `/api/state`,
+    on `GET /api/projects` and inside every `ThreadResponse` — the canonical
+    projection normalises all three onto every row, and the client already reads
+    `thread.lifecycle` to decide what a thread menu may offer. Neither the Python
+    contract nor the JS typedef declared them, and ARCHITECTURE §11.3 asserted
+    that T3 had added them. Parity passed because both mirrors were wrong
+    identically, so this pins the projection ITSELF against the contract.
+    """
+    from ouroboros.project_threads_registry import project_threads
+    from ouroboros.projects_registry import create_project, create_thread
+
+    declared = set(get_type_hints(ThreadEntry, include_extras=True))
+    create_project(tmp_path, "racer", name="Racer")
+    forked_source = create_thread(tmp_path, "racer", name="Tuning")
+    from ouroboros.projects_registry import archive_thread, fork_thread, get_project
+
+    fork_thread(tmp_path, "racer", forked_source["id"])
+    archive_thread(tmp_path, "racer", forked_source["id"])
+    rows = project_threads(get_project(tmp_path, "racer"))
+
+    assert len(rows) >= 3, rows
+    shipped: set = set()
+    for row in rows:
+        shipped |= set(row)
+    assert shipped <= declared, f"ThreadEntry does not declare: {sorted(shipped - declared)}"
+    # And the three the lifecycle actually adds are really on every row.
+    for row in rows:
+        assert {"lifecycle", "archived_at", "delete_error"} <= set(row)
