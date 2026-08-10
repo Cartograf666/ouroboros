@@ -1,6 +1,6 @@
 #!/bin/bash
 # Install the built .deb and .rpm in stock distro containers and check that the
-# packaged CLI actually runs from /usr/bin after a real install.
+# packaged CLI and desktop launcher actually run after a real install.
 #
 # Two lanes, because they carry different risk:
 #
@@ -44,13 +44,27 @@ smoke_package() {
             command -v git >/dev/null
             test -f /usr/share/applications/ouroboros.desktop
             test -f /usr/share/pixmaps/ouroboros.png
+            test -x /opt/ouroboros/Ouroboros
             ouroboros --help >/dev/null
+            mkdir -p /tmp/ouroboros-smoke-home /tmp/ouroboros-smoke-data
+            set +e
+            HOME=/tmp/ouroboros-smoke-home \
+              XDG_CACHE_HOME=/tmp/ouroboros-smoke-home/.cache \
+              OUROBOROS_DATA_DIR=/tmp/ouroboros-smoke-data \
+              timeout --signal=TERM --kill-after=5s 5s /opt/ouroboros/Ouroboros
+            launcher_rc=\$?
+            set -e
+            if [ \"\$launcher_rc\" -ne 124 ]; then
+                echo \"desktop launcher exited before the smoke deadline (rc=\$launcher_rc)\" >&2
+                exit 1
+            fi
+            test -s /tmp/ouroboros-smoke-data/logs/launcher.log
         "
 }
 
 case "$LANE" in
     official)
-        smoke_package ubuntu:24.04 "$DEB" "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq"
+        smoke_package ubuntu:22.04 "$DEB" "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq"
         smoke_package fedora:42 "$RPM" "dnf install -y -q"
         smoke_package fedora:42 "$RPM_RED80" "dnf install -y -q"
         ;;

@@ -1640,11 +1640,14 @@ The smoke checks require the embedded repository bundle, run the packaged CLI
 with `--help` in an isolated home directory, then use the embedded Claudexor
 seed and Node from that extracted final artifact to perform install, extraction,
 exact identity probe, owned-daemon handshake, one fake task, and an
-identity-bound graceful stop of the serving closure. The Linux shard then wraps
-that proven x86_64 payload into `.deb`, generic `.rpm`, and RED OS 8 `.rpm`
-assets. Their metadata declares Git, which packaged bootstrap requires; the
-gating smoke installs through `apt` or `dnf` in stock Ubuntu/Fedora and proves
-dependency resolution, desktop integration, and the real packaged CLI. Vendor
+identity-bound graceful stop of the serving closure. The Linux shard builds
+PyInstaller under the pinned portable interpreter so the runner's glibc cannot
+leak into the desktop launcher's libpython, then wraps that proven x86_64
+payload into `.deb`, generic `.rpm`, and RED OS 8 `.rpm` assets. Their metadata
+declares Git, which packaged bootstrap requires; the gating smoke installs
+through `apt` or `dnf` in Ubuntu 22.04/current Fedora and proves dependency
+resolution, desktop integration, the real packaged CLI, and a bounded
+desktop-launcher start. Vendor
 image smokes for Astra Linux and RED OS are non-blocking evidence, and their
 outcome is reported without becoming release authority. The separate
 Claudexor platform gate repeats that fixture path on ordinary branch changes and

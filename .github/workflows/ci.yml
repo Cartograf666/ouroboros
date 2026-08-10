@@ -837,7 +837,8 @@ jobs:
               --check package_install \
               --check runtime_dependency \
               --check packaged_cli_help \
-              --check desktop_entry
+              --check desktop_entry \
+              --check desktop_launcher_start
             cp "$PAYLOAD_SBOM" "dist/sbom-$1.cdx.json"
           }
           record linux-deb-amd64 "${{ steps.linux_packages.outputs.deb }}"

@@ -251,6 +251,27 @@ def test_linux_packages_declare_and_resolve_the_git_runtime_dependency():
     assert "rpm --install" not in smoke
 
 
+def test_linux_rpm_stage_recreates_the_absolute_cli_symlink():
+    builder = (REPO / "scripts" / "build_linux_packages.sh").read_text(encoding="utf-8")
+
+    assert 'cp -al "$ROOT"/. %{buildroot}/' not in builder
+    assert 'cp -al "$ROOT/opt/ouroboros" "%{buildroot}/opt/ouroboros"' in builder
+    assert (
+        'ln -s /opt/ouroboros/bin/ouroboros '
+        '"%{buildroot}/usr/bin/ouroboros"'
+    ) in builder
+
+
+def test_linux_package_smoke_starts_the_desktop_launcher_on_ubuntu_22_04():
+    smoke = (REPO / "scripts" / "smoke_linux_packages.sh").read_text(encoding="utf-8")
+
+    assert "ubuntu:22.04" in smoke
+    assert "test -x /opt/ouroboros/Ouroboros" in smoke
+    assert "timeout --signal=TERM --kill-after=5s 5s /opt/ouroboros/Ouroboros" in smoke
+    assert "desktop launcher exited before the smoke deadline" in smoke
+    assert "ouroboros-smoke-data/logs/launcher.log" in smoke
+
+
 def test_vendor_distro_smoke_is_informational_and_never_gates_a_release():
     workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     vendor_job = workflow[
@@ -323,6 +344,7 @@ def test_release_workflow_orders_smoke_sbom_attestation_and_draft_verification()
     assert "bash scripts/smoke_linux_packages.sh" in workflow
     assert "--check package_install" in workflow
     assert "--check runtime_dependency" in workflow
+    assert "--check desktop_launcher_start" in workflow
     assert "release-artifacts/ouroboros_*_amd64.deb" in workflow
     assert "release-artifacts/ouroboros-*-1.x86_64.rpm" in workflow
     assert "release-artifacts/ouroboros-*-1.red80.x86_64.rpm" in workflow

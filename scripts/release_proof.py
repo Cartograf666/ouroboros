@@ -44,7 +44,13 @@ COMMON_SMOKE_CHECKS = frozenset(
 # release-gating lane counts here: the Astra Linux and RED OS runs are
 # informational and cannot be required of a receipt.
 PACKAGE_SMOKE_CHECKS = frozenset(
-    {"package_install", "runtime_dependency", "packaged_cli_help", "desktop_entry"}
+    {
+        "package_install",
+        "runtime_dependency",
+        "packaged_cli_help",
+        "desktop_entry",
+        "desktop_launcher_start",
+    }
 )
 REQUIRED_SMOKE_CHECKS = {
     "macos-arm64": COMMON_SMOKE_CHECKS

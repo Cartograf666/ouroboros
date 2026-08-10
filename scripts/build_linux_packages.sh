@@ -128,8 +128,20 @@ Ships a self-contained Python, Node.js and browser runtime under
 
 %install
 rm -rf %{buildroot}
-mkdir -p %{buildroot}
-cp -al "$ROOT"/. %{buildroot}/
+mkdir -p \
+  "%{buildroot}/opt" \
+  "%{buildroot}/usr/bin" \
+  "%{buildroot}/usr/share/applications" \
+  "%{buildroot}/usr/share/pixmaps"
+# Keep the multi-gigabyte payload hardlinked inside the output-local stage,
+# but recreate the absolute CLI symlink explicitly. Some rpmbuild/cp
+# combinations try to hardlink its missing target when copying the whole root.
+cp -al "$ROOT/opt/ouroboros" "%{buildroot}/opt/ouroboros"
+ln -s /opt/ouroboros/bin/ouroboros "%{buildroot}/usr/bin/ouroboros"
+cp -a "$ROOT/usr/share/applications/ouroboros.desktop" \
+  "%{buildroot}/usr/share/applications/ouroboros.desktop"
+cp -a "$ROOT/usr/share/pixmaps/ouroboros.png" \
+  "%{buildroot}/usr/share/pixmaps/ouroboros.png"
 
 %files
 %defattr(-,root,root,-)

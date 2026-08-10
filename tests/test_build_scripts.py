@@ -295,6 +295,18 @@ class TestBuildLinuxSh:
         assert pi_pos != -1
         assert bundle_pos < pi_pos, "repo bundle generation must happen before PyInstaller in build_linux.sh"
 
+    def test_pyinstaller_uses_the_packaged_portable_python(self):
+        src = _read("build_linux.sh")
+        assert 'PORTABLE_PYTHON="python-standalone/bin/python3"' in src
+        assert '"$PORTABLE_PYTHON" -m venv "$BUILD_VENV"' in src
+        assert (
+            '"$BUILD_PYTHON" -m pip install -q -r requirements-launcher.txt '
+            '"pyinstaller>=6.0"'
+        ) in src
+        assert '"$BUILD_PYTHON" -m PyInstaller Ouroboros.spec' in src
+        assert '"$PORTABLE_PYTHON" -m pip install -q -r requirements-launcher.txt' not in src
+        assert '"$HOST_PYTHON_CMD" -m PyInstaller' not in src
+
     def test_ripgrep_download_before_pyinstaller(self):
         src = _read("build_linux.sh")
         rg_pos = src.find("download_ripgrep_standalone.sh")
