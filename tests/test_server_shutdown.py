@@ -96,6 +96,33 @@ def test_ordinary_restart_disarms_orphan_update_intent(monkeypatch):
     assert calls == ["clear", "restart"]
 
 
+def test_restart_deferred_while_assisted_merge_is_being_resolved(monkeypatch):
+    """Regression pin for the restart guard: while an assisted managed-update merge is
+    mid-resolution (any assisted phase), _safe_restart_serialized must DEFER the restart
+    instead of running the checkout/reset that would wipe the resolver's worktree."""
+    import server
+    import supervisor.update_merge as update_merge
+
+    monkeypatch.setattr(update_merge, "acquire_update_lock", lambda: object())
+    monkeypatch.setattr(update_merge, "release_update_lock", lambda _lock: None)
+    for phase in ("materializing_assisted", "assisted_resolution", "committing_assisted"):
+        monkeypatch.setattr(
+            update_merge, "read_update_tx_strict",
+            lambda phase=phase: ("valid", {"phase": phase, "task_id": "resolver"}),
+        )
+
+        ok, message = server._safe_restart_serialized(
+            lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("restart must be deferred during assisted resolution")
+            ),
+            reason="owner_restart",
+            unsynced_policy="rescue_and_reset",
+        )
+
+        assert ok is False, phase
+        assert "deferred" in message.lower()
+
+
 def test_supervisor_startup_restores_queue_before_worker_reset():
     """A fresh process must not overwrite the durable queue with its empty memory."""
     import inspect

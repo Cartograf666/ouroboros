@@ -1,7 +1,8 @@
 """Tests for the AUTOMATED assisted managed-update merge (P2/SC2) — native MERGE_HEAD staged
 in a real temp repo, the tx authorization gate, the conflict-marker gate, merge-state
-classification, and non-destructive boot recovery."""
+classification, non-destructive boot recovery, and the rescue-before-rollback hook."""
 
+import json
 import subprocess
 from types import SimpleNamespace
 
@@ -260,7 +261,9 @@ def test_cancelled_resolver_task_done_keeps_event_authority(tmp_path, monkeypatc
 
 
 def test_assisted_objective_is_truthful_for_any_conflict_free_reviewed_merge():
-    objective = update_merge._assisted_objective({
+    from supervisor.update_merge_policy import assisted_objective
+
+    objective = assisted_objective({
         "target_sha": "b" * 40,
         "conflict_paths": [],
     })
@@ -269,6 +272,8 @@ def test_assisted_objective_is_truthful_for_any_conflict_free_reviewed_merge():
     assert "combines local and official history" in objective
     assert "conflicts are marked" not in objective
     assert "see `git status` for unmerged paths" not in objective
+    # No prior rescue on the tx → the objective must not invent one.
+    assert "was rescued to" not in objective
 
 
 def test_boot_resume_does_not_enqueue_a_duplicate_assisted_resolver(monkeypatch):
@@ -689,3 +694,279 @@ def test_dirty_local_work_is_in_the_reviewed_diff(tmp_path, monkeypatch):
     staged = _git(repo, "diff", "--cached", "--name-only", plan["base_sha"]).stdout.split()
     assert "secret_local.txt" in staged, staged
     assert "b.txt" in staged  # the official change is in the same reviewed diff
+
+
+def _stub_worker_gates(monkeypatch):
+    """Neutral worker-pool/admission stubs for rollback paths (parallel-safe)."""
+    import supervisor.workers as workers
+
+    monkeypatch.setattr(workers, "ensure_worker_pool_started", lambda **_kwargs: True)
+    monkeypatch.setattr(workers, "close_repo_writer_admission", lambda reason: None)
+    monkeypatch.setattr(workers, "open_repo_writer_admission", lambda expected_reason="": None)
+
+
+def _supervisor_events(tmp_path, event_type):
+    path = tmp_path / "data" / "logs" / "supervisor.jsonl"
+    if not path.is_file():
+        return []
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [row for row in rows if row.get("type") == event_type]
+
+
+def _materialized_conflict_tx(tmp_path, monkeypatch):
+    """A live materialized assisted merge with an UNCOMMITTED resolution in the worktree."""
+    repo, head, plan = _conflict_repo(tmp_path, monkeypatch)
+    ok, msg = update_merge.materialize_assisted_merge_live(
+        head, plan["local_snapshot"], plan["target_sha"], plan["base_sha"]
+    )
+    assert ok, msg
+    (repo / "a.txt").write_text("the resolver's precious resolution\n")
+    tx = {
+        "phase": "assisted_resolution", "task_id": "resolver",
+        "pre_update_sha": plan["base_sha"], "pre_update_branch": head,
+        "local_snapshot": plan["local_snapshot"], "target_sha": plan["target_sha"],
+    }
+    update_merge.write_update_tx(tx)
+    return repo, head, plan, tx
+
+
+def test_orphan_rollback_rescues_uncommitted_resolutions(tmp_path, monkeypatch):
+    repo, head, plan, tx = _materialized_conflict_tx(tmp_path, monkeypatch)
+    _stub_worker_gates(monkeypatch)
+    # A rollback rescue must never flip an active evolution transaction to "abandoned".
+    monkeypatch.setattr(
+        git_ops, "_link_rescue_to_evolution_transaction",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("rollback rescue must not link to the evolution tx")
+        ),
+    )
+
+    result = update_merge.abort_orphaned_assisted_tx("resolver", _authority_metadata(tx))
+
+    assert result.get("rolled_back") is True, result
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == plan["base_sha"]
+    rescue_dirs = list((tmp_path / "data" / "archive" / "rescue").iterdir())
+    assert len(rescue_dirs) == 1
+    assert "the resolver's precious resolution" in (
+        rescue_dirs[0] / "changes.diff"
+    ).read_text(encoding="utf-8")
+    meta = json.loads((rescue_dirs[0] / "rescue_meta.json").read_text(encoding="utf-8"))
+    assert meta["reason"] == "managed_update_rollback:assisted_resolution_orphaned"
+    assert meta["merge_head"] == plan["target_sha"]
+    assert int(meta["unmerged_count"]) > 0
+    assert meta["rescue_stash_error"]  # stash create fails on an unmerged index — disclosed
+    assert (rescue_dirs[0] / "unmerged.txt").read_text(encoding="utf-8").strip()
+    # The hook writes its own durable line BEFORE the destructive reset — a crash
+    # between clear_update_tx and the terminal event cannot hide the rescue.
+    captured = _supervisor_events(tmp_path, "managed_update_rescue_captured")
+    assert captured and captured[-1]["rescue_path"] == str(rescue_dirs[0])
+    rolled = _supervisor_events(tmp_path, "managed_update_rolled_back")
+    assert rolled and rolled[-1]["rescue_path"] == str(rescue_dirs[0])
+    assert rolled[-1]["reason"] == "assisted_resolution_orphaned"
+    assert rolled[-1].get("rescue_ts")
+
+
+def test_boot_cap_rollback_rescues_before_reset(tmp_path, monkeypatch):
+    repo, head, plan, tx = _materialized_conflict_tx(tmp_path, monkeypatch)
+    tx["resolution_attempts"] = 4  # past _ASSISTED_BOOT_ATTEMPT_CAP on the next boot
+    update_merge.write_update_tx(tx)
+    _stub_worker_gates(monkeypatch)
+
+    result = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)
+
+    assert result.get("rolled_back") is True, result
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == plan["base_sha"]
+    rescue_dirs = list((tmp_path / "data" / "archive" / "rescue").iterdir())
+    assert len(rescue_dirs) == 1
+    assert "the resolver's precious resolution" in (
+        rescue_dirs[0] / "changes.diff"
+    ).read_text(encoding="utf-8")
+    rolled = _supervisor_events(tmp_path, "managed_update_rolled_back")
+    assert rolled and rolled[-1]["rescue_path"] == str(rescue_dirs[0])
+    assert rolled[-1]["reason"] == "assisted_resolution_expired"
+
+
+def test_rollback_on_clean_tree_creates_no_rescue(tmp_path, monkeypatch):
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    pre = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    update_merge.write_update_tx({
+        "phase": "pending_boot_smoke", "pre_update_sha": pre, "pre_update_branch": head,
+    })
+    _stub_worker_gates(monkeypatch)
+
+    ok, _message = update_merge.rollback_managed_update("clean_tree_test")
+
+    assert ok is True
+    assert not (tmp_path / "data" / "archive" / "rescue").exists()
+    rolled = _supervisor_events(tmp_path, "managed_update_rolled_back")
+    assert rolled
+    assert "rescue_path" not in rolled[-1]
+    assert "rescue_error" not in rolled[-1]
+
+
+def test_rollback_replay_does_not_duplicate_rescue(tmp_path, monkeypatch):
+    """No second snapshot when the tx ALREADY CARRIES a written rollback_rescue marker.
+
+    Honest scope (accepted residual): the guarantee is at-least-once, not exactly-once —
+    a crash in the window between creating the rescue dir and writing the tx marker
+    replays the rescue and can leave one extra rescue dir on disk. That duplicate is
+    cheap and durable; a two-phase planned/captured protocol was explicitly declined
+    (Proportionality). This test pins the replay-with-marker case only."""
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    pre = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "a.txt").write_text("dirt from the attempt that was already rescued\n")
+    update_merge.write_update_tx({
+        "phase": "rolling_back", "pre_update_sha": pre, "pre_update_branch": head,
+        "rollback_rescue": {"path": "/rescued/earlier", "ref": "refs/rescue/x", "reason": "first"},
+    })
+    _stub_worker_gates(monkeypatch)
+    monkeypatch.setattr(
+        git_ops, "rescue_before_destructive_rollback",
+        lambda reason, **_kw: (_ for _ in ()).throw(
+            AssertionError("a rollback replay must not take a second rescue")
+        ),
+    )
+
+    ok, _message = update_merge.rollback_managed_update("replay")
+
+    assert ok is True
+    rolled = _supervisor_events(tmp_path, "managed_update_rolled_back")
+    assert rolled and rolled[-1]["rescue_path"] == "/rescued/earlier"
+    assert rolled[-1]["rescue_ref"] == "refs/rescue/x"
+
+
+def test_rescue_failure_is_fail_open_and_disclosed(tmp_path, monkeypatch):
+    """Owner decision 4=A: a failed rescue never blocks the rollback — it is disclosed."""
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    pre = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "a.txt").write_text("dirty work the rescue could not save\n")
+    update_merge.write_update_tx({
+        "phase": "pending_boot_smoke", "pre_update_sha": pre, "pre_update_branch": head,
+    })
+    _stub_worker_gates(monkeypatch)
+    monkeypatch.setattr(
+        git_ops, "_create_rescue_snapshot",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("disk full")),
+    )
+
+    ok, _message = update_merge.rollback_managed_update("rescue_fail")
+
+    assert ok is True
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == pre
+    rolled = _supervisor_events(tmp_path, "managed_update_rolled_back")
+    assert rolled and "disk full" in rolled[-1]["rescue_error"]
+    assert "rescue_path" not in rolled[-1]
+    # The hook also wrote its own durable failure line before the reset.
+    failed = _supervisor_events(tmp_path, "managed_update_rescue_failed")
+    assert failed and "disk full" in failed[-1]["error"]
+    assert failed[-1]["reason"] == "rescue_fail"
+
+
+def test_failed_rollback_attempt_drops_marker_and_retry_rescues_fresh_tree(tmp_path, monkeypatch):
+    """The rescue marker is per-ATTEMPT, not per-tx. A transient failure of the first
+    destructive step must drop the just-written marker so the retry re-rescues the
+    tree it actually finds — including second-generation work written in between."""
+    import pathlib
+
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    pre = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "a.txt").write_text("first-generation resolution\n")
+    update_merge.write_update_tx({
+        "phase": "assisted_resolution", "task_id": "resolver",
+        "pre_update_sha": pre, "pre_update_branch": head,
+    })
+    _stub_worker_gates(monkeypatch)
+    real_git_capture = git_ops.git_capture
+    armed = {"on": True}
+
+    def flaky(cmd):  # one transient failure (index.lock class) on the first reset
+        if armed["on"] and cmd == ["git", "reset", "--hard", "HEAD"]:
+            armed["on"] = False
+            return 1, "", "fatal: Unable to create '.git/index.lock': File exists."
+        return real_git_capture(cmd)
+
+    monkeypatch.setattr(git_ops, "git_capture", flaky)
+
+    ok1, msg1 = update_merge.rollback_managed_update("attempt_one")
+
+    assert ok1 is False and "reset failed" in msg1
+    assert len(list((tmp_path / "data" / "archive" / "rescue").iterdir())) == 1
+    # The stale first-attempt marker is gone — the retry re-runs the hook.
+    assert "rollback_rescue" not in update_merge.read_update_tx()
+
+    # The tree keeps moving before the retry (second-generation work).
+    (repo / "a.txt").write_text("SECOND-GENERATION resolution\n")
+    (repo / "brand_new_untracked.txt").write_text("also new\n")
+
+    ok2, _msg2 = update_merge.rollback_managed_update("attempt_two")
+
+    assert ok2 is True
+    rescue_dirs = sorted((tmp_path / "data" / "archive" / "rescue").iterdir())
+    assert len(rescue_dirs) == 2, "the retry must take a FRESH rescue of the moved tree"
+    rolled = _supervisor_events(tmp_path, "managed_update_rolled_back")
+    latest = pathlib.Path(rolled[-1]["rescue_path"])
+    assert "SECOND-GENERATION resolution" in (latest / "changes.diff").read_text(encoding="utf-8")
+    assert (latest / "untracked" / "brand_new_untracked.txt").exists()
+
+
+def test_boot_rematerialize_rescues_dirty_work_and_points_resolver_at_it(tmp_path, monkeypatch):
+    """The re-materialization reset (boot resume, has_progress=False) rescues surviving
+    dirty resolutions, persists the tx pointer BEFORE materialize runs (a crash inside
+    it must not lose the pointer), and the resumed resolver's objective points at it.
+    A further boot keeps that pointer, because `materialize_assisted_merge_live` sets
+    MERGE_HEAD and dirties the tree WITHOUT replaying the rescued edits — dropping the
+    pointer on those two signals would lose the rescue nobody has read yet."""
+    import supervisor.queue as queue
+    import supervisor.workers as workers
+
+    repo, head, plan, _tx = _materialized_conflict_tx(tmp_path, monkeypatch)
+    (repo / "a.txt").write_text("half-finished resolution\n")
+    # The residual class: MERGE_HEAD lost while dirty resolution work survives.
+    (repo / ".git" / "MERGE_HEAD").unlink()
+    assert update_merge._merge_head_sha() == ""
+    _stub_worker_gates(monkeypatch)
+    monkeypatch.setattr(workers, "PENDING", [])
+    monkeypatch.setattr(workers, "RUNNING", {})
+    captured = []
+    monkeypatch.setattr(queue, "enqueue_task", lambda task, front=False: captured.append(task))
+    persisted_before_materialize = []
+    real_materialize = update_merge.materialize_assisted_merge_live
+
+    def spying_materialize(*args, **kwargs):
+        persisted_before_materialize.append(
+            (update_merge.read_update_tx().get("progress_rescue") or {}).get("path")
+        )
+        return real_materialize(*args, **kwargs)
+
+    monkeypatch.setattr(update_merge, "materialize_assisted_merge_live", spying_materialize)
+
+    result = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)
+
+    assert result.get("resumed") is True, result
+    rescue_dirs = list((tmp_path / "data" / "archive" / "rescue").iterdir())
+    assert len(rescue_dirs) == 1
+    assert "half-finished resolution" in (
+        rescue_dirs[0] / "changes.diff"
+    ).read_text(encoding="utf-8")
+    # The durable pointer was already on disk when materialize started.
+    assert persisted_before_materialize == [str(rescue_dirs[0])]
+    stored = update_merge.read_update_tx()
+    assert stored["progress_rescue"]["path"] == str(rescue_dirs[0])
+    meta = json.loads((rescue_dirs[0] / "rescue_meta.json").read_text(encoding="utf-8"))
+    assert meta["reason"] == "managed_update_rescue:assisted_rematerialize"  # not rollback:*
+    assert captured, "the resumed resolver task must be enqueued"
+    assert str(rescue_dirs[0]) in captured[0]["text"]
+    assert "do not run git commands" in captured[0]["text"]
+    # Second boot with the merge state intact (has_progress=True). "MERGE_HEAD +
+    # dirty" is exactly what the materialize above just produced, and materialize
+    # never re-applies the rescued edits — so this state is NOT evidence that the
+    # work came back, and the pointer must survive into the next objective.
+    result2 = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)
+    assert result2.get("resumed") is True, result2
+    assert update_merge.read_update_tx()["progress_rescue"]["path"] == str(rescue_dirs[0])
+    assert str(rescue_dirs[0]) in captured[-1]["text"]
+    assert "was rescued to" in captured[-1]["text"]

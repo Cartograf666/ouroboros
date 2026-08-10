@@ -857,24 +857,38 @@ def rollback_managed_update(
         return False, "rollback could not clear update intent before restoring the repository"
     if resume_with_restored_work:
         return _finish_rollback(tx, pre, branch, reason, "", reopen_writer_admission)
+    # Fresh rescue BEFORE the destructive reset; the persisted pointer is the replay guard.
+    if not tx.get("rollback_rescue"):
+        _g.rescue_into_tx(tx, key="rollback_rescue", reason=str(reason),
+                          context="rollback", writer=write_update_tx)
+
+    def _fail(message: str) -> Tuple[bool, str]:
+        # Drop the marker (best-effort) so a RETRY re-rescues the tree it actually finds.
+        if tx.pop("rollback_rescue", None) is not None:
+            try:
+                write_update_tx(tx)
+            except Exception:
+                _g.log.warning("could not drop the stale rollback_rescue marker", exc_info=True)
+        return False, message
+
     rc_h, cur_head, _he = _g.git_capture(["git", "rev-parse", "--short", "HEAD"])
     if rc_h == 0 and cur_head:
         _g.git_capture(["git", "branch", "-f", f"failed-update-{cur_head}", "HEAD"])
     rc0, _o0, e0 = _g.git_capture(["git", "reset", "--hard", "HEAD"])
     if rc0 != 0:
-        return False, f"rollback reset failed before checkout: {e0}"
+        return _fail(f"rollback reset failed before checkout: {e0}")
     rc_clean0, _co0, ce0 = _g.git_capture(["git", "clean", "-fd"])
     if rc_clean0 != 0:
-        return False, f"rollback clean failed before checkout: {ce0}"
+        return _fail(f"rollback clean failed before checkout: {ce0}")
     rc1, _o1, e1 = _g.git_capture(["git", "checkout", "-B", branch, pre])
     if rc1 != 0:
-        return False, f"rollback checkout -B {branch} {pre[:12]} failed: {e1}"
+        return _fail(f"rollback checkout -B {branch} {pre[:12]} failed: {e1}")
     rc2, _o2, e2 = _g.git_capture(["git", "reset", "--hard", pre])
     if rc2 != 0:
-        return False, f"rollback reset --hard {pre[:12]} failed: {e2}"
+        return _fail(f"rollback reset --hard {pre[:12]} failed: {e2}")
     rc_clean, _co, clean_error = _g.git_capture(["git", "clean", "-fd"])
     if rc_clean != 0:
-        return False, f"rollback clean failed: {clean_error}"
+        return _fail(f"rollback clean failed: {clean_error}")
     rc_h2, restored_head, head_error = _g.git_capture(["git", "rev-parse", "--verify", "HEAD"])
     rc_b2, restored_branch, branch_error = _g.git_capture(
         ["git", "rev-parse", "--abbrev-ref", "HEAD"]
@@ -891,7 +905,7 @@ def rollback_managed_update(
         or not managed_update_constitution_present("HEAD")
     ):
         detail = head_error or branch_error or status_error or "rollback verification mismatch"
-        return False, f"rollback could not be verified: {detail}"
+        return _fail(f"rollback could not be verified: {detail}")
     stash_note = ""
     stash_sha = str(tx.get("stash_sha") or "")
     if stash_sha:
@@ -924,10 +938,13 @@ def _finish_rollback(
         return False, "rollback restored the repository but could not close writer admission"
     if not clear_update_tx():
         return False, "rollback restored the repository but could not clear update transaction"
+    rescue = tx.get("rollback_rescue") if isinstance(tx.get("rollback_rescue"), dict) else {}
     append_jsonl(
         _g.DRIVE_ROOT / "logs" / "supervisor.jsonl",
         {"ts": utc_now_iso(), "type": "managed_update_rolled_back", "reason": reason,
-         "pre_update_sha": pre, "branch": branch},
+         "pre_update_sha": pre, "branch": branch,
+         **{f"rescue_{key}": rescue[key] for key in ("path", "ref", "ts") if rescue.get(key)},
+         **({"rescue_error": tx["rollback_rescue_error"]} if tx.get("rollback_rescue_error") else {})},
     )
     if reopen_writer_admission:
         try:
@@ -940,29 +957,6 @@ def _finish_rollback(
     if stash_note:
         message += f"; {stash_note}"
     return True, message
-
-
-def _assisted_objective(tx: Dict[str, Any]) -> str:
-    target = str(tx.get("target_sha") or "")[:12]
-    conflicts = list(tx.get("conflict_paths") or [])
-    if conflicts:
-        work = (
-            f"Resolve each conflicting file ({', '.join(conflicts)}), preserve both intents "
-            "where possible, and remove every conflict marker (<<<<<<<, =======, >>>>>>>)."
-        )
-    else:
-        work = (
-            "The merge itself is clean, but it combines local and official history and therefore "
-            "requires review. Inspect the staged combination and correct it if needed."
-        )
-    return (
-        f"A managed Ouroboros update (target {target}) has been merged into your working tree by the "
-        "supervisor: MERGE_HEAD is set and the combined tree is staged for review. Do NOT run any git "
-        "command (fetch/merge/commit/checkout are blocked) — the merge is already staged for you. "
-        f"{work} Do not discard either side merely because a file is normally restricted. When ready, "
-        "run `advisory_review` with the commit message, then `commit_reviewed` (it will create the reviewed "
-        "2-parent merge commit), then `request_restart` to finish landing the update."
-    )
 
 
 def ensure_assisted_resolver_ready(expected_sha: str, timeout_sec: float = 90.0) -> bool:
@@ -1011,11 +1005,12 @@ def enqueue_assisted_resolution_task(tx: Dict[str, Any]) -> str:
     structured metadata stay in one place. Returns the task id."""
     from supervisor import workers
     from supervisor.queue import _queue_lock, enqueue_task
+    from supervisor.update_merge_policy import assisted_objective
 
     task_id = str(tx.get("task_id") or "")
     task = {
         "id": task_id,
-        "text": _assisted_objective(tx),
+        "text": assisted_objective(tx),
         "type": "task",
         "chat_id": int(tx.get("owner_chat_id") or 0),
         "metadata": {
@@ -1248,7 +1243,13 @@ def _recover_assisted_on_boot(tx: Dict[str, Any], supervisor_ready: bool) -> Dic
         # progress when MERGE_HEAD + a dirty tree already survived.
         rc_d, dirty, _de = _g.git_capture(["git", "status", "--porcelain"])
         has_progress = bool(_merge_head_sha()) and rc_d == 0 and bool(dirty.strip())
+        rescue_info: Dict[str, Any] = {}
         if not has_progress:
+            # Re-materialization hard-resets the tree: rescue surviving dirty work; the
+            # pointer persists BEFORE materialize and reaches the objective via enqueue.
+            rescue_info = _g.rescue_into_tx(
+                tx, key="progress_rescue", reason="assisted_rematerialize",
+                context="rematerialize", writer=write_update_tx)
             ok, msg = materialize_assisted_merge_live(
                 str(tx.get("pre_update_branch") or _g.BRANCH_DEV),
                 str(tx.get("local_snapshot") or ""),
@@ -1268,7 +1269,8 @@ def _recover_assisted_on_boot(tx: Dict[str, Any], supervisor_ready: bool) -> Dic
         write_update_tx(tx)
         enqueue_assisted_resolution_task(tx)
         _log_supervisor({"type": "managed_update_assisted_resumed",
-                         "resolution_attempts": attempts, "preserved_progress": has_progress})
+                         "resolution_attempts": attempts, "preserved_progress": has_progress,
+                         **({"progress_rescue_error": rescue_info["error"]} if rescue_info.get("error") else {})})
         return {"finalized": False, "resumed": True, "resolution_attempts": attempts}
     # unknown: do not touch the tree; leave the tx for the owner / a later boot.
     _log_supervisor({"type": "managed_update_assisted_unknown_state"})
