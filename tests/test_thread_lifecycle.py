@@ -232,3 +232,116 @@ def test_the_queue_warning_stays_silent_when_the_queue_cannot_be_read():
     assert _project_lane_wait_suffix(
         {"id": "t1", "project_id": "racer", "workspace_root": "/w/racer"}, Unreadable(),
     ) == ""
+
+
+def test_an_archived_thread_can_be_ASKED_for_so_restore_is_reachable(project):
+    """T3R-8. `projects_summary` is the ONLY projection that lists threads, and it
+    filtered archived ones out unconditionally.
+
+    That made archive a ONE-WAY trip by construction: no surface the owner could
+    reach ever carried an archived thread, so `POST …/restore` and the `restore`
+    row in the thread menu could not be rendered, let alone clicked. Restoring
+    something requires a surface that can show it first.
+    """
+    thread = create_thread(project, "racer", name="Side quest")
+    tid = int(thread["id"])
+    archive_thread(project, "racer", tid)
+
+    # The default is unchanged — the sidebar still hides it.
+    assert _visible_ids(project) == [MAIN_THREAD_ID]
+
+    asked = projects_summary(project, include_archived=True)[0]["threads"]
+    assert [int(row["id"]) for row in asked] == [MAIN_THREAD_ID, tid]
+    assert next(row for row in asked if int(row["id"]) == tid)["lifecycle"] == THREAD_ARCHIVED
+    # And from there restore is a real gesture again.
+    assert restore_thread(project, "racer", tid)["lifecycle"] == THREAD_ACTIVE
+    assert _visible_ids(project) == [MAIN_THREAD_ID, tid]
+
+
+def test_asking_for_archived_threads_never_reveals_a_tombstoned_one(project):
+    """`include_archived` widens ONE lifecycle. A tombstoned thread really is
+    gone, and its id is reserved forever."""
+    thread = create_thread(project, "racer", name="Doomed")
+    tid = int(thread["id"])
+    begin_thread_deletion(project, "racer", tid)
+    complete_thread_deletion(project, "racer", tid)
+
+    rows = projects_summary(project, include_archived=True)[0]["threads"]
+
+    assert [int(row["id"]) for row in rows] == [MAIN_THREAD_ID]
+    assert get_thread(project, "racer", tid)["lifecycle"] == THREAD_TOMBSTONED
+
+
+def test_the_projects_route_only_widens_when_ASKED(tmp_path):
+    """The query param is the whole difference, and the answer says which list
+    this is — two summaries disagreeing about which threads exist, without either
+    saying so, would be worse than either answer alone."""
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from ouroboros.gateway.projects import api_projects_list
+
+    create_project(tmp_path, "racer", name="Cyber Racer")
+    thread = create_thread(tmp_path, "racer", name="Side quest")
+    tid = int(thread["id"])
+    archive_thread(tmp_path, "racer", tid)
+    app = Starlette(routes=[Route("/api/projects", api_projects_list, methods=["GET"])])
+    app.state.drive_root = tmp_path
+
+    with TestClient(app) as client:
+        default = client.get("/api/projects").json()
+        widened = client.get("/api/projects?include_archived=1").json()
+
+    assert default["include_archived"] is False
+    assert [int(t["id"]) for t in default["projects"][0]["threads"]] == [MAIN_THREAD_ID]
+    assert widened["include_archived"] is True
+    assert [int(t["id"]) for t in widened["projects"][0]["threads"]] == [MAIN_THREAD_ID, tid]
+
+
+def test_the_agents_project_list_reads_the_same_live_set_the_UI_does(tmp_path, monkeypatch):
+    """T3R-8's other half. The control tool called the projection with NO live
+    chat-id set, so an archived thread with a task still running counted as hidden
+    for the agent and visible for the owner (X10) — the two lists disagreeing in
+    exactly the case the projection's docstring says they must not."""
+    from ouroboros.tools import control
+
+    create_project(tmp_path, "racer", name="Cyber Racer")
+    thread = create_thread(tmp_path, "racer", name="Side quest")
+    chat_id = int(thread["chat_id"])
+    archive_thread(tmp_path, "racer", int(thread["id"]))
+
+    seen = {}
+
+    def _spy(drive_root, *, limit=50, live_chat_ids=None, include_archived=False):
+        seen["live"] = set(live_chat_ids or ())
+        return []
+
+    monkeypatch.setattr("ouroboros.projects_registry.projects_summary", _spy)
+    monkeypatch.setattr(
+        "ouroboros.gateway.state.live_thread_chat_ids", lambda: {chat_id},
+    )
+    ctx = type("Ctx", (), {"drive_root": str(tmp_path)})()
+
+    control._list_projects(ctx)
+
+    assert seen["live"] == {chat_id}, "the agent must read the same live set the gateway does"
+
+
+def test_the_agents_project_list_still_works_without_a_supervisor(tmp_path, monkeypatch):
+    """Listing projects must not depend on the queue: an unreadable one is the old
+    behaviour, not an error."""
+    from ouroboros.tools import control
+
+    create_project(tmp_path, "racer", name="Cyber Racer")
+
+    def _explode():
+        raise RuntimeError("no supervisor here")
+
+    monkeypatch.setattr("ouroboros.gateway.state.live_thread_chat_ids", _explode)
+    ctx = type("Ctx", (), {"drive_root": str(tmp_path)})()
+
+    out = control._list_projects(ctx)
+
+    assert "PROJECTS_ERROR" not in out
+    assert "racer" in out

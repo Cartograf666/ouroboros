@@ -480,6 +480,16 @@
  * @property {string=} head_after
  * @property {boolean=} worktree_kept
  * @property {boolean=} removed
+ * @property {boolean=} branch_removed a CLEAN removal deletes the thread/<name>
+ *   branch too, so the same thread can branch off again
+ * @property {string=} branch_kept_reason why a branch SURVIVED a removal — it is
+ *   exactly what the next branch-off would refuse on
+ * @property {string=} checkout_branch on `checkout_head_off_branch`: the branch
+ *   the thread's checkout is actually standing on, which is not the one merged
+ * @property {boolean=} folder_left_mid_merge on `merge_abort_failed`: the merge
+ *   could neither complete NOR be undone, so the project folder is stopped
+ *   part-way through it and says so rather than claiming it was untouched
+ * @property {string=} abort_detail
  * @property {Object=} inspection
  * @property {string=} error
  */

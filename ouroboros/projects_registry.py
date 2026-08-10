@@ -1162,6 +1162,7 @@ def adopt_task_workspace(
 
 def projects_summary(
     drive_root: Any, *, limit: int = 50, live_chat_ids: Any = None,
+    include_archived: bool = False,
 ) -> List[Dict[str, Any]]:
     """Compact list for /api/state and the sidebar.
 
@@ -1172,6 +1173,13 @@ def projects_summary(
     caller supplies it because reading the supervisor queue belongs at the
     gateway, not inside a registry projection that every read path touches;
     omitting it simply means no archived thread is treated as live.
+
+    ``include_archived`` asks for them ON PURPOSE, and it exists because this is
+    the ONLY projection that lists threads. With archived ones filtered out of it
+    unconditionally, no surface the owner could reach ever carried an archived
+    thread, which made ``POST …/restore`` and the ``restore`` row in the thread
+    menu unreachable BY CONSTRUCTION: archive was a one-way trip. Restoring
+    something requires a surface that can show it, so the caller asks for one.
     """
     out: List[Dict[str, Any]] = []
     bindings = _load_bindings(drive_root).get("bindings", {})
@@ -1219,7 +1227,7 @@ def projects_summary(
             # one that hard-coded it would hide a live archived thread (X10).
             "threads": [
                 thread for thread in project_threads(project)
-                if thread_is_visible(thread, live_chat_ids)
+                if thread_is_visible(thread, live_chat_ids, include_archived=include_archived)
             ],
         })
     return out

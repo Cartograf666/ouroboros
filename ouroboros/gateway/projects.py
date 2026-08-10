@@ -288,6 +288,15 @@ def _emit_naming_reason(drive_root: object, task_id: str, name: str, reason: str
 
 
 async def api_projects_list(request: Request) -> JSONResponse:
+    """GET /api/projects — the sidebar's list, optionally WITH archived threads.
+
+    ``?include_archived=1`` is the only way an archived thread ever reaches a
+    surface, and it exists because without it archiving was a ONE-WAY trip:
+    ``projects_summary`` is the only projection that lists threads, so a thread it
+    filtered out could never be shown, which made ``POST …/restore`` and the
+    ``restore`` row in the thread menu unreachable by construction (T3R-8). The
+    default is unchanged, so the sidebar keeps hiding them.
+    """
     try:
         from ouroboros.gateway.state import live_thread_chat_ids
         from ouroboros.projects_registry import (
@@ -295,12 +304,21 @@ async def api_projects_list(request: Request) -> JSONResponse:
         )
 
         drive_root = request_drive_root(request)
-        # Same visibility rule as /api/state: archived threads are hidden unless
-        # a task is still live in them (X10). Two summaries disagreeing about
-        # which threads exist would be worse than either answer alone.
-        return JSONResponse({"projects": projects_summary(
-            drive_root, limit=200, live_chat_ids=live_thread_chat_ids(),
-        )})
+        include_archived = str(
+            request.query_params.get("include_archived") or ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        # Same visibility rule as /api/state unless the caller ASKS otherwise:
+        # archived threads are hidden unless a task is still live in them (X10).
+        # Two summaries disagreeing about which threads exist would be worse than
+        # either answer alone — so the difference is REQUESTED, never incidental,
+        # and the answer echoes which list this is.
+        return JSONResponse({
+            "projects": projects_summary(
+                drive_root, limit=200, live_chat_ids=live_thread_chat_ids(),
+                include_archived=include_archived,
+            ),
+            "include_archived": include_archived,
+        })
     except Exception as exc:
         return json_exception(exc)
 

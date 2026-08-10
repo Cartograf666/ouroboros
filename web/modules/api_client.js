@@ -122,6 +122,18 @@ export const apiClient = {
     skillGrants: (skill, items) => jsonPost(`/api/skills/${encodeURIComponent(skill)}/grants`, { items }),
     chatHistory: (limit = 1000) => fetchJson(`/api/chat/history?limit=${encodeURIComponent(limit)}`, { cache: 'no-store' }),
     projectFromTask: (taskId, id, name, objectiveHint = '') => jsonPost('/api/projects/from-task', { task_id: taskId, id, name, objective_hint: objectiveHint }),
+    /**
+     * The projects list, optionally INCLUDING archived threads.
+     *
+     * `/api/state` carries the sidebar's own copy, where archived threads are
+     * hidden. This is the one call that can ask for them, and it is the only way
+     * `threadRestore` is reachable at all: a thread no surface can show is a
+     * thread no owner can restore (T3R-8).
+     */
+    projectsList: (includeArchived = false) => fetchJson(
+        includeArchived ? '/api/projects?include_archived=1' : '/api/projects',
+        { cache: 'no-store' },
+    ),
     /** @param {import('./api_types.js').ProjectCreateRequest} payload */
     projectCreate: (payload) => jsonPost('/api/projects', payload),
     projectUpdate: (projectId, name) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/update`, { name }),

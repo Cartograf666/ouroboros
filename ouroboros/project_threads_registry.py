@@ -163,7 +163,9 @@ def _thread_zero_lifecycle(project: Dict[str, Any]) -> str:
     }.get(str(project.get("lifecycle") or PROJECT_ACTIVE), THREAD_ACTIVE)
 
 
-def thread_is_visible(thread: Dict[str, Any], live_chat_ids: Any = None) -> bool:
+def thread_is_visible(
+    thread: Dict[str, Any], live_chat_ids: Any = None, *, include_archived: bool = False,
+) -> bool:
     """Should this thread be SHOWN? (D4 + X10's owner-locked reading.)
 
     ``active`` and ``deleting`` are always visible — a deleting thread stays on
@@ -175,12 +177,22 @@ def thread_is_visible(thread: Dict[str, Any], live_chat_ids: Any = None) -> bool
     ``live_chat_ids`` is supplied by the CALLER (the gateway reads the queue).
     This module stays pure: a registry projection that reached into the supervisor
     queue would make every read of the sidebar depend on the queue lock.
+
+    ``include_archived`` is the ASKING-FOR-THEM case, and it exists because the
+    default made archive a ONE-WAY trip. Archived threads were filtered out of
+    the only projection that lists threads, so nothing the owner could see ever
+    carried an archived thread — which made ``POST …/restore`` and the ``restore``
+    row in the thread menu unreachable BY CONSTRUCTION. Restoring something
+    requires a surface that can show it first. ``tombstoned`` is still never
+    shown: that one really is gone.
     """
     lifecycle = str(thread.get("lifecycle") or THREAD_ACTIVE)
     if lifecycle in _SIDEBAR_LIFECYCLES:
         return True
     if lifecycle != THREAD_ARCHIVED:
         return False
+    if include_archived:
+        return True
     try:
         return int(thread.get("chat_id") or 0) in set(live_chat_ids or ())
     except (TypeError, ValueError):
