@@ -185,10 +185,17 @@ export const apiClient = {
     /**
      * MERGE BACK (A7/A9). A conflict comes back as ok:false with `conflicts`;
      * the merge is already aborted by then and the thread keeps its branch.
+     *
+     * `acknowledgeCheckoutDirty` IS the owner's answer to the `checkout_dirty`
+     * refusal, mirroring `threadWorktreeRemove`'s `acknowledgeUnmerged`. Without
+     * it the server's only escape from that refusal had NO producer in any client
+     * code, so one stray `build.log` in a checkout made merge-back permanently
+     * unreachable — the exact failure the refusal was written to prevent.
      * @returns {Promise<import('./api_types.js').ThreadWorktreeResponse>}
      */
-    threadMergeBack: (projectId, threadId) => jsonPost(
-        `${threadPath(projectId, threadId)}/merge-back`, {},
+    threadMergeBack: (projectId, threadId, acknowledgeCheckoutDirty = false) => jsonPost(
+        `${threadPath(projectId, threadId)}/merge-back`,
+        acknowledgeCheckoutDirty ? { acknowledge_checkout_dirty: true } : {},
     ),
     /**
      * What removing this checkout would DESTROY — read before offering removal

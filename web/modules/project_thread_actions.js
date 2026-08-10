@@ -13,9 +13,13 @@
  *   1. A thread's LOCATION is derived, never stored (A7). Every helper reads it
  *      from `location.where` — no caller keeps a boolean about it.
  *   2. A refusal is SHOWN, never smoothed over (A9/A10). `describeOutcome` turns
- *      every typed reason into the sentence the server already wrote, and
+ *      every typed reason into the sentence the server already wrote;
  *      `conflicts`/`dirty_files`/`inspection` ride along as evidence rather than
- *      being flattened into "something went wrong".
+ *      being flattened into "something went wrong", and so do the two fields that
+ *      make a refusal ANSWERABLE — `acknowledgeable` (the flag that re-sends the
+ *      call) and `decision` (T2's typed `git_init_required` offer, whose yes is
+ *      `apiClient.projectInitGit`). A refusal a menu cannot answer is a dead end
+ *      wearing a sentence.
  *   3. Removing a checkout is always a separate, confirmed act (A10). There is
  *      no path here that removes one as a side effect of anything else, and the
  *      acknowledgement is a distinct second call the owner has to reach.
@@ -36,27 +40,51 @@ export function isBranched(location) {
  * omission. A missing item teaches nothing; a greyed one with a reason teaches
  * what to do first.
  *
- * @param {{id?: number, lifecycle?: string}} thread
+ * `deleting` and `tombstoned` are NOT the same state, and collapsing them into
+ * one `terminal` flag left the owner with no way out of the first. A thread stuck
+ * in `deleting` — the deliberate end state of `fail_thread_deletion`, which
+ * `thread_is_visible` keeps on screen precisely so the owner can act on it — had
+ * EVERY row disabled, while the server accepts a delete retry idempotently and
+ * the checkout-removal route still works. Its committed work was unreachable both
+ * ways and the only escape was a server restart. So `deleting` disables
+ * everything EXCEPT `delete`, relabelled "Retry delete" and carrying
+ * `thread.delete_error` as the reason it is on offer — that field is normalised
+ * onto every row and nothing read it. `tombstoned` really is terminal.
+ *
+ * @param {{id?: number, lifecycle?: string, delete_error?: string}} thread
  * @param {{where?: string, branch?: string}} location
  */
 export function threadActions(thread, location) {
     const isMain = Number(thread?.id ?? 0) === 0;
     const lifecycle = String(thread?.lifecycle || 'active');
     const branched = isBranched(location);
-    const terminal = lifecycle === 'deleting' || lifecycle === 'tombstoned';
+    const settling = lifecycle === 'deleting';
+    const terminal = lifecycle === 'tombstoned';
+    const fenced = settling || terminal;
     // Thread #0 IS the project. Offering it a lifecycle of its own would promise
     // an operation the server refuses by name, so it is disabled with the reason.
     const projectItself = isMain ? 'This thread is the project itself.' : '';
     // A thread on its way out overrides every other explanation: "already works
     // in its own branch" is true but useless when the thread is being deleted.
-    const settling = terminal ? 'This thread is being deleted.' : '';
+    const goingAway = terminal ? 'This thread is deleted.' : 'This thread is being deleted.';
     const row = (id, label, allowed, reason) => ({
         id,
         label,
-        available: allowed && !terminal,
-        disabledReason: terminal ? settling : (allowed ? '' : reason),
+        available: allowed && !fenced,
+        disabledReason: fenced ? goingAway : (allowed ? '' : reason),
     });
     const noCheckout = 'This thread works in the project folder.';
+    const deleteError = String(thread?.delete_error || '').trim();
+    const retry = {
+        id: 'delete',
+        label: 'Retry delete',
+        available: true,
+        // Not a disabled reason — the reason this row is OFFERED. A deletion that
+        // did not quiesce stays fenced on purpose, and the owner has to be able to
+        // see why before deciding to ask again.
+        disabledReason: '',
+        reason: deleteError || 'This thread\'s deletion did not finish.',
+    };
     return [
         row('branch_off', 'Branch off…', !branched, 'This thread already works in its own branch.'),
         row('merge_back', 'Merge back', branched, noCheckout),
@@ -68,7 +96,7 @@ export function threadActions(thread, location) {
             !isMain,
             projectItself,
         ),
-        row('delete', 'Delete…', !isMain, projectItself),
+        settling ? retry : row('delete', 'Delete…', !isMain, projectItself),
     ];
 }
 
@@ -80,6 +108,16 @@ export function threadActions(thread, location) {
  * and re-authoring it here is how two surfaces end up explaining the same
  * refusal differently. `evidence` is the list the owner needs to act: the
  * conflicting paths, the files blocking a merge, what a removal would destroy.
+ *
+ * Two fields ride the refusal that a menu cannot do without, and both were being
+ * dropped here:
+ *
+ *   - `acknowledgeable` — the server saying this refusal HAS an owner-answerable
+ *     flag. Without it nothing could render the second call, so `checkout_dirty`
+ *     read as a dead end when it is a question.
+ *   - `decision` — T2's typed `git_init_required` OFFER. `apiClient.projectInitGit`
+ *     exists and is the yes to it; a menu that never sees the object cannot
+ *     offer the yes.
  */
 export function describeOutcome(outcome) {
     const reason = String(outcome?.reason || '');
@@ -97,6 +135,9 @@ export function describeOutcome(outcome) {
         text: server || `This could not be done (${reason || 'unknown reason'}).`,
         evidence,
         reason,
+        // A refusal the owner can answer, and the object that answers it.
+        acknowledgeable: Boolean(outcome?.acknowledgeable),
+        decision: (outcome && typeof outcome.decision === 'object') ? outcome.decision : null,
     };
 }
 
@@ -244,7 +285,16 @@ export function openThreadChanges({ projectId, threadId, label = '', branch = ''
 export const threadOps = {
     bases: (projectId, threadId) => apiClient.threadBranchBases(projectId, threadId),
     branchOff: (projectId, threadId, baseRef) => apiClient.threadBranchOff(projectId, threadId, baseRef),
-    mergeBack: (projectId, threadId) => apiClient.threadMergeBack(projectId, threadId),
+    /**
+     * Merge a thread's branch home. `acknowledged` is the owner's answer to the
+     * `checkout_dirty` refusal — the SAME shape `removeWorktree` already has, and
+     * deliberately a separate argument so no caller passes it by accident. It had
+     * no producer at all, which made the server's only escape from that refusal
+     * unreachable: one stray `build.log` in a checkout and merge-back was over.
+     */
+    mergeBack: (projectId, threadId, acknowledged = false) => (
+        apiClient.threadMergeBack(projectId, threadId, acknowledged)
+    ),
     inspectWorktree: (projectId, threadId) => apiClient.threadWorktree(projectId, threadId),
     /**
      * Remove a checkout. `acknowledged` is the owner's answer to `removalPrompt`

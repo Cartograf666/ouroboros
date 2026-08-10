@@ -113,3 +113,20 @@ test('task mode still prepends the task line unchanged', () => {
 
     assert.ok(parts[0].text.startsWith('Re task t1 ("Fix the parser"): '));
 });
+
+test('a blocked CHECKOUT diff is not described as a task (T3R2-L4)', () => {
+    // The neighbouring notes label already keys on `source`. This sentence did
+    // not, so a thread-checkout diff blocked for anything other than the two
+    // named states sent the owner looking for a task a worktree does not have.
+    const [row] = diffBanners({
+        status: 'blocked', source: 'thread_checkout', blockers: ['git_unavailable'],
+    });
+    assert.equal(row.tone, 'blocked');
+    assert.equal(row.text, 'No trustworthy diff can be shown for this checkout.');
+
+    // A task diff is still a task diff.
+    const [taskRow] = diffBanners({
+        status: 'blocked', source: 'mutation_baseline', blockers: ['git_unavailable'],
+    });
+    assert.equal(taskRow.text, 'No trustworthy diff can be shown for this task.');
+});

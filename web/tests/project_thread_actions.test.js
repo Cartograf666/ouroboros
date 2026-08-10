@@ -65,12 +65,88 @@ test('archive flips to restore once the thread is archived', () => {
     assert.equal(archived.archive, undefined);
 });
 
-test('a thread already being deleted offers nothing runnable', () => {
-    const deleting = byId({ id: 2, lifecycle: 'deleting' }, IN_WORKTREE);
+test('a thread STUCK in deleting can still be told to try again (T3R2-H7)', () => {
+    // `deleting` is the deliberate end state of `fail_thread_deletion`, and
+    // `thread_is_visible` keeps it on screen precisely so the owner can act on it.
+    // Collapsing it into one `terminal` flag with `tombstoned` disabled every row,
+    // while the server accepts a delete retry idempotently — the thread's
+    // committed work was unreachable and the only escape was a server restart.
+    const deleting = byId(
+        { id: 2, lifecycle: 'deleting', delete_error: 'RuntimeError: did not quiesce (t1)' },
+        IN_WORKTREE,
+    );
     for (const row of Object.values(deleting)) {
+        if (row.id === 'delete') continue;
         assert.equal(row.available, false, `${row.id} must not be offered while deleting`);
         assert.match(row.disabledReason, /being deleted/);
     }
+    assert.equal(deleting.delete.available, true);
+    assert.equal(deleting.delete.label, 'Retry delete');
+    // `delete_error` is normalised onto every row and nothing read it. It is the
+    // reason the retry is OFFERED, not a reason something is disabled.
+    assert.match(deleting.delete.reason, /did not quiesce/);
+    assert.equal(deleting.delete.disabledReason, '');
+
+    // A deleting thread with no recorded error still offers the retry, with a
+    // sentence rather than a blank.
+    const quiet = byId({ id: 2, lifecycle: 'deleting' }, IN_FOLDER);
+    assert.equal(quiet.delete.available, true);
+    assert.match(quiet.delete.reason, /did not finish/);
+});
+
+test('a TOMBSTONED thread really is terminal', () => {
+    const gone = byId({ id: 2, lifecycle: 'tombstoned' }, IN_FOLDER);
+    for (const row of Object.values(gone)) {
+        assert.equal(row.available, false, `${row.id} must not be offered once tombstoned`);
+        assert.match(row.disabledReason, /deleted/);
+    }
+});
+
+test('a refusal the owner can ANSWER says so, and carries the object that answers it', () => {
+    // T3R2-H6/L3. `acknowledge_checkout_dirty` is the server's only escape from
+    // `checkout_dirty`, and it had NO producer in any client code: one stray
+    // build.log made merge-back permanently unreachable. `decision` is T2's typed
+    // git_init_required offer, whose yes is apiClient.projectInitGit.
+    const dirty = describeOutcome({
+        ok: false,
+        reason: 'checkout_dirty',
+        message: 'This thread\'s checkout has changes that were never committed.',
+        dirty_files: ['?? build.log'],
+        acknowledgeable: true,
+    });
+    assert.equal(dirty.acknowledgeable, true);
+    assert.deepEqual(dirty.evidence, ['?? build.log']);
+
+    // The branch being WRONG is deliberately not acknowledgeable, and neither is
+    // a project folder standing on no branch at all.
+    for (const reason of ['checkout_head_off_branch', 'project_head_detached']) {
+        assert.equal(describeOutcome({ ok: false, reason }).acknowledgeable, false);
+    }
+
+    const offer = describeOutcome({
+        ok: false,
+        reason: 'git_init_required',
+        message: 'This folder is not tracked by git yet.',
+        decision: { decision: 'git_init_required', offer: 'init_git', enables: ['branching'] },
+    });
+    assert.equal(offer.decision.offer, 'init_git');
+    assert.equal(describeOutcome({ ok: false, reason: 'branch_failed' }).decision, null);
+});
+
+test('merge-back carries the owner\'s acknowledgement as its own argument', async () => {
+    // Mirrors removeWorktree: a separate argument so nobody passes it by accident.
+    const { threadOps } = await import('../modules/project_thread_actions.js');
+    const { apiClient } = await import('../modules/api_client.js');
+    const seen = [];
+    const original = apiClient.threadMergeBack;
+    apiClient.threadMergeBack = (...args) => { seen.push(args); return Promise.resolve({}); };
+    try {
+        await threadOps.mergeBack('racer', 2);
+        await threadOps.mergeBack('racer', 2, true);
+    } finally {
+        apiClient.threadMergeBack = original;
+    }
+    assert.deepEqual(seen, [['racer', 2, false], ['racer', 2, true]]);
 });
 
 test('a merge conflict is SHOWN with its paths, in the server\'s own words', () => {

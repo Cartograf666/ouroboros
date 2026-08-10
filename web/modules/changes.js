@@ -234,11 +234,19 @@ export function diffBanners(diff) {
         } else if (tooBig) {
             rows.push({ tone: 'blocked', text: tooBig.text, detail: blockers.join(', ') });
         } else {
+            // The NOUN follows the SOURCE, exactly as the notes label below
+            // already does. A thread-checkout diff blocked for anything other
+            // than the two states named above is still a checkout, and "for this
+            // task" pointed the owner at something a thread worktree does not
+            // have — there is no task here to go and look at.
+            const subject = String(diff?.source || '') === 'thread_checkout'
+                ? 'this checkout'
+                : 'this task';
             rows.push(diffLacksBaselineOnly(diff)
                 ? { tone: 'neutral', text: NO_BASELINE_NOTICE }
                 : {
                     tone: 'blocked',
-                    text: 'No trustworthy diff can be shown for this task.',
+                    text: `No trustworthy diff can be shown for ${subject}.`,
                     detail: blockers.join(', '),
                 });
         }
