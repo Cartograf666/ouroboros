@@ -783,6 +783,15 @@ Every `/api/files/*` operation resolves its requested path and refuses the opera
 | POST | `/api/projects/{project_id}/threads` | `gateway.projects.api_project_thread_create` |
 | POST | `/api/projects/{project_id}/threads/{thread_id}/update` | `gateway.projects.api_project_thread_update` |
 | POST | `/api/projects/{project_id}/threads/{thread_id}/fork` | `gateway.projects.api_project_thread_fork` |
+| GET | `/api/projects/{project_id}/threads/{thread_id}/branch-bases` | `gateway.project_threads.api_thread_branch_bases` (A8 — the OWNER's list of bases, plus A14's queue notice; the list is an offer, and any commit-ish typed instead is accepted by branch-off) |
+| POST | `/api/projects/{project_id}/threads/{thread_id}/branch-off` | `gateway.project_threads.api_thread_branch_off` (A7 — the thread's location becomes "worktree" because a worktree now EXISTS, never because a flag was set) |
+| POST | `/api/projects/{project_id}/threads/{thread_id}/merge-back` | `gateway.project_threads.api_thread_merge_back` (A9 — typed 409s for a busy project, a dirty local tree, a checkout ahead of its branch, a conflict, and a conflict whose abort did not take) |
+| GET | `/api/projects/{project_id}/threads/{thread_id}/worktree` | `gateway.project_threads.api_thread_worktree_inspect` (A10's evidence, BEFORE anything is removed) |
+| POST | `/api/projects/{project_id}/threads/{thread_id}/worktree/remove` | `gateway.project_threads.api_thread_worktree_remove` (A10 — `acknowledge_unmerged` IS the owner's consent and there is no other path in) |
+| GET | `/api/projects/{project_id}/threads/{thread_id}/diff` | `gateway.project_threads.api_thread_diff` (A13/X9 — the checkout's whole tree against its base, through the same envelope and the same diff gate as the task diff) |
+| POST | `/api/projects/{project_id}/threads/{thread_id}/archive` | `gateway.project_threads.api_thread_archive` (D4 — HIDE and nothing else; X10 keeps it visible while a task is still live in it) |
+| POST | `/api/projects/{project_id}/threads/{thread_id}/restore` | `gateway.project_threads.api_thread_restore` (un-archive; reachable because `GET /api/projects?include_archived=1` can show an archived thread in the first place) |
+| POST | `/api/projects/{project_id}/threads/{thread_id}/delete` | `gateway.project_threads.api_thread_delete` (X10 — fence routing, cancel and quiesce by EXACT thread chat id, then tombstone; the checkout is NOT removed) |
 | GET | `/api/fs/dirs` | `gateway.projects.api_fs_dirs` |
 | GET | `/api/chat/history` | `gateway.history.make_chat_history_endpoint` |
 | GET | `/api/logs/{name}` | `gateway.logs.api_logs_tail` |

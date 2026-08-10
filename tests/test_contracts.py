@@ -1456,3 +1456,32 @@ def test_owner_scope_review_floor_deprecation_notice_crosses_the_wire(tmp_path, 
     assert "context mode" in notice.lower(), "the notice must name the control that now decides"
     # The owner's customization is stored even though it is enforcement-inert.
     assert json.loads(settings_path.read_text(encoding="utf-8"))["OUROBOROS_SCOPE_REVIEW_FLOOR"] == "advisory"
+
+
+def test_every_frozen_endpoint_has_a_row_in_the_ARCHITECTURE_route_table():
+    """T3R-7. `HTTP_ENDPOINTS` is the frozen index; §11.3 requires the doc to name
+    every frozen surface. Nine thread routes landed in the index with no row in
+    the route table, which is how a route table stops being a map and becomes a
+    list of the routes somebody remembered.
+
+    Checked programmatically rather than by eye, so it cannot drift again: the
+    doc's rows are parsed and compared to the index itself.
+    """
+    import pathlib
+    import re
+
+    from ouroboros.gateway.contracts import HTTP_ENDPOINTS
+
+    doc = (pathlib.Path(__file__).resolve().parent.parent / "docs" / "ARCHITECTURE.md")
+    rows = {
+        f"{m.group(1)} {m.group(2)}"
+        for m in re.finditer(
+            r"^\|\s*(GET|POST|PUT|DELETE|PATCH|ANY|WS)\s*\|\s*`([^`]+)`",
+            doc.read_text(encoding="utf-8"),
+            re.M,
+        )
+    }
+
+    missing = sorted(endpoint for endpoint in HTTP_ENDPOINTS if endpoint not in rows)
+
+    assert missing == [], f"routes in HTTP_ENDPOINTS with no ARCHITECTURE row: {missing}"

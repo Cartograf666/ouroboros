@@ -633,6 +633,10 @@ async def api_project_thread_create(request: Request) -> JSONResponse:
     thread's chat id rides the `projects_changed` broadcast so every open client
     adds it to its known-chat set BEFORE a live frame for it can arrive.
     """
+    # Imported BEFORE the guard, not inside it: an `except` clause naming an
+    # unbound local would turn any earlier failure into a NameError.
+    from ouroboros.project_threads_registry import ThreadLifecycleError
+
     try:
         from ouroboros.projects_registry import create_thread, get_project, touch_project
 
@@ -652,6 +656,15 @@ async def api_project_thread_create(request: Request) -> JSONResponse:
         touch_project(drive_root, str(project["id"]))
         _broadcast_projects_changed(str(project["id"]), thread.get("chat_id"))
         return JSONResponse({"project_id": str(project["id"]), "thread": thread})
+    except ThreadLifecycleError as exc:
+        # A project on its way out refusing thread changes is a PRECONDITION the
+        # owner can read, not a malformed request and not a crash: it answers 409
+        # with the same typed reason the archive/restore/delete routes use
+        # (T3R-17). Caught BEFORE ValueError because it is one.
+        return JSONResponse(
+            {"ok": False, "reason": exc.reason, "error": str(exc), "message": str(exc)},
+            status_code=409,
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
     except Exception as exc:
@@ -660,6 +673,10 @@ async def api_project_thread_create(request: Request) -> JSONResponse:
 
 async def api_project_thread_update(request: Request) -> JSONResponse:
     """POST /api/projects/{project_id}/threads/{thread_id}/update — rename."""
+    # Imported BEFORE the guard, not inside it: an `except` clause naming an
+    # unbound local would turn any earlier failure into a NameError.
+    from ouroboros.project_threads_registry import ThreadLifecycleError
+
     try:
         from ouroboros.projects_registry import get_project, get_thread, rename_thread
 
@@ -683,6 +700,15 @@ async def api_project_thread_update(request: Request) -> JSONResponse:
             return JSONResponse({"error": f"unknown thread: {thread_id}"}, status_code=404)
         _broadcast_projects_changed(str(project["id"]), thread.get("chat_id"))
         return JSONResponse({"project_id": str(project["id"]), "thread": thread})
+    except ThreadLifecycleError as exc:
+        # A project on its way out refusing thread changes is a PRECONDITION the
+        # owner can read, not a malformed request and not a crash: it answers 409
+        # with the same typed reason the archive/restore/delete routes use
+        # (T3R-17). Caught BEFORE ValueError because it is one.
+        return JSONResponse(
+            {"ok": False, "reason": exc.reason, "error": str(exc), "message": str(exc)},
+            status_code=409,
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
     except Exception as exc:
@@ -695,6 +721,10 @@ async def api_project_thread_fork(request: Request) -> JSONResponse:
     The source thread is UNTOUCHED: the new thread stores a cursor into the
     source's rows, so no history is copied and no row identity is minted twice.
     """
+    # Imported BEFORE the guard, not inside it: an `except` clause naming an
+    # unbound local would turn any earlier failure into a NameError.
+    from ouroboros.project_threads_registry import ThreadLifecycleError
+
     try:
         from ouroboros.projects_registry import fork_thread, get_project, touch_project
 
@@ -713,6 +743,15 @@ async def api_project_thread_fork(request: Request) -> JSONResponse:
         touch_project(drive_root, str(project["id"]))
         _broadcast_projects_changed(str(project["id"]), thread.get("chat_id"))
         return JSONResponse({"project_id": str(project["id"]), "thread": thread})
+    except ThreadLifecycleError as exc:
+        # A project on its way out refusing thread changes is a PRECONDITION the
+        # owner can read, not a malformed request and not a crash: it answers 409
+        # with the same typed reason the archive/restore/delete routes use
+        # (T3R-17). Caught BEFORE ValueError because it is one.
+        return JSONResponse(
+            {"ok": False, "reason": exc.reason, "error": str(exc), "message": str(exc)},
+            status_code=409,
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
     except Exception as exc:

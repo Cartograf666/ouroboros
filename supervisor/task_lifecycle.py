@@ -12,6 +12,7 @@ import itertools
 import logging
 import pathlib
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,6 +20,17 @@ from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
 
+
+#: How long a quiesce pass waits before re-reading the live set.
+#:
+#: Cancellation is a REQUEST, not an instant: `cancel_task_by_id` flags a task
+#: and the worker settles on its own schedule. Re-reading with no pause spun a
+#: daemon thread at full speed against the queue lock the workers need to
+#: finish, and — worse — reached the "did not shrink" verdict on a millisecond
+#: timescale, so a deletion could be declared stuck before anything had had a
+#: chance to stop. Small enough that a real deletion is not noticeably slower,
+#: long enough that a settling task gets a turn (T3R-17).
+_QUIESCE_SETTLE_SEC = 0.05
 
 _PROJECT_DELETE_WORKERS_LOCK = threading.Lock()
 _PROJECT_DELETE_WORKERS: set[tuple[str, str]] = set()
@@ -1151,6 +1163,9 @@ def run_project_deletion(
             if set(remaining) >= set(live_ids):
                 detail = "; ".join(errors) if errors else "cancel_task_by_id left tasks live"
                 raise RuntimeError(f"Project deletion did not quiesce ({', '.join(remaining)}): {detail}")
+            # It SHRANK, so cancellation is working — give the rest a turn to
+            # settle instead of spinning against the lock they need.
+            time.sleep(_QUIESCE_SETTLE_SEC)
     except Exception as exc:
         q.log.exception("Project deletion failed for %s", project_id)
         fail_project_deletion(drive_root, project_id, f"{type(exc).__name__}: {exc}")
@@ -1296,6 +1311,9 @@ def run_thread_deletion(
                 raise RuntimeError(
                     f"thread deletion did not quiesce ({', '.join(remaining)}): {detail}"
                 )
+            # It SHRANK, so cancellation is working — give the rest a turn to
+            # settle instead of spinning against the lock they need.
+            time.sleep(_QUIESCE_SETTLE_SEC)
     except Exception as exc:
         q.log.exception("Thread deletion failed for %s#%s", project_id, thread_id)
         try:

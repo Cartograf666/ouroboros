@@ -330,16 +330,27 @@ def _mint_thread(data: Dict[str, Any], entry: Dict[str, Any], existing: List[Dic
 
 
 def _active_project_row(data: Dict[str, Any], pid: str) -> Dict[str, Any]:
+    """The project row a thread mutation may write to, or a TYPED refusal.
+
+    A project that is deleting or tombstoned refusing thread changes is a
+    PRECONDITION the owner can read and act on — the project is on its way out —
+    so it answers like every other lifecycle refusal in this module and reaches
+    the routes as a 409. A bare ``ValueError`` here reached ``json_exception``
+    instead and became a 500: the same fact, rendered as a crash, with no reason
+    a UI could branch on (T3R-17).
+    """
     from ouroboros.projects_registry import PROJECT_ACTIVE
 
     for entry in data["projects"]:
         if entry.get("id") == pid:
-            if entry.get("lifecycle") != PROJECT_ACTIVE:
-                raise ValueError(
-                    f"project {pid!r} is {entry.get('lifecycle')}; it cannot accept thread changes"
+            lifecycle = str(entry.get("lifecycle") or PROJECT_ACTIVE)
+            if lifecycle != PROJECT_ACTIVE:
+                raise ThreadLifecycleError(
+                    "project_not_active",
+                    f"This project is {lifecycle}, so its threads cannot be changed.",
                 )
             return entry
-    raise ValueError(f"unknown project: {pid!r}")
+    raise ThreadLifecycleError("unknown_project", f"unknown project: {pid!r}")
 
 
 def create_thread(

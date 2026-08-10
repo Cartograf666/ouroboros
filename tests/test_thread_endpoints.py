@@ -170,3 +170,56 @@ def test_threads_of_a_fenced_project_are_refused(tmp_path, broadcasts):
 
     # A fenced project is no longer "active", so it is not even addressable.
     assert client.post("/api/projects/racer/threads", json={"name": "x"}).status_code == 404
+
+
+def test_a_project_that_starts_DELETING_mid_request_answers_409_not_500(tmp_path, monkeypatch):
+    """T3R-17. A project on its way out refusing thread changes is a PRECONDITION
+    the owner can read — the project is being deleted — not a crash.
+
+    The routes look the project up first, so this is reachable exactly by the
+    RACE the lookup cannot close: deletion starts between `get_project` and the
+    registry write. `_active_project_row` raised a bare `ValueError` there, which
+    reached `json_exception` as a 500 with no reason a UI could branch on — the
+    same fact, rendered as "something broke". It is now the module's own typed
+    lifecycle refusal, which every other thread route already answers as a 409.
+    """
+    import ouroboros.projects_registry as registry
+    from ouroboros.gateway import projects as gateway_projects
+    from ouroboros.projects_registry import begin_project_deletion, create_project, get_project
+
+    create_project(tmp_path, "racer", name="Cyber Racer")
+    alive = get_project(tmp_path, "racer")
+    begin_project_deletion(tmp_path, "racer")
+    # The lookup saw the project alive; the registry write finds it deleting.
+    monkeypatch.setattr(registry, "get_project", lambda *_a, **_k: alive)
+    app = Starlette(routes=[
+        Route(
+            "/api/projects/{project_id}/threads",
+            gateway_projects.api_project_thread_create, methods=["POST"],
+        ),
+    ])
+    app.state.drive_root = tmp_path
+
+    with TestClient(app) as client:
+        response = client.post("/api/projects/racer/threads", json={"name": "Side quest"})
+
+    assert response.status_code == 409, response.text
+    body = response.json()
+    assert body["reason"] == "project_not_active"
+    assert "deleting" in body["message"]
+
+
+def test_the_typed_project_refusal_is_still_a_ValueError_for_older_callers(tmp_path):
+    """It is raised where a plain `ValueError` was, so nothing that already
+    caught one starts leaking an exception."""
+    from ouroboros.project_threads_registry import ThreadLifecycleError
+    from ouroboros.projects_registry import begin_project_deletion, create_project, create_thread
+
+    create_project(tmp_path, "racer", name="Cyber Racer")
+    begin_project_deletion(tmp_path, "racer")
+
+    with pytest.raises(ValueError) as caught:
+        create_thread(tmp_path, "racer", name="Side quest")
+
+    assert isinstance(caught.value, ThreadLifecycleError)
+    assert caught.value.reason == "project_not_active"
