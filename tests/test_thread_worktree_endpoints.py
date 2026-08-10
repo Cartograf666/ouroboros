@@ -392,6 +392,10 @@ def test_branch_bases_carries_the_honest_queue_notice(wired, monkeypatch):
     client, _drive, tid, folder = wired
 
     quiet = client.get(f"/api/projects/racer/threads/{tid}/branch-bases").json()
+    # T3R2-L5: the response contract declares `ok` and the refusal path sets it,
+    # so a client reading `body.ok` first — which the shared envelope asks of it —
+    # read every SUCCESSFUL bases list as a refusal.
+    assert quiet["ok"] is True
     assert quiet["queue_notice"]["queued"] is False
     assert quiet["queue_notice"]["message"] == ""
 

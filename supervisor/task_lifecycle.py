@@ -1249,7 +1249,13 @@ def _live_thread_task_ids(chat_id: int) -> list[str]:
             task_chat = int(task.get("chat_id") or 0)
         except (TypeError, ValueError):
             task_chat = 0
-        if task_chat == int(chat_id):
+        # A falsy chat id is "this task has no room", not "this task belongs to
+        # room 0": without the guard, `_live_thread_task_ids(0)` selected every
+        # chat-less task in the queue — every headless subagent — and cancelled
+        # them. Unreachable today because thread #0 is the project and
+        # `begin_thread_deletion` refuses it, but the selection is one caller away
+        # from being wrong about the owner's whole swarm.
+        if task_chat and task_chat == int(chat_id):
             associated.add(task_id)
     changed = True
     while changed:
@@ -1353,8 +1359,16 @@ def resume_thread_deletions(drive_root: object) -> int:
     Same reason the project version exists: a restart between the fence and the
     tombstone would otherwise leave a thread fenced forever — invisible to
     routing, still on screen, never finishing.
+
+    Thread #0 is SKIPPED: it is the project, its synthesized lifecycle mirrors the
+    project's, and `list_sidebar_projects` includes deleting projects. So a
+    project mid-deletion produced a bogus thread-deletion worker for its own
+    thread #0 that cancelled the project's whole tree in parallel with
+    `resume_project_deletions` and then raised `thread_zero_is_the_project`,
+    logging a traceback on every restart. Thread #0 belongs to the project path.
     """
     from ouroboros.projects_registry import (
+        MAIN_THREAD_ID,
         THREAD_DELETING,
         list_sidebar_projects,
         project_threads,
@@ -1363,6 +1377,8 @@ def resume_thread_deletions(drive_root: object) -> int:
     started = 0
     for project in list_sidebar_projects(drive_root):
         for thread in project_threads(project):
+            if int(thread.get("id") or 0) == MAIN_THREAD_ID:
+                continue
             if str(thread.get("lifecycle") or "") != THREAD_DELETING:
                 continue
             started += int(start_thread_deletion(

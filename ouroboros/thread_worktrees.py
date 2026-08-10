@@ -378,7 +378,7 @@ def remove_thread_worktree(
         # merge-back actually asked. Reproduced: a running task in the checkout,
         # merge-back correctly refuses `project_busy`, and removal answered
         # `removed: True` and deleted the folder under the live worker.
-        if _project_is_busy(project_id) if busy is None else bool(busy):
+        if _project_is_busy(project_id, match) if busy is None else bool(busy):
             return {"removed": False, "reason": "project_busy", "inspection": {}}
         inspection = inspect_thread_worktree(match)
         unsafe = bool(inspection["dirty"]) or int(inspection["unmerged_commits"]) > 0
@@ -418,16 +418,18 @@ def remove_thread_worktree(
         }
 
 
-def _project_is_busy(project_id: Any) -> bool:
-    """Is anything alive anywhere in this project? — merge-back's own judge.
+def _project_is_busy(project_id: Any, row: Dict[str, Any]) -> bool:
+    """Is anything alive in this project, or in the CHECKOUT? — merge-back's judge.
 
     Imported lazily because ``thread_branching`` imports THIS module; the answer
     has to be the same one merge-back gets, or the two owner gestures would
-    disagree about whether the folder is safe to touch.
+    disagree about whether the folder is safe to touch. The folder asked about is
+    the CHECKOUT — that is the one this deletes — and the project-wide half of the
+    query already covers a task running anywhere else in the project.
     """
     from ouroboros.thread_branching import project_is_busy
 
-    return project_is_busy(str(project_id or ""))
+    return project_is_busy(str(project_id or ""), str(row.get("path") or ""))
 
 
 def _trusted_guard_root(row: Dict[str, Any], fallback: Path, data_dir: Any) -> Path:

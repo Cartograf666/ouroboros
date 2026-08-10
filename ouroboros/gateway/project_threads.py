@@ -108,6 +108,10 @@ async def api_thread_branch_bases(request: Request) -> JSONResponse:
             )
         listed = await asyncio.to_thread(branch_off_bases, resolved["repo_dir"])
         return JSONResponse({
+            # The response contract declares `ok` and the refusal path sets it, so
+            # a client reading `body.ok` first — which is what the shared envelope
+            # asks of it — read every SUCCESSFUL bases list as a refusal.
+            "ok": True,
             "project_id": pid,
             "thread_id": int(thread["id"]),
             "location": thread_location(drive_root, pid, thread["id"]),

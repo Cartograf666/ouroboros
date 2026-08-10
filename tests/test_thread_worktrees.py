@@ -538,7 +538,7 @@ def test_removal_reads_the_live_activity_query_when_no_answer_is_supplied(repo, 
     from pathlib import Path
 
     handle = _provision(repo, tmp_path, wt_root)
-    monkeypatch.setattr(branching, "project_is_busy", lambda pid: pid == "racer")
+    monkeypatch.setattr(branching, "project_is_busy", lambda pid, repo=None: pid == "racer")
 
     refused = remove_thread_worktree(
         data_dir=tmp_path / "data", project_id="racer", thread_id=1, worktree_root=wt_root,

@@ -24,12 +24,13 @@ rather than reinvented, and never silent — the resulting sha and the skipped
 paths come back in the receipt.
 
 **MERGE BACK** merges the thread's branch into the project's own checkout under
-A9's preconditions: nothing running anywhere in the project (the project-WIDE
-activity query, NOT the writer lane), a project folder that is ON a branch (a
-detached HEAD has nothing for the merge commit to land on), a clean local tree,
-and a checkout whose work is actually ON the branch being merged — uncommitted
-edits and commits made
-on some other branch inside that checkout are refusals, because a merge moves
+A9's preconditions: nothing running anywhere in the project OR in the folder (the
+project-WIDE activity query, NOT the writer lane — and the folder half too, since
+the lane is folder-keyed and a second project's task in the same folder reduces
+to a different id), a project folder that is ON a branch (a detached HEAD has
+nothing for the merge commit to land on), a clean local tree, and a checkout
+whose work is actually ON the branch being merged — uncommitted edits and commits
+made on some other branch inside that checkout are refusals, because a merge moves
 COMMITS ON A BRANCH and reporting success while the owner's work sits outside it
 is the one failure they cannot see. A conflict is SHOWN and STOPS the operation:
 the merge is aborted and the abort is VERIFIED, so "the folder was left exactly
@@ -79,6 +80,7 @@ REASON_CHECKOUT_HEAD_OFF_BRANCH = "checkout_head_off_branch"
 REASON_CHECKOUT_MISSING = "checkout_missing"
 REASON_PROJECT_HEAD_DETACHED = "project_head_detached"
 REASON_THREAD_NOT_LIVE = "thread_not_live"
+
 
 def _git_timeout_sec() -> float:
     """Bounded like every other owner-facing git call on a request path.
@@ -611,8 +613,8 @@ def _branch_failed_message(detail: str, snapshot: Dict[str, Any]) -> str:
 # MERGE BACK
 # --------------------------------------------------------------------------- #
 
-def project_is_busy(project_id: str) -> bool:
-    """Is ANYTHING alive anywhere in this project? (A9's first precondition.)
+def project_is_busy(project_id: str, repo_dir: Any = None) -> bool:
+    """Is ANYTHING alive in this project, or in this FOLDER? (A9's precondition.)
 
     Reads the project-WIDE ACTIVITY query, deliberately NOT the writer lane: a
     merge touches the project as a whole, so a task in a DIFFERENT folder of the
@@ -624,24 +626,42 @@ def project_is_busy(project_id: str) -> bool:
       its own parent; that is a scheduling rule about who may be ASSIGNED. A
       subagent still writes files in the project, and exempting it here let a
       merge rewrite the folder while a swarm member was mid-write.
-    * PENDING counts. A queued task for this project can be assigned at any
-      instant, including the one right after this returns, and a merge holds no
-      lock against the scheduler. Counting it costs the owner a wait; not
-      counting it costs a folder rewritten under a task that has just started.
+    * PENDING counts, except work that cannot start without the owner. A queued
+      task for this project can be assigned at any instant, including the one
+      right after this returns. A BUDGET-PAUSED one cannot: it waits for the
+      owner, possibly forever and across a queue-snapshot restore, so counting it
+      made "this project is busy" permanently true and locked the owner out of
+      merging their own work back with nothing on screen to explain why. Work only
+      the owner can release is their decision, already taken — not activity to
+      wait behind.
+
+    ``repo_dir`` adds the FOLDER half, and it is not optional in practice: the
+    lane is keyed on the folder alone now, so "is this folder busy" no longer
+    reduces to a project id. Project *alpha* merging into a folder while project
+    *beta*'s task writes in it read as idle, and so did a task carrying a
+    ``workspace_root`` with no ``project_id`` at all — which holds no lane and is
+    still in the folder.
 
     Fail-CLOSED — if the queue cannot be read, the project counts as busy,
     because "cannot tell" must never license a merge into a folder something
     might be writing in.
     """
     try:
-        from ouroboros.project_lease import running_project_ids
+        from ouroboros.project_lease import (
+            normalize_workspace_root,
+            running_project_ids,
+            running_workspace_roots,
+        )
         from supervisor.queue import _queue_lock
         from supervisor.workers import PENDING, RUNNING
 
         with _queue_lock:
             running = list(RUNNING.values())
             pending = list(PENDING)
-        return str(project_id) in running_project_ids(running, pending)
+        if str(project_id) in running_project_ids(running, pending):
+            return True
+        folder = normalize_workspace_root(repo_dir)
+        return bool(folder) and folder in running_workspace_roots(running, pending)
     except Exception:
         log.debug("project_is_busy could not read the queue for %s", project_id, exc_info=True)
         return True
@@ -920,157 +940,167 @@ def merge_back_thread(
             project_id=pid, thread_id=tid, branch=branch,
         )
 
-    if project_is_busy(pid) if busy is None else bool(busy):
-        return _refused(
-            REASON_PROJECT_BUSY,
-            "A task is running or queued in this project right now. Merging while "
-            "something is writing could mix half-finished work into the folder, so "
-            "it waits until that task finishes.",
-            project_id=pid, thread_id=tid, branch=branch,
-        )
-    # A folder already stopped part-way through a merge cannot be merged into,
-    # and it must not be told to "commit or stash" — that is advice for a folder
-    # with edits in it, not one with MERGE_HEAD set and conflict markers in the
-    # files. Without this, the retry after `merge_abort_failed` sent the owner
-    # somewhere that could only make it worse.
-    if _in_merge(repo_dir):
-        return _refused(
-            REASON_MERGE_ABORT_FAILED,
-            "The project folder is stopped part-way through an earlier merge: git "
-            "still has that merge in progress. Nothing here is lost and the thread "
-            "keeps its branch, but the folder has to come out of it first — in that "
-            "folder, `git merge --abort` goes back, or resolve the files and commit "
-            "to go forward.",
-            project_id=pid, thread_id=tid, branch=branch,
-            folder_left_mid_merge=True, working_dir=str(repo_dir),
-        )
-    # A merge needs somewhere to LAND. `git merge --no-ff` onto a detached head
-    # succeeds — it writes the merge commit and moves HEAD to it — and the commit
-    # belongs to no branch at all: the moment the folder checks anything else out
-    # it is reachable only through the reflog. Both of this phase's safety judges
-    # are fooled by the same wrong reference: `inspect_thread_worktree` counts
-    # unmerged commits against the project's HEAD, which now IS that dangling
-    # merge, so it answers zero; and `git branch -d` agrees the thread branch is
-    # merged, because against that HEAD it is. So a one-click removal deletes the
-    # checkout AND the branch, and the only remaining copy of the work is a reflog
-    # entry. Deliberately NOT acknowledgeable, exactly like a checkout standing off
-    # its branch: this is not work left behind, it is a merge with no destination.
-    if not _current_branch(repo_dir):
-        return _refused(
-            REASON_PROJECT_HEAD_DETACHED,
-            "The project folder is not on any branch (a detached HEAD), so there is "
-            "nothing for this merge to land on: git would make the merge commit and "
-            "no branch would point at it, leaving the work unreachable the moment "
-            "the folder checks something else out. Check a branch out in that folder "
-            f"first, then merge {branch!r} back.",
-            project_id=pid, thread_id=tid, branch=branch, working_dir=str(repo_dir),
-        )
-    # TRACKED changes only. An untracked file is not part of a merge and cannot
-    # blur which work came from where, which is the whole point of this check.
-    status = _git(repo_dir, "status", "--porcelain", "--untracked-files=no")
-    if status.returncode != 0:
-        return _refused(
-            REASON_MERGE_FAILED, _detail(status), project_id=pid, thread_id=tid, branch=branch,
-        )
-    dirty = [line for line in (status.stdout or "").splitlines() if line.strip()]
-    if dirty:
-        return _refused(
-            REASON_LOCAL_TREE_DIRTY,
-            "The project folder has uncommitted changes. Commit or stash them "
-            "first — merging on top of them would blur which work came from where.",
-            project_id=pid, thread_id=tid, branch=branch, dirty_files=dirty[:200],
-        )
+    # M5: HOLD the folder for the merge's duration. `project_is_busy` is a bare
+    # READ — it answers about the instant it ran, and the instant after that a
+    # task the scheduler was already holding could be admitted straight into the
+    # folder this is rewriting. That is the two-writer state the lane exists to
+    # prevent, reached through the gap between a check and the work it checked
+    # for. The reservation is released in a `finally` inside the context manager,
+    # so a failed merge can never strand a folder nobody can schedule into.
+    from ouroboros.project_lease import reserved_folder_lane
 
-    # A9's LAST precondition, and the one only the checkout can answer: is the
-    # branch about to be merged actually where the thread's work IS? Checked here,
-    # after the cheap preconditions and BEFORE anything is merged, so a refusal
-    # leaves nothing half-done.
-    from ouroboros.thread_worktrees import inspect_thread_worktree
-
-    inspection = inspect_thread_worktree(row)
-    ahead = _checkout_ahead_refusal(
-        row, pid, tid, branch, inspection,
-        acknowledged=bool(acknowledge_checkout_dirty),
-    )
-    if ahead is not None:
-        return ahead
-    # Named on the SUCCESS too: acknowledging work stays behind is not the same
-    # as forgetting it did.
-    left_behind = list(inspection.get("dirty_files") or [])[:200]
-
-    before = _git(repo_dir, "rev-parse", "HEAD")
-    head_before = (before.stdout or "").strip() if before.returncode == 0 else ""
-    merge = _git(
-        repo_dir,
-        "-c", "user.name=Ouroboros", "-c", "user.email=ouroboros@local",
-        "merge", "--no-ff", "--no-edit", branch,
-    )
-    if merge.returncode != 0:
-        conflicted = _git(repo_dir, "diff", "--name-only", "--diff-filter=U")
-        paths = [p for p in (conflicted.stdout or "").splitlines() if p.strip()]
-        # STOP, and leave the folder exactly as it was. The thread keeps its
-        # branch and every commit in it; nothing is discarded by aborting — but
-        # "the folder was left as it was" is a CLAIM about a git command that can
-        # fail, so it is only made once that command has been checked and the
-        # mid-merge state is CONFIRMED gone. An unchecked abort turned a conflict
-        # into an assertion the owner had no way to test, while their folder sat
-        # with MERGE_HEAD, `UU` entries and conflict markers in the files.
-        #
-        # Only aborted when a merge actually started: a merge that git refused
-        # outright ("not something we can merge", unrelated histories) leaves
-        # nothing in progress, and `merge --abort` failing there means the folder
-        # is FINE, not stopped part-way.
-        if _in_merge(repo_dir):
-            abort = _git(repo_dir, "merge", "--abort")
-            if abort.returncode != 0 or _in_merge(repo_dir):
-                return _refused(
-                    REASON_MERGE_ABORT_FAILED,
-                    "The merge hit a conflict AND could not be undone, so the "
-                    "project folder is stopped part-way through it: git still has "
-                    "the merge in progress and the overlapping files hold conflict "
-                    "markers. Nothing is lost — the thread keeps its branch and "
-                    "every commit — but the folder needs you before anything else "
-                    "can run in it: in that folder, `git merge --abort` goes back, "
-                    "or resolve the files and commit to go forward.",
-                    project_id=pid, thread_id=tid, branch=branch,
-                    conflicts=paths[:200],
-                    abort_detail=_detail(abort),
-                    folder_left_mid_merge=True,
-                    working_dir=str(repo_dir),
-                )
-        if paths:
+    with reserved_folder_lane(repo_dir):
+        if project_is_busy(pid, repo_dir) if busy is None else bool(busy):
             return _refused(
-                REASON_MERGE_CONFLICT,
-                "These files changed on both sides, so the merge was stopped and "
-                "the folder left as it was. The thread keeps its branch and all "
-                "its commits — resolve the overlap and merge again.",
-                project_id=pid, thread_id=tid, branch=branch, conflicts=paths[:200],
+                REASON_PROJECT_BUSY,
+                "A task is running or queued in this project right now. Merging while "
+                "something is writing could mix half-finished work into the folder, so "
+                "it waits until that task finishes.",
+                project_id=pid, thread_id=tid, branch=branch,
             )
-        return _refused(
-            REASON_MERGE_FAILED, _detail(merge),
-            project_id=pid, thread_id=tid, branch=branch,
+        # A folder already stopped part-way through a merge cannot be merged into,
+        # and it must not be told to "commit or stash" — that is advice for a folder
+        # with edits in it, not one with MERGE_HEAD set and conflict markers in the
+        # files. Without this, the retry after `merge_abort_failed` sent the owner
+        # somewhere that could only make it worse.
+        if _in_merge(repo_dir):
+            return _refused(
+                REASON_MERGE_ABORT_FAILED,
+                "The project folder is stopped part-way through an earlier merge: git "
+                "still has that merge in progress. Nothing here is lost and the thread "
+                "keeps its branch, but the folder has to come out of it first — in that "
+                "folder, `git merge --abort` goes back, or resolve the files and commit "
+                "to go forward.",
+                project_id=pid, thread_id=tid, branch=branch,
+                folder_left_mid_merge=True, working_dir=str(repo_dir),
+            )
+        # A merge needs somewhere to LAND. `git merge --no-ff` onto a detached head
+        # succeeds — it writes the merge commit and moves HEAD to it — and the commit
+        # belongs to no branch at all: the moment the folder checks anything else out
+        # it is reachable only through the reflog. Both of this phase's safety judges
+        # are fooled by the same wrong reference: `inspect_thread_worktree` counts
+        # unmerged commits against the project's HEAD, which now IS that dangling
+        # merge, so it answers zero; and `git branch -d` agrees the thread branch is
+        # merged, because against that HEAD it is. So a one-click removal deletes the
+        # checkout AND the branch, and the only remaining copy of the work is a reflog
+        # entry. Deliberately NOT acknowledgeable, exactly like a checkout standing off
+        # its branch: this is not work left behind, it is a merge with no destination.
+        if not _current_branch(repo_dir):
+            return _refused(
+                REASON_PROJECT_HEAD_DETACHED,
+                "The project folder is not on any branch (a detached HEAD), so there is "
+                "nothing for this merge to land on: git would make the merge commit and "
+                "no branch would point at it, leaving the work unreachable the moment "
+                "the folder checks something else out. Check a branch out in that folder "
+                f"first, then merge {branch!r} back.",
+                project_id=pid, thread_id=tid, branch=branch, working_dir=str(repo_dir),
+            )
+        # TRACKED changes only. An untracked file is not part of a merge and cannot
+        # blur which work came from where, which is the whole point of this check.
+        status = _git(repo_dir, "status", "--porcelain", "--untracked-files=no")
+        if status.returncode != 0:
+            return _refused(
+                REASON_MERGE_FAILED, _detail(status), project_id=pid, thread_id=tid, branch=branch,
+            )
+        dirty = [line for line in (status.stdout or "").splitlines() if line.strip()]
+        if dirty:
+            return _refused(
+                REASON_LOCAL_TREE_DIRTY,
+                "The project folder has uncommitted changes. Commit or stash them "
+                "first — merging on top of them would blur which work came from where.",
+                project_id=pid, thread_id=tid, branch=branch, dirty_files=dirty[:200],
+            )
+
+        # A9's LAST precondition, and the one only the checkout can answer: is the
+        # branch about to be merged actually where the thread's work IS? Checked here,
+        # after the cheap preconditions and BEFORE anything is merged, so a refusal
+        # leaves nothing half-done.
+        from ouroboros.thread_worktrees import inspect_thread_worktree
+
+        inspection = inspect_thread_worktree(row)
+        ahead = _checkout_ahead_refusal(
+            row, pid, tid, branch, inspection,
+            acknowledged=bool(acknowledge_checkout_dirty),
         )
-    after = _git(repo_dir, "rev-parse", "HEAD")
-    head_after = (after.stdout or "").strip() if after.returncode == 0 else ""
-    return {
-        "ok": True,
-        "project_id": pid,
-        "thread_id": tid,
-        "branch": branch,
-        "merged": head_after != head_before,
-        "head_before": head_before,
-        "head_after": head_after,
-        # A10: merging never removes the checkout. The owner removes it, or not.
-        "worktree_kept": True,
-        # What the merge did NOT bring, named on the success. Only ever non-empty
-        # when the owner acknowledged it, and said out loud there rather than left
-        # for them to rediscover in a folder they have stopped looking at.
-        "checkout_left_behind": left_behind,
-        "location": thread_location(data_root, pid, tid),
-    }
+        if ahead is not None:
+            return ahead
+        # Named on the SUCCESS too: acknowledging work stays behind is not the same
+        # as forgetting it did.
+        left_behind = list(inspection.get("dirty_files") or [])[:200]
+
+        before = _git(repo_dir, "rev-parse", "HEAD")
+        head_before = (before.stdout or "").strip() if before.returncode == 0 else ""
+        merge = _git(
+            repo_dir,
+            "-c", "user.name=Ouroboros", "-c", "user.email=ouroboros@local",
+            "merge", "--no-ff", "--no-edit", branch,
+        )
+        if merge.returncode != 0:
+            conflicted = _git(repo_dir, "diff", "--name-only", "--diff-filter=U")
+            paths = [p for p in (conflicted.stdout or "").splitlines() if p.strip()]
+            # STOP, and leave the folder exactly as it was. The thread keeps its
+            # branch and every commit in it; nothing is discarded by aborting — but
+            # "the folder was left as it was" is a CLAIM about a git command that can
+            # fail, so it is only made once that command has been checked and the
+            # mid-merge state is CONFIRMED gone. An unchecked abort turned a conflict
+            # into an assertion the owner had no way to test, while their folder sat
+            # with MERGE_HEAD, `UU` entries and conflict markers in the files.
+            #
+            # Only aborted when a merge actually started: a merge that git refused
+            # outright ("not something we can merge", unrelated histories) leaves
+            # nothing in progress, and `merge --abort` failing there means the folder
+            # is FINE, not stopped part-way.
+            if _in_merge(repo_dir):
+                abort = _git(repo_dir, "merge", "--abort")
+                if abort.returncode != 0 or _in_merge(repo_dir):
+                    return _refused(
+                        REASON_MERGE_ABORT_FAILED,
+                        "The merge hit a conflict AND could not be undone, so the "
+                        "project folder is stopped part-way through it: git still has "
+                        "the merge in progress and the overlapping files hold conflict "
+                        "markers. Nothing is lost — the thread keeps its branch and "
+                        "every commit — but the folder needs you before anything else "
+                        "can run in it: in that folder, `git merge --abort` goes back, "
+                        "or resolve the files and commit to go forward.",
+                        project_id=pid, thread_id=tid, branch=branch,
+                        conflicts=paths[:200],
+                        abort_detail=_detail(abort),
+                        folder_left_mid_merge=True,
+                        working_dir=str(repo_dir),
+                    )
+            if paths:
+                return _refused(
+                    REASON_MERGE_CONFLICT,
+                    "These files changed on both sides, so the merge was stopped and "
+                    "the folder left as it was. The thread keeps its branch and all "
+                    "its commits — resolve the overlap and merge again.",
+                    project_id=pid, thread_id=tid, branch=branch, conflicts=paths[:200],
+                )
+            return _refused(
+                REASON_MERGE_FAILED, _detail(merge),
+                project_id=pid, thread_id=tid, branch=branch,
+            )
+        after = _git(repo_dir, "rev-parse", "HEAD")
+        head_after = (after.stdout or "").strip() if after.returncode == 0 else ""
+        return {
+            "ok": True,
+            "project_id": pid,
+            "thread_id": tid,
+            "branch": branch,
+            "merged": head_after != head_before,
+            "head_before": head_before,
+            "head_after": head_after,
+            # A10: merging never removes the checkout. The owner removes it, or not.
+            "worktree_kept": True,
+            # What the merge did NOT bring, named on the success. Only ever non-empty
+            # when the owner acknowledged it, and said out loud there rather than left
+            # for them to rediscover in a folder they have stopped looking at.
+            "checkout_left_behind": left_behind,
+            "location": thread_location(data_root, pid, tid),
+        }
 
 
-__all__ = [
+    __all__ = [
     "BASE_SNAPSHOT",
     "QUEUE_NOTICE",
     "QUEUE_NOTICE_OWN_CHECKOUT",

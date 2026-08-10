@@ -48,9 +48,11 @@ what the lane deliberately ignores: subagents, and queued work.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
-from typing import Any, Dict, Iterable, Optional, Set, Tuple
+import threading
+from typing import Any, Dict, Iterable, Iterator, Optional, Set, Tuple
 
 # A lane key. Either ("", normalized workspace_root) — a FOLDER lane, held by
 # every writer that named that folder — or (project_id, "") for a project-scoped
@@ -97,10 +99,25 @@ def _task_workspace_root(task: Any) -> str:
     if not isinstance(task, dict):
         return ""
     metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
-    raw = str(task.get("workspace_root") or metadata.get("workspace_root") or "").strip()
-    if not raw:
+    return normalize_workspace_root(
+        task.get("workspace_root") or metadata.get("workspace_root") or ""
+    )
+
+
+def normalize_workspace_root(raw: Any) -> str:
+    """The comparison form of a folder path — the ONE spelling a lane key uses.
+
+    PURE (``normpath``/``normcase``, plus a ``casefold`` on case-insensitive
+    platforms): this runs under the queue lock on every assignment pass, so it
+    must never touch the filesystem to resolve symlinks or ask the OS what a path
+    really is. Public because anything comparing a folder to the lane set — a
+    merge-back holding a folder, an activity query asking whether something is
+    writing in one — has to spell it the same way or the comparison is theatre.
+    """
+    text = str(raw or "").strip()
+    if not text:
         return ""
-    normalized = os.path.normcase(os.path.normpath(raw))
+    normalized = os.path.normcase(os.path.normpath(text))
     if sys.platform in _CASE_INSENSITIVE_PLATFORMS:
         # normcase already lowercases on win32; on darwin it is a no-op and the
         # lane would otherwise split one folder into two by capitalization alone.
@@ -172,17 +189,84 @@ def _is_lane_occupant(task: Any) -> bool:
     return bool(_task_project_id(task))
 
 
+#: Folder lanes held by something that is NOT a task — today, a merge-back
+#: rewriting the project folder. Refcounted so nested/concurrent holders cannot
+#: release each other's claim, and in-process only: a restart clears it, which is
+#: correct, because the operation holding it did not survive either.
+_RESERVED_LANES: Dict[LaneKey, int] = {}
+_RESERVED_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def reserved_folder_lane(workspace_root: Any) -> Iterator[Optional[LaneKey]]:
+    """Hold a FOLDER's writer lane for the duration of a non-task operation.
+
+    Merge-back rewrites the project folder and held nothing: its
+    ``project_is_busy`` check is a bare read, so a task arriving one instant later
+    was admitted into the folder mid-merge — the exact two-writer state the lane
+    exists to prevent, reached through the gap between a check and the work it was
+    checking for. A reservation closes the gap, and it is released in a ``finally``
+    so a failed merge cannot strand a folder nobody can schedule into.
+
+    Yields the lane key it took, or ``None`` when there is no folder to hold.
+    """
+    key: LaneKey = ("", normalize_workspace_root(workspace_root))
+    if not key[1]:
+        yield None
+        return
+    with _RESERVED_LOCK:
+        _RESERVED_LANES[key] = _RESERVED_LANES.get(key, 0) + 1
+    try:
+        yield key
+    finally:
+        with _RESERVED_LOCK:
+            remaining = _RESERVED_LANES.get(key, 0) - 1
+            if remaining > 0:
+                _RESERVED_LANES[key] = remaining
+            else:
+                _RESERVED_LANES.pop(key, None)
+
+
+def reserved_folder_lanes() -> Set[LaneKey]:
+    """Folder lanes currently reserved by a non-task operation."""
+    with _RESERVED_LOCK:
+        return set(_RESERVED_LANES)
+
+
 def running_project_lanes(running: Iterable[Any]) -> Set[LaneKey]:
     """Writer lanes currently held: ``{(project_id, workspace_root), ...}``.
 
     ``running`` is the supervisor's RUNNING mapping values (or any iterable of
-    task dicts); read under the queue lock by the caller.
+    task dicts); read under the queue lock by the caller. Lanes RESERVED by a
+    non-task operation are unioned in — a merge-back holds the project folder for
+    as long as it is rewriting it, and to the scheduler that is the same fact as a
+    task holding it.
     """
-    out: Set[LaneKey] = set()
+    out: Set[LaneKey] = set(reserved_folder_lanes())
     for task in running or ():
         if _is_lane_occupant(task):
             out.add(_held_lane(task))
     return out
+
+
+def running_workspace_roots(running: Iterable[Any], pending: Iterable[Any] = ()) -> Set[str]:
+    """Every FOLDER a live task names — the folder half of the activity query.
+
+    Sibling of :func:`running_project_ids`, and needed for the same reason the
+    lane key stopped being ``(project_id, workspace_root)``: "is anything writing
+    in this folder" is not answerable from project ids. Project *alpha* merging
+    into a folder while project *beta*'s task writes in it reduced to two
+    different ids and read as idle, and a task carrying a ``workspace_root`` with
+    NO ``project_id`` holds no lane at all yet still writes there.
+
+    Same activity semantics as :func:`running_project_ids` — subagents count,
+    startable pending work counts, work parked for the owner does not — and
+    deliberately NOT filtered by lane occupancy: occupancy is a scheduling rule
+    about who may be ASSIGNED, and this asks who is actually in the folder.
+    """
+    startable = [task for task in (pending or ()) if _can_still_start(task)]
+    roots = {_task_workspace_root(task) for task in (*(running or ()), *startable)}
+    return {root for root in roots if root}
 
 
 def running_project_ids(running: Iterable[Any], pending: Iterable[Any] = ()) -> Set[str]:
@@ -301,7 +385,11 @@ __all__ = [
     "LaneKey",
     "candidate_is_leasable",
     "mark_task_project",
+    "normalize_workspace_root",
     "pin_task_lane",
+    "reserved_folder_lane",
+    "reserved_folder_lanes",
     "running_project_ids",
     "running_project_lanes",
+    "running_workspace_roots",
 ]

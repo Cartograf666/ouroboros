@@ -2952,6 +2952,12 @@ def _project_lane_wait_suffix(task: Any, running_ref: Any) -> str:
     Never raises and never guesses: an unreadable queue answers "" rather than
     warning about a wait that may not exist. A false warning here costs trust; a
     missing one costs a few seconds of surprise.
+
+    A task is never its OWN obstacle. Without self-exclusion, a task that is
+    already RUNNING holds the folder's lane itself, the lane read comes back
+    occupied, and the owner is told their running task is queued behind "another
+    task in this folder" — a task that does not exist. That is exactly the false
+    warning the paragraph above forbids.
     """
     try:
         from ouroboros.project_lease import candidate_is_leasable, running_project_lanes
@@ -2959,13 +2965,25 @@ def _project_lane_wait_suffix(task: Any, running_ref: Any) -> str:
 
         if not isinstance(task, dict) or not str(task.get("project_id") or "").strip():
             return ""
-        lanes = running_project_lanes(list(running_ref.values()) if hasattr(running_ref, "values") else running_ref)
+        rows = list(running_ref.values()) if hasattr(running_ref, "values") else list(running_ref or ())
+        own_id = str(task.get("id") or task.get("task_id") or "").strip()
+        if own_id:
+            rows = [row for row in rows if _lane_row_task_id(row) != own_id]
+        lanes = running_project_lanes(rows)
         if candidate_is_leasable(task, lanes):
             return ""
     except Exception:
         log.debug("Could not read the writer lane for a scheduled task", exc_info=True)
         return ""
     return f" ({QUEUE_NOTICE})"
+
+
+def _lane_row_task_id(row: Any) -> str:
+    """The task id of one RUNNING entry, whether wrapped in the meta shape or not."""
+    task = row.get("task") if isinstance(row, dict) and isinstance(row.get("task"), dict) else row
+    if not isinstance(task, dict):
+        return ""
+    return str(task.get("id") or task.get("task_id") or "").strip()
 
 
 def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:

@@ -1075,3 +1075,93 @@ def test_promoted_admission_binds_the_branched_threads_checkout_as_the_workspace
     assert _computed_lane(task) != _computed_lane(
         {"project_id": "racer", "workspace_root": str(folder)},
     )
+
+
+def test_the_busy_check_asks_about_the_FOLDER_not_only_the_project_id(monkeypatch, tmp_path):
+    """T3R2-M1: T0R2-5 keyed the lane on the folder; this check did not follow.
+
+    Project *alpha* merging into a shared folder while project *beta*'s task
+    writes in it reduced to two different project ids and read as idle. So did a
+    task carrying a `workspace_root` with NO `project_id` — which holds no lane at
+    all and is still in the folder.
+    """
+    import ouroboros.thread_branching as branching
+    from supervisor import workers
+
+    folder = str(tmp_path / "shared")
+
+    def _busy_with(task):
+        monkeypatch.setitem(workers.RUNNING, "x", {"task": task})
+        try:
+            return branching.project_is_busy("alpha", folder)
+        finally:
+            workers.RUNNING.pop("x", None)
+
+    # Another PROJECT writing in the same folder.
+    assert _busy_with({"id": "x", "project_id": "beta", "workspace_root": folder}) is True
+    # A task that names the folder and no project at all — it holds no lane, and
+    # it is still writing there.
+    assert _busy_with({"id": "x", "workspace_root": folder}) is True
+    # A different folder in a different project is not this merge's business.
+    assert _busy_with(
+        {"id": "x", "project_id": "beta", "workspace_root": str(tmp_path / "elsewhere")},
+    ) is False
+    # ...and the project half still answers on its own, with no folder given.
+    assert branching.project_is_busy("alpha") is False
+
+
+def test_merge_back_HOLDS_the_folder_lane_while_it_rewrites_the_folder(drive, folder, wt_root, monkeypatch):
+    """T3R2-M5: the busy check is a bare READ.
+
+    It answers about the instant it ran; the instant after that, the scheduler
+    could admit a task straight into the folder being rewritten — the two-writer
+    state the lane exists to prevent, reached through the gap between a check and
+    the work it checked for.
+    """
+    import ouroboros.thread_branching as branching
+    from ouroboros.project_lease import (
+        candidate_is_leasable,
+        normalize_workspace_root,
+        reserved_folder_lanes,
+        running_project_lanes,
+    )
+
+    thread = _project(drive, folder)
+    out = _branch(drive, "racer", thread["id"], wt_root)
+    _commit_in(out["path"], "feature.txt", "from the thread\n")
+    lane = ("", normalize_workspace_root(str(folder)))
+    newcomer = {"id": "late", "project_id": "racer", "workspace_root": str(folder)}
+    assert candidate_is_leasable(newcomer, running_project_lanes([])) is True
+
+    seen = {}
+    real_git = branching._git
+
+    def _watch(root, *args):
+        if "merge" in args and "--no-ff" in args:
+            # Mid-merge: what would the scheduler decide about a task arriving now?
+            seen["lanes"] = running_project_lanes([])
+            seen["leasable"] = candidate_is_leasable(newcomer, seen["lanes"])
+        return real_git(root, *args)
+
+    monkeypatch.setattr(branching, "_git", _watch)
+    merged = branching.merge_back_thread(drive, "racer", thread["id"], data_dir=drive, busy=False)
+
+    assert merged["ok"] is True, merged
+    assert lane in seen["lanes"], "the merge must HOLD the folder it is rewriting"
+    assert seen["leasable"] is False
+    # And it lets go, whatever happened — a failed merge must never strand a
+    # folder nobody can schedule into.
+    assert reserved_folder_lanes() == set()
+
+
+def test_a_failed_merge_still_releases_the_folder_it_held(drive, folder, wt_root):
+    from ouroboros.project_lease import reserved_folder_lanes
+
+    thread = _project(drive, folder)
+    _branch(drive, "racer", thread["id"], wt_root)
+    (folder / "app.txt").write_text("owner is mid-edit\n", encoding="utf-8")
+
+    refused = merge_back_thread(drive, "racer", thread["id"], data_dir=drive, busy=False)
+
+    assert refused["ok"] is False
+    assert reserved_folder_lanes() == set()

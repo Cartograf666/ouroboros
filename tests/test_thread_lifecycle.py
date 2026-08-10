@@ -16,6 +16,9 @@ The claims worth breaking a build over:
 
 from __future__ import annotations
 
+import threading
+import types
+
 import pytest
 
 from ouroboros.contracts.chat_id_policy import MAIN_THREAD_ID
@@ -228,6 +231,25 @@ def test_the_scheduled_notice_says_QUEUED_not_rejected(monkeypatch):
     assert _project_lane_wait_suffix({"id": "t4", "workspace_root": "/w/racer"}, busy) == ""
 
 
+def test_a_running_task_is_never_told_it_is_queued_behind_ITSELF(monkeypatch):
+    """T3R2-M6: no self-exclusion.
+
+    A task that is already RUNNING holds the folder's lane itself, so the lane
+    read came back occupied and the owner was told their running task was queued
+    behind "another task in this folder" — a task that does not exist. That is
+    exactly the false warning this module's own docstring forbids.
+    """
+    from supervisor.events import _project_lane_wait_suffix
+
+    task = {"id": "t1", "project_id": "racer", "workspace_root": "/w/racer"}
+    running = {"t1": {"task": dict(task)}}
+
+    assert _project_lane_wait_suffix(task, running) == ""
+    # Someone ELSE in the folder is still a real wait.
+    running["t9"] = {"task": {"id": "t9", "project_id": "other", "workspace_root": "/w/racer"}}
+    assert _project_lane_wait_suffix(task, running) != ""
+
+
 def test_the_queue_warning_stays_silent_when_the_queue_cannot_be_read():
     """A false "your work will wait" costs trust; a missing one costs surprise."""
     from supervisor.events import _project_lane_wait_suffix
@@ -352,3 +374,58 @@ def test_the_agents_project_list_still_works_without_a_supervisor(tmp_path, monk
 
     assert "PROJECTS_ERROR" not in out
     assert "racer" in out
+
+
+def test_resume_skips_thread_ZERO_which_belongs_to_the_project_path(tmp_path, monkeypatch):
+    """T3R2-M9: `list_sidebar_projects` includes DELETING projects, and thread #0
+    is synthesized with the project's own lifecycle.
+
+    So a project mid-deletion produced a bogus thread-deletion worker for its own
+    thread #0, which cancelled the project's whole tree in parallel with
+    `resume_project_deletions` and then raised `thread_zero_is_the_project`,
+    logging a traceback on every restart.
+    """
+    from ouroboros.projects_registry import (
+        begin_project_deletion,
+        begin_thread_deletion,
+        create_project,
+        create_thread,
+    )
+    from supervisor import task_lifecycle
+
+    create_project(tmp_path, "racer", name="Racer")
+    thread = create_thread(tmp_path, "racer", name="Side quest")
+    begin_thread_deletion(tmp_path, "racer", thread["id"])
+    begin_project_deletion(tmp_path, "racer")
+    started: list = []
+    monkeypatch.setattr(
+        task_lifecycle, "start_thread_deletion",
+        lambda drive_root, pid, tid, chat_id: started.append(int(tid)) or True,
+    )
+
+    resumed = task_lifecycle.resume_thread_deletions(tmp_path)
+
+    assert started == [int(thread["id"])], started
+    assert 0 not in started, "thread #0 IS the project; resume_project_deletions owns it"
+    assert resumed == 1
+
+
+def test_a_chatless_task_is_never_selected_as_a_threads_task(monkeypatch):
+    """T3R2-L1: `int(task.get("chat_id") or 0)` makes a MISSING chat id read as
+    chat 0, so `_live_thread_task_ids(0)` selected every chat-less task in the
+    queue — every headless subagent — and a cascade would cancel them."""
+    from supervisor import task_lifecycle
+
+    queue = types.SimpleNamespace(
+        _queue_lock=threading.Lock(),
+        PENDING=[
+            {"id": "headless-1"},
+            {"id": "headless-2", "chat_id": 0},
+            {"id": "roomed", "chat_id": 4242},
+        ],
+        RUNNING={},
+    )
+    monkeypatch.setattr(task_lifecycle, "_queue_module", lambda: queue)
+
+    assert task_lifecycle._live_thread_task_ids(0) == []
+    assert task_lifecycle._live_thread_task_ids(4242) == ["roomed"]
