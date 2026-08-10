@@ -111,6 +111,44 @@ export function diffLacksBaselineOnly(diff) {
 }
 
 /**
+ * Was this blocked because a WHOLE diff could not be served? (T3R-6.)
+ *
+ * `untracked_projection_capped` means the projection dropped EVERY new-file
+ * section rather than showing a prefix of them; `patch_too_large` means the patch
+ * was refused for its size. Both are the SAME promise kept — a diff is complete
+ * or it is not served — and both leave the owner with no patch at all. They get
+ * their own sentence because "no trustworthy diff can be shown" reads as a fault
+ * in the read, and neither is one: the files are fine, the answer is just too big
+ * to show honestly.
+ *
+ * `untracked_projection_capped` used to ride along as a footnote beside a
+ * rendered patch, which is exactly the silent clip the no-clipping rule forbids:
+ * the tracked half of a diff looks precisely like a whole one.
+ */
+export function diffTooBigRefusal(diff) {
+    if (String(diff?.status || '') !== 'blocked') return null;
+    const blockers = Array.isArray(diff?.blockers) ? diff.blockers.filter(Boolean) : [];
+    if (blockers.includes('untracked_projection_capped')) {
+        return {
+            reason: 'untracked_projection_capped',
+            meta: 'too many new files to diff',
+            text: 'There are too many new files here to show a complete diff, so none of it '
+                + 'is shown rather than part of it. Nothing is wrong with the files — open '
+                + 'the folder to see them.',
+        };
+    }
+    if (blockers.includes('patch_too_large')) {
+        return {
+            reason: 'patch_too_large',
+            meta: 'diff too large to show',
+            text: 'This diff is too large to serve, so it is not shown at all rather than '
+                + 'shortened into something that would read as complete.',
+        };
+    }
+    return null;
+}
+
+/**
  * The rail/header meta line for one loaded diff: `N files · +A −R`.
  * A diff that is not `ready` reports its lifecycle instead of a fake `0 files`.
  */
@@ -120,6 +158,8 @@ export function diffSummaryMeta(diff, parsed) {
     if (status === 'blocked') {
         const threadReason = threadCheckoutRefusal(diff);
         if (threadReason) return threadReason.meta;
+        const tooBig = diffTooBigRefusal(diff);
+        if (tooBig) return tooBig.meta;
         return diffLacksBaselineOnly(diff) ? 'no diff baseline recorded' : 'diff unavailable';
     }
     if (status === 'empty') return 'no changes';
@@ -185,8 +225,14 @@ export function diffBanners(diff) {
         // A missing baseline is an absence, not a broken read: it gets the neutral
         // sentence and no blocker code, because `baseline_missing` is not an
         // owner-actionable fault.
+        // A diff refused for its SIZE is not a failed read either: the answer
+        // exists, it is just too big to show whole, and showing part of it is the
+        // one thing the no-clipping rule forbids.
+        const tooBig = diffTooBigRefusal(diff);
         if (threadReason) {
             rows.push({ tone: 'neutral', text: threadReason.text });
+        } else if (tooBig) {
+            rows.push({ tone: 'blocked', text: tooBig.text, detail: blockers.join(', ') });
         } else {
             rows.push(diffLacksBaselineOnly(diff)
                 ? { tone: 'neutral', text: NO_BASELINE_NOTICE }

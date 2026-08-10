@@ -356,14 +356,25 @@ def _diff_envelope(
 ) -> Dict[str, Any]:
     """Build the response, applying the ONE no-clipping rule for both sources.
 
-    A patch over ``DIFF_MAX_PATCH_BYTES`` is answered as ``blocked`` +
-    ``patch_too_large`` with an EMPTY patch: the owner is told the diff is too big
-    to serve rather than shown a silently shortened one they would review as
-    complete.
+    TWO reasons answer ``blocked`` with an EMPTY patch. They are the same rule
+    seen from two sides — the owner is told a complete diff cannot be served,
+    rather than shown an incomplete one they would review as complete:
+
+    * ``patch_too_large`` — a patch over ``DIFF_MAX_PATCH_BYTES``;
+    * ``untracked_projection_capped`` — more new files than
+      ``DIFF_MAX_UNTRACKED_SECTIONS``, so EVERY new-file section was dropped
+      rather than a prefix of them shown. That still leaves a patch behind: the
+      TRACKED half, which renders exactly like a whole diff and says nothing
+      about the files missing from it. Carried as a footnote beside a `ready`
+      status it was a silent clip, which is the one thing this rule forbids.
     """
     body = patch
     reasons = list(blockers or [])
     digest = patch_sha256
+    if "untracked_projection_capped" in reasons:
+        status = DIFF_STATUS_BLOCKED
+        body = ""
+        digest = ""
     if len(body.encode("utf-8", errors="replace")) > DIFF_MAX_PATCH_BYTES:
         status = DIFF_STATUS_BLOCKED
         reasons.append("patch_too_large")
@@ -591,15 +602,40 @@ def task_diff_payload(
 def _status_paths(status: str) -> List[str]:
     """Every path named by `git status --porcelain -z`, renames included.
 
-    ``-z`` entries are ``XY<space><path>`` NUL-terminated, and a rename adds a
-    bare second token for the original name. Anything without the two-character
-    code plus separator is therefore that bare token and is taken whole.
+    Parsed POSITIONALLY, because ``-z`` porcelain has a record structure and not
+    a per-token shape. Each record is ``XY<space><path>`` NUL-terminated, and a
+    rename or copy (``R``/``C`` in either status column) is TWO tokens: the record
+    itself and then the ORIGIN path, bare, as its own NUL-terminated entry.
+
+    Guessing per token — "does this look like it starts with a status code" —
+    happened to work for most origin paths and mis-sliced the rest: a renamed-FROM
+    path whose third character is a space (``ab cd.txt``) was read as a record and
+    cut down to ``cd.txt``, so the fingerprint watched a file that does not exist
+    and stopped watching one that does. Consuming the origin token as part of its
+    record removes the guess entirely.
     """
     out: List[str] = []
-    for token in status.split("\0"):
+    tokens = status.split("\0")
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
         if not token:
             continue
-        out.append(token[3:] if len(token) > 3 and token[2] == " " else token)
+        if len(token) > 3 and token[2] == " ":
+            out.append(token[3:])
+            if token[0] in "RC" or token[1] in "RC":
+                # The very next token is this record's origin path, whatever it
+                # looks like. It is never a record of its own.
+                while index < len(tokens) and not tokens[index]:
+                    index += 1
+                if index < len(tokens):
+                    out.append(tokens[index])
+                    index += 1
+            continue
+        # A token that is not a well-formed record is taken whole rather than
+        # dropped: an unrecognised line must never make a path invisible.
+        out.append(token)
     return out
 
 
@@ -660,22 +696,33 @@ def thread_checkout_diff_payload(
     A thread that is not branched off is NOT an error: it works in the project
     folder, so it reports the typed ``thread_not_branched`` blocker and the client
     tells the owner where its work actually lives.
+
+    ``branch`` rides every answer, including the refusals. The header shows
+    "thread · branch" and the client learns the branch HERE rather than requiring
+    whoever opened the screen to already know it — which was the documented
+    intent, while the payload did not actually carry the field (T3R-12).
     """
     from ouroboros.thread_worktrees import get_thread_worktree
 
     envelope: Dict[str, Any] = dict(source=DIFF_SOURCE_THREAD_CHECKOUT)
+    branch = ""
+
+    def _answer(status: str, **kwargs: Any) -> Dict[str, Any]:
+        return {**_diff_envelope(status, **kwargs), "branch": branch}
+
     row = get_thread_worktree(drive_root, project_id, thread_id)
     if not row:
-        return _diff_envelope(DIFF_STATUS_BLOCKED, blockers=["thread_not_branched"], **envelope)
+        return _answer(DIFF_STATUS_BLOCKED, blockers=["thread_not_branched"], **envelope)
+    branch = str(row.get("branch") or "")
     root = pathlib.Path(str(row.get("path") or ""))
     base_commit = str(row.get("base_sha") or "")
     envelope["base_commit"] = base_commit
     if not root.is_dir():
-        return _diff_envelope(DIFF_STATUS_BLOCKED, blockers=["checkout_missing"], **envelope)
+        return _answer(DIFF_STATUS_BLOCKED, blockers=["checkout_missing"], **envelope)
     if not _BASE_COMMIT_RE.fullmatch(base_commit):
         # Same rule as the self-repo path: a baseline that is not a hex object
         # name never reaches argv, where git would read it as an OPTION.
-        return _diff_envelope(DIFF_STATUS_BLOCKED, blockers=["base_commit_unknown"], **envelope)
+        return _answer(DIFF_STATUS_BLOCKED, blockers=["base_commit_unknown"], **envelope)
     current_head = _git_head(root)
     # `head_advanced` here means the thread has committed work of its own — the
     # honest reading of "HEAD moved off the disclosed baseline" for a checkout
@@ -690,13 +737,13 @@ def thread_checkout_diff_payload(
         before = _checkout_fingerprint(root)
         patch, blockers = _build_projection_patch(root, base_commit, [])
         if before != _checkout_fingerprint(root):
-            return _diff_envelope(
+            return _answer(
                 DIFF_STATUS_BLOCKED, blockers=["projection_changed_during_read"], **envelope,
             )
     envelope["blockers"] = blockers
     if "baseline_diff_failed" in blockers:
-        return _diff_envelope(DIFF_STATUS_BLOCKED, **envelope)
-    return _diff_envelope(
+        return _answer(DIFF_STATUS_BLOCKED, **envelope)
+    return _answer(
         DIFF_STATUS_READY if patch.strip() else DIFF_STATUS_EMPTY,
         patch=patch,
         patch_sha256=_patch_digest(patch),

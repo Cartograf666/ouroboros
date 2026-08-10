@@ -653,6 +653,10 @@ class ThreadDiffResponse(TypedDict, total=False):
     blockers: list[str]
     patch: str
     patch_sha256: str
+    #: The checkout's branch, on EVERY answer including the refusals: the Changes
+    #: header shows "thread · branch", and it learns the branch from the diff
+    #: rather than requiring whoever opened the screen to already know it.
+    branch: str
     error: str
 
 

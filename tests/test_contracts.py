@@ -566,10 +566,12 @@ def test_thread_worktree_surface_is_indexed_and_typed():
         "GET /api/projects/{project_id}/threads/{thread_id}/diff",
     ):
         assert route in HTTP_ENDPOINTS, route
-    # The thread diff IS the task diff envelope plus the thread's identity.
+    # The thread diff IS the task diff envelope plus the thread's identity — and
+    # its BRANCH, which the Changes header shows beside the thread's name and
+    # learns from the diff rather than from whoever opened the screen (T3R-12).
     assert set(TaskDiffResponse.__annotations__) < set(ThreadDiffResponse.__annotations__)
     assert set(ThreadDiffResponse.__annotations__) - set(TaskDiffResponse.__annotations__) == {
-        "project_id", "thread_id",
+        "project_id", "thread_id", "branch",
     }
     # Additive frozen surfaces: no field of either is ever required (§11.1).
     assert ThreadDiffResponse.__required_keys__ == frozenset()

@@ -503,6 +503,9 @@
  * @property {string[]=} blockers
  * @property {string=} patch
  * @property {string=} patch_sha256
+ * @property {string=} branch the checkout's branch, on EVERY answer including
+ *   the refusals — the Changes header shows "thread · branch" and learns the
+ *   branch here rather than requiring whoever opened the screen to know it
  * @property {string=} error
  */
 
