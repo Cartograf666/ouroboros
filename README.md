@@ -166,6 +166,33 @@ Benchmark adapters, run scripts, and per-benchmark methodology live in [`devtool
 
 ---
 
+## Install the isolated CLI with uv
+
+For a user-level CLI/server install without cloning a working tree, uv can
+build Ouroboros directly from the contribution branch:
+
+```bash
+uv tool install "git+https://github.com/razzant/ouroboros.git@ouroboros"
+ouroboros --help
+```
+
+The tool environment is isolated and exposes the `ouroboros` and
+`ouroboros-web` commands. Update or remove it with:
+
+```bash
+uv tool upgrade ouroboros
+uv tool uninstall ouroboros
+```
+
+This Git-branch form follows the latest `ouroboros` commit and resolves the
+dependencies declared in `pyproject.toml`; `uv tool install` does not consume
+the repository's `uv.lock`. For a repeatable install, replace `ouroboros` after
+the `@` with a reviewed full commit SHA. Use the source setup below for
+development, repository tests, and the complete browser extras, or use a
+platform release artifact for the packaged desktop runtime.
+
+---
+
 ## Run from Source
 
 ### Requirements

@@ -1468,6 +1468,14 @@ in README, and leaves its CI clean-diff check green.
 The pinned `tool.uv.required-version` and the digest-pinned `setup-uv` action
 make resolver changes deliberate rather than an ambient CI upgrade.
 
+`uv tool install "git+https://github.com/razzant/ouroboros.git@ouroboros"`
+is the documented checkout-free CLI/server path. It resolves the project
+metadata into an isolated tool environment but does not read this repository's
+`uv.lock`; branch installs therefore follow dependency ranges as well as source
+HEAD. Documentation must pair that convenient form with the full-commit-SHA
+form for repeatability and must not describe it as a release-artifact install
+or a contributor development environment.
+
 ### Pytest marker lanes
 
 Default local pytest excludes costly or environment-dependent lanes:

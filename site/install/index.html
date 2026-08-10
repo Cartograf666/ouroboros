@@ -66,6 +66,13 @@
 
     <p>Prerelease artifacts stay on their tag pages; the latest-release page points to the latest stable release. The AppImage bundles Chromium and WebKit binaries, but distro shared libraries remain host dependencies. Prefer the native package where available; otherwise extract the AppImage and run <code>./squashfs-root/usr/lib/ouroboros/_internal/python-standalone/bin/python3 -m playwright install-deps chromium webkit</code> to identify and install the required host packages.</p>
 
+    <h2>Install the isolated CLI with uv</h2>
+    <p>For a user-level CLI/server install without a checkout, install directly from the contribution branch. This follows the branch and resolves <code>pyproject.toml</code>; it does not consume the repository's <code>uv.lock</code>. Replace <code>ouroboros</code> after the <code>@</code> with a reviewed full commit SHA for a repeatable install.</p>
+    <pre><code>uv tool install "git+https://github.com/razzant/ouroboros.git@ouroboros"
+ouroboros --help
+uv tool upgrade ouroboros
+# Later: uv tool uninstall ouroboros</code></pre>
+
     <h2>Run from source</h2>
     <p>Source mode needs Python 3.10 or newer, Git, and uv 0.12.1.</p>
     <pre><code>git clone https://github.com/razzant/ouroboros.git
