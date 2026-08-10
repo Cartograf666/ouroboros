@@ -794,7 +794,10 @@ class ProjectDeleteResponse(TypedDict, total=False):
     worktrees_removed: List[int]
     #: ``thread/<name>`` branches deleted along with those checkouts.
     branches_removed: List[str]
-    #: ``[{thread_id, reason}]`` — a checkout that could not be taken yet.
+    #: ``[{thread_id, path, branch, reason}]`` — a checkout that could not be
+    #: taken yet. ``path``/``branch`` are named because the cancellation worker
+    #: may not manage to take it either, and a tombstoned project has no surface
+    #: left that could point the owner at the folder.
     worktrees_pending: List[Dict[str, Any]]
     reason: str
     message: str

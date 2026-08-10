@@ -225,3 +225,193 @@ def test_supervisor_resumes_deleting_project_after_restart(tmp_path, isolated_pr
     _wait_for_lifecycle(tmp_path, "resume", "tombstoned")
     assert isolated_project_queue.cancelled == ["resume-root"]
     assert reconcile_projects(tmp_path) == 0
+
+
+# --------------------------------------------------------------------------- #
+# P1 — the sweep must not acknowledge work the owner never saw
+# --------------------------------------------------------------------------- #
+
+def _git(cwd, *args, check=True):
+    import subprocess
+
+    return subprocess.run(
+        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=check
+    )
+
+
+@pytest.fixture
+def owner_repo(tmp_path):
+    root = tmp_path / "owner_folder"
+    root.mkdir()
+    _git(root, "init", "-b", "main")
+    _git(root, "config", "user.email", "t@example.com")
+    _git(root, "config", "user.name", "T")
+    (root / "app.txt").write_text("one\n", encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-m", "seed")
+    return root
+
+
+def test_the_sweep_reinspects_and_keeps_a_newly_at_risk_checkout(
+    tmp_path, owner_repo, monkeypatch
+):
+    """P1: `remove_project_thread_worktrees` hardcoded `acknowledge_unmerged=True`.
+
+    Reproduced end to end on the merged tree: the checkout is CLEAN when
+    `api_project_delete` inspects it, so nothing refuses; the route's own removal
+    correctly answers `project_busy` because a task is still writing there; the
+    still-running task then commits work that exists nowhere else and edits a
+    tracked file; the post-quiescence sweep destroyed both with no re-inspection
+    and no fresh consent.
+
+    The sweep now re-asks the SAME judge the route asked, so a checkout that became
+    at-risk after the owner looked comes back `unmerged_work` and is KEPT.
+    """
+    import pathlib
+
+    from ouroboros.project_threads_registry import create_thread
+    from ouroboros.projects_registry import create_project
+    from ouroboros.thread_branching import branch_off_thread
+    from ouroboros.thread_worktrees import (
+        checkout_work_at_risk,
+        get_thread_worktree,
+        inspect_thread_worktree,
+    )
+    from supervisor.task_lifecycle import _sweep_project_checkouts
+
+    monkeypatch.setenv("OUROBOROS_THREAD_WORKTREE_ROOT", str(tmp_path / "wts"))
+    drive = tmp_path / "drive"
+    create_project(drive, "racer", name="Racer", working_dir=str(owner_repo))
+    thread = create_thread(drive, "racer", name="Side quest")
+    out = branch_off_thread(
+        drive, "racer", thread["id"], data_dir=drive, worktree_root=tmp_path / "wts"
+    )
+    assert out["ok"] is True
+    checkout = pathlib.Path(out["path"])
+
+    # What the still-running task produced after the owner's pre-fence look.
+    (checkout / "only_copy.txt").write_text("exists nowhere else\n", encoding="utf-8")
+    _git(checkout, "add", "-A")
+    _git(
+        checkout, "-c", "user.email=t@example.com", "-c", "user.name=T",
+        "commit", "-m", "add only_copy.txt",
+    )
+    (checkout / "app.txt").write_text("owner edit, uncommitted\n", encoding="utf-8")
+
+    risk = checkout_work_at_risk(
+        inspect_thread_worktree(get_thread_worktree(drive, "racer", thread["id"]))
+    )
+    assert risk["at_risk"] is True
+    assert risk["unmerged_commits"] == 1
+    assert risk["tracked_files"]
+
+    note = _sweep_project_checkouts(drive, "racer")
+
+    assert checkout.is_dir(), "the sweep destroyed work the owner never acknowledged"
+    assert (checkout / "only_copy.txt").is_file()
+    assert (checkout / "app.txt").read_text(encoding="utf-8") == "owner edit, uncommitted\n"
+    assert get_thread_worktree(drive, "racer", thread["id"]) is not None
+    # ...and it did not happen silently: the survivor is named, WITH its folder.
+    assert "unmerged_work" in note
+    assert str(checkout) in note
+    assert out["branch"] in note
+
+
+def test_rebuildable_dirt_is_still_swept_without_a_second_prompt(
+    tmp_path, owner_repo, monkeypatch
+):
+    """The re-inspection must not turn the sweep into a wall.
+
+    `checkout_work_at_risk` is deliberately narrower than the removal's own "would
+    be destroyed": an ignored build directory is not work at risk, the owner
+    already confirmed the deletion, and refusing over it would resurrect the
+    three-step detour H-ter closed.
+    """
+    import pathlib
+
+    from ouroboros.project_threads_registry import create_thread
+    from ouroboros.projects_registry import create_project
+    from ouroboros.thread_branching import branch_off_thread
+    from ouroboros.thread_worktrees import get_thread_worktree
+    from supervisor.task_lifecycle import _sweep_project_checkouts
+
+    monkeypatch.setenv("OUROBOROS_THREAD_WORKTREE_ROOT", str(tmp_path / "wts"))
+    drive = tmp_path / "drive"
+    (owner_repo / ".gitignore").write_text("*.log\n", encoding="utf-8")
+    _git(owner_repo, "add", "-A")
+    _git(owner_repo, "commit", "-m", "ignore logs")
+    create_project(drive, "racer", name="Racer", working_dir=str(owner_repo))
+    thread = create_thread(drive, "racer", name="Side quest")
+    out = branch_off_thread(
+        drive, "racer", thread["id"], data_dir=drive, worktree_root=tmp_path / "wts"
+    )
+    checkout = pathlib.Path(out["path"])
+    (checkout / "build.log").write_text("noise\n", encoding="utf-8")
+    (checkout / "never_added.txt").write_text("untracked\n", encoding="utf-8")
+
+    note = _sweep_project_checkouts(drive, "racer")
+
+    assert note == ""
+    assert not checkout.exists()
+    assert get_thread_worktree(drive, "racer", thread["id"]) is None
+
+
+def test_a_checkout_that_survives_is_disclosed_on_the_tombstone_and_to_the_owner(
+    tmp_path, owner_repo, monkeypatch
+):
+    """P1, second half: a `removal_failed` used to end with `lifecycle` tombstoned,
+    the checkout on disk, the registry row present and `delete_error == ""` — the
+    sweep's `log.warning` reaching no surface at all.
+
+    Keeping the project UNTOMBSTONED was rejected as owner direction (§I M2), so
+    the answer is disclosure: the survivors ride the tombstoned row and the owner
+    is told where they are.
+    """
+    import pathlib
+
+    from ouroboros.project_threads_registry import create_thread
+    from ouroboros.projects_registry import (
+        begin_project_deletion,
+        create_project,
+        get_reserved_project,
+    )
+    from ouroboros.thread_branching import branch_off_thread
+    import ouroboros.thread_worktrees as twt
+    import supervisor.task_lifecycle as lifecycle
+
+    monkeypatch.setenv("OUROBOROS_THREAD_WORKTREE_ROOT", str(tmp_path / "wts"))
+    drive = tmp_path / "drive"
+    create_project(drive, "racer", name="Racer", working_dir=str(owner_repo))
+    thread = create_thread(drive, "racer", name="Side quest")
+    out = branch_off_thread(
+        drive, "racer", thread["id"], data_dir=drive, worktree_root=tmp_path / "wts"
+    )
+    checkout = pathlib.Path(out["path"])
+    assert checkout.is_dir()
+
+    # Removal cannot take it — a git lock, a read-only parent, a busy file.
+    monkeypatch.setattr(
+        twt, "remove_thread_worktree",
+        lambda **kw: {"removed": False, "reason": "removal_failed", "inspection": {}},
+    )
+    monkeypatch.setattr(lifecycle, "_live_project_task_ids", lambda *a, **k: [])
+    monkeypatch.setattr(lifecycle, "_broadcast_projects_changed", lambda *a, **k: None)
+    told: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        lifecycle, "_tell_owner_about_orphaned_checkouts",
+        lambda pid, note: told.append((pid, note)),
+    )
+
+    begin_project_deletion(drive, "racer")
+    lifecycle.run_project_deletion(drive, "racer", 1234)
+
+    entry = get_reserved_project(drive, "racer")
+    # The tombstone still happens — that is the owner's decision, not a defect.
+    assert entry["lifecycle"] == "tombstoned"
+    assert checkout.is_dir()
+    # ...but the owner learns WHAT was left behind and WHERE.
+    assert "removal_failed" in entry["delete_error"]
+    assert str(checkout) in entry["delete_error"]
+    assert out["branch"] in entry["delete_error"]
+    assert told and told[0][0] == "racer"
+    assert str(checkout) in told[0][1]

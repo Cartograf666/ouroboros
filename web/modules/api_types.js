@@ -626,7 +626,9 @@
  * @property {boolean} folder_untouched
  * @property {number[]=} worktrees_removed thread ids whose checkout went with it
  * @property {string[]=} branches_removed thread/<name> branches deleted with them
- * @property {Object[]=} worktrees_pending [{thread_id, reason}] — not takeable yet
+ * @property {Object[]=} worktrees_pending [{thread_id, path, branch, reason}] — not
+ *   takeable yet; the folder is named because a tombstoned project has no surface
+ *   left that could point at it
  * @property {string=} reason
  * @property {string=} message
  * @property {Object[]=} threads on threads_hold_checkouts: [{thread_id, path,

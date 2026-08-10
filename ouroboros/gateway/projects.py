@@ -597,6 +597,13 @@ async def api_project_delete(request: Request) -> JSONResponse:
     yet (a task is still writing in that folder) is reported as PENDING and swept
     by the cancellation worker once the project quiesces, so no path leaves an
     orphan silently.
+
+    "Swept" is not "force-removed": the sweep re-asks ``checkout_work_at_risk`` per
+    checkout, because the inspection this route took is a fact about a moment that
+    has passed by then — the task that made a removal refuse ``project_busy`` here
+    can commit work and edit tracked files before it stops. A checkout that became
+    at-risk in that window survives the sweep and is disclosed on the tombstoned
+    row (``delete_error``) and in a chat note naming the folder and its branch (P1).
     """
     try:
         import asyncio
@@ -658,8 +665,10 @@ async def api_project_delete(request: Request) -> JSONResponse:
             "worktrees_removed": swept["removed"],
             "branches_removed": swept["branches"],
             # Not removable YET (a task is still in that folder). The cancellation
-            # worker takes them once the project quiesces; named here so "the
-            # checkouts went with it" is never claimed before it is true.
+            # worker takes them once the project quiesces — unless the work in them
+            # has become unrebuildable by then, in which case they SURVIVE and the
+            # tombstone discloses them. Named here, with their folder and branch, so
+            # "the checkouts went with it" is never claimed before it is true.
             "worktrees_pending": swept["kept"],
         })
     except Exception as exc:

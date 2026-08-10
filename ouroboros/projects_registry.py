@@ -886,11 +886,24 @@ def fail_project_deletion(
     return None
 
 
-def complete_project_deletion(drive_root: Any, project_id: str) -> Optional[Dict[str, Any]]:
-    """Commit the tombstone after the supervisor proves subtree quiescence."""
+def complete_project_deletion(
+    drive_root: Any, project_id: str, *, delete_error: str = ""
+) -> Optional[Dict[str, Any]]:
+    """Commit the tombstone after the supervisor proves subtree quiescence.
+
+    ``delete_error`` records what the teardown could NOT take — today, thread
+    checkouts that outlived the sweep. The tombstone still happens: keeping the
+    project alive because a folder survived was considered and REJECTED by the
+    owner (it collides with §I M2 and with "deleting a thread with its worktree
+    must be easy"). But a tombstoned project is invisible on every surface, so a
+    surviving checkout would be a folder and a ``thread/*`` branch nothing can
+    reach, previously announced by a ``log.warning`` alone. It is written onto the
+    row here, and the caller also tells the owner in chat — never silently.
+    """
     pid = sanitize_project_id(project_id)
     if not pid:
         return None
+    note = str(delete_error or "")[:2000]
     with _file_write_lock(_registry_path(drive_root)):
         data = _load(drive_root)
         for entry in data["projects"]:
@@ -902,11 +915,11 @@ def complete_project_deletion(drive_root: Any, project_id: str) -> Optional[Dict
                 raise ValueError(f"project {pid!r} is not deleting")
             entry["lifecycle"] = PROJECT_TOMBSTONED
             entry["tombstoned_at"] = utc_now_iso()
-            entry["delete_error"] = ""
+            entry["delete_error"] = note
             _save(drive_root, data)
             log.info(
-                "Project tombstoned: %s (history, bindings, folder and memory preserved)",
-                pid,
+                "Project tombstoned: %s (history, bindings, folder and memory preserved)%s",
+                pid, f" — LEFT BEHIND: {note}" if note else "",
             )
             return dict(entry)
     return None

@@ -1132,26 +1132,90 @@ def _broadcast_projects_changed(project_id: str, chat_id: Any) -> None:
         _queue_module().log.debug("projects_changed broadcast failed for %s", project_id, exc_info=True)
 
 
-def _sweep_project_checkouts(drive_root: object, project_id: str) -> None:
+def _sweep_project_checkouts(drive_root: object, project_id: str) -> str:
     """Take any thread checkout that outlived the delete route's own attempt.
 
-    Best-effort and never raising: a checkout that still cannot be removed is
-    LOGGED at warning, because the alternative is a silent orphan and the
-    tombstone is about to make it unreachable. It is not a reason to fail the
-    deletion — the project row's own teardown has already succeeded by here.
+    Best-effort and never raising: a checkout that still cannot be removed is not
+    a reason to fail the deletion — the project row's own teardown has already
+    succeeded by here. But it must not VANISH either, so this returns a disclosure
+    sentence ("" when nothing was left behind) that the caller writes onto the
+    tombstoned row and sends to the owner. A ``log.warning`` was the whole of the
+    previous disclosure and it reaches no owner surface at all.
+
+    The sweep no longer acknowledges unmerged work on the owner's behalf (see
+    ``thread_worktrees.remove_project_thread_worktrees``), so a checkout that
+    became at-risk AFTER the owner's pre-fence look now survives here deliberately
+    — which is precisely why the survivors have to be disclosed.
     """
     try:
         from ouroboros.thread_worktrees import remove_project_thread_worktrees
 
         swept = remove_project_thread_worktrees(drive_root, project_id)
-        if swept["kept"]:
-            _queue_module().log.warning(
-                "Project %s tombstoned with %d thread checkout(s) still on disk: %s",
-                project_id, len(swept["kept"]), swept["kept"],
-            )
-    except Exception:
+        if not swept["kept"]:
+            return ""
+        _queue_module().log.warning(
+            "Project %s tombstoned with %d thread checkout(s) still on disk: %s",
+            project_id, len(swept["kept"]), swept["kept"],
+        )
+        return _orphaned_checkouts_note(swept["kept"])
+    except Exception as exc:
         _queue_module().log.warning(
             "Project %s: thread checkout sweep failed", project_id, exc_info=True,
+        )
+        return (
+            "the thread checkouts could not be swept "
+            f"({type(exc).__name__}: {exc}), so any that exist are still on disk."
+        )[:2000]
+
+
+def _orphaned_checkouts_note(kept: List[Dict[str, Any]]) -> str:
+    """What was left behind, and WHERE — the sentence the owner is owed.
+
+    Names each folder and branch rather than counting them: the project is about to
+    become invisible on every surface, so this text is the only thing that can
+    still point the owner at work only they can reach now.
+    """
+    lines = []
+    for item in kept:
+        path = str(item.get("path") or "").strip() or "(path unknown)"
+        branch = str(item.get("branch") or "").strip()
+        reason = str(item.get("reason") or "removal_failed")
+        lines.append(
+            f"thread {item.get('thread_id')}: {path}"
+            + (f" (branch {branch})" if branch else "")
+            + f" — {reason}"
+        )
+    count = len(lines)
+    return (
+        f"{count} thread checkout{'' if count == 1 else 's'} could not be removed and "
+        f"{'is' if count == 1 else 'are'} still on disk; the project is deleted, so "
+        "nothing in the app can reach them any more. " + "; ".join(lines)
+    )[:2000]
+
+
+def _tell_owner_about_orphaned_checkouts(project_id: str, note: str) -> None:
+    """Send the disclosure to the one surface a tombstoned project still has.
+
+    A tombstoned row is filtered out of ``list_sidebar_projects``, so writing the
+    note onto the row makes it durable and checkable but shows it to nobody. The
+    owner's chat is where every other background lifecycle reports itself
+    (``evolution_lifecycle.notify_owner_cycle_outcome`` is the precedent) and this
+    is the same class of fact: a teardown that finished in a way the owner has to
+    know about. Fully guarded — a disclosure that cannot be SENT must not take the
+    deletion down with it, and the note is on the row either way.
+    """
+    try:
+        from supervisor.message_bus import send_with_budget
+        from supervisor.state import load_state
+
+        owner_chat_id = int(load_state().get("owner_chat_id") or 0)
+        if not owner_chat_id:
+            return
+        send_with_budget(owner_chat_id, f"⚠️ Project “{project_id}” was deleted, but {note}")
+    except Exception:
+        _queue_module().log.warning(
+            "Project %s: could not tell the owner about the checkouts left behind: %s",
+            project_id, note, exc_info=True,
         )
 
 
@@ -1169,15 +1233,32 @@ def run_project_deletion(
     ``project_busy`` there and would otherwise be left behind — a folder and a
     ``thread/*`` branch that a tombstoned project has no surface to reach. Here the
     tasks are gone, so the removal's own busy judge lets it through.
+
+    What it does NOT do is acknowledge unmerged work for the owner. The pre-fence
+    inspection is a fact about a moment that has passed by the time this runs: the
+    task that made the route refuse ``project_busy`` went on to commit work and edit
+    tracked files in that checkout, and the sweep's hardcoded acknowledgement
+    destroyed both (P1). Each row is re-inspected by the same judge the route used,
+    so a newly at-risk checkout SURVIVES — and then rides the tombstone as a
+    disclosure, naming the folder and the branch, plus a chat note to the owner. The
+    project is still tombstoned: keeping it alive because a folder survived was
+    rejected as owner direction (§I M2), so the answer is disclosure, never silence.
     """
     from ouroboros.projects_registry import complete_project_deletion, fail_project_deletion
 
     q = _queue_module()
 
     def _finish() -> None:
-        _sweep_project_checkouts(drive_root, project_id)
-        complete_project_deletion(drive_root, project_id)
+        # The sweep's own answer rides the tombstone. A checkout it could not take
+        # is now KEPT rather than force-removed (the sweep stopped acknowledging
+        # unmerged work on the owner's behalf), so "what was left behind and where"
+        # is a fact the tombstone has to carry — and the owner has to be told,
+        # because a tombstoned project is on no surface that could show them.
+        left_behind = _sweep_project_checkouts(drive_root, project_id)
+        complete_project_deletion(drive_root, project_id, delete_error=left_behind)
         _broadcast_projects_changed(project_id, chat_id)
+        if left_behind:
+            _tell_owner_about_orphaned_checkouts(project_id, left_behind)
 
     try:
         while True:

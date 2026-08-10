@@ -658,34 +658,60 @@ def project_checkouts_at_risk(data_dir: Any, project_id: Any) -> List[Dict[str, 
 def remove_project_thread_worktrees(data_dir: Any, project_id: Any) -> Dict[str, Any]:
     """Remove every checkout of a project, reporting each outcome.
 
-    Returns ``{removed: [...], kept: [{thread_id, reason}], branches: [...]}``.
-    ``acknowledge_unmerged`` is passed because the CALLER has already refused on
-    anything at risk (:func:`project_checkouts_at_risk`) — what is left is
-    rebuildable content the owner confirmed, exactly as thread deletion does it.
-    Never raises: a checkout that survives is REPORTED, because the project row is
-    on its way to a tombstone and a swallowed failure would be the orphan this
-    function exists to prevent.
+    Returns ``{removed: [...], kept: [{thread_id, path, branch, reason}],
+    branches: [...]}``. Never raises: a checkout that survives is REPORTED,
+    because the project row is on its way to a tombstone and a swallowed failure
+    would be the orphan this function exists to prevent — ``path`` and ``branch``
+    ride each ``kept`` entry so the disclosure can say WHERE it was left.
+
+    ``acknowledge_unmerged`` is decided PER ROW, by asking the same judge the
+    route asked, and that is the fix for a real destruction path. It used to be a
+    hardcoded ``True``, justified by "the CALLER has already refused on anything at
+    risk" — which is true of ``api_project_delete``'s pre-fence inspection and NOT
+    true of the moment this runs. Reproduced: a clean checkout passes the
+    pre-check; the route's own removal correctly refuses ``project_busy`` because a
+    task is still writing there; the task then COMMITS work and edits a tracked
+    file; the post-quiescence sweep (``supervisor.task_lifecycle
+    ._sweep_project_checkouts``) calls this, and the hardcoded acknowledgement
+    destroyed both with no re-inspection and no fresh consent — exactly the
+    "acknowledge on the owner's behalf" that A10/D4 forbid.
+
+    So each row is re-inspected here and ``acknowledge_unmerged`` is
+    ``not risk["at_risk"]``: rebuildable dirt the owner already confirmed still
+    goes, while a checkout that became at-risk AFTER the owner looked comes back
+    ``unmerged_work`` and lands in ``kept``. The consequence is disclosed rather
+    than hidden — see the caller, which records the survivors on the tombstoned row
+    and tells the owner where they are.
     """
     removed: List[int] = []
     kept: List[Dict[str, Any]] = []
     branches: List[str] = []
     for row in project_thread_worktrees(data_dir, project_id):
         tid = int(row.get("thread_id") or 0)
+        survivor = {
+            "thread_id": tid,
+            "path": str(row.get("path") or ""),
+            "branch": str(row.get("branch") or ""),
+        }
         try:
+            # The SAME judge `api_project_delete` used before fencing, asked again
+            # NOW: consent given for a clean checkout is not consent for whatever
+            # a still-running task put in it afterwards.
+            risk = checkout_work_at_risk(inspect_thread_worktree(row))
             outcome = remove_thread_worktree(
                 data_dir=data_dir, project_id=str(project_id or ""), thread_id=tid,
-                acknowledge_unmerged=True,
+                acknowledge_unmerged=not risk["at_risk"],
             )
         except Exception as exc:  # noqa: BLE001 — an orphan must never be silent
             log.warning("Project deletion could not remove checkout %s#%s", project_id, tid, exc_info=True)
-            kept.append({"thread_id": tid, "reason": f"{type(exc).__name__}: {exc}"[:200]})
+            kept.append({**survivor, "reason": f"{type(exc).__name__}: {exc}"[:200]})
             continue
         if outcome.get("removed"):
             removed.append(tid)
             if outcome.get("branch_removed") and outcome.get("branch"):
                 branches.append(str(outcome["branch"]))
         else:
-            kept.append({"thread_id": tid, "reason": str(outcome.get("reason") or "removal_failed")})
+            kept.append({**survivor, "reason": str(outcome.get("reason") or "removal_failed")})
     return {"removed": removed, "kept": kept, "branches": branches}
 
 
