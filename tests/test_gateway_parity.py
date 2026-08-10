@@ -20,10 +20,17 @@ from ouroboros.gateway.contracts import (
     TaskCostBreakdown,
     TaskDetailResponse,
     TaskDiffResponse,
+    ThreadBranchBase,
+    ThreadBranchBasesResponse,
+    ThreadBranchOffRequest,
     ThreadCreateRequest,
+    ThreadDiffResponse,
     ThreadEntry,
+    ThreadLocation,
     ThreadResponse,
     ThreadUpdateRequest,
+    ThreadWorktreeRemoveRequest,
+    ThreadWorktreeResponse,
     UiPreferencesResponse,
     UpdateApplyErrorResponse,
     UpdateApplyRequest,
@@ -124,6 +131,13 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "ThreadCreateRequest",
         "ThreadUpdateRequest",
         "ThreadResponse",
+        "ThreadLocation",
+        "ThreadBranchBase",
+        "ThreadBranchBasesResponse",
+        "ThreadBranchOffRequest",
+        "ThreadWorktreeRemoveRequest",
+        "ThreadWorktreeResponse",
+        "ThreadDiffResponse",
         "WorkspaceGitInitDecision",
         "ProjectInitGitResponse",
         "ProjectFromTaskResponse",
@@ -137,6 +151,14 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     # Thread lifecycle: the browser must reach every route the gateway mounts,
     # or the UI phase would hand-roll fetches outside the api_client seam.
     for call in ("projectThreadCreate", "projectThreadUpdate", "projectThreadFork"):
+        assert call in api_client, f"api_client.js missing {call}"
+    # T3: branching, the inspected removal and the thread-checkout diff ride the
+    # SAME seam. A UI phase that hand-rolls one of these fetches loses the shared
+    # path builder and, with it, the encoding of an owner-typed project id.
+    for call in (
+        "threadBranchBases", "threadBranchOff", "threadMergeBack",
+        "threadWorktree", "threadWorktreeRemove", "threadDiff",
+    ):
         assert call in api_client, f"api_client.js missing {call}"
     # T2: the owner's YES to the git_init_required offer must be reachable through
     # the one client seam, or the UI phase hand-rolls a fetch for the single route
@@ -156,6 +178,9 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
                 ClaudexorStatusReads, ClaudexorStatusResponse, TaskDiffResponse,
                 UiPreferencesResponse, ProjectEntry,
                 ThreadEntry, ThreadCreateRequest, ThreadUpdateRequest, ThreadResponse,
+                ThreadLocation, ThreadBranchBase, ThreadBranchBasesResponse,
+                ThreadBranchOffRequest, ThreadWorktreeRemoveRequest,
+                ThreadWorktreeResponse, ThreadDiffResponse,
                 WorkspaceGitInitDecision, ProjectInitGitResponse,
                 ProjectFromTaskResponse):
         expected = set(get_type_hints(cls, include_extras=True))

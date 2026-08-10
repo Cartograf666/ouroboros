@@ -498,6 +498,132 @@ class ThreadResponse(TypedDict):
     thread: ThreadEntry
 
 
+class ThreadLocation(TypedDict, total=False):
+    """WHERE a thread works — DERIVED, never stored (A7).
+
+    ``where`` is ``project_folder`` or ``worktree``, and it is the answer to one
+    question: does a durable worktree exist for this thread? There is no toggle
+    to read, so no client can be shown a location the filesystem disagrees with.
+    The remaining fields are present only in the ``worktree`` case.
+    """
+
+    where: str
+    path: str
+    branch: str
+    base_sha: str
+    created_at: str
+
+
+class ThreadBranchBase(TypedDict, total=False):
+    """One base the owner may branch off from (A8).
+
+    ``kind`` is ``branch``, ``tag`` or ``snapshot``. The snapshot entry — "exactly
+    as it is now" — is not a git ref: ``creates_commit`` discloses whether
+    choosing it would make a snapshot commit (a dirty tree) or simply reuse HEAD
+    (a clean one). A commit-ish the owner types is accepted by the branch-off
+    route and is deliberately not enumerated here; listing every commit is not an
+    offer.
+    """
+
+    ref: str
+    kind: str
+    label: str
+    dirty: bool
+    creates_commit: bool
+
+
+class ThreadBranchBasesResponse(TypedDict, total=False):
+    """``GET /api/projects/{project_id}/threads/{thread_id}/branch-bases``."""
+
+    project_id: str
+    thread_id: int
+    current_branch: str
+    bases: List[ThreadBranchBase]
+    snapshot: ThreadBranchBase
+    location: ThreadLocation
+    ok: bool
+    reason: str
+    message: str
+
+
+class ThreadBranchOffRequest(TypedDict, total=False):
+    """Branch-off body. ``base_ref`` is a branch, a tag, any commit-ish, or the
+    ``@snapshot`` sentinel meaning "exactly as it is now"; empty means HEAD."""
+
+    base_ref: str
+
+
+class ThreadWorktreeRemoveRequest(TypedDict, total=False):
+    """Worktree-removal body. ``acknowledge_unmerged`` IS the owner's consent
+    (A10): a checkout holding unmerged commits or uncommitted edits refuses
+    without it, and there is no other path into the removal."""
+
+    acknowledge_unmerged: bool
+
+
+class ThreadWorktreeResponse(TypedDict, total=False):
+    """ONE envelope for every branch/merge/remove answer, success or refusal.
+
+    ``ok`` is the only field a client must read first. A refusal carries a TYPED
+    ``reason`` plus owner-facing ``message`` copy and whatever evidence that
+    reason has: ``conflicts`` for a stopped merge, ``dirty_files`` for a local
+    tree that must be settled first, ``inspection`` for a removal that would
+    destroy work, ``decision`` for T2's ``git_init_required`` offer. Sharing one
+    envelope is deliberate — three near-identical shapes would drift, and the
+    client renders refusals the same way whichever operation produced them.
+
+    ``worktree_kept`` is stated explicitly on a successful merge because A10 turns
+    on it: merging back never removes the checkout.
+    """
+
+    ok: bool
+    reason: str
+    message: str
+    project_id: str
+    thread_id: int
+    location: ThreadLocation
+    branch: str
+    path: str
+    base_ref: str
+    base_sha: str
+    working_dir: str
+    decision: WorkspaceGitInitDecision
+    snapshot_commit: Dict[str, Any]
+    conflicts: List[str]
+    dirty_files: List[str]
+    merged: bool
+    head_before: str
+    head_after: str
+    worktree_kept: bool
+    removed: bool
+    inspection: Dict[str, Any]
+    error: str
+
+
+class ThreadDiffResponse(TypedDict, total=False):
+    """``GET /api/projects/{project_id}/threads/{thread_id}/diff`` (A13/X9).
+
+    The SAME envelope as ``TaskDiffResponse`` — same statuses, same no-clipping
+    rule, same ``patch``/``patch_sha256`` contract — plus the thread identity,
+    because Changes is otherwise task-centric and its per-task route structurally
+    cannot answer for a persistent checkout that has no task. ``source`` is always
+    ``thread_checkout``; a thread that is not branched off answers ``blocked``
+    with the typed ``thread_not_branched`` blocker rather than an empty diff,
+    because "works in the project folder" is not "changed nothing".
+    """
+
+    project_id: str
+    thread_id: int
+    status: str
+    source: str
+    base_commit: str
+    head_advanced: bool
+    blockers: list[str]
+    patch: str
+    patch_sha256: str
+    error: str
+
+
 class ProjectDeleteResponse(TypedDict):
     """POST /api/projects/{project_id}/delete — fence, quiesce, and tombstone;
     the immutable binding, working folder, history, and memory are preserved."""
@@ -1044,6 +1170,12 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "POST /api/projects/{project_id}/threads",
     "POST /api/projects/{project_id}/threads/{thread_id}/update",
     "POST /api/projects/{project_id}/threads/{thread_id}/fork",
+    "GET /api/projects/{project_id}/threads/{thread_id}/branch-bases",
+    "POST /api/projects/{project_id}/threads/{thread_id}/branch-off",
+    "POST /api/projects/{project_id}/threads/{thread_id}/merge-back",
+    "GET /api/projects/{project_id}/threads/{thread_id}/worktree",
+    "POST /api/projects/{project_id}/threads/{thread_id}/worktree/remove",
+    "GET /api/projects/{project_id}/threads/{thread_id}/diff",
     "GET /api/fs/dirs",
     "GET /api/chat/history",
     "GET /api/logs/{name}",
@@ -1151,7 +1283,14 @@ __all__ = [
     "ProjectInitGitResponse",
     "WorkspaceGitInitDecision",
     "ThreadCreateRequest",
+    "ThreadBranchBase",
+    "ThreadBranchBasesResponse",
+    "ThreadBranchOffRequest",
+    "ThreadDiffResponse",
     "ThreadEntry",
+    "ThreadLocation",
+    "ThreadWorktreeRemoveRequest",
+    "ThreadWorktreeResponse",
     "ThreadResponse",
     "ThreadUpdateRequest",
     "ProjectDeleteResponse",

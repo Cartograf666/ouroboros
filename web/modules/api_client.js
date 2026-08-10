@@ -58,6 +58,15 @@ export function cleanExtensionRoute(value) {
     return parts.map(encodeURIComponent).join('/');
 }
 
+/**
+ * The one place a thread's route prefix is spelled. Six T3 routes hang off it,
+ * and hand-building the path per call is how one of them ends up missing an
+ * `encodeURIComponent` on a project id the owner typed.
+ */
+export function threadPath(projectId, threadId) {
+    return `/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}`;
+}
+
 export function extensionRoutePrefix(skill) {
     return `/api/extensions/${encodeURIComponent(skill)}/`;
 }
@@ -144,6 +153,54 @@ export const apiClient = {
      */
     projectThreadFork: (projectId, threadId) => jsonPost(
         `/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/fork`, {},
+    ),
+    /**
+     * The bases this thread may branch off from (A8) — current branch, other
+     * branches, tags, plus the always-present "exactly as it is now" entry.
+     * @returns {Promise<import('./api_types.js').ThreadBranchBasesResponse>}
+     */
+    threadBranchBases: (projectId, threadId) => fetchJson(
+        `${threadPath(projectId, threadId)}/branch-bases`, { cache: 'no-store' },
+    ),
+    /**
+     * BRANCH OFF (A7): give this thread its own git worktree from `baseRef`
+     * (a branch, tag, commit-ish, or '@snapshot' for "exactly as it is now").
+     * @returns {Promise<import('./api_types.js').ThreadWorktreeResponse>}
+     */
+    threadBranchOff: (projectId, threadId, baseRef = '') => jsonPost(
+        `${threadPath(projectId, threadId)}/branch-off`, baseRef ? { base_ref: baseRef } : {},
+    ),
+    /**
+     * MERGE BACK (A7/A9). A conflict comes back as ok:false with `conflicts`;
+     * the merge is already aborted by then and the thread keeps its branch.
+     * @returns {Promise<import('./api_types.js').ThreadWorktreeResponse>}
+     */
+    threadMergeBack: (projectId, threadId) => jsonPost(
+        `${threadPath(projectId, threadId)}/merge-back`, {},
+    ),
+    /**
+     * What removing this checkout would DESTROY — read before offering removal
+     * (A10), never after.
+     * @returns {Promise<import('./api_types.js').ThreadWorktreeResponse>}
+     */
+    threadWorktree: (projectId, threadId) => fetchJson(
+        `${threadPath(projectId, threadId)}/worktree`, { cache: 'no-store' },
+    ),
+    /**
+     * Remove this thread's checkout. `acknowledgeUnmerged` IS the owner's
+     * consent: without it, unmerged work refuses with its inspection attached.
+     * @returns {Promise<import('./api_types.js').ThreadWorktreeResponse>}
+     */
+    threadWorktreeRemove: (projectId, threadId, acknowledgeUnmerged = false) => jsonPost(
+        `${threadPath(projectId, threadId)}/worktree/remove`,
+        { acknowledge_unmerged: !!acknowledgeUnmerged },
+    ),
+    /**
+     * A branched thread's own checkout diff (A13) — same envelope as taskDiff.
+     * @returns {Promise<import('./api_types.js').ThreadDiffResponse>}
+     */
+    threadDiff: (projectId, threadId) => fetchJson(
+        `${threadPath(projectId, threadId)}/diff`, { cache: 'no-store' },
     ),
     /** @returns {Promise<import('./api_types.js').FsDirsResponse>} */
     fsDirs: (path = '') => fetchJson(`/api/fs/dirs${path ? `?path=${encodeURIComponent(path)}` : ''}`, { cache: 'no-store' }),

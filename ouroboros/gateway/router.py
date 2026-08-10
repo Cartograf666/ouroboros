@@ -107,6 +107,14 @@ def collect_routes(
         api_projects_create,
         api_projects_list,
     )
+    from ouroboros.gateway.project_threads import (
+        api_thread_branch_bases,
+        api_thread_branch_off,
+        api_thread_diff,
+        api_thread_merge_back,
+        api_thread_worktree_inspect,
+        api_thread_worktree_remove,
+    )
     from ouroboros.gateway.state import api_health, api_state
     from ouroboros.gateway.tasks import (
         api_task_artifact,
@@ -217,6 +225,12 @@ def collect_routes(
         Route("/api/projects/{project_id}/threads", endpoint=api_project_thread_create, methods=["POST"]),
         Route("/api/projects/{project_id}/threads/{thread_id}/update", endpoint=api_project_thread_update, methods=["POST"]),
         Route("/api/projects/{project_id}/threads/{thread_id}/fork", endpoint=api_project_thread_fork, methods=["POST"]),
+        Route("/api/projects/{project_id}/threads/{thread_id}/branch-bases", endpoint=api_thread_branch_bases, methods=["GET"]),
+        Route("/api/projects/{project_id}/threads/{thread_id}/branch-off", endpoint=api_thread_branch_off, methods=["POST"]),
+        Route("/api/projects/{project_id}/threads/{thread_id}/merge-back", endpoint=api_thread_merge_back, methods=["POST"]),
+        Route("/api/projects/{project_id}/threads/{thread_id}/worktree", endpoint=api_thread_worktree_inspect, methods=["GET"]),
+        Route("/api/projects/{project_id}/threads/{thread_id}/worktree/remove", endpoint=api_thread_worktree_remove, methods=["POST"]),
+        Route("/api/projects/{project_id}/threads/{thread_id}/diff", endpoint=api_thread_diff, methods=["GET"]),
         Route("/api/fs/dirs", endpoint=api_fs_dirs, methods=["GET"]),
         Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"]),
         Route("/api/tasks", endpoint=api_tasks_list, methods=["GET"]),

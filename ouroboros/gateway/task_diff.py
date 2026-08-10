@@ -1,8 +1,17 @@
-"""ONE owner-facing diff projection for both task shapes (no routes live here).
+"""ONE owner-facing diff projection for every reviewable surface (no routes here).
 
-`gateway/tasks.py` keeps the thin `GET /api/tasks/{task_id}/diff` route; every
-decision about WHAT that route answers is made in this module, which is pure
-computation over a task result plus the repo on disk.
+`gateway/tasks.py` keeps the thin `GET /api/tasks/{task_id}/diff` route and
+`gateway/project_threads.py` the thread-checkout one; every decision about WHAT
+those routes answer is made in this module, which is pure computation over a task
+result (or a thread's registered checkout) plus the repo on disk.
+
+Three sources, ONE envelope and ONE git layer. A WORKSPACE task answers with its
+durable patch bytes, a SELF-REPO task with a live projection over its attributed
+paths, and a branched THREAD with everything its persistent checkout holds
+against the commit it branched from (A13/X9). The third was added deliberately
+here rather than beside the thread routes: a second git layer for a second
+surface is how two answers to one question start disagreeing about what the owner
+is looking at.
 
 A WORKSPACE task already has a DURABLE `workspace.patch` artifact, so its diff is
 those exact bytes. A SELF-REPO task has no historical patch, so its diff is an
@@ -60,6 +69,9 @@ DIFF_STATUS_EMPTY = "empty"
 DIFF_STATUS_BLOCKED = "blocked"
 DIFF_SOURCE_WORKSPACE = "workspace_patch"
 DIFF_SOURCE_MUTATION_BASELINE = "mutation_baseline"
+#: A branched THREAD's persistent checkout against the commit it branched from
+#: (A13/X9) — no task, no artifact, no attributed path set: the whole tree.
+DIFF_SOURCE_THREAD_CHECKOUT = "thread_checkout"
 
 #: `git`'s own name for "the empty side" of a `--no-index` comparison. This is a GIT
 #: PROTOCOL SENTINEL, not a filesystem path: git matches the exact string "/dev/null"
@@ -574,11 +586,130 @@ def task_diff_payload(
     return _self_repo_diff_payload(drive_root, repo_dir, task_id, result)
 
 
+# --- thread-checkout source -------------------------------------------------
+
+def _status_paths(status: str) -> List[str]:
+    """Every path named by `git status --porcelain -z`, renames included.
+
+    ``-z`` entries are ``XY<space><path>`` NUL-terminated, and a rename adds a
+    bare second token for the original name. Anything without the two-character
+    code plus separator is therefore that bare token and is taken whole.
+    """
+    out: List[str] = []
+    for token in status.split("\0"):
+        if not token:
+            continue
+        out.append(token[3:] if len(token) > 3 and token[2] == " " else token)
+    return out
+
+
+def _checkout_fingerprint(root: pathlib.Path) -> str:
+    """Bind a WHOLE-TREE read to the exact checkout state it was computed from.
+
+    The task sources fingerprint a KNOWN list of candidate paths; a thread
+    checkout has no such list, so the list is derived: git's own full status
+    (untracked included) names every path that is not identical to HEAD, and each
+    of those gets the same size/mtime row the task path uses. Status alone would
+    not be enough — a file that stays `M` while its contents change again during
+    the read keeps the same status code.
+
+    The worktree's index stat is deliberately NOT part of this. `git status`
+    REFRESHES the index, and a freshly created checkout is full of racily-clean
+    files (written in the same clock tick as the index), so git rewrites the index
+    on every single status call. Including its mtime made the fingerprint differ
+    from itself on every read of a new checkout — a guard that fires constantly
+    for no reason teaches the owner to ignore it. What the index would have caught
+    — work moved between index and worktree — the status codes catch directly, and
+    with the path's identity rather than a global timestamp.
+    """
+    rows = [_git_head(root) or "head_unavailable"]
+    rc, status = _git_capture(root, ["status", "--porcelain", "-z", "--untracked-files=all"])
+    if rc != 0:
+        rows.append("\x00status\x1funavailable")
+        return hashlib.sha256("\x1e".join(rows).encode("utf-8")).hexdigest()
+    rows.append(status)
+    for rel in _status_paths(status):
+        try:
+            stat = (root / rel).stat()
+            rows.append(f"{rel}\x1f{stat.st_size}\x1f{stat.st_mtime_ns}")
+        except OSError:
+            rows.append(f"{rel}\x1fabsent")
+    return hashlib.sha256("\x1e".join(rows).encode("utf-8")).hexdigest()
+
+
+def thread_checkout_diff_payload(
+    drive_root: pathlib.Path,
+    project_id: str,
+    thread_id: Any,
+) -> Dict[str, Any]:
+    """What a BRANCHED thread's own checkout currently holds (A13/X9).
+
+    Changes is task-centric, and the per-task route cannot answer this: a thread
+    worktree is a PERSISTENT checkout with no task, no artifact and no attributed
+    path set, so its diff is everything that checkout holds against the commit it
+    branched from — committed work, staged work, unsaved edits and new files
+    alike. That is what the owner sees when they open the folder, so it is what
+    the Changes screen must show for it.
+
+    Deliberately built from the SAME hardened invocation and the SAME envelope as
+    the task sources: literal pathspecs, no external differ, byte-decoded stdout,
+    the no-clipping rule, and the read-repeat guard that refuses rather than serve
+    a patch that does not belong to the disclosed baseline. Forking a second git
+    layer for a second surface is how two answers to one question start disagreeing.
+
+    A thread that is not branched off is NOT an error: it works in the project
+    folder, so it reports the typed ``thread_not_branched`` blocker and the client
+    tells the owner where its work actually lives.
+    """
+    from ouroboros.thread_worktrees import get_thread_worktree
+
+    envelope: Dict[str, Any] = dict(source=DIFF_SOURCE_THREAD_CHECKOUT)
+    row = get_thread_worktree(drive_root, project_id, thread_id)
+    if not row:
+        return _diff_envelope(DIFF_STATUS_BLOCKED, blockers=["thread_not_branched"], **envelope)
+    root = pathlib.Path(str(row.get("path") or ""))
+    base_commit = str(row.get("base_sha") or "")
+    envelope["base_commit"] = base_commit
+    if not root.is_dir():
+        return _diff_envelope(DIFF_STATUS_BLOCKED, blockers=["checkout_missing"], **envelope)
+    if not _BASE_COMMIT_RE.fullmatch(base_commit):
+        # Same rule as the self-repo path: a baseline that is not a hex object
+        # name never reaches argv, where git would read it as an OPTION.
+        return _diff_envelope(DIFF_STATUS_BLOCKED, blockers=["base_commit_unknown"], **envelope)
+    current_head = _git_head(root)
+    # `head_advanced` here means the thread has committed work of its own — the
+    # honest reading of "HEAD moved off the disclosed baseline" for a checkout
+    # whose whole purpose is to move.
+    envelope["head_advanced"] = bool(current_head and current_head != base_commit)
+    before = _checkout_fingerprint(root)
+    # No candidate list: a checkout's diff is the WHOLE tree against its base.
+    patch, blockers = _build_projection_patch(root, base_commit, [])
+    if before != _checkout_fingerprint(root):
+        # The checkout moved under the read: retry ONCE, then refuse rather than
+        # answer with a patch that belongs to two different states.
+        before = _checkout_fingerprint(root)
+        patch, blockers = _build_projection_patch(root, base_commit, [])
+        if before != _checkout_fingerprint(root):
+            return _diff_envelope(
+                DIFF_STATUS_BLOCKED, blockers=["projection_changed_during_read"], **envelope,
+            )
+    envelope["blockers"] = blockers
+    if "baseline_diff_failed" in blockers:
+        return _diff_envelope(DIFF_STATUS_BLOCKED, **envelope)
+    return _diff_envelope(
+        DIFF_STATUS_READY if patch.strip() else DIFF_STATUS_EMPTY,
+        patch=patch,
+        patch_sha256=_patch_digest(patch),
+        **envelope,
+    )
+
+
 __all__ = [
     "ArtifactRefusal",
     "DIFF_MAX_PATCH_BYTES",
     "DIFF_MAX_UNTRACKED_SECTIONS",
     "DIFF_SOURCE_MUTATION_BASELINE",
+    "DIFF_SOURCE_THREAD_CHECKOUT",
     "DIFF_SOURCE_WORKSPACE",
     "DIFF_STATUS_BLOCKED",
     "DIFF_STATUS_EMPTY",
@@ -590,4 +721,5 @@ __all__ = [
     "is_workspace_result",
     "resolve_task_artifact_path",
     "task_diff_payload",
+    "thread_checkout_diff_payload",
 ]

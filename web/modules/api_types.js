@@ -380,6 +380,118 @@
  */
 
 /**
+ * WHERE a thread works — DERIVED, never stored (A7). where is 'project_folder'
+ * or 'worktree', and it answers exactly one question: does a durable worktree
+ * exist for this thread? There is no toggle to read, so no client can be shown a
+ * location the filesystem disagrees with. The other fields appear only for a
+ * worktree.
+ * @typedef {Object} ThreadLocation
+ * @property {string=} where
+ * @property {string=} path
+ * @property {string=} branch
+ * @property {string=} base_sha
+ * @property {string=} created_at
+ */
+
+/**
+ * One base the owner may branch off from (A8). kind is 'branch', 'tag' or
+ * 'snapshot'. The snapshot entry — "exactly as it is now" — is not a git ref:
+ * creates_commit discloses whether choosing it would make a snapshot commit (a
+ * dirty tree) or simply reuse HEAD (a clean one). A commit-ish the owner types is
+ * accepted by the branch-off route and is deliberately not enumerated here.
+ * @typedef {Object} ThreadBranchBase
+ * @property {string=} ref
+ * @property {string=} kind
+ * @property {string=} label
+ * @property {boolean=} dirty
+ * @property {boolean=} creates_commit
+ */
+
+/**
+ * GET /api/projects/{project_id}/threads/{thread_id}/branch-bases.
+ * @typedef {Object} ThreadBranchBasesResponse
+ * @property {string=} project_id
+ * @property {number=} thread_id
+ * @property {string=} current_branch
+ * @property {ThreadBranchBase[]=} bases
+ * @property {ThreadBranchBase=} snapshot
+ * @property {ThreadLocation=} location
+ * @property {boolean=} ok
+ * @property {string=} reason
+ * @property {string=} message
+ */
+
+/**
+ * Branch-off body. base_ref is a branch, a tag, any commit-ish, or the
+ * '@snapshot' sentinel meaning "exactly as it is now"; empty means HEAD.
+ * @typedef {Object} ThreadBranchOffRequest
+ * @property {string=} base_ref
+ */
+
+/**
+ * Worktree-removal body. acknowledge_unmerged IS the owner's consent (A10): a
+ * checkout holding unmerged commits or uncommitted edits refuses without it, and
+ * there is no other path into the removal.
+ * @typedef {Object} ThreadWorktreeRemoveRequest
+ * @property {boolean=} acknowledge_unmerged
+ */
+
+/**
+ * ONE envelope for every branch/merge/remove answer, success or refusal. ok is
+ * the only field to read first. A refusal carries a typed reason, owner-facing
+ * message copy, and whatever evidence that reason has: conflicts for a stopped
+ * merge, dirty_files for a local tree that must be settled, inspection for a
+ * removal that would destroy work, decision for the git_init_required offer.
+ * worktree_kept is stated explicitly on a successful merge because A10 turns on
+ * it: merging back never removes the checkout.
+ * @typedef {Object} ThreadWorktreeResponse
+ * @property {boolean=} ok
+ * @property {string=} reason
+ * @property {string=} message
+ * @property {string=} project_id
+ * @property {number=} thread_id
+ * @property {ThreadLocation=} location
+ * @property {string=} branch
+ * @property {string=} path
+ * @property {string=} base_ref
+ * @property {string=} base_sha
+ * @property {string=} working_dir
+ * @property {WorkspaceGitInitDecision=} decision
+ * @property {Object=} snapshot_commit
+ * @property {string[]=} conflicts
+ * @property {string[]=} dirty_files
+ * @property {boolean=} merged
+ * @property {string=} head_before
+ * @property {string=} head_after
+ * @property {boolean=} worktree_kept
+ * @property {boolean=} removed
+ * @property {Object=} inspection
+ * @property {string=} error
+ */
+
+/**
+ * GET /api/projects/{project_id}/threads/{thread_id}/diff (A13). The SAME
+ * envelope as TaskDiffResponse — same statuses, same no-clipping rule, same
+ * patch/patch_sha256 contract — plus the thread identity, because Changes is
+ * otherwise task-centric and its per-task route structurally cannot answer for a
+ * persistent checkout that has no task. source is always 'thread_checkout'; a
+ * thread that is not branched off answers blocked with the typed
+ * thread_not_branched blocker, because "works in the project folder" is not
+ * "changed nothing".
+ * @typedef {Object} ThreadDiffResponse
+ * @property {string=} project_id
+ * @property {number=} thread_id
+ * @property {string=} status
+ * @property {string=} source
+ * @property {string=} base_commit
+ * @property {boolean=} head_advanced
+ * @property {string[]=} blockers
+ * @property {string=} patch
+ * @property {string=} patch_sha256
+ * @property {string=} error
+ */
+
+/**
  * @typedef {Object} ProjectDeleteResponse
  * @property {boolean} ok
  * @property {string} project_id
