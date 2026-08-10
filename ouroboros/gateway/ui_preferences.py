@@ -45,8 +45,10 @@ _MAX_PROJECT_CURSORS = 1000
 # are small integers bounded separately by _MAX_THREAD_CURSORS. Revisited and
 # deliberately left at 64 (X6).
 _MAX_PROJECT_ID_LENGTH = 64
-# Per project. A project's thread count is owner-driven; this only bounds what a
-# malicious or buggy client can persist, and drops the oldest entries first.
+# Per project, PER REQUEST. A project's thread count is owner-driven, so this
+# never bounds what is STORED — the merge prunes a stored lane against the
+# project's live threads instead (see api_ui_preferences_post). It only bounds
+# how many thread cursors one request may carry.
 _MAX_THREAD_CURSORS = 200
 _MAX_THREAD_ID_LENGTH = 12
 _MAX_ORDERED_PROJECTS = 1000
@@ -312,14 +314,27 @@ async def api_ui_preferences_post(request: Request) -> JSONResponse:
                         str(thread["id"]): max(0, int(thread.get("visible_revision") or 0))
                         for thread in project_threads(project)
                     }
-                    lane = dict(merged.get(project_id) or {})
+                    # PRUNE by existence, never by insertion order. `ceilings` is
+                    # the project's complete live thread set, so a lane key it does
+                    # not contain belongs to a thread that no longer exists and is
+                    # dropped here — which is also the only bound this lane needs.
+                    # Trimming to the _MAX_THREAD_CURSORS newest-inserted entries
+                    # instead would, on a project with more threads than that, drop
+                    # whichever lane happened to be written FIRST — routinely
+                    # thread #0 — and silently re-mark the project's main chat
+                    # unread. That constant still bounds one REQUEST
+                    # (`_normalize_seen_revision`); it has no business bounding a
+                    # lane whose size the owner's own thread count decides.
+                    lane = {
+                        thread_id: revision
+                        for thread_id, revision in (merged.get(project_id) or {}).items()
+                        if thread_id in ceilings
+                    }
                     for thread_id, revision in requested.items():
                         if thread_id not in ceilings:
                             continue  # unknown/removed thread: never newly admitted
                         acknowledged = min(max(0, int(revision or 0)), ceilings[thread_id])
                         lane[thread_id] = max(int(lane.get(thread_id) or 0), acknowledged)
-                    if len(lane) > _MAX_THREAD_CURSORS:
-                        lane = dict(list(lane.items())[-_MAX_THREAD_CURSORS:])
                     merged[project_id] = lane
                 if len(merged) > _MAX_PROJECT_CURSORS:
                     # Bound retained cursors by insertion order; active-only writes

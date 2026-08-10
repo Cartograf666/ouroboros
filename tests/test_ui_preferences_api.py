@@ -196,6 +196,48 @@ def test_ui_preferences_nested_cursor_is_per_thread_and_migrates_flat(tmp_path):
         ).json()["project_seen_revision"]["twin"]
 
 
+def test_ui_preferences_prunes_dead_lanes_and_never_evicts_a_live_one(tmp_path):
+    """A merge drops lanes for threads that no longer exist — and ONLY those.
+
+    The regression this pins is silent: bounding a lane by insertion order drops
+    whichever key was written FIRST, which on a project with more threads than
+    the bound is routinely thread #0 — the project's main chat, re-marked unread
+    with nothing on screen to explain it. Existence, not arrival order, decides.
+    """
+    from starlette.testclient import TestClient
+
+    from ouroboros.projects_registry import (
+        create_project,
+        create_thread,
+        increment_project_visible_revision,
+    )
+    from ouroboros.utils import atomic_write_json
+
+    app = Starlette(routes=collect_routes(data_dir=tmp_path))
+    app.state.drive_root = tmp_path
+    create_project(tmp_path, "pruned", name="Pruned")
+    thread = create_thread(tmp_path, "pruned", name="Side")
+    increment_project_visible_revision(tmp_path, project_id="pruned")          # thread #0
+    increment_project_visible_revision(tmp_path, chat_id=int(thread["chat_id"]))
+    tid = str(thread["id"])
+
+    # On disk: thread #0's lane (oldest), a live sibling, and two lanes whose
+    # threads are gone. A stored cursor is not re-validated on read, so they can
+    # only ever be cleaned up here, at merge time.
+    atomic_write_json(
+        tmp_path / "state" / "ui_preferences.json",
+        {"project_seen_revision": {"pruned": {"0": 1, tid: 1, "77": 5, "88": 5}}},
+        trailing_newline=True,
+    )
+    with TestClient(app) as client:
+        merged = client.post(
+            "/api/ui/preferences", json={"project_seen_revision": {"pruned": {tid: 1}}}
+        ).json()["project_seen_revision"]["pruned"]
+        assert merged == {"0": 1, tid: 1}, "dead lanes dropped, live lanes kept"
+        # Thread #0 survived a merge it was not itself part of.
+        assert merged["0"] == 1
+
+
 def test_ui_preferences_concurrent_paint_acks_are_monotonic(tmp_path):
     from ouroboros.gateway.ui_preferences import api_ui_preferences_post
     from ouroboros.projects_registry import create_project, increment_project_visible_revision
