@@ -658,13 +658,20 @@ def _checkout_ahead_refusal(
     head_ref = _git(checkout, "rev-parse", "--abbrev-ref", "HEAD")
     on = (head_ref.stdout or "").strip() if head_ref.returncode == 0 else ""
     if on and branch and on != branch:
+        # `--abbrev-ref` answers the literal string "HEAD" for a DETACHED head,
+        # which is not a branch name and must not be quoted back as one.
+        where = "not on any branch (a detached HEAD)" if on == "HEAD" else f"on {on!r}"
+        remedy = (
+            f"Check {branch!r} back out in that folder first"
+            if on == "HEAD"
+            else f"Switch the checkout back to {branch!r}, or merge {on!r} into it there, first"
+        )
         return _refused(
             REASON_CHECKOUT_HEAD_OFF_BRANCH,
-            f"This thread's checkout is on {on!r}, not on {branch!r} — the branch "
+            f"This thread's checkout is {where}, not on {branch!r} — the branch "
             "this thread merges back. Anything committed there is NOT on "
             f"{branch!r}, so merging now would report success and bring none of "
-            f"it. Switch the checkout back to {branch!r} (or merge {on!r} into it "
-            "there) first.",
+            f"it. {remedy}.",
             project_id=pid, thread_id=tid, branch=branch,
             checkout_branch=on, path=str(checkout), inspection=inspection,
         )

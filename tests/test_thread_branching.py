@@ -541,6 +541,24 @@ def test_merge_back_refuses_when_the_checkouts_HEAD_is_off_the_threads_branch(dr
     assert not (folder / "feature.txt").exists()
 
 
+def test_a_DETACHED_checkout_is_not_described_as_a_branch_named_HEAD(drive, folder, wt_root):
+    """`git rev-parse --abbrev-ref` answers the literal string "HEAD" for a
+    detached head. That is not a branch name and must not be quoted back as one
+    in copy the owner is meant to act on."""
+    thread = _project(drive, folder)
+    out = _branch(drive, "racer", thread["id"], wt_root)
+    _commit_in(out["path"], "feature.txt", "work made while detached\n")
+    _git(out["path"], "checkout", "-q", "--detach")
+
+    refused = merge_back_thread(drive, "racer", thread["id"], data_dir=drive, busy=False)
+
+    assert refused["ok"] is False
+    assert refused["reason"] == REASON_CHECKOUT_HEAD_OFF_BRANCH
+    assert "detached HEAD" in refused["message"]
+    assert "'HEAD'" not in refused["message"], "a detached head is not a branch called HEAD"
+    assert refused["branch"] in refused["message"]
+
+
 def test_an_unbranched_thread_has_nothing_to_merge(drive, folder, wt_root):
     thread = _project(drive, folder)
 
