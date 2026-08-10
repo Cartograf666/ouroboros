@@ -1028,7 +1028,7 @@ export async function openArchivedThreadsMenu(project, {
         // server accepts all three on an archived thread. A branched-then-archived
         // thread's checkout was two undisclosed steps from any A10 surface (I13).
         itemsHtml: rows.map((row) => (
-            `<button type="button" role="menuitem" data-prm="restore:${escapeHtml(row.id)}" title="Restore this thread — restore it to act on it">${escapeHtml(row.name)}</button>`
+            `<button type="button" role="menuitem" data-prm="restore:${escapeHtml(row.id)}" title="Restore this thread. Merging it back, its changes and its checkout become reachable again once it is active.">${escapeHtml(row.name)}</button>`
         )).join('\n'),
         // Routed through `runThreadAction` rather than awaiting `ops.restore` here,
         // because this was the ONE unguarded `await ops.*` left in the module. A

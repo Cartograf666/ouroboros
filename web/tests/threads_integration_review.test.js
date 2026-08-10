@@ -221,7 +221,13 @@ test('the archived-threads menu discloses that a thread must be restored to act 
 
     assert.equal(rows.length, 1);
     assert.match(itemsHtml, /data-prm="restore:4"/);
-    assert.match(itemsHtml, /restore it to act on it/);
+    // The guarantee is that the row DISCLOSES restore-first — an archived thread
+    // otherwise looks as though it simply has no merge back, no changes and no way
+    // to reach its checkout. Asserted on the substance, not on one phrasing: the
+    // first wording read "restore it to act on it", a tautology beside the word
+    // "Restore" that explained nothing, caught by looking at the rendered menu.
+    assert.match(itemsHtml, /reachable again once it is active/);
+    assert.match(itemsHtml, /checkout/);
 });
 
 // ---------------------------------------------------------------------------
