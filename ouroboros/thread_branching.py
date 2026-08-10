@@ -703,11 +703,19 @@ def merge_back_thread(
 ) -> Dict[str, Any]:
     """Merge a branched thread's work back into the project's own checkout (A9).
 
-    Preconditions, both refused with a typed reason and honest copy: nothing
-    running anywhere in the project, and a clean local tree. A conflict is SHOWN
-    with its paths and STOPS the operation — the merge is aborted, so the owner's
-    folder is left byte-for-byte as it was and the thread keeps every commit in
-    its own branch.
+    THREE preconditions, each refused with a typed reason and honest copy:
+    nothing alive anywhere in the project, a clean local tree, and a checkout
+    whose work is actually ON the branch being merged. The third exists because a
+    merge moves COMMITS ON A BRANCH: uncommitted edits in the checkout, and
+    commits made there on some other branch, do not travel with it, and answering
+    ``ok: true`` while they stay behind is the one failure the owner cannot see.
+
+    A conflict is SHOWN with its paths and STOPS the operation — the merge is
+    aborted, so the owner's folder is left byte-for-byte as it was and the thread
+    keeps every commit in its own branch. The abort is CHECKED, because that last
+    sentence is a claim about a git command that can fail; when it did not take,
+    :data:`REASON_MERGE_ABORT_FAILED` says the folder is stopped mid-merge and
+    what the owner has to do about it.
 
     The worktree SURVIVES a successful merge. Removing it is a separate, inspected
     act (A10) so the owner is always the one who decides that the checkout has
