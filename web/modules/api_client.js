@@ -232,8 +232,11 @@ export const apiClient = {
     threadRestore: (projectId, threadId) => jsonPost(`${threadPath(projectId, threadId)}/restore`, {}),
     /**
      * Delete a thread: fence routing, cancel its tasks, then tombstone. The id is
-     * never reused, the journal rows honestly remain, and the thread's checkout
-     * is NOT removed — that stays its own inspected act.
+     * never reused and the journal rows honestly remain. A CLEAN checkout goes
+     * with the thread (`worktree_removed`) — a tombstoned thread is invisible on
+     * every surface, so one left behind is a folder and a branch nothing can
+     * reach; one holding work REFUSES the delete with `checkout_holds_work`, and
+     * removing that is still its own inspected act.
      * @returns {Promise<import('./api_types.js').ThreadLifecycleResponse>}
      */
     threadDelete: (projectId, threadId) => jsonPost(`${threadPath(projectId, threadId)}/delete`, {}),
