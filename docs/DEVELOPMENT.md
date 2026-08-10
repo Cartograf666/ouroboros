@@ -1645,7 +1645,7 @@ PyInstaller under the pinned portable interpreter so the runner's glibc cannot
 leak into the desktop launcher's libpython, then wraps that proven x86_64
 payload into `.deb`, generic `.rpm`, and RED OS 8 `.rpm` assets. Their metadata
 declares Git, which packaged bootstrap requires; the gating smoke installs
-through `apt` or `dnf` in Ubuntu 22.04/current Fedora and proves dependency
+through `apt` or `dnf` in Ubuntu 22.04/Fedora 42 and proves dependency
 resolution, desktop integration, the real packaged CLI, and a bounded
 desktop-launcher start. Vendor
 image smokes for Astra Linux and RED OS are non-blocking evidence, and their
