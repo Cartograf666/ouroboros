@@ -551,3 +551,90 @@ test('the project row menu takes thread #0\'s CHECKOUT rows only', () => {
     assert.match(all, /data-prm="archive"[^>]*disabled/);
     assert.match(all, /the project itself/);
 });
+
+// ---------------------------------------------------------------------------
+// P2 — restoring an archived thread cannot become an unhandled rejection
+// ---------------------------------------------------------------------------
+
+/** The archived-menu harness: capture `onSelect`, watch what the owner is told. */
+function archivedHarness(restoreImpl) {
+    let onSelect = null;
+    const asked = [];
+    const changed = [];
+    const apiClient = {
+        projectsList: async () => ({
+            projects: [{
+                id: 'alpha',
+                threads: [{ id: 4, name: 'Old idea', lifecycle: 'archived' }],
+            }],
+        }),
+    };
+    return {
+        asked,
+        changed,
+        run: async () => {
+            await openArchivedThreadsMenu(PROJECT, {
+                apiClient,
+                anchorEl: null,
+                onChanged: (x) => changed.push(x),
+                openMenu: (options) => { onSelect = options.onSelect; },
+                ask: async (options) => { asked.push(options); return false; },
+                ops: { restore: restoreImpl },
+            });
+            return onSelect;
+        },
+    };
+}
+
+test('a 500 / HTML error page during restore is announced, not thrown past the menu', async () => {
+    // The FINDING is narrower than filed and the narrower half is real: a TYPED
+    // refusal was already handled (`typedAnswer` unwraps a 409 envelope to a VALUE,
+    // so describeOutcome + announce fired). A non-envelope failure re-throws, and
+    // this was the one unguarded `await ops.*` in the module — so the rejection
+    // escaped `onSelect` into `project_create.js`'s async click listener, which has
+    // no try/catch: an unhandled rejection, no owner-facing error, no refresh, and a
+    // stale archived row still clickable.
+    const boom = Object.assign(new Error('Internal Server Error'), {
+        status: 500, body: '<html>500</html>',
+    });
+    const harness = archivedHarness(async () => { throw boom; });
+    const onSelect = await harness.run();
+
+    await onSelect('restore:4');  // must NOT reject
+
+    assert.equal(harness.asked.length, 1, 'the owner is told');
+    assert.match(harness.asked[0].body, /restore did not finish/i);
+    assert.match(harness.asked[0].body, /Internal Server Error/);
+    assert.equal(harness.changed.length, 1, 'and the sidebar is re-read');
+    assert.equal(harness.changed[0].authoritative, true);
+});
+
+test('a TYPED restore refusal keeps announcing exactly as it did', async () => {
+    const harness = archivedHarness(async () => ({
+        ok: false, reason: 'thread_busy', message: 'A task is still running.',
+    }));
+    const onSelect = await harness.run();
+
+    await onSelect('restore:4');
+
+    assert.equal(harness.changed.length, 1);
+    assert.equal(harness.asked.length, 1);
+    assert.match(harness.asked[0].body, /A task is still running/);
+});
+
+test('a successful restore stays silent and refreshes once', async () => {
+    const calls = [];
+    const harness = archivedHarness(async (pid, tid) => {
+        calls.push([pid, tid]);
+        return { ok: true };
+    });
+    const onSelect = await harness.run();
+
+    await onSelect('restore:4');
+
+    // The id the route receives is unchanged by the rerouting through
+    // `runThreadAction`: the string the menu carried.
+    assert.deepEqual(calls, [['alpha', '4']]);
+    assert.equal(harness.changed.length, 1);
+    assert.equal(harness.asked.length, 0, 'success is not announced');
+});

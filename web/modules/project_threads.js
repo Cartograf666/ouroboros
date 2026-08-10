@@ -992,7 +992,8 @@ async function deleteThread(project, thread, { apiClient, refresh, ask, ops }) {
  * with a documented inverse nobody could press. `include_archived` exists on
  * `/api/projects` precisely for a surface that can show them; this is that
  * surface, deliberately built out of the SAME row-menu vocabulary rather than a
- * new screen (P7).
+ * new screen (P7) — and, since the restore itself rides `runThreadAction`, out of
+ * the same failure handling as every other thread gesture.
  */
 export async function openArchivedThreadsMenu(project, {
     apiClient, anchorEl, onChanged, ask = openConfirmDialog, openMenu = openRowMenu,
@@ -1029,12 +1030,25 @@ export async function openArchivedThreadsMenu(project, {
         itemsHtml: rows.map((row) => (
             `<button type="button" role="menuitem" data-prm="restore:${escapeHtml(row.id)}" title="Restore this thread — restore it to act on it">${escapeHtml(row.name)}</button>`
         )).join('\n'),
+        // Routed through `runThreadAction` rather than awaiting `ops.restore` here,
+        // because this was the ONE unguarded `await ops.*` left in the module. A
+        // TYPED refusal was already handled — `typedAnswer` unwraps a 409 envelope
+        // to a VALUE, so `describeOutcome` + `announce` fired — but a 500, an HTML
+        // error page or a transport error RE-THROWS: the rejection escaped
+        // `onSelect`, and `project_create.js`'s `menu.addEventListener('click',
+        // async …)` has no try/catch, so it became an unhandled rejection with no
+        // owner-facing error and no refresh, leaving a stale archived row clickable.
+        // `runThreadAction` already owns exactly this shape: the catch, the
+        // announce, the authoritative refresh on BOTH paths, and the refocus.
         onSelect: async (action) => {
             const id = String(action || '').startsWith('restore:') ? action.slice(8) : '';
             if (!id) return;
-            const described = describeOutcome(await ops.restore(project.id, id));
-            onChanged?.({ authoritative: true });
-            if (described.tone !== 'ok') await announce(ask, 'Restore', described);
+            const row = rows.find((thread) => String(thread.id) === id) || { name: id };
+            // The id stays the STRING the menu carried — that is what the route
+            // takes and what this gesture has always sent.
+            await runThreadAction('restore', project, { ...row, id }, {
+                apiClient, onChanged, ask, ops,
+            });
             if (anchorEl?.isConnected) anchorEl.focus();
         },
     });
