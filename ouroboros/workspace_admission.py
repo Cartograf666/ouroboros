@@ -313,7 +313,9 @@ def resolve_room_workspace(
     return (str(resolved) if resolved else ""), "", {}
 
 
-def room_chat_lens_dir(drive_root: Any, project_id: str) -> tuple[str, str]:
+def room_chat_lens_dir(
+    drive_root: Any, project_id: str, room_chat_id: Any = 0,
+) -> tuple[str, str]:
     """The project-room folder for the DIRECT-CHAT lens (v6.61.3), or ("", note).
 
     Chat-lane sibling of ``resolve_room_workspace``: the conversation lane of a
@@ -324,26 +326,48 @@ def room_chat_lens_dir(drive_root: Any, project_id: str) -> tuple[str, str]:
     chat is fine); mutations still go through promoted tasks, which keep the full
     ``validate_workspace_root`` gate. Returns ``(dir, note)``: a set-but-unusable
     working_dir yields ("", loud note) so the chat context can disclose the
-    breakage instead of silently falling back to the system repo."""
+    breakage instead of silently falling back to the system repo.
+
+    ``room_chat_id`` is the room asking, and it applies the SAME precedence
+    ``resolve_room_workspace`` does: the checkout registered for THAT thread
+    first, the project's ``working_dir`` otherwise. Without it this answered the
+    project folder unconditionally, so a branched thread's TASKS wrote its
+    checkout while its CHAT read the project folder and the model was told the
+    promoted task would inherit the folder it was looking at — the same
+    fact/affordance split the robot-room incident was (I7). It is a keyword with
+    a default because both call sites hold the id and a project-wide caller may
+    not; a caller that omits it gets the pre-thread answer, which is correct only
+    for an unbranched thread."""
     pid = str(project_id or "").strip()
     if not pid:
         return "", ""
-    try:
-        from ouroboros.projects_registry import get_project
+    checkout, label = thread_checkout_for_room(drive_root, pid, room_chat_id)
+    if label == "unreadable":
+        return "", (
+            f"the thread-worktree registry for project {pid!r} is unreadable — cannot "
+            "tell whether this room works in its own checkout; room reads/shell fall "
+            "back to the system repo"
+        )
+    raw = checkout
+    what = f"thread checkout {checkout}" if checkout else ""
+    if not raw:
+        try:
+            from ouroboros.projects_registry import get_project
 
-        project = get_project(drive_root, pid) or {}
-        raw = str(project.get("working_dir") or "").strip()
-    except Exception:
-        return "", ""
+            project = get_project(drive_root, pid) or {}
+            raw = str(project.get("working_dir") or "").strip()
+        except Exception:
+            return "", ""
+        what = f"working_dir {raw}"
     if not raw:
         return "", ""
     try:
         resolved = pathlib.Path(raw).expanduser().resolve(strict=False)
     except OSError as exc:
-        return "", f"project {pid!r} working_dir is unusable: {type(exc).__name__}: {exc}"
+        return "", f"project {pid!r} {what} is unusable: {type(exc).__name__}: {exc}"
     if not resolved.is_dir():
         return "", (
-            f"project {pid!r} working_dir {raw} is unusable (missing or not a directory) — "
+            f"project {pid!r} {what} is unusable (missing or not a directory) — "
             "room reads/shell fall back to the system repo; fix or re-attach the folder"
         )
     return str(resolved), ""

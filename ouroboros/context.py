@@ -343,19 +343,24 @@ def _project_room_fact(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             if _room_wd:
                 # Same resolver the agent uses for the tool lens, so the stated rule
                 # and the actual tool surface cannot diverge (the robot incident).
-                _lens_dir, _room_note = _room_lens(_DATA_DIR, _room_pid)
+                # The ROOM's chat id goes in: a thread that branched off reads its
+                # OWN checkout, and the rule below must name the folder that was
+                # actually resolved rather than the project's working_dir (I7).
+                _lens_dir, _room_note = _room_lens(_DATA_DIR, _room_pid, task.get("chat_id"))
                 _lens_active = bool(task.get("_is_direct_chat")) and bool(_lens_dir)
                 fact = {
                     "project_id": _room_pid,
                     "working_dir": _room_wd,
                     "rule": (
                         (
-                            "This room's chat lane LOOKS AT the project folder: read_file/"
-                            "list_files/search_code/query_code with root=active_workspace and "
-                            "the DEFAULT shell cwd resolve to working_dir. The Ouroboros "
+                            "This room's chat lane LOOKS AT the folder named in room_dir: "
+                            "read_file/list_files/search_code/query_code with "
+                            "root=active_workspace and the DEFAULT shell cwd resolve to it. "
+                            "For a thread that has BRANCHED OFF, room_dir is that thread's "
+                            "own checkout and not the project's working_dir. The Ouroboros "
                             "system repo needs explicit root=\"system_repo\" (reads) or an "
                             "explicit cwd (shell). File WRITES here go through "
-                            "promote_chat_to_task — the promoted task inherits this folder as "
+                            "promote_chat_to_task — the promoted task inherits room_dir as "
                             "its workspace (workspace='none' opts out)."
                         )
                         if _lens_active
@@ -366,6 +371,12 @@ def _project_room_fact(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                         )
                     ),
                 }
+                if _lens_active:
+                    # The RESOLVED folder. Stating `working_dir` as the room's own
+                    # folder was a falsehood for a branched thread — its reads, its
+                    # shell and its promoted tasks all land here instead, while the
+                    # project's own folder is where its SIBLINGS write.
+                    fact["room_dir"] = _lens_dir
                 if _room_note:
                     fact["working_dir_warning"] = _room_note
                 return fact
