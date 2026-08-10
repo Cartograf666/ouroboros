@@ -1659,6 +1659,10 @@ payload, and an arm64 app executable.
 Linux additionally emits an AppImage built by a version- and digest-pinned
 `appimagetool`. CI extracts it without FUSE and independently verifies its
 desktop metadata, embedded repository, CLI, and managed Claudexor runtime.
+`OUROBOROS_SKIP_PLAYWRIGHT_INSTALL_DEPS=1` is only a local-builder escape hatch
+for hosts whose system packages are managed separately: it skips Playwright's
+interactive host-library installation, not browser-binary bundling, and a build
+using it must disclose that browser host compatibility was not locally proven.
 Each shard also generates a CycloneDX SBOM from the payload extracted from the
 final archive. The Linux payload inventory is reused for its three native
 wrappers because their `/opt/ouroboros` bytes come from that same payload; each

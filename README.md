@@ -52,6 +52,44 @@ To run tasks, configure at least one supported remote provider API key or a loca
 
 Prerelease artifacts stay on their tag pages; `/releases/latest` points to the latest stable release. If bundled browser tools on Linux need host libraries, run `./Ouroboros/python-standalone/bin/python3 -m playwright install-deps chromium webkit`. See the [full install and verification guide](https://ouroboros-agent.ai/install/) for source setup and release proof files.
 
+#### Install the Linux AppImage
+
+An AppImage is a portable executable, so user-level installation means copying
+it to a stable path and making it executable; it does not need root access:
+
+```bash
+VERSION=x.y.z
+install -Dm755 "./Ouroboros-${VERSION}-linux-x86_64.AppImage" \
+  "$HOME/Applications/Ouroboros.AppImage"
+"$HOME/Applications/Ouroboros.AppImage"
+```
+
+The embedded desktop file and icon allow compatible AppImage integration tools
+to register that stable path with the application menu. The same file exposes
+the packaged CLI:
+
+```bash
+"$HOME/Applications/Ouroboros.AppImage" --cli status
+```
+
+If FUSE mounting is unavailable, extract and run ephemerally instead:
+
+```bash
+APPIMAGE_EXTRACT_AND_RUN=1 "$HOME/Applications/Ouroboros.AppImage"
+```
+
+Chromium and WebKit binaries are bundled, but their distro-level shared
+libraries remain host dependencies. If a browser engine reports missing
+libraries, use the native `.deb`/`.rpm` package where available, or extract the
+AppImage and let its bundled Playwright report/install the packages required by
+your distribution:
+
+```bash
+"$HOME/Applications/Ouroboros.AppImage" --appimage-extract
+./squashfs-root/usr/lib/ouroboros/python-standalone/bin/python3 \
+  -m playwright install-deps chromium webkit
+```
+
 Use your existing **Codex, Claude Code, or Cursor subscriptions** for
 delegated coding and review — Ouroboros drives them through
 [Claudexor](https://github.com/razzant/claudexor), its bundled multi-harness
