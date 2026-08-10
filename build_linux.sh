@@ -101,8 +101,13 @@ tar -czf "$ARCHIVE_NAME" Ouroboros/
 cd ..
 
 echo ""
+echo "=== Creating AppImage ==="
+bash scripts/build_appimage.sh
+
+echo ""
 echo "=== Done ==="
 echo "Archive: dist/$ARCHIVE_NAME"
+echo "AppImage: dist/Ouroboros-${VERSION}-linux-$(uname -m).AppImage"
 echo ""
 echo "To run: extract and execute ./Ouroboros/Ouroboros"
 echo "To install CLI: ./Ouroboros/bin/install-ouroboros-cli"

@@ -13,13 +13,16 @@ from typing import Iterable
 
 
 # One build job produces exactly one platform archive, so ``locate`` only ever
-# looks at these suffixes. The native Linux packages are wrapped around an
-# already-located archive payload and are discovered separately.
+# looks at these suffixes. The AppImage and native Linux packages are produced
+# after the tarball is located and are discovered separately.
 ARCHIVE_SUFFIXES = (".dmg", ".tar.gz", ".zip")
-RELEASE_ASSET_SUFFIXES = ARCHIVE_SUFFIXES + (".deb", ".rpm")
+RELEASE_ASSET_SUFFIXES = ARCHIVE_SUFFIXES + (".AppImage", ".deb", ".rpm")
 PROOF_IDS = {
     "macos-arm64": lambda version: f"Ouroboros-{version}.dmg",
     "linux-x86_64": lambda version: f"Ouroboros-{version}-linux-x86_64.tar.gz",
+    "linux-appimage-x86_64": (
+        lambda version: f"Ouroboros-{version}-linux-x86_64.AppImage"
+    ),
     "linux-deb-amd64": lambda version: f"ouroboros_{version}_amd64.deb",
     "linux-rpm-x86_64": lambda version: f"ouroboros-{version}-1.x86_64.rpm",
     "linux-rpm-red80-x86_64": (
@@ -58,6 +61,8 @@ REQUIRED_SMOKE_CHECKS = {
         {"applications_shortcut", "install_cli_command", "arm64_main_executable"}
     ),
     "linux-x86_64": COMMON_SMOKE_CHECKS,
+    "linux-appimage-x86_64": COMMON_SMOKE_CHECKS
+    | frozenset({"appimage_extract_and_run", "appimage_metadata"}),
     "linux-deb-amd64": PACKAGE_SMOKE_CHECKS,
     "linux-rpm-x86_64": PACKAGE_SMOKE_CHECKS,
     "linux-rpm-red80-x86_64": PACKAGE_SMOKE_CHECKS,
