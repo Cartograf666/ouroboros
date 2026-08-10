@@ -8,9 +8,9 @@ export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-${TMPDIR:-/tmp}/ouroboros-build-pycache}"
 mkdir -p "$PYTHONPYCACHEPREFIX"
 
-PYTHON_CMD="${PYTHON_CMD:-python3}"
-if ! command -v "$PYTHON_CMD" >/dev/null 2>&1; then
-    PYTHON_CMD=python
+HOST_PYTHON_CMD="${PYTHON_CMD:-python3}"
+if ! command -v "$HOST_PYTHON_CMD" >/dev/null 2>&1; then
+    HOST_PYTHON_CMD=python
 fi
 
 echo "=== Building Ouroboros for Linux (v${VERSION}) ==="
@@ -20,6 +20,7 @@ if [ ! -f "python-standalone/bin/python3" ]; then
     echo "Run first: bash scripts/download_python_standalone.sh"
     exit 1
 fi
+PORTABLE_PYTHON="python-standalone/bin/python3"
 
 # Bundle the official Node.js runtime so node-runtime skills work in the
 # packaged app out of the box.
@@ -33,29 +34,36 @@ if [ ! -f "ripgrep-standalone/bin/rg" ]; then
     bash scripts/download_ripgrep_standalone.sh
 fi
 
-echo "--- Installing launcher dependencies ---"
-"$PYTHON_CMD" -m pip install -q -r requirements-launcher.txt
+rm -rf build dist
+
+echo "--- Creating portable-Python launcher build environment ---"
+# PyInstaller inherits the build interpreter's libpython/glibc floor. Derive a
+# build-only venv from the portable interpreter the payload ships so a newer
+# runner cannot make the desktop launcher less portable or add build tooling to
+# the packaged Python tree.
+BUILD_VENV="build/linux-pyinstaller-venv"
+"$PORTABLE_PYTHON" -m venv "$BUILD_VENV"
+BUILD_PYTHON="$BUILD_VENV/bin/python"
+"$BUILD_PYTHON" -m pip install -q -r requirements-launcher.txt "pyinstaller>=6.0"
 
 echo "--- Installing agent dependencies into python-standalone ---"
-python-standalone/bin/pip3 install -q -r requirements.txt
+"$PORTABLE_PYTHON" -m pip install -q -r requirements.txt
 
 echo "--- Fetching exact Claudexor runtime seed ---"
-python-standalone/bin/python3 scripts/fetch_claudexor_runtime.py --output-dir claudexor-runtime
-
-rm -rf build dist
+"$PORTABLE_PYTHON" scripts/fetch_claudexor_runtime.py --output-dir claudexor-runtime
 
 export PYINSTALLER_CONFIG_DIR="$PWD/.pyinstaller-cache"
 mkdir -p "$PYINSTALLER_CONFIG_DIR"
 
 echo "--- Installing Chromium/WebKit for browser tools (bundled into python-standalone) ---"
-python-standalone/bin/python3 -m playwright install-deps chromium webkit
-PLAYWRIGHT_BROWSERS_PATH=0 python-standalone/bin/python3 -m playwright install chromium webkit
+"$PORTABLE_PYTHON" -m playwright install-deps chromium webkit
+PLAYWRIGHT_BROWSERS_PATH=0 "$PORTABLE_PYTHON" -m playwright install chromium webkit
 
 echo "--- Building embedded managed repo bundle ---"
-"$PYTHON_CMD" scripts/build_repo_bundle.py --source-branch "$MANAGED_SOURCE_BRANCH"
+"$HOST_PYTHON_CMD" scripts/build_repo_bundle.py --source-branch "$MANAGED_SOURCE_BRANCH"
 
 echo "--- Running PyInstaller ---"
-"$PYTHON_CMD" -m PyInstaller Ouroboros.spec --clean --noconfirm
+"$BUILD_PYTHON" -m PyInstaller Ouroboros.spec --clean --noconfirm
 
 echo "--- Installing packaged CLI wrappers ---"
 mkdir -p dist/Ouroboros/bin

@@ -74,7 +74,16 @@ def test_locate_artifact_requires_exactly_one_archive(tmp_path: Path):
         release_proof.locate_artifact(tmp_path)
 
 
-def test_assemble_binds_three_archives_smokes_and_sboms(tmp_path: Path):
+def test_locate_artifact_ignores_native_linux_packages(tmp_path: Path):
+    archive = tmp_path / "Ouroboros-1.0.0-linux-x86_64.tar.gz"
+    archive.write_bytes(b"archive")
+    (tmp_path / "ouroboros_1.0.0_amd64.deb").write_bytes(b"deb")
+    (tmp_path / "ouroboros-1.0.0-1.x86_64.rpm").write_bytes(b"rpm")
+    (tmp_path / "ouroboros-1.0.0-1.red80.x86_64.rpm").write_bytes(b"rpm")
+    assert release_proof.locate_artifact(tmp_path) == archive
+
+
+def test_assemble_binds_every_asset_smoke_and_sbom(tmp_path: Path):
     release_dir, version_file, readme = _fixture_release(tmp_path)
     notes = tmp_path / "notes.md"
     args = argparse.Namespace(
@@ -93,12 +102,18 @@ def test_assemble_binds_three_archives_smokes_and_sboms(tmp_path: Path):
 
     evidence = json.loads((release_dir / "release-evidence.json").read_text())
     assert evidence["source"]["commit"] == "a" * 40
-    assert len(evidence["artifacts"]) == 3
+    assert len(evidence["artifacts"]) == 6
     assert {row["proofId"] for row in evidence["artifacts"]} == set(
         release_proof.PROOF_IDS
     )
+    assert {row["name"] for row in evidence["artifacts"]} >= {
+        "ouroboros_6.87.5_amd64.deb",
+        "ouroboros-6.87.5-1.x86_64.rpm",
+        "ouroboros-6.87.5-1.red80.x86_64.rpm",
+    }
+    # One archive + one smoke receipt + one SBOM per proof id.
     checksum_lines = (release_dir / "SHA256SUMS").read_text().splitlines()
-    assert len(checksum_lines) == 9
+    assert len(checksum_lines) == 3 * len(release_proof.PROOF_IDS)
     assert checksum_lines == sorted(checksum_lines, key=lambda line: line.split("  ", 1)[1])
     assert "A clear release note." in notes.read_text()
     assert "v6.87.4...v6.87.5" in notes.read_text()
@@ -212,6 +227,75 @@ def test_verify_uploaded_requires_exact_names_sizes_and_digests(tmp_path: Path):
         )
 
 
+def test_linux_package_smoke_pins_third_party_vendor_images_by_digest():
+    script = (REPO / "scripts" / "smoke_linux_packages.sh").read_text(encoding="utf-8")
+    for repository in (
+        "registry.red-soft.ru/ubi8/ubi",
+        "registry.astralinux.ru/library/astra/ubi18",
+    ):
+        assert f"{repository}@sha256:" in script
+        assert f"{repository}:" not in script
+
+
+def test_linux_packages_declare_and_resolve_the_git_runtime_dependency():
+    builder = (REPO / "scripts" / "build_linux_packages.sh").read_text(encoding="utf-8")
+    smoke = (REPO / "scripts" / "smoke_linux_packages.sh").read_text(encoding="utf-8")
+
+    assert "Depends: git" in builder
+    assert "Requires:       git" in builder
+    assert "normalize_linux_package_version" in builder
+    assert "apt-get install -y -qq" in smoke
+    assert "dnf install -y -q" in smoke
+    assert "command -v git" in smoke
+    assert "dpkg --install" not in smoke
+    assert "rpm --install" not in smoke
+
+
+def test_linux_rpm_stage_recreates_the_absolute_cli_symlink():
+    builder = (REPO / "scripts" / "build_linux_packages.sh").read_text(encoding="utf-8")
+
+    assert 'cp -al "$ROOT"/. %{buildroot}/' not in builder
+    assert 'cp -al "$ROOT/opt/ouroboros" "%{buildroot}/opt/ouroboros"' in builder
+    assert (
+        'ln -s /opt/ouroboros/bin/ouroboros '
+        '"%{buildroot}/usr/bin/ouroboros"'
+    ) in builder
+
+
+def test_linux_package_smoke_starts_the_desktop_launcher_on_ubuntu_22_04():
+    smoke = (REPO / "scripts" / "smoke_linux_packages.sh").read_text(encoding="utf-8")
+
+    assert "ubuntu:22.04" in smoke
+    assert "test -x /opt/ouroboros/Ouroboros" in smoke
+    assert "timeout --signal=TERM --kill-after=5s 5s /opt/ouroboros/Ouroboros" in smoke
+    assert "desktop launcher exited before the smoke deadline" in smoke
+    assert "ouroboros-smoke-data/logs/launcher.log" in smoke
+
+
+def test_vendor_distro_smoke_is_informational_and_never_gates_a_release():
+    workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    vendor_job = workflow[
+        workflow.index("  vendor-package-smoke:") : workflow.index("  release:")
+    ]
+    assert "continue-on-error: true" in vendor_job
+    assert "smoke_linux_packages.sh vendor" in vendor_job
+
+    # The gating lane runs every package through Docker Hub images only, so a
+    # vendor registry outage cannot stop a tagged release.
+    build_job = workflow[
+        workflow.index("  build:") : workflow.index("  vendor-package-smoke:")
+    ]
+    assert "smoke_linux_packages.sh official" in build_job
+    assert "smoke_linux_packages.sh vendor" not in build_job
+
+    release_needs = next(
+        line
+        for line in workflow[workflow.index("  release:") :].splitlines()
+        if line.strip().startswith("needs:")
+    )
+    assert "vendor-package-smoke" not in release_needs
+
+
 def test_release_workflow_orders_smoke_sbom_attestation_and_draft_verification():
     workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     markers = [
@@ -222,6 +306,10 @@ def test_release_workflow_orders_smoke_sbom_attestation_and_draft_verification()
         "- name: Generate CycloneDX SBOM from packaged payload",
         "- name: Attest build provenance",
         "- name: Attest SBOM",
+        "- name: Build Linux .deb and .rpm packages",
+        "- name: Smoke Linux packages in Ubuntu and Fedora containers",
+        "- name: Record Linux package smoke and reuse payload SBOM",
+        "- name: Attest Linux package provenance",
         "- name: Upload build artifact",
         "- name: Assemble release proof capsule and notes",
         "- name: Verify artifact attestations",
@@ -250,6 +338,26 @@ def test_release_workflow_orders_smoke_sbom_attestation_and_draft_verification()
     assert 'test -L "$SBOM_ROOT/Applications"' in workflow
     assert 'unlink "$SBOM_ROOT/Applications"' in workflow
     assert "--check applications_shortcut" in workflow
+    # The native Linux packages are released alongside the tarball and go
+    # through the same smoke → SBOM → attestation → upload chain.
+    assert "bash scripts/build_linux_packages.sh" in workflow
+    assert "bash scripts/smoke_linux_packages.sh" in workflow
+    assert "--check package_install" in workflow
+    assert "--check runtime_dependency" in workflow
+    assert "--check desktop_launcher_start" in workflow
+    assert "release-artifacts/ouroboros_*_amd64.deb" in workflow
+    assert "release-artifacts/ouroboros-*-1.x86_64.rpm" in workflow
+    assert "release-artifacts/ouroboros-*-1.red80.x86_64.rpm" in workflow
+    assert "sbom-path: dist/sbom-linux-deb-amd64.cdx.json" in workflow
+    assert "sbom-path: dist/sbom-linux-rpm-x86_64.cdx.json" in workflow
+    assert "sbom-path: dist/sbom-linux-rpm-red80-x86_64.cdx.json" in workflow
+    package_proof = workflow[
+        workflow.index("- name: Record Linux package smoke and reuse payload SBOM") :
+        workflow.index("- name: Attest Linux package provenance")
+    ]
+    assert 'PAYLOAD_SBOM="dist/sbom-linux-x86_64.cdx.json"' in package_proof
+    assert 'cp "$PAYLOAD_SBOM" "dist/sbom-$1.cdx.json"' in package_proof
+    assert "steps.syft.outputs.path" not in package_proof
     assert "lipo -archs" in workflow
     assert "Refusing to modify the published release" in workflow
     assert "group: release-${{ github.ref }}" in workflow
@@ -266,7 +374,9 @@ def test_release_workflow_orders_smoke_sbom_attestation_and_draft_verification()
     assert "$env:APPDATA = Join-Path $HomeDir" in workflow
     assert "$env:HOMEDRIVE = Split-Path -Qualifier $HomeDir" in workflow
     assert "$env:HOMEPATH = $HomeDir.Substring" in workflow
-    build_job = workflow[workflow.index("  build:") : workflow.index("  release:")]
+    build_job = workflow[
+        workflow.index("  build:") : workflow.index("  vendor-package-smoke:")
+    ]
     job_env = build_job[build_job.index("    env:") : build_job.index("    steps:")]
     assert "BUILD_CERTIFICATE_BASE64:" not in job_env
     assert "P12_PASSWORD:" not in job_env

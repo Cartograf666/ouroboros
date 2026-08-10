@@ -33,6 +33,28 @@
       "nameTemplate": "Ouroboros-{version}-linux-x86_64.tar.gz"
     },
     {
+      "platform": "linux",
+      "architecture": "x86_64",
+      "format": "deb",
+      "availability": "per-release",
+      "nameTemplate": "ouroboros_{version}_amd64.deb"
+    },
+    {
+      "platform": "linux",
+      "architecture": "x86_64",
+      "format": "rpm",
+      "availability": "per-release",
+      "nameTemplate": "ouroboros-{version}-1.x86_64.rpm"
+    },
+    {
+      "platform": "linux",
+      "architecture": "x86_64",
+      "format": "rpm",
+      "distribution": "redos8",
+      "availability": "per-release",
+      "nameTemplate": "ouroboros-{version}-1.red80.x86_64.rpm"
+    },
+    {
       "platform": "windows",
       "architecture": "x64",
       "format": "zip",
