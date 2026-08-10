@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -73,6 +74,63 @@ def thread_worktree_root() -> Path:
     raw = str(os.environ.get(_ROOT_ENV, "") or "").strip()
     root = raw or os.path.expanduser(os.path.join("~", "Ouroboros", "thread_worktrees"))
     return Path(root).expanduser().resolve()
+
+
+def _git_timeout_sec() -> float:
+    """The ceiling for every git call in this module, from the ONE settings SSOT.
+
+    Read through ``config`` rather than pinned as a module-local number, and it is
+    the SAME knob ``thread_branching`` uses (``OUROBOROS_THREAD_GIT_TIMEOUT_SEC``,
+    120s, clamped 5-300): branch-off, merge-back, the inspection and the removal
+    are arms of one owner gesture on one repository, so a wedged git must expire at
+    the same point on all of them. Deliberately not the task-diff READ key, whose
+    30s ceiling silently narrowed this path once already (H-ter).
+    """
+    from ouroboros.config import get_thread_git_timeout_sec
+
+    return get_thread_git_timeout_sec()
+
+
+def _git(root: Any, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    """One BOUNDED git call — the only way this module invokes git.
+
+    ``subagent_worktrees.run_git`` passes no timeout, and that is correct for ITS
+    callers: background provisioning and the startup orphan sweep, which nothing
+    waits on. This module's calls are reached from six OWNER-FACING routes that did
+    not exist before T3 — ``GET``/``POST`` on a thread's worktree, branch-off,
+    merge-back, thread delete and ``DELETE /api/projects/{id}`` — where a git that
+    never returns holds the owner's request AND a thread-pool thread forever, with
+    the registry ``_LOCK`` released but the git-op lock still held, so every other
+    worktree gesture on that repo wedges behind it too.
+
+    An expiry is a typed, owner-legible OUTCOME, never a traceback:
+
+    * ``check=False`` (every read, and both deletions) comes back as an ordinary
+      ``CompletedProcess`` with ``returncode=124`` and a sentence naming the
+      ceiling, so :func:`inspect_thread_worktree` reports it as ``error`` — which
+      already counts as "cannot tell", i.e. UNSAFE — and
+      :func:`remove_thread_worktree` reports ``removal_failed`` and keeps its row.
+    * ``check=True`` (provisioning, which must refuse rather than continue) raises
+      ``ValueError`` with the same sentence, the exact channel
+      ``thread_branching.branch_off_thread`` already turns into a typed
+      ``branch_failed`` refusal carrying the message.
+
+    ``TimeoutExpired`` is the only exception converted. A ``CalledProcessError``
+    from ``check=True`` still propagates unchanged, because provisioning's refusals
+    are built on it.
+    """
+    limit = _git_timeout_sec()
+    try:
+        return run_git(root, *args, check=check, timeout=limit)
+    except subprocess.TimeoutExpired:
+        detail = (
+            f"git {' '.join(str(a) for a in args[:4])} in {root} did not finish within "
+            f"{limit:g}s (OUROBOROS_THREAD_GIT_TIMEOUT_SEC)"
+        )
+        log.warning("Thread worktree git call timed out: %s", detail)
+        if check:
+            raise ValueError(detail) from None
+        return subprocess.CompletedProcess(["git", *args], 124, stdout="", stderr=detail)
 
 
 @dataclass(frozen=True)
@@ -177,19 +235,19 @@ def provision_thread_worktree(
             )
         if wt_path.exists():
             raise ValueError(f"refusing to reuse an existing path: {wt_path}")
-        existing_branch = run_git(repo, "rev-parse", "--verify", branch, check=False)
+        existing_branch = _git(repo, "rev-parse", "--verify", branch, check=False)
         if existing_branch.returncode == 0:
             raise ValueError(
                 f"branch {branch!r} already exists — delete it deliberately before branching off again"
             )
         if base_ref:
-            run_git(repo, "rev-parse", "--verify", f"{base_ref}^{{commit}}")
-            base_sha = run_git(repo, "rev-parse", base_ref).stdout.strip()
+            _git(repo, "rev-parse", "--verify", f"{base_ref}^{{commit}}")
+            base_sha = _git(repo, "rev-parse", base_ref).stdout.strip()
         else:
-            base_sha = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+            base_sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
         wt_path.parent.mkdir(parents=True, exist_ok=True)
         # No --force: git must refuse rather than take over a foreign checkout.
-        run_git(repo, "worktree", "add", "-b", branch, str(wt_path), base_sha)
+        _git(repo, "worktree", "add", "-b", branch, str(wt_path), base_sha)
         handle = ThreadWorktree(
             project_id=key[0],
             thread_id=key[1],
@@ -212,7 +270,7 @@ def _project_head(row: Dict[str, Any]) -> str:
     try:
         if not repo.is_dir():
             return ""
-        head = run_git(repo, "rev-parse", "HEAD", check=False)
+        head = _git(repo, "rev-parse", "HEAD", check=False)
     except Exception:
         return ""
     return (head.stdout or "").strip() if head.returncode == 0 else ""
@@ -280,7 +338,7 @@ def inspect_thread_worktree(row: Dict[str, Any]) -> Dict[str, Any]:
         # this listed the C-quoted spelling while `merge_back_thread`'s own status
         # call — which pins it — listed the real one, and the two surfaces
         # disagreed about the same file.
-        status = run_git(
+        status = _git(
             wt_path, "-c", "core.quotepath=off", "status", "--porcelain",
             "--ignored=matching", check=False,
         )
@@ -297,11 +355,11 @@ def inspect_thread_worktree(row: Dict[str, Any]) -> Dict[str, Any]:
             out["unmerged_against"] = reference
             tips = ["HEAD"]
             branch = str(row.get("branch") or "").strip()
-            if branch and run_git(
+            if branch and _git(
                 wt_path, "rev-parse", "--verify", "-q", branch, check=False,
             ).returncode == 0:
                 tips.append(branch)
-            ahead = run_git(
+            ahead = _git(
                 wt_path, "rev-list", "--count", *tips, "--not", reference, check=False,
             )
             if ahead.returncode != 0:
@@ -446,12 +504,13 @@ def remove_thread_worktree(
     # provisioning it was supposed to serialize against (`_ops_lock_path`).
     with worktree_ops_lock(str(seen.get("repo_dir") or root), mkdir_root=root):
         # `_LOCK` covers the registry READ and the final SAVE, nothing between.
-        # Holding it across two `run_git` calls, `force_rmtree`, a prune and a
+        # Holding it across two git calls, `force_rmtree`, a prune and a
         # `git branch -d` blocked every `thread_location`/`get_thread_worktree`
-        # read for the duration — and with `run_git`'s known missing timeout that
-        # duration is unbounded, so one wedged git call froze the sidebar. The
-        # git-op lock still serializes the whole operation per root, which is what
-        # actually needs to be exclusive.
+        # read for the duration — and back when this module called the unbounded
+        # `run_git` directly that duration had no ceiling at all, so one wedged git
+        # call froze the sidebar. Every call here now goes through the bounded
+        # module-local `_git`, and the git-op lock still serializes the whole
+        # operation per root, which is what actually needs to be exclusive.
         with _LOCK:
             match = next((row for row in _load(data_dir) if _matches(row, key)), None)
         if match is None:
@@ -483,10 +542,10 @@ def remove_thread_worktree(
             return {"removed": False, "reason": "path_outside_root", "inspection": inspection}
         repo = Path(str(match.get("repo_dir") or "."))
         branch = str(match.get("branch") or "").strip()
-        run_git(repo, "worktree", "remove", "--force", str(wt_path), check=False)
+        _git(repo, "worktree", "remove", "--force", str(wt_path), check=False)
         if wt_path.exists():
             force_rmtree(wt_path)
-        run_git(repo, "worktree", "prune", check=False)
+        _git(repo, "worktree", "prune", check=False)
         if wt_path.exists():
             # Both deletions above run best-effort (`check=False` / a swallowing
             # rmtree), so a checkout held by a git lock, a read-only parent or a
@@ -674,7 +733,7 @@ def _drop_clean_branch(repo: Path, branch: str, holds_commits: bool) -> tuple:
         # thing and this is the last copy of them.
         return False, "the checkout held unmerged work, so its branch keeps the commits"
     try:
-        dropped = run_git(repo, "branch", "-d", branch, check=False)
+        dropped = _git(repo, "branch", "-d", branch, check=False)
     except Exception as exc:
         return False, f"the branch could not be deleted: {type(exc).__name__}: {exc}"
     if dropped.returncode != 0:

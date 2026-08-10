@@ -248,13 +248,30 @@ def _force_rmtree(path: Path) -> None:
         pass
 
 
-def _git(repo_dir: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+def _git(
+    repo_dir: Path,
+    *args: str,
+    check: bool = True,
+    timeout: Optional[float] = None,
+) -> subprocess.CompletedProcess:
+    """One git call. ``timeout`` is a pass-through to ``subprocess.run``.
+
+    The default stays ``None`` — UNBOUNDED — on purpose: this helper's own callers
+    are background provisioning and the startup orphan sweep, no request waits on
+    them, and giving them a ceiling here would be a behaviour change nobody asked
+    for. The parameter exists because ``thread_worktrees`` reuses this primitive on
+    OWNER-FACING request paths (``GET`` / ``POST`` on a thread's worktree, and the
+    project delete), where a wedged git otherwise holds an HTTP request and a
+    thread-pool thread forever; that module passes
+    ``config.get_thread_git_timeout_sec()`` at every call site.
+    """
     return subprocess.run(
         ["git", *args],
         cwd=str(repo_dir),
         capture_output=True,
         text=True,
         check=check,
+        timeout=timeout,
     )
 
 

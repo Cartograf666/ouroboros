@@ -849,3 +849,141 @@ def test_an_acknowledged_removal_keeps_the_branch_only_for_COMMITS(repo, tmp_pat
     assert done["branch_removed"] is True, done["branch_kept_reason"]
     assert done["branch_kept_reason"] == ""
     assert handle.branch not in _git(repo, "branch", "--format=%(refname:short)").stdout.split()
+
+
+# --------------------------------------------------------------------------- #
+# P4 — every git call on an owner-facing worktree path is BOUNDED
+# --------------------------------------------------------------------------- #
+
+def test_every_git_call_in_this_module_goes_through_the_bounded_seam():
+    """P4: `subagent_worktrees.run_git` passes NO timeout to `subprocess.run`.
+
+    That is correct for its own callers (background provisioning, the startup
+    orphan sweep — nothing waits on them), but this module is reached from six
+    routes that did not exist before T3: `GET`/`POST` on a thread's worktree,
+    branch-off, merge-back, thread delete and `DELETE /api/projects/{id}`. A
+    wedged git there holds the owner's request and a thread-pool thread forever.
+
+    Read from the AST so prose about the unbounded helper cannot satisfy it: the
+    ONLY function allowed to call `run_git` is the bounded `_git` wrapper, and it
+    must pass a `timeout`.
+    """
+    import ast
+    import inspect
+
+    import ouroboros.thread_worktrees as twt
+
+    tree = ast.parse(inspect.getsource(twt))
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Name)
+                and inner.func.id == "run_git"
+                and node.name != "_git"
+            ):
+                offenders.append(node.name)
+    assert not offenders, f"unbounded git calls remain in: {sorted(set(offenders))}"
+
+    seam = ast.parse(inspect.getsource(twt._git))
+    passes_timeout = any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "run_git"
+        and any(kw.arg == "timeout" for kw in node.keywords)
+        for node in ast.walk(seam)
+    )
+    assert passes_timeout, "the seam must pass a timeout through to run_git"
+    # ...and the ceiling is the SSOT knob, not a module-local number.
+    from ouroboros.config import get_thread_git_timeout_sec
+
+    assert twt._git_timeout_sec() == get_thread_git_timeout_sec()
+
+
+def test_the_shared_helper_accepts_a_timeout_and_defaults_to_unbounded():
+    """The pass-through is added WITHOUT changing the pre-existing surface: the
+    subagent path keeps its unbounded default, which is what its own callers were
+    written under."""
+    import inspect
+
+    from ouroboros.subagent_worktrees import run_git
+
+    signature = inspect.signature(run_git)
+    assert "timeout" in signature.parameters
+    assert signature.parameters["timeout"].default is None
+
+
+def test_a_timed_out_git_is_a_typed_outcome_not_a_traceback(repo, tmp_path, wt_root, monkeypatch):
+    """An expiry has to be legible on both call shapes.
+
+    `check=False` (every read, and both deletions) must come back as rc=124 with a
+    sentence naming the ceiling, so the inspection reports it as "cannot tell" —
+    which already counts as UNSAFE. `check=True` (provisioning, which must refuse
+    rather than continue) must raise into the channel `branch_off_thread` already
+    turns into a typed `branch_failed`.
+    """
+    import ouroboros.thread_worktrees as twt
+
+    def _wedged(root, *args, **kwargs):
+        raise subprocess.TimeoutExpired(["git", *args], kwargs.get("timeout") or 1)
+
+    monkeypatch.setattr(twt, "run_git", _wedged)
+
+    soft = twt._git(repo, "status", "--porcelain", check=False)
+    assert soft.returncode == 124
+    assert "OUROBOROS_THREAD_GIT_TIMEOUT_SEC" in soft.stderr
+
+    with pytest.raises(ValueError) as raised:
+        twt._git(repo, "rev-parse", "HEAD")
+    assert "OUROBOROS_THREAD_GIT_TIMEOUT_SEC" in str(raised.value)
+
+    # The inspection folds the soft form into its own "unsafe by construction"
+    # answer rather than raising out of an HTTP handler.
+    out = inspect_thread_worktree(
+        {"path": str(repo), "repo_dir": str(tmp_path / "nope"), "branch": "thread/x",
+         "base_sha": "deadbeef"},
+    )
+    assert out["dirty"] is True
+    assert "did not finish within" in out["error"]
+
+
+def test_a_wedged_git_lets_the_inspection_return(tmp_path, monkeypatch):
+    """The reproduction itself: with a `git` that never exits, the owner-facing
+    inspection used to hang forever. It now returns inside the ceiling with a
+    typed error. Bounded by the SSOT knob's own minimum (5s)."""
+    import os
+    import threading
+
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    fake = fakebin / "git"
+    fake.write_text("#!/bin/sh\nsleep 3600\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fakebin}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("OUROBOROS_THREAD_GIT_TIMEOUT_SEC", "5")
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    row = {
+        "path": str(checkout),
+        # A repo_dir that is not a directory, so `_project_head` costs no git call
+        # and the test spends exactly one ceiling.
+        "repo_dir": str(tmp_path / "absent"),
+        "branch": "thread/x",
+        "base_sha": "deadbeef",
+    }
+
+    result = {}
+
+    def _call():
+        result["out"] = inspect_thread_worktree(row)
+
+    worker = threading.Thread(target=_call, daemon=True)
+    worker.start()
+    worker.join(timeout=45.0)
+    assert not worker.is_alive(), "inspect_thread_worktree never returned — unbounded"
+    assert result["out"]["dirty"] is True
+    assert "did not finish within" in result["out"]["error"]
