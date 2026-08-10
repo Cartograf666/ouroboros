@@ -375,7 +375,19 @@ def test_ui_smoke_project_panel_lifecycle_does_not_leak(direct_server_with_data)
     }"""
     live_panels = """() => [...document.querySelectorAll('.chat-instance-panel')]
         .filter((panel) => panel.dataset.pendingWork !== '1').length"""
-    dom_count = "() => document.getElementsByTagName('*').length"
+    # SCOPED to the surfaces this test exercises. Counting the whole document made
+    # the assertion depend on how much of Skills / Logs / Costs had lazily
+    # hydrated in the background between the two samples — an unrelated screen
+    # finishing its first paint mid-run reads as a panel leak (measured: ~95
+    # nodes of skills cards, log rows and cost cells, and ZERO from any chat
+    # surface). What the test claims to catch is an accumulated panel or card
+    # timeline, which is hundreds of nodes INSIDE these roots.
+    dom_count = """() => ['#page-thread', '#page-chat', '#nav-projects-list']
+        .map((sel) => document.querySelector(sel))
+        .filter(Boolean)
+        .reduce((total, root) => total + root.getElementsByTagName('*').length, 0)
+        + [...document.querySelectorAll('.chat-instance-panel')]
+            .reduce((total, panel) => total + 1 + panel.getElementsByTagName('*').length, 0)"""
 
     try:
         with sync_playwright() as pw:
