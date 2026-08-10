@@ -545,6 +545,65 @@ def project_thread_worktrees(data_dir: Any, project_id: Any) -> List[Dict[str, A
     return [row for row in list_thread_worktrees(data_dir) if str(row.get("project_id") or "") == pid]
 
 
+def project_checkouts_at_risk(data_dir: Any, project_id: Any) -> List[Dict[str, Any]]:
+    """Which of a project's checkouts hold work that cannot be rebuilt.
+
+    Returns one entry per checkout that WOULD be destroyed by deleting the
+    project, each ``{thread_id, path, branch, inspection, risk}``. The judge is
+    ``checkout_work_at_risk`` — the SAME narrower fact thread deletion asks, not
+    removal's broader "would be destroyed" — so deleting a project is refused for
+    exactly the reasons deleting one of its threads is refused, and a stray
+    ``node_modules/`` never blocks it.
+    """
+    out: List[Dict[str, Any]] = []
+    for row in project_thread_worktrees(data_dir, project_id):
+        inspection = inspect_thread_worktree(row)
+        risk = checkout_work_at_risk(inspection)
+        if risk["at_risk"]:
+            out.append({
+                "thread_id": int(row.get("thread_id") or 0),
+                "path": str(row.get("path") or ""),
+                "branch": str(row.get("branch") or ""),
+                "inspection": inspection,
+                "risk": risk,
+            })
+    return out
+
+
+def remove_project_thread_worktrees(data_dir: Any, project_id: Any) -> Dict[str, Any]:
+    """Remove every checkout of a project, reporting each outcome.
+
+    Returns ``{removed: [...], kept: [{thread_id, reason}], branches: [...]}``.
+    ``acknowledge_unmerged`` is passed because the CALLER has already refused on
+    anything at risk (:func:`project_checkouts_at_risk`) — what is left is
+    rebuildable content the owner confirmed, exactly as thread deletion does it.
+    Never raises: a checkout that survives is REPORTED, because the project row is
+    on its way to a tombstone and a swallowed failure would be the orphan this
+    function exists to prevent.
+    """
+    removed: List[int] = []
+    kept: List[Dict[str, Any]] = []
+    branches: List[str] = []
+    for row in project_thread_worktrees(data_dir, project_id):
+        tid = int(row.get("thread_id") or 0)
+        try:
+            outcome = remove_thread_worktree(
+                data_dir=data_dir, project_id=str(project_id or ""), thread_id=tid,
+                acknowledge_unmerged=True,
+            )
+        except Exception as exc:  # noqa: BLE001 — an orphan must never be silent
+            log.warning("Project deletion could not remove checkout %s#%s", project_id, tid, exc_info=True)
+            kept.append({"thread_id": tid, "reason": f"{type(exc).__name__}: {exc}"[:200]})
+            continue
+        if outcome.get("removed"):
+            removed.append(tid)
+            if outcome.get("branch_removed") and outcome.get("branch"):
+                branches.append(str(outcome["branch"]))
+        else:
+            kept.append({"thread_id": tid, "reason": str(outcome.get("reason") or "removal_failed")})
+    return {"removed": removed, "kept": kept, "branches": branches}
+
+
 def _project_is_busy(project_id: Any, row: Dict[str, Any]) -> bool:
     """Is anything alive in this project, or in the CHECKOUT? — merge-back's judge.
 
@@ -629,7 +688,10 @@ __all__ = [
     "get_thread_worktree",
     "inspect_thread_worktree",
     "list_thread_worktrees",
+    "project_checkouts_at_risk",
+    "project_thread_worktrees",
     "provision_thread_worktree",
+    "remove_project_thread_worktrees",
     "remove_thread_worktree",
     "thread_worktree_root",
 ]

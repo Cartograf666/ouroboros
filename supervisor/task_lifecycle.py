@@ -1132,22 +1132,58 @@ def _broadcast_projects_changed(project_id: str, chat_id: Any) -> None:
         _queue_module().log.debug("projects_changed broadcast failed for %s", project_id, exc_info=True)
 
 
+def _sweep_project_checkouts(drive_root: object, project_id: str) -> None:
+    """Take any thread checkout that outlived the delete route's own attempt.
+
+    Best-effort and never raising: a checkout that still cannot be removed is
+    LOGGED at warning, because the alternative is a silent orphan and the
+    tombstone is about to make it unreachable. It is not a reason to fail the
+    deletion — the project row's own teardown has already succeeded by here.
+    """
+    try:
+        from ouroboros.thread_worktrees import remove_project_thread_worktrees
+
+        swept = remove_project_thread_worktrees(drive_root, project_id)
+        if swept["kept"]:
+            _queue_module().log.warning(
+                "Project %s tombstoned with %d thread checkout(s) still on disk: %s",
+                project_id, len(swept["kept"]), swept["kept"],
+            )
+    except Exception:
+        _queue_module().log.warning(
+            "Project %s: thread checkout sweep failed", project_id, exc_info=True,
+        )
+
+
 def run_project_deletion(
     drive_root: object,
     project_id: str,
     chat_id: Any,
     worker_key: tuple[str, str] | None = None,
 ) -> None:
-    """Cancel a fenced Project tree and tombstone only after quiescence."""
+    """Cancel a fenced Project tree and tombstone only after quiescence.
+
+    The LAST act before the tombstone is taking any thread checkout the route
+    could not take yet (I1): ``api_project_delete`` refuses on work at risk and
+    removes what it can, but a checkout with a task still writing in it refuses
+    ``project_busy`` there and would otherwise be left behind — a folder and a
+    ``thread/*`` branch that a tombstoned project has no surface to reach. Here the
+    tasks are gone, so the removal's own busy judge lets it through.
+    """
     from ouroboros.projects_registry import complete_project_deletion, fail_project_deletion
 
     q = _queue_module()
+
+    def _finish() -> None:
+        _sweep_project_checkouts(drive_root, project_id)
+        complete_project_deletion(drive_root, project_id)
+        _broadcast_projects_changed(project_id, chat_id)
+
     try:
         while True:
             live_ids = _live_project_task_ids(drive_root, project_id)
             if not live_ids:
-                complete_project_deletion(drive_root, project_id)
-                _broadcast_projects_changed(project_id, chat_id)
+                _finish()
                 return
             errors: list[str] = []
             for task_id in live_ids:
@@ -1157,8 +1193,7 @@ def run_project_deletion(
                     errors.append(f"{task_id}: {type(exc).__name__}: {exc}")
             remaining = _live_project_task_ids(drive_root, project_id)
             if not remaining:
-                complete_project_deletion(drive_root, project_id)
-                _broadcast_projects_changed(project_id, chat_id)
+                _finish()
                 return
             if set(remaining) >= set(live_ids):
                 detail = "; ".join(errors) if errors else "cancel_task_by_id left tasks live"

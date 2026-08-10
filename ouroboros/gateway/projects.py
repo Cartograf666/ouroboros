@@ -576,12 +576,39 @@ async def api_project_delete(request: Request) -> JSONResponse:
     The response acknowledges that deletion has STARTED; cancellation runs off
     the event loop because cancelling a running task may join/respawn a worker.
     Chat, folder, history, memory, id, and immutable bindings are never removed.
+
+    Its threads' CHECKOUTS are a different matter, and this route used to walk
+    past them entirely (I1). Every clause ``api_thread_delete`` gives for taking a
+    thread's checkout with the thread is equally true of the PROJECT: a tombstoned
+    project is invisible on every surface, ``list_thread_worktrees`` has no route,
+    and branch/merge refuse a thread that is not live — so a checkout left behind
+    is a folder and a ``thread/*`` branch that A10's explicit removal can no
+    longer reach, on durable state exempt from every GC. Nothing applied it, so
+    one gesture destroyed-by-orphaning a file that existed only inside a checkout,
+    and D4's "a thread's worktree is NEVER removed silently" had a hole exactly
+    one click wide.
+
+    So: BEFORE the fence, refuse ``threads_hold_checkouts`` when any checkout
+    holds work that cannot be rebuilt — the same ``checkout_work_at_risk`` judge
+    thread deletion uses and the same sentence, naming the threads and the
+    explicit removal route. Asked before anything is fenced, because a refusal
+    must leave the project exactly as it was. Otherwise the checkouts go WITH the
+    project and are disclosed on the answer. A checkout the removal cannot take
+    yet (a task is still writing in that folder) is reported as PENDING and swept
+    by the cancellation worker once the project quiesces, so no path leaves an
+    orphan silently.
     """
     try:
+        import asyncio
+
         from ouroboros.projects_registry import (
             PROJECT_TOMBSTONED,
             begin_project_deletion,
             get_reserved_project,
+        )
+        from ouroboros.thread_worktrees import (
+            project_checkouts_at_risk,
+            remove_project_thread_worktrees,
         )
         from supervisor.task_lifecycle import start_project_deletion
 
@@ -594,16 +621,72 @@ async def api_project_delete(request: Request) -> JSONResponse:
         # lookup accepts a case-variant for compatibility, but cancellation must
         # not compare that raw route token against canonical task.project_id.
         project_id = str(entry.get("id") or project_id)
+        at_risk = await asyncio.to_thread(project_checkouts_at_risk, drive_root, project_id)
+        if at_risk:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "reason": "threads_hold_checkouts",
+                    "message": _project_checkouts_refusal_message(at_risk),
+                    "project_id": project_id,
+                    "threads": [
+                        {
+                            "thread_id": item["thread_id"],
+                            "path": item["path"],
+                            "branch": item["branch"],
+                            "inspection": item["inspection"],
+                        }
+                        for item in at_risk
+                    ],
+                },
+                status_code=409,
+            )
         fenced = begin_project_deletion(drive_root, project_id)
         if fenced is None:
             return JSONResponse({"error": f"unknown project: {project_id}"}, status_code=404)
         chat_id = fenced.get("chat_id")
+        # Inside the fence: routing into the project is already closed, so nothing
+        # NEW can start writing in a checkout while it is being taken.
+        swept = await asyncio.to_thread(remove_project_thread_worktrees, drive_root, project_id)
         _broadcast_projects_changed(project_id, chat_id)
         if str(fenced.get("lifecycle") or "") != PROJECT_TOMBSTONED:
             start_project_deletion(drive_root, project_id, chat_id)
-        return JSONResponse({"ok": True, "project_id": project_id, "folder_untouched": True})
+        return JSONResponse({
+            "ok": True,
+            "project_id": project_id,
+            "folder_untouched": True,
+            "worktrees_removed": swept["removed"],
+            "branches_removed": swept["branches"],
+            # Not removable YET (a task is still in that folder). The cancellation
+            # worker takes them once the project quiesces; named here so "the
+            # checkouts went with it" is never claimed before it is true.
+            "worktrees_pending": swept["kept"],
+        })
     except Exception as exc:
         return json_exception(exc)
+
+
+def _project_checkouts_refusal_message(at_risk: list) -> str:
+    """Why a project delete stops, naming the threads whose work is at stake.
+
+    Built from the SAME ``_delete_refusal_message`` a single thread's deletion
+    uses, so the two gestures explain the identical fact identically — a second
+    copy would drift the moment either was edited.
+    """
+    from ouroboros.gateway.project_threads import _delete_refusal_message
+
+    count = len(at_risk)
+    head = (
+        f"{count} of this project's threads {'has' if count == 1 else 'have'} a checkout "
+        "holding work that exists nowhere else. Deleting the project would delete those "
+        "folders and their branches, and a deleted project leaves no surface that could "
+        "reach them — so the delete stops here."
+    )
+    lines = [
+        f"Thread {item['thread_id']}: {_delete_refusal_message(item['risk'])}"
+        for item in at_risk
+    ]
+    return " ".join([head, *lines])
 
 
 async def _thread_body(request: Request) -> Any:

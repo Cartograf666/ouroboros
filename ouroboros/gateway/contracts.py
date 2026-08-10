@@ -764,13 +764,38 @@ class ThreadLifecycleResponse(TypedDict, total=False):
     location: ThreadLocation
 
 
-class ProjectDeleteResponse(TypedDict):
+class ProjectDeleteResponse(TypedDict, total=False):
     """POST /api/projects/{project_id}/delete — fence, quiesce, and tombstone;
-    the immutable binding, working folder, history, and memory are preserved."""
+    the immutable binding, working folder, history, and memory are preserved.
+
+    Its threads' CHECKOUTS are not (I1). A tombstoned project is invisible on
+    every surface and branch/merge refuse a thread that is not live, so a checkout
+    left behind is a folder and a ``thread/*`` branch nothing can reach — it goes
+    WITH the project and is disclosed here rather than removed silently.
+    ``worktrees_pending`` names the ones a task was still writing in, which the
+    cancellation worker takes once the project quiesces; ``ok`` stays true because
+    the deletion did start.
+
+    A checkout holding work that cannot be REBUILT refuses instead: ``ok: false``,
+    ``reason: "threads_hold_checkouts"`` under a 409, carrying the sentence a
+    single thread's deletion gives for the same fact and ``threads`` naming each
+    one. Same envelope shape as every other typed refusal, so a client reads
+    ``ok`` first here as everywhere else.
+    """
 
     ok: bool
     project_id: str
     folder_untouched: bool
+    #: Thread ids whose checkout was removed with the project.
+    worktrees_removed: List[int]
+    #: ``thread/<name>`` branches deleted along with those checkouts.
+    branches_removed: List[str]
+    #: ``[{thread_id, reason}]`` — a checkout that could not be taken yet.
+    worktrees_pending: List[Dict[str, Any]]
+    reason: str
+    message: str
+    #: On ``threads_hold_checkouts``: ``[{thread_id, path, branch, inspection}]``.
+    threads: List[Dict[str, Any]]
 
 
 class FsDirsEntry(TypedDict):

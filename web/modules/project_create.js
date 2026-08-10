@@ -334,7 +334,12 @@ async function runProjectRowAction(action, project, { apiClient, anchorEl, onCha
     } else if (action === 'delete') {
         const ok = await openConfirmDialog({
             title: 'Delete project',
-            body: `Delete “${project.name || project.id}”? Running work will be cancelled. The Project will be removed from the active UI; its id, chat history, task bindings, memory, and working folder are preserved.`,
+            // The last sentence is the one that was missing (I1): a project's
+            // threads can each own a git CHECKOUT and a `thread/<name>` branch,
+            // and a tombstoned project leaves no surface that could reach them —
+            // so they go with it. Saying "your working folder is preserved" and
+            // nothing else described a deletion that also destroyed N folders.
+            body: `Delete “${project.name || project.id}”? Running work will be cancelled. The Project will be removed from the active UI; its id, chat history, task bindings, memory, and working folder are preserved. Any checkouts its threads branched off — and their thread/… branches — are removed with it; if one still holds work the project folder never received, the delete stops and says which thread.`,
             confirmLabel: 'Delete',
             danger: true,
         });

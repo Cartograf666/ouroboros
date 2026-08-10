@@ -11,6 +11,7 @@ from ouroboros.gateway.contracts import (
     ChatOutbound,
     OwnerScopeReviewFloorResponse,
     PhotoOutbound,
+    ProjectDeleteResponse,
     ProjectEntry,
     ProjectFromTaskResponse,
     ProjectInitGitResponse,
@@ -192,6 +193,10 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
                 ThreadDeleteRequest,
                 ThreadWorktreeResponse, ThreadDiffResponse, ThreadLifecycleResponse, ThreadQueueNotice,
                 WorkspaceGitInitDecision, ProjectInitGitResponse,
+                # I1: the project delete answers what happened to its threads' checkouts,
+                # and this class was only in the NAME-level loop above — so the new
+                # fields could have landed on one side alone.
+                ProjectDeleteResponse,
                 ProjectFromTaskResponse):
         expected = set(get_type_hints(cls, include_extras=True))
         actual = _js_typedef_fields(text, cls.__name__)

@@ -605,10 +605,29 @@
  */
 
 /**
+ * POST /api/projects/{project_id}/delete. The project's own folder, history,
+ * bindings, memory and id are preserved; its threads' CHECKOUTS are not. A
+ * tombstoned project is invisible on every surface and branch/merge refuse a
+ * thread that is not live, so a checkout left behind is a folder and a thread/…
+ * branch nothing can reach — it goes WITH the project and is disclosed here
+ * rather than removed silently. worktrees_pending names the ones a task was still
+ * writing in, which the cancellation worker takes once the project quiesces; ok
+ * stays true because the deletion did start.
+ *
+ * A checkout holding work that cannot be REBUILT refuses instead: ok false,
+ * reason 'threads_hold_checkouts' under a 409, carrying the sentence a single
+ * thread's deletion gives for the same fact and threads naming each one.
  * @typedef {Object} ProjectDeleteResponse
  * @property {boolean} ok
  * @property {string} project_id
  * @property {boolean} folder_untouched
+ * @property {number[]=} worktrees_removed thread ids whose checkout went with it
+ * @property {string[]=} branches_removed thread/<name> branches deleted with them
+ * @property {Object[]=} worktrees_pending [{thread_id, reason}] — not takeable yet
+ * @property {string=} reason
+ * @property {string=} message
+ * @property {Object[]=} threads on threads_hold_checkouts: [{thread_id, path,
+ *   branch, inspection}]
  */
 
 /**
