@@ -820,13 +820,13 @@ jobs:
           echo "rpm=$RPM" >> "$GITHUB_OUTPUT"
           echo "rpm_red80=$RPM_RED80" >> "$GITHUB_OUTPUT"
 
-      - name: Record Linux package smoke and SBOMs
+      - name: Record Linux package smoke and reuse payload SBOM
         if: matrix.os == 'ubuntu-latest'
         shell: bash
-        env:
-          SBOM_PATH: ${{ steps.smoke_linux.outputs.sbom_path }}
         run: |
           set -euo pipefail
+          PAYLOAD_SBOM="dist/sbom-linux-x86_64.cdx.json"
+          test -f "$PAYLOAD_SBOM"
           record() {
             python scripts/release_proof.py record-smoke \
               --proof-id "$1" \
@@ -835,10 +835,10 @@ jobs:
               --commit "$GITHUB_SHA" \
               --tag "$GITHUB_REF_NAME" \
               --check package_install \
+              --check runtime_dependency \
               --check packaged_cli_help \
               --check desktop_entry
-            "${{ steps.syft.outputs.path }}" "dir:$SBOM_PATH" \
-              --output "cyclonedx-json=dist/sbom-$1.cdx.json"
+            cp "$PAYLOAD_SBOM" "dist/sbom-$1.cdx.json"
           }
           record linux-deb-amd64 "${{ steps.linux_packages.outputs.deb }}"
           record linux-rpm-x86_64 "${{ steps.linux_packages.outputs.rpm }}"

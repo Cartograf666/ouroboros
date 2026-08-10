@@ -7,6 +7,7 @@ import pytest
 from ouroboros.tools.release_sync import (
     check_history_limit,
     detect_numeric_claims,
+    normalize_linux_package_version,
     run_release_preflight,
     sync_release_metadata,
     version_carrier_desyncs,
@@ -375,6 +376,25 @@ class TestNormalizePep440:
     def test_stable_version_passes_through_unchanged(self):
         assert _normalize_pep440("4.50.0") == "4.50.0"
         assert _normalize_pep440("1.2.3") == "1.2.3"
+
+
+class TestNormalizeLinuxPackageVersion:
+    @pytest.mark.parametrize(
+        "src,expected",
+        [
+            ("4.50.0", "4.50.0"),
+            ("4.50.0-rc.1", "4.50.0~rc1"),
+            ("4.50.0rc1", "4.50.0~rc1"),
+            ("4.50.0-alpha.2", "4.50.0~a2"),
+            ("4.50.0-beta3", "4.50.0~b3"),
+        ],
+    )
+    def test_normalizes_supported_release_spellings(self, src, expected):
+        assert normalize_linux_package_version(src) == expected
+
+    def test_rejects_a_non_release_version(self):
+        with pytest.raises(ValueError, match="unsupported release version"):
+            normalize_linux_package_version("dev")
 
 
 class TestShieldsEscape:

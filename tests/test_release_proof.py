@@ -237,6 +237,20 @@ def test_linux_package_smoke_pins_third_party_vendor_images_by_digest():
         assert f"{repository}:" not in script
 
 
+def test_linux_packages_declare_and_resolve_the_git_runtime_dependency():
+    builder = (REPO / "scripts" / "build_linux_packages.sh").read_text(encoding="utf-8")
+    smoke = (REPO / "scripts" / "smoke_linux_packages.sh").read_text(encoding="utf-8")
+
+    assert "Depends: git" in builder
+    assert "Requires:       git" in builder
+    assert "normalize_linux_package_version" in builder
+    assert "apt-get install -y -qq" in smoke
+    assert "dnf install -y -q" in smoke
+    assert "command -v git" in smoke
+    assert "dpkg --install" not in smoke
+    assert "rpm --install" not in smoke
+
+
 def test_vendor_distro_smoke_is_informational_and_never_gates_a_release():
     workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     vendor_job = workflow[
@@ -273,7 +287,7 @@ def test_release_workflow_orders_smoke_sbom_attestation_and_draft_verification()
         "- name: Attest SBOM",
         "- name: Build Linux .deb and .rpm packages",
         "- name: Smoke Linux packages in Ubuntu and Fedora containers",
-        "- name: Record Linux package smoke and SBOMs",
+        "- name: Record Linux package smoke and reuse payload SBOM",
         "- name: Attest Linux package provenance",
         "- name: Upload build artifact",
         "- name: Assemble release proof capsule and notes",
@@ -308,12 +322,20 @@ def test_release_workflow_orders_smoke_sbom_attestation_and_draft_verification()
     assert "bash scripts/build_linux_packages.sh" in workflow
     assert "bash scripts/smoke_linux_packages.sh" in workflow
     assert "--check package_install" in workflow
+    assert "--check runtime_dependency" in workflow
     assert "release-artifacts/ouroboros_*_amd64.deb" in workflow
     assert "release-artifacts/ouroboros-*-1.x86_64.rpm" in workflow
     assert "release-artifacts/ouroboros-*-1.red80.x86_64.rpm" in workflow
     assert "sbom-path: dist/sbom-linux-deb-amd64.cdx.json" in workflow
     assert "sbom-path: dist/sbom-linux-rpm-x86_64.cdx.json" in workflow
     assert "sbom-path: dist/sbom-linux-rpm-red80-x86_64.cdx.json" in workflow
+    package_proof = workflow[
+        workflow.index("- name: Record Linux package smoke and reuse payload SBOM") :
+        workflow.index("- name: Attest Linux package provenance")
+    ]
+    assert 'PAYLOAD_SBOM="dist/sbom-linux-x86_64.cdx.json"' in package_proof
+    assert 'cp "$PAYLOAD_SBOM" "dist/sbom-$1.cdx.json"' in package_proof
+    assert "steps.syft.outputs.path" not in package_proof
     assert "lipo -archs" in workflow
     assert "Refusing to modify the published release" in workflow
     assert "group: release-${{ github.ref }}" in workflow

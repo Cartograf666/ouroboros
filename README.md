@@ -44,9 +44,9 @@ To run tasks, configure at least one supported remote provider API key or a loca
 
 ### Linux and Windows
 
-- **Debian / Ubuntu / Astra Linux x86_64:** download `ouroboros_<version>_amd64.deb` from the [latest stable release](https://github.com/razzant/ouroboros/releases/latest) and run `sudo apt install ./ouroboros_<version>_amd64.deb`. It installs to `/opt/ouroboros`, puts `ouroboros` on `PATH`, and adds a desktop entry. The same package is release-tested on Astra Linux 1.8.
-- **Fedora / RHEL x86_64:** download `ouroboros-<version>-1.x86_64.rpm` from the same release and run `sudo dnf install ./ouroboros-<version>-1.x86_64.rpm`. Same layout as the `.deb`.
-- **RED OS 8 x86_64:** download `ouroboros-<version>-1.red80.x86_64.rpm` and run `sudo dnf install ./ouroboros-<version>-1.red80.x86_64.rpm`. Same payload as the generic `.rpm`, carrying the `red80` release tag and verified by an install-and-run smoke on RED OS 8.
+- **Debian / Ubuntu / Astra Linux x86_64:** when the selected release lists `ouroboros_<version>_amd64.deb`, download it and run `sudo apt install ./ouroboros_<version>_amd64.deb`. It installs Git as a package dependency, installs Ouroboros to `/opt/ouroboros`, puts `ouroboros` on `PATH`, and adds a desktop entry.
+- **Fedora / RHEL x86_64:** when listed, download `ouroboros-<version>-1.x86_64.rpm` and run `sudo dnf install ./ouroboros-<version>-1.x86_64.rpm`. Same layout and Git dependency as the `.deb`.
+- **RED OS 8 x86_64:** when listed, download `ouroboros-<version>-1.red80.x86_64.rpm` and run `sudo dnf install ./ouroboros-<version>-1.red80.x86_64.rpm`. It carries the `red80` release tag. CI attempts non-blocking install-and-run smokes on Astra Linux 1.8 and RED OS 8; inspect the tagged workflow run for their outcome.
 - **Other Linux x86_64:** from the [latest stable release](https://github.com/razzant/ouroboros/releases/latest), download `Ouroboros-<version>-linux-x86_64.tar.gz`, extract it, and run `./Ouroboros/Ouroboros`. The optional CLI installer is `./Ouroboros/bin/install-ouroboros-cli`.
 - **Windows x64:** from the [latest stable release](https://github.com/razzant/ouroboros/releases/latest), download `Ouroboros-<version>-windows-x64.zip`, extract it, and run `Ouroboros\Ouroboros.exe`. The optional CLI installer is `Ouroboros\bin\install-ouroboros-cli.cmd`.
 
@@ -270,7 +270,7 @@ sudo apt-get install -y dpkg-dev rpm   # rpm provides rpmbuild
 bash scripts/build_linux_packages.sh
 ```
 
-Output: `dist/ouroboros_<VERSION>_amd64.deb`, `dist/ouroboros-<VERSION>-1.x86_64.rpm` and `dist/ouroboros-<VERSION>-1.red80.x86_64.rpm` (RED OS 8). All three install to `/opt/ouroboros` with a `/usr/bin/ouroboros` symlink and a desktop entry. `bash scripts/smoke_linux_packages.sh official <deb> <rpm> <red80-rpm>` installs all three in stock Ubuntu and Fedora containers and checks the CLI runs; this lane gates the release. Swap `official` for `vendor` to repeat the check on Astra Linux 1.8 and RED OS 8 images from the vendors' own registries — that lane runs informationally in CI, so an outage at a third-party registry cannot block a tagged release.
+Output: `dist/ouroboros_<VERSION>_amd64.deb`, `dist/ouroboros-<VERSION>-1.x86_64.rpm` and `dist/ouroboros-<VERSION>-1.red80.x86_64.rpm` (RED OS 8). All three declare Git as a runtime dependency and install to `/opt/ouroboros` with a `/usr/bin/ouroboros` symlink and a desktop entry. `bash scripts/smoke_linux_packages.sh official <deb> <rpm> <red80-rpm>` installs all three through `apt` or `dnf` in stock Ubuntu and Fedora containers, resolves Git, and checks the real CLI runs; this lane gates the release. Swap `official` for `vendor` to repeat the check on Astra Linux 1.8 and RED OS 8 images from the vendors' own registries — that lane runs informationally in CI, so an outage at a third-party registry cannot block a tagged release.
 
 ### Windows (.zip)
 

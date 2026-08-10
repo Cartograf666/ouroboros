@@ -147,6 +147,11 @@ def test_install_manifest_discovers_releases_without_future_asset_hashes():
     for row in manifest["artifacts"]:
         assert "sha256" not in row
         assert "url" not in row
+    native_packages = [
+        row for row in manifest["artifacts"] if row["format"] in {"deb", "rpm"}
+    ]
+    assert native_packages
+    assert all(row["availability"] == "per-release" for row in native_packages)
     verification = manifest["verification"]
     assert verification["availability"] == "per-release"
     assert verification["githubAttestations"] == {
@@ -163,6 +168,12 @@ def test_install_page_does_not_promise_future_proof_files_for_every_release():
     assert "Proof files vary by release" in html
     assert "if present" in html
     assert "Each release carries" not in html
+
+
+def test_install_page_does_not_promise_native_packages_on_older_releases():
+    html = (SITE / "install" / "index.html").read_text(encoding="utf-8")
+    assert "When that release lists native packages" in html
+    assert "does not list a native package" in html
 
 
 def test_benchmark_assets_expose_status_and_accessible_text():

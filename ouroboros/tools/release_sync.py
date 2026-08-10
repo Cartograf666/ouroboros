@@ -65,6 +65,7 @@ _PRE_TAIL_RE = re.compile(
     r'(-?)(rc|alpha|beta|a|b)(\.?)(\d+)$',
     re.IGNORECASE,
 )
+_PRE_CANONICAL_ALIASES = {"alpha": "a", "beta": "b"}
 
 
 def _normalize_pep440(version: str) -> str:
@@ -74,10 +75,23 @@ def _normalize_pep440(version: str) -> str:
         return version
     base = version[: match.start()]
     identifier_raw = match.group(2).lower()
-    _pep440_alias = {"alpha": "a", "beta": "b"}
-    identifier = _pep440_alias.get(identifier_raw, identifier_raw)
+    identifier = _PRE_CANONICAL_ALIASES.get(identifier_raw, identifier_raw)
     number = match.group(4)
     return f"{base}{identifier}{number}"
+
+
+def normalize_linux_package_version(version: str) -> str:
+    """Return dpkg/rpm spelling whose prereleases sort before the final release."""
+    raw = str(version or "").strip()
+    if not is_release_version(raw):
+        raise ValueError(f"unsupported release version: {raw!r}")
+    match = _PRE_TAIL_RE.search(raw)
+    if not match:
+        return raw
+    base = raw[: match.start()]
+    identifier_raw = match.group(2).lower()
+    identifier = _PRE_CANONICAL_ALIASES.get(identifier_raw, identifier_raw)
+    return f"{base}~{identifier}{match.group(4)}"
 
 
 def is_release_version(version: str) -> bool:

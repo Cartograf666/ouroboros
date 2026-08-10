@@ -44,7 +44,7 @@ COMMON_SMOKE_CHECKS = frozenset(
 # release-gating lane counts here: the Astra Linux and RED OS runs are
 # informational and cannot be required of a receipt.
 PACKAGE_SMOKE_CHECKS = frozenset(
-    {"package_install", "packaged_cli_help", "desktop_entry"}
+    {"package_install", "runtime_dependency", "packaged_cli_help", "desktop_entry"}
 )
 REQUIRED_SMOKE_CHECKS = {
     "macos-arm64": COMMON_SMOKE_CHECKS
@@ -265,9 +265,9 @@ def _release_notes(
         f"This release was built from [`{short_commit}`](https://github.com/{repository}/commit/{commit}).",
         "The release workflow passed the full test matrix, UI and Docker smoke tests, skill smoke tests, and packaged artifact smoke tests before publication.",
         "",
-        "- `SHA256SUMS` covers every platform archive, SBOM, and smoke receipt.",
+        "- `SHA256SUMS` covers every release asset, SBOM, and smoke receipt.",
         "- `release-evidence.json` binds the tag, commit, workflow run, artifact hashes, SBOMs, and smoke receipts.",
-        "- Each platform archive has GitHub build provenance and SBOM attestations.",
+        "- Each release asset has GitHub build provenance and SBOM attestations.",
         f"- Verify build provenance with `{verify_base}`.",
         f"- Verify the CycloneDX attestation with `{verify_base} --predicate-type https://cyclonedx.org/bom`.",
     ]

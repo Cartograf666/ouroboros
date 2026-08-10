@@ -10,11 +10,11 @@
 set -euo pipefail
 
 VERSION=$(tr -d '[:space:]' < VERSION)
-# dpkg and rpm both reject "-" inside a version. "~" is the conventional
-# pre-release spelling and sorts before the final release in both tools, so
-# 6.92.1~rc1 upgrades cleanly to 6.92.1. Filenames keep the raw VERSION so
-# they stay derivable from the tag.
-PKG_VERSION="${VERSION//-/\~}"
+# Keep every accepted author-facing prerelease spelling upgrade-safe in both
+# package managers. Filenames retain VERSION so they stay derivable from the
+# release tag; package metadata uses the shared release grammar's canonical
+# ``~rcN`` / ``~aN`` / ``~bN`` spelling.
+PKG_VERSION="$(python3 -c 'import runpy, sys; release_sync = runpy.run_path("ouroboros/tools/release_sync.py"); print(release_sync["normalize_linux_package_version"](sys.argv[1]))' "$VERSION")"
 PAYLOAD="${1:-dist/Ouroboros}"
 OUTDIR="${2:-dist}"
 DEB_PATH="$OUTDIR/ouroboros_${VERSION}_amd64.deb"
@@ -53,7 +53,11 @@ rm -rf "$STAGE"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$ROOT/opt" "$ROOT/usr/bin" "$ROOT/usr/share/applications" "$ROOT/usr/share/pixmaps"
 
-cp -al "$PAYLOAD" "$ROOT/opt/ouroboros"
+if ! cp -al "$PAYLOAD" "$ROOT/opt/ouroboros" 2>/dev/null; then
+    echo "Hardlink staging is unavailable; copying the payload once instead."
+    rm -rf "$ROOT/opt/ouroboros"
+    cp -a "$PAYLOAD" "$ROOT/opt/ouroboros"
+fi
 # The packaged CLI shim resolves its own symlink before locating the bundle
 # root, so a plain /usr/bin symlink is all either package needs.
 ln -s /opt/ouroboros/bin/ouroboros "$ROOT/usr/bin/ouroboros"
@@ -79,6 +83,7 @@ Architecture: amd64
 Maintainer: $MAINTAINER
 Section: utils
 Priority: optional
+Depends: git
 Installed-Size: $INSTALLED_KB
 Homepage: $HOMEPAGE
 Description: $SUMMARY
@@ -114,6 +119,7 @@ License:        MIT
 URL:            $HOMEPAGE
 BuildArch:      x86_64
 AutoReqProv:    no
+Requires:       git
 
 %description
 $SUMMARY
@@ -123,7 +129,7 @@ Ships a self-contained Python, Node.js and browser runtime under
 %install
 rm -rf %{buildroot}
 mkdir -p %{buildroot}
-cp -al $ROOT/. %{buildroot}/
+cp -al "$ROOT"/. %{buildroot}/
 
 %files
 %defattr(-,root,root,-)

@@ -41,6 +41,7 @@ smoke_package() {
         "$image" sh -c "
             set -eu
             $install_cmd /tmp/$name
+            command -v git >/dev/null
             test -f /usr/share/applications/ouroboros.desktop
             test -f /usr/share/pixmaps/ouroboros.png
             ouroboros --help >/dev/null
@@ -49,13 +50,13 @@ smoke_package() {
 
 case "$LANE" in
     official)
-        smoke_package ubuntu:24.04 "$DEB" "dpkg --install"
-        smoke_package fedora:42 "$RPM" "rpm --install"
-        smoke_package fedora:42 "$RPM_RED80" "rpm --install"
+        smoke_package ubuntu:24.04 "$DEB" "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq"
+        smoke_package fedora:42 "$RPM" "dnf install -y -q"
+        smoke_package fedora:42 "$RPM_RED80" "dnf install -y -q"
         ;;
     vendor)
-        smoke_package "$ASTRA_IMAGE" "$DEB" "dpkg --install"
-        smoke_package "$RED80_IMAGE" "$RPM_RED80" "rpm --install"
+        smoke_package "$ASTRA_IMAGE" "$DEB" "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq"
+        smoke_package "$RED80_IMAGE" "$RPM_RED80" "dnf install -y -q"
         ;;
     *)
         echo "ERROR: unknown lane: $LANE (expected 'official' or 'vendor')" >&2

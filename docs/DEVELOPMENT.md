@@ -1635,12 +1635,18 @@ signing material never persists across runs.
 
 The tagged build binds public release assets to their source and verification
 record. Each platform shard locates the final DMG, tarball, or ZIP after all
-packaging steps, then performs a smoke test against that final archive. The
-smoke checks require the embedded repository bundle, run the packaged CLI with
-`--help` in an isolated home directory, then use the embedded Claudexor seed and
-Node from that extracted final artifact to perform install, extraction, exact
-identity probe, owned-daemon handshake, one fake task, and an identity-bound
-graceful stop of the serving closure. The separate
+archive packaging steps, then performs a smoke test against that final archive.
+The smoke checks require the embedded repository bundle, run the packaged CLI
+with `--help` in an isolated home directory, then use the embedded Claudexor
+seed and Node from that extracted final artifact to perform install, extraction,
+exact identity probe, owned-daemon handshake, one fake task, and an
+identity-bound graceful stop of the serving closure. The Linux shard then wraps
+that proven x86_64 payload into `.deb`, generic `.rpm`, and RED OS 8 `.rpm`
+assets. Their metadata declares Git, which packaged bootstrap requires; the
+gating smoke installs through `apt` or `dnf` in stock Ubuntu/Fedora and proves
+dependency resolution, desktop integration, and the real packaged CLI. Vendor
+image smokes for Astra Linux and RED OS are non-blocking evidence, and their
+outcome is reported without becoming release authority. The separate
 Claudexor platform gate repeats that fixture path on ordinary branch changes and
 adds the explicit-key live compatibility matrix; neither path installs a
 floating Claudexor npm package. The macOS check also requires the
@@ -1648,17 +1654,21 @@ floating Claudexor npm package. The macOS check also requires the
 payload, and an arm64 app executable.
 
 Each shard also generates a CycloneDX SBOM from the payload extracted from the
-final archive. The macOS smoke proves the Applications link, then removes only
+final archive. The Linux payload inventory is reused for its three native
+wrappers because their `/opt/ouroboros` bytes come from that same payload; each
+wrapper still has its own digest-bound smoke receipt, provenance attestation,
+and SBOM attestation. The macOS smoke proves the Applications link, then removes only
 that link from the SBOM staging copy so Syft cannot follow it into the runner's
 host `/Applications`; the app and CLI launcher remain in the scan. The workflow
 downloads a fixed Syft release asset and checks its platform-specific SHA-256
 before execution. GitHub artifact attestations bind both build provenance and
-the SBOM to the final archive digest. The release job downloads the three
-archives and their proof files, checks the exact platform allowlist,
+the SBOM to each final asset digest. The release job downloads the three
+archives, three native Linux packages, and their proof files, checks the exact
+six-asset allowlist,
 recalculates every digest, and verifies both predicates against the exact source
 SHA, tag ref, repository, and signer workflow before it writes:
 
-- `SHA256SUMS` for archives, SBOMs, and smoke receipts;
+- `SHA256SUMS` for release assets, SBOMs, and smoke receipts;
 - `release-evidence.json` with tag, commit, workflow, checks, and artifact
   bindings;
 - release notes from the matching README Version History row.
