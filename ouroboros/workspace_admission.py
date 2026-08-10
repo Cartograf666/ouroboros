@@ -165,6 +165,60 @@ def validate_workspace_root(
 WORKSPACE_NONE = "none"
 
 
+def thread_checkout_for_room(drive_root: Any, project_id: str, room_chat_id: Any) -> tuple[str, str]:
+    """The registered CHECKOUT of the thread this room is, or ``("", "")``.
+
+    Returns ``(path, label)``; ``label`` names the source for a loud failure.
+
+    This is the binding that makes branching off mean anything (A7/A14/R1). The
+    writer lane is keyed on the FOLDER, so two tasks run at once exactly when they
+    name two folders — but nothing connected a THREAD's checkout to the workspace
+    its tasks are admitted into: ``resolve_room_workspace`` read the project's
+    ``working_dir`` and ``get_thread_worktree`` had no consumer in any admission
+    path at all. So a branched thread's task took the project-folder lane and
+    QUEUED behind the main thread's task, while ``queue_notice`` — which keys its
+    candidate on ``thread_location(...)["path"]`` — answered "this will not wait"
+    and the branch-off copy promised "both can run at the same time". The two
+    surfaces disagreed, and the one the owner was reading was the wrong one.
+
+    Deliberately narrow: the room must resolve to a thread of THIS project, or the
+    answer is nothing. A chat id that belongs somewhere else is not this task's
+    workspace, and a mismatch here would move a writer into another project's
+    checkout rather than merely failing to help.
+    """
+    pid = str(project_id or "").strip()
+    if not pid:
+        return "", ""
+    try:
+        chat_id = int(room_chat_id or 0)
+    except (TypeError, ValueError):
+        return "", ""
+    if not chat_id:
+        return "", ""
+    try:
+        from ouroboros.projects_registry import resolve_chat_binding
+        from ouroboros.thread_worktrees import get_thread_worktree
+
+        binding = resolve_chat_binding(drive_root, chat_id)
+        if str(binding.get("project_id") or "") != pid:
+            return "", ""
+        thread_id = int(binding.get("thread_id") or 0)
+        row = get_thread_worktree(drive_root, pid, thread_id) or {}
+    except Exception:
+        # A registry read that fails is NOT "this thread works in the project
+        # folder": answering that would silently put the writer back in the folder
+        # branching off exists to keep it out of. The caller loud-fails instead.
+        log.warning(
+            "thread_checkout_for_room: registry read failed for %r chat %r",
+            pid, room_chat_id, exc_info=True,
+        )
+        return "", "unreadable"
+    path = str(row.get("path") or "").strip()
+    if not path:
+        return "", ""
+    return path, f"project {pid!r} thread {thread_id} checkout"
+
+
 def resolve_room_workspace(
     *,
     drive_root: Any,
@@ -172,6 +226,7 @@ def resolve_room_workspace(
     project_id: str,
     explicit_workspace: str = "",
     workspace_sentinel: str = "",
+    room_chat_id: Any = 0,
 ) -> tuple[str, str, dict]:
     """Resolve the workspace_root for a task born in a project room (promote/route).
 
@@ -180,8 +235,15 @@ def resolve_room_workspace(
 
     - ``workspace_sentinel == "none"`` → no workspace (explicit opt-out), returns ("","").
     - an ``explicit_workspace`` the caller passed → validated and used as-is.
+    - else the CHECKOUT registered for the room's own thread, if it has one (A7:
+      that is what branching off did, and it is the only thing that makes the
+      thread a second writer lane instead of a second queue entry).
     - else the project's registered ``working_dir`` (if any) → validated and used.
     - else no workspace (a file-less project), returns ("","").
+
+    ``room_chat_id`` is the room the task was born in — a thread's chat id. It is
+    how this function knows WHICH thread is asking; without it the answer is the
+    project's folder for every thread of the project, branched or not.
 
     Returns ``(workspace_root, error, decision)``. ``error`` is non-empty when a
     workspace was REQUESTED (explicit path or a set project working_dir) but is
@@ -198,6 +260,19 @@ def resolve_room_workspace(
 
     requested = str(explicit_workspace or "").strip()
     source = "explicit workspace_root"
+    if not requested and str(project_id or "").strip():
+        # A7's whole payoff: a thread that BRANCHED OFF works in its own checkout,
+        # so its tasks must be admitted into that folder — otherwise they take the
+        # project folder's writer lane and queue behind it, and branching bought
+        # the owner nothing but a second copy of their files.
+        checkout, checkout_label = thread_checkout_for_room(drive_root, project_id, room_chat_id)
+        if checkout_label == "unreadable":
+            return "", (
+                f"the thread-worktree registry for project {project_id!r} is unreadable "
+                "— cannot tell whether this thread works in its own checkout"
+            ), {}
+        if checkout:
+            requested, source = checkout, checkout_label
     if not requested and str(project_id or "").strip():
         try:
             from ouroboros.projects_registry import get_project

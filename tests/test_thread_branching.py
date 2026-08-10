@@ -952,3 +952,126 @@ def test_an_ARCHIVED_thread_can_still_branch_off(drive, folder, wt_root):
     out = _branch(drive, "racer", thread["id"], wt_root)
 
     assert out["ok"] is True, out
+
+
+# --------------------------------------------------------------------------- #
+# Branching off must actually BUY concurrency (T3R2-B4)
+# --------------------------------------------------------------------------- #
+
+def test_a_branched_threads_task_gets_its_own_folder_lane_and_the_notice_agrees(
+    drive, folder, wt_root,
+):
+    """T3R2-B4, the reproduction. The whole phase exists for this.
+
+    The writer lane is keyed on the FOLDER, so two tasks run at once exactly when
+    they name two folders. Nothing bound a THREAD's checkout to the workspace its
+    tasks are admitted into: `resolve_room_workspace` read the project's
+    `working_dir` and `get_thread_worktree` had ZERO consumers in any admission
+    path. So a branched thread's task took the project-folder lane and QUEUED —
+    while `queue_notice`, which keys its candidate on `thread_location(...)`,
+    answered "this will not wait" and the branch-off copy promised "both can run
+    at the same time". The two surfaces disagreed and the owner read the wrong one.
+
+    Both judges are asserted in BOTH directions here, because agreeing by being
+    equally wrong is what happened last time.
+    """
+    from ouroboros.project_lease import candidate_is_leasable, running_project_lanes
+    from ouroboros.projects_registry import get_project
+    from ouroboros.thread_branching import (
+        QUEUE_NOTICE_OWN_CHECKOUT,
+        queue_notice,
+    )
+    from ouroboros.workspace_admission import resolve_room_workspace
+
+    thread = _project(drive, folder)
+    branched = _branch(drive, "racer", thread["id"], wt_root)
+    assert branched["ok"] is True, branched
+    checkout = branched["path"]
+    project = get_project(drive, "racer")
+    system_repo = drive.parent / "system_repo"
+
+    def _workspace(chat_id):
+        return resolve_room_workspace(
+            drive_root=drive, system_repo_dir=system_repo,
+            project_id="racer", room_chat_id=chat_id,
+        )
+
+    # Thread #0 is holding the project folder's lane right now.
+    running = [{"task": {"id": "main", "project_id": "racer", "workspace_root": str(folder)}}]
+    lanes = running_project_lanes(running)
+
+    # 1. Admission resolves the BRANCHED thread's room to its own checkout.
+    resolved, error, decision = _workspace(thread["chat_id"])
+    assert (error, decision) == ("", {})
+    assert resolved == checkout
+
+    # 2. So the scheduler puts it in a DIFFERENT lane — both run at once.
+    assert candidate_is_leasable(
+        {"id": "side", "project_id": "racer", "workspace_root": resolved}, lanes,
+    ) is True
+
+    # 3. And the sentence the owner reads says the same thing.
+    assert queue_notice(
+        drive, "racer", thread["id"], data_dir=drive, running=running,
+    )["queued"] is False
+
+    # The OTHER direction, same two judges: the unbranched thread #0 resolves to
+    # the project folder, queues behind the running task, and is TOLD so.
+    zero_ws, zero_error, _ = _workspace(project["chat_id"])
+    assert (zero_ws, zero_error) == (str(folder), "")
+    assert candidate_is_leasable(
+        {"id": "zero", "project_id": "racer", "workspace_root": zero_ws}, lanes,
+    ) is False
+    zero_notice = queue_notice(drive, "racer", 0, data_dir=drive, running=running)
+    assert zero_notice["queued"] is True
+    assert zero_notice["remedy"] == "branch_off"
+
+    # And the branched thread waiting on ITSELF: `QUEUE_NOTICE_OWN_CHECKOUT` and
+    # its `own` branch were dead code, because nothing could ever occupy that lane.
+    own_running = [{"task": {"id": "side", "project_id": "racer", "workspace_root": checkout}}]
+    own_notice = queue_notice(
+        drive, "racer", thread["id"], data_dir=drive, running=own_running,
+    )
+    assert own_notice["queued"] is True
+    assert own_notice["message"] == QUEUE_NOTICE_OWN_CHECKOUT
+    assert own_notice["remedy"] == "", "branching again is advice that does not work"
+
+
+def test_promoted_admission_binds_the_branched_threads_checkout_as_the_workspace(
+    drive, folder, wt_root, tmp_path, monkeypatch,
+):
+    """The same binding through the REAL admission path, not just its helper.
+
+    `_admit_promoted_workspace` passed only `pid`, so every thread of a project
+    was admitted into the project's folder. The room's chat id comes from the
+    EVENT: `task["chat_id"]` is rewritten to the project's own chat further up
+    when a project is bound during promotion, so by that point it can no longer
+    name the room the task was born in.
+    """
+    from types import SimpleNamespace
+
+    from ouroboros.project_lease import _computed_lane, _task_workspace_root
+    from supervisor import workers
+
+    thread = _project(drive, folder)
+    branched = _branch(drive, "racer", thread["id"], wt_root)
+    assert branched["ok"] is True, branched
+    monkeypatch.setattr(workers, "DRIVE_ROOT", drive)
+    monkeypatch.setattr(workers, "REPO_DIR", tmp_path / "system_repo")
+
+    task = {"id": "t-side", "chat_id": thread["chat_id"], "text": "do it", "project_id": "racer"}
+    outcome = workers._admit_promoted_workspace(
+        {"chat_id": thread["chat_id"], "project_id": "racer"},
+        SimpleNamespace(), task, pid="racer", tid="t-side",
+    )
+
+    assert outcome is None, outcome
+    assert task["workspace_root"] == branched["path"]
+    assert task["metadata"]["workspace_root"] == branched["path"]
+    # Which is the lane it will actually hold — not the project folder's.
+    assert _computed_lane(task) == ("", _task_workspace_root(
+        {"workspace_root": branched["path"]},
+    ))
+    assert _computed_lane(task) != _computed_lane(
+        {"project_id": "racer", "workspace_root": str(folder)},
+    )

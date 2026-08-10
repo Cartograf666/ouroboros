@@ -782,6 +782,14 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
         project_id=pid,
         explicit_workspace=str(evt.get("workspace_root") or "").strip(),
         workspace_sentinel=str(evt.get("workspace") or ""),
+        # WHICH thread's room this task was born in (A7). A thread that branched
+        # off works in its own checkout, and its tasks have to be admitted into
+        # THAT folder or they take the project folder's writer lane and queue
+        # behind it — branching would buy the owner a second copy of their files
+        # and no concurrency at all. Read from the EVENT: `task["chat_id"]` is
+        # rewritten to the project's own chat further up when a project is bound
+        # here, so by this point it can no longer name the room.
+        room_chat_id=evt.get("chat_id"),
     )
     if ws_decision:
         # A12: the owner's folder is untracked. STOP before queueing (never auto-init
