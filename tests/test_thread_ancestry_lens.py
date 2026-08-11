@@ -761,6 +761,106 @@ def test_a_fork_whose_shared_past_IS_in_the_scan_says_nothing(tmp_path):
     assert any("shared past, in view" in s for s in sections)
 
 
+def test_a_full_window_alone_is_not_a_gap(tmp_path):
+    """The cap is necessary, not sufficient.
+
+    A live journal that has reached `_PROJECT_THREAD_SCAN` rows is the ordinary
+    state of any busy install, so making the cap the WHOLE test put the gaps
+    section on every fork's context permanently — including this one, where the
+    parent's entire shared past sits inside the window with thousands of older
+    rows read behind it and nothing whatsoever is missing. A disclosure that is
+    always on is one the reader learns to skip, which costs exactly the warning
+    A3b exists to give.
+    """
+    from ouroboros import context as ctx
+    from ouroboros.memory import Memory
+
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    create_project(tmp_path, "alpha", name="Alpha", working_dir=str(folder))
+    parent = create_thread(tmp_path, "alpha", name="Parent")
+    forked = fork_thread(tmp_path, "alpha", parent["id"])
+    parent_chat = int(parent["chat_id"])
+    fork_chat = int(forked["chat_id"])
+
+    lens = thread_ancestry_lens(tmp_path, fork_chat)
+    cutoff = lens.cutoffs[parent_chat]
+    assert cutoff
+
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    # A FULL window: unrelated Main traffic first, then the parent's whole
+    # conversation, then the fork's own turn. The parent's oldest row is deep
+    # inside the window, so the scan demonstrably read back past its beginning.
+    rows = [
+        {"chat_id": 1, "ts": f"2020-01-01T00:00:{i % 60:02d}Z", "direction": "in",
+         "text": f"unrelated {i}"}
+        for i in range(ctx._PROJECT_THREAD_SCAN)
+    ]
+    rows += [
+        {"chat_id": parent_chat, "ts": "2020-02-01T00:00:00Z", "direction": "in",
+         "text": "shared past, wholly in view"},
+        {"chat_id": fork_chat, "ts": "2026-03-01T00:00:00Z", "direction": "in",
+         "text": "own turn"},
+    ]
+    (logs / "chat.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8",
+    )
+
+    memory = Memory(tmp_path)
+    assert len(memory.read_jsonl_tail("chat.jsonl", ctx._PROJECT_THREAD_SCAN)) == (
+        ctx._PROJECT_THREAD_SCAN
+    ), "the window must be FULL, or this test proves nothing"
+
+    sections = ctx.build_recent_sections(memory, env=None, thread_chat_id=fork_chat)
+    assert not [s for s in sections if s.startswith("## Conversation gaps in this view")]
+    assert any("shared past, wholly in view" in s for s in sections)
+
+
+def test_a_full_window_that_cuts_the_ancestors_stream_still_discloses(tmp_path):
+    """...and the cap still fires when the window edge cuts the parent's stream.
+
+    Same full window, but the parent is the OLDEST row the scan could read, so
+    the scan shows no sign of having reached back past that parent's beginning.
+    Narrowing the condition must not turn A3b's disclosure off.
+    """
+    from ouroboros import context as ctx
+    from ouroboros.memory import Memory
+
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    create_project(tmp_path, "alpha", name="Alpha", working_dir=str(folder))
+    parent = create_thread(tmp_path, "alpha", name="Parent")
+    forked = fork_thread(tmp_path, "alpha", parent["id"])
+    parent_chat = int(parent["chat_id"])
+    fork_chat = int(forked["chat_id"])
+
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {"chat_id": 1, "ts": "2019-01-01T00:00:00Z", "direction": "in",
+         "text": "pushed out of the window"},
+    ]
+    rows += [
+        {"chat_id": parent_chat, "ts": f"2020-01-01T00:00:{i % 60:02d}Z",
+         "direction": "in", "text": f"parent {i}"}
+        for i in range(ctx._PROJECT_THREAD_SCAN)
+    ]
+    rows.append({"chat_id": fork_chat, "ts": "2026-03-01T00:00:00Z",
+                 "direction": "in", "text": "own turn"})
+    (logs / "chat.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8",
+    )
+
+    sections = ctx.build_recent_sections(
+        Memory(tmp_path), env=None, thread_chat_id=fork_chat,
+    )
+    gaps = [s for s in sections if s.startswith("## Conversation gaps in this view")]
+    assert gaps, sections
+    assert str(parent_chat) in gaps[0]
+    assert "does not reach back past where that chat's rows begin" in gaps[0]
+
+
 def test_a_non_fork_thread_never_gets_the_notice(tmp_path):
     """An ancestor-less thread has no shared past to be missing."""
     from ouroboros import context as ctx

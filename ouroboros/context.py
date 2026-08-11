@@ -846,7 +846,30 @@ def _entry_chat_id(entry: Any) -> int:
 _PROJECT_THREAD_SCAN = 4000
 
 
-def _shared_past_beyond_scan(lens: Any, scanned: List[Dict[str, Any]]) -> str:
+def _ancestor_reach(
+    scanned: List[Dict[str, Any]], chat: int, cutoff: str, bound: Dict[str, int],
+) -> Optional[int]:
+    """Index of the OLDEST row in ``scanned`` this ancestor's window admits.
+
+    ``None`` when the window holds none of that ancestor's rows at all. Ownership
+    is resolved exactly as ``admits_row`` resolves it — the durable task BINDING
+    first, the row's own ``chat_id`` otherwise — so a post-hoc bound task's rows
+    count for the ancestor that owns them rather than for the main chat their
+    ``chat_id`` still names.
+    """
+    from ouroboros.thread_history import _entry_chat, bound_chat_for_row
+
+    for index, entry in enumerate(scanned):
+        if (bound_chat_for_row(entry, bound) or _entry_chat(entry)) != chat:
+            continue
+        if not cutoff or str((entry or {}).get("ts") or "") <= cutoff:
+            return index
+    return None
+
+
+def _shared_past_beyond_scan(
+    lens: Any, scanned: List[Dict[str, Any]], bound: Optional[Dict[str, int]] = None,
+) -> str:
     """Did a FORK's shared past fall out of the scanned tail entirely? (A3b, P8)
 
     The focused thread view reads one bounded tail of the shared live
@@ -862,19 +885,37 @@ def _shared_past_beyond_scan(lens: Any, scanned: List[Dict[str, Any]]) -> str:
     archive-cap work, so the fix here is to say what is missing rather than to go
     and get it.
 
-    TWO conditions, either of which proves the scan could not have covered an
-    ancestor's admitted window. Both are one-directional: they establish that rows
-    were not READ, never that rows existed, so the wording says the shared past is
-    not in this view rather than asserting a loss.
+    Evaluated PER ANCESTOR, and only the ancestors it actually applies to are
+    named. Every condition is one-directional: they establish that rows were not
+    READ, never that rows existed, so the wording says the shared past is not in
+    this view rather than asserting a loss.
 
-    * The scan hit its CAP, so anything older than its oldest row was not read at
-      all, and every ancestor's admitted window extends below that edge by
-      construction — which is why the tail size alone is enough. This is the case a
-      real install reaches: the fork happens, then 4000 rows accumulate after it.
-    * The oldest scanned row is NEWER than an ancestor's cutoff. Rows are appended
-      in timestamp order, so nothing of that ancestor's window is in the scan at
-      all — and if the live file was not even capped, those rows are in the rotated
-      archive this reader does not open.
+    * The oldest scanned row is NEWER than that ancestor's cutoff. Rows are
+      appended in timestamp order, so nothing of that ancestor's window is in the
+      scan at all — and if the live file was not even capped, those rows are in
+      the rotated archive this reader does not open.
+    * The scan hit its CAP — so rows below its oldest were not read — AND the
+      window shows no sign of having reached back past that ancestor's beginning:
+      either it holds NONE of that ancestor's admitted rows, or the oldest one it
+      holds is the oldest row the scan read at all, i.e. the window edge cuts
+      straight through that ancestor's stream.
+
+    The cap ALONE used to be the whole test, and that made the section fire on
+    every fork on any install whose live journal has reached 4000 rows —
+    permanently, including when the ancestor's entire shared past sits inside the
+    window with thousands of older rows read behind it. A disclosure that is
+    always on is one the reader learns to skip, which costs exactly the warning
+    A3b exists to give. So the cap is now necessary and not sufficient: the scan
+    must also fail to account for that ancestor's beginning.
+
+    DISCLOSED residual, not a silent one: an ancestor that was SILENT across the
+    oldest rows of the window and active before it reads here as "the window
+    reached back past its beginning" and is not named. Telling that apart needs a
+    read BELOW the window — per-ancestor bounded reads across the archives — which
+    is §C+'s deliberately deferred archive-cap work, the same reason this function
+    discloses rather than fetches. The residual is bounded by the same fact:
+    whatever is not named here is also not fetched by any other reader on this
+    surface today.
     """
     if not bool(getattr(lens, "has_ancestors", False)) or not scanned:
         return ""
@@ -895,19 +936,28 @@ def _shared_past_beyond_scan(lens: Any, scanned: List[Dict[str, Any]]) -> str:
         return ""
     oldest = str((scanned[0] or {}).get("ts") or "")
     capped = len(scanned) >= _PROJECT_THREAD_SCAN
-    wholly_out = bool(oldest) and any(
-        bound and oldest > bound for _chat, bound in ancestors
-    )
-    if not capped and not wholly_out:
+    bindings = bound or {}
+    beyond, out_of_window = [], False
+    for chat, cutoff in sorted(ancestors):
+        if oldest and cutoff and oldest > cutoff:
+            beyond.append(chat)
+            out_of_window = True
+            continue
+        if not capped:
+            continue
+        reach = _ancestor_reach(scanned, chat, cutoff, bindings)
+        if reach is None or reach == 0:
+            beyond.append(chat)
+    if not beyond:
         return ""
-    named = ", ".join(str(chat) for chat, _bound in sorted(ancestors))
+    named = ", ".join(str(chat) for chat in beyond)
     why = (
         # Deliberately NOT "older rows exist": a live file of exactly the cap length
         # with no archive behind it has none, and a disclosure must not assert what
         # it cannot see. "Anything older was not read" is true either way.
-        f"the {len(scanned)}-row window scanned here is full, so anything older than "
-        "it was not read"
-        if capped else
+        f"the {len(scanned)}-row window scanned here is full and does not reach back "
+        "past where that chat's rows begin, so anything older than it was not read"
+        if not out_of_window else
         f"this window begins at {oldest}, after the point the fork was taken"
     )
     return (
@@ -999,7 +1049,7 @@ def build_recent_sections(
                 e for e in recent
                 if admits_row(_lens, e, bound_chat_for_row(e, _bound))
             ][-_chat_tail:]
-            _shared_past_note = _shared_past_beyond_scan(_lens, recent)
+            _shared_past_note = _shared_past_beyond_scan(_lens, recent, _bound)
             if _shared_past_note:
                 _thread_omissions.append(_shared_past_note)
         else:
