@@ -14,7 +14,7 @@ from ouroboros.shell_parse import (
     strip_leading_env_assignments,
     unwrap_env_argv,
 )
-from ouroboros.tool_access import resolve_shell_cwd
+from ouroboros.tool_access import ResolvedResourceBinding, resolve_shell_cwd
 from ouroboros.tools.shell_guards import interpreter_family, writer_target_tokens
 from ouroboros.workspace_executor import executor_ref_from_ctx, map_backend_path, map_host_path
 
@@ -151,14 +151,19 @@ def _artifact_records(ctx: Any) -> List[Dict[str, Any]]:
     return [dict(item) for item in records if isinstance(item, dict)] if isinstance(records, list) else []
 
 
-def _base_roots(ctx: Any) -> List[pathlib.Path]:
+def _base_roots(
+    ctx: Any,
+    binding: ResolvedResourceBinding | None = None,
+) -> List[pathlib.Path]:
     roots: List[pathlib.Path] = []
-    for value in (
+    values = (
+        binding.base_path if binding is not None else None,
         getattr(ctx, "workspace_root", None),
         getattr(ctx, "repo_dir", None),
         getattr(ctx, "system_repo_dir", None),
         getattr(ctx, "drive_root", None),
-    ):
+    )
+    for value in values:
         if value is None:
             continue
         try:
@@ -170,7 +175,11 @@ def _base_roots(ctx: Any) -> List[pathlib.Path]:
     return roots
 
 
-def _resolve_policy_path(ctx: Any, raw_path: str) -> pathlib.Path | None:
+def _resolve_policy_path(
+    ctx: Any,
+    raw_path: str,
+    binding: ResolvedResourceBinding | None = None,
+) -> pathlib.Path | None:
     text = str(raw_path or "").strip()
     if not text:
         return None
@@ -180,7 +189,7 @@ def _resolve_policy_path(ctx: Any, raw_path: str) -> pathlib.Path | None:
         return None
     if path.is_absolute():
         return path.resolve(strict=False)
-    roots = _base_roots(ctx)
+    roots = _base_roots(ctx, binding)
     if not roots:
         return path.resolve(strict=False)
     return (roots[0] / path).resolve(strict=False)
@@ -225,7 +234,10 @@ def _backend_cwd_relative_spellings(ctx: Any, work_dir: pathlib.Path, spellings:
     return relative
 
 
-def protected_artifact_paths(ctx: Any) -> List[pathlib.Path]:
+def protected_artifact_paths(
+    ctx: Any,
+    binding: ResolvedResourceBinding | None = None,
+) -> List[pathlib.Path]:
     paths: List[pathlib.Path] = []
     for record in _artifact_records(ctx):
         for raw_path in record.get("paths") or []:
@@ -238,7 +250,7 @@ def protected_artifact_paths(ctx: Any) -> List[pathlib.Path]:
                         paths.append(mapped)
             except Exception:
                 pass
-            resolved = _resolve_policy_path(ctx, str(raw_path))
+            resolved = _resolve_policy_path(ctx, str(raw_path), binding)
             if resolved is not None and resolved not in paths:
                 paths.append(resolved)
     return paths
@@ -294,12 +306,17 @@ def _backend_spelling_matches(candidate: pathlib.Path, protected_spellings: set[
     return False
 
 
-def block_reason_for_path(ctx: Any, target: pathlib.Path, operation: str) -> str:
+def block_reason_for_path(
+    ctx: Any,
+    target: pathlib.Path,
+    operation: str,
+    binding: ResolvedResourceBinding | None = None,
+) -> str:
     for record in _artifact_records(ctx):
         if not _operation_denied(record, operation):
             continue
         for raw_path in record.get("paths") or []:
-            protected_path = _resolve_policy_path(ctx, str(raw_path))
+            protected_path = _resolve_policy_path(ctx, str(raw_path), binding)
             protected_spellings = _policy_backend_spellings(ctx, str(raw_path), protected_path)
             target_backend_spellings = _backend_spellings_for_host_path(ctx, pathlib.Path(target))
             if (
@@ -336,15 +353,25 @@ def _nearest_allowed_action(record: Dict[str, Any]) -> str:
     return f"Allowed operations for this artifact: {', '.join(sorted(allow))}."
 
 
-def any_protected_target(ctx: Any, candidates: Iterable[pathlib.Path], operation: str) -> str:
+def any_protected_target(
+    ctx: Any,
+    candidates: Iterable[pathlib.Path],
+    operation: str,
+    binding: ResolvedResourceBinding | None = None,
+) -> str:
     for candidate in candidates:
-        reason = block_reason_for_path(ctx, pathlib.Path(candidate), operation)
+        reason = block_reason_for_path(ctx, pathlib.Path(candidate), operation, binding)
         if reason:
             return reason
     return ""
 
 
-def _directory_contains_protected_target(ctx: Any, candidates: Iterable[pathlib.Path], operation: str) -> str:
+def _directory_contains_protected_target(
+    ctx: Any,
+    candidates: Iterable[pathlib.Path],
+    operation: str,
+    binding: ResolvedResourceBinding | None = None,
+) -> str:
     for candidate in candidates:
         try:
             candidate_resolved = pathlib.Path(candidate).expanduser().resolve(strict=False)
@@ -357,7 +384,7 @@ def _directory_contains_protected_target(ctx: Any, candidates: Iterable[pathlib.
                 continue
             for raw_path in record.get("paths") or []:
                 protected_paths: list[pathlib.Path] = []
-                protected_path = _resolve_policy_path(ctx, str(raw_path))
+                protected_path = _resolve_policy_path(ctx, str(raw_path), binding)
                 if protected_path is not None:
                     protected_paths.append(pathlib.Path(protected_path))
                 try:
@@ -373,7 +400,7 @@ def _directory_contains_protected_target(ctx: Any, candidates: Iterable[pathlib.
                         continue
                     except Exception:
                         continue
-                    return block_reason_for_path(ctx, candidate_protected, operation)
+                    return block_reason_for_path(ctx, candidate_protected, operation, binding)
     return ""
 
 
@@ -412,7 +439,13 @@ def _glob_base_candidate(ctx: Any, work_dir: pathlib.Path, text: str) -> pathlib
     return _resolve_candidate_path(ctx, work_dir, base_text)
 
 
-def _glob_pattern_could_match_protected(ctx: Any, work_dir: pathlib.Path, glob_text: str, operation: str) -> str:
+def _glob_pattern_could_match_protected(
+    ctx: Any,
+    work_dir: pathlib.Path,
+    glob_text: str,
+    operation: str,
+    binding: ResolvedResourceBinding | None = None,
+) -> str:
     """v6.57.0 (1.6): a write/delete GLOB (e.g. `rm -f *.out`) blocks ONLY when the glob
     pattern could ACTUALLY match a protected artifact's basename in the glob's directory —
     not merely because the protected binary sits in the same directory (the differential-
@@ -432,7 +465,7 @@ def _glob_pattern_could_match_protected(ctx: Any, work_dir: pathlib.Path, glob_t
         base_resolved = pathlib.Path(base).expanduser().resolve(strict=False)
     except (OSError, TypeError, ValueError):
         return ""
-    for protected in protected_artifact_paths(ctx):
+    for protected in protected_artifact_paths(ctx, binding):
         try:
             protected_resolved = pathlib.Path(protected).resolve(strict=False)
         except (OSError, TypeError, ValueError):
@@ -447,7 +480,7 @@ def _glob_pattern_could_match_protected(ctx: Any, work_dir: pathlib.Path, glob_t
         if not under_base:
             continue
         if recursive or fnmatch.fnmatch(protected_resolved.name, filename_pattern):
-            block = block_reason_for_path(ctx, protected_resolved, operation)
+            block = block_reason_for_path(ctx, protected_resolved, operation, binding)
             if block:
                 return block
     return ""
@@ -798,8 +831,15 @@ def _git_static_introspection_is_path_limited(work_dir: pathlib.Path, candidates
     return False
 
 
-def shell_block_reason(ctx: Any, raw_cmd: Any, *, cwd: str = "", default_cwd: pathlib.Path | None = None) -> str:
-    protected_paths = protected_artifact_paths(ctx)
+def shell_block_reason(
+    ctx: Any,
+    raw_cmd: Any,
+    *,
+    cwd: str = "",
+    default_cwd: pathlib.Path | None = None,
+    binding: ResolvedResourceBinding | None = None,
+) -> str:
+    protected_paths = protected_artifact_paths(ctx, binding)
     if not protected_paths:
         return ""
     raw_argv = shell_argv(raw_cmd)
@@ -821,7 +861,13 @@ def shell_block_reason(ctx: Any, raw_cmd: Any, *, cwd: str = "", default_cwd: pa
     if first in _SHELLS:
         inline = _inline_shell_command(argv, first)
         if inline:
-            return shell_block_reason(ctx, inline, cwd=cwd, default_cwd=default_cwd)
+            return shell_block_reason(
+                ctx,
+                inline,
+                cwd=cwd,
+                default_cwd=default_cwd,
+                binding=binding,
+            )
     operation = (
         _git_static_introspection_operation(argv)
         if first == "git"
@@ -830,10 +876,13 @@ def shell_block_reason(ctx: Any, raw_cmd: Any, *, cwd: str = "", default_cwd: pa
         else _SHELL_COMMAND_OPERATIONS.get(first)
     )
     high_risk = _is_high_risk_interpreter(first)
-    try:
-        work_dir, _cwd_root, _allowed = resolve_shell_cwd(ctx, cwd)
-    except Exception:
-        work_dir = pathlib.Path(default_cwd or ".").resolve(strict=False)
+    if binding is not None:
+        work_dir = pathlib.Path(binding.target_path)
+    else:
+        try:
+            work_dir, _cwd_root, _allowed = resolve_shell_cwd(ctx, cwd)
+        except Exception:
+            work_dir = pathlib.Path(default_cwd or ".").resolve(strict=False)
     try:
         first_path = pathlib.Path(str(argv[0] or "")).expanduser()
         first_target = first_path.resolve(strict=False) if first_path.is_absolute() else (pathlib.Path(work_dir) / first_path).resolve(strict=False)
@@ -842,7 +891,7 @@ def shell_block_reason(ctx: Any, raw_cmd: Any, *, cwd: str = "", default_cwd: pa
     if first_target is not None:
         for protected in protected_paths:
             if first_target == pathlib.Path(protected).resolve(strict=False):
-                return block_reason_for_path(ctx, first_target, "execute")
+                return block_reason_for_path(ctx, first_target, "execute", binding)
     if first == "git":
         work_dir = _git_work_dir(ctx, argv, pathlib.Path(work_dir))
         candidate_tokens = [*env_values, *_git_candidate_tokens(argv)]
@@ -901,26 +950,34 @@ def shell_block_reason(ctx: Any, raw_cmd: Any, *, cwd: str = "", default_cwd: pa
             candidate = _resolve_candidate_path(ctx, pathlib.Path(work_dir), text)
             if candidate is not None:
                 write_candidates.append(candidate)
-        write_block = any_protected_target(ctx, write_candidates, "write")
+        write_block = any_protected_target(ctx, write_candidates, "write", binding)
         if write_block:
             return write_block
-        write_dir_block = _directory_contains_protected_target(ctx, write_candidates, "write")
+        write_dir_block = _directory_contains_protected_target(
+            ctx, write_candidates, "write", binding
+        )
         if write_dir_block:
             return write_dir_block
         for gt in write_glob_texts:
-            gblock = _glob_pattern_could_match_protected(ctx, pathlib.Path(work_dir), gt, "write")
+            gblock = _glob_pattern_could_match_protected(
+                ctx, pathlib.Path(work_dir), gt, "write", binding
+            )
             if gblock:
                 return gblock
     if operation:
-        direct_block = any_protected_target(ctx, candidates, operation)
+        direct_block = any_protected_target(ctx, candidates, operation, binding)
         if direct_block:
             return direct_block
         for gt in glob_texts:
-            gblock = _glob_pattern_could_match_protected(ctx, pathlib.Path(work_dir), gt, operation)
+            gblock = _glob_pattern_could_match_protected(
+                ctx, pathlib.Path(work_dir), gt, operation, binding
+            )
             if gblock:
                 return gblock
         if operation in _DIRECTORY_TARGET_OPERATIONS:
-            return _directory_contains_protected_target(ctx, candidates, operation)
+            return _directory_contains_protected_target(
+                ctx, candidates, operation, binding
+            )
         return ""
     if not high_risk:
         return ""
@@ -935,7 +992,9 @@ def shell_block_reason(ctx: Any, raw_cmd: Any, *, cwd: str = "", default_cwd: pa
             resolved_script = _resolve_candidate_path(ctx, pathlib.Path(work_dir), operand)
             if resolved_script is not None:
                 script_candidates.append(resolved_script)
-    default_block = any_protected_target(ctx, script_candidates, "read_bytes")
+    default_block = any_protected_target(
+        ctx, script_candidates, "read_bytes", binding
+    )
     if default_block:
         return default_block
     tail_text = " ".join(str(part or "") for part in [*env_values, *argv[1:]])
@@ -946,7 +1005,7 @@ def shell_block_reason(ctx: Any, raw_cmd: Any, *, cwd: str = "", default_cwd: pa
         needles = {str(protected), protected.as_posix(), slash_normalize_path_text(protected)}
         for record in records:
             for raw_path in record.get("paths") or []:
-                protected_path = _resolve_policy_path(ctx, str(raw_path))
+                protected_path = _resolve_policy_path(ctx, str(raw_path), binding)
                 if protected_path is not None and _matches(protected, protected_path):
                     backend_spellings = _policy_backend_spellings(ctx, str(raw_path), protected_path)
                     needles.update(backend_spellings)
@@ -968,7 +1027,7 @@ def shell_block_reason(ctx: Any, raw_cmd: Any, *, cwd: str = "", default_cwd: pa
             # indirection at all; an execute-allowed one is blocked only when a
             # content-read primitive sits next to the mention (running the binary
             # and capturing its stdout is the benchmark-sanctioned workflow).
-            execute_block = block_reason_for_path(ctx, protected, "execute")
+            execute_block = block_reason_for_path(ctx, protected, "execute", binding)
             if execute_block:
                 return execute_block
             if any(
@@ -976,14 +1035,14 @@ def shell_block_reason(ctx: Any, raw_cmd: Any, *, cwd: str = "", default_cwd: pa
                 or _read_primitive_near(tail_text_posix, slash_normalize_path_text(needle))
                 for needle in mention_hits
             ):
-                return block_reason_for_path(ctx, protected, "read_bytes")
+                return block_reason_for_path(ctx, protected, "read_bytes", binding)
             # Alias-separated read: `p = './ref'; …pad…; open(p).read()` binds the
             # protected literal to a variable, then reads it FAR from the literal
             # (outside the proximity window). Catch a simple binding consumed by a
             # read/copy primitive — execute-via-alias (subprocess.run([p])) is not
             # a read and stays allowed.
             if _protected_read_via_alias(tail_text, mention_hits):
-                return block_reason_for_path(ctx, protected, "read_bytes")
+                return block_reason_for_path(ctx, protected, "read_bytes", binding)
         parent = protected.parent.as_posix()
         name = protected.name
         stem = protected.stem
@@ -999,5 +1058,5 @@ def shell_block_reason(ctx: Any, raw_cmd: Any, *, cwd: str = "", default_cwd: pa
                 _read_primitive_near(tail_text, probe_needle)
                 or _read_primitive_near(tail_text_posix, slash_normalize_path_text(probe_needle))
             ):
-                return block_reason_for_path(ctx, protected, "read_bytes")
+                return block_reason_for_path(ctx, protected, "read_bytes", binding)
     return ""

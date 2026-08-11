@@ -20,7 +20,11 @@ from ouroboros.contracts.task_constraint import (
 )
 from ouroboros.platform_layer import project_venv_python
 from ouroboros.shell_parse import normalize_check_argv
-from ouroboros.tool_access import path_is_relative_to, resolve_shell_cwd
+from ouroboros.tool_access import (
+    ResolvedResourceBinding,
+    build_resolved_resource_binding,
+    path_is_relative_to,
+)
 from ouroboros.utils import append_jsonl, utc_now_iso
 
 _PYTHON_TOKENS = frozenset({"python", "python3"})
@@ -48,6 +52,10 @@ class PythonResolutionTrace:
     reason: str
     fallback_reason: str = ""
     error_reason: str = ""
+    target_root: str = ""
+    target_cwd: str = ""
+    target_source: str = ""
+    target_skill: str = ""
 
     @property
     def changed(self) -> bool:
@@ -91,21 +99,6 @@ def _python_request(tool_name: str, args: Mapping[str, Any]) -> tuple[str, list[
     return "", None
 
 
-def _effective_cwd_text(ctx: Any, tool_name: str, args: Mapping[str, Any], runtime_mode: str) -> str:
-    cwd = str(args.get("cwd") or "")
-    if (
-        tool_name == "run_script"
-        and not cwd.strip()
-        and str(runtime_mode or "").strip() == "light"
-        and not bool(getattr(ctx, "is_workspace_mode", lambda: False)())
-    ):
-        try:
-            return str(ctx.task_drive_root())
-        except Exception:
-            return cwd
-    return cwd
-
-
 def _usable_executable(path_text: str) -> str:
     """Validate an interpreter while preserving venv symlink semantics."""
 
@@ -128,22 +121,37 @@ def _usable_executable(path_text: str) -> str:
     return os.path.abspath(os.fspath(candidate))
 
 
-def _reviewed_skill_python(ctx: Any) -> tuple[str, str]:
-    """Return a lifecycle-proven isolated Python for a skill-origin task."""
+def _reviewed_skill_python(
+    ctx: Any,
+    binding: ResolvedResourceBinding | None = None,
+) -> tuple[str, str]:
+    """Return the lifecycle-proven isolated Python for the selected skill.
 
-    metadata = getattr(ctx, "task_metadata", {})
-    if not isinstance(metadata, dict):
-        return "", ""
-    skill_name = str(metadata.get("skill") or "").strip()
-    if not skill_name:
-        return "", ""
+    A dispatch binding is authoritative and loads exactly its physical payload
+    against its canonical state root.  Legacy task metadata is consulted only
+    when a non-registry/direct caller supplied no binding.
+    """
+
     try:
         from ouroboros.marketplace.isolated_deps import python_runtime_binary, read_deps_state
-        from ouroboros.skill_loader import find_skill
+        from ouroboros.skill_loader import find_skill, load_skill
         from ouroboros.skill_readiness import skill_readiness_for_execution
 
-        drive_root = pathlib.Path(getattr(ctx, "drive_root"))
-        loaded = find_skill(drive_root, skill_name)
+        if binding is not None:
+            if binding.root != "skill_payload":
+                return "", ""
+            drive_root = pathlib.Path(binding.state_drive_root)
+            loaded = load_skill(pathlib.Path(binding.base_path), drive_root)
+            if loaded is None or loaded.name != binding.skill_name:
+                return "", "reviewed_skill_environment_unavailable"
+        else:
+            metadata = getattr(ctx, "task_metadata", {})
+            metadata = metadata if isinstance(metadata, dict) else {}
+            skill_name = str(metadata.get("skill") or "").strip()
+            if not skill_name:
+                return "", ""
+            drive_root = pathlib.Path(getattr(ctx, "drive_root"))
+            loaded = find_skill(drive_root, skill_name)
         if loaded is None or not skill_readiness_for_execution(drive_root, loaded).ready:
             return "", "reviewed_skill_environment_unavailable"
         deps_state = read_deps_state(drive_root, loaded.name, loaded.skill_dir)
@@ -173,18 +181,31 @@ def _executor_covers(ctx: Any, work_dir: pathlib.Path) -> tuple[bool, str]:
         return False, "executor_resolution_failed"
 
 
-def _surface_for(ctx: Any, cwd_root: str, work_dir: pathlib.Path, constraint: Optional[TaskConstraint]) -> str:
-    if cwd_root != "active_workspace":
-        return cwd_root or "unresolved"
+def _surface_for(
+    ctx: Any,
+    binding: ResolvedResourceBinding,
+    constraint: Optional[TaskConstraint],
+) -> str:
+    if binding.root != "active_workspace":
+        return binding.root or "unresolved"
     if constraint and constraint.mode == "acting_subagent" and constraint.surface == "self_worktree":
         return "system_repo"
     mode = str(getattr(ctx, "workspace_mode", "") or "").strip().lower()
     if mode in {"external", "external_workspace", "genesis"}:
         return "external_workspace"
     system_repo = pathlib.Path(
-        getattr(ctx, "system_repo_dir", None) or getattr(ctx, "repo_dir", work_dir)
+        getattr(ctx, "system_repo_dir", None) or getattr(ctx, "repo_dir", binding.target_path)
     ).resolve(strict=False)
-    return "system_repo" if path_is_relative_to(work_dir, system_repo) else "external_workspace"
+    return "system_repo" if path_is_relative_to(binding.target_path, system_repo) else "external_workspace"
+
+
+def _trace_target(binding: ResolvedResourceBinding) -> Dict[str, str]:
+    return {
+        "target_root": binding.root,
+        "target_cwd": str(binding.target_path),
+        "target_source": binding.source,
+        "target_skill": binding.skill_name,
+    }
 
 
 def _project_root(ctx: Any, surface: str, work_dir: pathlib.Path) -> pathlib.Path:
@@ -224,6 +245,7 @@ def resolve_process_python(
     *,
     runtime_mode: str,
     effective_constraint: Optional[TaskConstraint] = None,
+    resolved_binding: ResolvedResourceBinding | None = None,
 ) -> tuple[Dict[str, Any], Optional[PythonResolutionTrace]]:
     """Resolve an exact ``python``/``python3`` request for one process tool."""
 
@@ -236,11 +258,19 @@ def resolve_process_python(
         return original, None
 
     constraint = normalize_task_constraint(effective_constraint)
-    cwd_text = _effective_cwd_text(ctx, name, original, runtime_mode)
+    cwd_text = str(original.get("cwd") or "")
+    binding = resolved_binding
     try:
         operation = "service" if name == "start_service" else "shell"
-        work_dir, cwd_root, _allowed = resolve_shell_cwd(ctx, cwd_text, operation=operation)
-        work_dir = pathlib.Path(work_dir).resolve(strict=False)
+        if binding is None:
+            binding = build_resolved_resource_binding(
+                ctx,
+                operation=operation,
+                process_cwd=cwd_text,
+                bucket=str(original.get("bucket") or ""),
+                skill_name=str(original.get("skill_name") or ""),
+            )
+        work_dir = pathlib.Path(binding.target_path).resolve(strict=False)
     except Exception:
         trace = PythonResolutionTrace(
             tool=name,
@@ -255,7 +285,11 @@ def resolve_process_python(
         return original, trace
 
     fallback_reason = ""
-    skill_python, skill_reason = _reviewed_skill_python(ctx)
+    assert binding is not None
+    skill_binding = resolved_binding
+    if skill_binding is None and binding.root == "skill_payload":
+        skill_binding = binding
+    skill_python, skill_reason = _reviewed_skill_python(ctx, skill_binding)
     if skill_python:
         trace = PythonResolutionTrace(
             tool=name,
@@ -264,6 +298,7 @@ def resolve_process_python(
             surface="reviewed_skill",
             environment="isolated_skill",
             reason="reviewed_skill_environment",
+            **_trace_target(binding),
         )
         return _replace_request(name, original, argv, skill_python), trace
     if skill_reason:
@@ -279,12 +314,13 @@ def resolve_process_python(
             environment="backend_path",
             reason="executor_backend_python3",
             fallback_reason=fallback_reason,
+            **_trace_target(binding),
         )
         return _replace_request(name, original, argv, "python3"), trace
     if executor_error and not fallback_reason:
         fallback_reason = executor_error
 
-    surface = _surface_for(ctx, cwd_root, work_dir, constraint)
+    surface = _surface_for(ctx, binding, constraint)
     if surface in {"external_workspace", "user_files"}:
         project_python = project_venv_python(_project_root(ctx, surface, work_dir))
         if project_python:
@@ -296,6 +332,7 @@ def resolve_process_python(
                 environment="project_venv",
                 reason="project_venv",
                 fallback_reason=fallback_reason,
+                **_trace_target(binding),
             )
             return _replace_request(name, original, argv, project_python), trace
         trace = PythonResolutionTrace(
@@ -306,6 +343,7 @@ def resolve_process_python(
             environment="target_path",
             reason="target_path_fallback",
             fallback_reason=fallback_reason or "project_venv_unavailable",
+            **_trace_target(binding),
         )
         return original, trace
 
@@ -325,6 +363,7 @@ def resolve_process_python(
                 fallback_reason
                 or ("agent_env_unavailable_process_fallback" if not configured_agent_python else "")
             ),
+            **_trace_target(binding),
         )
         return _replace_request(name, original, argv, agent_python), trace
 
@@ -337,6 +376,7 @@ def resolve_process_python(
         reason="target_path_fallback",
         fallback_reason=fallback_reason or "agent_python_unavailable",
         error_reason="agent_python_unavailable",
+        **_trace_target(binding),
     )
     return original, trace
 

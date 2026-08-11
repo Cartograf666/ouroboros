@@ -439,37 +439,84 @@ def subagent_profile_satisfies(profile: ToolProfile, needs: Iterable[str]) -> tu
     return (not missing, missing)
 
 
-def _side_effect_free_process_roots(ctx: Any, operation: Operation) -> list[tuple[str, pathlib.Path]]:
-    """Resolve allowed process cwd roots without creating task/artifact dirs."""
+def _process_root_candidates(
+    ctx: Any,
+    operation: Operation,
+    *,
+    bucket: str = "",
+    skill_name: str = "",
+    include_skill: bool = False,
+) -> list[tuple[ResourceRoot, pathlib.Path, str, str]]:
+    """Side-effect-free cwd inventory shared by process discovery and execution.
+
+    Entries carry ``(logical_root, physical_base, source, skill_name)``.  The
+    inventory never creates task/artifact directories; the execution selector
+    materializes only the selected task-owned target.  Skill discovery is exact
+    and opt-in, so an ordinary process scan never walks every installed skill.
+    """
 
     profile = active_tool_profile(ctx)
-    candidates: list[tuple[ResourceRoot, pathlib.Path]] = [
-        ("active_workspace", resource_root_path(ctx, "active_workspace"))
-    ]
+    active = resource_root_path(ctx, "active_workspace")
+    candidates: list[tuple[ResourceRoot, pathlib.Path, str, str]] = []
+    room = project_room_lens_dir(ctx)
+    if room is not None:
+        candidates.append(("active_workspace", room, "active_workspace", ""))
+    candidates.extend([
+        ("active_workspace", active, "active_workspace", ""),
+        ("system_repo", resource_root_path(ctx, "system_repo"), "system_repo", ""),
+    ])
     if hasattr(ctx, "drive_root"):
         candidates.extend([
-            ("task_drive", resource_root_path(ctx, "task_drive")),
-            ("artifact_store", resource_root_path(ctx, "artifact_store")),
+            ("task_drive", resource_root_path(ctx, "task_drive"), "task_drive", ""),
+            ("artifact_store", resource_root_path(ctx, "artifact_store"), "artifact_store", ""),
         ])
-        meta = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
+        meta = getattr(ctx, "task_metadata", {})
+        meta = meta if isinstance(meta, dict) else {}
         for key in ("drive_root", "child_drive_root", "headless_child_drive_root"):
-            if meta.get(key):
-                meta_drive = pathlib.Path(meta[key]).resolve(strict=False)
-                task_id = task_id_for_artifacts(ctx)
-                candidates.extend([
-                    ("task_drive", (meta_drive / "task_drives" / task_id).resolve(strict=False)),
-                    ("artifact_store", task_artifact_dir_path(meta_drive, task_id, create=False).resolve(strict=False)),
-                ])
-    workspace_mode = bool(getattr(ctx, "is_workspace_mode", lambda: False)())
-    if not workspace_mode and hasattr(ctx, "drive_root"):
-        candidates.append(("user_files", resource_root_path(ctx, "user_files")))
-    elif is_external_workspace(ctx) and decide_tool_access(profile=profile, root="user_files", operation=operation).allow:
-        candidates.append(("user_files", resource_root_path(ctx, "user_files")))
+            if not meta.get(key):
+                continue
+            meta_drive = pathlib.Path(meta[key]).resolve(strict=False)
+            task_id = task_id_for_artifacts(ctx)
+            candidates.append((
+                "task_drive", (meta_drive / "task_drives" / task_id).resolve(strict=False),
+                "task_drive", "",
+            ))
+            candidates.append((
+                "artifact_store", task_artifact_dir_path(meta_drive, task_id, create=False).resolve(strict=False),
+                "artifact_store", "",
+            ))
+    if hasattr(ctx, "drive_root"):
+        candidates.append(("user_files", resource_root_path(ctx, "user_files"), "user_files", ""))
+    if include_skill:
+        base, source, selected_name = _skill_payload_base(
+            ctx,
+            profile=profile,
+            operation=operation,
+            location=bucket,
+            skill_name=skill_name,
+        )
+        candidates.append(("skill_payload", base, source, selected_name))
     return [
-        (label, root)
-        for label, root in candidates
+        (label, pathlib.Path(root).resolve(strict=False), source, selected_name)
+        for label, root, source, selected_name in candidates
         if decide_tool_access(profile=profile, root=label, operation=operation).allow
     ]
+
+
+def _side_effect_free_process_roots(
+    ctx: Any,
+    operation: Operation,
+    *,
+    bucket: str = "",
+    skill_name: str = "",
+    include_skill: bool = False,
+) -> list[tuple[str, pathlib.Path]]:
+    """Project the shared process inventory without materializing any root."""
+
+    records = _process_root_candidates(
+        ctx, operation, bucket=bucket, skill_name=skill_name, include_skill=include_skill,
+    )
+    return [(label, root) for label, root, _source, _name in records]
 
 
 def project_room_lens_dir(ctx: Any) -> Optional[pathlib.Path]:
@@ -1081,101 +1128,132 @@ def resolve_user_file_path(
     return candidate
 
 
-def resolve_shell_cwd(ctx: Any, cwd: str = "", *, operation: Operation = "shell") -> tuple[pathlib.Path, str, list[tuple[str, pathlib.Path]]]:
-    """Resolve process cwd using Tool API roots instead of repo-only assumptions."""
-
-    def ensure_process_cwd(label: str, candidate: pathlib.Path) -> pathlib.Path:
-        if label in {"task_drive", "artifact_store"}:
-            try:
-                candidate.mkdir(parents=True, exist_ok=True)
-            except OSError as exc:
-                raise ValueError(f"could not create {label} cwd {candidate}: {exc}") from exc
-        return candidate
+def _select_process_target(
+    ctx: Any,
+    cwd: str,
+    operation: Operation,
+    *,
+    bucket: str = "",
+    skill_name: str = "",
+    materialize: bool,
+) -> tuple[ResourceRoot, pathlib.Path, pathlib.Path, str, str, list[tuple[str, pathlib.Path]]]:
+    """Select one process target from the shared candidate inventory."""
 
     profile = active_tool_profile(ctx)
-    candidates: list[tuple[ResourceRoot, pathlib.Path]] = [("active_workspace", resource_root_path(ctx, "active_workspace"))]
-    _room = project_room_lens_dir(ctx)
-    if _room is not None:
-        # Room lens (v6.61.3): in a folder-room chat the DEFAULT cwd (and relative
-        # cwd resolution) is the project folder — "." must mean the same thing the
-        # room fact and the read tools say. The system repo stays an allowed root
-        # (explicit absolute/relative repo cwds keep working), it just is not the
-        # default anymore. Label rides "active_workspace" so profile access
-        # decisions are unchanged.
-        candidates.insert(0, ("active_workspace", _room))
-    if hasattr(ctx, "drive_root"):
-        candidates.extend([
-            ("task_drive", resource_root_path(ctx, "task_drive")),
-            ("artifact_store", resource_root_path(ctx, "artifact_store")),
-        ])
-        meta = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
-        for key in ("drive_root", "child_drive_root", "headless_child_drive_root"):
-            if meta.get(key):
-                meta_drive = pathlib.Path(meta[key]).resolve(strict=False)
-                task_id = task_id_for_artifacts(ctx)
-                candidates.extend([
-                    ("task_drive", (meta_drive / "task_drives" / task_id).resolve(strict=False)),
-                    ("artifact_store", task_artifact_dir_path(meta_drive, task_id, create=False).resolve(strict=False)),
-                ])
-    workspace_mode = bool(getattr(ctx, "is_workspace_mode", lambda: False)())
-    if not workspace_mode and hasattr(ctx, "drive_root"):
-        candidates.append(("user_files", resource_root_path(ctx, "user_files")))
-    allowed: list[tuple[str, pathlib.Path]] = [
-        (label, root)
-        for label, root in candidates
-        if decide_tool_access(profile=profile, root=label, operation=operation).allow
-    ]
-    if not allowed:
+    text = str(cwd or "").strip()
+    normalized = text.replace("\\", "/")
+    reserved_root = ""
+    reserved_subdir = ""
+    if normalized and not is_absolute_path_text(text) and not text.startswith("~"):
+        head, separator, tail = normalized.partition("/")
+        if head in _ALL_ROOTS:
+            reserved_root = head
+            reserved_subdir = tail if separator else ""
+
+    if reserved_root:
+        decision = decide_tool_access(
+            profile=profile, root=reserved_root, operation=operation,  # type: ignore[arg-type]
+        )
+        if not decision.allow:
+            raise ValueError(decision.reason)
+    include_skill = reserved_root == "skill_payload"
+    if include_skill and (not str(bucket or "").strip() or not str(skill_name or "").strip()):
+        raise ValueError("cwd=skill_payload[/subdir] requires bucket and skill_name")
+
+    candidate_records = _process_root_candidates(
+        ctx, operation, bucket=bucket, skill_name=skill_name, include_skill=include_skill,
+    )
+    allowed = [(label, root) for label, root, _source, _name in candidate_records]
+    if not candidate_records:
         raise ValueError(f"profile={profile} cannot {operation} any process cwd root")
 
-    text = str(cwd or "").strip()
-    if not text or text in {".", "./"}:
-        return ensure_process_cwd(allowed[0][0], allowed[0][1]), allowed[0][0], allowed
-    for label, root in allowed:
-        if text == label:
-            if label == "user_files":
-                root = _deliverables_root()
-                root.mkdir(parents=True, exist_ok=True)
-                reason = user_files_path_block_reason(ctx, root)
-                if reason:
-                    break
-            return ensure_process_cwd(label, root), label, allowed
+    def _finish(
+        record: tuple[ResourceRoot, pathlib.Path, str, str], target: pathlib.Path,
+        *, scoped_allowed: list[tuple[str, pathlib.Path]] | None = None,
+    ) -> tuple[ResourceRoot, pathlib.Path, pathlib.Path, str, str, list[tuple[str, pathlib.Path]]]:
+        label, base, source, selected_name = record
+        selected = pathlib.Path(target).resolve(strict=False)
+        if label == "user_files":
+            reason = user_files_path_block_reason(ctx, selected)
+            if reason:
+                raise ValueError(reason)
+        if materialize and label in {"task_drive", "artifact_store"}:
+            try:
+                selected.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise ValueError(f"could not create {label} cwd {selected}: {exc}") from exc
+        return label, base, selected, source, selected_name, scoped_allowed or allowed
+
+    if not text or normalized in {".", "./"}:
+        first = candidate_records[0]
+        return _finish(first, first[1])
+
+    if reserved_root:
+        for record in candidate_records:
+            label, base, _source, _name = record
+            if label != reserved_root:
+                continue
+            if label == "user_files" and not reserved_subdir:
+                deliverables = _deliverables_root()
+                if materialize:
+                    deliverables.mkdir(parents=True, exist_ok=True)
+                return _finish(record, deliverables)
+            target = (base / safe_relpath(reserved_subdir or ".")).resolve(strict=False)
+            if not path_is_relative_to(target, base):
+                raise ValueError(f"cwd escapes {label}")
+            return _finish(record, target)
+        raise ValueError(f"profile={profile} cannot {operation} root={reserved_root}")
 
     raw = pathlib.Path(text).expanduser()
-    candidates: list[pathlib.Path] = []
+    physical_candidates: list[pathlib.Path] = []
     if is_absolute_path_text(text) or text.startswith("~"):
-        candidates.append(raw.resolve(strict=False))
+        physical_candidates.append(raw.resolve(strict=False))
     else:
-        candidates.extend((root / safe_relpath(text)).resolve(strict=False) for _, root in allowed)
+        physical_candidates.extend((root / safe_relpath(text)).resolve(strict=False)
+                                   for _label, root, _source, _name in candidate_records)
 
-    for candidate in candidates:
-        for label, root in allowed:
-            if not path_is_relative_to(candidate, root):
-                continue
-            if label == "user_files":
-                reason = user_files_path_block_reason(ctx, candidate)
-                if reason:
+    for target in physical_candidates:
+        for record in candidate_records:
+            label, base, _source, _name = record
+            if path_is_relative_to(target, base):
+                try:
+                    return _finish(record, target)
+                except ValueError:
                     continue
-            return ensure_process_cwd(label, candidate), label, allowed
 
-    # External-workspace tasks may run commands FROM host scratch (a repo under
-    # /tmp, a /build tree, a sibling checkout). Accept an absolute cwd that clears
-    # the user_files PATH guard (non-runtime, non-credential), scoped to THAT
-    # exact path — never the filesystem root — so the workspace write-guard
-    # allowlist (which reuses this returned root list) is not widened beyond the
-    # chosen working directory.
+    # External-workspace compatibility: a host-scratch absolute cwd remains a
+    # user_files-policy path fact scoped to that exact directory, not to `/`.
     if is_external_workspace(ctx) and decide_tool_access(
-        profile=profile, root="user_files", operation=operation
+        profile=profile, root="user_files", operation=operation,
     ).allow:
-        for candidate in candidates:
-            if not candidate.is_absolute():
+        for target in physical_candidates:
+            if not target.is_absolute() or user_files_path_block_reason(ctx, target):
                 continue
-            if user_files_path_block_reason(ctx, candidate):
-                continue
-            scoped_allowed = [*allowed, ("user_files", candidate)]
-            return ensure_process_cwd("user_files", candidate), "user_files", scoped_allowed
+            record = ("user_files", target, "user_files", "")
+            return _finish(record, target, scoped_allowed=[*allowed, ("user_files", target)])
 
     raise ValueError("cwd is outside allowed roots")
+
+
+def resolve_shell_cwd(
+    ctx: Any,
+    cwd: str = "",
+    *,
+    operation: Operation = "shell",
+    bucket: str = "",
+    skill_name: str = "",
+) -> tuple[pathlib.Path, str, list[tuple[str, pathlib.Path]]]:
+    """Compatibility projection of the process target selector."""
+
+    root, _base, target, _source, _selected_name, allowed = _select_process_target(
+        ctx,
+        cwd,
+        operation,
+        bucket=bucket,
+        skill_name=skill_name,
+        materialize=True,
+    )
+    return target, root, allowed
 
 
 def canonical_data_root(ctx: Any) -> pathlib.Path:
@@ -1198,7 +1276,8 @@ def canonical_data_root(ctx: Any) -> pathlib.Path:
         text = str(candidate or "").strip()
         if text:
             return pathlib.Path(text).resolve(strict=False)
-    return pathlib.Path(getattr(ctx, "drive_root")).resolve(strict=False)
+    drive_root = getattr(ctx, "drive_root", None) or getattr(ctx, "repo_dir", ".")
+    return pathlib.Path(drive_root).resolve(strict=False)
 
 
 def normalize_runtime_data_path(data_root: pathlib.Path, path: str) -> str:
@@ -1434,8 +1513,29 @@ def build_resolved_resource_binding(
     path: str = ".",
     bucket: str = "",
     skill_name: str = "",
+    process_cwd: str | None = None,
 ) -> ResolvedResourceBinding:
     """Resolve policy, physical base, and target exactly once for one call."""
+
+    if process_cwd is not None:
+        selected_root, base, target, source, selected_name, _allowed = _select_process_target(
+            ctx,
+            process_cwd,
+            operation,
+            bucket=bucket,
+            skill_name=skill_name,
+            materialize=True,
+        )
+        return ResolvedResourceBinding(
+            profile=active_tool_profile(ctx),
+            root=selected_root,
+            operation=operation,
+            base_path=pathlib.Path(base).resolve(strict=False),
+            target_path=pathlib.Path(target).resolve(strict=False),
+            source=source,
+            skill_name=selected_name,
+            state_drive_root=canonical_data_root(ctx),
+        )
 
     normalized = normalize_root(root)
     profile = active_tool_profile(ctx)
@@ -1563,8 +1663,6 @@ def build_resolved_resource_binding(
         skill_name=selected_name,
         state_drive_root=canonical_data_root(ctx),
     )
-
-
 def resolve_resource_path(
     ctx: Any,
     *,

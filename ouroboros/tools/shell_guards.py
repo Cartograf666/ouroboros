@@ -894,16 +894,6 @@ def process_shell_guard_args(name: str, args: Dict[str, Any], *, ctx: Any = None
         interpreter = str(args.get("interpreter") or "python3").strip() or "python3"
         script = str(args.get("script") or "")
         cwd = args.get("cwd", "")
-        if (
-            not str(cwd or "").strip()
-            and ctx is not None
-            and str(runtime_mode or "").strip() == "light"
-            and not bool(getattr(ctx, "is_workspace_mode", lambda: False)())
-        ):
-            try:
-                cwd = str(ctx.task_drive_root())
-            except Exception:
-                cwd = ""
         return {
             "cmd": [interpreter, "-c", script],
             "cwd": cwd,

@@ -23,6 +23,10 @@ from ouroboros._outcome_receipts import (
 from ouroboros.outcomes import append_verification_receipt
 from ouroboros.platform_layer import bootstrap_process_path
 from ouroboros.shell_parse import normalize_check_argv
+from ouroboros.tool_access import (
+    ResolvedResourceBinding,
+    build_resolved_resource_binding,
+)
 from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for
 from ouroboros.utils import utc_now_iso
 
@@ -400,13 +404,17 @@ def _verify_and_record(
     criterion_id: str = "",
     check: Any = None,
     expected: str = "",
-    expected_match: str = "substring",
-    artifact_paths: Any = None,
     cwd: str = "",
-    timeout_sec: int | None = None,
-    criterion_source: str = "",
-    criterion_basis: str = "",
+    _resolved_binding: ResolvedResourceBinding | None = None,
+    **kwargs,
 ) -> str:
+    expected_match = kwargs.get("expected_match", "substring")
+    artifact_paths = kwargs.get("artifact_paths")
+    timeout_sec = kwargs.get("timeout_sec")
+    criterion_source = kwargs.get("criterion_source", "")
+    criterion_basis = kwargs.get("criterion_basis", "")
+    bucket = str(kwargs.get("bucket") or "")
+    skill_name = str(kwargs.get("skill_name") or "")
     kind = str(contract_kind or "").strip()
     if kind not in _CONTRACT_KINDS:
         return f"⚠️ TOOL_ARG_ERROR (verify_and_record): contract_kind must be one of {', '.join(_CONTRACT_KINDS)}."
@@ -466,14 +474,27 @@ def _verify_and_record(
             _resolve_effective_timeout,
             _shell_env_for_cwd,
             _tracked_subprocess_run,
-            resolve_shell_cwd,
         )
         from ouroboros.workspace_executor import execute as executor_execute
 
         try:
-            work_dir, _cwd_root, _allowed = resolve_shell_cwd(ctx, cwd)
+            binding = _resolved_binding or build_resolved_resource_binding(
+                ctx,
+                operation="shell",
+                process_cwd=cwd,
+                bucket=bucket,
+                skill_name=skill_name,
+            )
+            work_dir = pathlib.Path(binding.target_path)
         except (OSError, ValueError) as exc:
             return f"⚠️ VERIFY_CWD_BLOCKED: check cwd escapes allowed roots: {exc}."
+        receipt["resource_binding"] = {
+            "root": binding.root,
+            "base_path": str(binding.base_path),
+            "target_path": str(binding.target_path),
+            "source": binding.source,
+            "skill_name": binding.skill_name,
+        }
         timeout = _resolve_effective_timeout(_RUN_SHELL_DEFAULT_TIMEOUT_SEC, ctx, override_sec=timeout_sec)
         bootstrap_process_path()  # mirror run_command: ensure the check sees the full PATH
         use_executor = _executor_can_run_cwd(ctx, pathlib.Path(work_dir))
@@ -496,7 +517,10 @@ def _verify_and_record(
             # stamp: a timeout red must be reconcilable by the later green of that argv.
             receipt.update({"status": "fail", "returncode": None, "matched": False, "check": shlex.join(argv), "check_rendering": CHECK_RENDERING_SHLEX_JOIN, "summary": f"check timed out after {timeout}s"})
             append_verification_receipt(drive_root, task_id, receipt)
-            return f"verify_and_record [{kind}] FAIL: check timed out after {timeout}s. Receipt recorded."
+            return (
+                f"verify_and_record [{kind}] FAIL: check timed out after {timeout}s. "
+                f"root={binding.root}, cwd={binding.target_path}. Receipt recorded."
+            )
         # Full output captured in-handler BEFORE any transport truncation.
         out = (res.stdout or "") + (("\n" + res.stderr) if res.stderr else "")
         rc = res.returncode
@@ -542,7 +566,11 @@ def _verify_and_record(
         append_verification_receipt(drive_root, task_id, receipt)
         verdict = "PASS" if passed else "FAIL"
         exp_note = f" expected={expected_s!r}" if expected_s else ""
-        return f"verify_and_record [{kind}] {verdict}: exit={rc}{exp_note}. Host-attested receipt recorded.\n\n{_bounded(out, _TOOL_OUTPUT_CAP)}"
+        return (
+            f"verify_and_record [{kind}] {verdict}: exit={rc}{exp_note}; "
+            f"root={binding.root}, cwd={binding.target_path}. Host-attested receipt recorded.\n\n"
+            f"{_bounded(out, _TOOL_OUTPUT_CAP)}"
+        )
 
     if kind == "artifact_observation":
         paths = [str(p) for p in (artifact_paths or []) if str(p or "").strip()]
@@ -600,7 +628,23 @@ def get_tools() -> List[ToolEntry]:
                 "expected": {"type": "string", "default": "", "description": "Optional expected substring/metric in the check output (explicit_command/explicit_metric)."},
                 "expected_match": {"type": "string", "enum": list(_EXPECTED_MATCH_KINDS), "default": "substring", "description": "How `expected` is matched: substring (default) · exact (whole stripped output equals expected) · exact_line (expected equals one stripped output line) · json_equals (output and expected parse to equal JSON, key-order tolerant) · bytes_equal (after the check runs, artifact_paths=[a, b] are compared BYTE-FOR-BYTE — golden files, migration parity; the receipt records a bounded hexdump of the first divergence). Use a stricter mode when the task gives a worked example / exact output."},
                 "artifact_paths": {"type": "array", "items": {"type": "string"}, "description": "Deliverable paths. For artifact_observation the host confirms they exist (existence/size only, never content) — observable roots are the active workspace plus every resource root the ACTIVE profile can already read (for orchestrating parents that includes subagent_projects and deliverables, so a parent CAN confirm a child's deliverable in the projects tree; child/readonly profiles lack those roots); a path outside these is a non-fatal refused_out_of_scope, not a failure. For run-kind checks (visible_verifier/explicit_command/explicit_metric) the host ALSO probes (after the check) whether each declared path that is RELATIVE to the check's working directory (cwd) still exists and records an advisory artifact_lifecycle flag — catching a check that built then deleted its own deliverable."},
-                "cwd": {"type": "string", "default": "", "description": "Working directory for `check` (same roots as run_command)."},
+                "cwd": {
+                    "type": "string",
+                    "default": "",
+                    "description": (
+                        "For run-kind checks, omit for active_workspace; use system_repo[/subdir] "
+                        "for Ouroboros or skill_payload[/subdir] with bucket+skill_name for a skill."
+                    ),
+                },
+                "bucket": {
+                    "type": "string",
+                    "enum": ["external", "clawhub", "ouroboroshub", "user_repo"],
+                    "description": "Physical skill location for a run-kind cwd=skill_payload[/subdir].",
+                },
+                "skill_name": {
+                    "type": "string",
+                    "description": "Exact skill identity for a run-kind cwd=skill_payload[/subdir].",
+                },
                 "timeout_sec": {"type": "integer", "description": "Optional check timeout override."},
             }, "required": ["contract_kind"]},
         }, _verify_and_record, is_code_tool=True, timeout_sec=900, mutates_worktree=True),

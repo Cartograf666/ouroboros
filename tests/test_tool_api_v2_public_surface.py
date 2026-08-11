@@ -365,6 +365,7 @@ def test_light_mode_blocks_run_script_runtime_data_upload_writes(tmp_path, monke
                 "p.parent.mkdir(parents=True, exist_ok=True)\n"
                 "p.write_text('bad')\n"
             ),
+            "cwd": "task_drive",
         },
     )
 
@@ -501,6 +502,7 @@ def test_light_mode_blocks_relative_run_script_runtime_data_upload_writes(tmp_pa
                 "p.parent.mkdir(parents=True, exist_ok=True)\n"
                 "p.write_text('bad')\n"
             ),
+            "cwd": "task_drive",
         },
     )
 
@@ -525,6 +527,7 @@ def test_light_run_script_allows_readonly_repo_analysis_with_external_write(tmp_
                 "out.write_text(repo)\n"
                 "import sys; sys.stdout.write(repo)\n"
             ),
+            "cwd": "task_drive",
             "outputs": [str(out)],
         },
     )
@@ -548,6 +551,7 @@ def test_light_run_script_blocks_dynamic_repo_write_even_from_task_drive(tmp_pat
                 "name = 'dynamic.txt'\n"
                 "(repo / name).write_text('bad')\n"
             ),
+            "cwd": "task_drive",
         },
     )
 
@@ -568,6 +572,7 @@ def test_light_run_script_blocks_path_open_repo_write(tmp_path, monkeypatch):
                 "from pathlib import Path\n"
                 f"Path({str(target)!r}).open('w').write('bad')\n"
             ),
+            "cwd": "task_drive",
         },
     )
 
@@ -589,6 +594,7 @@ def test_light_run_script_allows_constant_expression_task_drive_write(tmp_path, 
                 "name = 'out' + '.txt'\n"
                 "Path(name).write_text('ok')\n"
             ),
+            "cwd": "task_drive",
         },
     )
 
@@ -610,6 +616,7 @@ def test_light_run_script_allows_resolved_open_handle_task_drive_write(tmp_path,
                 "f.write('ok')\n"
                 "f.close()\n"
             ),
+            "cwd": "task_drive",
         },
     )
 
@@ -625,7 +632,7 @@ def test_light_run_script_allows_with_open_handle_task_drive_write(tmp_path, mon
 
     result = registry.execute(
         "run_script",
-        {"script": "with open('with-open.txt', 'w') as f:\n    f.write('ok')\n"},
+        {"script": "with open('with-open.txt', 'w') as f:\n    f.write('ok')\n", "cwd": "task_drive"},
     )
 
     assert "LIGHT_MODE_BLOCKED" not in result, result
@@ -645,6 +652,7 @@ def test_light_run_script_allows_path_cwd_task_drive_write(tmp_path, monkeypatch
                 "from pathlib import Path\n"
                 "(Path.cwd() / 'cwd-write.txt').write_text('ok')\n"
             ),
+            "cwd": "task_drive",
         },
     )
 
@@ -666,6 +674,7 @@ def test_light_run_script_allows_in_memory_write_method(tmp_path, monkeypatch):
                 "buf.write('ok')\n"
                 "print(buf.getvalue())\n"
             ),
+            "cwd": "task_drive",
         },
     )
 
@@ -725,7 +734,7 @@ def test_write_file_batch_partial_failure_is_semantic_failure(tmp_path, monkeypa
     assert not (data / "task_results" / "artifacts" / "task1" / ".artifact_manifest.json").exists()
 
 
-def test_run_script_light_default_cwd_is_task_drive_and_outputs_are_artifacts(tmp_path, monkeypatch):
+def test_run_script_light_explicit_task_drive_outputs_are_artifacts(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     registry, repo, data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
@@ -734,6 +743,7 @@ def test_run_script_light_default_cwd_is_task_drive_and_outputs_are_artifacts(tm
         "run_script",
         {
             "script": "from pathlib import Path\nif 1 > 0:\n    Path('probe.txt').write_text('ok')\n",
+            "cwd": "task_drive",
             "outputs": ["probe.txt"],
         },
     )
@@ -800,6 +810,7 @@ def test_run_script_registers_directory_outputs_as_manifest_and_zip(tmp_path, mo
                 "Path('site/index.html').write_text('<h1>ok</h1>')\n"
                 "Path('site/assets/app.js').write_text('console.log(1)')\n"
             ),
+            "cwd": "task_drive",
             "outputs": ["site"],
         },
     )

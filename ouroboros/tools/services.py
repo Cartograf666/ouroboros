@@ -21,7 +21,11 @@ from ouroboros.platform_layer import (
     process_group_id,
 )
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.tool_access import resolve_shell_cwd
+from ouroboros.tool_access import (
+    ResolvedResourceBinding,
+    build_resolved_resource_binding,
+    shell_cwd_block_message,
+)
 from ouroboros.utils import append_jsonl, utc_now_iso
 from ouroboros.workspace_executor import executor_ref_from_ctx
 from ouroboros.workspace_executor import kill_all_services as executor_kill_all_services
@@ -48,6 +52,9 @@ class ServiceRecord:
     ready: bool = False
     outputs: List[str] = field(default_factory=list)
     cwd_root: str = ""
+    cwd_base: str = ""
+    cwd_source: str = ""
+    skill_name: str = ""
     before_outputs: Dict[str, tuple[bool, int, str]] = field(default_factory=dict)
     keep_alive: bool = False
 
@@ -336,6 +343,7 @@ def _start_service(
     readiness: Dict[str, Any] | None = None,
     outputs: List[str] | None = None,
     keep_alive: bool = False,
+    _resolved_binding: ResolvedResourceBinding | None = None,
 ) -> str:
     if not isinstance(cmd, list) or not cmd or not all(str(x).strip() for x in cmd):
         return "⚠️ TOOL_ARG_ERROR (start_service): cmd must be a non-empty array of strings."
@@ -351,19 +359,28 @@ def _start_service(
         if existing and existing.proc.poll() is None:
             return f"⚠️ SERVICE_ALREADY_RUNNING: {service_name} pid={existing.proc.pid}"
     try:
-        workdir, cwd_root, _allowed_roots = resolve_shell_cwd(ctx, cwd, operation="service")
-        workdir = pathlib.Path(workdir).resolve(strict=False)
+        binding = _resolved_binding or build_resolved_resource_binding(
+            ctx,
+            operation="service",
+            process_cwd=cwd,
+        )
+        workdir = pathlib.Path(binding.target_path)
+        cwd_root = binding.root
     except Exception as exc:
         # One failure class, one message (v6.54.3 SSOT): the canonical cwd block
         # names every allowed root as label=path instead of a bare rootless
         # ValueError echo; the SHELL_CWD_BLOCKED status is a typed policy denial.
-        from ouroboros.tool_access import shell_cwd_block_message
-
         return shell_cwd_block_message(ctx, cwd, operation="service", error=exc)
     try:
         from ouroboros.protected_artifacts import shell_block_reason
 
-        protected_block = shell_block_reason(ctx, cmd, cwd=str(workdir), default_cwd=workdir)
+        protected_block = shell_block_reason(
+            ctx,
+            cmd,
+            cwd=str(workdir),
+            default_cwd=workdir,
+            binding=binding,
+        )
         if protected_block:
             return protected_block
     except Exception:
@@ -389,6 +406,9 @@ def _start_service(
                 cmd=[str(part) for part in cmd],
                 host_cwd=workdir,
                 cwd_root=cwd_root,
+                cwd_base=str(binding.base_path),
+                cwd_source=binding.source,
+                skill_name=binding.skill_name,
                 readiness=dict(readiness or {}),
                 outputs=declared_outputs,
                 before_outputs=before_outputs,
@@ -440,13 +460,23 @@ def _start_service(
         readiness=dict(readiness or {}),
         outputs=declared_outputs,
         cwd_root=cwd_root,
+        cwd_base=str(binding.base_path),
+        cwd_source=binding.source,
+        skill_name=binding.skill_name,
         before_outputs=before_outputs,
         keep_alive=keep_alive,
     )
     with _LOCK:
         _SERVICES[key] = record
     try:
-        if cwd_root == "active_workspace" and not bool(getattr(ctx, "is_workspace_mode", lambda: False)()):
+        system_root = pathlib.Path(
+            getattr(ctx, "system_repo_dir", None) or getattr(ctx, "repo_dir")
+        ).resolve(strict=False)
+        mutates_system_repo = (
+            binding.root == "system_repo"
+            or pathlib.Path(binding.base_path).resolve(strict=False) == system_root
+        )
+        if mutates_system_repo:
             from ouroboros.tools.commit_gate import _invalidate_advisory
 
             _invalidate_advisory(
@@ -483,6 +513,9 @@ def _status_payload(record: ServiceRecord) -> Dict[str, Any]:
         "uptime_sec": round(max(0.0, time.time() - record.started_at), 3),
         "cwd": record.cwd,
         "cwd_root": record.cwd_root,
+        "cwd_base": record.cwd_base,
+        "cwd_source": record.cwd_source,
+        "skill_name": record.skill_name,
         "cmd": record.cmd,
         "outputs": list(record.outputs),
         "keep_alive": bool(record.keep_alive),
@@ -802,7 +835,14 @@ def get_tools() -> List[ToolEntry]:
             "description": "Start a task-scoped long-running service and return pid/readiness/state.",
             "parameters": {"type": "object", "properties": {
                 "cmd": {"type": "array", "items": {"type": "string"}},
-                "cwd": {"type": "string", "default": ""},
+                "cwd": {
+                    "type": "string",
+                    "default": "",
+                    "description": (
+                        "Omit for active_workspace; use system_repo[/subdir] for Ouroboros. "
+                        "Skill payload services are not supported."
+                    ),
+                },
                 "name": {"type": "string", "default": "service"},
                 "readiness": {"type": "object", "default": {}, "description": "Optional {log_contains|stdout_contains, timeout_sec} readiness probe."},
                 "outputs": {"type": "array", "items": {"type": "string"}, "default": [], "description": "Files generated by the service to copy into the task artifact store when the service stops."},
