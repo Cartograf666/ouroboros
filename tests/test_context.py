@@ -188,6 +188,29 @@ def test_runtime_section_external_workspace_includes_user_files_shell_affordance
     assert "user_files" in fs["allowed_shell_cwd_roots"]
 
 
+def test_runtime_section_workspace_rule_preserves_system_review_commit_authority(tmp_path, monkeypatch):
+    env = _make_health_env(tmp_path)
+    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "advanced")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    section = build_runtime_section(
+        env,
+        {
+            "id": "task-1",
+            "type": "task",
+            "workspace_root": str(workspace),
+            "workspace_mode": "external",
+            "memory_mode": "forked",
+        },
+    )
+    rule = json.loads(section.split("\n\n", 1)[1])["active_workspace"]["rule"]
+
+    assert "default to the active workspace" in rule
+    assert "explicit typed root/cwd" in rule
+    assert "self-review/commit tools remain available" in rule
+    assert "self-review/commit tools are unavailable" not in rule
+
+
 def test_health_invariants_reports_remote_context_overflow(tmp_path):
     env = _make_health_env(
         tmp_path,

@@ -510,8 +510,10 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
             "workspace_mode": str(task.get("workspace_mode") or ""),
             "memory_mode": str(task.get("memory_mode") or ""),
             "rule": (
-                "read_file/write_file/list_files/search_code/run_command target the active workspace; "
-                "Ouroboros self-review/commit tools are unavailable; final changes are exported as artifacts."
+                "File and process tools default to the active workspace; explicit typed root/cwd "
+                "selectors target other authorized resources per call. Project focus does not remove "
+                "the ordinary top-level toolset: Ouroboros self-review/commit tools remain available "
+                "for system_repo changes, while external-project changes are exported as artifacts."
             ),
         }
     if str(runtime_mode).lower() == "light":
