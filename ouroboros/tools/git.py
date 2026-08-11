@@ -27,12 +27,7 @@ from ouroboros.tools.registry import (
     ToolContext,
     ToolEntry,
     _authorized_managed_update_resolver,
-    active_repo_dir_for,
     system_repo_dir_for,
-)
-from ouroboros.tool_access import (
-    ResolvedResourceBinding,
-    build_resolved_resource_binding,
 )
 from ouroboros.tool_access import (
     ResolvedResourceBinding,

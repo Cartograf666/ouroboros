@@ -153,6 +153,24 @@ def test_preflight_reads_bound_canonical_payload_not_fork_shadow(tmp_path):
     )
 
 
+def test_registry_preflight_infers_unique_canonical_skill_binding(tmp_path):
+    ctx, repo, parent, child = _fork_ctx(tmp_path)
+    canonical = _skill(parent, "external", "alpha", body="if True print('broken')\n")
+    shadow = _skill(child, "external", "alpha", body="VALUE = 1\n")
+    registry = ToolRegistry(repo_dir=repo, drive_root=child)
+    registry.set_context(ctx)
+
+    payload = json.loads(registry.execute("skill_preflight", {"skill": "alpha"}))
+
+    assert canonical.resolve() != shadow.resolve()
+    assert payload["ok"] is False
+    assert any(
+        item.get("path") == "tool.py" and not item.get("ok")
+        for item in payload["files"]
+    )
+    assert not (child / "state" / "skills" / "alpha").exists()
+
+
 def test_review_lifecycle_enablement_and_job_state_follow_binding_state_root(
     tmp_path, monkeypatch,
 ):

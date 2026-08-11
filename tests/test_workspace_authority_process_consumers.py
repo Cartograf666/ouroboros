@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ouroboros.tools.registry import ToolContext
+from ouroboros.tools.registry import ToolContext, ToolRegistry
 from ouroboros.outcomes import verification_receipts_path
 from ouroboros.protected_artifacts import shell_block_reason
 from ouroboros.python_interpreter import resolve_process_python
@@ -16,7 +16,7 @@ from ouroboros.tool_access import (
     build_resolved_resource_binding,
 )
 from ouroboros.tools.services import _start_service, _stop_service
-from ouroboros.tools.shell import _run_script, _run_shell
+from ouroboros.tools.shell import _resolve_declared_output, _run_script, _run_shell
 from ouroboros.tools.verify import _verify_and_record
 
 
@@ -320,6 +320,117 @@ def test_run_and_verify_disclose_binding_but_keep_task_custody(tmp_path):
     assert receipt["resource_binding"]["target_path"] == str(skill / "sub")
     assert receipt["resource_binding"]["source"] == "external"
     assert not verification_receipts_path(canonical, ctx.task_id).exists()
+
+
+def test_exact_skill_outputs_use_binding_and_remain_task_custodied(tmp_path):
+    ctx, _system, _active, canonical, task = _ctx(tmp_path, forked=True)
+    skill = _skill(canonical)
+    binding = build_resolved_resource_binding(
+        ctx, operation="shell", process_cwd="skill_payload/sub",
+        bucket="external", skill_name="alpha",
+    )
+
+    result = _run_shell(
+        ctx,
+        [sys.executable, "-c", "from pathlib import Path; Path('report.txt').write_text('ok')"],
+        outputs=["report.txt"],
+        _resolved_binding=binding,
+    )
+
+    assert "ARTIFACT_OUTPUTS" in result
+    assert "ARTIFACT_OUTPUT_ERROR" not in result
+    assert (skill / "sub" / "report.txt").read_text(encoding="utf-8") == "ok"
+    assert any(path.name == "report.txt" for path in task.rglob("report.txt"))
+    assert not any(path.name == "report.txt" for path in canonical.glob("task_results/**/*"))
+
+
+def test_registry_injects_same_binding_for_exact_skill_process(tmp_path, monkeypatch):
+    import ouroboros.safety as safety
+
+    ctx, system, _active, canonical, task = _ctx(tmp_path, forked=True)
+    skill = _skill(canonical)
+    registry = ToolRegistry(repo_dir=system, drive_root=task)
+    registry.set_context(ctx)
+    monkeypatch.setattr(safety, "check_safety", lambda *_a, **_k: (True, ""))
+
+    result = registry.execute(
+        "run_command",
+        {
+            "cmd": [
+                sys.executable,
+                "-c",
+                "from pathlib import Path; Path('registry.txt').write_text('bound')",
+            ],
+            "cwd": "skill_payload/sub",
+            "bucket": "external",
+            "skill_name": "alpha",
+            "outputs": ["registry.txt"],
+        },
+    )
+
+    assert "ARTIFACT_OUTPUTS" in result
+    assert "ARTIFACT_OUTPUT_ERROR" not in result
+    assert "root=skill_payload" in result
+    assert (skill / "sub" / "registry.txt").read_text(encoding="utf-8") == "bound"
+    assert any(path.name == "registry.txt" for path in task.rglob("registry.txt"))
+
+
+def test_registry_light_mode_follows_selected_project_skill_or_system_target(
+    tmp_path, monkeypatch,
+):
+    import ouroboros.safety as safety
+
+    ctx, system, active, canonical, task = _ctx(tmp_path)
+    skill = _skill(canonical)
+    registry = ToolRegistry(repo_dir=system, drive_root=task)
+    registry.set_context(ctx)
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    monkeypatch.setattr(safety, "check_safety", lambda *_a, **_k: (True, ""))
+
+    project_result = registry.execute(
+        "run_command", {"cmd": ["touch", "project.txt"]},
+    )
+    skill_result = registry.execute(
+        "run_command",
+        {
+            "cmd": ["touch", "skill.txt"],
+            "cwd": "skill_payload/sub",
+            "bucket": "external",
+            "skill_name": "alpha",
+        },
+    )
+    system_result = registry.execute(
+        "run_command",
+        {"cmd": ["touch", "system.txt"], "cwd": "system_repo"},
+    )
+
+    assert "exit_code=0" in project_result
+    assert "exit_code=0" in skill_result
+    assert (active / "project.txt").is_file()
+    assert (skill / "sub" / "skill.txt").is_file()
+    assert "LIGHT_MODE_BLOCKED" in system_result
+    assert not (system / "system.txt").exists()
+
+
+def test_explicit_system_output_keeps_binding_relative_protected_policy(tmp_path):
+    ctx, system, _active, _canonical, _task = _ctx(tmp_path)
+    protected = system / "BIBLE.md"
+    protected.write_text("protected", encoding="utf-8")
+    binding = build_resolved_resource_binding(
+        ctx, operation="shell", process_cwd="system_repo",
+    )
+
+    source, reason = _resolve_declared_output(
+        ctx,
+        "BIBLE.md",
+        system,
+        cwd_root="system_repo",
+        changed_paths={"BIBLE.md"},
+        binding=binding,
+    )
+
+    assert source is None
+    assert "protected" in reason.lower()
 
 
 @pytest.mark.serial

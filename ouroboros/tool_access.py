@@ -227,9 +227,7 @@ _TOP_LEVEL_PRINCIPAL_POLICY: dict[str, set[str]] = {
 
 _POLICY: dict[str, dict[str, set[str]]] = {
     "local_readonly_subagent": {
-        # vcs_status/vcs_diff are explicit read-only child tools. The child
-        # name profile withholds every mutating VCS primitive; this operation
-        # grant lets their target binding resolve without widening that surface.
+        # Read-only child VCS names still need their target binding to resolve.
         "active_workspace": set(_READ_OPS) | {"vcs"},
         "system_repo": set(_READ_OPS) | {"vcs"},
         "runtime_data": {"read", "list"},
@@ -447,13 +445,7 @@ def _process_root_candidates(
     skill_name: str = "",
     include_skill: bool = False,
 ) -> list[tuple[ResourceRoot, pathlib.Path, str, str]]:
-    """Side-effect-free cwd inventory shared by process discovery and execution.
-
-    Entries carry ``(logical_root, physical_base, source, skill_name)``.  The
-    inventory never creates task/artifact directories; the execution selector
-    materializes only the selected task-owned target.  Skill discovery is exact
-    and opt-in, so an ordinary process scan never walks every installed skill.
-    """
+    """Return side-effect-free ``(root, base, source, skill)`` candidates."""
 
     profile = active_tool_profile(ctx)
     active = resource_root_path(ctx, "active_workspace")
@@ -461,30 +453,26 @@ def _process_root_candidates(
     room = project_room_lens_dir(ctx)
     if room is not None:
         candidates.append(("active_workspace", room, "active_workspace", ""))
-    candidates.extend([
+    candidates += [
         ("active_workspace", active, "active_workspace", ""),
         ("system_repo", resource_root_path(ctx, "system_repo"), "system_repo", ""),
-    ])
-    if hasattr(ctx, "drive_root"):
+    ]
+
+    def _add_task_roots(drive: pathlib.Path) -> None:
+        task_id = task_id_for_artifacts(ctx)
         candidates.extend([
-            ("task_drive", resource_root_path(ctx, "task_drive"), "task_drive", ""),
-            ("artifact_store", resource_root_path(ctx, "artifact_store"), "artifact_store", ""),
+            ("task_drive", drive / "task_drives" / task_id, "task_drive", ""),
+            ("artifact_store", task_artifact_dir_path(drive, task_id, create=False), "artifact_store", ""),
         ])
+
+    if hasattr(ctx, "drive_root"):
+        _add_task_roots(pathlib.Path(ctx.drive_root).resolve(strict=False))
         meta = getattr(ctx, "task_metadata", {})
         meta = meta if isinstance(meta, dict) else {}
         for key in ("drive_root", "child_drive_root", "headless_child_drive_root"):
             if not meta.get(key):
                 continue
-            meta_drive = pathlib.Path(meta[key]).resolve(strict=False)
-            task_id = task_id_for_artifacts(ctx)
-            candidates.append((
-                "task_drive", (meta_drive / "task_drives" / task_id).resolve(strict=False),
-                "task_drive", "",
-            ))
-            candidates.append((
-                "artifact_store", task_artifact_dir_path(meta_drive, task_id, create=False).resolve(strict=False),
-                "artifact_store", "",
-            ))
+            _add_task_roots(pathlib.Path(meta[key]).resolve(strict=False))
     if hasattr(ctx, "drive_root"):
         candidates.append(("user_files", resource_root_path(ctx, "user_files"), "user_files", ""))
     if include_skill:
@@ -512,27 +500,20 @@ def _side_effect_free_process_roots(
     include_skill: bool = False,
 ) -> list[tuple[str, pathlib.Path]]:
     """Project the shared process inventory without materializing any root."""
-
-    records = _process_root_candidates(
-        ctx, operation, bucket=bucket, skill_name=skill_name, include_skill=include_skill,
-    )
-    return [(label, root) for label, root, _source, _name in records]
+    return [
+        (label, root)
+        for label, root, _source, _name in _process_root_candidates(
+            ctx, operation, bucket=bucket, skill_name=skill_name,
+            include_skill=include_skill,
+        )
+    ]
 
 
 def project_room_lens_dir(ctx: Any) -> Optional[pathlib.Path]:
-    """The project-room lens root for the DIRECT-CHAT lane (v6.61.3), or None.
+    """Return a direct-chat room's verified project cwd, otherwise ``None``.
 
-    The robot-room incident: a folder-room's chat lane resolved ``"."`` against the
-    system repo while the room fact named the project folder — the agent narrated
-    the wrong tree. The lens re-points the chat lane's ``active_workspace`` READS
-    and the default shell cwd at the room's registered ``working_dir`` so the
-    affordance matches the room fact (affordance-context coherence).
-
-    STRICT structural key — every leg must hold, else None (byte-identical old
-    behavior): the DIRECT-CHAT lane only (never pooled/workspace/subagent/headless
-    tasks — benchmarks and promoted tasks carry their own workspace wiring), no
-    workspace of its own, and a host-verified room dir injected by the agent at
-    task build (``_project_room_dir`` metadata: registry working_dir, existing dir).
+    Promoted/workspace/subagent tasks carry their own workspace; only a direct
+    chat without one may use the injected existing ``_project_room_dir``.
     """
     if not bool(getattr(ctx, "is_direct_chat", False)):
         return None
@@ -578,11 +559,7 @@ def filesystem_affordance_map(ctx: Any, *, runtime_mode: str = "") -> dict[str, 
         for root in ("active_workspace", "system_repo"):
             if root in policy:
                 light_gated_roots.append(root)
-    # label=resolved-path pairs for every root the profile can see (the v6.54.3
-    # shell_cwd_block_message lesson applied to the context digest: a bare label
-    # left the model guessing absolute paths and re-tripping the same block).
-    # skill_payload is omitted (its path needs bucket/skill args); per-root
-    # resolution is fail-soft so one unresolvable root never hides the rest.
+    # Skill payload needs selectors; every other visible root is projected fail-soft.
     root_paths: dict[str, str] = {}
     for _root_label in sorted(policy):
         if _root_label == "skill_payload":
@@ -595,9 +572,7 @@ def filesystem_affordance_map(ctx: Any, *, runtime_mode: str = "") -> dict[str, 
         "profile": profile,
         "writable_roots": writable_roots,
         "readonly_roots": readonly_roots,
-        # Roots this profile CANNOT see at all (v6.70.0): an environment fact,
-        # not a behavioral gate — subagents used to infer invisibility only by
-        # absence and then burned rounds re-probing blocked roots.
+        # Environment fact, not another policy gate.
         "invisible_roots": sorted(_ALL_ROOTS - set(policy)),
         "root_paths": root_paths,
         "default_shell_cwd": shell_roots[0][0] if shell_roots else "",
@@ -615,27 +590,18 @@ def filesystem_affordance_map(ctx: Any, *, runtime_mode: str = "") -> dict[str, 
         )
     _room = project_room_lens_dir(ctx)
     if _room is not None:
-        # Room-lens disclosure (v6.61.3): in this chat, active_workspace READS and
-        # the default shell cwd resolve to the PROJECT FOLDER, not the system repo.
+        # In this chat the project room is the active/default filesystem focus.
         result["project_room_dir"] = str(_room)
         result["default_shell_cwd"] = f"project room ({_room})"
     return result
 
 
 def profile_readable_root_paths(ctx: Any) -> list[tuple[str, pathlib.Path]]:
-    """Resolved ``(label, path)`` pairs for every resource root the ACTIVE
-    profile can already READ via ``read_file`` (the ``_POLICY`` 'read' verb).
+    """Project readable ``(label, path)`` pairs from the policy SSOT.
 
-    The consistency SSOT for read-side tools that need "where may I look"
-    (view_image, verify_and_record artifact observation): deriving from the ONE
-    matrix instead of hand-maintaining private per-tool root lists is what kills
-    the copy-shuffle class (three tools, three disagreeing lists — wave3 r8/r24).
-    Widens nothing: every returned root is one the profile already reads through
-    read_file. It CAN, however, narrow a consumer that previously trusted a root
-    unconditionally — verify's orchestrator roots did; the disclosed delta lives
-    at ``tools/verify.py::_within_readonly_orchestrator_root``. ``skill_payload``
-    is omitted (its path needs bucket/skill args); per-root resolution is
-    fail-soft."""
+    ``skill_payload`` needs selectors and is omitted; individual resolution is
+    fail-soft so one unavailable root cannot hide the rest.
+    """
     out: list[tuple[str, pathlib.Path]] = []
     try:
         policy = _POLICY.get(active_tool_profile(ctx), {})
@@ -656,8 +622,7 @@ def shell_cwd_block_message(ctx: Any, cwd: str = "", *, operation: Operation = "
 
     try:
         allowed = _side_effect_free_process_roots(ctx, operation)
-        # Show the RESOLVED path per label (deduped): a bare label left the model
-        # guessing absolute paths and re-tripping this same block (v6.54.3, GAIA).
+        # Show resolved label=path pairs so the caller can self-correct.
         seen: set[str] = set()
         allowed_entries: list[str] = []
         for label, root in allowed:
@@ -1138,7 +1103,6 @@ def _select_process_target(
     materialize: bool,
 ) -> tuple[ResourceRoot, pathlib.Path, pathlib.Path, str, str, list[tuple[str, pathlib.Path]]]:
     """Select one process target from the shared candidate inventory."""
-
     profile = active_tool_profile(ctx)
     text = str(cwd or "").strip()
     normalized = text.replace("\\", "/")
@@ -1147,26 +1111,21 @@ def _select_process_target(
     if normalized and not is_absolute_path_text(text) and not text.startswith("~"):
         head, separator, tail = normalized.partition("/")
         if head in _ALL_ROOTS:
-            reserved_root = head
-            reserved_subdir = tail if separator else ""
-
-    if reserved_root:
-        decision = decide_tool_access(
-            profile=profile, root=reserved_root, operation=operation,  # type: ignore[arg-type]
-        )
-        if not decision.allow:
-            raise ValueError(decision.reason)
+            reserved_root, reserved_subdir = head, tail if separator else ""
+    decision = decide_tool_access(
+        profile=profile, root=reserved_root, operation=operation,  # type: ignore[arg-type]
+    ) if reserved_root else None
+    if decision is not None and not decision.allow:
+        raise ValueError(decision.reason)
     include_skill = reserved_root == "skill_payload"
     if include_skill and (not str(bucket or "").strip() or not str(skill_name or "").strip()):
         raise ValueError("cwd=skill_payload[/subdir] requires bucket and skill_name")
-
     candidate_records = _process_root_candidates(
         ctx, operation, bucket=bucket, skill_name=skill_name, include_skill=include_skill,
     )
     allowed = [(label, root) for label, root, _source, _name in candidate_records]
     if not candidate_records:
         raise ValueError(f"profile={profile} cannot {operation} any process cwd root")
-
     def _finish(
         record: tuple[ResourceRoot, pathlib.Path, str, str], target: pathlib.Path,
         *, scoped_allowed: list[tuple[str, pathlib.Path]] | None = None,
@@ -1183,11 +1142,9 @@ def _select_process_target(
             except OSError as exc:
                 raise ValueError(f"could not create {label} cwd {selected}: {exc}") from exc
         return label, base, selected, source, selected_name, scoped_allowed or allowed
-
     if not text or normalized in {".", "./"}:
         first = candidate_records[0]
         return _finish(first, first[1])
-
     if reserved_root:
         for record in candidate_records:
             label, base, _source, _name = record
@@ -1203,15 +1160,13 @@ def _select_process_target(
                 raise ValueError(f"cwd escapes {label}")
             return _finish(record, target)
         raise ValueError(f"profile={profile} cannot {operation} root={reserved_root}")
-
     raw = pathlib.Path(text).expanduser()
-    physical_candidates: list[pathlib.Path] = []
-    if is_absolute_path_text(text) or text.startswith("~"):
-        physical_candidates.append(raw.resolve(strict=False))
-    else:
-        physical_candidates.extend((root / safe_relpath(text)).resolve(strict=False)
-                                   for _label, root, _source, _name in candidate_records)
-
+    physical_candidates = (
+        [raw.resolve(strict=False)]
+        if is_absolute_path_text(text) or text.startswith("~") else
+        [(root / safe_relpath(text)).resolve(strict=False)
+         for _label, root, _source, _name in candidate_records]
+    )
     for target in physical_candidates:
         for record in candidate_records:
             label, base, _source, _name = record
@@ -1220,9 +1175,7 @@ def _select_process_target(
                     return _finish(record, target)
                 except ValueError:
                     continue
-
-    # External-workspace compatibility: a host-scratch absolute cwd remains a
-    # user_files-policy path fact scoped to that exact directory, not to `/`.
+    # External-workspace host scratch remains an exact user-files path, not `/`.
     if is_external_workspace(ctx) and decide_tool_access(
         profile=profile, root="user_files", operation=operation,
     ).allow:
@@ -1231,7 +1184,6 @@ def _select_process_target(
                 continue
             record = ("user_files", target, "user_files", "")
             return _finish(record, target, scoped_allowed=[*allowed, ("user_files", target)])
-
     raise ValueError("cwd is outside allowed roots")
 
 
@@ -1244,32 +1196,14 @@ def resolve_shell_cwd(
     skill_name: str = "",
 ) -> tuple[pathlib.Path, str, list[tuple[str, pathlib.Path]]]:
     """Compatibility projection of the process target selector."""
-
     root, _base, target, _source, _selected_name, allowed = _select_process_target(
-        ctx,
-        cwd,
-        operation,
-        bucket=bucket,
-        skill_name=skill_name,
-        materialize=True,
+        ctx, cwd, operation, bucket=bucket, skill_name=skill_name, materialize=True,
     )
     return target, root, allowed
 
 
 def canonical_data_root(ctx: Any) -> pathlib.Path:
-    """Canonical (parent/budget) data root for resources that exist only on the
-    real drive — installed skill payloads under ``data/skills/``.
-
-    Live subagents run on an isolated child drive
-    (``data/state/headless_tasks/<tid>/data``) that physically has no
-    ``skills/`` tree, so resolving ``root=skill_payload`` against
-    ``ctx.drive_root`` blinded every read-only scout with a bare
-    "Directory not found" (v6.70.0 granted the read/list/search verbs; this
-    supplies the matching path base). Precedence mirrors the existing
-    canonical-root consumers (``task_pacing``): task_metadata
-    ``budget_drive_root`` → ctx ``budget_drive_root`` → ``drive_root``.
-    For root tasks all three are the same directory, so behavior there is
-    unchanged; isolated benchmark roots keep their own canonical root."""
+    """Return canonical skill data: task budget → context budget → task drive."""
     metadata = getattr(ctx, "task_metadata", None)
     metadata = metadata if isinstance(metadata, dict) else {}
     for candidate in (metadata.get("budget_drive_root"), getattr(ctx, "budget_drive_root", "")):
@@ -1283,18 +1217,14 @@ def canonical_data_root(ctx: Any) -> pathlib.Path:
 def normalize_runtime_data_path(data_root: pathlib.Path, path: str) -> str:
     """Normalize historical runtime-data prefixes before physical binding."""
     norm = str(path or ".").strip().replace("\\", "/")
-    if norm.startswith("./"):
-        norm = norm[2:]
-    root_text = str(pathlib.Path(data_root)).rstrip("/")
-    root_without_lead = root_text.lstrip("/")
-    if root_without_lead and norm.lstrip("/").startswith(root_without_lead):
-        stripped = norm.lstrip("/")
-        return stripped[len(root_without_lead):].lstrip("/") or "."
-    if norm.startswith(".tmp-data-") or norm.lstrip("/").startswith(".tmp-data-"):
-        candidate = norm.lstrip("/")
-        first_slash = candidate.find("/")
-        if first_slash > 0:
-            after = candidate[first_slash + 1:]
+    norm = norm[2:] if norm.startswith("./") else norm
+    stripped = norm.lstrip("/")
+    root_text = str(pathlib.Path(data_root)).rstrip("/").lstrip("/")
+    if root_text and stripped.startswith(root_text):
+        return stripped[len(root_text):].lstrip("/") or "."
+    if stripped.startswith(".tmp-data-"):
+        _prefix, separator, after = stripped.partition("/")
+        if separator:
             return after[len("data/"):] if after.startswith("data/") else after
     return norm or "."
 
@@ -1302,7 +1232,6 @@ def normalize_runtime_data_path(data_root: pathlib.Path, path: str) -> str:
 def load_bound_skill(binding: ResolvedResourceBinding) -> Any:
     """Load the frozen payload target while preserving lifecycle provenance."""
     from ouroboros.skill_loader import _classify_skill_source, load_skill
-
     loaded = load_skill(binding.base_path, binding.state_drive_root)
     if loaded is not None:
         loaded.source = _classify_skill_source(
@@ -1314,24 +1243,7 @@ def load_bound_skill(binding: ResolvedResourceBinding) -> Any:
 
 
 def canonical_repo_relative_path(ctx: Any, root: str, path: str) -> str:
-    """Collapse a repo-lane path to the spelling its GUARDS must judge.
-
-    ``ToolContext.repo_path`` already runs ``normalize_root_relative``, so an
-    absolute path inside the root and a redundant root-basename prefix write to
-    the SAME file a bare relative path does. A guard that inspects the raw
-    spelling therefore desyncs from the operation: ``repo/BIBLE.md`` is not a
-    member of the protected-path table while ``BIBLE.md`` is.
-
-    ``write_file``/``edit_text`` are canonicalized once at dispatch
-    (``_normalize_dispatch_path_args``). Tools that carry paths INSIDE their
-    payload (``apply_patch``'s patch text, ``edit_batch``'s ``edits[]``) cannot
-    use that seam, so they call this instead — one shared normalization point is
-    what keeps a guard from desyncing from the write. Returns the input
-    unchanged for non-repo roots or when the root cannot be resolved: this only
-    ever shortens toward the root, so the caller's ``safe_relpath`` +
-    confinement check still rejects a genuine escape.
-    """
-
+    """Normalize repo paths so guards and mutations judge the same target."""
     if root not in {"active_workspace", "system_repo"}:
         return path
     try:
@@ -1354,13 +1266,11 @@ def _skill_payload_base(
     allow_missing: bool = False,
 ) -> tuple[pathlib.Path, str, str]:
     """Select one physical skill package without reading lifecycle state."""
-
     from ouroboros.skill_loader import (
         _sanitize_skill_name,
         _select_skill_location,
         _skill_location_inventory,
     )
-
     requested_location = str(location or "").strip().lower()
     allowed_locations = {"external", "clawhub", "ouroboroshub", "native", "user_repo"}
     canonical_name = _sanitize_skill_name(skill_name)

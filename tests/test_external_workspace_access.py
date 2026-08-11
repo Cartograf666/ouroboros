@@ -151,12 +151,13 @@ def test_shell_cwd_scratch_scoped_not_filesystem_root(tmp_path):
     assert str(scratch.resolve()) in roots
 
 
-def test_shell_cwd_runtime_is_rejected_in_external(tmp_path):
+def test_shell_cwd_data_is_rejected_but_system_is_explicit_in_external(tmp_path):
     ext = _ctx(tmp_path, mode="external")
     with pytest.raises(ValueError):
         resolve_shell_cwd(ext, str(tmp_path / "data"))  # parent data drive
-    with pytest.raises(ValueError):
-        resolve_shell_cwd(ext, str(tmp_path / "system"))  # system repo
+    work_dir, label, _allowed = resolve_shell_cwd(ext, str(tmp_path / "system"))
+    assert label == "system_repo"
+    assert work_dir == (tmp_path / "system").resolve()
 
 
 def test_external_shell_read_cannot_reach_runtime_or_secrets(tmp_path):

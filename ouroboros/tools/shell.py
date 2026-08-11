@@ -224,10 +224,23 @@ def _format_process_output(stdout: str, stderr: str, *, limit: int = 50_000) -> 
     return rendered
 
 
-def _allowed_output_roots(ctx: ToolContext, work_dir: pathlib.Path, cwd_root: str = "") -> list[tuple[str, pathlib.Path]]:
+def _allowed_output_roots(
+    ctx: ToolContext,
+    work_dir: pathlib.Path,
+    cwd_root: str = "",
+    binding: ResolvedResourceBinding | None = None,
+) -> list[tuple[str, pathlib.Path]]:
     roots: list[tuple[str, pathlib.Path]] = []
     root_label = str(cwd_root or "cwd").strip() or "cwd"
     roots.append((root_label, pathlib.Path(work_dir).resolve(strict=False)))
+    if binding is not None:
+        base = pathlib.Path(binding.base_path).resolve(strict=False)
+        if not any(
+            path_is_relative_to(base, existing)
+            and path_is_relative_to(existing, base)
+            for _, existing in roots
+        ):
+            roots.append((binding.root, base))
     profile = active_tool_profile(ctx)
     for label in ("task_drive", "artifact_store", "user_files"):
         # A user_files output is a deliverable the command produced, so that root
@@ -245,13 +258,21 @@ def _allowed_output_roots(ctx: ToolContext, work_dir: pathlib.Path, cwd_root: st
     return roots
 
 
-def _protected_output_source_reason(ctx: ToolContext, source: pathlib.Path, label: str, changed_paths: set[str]) -> str:
+def _protected_output_source_reason(
+    ctx: ToolContext,
+    source: pathlib.Path,
+    label: str,
+    changed_paths: set[str],
+    binding: ResolvedResourceBinding | None = None,
+) -> str:
     """Return a block reason for protected/control-plane output sources."""
 
     try:
         from ouroboros.protected_artifacts import block_reason_for_path
 
-        protected_artifact_reason = block_reason_for_path(ctx, source, "copy")
+        protected_artifact_reason = block_reason_for_path(
+            ctx, source, "copy", binding,
+        )
         if protected_artifact_reason:
             return protected_artifact_reason
     except Exception:
@@ -283,6 +304,12 @@ def _protected_output_source_reason(ctx: ToolContext, source: pathlib.Path, labe
     try:
         drive = pathlib.Path(getattr(ctx, "drive_root")).resolve(strict=False)
         if path_is_relative_to(source, drive):
+            if (
+                binding is not None
+                and binding.root == "skill_payload"
+                and path_is_relative_to(source, binding.base_path)
+            ):
+                return ""
             task_drive = resource_root_path(ctx, "task_drive")
             artifact_store = resource_root_path(ctx, "artifact_store")
             if not (path_is_relative_to(source, task_drive) or path_is_relative_to(source, artifact_store)):
@@ -310,6 +337,7 @@ def _resolve_declared_output(
     work_dir: pathlib.Path,
     cwd_root: str = "",
     changed_paths: set[str] | None = None,
+    binding: ResolvedResourceBinding | None = None,
 ) -> tuple[pathlib.Path | None, str]:
     text = str(raw_item or "").strip()
     if not text:
@@ -329,18 +357,23 @@ def _resolve_declared_output(
     else:
         source = (pathlib.Path(work_dir) / safe_relpath(text)).resolve(strict=False)
     changed = changed_paths or set()
-    for label, root in _allowed_output_roots(ctx, work_dir, cwd_root):
+    for label, root in _allowed_output_roots(ctx, work_dir, cwd_root, binding):
         if not path_is_relative_to(source, root):
             continue
         if label == "user_files":
             reason = user_files_path_block_reason(ctx, source)
             if reason:
                 return None, f"protected user_files output {text}: {reason}"
-        protected_reason = _protected_output_source_reason(ctx, source, label, changed)
+        protected_reason = _protected_output_source_reason(
+            ctx, source, label, changed, binding,
+        )
         if protected_reason:
             return None, protected_reason
         return source, ""
-    allowed = ", ".join(f"{label}={root}" for label, root in _allowed_output_roots(ctx, work_dir, cwd_root))
+    allowed = ", ".join(
+        f"{label}={root}"
+        for label, root in _allowed_output_roots(ctx, work_dir, cwd_root, binding)
+    )
     return None, f"output escapes allowed artifact roots: {text}; allowed_roots: {allowed}"
 
 
@@ -403,6 +436,7 @@ def _snapshot_declared_outputs(
     work_dir: pathlib.Path,
     cwd_root: str = "",
     changed_paths: set[str] | None = None,
+    binding: ResolvedResourceBinding | None = None,
 ) -> Dict[str, tuple[bool, int, str]]:
     snapshots: Dict[str, tuple[bool, int, str]] = {}
     for raw_item in outputs or []:
@@ -412,6 +446,7 @@ def _snapshot_declared_outputs(
             work_dir,
             cwd_root=cwd_root,
             changed_paths=changed_paths,
+            binding=binding,
         )
         if source is not None and not block_reason:
             snapshots[str(source)] = _fingerprint_output(source)
@@ -424,6 +459,7 @@ def _scan_directory_output_members(
     *,
     label: str,
     changed_paths: set[str],
+    binding: ResolvedResourceBinding | None = None,
 ) -> tuple[list[pathlib.Path], int, str]:
     root = pathlib.Path(source).resolve(strict=False)
     members: list[pathlib.Path] = []
@@ -446,7 +482,9 @@ def _scan_directory_output_members(
             component_reason = _sensitive_output_component_reason(rel_parts)
             if component_reason:
                 return [], dir_size, f"{child}: {component_reason}"
-            reason = _protected_output_source_reason(ctx, child.resolve(strict=False), label, changed_paths)
+            reason = _protected_output_source_reason(
+                ctx, child.resolve(strict=False), label, changed_paths, binding,
+            )
             if reason:
                 return [], dir_size, f"{child}: {reason}"
             if len(members) > _OUTPUT_DIR_MAX_FILES:
@@ -465,6 +503,7 @@ def _register_process_outputs(
     cwd_root: str = "",
     changed_paths: set[str] | None = None,
     before_outputs: Dict[str, tuple[bool, int, str]] | None = None,
+    binding: ResolvedResourceBinding | None = None,
 ) -> tuple[str, bool]:
     """Copy declared command outputs into the task artifact store."""
 
@@ -481,6 +520,7 @@ def _register_process_outputs(
             work_dir,
             cwd_root=cwd_root,
             changed_paths=changed_paths,
+            binding=binding,
         )
         if block_reason:
             notes.append(block_reason)
@@ -526,6 +566,7 @@ def _register_process_outputs(
                 source,
                 label=str(cwd_root or "cwd"),
                 changed_paths=changed_paths or set(),
+                binding=binding,
             )
             if blocked_member:
                 notes.append(f"blocked directory output: {blocked_member}")
@@ -1158,6 +1199,7 @@ def _run_shell(
         pathlib.Path(work_dir),
         cwd_root=cwd_root,
         changed_paths=set(before_changed or []),
+        binding=binding,
     )
 
     # Scratch is confined/new/untracked, patch-excluded, and never an artifact.
@@ -1222,6 +1264,7 @@ def _run_shell(
             cwd_root=cwd_root,
             changed_paths=set(after_changed or []),
             before_outputs=before_outputs,
+            binding=binding,
         )
         audit_note = ""
         if cwd_root == "user_files" and not outputs:

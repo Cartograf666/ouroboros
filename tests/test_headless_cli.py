@@ -793,7 +793,7 @@ def test_effective_task_result_preserves_parent_terminal_status(tmp_path, status
     assert payload["ts"] == "2026-01-01T00:00:02Z"
 
 
-def test_workspace_context_routes_repo_tools_and_blocks_self_commit(tmp_path):
+def test_workspace_context_routes_project_files_and_keeps_system_tools_reachable(tmp_path):
     system_repo = tmp_path / "system"
     workspace = tmp_path / "workspace"
     data = tmp_path / "data"
@@ -814,10 +814,10 @@ def test_workspace_context_routes_repo_tools_and_blocks_self_commit(tmp_path):
     assert "workspace" in _repo_read(ctx, "README.md")
     registry = ToolRegistry(repo_dir=system_repo, drive_root=data)
     registry.set_context(ctx)
-    assert "WORKSPACE_MODE_BLOCKED" in registry.execute("commit_reviewed", {"commit_message": "nope"})
-    assert registry.get_schema_by_name("commit_reviewed") is None
-    assert registry.get_schema_by_name("request_restart") is None
-    assert "WORKSPACE_MODE_BLOCKED" in registry.execute("request_restart", {"reason": "nope"})
+    commit_result = registry.execute("commit_reviewed", {"commit_message": "nope"})
+    assert "WORKSPACE_MODE_BLOCKED" not in commit_result
+    assert registry.get_schema_by_name("commit_reviewed") is not None
+    assert registry.get_schema_by_name("request_restart") is not None
     assert "Written" in registry.execute("write_file", {"path": "BIBLE.md", "content": "external edit"})
     assert (workspace / "BIBLE.md").read_text(encoding="utf-8") == "external edit"
     replaced = registry.execute(
@@ -828,10 +828,10 @@ def test_workspace_context_routes_repo_tools_and_blocks_self_commit(tmp_path):
     assert (workspace / "README.md").read_text(encoding="utf-8") == "workspace edited"
 
 
-def test_workspace_run_shell_cwd_allows_scratch_blocks_runtime(tmp_path, monkeypatch):
+def test_workspace_run_shell_cwd_allows_scratch_and_explicit_system(tmp_path, monkeypatch):
     """External-workspace tasks may run from host scratch (a sibling checkout, a
-    /tmp tree); only the Ouroboros runtime (system repo + data drive) stays
-    off-limits as a working directory, and runtime writes remain blocked."""
+    /tmp tree) and explicitly select the system repo; generic runtime data stays
+    off-limits and system-repo mutation remains independently governed."""
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     # Pin $HOME outside tmp_path so the host-scratch cwd allowance holds on Windows
     # CI too (where pytest's tmp dir lives UNDER home and the data-parent-under-home
@@ -858,9 +858,11 @@ def test_workspace_run_shell_cwd_allows_scratch_blocks_runtime(tmp_path, monkeyp
     # Host scratch outside the declared workspace is now a legitimate cwd...
     scratch_cwd = registry.execute("run_command", {"cmd": ["pwd"], "cwd": str(outside)})
     assert "SHELL_CWD_BLOCKED" not in scratch_cwd
-    # ...but the Ouroboros runtime (system repo + data drive) is never a cwd.
+    # The approved root contract makes system_repo an explicit cwd; generic
+    # runtime_data remains unavailable to process tools.
     runtime_repo_cwd = registry.execute("run_command", {"cmd": ["pwd"], "cwd": str(system_repo)})
-    assert "SHELL_CWD_BLOCKED" in runtime_repo_cwd
+    assert "SHELL_CWD_BLOCKED" not in runtime_repo_cwd
+    assert f"cwd={system_repo.resolve()}" in runtime_repo_cwd
     runtime_data_cwd = registry.execute("run_command", {"cmd": ["pwd"], "cwd": str(data)})
     assert "SHELL_CWD_BLOCKED" in runtime_data_cwd
     # READ-ONLY git at a runtime target is ALLOWED (owner contract "read-only

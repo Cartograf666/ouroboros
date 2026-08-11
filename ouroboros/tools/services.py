@@ -23,7 +23,9 @@ from ouroboros.platform_layer import (
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.tool_access import (
     ResolvedResourceBinding,
+    active_tool_profile,
     build_resolved_resource_binding,
+    canonical_data_root,
     shell_cwd_block_message,
 )
 from ouroboros.utils import append_jsonl, utc_now_iso
@@ -80,6 +82,31 @@ def task_service_teardown(ctx: ToolContext) -> str:
     if isinstance(meta, dict) and str(meta.get("service_teardown") or "").strip().lower() == "keep":
         return "keep"
     return "stop"
+
+
+def _service_output_binding(
+    ctx: ToolContext,
+    *,
+    cwd_root: str,
+    cwd_base: str,
+    cwd: str,
+    cwd_source: str,
+    skill_name: str,
+) -> ResolvedResourceBinding | None:
+    """Rehydrate the exact stored target identity without resolving it again."""
+
+    if not str(cwd_base or "").strip() or not str(cwd or "").strip():
+        return None
+    return ResolvedResourceBinding(
+        profile=active_tool_profile(ctx),
+        root=str(cwd_root or "active_workspace"),
+        operation="service",
+        base_path=pathlib.Path(cwd_base).resolve(strict=False),
+        target_path=pathlib.Path(cwd).resolve(strict=False),
+        source=str(cwd_source or cwd_root or "active_workspace"),
+        skill_name=str(skill_name or ""),
+        state_drive_root=canonical_data_root(ctx),
+    )
 
 
 def _executor_can_run_cwd(ctx: ToolContext, workdir: pathlib.Path) -> bool:
@@ -389,7 +416,9 @@ def _start_service(
     try:
         from ouroboros.tools.shell import _snapshot_declared_outputs
 
-        before_outputs = _snapshot_declared_outputs(ctx, declared_outputs, workdir, cwd_root=cwd_root)
+        before_outputs = _snapshot_declared_outputs(
+            ctx, declared_outputs, workdir, cwd_root=cwd_root, binding=binding,
+        )
     except Exception:
         before_outputs = {}
     # Resolve the effective keep BEFORE choosing a backend: a task-level
@@ -602,12 +631,21 @@ def _stop_service(ctx: ToolContext, name: str = "service") -> str:
             try:
                 from ouroboros.tools.shell import _register_process_outputs
 
+                output_binding = _service_output_binding(
+                    ctx,
+                    cwd_root=record.cwd_root,
+                    cwd_base=record.cwd_base,
+                    cwd=record.cwd,
+                    cwd_source=record.cwd_source,
+                    skill_name=record.skill_name,
+                )
                 artifact_note, artifact_failed = _register_process_outputs(
                     ctx,
                     record.outputs,
                     pathlib.Path(record.cwd),
                     cwd_root=record.cwd_root,
                     before_outputs=record.before_outputs,
+                    binding=output_binding,
                 )
             except Exception as exc:
                 artifact_note = f"\n\n⚠️ ARTIFACT_OUTPUT_ERROR:\n- service output finalization failed: {type(exc).__name__}: {exc}"
@@ -638,12 +676,21 @@ def _stop_service(ctx: ToolContext, name: str = "service") -> str:
             try:
                 from ouroboros.tools.shell import _register_process_outputs
 
+                output_binding = _service_output_binding(
+                    ctx,
+                    cwd_root=str(payload.get("cwd_root") or ""),
+                    cwd_base=str(payload.get("cwd_base") or ""),
+                    cwd=str(payload.get("host_cwd") or ""),
+                    cwd_source=str(payload.get("cwd_source") or ""),
+                    skill_name=str(payload.get("skill_name") or ""),
+                )
                 artifact_note, artifact_failed = _register_process_outputs(
                     ctx,
                     [str(item) for item in (payload.get("outputs") or [])],
                     pathlib.Path(str(payload.get("host_cwd") or ".")),
                     cwd_root=str(payload.get("cwd_root") or ""),
                     before_outputs=before_outputs if isinstance(before_outputs, dict) else None,
+                    binding=output_binding,
                 )
             except Exception as exc:
                 artifact_note = f"\n\n⚠️ ARTIFACT_OUTPUT_ERROR:\n- executor service output finalization failed: {type(exc).__name__}: {exc}"
