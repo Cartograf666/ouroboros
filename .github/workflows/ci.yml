@@ -52,6 +52,12 @@ on:
   pull_request:
     branches: [ouroboros]
   workflow_dispatch:
+    inputs:
+      appimage_cleanup_diagnostic:
+        description: "Run only the temporary v6.97.1 AppImage cleanup diagnostic"
+        required: false
+        default: false
+        type: boolean
 
 # Note: GitHub Actions evaluates `branches` + `paths` together but `tags`
 # separately — a tag push matching `v*` will trigger regardless of paths.
@@ -62,6 +68,223 @@ permissions:
   contents: read
 
 jobs:
+  # Temporary owner-authorized diagnostic. This job is confined to the
+  # diagnostic branch and checks out the immutable v6.97.1 commit before
+  # building, so none of the instrumentation enters the product artifact.
+  appimage-cleanup-diagnostic:
+    if: github.event_name == 'workflow_dispatch' && inputs.appimage_cleanup_diagnostic
+    runs-on: ubuntu-latest
+    env:
+      OUROBOROS_MANAGED_SOURCE_BRANCH: ouroboros
+      OUROBOROS_RELEASE_TAG: v6.97.1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: bd8338490fa33853a0df08037cb5aa9feff2a158
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Confirm immutable diagnostic subject
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "bd8338490fa33853a0df08037cb5aa9feff2a158"
+          test "$(git rev-parse 'v6.97.1^{}')" = "bd8338490fa33853a0df08037cb5aa9feff2a158"
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - uses: ./.github/actions/setup-python-env
+        with:
+          profile: build
+      - name: Build exact v6.97.1 Linux artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/download_python_standalone.sh
+          bash build_linux.sh
+      - name: Capture AppImage cleanup lifecycle evidence
+        id: diagnostic
+        shell: bash
+        run: |
+          set +e
+          (
+            set -euo pipefail
+            VERSION="$(tr -d '[:space:]' < VERSION)"
+            APPIMAGE="$PWD/dist/Ouroboros-${VERSION}-linux-x86_64.AppImage"
+            EVIDENCE="$RUNNER_TEMP/appimage-cleanup-evidence"
+            EXTRACT_ROOT="$RUNNER_TEMP/ouroboros-appimage-diagnostic"
+            HOME_DIR="$RUNNER_TEMP/ouroboros-appimage-diagnostic-home"
+            APP_ROOT="$HOME_DIR/Ouroboros"
+            DATA_DIR="$APP_ROOT/data"
+            PID_FILE="$APP_ROOT/ouroboros.pid"
+            PORT_FILE="$DATA_DIR/state/server_port"
+            CLI_LOG="$EVIDENCE/cli.log"
+            LAUNCHER_PID=""
+            APPIMAGE_RUNTIME_PID=""
+            PRIVATE_BASE=""
+
+            mkdir -p "$EVIDENCE" "$EXTRACT_ROOT" "$HOME_DIR" "$DATA_DIR"
+            cleanup_diagnostic() {
+              if [ -n "${LAUNCHER_PID:-}" ]; then
+                kill -TERM "$LAUNCHER_PID" 2>/dev/null || true
+              elif [ -s "$PID_FILE" ]; then
+                kill -TERM "$(tr -d '[:space:]' < "$PID_FILE")" 2>/dev/null || true
+              fi
+              if [ -n "${PRIVATE_BASE:-}" ]; then
+                case "$PRIVATE_BASE" in
+                  /tmp/ouroboros-appimage-runtime-*|"$RUNNER_TEMP"/ouroboros-appimage-runtime-*)
+                    rm -rf -- "$PRIVATE_BASE" || true
+                    ;;
+                esac
+              fi
+            }
+            trap cleanup_diagnostic EXIT
+
+            {
+              echo "subject_sha=$(git rev-parse HEAD)"
+              echo "subject_tree=$(git rev-parse HEAD^{tree})"
+              echo "tag_object=$(git rev-parse v6.97.1)"
+              echo "tag_target=$(git rev-parse 'v6.97.1^{}')"
+              echo "runner_image=${ImageOS:-unknown}-${ImageVersion:-unknown}"
+              echo "kernel=$(uname -a)"
+              echo "glibc=$(ldd --version | head -1)"
+              echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            } > "$EVIDENCE/identity.txt"
+
+            test -x "$APPIMAGE"
+            (cd "$EXTRACT_ROOT" && "$APPIMAGE" --appimage-extract >/dev/null)
+            APPDIR="$EXTRACT_ROOT/squashfs-root"
+            test -x "$APPDIR/AppRun"
+
+            set +e
+            env -u DISPLAY -u WAYLAND_DISPLAY \
+              HOME="$HOME_DIR" XDG_CACHE_HOME="$HOME_DIR/.cache" BROWSER=/bin/true \
+              OPENROUTER_API_KEY=ci-placeholder OUROBOROS_MAX_WORKERS=1 \
+              APPIMAGE_EXTRACT_AND_RUN=1 \
+              "$APPIMAGE" --cli run --start --detach >"$CLI_LOG" 2>&1
+            CLI_RC=$?
+            set -e
+            echo "cli_rc=$CLI_RC" >> "$EVIDENCE/identity.txt"
+
+            READY=false
+            for _ in $(seq 1 180); do
+              if [ -s "$PID_FILE" ] && [ -s "$PORT_FILE" ]; then
+                PORT="$(tr -d '[:space:]' < "$PORT_FILE")"
+                if curl --fail --silent "http://127.0.0.1:$PORT/api/health" >/dev/null; then
+                  READY=true
+                  break
+                fi
+              fi
+              sleep 0.5
+            done
+            echo "gateway_ready=$READY" >> "$EVIDENCE/identity.txt"
+            test "$READY" = true
+
+            LAUNCHER_PID="$(tr -d '[:space:]' < "$PID_FILE")"
+            LAUNCHER_EXE="$(readlink "/proc/$LAUNCHER_PID/exe")"
+            APPIMAGE_RUNTIME_ROOT="${LAUNCHER_EXE%/usr/lib/ouroboros/Ouroboros}"
+            PRIVATE_BASE="$(dirname "$APPIMAGE_RUNTIME_ROOT")"
+            APPIMAGE_RUNTIME_PID="$(ps -o ppid= -p "$LAUNCHER_PID" | tr -d '[:space:]')"
+            case "$PRIVATE_BASE" in
+              /tmp/ouroboros-appimage-runtime-*|"$RUNNER_TEMP"/ouroboros-appimage-runtime-*) ;;
+              *) echo "unsafe private base: $PRIVATE_BASE" >&2; exit 20 ;;
+            esac
+            test "$(readlink "/proc/$APPIMAGE_RUNTIME_PID/exe")" = "$APPIMAGE"
+
+            {
+              echo "launcher_pid=$LAUNCHER_PID"
+              echo "launcher_exe=$LAUNCHER_EXE"
+              echo "runtime_pid=$APPIMAGE_RUNTIME_PID"
+              echo "runtime_root=$APPIMAGE_RUNTIME_ROOT"
+              echo "private_base=$PRIVATE_BASE"
+              echo "private_base_initial_bytes=$(du -sb "$PRIVATE_BASE" | cut -f1)"
+            } >> "$EVIDENCE/identity.txt"
+            tr '\0' '\n' < "/proc/$APPIMAGE_RUNTIME_PID/environ" \
+              | grep -E '^(APPIMAGE|APPDIR|TMPDIR|NO_CLEANUP|OUROBOROS_APPIMAGE)' \
+              > "$EVIDENCE/runtime-environment.txt" || true
+            ps -eo pid,ppid,pgid,sid,stat,lstart,cmd --forest > "$EVIDENCE/processes-before-stop.txt"
+            cp "/proc/$APPIMAGE_RUNTIME_PID/status" "$EVIDENCE/runtime-status-before-stop.txt"
+
+            kill -TERM "$LAUNCHER_PID"
+            for _ in $(seq 1 120); do
+              ! kill -0 "$LAUNCHER_PID" 2>/dev/null && break
+              sleep 0.5
+            done
+            LAUNCHER_GONE=true
+            kill -0 "$LAUNCHER_PID" 2>/dev/null && LAUNCHER_GONE=false
+            echo "launcher_gone=$LAUNCHER_GONE" >> "$EVIDENCE/identity.txt"
+
+            for _ in $(seq 1 240); do
+              ! kill -0 "$APPIMAGE_RUNTIME_PID" 2>/dev/null && break
+              sleep 0.5
+            done
+            RUNTIME_GONE=true
+            kill -0 "$APPIMAGE_RUNTIME_PID" 2>/dev/null && RUNTIME_GONE=false
+            echo "runtime_gone=$RUNTIME_GONE" >> "$EVIDENCE/identity.txt"
+            echo "runtime_finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$EVIDENCE/identity.txt"
+            sleep 2
+
+            ps -eo pid,ppid,pgid,sid,stat,lstart,cmd --forest > "$EVIDENCE/processes-after-stop.txt"
+            {
+              echo "runtime_root_exists_after_exit=$([ -e "$APPIMAGE_RUNTIME_ROOT" ] && echo true || echo false)"
+              echo "private_base_exists_after_exit=$([ -e "$PRIVATE_BASE" ] && echo true || echo false)"
+              if [ -e "$PRIVATE_BASE" ]; then
+                echo "private_base_residual_bytes=$(du -sb "$PRIVATE_BASE" | cut -f1)"
+                echo "private_base_residual_entries=$(find "$PRIVATE_BASE" -xdev | wc -l | tr -d ' ')"
+              fi
+            } >> "$EVIDENCE/identity.txt"
+
+            if [ -e "$PRIVATE_BASE" ]; then
+              stat "$PRIVATE_BASE" "$APPIMAGE_RUNTIME_ROOT" > "$EVIDENCE/residue-stat.txt" 2>&1 || true
+              find "$PRIVATE_BASE" -xdev \
+                -printf '%y\t%m\t%u\t%g\t%s\t%p\n' \
+                > "$EVIDENCE/residue-manifest.tsv" 2>&1 || true
+              timeout 30s lsof +D "$PRIVATE_BASE" > "$EVIDENCE/residue-lsof.txt" 2>&1 || true
+              fuser -vm "$PRIVATE_BASE" > "$EVIDENCE/residue-fuser.txt" 2>&1 || true
+              findmnt --target "$APPIMAGE_RUNTIME_ROOT" > "$EVIDENCE/residue-findmnt.txt" 2>&1 || true
+            fi
+
+            set +e
+            CLEANUP_STARTED="$(date +%s%N)"
+            rm -rf -- "$PRIVATE_BASE" 2> "$EVIDENCE/plain-rm-stderr.txt"
+            PLAIN_RM_RC=$?
+            CLEANUP_FINISHED="$(date +%s%N)"
+            set -e
+            {
+              echo "plain_rm_rc=$PLAIN_RM_RC"
+              echo "plain_rm_elapsed_ns=$((CLEANUP_FINISHED - CLEANUP_STARTED))"
+              echo "private_base_exists_after_plain_rm=$([ -e "$PRIVATE_BASE" ] && echo true || echo false)"
+            } >> "$EVIDENCE/identity.txt"
+
+            if [ -e "$PRIVATE_BASE" ]; then
+              set +e
+              chmod -R u+w "$PRIVATE_BASE" 2> "$EVIDENCE/chmod-stderr.txt"
+              CHMOD_RC=$?
+              rm -rf -- "$PRIVATE_BASE" 2> "$EVIDENCE/retry-rm-stderr.txt"
+              RETRY_RM_RC=$?
+              set -e
+              {
+                echo "chmod_rc=$CHMOD_RC"
+                echo "retry_rm_rc=$RETRY_RM_RC"
+                echo "private_base_exists_after_retry_rm=$([ -e "$PRIVATE_BASE" ] && echo true || echo false)"
+              } >> "$EVIDENCE/identity.txt"
+            fi
+
+            cat "$CLI_LOG"
+            cat "$EVIDENCE/identity.txt"
+            trap - EXIT
+          )
+          DIAGNOSTIC_RC=$?
+          set -e
+          mkdir -p "$RUNNER_TEMP/appimage-cleanup-evidence"
+          echo "diagnostic_script_rc=$DIAGNOSTIC_RC" | tee -a "$RUNNER_TEMP/appimage-cleanup-evidence/identity.txt"
+          exit 0
+      - name: Upload AppImage cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: appimage-cleanup-evidence
+          path: ${{ runner.temp }}/appimage-cleanup-evidence
+          if-no-files-found: error
+          retention-days: 7
+
   # ──────────────────────────────────────────────────────────────────
   # Tier 1: Quick tests on Ubuntu (push to ouroboros or PR targeting it)
   # ──────────────────────────────────────────────────────────────────
@@ -114,7 +337,7 @@ jobs:
   full-test:
     if: |
       github.ref == 'refs/heads/ouroboros-stable'
-      || github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'workflow_dispatch' && inputs.appimage_cleanup_diagnostic != true)
       || startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
@@ -151,7 +374,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────
   integration-test:
     if: |
-      github.event_name == 'workflow_dispatch'
+      (github.event_name == 'workflow_dispatch' && inputs.appimage_cleanup_diagnostic != true)
       || github.ref == 'refs/heads/main'
       || github.ref == 'refs/heads/ouroboros'
       || github.ref == 'refs/heads/ouroboros-stable'
@@ -206,7 +429,7 @@ jobs:
   skill-smoke:
     if: |
       github.ref == 'refs/heads/ouroboros-stable'
-      || github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'workflow_dispatch' && inputs.appimage_cleanup_diagnostic != true)
       || startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
@@ -255,7 +478,7 @@ jobs:
 
   marker-guards:
     if: |
-      github.event_name == 'workflow_dispatch'
+      (github.event_name == 'workflow_dispatch' && inputs.appimage_cleanup_diagnostic != true)
       || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -296,7 +519,7 @@ jobs:
 
   ui-smoke:
     if: |
-      github.event_name == 'workflow_dispatch'
+      (github.event_name == 'workflow_dispatch' && inputs.appimage_cleanup_diagnostic != true)
       || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -315,7 +538,7 @@ jobs:
 
   docker-ui-smoke:
     if: |
-      github.event_name == 'workflow_dispatch'
+      (github.event_name == 'workflow_dispatch' && inputs.appimage_cleanup_diagnostic != true)
       || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -339,7 +562,7 @@ jobs:
 
   docker-portable-test:
     if: |
-      github.event_name == 'workflow_dispatch'
+      (github.event_name == 'workflow_dispatch' && inputs.appimage_cleanup_diagnostic != true)
       || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
