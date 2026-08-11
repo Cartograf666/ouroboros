@@ -86,6 +86,45 @@ def test_apprun_exposes_cli_without_writing_to_the_mount(tmp_path: pathlib.Path)
     assert result.stdout.strip() == str(appdir / "usr/lib/ouroboros/_internal")
 
 
+@pytest.mark.parametrize("original_tmpdir", [None, "/caller/tmp"])
+def test_apprun_restores_tmpdir_before_payload(tmp_path: pathlib.Path, original_tmpdir: str | None):
+    appdir = tmp_path / "AppDir"
+    cli = appdir / "usr/lib/ouroboros/bin/ouroboros"
+    cli.parent.mkdir(parents=True)
+    cli.write_text(
+        "#!/bin/sh\n"
+        "if [ \"${TMPDIR+x}\" = x ]; then printf 'set:%s\\n' \"$TMPDIR\"; else printf 'unset\\n'; fi\n"
+        "if env | grep -q '^OUROBOROS_APPIMAGE_'; then exit 9; fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    cli.chmod(0o755)
+    launcher = appdir / "usr/lib/ouroboros/Ouroboros"
+    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    apprun = appdir / "AppRun"
+    apprun.write_bytes((REPO / "packaging/appimage/AppRun").read_bytes())
+    apprun.chmod(0o755)
+    env = {
+        **os.environ,
+        "APPDIR": str(appdir),
+        "TMPDIR": "/private/extraction",
+        "OUROBOROS_APPIMAGE_RESTORE_TMPDIR": "1",
+        "OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR_SET": "1" if original_tmpdir is not None else "0",
+        "OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR": original_tmpdir or "",
+    }
+
+    result = subprocess.run(
+        [str(apprun), "--cli", "--help"],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.strip() == (f"set:{original_tmpdir}" if original_tmpdir is not None else "unset")
+
+
 def test_appimage_builder_pins_tool_and_embedded_runtime():
     script = (REPO / "scripts/build_appimage.sh").read_text(encoding="utf-8")
 

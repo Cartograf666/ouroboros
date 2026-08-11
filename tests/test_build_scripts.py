@@ -605,6 +605,11 @@ def test_uv_project_commands_validate_lock_freshness(path):
     assert all("--frozen" not in command for command in commands), commands
 
 
+def test_generated_runtime_lock_keeps_lf_on_windows():
+    attributes = _read(".gitattributes").splitlines()
+    assert "requirements-runtime.lock text eol=lf" in attributes
+
+
 # ---------------------------------------------------------------------------
 # scripts/build_repo_bundle.py  (release tag SSOT)
 # ---------------------------------------------------------------------------
@@ -630,6 +635,12 @@ class TestRepoBundleReleaseTagGuard:
         assert '"rev-parse", "HEAD"' in src
         assert '"rev-list", "-1"' in src
         assert "does not point at HEAD" in src
+
+    def test_dirty_tree_refusal_reports_the_offending_paths(self):
+        src = _read("scripts/build_repo_bundle.py")
+        assert '"status", "--porcelain"' in src
+        assert '"Commit or stash changes first so the embedded managed repo matches the packaged code.\\n"' in src
+        assert "+ status" in src
 
 
 # ---------------------------------------------------------------------------

@@ -69,6 +69,120 @@ def test_packaged_cli_linux_relaunches_outer_appimage(tmp_path, monkeypatch):
     assert packaged_cli._desktop_app_path(bundle_root) == appimage
 
 
+def test_packaged_cli_linux_extract_relaunch_uses_private_temp_base(tmp_path, monkeypatch):
+    from ouroboros import packaged_cli
+
+    appimage = tmp_path / "Ouroboros.AppImage"
+    appimage.write_bytes(b"appimage")
+    private_tmp = tmp_path / "private-runtime"
+    original_tmp = tmp_path / "caller-tmp"
+    runtime = packaged_cli.PackagedRuntime(
+        bundle_root=tmp_path / "mount/usr/lib/ouroboros/_internal",
+        embedded_python=tmp_path / "python",
+        app_root=tmp_path / "home/Ouroboros",
+        repo_dir=tmp_path / "home/Ouroboros/repo",
+        data_dir=tmp_path / "home/Ouroboros/data",
+        app_version="6.97.0",
+    )
+    launched = {}
+
+    monkeypatch.setattr(packaged_cli, "IS_MACOS", False)
+    monkeypatch.setattr(packaged_cli, "IS_WINDOWS", False)
+    monkeypatch.setenv("APPIMAGE", str(appimage))
+    monkeypatch.setenv("APPIMAGE_EXTRACT_AND_RUN", "1")
+    monkeypatch.setenv("TMPDIR", str(original_tmp))
+    monkeypatch.setattr(packaged_cli.tempfile, "mkdtemp", lambda **_kwargs: str(private_tmp))
+    monkeypatch.setattr(
+        packaged_cli.subprocess,
+        "Popen",
+        lambda args, **kwargs: launched.update(args=args, kwargs=kwargs),
+    )
+
+    packaged_cli._launch_desktop_app(runtime)
+
+    child_env = launched["kwargs"]["env"]
+    assert launched["args"] == [str(appimage)]
+    assert child_env["TMPDIR"] == str(private_tmp)
+    assert child_env["APPIMAGE_EXTRACT_AND_RUN"] == "1"
+    assert child_env["OUROBOROS_APPIMAGE_RESTORE_TMPDIR"] == "1"
+    assert child_env["OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR_SET"] == "1"
+    assert child_env["OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR"] == str(original_tmp)
+    assert os.environ["TMPDIR"] == str(original_tmp)
+
+
+def test_packaged_cli_explicit_extract_flag_is_carried_to_relaunch(tmp_path, monkeypatch):
+    from ouroboros import packaged_cli
+
+    appimage = tmp_path / "Ouroboros.AppImage"
+    appimage.write_bytes(b"appimage")
+    extracted_appdir = tmp_path / "appimage-extracted"
+    extracted_appdir.mkdir()
+    private_tmp = tmp_path / "private-runtime"
+    runtime = packaged_cli.PackagedRuntime(
+        bundle_root=extracted_appdir / "usr/lib/ouroboros/_internal",
+        embedded_python=tmp_path / "python",
+        app_root=tmp_path / "home/Ouroboros",
+        repo_dir=tmp_path / "home/Ouroboros/repo",
+        data_dir=tmp_path / "home/Ouroboros/data",
+        app_version="6.97.0",
+    )
+    launched = {}
+
+    monkeypatch.setattr(packaged_cli, "IS_MACOS", False)
+    monkeypatch.setattr(packaged_cli, "IS_WINDOWS", False)
+    monkeypatch.setenv("APPIMAGE", str(appimage))
+    monkeypatch.setenv("APPDIR", str(extracted_appdir))
+    monkeypatch.delenv("APPIMAGE_EXTRACT_AND_RUN", raising=False)
+    monkeypatch.setattr(packaged_cli.os.path, "ismount", lambda _path: False)
+    monkeypatch.setattr(packaged_cli.tempfile, "mkdtemp", lambda **_kwargs: str(private_tmp))
+    monkeypatch.setattr(
+        packaged_cli.subprocess,
+        "Popen",
+        lambda args, **kwargs: launched.update(args=args, kwargs=kwargs),
+    )
+
+    packaged_cli._launch_desktop_app(runtime)
+
+    child_env = launched["kwargs"]["env"]
+    assert child_env["APPIMAGE_EXTRACT_AND_RUN"] == "1"
+    assert child_env["TMPDIR"] == str(private_tmp)
+
+
+def test_packaged_cli_normal_linux_relaunch_keeps_process_environment(tmp_path, monkeypatch):
+    from ouroboros import packaged_cli
+
+    appimage = tmp_path / "Ouroboros.AppImage"
+    appimage.write_bytes(b"appimage")
+    runtime = packaged_cli.PackagedRuntime(
+        bundle_root=tmp_path / "mount/usr/lib/ouroboros/_internal",
+        embedded_python=tmp_path / "python",
+        app_root=tmp_path / "home/Ouroboros",
+        repo_dir=tmp_path / "home/Ouroboros/repo",
+        data_dir=tmp_path / "home/Ouroboros/data",
+        app_version="6.97.0",
+    )
+    launched = {}
+
+    monkeypatch.setattr(packaged_cli, "IS_MACOS", False)
+    monkeypatch.setattr(packaged_cli, "IS_WINDOWS", False)
+    monkeypatch.setenv("APPIMAGE", str(appimage))
+    mounted_appdir = tmp_path / "mount"
+    mounted_appdir.mkdir()
+    monkeypatch.setenv("APPDIR", str(mounted_appdir))
+    monkeypatch.delenv("APPIMAGE_EXTRACT_AND_RUN", raising=False)
+    monkeypatch.setattr(packaged_cli.os.path, "ismount", lambda _path: True)
+    monkeypatch.setattr(
+        packaged_cli.subprocess,
+        "Popen",
+        lambda args, **kwargs: launched.update(args=args, kwargs=kwargs),
+    )
+
+    packaged_cli._launch_desktop_app(runtime)
+
+    assert launched["args"] == [str(appimage)]
+    assert "env" not in launched["kwargs"]
+
+
 def test_packaged_cli_does_not_treat_prompt_start_text_as_option(tmp_path, monkeypatch):
     from ouroboros import packaged_cli
 

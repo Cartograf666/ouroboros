@@ -12,6 +12,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -397,7 +398,40 @@ def _launch_desktop_app(runtime: PackagedRuntime) -> None:
     elif IS_WINDOWS:
         subprocess.Popen([str(app)], cwd=str(app.parent))
     else:
-        subprocess.Popen([str(app)], cwd=str(app.parent))
+        relaunch_env = _linux_appimage_relaunch_env(app)
+        if relaunch_env is None:
+            subprocess.Popen([str(app)], cwd=str(app.parent))
+        else:
+            subprocess.Popen([str(app)], cwd=str(app.parent), env=relaunch_env)
+
+
+def _linux_appimage_relaunch_env(app: pathlib.Path) -> dict[str, str] | None:
+    """Give a nested extract-and-run AppImage its own extraction namespace."""
+    if IS_MACOS or IS_WINDOWS:
+        return None
+    appimage = os.environ.get("APPIMAGE", "").strip()
+    if not appimage or pathlib.Path(appimage) != app:
+        return None
+    appdir = os.environ.get("APPDIR", "").strip()
+    extract_and_run = "APPIMAGE_EXTRACT_AND_RUN" in os.environ
+    if not extract_and_run and appdir:
+        # The type-2 runtime removes the explicit --appimage-extract-and-run
+        # argument before execing AppRun. Its APPDIR is then a regular directory;
+        # a normal FUSE-backed APPDIR is a mount point.
+        extract_and_run = not os.path.ismount(appdir)
+    if not extract_and_run:
+        return None
+
+    env = os.environ.copy()
+    env["APPIMAGE_EXTRACT_AND_RUN"] = "1"
+    env["OUROBOROS_APPIMAGE_RESTORE_TMPDIR"] = "1"
+    env["OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR_SET"] = "1" if "TMPDIR" in os.environ else "0"
+    env["OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR"] = os.environ.get("TMPDIR", "")
+    # The type-2 runtime keys extract-and-run paths only by TMPDIR + AppImage
+    # digest. A nested launch of the same AppImage must therefore use a private
+    # temp base or the short-lived CLI runtime removes the desktop payload.
+    env["TMPDIR"] = tempfile.mkdtemp(prefix="ouroboros-appimage-runtime-")
+    return env
 
 
 def _desktop_app_path(bundle_root: pathlib.Path) -> pathlib.Path | None:

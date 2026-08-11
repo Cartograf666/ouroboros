@@ -4,6 +4,22 @@ set -eu
 APPDIR=${APPDIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}
 PAYLOAD="$APPDIR/usr/lib/ouroboros"
 
+# A nested extract-and-run relaunch receives a private TMPDIR so it cannot share
+# ownership of the outer CLI runtime's content-addressed extraction. Restore the
+# caller's TMPDIR before the actual product starts; only the AppImage runtime
+# itself should see the private extraction namespace.
+if [ "${OUROBOROS_APPIMAGE_RESTORE_TMPDIR:-}" = "1" ]; then
+    if [ "${OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR_SET:-0}" = "1" ]; then
+        TMPDIR=${OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR-}
+        export TMPDIR
+    else
+        unset TMPDIR
+    fi
+    unset OUROBOROS_APPIMAGE_RESTORE_TMPDIR
+    unset OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR_SET
+    unset OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR
+fi
+
 # The mounted AppImage is immutable. PyInstaller and the launcher already route
 # managed state, settings, logs, repositories, and bytecode to the user's data
 # and cache roots; expose the same explicit bundle root to child processes.

@@ -721,13 +721,27 @@ jobs:
           LAUNCHER_PID="$(tr -d '[:space:]' < "$PID_FILE")"
           kill -0 "$LAUNCHER_PID"
           LAUNCHER_EXE="$(readlink "/proc/$LAUNCHER_PID/exe")"
-          test -e "$LAUNCHER_EXE"
+          if [ ! -e "$LAUNCHER_EXE" ]; then
+            echo "AppImage launcher executable disappeared while the runtime is live: $LAUNCHER_EXE" >&2
+            cat "$CLI_LOG" >&2
+            exit 1
+          fi
           ldd "$LAUNCHER_EXE" >"$LDD_LOG"
           if grep -F "not found" "$LDD_LOG"; then
             echo "AppImage launcher has unresolved shared libraries" >&2
             exit 1
           fi
           APPIMAGE_RUNTIME_ROOT="${LAUNCHER_EXE%/usr/lib/ouroboros/Ouroboros}"
+          APPIMAGE_RUNTIME_PID="$(ps -o ppid= -p "$LAUNCHER_PID" | tr -d '[:space:]')"
+          if [ -z "$APPIMAGE_RUNTIME_PID" ] || ! kill -0 "$APPIMAGE_RUNTIME_PID" 2>/dev/null; then
+            echo "Could not identify the AppImage runtime that owns launcher $LAUNCHER_PID" >&2
+            exit 1
+          fi
+          APPIMAGE_RUNTIME_EXE="$(readlink "/proc/$APPIMAGE_RUNTIME_PID/exe")"
+          if [ "$APPIMAGE_RUNTIME_EXE" != "$APPIMAGE" ]; then
+            echo "Launcher parent is not the stable AppImage runtime: $APPIMAGE_RUNTIME_EXE" >&2
+            exit 1
+          fi
 
           kill -TERM "$LAUNCHER_PID"
           for _ in $(seq 1 120); do
@@ -740,12 +754,25 @@ jobs:
             echo "AppImage launcher did not shut down after SIGTERM" >&2
             exit 1
           fi
-          for _ in $(seq 1 60); do
-            [ ! -e "$APPIMAGE_RUNTIME_ROOT" ] && break
+          # The type-2 runtime removes its extraction after the launcher exits
+          # and only then terminates. Wait on that owning process instead of
+          # racing a fixed pathname cleanup interval.
+          for _ in $(seq 1 240); do
+            ! kill -0 "$APPIMAGE_RUNTIME_PID" 2>/dev/null && break
             sleep 0.5
           done
-          test ! -e "$APPIMAGE_RUNTIME_ROOT"
-          test ! -e "$PID_FILE"
+          if kill -0 "$APPIMAGE_RUNTIME_PID" 2>/dev/null; then
+            echo "AppImage runtime did not finish cleanup after launcher shutdown" >&2
+            exit 1
+          fi
+          if [ -e "$APPIMAGE_RUNTIME_ROOT" ]; then
+            echo "AppImage runtime left its extraction behind: $APPIMAGE_RUNTIME_ROOT" >&2
+            exit 1
+          fi
+          if [ -e "$PID_FILE" ]; then
+            echo "AppImage launcher left its PID file behind: $PID_FILE" >&2
+            exit 1
+          fi
           trap - EXIT
 
           HOME="$HOME_DIR" XDG_CACHE_HOME="$HOME_DIR/.cache" \
