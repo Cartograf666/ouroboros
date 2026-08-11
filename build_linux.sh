@@ -15,7 +15,7 @@ fi
 
 if ! command -v uv >/dev/null 2>&1; then
     echo "ERROR: uv is required for locked dependency installation."
-    echo "Install uv from https://docs.astral.sh/uv/getting-started/installation/"
+    echo "Install uv 0.12.1: curl -LsSf https://astral.sh/uv/0.12.1/install.sh | sh"
     exit 1
 fi
 
@@ -51,7 +51,7 @@ BUILD_VENV="build/linux-pyinstaller-venv"
 "$PORTABLE_PYTHON" -m venv "$BUILD_VENV"
 BUILD_PYTHON="$BUILD_VENV/bin/python"
 BUILD_REQUIREMENTS="$BUILD_VENV/build-requirements.txt"
-uv export --frozen --no-dev --extra browser --extra desktop --extra build \
+uv export --locked --no-dev --extra browser --extra desktop --extra build \
     --no-emit-project --no-hashes --no-annotate --output-file "$BUILD_REQUIREMENTS"
 uv pip install --python "$BUILD_PYTHON" -q -r "$BUILD_REQUIREMENTS"
 

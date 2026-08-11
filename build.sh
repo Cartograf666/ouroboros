@@ -26,7 +26,7 @@ echo "=== Building Ouroboros.app ==="
 
 if ! command -v uv >/dev/null 2>&1; then
     echo "ERROR: uv is required for locked dependency installation."
-    echo "Install uv from https://docs.astral.sh/uv/getting-started/installation/"
+    echo "Install uv 0.12.1: curl -LsSf https://astral.sh/uv/0.12.1/install.sh | sh"
     exit 1
 fi
 
@@ -52,7 +52,7 @@ fi
 echo "--- Installing launcher dependencies ---"
 BUILD_REQUIREMENTS="$(mktemp "${TMPDIR:-/tmp}/ouroboros-build-requirements.XXXXXX")"
 trap 'rm -f "$BUILD_REQUIREMENTS"' EXIT
-uv export --frozen --no-dev --extra browser --extra desktop --extra build \
+uv export --locked --no-dev --extra browser --extra desktop --extra build \
     --no-emit-project --no-hashes --no-annotate --output-file "$BUILD_REQUIREMENTS"
 uv pip install --python python3 -q -r "$BUILD_REQUIREMENTS"
 

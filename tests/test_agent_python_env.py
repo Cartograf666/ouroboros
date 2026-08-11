@@ -98,3 +98,10 @@ def test_pyproject_declares_pytest_as_runtime_dependency():
     repo_root = pathlib.Path(__file__).resolve().parent.parent
     pyproject = (repo_root / "pyproject.toml").read_text(encoding="utf-8")
     assert '"pytest>=7.0"' in pyproject
+
+
+def test_pyproject_declares_pip_as_runtime_dependency():
+    """uv environments must preserve the runtime's ``python -m pip`` contract."""
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    pyproject = (repo_root / "pyproject.toml").read_text(encoding="utf-8")
+    assert '"pip"' in pyproject

@@ -5,19 +5,19 @@
 
 # Run smoke tests (fast, no external deps needed at runtime)
 test:
-	uv run --frozen python -m pytest tests/ -q --tb=short
+	uv run --locked python -m pytest tests/ -q --tb=short
 
 # Run smoke tests with verbose output
 test-v:
-	uv run --frozen python -m pytest tests/ -v --tb=long
+	uv run --locked python -m pytest tests/ -v --tb=long
 
 # Lint: deterministic F-rule gate (NameError class); matches the CI quick-test step
 lint:
-	uv run --frozen python -m ruff check . --select F
+	uv run --locked python -m ruff check . --select F
 
 # Run codebase health check (requires ouroboros importable)
 health:
-	uv run --frozen python -c "from ouroboros.review import collect_sections, compute_complexity_metrics; \
+	uv run --locked python -c "from ouroboros.review import collect_sections, compute_complexity_metrics; \
 		import pathlib, json; \
 		sections, stats = collect_sections(pathlib.Path('.'), pathlib.Path('../data')); \
 		m = compute_complexity_metrics(sections); \

@@ -28,7 +28,7 @@ New-Item -ItemType Directory -Force -Path $env:PYTHONPYCACHEPREFIX | Out-Null
 Write-Host "=== Building Ouroboros for Windows (v${Version}) ==="
 
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
-    throw "uv is required for locked dependency installation. Install it from https://docs.astral.sh/uv/getting-started/installation/"
+    throw 'uv 0.12.1 is required. Install it with: powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/0.12.1/install.ps1 | iex"'
 }
 
 if (-not (Test-Path "python-standalone\python.exe")) {
@@ -48,7 +48,7 @@ if (-not (Test-Path "node-standalone\node.exe")) {
 Write-Host "--- Installing launcher dependencies ---"
 $BuildRequirements = Join-Path ([IO.Path]::GetTempPath()) "ouroboros-build-requirements-$PID.txt"
 Invoke-NativeChecked "Build dependency export" {
-    uv export --frozen --no-dev --extra browser --extra desktop --extra build `
+    uv export --locked --no-dev --extra browser --extra desktop --extra build `
         --no-emit-project --no-hashes --no-annotate --output-file $BuildRequirements
 }
 try {

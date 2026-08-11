@@ -23,7 +23,7 @@ ENV UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1 \
     PATH="/app/.venv/bin:$PATH"
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --extra browser --no-install-project
+RUN uv sync --locked --no-dev --extra browser --no-install-project
 
 # Install all Playwright native system dependencies for Chromium/WebKit (authoritative list from Playwright)
 RUN python3 -m playwright install-deps chromium webkit
@@ -33,7 +33,7 @@ RUN PLAYWRIGHT_BROWSERS_PATH=0 python3 -m playwright install chromium webkit
 
 # Copy application
 COPY . .
-RUN uv sync --frozen --no-dev --extra browser --no-editable
+RUN uv sync --locked --no-dev --extra browser --no-editable
 
 # Default environment
 ENV OUROBOROS_SERVER_HOST=0.0.0.0 \

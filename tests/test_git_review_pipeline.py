@@ -1219,6 +1219,35 @@ class TestPreflightCheck7P9Limits:
             "Check 7 fired without VERSION staged — it should be a no-op."
         )
 
+    def test_stale_staged_uv_lock_root_version_blocks(self, monkeypatch):
+        review = _get_review_module()
+        readme = self._wrap_readme("")
+
+        def _fake_git_show(repo_dir, path: str) -> str:
+            values = {
+                "VERSION": "4.99.0",
+                "pyproject.toml": 'version = "4.99.0"',
+                "uv.lock": (
+                    '[[package]]\nname = "ouroboros"\nversion = "4.98.0"\n'
+                    'source = { editable = "." }\n'
+                ),
+                "web/package.json": '{"version": "4.99.0"}',
+                "web/modules/api_types.js": "GATEWAY_CONTRACT_VERSION = '4.99.0'",
+                "README.md": readme,
+                "docs/ARCHITECTURE.md": "# Ouroboros v4.99.0 — Architecture",
+            }
+            return values.get(path, "")
+
+        monkeypatch.setattr(review, "_git_show_staged", _fake_git_show)
+        result = review._preflight_check(
+            "v4.99.0: release",
+            "M  VERSION\nM  README.md\nM  uv.lock",
+            "/repo",
+        )
+
+        assert result is not None
+        assert "uv.lock" in result
+
     def test_check7_passes_when_readme_not_staged(self, monkeypatch):
         """VERSION staged but README not staged → check 7 silently skips
         (git show returns empty string for an un-staged README)."""

@@ -684,7 +684,7 @@ the review substrate cannot self-attest its own fast path. Maintainers choose
 the landing parent and release version, preserve authorship, and run the normal
 final exact-candidate gate. `CONTRIBUTING.md` owns the contribution procedure.
 Accordingly, a pull request into `ouroboros` leaves `VERSION`,
-`pyproject.toml`, `web/package.json`,
+`pyproject.toml`, the editable root version in `uv.lock`, `web/package.json`,
 `web/modules/api_types.js::GATEWAY_CONTRACT_VERSION`, the README badge, and
 the Architecture header byte-identical to its target. At integration,
 `ouroboros/tools/release_sync.py::sync_release_metadata()` projects the chosen
@@ -1458,11 +1458,12 @@ already preserve the boundary.
 ### Python dependency locks
 
 `pyproject.toml` is the direct-dependency SSOT and `uv.lock` is the reviewed
-cross-platform resolution. Local and CI commands use `uv sync --frozen`; do not
+cross-platform resolution. Local and CI commands use `uv sync --locked`; do not
 add an independent hand-written requirements list. Release packaging preserves
 the separate build and embedded interpreters by exporting build requirements
-ephemerally and committing only `requirements-runtime.lock` for embedded pip
-and managed-update compatibility. A dependency change updates the project
+ephemerally and committing `requirements-runtime.lock` for embedded pip. The
+legacy `requirements.txt` is a generated pointer to that export for N-1 managed
+updaters, never a dependency authority. A dependency change updates the project
 metadata, runs `uv lock`, regenerates the runtime export with the exact command
 in README, and leaves its CI clean-diff check green.
 The pinned `tool.uv.required-version` and the digest-pinned `setup-uv` action
@@ -1472,9 +1473,9 @@ make resolver changes deliberate rather than an ambient CI upgrade.
 is the documented checkout-free CLI/server path. It resolves the project
 metadata into an isolated tool environment but does not read this repository's
 `uv.lock`; branch installs therefore follow dependency ranges as well as source
-HEAD. Documentation must pair that convenient form with the full-commit-SHA
-form for repeatability and must not describe it as a release-artifact install
-or a contributor development environment.
+HEAD. Documentation may pair that convenient form with a full commit SHA to pin
+the source revision, but must not claim that it locks dependencies or describe
+it as a release-artifact install or contributor development environment.
 
 ### Pytest marker lanes
 

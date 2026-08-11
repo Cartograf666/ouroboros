@@ -859,18 +859,14 @@ def _preflight_check(commit_message: str, staged_files: str,
             )
             version_str = _git_show_staged(repo_dir, "VERSION").strip()
             if is_release_version(version_str):
-                pyproject_text = _git_show_staged(repo_dir, "pyproject.toml")
-                web_package_text = _git_show_staged(repo_dir, "web/package.json")
-                readme_text = _git_show_staged(repo_dir, "README.md")
-                arch_text = _git_show_staged(repo_dir, "docs/ARCHITECTURE.md")
-                api_types_text = _git_show_staged(repo_dir, "web/modules/api_types.js")
                 desync = version_carrier_desyncs(
                     version_str,
-                    pyproject_text=pyproject_text,
-                    web_package_text=web_package_text,
-                    readme_text=readme_text,
-                    arch_text=arch_text,
-                    api_types_text=api_types_text,
+                    pyproject_text=_git_show_staged(repo_dir, "pyproject.toml"),
+                    uv_lock_text=_git_show_staged(repo_dir, "uv.lock"),
+                    web_package_text=_git_show_staged(repo_dir, "web/package.json"),
+                    readme_text=_git_show_staged(repo_dir, "README.md"),
+                    arch_text=_git_show_staged(repo_dir, "docs/ARCHITECTURE.md"),
+                    api_types_text=_git_show_staged(repo_dir, "web/modules/api_types.js"),
                     detailed=True,
                 )
                 if desync:

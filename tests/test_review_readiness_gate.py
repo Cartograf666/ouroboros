@@ -4,7 +4,10 @@ import subprocess
 from unittest.mock import patch, MagicMock
 
 
-from ouroboros.tools.review_helpers import check_worktree_readiness
+from ouroboros.tools.review_helpers import (
+    check_worktree_readiness,
+    check_worktree_version_sync,
+)
 
 
 class TestCheckWorktreeReadiness:
@@ -100,6 +103,19 @@ class TestCheckWorktreeReadiness:
                        return_value="VERSION mismatch: 1.0 vs 2.0"):
                 warnings = check_worktree_readiness(tmp_path)
                 assert any("version" in w.lower() or "mismatch" in w.lower() for w in warnings)
+
+    def test_stale_uv_lock_root_version_is_reported(self, tmp_path):
+        (tmp_path / "VERSION").write_text("4.99.0\n", encoding="utf-8")
+        (tmp_path / "pyproject.toml").write_text('version = "4.99.0"\n', encoding="utf-8")
+        (tmp_path / "uv.lock").write_text(
+            '[[package]]\nname = "ouroboros"\nversion = "4.98.0"\n'
+            'source = { editable = "." }\n',
+            encoding="utf-8",
+        )
+
+        warning = check_worktree_version_sync(tmp_path)
+
+        assert "uv.lock" in warning
 
     def test_git_error_does_not_crash(self, tmp_path):
         """If git subprocess fails, the gate should not crash."""

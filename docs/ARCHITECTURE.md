@@ -1963,12 +1963,15 @@ Python dependency resolution has one authority: direct requirements and their
 runtime/desktop/browser/build group membership live in `pyproject.toml`, while
 `uv.lock` records the universal cross-platform solution under the pinned
 `tool.uv.required-version`. Source and CI environments sync that lock with
-`--frozen`. Packaging keeps its deliberate two-interpreter boundary through
+`--locked`, so metadata drift is an error rather than a silently stale install.
+Packaging keeps its deliberate two-interpreter boundary through
 projections: build scripts export their temporary PyInstaller/desktop input
 directly from `uv.lock`, while the committed `requirements-runtime.lock`
 supplies embedded `python-standalone` and managed updates that intentionally
-use pip without bundling uv. CI regenerates that compatibility export and
-requires a clean diff, so it cannot become an independent dependency authority.
+use pip without bundling uv. A one-line `requirements.txt` pointer lets already
+released N-1 updaters find the same export. CI regenerates the compatibility
+export and requires a clean diff, so neither file becomes an independent
+dependency authority.
 
 Platform builds precompile bundled Python with unchecked-hash bytecode. Sealing valid bytecode prevents runtime `__pycache__` writes from invalidating a macOS signature; runtime children also route caches outside the bundle. When signing is enabled, hardened runtime, notarization, xattr hygiene, and strict verification remain part of the stable-release path. Prerelease artifacts may intentionally be unsigned, and their evidence must report the actual signing state rather than imply notarization. Linux and Windows use the same precompile for startup parity without a macOS seal.
 
@@ -1989,7 +1992,7 @@ Panic is a complete owner stop, not a restart. It stops consciousness, records t
 ## 10. Key Invariants
 
 1. **Constitution and identity persist.** `BIBLE.md` is never deleted; `identity.md` remains a physical file even when its content evolves.
-2. **Release metadata has one projection.** `VERSION` is canonical; `ouroboros/tools/release_sync.py::version_carrier_desyncs()` and `sync_release_metadata()` keep the PEP 440 form in `pyproject.toml`, the author-facing version in `web/package.json`, `web/modules/api_types.js::GATEWAY_CONTRACT_VERSION`, the README badge, and this document's header. Changelog prose remains deliberate. Pull requests into `ouroboros` leave these carriers byte-identical to their target; integration assigns the release version.
+2. **Release metadata has one projection.** `VERSION` is canonical; `ouroboros/tools/release_sync.py::version_carrier_desyncs()` and `sync_release_metadata()` keep the PEP 440 form in `pyproject.toml` and the editable root entry in `uv.lock`, plus the author-facing version in `web/package.json`, `web/modules/api_types.js::GATEWAY_CONTRACT_VERSION`, the README badge, and this document's header. Changelog prose remains deliberate. Pull requests into `ouroboros` leave these carriers byte-identical to their target; integration assigns the release version.
 3. **Configuration and messaging have single owners.** Defaults and paths live in `ouroboros/config.py`; messages go through `supervisor/message_bus.py`; concurrent state transitions use the owning file lock.
 4. **The attempt ledger is monetary authority.** `state/usage_attempts.jsonl` records every physical model send. State, task, event, and UI totals are projections carrying attempt identity; unknown or unresolved cost never becomes false zero.
 5. **Packaged bootstrap is manifest-bound.** A packaged install verifies `repo.bundle` and its manifest once, then runs the managed checkout. Restart preserves its local tip; only explicit update applies an approved exact SHA.

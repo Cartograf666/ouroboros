@@ -186,10 +186,11 @@ uv tool uninstall ouroboros
 
 This Git-branch form follows the latest `ouroboros` commit and resolves the
 dependencies declared in `pyproject.toml`; `uv tool install` does not consume
-the repository's `uv.lock`. For a repeatable install, replace `ouroboros` after
-the `@` with a reviewed full commit SHA. Use the source setup below for
-development, repository tests, and the complete browser extras, or use a
-platform release artifact for the packaged desktop runtime.
+the repository's `uv.lock`. Replacing `ouroboros` after the `@` with a reviewed
+full commit SHA pins the Ouroboros source revision, but dependencies are still
+resolved from `pyproject.toml`. Use the source setup below for a lock-verified
+environment, development, repository tests, and the complete browser extras,
+or use a platform release artifact for the packaged desktop runtime.
 
 ---
 
@@ -198,24 +199,36 @@ platform release artifact for the packaged desktop runtime.
 ### Requirements
 
 - Python 3.10+
-- [uv 0.12.1](https://docs.astral.sh/uv/getting-started/installation/)
+- uv 0.12.1 (the exact resolver version pinned by this checkout)
 - macOS, Linux, or Windows
 - Git
 - [GitHub CLI (`gh`)](https://cli.github.com/), optional unless you use GitHub integration
 
 ### Setup
 
+Install the pinned resolver version:
+
+```bash
+curl -LsSf https://astral.sh/uv/0.12.1/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/0.12.1/install.ps1 | iex"
+```
+
 ```bash
 git clone https://github.com/razzant/ouroboros.git
 cd ouroboros
-uv sync --frozen --extra browser --group dev
+uv sync --locked --extra browser --group dev
 source .venv/bin/activate
 ```
 
 Windows PowerShell:
 
 ```powershell
-uv sync --frozen --extra browser --group dev
+uv sync --locked --extra browser --group dev
 .\.venv\Scripts\Activate.ps1
 ```
 
@@ -281,12 +294,14 @@ make test
 cross-platform resolution lock. Release builds install the generated
 `requirements-runtime.lock` compatibility export into embedded interpreters
 that intentionally ship pip rather than uv. Build-only requirements are
-exported ephemerally from `uv.lock` and are not committed. After changing
+exported ephemerally from `uv.lock` and are not committed. The tiny
+`requirements.txt` file is only a pointer to that export for already-released
+managed updaters; it is not a second dependency declaration. After changing
 dependencies, refresh the reviewed lock and runtime export with:
 
 ```bash
 uv lock
-uv export --frozen --no-dev --extra browser --no-emit-project --no-hashes --no-annotate --output-file requirements-runtime.lock
+uv export --locked --no-dev --extra browser --no-emit-project --no-hashes --no-annotate --output-file requirements-runtime.lock
 ```
 
 ---

@@ -282,6 +282,12 @@ def test_windows_python_download_pins_the_release_checksum():
     assert "throw" in text.split("Get-FileHash", 1)[1]
 
 
+def test_windows_python_download_checks_native_dependency_install_exits():
+    text = (REPO_ROOT / "scripts" / "download_python_standalone.ps1").read_text(encoding="utf-8")
+    assert "Agent dependency installation failed with exit code" in text
+    assert "llama-cpp-python installation failed with exit code" in text
+
+
 # --------------------------------------------------------------------------
 # F5: Update Now must go through the merge plan, not the hard-reset hatch.
 # --------------------------------------------------------------------------

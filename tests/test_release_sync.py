@@ -34,6 +34,12 @@ def _make_repo(tmp_path: Path, version: str = "4.99.1") -> Path:
         '[tool.poetry]\nname = "ouroboros"\nversion = "0.0.0"\n',
         encoding="utf-8",
     )
+    (tmp_path / "uv.lock").write_text(
+        'version = 1\nrevision = 3\nrequires-python = ">=3.10"\n\n'
+        '[[package]]\nname = "ouroboros"\nversion = "0.0.0"\n'
+        'source = { editable = "." }\n',
+        encoding="utf-8",
+    )
     web = tmp_path / "web"
     web.mkdir()
     (web / "package.json").write_text(
@@ -82,6 +88,34 @@ class TestSyncReleaseMetadata:
         assert "pyproject.toml" in changed
         text = (repo / "pyproject.toml").read_text()
         assert 'version = "1.2.3"' in text
+
+    def test_syncs_editable_root_version_in_uv_lock(self, tmp_path):
+        repo = _make_repo(tmp_path, "1.2.3-rc.4")
+        changed = sync_release_metadata(str(repo))
+
+        assert "uv.lock" in changed
+        lock_text = (repo / "uv.lock").read_text(encoding="utf-8")
+        assert 'name = "ouroboros"\nversion = "1.2.3rc4"' in lock_text
+
+    def test_stale_uv_lock_root_version_is_reported(self, tmp_path):
+        repo = _make_repo(tmp_path, "1.2.3-rc.4")
+        sync_release_metadata(str(repo))
+        lock_path = repo / "uv.lock"
+        lock_path.write_text(
+            lock_path.read_text(encoding="utf-8").replace(
+                'version = "1.2.3rc4"',
+                'version = "1.2.3rc3"',
+            ),
+            encoding="utf-8",
+        )
+
+        desync = version_carrier_desyncs(
+            "1.2.3-rc.4",
+            uv_lock_text=lock_path.read_text(encoding="utf-8"),
+            detailed=True,
+        )
+
+        assert desync == ['uv.lock (expected editable root version = "1.2.3rc4")']
 
     def test_syncs_readme_badge(self, tmp_path):
         repo = _make_repo(tmp_path, "1.2.3")

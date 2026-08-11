@@ -23,12 +23,13 @@ runs:
       shell: bash
       run: |
         case "${{ inputs.profile }}" in
-          test) uv sync --frozen --extra browser --group dev ;;
-          build) uv sync --frozen --extra browser --extra desktop --extra build --group dev ;;
+          test) uv sync --locked --extra browser --group dev ;;
+          build) uv sync --locked --extra browser --extra desktop --extra build --group dev ;;
           *) echo "Unknown Python dependency profile: ${{ inputs.profile }}" >&2; exit 2 ;;
         esac
+        python -m pip --version
     - name: Verify generated release dependency exports
       shell: bash
       run: |
-        uv export --frozen --no-dev --extra browser --no-emit-project --no-hashes --no-annotate --output-file requirements-runtime.lock
+        uv export --locked --no-dev --extra browser --no-emit-project --no-hashes --no-annotate --output-file requirements-runtime.lock
         git diff --exit-code -- requirements-runtime.lock

@@ -299,7 +299,7 @@ class TestBuildLinuxSh:
         src = _read("build_linux.sh")
         assert 'PORTABLE_PYTHON="python-standalone/bin/python3"' in src
         assert '"$PORTABLE_PYTHON" -m venv "$BUILD_VENV"' in src
-        assert "uv export --frozen --no-dev --extra browser --extra desktop --extra build" in src
+        assert "uv export --locked --no-dev --extra browser --extra desktop --extra build" in src
         assert 'uv pip install --python "$BUILD_PYTHON" -q -r "$BUILD_REQUIREMENTS"' in src
         assert '"$BUILD_PYTHON" -m PyInstaller Ouroboros.spec' in src
         assert 'uv pip install --python "$PORTABLE_PYTHON" -q -r requirements-runtime.lock' in src
@@ -584,6 +584,25 @@ class TestDockerfile:
             f"Found {len(playwright_invocations)} playwright invocation(s) at positions: "
             f"{playwright_invocations}"
         )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".github/actions/setup-python-env/action.yml",
+        "Dockerfile",
+        "Makefile",
+        "build.sh",
+        "build_linux.sh",
+        "build_windows.ps1",
+    ],
+)
+def test_uv_project_commands_validate_lock_freshness(path):
+    source = _read(path)
+    commands = re.findall(r"uv (?:sync|run|export)[^\n]*", source)
+    assert commands, f"no uv project command found in {path}"
+    assert all("--locked" in command for command in commands), commands
+    assert all("--frozen" not in command for command in commands), commands
 
 
 # ---------------------------------------------------------------------------
