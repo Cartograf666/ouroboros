@@ -401,6 +401,15 @@ def _launch_desktop_app(runtime: PackagedRuntime) -> None:
 
 
 def _desktop_app_path(bundle_root: pathlib.Path) -> pathlib.Path | None:
+    if not IS_MACOS and not IS_WINDOWS:
+        # Inside an AppImage, the inner PyInstaller launcher lives on a mount (or
+        # temporary extract tree) owned by the outer runtime.  Starting that raw
+        # binary would let the CLI exit and release the payload underneath the
+        # detached desktop process. Relaunch the stable AppImage path instead so
+        # its own runtime owns the payload for the launcher's whole lifetime.
+        appimage = pathlib.Path(os.environ.get("APPIMAGE", "").strip())
+        if appimage.is_file():
+            return appimage
     for parent in (bundle_root, *bundle_root.parents):
         if IS_MACOS and parent.suffix == ".app":
             return parent

@@ -4,8 +4,13 @@ import os
 import pathlib
 import subprocess
 
+import pytest
+
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
+pytestmark = pytest.mark.skipif(
+    os.name == "nt", reason="AppImage packaging is POSIX-only"
+)
 
 
 def test_appdir_layout_wraps_the_existing_pyinstaller_payload(tmp_path: pathlib.Path):
@@ -18,6 +23,10 @@ def test_appdir_layout_wraps_the_existing_pyinstaller_payload(tmp_path: pathlib.
     internal = payload / "_internal"
     internal.mkdir()
     (internal / "repo.bundle").write_bytes(b"bundle")
+    (internal / "VERSION").write_text("6.96.2\n", encoding="utf-8")
+    embedded_python = internal / "python-standalone/bin/python3"
+    embedded_python.parent.mkdir(parents=True)
+    embedded_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
 
     appdir = tmp_path / "Ouroboros.AppDir"
     env = os.environ.copy()
@@ -37,9 +46,21 @@ def test_appdir_layout_wraps_the_existing_pyinstaller_payload(tmp_path: pathlib.
     assert (appdir / "ouroboros.png").is_file()
     assert (appdir / "usr/lib/ouroboros/Ouroboros").is_file()
     assert (appdir / "usr/lib/ouroboros/_internal/repo.bundle").is_file()
+    assert (
+        appdir / "usr/lib/ouroboros/_internal/python-standalone/bin/python3"
+    ).is_file()
     desktop = (appdir / "ouroboros.desktop").read_text(encoding="utf-8")
     assert "Exec=Ouroboros" in desktop
     assert "Icon=ouroboros" in desktop
+
+    version = subprocess.run(
+        [str(appdir / "AppRun"), "--version"],
+        env={**os.environ, "APPDIR": str(appdir)},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert version.stdout.strip() == "Ouroboros 6.96.2"
 
 
 def test_apprun_exposes_cli_without_writing_to_the_mount(tmp_path: pathlib.Path):
@@ -63,3 +84,14 @@ def test_apprun_exposes_cli_without_writing_to_the_mount(tmp_path: pathlib.Path)
         text=True,
     )
     assert result.stdout.strip() == str(appdir / "usr/lib/ouroboros/_internal")
+
+
+def test_appimage_builder_pins_tool_and_embedded_runtime():
+    script = (REPO / "scripts/build_appimage.sh").read_text(encoding="utf-8")
+
+    assert "RUNTIME_VERSION=20251108" in script
+    assert "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d" in script
+    assert "00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444" in script
+    assert "releases/download/${RUNTIME_VERSION}/runtime-${TOOL_ARCH}" in script
+    assert 'fetch_verified "$RUNTIME" "$RUNTIME_URL" "$RUNTIME_SHA256"' in script
+    assert '"$TOOL" --runtime-file "$RUNTIME" "$APPDIR" "$OUTPUT"' in script

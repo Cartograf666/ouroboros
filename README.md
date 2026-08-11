@@ -47,15 +47,16 @@ To run tasks, configure at least one supported remote provider API key or a loca
 - **Debian / Ubuntu / Astra Linux x86_64:** when the selected release lists `ouroboros_<version>_amd64.deb`, download it and run `sudo apt install ./ouroboros_<version>_amd64.deb`. It installs Git as a package dependency, installs Ouroboros to `/opt/ouroboros`, puts `ouroboros` on `PATH`, and adds a desktop entry.
 - **Fedora / RHEL x86_64:** when listed, download `ouroboros-<version>-1.x86_64.rpm` and run `sudo dnf install ./ouroboros-<version>-1.x86_64.rpm`. Same layout and Git dependency as the `.deb`.
 - **RED OS 8 x86_64:** when listed, download `ouroboros-<version>-1.red80.x86_64.rpm` and run `sudo dnf install ./ouroboros-<version>-1.red80.x86_64.rpm`. It carries the `red80` release tag. CI attempts non-blocking install-and-run smokes on Astra Linux 1.8 and RED OS 8; inspect the tagged workflow run for their outcome.
-- **Other Linux x86_64:** from the [latest stable release](https://github.com/razzant/ouroboros/releases/latest), download `Ouroboros-<version>-linux-x86_64.AppImage`, make it executable, and run it. Use `./Ouroboros-<version>-linux-x86_64.AppImage --cli <args>` for the bundled CLI. The tarball remains available for extraction-based installs.
+- **Other Linux x86_64:** from the [selected release](https://github.com/razzant/ouroboros/releases), use `Ouroboros-<version>-linux-x86_64.AppImage` when listed: make it executable and run it, or pass `--cli <args>` for the bundled CLI. Git must already be installed. If that release does not list an AppImage, use the extraction-friendly tarball.
 - **Windows x64:** from the [latest stable release](https://github.com/razzant/ouroboros/releases/latest), download `Ouroboros-<version>-windows-x64.zip`, extract it, and run `Ouroboros\Ouroboros.exe`. The optional CLI installer is `Ouroboros\bin\install-ouroboros-cli.cmd`.
 
-Prerelease artifacts stay on their tag pages; `/releases/latest` points to the latest stable release. If bundled browser tools on Linux need host libraries, run `./Ouroboros/python-standalone/bin/python3 -m playwright install-deps chromium webkit`. See the [full install and verification guide](https://ouroboros-agent.ai/install/) for source setup and release proof files.
+Prerelease artifacts stay on their tag pages; `/releases/latest` points to the latest stable release. If bundled browser tools on Linux need host libraries, run `./Ouroboros/_internal/python-standalone/bin/python3 -m playwright install-deps chromium webkit`. See the [full install and verification guide](https://ouroboros-agent.ai/install/) for source setup and release proof files.
 
 #### Install the Linux AppImage
 
-An AppImage is a portable executable, so user-level installation means copying
-it to a stable path and making it executable; it does not need root access:
+When a release lists the AppImage, user-level installation means copying the
+portable executable to a stable path and making it executable; it does not need
+root access. Ouroboros bootstrap still requires Git on the host:
 
 ```bash
 VERSION=x.y.z
@@ -86,7 +87,7 @@ your distribution:
 
 ```bash
 "$HOME/Applications/Ouroboros.AppImage" --appimage-extract
-./squashfs-root/usr/lib/ouroboros/python-standalone/bin/python3 \
+./squashfs-root/usr/lib/ouroboros/_internal/python-standalone/bin/python3 \
   -m playwright install-deps chromium webkit
 ```
 
@@ -297,7 +298,7 @@ bash scripts/download_python_standalone.sh
 bash build_linux.sh
 ```
 
-Outputs: `dist/Ouroboros-<VERSION>-linux-<arch>.AppImage` and the extraction-friendly `dist/Ouroboros-<VERSION>-linux-<arch>.tar.gz`. Run the AppImage after `chmod +x`, or pass `--cli` to reach its bundled CLI. If FUSE is unavailable, set `APPIMAGE_EXTRACT_AND_RUN=1` when launching it. The tarball contains `Ouroboros/bin/install-ouroboros-cli`. If bundled browser tools need host libraries, run `./Ouroboros/python-standalone/bin/python3 -m playwright install-deps chromium webkit` from the extracted tarball.
+Outputs: `dist/Ouroboros-<VERSION>-linux-<arch>.AppImage` and the extraction-friendly `dist/Ouroboros-<VERSION>-linux-<arch>.tar.gz`. The AppImage needs host Git; run it after `chmod +x`, or pass `--cli` to reach its bundled CLI. If FUSE is unavailable, set `APPIMAGE_EXTRACT_AND_RUN=1` when launching it. The tarball contains `./Ouroboros/bin/install-ouroboros-cli`. If bundled browser tools need host libraries, run `./Ouroboros/_internal/python-standalone/bin/python3 -m playwright install-deps chromium webkit` from the extracted tarball.
 
 On a build host where system packages are managed separately, set `OUROBOROS_SKIP_PLAYWRIGHT_INSTALL_DEPS=1`; Chromium and WebKit are still downloaded and bundled, but the build does not invoke `sudo` to install host libraries.
 

@@ -134,6 +134,7 @@ def test_install_manifest_discovers_releases_without_future_asset_hashes():
     expected = {
         "Ouroboros-{version}.dmg": ("macos", "arm64"),
         "Ouroboros-{version}-linux-x86_64.tar.gz": ("linux", "x86_64"),
+        "Ouroboros-{version}-linux-x86_64.AppImage": ("linux", "x86_64"),
         "ouroboros_{version}_amd64.deb": ("linux", "x86_64"),
         "ouroboros-{version}-1.x86_64.rpm": ("linux", "x86_64"),
         "ouroboros-{version}-1.red80.x86_64.rpm": ("linux", "x86_64"),
@@ -152,6 +153,9 @@ def test_install_manifest_discovers_releases_without_future_asset_hashes():
     ]
     assert native_packages
     assert all(row["availability"] == "per-release" for row in native_packages)
+    appimages = [row for row in manifest["artifacts"] if row["format"] == "AppImage"]
+    assert len(appimages) == 1
+    assert appimages[0]["availability"] == "per-release"
     verification = manifest["verification"]
     assert verification["availability"] == "per-release"
     assert verification["githubAttestations"] == {
@@ -174,6 +178,7 @@ def test_install_page_does_not_promise_native_packages_on_older_releases():
     html = (SITE / "install" / "index.html").read_text(encoding="utf-8")
     assert "When that release lists native packages" in html
     assert "does not list a native package" in html
+    assert "usr/lib/ouroboros/_internal/python-standalone/bin/python3" in html
 
 
 def test_benchmark_assets_expose_status_and_accessible_text():

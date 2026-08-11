@@ -55,6 +55,20 @@ def test_packaged_cli_run_start_launches_desktop_and_strips_start(tmp_path, monk
     assert inner["args"] == ["run", "2+2?"]
 
 
+def test_packaged_cli_linux_relaunches_outer_appimage(tmp_path, monkeypatch):
+    from ouroboros import packaged_cli
+
+    appimage = tmp_path / "Ouroboros.AppImage"
+    appimage.write_bytes(b"appimage")
+    bundle_root = tmp_path / "mount" / "usr" / "lib" / "ouroboros" / "_internal"
+
+    monkeypatch.setattr(packaged_cli, "IS_MACOS", False)
+    monkeypatch.setattr(packaged_cli, "IS_WINDOWS", False)
+    monkeypatch.setenv("APPIMAGE", str(appimage))
+
+    assert packaged_cli._desktop_app_path(bundle_root) == appimage
+
+
 def test_packaged_cli_does_not_treat_prompt_start_text_as_option(tmp_path, monkeypatch):
     from ouroboros import packaged_cli
 

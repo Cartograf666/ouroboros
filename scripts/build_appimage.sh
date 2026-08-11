@@ -2,27 +2,11 @@
 set -euo pipefail
 
 VERSION=$(tr -d '[:space:]' < VERSION)
-ARCH=$(uname -m)
 DIST_DIR=${OUROBOROS_DIST_DIR:-dist}
 PAYLOAD_DIR="$DIST_DIR/Ouroboros"
 APPDIR=${OUROBOROS_APPDIR:-$DIST_DIR/Ouroboros.AppDir}
-OUTPUT="$DIST_DIR/Ouroboros-${VERSION}-linux-${ARCH}.AppImage"
 TOOL_VERSION=1.9.1
-
-case "$ARCH" in
-    x86_64)
-        TOOL_ARCH=x86_64
-        TOOL_SHA256=ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
-        ;;
-    aarch64)
-        TOOL_ARCH=aarch64
-        TOOL_SHA256=f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158
-        ;;
-    *)
-        echo "Unsupported AppImage architecture: $ARCH" >&2
-        exit 1
-        ;;
-esac
+RUNTIME_VERSION=20251108
 
 if [ ! -x "$PAYLOAD_DIR/Ouroboros" ]; then
     echo "ERROR: PyInstaller payload not found at $PAYLOAD_DIR/Ouroboros" >&2
@@ -49,24 +33,59 @@ if [ "${1:-}" = "--appdir-only" ]; then
     exit 0
 fi
 
+ARCH=$(uname -m)
+OUTPUT="$DIST_DIR/Ouroboros-${VERSION}-linux-${ARCH}.AppImage"
+case "$ARCH" in
+    x86_64)
+        TOOL_ARCH=x86_64
+        TOOL_SHA256=ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+        RUNTIME_SHA256=2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+        ;;
+    aarch64)
+        TOOL_ARCH=aarch64
+        TOOL_SHA256=f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158
+        RUNTIME_SHA256=00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444
+        ;;
+    *)
+        echo "Unsupported AppImage architecture: $ARCH" >&2
+        exit 1
+        ;;
+esac
+
 TOOL_CACHE=${APPIMAGE_TOOL_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/ouroboros/appimage}
 TOOL="$TOOL_CACHE/appimagetool-${TOOL_VERSION}-${TOOL_ARCH}.AppImage"
 TOOL_URL="https://github.com/AppImage/appimagetool/releases/download/${TOOL_VERSION}/appimagetool-${TOOL_ARCH}.AppImage"
+RUNTIME="$TOOL_CACHE/type2-runtime-${RUNTIME_VERSION}-${TOOL_ARCH}"
+RUNTIME_URL="https://github.com/AppImage/type2-runtime/releases/download/${RUNTIME_VERSION}/runtime-${TOOL_ARCH}"
 mkdir -p "$TOOL_CACHE"
-if [ ! -f "$TOOL" ]; then
-    curl --fail --location --silent --show-error "$TOOL_URL" --output "$TOOL.tmp"
-    mv "$TOOL.tmp" "$TOOL"
-fi
 
-ACTUAL_SHA256=$(sha256sum "$TOOL" | awk '{print $1}')
-if [ "$ACTUAL_SHA256" != "$TOOL_SHA256" ]; then
-    echo "appimagetool SHA256 mismatch: expected $TOOL_SHA256, got $ACTUAL_SHA256" >&2
-    exit 1
-fi
+fetch_verified() {
+    local destination="$1" url="$2" expected="$3" actual tmp
+    if [ -f "$destination" ]; then
+        actual=$(sha256sum "$destination" | awk '{print $1}')
+        if [ "$actual" = "$expected" ]; then
+            return 0
+        fi
+    fi
+    tmp="${destination}.tmp.$$"
+    rm -f "$tmp"
+    curl --fail --location --silent --show-error "$url" --output "$tmp"
+    actual=$(sha256sum "$tmp" | awk '{print $1}')
+    if [ "$actual" != "$expected" ]; then
+        echo "SHA256 mismatch for $(basename "$destination"): expected $expected, got $actual" >&2
+        rm -f "$tmp"
+        return 1
+    fi
+    mv -f "$tmp" "$destination"
+}
+
+fetch_verified "$TOOL" "$TOOL_URL" "$TOOL_SHA256"
+fetch_verified "$RUNTIME" "$RUNTIME_URL" "$RUNTIME_SHA256"
 chmod +x "$TOOL"
 
 rm -f "$OUTPUT"
-ARCH="$TOOL_ARCH" APPIMAGE_EXTRACT_AND_RUN=1 "$TOOL" "$APPDIR" "$OUTPUT"
+ARCH="$TOOL_ARCH" APPIMAGE_EXTRACT_AND_RUN=1 \
+    "$TOOL" --runtime-file "$RUNTIME" "$APPDIR" "$OUTPUT"
 chmod +x "$OUTPUT"
 rm -rf "$APPDIR"
 

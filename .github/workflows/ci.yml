@@ -705,8 +705,14 @@ jobs:
           APPIMAGE="$PWD/dist/Ouroboros-${VERSION}-linux-x86_64.AppImage"
           EXTRACT_ROOT="$RUNNER_TEMP/ouroboros-appimage-${GITHUB_RUN_ATTEMPT}"
           HOME_DIR="$RUNNER_TEMP/ouroboros-appimage-home"
+          APP_ROOT="$HOME_DIR/Ouroboros"
+          DATA_DIR="$APP_ROOT/data"
+          PID_FILE="$APP_ROOT/ouroboros.pid"
+          PORT_FILE="$DATA_DIR/state/server_port"
+          CLI_LOG="$RUNNER_TEMP/ouroboros-appimage-cli.log"
+          LDD_LOG="$RUNNER_TEMP/ouroboros-appimage-ldd.log"
           test -x "$APPIMAGE"
-          mkdir -p "$EXTRACT_ROOT" "$HOME_DIR"
+          mkdir -p "$EXTRACT_ROOT" "$HOME_DIR" "$DATA_DIR"
           (cd "$EXTRACT_ROOT" && "$APPIMAGE" --appimage-extract >/dev/null)
           APPDIR="$EXTRACT_ROOT/squashfs-root"
           test -x "$APPDIR/AppRun"
@@ -716,8 +722,81 @@ jobs:
           test -f "$APPDIR/usr/lib/ouroboros/_internal/repo_bundle_manifest.json"
           python scripts/fetch_claudexor_runtime.py --verify-only \
             --output-dir "$APPDIR/usr/lib/ouroboros/_internal/claudexor-runtime"
-          HOME="$HOME_DIR" XDG_CACHE_HOME="$HOME_DIR/.cache" APPDIR="$APPDIR" \
-            "$APPDIR/AppRun" --cli --help >/dev/null
+
+          VERSION_OUTPUT="$(APPIMAGE_EXTRACT_AND_RUN=1 "$APPIMAGE" --version)"
+          test "$VERSION_OUTPUT" = "Ouroboros $VERSION"
+          HOME="$HOME_DIR" XDG_CACHE_HOME="$HOME_DIR/.cache" \
+            APPIMAGE_EXTRACT_AND_RUN=1 "$APPIMAGE" --cli --help >/dev/null
+
+          cleanup_appimage_smoke() {
+            if [ -s "$PID_FILE" ]; then
+              pid="$(tr -d '[:space:]' < "$PID_FILE")"
+              kill -TERM "$pid" 2>/dev/null || true
+            fi
+          }
+          trap cleanup_appimage_smoke EXIT
+
+          # `run --start` must launch a fresh outer AppImage runtime, not the
+          # raw PyInstaller binary inside the first temporary extraction. The
+          # deliberately empty prompt exits the CLI after readiness without
+          # enqueueing work; the desktop runtime must remain alive afterwards.
+          set +e
+          env -u DISPLAY -u WAYLAND_DISPLAY \
+            HOME="$HOME_DIR" XDG_CACHE_HOME="$HOME_DIR/.cache" BROWSER=/bin/true \
+            OPENROUTER_API_KEY=ci-placeholder OUROBOROS_MAX_WORKERS=1 \
+            APPIMAGE_EXTRACT_AND_RUN=1 \
+            "$APPIMAGE" --cli run --start --detach >"$CLI_LOG" 2>&1
+          CLI_RC=$?
+          set -e
+          test "$CLI_RC" -eq 2
+
+          for _ in $(seq 1 180); do
+            if [ -s "$PID_FILE" ] && [ -s "$PORT_FILE" ]; then
+              PORT="$(tr -d '[:space:]' < "$PORT_FILE")"
+              if curl --fail --silent "http://127.0.0.1:$PORT/api/health" >/dev/null; then
+                break
+              fi
+            fi
+            sleep 0.5
+          done
+          test -s "$PID_FILE"
+          test -s "$PORT_FILE"
+          PORT="$(tr -d '[:space:]' < "$PORT_FILE")"
+          curl --fail --silent "http://127.0.0.1:$PORT/api/health" \
+            | jq -e --arg version "$VERSION" '.version == $version' >/dev/null
+          curl --fail --silent "http://127.0.0.1:$PORT/api/state" \
+            | jq -e '.supervisor_ready == true' >/dev/null
+
+          LAUNCHER_PID="$(tr -d '[:space:]' < "$PID_FILE")"
+          kill -0 "$LAUNCHER_PID"
+          LAUNCHER_EXE="$(readlink "/proc/$LAUNCHER_PID/exe")"
+          test -e "$LAUNCHER_EXE"
+          ldd "$LAUNCHER_EXE" >"$LDD_LOG"
+          if grep -F "not found" "$LDD_LOG"; then
+            echo "AppImage launcher has unresolved shared libraries" >&2
+            exit 1
+          fi
+          APPIMAGE_RUNTIME_ROOT="${LAUNCHER_EXE%/usr/lib/ouroboros/Ouroboros}"
+
+          kill -TERM "$LAUNCHER_PID"
+          for _ in $(seq 1 120); do
+            if ! kill -0 "$LAUNCHER_PID" 2>/dev/null; then
+              break
+            fi
+            sleep 0.5
+          done
+          if kill -0 "$LAUNCHER_PID" 2>/dev/null; then
+            echo "AppImage launcher did not shut down after SIGTERM" >&2
+            exit 1
+          fi
+          for _ in $(seq 1 60); do
+            [ ! -e "$APPIMAGE_RUNTIME_ROOT" ] && break
+            sleep 0.5
+          done
+          test ! -e "$APPIMAGE_RUNTIME_ROOT"
+          test ! -e "$PID_FILE"
+          trap - EXIT
+
           HOME="$HOME_DIR" XDG_CACHE_HOME="$HOME_DIR/.cache" \
             OUROBOROS_DATA_DIR="$RUNNER_TEMP/ouroboros-appimage-claudexor-smoke" \
             OUROBOROS_BUNDLE_DIR="$APPDIR/usr/lib/ouroboros/_internal" \
@@ -786,7 +865,9 @@ jobs:
             --commit "$GITHUB_SHA" --tag "$GITHUB_REF_NAME" \
             --check embedded_repo_bundle --check embedded_claudexor_runtime \
             --check packaged_cli_help --check appimage_extract_and_run \
-            --check appimage_metadata
+            --check appimage_metadata --check product_version \
+            --check browser_fallback_start --check gateway_readiness \
+            --check clean_shutdown --check shared_libraries
 
       - name: Install digest-pinned Syft
         id: syft

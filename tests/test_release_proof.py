@@ -118,6 +118,7 @@ def test_assemble_binds_every_asset_smoke_and_sbom(tmp_path: Path):
     assert len(checksum_lines) == 3 * len(release_proof.PROOF_IDS)
     assert checksum_lines == sorted(checksum_lines, key=lambda line: line.split("  ", 1)[1])
     assert "A clear release note." in notes.read_text()
+    assert "The AppImage runs from a user-writable path" in notes.read_text()
     assert "v6.87.4...v6.87.5" in notes.read_text()
     commands = evidence["verification"]["attestationCommands"]
     assert len(commands) == 2
@@ -340,6 +341,13 @@ def test_release_workflow_orders_smoke_sbom_attestation_and_draft_verification()
     assert "Ouroboros-*-linux-x86_64.AppImage" in workflow
     assert "--check appimage_extract_and_run" in workflow
     assert "--check appimage_metadata" in workflow
+    assert "--check product_version" in workflow
+    assert "--check browser_fallback_start" in workflow
+    assert "--check gateway_readiness" in workflow
+    assert "--check clean_shutdown" in workflow
+    assert "--check shared_libraries" in workflow
+    assert 'APP_ROOT="$HOME_DIR/Ouroboros"' in workflow
+    assert 'OUROBOROS_APP_ROOT="$APP_ROOT"' not in workflow
     assert 'test -x "$MOUNT/Install CLI.command"' in workflow
     assert 'test -L "$MOUNT/Applications"' in workflow
     assert 'test "$(readlink "$MOUNT/Applications")" = "/Applications"' in workflow

@@ -62,7 +62,17 @@ REQUIRED_SMOKE_CHECKS = {
     ),
     "linux-x86_64": COMMON_SMOKE_CHECKS,
     "linux-appimage-x86_64": COMMON_SMOKE_CHECKS
-    | frozenset({"appimage_extract_and_run", "appimage_metadata"}),
+    | frozenset(
+        {
+            "appimage_extract_and_run",
+            "appimage_metadata",
+            "browser_fallback_start",
+            "clean_shutdown",
+            "gateway_readiness",
+            "product_version",
+            "shared_libraries",
+        }
+    ),
     "linux-deb-amd64": PACKAGE_SMOKE_CHECKS,
     "linux-rpm-x86_64": PACKAGE_SMOKE_CHECKS,
     "linux-rpm-red80-x86_64": PACKAGE_SMOKE_CHECKS,
@@ -269,7 +279,8 @@ def _release_notes(
         "",
         "On Linux, `sudo apt install ./ouroboros_*_amd64.deb` or `sudo dnf install ./ouroboros-*.x86_64.rpm`"
         " installs to `/opt/ouroboros` and puts `ouroboros` on `PATH`; RED OS 8 has its own"
-        " `.red80.x86_64.rpm`, and the `.tar.gz` stays available for distributions without dpkg or rpm.",
+        " `.red80.x86_64.rpm`. The AppImage runs from a user-writable path when listed and host Git"
+        " is installed; the `.tar.gz` stays available for extraction-based installs.",
         "",
         "## Release proof",
         "",
