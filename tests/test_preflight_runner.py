@@ -2238,6 +2238,35 @@ def test_the_post_commit_baseline_reaches_back_exactly_one_commit(tmp_path, two_
     assert [event[0] for event in events].count("pass") == 0
 
 
+def test_an_unreadable_baseline_ref_hard_blocks_instead_of_reading_as_no_tests(tmp_path, two_pass_env, stub_passes):
+    """`ls-tree` returning nonzero is not on its own evidence a ref is absent:
+    git fails that way too when the ref resolves fine but its tree cannot be
+    read (a corrupt or missing object, a permissions/IO error). Reading that
+    failure as "this ref never tracked tests" lets a candidate that deletes
+    tests/ sail through the hard block below merely because git could not
+    read a real, resolvable ref's tree. The corrupted ref here is HEAD~1,
+    which legitimately carries the suite the deletion commit removed."""
+    from ouroboros.preflight_runner import run_hermetic_pytest
+
+    events = stub_passes([])
+    repo = _make_repo(tmp_path, {"tests/test_plain.py": "def test_ok():\n    assert True\n"})
+    tree_oid = subprocess.run(
+        ["git", "rev-parse", "HEAD:tests"], cwd=str(repo),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    _git(repo, "rm", "-r", "--quiet", "tests")
+    _commit_all(repo)
+
+    obj_path = repo / ".git" / "objects" / tree_oid[:2] / tree_oid[2:]
+    assert obj_path.exists(), "fixture assumption: a fresh repo keeps this tree as a loose object"
+    obj_path.unlink()
+
+    result = run_hermetic_pytest(repo, timeout=120)
+    assert result is not None, "an unreadable baseline ref must hard-block, not silently pass"
+    assert "PREFLIGHT_TESTS_BASELINE_UNREADABLE" in result
+    assert [event[0] for event in events].count("pass") == 0
+
+
 def test_the_pre_commit_baseline_is_head_only_after_a_deliberate_removal(tmp_path, two_pass_env, stub_passes):
     """HEAD~1 belongs to the POST-commit phase and false-blocks the pre-commit one.
 

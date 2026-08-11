@@ -328,9 +328,21 @@ def _baseline_refs(phase: str) -> tuple:
 
 
 def _ref_tracks_tests(repo: pathlib.Path, ref: str) -> bool:
+    # `ls-tree` failing is not evidence the ref is absent; it also fails when
+    # the ref resolves but its tree cannot be read. Resolve first so that case
+    # is not reported as "never tracked tests".
+    resolved = _run_git(repo, ["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"])
+    if resolved.returncode != 0:
+        return False  # no such ref (root commit, empty repository)
     listed = _run_git(repo, ["ls-tree", "-r", "--name-only", ref, "--", "tests"])
     if listed.returncode != 0:
-        return False  # no such ref (root commit, empty repository)
+        # The ref exists, so this is a real git failure, not "no such ref";
+        # reporting it as "never tracked tests" would wave a tests/-deleting
+        # candidate through the hard block below.
+        raise RuntimeError(
+            f"git ls-tree failed on resolvable ref {ref!r}: "
+            f"{listed.stderr.strip() or 'no error output'}"
+        )
     return bool((listed.stdout or "").strip())
 
 
@@ -1076,7 +1088,19 @@ def run_hermetic_pytest(
         # all-passes-empty hard block below never ran and the change that
         # deleted the gate sailed through it.
         baseline_refs = _baseline_refs(phase)
-        if _head_tracks_tests(repo, baseline_refs):
+        try:
+            baseline_tracks_tests = _head_tracks_tests(repo, baseline_refs)
+        except (RuntimeError, subprocess.SubprocessError, OSError) as exc:
+            return _diagnosis(
+                "⚠️ PRE_PUSH_TEST_ERROR: PREFLIGHT_TESTS_BASELINE_UNREADABLE (hard block): "
+                f"could not read {' or '.join(baseline_refs)}",
+                "The working tree just lost its tests/ directory and git could not read "
+                "one of the baseline refs well enough to say whether that loss is real. "
+                "Treating an unreadable ref as 'never tracked tests' would let this "
+                "candidate through the gate it exists to trip. This is not a test failure.",
+                str(exc), max_output,
+            )
+        if baseline_tracks_tests:
             return (
                 "⚠️ PRE_PUSH_TEST_ERROR: the candidate change removes the entire tests/ tree "
                 f"that {' or '.join(baseline_refs)} carries. The preflight cannot verify "
