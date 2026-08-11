@@ -956,7 +956,7 @@ def _shared_past_beyond_scan(
         # with no archive behind it has none, and a disclosure must not assert what
         # it cannot see. "Anything older was not read" is true either way.
         f"the {len(scanned)}-row window scanned here is full and does not reach back "
-        "past where that chat's rows begin, so anything older than it was not read"
+        "past where those rows begin, so anything older than it was not read"
         if not out_of_window else
         f"this window begins at {oldest}, after the point the fork was taken"
     )

@@ -858,7 +858,7 @@ def test_a_full_window_that_cuts_the_ancestors_stream_still_discloses(tmp_path):
     gaps = [s for s in sections if s.startswith("## Conversation gaps in this view")]
     assert gaps, sections
     assert str(parent_chat) in gaps[0]
-    assert "does not reach back past where that chat's rows begin" in gaps[0]
+    assert "does not reach back past where those rows begin" in gaps[0]
 
 
 def test_a_non_fork_thread_never_gets_the_notice(tmp_path):
