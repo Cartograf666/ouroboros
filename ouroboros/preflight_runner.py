@@ -363,7 +363,16 @@ def _apply_diff(worktree: pathlib.Path, diff_text: "str | bytes") -> None:
         return
     proc = _run_git(
         worktree,
-        ["apply", "--whitespace=nowarn", "--binary", "--unidiff-zero"],
+        # `-c core.autocrlf=false -c core.eol=lf`: the candidate capture is
+        # byte-exact (`--binary`, no textconv), so the apply must not re-run
+        # end-of-line conversion either. On a Windows runner (`core.autocrlf=true`
+        # by default) an LF payload applied against a CRLF-converted checkout
+        # otherwise mangles every line ending, breaking the byte-faithful
+        # guarantee this whole capture exists to hold. No `.gitattributes text`
+        # directive governs the affected paths, so the config override is
+        # authoritative.
+        ["-c", "core.autocrlf=false", "-c", "core.eol=lf",
+         "apply", "--whitespace=nowarn", "--binary", "--unidiff-zero"],
         input_text=diff_text,
         timeout=60,
     )
@@ -1099,7 +1108,18 @@ def run_hermetic_pytest(
                     "\n".join(problems), max_output,
                 )
 
-        add = _run_git(repo, ["worktree", "add", "--detach", str(worktree), "HEAD"], timeout=60)
+        # `-c core.autocrlf=false -c core.eol=lf`: check HEAD out byte-for-byte so
+        # the hermetic worktree matches the bytes the `--binary` candidate diff was
+        # captured against. Without it a Windows runner (`core.autocrlf=true`)
+        # materializes HEAD with CRLF, and the LF candidate then applies onto a
+        # CRLF base — the capture is byte-faithful but the checkout it lands on is
+        # not. Paired with the same override on `_apply_diff`.
+        add = _run_git(
+            repo,
+            ["-c", "core.autocrlf=false", "-c", "core.eol=lf",
+             "worktree", "add", "--detach", str(worktree), "HEAD"],
+            timeout=60,
+        )
         if add.returncode != 0:
             return f"⚠️ PRE_PUSH_TEST_ERROR: could not create hermetic worktree: {add.stderr.strip()}"
         worktree_added = True

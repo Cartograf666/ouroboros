@@ -3982,11 +3982,22 @@ def test_an_untracked_file_with_a_non_utf8_name_reaches_the_candidate(
     )
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "POSIX-only invariant: the guarantee is that a raw non-UTF-8 filename byte "
+        "survives to the copy via os.fsdecode's surrogateescape round-trip. Windows "
+        "uses a UTF-16 filesystem where such a name cannot exist, and its fs codec "
+        "(utf-8/surrogatepass) raises on the synthetic 0xff byte this test injects — "
+        "git never emits such a name on Windows, so the production path is unaffected."
+    ),
+)
 def test_untracked_listing_is_decoded_with_the_filesystem_codec(tmp_path, monkeypatch):
     """Filesystem-independent pin for the same defect (the test above can only run
     where non-UTF-8 names are creatable): the listing is read as BYTES and each
     name goes through `os.fsdecode`, so the original bytes reach the copy instead
-    of a U+FFFD name that matches no file on disk."""
+    of a U+FFFD name that matches no file on disk. POSIX-only: os.fsdecode is only
+    byte-transparent under surrogateescape (POSIX); see the skip marker."""
     from ouroboros import preflight_runner
 
     seen_kwargs = {}
