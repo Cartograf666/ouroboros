@@ -960,7 +960,13 @@ def test_a_wedged_git_lets_the_inspection_return(tmp_path, monkeypatch):
     fakebin = tmp_path / "fakebin"
     fakebin.mkdir()
     fake = fakebin / "git"
-    fake.write_text("#!/bin/sh\nsleep 3600\n", encoding="utf-8")
+    # `exec`, not a bare `sleep`: without it the shell forks the sleep as a CHILD,
+    # and when the timeout kills the shell the sleep is re-parented to init and
+    # survives the whole session. The preflight container reports exactly that as
+    # PREFLIGHT_CONTAINMENT_FAILED and refuses the pass verdict — a leaked tree
+    # outlives the run that made it. With `exec` the process the timeout kills IS
+    # the sleep, so this test owns no process once it returns.
+    fake.write_text("#!/bin/sh\nexec sleep 3600\n", encoding="utf-8")
     fake.chmod(0o755)
     monkeypatch.setenv("PATH", f"{fakebin}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("OUROBOROS_THREAD_GIT_TIMEOUT_SEC", "5")
