@@ -229,20 +229,24 @@ def ws(tmp_path, monkeypatch):
     # Route guard helpers around ToolContext specifics: keep the real access
     # logic out of scope — these tests exercise edit mechanics.
     monkeypatch.setattr(edit_ops, "_resolve_edit_target", _fake_resolver(ctx))
-    monkeypatch.setattr(edit_ops, "_finish_mutation", lambda ctx_, paths, tool: "NOT committed.")
+    monkeypatch.setattr(
+        edit_ops,
+        "_finish_mutation",
+        lambda ctx_, paths, tool, binding=None: "NOT committed.",
+    )
     return ctx
 
 
 def _fake_resolver(ctx):
     from ouroboros.utils import safe_relpath
 
-    def resolver(_ctx, path, _root, *, error_tag):
+    def resolver(_ctx, path, _root, *, error_tag, _resolved_binding=None):
         if not path:
-            return None, "", f"⚠️ {error_tag}: path is required."
+            return None, "", None, f"⚠️ {error_tag}: path is required."
         try:
-            return ctx.repo_path(path), safe_relpath(path), ""
+            return ctx.repo_path(path), safe_relpath(path), _resolved_binding, ""
         except ValueError as e:
-            return None, "", f"⚠️ PATH_ERROR: {e}"
+            return None, "", None, f"⚠️ PATH_ERROR: {e}"
     return resolver
 
 
@@ -404,7 +408,7 @@ def test_repo_write_new_file_has_no_diff_section(tmp_path):
 # governance rails: envelopes, advisory staleness (P3), force disclosure
 # ---------------------------------------------------------------------------
 
-def test_capability_envelopes_pin_new_tools():
+def test_capability_profiles_pin_new_tools():
     # Write-capable lanes see the tools; the read-only subagent lane and the
     # heal-mode allowlist must NOT (P3: the read-only lane stays write-free,
     # and heal mode edits skill payloads, which these tools refuse).
@@ -413,12 +417,11 @@ def test_capability_envelopes_pin_new_tools():
         CORE_TOOL_NAMES,
         LOCAL_READONLY_SUBAGENT_TOOL_NAMES,
     )
-    from ouroboros.tools.registry import _HEAL_MODE_ALLOWED_TOOLS, _WORKSPACE_ALLOWED_TOOLS
+    from ouroboros.tools.registry import _HEAL_MODE_ALLOWED_TOOLS
 
     for name in ("apply_patch", "edit_batch"):
         assert name in CORE_TOOL_NAMES
         assert name in ACTING_SUBAGENT_TOOL_NAMES
-        assert name in _WORKSPACE_ALLOWED_TOOLS
         assert name not in LOCAL_READONLY_SUBAGENT_TOOL_NAMES
         assert name not in _HEAL_MODE_ALLOWED_TOOLS
 
@@ -508,6 +511,108 @@ def test_protected_path_blocked_in_every_spelling(tmp_path, tool, spelling):
     result = str(reg.execute(tool, _protected_call(tool, spellings[spelling])))
     assert "BLOCKED" in result, result[:200]
     assert (repo / "BIBLE.md").read_text() == "P1 honest\n"
+
+
+def _workspace_guard_registry(tmp_path, monkeypatch):
+    import subprocess
+
+    import ouroboros.safety as safety
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+    system = tmp_path / "system"
+    project = tmp_path / "project"
+    drive = tmp_path / "drive"
+    for path in (system, project, drive):
+        path.mkdir()
+    for repo in (system, project):
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    ctx = ToolContext(
+        repo_dir=system,
+        system_repo_dir=system,
+        drive_root=drive,
+        workspace_root=project,
+        workspace_mode="external",
+    )
+    registry = ToolRegistry(repo_dir=system, drive_root=drive)
+    registry.set_context(ctx)
+    monkeypatch.setattr(safety, "check_safety", lambda *args, **kwargs: (True, ""))
+    return registry, ctx, system, project
+
+
+@pytest.mark.parametrize("tool", ["apply_patch", "edit_batch"])
+def test_repo_batch_tool_explicit_system_binding_mutates_only_system_and_invalidates_it(
+    tmp_path, monkeypatch, tool,
+):
+    from ouroboros.tools import commit_gate
+
+    registry, _ctx, system, project = _workspace_guard_registry(tmp_path, monkeypatch)
+    (system / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (project / "mod.py").write_text("VALUE = 9\n", encoding="utf-8")
+    invalidations = []
+    monkeypatch.setattr(
+        commit_gate,
+        "_invalidate_advisory",
+        lambda _ctx, **kwargs: invalidations.append(kwargs),
+    )
+    args = {
+        "apply_patch": {
+            "root": "system_repo",
+            "patch": "*** Update File: mod.py\n-VALUE = 1\n+VALUE = 2\n",
+        },
+        "edit_batch": {
+            "root": "system_repo",
+            "edits": [{"path": "mod.py", "old_str": "VALUE = 1", "new_str": "VALUE = 2"}],
+        },
+    }[tool]
+
+    result = registry.execute(tool, args)
+
+    assert result.startswith("✅"), result
+    assert "Run commit_reviewed" in result
+    assert "headless runner" not in result
+    assert (system / "mod.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    assert (project / "mod.py").read_text(encoding="utf-8") == "VALUE = 9\n"
+    assert invalidations
+    assert pathlib.Path(invalidations[-1]["mutation_root"]).resolve() == system.resolve()
+
+
+@pytest.mark.parametrize("tool", ["apply_patch", "edit_batch"])
+def test_repo_batch_tool_protected_name_depends_on_physical_target(
+    tmp_path, monkeypatch, tool,
+):
+    from ouroboros import config
+
+    registry, _ctx, system, project = _workspace_guard_registry(tmp_path, monkeypatch)
+    (system / "BIBLE.md").write_text("SYSTEM = 1\n", encoding="utf-8")
+    (project / "BIBLE.md").write_text("PROJECT = 1\n", encoding="utf-8")
+    monkeypatch.setattr(config, "get_runtime_mode", lambda: "light")
+    monkeypatch.setattr(edit_ops, "get_runtime_mode", lambda: "light")
+    project_args = {
+        "apply_patch": {
+            "patch": "*** Update File: BIBLE.md\n-PROJECT = 1\n+PROJECT = 2\n",
+        },
+        "edit_batch": {
+            "edits": [{"path": "BIBLE.md", "old_str": "PROJECT = 1", "new_str": "PROJECT = 2"}],
+        },
+    }[tool]
+    system_args = {
+        "apply_patch": {
+            "root": "system_repo",
+            "patch": "*** Update File: BIBLE.md\n-SYSTEM = 1\n+SYSTEM = 2\n",
+        },
+        "edit_batch": {
+            "root": "system_repo",
+            "edits": [{"path": "BIBLE.md", "old_str": "SYSTEM = 1", "new_str": "SYSTEM = 2"}],
+        },
+    }[tool]
+
+    project_result = registry.execute(tool, project_args)
+    system_result = registry.execute(tool, system_args)
+
+    assert project_result.startswith("✅"), project_result
+    assert "LIGHT_MODE_BLOCKED" in system_result or "CORE_PROTECTION_BLOCKED" in system_result
+    assert (project / "BIBLE.md").read_text(encoding="utf-8") == "PROJECT = 2\n"
+    assert (system / "BIBLE.md").read_text(encoding="utf-8") == "SYSTEM = 1\n"
 
 
 @pytest.mark.parametrize("tool", ["write_file", "apply_patch", "edit_batch"])

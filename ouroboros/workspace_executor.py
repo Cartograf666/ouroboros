@@ -69,6 +69,9 @@ class _ExecutorService:
     cwd_root: str
     outputs: list[str]
     before_outputs: dict[str, tuple[bool, int, str]]
+    cwd_base: str = ""
+    cwd_source: str = ""
+    skill_name: str = ""
     keep_alive: bool = False
     started_at: float = field(default_factory=time.time)
     local_proc: subprocess.Popen | None = None
@@ -483,6 +486,11 @@ def _register_service_process(drive_root: pathlib.Path | None, record: _Executor
             "backend_pid": record.backend_pid,
             "backend_log_path": record.backend_log_path,
             "backend_cwd": record.backend_cwd,
+            "host_cwd": str(record.host_cwd),
+            "cwd_root": record.cwd_root,
+            "cwd_base": record.cwd_base,
+            "cwd_source": record.cwd_source,
+            "skill_name": record.skill_name,
             "cmd": _redacted_cmd(record.cmd),
             "keep_alive": bool(record.keep_alive),
         },
@@ -716,6 +724,9 @@ def start_service(
     readiness: dict[str, Any],
     outputs: list[str],
     before_outputs: dict[str, tuple[bool, int, str]],
+    cwd_base: str = "",
+    cwd_source: str = "",
+    skill_name: str = "",
     keep_alive: bool = False,
 ) -> dict[str, Any]:
     executor = executor_ref_from_ctx(ctx)
@@ -741,6 +752,9 @@ def start_service(
         host_cwd=host_cwd,
         backend_cwd=backend_cwd,
         cwd_root=cwd_root,
+        cwd_base=str(cwd_base),
+        cwd_source=str(cwd_source),
+        skill_name=str(skill_name),
         outputs=list(outputs),
         before_outputs=before_outputs,
         keep_alive=bool(keep_alive),
@@ -1052,6 +1066,9 @@ def _service_payload(record: _ExecutorService, *, state: str | None = None, note
         "backend_cwd": record.backend_cwd,
         "host_cwd": str(record.host_cwd),
         "cwd_root": record.cwd_root,
+        "cwd_base": record.cwd_base,
+        "cwd_source": record.cwd_source,
+        "skill_name": record.skill_name,
         "cmd": _redacted_cmd(record.cmd),
         "outputs": list(record.outputs),
         "keep_alive": bool(record.keep_alive),

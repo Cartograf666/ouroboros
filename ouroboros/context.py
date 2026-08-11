@@ -411,18 +411,12 @@ def _runtime_budget_info(env: Any, task: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _promoted_task_toolset(env: Any) -> Dict[str, Any]:
-    """F6 (2026-08-10 amendments): the LIVE built-in toolset a promoted task will see.
+    """The LIVE built-in toolset available to an ordinary promoted task.
 
-    The first cut projected the static ``_WORKSPACE_ALLOWED_TOOLS`` /
-    ``CORE|META`` union — it advertised credential-gated built-ins that real
-    availability removes (web_search without a backend) and omitted every valid
-    registered non-workspace built-in (get_github_issue, ...), so the router
-    could still author impossible or over-restricted contracts. This projection
-    asks the REGISTRY itself, through the same ``available_tools()`` resolution
-    a running task gets, once per intended target shape (workspace-mode task vs
-    non-workspace). Probe contexts carry a task_id so the credential-gate
-    predicates evaluate LIVE instead of taking the bare-registry structural
-    carve-out. Bounded structural list; no contract text is scanned (P5).
+    Workspace focus changes the default target, not the top-level principal's
+    tool names. The projection therefore asks the real registry once and keeps
+    credential omissions typed instead of maintaining a second static catalog.
+    Dynamic extension/MCP availability remains task-time state.
     """
     from types import SimpleNamespace
 
@@ -430,18 +424,16 @@ def _promoted_task_toolset(env: Any) -> Dict[str, Any]:
 
     registry = ToolRegistry(pathlib.Path(env.repo_dir), pathlib.Path(getattr(env, "drive_root", ".")))
 
-    def _probe(workspace: bool) -> Any:
-        return SimpleNamespace(
-            task_id="promote_toolset_probe", task_metadata={}, task_contract={},
-            task_constraint=None, is_workspace_mode=lambda: workspace,
-            is_ephemeral_turn=False,
-        )
-
-    registry.set_context(_probe(workspace=True))
-    workspace_tools = set(registry.available_tools())
-    probe = _probe(workspace=False)
+    probe = SimpleNamespace(
+        task_id="promote_toolset_probe",
+        task_metadata={},
+        task_contract={},
+        task_constraint=None,
+        is_workspace_mode=lambda: False,
+        is_ephemeral_turn=False,
+    )
     registry.set_context(probe)
-    non_workspace_tools = set(registry.available_tools())
+    top_level_tools = set(registry.available_tools())
     # Typed omissions: registered built-ins that live availability removes right
     # now (credential gates). Named with their reason so the router can tell
     # "does not exist" from "exists but currently unavailable".
@@ -451,16 +443,14 @@ def _promoted_task_toolset(env: Any) -> Dict[str, Any]:
         if not available:
             unavailable[name] = f"{reason}: {detail}" if detail else reason
     return {
-        "workspace_task_tools": sorted(workspace_tools),
-        "non_workspace_extra_tools": sorted(non_workspace_tools - workspace_tools),
+        "top_level_tools": sorted(top_level_tools),
         **({"unavailable_builtin_tools": dict(sorted(unavailable.items()))} if unavailable else {}),
         "rule": (
             "LIVE built-in tool availability, evaluated by the real tool "
-            "registry at promote time. A task running in a project workspace "
-            "sees workspace_task_tools ONLY; other tasks additionally see "
-            "non_workspace_extra_tools. unavailable_builtin_tools exist but are "
-            "currently unusable (e.g. missing credentials) — do not demand "
-            "them. Dynamic extension/MCP tools are NOT listed (their "
+            "registry at promote time. Project focus changes the default root, "
+            "not this ordinary top-level toolset. unavailable_builtin_tools "
+            "exist but are currently unusable (e.g. missing credentials) — do "
+            "not demand them. Dynamic extension/MCP tools are NOT listed (their "
             "availability is unknowable at promote time). If an objective/"
             "expected_output demands specific BUILT-IN tools, demand only names "
             "listed here."
@@ -520,8 +510,10 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
             "workspace_mode": str(task.get("workspace_mode") or ""),
             "memory_mode": str(task.get("memory_mode") or ""),
             "rule": (
-                "read_file/write_file/list_files/search_code/run_command target the active workspace; "
-                "Ouroboros self-review/commit tools are unavailable; final changes are exported as artifacts."
+                "File and process tools default to the active workspace; explicit typed root/cwd "
+                "selectors target other authorized resources per call. Project focus does not remove "
+                "the ordinary top-level toolset: Ouroboros self-review/commit tools remain available "
+                "for system_repo changes, while external-project changes are exported as artifacts."
             ),
         }
     if str(runtime_mode).lower() == "light":
@@ -639,10 +631,8 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
             "message in a project room defaults to that project unless it clearly says otherwise."
         )
     if _swarm_router:
-        # F6 (2026-08-10 saga): the router turn authors objectives/contracts for a
-        # task it will never run, and once wrote a HARD requirement on a tool the
-        # promoted task could not see (send_photo behind the workspace envelope).
-        # Give the turn the bounded LIVE tool-name envelope as a structural fact;
+        # The router turn authors objectives/contracts for a task it will never
+        # run. Give it the bounded LIVE top-level tool catalog as a structural fact;
         # the model still writes the contract itself (P5) — no contract text is
         # ever scanned or gated.
         try:

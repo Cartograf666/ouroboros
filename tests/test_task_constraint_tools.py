@@ -11,6 +11,7 @@ def _ctx(tmp_path):
     repo.mkdir()
     skill = drive / "skills" / "external" / "alpha"
     skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# alpha\n", encoding="utf-8")
     return ToolContext(repo_dir=repo, drive_root=drive, task_constraint=TaskConstraint(mode="skill_repair", skill_name="alpha", payload_root="skills/external/alpha", allow_enable=False)), skill
 
 
@@ -168,6 +169,7 @@ def test_light_mode_allows_normal_skill_str_replace_without_repair_constraint(tm
     repo.mkdir()
     skill = drive / "skills" / "clawhub" / "alpha"
     skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# alpha\n", encoding="utf-8")
     target = skill / "plugin.py"
     target.write_text("VALUE = 1\n", encoding="utf-8")
     registry = ToolRegistry(repo_dir=repo, drive_root=drive)
@@ -192,6 +194,7 @@ def test_light_mode_blocks_normal_skill_sidecar_str_replace(tmp_path, monkeypatc
     repo.mkdir()
     skill = drive / "skills" / "ouroboroshub" / "alpha"
     skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# alpha\n", encoding="utf-8")
     sidecar = skill / ".ouroboroshub.json"
     sidecar.write_text('{"version":"1"}\n', encoding="utf-8")
     registry = ToolRegistry(repo_dir=repo, drive_root=drive)
@@ -207,7 +210,7 @@ def test_light_mode_blocks_normal_skill_sidecar_str_replace(tmp_path, monkeypatc
     assert sidecar.read_text(encoding="utf-8") == '{"version":"1"}\n'
 
 
-def test_light_mode_blocks_review_excluded_skill_dirs(tmp_path, monkeypatch):
+def test_review_excluded_skill_dirs_stay_blocked_in_light_mode(tmp_path, monkeypatch):
     from ouroboros import config as cfg
     from ouroboros.tools.registry import ToolRegistry
 
@@ -216,6 +219,7 @@ def test_light_mode_blocks_review_excluded_skill_dirs(tmp_path, monkeypatch):
     repo.mkdir()
     target_dir = drive / "skills" / "external" / "alpha" / "node_modules"
     target_dir.mkdir(parents=True)
+    (target_dir.parent / "SKILL.md").write_text("# alpha\n", encoding="utf-8")
     target = target_dir / "dep.js"
     target.write_text("VALUE = 1\n", encoding="utf-8")
     registry = ToolRegistry(repo_dir=repo, drive_root=drive)
@@ -226,7 +230,7 @@ def test_light_mode_blocks_review_excluded_skill_dirs(tmp_path, monkeypatch):
         {"path": "skills/external/alpha/node_modules/dep.js", "old_str": "VALUE = 1", "new_str": "VALUE = 2"},
     )
 
-    assert "LIGHT_MODE_BLOCKED" in result
+    assert "STR_REPLACE_BLOCKED" in result
     assert target.read_text(encoding="utf-8") == "VALUE = 1\n"
 
 
@@ -255,6 +259,7 @@ def test_light_mode_allows_skill_payload_write_file(tmp_path, monkeypatch):
     repo.mkdir()
     skill = drive / "skills" / "external" / "alpha"
     skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# alpha\n", encoding="utf-8")
     registry = ToolRegistry(repo_dir=repo, drive_root=drive)
     monkeypatch.setattr(cfg, "get_runtime_mode", lambda: "light")
 

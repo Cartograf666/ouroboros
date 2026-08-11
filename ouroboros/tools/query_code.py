@@ -9,8 +9,13 @@ import time
 from typing import Any, List
 
 from ouroboros.protected_artifacts import block_reason_for_path
-from ouroboros.tool_access import normalize_root_relative, path_is_relative_to, resolve_user_file_path
-from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for, system_repo_dir_for
+from ouroboros.tool_access import (
+    ResolvedResourceBinding,
+    build_resolved_resource_binding,
+    normalize_root_relative,
+    path_is_relative_to,
+)
+from ouroboros.tools.registry import ToolContext, ToolEntry
 
 
 _OPS = (
@@ -78,7 +83,12 @@ def _safe_path(repo_root: pathlib.Path, path: str) -> str:
         raise ValueError(f"path escapes root: {path}") from exc
 
 
-def _visible_file(ctx: ToolContext, repo_root: pathlib.Path, rel_path: str) -> bool:
+def _visible_file(
+    ctx: ToolContext,
+    repo_root: pathlib.Path,
+    rel_path: str,
+    binding: ResolvedResourceBinding | None = None,
+) -> bool:
     try:
         target = (repo_root / rel_path).resolve(strict=False)
     except Exception:
@@ -91,12 +101,18 @@ def _visible_file(ctx: ToolContext, repo_root: pathlib.Path, rel_path: str) -> b
     except Exception:
         pass
     return not (
-        block_reason_for_path(ctx, target, "read_bytes")
-        or block_reason_for_path(ctx, target, "static_introspection")
+        block_reason_for_path(ctx, target, "read_bytes", binding)
+        or block_reason_for_path(ctx, target, "static_introspection", binding)
     )
 
 
-def _inventory_rows(ctx: ToolContext, inventory: Any, repo_root: pathlib.Path, opts: dict[str, Any]) -> list[str]:
+def _inventory_rows(
+    ctx: ToolContext,
+    inventory: Any,
+    repo_root: pathlib.Path,
+    opts: dict[str, Any],
+    binding: ResolvedResourceBinding | None = None,
+) -> list[str]:
     from ouroboros.code_intelligence import (
         impact_files,
         relevant_files,
@@ -116,30 +132,38 @@ def _inventory_rows(ctx: ToolContext, inventory: Any, repo_root: pathlib.Path, o
     rows: list[str] = []
     if op in {"symbols", "definition"}:
         for file, symbol in symbol_definitions(inventory, query, path=path, kind=kind or "any"):
-            if _visible_file(ctx, repo_root, file.path):
+            if _visible_file(ctx, repo_root, file.path, binding):
                 rows.append(f"{file.path}:{symbol.line_start} {symbol.kind} {symbol.signature or symbol.name}")
     elif op == "references":
         for file, ref in symbol_references(inventory, query, path=path):
-            if _visible_file(ctx, repo_root, file.path):
+            if _visible_file(ctx, repo_root, file.path, binding):
                 rows.append(f"{file.path}:{ref.line} {query}{' in ' + ref.enclosing if ref.enclosing else ''}")
     elif op in {"callers", "callees"}:
         iterator = symbol_callers(inventory, query, path=path) if op == "callers" else symbol_callees(inventory, query, path=path)
         for file, call in iterator:
-            if _visible_file(ctx, repo_root, file.path):
+            if _visible_file(ctx, repo_root, file.path, binding):
                 rows.append(f"{file.path}:{call.line} {call.enclosing + ' -> ' if call.enclosing else ''}{call.name}")
     elif op == "impact":
         for file, reason in impact_files(inventory, path or query, depth=depth):
-            if _visible_file(ctx, repo_root, file.path):
+            if _visible_file(ctx, repo_root, file.path, binding):
                 rows.append(f"{file.path}  {reason}")
     elif op == "relevant_files":
         for idx, (file, score, reason) in enumerate(relevant_files(inventory, query, limit=min(_MAX_LIMIT, offset + limit)), 1):
-            if _visible_file(ctx, repo_root, file.path):
+            if _visible_file(ctx, repo_root, file.path, binding):
                 top_symbols = ", ".join(symbol.name for symbol in file.symbols[:5])
                 rows.append(f"{idx}. {file.path} score={score:.2f} reason={reason}{' symbols=' + top_symbols if top_symbols else ''}")
     return rows
 
 
-def _structural(ctx: ToolContext, repo_root: pathlib.Path, query: str, path: str, lang: str, limit: int) -> list[str]:
+def _structural(
+    ctx: ToolContext,
+    repo_root: pathlib.Path,
+    query: str,
+    path: str,
+    lang: str,
+    limit: int,
+    binding: ResolvedResourceBinding | None = None,
+) -> list[str]:
     # Conservative first step: use tree-sitter when available, otherwise a Python
     # ast fallback plus literal matching. Query may be a tree-sitter S-expression
     # like "(function_definition)" or a node type such as "FunctionDef".
@@ -218,7 +242,7 @@ def _structural(ctx: ToolContext, repo_root: pathlib.Path, query: str, path: str
             rel = fp.relative_to(repo_root).as_posix()
         except ValueError:
             continue
-        if not _visible_file(ctx, repo_root, rel):
+        if not _visible_file(ctx, repo_root, rel, binding):
             continue
         if not ts_node_type:
             continue
@@ -251,13 +275,20 @@ def _structural(ctx: ToolContext, repo_root: pathlib.Path, query: str, path: str
     return rows
 
 
-def _query_code(ctx: ToolContext, op: str, **options: Any) -> str:
+def _query_code(
+    ctx: ToolContext,
+    op: str,
+    _resolved_binding: ResolvedResourceBinding | None = None,
+    **options: Any,
+) -> str:
     query = str(options.get("query") or "")
     path = str(options.get("path") or "")
     lang = str(options.get("lang") or "any")
     kind = str(options.get("kind") or "any")
     depth = int(options.get("depth") or 1)
     root = str(options.get("root") or "active_workspace")
+    bucket = str(options.get("bucket") or "")
+    skill_name = str(options.get("skill_name") or "")
     limit = int(options.get("limit") or 40)
     offset = int(options.get("offset") or 0)
     op = str(op or "").strip()
@@ -266,7 +297,20 @@ def _query_code(ctx: ToolContext, op: str, **options: Any) -> str:
     if op not in ("symbols", "digest") and not str(query or "").strip():
         return f"⚠️ TOOL_ARG_ERROR (query_code): op '{op}' requires query."
     try:
-        normalized_root = str(root or "active_workspace").strip() or "active_workspace"
+        binding = _resolved_binding or build_resolved_resource_binding(
+            ctx,
+            root=root,
+            operation="search",
+            path=path or ".",
+            bucket=bucket,
+            skill_name=skill_name,
+        )
+    except Exception as exc:
+        if str(exc).startswith("profile=") and " cannot " in str(exc):
+            return f"⚠️ TOOL_ACCESS_BLOCKED: {str(exc).rstrip('.')}."
+        return f"⚠️ TOOL_ARG_ERROR (query_code): {exc}"
+    try:
+        normalized_root = binding.root
         if normalized_root == "system_repo":
             try:
                 from ouroboros.tool_access import active_tool_profile
@@ -275,19 +319,12 @@ def _query_code(ctx: ToolContext, op: str, **options: Any) -> str:
                     return "⚠️ TOOL_ACCESS_BLOCKED: query_code root=system_repo is not available to acting subagents."
             except Exception:
                 pass
-            repo_root = pathlib.Path(system_repo_dir_for(ctx)).resolve(strict=False)
+            repo_root = binding.base_path
         elif normalized_root == "active_workspace":
-            repo_root = pathlib.Path(active_repo_dir_for(ctx)).resolve(strict=False)
-            try:
-                from ouroboros.tool_access import project_room_lens_dir
-
-                _room = project_room_lens_dir(ctx)
-                if _room is not None:
-                    # Room lens (v6.61.3): folder-room chat queries the PROJECT
-                    # FOLDER; self-repo queries stay on root="system_repo".
-                    repo_root = _room
-            except Exception:
-                pass
+            repo_root = binding.base_path
+        elif normalized_root == "skill_payload":
+            repo_root = binding.base_path
+            path = binding.target_path.relative_to(binding.base_path).as_posix()
         elif normalized_root == "user_files":
             # Read-only structured intelligence over an EXTERNAL workspace target
             # (e.g. the SWE-bench dig-direct /app) — R1. Restricted subagents must
@@ -310,7 +347,7 @@ def _query_code(ctx: ToolContext, op: str, **options: Any) -> str:
             # (e.g. a benchmark /app) stays supported — opt out of the v6.54.3
             # home-membership rejection; the credential/control-plane block
             # reasons still apply inside resolve_user_file_path.
-            target = resolve_user_file_path(ctx, str(path).strip(), allow_outside_home=True)
+            target = binding.target_path
             if target.is_dir():
                 repo_root = target.resolve(strict=False)
                 path = ""
@@ -320,7 +357,9 @@ def _query_code(ctx: ToolContext, op: str, **options: Any) -> str:
             else:
                 raise ValueError(f"user_files path does not exist: {str(path).strip()}")
         else:
-            raise ValueError("root must be active_workspace, system_repo, or user_files")
+            raise ValueError(
+                "root must be active_workspace, system_repo, skill_payload, or user_files"
+            )
         # Accept absolute/redundant-prefix paths inside the root (e.g. '/app/x'
         # or 'app/x' under a root at /app); _safe_path still confines below.
         path = normalize_root_relative(repo_root, path)
@@ -333,12 +372,14 @@ def _query_code(ctx: ToolContext, op: str, **options: Any) -> str:
 
     try:
         if op == "structural":
-            rows = _structural(ctx, repo_root, query, scoped_path, str(lang or "any"), limit)
+            rows = _structural(
+                ctx, repo_root, query, scoped_path, str(lang or "any"), limit, binding
+            )
         else:
             from ouroboros.code_intelligence import build_code_inventory
             from ouroboros.protected_artifacts import protected_artifact_paths
 
-            exclude_paths: list[pathlib.Path] = list(protected_artifact_paths(ctx))
+            exclude_paths: list[pathlib.Path] = list(protected_artifact_paths(ctx, binding))
             persist = True
             if exclude_paths or normalized_root == "user_files":
                 # Do not cache an external/ephemeral user_files target's inventory
@@ -356,7 +397,10 @@ def _query_code(ctx: ToolContext, op: str, **options: Any) -> str:
             except Exception:
                 pass
             inventory = build_code_inventory(repo_root, drive_root=pathlib.Path(ctx.drive_root), persist=persist, exclude_paths=exclude_paths)
-            inventory.files = [file for file in inventory.files if _visible_file(ctx, repo_root, file.path)]
+            inventory.files = [
+                file for file in inventory.files
+                if _visible_file(ctx, repo_root, file.path, binding)
+            ]
             if op == "digest":
                 # Whole-repo map (folded from the former codebase_digest tool):
                 # a compact file/symbol inventory to orient in an unfamiliar repo.
@@ -365,7 +409,7 @@ def _query_code(ctx: ToolContext, op: str, **options: Any) -> str:
             rows = _inventory_rows(ctx, inventory, repo_root, {
                 "op": op, "query": query, "path": scoped_path, "kind": kind,
                 "depth": depth, "limit": limit, "offset": offset,
-            })
+            }, binding)
     except Exception as exc:
         return f"⚠️ QUERY_CODE_ERROR: {type(exc).__name__}: {exc}"
 
@@ -435,7 +479,9 @@ def get_tools() -> List[ToolEntry]:
                 "lang": {"type": "string", "enum": ["python", "javascript", "typescript", "go", "rust", "java", "ruby", "c", "cpp", "csharp", "php", "kotlin", "swift", "scala", "lua", "bash", "any"], "default": "any"},
                 "kind": {"type": "string", "enum": ["function", "async_function", "class", "constant", "any"], "default": "any"},
                 "depth": {"type": "integer", "default": 1, "description": "Graph depth for impact."},
-                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "user_files"], "default": "active_workspace", "description": "active_workspace/system_repo are Ouroboros repos; user_files runs read-only intelligence over an EXTERNAL target dir/file named by path= (e.g. /app), never the whole home."},
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "skill_payload", "user_files"], "default": "active_workspace", "description": "active_workspace/system_repo are code roots; skill_payload selects one exact skill with bucket + skill_name; user_files runs read-only intelligence over an EXTERNAL target dir/file named by path= (e.g. /app), never the whole home."},
+                "bucket": {"type": "string", "enum": ["external", "clawhub", "ouroboroshub", "native", "user_repo"], "description": "Required with root=skill_payload; selects the physical skill source."},
+                "skill_name": {"type": "string", "description": "Required with root=skill_payload; exact skill directory identity."},
                 "limit": {"type": "integer", "default": 40},
                 "offset": {"type": "integer", "default": 0},
             }, "required": ["op"]},

@@ -278,7 +278,7 @@ def test_noneligible_invocations_are_byte_for_byte_unchanged(tmp_path, tool_name
     assert trace is None
 
 
-def test_light_run_script_default_cwd_uses_task_drive_agent_python(tmp_path, monkeypatch):
+def test_light_run_script_default_cwd_uses_active_workspace_agent_python(tmp_path, monkeypatch):
     ctx = _context(tmp_path)
     agent_python = _executable(tmp_path / "agent" / "bin" / "python")
     monkeypatch.setenv("OUROBOROS_AGENT_PYTHON", str(agent_python))
@@ -291,7 +291,8 @@ def test_light_run_script_default_cwd_uses_task_drive_agent_python(tmp_path, mon
     )
 
     assert resolved["interpreter"] == str(agent_python)
-    assert trace is not None and trace.surface == "task_drive"
+    assert trace is not None and trace.surface == "system_repo"
+    assert trace.target_root == "active_workspace"
 
 
 def test_registry_guard_and_handler_receive_same_resolved_verify_argv(tmp_path, monkeypatch):
@@ -318,8 +319,9 @@ def test_registry_guard_and_handler_receive_same_resolved_verify_argv(tmp_path, 
         captured["guard"] = list(guarded["cmd"])
         return guarded
 
-    def capture_handler(_ctx, contract_kind, check, **kwargs):
+    def capture_handler(_ctx, contract_kind, check, _resolved_binding=None, **kwargs):
         assert contract_kind == "explicit_command"
+        assert _resolved_binding is not None
         captured["handler"] = list(check)
         return "ok"
 
@@ -357,7 +359,8 @@ def test_registry_uses_current_process_python_before_server_bootstrap(
     registry.set_context(ctx)
     observed = {}
 
-    def handler(_ctx, cmd, **_kwargs):
+    def handler(_ctx, cmd, _resolved_binding=None, **_kwargs):
+        assert _resolved_binding is not None
         observed["cmd"] = cmd
         return "ok"
 

@@ -1054,6 +1054,99 @@ body
     assert queue.list_scheduled_tasks()["tasks"] == []
 
 
+def test_skill_schedule_sync_preserves_ambiguous_identity_rows(tmp_path):
+    from ouroboros.contracts.skill_manifest import parse_skill_manifest_text
+    from supervisor import queue
+
+    queue.init(tmp_path, 600, 1800)
+    manifest = parse_skill_manifest_text("""---
+name: cron-demo
+description: Cron demo
+version: 0.1.0
+type: extension
+entry: plugin.py
+permissions: [supervised_task]
+scheduled_tasks:
+  - name: refresh
+    cron: "0 * * * *"
+---
+body
+""")
+    skill = SimpleNamespace(
+        name="cron-demo", manifest=manifest, enabled=True, load_error="",
+        content_hash="abc", identity_collision=False,
+        review=SimpleNamespace(status="pass", is_stale_for=lambda _h: False),
+    )
+    queue.sync_skill_schedules([skill])
+    before = queue.list_scheduled_tasks()["tasks"]
+
+    collision = SimpleNamespace(
+        name="cron-demo", identity_collision=True,
+        manifest=SimpleNamespace(scheduled_tasks=[]),
+    )
+    unique = SimpleNamespace(
+        name="other", manifest=manifest, enabled=True, load_error="",
+        content_hash="def", identity_collision=False,
+        review=SimpleNamespace(status="pass", is_stale_for=lambda _h: False),
+    )
+    report = queue.sync_skill_schedules([collision, unique])
+    after = queue.list_scheduled_tasks()["tasks"]
+
+    assert report["changed"] is True
+    assert next(item for item in after if item["id"] == "skill-cron-demo-refresh") == before[0]
+    assert any(item["id"] == "skill-other-refresh" for item in after)
+
+
+def test_due_skill_schedule_does_not_run_while_identity_is_ambiguous(
+    tmp_path, monkeypatch,
+):
+    from supervisor import queue, state
+
+    state.init(tmp_path)
+    queue.init(tmp_path, 600, 1800)
+    pending = []
+    queue.init_queue_refs(pending, {}, {"value": 0})
+    manifest = """---
+name: cron-demo
+description: Cron demo
+version: 0.1.0
+type: extension
+entry: plugin.py
+permissions: [supervised_task]
+scheduled_tasks:
+  - name: refresh
+    cron: "* * * * *"
+---
+body
+"""
+    data_skill = tmp_path / "skills" / "external" / "cron-demo"
+    user_skill = tmp_path / "user-skills" / "cron-demo"
+    for skill_dir in (data_skill, user_skill):
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(manifest, encoding="utf-8")
+        (skill_dir / "plugin.py").write_text("", encoding="utf-8")
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(user_skill.parent))
+    queue.upsert_scheduled_task({
+        "id": "skill-cron-demo-refresh",
+        "name": "cron-demo/refresh",
+        "enabled": True,
+        "source": "skill_manifest",
+        "skill": "cron-demo",
+        "trigger": {"type": "cron", "expr": "* * * * *"},
+        "next_run_at": "2000-01-01T00:00:00+00:00",
+        "task": {"type": "task", "text": "run cron-demo"},
+    })
+
+    queue.resync_skill_schedules(tmp_path)
+    before = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
+    monkeypatch.setattr(queue, "_last_skill_schedule_sync", queue.time.monotonic())
+    queue.check_scheduled_tasks()
+
+    assert pending == []
+    assert queue.list_scheduled_tasks(tmp_path)["tasks"] == [before]
+    assert not (tmp_path / "task_results").exists()
+
+
 def test_reflection_extract_trailing_json_parses_memory_and_backlog():
     from ouroboros.reflection import _extract_trailing_json
 

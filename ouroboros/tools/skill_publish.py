@@ -27,13 +27,17 @@ from ouroboros.skill_loader import (
     _iter_payload_files,
     _sanitize_skill_name,
     compute_content_hash,
-    find_skill,
 )
 from ouroboros.skill_publish_eligibility import PUBLISHABLE_STATUSES
 from ouroboros.skill_review_status import normalize_skill_review_status
 from ouroboros.contracts.skill_payload_policy import SKILL_PAYLOAD_CONTROL_FILENAMES
 from ouroboros.tools.github import _gh_cmd, github_token_from_env_or_settings
 from ouroboros.tools.registry import ToolContext, ToolEntry
+from ouroboros.tool_access import (
+    ResolvedResourceBinding,
+    build_resolved_resource_binding,
+    load_bound_skill,
+)
 from ouroboros.utils import contains_real_secret_value, read_json_dict, utc_now_iso
 
 _MAX_PAYLOAD_BYTES = 5 * 1024 * 1024
@@ -190,13 +194,20 @@ def _provenance_hint(skill_dir: pathlib.Path, source: str) -> str:
     )
 
 
-def _validate_local_skill(ctx: ToolContext, skill: str):
+def _validate_local_skill(
+    ctx: ToolContext,
+    skill: str,
+    binding: ResolvedResourceBinding | None = None,
+):
     safe = _sanitize_skill_name(skill)
     if not safe or safe == "_unnamed":
         raise ValueError("skill name is required")
     if not github_token_from_env_or_settings():
         raise ValueError("GITHUB_TOKEN missing in Settings -> Secrets")
-    loaded = find_skill(pathlib.Path(ctx.drive_root), safe)
+    binding = binding or build_resolved_resource_binding(
+        ctx, root="skill_payload", operation="review", path=".", skill_name=safe,
+    )
+    loaded = load_bound_skill(binding)
     if loaded is None:
         raise ValueError(f"skill not found: {safe}")
     allowed_sources = {
@@ -530,13 +541,14 @@ def _submit_skill_to_hub(
     note: str = "",
     confirm_public_submission: bool = False,
     permission_statement: str = "",
+    _resolved_binding: ResolvedResourceBinding | None = None,
 ) -> str:
     try:
         if not confirm_public_submission:
             return _warn("explicit public submission confirmation is required")
         if "publish" not in permission_statement.lower() and "submit" not in permission_statement.lower():
             return _warn("permission_statement must state that the human explicitly asked to publish/submit this skill")
-        safe_skill, loaded = _validate_local_skill(ctx, skill)
+        safe_skill, loaded = _validate_local_skill(ctx, skill, _resolved_binding)
         owner, repo, base_branch = _parse_hub_destination(get_ouroboroshub_catalog_url())
         login = _ensure_user_fork(ctx, owner, repo, base_branch)
         catalog, base_sha = _fetch_upstream_catalog(ctx, owner, repo, base_branch)

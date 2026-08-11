@@ -61,7 +61,11 @@ from ouroboros.runtime_mode_policy import (
     protected_paths_in,
     protected_write_block_message,
 )
-from ouroboros.tool_access import canonical_repo_relative_path
+from ouroboros.tool_access import (
+    ResolvedResourceBinding,
+    binding_targets_system_repo,
+    build_resolved_resource_binding,
+)
 from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for
 from ouroboros.utils import safe_relpath, write_text
 
@@ -73,11 +77,17 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _resolve_edit_target(
-    ctx: ToolContext, path: str, root: str, *, error_tag: str
-) -> Tuple[Optional[pathlib.Path], str, str]:
+    ctx: ToolContext,
+    path: str,
+    root: str,
+    *,
+    error_tag: str,
+    _resolved_binding: ResolvedResourceBinding | None = None,
+) -> Tuple[Optional[pathlib.Path], str, Optional[ResolvedResourceBinding], str]:
     """Resolve ``path`` under ``root`` with the same guards as edit_text.
 
-    Returns ``(target, canonical_rel, "")`` on success or ``(None, "", error)``.
+    Returns ``(target, canonical_rel, binding, "")`` on success or an empty
+    target/identity/binding plus the typed error on refusal.
 
     The canonical rel is returned, not just used internally: it is the file's
     IDENTITY. Callers plan, dedup, diagnose and invalidate by it, so two
@@ -86,59 +96,51 @@ def _resolve_edit_target(
     """
     from ouroboros.tools.core import (
         _access_or_block,
-        _protected_artifact_write_block,
         project_room_lens_dir,
     )
 
     if not path or not str(path).strip():
-        return None, "", f"⚠️ {error_tag}: path is required."
+        return None, "", None, f"⚠️ {error_tag}: path is required."
     normalized, block = _access_or_block(ctx, root, "edit")
     if block:
-        return None, "", block
+        return None, "", None, block
     if normalized not in {"active_workspace", "system_repo"}:
-        return None, "", (
+        return None, "", None, (
             f"⚠️ {error_tag}: root={normalized!r} is not supported; "
             "these tools edit repo lanes only (active_workspace / system_repo). "
             "Use write_file/edit_text for data-plane roots."
         )
-    if normalized == "system_repo":
-        try:
-            from ouroboros.tool_access import resource_root_path
+    try:
+        binding = _resolved_binding or build_resolved_resource_binding(
+            ctx, root=normalized, operation="edit", path=path,
+        )
+    except Exception as exc:  # noqa: BLE001 - target selection must fail closed
+        return None, "", None, f"⚠️ {error_tag}: {type(exc).__name__}: {exc}"
+    if binding.root != normalized:
+        return None, "", None, (
+            f"⚠️ {error_tag}: internal target binding root mismatch "
+            f"({binding.root!r} != {normalized!r})."
+        )
+    target = pathlib.Path(binding.target_path)
+    try:
+        rel = target.relative_to(binding.base_path).as_posix()
+    except ValueError:
+        return None, "", None, f"⚠️ {error_tag}: selected target escapes its repository root."
+    from ouroboros.protected_artifacts import block_reason_for_path
 
-            active_root = resource_root_path(ctx, "active_workspace")
-            system_root = resource_root_path(ctx, "system_repo")
-            if active_root.resolve(strict=False) != system_root.resolve(strict=False):
-                return None, "", (
-                    f"⚠️ {error_tag}: root=system_repo edits require the active "
-                    "workspace to be the system repo."
-                )
-        except Exception as exc:  # noqa: BLE001 - validation must fail closed
-            return None, "", f"⚠️ {error_tag}: could not validate system_repo root: {type(exc).__name__}: {exc}"
-    # CANONICALIZE BEFORE ANY GUARD READS THE PATH. `ctx.repo_path` applies
-    # `normalize_root_relative` (absolute-inside-root and redundant root-basename
-    # spellings collapse to the same target), so a guard that inspects the RAW
-    # spelling desyncs from the file that actually gets written: `repo/BIBLE.md`
-    # and `/…/repo/BIBLE.md` are not members of the protected-path table while
-    # `BIBLE.md` is. `edit_text`/`write_file` are immune because the dispatcher
-    # normalizes their `path` arg once in `_normalize_dispatch_path_args`; these
-    # tools carry their paths inside the patch text / edits[] entries, so they
-    # must do the same normalization here — before the protected checks, and for
-    # the dedup keys and diagnostics too.
-    path = canonical_repo_relative_path(ctx, normalized, path)
-    protected_block = _protected_artifact_write_block(
-        ctx, normalized, [path], prefix=error_tag
-    )
-    if protected_block:
-        return None, "", protected_block
+    if reason := block_reason_for_path(ctx, target, "write", binding):
+        return None, "", None, (
+            f"⚠️ {error_tag}: protected artifact path blocked: {reason}"
+        )
     if normalized == "active_workspace" and project_room_lens_dir(ctx) is not None:
-        return None, "", (
+        return None, "", None, (
             "⚠️ ROOM_WRITE_VIA_TASK: this room's files are edited by PROMOTED tasks — "
             "call promote_chat_to_task for real work there. For a deliberate edit of "
             'the Ouroboros system repo, pass root="system_repo" explicitly.'
         )
-    norm = normalize_repo_path(path)
+    norm = normalize_repo_path(rel)
     if (
-        not ctx.is_workspace_mode()
+        binding_targets_system_repo(ctx, binding)
         and is_protected_runtime_path(norm)
         and not mode_allows_protected_write(_runtime_mode())
         # The assisted managed-update resolver edits whatever official file the
@@ -147,14 +149,10 @@ def _resolve_edit_target(
         # lane that cannot finish a conflict resolution.
         and not _authorized_resolver(ctx)
     ):
-        return None, "", protected_write_block_message(
+        return None, "", None, protected_write_block_message(
             path=norm, runtime_mode=_runtime_mode(), action="edit"
         )
-    try:
-        target = ctx.repo_path(path)
-    except ValueError as e:
-        return None, "", f"⚠️ PATH_ERROR: {e}"
-    return target, safe_relpath(path), ""
+    return target, safe_relpath(rel), binding, ""
 
 
 def _authorized_resolver(ctx: ToolContext) -> bool:
@@ -173,7 +171,12 @@ def _runtime_mode() -> str:
         return "advanced"
 
 
-def _finish_mutation(ctx: ToolContext, changed_paths: List[str], source_tool: str) -> str:
+def _finish_mutation(
+    ctx: ToolContext,
+    changed_paths: List[str],
+    source_tool: str,
+    binding: ResolvedResourceBinding | None = None,
+) -> str:
     """Advisory invalidation + the standard commit/patch-artifact footer."""
     from ouroboros.tools.commit_gate import _invalidate_advisory
 
@@ -181,12 +184,13 @@ def _finish_mutation(ctx: ToolContext, changed_paths: List[str], source_tool: st
         _invalidate_advisory(
             ctx,
             changed_paths=changed_paths,
-            mutation_root=active_repo_dir_for(ctx),
+            mutation_root=(binding.base_path if binding is not None else active_repo_dir_for(ctx)),
             source_tool=source_tool,
         )
     except Exception:
         log.debug("%s: advisory invalidation failed (non-critical)", source_tool, exc_info=True)
-    if ctx.is_workspace_mode():
+    targets_system = binding_targets_system_repo(ctx, binding) if binding is not None else False
+    if ctx.is_workspace_mode() and not targets_system:
         return "Files are on disk but NOT committed. Do not commit; the headless runner will emit a patch artifact."
     footer = (
         "Files are on disk but NOT committed. Run commit_reviewed when ready.\n"
@@ -195,14 +199,19 @@ def _finish_mutation(ctx: ToolContext, changed_paths: List[str], source_tool: st
     # A pro-mode edit of a protected surface announces itself here exactly as it
     # does from git._repo_write / _str_replace_editor (SYSTEM.md's protected-write
     # contract): the mode ALLOWS the write, and the notice is what keeps it visible.
-    protected = protected_paths_in(changed_paths)
+    protected = protected_paths_in(changed_paths) if targets_system or not ctx.is_workspace_mode() else []
     if protected and mode_allows_protected_write(_runtime_mode()):
         footer += "\n\n" + core_patch_notice(protected)
     return footer
 
 
 def _partial_write_failure(
-    ctx: ToolContext, changed_paths: List[str], source_tool: str, tag: str, detail: str
+    ctx: ToolContext,
+    changed_paths: List[str],
+    source_tool: str,
+    tag: str,
+    detail: str,
+    binding: ResolvedResourceBinding | None = None,
 ) -> str:
     """Report an I/O failure that landed AFTER some files were already written.
 
@@ -215,7 +224,7 @@ def _partial_write_failure(
     """
 
     if changed_paths:
-        _finish_mutation(ctx, changed_paths, source_tool)
+        _finish_mutation(ctx, changed_paths, source_tool, binding)
         # NOT the tools' own *_ERROR prefix: those read as validation refusals
         # (a counted/context miss) and are classified as policy denials. This is a
         # genuine partial mutation from an I/O fault and must stay an execution
@@ -447,7 +456,12 @@ def _apply_hunks_to_text(
     return "\n".join(file_lines), notes, ""
 
 
-def _apply_patch(ctx: ToolContext, patch: str, root: str = "active_workspace") -> str:
+def _apply_patch(
+    ctx: ToolContext,
+    patch: str,
+    root: str = "active_workspace",
+    _resolved_binding: ResolvedResourceBinding | tuple[ResolvedResourceBinding, ...] | None = None,
+) -> str:
     if not patch or not patch.strip():
         return "⚠️ APPLY_PATCH_ERROR: patch is required."
     ops, err = _parse_patch(patch)
@@ -460,10 +474,26 @@ def _apply_patch(ctx: ToolContext, patch: str, root: str = "active_workspace") -
     summaries: List[str] = []
     all_notes: List[str] = []
     seen: Dict[str, str] = {}  # rel path -> pending content (chained updates)
+    supplied_bindings = (
+        tuple(_resolved_binding)
+        if isinstance(_resolved_binding, tuple)
+        else ((_resolved_binding,) if _resolved_binding is not None else ())
+    )
+    if supplied_bindings and len(supplied_bindings) != len(ops):
+        return "⚠️ APPLY_PATCH_ERROR: internal target binding count mismatch."
+    binding_iter = iter(supplied_bindings)
+    mutation_binding: ResolvedResourceBinding | None = None
     for op in ops:
-        target, rel, terr = _resolve_edit_target(ctx, op.path, root, error_tag="APPLY_PATCH_BLOCKED")
+        target, rel, item_binding, terr = _resolve_edit_target(
+            ctx,
+            op.path,
+            root,
+            error_tag="APPLY_PATCH_BLOCKED",
+            _resolved_binding=next(binding_iter, None),
+        )
         if terr:
             return terr
+        mutation_binding = mutation_binding or item_binding
         if op.kind == "add":
             if rel in seen or target.exists():
                 return (
@@ -515,6 +545,7 @@ def _apply_patch(ctx: ToolContext, patch: str, root: str = "active_workspace") -
             return _partial_write_failure(
                 ctx, changed_paths, "apply_patch", "APPLY_PATCH_ERROR",
                 f"write failed for {rel}: {e}",
+                mutation_binding,
             )
         changed_paths.append(rel)
     for target, rel in planned_deletes:
@@ -524,10 +555,11 @@ def _apply_patch(ctx: ToolContext, patch: str, root: str = "active_workspace") -
             return _partial_write_failure(
                 ctx, changed_paths, "apply_patch", "APPLY_PATCH_ERROR",
                 f"delete failed for {rel}: {e}",
+                mutation_binding,
             )
         changed_paths.append(rel)
 
-    footer = _finish_mutation(ctx, changed_paths, "apply_patch")
+    footer = _finish_mutation(ctx, changed_paths, "apply_patch", mutation_binding)
     body = "\n".join(summaries)
     if all_notes:
         body += "\nNotes:\n" + "\n".join("  " + n for n in all_notes)
@@ -538,17 +570,30 @@ def _apply_patch(ctx: ToolContext, patch: str, root: str = "active_workspace") -
 # edit_batch
 # ---------------------------------------------------------------------------
 
-def _edit_batch(ctx: ToolContext, edits: List[Dict[str, Any]], root: str = "active_workspace") -> str:
+def _edit_batch(
+    ctx: ToolContext,
+    edits: List[Dict[str, Any]],
+    root: str = "active_workspace",
+    _resolved_binding: ResolvedResourceBinding | tuple[ResolvedResourceBinding, ...] | None = None,
+) -> str:
     if not edits or not isinstance(edits, list):
         return "⚠️ EDIT_BATCH_ERROR: edits must be a non-empty array."
     contents: Dict[str, str] = {}
     targets: Dict[str, pathlib.Path] = {}
     applied: List[str] = []
     errors: List[str] = []
+    supplied_bindings = (
+        tuple(_resolved_binding)
+        if isinstance(_resolved_binding, tuple)
+        else ((_resolved_binding,) if _resolved_binding is not None else ())
+    )
+    binding_iter = iter(supplied_bindings)
+    mutation_binding: ResolvedResourceBinding | None = None
     for idx, edit in enumerate(edits, 1):
         if not isinstance(edit, dict):
             errors.append(f"edit {idx}: must be an object")
             continue
+        item_binding = next(binding_iter, None)
         path = str(edit.get("path", "") or "")
         old_str = edit.get("old_str", "")
         new_str = edit.get("new_str", "")
@@ -569,10 +614,17 @@ def _edit_batch(ctx: ToolContext, edits: List[Dict[str, Any]], root: str = "acti
         # Resolve BEFORE keying: the canonical rel is the file's identity, so two
         # spellings of one file in a single batch share one buffer instead of two
         # that overwrite each other.
-        target, rel, terr = _resolve_edit_target(ctx, path, root, error_tag="EDIT_BATCH_BLOCKED")
+        target, rel, item_binding, terr = _resolve_edit_target(
+            ctx,
+            path,
+            root,
+            error_tag="EDIT_BATCH_BLOCKED",
+            _resolved_binding=item_binding,
+        )
         if terr:
             errors.append(f"edit {idx}: {terr.lstrip('⚠️ ')}")
             continue
+        mutation_binding = mutation_binding or item_binding
         if rel not in contents:
             if not target.exists():
                 errors.append(f"edit {idx} ({rel}): file not found")
@@ -608,9 +660,10 @@ def _edit_batch(ctx: ToolContext, edits: List[Dict[str, Any]], root: str = "acti
             return _partial_write_failure(
                 ctx, changed, "edit_batch", "EDIT_BATCH_ERROR",
                 f"write failed for {rel}: {e}",
+                mutation_binding,
             )
         changed.append(rel)
-    footer = _finish_mutation(ctx, changed, "edit_batch")
+    footer = _finish_mutation(ctx, changed, "edit_batch", mutation_binding)
     return (
         f"✅ edit_batch applied {len(applied)} edit(s) across {len(changed)} file(s):\n"
         + "\n".join("  " + a for a in applied)

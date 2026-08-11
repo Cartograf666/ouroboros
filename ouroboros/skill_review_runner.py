@@ -26,6 +26,7 @@ from ouroboros.skill_loader import (
     find_skill,
     review_status_allows_execution,
     save_enabled,
+    skill_identity_collision_names,
     skill_review_gate,
     skill_state_dir,
 )
@@ -42,6 +43,11 @@ from ouroboros.skill_review_status import (
     normalize_skill_review_status,
 )
 from ouroboros.utils import append_jsonl, atomic_write_json, read_json_dict, utc_now_iso
+from ouroboros.tool_access import (
+    ResolvedResourceBinding,
+    build_resolved_resource_binding,
+    load_bound_skill,
+)
 
 log = logging.getLogger(__name__)
 
@@ -49,7 +55,7 @@ _HEARTBEAT_INTERVAL_SEC = 30.0
 _STALE_REVIEW_JOB_SEC = int(os.environ.get("OUROBOROS_SKILL_REVIEW_JOB_STALE_SEC", "7200"))
 
 
-ReviewImpl = Callable[[Any, str], SkillReviewOutcome]
+ReviewImpl = Callable[..., SkillReviewOutcome]
 
 
 def review_job_state_path(drive_root: pathlib.Path, skill_name: str) -> pathlib.Path:
@@ -387,12 +393,17 @@ def reconcile_stale_review_jobs(
     root = pathlib.Path(drive_root) / "state" / "skills"
     if not root.exists():
         return 0
+    collision_names = skill_identity_collision_names(
+        pathlib.Path(drive_root), repo_path=get_skills_repo_path(),
+    )
     count = 0
     for path in root.glob("*/review_job.json"):
+        skill_name = path.parent.name
+        if skill_name in collision_names:
+            continue
         before = _read_review_job(path)
         if str(before.get("status") or "") != "running":
             continue
-        skill_name = path.parent.name
         mark_stale_review_job_interrupted(
             pathlib.Path(drive_root),
             skill_name,
@@ -449,8 +460,19 @@ def _review_job_heartbeat(drive_root: pathlib.Path, skill_name: str):
         thread.join(timeout=1.0)
 
 
-def _skill_content_hash(drive_root: pathlib.Path, skill_name: str, repo_path: str | None) -> str:
-    skill = find_skill(drive_root, skill_name, repo_path=repo_path)
+def _load_binding_skill(binding: ResolvedResourceBinding) -> Any:
+    return load_bound_skill(binding)
+
+
+def _skill_content_hash(
+    drive_root: pathlib.Path,
+    skill_name: str,
+    repo_path: str | None,
+    binding: ResolvedResourceBinding | None = None,
+) -> str:
+    skill = _load_binding_skill(binding) if binding is not None else find_skill(
+        drive_root, skill_name, repo_path=repo_path,
+    )
     if skill is None or skill.load_error:
         return ""
     try:
@@ -472,6 +494,8 @@ def _call_review_with_lifecycle_guard(
     review_impl: ReviewImpl,
     ctx: Any,
     skill_name: str,
+    drive_root: pathlib.Path | None = None,
+    binding: ResolvedResourceBinding | None = None,
 ) -> SkillReviewOutcome:
     sentinel = object()
     previous = {
@@ -482,8 +506,10 @@ def _call_review_with_lifecycle_guard(
         "_skill_review_round": getattr(ctx, "_skill_review_round", sentinel),
         "_skill_review_snapshot_attempt": getattr(ctx, "_skill_review_snapshot_attempt", sentinel),
         "_skill_review_snapshot_revised": getattr(ctx, "_skill_review_snapshot_revised", sentinel),
+        "_skill_review_resolved_binding": getattr(ctx, "_skill_review_resolved_binding", sentinel),
     }
-    job_data = _read_review_job(review_job_state_path(pathlib.Path(ctx.drive_root), skill_name))
+    state_root = pathlib.Path(drive_root or ctx.drive_root)
+    job_data = _read_review_job(review_job_state_path(state_root, skill_name))
     setattr(ctx, "_skill_review_lifecycle_guard", True)
     setattr(ctx, "_skill_review_lifecycle_job_id", str(job_data.get("job_id") or ""))
     setattr(ctx, "_skill_review_content_hash", str(job_data.get("content_hash") or ""))
@@ -491,7 +517,10 @@ def _call_review_with_lifecycle_guard(
     setattr(ctx, "_skill_review_round", int(job_data.get("review_round") or 1))
     setattr(ctx, "_skill_review_snapshot_attempt", int(job_data.get("snapshot_attempt") or 1))
     setattr(ctx, "_skill_review_snapshot_revised", bool(job_data.get("snapshot_revised")))
+    setattr(ctx, "_skill_review_resolved_binding", binding)
     try:
+        if binding is not None and review_impl is _default_review_skill:
+            return review_impl(ctx, skill_name, _resolved_binding=binding)
         return review_impl(ctx, skill_name)
     finally:
         for attr, value in previous.items():
@@ -626,6 +655,7 @@ def _reconcile_deps_after_pass_review(
     skill_name: str,
     *,
     repo_path: str | None = None,
+    binding: ResolvedResourceBinding | None = None,
 ) -> tuple[str, str]:
     try:
         from ouroboros.marketplace.install_specs import install_specs_hash
@@ -634,7 +664,9 @@ def _reconcile_deps_after_pass_review(
             read_deps_state,
         )
 
-        loaded = find_skill(drive_root, skill_name, repo_path=repo_path)
+        loaded = _load_binding_skill(binding) if binding is not None else find_skill(
+            drive_root, skill_name, repo_path=repo_path,
+        )
         if loaded is None:
             return "failed", "skill not found during dependency reconciliation"
         from ouroboros.skill_dependencies import auto_install_specs_for_skill
@@ -716,7 +748,9 @@ def _reconcile_extension_payload(
     ctx: Any,
     skill_name: str,
     *,
+    drive_root: pathlib.Path,
     repo_path: str | None,
+    binding: ResolvedResourceBinding | None,
     heal_mode: bool,
     revert_enabled_on_error: bool = False,
 ) -> tuple[Any, Any]:
@@ -735,9 +769,12 @@ def _reconcile_extension_payload(
 
         live_state = extension_loader.reconcile_extension(
             skill_name,
-            pathlib.Path(ctx.drive_root),
+            drive_root,
             load_settings,
             repo_path=repo_path,
+            selected_skill=(
+                _load_binding_skill(binding) if binding is not None else None
+            ),
             retry_load_error=True,
             revert_enabled_on_error=revert_enabled_on_error,
         )
@@ -1003,6 +1040,7 @@ async def run_skill_review_lifecycle(
     source: str = "skills",
     review_impl: ReviewImpl = _default_review_skill,
     repo_path: str | None = None,
+    _resolved_binding: ResolvedResourceBinding | None = None,
 ) -> Dict[str, Any]:
     return await _to_thread_preserving_result(
         run_skill_review_lifecycle_blocking,
@@ -1011,6 +1049,7 @@ async def run_skill_review_lifecycle(
         source=source,
         review_impl=review_impl,
         repo_path=repo_path,
+        _resolved_binding=_resolved_binding,
     )
 
 
@@ -1021,10 +1060,59 @@ def run_skill_review_lifecycle_blocking(
     source: str = "tool",
     review_impl: ReviewImpl = _default_review_skill,
     repo_path: str | None = None,
+    _resolved_binding: ResolvedResourceBinding | None = None,
 ) -> Dict[str, Any]:
-    drive_root = pathlib.Path(ctx.drive_root)
+    binding = _resolved_binding
+    if binding is None and repo_path is None:
+        try:
+            binding = build_resolved_resource_binding(
+                ctx, root="skill_payload", operation="review", path=".",
+                skill_name=skill_name,
+            )
+        except Exception as exc:
+            return _outcome_payload(
+                SkillReviewOutcome(
+                    skill_name=skill_name, status=STATUS_PENDING, error=str(exc),
+                ),
+                deps_status="not_run", deps_error="",
+                extension_action=None, extension_reason=None,
+            )
+    drive_root = (
+        binding.state_drive_root if binding is not None
+        else pathlib.Path(ctx.drive_root)
+    )
     repo_path = repo_path if repo_path is not None else get_skills_repo_path()
-    content_hash = _skill_content_hash(drive_root, skill_name, repo_path)
+    selected = _load_binding_skill(binding) if binding is not None else find_skill(
+        drive_root, skill_name, repo_path=repo_path,
+    )
+    if selected is not None and bool(getattr(selected, "identity_collision", False)):
+        # A review/attestation is lifecycle state for one canonical identity.
+        # Collision placeholders are topology-only, so refuse before creating a
+        # review job, heartbeat, history row, grant, dependency, or enablement
+        # state for an ambiguous name.
+        return _outcome_payload(
+            SkillReviewOutcome(
+                skill_name=skill_name,
+                status=STATUS_PENDING,
+                error=selected.load_error or "skill identity collision",
+            ),
+            deps_status="not_run",
+            deps_error="",
+            extension_action=None,
+            extension_reason=None,
+        )
+    if selected is None:
+        return _outcome_payload(
+            SkillReviewOutcome(
+                skill_name=skill_name, status=STATUS_PENDING,
+                error=f"Skill {skill_name!r} not found",
+            ),
+            deps_status="not_run", deps_error="",
+            extension_action=None, extension_reason=None,
+        )
+    content_hash = _skill_content_hash(
+        drive_root, skill_name, repo_path, binding,
+    )
     mark_stale_review_job_interrupted(drive_root, skill_name, current_content_hash=content_hash)
     dedupe_key = _review_dedupe_key(skill_name, content_hash)
     started_monotonic: Dict[str, float] = {}
@@ -1035,7 +1123,9 @@ def run_skill_review_lifecycle_blocking(
     def _run_review() -> SkillReviewOutcome:
         with _review_job_heartbeat(drive_root, skill_name):
             progress.set("Running tri-model review…")
-            outcome = _call_review_with_lifecycle_guard(review_impl, ctx, skill_name)
+            outcome = _call_review_with_lifecycle_guard(
+                review_impl, ctx, skill_name, drive_root, binding,
+            )
             deps_status = "not_required"
             deps_error = ""
             executable_review = review_status_allows_execution(getattr(outcome, "status", ""))
@@ -1045,6 +1135,7 @@ def run_skill_review_lifecycle_blocking(
                     drive_root,
                     skill_name,
                     repo_path=repo_path,
+                    binding=binding,
                 )
             setattr(outcome, "deps_status", deps_status)
             setattr(outcome, "deps_error", deps_error)
@@ -1059,7 +1150,9 @@ def run_skill_review_lifecycle_blocking(
             extension_action, extension_reason = _reconcile_extension_payload(
                 ctx,
                 skill_name,
+                drive_root=drive_root,
                 repo_path=repo_path,
+                binding=binding,
                 heal_mode=_heal_mode(ctx),
                 revert_enabled_on_error=just_auto_enabled,
             )
@@ -1083,7 +1176,7 @@ def run_skill_review_lifecycle_blocking(
                 on_started=_on_started(
                     drive_root, skill_name, content_hash, started_monotonic, provenance,
                     refresh_content_hash=lambda: _skill_content_hash(
-                        drive_root, skill_name, repo_path,
+                        drive_root, skill_name, repo_path, binding,
                     ),
                     bound_content_hash=bound_content_hash,
                 ),

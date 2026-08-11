@@ -932,7 +932,10 @@ def test_toggle_skill_blocked_in_heal_context(tmp_path, monkeypatch):
     ("run_command", {"cmd": ["python", "-c", "print('x')"]}),
     ("browse_page", {"url": "http://127.0.0.1"}),
     ("browser_action", {"action": "evaluate", "value": "fetch('/api/skills/x/toggle')"}),
-    ("schedule_subagent", {"text": "enable skill"}),
+    ("schedule_subagent", {
+        "objective": "enable skill",
+        "expected_output": "skill enabled",
+    }),
     ("skill_exec", {"skill": "alpha", "script": "hello.py"}),
     ("write_file", {"root": "skill_payload", "bucket": "external", "skill_name": "alpha", "path": ".self_authored.json", "content": "{}"}),
 ])
@@ -950,7 +953,7 @@ def test_heal_context_blocks_indirect_enable_paths(tool_name, args, tmp_path):
 def test_heal_context_allows_payload_tools_and_review(tmp_path):
     ctx = _make_ctx(tmp_path)
     _set_skill_repair(ctx, "alpha", "skills/external/alpha")
-    (ctx.drive_root / "skills" / "external" / "alpha").mkdir(parents=True)
+    _build_skill(ctx.drive_root / "skills" / "external", "alpha")
     registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
     registry._ctx = ctx
 
@@ -972,7 +975,7 @@ def test_heal_context_allows_payload_tools_and_review(tmp_path):
 def test_heal_context_allows_ouroboroshub_payload_tools(tmp_path):
     ctx = _make_ctx(tmp_path)
     _set_skill_repair(ctx, "nanobanana", "skills/ouroboroshub/nanobanana")
-    (ctx.drive_root / "skills" / "ouroboroshub" / "nanobanana").mkdir(parents=True)
+    _build_skill(ctx.drive_root / "skills" / "ouroboroshub", "nanobanana")
     registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
     registry._ctx = ctx
 
@@ -1145,6 +1148,7 @@ def test_heal_review_does_not_reconcile_live_extension(tmp_path, monkeypatch):
     skills_root = tmp_path / "skills"
     skills_root.mkdir()
     monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    _build_skill(ctx.drive_root / "skills" / "external", "alpha")
     _set_skill_repair(ctx, "alpha", "skills/external/alpha")
     calls = []
 

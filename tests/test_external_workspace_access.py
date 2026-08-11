@@ -1,9 +1,8 @@
-"""External-workspace access envelope (v6.33.0 WS1, items S2-S5).
+"""External-workspace focus and independent path guards.
 
-External-workspace tasks (ctx.workspace_mode == "external") operate host-wide for
-READ / shell-CWD / git — a repo under /tmp, a /build tree, sibling checkouts —
-while the Ouroboros runtime (system repo + every data drive) and credential-like
-files stay protected. Non-external workspace modes keep the tighter envelope.
+Workspace mode chooses the default repo/cwd. It does not choose a weaker
+top-level principal; host-scratch compatibility and credential/runtime path
+guards remain independent of the shared operation matrix.
 """
 
 from __future__ import annotations
@@ -63,26 +62,20 @@ def test_is_external_workspace_only_for_external_mode(tmp_path):
     assert is_external_workspace(_ctx(tmp_path, mode="")) is False
 
 
-def test_external_profile_grants_user_files_read_shell_not_write(tmp_path):
+def test_external_profile_uses_shared_top_level_principal(tmp_path):
     ext = _ctx(tmp_path, mode="external")
     assert active_tool_profile(ext) == "external_workspace_task"
-    for op in ("read", "list", "search", "shell"):
+    for op in ("read", "list", "search", "write", "edit", "shell", "service"):
         assert decide_tool_access(profile="external_workspace_task", root="user_files", operation=op).allow
-    # No host-wide write/edit/vcs: structured edits go through the workspace.
-    for op in ("write", "edit", "vcs"):
-        assert not decide_tool_access(profile="external_workspace_task", root="user_files", operation=op).allow
+    assert not decide_tool_access(profile="external_workspace_task", root="user_files", operation="vcs").allow
 
 
-def test_workspace_task_reads_user_files_not_writes(tmp_path):
-    """v6.52.0 (P1): a non-external workspace task may READ user files (so an attached/owner
-    file is reachable) but NOT write/edit/shell them; the path guard still applies. external
-    workspace keeps its broader read+shell reach (asserted above)."""
+def test_workspace_task_uses_same_top_level_principal(tmp_path):
     ws = _ctx(tmp_path, mode="workspace")
     assert active_tool_profile(ws) == "workspace_task"
-    for op in ("read", "list", "search"):
+    for op in ("read", "list", "search", "write", "edit", "shell", "service"):
         assert decide_tool_access(profile="workspace_task", root="user_files", operation=op).allow
-    for op in ("write", "edit", "shell", "vcs"):
-        assert not decide_tool_access(profile="workspace_task", root="user_files", operation=op).allow
+    assert not decide_tool_access(profile="workspace_task", root="user_files", operation="vcs").allow
 
 
 def test_subagent_inherits_active_external_workspace_when_metadata_missing(tmp_path, monkeypatch):
@@ -158,12 +151,13 @@ def test_shell_cwd_scratch_scoped_not_filesystem_root(tmp_path):
     assert str(scratch.resolve()) in roots
 
 
-def test_shell_cwd_runtime_is_rejected_in_external(tmp_path):
+def test_shell_cwd_data_is_rejected_but_system_is_explicit_in_external(tmp_path):
     ext = _ctx(tmp_path, mode="external")
     with pytest.raises(ValueError):
         resolve_shell_cwd(ext, str(tmp_path / "data"))  # parent data drive
-    with pytest.raises(ValueError):
-        resolve_shell_cwd(ext, str(tmp_path / "system"))  # system repo
+    work_dir, label, _allowed = resolve_shell_cwd(ext, str(tmp_path / "system"))
+    assert label == "system_repo"
+    assert work_dir == (tmp_path / "system").resolve()
 
 
 def test_external_shell_read_cannot_reach_runtime_or_secrets(tmp_path):

@@ -20,7 +20,7 @@ from typing import Dict, List
 
 from ouroboros.artifacts import copy_directory_to_task_artifacts, copy_file_to_task_artifacts, record_task_scratch
 from ouroboros.platform_layer import bootstrap_process_path, kill_process_tree, scrub_repo_from_pythonpath, subprocess_new_group_kwargs
-from ouroboros.config import SETTINGS_DEFAULTS, get_runtime_mode, load_settings
+from ouroboros.config import SETTINGS_DEFAULTS, load_settings
 from ouroboros.runtime_mode_policy import (
     is_protected_runtime_path,
 )
@@ -32,11 +32,13 @@ from ouroboros.tools.registry import (
     active_repo_dir_for,
 )
 from ouroboros.tool_access import (
+    ResolvedResourceBinding,
     active_tool_profile,
+    build_resolved_resource_binding,
     decide_tool_access,
     path_is_relative_to,
     resource_root_path,
-    resolve_shell_cwd,
+    shell_cwd_block_message,
     user_files_path_block_reason,
 )
 from ouroboros.utils import safe_relpath
@@ -184,7 +186,8 @@ def _resolve_effective_timeout(
     return max(1, int(effective))
 
 
-def _describe_returncode(returncode: int, *, cwd: pathlib.Path | str | None = None) -> str:
+def _describe_returncode(returncode: int, *, cwd: pathlib.Path | str | None = None,
+                         binding: ResolvedResourceBinding | None = None) -> str:
     """Render a return code with signal details when applicable."""
     suffix: list[str] = []
     if int(returncode) < 0:
@@ -197,7 +200,13 @@ def _describe_returncode(returncode: int, *, cwd: pathlib.Path | str | None = No
     if cwd is not None:
         suffix.append(f"cwd={pathlib.Path(cwd).resolve(strict=False)}")
     rendered_suffix = f" ({', '.join(suffix)})" if suffix else ""
-    return f"exit_code={returncode}{rendered_suffix}"
+    target_suffix = ""
+    if binding is not None:
+        target = [f"root={binding.root}", f"source={binding.source}"]
+        if binding.skill_name:
+            target.append(f"skill={binding.skill_name}")
+        target_suffix = "; " + ", ".join(target)
+    return f"exit_code={returncode}{rendered_suffix}{target_suffix}"
 
 
 def _format_process_output(stdout: str, stderr: str, *, limit: int = 50_000) -> str:
@@ -215,15 +224,28 @@ def _format_process_output(stdout: str, stderr: str, *, limit: int = 50_000) -> 
     return rendered
 
 
-def _allowed_output_roots(ctx: ToolContext, work_dir: pathlib.Path, cwd_root: str = "") -> list[tuple[str, pathlib.Path]]:
+def _allowed_output_roots(
+    ctx: ToolContext,
+    work_dir: pathlib.Path,
+    cwd_root: str = "",
+    binding: ResolvedResourceBinding | None = None,
+) -> list[tuple[str, pathlib.Path]]:
     roots: list[tuple[str, pathlib.Path]] = []
     root_label = str(cwd_root or "cwd").strip() or "cwd"
     roots.append((root_label, pathlib.Path(work_dir).resolve(strict=False)))
+    if binding is not None:
+        base = pathlib.Path(binding.base_path).resolve(strict=False)
+        if not any(
+            path_is_relative_to(base, existing)
+            and path_is_relative_to(existing, base)
+            for _, existing in roots
+        ):
+            roots.append((binding.root, base))
     profile = active_tool_profile(ctx)
     for label in ("task_drive", "artifact_store", "user_files"):
-        # An output is a deliverable the command PRODUCED, so its root must be WRITABLE by the
-        # profile — not merely readable. (v6.52.0: workspace_task gained user_files READ for
-        # attachments; that must NOT make user_files a valid run_command output destination.)
+        # A user_files output is a deliverable the command produced, so that root
+        # must be WRITABLE by the active profile.  Task/artifact registration keeps
+        # its existing host-owned read/copy semantics.
         op = "write" if label == "user_files" else "read"
         if not decide_tool_access(profile=profile, root=label, operation=op).allow:  # type: ignore[arg-type]
             continue
@@ -236,13 +258,21 @@ def _allowed_output_roots(ctx: ToolContext, work_dir: pathlib.Path, cwd_root: st
     return roots
 
 
-def _protected_output_source_reason(ctx: ToolContext, source: pathlib.Path, label: str, changed_paths: set[str]) -> str:
+def _protected_output_source_reason(
+    ctx: ToolContext,
+    source: pathlib.Path,
+    label: str,
+    changed_paths: set[str],
+    binding: ResolvedResourceBinding | None = None,
+) -> str:
     """Return a block reason for protected/control-plane output sources."""
 
     try:
         from ouroboros.protected_artifacts import block_reason_for_path
 
-        protected_artifact_reason = block_reason_for_path(ctx, source, "copy")
+        protected_artifact_reason = block_reason_for_path(
+            ctx, source, "copy", binding,
+        )
         if protected_artifact_reason:
             return protected_artifact_reason
     except Exception:
@@ -274,6 +304,12 @@ def _protected_output_source_reason(ctx: ToolContext, source: pathlib.Path, labe
     try:
         drive = pathlib.Path(getattr(ctx, "drive_root")).resolve(strict=False)
         if path_is_relative_to(source, drive):
+            if (
+                binding is not None
+                and binding.root == "skill_payload"
+                and path_is_relative_to(source, binding.base_path)
+            ):
+                return ""
             task_drive = resource_root_path(ctx, "task_drive")
             artifact_store = resource_root_path(ctx, "artifact_store")
             if not (path_is_relative_to(source, task_drive) or path_is_relative_to(source, artifact_store)):
@@ -301,6 +337,7 @@ def _resolve_declared_output(
     work_dir: pathlib.Path,
     cwd_root: str = "",
     changed_paths: set[str] | None = None,
+    binding: ResolvedResourceBinding | None = None,
 ) -> tuple[pathlib.Path | None, str]:
     text = str(raw_item or "").strip()
     if not text:
@@ -320,18 +357,23 @@ def _resolve_declared_output(
     else:
         source = (pathlib.Path(work_dir) / safe_relpath(text)).resolve(strict=False)
     changed = changed_paths or set()
-    for label, root in _allowed_output_roots(ctx, work_dir, cwd_root):
+    for label, root in _allowed_output_roots(ctx, work_dir, cwd_root, binding):
         if not path_is_relative_to(source, root):
             continue
         if label == "user_files":
             reason = user_files_path_block_reason(ctx, source)
             if reason:
                 return None, f"protected user_files output {text}: {reason}"
-        protected_reason = _protected_output_source_reason(ctx, source, label, changed)
+        protected_reason = _protected_output_source_reason(
+            ctx, source, label, changed, binding,
+        )
         if protected_reason:
             return None, protected_reason
         return source, ""
-    allowed = ", ".join(f"{label}={root}" for label, root in _allowed_output_roots(ctx, work_dir, cwd_root))
+    allowed = ", ".join(
+        f"{label}={root}"
+        for label, root in _allowed_output_roots(ctx, work_dir, cwd_root, binding)
+    )
     return None, f"output escapes allowed artifact roots: {text}; allowed_roots: {allowed}"
 
 
@@ -394,6 +436,7 @@ def _snapshot_declared_outputs(
     work_dir: pathlib.Path,
     cwd_root: str = "",
     changed_paths: set[str] | None = None,
+    binding: ResolvedResourceBinding | None = None,
 ) -> Dict[str, tuple[bool, int, str]]:
     snapshots: Dict[str, tuple[bool, int, str]] = {}
     for raw_item in outputs or []:
@@ -403,6 +446,7 @@ def _snapshot_declared_outputs(
             work_dir,
             cwd_root=cwd_root,
             changed_paths=changed_paths,
+            binding=binding,
         )
         if source is not None and not block_reason:
             snapshots[str(source)] = _fingerprint_output(source)
@@ -415,6 +459,7 @@ def _scan_directory_output_members(
     *,
     label: str,
     changed_paths: set[str],
+    binding: ResolvedResourceBinding | None = None,
 ) -> tuple[list[pathlib.Path], int, str]:
     root = pathlib.Path(source).resolve(strict=False)
     members: list[pathlib.Path] = []
@@ -437,7 +482,9 @@ def _scan_directory_output_members(
             component_reason = _sensitive_output_component_reason(rel_parts)
             if component_reason:
                 return [], dir_size, f"{child}: {component_reason}"
-            reason = _protected_output_source_reason(ctx, child.resolve(strict=False), label, changed_paths)
+            reason = _protected_output_source_reason(
+                ctx, child.resolve(strict=False), label, changed_paths, binding,
+            )
             if reason:
                 return [], dir_size, f"{child}: {reason}"
             if len(members) > _OUTPUT_DIR_MAX_FILES:
@@ -456,6 +503,7 @@ def _register_process_outputs(
     cwd_root: str = "",
     changed_paths: set[str] | None = None,
     before_outputs: Dict[str, tuple[bool, int, str]] | None = None,
+    binding: ResolvedResourceBinding | None = None,
 ) -> tuple[str, bool]:
     """Copy declared command outputs into the task artifact store."""
 
@@ -472,6 +520,7 @@ def _register_process_outputs(
             work_dir,
             cwd_root=cwd_root,
             changed_paths=changed_paths,
+            binding=binding,
         )
         if block_reason:
             notes.append(block_reason)
@@ -517,6 +566,7 @@ def _register_process_outputs(
                 source,
                 label=str(cwd_root or "cwd"),
                 changed_paths=changed_paths or set(),
+                binding=binding,
             )
             if blocked_member:
                 notes.append(f"blocked directory output: {blocked_member}")
@@ -1001,23 +1051,23 @@ def _run_shell(
     cwd: str = "",
     outputs: List[str] | None = None,
     scratch: List[str] | None = None,
-    timeout_sec: int | None = None,
-    timeout: int | None = None,
+    _resolved_binding: ResolvedResourceBinding | None = None,
+    **kwargs,
 ) -> str:
     # Per-call timeout override (canonical timeout_sec; timeout accepted as alias).
+    timeout_sec = kwargs.get("timeout_sec")
+    timeout = kwargs.get("timeout")
     _timeout_override = timeout_sec if timeout_sec is not None else timeout
+    bucket = str(kwargs.get("bucket") or "")
+    skill_name = str(kwargs.get("skill_name") or "")
     if isinstance(cmd, str):
-        # Recover common stringified argv mistakes before failing (shared SSOT with
-        # verify_and_record via shell_parse.recover_stringified_argv — P7 DRY / P2 class-fix).
+        # Shared recovery keeps run_command and verify argv semantics aligned.
         recovered = recover_stringified_argv(cmd)
         # Malformed structured literals are not shell commands; refuse explicitly.
         if recovered is None:
             stripped = cmd.lstrip()
             is_posix_test_cmd = stripped.startswith("[ ") and stripped.rstrip().endswith(" ]")
-            # A shell brace group `{ ...; }` starts with "{ " (brace + space, the
-            # reserved word) — distinct from a JSON object `{"k":...}`. It is valid
-            # shell, not a malformed list, so don't emit the misleading JSON error;
-            # point at sh -c instead (run_command runs argv directly, no shell).
+            # A `{ ...; }` brace group is valid shell, not malformed JSON.
             is_brace_group = stripped.startswith("{ ") and stripped.rstrip().endswith("}")
             if is_brace_group:
                 return (
@@ -1098,10 +1148,7 @@ def _run_shell(
             '(2) For pipes/chaining: ["sh", "-c", "cmd1 && cmd2"]'
         )
 
-    # A redirect glued into one argv element (e.g. "2>/dev/null", "2>&1") slips
-    # past the standalone-operator set above and reaches the program as a literal
-    # arg — the program then dies cryptically ("find: 2>/dev/null: unknown
-    # primary"). Surface the same actionable hint before subprocess runs.
+    # Glued redirects bypass the standalone-operator set but remain shell syntax.
     for arg in cmd:
         if _GLUED_REDIRECT_RE.match(arg):
             return (
@@ -1111,28 +1158,20 @@ def _run_shell(
                 'Use ["sh", "-c", "your command with redirects"] for redirection.'
             )
 
-    active_repo_dir = active_repo_dir_for(ctx)
-    active_root = pathlib.Path(active_repo_dir).resolve(strict=False)
     try:
-        work_dir, cwd_root, allowed_roots = resolve_shell_cwd(ctx, cwd)
-    except (OSError, ValueError) as exc:
-        try:
-            _, _, allowed_roots = resolve_shell_cwd(ctx, "")
-        except Exception:
-            allowed_roots = [("active_workspace", active_root)]
-        roots = ", ".join(f"{name}={pathlib.Path(root).resolve(strict=False)}" for name, root in allowed_roots)
-        return (
-            f"⚠️ SHELL_CWD_BLOCKED: cwd escapes allowed roots: {exc}. "
-            f"allowed_roots: {roots}. For user-visible files use an absolute/~/ cwd "
-            "under user_files, root=artifact_store, or root=task_drive."
+        binding = _resolved_binding or build_resolved_resource_binding(
+            ctx, operation="shell", process_cwd=cwd, bucket=bucket, skill_name=skill_name,
         )
+        work_dir = pathlib.Path(binding.target_path)
+        cwd_root = binding.root
+    except (OSError, ValueError) as exc:
+        return shell_cwd_block_message(ctx, cwd, operation="shell", error=exc)
     if not work_dir.exists() or not work_dir.is_dir():
-        roots = ", ".join(f"{name}={pathlib.Path(root).resolve(strict=False)}" for name, root in allowed_roots)
-        return f"⚠️ SHELL_CWD_BLOCKED: cwd is not a directory: {cwd or work_dir}. allowed_roots: {roots}"
-    # Room-lens cwd disclosure (v6.61.3): the FIRST default-cwd command of a
-    # folder-room chat names where it ran (the room folder is the default now)
-    # so the surface change is never silent. One-shot per task; explicit cwd
-    # calls are the caller's own choice and carry no note.
+        return (
+            f"⚠️ SHELL_CWD_BLOCKED: cwd is not a directory: {work_dir}. "
+            f"root={binding.root}, source={binding.source}."
+        )
+    # Disclose the room-lens default once; explicit cwd is already caller-visible.
     if not str(cwd or "").strip() and not getattr(ctx, "_room_cwd_noted", False):
         try:
             from ouroboros.tool_access import project_room_lens_dir
@@ -1148,9 +1187,7 @@ def _run_shell(
             )
     repo_root = _resolve_git_root(pathlib.Path(work_dir))
     before_changed = _status_snapshot(repo_root)
-    # R5: for a non-git user_files cwd, take a bounded shallow snapshot so the
-    # artifact-audit nudge can be effect-based (only when the command actually
-    # produced a top-level deliverable), not fired on every read-only command.
+    # Bounded snapshot makes the user_files artifact nudge effect-based.
     before_listing = (
         _shallow_listing(pathlib.Path(work_dir))
         if (cwd_root == "user_files" and repo_root is None and not outputs)
@@ -1162,13 +1199,10 @@ def _run_shell(
         pathlib.Path(work_dir),
         cwd_root=cwd_root,
         changed_paths=set(before_changed or []),
+        binding=binding,
     )
 
-    # Ephemeral verification scratch (v6.52.2): a sanctioned channel for a throwaway in-workspace
-    # file the agent writes, runs, and deletes (e.g. an in-package scratch test that MUST live in
-    # the repo to compile). Pre-exec gate it (confined + NEW + untracked) so it cannot mask a real
-    # edit, then record it so workspace patch capture EXCLUDES it. It is exempt from the
-    # undeclared-output guard below and is never registered as a task artifact.
+    # Scratch is confined/new/untracked, patch-excluded, and never an artifact.
     scratch_abs = _resolve_scratch_abs(scratch, work_dir)
     if scratch_abs:
         _scratch_reason = _scratch_safety_reason(ctx, scratch_abs, pathlib.Path(work_dir), repo_root)
@@ -1189,9 +1223,7 @@ def _run_shell(
                 text=True, timeout=timeout_sec,
                 **({"env": run_env} if run_env is not None else {}),
             )
-        # Record scratch FINGERPRINTS (sha256 of declared scratch files that exist AFTER the command)
-        # so workspace patch capture excludes a file ONLY while it still matches — a later real file at
-        # the same path has a different sha and is NOT dropped (v6.52.2; runs regardless of exit code).
+        # Post-run hashes exclude scratch only while its exact bytes still match.
         _record_scratch_fingerprints(ctx, scratch_abs)
         if res.returncode != 0:
             executor_note = ""
@@ -1199,16 +1231,14 @@ def _run_shell(
                 executor_note = "\n\nEXECUTOR_TRACE:\n" + json.dumps(res.backend_trace, ensure_ascii=False, indent=2)
             if _is_search_no_match(res):
                 return autocorrect_note + (
-                    f"{_describe_returncode(res.returncode, cwd=work_dir)} (no matches)\n"
+                    f"{_describe_returncode(res.returncode, cwd=work_dir, binding=binding)} (no matches)\n"
                     f"{_format_process_output(res.stdout or '', '')}"
                     f"{executor_note}"
                 )
-            return autocorrect_note + f"⚠️ SHELL_EXIT_ERROR: command exited with {_describe_returncode(res.returncode, cwd=work_dir)}.\n\n{_format_process_output(res.stdout or '', res.stderr or '')}{executor_note}"
+            return autocorrect_note + f"⚠️ SHELL_EXIT_ERROR: command exited with {_describe_returncode(res.returncode, cwd=work_dir, binding=binding)}.\n\n{_format_process_output(res.stdout or '', res.stderr or '')}{executor_note}"
         after_changed = _status_snapshot(repo_root)
         if after_changed != before_changed:
-            # Kept (nonstandard case): repo_root here is the RESOLVED cwd root,
-            # which may be a workspace/skill repo the central live-repo
-            # dispatcher check does not watch; this call passes precise paths.
+            # This resolved cwd may be outside the live-repo dispatcher snapshot.
             _invalidate_advisory(
                 ctx,
                 changed_paths=after_changed or before_changed,
@@ -1224,7 +1254,7 @@ def _run_shell(
                 "without declaring outputs=[...]. Declare generated user-visible files so "
                 "they are copied into the task artifact store before claiming completion. "
                 f"Paths: {', '.join(undeclared_user_outputs[:5])}.\n\n"
-                + f"{_describe_returncode(0, cwd=work_dir)}\n"
+                + f"{_describe_returncode(0, cwd=work_dir, binding=binding)}\n"
                 + _format_process_output(res.stdout or "", res.stderr or "")
             )
         artifact_note, artifact_failed = _register_process_outputs(
@@ -1234,12 +1264,11 @@ def _run_shell(
             cwd_root=cwd_root,
             changed_paths=set(after_changed or []),
             before_outputs=before_outputs,
+            binding=binding,
         )
         audit_note = ""
         if cwd_root == "user_files" and not outputs:
-            # Audit only NON-scratch user_files effects: declared scratch is transient (not a
-            # deliverable), but a command may ALSO create a real undeclared deliverable — so strip the
-            # scratch paths from the change set rather than disabling the audit whenever scratch exists.
+            # Remove scratch effects without hiding a simultaneous real deliverable.
             _after_for_audit = after_changed
             if scratch_abs and repo_root is not None:
                 _repo = pathlib.Path(repo_root).resolve(strict=False)
@@ -1269,21 +1298,20 @@ def _run_shell(
             return (
                 autocorrect_note
                 + "⚠️ ARTIFACT_OUTPUT_ERROR: command succeeded but declared output registration failed. "
-                + f"{_describe_returncode(0, cwd=work_dir)}\n"
+                + f"{_describe_returncode(0, cwd=work_dir, binding=binding)}\n"
                 + f"{_format_process_output(res.stdout or '', res.stderr or '')}"
                 + artifact_note
             )
         executor_note = ""
         if getattr(res, "backend_trace", None):
             executor_note = "\n\nEXECUTOR_TRACE:\n" + json.dumps(res.backend_trace, ensure_ascii=False, indent=2)
-        return autocorrect_note + f"{_describe_returncode(0, cwd=work_dir)}\n{_format_process_output(res.stdout or '', res.stderr or '')}{artifact_note}{audit_note}{scratch_note}{executor_note}"
+        return autocorrect_note + f"{_describe_returncode(0, cwd=work_dir, binding=binding)}\n{_format_process_output(res.stdout or '', res.stderr or '')}{artifact_note}{audit_note}{scratch_note}{executor_note}"
     except subprocess.TimeoutExpired:
-        # A timed-out command may have created its declared scratch before the kill — fingerprint it
-        # so headless still excludes it from the workspace patch (v6.52.2 leak-safety on the timeout path).
+        # Timeout-created scratch still needs its exclusion fingerprint.
         _record_scratch_fingerprints(ctx, scratch_abs)
         return (
             f"⚠️ TOOL_TIMEOUT (run_command): command exceeded the per-command timeout of {timeout_sec}s "
-            f"and its subprocess tree was terminated (cwd={work_dir}). NOTE: this is the per-command "
+            f"and its subprocess tree was terminated (root={binding.root}, cwd={work_dir}). NOTE: this is the per-command "
             f"FOREGROUND timeout, NOT the task deadline. For genuinely long-running compute (training, "
             f"sampling, large builds/downloads), start it with start_service and poll "
             f"service_status/service_logs while you do other work, or pass an explicit timeout_sec=<seconds> "
@@ -1291,7 +1319,7 @@ def _run_shell(
         )
     except Exception as e:
         _record_scratch_fingerprints(ctx, scratch_abs)
-        return f"⚠️ SHELL_ERROR: {e}. cwd={work_dir}"
+        return f"⚠️ SHELL_ERROR: {e}. root={binding.root}, cwd={work_dir}"
 
 
 def _load_project_context(repo_dir: pathlib.Path) -> str:
@@ -1349,14 +1377,19 @@ def _run_script(
     args: List[str] | None = None,
     cwd: str = "",
     outputs: List[str] | None = None,
-    scratch: List[str] | None = None,
+    _resolved_binding: ResolvedResourceBinding | None = None,
     **kwargs,
 ) -> str:
-    """Write a task-scoped temporary script and run it as a foreground command. The `timeout_sec`
-    / `timeout` aliases ride in **kwargs to keep the signature within the <=8-parameter rule
-    (DEVELOPMENT.md) after the `scratch` addition; both are forwarded to _run_shell unchanged."""
+    """Stage a temporary script and run it with one resolved process binding.
+
+    Optional public fields ride in ``kwargs`` to keep the handler within the
+    DEVELOPMENT parameter limit; dispatch validates them against the schema.
+    """
     timeout_sec = kwargs.get("timeout_sec")
     timeout = kwargs.get("timeout")
+    scratch = kwargs.get("scratch")
+    bucket = str(kwargs.get("bucket") or "")
+    skill_name = str(kwargs.get("skill_name") or "")
     interp = str(interpreter or "python3").strip()
     allowed = {"python", "python3", "python.exe", "python3.exe", "bash", "sh", "node", "ruby"}
     resolver_attested = False
@@ -1378,34 +1411,24 @@ def _run_script(
     body = str(script or "")
     if not body.strip():
         return "⚠️ TOOL_ARG_ERROR (run_script): script is required."
+    try:
+        binding = _resolved_binding or build_resolved_resource_binding(
+            ctx, operation="shell", process_cwd=cwd, bucket=bucket, skill_name=skill_name,
+        )
+    except (OSError, ValueError) as exc:
+        return shell_cwd_block_message(ctx, cwd, operation="shell", error=exc)
     # The undeclared-output audit of the script BODY (argv only carries the temp script path, so
     # _run_shell cannot see the body) is POST-exec (v6.56.0): the stat filter needs the files to
     # exist, and a pre-exec scan on not-yet-written paths would either be a no-op or false-flag
     # import strings. We resolve the body-audit scratch against the SAME effective cwd the script
     # executes in so a relatively-declared scratch path matches a user_files write in the body.
-    _audit_cwd = str(cwd or "").strip()
-    if not _audit_cwd and get_runtime_mode() == "light" and not bool(getattr(ctx, "is_workspace_mode", lambda: False)()):
-        try:
-            _audit_cwd = str(pathlib.Path(ctx.task_drive_root()).resolve(strict=False))
-        except Exception:
-            _audit_cwd = ""
-    _scratch_abs_body = _resolve_scratch_abs(scratch, _audit_cwd or active_repo_dir_for(ctx))
+    resolved_workdir = pathlib.Path(binding.target_path)
+    _scratch_abs_body = _resolve_scratch_abs(scratch, resolved_workdir)
     _body_start_ts = time.time()
-    try:
-        workdir, _cwd_root, _allowed = resolve_shell_cwd(ctx, cwd)
-        resolved_workdir = pathlib.Path(workdir).resolve(strict=False)
-    except Exception:
-        if executor_ref_from_ctx(ctx) is not None:
-            return f"⚠️ RUN_SCRIPT_BLOCKED: executor-backed run_script could not resolve mapped cwd {cwd!r}."
-        resolved_workdir = pathlib.Path("")
-    executor_active = _executor_can_run_cwd(ctx, resolved_workdir) if str(resolved_workdir) else False
-    workspace_backed_script = False
-    if executor_active:
+    executor_active = _executor_can_run_cwd(ctx, resolved_workdir)
+    active_workspace_script = binding.root == "active_workspace"
+    if active_workspace_script:
         root = resolved_workdir / ".ouroboros" / "tmp_scripts"
-        workspace_backed_script = True
-    elif str(resolved_workdir) and bool(getattr(ctx, "is_workspace_mode", lambda: False)()):
-        root = resolved_workdir / ".ouroboros" / "tmp_scripts"
-        workspace_backed_script = True
     else:
         try:
             root = pathlib.Path(ctx.task_drive_root()) / "tmp_scripts"
@@ -1429,23 +1452,19 @@ def _run_script(
                 script_path.unlink(missing_ok=True)
                 return f"⚠️ RUN_SCRIPT_BLOCKED: executor-backed run_script could not map temp script path: {type(exc).__name__}: {exc}"
     argv = [interp, script_arg, *[str(item) for item in (args or [])]]
-    effective_cwd = str(cwd or "")
-    if (
-        not effective_cwd.strip()
-        and get_runtime_mode() == "light"
-        and not bool(getattr(ctx, "is_workspace_mode", lambda: False)())
-    ):
-        effective_cwd = str(pathlib.Path(ctx.task_drive_root()).resolve(strict=False))
     try:
-        result = _run_shell(ctx, argv, cwd=effective_cwd, outputs=outputs, scratch=scratch, timeout_sec=timeout_sec, timeout=timeout)
+        result = _run_shell(
+            ctx, argv, cwd=cwd, outputs=outputs, scratch=scratch,
+            _resolved_binding=binding, timeout_sec=timeout_sec, timeout=timeout,
+        )
     finally:
-        if workspace_backed_script:
-            try:
-                script_path.unlink(missing_ok=True)
-                script_path.parent.rmdir()
+        try:
+            script_path.unlink(missing_ok=True)
+            script_path.parent.rmdir()
+            if active_workspace_script:
                 script_path.parent.parent.rmdir()
-            except OSError:
-                pass
+        except OSError:
+            pass
     # POST-exec body audit: stat-confirmed user_files writes performed by the script
     # body itself. Runs on EVERY exit path (parity with _record_scratch_fingerprints):
     # a script that writes an undeclared deliverable and then FAILS (raise/SystemExit/
@@ -1494,16 +1513,9 @@ def get_tools() -> List[ToolEntry]:
                         "stringified array like '[\"git\", \"log\"]'."
                     ),
                 },
-	                "cwd": {
-	                    "type": "string", "default": "",
-	                    "description": (
-	                        "Working directory. Relative paths resolve under allowed task/workspace roots; "
-	                        "absolute or ~ paths under user_files are allowed for external user deliverables. "
-	                        "Use "
-	                        "this instead of `cd` (which is a shell builtin "
-	                        "and is rejected)."
-	                    ),
-	                },
+	                "cwd": {"type": "string", "default": "", "description": "Omit for active_workspace; use system_repo[/subdir] for Ouroboros or skill_payload[/subdir] with bucket+skill_name for a skill. Existing task_drive, artifact_store, user_files and authorized absolute cwd forms remain available; use cwd instead of the rejected cd builtin."},
+	                "bucket": {"type": "string", "enum": ["external", "clawhub", "ouroboroshub", "user_repo"], "description": "Physical skill location for cwd=skill_payload[/subdir]."},
+	                "skill_name": {"type": "string", "description": "Exact skill identity for cwd=skill_payload[/subdir]."},
 	                "outputs": {
 	                    "type": "array",
 	                    "items": {"type": "string"},
@@ -1548,7 +1560,9 @@ def get_tools() -> List[ToolEntry]:
                 "script": {"type": "string"},
 	                "interpreter": {"type": "string", "enum": ["python", "python3", "bash", "sh", "node", "ruby"], "default": "python3"},
 	                "args": {"type": "array", "items": {"type": "string"}, "default": []},
-	                "cwd": {"type": "string", "default": ""},
+	                "cwd": {"type": "string", "default": "", "description": "Omit for active_workspace; use system_repo[/subdir] for Ouroboros or skill_payload[/subdir] with bucket+skill_name for a skill."},
+	                "bucket": {"type": "string", "enum": ["external", "clawhub", "ouroboroshub", "user_repo"], "description": "Physical skill location for cwd=skill_payload[/subdir]."},
+	                "skill_name": {"type": "string", "description": "Exact skill identity for cwd=skill_payload[/subdir]."},
 	                "outputs": {
 	                    "type": "array",
 	                    "items": {"type": "string"},

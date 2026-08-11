@@ -28,6 +28,7 @@ from ouroboros.skill_loader import (
     skill_state_dir,
 )
 from ouroboros.utils import atomic_write_json, utc_now_iso
+from ouroboros.tool_access import canonical_data_root, load_bound_skill
 
 
 def run_owner_attestation(ctx: Any, drive_root: pathlib.Path, skill: Any, content_hash: str):
@@ -43,7 +44,8 @@ def run_owner_attestation(ctx: Any, drive_root: pathlib.Path, skill: Any, conten
     # persist=False: a FAILED attestation attempt must not clobber the skill's existing
     # review state — the endpoint surfaces the preflight failure (409) and leaves state as-is.
     preflight_outcome = _sr._run_deterministic_preflight(
-        ctx, drive_root, skill, content_hash, persist=False
+        ctx, drive_root, skill, content_hash, persist=False,
+        binding=getattr(ctx, "_skill_review_resolved_binding", None),
     )
     if preflight_outcome is not None:
         # Deterministic preflight FAILED -> NOT attestable (the LLM phase is skipped, this
@@ -121,8 +123,17 @@ def review_skill_owner_attest(ctx: Any, skill_name: str):
     skill exactly like ``review_skill``, then run the preflight-floored owner attestation
     (no LLM phase). Reused through ``run_skill_review_lifecycle`` so it shares the standard
     job tracking / payload shape."""
-    drive_root = pathlib.Path(getattr(ctx, "drive_root", pathlib.Path.home() / "Ouroboros" / "data"))
-    skill = find_skill(drive_root, skill_name)
+    binding = getattr(ctx, "_skill_review_resolved_binding", None)
+    drive_root = (
+        pathlib.Path(binding.state_drive_root)
+        if binding is not None
+        else canonical_data_root(ctx)
+    )
+    skill = (
+        load_bound_skill(binding)
+        if binding is not None
+        else find_skill(drive_root, skill_name)
+    )
     if skill is None:
         return _sr.SkillReviewOutcome(
             skill_name=skill_name, status=_sr.STATUS_PENDING,

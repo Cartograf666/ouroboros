@@ -20,7 +20,11 @@ from ouroboros.marketplace.fetcher import FetchError, land_staged_tree
 from ouroboros.marketplace.install_specs import install_specs_hash
 from ouroboros.marketplace.isolated_deps import DEPS_STATE_FILENAME, read_deps_state
 from ouroboros.skill_dependencies import normalize_declared_dependency_specs
-from ouroboros.skill_loader import _sanitize_skill_name, skill_state_dir
+from ouroboros.skill_loader import (
+    _sanitize_skill_name,
+    _skill_location_conflict_error,
+    skill_state_dir,
+)
 from ouroboros.utils import atomic_write_json, utc_now_iso
 
 
@@ -257,6 +261,29 @@ def _has_repairable_hub_partial(drive_root: pathlib.Path, sanitized: str, target
     )
 
 
+def install_identity_error(
+    sanitized_name: str,
+    *,
+    drive_root: pathlib.Path | None = None,
+) -> str:
+    """Return a pure pre-landing identity conflict, or an empty string."""
+
+    sanitized = _sanitize_skill_name(sanitized_name)
+    target_root = (
+        pathlib.Path(drive_root) / "skills" / "ouroboroshub"
+        if drive_root is not None
+        else get_ouroboroshub_skills_dir()
+    )
+    target_dir = target_root / sanitized
+    identity_root = pathlib.Path(drive_root) if drive_root is not None else target_root.parent.parent
+    return _skill_location_conflict_error(
+        identity_root,
+        name=sanitized,
+        location="ouroboroshub",
+        target_dir=target_dir,
+    )
+
+
 def install(slug: str, *, overwrite: bool = False) -> HubInstallResult:
     catalog = load_catalog()
     raw_base = str(catalog.get("raw_base_url") or "").rstrip("/")
@@ -266,10 +293,14 @@ def install(slug: str, *, overwrite: bool = False) -> HubInstallResult:
     sanitized = _sanitize_skill_name(summary.slug)
     target_root = get_ouroboroshub_skills_dir()
     target_dir = target_root / sanitized
+    drive_root = target_root.parent.parent
+    identity_error = install_identity_error(sanitized, drive_root=drive_root)
+    if identity_error:
+        return HubInstallResult(False, sanitized, error=identity_error, summary=summary)
     raw_install = summary.install_specs or summary.raw.get("dependencies") or []
     auto_specs, manual_specs, _warnings = normalize_declared_dependency_specs(raw_install)
     if target_dir.exists() and not overwrite:
-        deps_state = read_deps_state(target_root.parent.parent, sanitized, target_dir)
+        deps_state = read_deps_state(drive_root, sanitized, target_dir)
         marker = _valid_existing_hub_marker(target_dir, sanitized)
         if (
             auto_specs
@@ -278,12 +309,12 @@ def install(slug: str, *, overwrite: bool = False) -> HubInstallResult:
             and marker
         ):
             atomic_write_json(
-                skill_state_dir(target_root.parent.parent, sanitized) / DEPS_STATE_FILENAME,
+                skill_state_dir(drive_root, sanitized) / DEPS_STATE_FILENAME,
                 deps_state,
                 trailing_newline=True,
             )
             return HubInstallResult(True, sanitized, target_dir=target_dir, summary=summary, provenance=marker)
-        if not _has_repairable_hub_partial(target_root.parent.parent, sanitized, target_dir):
+        if not _has_repairable_hub_partial(drive_root, sanitized, target_dir):
             return HubInstallResult(False, sanitized, error=f"{sanitized} already installed", summary=summary)
     staging_root = target_root / ".staging"
     staging_root.mkdir(parents=True, exist_ok=True)

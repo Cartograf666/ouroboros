@@ -1507,6 +1507,7 @@ def reconcile_extension(
     *,
     repo_path: str | None = None,
     skills: Optional[List[LoadedSkill]] = None,
+    selected_skill: LoadedSkill | None = None,
     retry_load_error: bool = False,
     revert_enabled_on_error: bool = False,
 ) -> Dict[str, Any]:
@@ -1523,6 +1524,9 @@ def reconcile_extension(
         peers = list(skills) if skills is not None else discover_skills(
             drive_root, repo_path=resolved_repo_path
         )
+        if selected_skill is not None:
+            peers = [item for item in peers if item.name != selected_skill.name]
+            peers.append(selected_skill)
         state = runtime_state_for_skill_name(
             skill_name,
             drive_root,
@@ -1573,6 +1577,7 @@ def reconcile_extension(
                     drive_root,
                     settings_reader,
                     repo_path=repo_path,
+                    selected_skill=selected_skill,
                 )
             _request_server_reconcile_if_worker(drive_root, skill_name, reason="already_live")
             return state
@@ -1627,6 +1632,7 @@ def ensure_companions_running(
     settings_reader: Callable[[], Dict[str, Any]],
     *,
     repo_path: str | None = None,
+    selected_skill: LoadedSkill | None = None,
 ) -> Dict[str, Any]:
     """Ensure the server supervisor matches a live extension's registered companions.
 
@@ -1642,7 +1648,10 @@ def ensure_companions_running(
         return {"action": "no_supervisor", "started": [], "missing": []}
 
     drive_root = pathlib.Path(drive_root)
-    state = runtime_state_for_skill_name(skill_name, drive_root, repo_path=repo_path)
+    state = runtime_state_for_skill_name(
+        skill_name, drive_root, repo_path=repo_path,
+        skills=[selected_skill] if selected_skill is not None else None,
+    )
     if not state.get("desired_live"):
         supervisor.stop_skill(skill_name)
         return {"action": "stopped_disabled", "started": [], "missing": []}
@@ -1672,7 +1681,9 @@ def ensure_companions_running(
     from ouroboros.config import get_skills_repo_path
 
     resolved_repo_path = get_skills_repo_path() if repo_path is None else repo_path
-    skill = find_skill(drive_root, skill_name, repo_path=resolved_repo_path)
+    skill = selected_skill or find_skill(
+        drive_root, skill_name, repo_path=resolved_repo_path,
+    )
     if skill is None:
         return {"action": "missing_skill", "started": [], "missing": missing}
     try:

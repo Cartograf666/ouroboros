@@ -613,6 +613,10 @@ def test_affordance_map_carries_label_path_pairs(tmp_path):
     paths = result.get("root_paths")
     assert isinstance(paths, dict) and paths
     assert "skill_payload" not in paths  # needs bucket/skill args
+    assert result["default_root"] == "active_workspace"
+    assert result["skill_payload_selector"] == (
+        "root=skill_payload requires bucket + skill_name"
+    )
     for label, path in paths.items():
         assert path and str(path).startswith("/") or ":" in str(path), (label, path)
     # The read-only orchestrator root is resolvable when visible to the profile.

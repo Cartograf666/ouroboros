@@ -27,7 +27,12 @@ from ouroboros.tools.registry import (
     ToolContext,
     ToolEntry,
     _authorized_managed_update_resolver,
-    active_repo_dir_for,
+    system_repo_dir_for,
+)
+from ouroboros.tool_access import (
+    ResolvedResourceBinding,
+    binding_targets_system_repo,
+    build_resolved_resource_binding,
 )
 from ouroboros.tools.claude_advisory_review import advisory_gate_unavailable
 from ouroboros.tools.commit_gate import (
@@ -1262,17 +1267,30 @@ def _format_commit_result(ctx, commit_message, push_status, test_warning):
     return result
 
 
-def _check_shrink_guard(ctx: ToolContext, file_path: str, new_content: str, force: bool = False) -> Optional[str]:
+def _binding_repo_rel(binding: ResolvedResourceBinding) -> str:
+    return binding.target_path.relative_to(binding.base_path).as_posix()
+
+
+def _binding_targets_system_repo(ctx: ToolContext, binding: ResolvedResourceBinding) -> bool:
+    return binding.base_path.resolve(strict=False) == system_repo_dir_for(ctx).resolve(strict=False)
+
+
+def _check_shrink_guard(
+    binding: ResolvedResourceBinding,
+    new_content: str,
+    force: bool = False,
+) -> Optional[str]:
     """Block likely accidental tracked-file truncation unless force=True."""
     if force:
         return None
     try:
-        target = ctx.repo_path(file_path)
+        target = binding.target_path
+        file_path = _binding_repo_rel(binding)
         if not target.exists():
             return None
         result = subprocess.run(
             ["git", "ls-files", "--error-unmatch", safe_relpath(file_path)],
-            cwd=str(active_repo_dir_for(ctx)), capture_output=True, text=True,
+            cwd=str(binding.base_path), capture_output=True, text=True,
         )
         if result.returncode != 0:
             return None
@@ -1295,7 +1313,10 @@ def _check_shrink_guard(ctx: ToolContext, file_path: str, new_content: str, forc
 def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
                 files: Optional[List[Dict[str, str]]] = None,
                 force: bool = False,
-                display_root: str = "active_workspace") -> str:
+                display_root: str = "active_workspace",
+                _resolved_binding: (
+                    ResolvedResourceBinding | tuple[ResolvedResourceBinding, ...] | None
+                ) = None) -> str:
     """Write file(s) to the repo working directory without committing."""
     write_list: List[Dict[str, str]] = []
     if files:
@@ -1315,10 +1336,27 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
     if not write_list:
         return "⚠️ WRITE_ERROR: nothing to write."
 
-    for e in write_list:
-        norm = normalize_repo_path(e["path"])
+    try:
+        if _resolved_binding is None:
+            binding_items = tuple(
+                build_resolved_resource_binding(
+                    ctx, root=display_root, operation="write", path=e["path"],
+                )
+                for e in write_list
+            )
+        elif isinstance(_resolved_binding, tuple):
+            binding_items = _resolved_binding
+        else:
+            binding_items = (_resolved_binding,)
+        if len(binding_items) != len(write_list):
+            return "⚠️ WRITE_ERROR: resolved target count does not match files."
+    except Exception as exc:
+        return f"⚠️ WRITE_ERROR: could not resolve target: {type(exc).__name__}: {exc}"
+
+    for e, binding in zip(write_list, binding_items):
+        norm = normalize_repo_path(_binding_repo_rel(binding))
         if (
-            not ctx.is_workspace_mode()
+            _binding_targets_system_repo(ctx, binding)
             and is_protected_runtime_path(norm)
             and not mode_allows_protected_write(_current_runtime_mode())
             and not _authorized_managed_update_resolver(ctx)
@@ -1343,12 +1381,13 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
     syntax_bypass_notes: List[str] = []
     from ouroboros.tools.edit_ops import _syntax_check
 
-    for e in write_list:
-        syntax_err = _syntax_check(safe_relpath(e["path"]), e["content"])
+    for e, binding in zip(write_list, binding_items):
+        rel_path = _binding_repo_rel(binding)
+        syntax_err = _syntax_check(rel_path, e["content"])
         if not syntax_err:
             continue
         if force:
-            syntax_bypass_notes.append(f"{safe_relpath(e['path'])}: {syntax_err}")
+            syntax_bypass_notes.append(f"{rel_path}: {syntax_err}")
             continue
         return (
             f"⚠️ WRITE_BLOCKED_SYNTAX: {syntax_err} for '{e['path']}'. "
@@ -1359,19 +1398,20 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
     written = []
     written_paths: List[str] = []
     overwrite_diffs: List[str] = []
-    for e in write_list:
-        shrink_warning = _check_shrink_guard(ctx, e["path"], e["content"], force=force)
+    for e, binding in zip(write_list, binding_items):
+        rel_path = _binding_repo_rel(binding)
+        shrink_warning = _check_shrink_guard(binding, e["content"], force=force)
         if shrink_warning:
             if written:
                 _invalidate_advisory(
                     ctx,
                     changed_paths=written_paths,
-                    mutation_root=active_repo_dir_for(ctx),
+                    mutation_root=binding_items[0].base_path,
                     source_tool="write_file",
                 )
             return shrink_warning
         try:
-            target = ctx.repo_path(e["path"])
+            target = binding.target_path
             old_content: Optional[str] = None
             if target.exists():
                 try:
@@ -1380,18 +1420,18 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
                     old_content = None
             target.parent.mkdir(parents=True, exist_ok=True)
             write_text(target, e["content"])
-            written.append(f"{display_root}:{safe_relpath(e['path'])} ({len(e['content'])} chars)")
-            written_paths.append(e["path"])
+            written.append(f"{display_root}:{rel_path} ({len(e['content'])} chars)")
+            written_paths.append(rel_path)
             if old_content is not None and old_content != e["content"]:
                 from ouroboros.tools.edit_ops import _unified_diff
 
-                overwrite_diffs.append(_unified_diff(safe_relpath(e["path"]), old_content, e["content"], cap=120))
+                overwrite_diffs.append(_unified_diff(rel_path, old_content, e["content"], cap=120))
         except Exception as exc:
             if written:
                 _invalidate_advisory(
                     ctx,
                     changed_paths=written_paths,
-                    mutation_root=active_repo_dir_for(ctx),
+                    mutation_root=binding_items[0].base_path,
                     source_tool="write_file",
                 )
             already = ", ".join(written) if written else "(none)"
@@ -1403,11 +1443,12 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
     _invalidate_advisory(
         ctx,
         changed_paths=written_paths,
-        mutation_root=active_repo_dir_for(ctx),
+        mutation_root=binding_items[0].base_path,
         source_tool="write_file",
     )
     summary = ", ".join(written)
-    if ctx.is_workspace_mode():
+    system_target = _binding_targets_system_repo(ctx, binding_items[0])
+    if ctx.is_workspace_mode() and not system_target:
         result = (
             f"✅ Written {len(written)} file(s): {summary}\n"
             "Files are on disk in the active workspace. Do not commit; the headless runner will emit a patch artifact."
@@ -1418,6 +1459,7 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
             "Files are on disk but NOT committed. Run commit_reviewed when ready.\n"
             "⚠️ Advisory pre-review is now stale — run advisory_review before commit_reviewed."
         )
+    result += f"\nResolved root: {binding_items[0].base_path}"
     if syntax_bypass_notes:
         result += (
             "\n⚠️ SYNTAX_GUARD_BYPASSED (force=true): "
@@ -1428,7 +1470,12 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
             "\nDiff vs the previous version (verify it matches your intent):\n"
             + "\n".join(overwrite_diffs)
         )
-    protected_written = [] if ctx.is_workspace_mode() else protected_paths_in(written_paths)
+    if system_target and any(pathlib.PurePosixPath(item).parts[:1] == ("skills",) for item in written_paths):
+        result += (
+            "\nℹ️ Native seed boundary: system_repo/skills changed; the installed "
+            "data/skills/native copy remains unchanged until launcher reseed."
+        )
+    protected_written = protected_paths_in(written_paths) if system_target else []
     if protected_written and mode_allows_protected_write(_current_runtime_mode()):
         result += "\n\n" + core_patch_notice(protected_written)
     return result
@@ -1442,6 +1489,8 @@ def _str_replace_editor(
     bucket: str = "",
     skill_name: str = "",
     display_root: str = "active_workspace",
+    force: bool = False,
+    _resolved_binding: ResolvedResourceBinding | None = None,
 ) -> str:
     """Replace exactly one occurrence of old_str with new_str in a file."""
     if not path or not path.strip():
@@ -1449,30 +1498,15 @@ def _str_replace_editor(
     if not old_str:
         return "⚠️ STR_REPLACE_ERROR: old_str is required (cannot be empty)."
 
-    norm = normalize_repo_path(path)
-    if (
-        not ctx.is_workspace_mode()
-        and is_protected_runtime_path(norm)
-        and not mode_allows_protected_write(_current_runtime_mode())
-        and not _authorized_managed_update_resolver(ctx)
-    ):
-        return protected_write_block_message(
-            path=norm,
-            runtime_mode=_current_runtime_mode(),
-            action="edit",
-        )
-
     existing_tc = normalize_task_constraint(getattr(ctx, "task_constraint", None))
     data_skill_target = None
     task_constraint = existing_tc
     short_form = None
-    if ctx.is_workspace_mode():
-        try:
-            target = ctx.repo_path(path)
-        except ValueError as e:
-            return f"⚠️ PATH_ERROR: {e}"
-        invalidation_root = active_repo_dir_for(ctx)
-    else:
+    binding = _resolved_binding
+    if binding is not None:
+        target = binding.target_path
+        invalidation_root = binding.base_path
+    elif not ctx.is_workspace_mode():
         short_form = decide_payload_short_form(
             bucket=bucket,
             skill_name=skill_name,
@@ -1488,7 +1522,7 @@ def _str_replace_editor(
             return f"⚠️ SKILL_REDIRECT_BLOCKED: {redirect_err}"
         task_constraint = existing_tc if existing_tc and existing_tc.mode == "skill_repair" else synth or existing_tc
 
-    if not ctx.is_workspace_mode() and task_constraint and task_constraint.mode == "skill_repair" and task_constraint.payload_root:
+    if binding is None and not ctx.is_workspace_mode() and task_constraint and task_constraint.mode == "skill_repair" and task_constraint.payload_root:
         try:
             target = resolve_payload_path(pathlib.Path(ctx.drive_root), task_constraint, path)
             data_skill_target = target
@@ -1501,7 +1535,7 @@ def _str_replace_editor(
                 "control-plane state. Edit user-authored payload files instead."
             )
         invalidation_root = pathlib.Path(ctx.drive_root)
-    elif not ctx.is_workspace_mode():
+    elif binding is None and not ctx.is_workspace_mode():
         data_skill_target = _data_skill_path(path, pathlib.Path(ctx.drive_root))
         if data_skill_target is not None:
             if is_skill_control_plane_path(data_skill_target, pathlib.Path(ctx.drive_root).resolve(strict=False)):
@@ -1512,12 +1546,30 @@ def _str_replace_editor(
                 )
             target = data_skill_target
             invalidation_root = pathlib.Path(ctx.drive_root)
-        else:
-            try:
-                target = ctx.repo_path(path)
-            except ValueError as e:
-                return f"⚠️ PATH_ERROR: {e}"
-            invalidation_root = active_repo_dir_for(ctx)
+    if binding is None and data_skill_target is None:
+        try:
+            binding = build_resolved_resource_binding(
+                ctx, root=display_root, operation="edit", path=path,
+            )
+        except Exception as exc:
+            return f"⚠️ PATH_ERROR: {exc}"
+        target = binding.target_path
+        invalidation_root = binding.base_path
+
+    rel_path = _binding_repo_rel(binding) if binding is not None else safe_relpath(path)
+    system_target = bool(binding and _binding_targets_system_repo(ctx, binding))
+    norm = normalize_repo_path(rel_path)
+    if (
+        system_target
+        and is_protected_runtime_path(norm)
+        and not mode_allows_protected_write(_current_runtime_mode())
+        and not _authorized_managed_update_resolver(ctx)
+    ):
+        return protected_write_block_message(
+            path=norm,
+            runtime_mode=_current_runtime_mode(),
+            action="edit",
+        )
 
     if not target.exists():
         return f"⚠️ STR_REPLACE_ERROR: file not found: {path}"
@@ -1539,7 +1591,11 @@ def _str_replace_editor(
         # carries the force escape hatch.)
         from ouroboros.tools.core import _check_data_shrink_guard
 
-        _shrink_block = _check_data_shrink_guard(target, new_content)
+        _shrink_block = _check_data_shrink_guard(target, new_content, force)
+        if _shrink_block:
+            return _shrink_block
+    elif binding is not None:
+        _shrink_block = _check_shrink_guard(binding, new_content, force)
         if _shrink_block:
             return _shrink_block
     try:
@@ -1556,24 +1612,31 @@ def _str_replace_editor(
 
     _invalidate_advisory(
         ctx,
-        changed_paths=[path],
+        changed_paths=[rel_path],
         mutation_root=invalidation_root,
         source_tool="edit_text",
     )
     result = (
-        f"✅ Replaced in {display_root}:{safe_relpath(path)} (line {replacement_line}).\n"
+        f"✅ Replaced in {display_root}:{rel_path} (line {replacement_line}).\n"
         f"Context:\n{context_preview}\n\n"
         "File is on disk but NOT committed."
     )
+    if binding is not None:
+        result += f"\nResolved root: {binding.base_path}"
     if short_form is not None and short_form.ignored_reason:
         result += f"\n⚠️ SKILL_SHORT_FORM_IGNORED: {short_form.ignored_reason}."
-    if data_skill_target is None and ctx.is_workspace_mode():
+    if data_skill_target is None and ctx.is_workspace_mode() and not system_target:
         result += "\nDo not commit; the headless runner will emit a patch artifact."
     elif data_skill_target is None:
         result += "\nRun commit_reviewed when ready.\n⚠️ Advisory pre-review is now stale — run advisory_review before commit_reviewed."
     else:
         result += "\nRun skill_review for this skill before enabling or declaring it ready."
-    if not ctx.is_workspace_mode() and is_protected_runtime_path(norm) and mode_allows_protected_write(_current_runtime_mode()):
+    if system_target and pathlib.PurePosixPath(rel_path).parts[:1] == ("skills",):
+        result += (
+            "\nℹ️ Native seed boundary: system_repo/skills changed; the installed "
+            "data/skills/native copy remains unchanged until launcher reseed."
+        )
+    if system_target and is_protected_runtime_path(norm) and mode_allows_protected_write(_current_runtime_mode()):
         result += "\n\n" + core_patch_notice([norm])
     return result
 
@@ -2339,12 +2402,65 @@ def _limit_git_output(text: str, max_chars: int = 0) -> str:
     return text[:limit] + f"\n⚠️ OUTPUT_TRUNCATED: git output limited to {limit} characters by max_chars."
 
 
-def _git_status(ctx: ToolContext, path: str = "", max_chars: int = 0) -> str:
+def _vcs_binding(
+    ctx: ToolContext,
+    binding: Optional[ResolvedResourceBinding],
+    *,
+    root: str = "system_repo",
+    path: str = ".",
+) -> ResolvedResourceBinding:
+    """Return the dispatch binding, with a system-repo fallback for direct callers.
+
+    Public Tool API calls always receive a registry-built binding. The fallback
+    preserves the historical system-repo target for internal/direct helper calls
+    without making handler-local target selection part of the public contract.
+    """
+
+    resolved = binding or build_resolved_resource_binding(
+        ctx,
+        root=root,
+        operation="vcs",
+        path=path or ".",
+    )
+    if resolved.operation != "vcs" or resolved.root not in {"active_workspace", "system_repo"}:
+        raise ValueError(
+            "generic VCS tools require a vcs binding on active_workspace or system_repo"
+        )
+    return resolved
+
+
+def _vcs_result(text: str, binding: ResolvedResourceBinding) -> str:
+    receipt = f"VCS target: root={binding.root}; repo={binding.base_path}"
+    rendered = str(text or "").rstrip()
+    return f"{rendered}\n\n{receipt}" if rendered else receipt
+
+
+def _binding_relative_path(binding: ResolvedResourceBinding, requested: str) -> str:
+    if not str(requested or "").strip():
+        return ""
     try:
+        relative = binding.target_path.relative_to(binding.base_path)
+    except ValueError as exc:
+        raise ValueError("VCS path escapes the selected repository") from exc
+    return str(relative) if str(relative) != "." else ""
+
+
+def _git_status(
+    ctx: ToolContext,
+    path: str = "",
+    max_chars: int = 0,
+    root: str = "system_repo",
+    _resolved_binding: Optional[ResolvedResourceBinding] = None,
+) -> str:
+    try:
+        binding = _vcs_binding(ctx, _resolved_binding, root=root, path=path or ".")
         cmd = ["git", "status", "--porcelain"]
-        if str(path or "").strip():
-            cmd.extend(["--", safe_relpath(str(path))])
-        return _limit_git_output(run_cmd(cmd, cwd=active_repo_dir_for(ctx)), max_chars)
+        if relative := _binding_relative_path(binding, path):
+            cmd.extend(["--", safe_relpath(relative)])
+        return _vcs_result(
+            _limit_git_output(run_cmd(cmd, cwd=binding.base_path), max_chars),
+            binding,
+        )
     except Exception as e:
         return f"⚠️ GIT_ERROR: {_sanitize_git_error(str(e))}"
 
@@ -2356,9 +2472,12 @@ def _git_diff(
     stat: bool = False,
     name_only: bool = False,
     max_chars: int = 0,
+    root: str = "system_repo",
+    _resolved_binding: Optional[ResolvedResourceBinding] = None,
 ) -> str:
     try:
-        repo_dir = active_repo_dir_for(ctx)
+        binding = _vcs_binding(ctx, _resolved_binding, root=root, path=path or ".")
+        repo_dir = binding.base_path
         cmd = ["git", "diff"]
         if staged:
             cmd.append("--staged")
@@ -2366,14 +2485,16 @@ def _git_diff(
             cmd.append("--name-only")
         elif stat:
             cmd.append("--stat")
-        if str(path or "").strip():
-            cmd.extend(["--", safe_relpath(str(path))])
+        if relative := _binding_relative_path(binding, path):
+            cmd.extend(["--", safe_relpath(relative)])
         from ouroboros.protected_artifacts import shell_block_reason as protected_artifact_shell_block_reason
 
-        protected_block = protected_artifact_shell_block_reason(ctx, cmd, cwd=str(repo_dir), default_cwd=repo_dir)
+        protected_block = protected_artifact_shell_block_reason(
+            ctx, cmd, cwd=str(repo_dir), default_cwd=repo_dir, binding=binding,
+        )
         if protected_block:
-            return protected_block
-        return _limit_git_output(run_cmd(cmd, cwd=repo_dir), max_chars)
+            return _vcs_result(protected_block, binding)
+        return _vcs_result(_limit_git_output(run_cmd(cmd, cwd=repo_dir), max_chars), binding)
     except Exception as e:
         return f"⚠️ GIT_ERROR: {_sanitize_git_error(str(e))}"
 
@@ -2430,38 +2551,55 @@ def _ff_pull(repo_dir: pathlib.Path) -> str:
     return "\n".join(lines)
 
 
-def _pull_from_remote(ctx: ToolContext) -> str:
-    return _ff_pull(pathlib.Path(ctx.repo_dir))
+def _pull_from_remote(
+    ctx: ToolContext,
+    root: str = "system_repo",
+    _resolved_binding: Optional[ResolvedResourceBinding] = None,
+) -> str:
+    try:
+        binding = _vcs_binding(ctx, _resolved_binding, root=root)
+        return _vcs_result(_ff_pull(binding.base_path), binding)
+    except Exception as e:
+        return f"⚠️ PULL_ERROR: {_sanitize_git_error(str(e))}"
 
 
 def _restore_to_head(ctx: ToolContext, confirm: bool = False,
-                     paths: Optional[List[str]] = None) -> str:
-    repo_dir = pathlib.Path(ctx.repo_dir)
+                     paths: Optional[List[str]] = None,
+                     root: str = "system_repo",
+                     _resolved_binding: Optional[ResolvedResourceBinding] = None) -> str:
+    try:
+        binding = _vcs_binding(ctx, _resolved_binding, root=root)
+    except Exception as e:
+        return f"⚠️ RESTORE_ERROR: {_sanitize_git_error(str(e))}"
+    repo_dir = binding.base_path
     try:
         status = run_cmd(["git", "status", "--porcelain"], cwd=repo_dir).strip()
     except Exception as e:
-        return f"⚠️ RESTORE_ERROR: git status failed: {e}"
+        return _vcs_result(f"⚠️ RESTORE_ERROR: git status failed: {e}", binding)
     if not status:
-        return "Nothing to restore — working directory is already clean."
+        return _vcs_result("Nothing to restore — working directory is already clean.", binding)
     dirty_files = [
         path
         for line in status.splitlines()
         for path in _review_paths_from_porcelain_line(line)
     ]
-    affected_protected = protected_paths_in(dirty_files)
-    if paths:
+    targets_system = binding_targets_system_repo(ctx, binding)
+    affected_protected = protected_paths_in(dirty_files) if targets_system else []
+    if paths and targets_system:
         for p in paths:
             norm = normalize_repo_path(p)
             if is_protected_runtime_path(norm):
-                return (
+                return _vcs_result(
                     f"⚠️ RESTORE_BLOCKED: Cannot restore protected file: {norm}. "
-                    "Protected core/contract/release paths must be changed through reviewed commits."
+                    "Protected core/contract/release paths must be changed through reviewed commits.",
+                    binding,
                 )
     elif affected_protected:
-        return (
+        return _vcs_result(
             f"⚠️ RESTORE_BLOCKED: Uncommitted changes touch protected file(s): "
             f"{format_protected_paths(affected_protected)}. "
-            f"Use paths= to restore specific non-critical files, or resolve manually."
+            f"Use paths= to restore specific non-critical files, or resolve manually.",
+            binding,
         )
     if not confirm:
         try:
@@ -2482,43 +2620,56 @@ def _restore_to_head(ctx: ToolContext, confirm: bool = False,
                 preview.append(f"  {f}")
         preview.append("")
         preview.append("Call again with confirm=true to proceed.")
-        return "\n".join(preview)
+        return _vcs_result("\n".join(preview), binding)
     if paths:
         safe_paths = [os.path.normpath(p.strip().lstrip("./")) for p in paths if p.strip()]
         if not safe_paths:
-            return "⚠️ RESTORE_ERROR: No valid paths provided."
+            return _vcs_result("⚠️ RESTORE_ERROR: No valid paths provided.", binding)
         try:
             run_cmd(["git", "checkout", "HEAD", "--"] + safe_paths, cwd=repo_dir)
         except Exception as e:
-            return f"⚠️ RESTORE_ERROR: git checkout failed: {e}"
+            return _vcs_result(f"⚠️ RESTORE_ERROR: git checkout failed: {e}", binding)
         try:
             run_cmd(["git", "clean", "-fd", "--"] + safe_paths, cwd=repo_dir)
         except Exception:
             pass
-        return f"Restored {len(safe_paths)} path(s) to HEAD."
+        return _vcs_result(f"Restored {len(safe_paths)} path(s) to HEAD.", binding)
     else:
         try:
             run_cmd(["git", "checkout", "HEAD", "--", "."], cwd=repo_dir)
         except Exception as e:
-            return f"⚠️ RESTORE_ERROR: git checkout failed: {e}"
+            return _vcs_result(f"⚠️ RESTORE_ERROR: git checkout failed: {e}", binding)
         try:
             run_cmd(["git", "clean", "-fd"], cwd=repo_dir)
         except Exception:
             pass
-        return "All uncommitted changes discarded. Working directory matches HEAD."
+        return _vcs_result(
+            "All uncommitted changes discarded. Working directory matches HEAD.",
+            binding,
+        )
 
 
-def _revert_commit(ctx: ToolContext, sha: str, confirm: bool = False) -> str:
-    repo_dir = pathlib.Path(ctx.repo_dir)
+def _revert_commit(
+    ctx: ToolContext,
+    sha: str,
+    confirm: bool = False,
+    root: str = "system_repo",
+    _resolved_binding: Optional[ResolvedResourceBinding] = None,
+) -> str:
+    try:
+        binding = _vcs_binding(ctx, _resolved_binding, root=root)
+    except Exception as e:
+        return f"⚠️ REVERT_ERROR: {_sanitize_git_error(str(e))}"
+    repo_dir = binding.base_path
     sha = sha.strip()
     if not sha:
-        return "⚠️ REVERT_ERROR: sha parameter is required."
+        return _vcs_result("⚠️ REVERT_ERROR: sha parameter is required.", binding)
     try:
         full_sha = run_cmd(
             ["git", "rev-parse", "--verify", sha], cwd=repo_dir,
         ).strip()
     except Exception:
-        return f"⚠️ REVERT_ERROR: Commit '{sha}' not found."
+        return _vcs_result(f"⚠️ REVERT_ERROR: Commit '{sha}' not found.", binding)
     try:
         parents = run_cmd(
             ["git", "rev-list", "--parents", "-1", full_sha], cwd=repo_dir,
@@ -2526,9 +2677,10 @@ def _revert_commit(ctx: ToolContext, sha: str, confirm: bool = False) -> str:
     except Exception:
         parents = [full_sha]
     if len(parents) > 2:
-        return (
+        return _vcs_result(
             f"⚠️ REVERT_ERROR: Commit {sha[:8]} is a merge commit ({len(parents)-1} parents). "
-            "git revert on merge commits requires specifying a parent."
+            "git revert on merge commits requires specifying a parent.",
+            binding,
         )
     try:
         changed_files = run_cmd(
@@ -2537,13 +2689,18 @@ def _revert_commit(ctx: ToolContext, sha: str, confirm: bool = False) -> str:
         ).strip().splitlines()
     except Exception:
         changed_files = []
-    protected_changes = protected_paths_in(changed_files)
+    protected_changes = (
+        protected_paths_in(changed_files)
+        if binding_targets_system_repo(ctx, binding)
+        else []
+    )
     if protected_changes:
-        return (
+        return _vcs_result(
             f"⚠️ REVERT_BLOCKED: Commit {sha[:8]} touches protected file(s): "
             f"{format_protected_paths(protected_changes)}. "
             "Direct vcs_revert cannot create protected-path commits; stage the intended "
-            "revert manually and use commit_reviewed so the normal triad + scope review covers it."
+            "revert manually and use commit_reviewed so the normal triad + scope review covers it.",
+            binding,
         )
     try:
         commit_msg = run_cmd(
@@ -2558,21 +2715,23 @@ def _revert_commit(ctx: ToolContext, sha: str, confirm: bool = False) -> str:
             ).strip()
         except Exception:
             diff_stat = "(could not generate diff)"
-        return (
+        return _vcs_result(
             f"This will revert commit {full_sha[:8]}:\n"
             f"  Message: {commit_msg}\n"
             f"  Files changed:\n{diff_stat}\n\n"
             "A new commit will be created that undoes these changes.\n"
-            "Call again with confirm=true to proceed."
+            "Call again with confirm=true to proceed.",
+            binding,
         )
     try:
         status = run_cmd(["git", "status", "--porcelain"], cwd=repo_dir).strip()
     except Exception:
         status = ""
     if status:
-        return (
+        return _vcs_result(
             "⚠️ REVERT_ERROR: Working directory is not clean.\n"
-            "Commit or discard changes first (use vcs_restore), then retry."
+            "Commit or discard changes first (use vcs_restore), then retry.",
+            binding,
         )
     lock = _acquire_git_lock(ctx)
     try:
@@ -2583,10 +2742,13 @@ def _revert_commit(ctx: ToolContext, sha: str, confirm: bool = False) -> str:
                 run_cmd(["git", "revert", "--abort"], cwd=repo_dir)
             except Exception:
                 pass
-            return f"⚠️ REVERT_ERROR: git revert failed: {e}"
+            return _vcs_result(f"⚠️ REVERT_ERROR: git revert failed: {e}", binding)
     finally:
         _release_git_lock(lock)
-    return f"Reverted commit {full_sha[:8]}: {commit_msg}\nNew revert commit created."
+    return _vcs_result(
+        f"Reverted commit {full_sha[:8]}: {commit_msg}\nNew revert commit created.",
+        binding,
+    )
 
 
 def get_tools() -> List[ToolEntry]:
@@ -2627,18 +2789,20 @@ def get_tools() -> List[ToolEntry]:
         }, _repo_commit_push, is_code_tool=True),
         ToolEntry("vcs_status", {
             "name": "vcs_status",
-            "description": "git status --porcelain for the active repo/workspace",
+            "description": "git status --porcelain for the selected repository.",
             "parameters": {"type": "object", "properties": {
-                "path": {"type": "string", "default": "", "description": "Optional path filter relative to the active repo/workspace"},
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo"], "default": "active_workspace", "description": "Omit for the active project workspace; use system_repo for Ouroboros source."},
+                "path": {"type": "string", "default": "", "description": "Optional path filter relative to the selected repository"},
                 "max_chars": {"type": "integer", "default": 0, "description": "Optional output character limit; 0 means no explicit limit"},
             }, "required": []},
         }, _git_status, is_code_tool=True),
         ToolEntry("vcs_diff", {
             "name": "vcs_diff",
-            "description": "git diff for the active repo/workspace (use staged=true to see staged changes after git add)",
+            "description": "git diff for the selected repository (use staged=true to see staged changes after git add).",
             "parameters": {"type": "object", "properties": {
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo"], "default": "active_workspace", "description": "Omit for the active project workspace; use system_repo for Ouroboros source."},
                 "staged": {"type": "boolean", "default": False, "description": "If true, show staged changes (--staged)"},
-                "path": {"type": "string", "default": "", "description": "Optional path filter relative to the active repo/workspace"},
+                "path": {"type": "string", "default": "", "description": "Optional path filter relative to the selected repository"},
                 "stat": {"type": "boolean", "default": False, "description": "If true, show --stat output"},
                 "name_only": {"type": "boolean", "default": False, "description": "If true, show --name-only output"},
                 "max_chars": {"type": "integer", "default": 0, "description": "Optional output character limit; 0 means no explicit limit"},
@@ -2646,21 +2810,25 @@ def get_tools() -> List[ToolEntry]:
         }, _git_diff, is_code_tool=True),
         ToolEntry("vcs_pull_ff", {
             "name": "vcs_pull_ff",
-            "description": "Fetch from origin and fast-forward merge. Safe: never rewrites history.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
+            "description": "Fetch from origin and fast-forward merge in the selected repository. Safe: never rewrites history.",
+            "parameters": {"type": "object", "properties": {
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo"], "default": "active_workspace", "description": "Omit for the active project workspace; use system_repo for Ouroboros source."},
+            }, "required": []},
         }, _pull_from_remote, is_code_tool=True, mutates_worktree=True),
         ToolEntry("vcs_restore", {
             "name": "vcs_restore",
-            "description": "Discard uncommitted changes, restoring to last committed state (HEAD).",
+            "description": "Discard uncommitted changes in the selected repository, restoring to HEAD.",
             "parameters": {"type": "object", "properties": {
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo"], "default": "active_workspace", "description": "Omit for the active project workspace; use system_repo for Ouroboros source."},
                 "confirm": {"type": "boolean", "description": "Must be true to execute."},
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "Specific files to restore"},
             }, "required": ["confirm"]},
         }, _restore_to_head, is_code_tool=True, mutates_worktree=True),
         ToolEntry("vcs_revert", {
             "name": "vcs_revert",
-            "description": "Revert a specific commit by creating a new undo commit. Safe: no history rewrite.",
+            "description": "Revert a commit in the selected repository by creating a new undo commit. Safe: no history rewrite.",
             "parameters": {"type": "object", "properties": {
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo"], "default": "active_workspace", "description": "Omit for the active project workspace; use system_repo for Ouroboros source."},
                 "sha": {"type": "string", "description": "Commit SHA to revert"},
                 "confirm": {"type": "boolean", "description": "Must be true to execute."},
             }, "required": ["sha", "confirm"]},

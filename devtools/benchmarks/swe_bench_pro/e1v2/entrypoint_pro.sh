@@ -417,8 +417,9 @@ else
   echo "[pro] ROOT-RUN $IID (self_modification; /app as active external workspace; post-task evolution=disabled baseline)" >&2
 fi
 # Tool denylist + per-task memory mode are passthrough knobs (run_pro --disable-tools / --memory-mode).
-# Defaults preserve the original tool behavior (full web/browser/vision + claude_code_edit disabled).
-OBO_DISABLE_TOOLS="${OBO_DISABLE_TOOLS:-web_search,browse_page,browser_action,analyze_screenshot,vlm_query,view_image,claude_code_edit}"
+# Methodology default: web/browser/vision/transcript lookup, the external coding
+# gateway, and model switching are disabled explicitly by the task contract.
+OBO_DISABLE_TOOLS="${OBO_DISABLE_TOOLS:-web_search,browse_page,browser_action,analyze_screenshot,vlm_query,view_image,youtube_transcript,claude_code_edit,switch_model}"
 # Benchmark default is a FRESH child memory drive (v6.56.0): the measured artifact
 # is the harness on this task, not memory accreted across tasks. Explicitly export
 # OBO_MEMORY_MODE=shared/forked to opt back into carried memory.

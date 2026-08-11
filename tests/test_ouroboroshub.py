@@ -25,6 +25,38 @@ def test_ouroboroshub_stages_under_target_root(monkeypatch, tmp_path):
     seen["staging"].relative_to(hub_root / ".staging")
 
 
+def test_ouroboroshub_rejects_foreign_identity_before_download(monkeypatch, tmp_path):
+    hub_root = tmp_path / "data" / "skills" / "ouroboroshub"
+    checkout = tmp_path / "checkout"
+    foreign = checkout / "demo"
+    foreign.mkdir(parents=True)
+    (foreign / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(checkout))
+    monkeypatch.setattr(ouroboroshub, "get_ouroboroshub_skills_dir", lambda: hub_root)
+    summary = ouroboroshub.HubSkillSummary(
+        slug="demo", name="demo", version="1.0.0",
+        files=[{"path": "SKILL.md", "sha256": "x", "size": 1}],
+    )
+    monkeypatch.setattr(
+        ouroboroshub,
+        "load_catalog",
+        lambda: {"raw_base_url": "https://raw.githubusercontent.com/razzant/OuroborosHub/main"},
+    )
+    monkeypatch.setattr(ouroboroshub, "_summaries", lambda _catalog: [summary])
+    monkeypatch.setattr(
+        ouroboroshub,
+        "_download_skill_files",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("download must not run")),
+    )
+
+    result = ouroboroshub.install("demo")
+
+    assert result.ok is False
+    assert "collision" in result.error.lower()
+    assert not (hub_root / "demo").exists()
+    assert not (tmp_path / "data" / "state" / "skills" / "demo").exists()
+
+
 def test_ouroboroshub_persists_catalog_dependency_specs(monkeypatch, tmp_path):
     hub_root = tmp_path / "hub"
     monkeypatch.setattr(ouroboroshub, "get_ouroboroshub_skills_dir", lambda: hub_root)

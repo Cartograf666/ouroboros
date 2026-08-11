@@ -31,10 +31,10 @@ class ToolSchemaProvider(Protocol):
 def initial_tool_schemas(registry: ToolSchemaProvider) -> List[Dict[str, Any]]:
     """Return the full capability envelope that should be present from round 1.
 
-    Visibility is selected by the registry context: normal main/direct/evolution
-    tasks expose all available first-party built-ins plus live extension/MCP
-    schemas; workspace and local-readonly tasks expose their guarded envelope.
-    No enabled schema is silently skipped here.
+    Visibility is selected by the registry context: ordinary top-level tasks
+    expose all available first-party built-ins plus live extension/MCP schemas;
+    delegated-child, repair, ephemeral, credential, resource, and contract
+    filters narrow independently. No enabled schema is silently skipped here.
     """
 
     return registry.schemas()

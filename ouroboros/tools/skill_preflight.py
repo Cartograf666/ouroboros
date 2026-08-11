@@ -17,6 +17,11 @@ import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.tools.registry import ToolContext, ToolEntry
+from ouroboros.tool_access import (
+    ResolvedResourceBinding,
+    build_resolved_resource_binding,
+    load_bound_skill,
+)
 from ouroboros.tools.shell import _active_subprocesses, _kill_process_group, _subprocess_lock
 from ouroboros.platform_layer import (
     merge_hidden_kwargs,
@@ -493,20 +498,25 @@ def _handle_skill_preflight(
     ctx: ToolContext,
     skill: str = "",
     paths: Optional[List[str]] = None,
+    _resolved_binding: ResolvedResourceBinding | None = None,
     **_kwargs: Any,
 ) -> str:
     skill_name = str(skill or "").strip()
     if not skill_name:
         return "⚠️ SKILL_PREFLIGHT_ERROR: 'skill' is required."
 
-    from ouroboros.skill_loader import find_skill
-
-    drive_root = pathlib.Path(ctx.drive_root)
-    loaded = find_skill(drive_root, skill_name)
+    try:
+        binding = _resolved_binding or build_resolved_resource_binding(
+            ctx, root="skill_payload", operation="review", path=".",
+            skill_name=skill_name,
+        )
+    except Exception as exc:
+        return f"⚠️ SKILL_PREFLIGHT_ERROR: {exc}"
+    loaded = load_bound_skill(binding)
     if loaded is None:
         return f"⚠️ SKILL_PREFLIGHT_ERROR: skill {skill_name!r} not found."
 
-    skill_dir = loaded.skill_dir.resolve()
+    skill_dir = binding.base_path
 
     # Broken manifests still become findings; keep other validators running.
     manifest_findings: List[Dict[str, Any]] = []

@@ -1444,7 +1444,7 @@ def test_review_skill_tool_result_has_no_raw_json_block(tmp_path, monkeypatch):
     monkeypatch.setattr(
         skill_exec_mod,
         "_review_skill_impl",
-        lambda _ctx, name: SkillReviewOutcome(
+        lambda _ctx, name, **_kwargs: SkillReviewOutcome(
             skill_name=name, status="clean",
             content_hash=compute_content_hash(skill_dir),
             reviewer_models=["fake/reviewer"], findings=[], error="",

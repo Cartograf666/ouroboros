@@ -58,7 +58,16 @@ def _loaded(
 
 def _patch_validate(monkeypatch, loaded: LoadedSkill, computed_hash: str = "h") -> None:
     monkeypatch.setattr(skill_publish, "github_token_from_env_or_settings", lambda: "tok")
-    monkeypatch.setattr(skill_publish, "find_skill", lambda root, name: loaded)
+    monkeypatch.setattr(
+        skill_publish,
+        "build_resolved_resource_binding",
+        lambda *args, **kwargs: types.SimpleNamespace(
+            base_path="/payload/demo",
+            state_drive_root="/data",
+            source=loaded.source,
+        ),
+    )
+    monkeypatch.setattr(skill_publish, "load_bound_skill", lambda binding: loaded)
     monkeypatch.setattr(skill_publish, "compute_content_hash", lambda *a, **k: computed_hash)
 
 
