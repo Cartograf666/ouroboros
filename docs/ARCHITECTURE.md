@@ -267,8 +267,9 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
 .github/workflows/claudexor-platform-gate.yml ← 3-OS delegated-execution gate: fixture lane (fake harness, offline, $0) + live lane on explicit API keys (subscription auth deliberately out of CI — verified by a live local run, D26)
 .github/workflows/scorecard.yml ← OpenSSF Scorecard on `main` pushes and weekly; full action SHA pins, read-only defaults, OIDC result publication, and SARIF artifact/code-scanning upload
 CODE_OF_CONDUCT.md            ← Contributor Covenant 3.0 community rules and private moderator contact
-CITATION.cff                  ← Machine-readable software citation; Anton is the cited author and Ouroboros's contribution is acknowledged
+CITATION.cff                  ← Machine-readable software citation plus the preferred six-author technical-report citation; no institutional affiliation is inferred
 docs/benchmarks/evidence.json ← Release-bound non-GAIA projection of public benchmark claims and immutable evidence links; README remains the claim SSOT
+site/paper/index.html         ← Canonical technical-report landing page with author/citation metadata, `ScholarlyArticle` JSON-LD, paper links, and evidence navigation
 scripts/claudexor_platform_smoke.py ← the platform gate's smoke runner (daemon boot, one delegated no-edit/edit task, containment report)
 scripts/fetch_claudexor_runtime.py  ← release-build fetcher for the pinned managed Claudexor runtime archive (claudexor_runtime_pin.json is the SSOT)
 build.sh                      ← macOS build (PyInstaller → .dmg)
@@ -286,7 +287,7 @@ skills/telegram/            ← Bundled owner-only Telegram text/photo bridge pl
 skills/unix_computer_use/   ← Bundled extension skill for supervised desktop observation and input, including explicitly configured remote connections stored in skill state. A disabled or missing active connection fails closed instead of falling back to the local desktop; unavailable platform backends report that fact rather than guessing.
 packaging/cli/                ← Packaged CLI shell/cmd wrappers and user-local installer launchers copied into desktop artifacts
 Dockerfile                    ← Docker image (web UI runtime)
-site/                         ← Public GitHub Pages source (Vite). `site/scripts/sync-assets.mjs` copies canonical `assets/` images into gitignored `site/public/assets/`, and `pnpm build` renders committed `docs/`. Text-first product and install routes, `/llms.txt`, `/install.json`, and the sitemap share the same build; `tests/test_public_site_metadata.py` guards canonical URLs, structured metadata, install data, asset hashes, and source-to-Pages sync.
+site/                         ← Public GitHub Pages source (Vite). `site/scripts/sync-assets.mjs` copies canonical `assets/` images into gitignored `site/public/assets/`, and `pnpm build` renders committed `docs/`. Text-first product, paper, and install routes, `/llms.txt`, `/install.json`, and the sitemap share the same build; `tests/test_public_site_metadata.py` guards canonical URLs, structured metadata, paper citations, install data, asset hashes, and source-to-Pages sync.
 devtools/                     ← Tracked operator tooling outside runtime and package discovery; domain-specific architecture and methodology stay with the relevant devtool.
 ```
 
@@ -1953,7 +1954,7 @@ The main CI workflow has five roles: fork-safe quick checks with no provider sec
 
 Quick pull-request jobs are read-only and never use `pull_request_target`. The live catalog skill lane is intentionally a release dependency: it proves that the published payloads still install on this runtime, while keeping provider credentials out of every process that imports payload code. This external-service dependency is an explicit owner trade-off rather than an accidental source of flaky authority.
 
-The separate Scorecard workflow runs on `main` pushes and weekly. It pins every action by full commit SHA, defaults permissions to read-only, and adds only `security-events: write` and `id-token: write` for SARIF upload and OpenSSF publication. `CODE_OF_CONDUCT.md` owns community rules and reporting; `CITATION.cff` owns citation metadata; `docs/benchmarks/evidence.json` is a historical, release-bound non-GAIA projection of public benchmark claims and immutable evidence links. README remains the claim SSOT.
+The separate Scorecard workflow runs on `main` pushes and weekly. It pins every action by full commit SHA, defaults permissions to read-only, and adds only `security-events: write` and `id-token: write` for SARIF upload and OpenSSF publication. `CODE_OF_CONDUCT.md` owns community rules and reporting; `CITATION.cff` owns the software citation and preferred technical-report citation; `site/paper/index.html` owns the canonical human- and machine-readable paper landing page; `docs/benchmarks/evidence.json` is a historical, release-bound non-GAIA projection of public benchmark claims and immutable evidence links. README remains the claim SSOT.
 
 ### Build scripts
 

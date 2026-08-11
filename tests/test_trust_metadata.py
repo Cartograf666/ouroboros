@@ -36,6 +36,23 @@ def test_citation_metadata_has_the_approved_author_and_acknowledgment():
     forbidden = {"orcid", "affiliation", "version", "date-released", "doi"}
     assert forbidden.isdisjoint(citation)
     assert forbidden.isdisjoint(citation["authors"][0])
+    preferred = citation["preferred-citation"]
+    assert preferred == {
+        "type": "article",
+        "title": "Ouroboros: A Self-Developing Frontier Coding Agent with Reviewed Core Evolution",
+        "authors": [
+            {"family-names": "Razzhigaev", "given-names": "Anton"},
+            {"family-names": "Gritsaev", "given-names": "Andrei"},
+            {"family-names": "Kaznacheev", "given-names": "Andrei"},
+            {"family-names": "Dragunov", "given-names": "Nikita"},
+            {"family-names": "Yampolskiy", "given-names": "Roman"},
+            {"family-names": "Kuznetsov", "given-names": "Andrei"},
+        ],
+        "journal": "arXiv",
+        "year": 2026,
+        "doi": "10.48550/arXiv.2608.08311",
+        "url": "https://arxiv.org/abs/2608.08311",
+    }
 
 
 def test_scorecard_workflow_is_fully_pinned_and_publishes_sarif():
@@ -185,6 +202,7 @@ def test_architecture_registers_each_new_public_metadata_surface():
         "CODE_OF_CONDUCT.md",
         "CITATION.cff",
         "docs/benchmarks/evidence.json",
+        "site/paper/index.html",
     ):
         assert path in architecture
     assert "README remains the claim SSOT" in architecture

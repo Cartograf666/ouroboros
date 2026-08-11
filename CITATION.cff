@@ -20,3 +20,23 @@ keywords:
   - self-modifying systems
   - persistent memory
   - multi-agent systems
+preferred-citation:
+  type: article
+  title: "Ouroboros: A Self-Developing Frontier Coding Agent with Reviewed Core Evolution"
+  authors:
+    - family-names: "Razzhigaev"
+      given-names: "Anton"
+    - family-names: "Gritsaev"
+      given-names: "Andrei"
+    - family-names: "Kaznacheev"
+      given-names: "Andrei"
+    - family-names: "Dragunov"
+      given-names: "Nikita"
+    - family-names: "Yampolskiy"
+      given-names: "Roman"
+    - family-names: "Kuznetsov"
+      given-names: "Andrei"
+  journal: "arXiv"
+  year: 2026
+  doi: "10.48550/arXiv.2608.08311"
+  url: "https://arxiv.org/abs/2608.08311"
