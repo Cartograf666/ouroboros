@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+
+APPDIR=${APPDIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}
+PAYLOAD="$APPDIR/usr/lib/ouroboros"
+
+# The mounted AppImage is immutable. PyInstaller and the launcher already route
+# managed state, settings, logs, repositories, and bytecode to the user's data
+# and cache roots; expose the same explicit bundle root to child processes.
+export OUROBOROS_BUNDLE_DIR="$PAYLOAD/_internal"
+
+if [ "${1:-}" = "--version" ]; then
+    VERSION_FILE="$OUROBOROS_BUNDLE_DIR/VERSION"
+    if [ ! -s "$VERSION_FILE" ]; then
+        echo "Ouroboros version metadata is missing" >&2
+        exit 1
+    fi
+    VERSION=
+    IFS= read -r VERSION < "$VERSION_FILE" || true
+    printf 'Ouroboros %s\n' "$VERSION"
+    exit 0
+fi
+
+if [ "${1:-}" = "--cli" ]; then
+    shift
+    exec "$PAYLOAD/bin/ouroboros" "$@"
+fi
+
+exec "$PAYLOAD/Ouroboros" "$@"

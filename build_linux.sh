@@ -56,7 +56,11 @@ export PYINSTALLER_CONFIG_DIR="$PWD/.pyinstaller-cache"
 mkdir -p "$PYINSTALLER_CONFIG_DIR"
 
 echo "--- Installing Chromium/WebKit for browser tools (bundled into python-standalone) ---"
-"$PORTABLE_PYTHON" -m playwright install-deps chromium webkit
+if [ "${OUROBOROS_SKIP_PLAYWRIGHT_INSTALL_DEPS:-0}" = "1" ]; then
+    echo "Skipping Playwright host-library installation by request."
+else
+    "$PORTABLE_PYTHON" -m playwright install-deps chromium webkit
+fi
 PLAYWRIGHT_BROWSERS_PATH=0 "$PORTABLE_PYTHON" -m playwright install chromium webkit
 
 echo "--- Building embedded managed repo bundle ---"
@@ -101,8 +105,13 @@ tar -czf "$ARCHIVE_NAME" Ouroboros/
 cd ..
 
 echo ""
+echo "=== Creating AppImage ==="
+bash scripts/build_appimage.sh
+
+echo ""
 echo "=== Done ==="
 echo "Archive: dist/$ARCHIVE_NAME"
+echo "AppImage: dist/Ouroboros-${VERSION}-linux-$(uname -m).AppImage"
 echo ""
 echo "To run: extract and execute ./Ouroboros/Ouroboros"
 echo "To install CLI: ./Ouroboros/bin/install-ouroboros-cli"

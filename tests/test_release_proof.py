@@ -74,12 +74,13 @@ def test_locate_artifact_requires_exactly_one_archive(tmp_path: Path):
         release_proof.locate_artifact(tmp_path)
 
 
-def test_locate_artifact_ignores_native_linux_packages(tmp_path: Path):
+def test_locate_artifact_ignores_companion_linux_assets(tmp_path: Path):
     archive = tmp_path / "Ouroboros-1.0.0-linux-x86_64.tar.gz"
     archive.write_bytes(b"archive")
     (tmp_path / "ouroboros_1.0.0_amd64.deb").write_bytes(b"deb")
     (tmp_path / "ouroboros-1.0.0-1.x86_64.rpm").write_bytes(b"rpm")
     (tmp_path / "ouroboros-1.0.0-1.red80.x86_64.rpm").write_bytes(b"rpm")
+    (tmp_path / "Ouroboros-1.0.0-linux-x86_64.AppImage").write_bytes(b"appimage")
     assert release_proof.locate_artifact(tmp_path) == archive
 
 
@@ -102,7 +103,7 @@ def test_assemble_binds_every_asset_smoke_and_sbom(tmp_path: Path):
 
     evidence = json.loads((release_dir / "release-evidence.json").read_text())
     assert evidence["source"]["commit"] == "a" * 40
-    assert len(evidence["artifacts"]) == 6
+    assert len(evidence["artifacts"]) == 7
     assert {row["proofId"] for row in evidence["artifacts"]} == set(
         release_proof.PROOF_IDS
     )
@@ -110,12 +111,14 @@ def test_assemble_binds_every_asset_smoke_and_sbom(tmp_path: Path):
         "ouroboros_6.87.5_amd64.deb",
         "ouroboros-6.87.5-1.x86_64.rpm",
         "ouroboros-6.87.5-1.red80.x86_64.rpm",
+        "Ouroboros-6.87.5-linux-x86_64.AppImage",
     }
     # One archive + one smoke receipt + one SBOM per proof id.
     checksum_lines = (release_dir / "SHA256SUMS").read_text().splitlines()
     assert len(checksum_lines) == 3 * len(release_proof.PROOF_IDS)
     assert checksum_lines == sorted(checksum_lines, key=lambda line: line.split("  ", 1)[1])
     assert "A clear release note." in notes.read_text()
+    assert "The AppImage runs from a user-writable path" in notes.read_text()
     assert "v6.87.4...v6.87.5" in notes.read_text()
     commands = evidence["verification"]["attestationCommands"]
     assert len(commands) == 2
@@ -332,6 +335,19 @@ def test_release_workflow_orders_smoke_sbom_attestation_and_draft_verification()
     assert "files: release-artifacts/*" not in workflow
     assert "matrix.sbom_path" not in workflow
     assert "steps.smoke_macos.outputs.sbom_path" in workflow
+    assert "steps.smoke_appimage.outputs.sbom_path" in workflow
+    assert "release-smoke-linux-appimage-x86_64.json" in workflow
+    assert "sbom-linux-appimage-x86_64.cdx.json" in workflow
+    assert "Ouroboros-*-linux-x86_64.AppImage" in workflow
+    assert "--check appimage_extract_and_run" in workflow
+    assert "--check appimage_metadata" in workflow
+    assert "--check product_version" in workflow
+    assert "--check browser_fallback_start" in workflow
+    assert "--check gateway_readiness" in workflow
+    assert "--check clean_shutdown" in workflow
+    assert "--check shared_libraries" in workflow
+    assert 'APP_ROOT="$HOME_DIR/Ouroboros"' in workflow
+    assert 'OUROBOROS_APP_ROOT="$APP_ROOT"' not in workflow
     assert 'test -x "$MOUNT/Install CLI.command"' in workflow
     assert 'test -L "$MOUNT/Applications"' in workflow
     assert 'test "$(readlink "$MOUNT/Applications")" = "/Applications"' in workflow

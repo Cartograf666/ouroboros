@@ -1071,9 +1071,10 @@ def test_ci_build_job_exports_release_tag_and_fetches_full_history():
     assert "fetch-depth: 0" in workflow
 
 
-def test_ci_release_smokes_the_exact_embedded_claudexor_archive_on_all_platforms():
+def test_ci_release_smokes_the_exact_embedded_claudexor_archive_in_all_assets():
     workflow = _ci_workflow()
-    assert workflow.count("fetch_claudexor_runtime.py --verify-only") == 3
-    assert workflow.count("scripts/claudexor_platform_smoke.py") == 3
-    assert workflow.count("--managed-runtime --lane fixture") == 3
+    # DMG, Linux tarball, Linux AppImage, and Windows ZIP.
+    assert workflow.count("fetch_claudexor_runtime.py --verify-only") == 4
+    assert workflow.count("scripts/claudexor_platform_smoke.py") == 4
+    assert workflow.count("--managed-runtime --lane fixture") == 4
     assert "embedded_claudexor_runtime" in workflow

@@ -35,6 +35,13 @@
     {
       "platform": "linux",
       "architecture": "x86_64",
+      "format": "AppImage",
+      "availability": "per-release",
+      "nameTemplate": "Ouroboros-{version}-linux-x86_64.AppImage"
+    },
+    {
+      "platform": "linux",
+      "architecture": "x86_64",
       "format": "deb",
       "availability": "per-release",
       "nameTemplate": "ouroboros_{version}_amd64.deb"

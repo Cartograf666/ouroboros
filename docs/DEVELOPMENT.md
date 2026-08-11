@@ -1656,6 +1656,17 @@ floating Claudexor npm package. The macOS check also requires the
 `Applications -> /Applications` drag target, the separate `Install CLI.command`
 payload, and an arm64 app executable.
 
+Linux additionally emits an AppImage built by a version- and digest-pinned
+`appimagetool` with a separately SHA-pinned embedded type-2 runtime. CI extracts
+it for metadata and SBOM inspection, then uses real extract-and-run invocations
+to verify product version, CLI dispatch, the browser-fallback launcher, gateway
+readiness, payload lifetime after `run --start`, shared libraries, and graceful
+shutdown. This smoke deliberately makes no native GTK/Qt claim: packaged native
+webview coverage remains a separate Linux distribution contract.
+`OUROBOROS_SKIP_PLAYWRIGHT_INSTALL_DEPS=1` is only a local-builder escape hatch
+for hosts whose system packages are managed separately: it skips Playwright's
+interactive host-library installation, not browser-binary bundling, and a build
+using it must disclose that browser host compatibility was not locally proven.
 Each shard also generates a CycloneDX SBOM from the payload extracted from the
 final archive. The Linux payload inventory is reused for its three native
 wrappers because their `/opt/ouroboros` bytes come from that same payload; each
@@ -1666,8 +1677,8 @@ host `/Applications`; the app and CLI launcher remain in the scan. The workflow
 downloads a fixed Syft release asset and checks its platform-specific SHA-256
 before execution. GitHub artifact attestations bind both build provenance and
 the SBOM to each final asset digest. The release job downloads the three
-archives, three native Linux packages, and their proof files, checks the exact
-six-asset allowlist,
+archives, the AppImage, three native Linux packages, and their proof files,
+checks the exact seven-asset allowlist,
 recalculates every digest, and verifies both predicates against the exact source
 SHA, tag ref, repository, and signer workflow before it writes:
 

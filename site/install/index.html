@@ -60,11 +60,11 @@
 
     <h2>Linux and Windows</h2>
     <div class="download-grid download-grid-two">
-      <article><h2>Linux</h2><p>x86_64 Linux.</p><a class="btn btn-primary" href="https://github.com/razzant/ouroboros/releases/latest">Open latest release</a><p>When that release lists native packages, use <code>sudo apt install ./ouroboros_&lt;version&gt;_amd64.deb</code> on Debian or Ubuntu, <code>sudo dnf install ./ouroboros-&lt;version&gt;-1.x86_64.rpm</code> on Fedora or RHEL, or the <code>.red80.x86_64.rpm</code> on RED OS 8. They install Git as a dependency, place Ouroboros in <code>/opt/ouroboros</code>, and put <code>ouroboros</code> on <code>PATH</code>. If the selected release does not list a native package, download the Linux tarball instead.</p></article>
+      <article><h2>Linux</h2><p>x86_64 Linux.</p><a class="btn btn-primary" href="https://github.com/razzant/ouroboros/releases/latest">Open latest release</a><p>When that release lists native packages, use its <code>.deb</code> or <code>.rpm</code>. If it does not list a native package, use the AppImage when listed: copy it to <code>~/Applications/Ouroboros.AppImage</code>, make it executable, and run it. Git must already be installed. Pass <code>--cli</code> for the bundled CLI, or set <code>APPIMAGE_EXTRACT_AND_RUN=1</code> when FUSE is unavailable. If that release lists neither option, download the tarball.</p></article>
       <article><h2>Windows</h2><p>64-bit Windows.</p><a class="btn btn-primary" href="https://github.com/razzant/ouroboros/releases/latest">Open latest release</a><p>Download the Windows ZIP, extract it, and run <code>Ouroboros.exe</code>. The CLI installer is in <code>Ouroboros\bin\</code>.</p></article>
     </div>
 
-    <p>Prerelease artifacts stay on their tag pages; the latest-release page points to the latest stable release. If bundled browser tools on Linux need host libraries, run <code>./Ouroboros/python-standalone/bin/python3 -m playwright install-deps chromium webkit</code>.</p>
+    <p>Prerelease artifacts stay on their tag pages; the latest-release page points to the latest stable release. The AppImage bundles Chromium and WebKit binaries, but distro shared libraries remain host dependencies. Prefer the native package where available; otherwise extract the AppImage and run <code>./squashfs-root/usr/lib/ouroboros/_internal/python-standalone/bin/python3 -m playwright install-deps chromium webkit</code> to identify and install the required host packages.</p>
 
     <h2>Run from source</h2>
     <p>Source mode needs Python 3.10 or newer and Git.</p>
