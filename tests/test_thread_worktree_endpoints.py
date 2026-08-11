@@ -670,3 +670,65 @@ def workers_module():
     from supervisor import workers
 
     return workers
+
+
+def test_a_failing_thread_route_never_answers_in_a_refusal_shape(monkeypatch):
+    """A REFUTATION, pinned so it stays true.
+
+    `project_thread_actions.js::typedAnswer` turns a thrown `error.body` into a
+    typed refusal when it carries a `reason` string or `ok === false`, and two
+    independent reviewers have now argued that a JSON 500/502 with `ok:false`
+    would therefore be rendered as an owner-answerable decision — an outage
+    dressed up as something the owner chose.
+
+    Nothing in this stack produces that shape. Every one of the eight routes
+    `threadOps` calls guards its whole body and answers a failure through
+    `gateway._helpers.json_exception`, whose payload is `{"error": ...}` — no
+    `ok`, no `reason` — so `typedAnswer` re-throws and the menu reports an error.
+    Anything escaping the guard is Starlette's plain-text 500, which
+    `fetchJson` cannot parse and turns into `{error: "non-json response (HTTP
+    500)"}`: again no `ok` and no `reason`. `_refusal_status` never returns 5xx,
+    and the app installs no exception handler or middleware that could rewrite a
+    body.
+
+    So the fix for that finding is this test rather than a speculative client
+    guard: if a route ever starts answering a failure with `ok` or `reason`, the
+    refutation stops being true and this fails loudly.
+    """
+    import asyncio
+    import json as _json
+
+    import ouroboros.gateway.project_threads as pt
+
+    routes = [
+        "api_thread_branch_bases", "api_thread_branch_off", "api_thread_merge_back",
+        "api_thread_worktree_inspect", "api_thread_worktree_remove",
+        "api_thread_archive", "api_thread_restore", "api_thread_delete",
+    ]
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("the drive went away mid-request")
+
+    monkeypatch.setattr(pt, "request_drive_root", _boom)
+
+    async def _drive(handler):
+        scope = {
+            "type": "http", "method": "POST", "path": "/x", "headers": [],
+            "path_params": {"project_id": "p", "thread_id": "1"}, "query_string": b"",
+            "app": None,
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"{}", "more_body": False}
+
+        from starlette.requests import Request
+
+        return await handler(Request(scope, receive))
+
+    for name in routes:
+        response = asyncio.run(_drive(getattr(pt, name)))
+        assert response.status_code >= 500, name
+        body = _json.loads(bytes(response.body).decode("utf-8"))
+        assert "ok" not in body, f"{name} answered a 5xx wearing a refusal's clothes: {body}"
+        assert "reason" not in body, f"{name} answered a 5xx with a typed reason: {body}"
+        assert body.get("error"), name
