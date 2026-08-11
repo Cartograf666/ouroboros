@@ -9,8 +9,13 @@ import time
 from typing import Any, List
 
 from ouroboros.protected_artifacts import block_reason_for_path
-from ouroboros.tool_access import normalize_root_relative, path_is_relative_to, resolve_user_file_path
-from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for, system_repo_dir_for
+from ouroboros.tool_access import (
+    ResolvedResourceBinding,
+    build_resolved_resource_binding,
+    normalize_root_relative,
+    path_is_relative_to,
+)
+from ouroboros.tools.registry import ToolContext, ToolEntry
 
 
 _OPS = (
@@ -251,13 +256,20 @@ def _structural(ctx: ToolContext, repo_root: pathlib.Path, query: str, path: str
     return rows
 
 
-def _query_code(ctx: ToolContext, op: str, **options: Any) -> str:
+def _query_code(
+    ctx: ToolContext,
+    op: str,
+    _resolved_binding: ResolvedResourceBinding | None = None,
+    **options: Any,
+) -> str:
     query = str(options.get("query") or "")
     path = str(options.get("path") or "")
     lang = str(options.get("lang") or "any")
     kind = str(options.get("kind") or "any")
     depth = int(options.get("depth") or 1)
     root = str(options.get("root") or "active_workspace")
+    bucket = str(options.get("bucket") or "")
+    skill_name = str(options.get("skill_name") or "")
     limit = int(options.get("limit") or 40)
     offset = int(options.get("offset") or 0)
     op = str(op or "").strip()
@@ -266,7 +278,20 @@ def _query_code(ctx: ToolContext, op: str, **options: Any) -> str:
     if op not in ("symbols", "digest") and not str(query or "").strip():
         return f"⚠️ TOOL_ARG_ERROR (query_code): op '{op}' requires query."
     try:
-        normalized_root = str(root or "active_workspace").strip() or "active_workspace"
+        binding = _resolved_binding or build_resolved_resource_binding(
+            ctx,
+            root=root,
+            operation="search",
+            path=path or ".",
+            bucket=bucket,
+            skill_name=skill_name,
+        )
+    except Exception as exc:
+        if str(exc).startswith("profile=") and " cannot " in str(exc):
+            return f"⚠️ TOOL_ACCESS_BLOCKED: {str(exc).rstrip('.')}."
+        return f"⚠️ TOOL_ARG_ERROR (query_code): {exc}"
+    try:
+        normalized_root = binding.root
         if normalized_root == "system_repo":
             try:
                 from ouroboros.tool_access import active_tool_profile
@@ -275,19 +300,12 @@ def _query_code(ctx: ToolContext, op: str, **options: Any) -> str:
                     return "⚠️ TOOL_ACCESS_BLOCKED: query_code root=system_repo is not available to acting subagents."
             except Exception:
                 pass
-            repo_root = pathlib.Path(system_repo_dir_for(ctx)).resolve(strict=False)
+            repo_root = binding.base_path
         elif normalized_root == "active_workspace":
-            repo_root = pathlib.Path(active_repo_dir_for(ctx)).resolve(strict=False)
-            try:
-                from ouroboros.tool_access import project_room_lens_dir
-
-                _room = project_room_lens_dir(ctx)
-                if _room is not None:
-                    # Room lens (v6.61.3): folder-room chat queries the PROJECT
-                    # FOLDER; self-repo queries stay on root="system_repo".
-                    repo_root = _room
-            except Exception:
-                pass
+            repo_root = binding.base_path
+        elif normalized_root == "skill_payload":
+            repo_root = binding.base_path
+            path = binding.target_path.relative_to(binding.base_path).as_posix()
         elif normalized_root == "user_files":
             # Read-only structured intelligence over an EXTERNAL workspace target
             # (e.g. the SWE-bench dig-direct /app) — R1. Restricted subagents must
@@ -310,7 +328,7 @@ def _query_code(ctx: ToolContext, op: str, **options: Any) -> str:
             # (e.g. a benchmark /app) stays supported — opt out of the v6.54.3
             # home-membership rejection; the credential/control-plane block
             # reasons still apply inside resolve_user_file_path.
-            target = resolve_user_file_path(ctx, str(path).strip(), allow_outside_home=True)
+            target = binding.target_path
             if target.is_dir():
                 repo_root = target.resolve(strict=False)
                 path = ""
@@ -320,7 +338,9 @@ def _query_code(ctx: ToolContext, op: str, **options: Any) -> str:
             else:
                 raise ValueError(f"user_files path does not exist: {str(path).strip()}")
         else:
-            raise ValueError("root must be active_workspace, system_repo, or user_files")
+            raise ValueError(
+                "root must be active_workspace, system_repo, skill_payload, or user_files"
+            )
         # Accept absolute/redundant-prefix paths inside the root (e.g. '/app/x'
         # or 'app/x' under a root at /app); _safe_path still confines below.
         path = normalize_root_relative(repo_root, path)
@@ -435,7 +455,9 @@ def get_tools() -> List[ToolEntry]:
                 "lang": {"type": "string", "enum": ["python", "javascript", "typescript", "go", "rust", "java", "ruby", "c", "cpp", "csharp", "php", "kotlin", "swift", "scala", "lua", "bash", "any"], "default": "any"},
                 "kind": {"type": "string", "enum": ["function", "async_function", "class", "constant", "any"], "default": "any"},
                 "depth": {"type": "integer", "default": 1, "description": "Graph depth for impact."},
-                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "user_files"], "default": "active_workspace", "description": "active_workspace/system_repo are Ouroboros repos; user_files runs read-only intelligence over an EXTERNAL target dir/file named by path= (e.g. /app), never the whole home."},
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "skill_payload", "user_files"], "default": "active_workspace", "description": "active_workspace/system_repo are code roots; skill_payload selects one exact skill with bucket + skill_name; user_files runs read-only intelligence over an EXTERNAL target dir/file named by path= (e.g. /app), never the whole home."},
+                "bucket": {"type": "string", "enum": ["external", "clawhub", "ouroboroshub", "native", "user_repo"], "description": "Required with root=skill_payload; selects the physical skill source."},
+                "skill_name": {"type": "string", "description": "Required with root=skill_payload; exact skill directory identity."},
                 "limit": {"type": "integer", "default": 40},
                 "offset": {"type": "integer", "default": 0},
             }, "required": ["op"]},

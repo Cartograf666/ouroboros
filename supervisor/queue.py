@@ -390,8 +390,15 @@ def sync_skill_schedules(skills: List[Any], *, drive_root: pathlib.Path | None =
         tasks = [item for item in data.get("tasks") or [] if isinstance(item, dict)]
         by_id = {str(item.get("id") or ""): dict(item) for item in tasks}
         touched: list[str] = []
+        blocked_skill_names = {
+            str(getattr(skill, "name", "") or "") for skill in skills
+            if bool(getattr(skill, "identity_collision", False))
+        }
         changed = False
         for skill in skills:
+            if bool(getattr(skill, "identity_collision", False)):
+                # Preserve prior rows: a collision is not a removed/runnable skill.
+                continue
             manifest = getattr(skill, "manifest", None)
             for spec in list(getattr(manifest, "scheduled_tasks", []) or []):
                 if not isinstance(spec, dict):
@@ -402,25 +409,15 @@ def sync_skill_schedules(skills: List[Any], *, drive_root: pathlib.Path | None =
                     continue
                 schedule_id = schedule_slug("skill", str(getattr(skill, "name", "")), name)
                 touched.append(schedule_id)
-                # SSOT: a skill schedule is enabled only when the skill is fully
-                # ready to execute (review/grants/deps/enablement), then layered
-                # with the schedule-specific supervised_task requirement. This
-                # keeps schedule readiness identical to execution readiness.
+                # Schedule readiness plus the supervised_task permission.
                 try:
                     from ouroboros.skill_readiness import skill_readiness_for_execution
-
-                    schedule_ready = skill_readiness_for_execution(
-                        pathlib.Path(drive_root or DRIVE_ROOT), skill
-                    ).ready
+                    schedule_ready = skill_readiness_for_execution(pathlib.Path(drive_root or DRIVE_ROOT), skill).ready
                 except Exception:
-                    log.debug(
-                        "skill schedule readiness probe failed for %s",
-                        getattr(skill, "name", ""),
-                        exc_info=True,
-                    )
+                    log.debug("skill schedule readiness probe failed for %s", getattr(skill, "name", ""), exc_info=True)
                     schedule_ready = False
-                schedule_ready = schedule_ready and (
-                    "supervised_task" in set(getattr(manifest, "permissions", []) or [])
+                schedule_ready = schedule_ready and "supervised_task" in set(
+                    getattr(manifest, "permissions", []) or []
                 )
                 record = by_id.get(schedule_id, {})
                 trigger = {"type": "cron", "expr": cron}
@@ -459,11 +456,14 @@ def sync_skill_schedules(skills: List[Any], *, drive_root: pathlib.Path | None =
                 if next_record != record:
                     by_id[schedule_id] = next_record
                     changed = True
-        # Drop schedules whose source skill/scheduled_task no longer exists
-        # (skill deleted, renamed, or scheduled_task removed). Leaving disabled
-        # tombstones around would accumulate stale rows in the active table.
+        # Drop vanished manifest schedules instead of accumulating disabled
+        # tombstones; ambiguous identities above remain deliberately untouched.
         for schedule_id, record in list(by_id.items()):
-            if str(record.get("source") or "") == "skill_manifest" and schedule_id not in touched:
+            if (
+                str(record.get("source") or "") == "skill_manifest"
+                and str(record.get("skill") or "") not in blocked_skill_names
+                and schedule_id not in touched
+            ):
                 by_id.pop(schedule_id, None)
                 changed = True
         if changed:

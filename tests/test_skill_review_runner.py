@@ -68,6 +68,34 @@ def _mark_self_authored(skill_dir: pathlib.Path) -> None:
     (state / "self_authored.json").write_text(__import__("json").dumps(payload) + "\n", encoding="utf-8")
 
 
+def test_review_lifecycle_rejects_identity_collision_before_state_write(tmp_path):
+    _reset_queue()
+    drive_root = tmp_path / "drive"
+    repo_dir = tmp_path / "repo"
+    checkout = tmp_path / "checkout"
+    repo_dir.mkdir()
+    _build_extension(drive_root / "skills" / "external", "alpha")
+    _build_extension(checkout, "alpha")
+    ctx = SimpleNamespace(drive_root=drive_root, repo_dir=repo_dir, messages=[])
+
+    def unexpected_review(_ctx, _skill_name):
+        raise AssertionError("ambiguous skill reached the review implementation")
+
+    payload = run_skill_review_lifecycle_blocking(
+        ctx,
+        "alpha",
+        source="test",
+        review_impl=unexpected_review,
+        repo_path=str(checkout),
+    )
+
+    assert payload["status"] == "pending"
+    assert payload["executable_review"] is False
+    assert "collision" in payload["error"].lower()
+    assert payload["deps_status"] == "not_run"
+    assert not (drive_root / "state" / "skills" / "alpha").exists()
+
+
 def test_blocking_review_lifecycle_uses_single_progress_card(tmp_path, monkeypatch):
     _reset_queue()
     sent = []

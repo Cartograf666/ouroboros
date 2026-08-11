@@ -212,6 +212,46 @@ def test_marketplace_api_browse_keeps_official_and_cursor(monkeypatch):
     assert payload["next_cursor"] == "next"
 
 
+def test_marketplace_installed_collision_does_not_read_lifecycle_provenance(
+    monkeypatch, tmp_path
+):
+    from ouroboros.contracts.skill_manifest import SkillManifest
+    from ouroboros.skill_loader import LoadedSkill
+
+    skill_dir = tmp_path / "skills" / "clawhub" / "demo"
+    skill_dir.mkdir(parents=True)
+    collision = LoadedSkill(
+        name="demo",
+        skill_dir=skill_dir,
+        manifest=SkillManifest(
+            name="demo", description="", version="", type="instruction"
+        ),
+        content_hash="",
+        load_error="Skill name collision: clawhub and user_repo",
+        source="clawhub",
+        identity_collision=True,
+    )
+    monkeypatch.setattr(
+        "ouroboros.skill_loader.discover_skills",
+        lambda *_args, **_kwargs: [collision],
+    )
+    monkeypatch.setattr(
+        marketplace_api,
+        "read_provenance",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ambiguous identity must not read provenance")
+        ),
+    )
+
+    rows = marketplace_api._installed_skills_for_source(tmp_path, "clawhub")
+
+    assert len(rows) == 1
+    assert rows[0]["name"] == "demo"
+    assert rows[0]["load_error"] == collision.load_error
+    assert rows[0]["provenance"] == {}
+    assert not (tmp_path / "state").exists()
+
+
 def test_ouroboroshub_install_response_shape_after_review_and_deps(monkeypatch, tmp_path):
     _stub_marketplace_roots(monkeypatch, tmp_path)
     _run_lifecycle_inline(monkeypatch)
@@ -267,6 +307,37 @@ def test_ouroboroshub_install_response_shape_after_review_and_deps(monkeypatch, 
     }
 
 
+def test_ouroboroshub_api_rejects_foreign_identity_before_lifecycle_job(
+    monkeypatch, tmp_path
+):
+    _stub_marketplace_roots(monkeypatch, tmp_path)
+    checkout = tmp_path / "checkout"
+    foreign = checkout / "demo"
+    foreign.mkdir(parents=True)
+    (foreign / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(checkout))
+
+    async def _unexpected_job(**_kwargs):
+        raise AssertionError("lifecycle job must not start for ambiguous identity")
+
+    monkeypatch.setattr(marketplace_api, "run_lifecycle_job", _unexpected_job)
+    monkeypatch.setattr(
+        marketplace_api.ouroboroshub,
+        "install",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("installer must not run for ambiguous identity")
+        ),
+    )
+
+    response = asyncio.run(
+        marketplace_api.api_ouroboroshub_install(_BodyRequest({"slug": "demo"}))
+    )
+
+    assert response.status_code == 409
+    assert "collision" in _json_response_payload(response)["error"].lower()
+    assert not (tmp_path / "state" / "skills" / "demo").exists()
+
+
 def test_clawhub_uninstall_clears_deps_state(tmp_path):
     from ouroboros.marketplace.install import uninstall_skill
 
@@ -299,6 +370,92 @@ def test_clawhub_fresh_install_rolls_back_payload_on_dependency_failure(monkeypa
     assert not (tmp_path / "skills" / "clawhub" / "demo").exists()
     assert not (tmp_path / "state" / "skills" / "demo" / "deps.json").exists()
     assert not (tmp_path / "state" / "skills" / "demo" / "clawhub.json").exists()
+
+
+def test_clawhub_target_override_rejects_foreign_identity_before_landing(monkeypatch, tmp_path):
+    install_mod = _patch_clawhub_install_pipeline(monkeypatch, tmp_path, auto_specs=[])
+    checkout = tmp_path / "checkout"
+    foreign = checkout / "demo"
+    foreign.mkdir(parents=True)
+    (foreign / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: User copy\nversion: 1.0.0\ntype: skill\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(checkout))
+
+    result = install_mod.install_skill(
+        tmp_path,
+        tmp_path / "repo",
+        slug="demo",
+        auto_review=True,
+        overwrite=True,
+        target_name_override="demo",
+    )
+
+    assert result.ok is False
+    assert "collision" in result.error.lower()
+    assert not (tmp_path / "skills" / "clawhub" / "demo").exists()
+    assert not (tmp_path / "state" / "skills" / "demo").exists()
+
+
+def test_clawhub_fresh_install_purely_dedupes_foreign_user_repo(monkeypatch, tmp_path):
+    install_mod = _patch_clawhub_install_pipeline(monkeypatch, tmp_path, auto_specs=[])
+    checkout = tmp_path / "checkout"
+    foreign = checkout / "demo"
+    foreign.mkdir(parents=True)
+    (foreign / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: User copy\nversion: 1.0.0\ntype: skill\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(checkout))
+
+    result = install_mod.install_skill(
+        tmp_path,
+        tmp_path / "repo",
+        slug="demo",
+        auto_review=False,
+    )
+
+    assert result.ok is True
+    assert result.sanitized_name == "demo-clawhub"
+    assert (tmp_path / "skills" / "clawhub" / "demo-clawhub" / "SKILL.md").is_file()
+    assert not (tmp_path / "state" / "skills" / "demo").exists()
+
+
+def test_clawhub_update_rejects_collision_before_provenance_or_unload(monkeypatch, tmp_path):
+    from ouroboros.marketplace import install as install_mod
+    from ouroboros.marketplace.provenance import write_provenance
+
+    target = tmp_path / "skills" / "clawhub" / "demo"
+    target.mkdir(parents=True)
+    original = "---\nname: demo\n---\nold payload\n"
+    (target / "SKILL.md").write_text(original, encoding="utf-8")
+    write_provenance(
+        tmp_path,
+        "demo",
+        {"schema_version": 1, "source": "clawhub", "slug": "demo"},
+    )
+    checkout = tmp_path / "checkout"
+    foreign = checkout / "demo"
+    foreign.mkdir(parents=True)
+    (foreign / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(checkout))
+    monkeypatch.setattr(
+        "ouroboros.extension_loader.is_extension_live",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("collision must block before unload")
+        ),
+    )
+
+    result = install_mod.update_skill(
+        tmp_path,
+        tmp_path / "repo",
+        sanitized_name="demo",
+    )
+
+    assert result.ok is False
+    assert "collision" in result.error.lower()
+    assert (target / "SKILL.md").read_text(encoding="utf-8") == original
 
 
 def test_clawhub_landing_failure_restores_previous_payload(monkeypatch, tmp_path):

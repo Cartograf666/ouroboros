@@ -576,7 +576,11 @@ def _installed_skills_for_source(drive_root: pathlib.Path, source: str) -> list[
     for skill in discover_skills(drive_root, repo_path=get_skills_repo_path()):
         if skill.source != source:
             continue
-        provenance = read_provenance(drive_root, skill.name) or {} if source == "clawhub" else None
+        provenance = None
+        if source == "clawhub":
+            provenance = {}
+            if not bool(getattr(skill, "identity_collision", False)):
+                provenance = read_provenance(drive_root, skill.name) or {}
         out.append(_installed_skill_payload(skill, drive_root, provenance=provenance))
     return out
 
@@ -658,12 +662,19 @@ async def api_ouroboroshub_install(request: Request) -> JSONResponse:
     auto_review = _coerce_bool(body.get("auto_review"), True)
     drive_root = _request_drive_root(request)
     repo_dir = _request_repo_dir(request)
+    from ouroboros.skill_loader import _sanitize_skill_name
+
+    sanitized = _sanitize_skill_name(slug)
+    identity_error = await asyncio.to_thread(
+        ouroboroshub.install_identity_error,
+        sanitized,
+        drive_root=drive_root,
+    )
+    if identity_error:
+        return json_error(identity_error, 409)
     install_progress = JobProgressTarget()
 
     async def _run_install() -> Dict[str, Any]:
-        from ouroboros.skill_loader import _sanitize_skill_name
-
-        sanitized = _sanitize_skill_name(slug)
         target_dir = drive_root / "skills" / "ouroboroshub" / sanitized
         rollback_snapshot = snapshot_payload_state(drive_root, sanitized, target_dir)
         install_progress.set("Downloading from OuroborosHub…")
@@ -721,6 +732,13 @@ async def api_ouroboroshub_update(request: Request) -> JSONResponse:
         return json_error(err, 400)
     drive_root = _request_drive_root(request)
     repo_dir = _request_repo_dir(request)
+    identity_error = await asyncio.to_thread(
+        ouroboroshub.install_identity_error,
+        name,
+        drive_root=drive_root,
+    )
+    if identity_error:
+        return json_error(identity_error, 409)
     update_progress = JobProgressTarget()
 
     async def _run_update() -> Dict[str, Any]:

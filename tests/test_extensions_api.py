@@ -223,6 +223,75 @@ def test_api_extensions_index_lists_extension_skills(tmp_path, monkeypatch):
         _stop_patches(patches)
 
 
+def test_extensions_index_collision_row_skips_lifecycle_projections(
+    tmp_path, monkeypatch
+):
+    import ouroboros.extension_health as extension_health
+    import ouroboros.extension_loader as extension_loader
+    import ouroboros.gateway.extensions as extensions_api
+    import ouroboros.marketplace.provenance as marketplace_provenance
+    import ouroboros.skill_review_runner as skill_review_runner
+    import ouroboros.tools.github as github_tools
+    import supervisor.queue as supervisor_queue
+    from ouroboros.contracts.skill_manifest import SkillManifest
+    from ouroboros.skill_loader import LoadedSkill
+
+    drive_root = tmp_path / "drive"
+    skill_dir = drive_root / "skills" / "clawhub" / "alpha"
+    skill_dir.mkdir(parents=True)
+    collision = LoadedSkill(
+        name="alpha",
+        skill_dir=skill_dir,
+        manifest=SkillManifest(
+            name="alpha",
+            description="",
+            version="",
+            type="extension",
+            entry="plugin.py",
+        ),
+        content_hash="",
+        load_error="Skill name collision: clawhub and user_repo",
+        source="clawhub",
+        identity_collision=True,
+    )
+
+    def _unexpected(*_args, **_kwargs):
+        raise AssertionError("collision row invoked a lifecycle/runtime projection")
+
+    monkeypatch.setattr(extensions_api, "discover_skills", lambda *_a, **_kw: [collision])
+    monkeypatch.setattr(extensions_api, "snapshot", lambda: {})
+    monkeypatch.setattr(extensions_api, "_review_fields", _unexpected)
+    monkeypatch.setattr(extensions_api, "skill_conflict_status", _unexpected)
+    monkeypatch.setattr(extensions_api, "grant_status_for_skill", _unexpected)
+    monkeypatch.setattr(extension_loader, "runtime_state_for_loaded_skill", _unexpected)
+    monkeypatch.setattr(extension_health, "read_extension_health", _unexpected)
+    monkeypatch.setattr(skill_review_runner, "skill_review_ui_projection", _unexpected)
+    monkeypatch.setattr(marketplace_provenance, "read_provenance", _unexpected)
+    schedule_inputs = []
+    monkeypatch.setattr(
+        supervisor_queue,
+        "sync_skill_schedules",
+        lambda skills, **_kwargs: schedule_inputs.append(list(skills)),
+    )
+    monkeypatch.setattr(github_tools, "github_token_from_env_or_settings", _unexpected)
+
+    payload = extensions_api._build_extensions_index(drive_root, repo_path="")
+
+    assert len(payload["skills"]) == 1
+    row = payload["skills"][0]
+    assert row["name"] == "alpha"
+    assert row["load_error"] == collision.load_error
+    assert row["source"] == "clawhub"
+    assert row["live_reason"] == "load_error"
+    assert row["live_loaded"] is False
+    assert row["dispatch_live"] is False
+    assert row["conflict"] is None
+    assert row["skill_review"] == {}
+    assert row["grants"] == {}
+    assert schedule_inputs == [[collision]]
+    assert not (drive_root / "state").exists()
+
+
 def test_api_extension_manifest_returns_metadata(tmp_path, monkeypatch):
     skills_root = tmp_path / "skills"
     plugin = "def register(api):\n    pass\n"

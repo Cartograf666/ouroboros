@@ -87,7 +87,8 @@ def test_query_code_user_files_blocked_for_subagent():
         workspace_root="", workspace_mode="", task_constraint=TaskConstraint(mode="local_readonly_subagent"),
     )
     out = _query_code(ctx, "symbols", root="user_files", path="/whatever")
-    assert "not available to subagents" in out
+    assert "TOOL_ACCESS_BLOCKED" in out
+    assert "profile=local_readonly_subagent cannot search root=user_files" in out
 
 
 def test_query_code_structural_walk_is_bounded_and_symlink_safe():

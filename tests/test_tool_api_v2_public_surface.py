@@ -157,7 +157,9 @@ def test_skill_payload_write_named_bible_is_not_system_protected(tmp_path, monke
     repo = tmp_path / "repo"
     data = tmp_path / "data"
     repo.mkdir()
-    (data / "skills" / "external" / "alpha").mkdir(parents=True)
+    payload = data / "skills" / "external" / "alpha"
+    payload.mkdir(parents=True)
+    (payload / "SKILL.md").write_text("# alpha\n", encoding="utf-8")
     registry = ToolRegistry(repo_dir=repo, drive_root=data)
 
     result = registry.execute(
@@ -1166,7 +1168,7 @@ def test_run_command_outputs_block_new_credential_like_repo_file(tmp_path, monke
     assert not (data / "task_results" / "artifacts" / "task1" / ".env").exists()
 
 
-def test_workspace_run_command_outputs_cannot_import_user_files(tmp_path, monkeypatch):
+def test_workspace_run_command_outputs_can_reference_policy_visible_user_files(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     registry, _repo, data, desktop = _registry_under_fake_home(tmp_path, monkeypatch)
     workspace = tmp_path / "workspace"
@@ -1181,8 +1183,8 @@ def test_workspace_run_command_outputs_cannot_import_user_files(tmp_path, monkey
         {"cmd": ["python3", "-c", "print('ok')"], "cwd": str(workspace), "outputs": [str(desktop / "outside.txt")]},
     )
 
-    assert result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
-    assert "output escapes allowed artifact roots" in result
+    assert not result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
+    assert "unchanged output (cosmetic)" in result
     assert not (data / "task_results" / "artifacts" / "task1" / "outside.txt").exists()
 
 

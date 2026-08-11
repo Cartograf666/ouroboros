@@ -118,6 +118,7 @@ class LoadedSkill:
     load_error: str = ""
     source: str = "native"
     is_self_authored: bool = False
+    identity_collision: bool = False
 
     @property
     def available_for_execution(self) -> bool:
@@ -152,6 +153,15 @@ class LoadedSkill:
             if _resolve_script_path(self.skill_dir, relpath) is not None:
                 return True
         return False
+
+
+@dataclass(frozen=True)
+class _SkillLocationCandidate:
+    """Manifest-bearing package location without payload or state reads."""
+
+    name: str
+    location: str
+    skill_dir: pathlib.Path
 
 
 # Disk paths
@@ -266,7 +276,12 @@ def _manifest_text_for_dir(skill_dir: pathlib.Path) -> Optional[tuple[str, pathl
     return None
 
 
-def _broken_skill(skill_dir: pathlib.Path, load_error: str) -> LoadedSkill:
+def _broken_skill(
+    skill_dir: pathlib.Path,
+    load_error: str,
+    *,
+    identity_collision: bool = False,
+) -> LoadedSkill:
     name = _sanitize_skill_name(skill_dir.name)
     return LoadedSkill(
         name=name,
@@ -279,6 +294,7 @@ def _broken_skill(skill_dir: pathlib.Path, load_error: str) -> LoadedSkill:
         ),
         content_hash="",
         load_error=load_error,
+        identity_collision=identity_collision,
     )
 
 
@@ -716,6 +732,23 @@ def save_skill_grants(
 
 
 def grant_status_for_skill(drive_root: pathlib.Path, skill: LoadedSkill) -> Dict[str, Any]:
+    if bool(getattr(skill, "identity_collision", False)):
+        # Collision placeholders deliberately carry no manifest/state payload.
+        # Do not create ``state/skills/<name>`` merely to summarize a target
+        # whose physical identity has not been selected.
+        return {
+            "requested_keys": [],
+            "granted_keys": [],
+            "missing_keys": [],
+            "requested_permissions": [],
+            "granted_permissions": [],
+            "missing_permissions": [],
+            "all_granted": True,
+            "usable": False,
+            "unsupported_for_skill_type": False,
+            "content_hash": "",
+            "updated_at": "",
+        }
     requested = requested_core_setting_keys(list(skill.manifest.env_from_settings or []))
     requested_permissions = requested_skill_permissions(
         list(skill.manifest.permissions or []),
@@ -945,55 +978,25 @@ def _walk_skill_packages(
     return out
 
 
-def _classify_skill_source(
+def _classify_skill_location(
     skill_dir: pathlib.Path,
     *,
     data_skills_root: Optional[pathlib.Path],
     user_repo_root: Optional[pathlib.Path],
 ) -> str:
-    """Return the source tag, using provenance sidecars for trusted buckets."""
+    """Classify physical location without consulting provenance or state."""
     from ouroboros.config import (
-        SKILL_SOURCE_CLAWHUB,
         SKILL_SOURCE_EXTERNAL,
-        SKILL_SOURCE_NATIVE,
-        SKILL_SOURCE_OUROBOROSHUB,
-        SKILL_SOURCE_SELF_AUTHORED,
-        SKILL_SOURCE_USER_REPO,
         SKILL_SOURCE_SUBDIRS,
+        SKILL_SOURCE_USER_REPO,
     )
-    try:
-        resolved = skill_dir.resolve()
-    except OSError:
-        return SKILL_SOURCE_EXTERNAL
+
+    resolved = skill_dir.resolve()
     if data_skills_root is not None:
         try:
             rel = resolved.relative_to(data_skills_root.resolve())
-            parts = rel.parts
-            if parts:
-                try:
-                    marker_drive_root = data_skills_root.resolve().parent
-                except OSError:
-                    marker_drive_root = None
-                if is_self_authored_skill_dir(resolved, drive_root=marker_drive_root):
-                    return SKILL_SOURCE_SELF_AUTHORED
-                bucket = parts[0]
-                if bucket in SKILL_SOURCE_SUBDIRS:
-                    if bucket == SKILL_SOURCE_NATIVE:
-                        # Native means launcher-seeded; absent marker is external.
-                        if (resolved / ".seed-origin").is_file():
-                            return SKILL_SOURCE_NATIVE
-                        return SKILL_SOURCE_EXTERNAL
-                    if bucket == SKILL_SOURCE_CLAWHUB:
-                        # Marketplace lifecycle actions require provenance.
-                        if (resolved / ".clawhub.json").is_file():
-                            return SKILL_SOURCE_CLAWHUB
-                        return SKILL_SOURCE_EXTERNAL
-                    if bucket == SKILL_SOURCE_OUROBOROSHUB:
-                        if (resolved / ".ouroboroshub.json").is_file():
-                            return SKILL_SOURCE_OUROBOROSHUB
-                        return SKILL_SOURCE_EXTERNAL
-                    return bucket
-            # Unknown buckets are user-managed external skills.
+            if rel.parts and rel.parts[0] in SKILL_SOURCE_SUBDIRS:
+                return rel.parts[0]
             return SKILL_SOURCE_EXTERNAL
         except ValueError:
             pass
@@ -1003,6 +1006,161 @@ def _classify_skill_source(
             return SKILL_SOURCE_USER_REPO
         except ValueError:
             pass
+    return SKILL_SOURCE_EXTERNAL
+
+
+def _skill_location_inventory(
+    drive_root: pathlib.Path,
+    repo_path: str | None = None,
+) -> tuple[_SkillLocationCandidate, ...]:
+    """Return deduplicated manifest locations without payload/state reads."""
+    if repo_path is None:
+        from ouroboros.config import get_skills_repo_path
+
+        repo_path = get_skills_repo_path()
+    repo_path = str(repo_path or "").strip()
+
+    data_skills_root = _resolve_data_skills_dir(drive_root)
+    user_repo_root: Optional[pathlib.Path] = None
+    if repo_path:
+        try:
+            candidate = pathlib.Path(repo_path).expanduser().resolve()
+        except OSError:
+            candidate = None
+        if candidate is not None and candidate.is_dir():
+            user_repo_root = candidate
+
+    roots: List[pathlib.Path] = []
+    if data_skills_root is not None:
+        roots.append(data_skills_root)
+    if user_repo_root is not None:
+        roots.append(user_repo_root)
+
+    inventory: List[_SkillLocationCandidate] = []
+    seen_dirs: set[pathlib.Path] = set()
+    for root in roots:
+        for entry in _walk_skill_packages(root):
+            try:
+                resolved = entry.resolve()
+            except OSError:
+                continue
+            if resolved in seen_dirs:
+                continue
+            seen_dirs.add(resolved)
+            try:
+                location = _classify_skill_location(
+                    resolved,
+                    data_skills_root=data_skills_root,
+                    user_repo_root=user_repo_root,
+                )
+            except OSError:
+                continue
+            inventory.append(
+                _SkillLocationCandidate(
+                    name=_sanitize_skill_name(resolved.name),
+                    location=location,
+                    skill_dir=resolved,
+                )
+            )
+
+    return tuple(
+        sorted(
+            inventory,
+            key=lambda item: (item.name, item.location, str(item.skill_dir)),
+        )
+    )
+
+
+def _select_skill_location(
+    candidates: tuple[_SkillLocationCandidate, ...],
+    *,
+    name: str,
+    location: str,
+    require_unique_identity: bool = True,
+) -> Optional[_SkillLocationCandidate]:
+    """Select one physical location, preserving global collision evidence."""
+    canonical_name = _sanitize_skill_name(name)
+    identity = tuple(item for item in candidates if item.name == canonical_name)
+    if not identity:
+        # The caller alone decides whether a missing explicit ``external``
+        # location starts the existing manifest-first creation flow.
+        return None
+
+    evidence = ", ".join(
+        f"{item.location}:{item.skill_dir}" for item in identity
+    )
+    if require_unique_identity and len(identity) > 1:
+        raise ValueError(
+            f"Skill name collision for {canonical_name!r}: {evidence}"
+        )
+
+    selected = tuple(item for item in identity if item.location == location)
+    if len(selected) > 1:
+        raise ValueError(
+            f"Skill location collision for {canonical_name!r} in "
+            f"{location!r}: {evidence}"
+        )
+    if not selected:
+        raise ValueError(
+            f"Skill {canonical_name!r} exists, but not in requested "
+            f"location {location!r}: {evidence}"
+        )
+    return selected[0]
+
+
+def _skill_location_conflict_error(
+    drive_root: pathlib.Path,
+    *,
+    name: str,
+    location: str,
+    target_dir: pathlib.Path,
+    repo_path: str | None = None,
+) -> str:
+    """Purely reject an identity that cannot map to one exact target."""
+
+    try:
+        selected = _select_skill_location(
+            _skill_location_inventory(drive_root, repo_path=repo_path),
+            name=name,
+            location=location,
+        )
+    except ValueError as exc:
+        return f"Skill identity collision: {exc}"
+    if selected is not None and selected.skill_dir.resolve() != pathlib.Path(target_dir).resolve():
+        return (
+            f"Skill identity collision: {name!r} resolves to "
+            f"{selected.skill_dir}, not {target_dir}"
+        )
+    return ""
+
+
+def _classify_skill_source(
+    skill_dir: pathlib.Path,
+    *,
+    location: str,
+    drive_root: pathlib.Path,
+) -> str:
+    """Return the source tag, using provenance sidecars for trusted buckets."""
+    from ouroboros.config import (
+        SKILL_SOURCE_CLAWHUB,
+        SKILL_SOURCE_EXTERNAL,
+        SKILL_SOURCE_NATIVE,
+        SKILL_SOURCE_OUROBOROSHUB,
+        SKILL_SOURCE_SELF_AUTHORED,
+        SKILL_SOURCE_USER_REPO,
+    )
+    if location == SKILL_SOURCE_USER_REPO:
+        return SKILL_SOURCE_USER_REPO
+    if is_self_authored_skill_dir(skill_dir, drive_root=drive_root):
+        return SKILL_SOURCE_SELF_AUTHORED
+    marker_by_source = {
+        SKILL_SOURCE_NATIVE: ".seed-origin",
+        SKILL_SOURCE_CLAWHUB: ".clawhub.json",
+        SKILL_SOURCE_OUROBOROSHUB: ".ouroboroshub.json",
+    }
+    marker = marker_by_source.get(location)
+    if marker:
+        return location if (skill_dir / marker).is_file() else SKILL_SOURCE_EXTERNAL
     return SKILL_SOURCE_EXTERNAL
 
 
@@ -1016,62 +1174,46 @@ def discover_skills(
         repo_path = get_skills_repo_path()
     repo_path = str(repo_path or "").strip()
 
-    data_skills_root = _resolve_data_skills_dir(drive_root)
-    user_repo_root: Optional[pathlib.Path] = None
-    if repo_path:
-        try:
-            user_repo_candidate = pathlib.Path(repo_path).expanduser().resolve()
-        except OSError:
-            user_repo_candidate = None
-        if user_repo_candidate is not None and user_repo_candidate.is_dir():
-            user_repo_root = user_repo_candidate
-
-    roots: List[pathlib.Path] = []
-    if data_skills_root is not None:
-        roots.append(data_skills_root)
-    if user_repo_root is not None:
-        # Avoid double-scanning when the optional checkout is the data root.
-        if data_skills_root is None or user_repo_root != data_skills_root.resolve():
-            roots.append(user_repo_root)
+    candidates = _skill_location_inventory(drive_root, repo_path=repo_path)
 
     skills: List[LoadedSkill] = []
-    seen_dirs: set[pathlib.Path] = set()
-    for root in roots:
-        for entry in _walk_skill_packages(root):
-            try:
-                resolved = entry.resolve()
-            except OSError:
-                continue
-            if resolved in seen_dirs:
-                continue
-            seen_dirs.add(resolved)
-            loaded = load_skill(entry, drive_root)
-            if loaded is None:
-                continue
-            loaded.source = _classify_skill_source(
-                entry,
-                data_skills_root=data_skills_root,
-                user_repo_root=user_repo_root,
-            )
-            skills.append(loaded)
-
-    # Distinct dirs must not share enabled/review state after name sanitizing.
-    by_name: Dict[str, List[LoadedSkill]] = {}
-    for skill in skills:
-        by_name.setdefault(skill.name, []).append(skill)
+    by_name: Dict[str, List[_SkillLocationCandidate]] = {}
+    for candidate in candidates:
+        by_name.setdefault(candidate.name, []).append(candidate)
     for name, group in by_name.items():
         if len(group) > 1:
-            dirs = ", ".join(str(s.skill_dir) for s in group)
-            for skill in group:
-                if not skill.load_error:
-                    skill.load_error = (
-                        f"Skill name collision: multiple checkout directories "
-                        f"({dirs}) sanitise to {name!r}. Rename the directories "
-                        "so their basenames yield distinct identifiers before "
-                        "enabling / reviewing / executing."
-                    )
+            dirs = ", ".join(
+                f"{candidate.location}:{candidate.skill_dir}"
+                for candidate in group
+            )
+            error = (
+                f"Skill name collision: multiple checkout directories "
+                f"({dirs}) sanitise to {name!r}. Rename the directories "
+                "so their basenames yield distinct identifiers before "
+                "enabling / reviewing / executing."
+            )
+            for candidate in group:
+                broken = _broken_skill(
+                    candidate.skill_dir,
+                    error,
+                    identity_collision=True,
+                )
+                broken.source = candidate.location
+                skills.append(broken)
+            continue
 
-    skills.sort(key=lambda s: s.name)
+        candidate = group[0]
+        loaded = load_skill(candidate.skill_dir, drive_root)
+        if loaded is None:
+            continue
+        loaded.source = _classify_skill_source(
+            candidate.skill_dir,
+            location=candidate.location,
+            drive_root=drive_root,
+        )
+        skills.append(loaded)
+
+    skills.sort(key=lambda s: (s.name, str(s.skill_dir)))
     return skills
 
 
@@ -1175,10 +1317,19 @@ def summarize_skills(drive_root: pathlib.Path) -> Dict[str, Any]:
     for s in skills:
         stale = s.review.is_stale_for(s.content_hash)
         gate = skill_review_gate(s.review.status, stale=stale)
-        readiness = skill_readiness_for_execution(drive_root, s, skills=skills)
-        grant_status = readiness.grant_status or grant_status_for_skill(drive_root, s)
-        grants_usable = grant_status.get("usable", True)
-        runnable = s.available_for_execution and readiness.ready
+        if s.identity_collision:
+            # Readiness probes include lifecycle/dependency state. A collision
+            # has no unique lifecycle identity, so its UI projection must stay
+            # topology-only just like discovery.
+            grants_usable = True
+            runnable = False
+            conflict = None
+        else:
+            readiness = skill_readiness_for_execution(drive_root, s, skills=skills)
+            grant_status = readiness.grant_status or grant_status_for_skill(drive_root, s)
+            grants_usable = grant_status.get("usable", True)
+            runnable = s.available_for_execution and readiness.ready
+            conflict = readiness.conflict or None
         available += int(runnable)
         blocked_by_grants += int(s.available_for_execution and not grants_usable)
         pending_review += int(
@@ -1207,7 +1358,7 @@ def summarize_skills(drive_root: pathlib.Path) -> Dict[str, Any]:
             "load_error": s.load_error,
             "source": s.source,
             "conflicts": list(s.manifest.conflicts or []),
-            "conflict": readiness.conflict or None,
+            "conflict": conflict,
         })
     return {
         "count": len(skills),

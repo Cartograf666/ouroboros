@@ -17,7 +17,6 @@ from typing import Any, Iterable, Literal, Optional
 from ouroboros.artifacts import task_artifact_dir_path, task_id_for_artifacts
 from ouroboros.tool_capabilities import ACTING_SUBAGENT_MODE, LOCAL_READONLY_SUBAGENT_MODE
 from ouroboros.contracts.task_constraint import VALID_WRITE_SURFACES, normalize_task_constraint
-from ouroboros.contracts.skill_payload_policy import resolve_skill_payload_target
 from ouroboros.shell_parse import is_absolute_path_text
 from ouroboros.utils import safe_relpath
 
@@ -110,6 +109,20 @@ class ToolAccessDecision:
     guard: str = ""
 
 
+@dataclass(frozen=True)
+class ResolvedResourceBinding:
+    """One dispatch-selected logical root and its exact physical target."""
+
+    profile: ToolProfile
+    root: ResourceRoot
+    operation: Operation
+    base_path: pathlib.Path
+    target_path: pathlib.Path
+    source: str
+    skill_name: str
+    state_drive_root: pathlib.Path
+
+
 _ALL_ROOTS: frozenset[str] = frozenset({
     "active_workspace",
     "system_repo",
@@ -128,6 +141,11 @@ _ALL_ROOTS: frozenset[str] = frozenset({
 # resolve_shell_cwd candidates) and NEVER to acting/readonly subagents (a child must not
 # read sibling projects). operator_control is capped to read-only on these too.
 _READONLY_RESOURCE_ROOTS: frozenset[str] = frozenset({"subagent_projects", "deliverables"})
+_TOP_LEVEL_PRINCIPAL_PROFILES: frozenset[str] = frozenset({
+    "workspace_task",
+    "external_workspace_task",
+    "self_modification",
+})
 
 _READ_OPS = frozenset({"read", "list", "search"})
 _USER_FILES_SECRET_COMPONENTS = frozenset({
@@ -194,6 +212,19 @@ _USER_FILES_ALLOWED_DOTNAMES = frozenset({
     ".editorconfig",
 })
 
+_TOP_LEVEL_PRINCIPAL_POLICY: dict[str, set[str]] = {
+    "active_workspace": {"read", "list", "search", "write", "edit", "shell", "vcs", "review", "service"},
+    "system_repo": {"read", "list", "search", "write", "edit", "shell", "vcs", "review", "service"},
+    "runtime_data": {"read", "list", "write", "edit"},
+    "task_drive": {"read", "list", "write", "edit", "shell", "service"},
+    "skill_payload": {"read", "list", "search", "write", "edit", "review", "shell"},
+    "artifact_store": {"read", "list", "write", "shell", "service"},
+    "user_files": {"read", "list", "search", "write", "edit", "shell", "service"},
+    "subagent_projects": {"read", "list", "search"},
+    "deliverables": {"read", "list", "search"},
+}
+
+
 _POLICY: dict[str, dict[str, set[str]]] = {
     "local_readonly_subagent": {
         "active_workspace": set(_READ_OPS),
@@ -215,36 +246,11 @@ _POLICY: dict[str, dict[str, set[str]]] = {
         "task_drive": {"read", "list"},
         "artifact_store": {"read", "list"},
     },
-    "workspace_task": {
-        "active_workspace": {"read", "list", "search", "write", "edit", "shell", "vcs", "service"},
-        "runtime_data": {"read", "list"},
-        "task_drive": {"read", "list", "write", "edit", "shell", "service"},
-        "artifact_store": {"read", "list", "write", "shell", "service"},
-        # v6.52.0 (P1): non-external workspace tasks may READ user files (no write/shell) so
-        # an attached/owner file is reachable; the user_files_path_block_reason guard (secret/
-        # control-plane/outside-home) still applies.
-        "user_files": {"read", "list", "search"},
-        "subagent_projects": {"read", "list", "search"},
-        "deliverables": {"read", "list", "search"},
-    },
-    # Top-level EXTERNAL-workspace task (ctx.workspace_mode == "external"). Same
-    # authority as workspace_task PLUS read/list/search/shell on user_files so the
-    # agent can inspect host scratch and run commands there (a repo under /tmp, a
-    # /build tree, sibling checkouts). NO write/edit/vcs on user_files: structured
-    # edits go through active_workspace / task_drive; this is read+inspect+run.
-    # The user_files PATH guards (is_external_workspace + user_files_path_block_reason)
-    # still confine it to non-runtime, non-credential paths. Kept distinct from
-    # workspace_task so non-external workspace modes and self_worktree/genesis
-    # acting surfaces never inherit the host-scratch reach.
-    "external_workspace_task": {
-        "active_workspace": {"read", "list", "search", "write", "edit", "shell", "vcs", "service"},
-        "runtime_data": {"read", "list"},
-        "task_drive": {"read", "list", "write", "edit", "shell", "service"},
-        "artifact_store": {"read", "list", "write", "shell", "service"},
-        "user_files": {"read", "list", "search", "shell"},
-        "subagent_projects": {"read", "list", "search"},
-        "deliverables": {"read", "list", "search"},
-    },
+    # Top-level preset names remain observable, but workspace focus never narrows
+    # the ordinary principal. Independent path/credential/child/runtime guards
+    # still apply after this shared operation matrix.
+    "workspace_task": _TOP_LEVEL_PRINCIPAL_POLICY,
+    "external_workspace_task": _TOP_LEVEL_PRINCIPAL_POLICY,
     # Mutative (acting) subagents write only inside their isolated active
     # workspace (self_worktree / external_workspace / genesis). No vcs-commit /
     # review here; the parent integrates and commits. self_worktree additionally
@@ -259,17 +265,7 @@ _POLICY: dict[str, dict[str, set[str]]] = {
         "task_drive": {"read", "list"},
         "artifact_store": {"read", "list"},
     },
-    "self_modification": {
-        "active_workspace": {"read", "list", "search", "write", "edit", "shell", "vcs", "review", "service"},
-        "system_repo": {"read", "list", "search", "write", "edit", "shell", "vcs", "review", "service"},
-        "runtime_data": {"read", "list", "write", "edit"},
-        "task_drive": {"read", "list", "write", "edit", "shell", "service"},
-        "skill_payload": {"read", "list", "search", "write", "edit", "review"},
-        "artifact_store": {"read", "list", "write", "shell", "service"},
-        "user_files": {"read", "list", "search", "write", "edit", "shell", "service"},
-        "subagent_projects": {"read", "list", "search"},
-        "deliverables": {"read", "list", "search"},
-    },
+    "self_modification": _TOP_LEVEL_PRINCIPAL_POLICY,
     # operator_control gets full authority on every mutable root, but the orchestrator
     # read-only roots stay read-only even here (they are deliverables/durable projects,
     # not a control surface).
@@ -341,8 +337,8 @@ def active_tool_profile(ctx: Any) -> ToolProfile:
     if _is_subagent_ctx(ctx):
         return "local_readonly_subagent"
     if bool(getattr(ctx, "is_workspace_mode", lambda: False)()):
-        # External workspaces additionally reach host scratch via user_files;
-        # other workspace modes keep the tighter workspace_task envelope.
+        # Keep distinct preset names for focus/path diagnostics. Both use the
+        # shared ordinary principal; external host-scratch reach is a path fact.
         if is_external_workspace(ctx):
             return "external_workspace_task"
         return "workspace_task"
@@ -1227,6 +1223,63 @@ def canonical_repo_relative_path(ctx: Any, root: str, path: str) -> str:
         return path
 
 
+def _skill_payload_base(
+    ctx: Any,
+    *,
+    profile: ToolProfile,
+    operation: Operation,
+    location: str,
+    skill_name: str,
+    allow_missing_external: bool = False,
+) -> tuple[pathlib.Path, str, str]:
+    """Select one physical skill package without reading lifecycle state."""
+
+    from ouroboros.skill_loader import (
+        _sanitize_skill_name,
+        _select_skill_location,
+        _skill_location_inventory,
+    )
+
+    requested_location = str(location or "").strip().lower()
+    allowed_locations = {"external", "clawhub", "ouroboroshub", "native", "user_repo"}
+    if requested_location not in allowed_locations:
+        raise ValueError(
+            "root=skill_payload requires bucket/location in "
+            "external|clawhub|ouroboroshub|native|user_repo"
+        )
+    canonical_name = _sanitize_skill_name(skill_name)
+    if not str(skill_name or "").strip() or canonical_name == "_unnamed":
+        raise ValueError("root=skill_payload requires a non-empty skill_name")
+    if requested_location in {"native", "user_repo"} and profile not in _TOP_LEVEL_PRINCIPAL_PROFILES:
+        raise ValueError(
+            f"profile={profile} cannot select skill location={requested_location}"
+        )
+    if requested_location == "native" and operation in {"write", "edit", "shell"}:
+        raise ValueError(
+            "installed native skills are read/review only; edit their seed via root=system_repo"
+        )
+
+    state_root = canonical_data_root(ctx)
+    candidates = _skill_location_inventory(state_root)
+    selected = _select_skill_location(
+        candidates,
+        name=canonical_name,
+        location=requested_location,
+        require_unique_identity=operation not in {"read", "list", "search"},
+    )
+    if selected is not None:
+        return selected.skill_dir.resolve(strict=False), selected.location, selected.name
+    if requested_location == "external" and operation == "write" and allow_missing_external:
+        return (
+            (state_root / "skills" / "external" / canonical_name).resolve(strict=False),
+            "external",
+            canonical_name,
+        )
+    raise ValueError(
+        f"skill {canonical_name!r} was not found in location {requested_location!r}"
+    )
+
+
 def resource_root_path(
     ctx: Any,
     root: ResourceRoot,
@@ -1266,17 +1319,120 @@ def resource_root_path(
         s = str(skill_name or "").strip()
         if not b or not s:
             raise ValueError("root=skill_payload requires bucket and skill_name")
-        # Installed payloads live only on the canonical data root; a subagent's
-        # isolated child drive has no skills/ tree (see canonical_data_root).
-        # Write authority is unaffected: the skill_payload verb matrix already
-        # confines write/edit/review to parent profiles (skill_repair /
-        # self_modification), which run on the canonical drive.
-        target = resolve_skill_payload_target(
-            canonical_data_root(ctx),
-            f"skills/{b}/{s}",
+        base, _source, _name = _skill_payload_base(
+            ctx,
+            profile=active_tool_profile(ctx),
+            operation="read",
+            location=b,
+            skill_name=s,
         )
-        return target.payload_root
+        return base
     raise ValueError(f"unknown root {root!r}")
+
+
+def _resolve_target_in_selected_base(
+    ctx: Any,
+    *,
+    root: ResourceRoot,
+    base_path: pathlib.Path,
+    path: str,
+    operation: Operation,
+) -> pathlib.Path:
+    """Resolve one target inside an already-selected physical base."""
+
+    if root == "user_files":
+        return resolve_user_file_path(
+            ctx,
+            path,
+            allow_protected_descendants=operation in {"list", "search"},
+        )
+    resolved_base = pathlib.Path(base_path).resolve(strict=False)
+    path_text = str(path or ".")
+    if root in {"active_workspace", "system_repo"}:
+        path_text = normalize_root_relative(resolved_base, path_text)
+    resolved = (resolved_base / safe_relpath(path_text)).resolve(strict=False)
+    try:
+        resolved.relative_to(resolved_base)
+    except ValueError as exc:
+        raise ValueError(f"path escapes {resolved_base}") from exc
+    return resolved
+
+
+def build_resolved_resource_binding(
+    ctx: Any,
+    *,
+    root: str | None = None,
+    operation: Operation,
+    path: str = ".",
+    bucket: str = "",
+    skill_name: str = "",
+) -> ResolvedResourceBinding:
+    """Resolve policy, physical base, and target exactly once for one call."""
+
+    normalized = normalize_root(root)
+    profile = active_tool_profile(ctx)
+    decision = decide_tool_access(profile=profile, root=normalized, operation=operation)
+    if not decision.allow:
+        raise ValueError(decision.reason)
+
+    source = str(normalized)
+    selected_name = ""
+    room = (
+        project_room_lens_dir(ctx)
+        if normalized == "active_workspace" and operation in {"read", "list", "search", "shell"}
+        else None
+    )
+    if normalized == "skill_payload":
+        selected_bucket = str(bucket or "").strip()
+        selected_skill = str(skill_name or "").strip()
+        constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
+        if constraint and constraint.mode == "skill_repair":
+            from ouroboros.contracts.skill_payload_policy import constraint_bucket_skill
+
+            expected_bucket, expected_skill = constraint_bucket_skill(constraint)
+            if not selected_bucket and not selected_skill:
+                selected_bucket, selected_skill = expected_bucket, expected_skill
+            elif (selected_bucket, selected_skill) != (expected_bucket, expected_skill):
+                raise ValueError(
+                    "SKILL_REDIRECT_BLOCKED: active skill_repair payload is "
+                    f"{expected_bucket}/{expected_skill}; cannot select "
+                    f"{selected_bucket}/{selected_skill}"
+                )
+        from ouroboros.contracts.skill_payload_policy import _is_skill_create_signal
+
+        base, source, selected_name = _skill_payload_base(
+            ctx,
+            profile=profile,
+            operation=operation,
+            location=selected_bucket,
+            skill_name=selected_skill,
+            allow_missing_external=(
+                operation == "write"
+                and selected_bucket.lower() == "external"
+                and _is_skill_create_signal(path)
+            ),
+        )
+    elif room is not None:
+        base = room
+    else:
+        base = resource_root_path(ctx, normalized)
+    target = _resolve_target_in_selected_base(
+        ctx,
+        root=normalized,
+        base_path=base,
+        path=path,
+        operation=operation,
+    )
+    return ResolvedResourceBinding(
+        profile=profile,
+        root=normalized,
+        operation=operation,
+        base_path=pathlib.Path(base).resolve(strict=False),
+        target_path=target,
+        source=source,
+        skill_name=selected_name,
+        state_drive_root=canonical_data_root(ctx),
+    )
 
 
 def resolve_resource_path(
@@ -1287,23 +1443,11 @@ def resolve_resource_path(
     bucket: str = "",
     skill_name: str = "",
 ) -> pathlib.Path:
-    if root == "user_files":
-        return resolve_user_file_path(ctx, path)
     base = resource_root_path(ctx, root, bucket=bucket, skill_name=skill_name)
-    resolved_base = pathlib.Path(base).resolve(strict=False)
-    # Redundant-root-basename / absolute-inside-root normalization is applied ONLY
-    # for the repo roots, where the dispatch boundary (registry) already normalizes
-    # args['path'] so guard and operation share the SAME target. Non-repo roots
-    # (runtime_data, deliverables, skill_payload, ...) resolve the RAW path in their
-    # own handlers (e.g. _data_read via _normalize_data_read_path, which strips only
-    # the full drive-root prefix, NOT a bare basename), so normalizing here would
-    # desync the guard from the operation — keep those raw (matches the approved T2
-    # dispatch-only scope).
-    if root in ("active_workspace", "system_repo"):
-        path = normalize_root_relative(resolved_base, path)
-    resolved = (resolved_base / safe_relpath(path or ".")).resolve(strict=False)
-    try:
-        resolved.relative_to(resolved_base)
-    except ValueError as exc:
-        raise ValueError(f"path escapes {resolved_base}") from exc
-    return resolved
+    return _resolve_target_in_selected_base(
+        ctx,
+        root=root,
+        base_path=base,
+        path=path,
+        operation="read",
+    )

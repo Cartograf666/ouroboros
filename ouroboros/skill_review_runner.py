@@ -1024,6 +1024,23 @@ def run_skill_review_lifecycle_blocking(
 ) -> Dict[str, Any]:
     drive_root = pathlib.Path(ctx.drive_root)
     repo_path = repo_path if repo_path is not None else get_skills_repo_path()
+    selected = find_skill(drive_root, skill_name, repo_path=repo_path)
+    if selected is not None and bool(getattr(selected, "identity_collision", False)):
+        # A review/attestation is lifecycle state for one canonical identity.
+        # Collision placeholders are topology-only, so refuse before creating a
+        # review job, heartbeat, history row, grant, dependency, or enablement
+        # state for an ambiguous name.
+        return _outcome_payload(
+            SkillReviewOutcome(
+                skill_name=skill_name,
+                status=STATUS_PENDING,
+                error=selected.load_error or "skill identity collision",
+            ),
+            deps_status="not_run",
+            deps_error="",
+            extension_action=None,
+            extension_reason=None,
+        )
     content_hash = _skill_content_hash(drive_root, skill_name, repo_path)
     mark_stale_review_job_interrupted(drive_root, skill_name, current_content_hash=content_hash)
     dedupe_key = _review_dedupe_key(skill_name, content_hash)

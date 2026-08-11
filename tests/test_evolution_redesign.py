@@ -1054,6 +1054,49 @@ body
     assert queue.list_scheduled_tasks()["tasks"] == []
 
 
+def test_skill_schedule_sync_preserves_ambiguous_identity_rows(tmp_path):
+    from ouroboros.contracts.skill_manifest import parse_skill_manifest_text
+    from supervisor import queue
+
+    queue.init(tmp_path, 600, 1800)
+    manifest = parse_skill_manifest_text("""---
+name: cron-demo
+description: Cron demo
+version: 0.1.0
+type: extension
+entry: plugin.py
+permissions: [supervised_task]
+scheduled_tasks:
+  - name: refresh
+    cron: "0 * * * *"
+---
+body
+""")
+    skill = SimpleNamespace(
+        name="cron-demo", manifest=manifest, enabled=True, load_error="",
+        content_hash="abc", identity_collision=False,
+        review=SimpleNamespace(status="pass", is_stale_for=lambda _h: False),
+    )
+    queue.sync_skill_schedules([skill])
+    before = queue.list_scheduled_tasks()["tasks"]
+
+    collision = SimpleNamespace(
+        name="cron-demo", identity_collision=True,
+        manifest=SimpleNamespace(scheduled_tasks=[]),
+    )
+    unique = SimpleNamespace(
+        name="other", manifest=manifest, enabled=True, load_error="",
+        content_hash="def", identity_collision=False,
+        review=SimpleNamespace(status="pass", is_stale_for=lambda _h: False),
+    )
+    report = queue.sync_skill_schedules([collision, unique])
+    after = queue.list_scheduled_tasks()["tasks"]
+
+    assert report["changed"] is True
+    assert next(item for item in after if item["id"] == "skill-cron-demo-refresh") == before[0]
+    assert any(item["id"] == "skill-other-refresh" for item in after)
+
+
 def test_reflection_extract_trailing_json_parses_memory_and_backlog():
     from ouroboros.reflection import _extract_trailing_json
 

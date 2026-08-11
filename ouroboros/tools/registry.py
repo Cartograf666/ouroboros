@@ -53,7 +53,18 @@ from ouroboros.tools.shell_guards import (
 from ouroboros.artifacts import task_artifact_dir_path, task_id_for_artifacts
 from ouroboros.protected_artifacts import shell_block_reason as protected_artifact_shell_block_reason
 from ouroboros.git_shell_policy import run_shell_git_block_reason, workspace_git_safety_violation
-from ouroboros.tool_access import canonical_repo_relative_path, is_external_workspace, light_cognitive_or_root_redirect, normalize_root, normalize_root_relative, resolve_shell_cwd, shell_cwd_block_message, workspace_mode_block_reason
+from ouroboros.tool_access import (
+    build_resolved_resource_binding,
+    canonical_repo_relative_path,
+    is_external_workspace,
+    light_cognitive_or_root_redirect,
+    normalize_root,
+    normalize_root_relative,
+    resolve_shell_cwd,
+    shell_cwd_block_message,
+    UserFilesPathBlockedError,
+    workspace_mode_block_reason,
+)
 from ouroboros.python_interpreter import record_python_resolution, resolve_process_python
 from ouroboros.utils import safe_relpath
 from ouroboros.contracts.task_constraint import TaskConstraint, VALID_WRITE_SURFACES, normalize_task_constraint
@@ -68,6 +79,7 @@ from ouroboros.contracts.skill_payload_policy import (
     is_skill_payload_control_filename,
     is_skill_payload_path,
     resolve_skill_payload_target,
+    synthesize_payload_constraint,
 )
 
 log = logging.getLogger(__name__)
@@ -956,6 +968,15 @@ _IGNORE_ROOT_ARG_TOOLS = frozenset({
     "vcs_commit_reviewed",
 })
 
+_TARGET_BINDING_OPERATIONS = {
+    "read_file": "read",
+    "list_files": "list",
+    "search_code": "search",
+    "query_code": "search",
+    "write_file": "write",
+    "edit_text": "edit",
+}
+
 
 def _builtin_tool_availability(name: str, ctx: Any = None) -> tuple[bool, str, str]:
     """Return ``(available, reason, detail)`` for built-in tool credential gates.
@@ -990,7 +1011,7 @@ def _handler_public_params(handler: Callable[..., Any]) -> list[str]:
         params = list(inspect.signature(handler).parameters)
     except (TypeError, ValueError):
         return []
-    return [name for name in params if name != "ctx"]
+    return [name for name in params if name not in {"ctx", "_resolved_binding"}]
 
 
 def _entry_public_params(entry: "ToolEntry") -> list[str]:
@@ -1023,6 +1044,139 @@ def _normalize_tool_call_args(entry: "ToolEntry", args: dict[str, Any]) -> None:
             args[canonical] = args.pop(alias)
     if tool_name in _IGNORE_ROOT_ARG_TOOLS and "root" in args and "root" not in accepted:
         args.pop("root", None)
+
+
+def _prepare_public_builtin_args(entry: "ToolEntry", args: dict[str, Any]) -> str:
+    """Normalize and validate only the model-visible builtin argument surface.
+
+    This runs after capability/lineage availability checks but before path
+    normalization, target selection, Python predispatch, or target-sensitive
+    guards. Private dispatch carriers therefore cannot be supplied by the model
+    and invalid public calls cannot trigger target work before rejection.
+    """
+
+    _normalize_tool_call_args(entry, args)
+    public_params = set(_entry_public_params(entry))
+    if _entry_has_public_param_schema(entry) and any(key not in public_params for key in args):
+        return _format_tool_arg_error(entry)
+    try:
+        inspect.signature(entry.handler).bind(object(), **args)
+    except TypeError:
+        return _format_tool_arg_error(entry)
+    return ""
+
+
+def _build_builtin_target_binding(ctx: Any, name: str, args: dict[str, Any]) -> Any:
+    """Build the private per-target carrier for the initial file/query slice."""
+
+    operation = _TARGET_BINDING_OPERATIONS.get(name)
+    if operation is None:
+        return None
+    root = str(args.get("root") or "active_workspace")
+    bucket = str(args.get("bucket") or "")
+    skill_name = str(args.get("skill_name") or "")
+
+    def _one(path: str) -> Any:
+        return build_resolved_resource_binding(
+            ctx,
+            root=root,
+            operation=operation,
+            path=path or ".",
+            bucket=bucket,
+            skill_name=skill_name,
+        )
+
+    if name == "write_file" and args.get("files"):
+        return tuple(
+            _one(str(item.get("path") or ""))
+            for item in args.get("files") or []
+            if isinstance(item, dict)
+        )
+    return _one(str(args.get("path") or "."))
+
+
+def _binding_error_text(name: str, root: str, exc: Exception) -> str:
+    detail = str(exc)
+    if detail.startswith("SKILL_REDIRECT_BLOCKED:"):
+        return f"⚠️ {detail}"
+    if detail.startswith("profile=") and " cannot " in detail:
+        return f"⚠️ TOOL_ACCESS_BLOCKED: {detail.rstrip('.')}."
+    if isinstance(exc, UserFilesPathBlockedError) and name in {
+        "read_file", "list_files", "search_code",
+    }:
+        return f"⚠️ USER_FILES_PATH_BLOCKED: {detail}"
+    if root == "skill_payload" and name in {"write_file", "edit_text"}:
+        return f"⚠️ SKILL_PAYLOAD_ARG_ERROR: {detail}"
+    prefixes = {
+        "read_file": "READ_FILE_ERROR",
+        "list_files": "LIST_FILES_ERROR",
+        "search_code": "SEARCH_ERROR",
+        "query_code": "TOOL_ARG_ERROR (query_code)",
+        "write_file": "WRITE_FILE_ERROR",
+        "edit_text": "EDIT_TEXT_ERROR",
+    }
+    return f"⚠️ {prefixes.get(name, 'TOOL_ERROR')}: {type(exc).__name__}: {detail}"
+
+
+def _payload_dispatch_constraint(
+    ctx: Any,
+    *,
+    name: str,
+    args: dict[str, Any],
+    task_constraint: Optional[TaskConstraint],
+    workspace_mode: bool,
+) -> tuple[Optional[TaskConstraint], str]:
+    """Preserve repair selectors without letting stray selectors retarget work."""
+
+    raw_bucket = str(args.get("bucket", "") or "")
+    raw_skill_name = str(args.get("skill_name", "") or "")
+    explicit_skill_root = str(args.get("root", "") or "").strip().lower() == "skill_payload"
+    short_form_decision = None if explicit_skill_root else decide_payload_short_form(
+        bucket=raw_bucket,
+        skill_name=raw_skill_name,
+        path_text=str(args.get("path", "") or "."),
+        repo_dir=pathlib.Path(ctx.repo_dir),
+        drive_root=pathlib.Path(ctx.drive_root),
+    )
+    if explicit_skill_root:
+        # Binding selection already handled the explicit target. This legacy
+        # constraint exists only for the light-mode data-payload carve-out.
+        synthesized = synthesize_payload_constraint(raw_bucket, raw_skill_name)
+    else:
+        synthesized = (
+            short_form_decision.constraint
+            if short_form_decision is not None
+            and task_constraint
+            and task_constraint.mode == "skill_repair"
+            else None
+        )
+
+    if (
+        (raw_bucket or raw_skill_name)
+        and short_form_decision is not None
+        and short_form_decision.error
+        and name in {"write_file", "edit_text"}
+    ):
+        root_arg = str(args.get("root", "") or "").strip().lower()
+        if _stray_skill_payload_failsoft(root_arg, workspace_mode, task_constraint):
+            log.info(
+                "Ignoring stray bucket/skill_name on %s (workspace edit, root=%s): %s",
+                name,
+                root_arg or "active_workspace",
+                short_form_decision.error[:80],
+            )
+            args.pop("bucket", None)
+            args.pop("skill_name", None)
+            synthesized = None
+        else:
+            return None, f"⚠️ SKILL_PAYLOAD_ARG_ERROR: {short_form_decision.error}"
+
+    redirect_err = cross_skill_redirect_error(task_constraint, synthesized)
+    if redirect_err and name in {"write_file", "edit_text"}:
+        return None, f"⚠️ SKILL_REDIRECT_BLOCKED: {redirect_err}"
+    if task_constraint and task_constraint.mode == "skill_repair":
+        return task_constraint, ""
+    return synthesized or task_constraint, ""
 
 
 def _format_tool_arg_error(entry: "ToolEntry") -> str:
@@ -2729,6 +2883,7 @@ class ToolRegistry:
         name: str,
         entry: Any,
         args: Dict[str, Any],
+        resolved_binding: Any,
         python_resolution: Any,
         worktree_before: Any,
     ) -> tuple[str | None, Any]:
@@ -2742,16 +2897,21 @@ class ToolRegistry:
         self._ctx._active_python_resolution = python_resolution
         try:
             try:
-                if entry is not None:
-                    _normalize_tool_call_args(entry, args)
-                    public_params = set(_entry_public_params(entry))
-                    if _entry_has_public_param_schema(entry) and any(key not in public_params for key in args):
-                        return _format_tool_arg_error(entry), None
+                handler_args = dict(args)
+                if name in _TARGET_BINDING_OPERATIONS:
+                    parameters = inspect.signature(entry.handler).parameters
+                    if "_resolved_binding" not in parameters:
+                        return (
+                            f"⚠️ TOOL_INTERNAL_ERROR ({name}): target-sensitive handler "
+                            "does not declare the private _resolved_binding keyword.",
+                            None,
+                        )
+                    handler_args["_resolved_binding"] = resolved_binding
                 try:
-                    inspect.signature(entry.handler).bind(self._ctx, **args)
+                    inspect.signature(entry.handler).bind(self._ctx, **handler_args)
                 except TypeError:
                     return _format_tool_arg_error(entry), None
-                return None, entry.handler(self._ctx, **args)
+                return None, entry.handler(self._ctx, **handler_args)
             except TypeError as e:
                 return f"⚠️ TOOL_ERROR ({name}): {e}", None
             except Exception as e:
@@ -2774,9 +2934,7 @@ class ToolRegistry:
     def execute(self, name: str, args: Dict[str, Any]) -> str:
         name = str(name or "").strip()
         args = dict(args or {})
-        _route_note = _normalize_dispatch_path_args(self._ctx, name, args)
-        if _route_note.startswith("⚠️ ROOT_REQUIRED_ACTIVE_WORKSPACE"):
-            return _route_note
+        _route_note = ""
         task_constraint = normalize_task_constraint(getattr(self._ctx, "task_constraint", None))
         local_readonly_subagent = self._is_local_readonly_subagent()
         acting_subagent = self._is_acting_subagent()
@@ -2832,7 +2990,6 @@ class ToolRegistry:
         )
         if _gate:
             return _gate
-
         workspace_block_reason = ""
         try:
             workspace_block_reason = workspace_mode_block_reason(self._ctx)
@@ -2844,7 +3001,40 @@ class ToolRegistry:
                 f"{workspace_block_reason}. Workspace tasks must not overlap the "
                 "Ouroboros repo, runtime data, or control plane."
             )
+        if entry is not None:
+            public_arg_error = _prepare_public_builtin_args(entry, args)
+            if public_arg_error:
+                return public_arg_error
+            _route_note = _normalize_dispatch_path_args(self._ctx, name, args)
+            if _route_note.startswith("⚠️ ROOT_REQUIRED_ACTIVE_WORKSPACE"):
+                return _route_note
+        heal_no_enable = bool(task_constraint and task_constraint.mode == "skill_repair")
+        if heal_no_enable:
+            heal_block = self._heal_mode_block(name, args, task_constraint, ext_tool, is_mcp)
+            if heal_block:
+                return heal_block
         workspace_mode = bool(getattr(self._ctx, "is_workspace_mode", lambda: False)())
+        effective_constraint = task_constraint
+        if entry is not None:
+            effective_constraint, payload_error = _payload_dispatch_constraint(
+                self._ctx,
+                name=name,
+                args=args,
+                task_constraint=task_constraint,
+                workspace_mode=workspace_mode,
+            )
+            if payload_error:
+                return payload_error
+        resolved_binding = None
+        if entry is not None and name in _TARGET_BINDING_OPERATIONS:
+            try:
+                resolved_binding = _build_builtin_target_binding(self._ctx, name, args)
+            except Exception as exc:
+                return _binding_error_text(
+                    name,
+                    str(args.get("root") or "active_workspace"),
+                    exc,
+                )
         if workspace_mode and not acting_subagent and entry is not None and name not in _WORKSPACE_ALLOWED_TOOLS:
             workspace = str(getattr(self._ctx, "workspace_root", "") or "")
             return (
@@ -2876,69 +3066,12 @@ class ToolRegistry:
         except Exception:
             _runtime_mode = "advanced"
 
-        heal_no_enable = bool(task_constraint and task_constraint.mode == "skill_repair")
-        if heal_no_enable:
-            heal_block = self._heal_mode_block(name, args, task_constraint, ext_tool, is_mcp)
-            if heal_block:
-                return heal_block
         if is_mcp:
             return self._dispatch_mcp_tool(name, args)
         if entry is None:
             if ext_tool and callable(ext_tool.get("handler")):
                 return self._dispatch_extension_tool(name, ext_tool, args)
             return f"⚠️ Unknown tool: {name}. Available: {', '.join(sorted(self._entries.keys()))}"
-        raw_bucket = str(args.get("bucket", "") or "")
-        raw_skill_name = str(args.get("skill_name", "") or "")
-        short_path_text = str(args.get("path", "") or "")
-        short_form_decision = decide_payload_short_form(
-            bucket=raw_bucket,
-            skill_name=raw_skill_name,
-            path_text=short_path_text or ".",
-            repo_dir=pathlib.Path(self._ctx.repo_dir),
-            drive_root=pathlib.Path(self._ctx.drive_root),
-        )
-        synth_constraint = short_form_decision.constraint
-        # Prefer specific skill payload arg errors over generic light-mode block —
-        # but ONLY when the model genuinely targeted a skill payload. B2 footgun:
-        # in external/normal workspaces models reflexively fill bucket="external"
-        # (a real skill-bucket name) on an ordinary active_workspace edit; the
-        # short-form then errors and the edit was hard-blocked, forcing fallback
-        # to shell rewrites. Hard-block only for an explicit skill-payload intent
-        # (root=skill_payload or an active skill_repair task); otherwise the
-        # bucket/skill_name are noise — drop them and do the normal edit.
-        if (
-            (raw_bucket or raw_skill_name)
-            and short_form_decision.error
-            and name in (
-                "write_file",
-                "edit_text",
-            )
-        ):
-            _root_arg = str(args.get("root", "") or "").strip().lower()
-            if _stray_skill_payload_failsoft(_root_arg, workspace_mode, task_constraint):
-                log.info(
-                    "Ignoring stray bucket/skill_name on %s (workspace edit, root=%s): %s",
-                    name, _root_arg or "active_workspace", short_form_decision.error[:80],
-                )
-                args.pop("bucket", None)
-                args.pop("skill_name", None)
-                raw_bucket = ""
-                raw_skill_name = ""
-                synth_constraint = None
-            else:
-                return f"⚠️ SKILL_PAYLOAD_ARG_ERROR: {short_form_decision.error}"
-        # Real skill_repair constraints beat synthesized short-form constraints.
-        redirect_err = cross_skill_redirect_error(task_constraint, synth_constraint)
-        if redirect_err and name in (
-            "write_file",
-            "edit_text",
-        ):
-            return f"⚠️ SKILL_REDIRECT_BLOCKED: {redirect_err}"
-        # Existing skill_repair constraint remains authoritative.
-        if task_constraint and task_constraint.mode == "skill_repair":
-            effective_constraint = task_constraint
-        else:
-            effective_constraint = synth_constraint or task_constraint
         args, python_resolution, python_block = self._resolve_python_predispatch(
             name, args, _runtime_mode, effective_constraint,
         )
@@ -3040,7 +3173,7 @@ class ToolRegistry:
             self._worktree_status_snapshot() if entry.mutates_worktree else None
         )
         early_error, result = self._invoke_builtin_handler(
-            name, entry, args, python_resolution, worktree_before,
+            name, entry, args, resolved_binding, python_resolution, worktree_before,
         )
         if early_error is not None:
             return early_error

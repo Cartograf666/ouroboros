@@ -235,15 +235,21 @@ def _build_extensions_index(drive_root, repo_path):
     live_snapshot = snapshot()
     # Scan data plane plus optional external checkout; bootstrap copies native refs.
     skills = discover_skills(drive_root, repo_path=repo_path)
+    unique_skills = [
+        skill for skill in skills
+        if not bool(getattr(skill, "identity_collision", False))
+    ]
     try:
         from supervisor.queue import sync_skill_schedules
 
+        # Empty inventory retires vanished skills; collision placeholders keep
+        # prior rows for ambiguous identities while unique peers still sync.
         sync_skill_schedules(skills, drive_root=drive_root)
     except Exception:
         log.debug("Failed to sync skill schedules", exc_info=True)
     runtime_states = {
         s.name: runtime_state_for_loaded_skill(s, drive_root, skills=skills)
-        for s in skills
+        for s in unique_skills
         if s.manifest.is_extension()
     }
 
@@ -295,26 +301,65 @@ def _build_extensions_index(drive_root, repo_path):
 
     # Request-invariant: resolve the github-token state ONCE for the whole index, not
     # once per skill (FR1 — avoids N settings.json reads per GET /api/extensions).
-    _gh_token_configured = bool(github_token_from_env_or_settings())
+    _gh_token_configured = (
+        bool(github_token_from_env_or_settings())
+        if unique_skills
+        else False
+    )
 
     for s in skills:
         payload_root = ""
-        health = read_extension_health(drive_root, s.name) if s.manifest.is_extension() else None
         try:
             rel_skill_dir = s.skill_dir.resolve().relative_to(drive_root.resolve())
             if rel_skill_dir.parts[:1] == ("skills",):
                 payload_root = rel_skill_dir.as_posix()
         except Exception:
             payload_root = ""
-        entry = {
+        entry: dict[str, Any] = {
             "name": s.name,
             "type": s.manifest.type,
             "version": s.manifest.version,
             "description": s.manifest.description,
             "enabled": s.enabled,
-            **_review_fields(s, github_token_configured=_gh_token_configured),
             "permissions": list(s.manifest.permissions or []),
             "conflicts": list(getattr(s.manifest, "conflicts", []) or []),
+            "load_error": s.load_error,
+            "is_self_authored": bool(getattr(s, "is_self_authored", False)),
+            # Keep source explicit so marketplace skills are not mislabeled native.
+            "source": s.source,
+            "payload_root": payload_root,
+            "installed_at": _path_installed_at(s.skill_dir),
+        }
+        if bool(getattr(s, "identity_collision", False)):
+            stale = True
+            gate = skill_review_gate(s.review.status, stale=stale)
+            entry.update({
+                "review_status": s.review.status,
+                "review_stale": stale,
+                "review_gate": gate,
+                "executable_review": False,
+                "review_profile": "",
+                "official_hub_verified": False,
+                "owner_attestable": False,
+                "submit_hub": {"visible": False, "disabled": True, "reason": ""},
+                "conflict": None,
+                "desired_live": False,
+                "live_loaded": False,
+                "live_reason": "load_error",
+                "health_regressed": False,
+                "last_known_good": None,
+                "dispatch_live": False,
+                "ui_tabs_pending": [],
+                "review_findings": [],
+                "skill_review": {},
+                "grants": {},
+            })
+            catalog.append(entry)
+            continue
+
+        health = read_extension_health(drive_root, s.name) if s.manifest.is_extension() else None
+        entry.update({
+            **_review_fields(s, github_token_configured=_gh_token_configured),
             "conflict": skill_conflict_status(s, skills),
             "load_error": runtime_states.get(s.name, {}).get("load_error", s.load_error),
             "desired_live": runtime_states.get(s.name, {}).get("desired_live", False),
@@ -331,12 +376,7 @@ def _build_extensions_index(drive_root, repo_path):
             "review_findings": list(s.review.findings or []),
             "skill_review": skill_review_ui_projection(drive_root, s.name),
             "grants": grant_status_for_skill(drive_root, s),
-            "is_self_authored": bool(getattr(s, "is_self_authored", False)),
-            # Keep source explicit so marketplace skills are not mislabeled native.
-            "source": s.source,
-            "payload_root": payload_root,
-            "installed_at": _path_installed_at(s.skill_dir),
-        }
+        })
         if s.source == "clawhub":
             try:
                 prov = read_provenance(drive_root, s.name) or {}

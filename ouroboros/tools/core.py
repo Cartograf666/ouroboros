@@ -19,6 +19,8 @@ from ouroboros.project_facts import project_store_access_block as _project_store
 from ouroboros.protected_artifacts import block_reason_for_path
 from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for
 from ouroboros.tool_access import (
+    ResolvedResourceBinding,
+    build_resolved_resource_binding,
     decide_tool_access,
     active_tool_profile,
     normalize_root,
@@ -34,6 +36,8 @@ from ouroboros.utils import atomic_write_json, read_text, safe_relpath, utc_now_
 from ouroboros.contracts.task_constraint import normalize_task_constraint, resolve_payload_path
 from ouroboros.contracts.skill_payload_policy import (
     SKILL_PAYLOAD_ALL_BUCKETS,
+    SKILL_PAYLOAD_CONTROL_DIRNAMES,
+    SKILL_PAYLOAD_CONTROL_FILENAMES,
     SKILL_OWNER_STATE_FILENAMES,
     SkillPayloadPathError,
     SkillPayloadTarget,
@@ -53,6 +57,42 @@ _SKILL_OWNER_STATE_FILENAMES = SKILL_OWNER_STATE_FILENAMES
 # Payload-local provenance sidecars are launcher/marketplace-owned, not
 # skill-author-editable. Generic write/delete/upload paths must block them.
 _SELF_AUTHORED_MARKER = ".self_authored.json"
+
+
+def _direct_resource_binding(
+    ctx: ToolContext,
+    supplied: Any,
+    *,
+    root: str,
+    operation: str,
+    path: str,
+    bucket: str = "",
+    skill_name: str = "",
+) -> ResolvedResourceBinding:
+    if supplied is not None:
+        return supplied
+    return build_resolved_resource_binding(
+        ctx,
+        root=root,
+        operation=operation,  # type: ignore[arg-type]
+        path=path or ".",
+        bucket=bucket,
+        skill_name=skill_name,
+    )
+
+
+def _binding_skill_control_plane_path(binding: ResolvedResourceBinding) -> bool:
+    """Apply the existing payload-sidecar vocabulary to any physical source."""
+
+    try:
+        relative = binding.target_path.relative_to(binding.base_path)
+    except ValueError:
+        return False
+    lowered = tuple(part.lower() for part in relative.parts)
+    return bool(
+        (lowered and lowered[-1] in SKILL_PAYLOAD_CONTROL_FILENAMES)
+        or any(part in SKILL_PAYLOAD_CONTROL_DIRNAMES for part in lowered)
+    )
 
 
 def _render_line_slice(path: str, content: str, max_lines: int = 2000, start_line: int = 1,
@@ -658,20 +698,18 @@ def _data_write(
     skill_name: str = "",
     display_root: str = "runtime_data",
     force: bool = False,
+    _resolved_binding: ResolvedResourceBinding | None = None,
 ) -> str:
-    if (b := _project_store_access_block(_normalize_data_read_path(ctx, path))):
+    if _resolved_binding is None and (b := _project_store_access_block(_normalize_data_read_path(ctx, path))):
         return b
     # bucket+skill_name synthesize a payload-confined skill_repair constraint.
-    short_form = decide_payload_short_form(
-        bucket=bucket,
-        skill_name=skill_name,
-        path_text=path,
-        repo_dir=pathlib.Path(ctx.repo_dir),
-        drive_root=pathlib.Path(ctx.drive_root),
+    short_form = None if _resolved_binding is not None else decide_payload_short_form(
+        bucket=bucket, skill_name=skill_name, path_text=path,
+        repo_dir=pathlib.Path(ctx.repo_dir), drive_root=pathlib.Path(ctx.drive_root),
     )
-    if short_form.error:
+    if short_form is not None and short_form.error:
         return f"⚠️ DATA_WRITE_ERROR: {short_form.error}"
-    synth = short_form.constraint
+    synth = short_form.constraint if short_form is not None else None
     existing_tc = normalize_task_constraint(getattr(ctx, "task_constraint", None))
     redirect_err = cross_skill_redirect_error(existing_tc, synth)
     if redirect_err:
@@ -686,7 +724,9 @@ def _data_write(
     # The manifest-first typo guard runs LATER, AFTER the owner-state/control-plane/content blocks, so
     # those security blocks take precedence over a missing-payload typo.
     _skill_target = None
-    if task_constraint and task_constraint.mode == "skill_repair" and task_constraint.payload_root:
+    if _resolved_binding is not None:
+        p = _resolved_binding.target_path
+    elif task_constraint and task_constraint.mode == "skill_repair" and task_constraint.payload_root:
         try:
             p = resolve_payload_path(pathlib.Path(ctx.drive_root), task_constraint, path)
         except ValueError as e:
@@ -704,9 +744,15 @@ def _data_write(
     from ouroboros import config as _cfg
     target_path = pathlib.Path(p)
     settings_path = pathlib.Path(_cfg.SETTINGS_PATH)
-    data_root = pathlib.Path(_cfg.DATA_DIR).resolve(strict=False)
+    data_root = (
+        _resolved_binding.state_drive_root
+        if _resolved_binding is not None
+        else pathlib.Path(_cfg.DATA_DIR).resolve(strict=False)
+    )
     ctx_data_root = pathlib.Path(ctx.drive_root).resolve(strict=False)
-    if task_constraint and task_constraint.mode == "skill_repair" and task_constraint.payload_root:
+    if _resolved_binding is not None:
+        lexical_target = pathlib.Path(p).resolve(strict=False)
+    elif task_constraint and task_constraint.mode == "skill_repair" and task_constraint.payload_root:
         lexical_target = pathlib.Path(p).resolve(strict=False)
     else:
         lexical_target = pathlib.Path(ctx.drive_root).resolve(strict=False) / safe_relpath(write_path)
@@ -738,7 +784,11 @@ def _data_write(
             "Skills UI toggle, or the desktop launcher grant flow."
         )
     # Block marketplace/launcher sidecars for every data_write path, not only heal mode.
-    if is_skill_control_plane_path(lexical_target, data_root) or is_skill_control_plane_path(target_path, data_root):
+    if (
+        (_resolved_binding is not None and _binding_skill_control_plane_path(_resolved_binding))
+        or is_skill_control_plane_path(lexical_target, data_root)
+        or is_skill_control_plane_path(target_path, data_root)
+    ):
         return (
             "⚠️ DATA_WRITE_BLOCKED: marketplace provenance and launcher "
             "seed markers (.clawhub.json, .ouroboroshub.json, "
@@ -841,11 +891,16 @@ def _data_write(
             "initial_content_hash": initial_hash,
         }
         atomic_write_json(marker_path, marker_payload_data, trailing_newline=True)
-        state_marker = pathlib.Path(ctx.drive_root) / "state" / "skills" / marker_payload[1] / "self_authored.json"
+        state_marker_root = (
+            _resolved_binding.state_drive_root
+            if _resolved_binding is not None
+            else pathlib.Path(ctx.drive_root)
+        )
+        state_marker = state_marker_root / "state" / "skills" / marker_payload[1] / "self_authored.json"
         state_marker.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_json(state_marker, marker_payload_data, trailing_newline=True)
     result = f"OK: wrote {mode} {_root_display_path(display_root, write_path)} ({len(content)} chars)"
-    if short_form.ignored_reason:
+    if short_form is not None and short_form.ignored_reason:
         result += f"\n⚠️ SKILL_SHORT_FORM_IGNORED: {short_form.ignored_reason}."
     return result
 
@@ -1023,10 +1078,20 @@ def _read_file(
     start_char: int = 0,
     bucket: str = "",
     skill_name: str = "",
+    _resolved_binding: ResolvedResourceBinding | None = None,
 ) -> str:
     normalized, block = _access_or_block(ctx, root, "read")
     if block:
         return block
+    try:
+        binding = _direct_resource_binding(
+            ctx, _resolved_binding, root=normalized, operation="read", path=path,
+            bucket=bucket, skill_name=skill_name,
+        )
+    except UserFilesPathBlockedError as exc:
+        return f"⚠️ USER_FILES_PATH_BLOCKED: {exc}"
+    except Exception as exc:
+        return f"⚠️ READ_FILE_ERROR: {type(exc).__name__}: {exc}"
     if normalized == "active_workspace":
         _room_target = _room_lens_target(ctx, path)
         if _room_target is not None:
@@ -1071,16 +1136,27 @@ def _read_file(
             start_line=start_line,
             display_path=_root_display_path(normalized, path),
         ))
-    task_constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
-    if normalized == "skill_payload" and not bucket and not skill_name and task_constraint and task_constraint.mode == "skill_repair":
+    if normalized == "skill_payload":
+        target = binding.target_path
+        protected_block = block_reason_for_path(ctx, target, "read_bytes")
+        if protected_block:
+            return protected_block
+        block_msg = _local_readonly_resource_block(
+            ctx, normalized, target, binding.base_path, action="READ_FILE"
+        )
+        if block_msg:
+            return block_msg
         try:
-            target = resolve_resource_path(ctx, root=normalized, path=path, bucket=bucket, skill_name=skill_name)
-            protected_block = block_reason_for_path(ctx, target, "read_bytes")
-            if protected_block:
-                return protected_block
-        except Exception:
-            pass
-        return _annotate_reread(ctx, locals().get("target"), start_line, max_lines, _data_read(ctx, path, max_lines=max_lines, start_line=start_line, display_path=_root_display_path(normalized, path)))
+            content = read_text(target)
+        except FileNotFoundError:
+            return f"⚠️ NOT_FOUND: {_root_display_path(normalized, path)} (resolved: {target})"
+        except Exception as exc:
+            return f"⚠️ READ_FILE_ERROR: {type(exc).__name__}: {exc}"
+        rendered = _render_line_slice(
+            _root_display_path(normalized, path), content,
+            max_lines=max_lines, start_line=start_line, start_char=start_char,
+        )
+        return _annotate_reread(ctx, target, start_line, max_lines, rendered, start_char=start_char)
     try:
         base = resource_root_path(ctx, normalized, bucket=bucket, skill_name=skill_name)
         target = resolve_resource_path(ctx, root=normalized, path=path, bucket=bucket, skill_name=skill_name)
@@ -1134,14 +1210,27 @@ def _list_files(
     max_entries: int = 500,
     bucket: str = "",
     skill_name: str = "",
+    _resolved_binding: ResolvedResourceBinding | None = None,
 ) -> str:
     normalized, block = _access_or_block(ctx, root, "list")
     if block:
         return block
-    protected_list_block = _protected_artifact_list_block(ctx, normalized, path, bucket=bucket, skill_name=skill_name)
+    try:
+        binding = _direct_resource_binding(
+            ctx, _resolved_binding, root=normalized, operation="list", path=path,
+            bucket=bucket, skill_name=skill_name,
+        )
+    except UserFilesPathBlockedError as exc:
+        return f"⚠️ USER_FILES_PATH_BLOCKED: {exc}"
+    except Exception as exc:
+        return f"⚠️ LIST_FILES_ERROR ({type(exc).__name__}): {exc}"
+    protected_list_block = (
+        block_reason_for_path(ctx, binding.target_path, "static_introspection")
+        if normalized == "skill_payload"
+        else _protected_artifact_list_block(ctx, normalized, path, bucket=bucket, skill_name=skill_name)
+    )
     if protected_list_block:
         return protected_list_block
-    task_constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
     try:
         # Every listing branch runs inside this try: a hard iterdir/permission/
         # race failure from any helper becomes the first-class LIST_FILES_ERROR
@@ -1158,8 +1247,12 @@ def _list_files(
             return _repo_list(ctx, dir=path, max_entries=max_entries)
         if normalized == "runtime_data":
             return _data_list(ctx, dir=path, max_entries=max_entries)
-        if normalized == "skill_payload" and not bucket and not skill_name and task_constraint and task_constraint.mode == "skill_repair":
-            return _data_list(ctx, dir=path, max_entries=max_entries)
+        if normalized == "skill_payload":
+            rel = binding.target_path.relative_to(binding.base_path).as_posix() or "."
+            items = _list_dir(binding.base_path, rel, max_entries)
+            if is_restricted_subagent_profile(ctx):
+                items = _filter_subagent_secret_listing(items, binding.base_path)
+            return json.dumps(items, ensure_ascii=False, indent=2)
         base = resource_root_path(ctx, normalized, bucket=bucket, skill_name=skill_name)
         if normalized == "user_files":
             target = resolve_user_file_path(ctx, path, allow_protected_descendants=True)
@@ -1198,10 +1291,28 @@ def _write_file(
     force: bool = False,
     bucket: str = "",
     skill_name: str = "",
+    _resolved_binding: ResolvedResourceBinding | tuple[ResolvedResourceBinding, ...] | None = None,
 ) -> str:
     normalized, block = _access_or_block(ctx, root, "write")
     if block:
         return block
+    try:
+        if _resolved_binding is None and files:
+            bindings: ResolvedResourceBinding | tuple[ResolvedResourceBinding, ...] = tuple(
+                _direct_resource_binding(
+                    ctx, None, root=normalized, operation="write",
+                    path=str(item.get("path") or ""), bucket=bucket, skill_name=skill_name,
+                )
+                for item in files if isinstance(item, dict)
+            )
+        else:
+            bindings = _direct_resource_binding(
+                ctx, _resolved_binding, root=normalized, operation="write", path=path,
+                bucket=bucket, skill_name=skill_name,
+            ) if _resolved_binding is None else _resolved_binding
+    except Exception as exc:
+        prefix = "SKILL_PAYLOAD_ARG_ERROR" if normalized == "skill_payload" else "WRITE_FILE_ERROR"
+        return f"⚠️ {prefix}: {exc}"
     if normalized == "system_repo":
         try:
             from ouroboros.tool_access import resource_root_path
@@ -1216,14 +1327,18 @@ def _write_file(
     for item in files or []:
         if isinstance(item, dict):
             write_paths.append(str(item.get("path") or ""))
-    protected_block = _protected_artifact_write_block(
-        ctx,
-        normalized,
-        write_paths,
-        bucket=bucket,
-        skill_name=skill_name,
-        prefix="WRITE_FILE_BLOCKED",
-    )
+    if normalized == "skill_payload":
+        binding_items = bindings if isinstance(bindings, tuple) else (bindings,)
+        protected_block = next((
+            f"⚠️ WRITE_FILE_BLOCKED: protected artifact path blocked: {reason}"
+            for item in binding_items
+            if (reason := block_reason_for_path(ctx, item.target_path, "write"))
+        ), "")
+    else:
+        protected_block = _protected_artifact_write_block(
+            ctx, normalized, write_paths, bucket=bucket, skill_name=skill_name,
+            prefix="WRITE_FILE_BLOCKED",
+        )
     if protected_block:
         return protected_block
     if normalized == "active_workspace" and (_room := project_room_lens_dir(ctx)) is not None:
@@ -1259,11 +1374,17 @@ def _write_file(
             return _join_write_results(results)
         return _data_write(ctx, path=path, content=content, mode=mode, display_root=normalized, force=force)
     if normalized == "skill_payload":
+        binding_items = bindings if isinstance(bindings, tuple) else (bindings,)
         if files:
             results = []
+            binding_iter = iter(binding_items)
             for item in files:
                 rel = str(item.get("path") or "") if isinstance(item, dict) else ""
                 body = str(item.get("content") or "") if isinstance(item, dict) else ""
+                item_binding = next(binding_iter, None) if isinstance(item, dict) else None
+                if item_binding is None:
+                    results.append("⚠️ TOOL_ARG_ERROR: files must contain {path, content} objects.")
+                    continue
                 results.append(_data_write(
                     ctx,
                     rel,
@@ -1273,9 +1394,14 @@ def _write_file(
                     skill_name=skill_name,
                     display_root=normalized,
                     force=force,
+                    _resolved_binding=item_binding,
                 ))
             return _join_write_results(results)
-        return _data_write(ctx, path=path, content=content, mode=mode, bucket=bucket, skill_name=skill_name, display_root=normalized, force=force)
+        return _data_write(
+            ctx, path=path, content=content, mode=mode, bucket=bucket,
+            skill_name=skill_name, display_root=normalized, force=force,
+            _resolved_binding=binding_items[0],
+        )
     try:
         if files:
             results = []
@@ -1337,10 +1463,19 @@ def _edit_text(
     bucket: str = "",
     skill_name: str = "",
     force: bool = False,
+    _resolved_binding: ResolvedResourceBinding | None = None,
 ) -> str:
     normalized, block = _access_or_block(ctx, root, "edit")
     if block:
         return block
+    try:
+        binding = _direct_resource_binding(
+            ctx, _resolved_binding, root=normalized, operation="edit", path=path,
+            bucket=bucket, skill_name=skill_name,
+        )
+    except Exception as exc:
+        prefix = "SKILL_PAYLOAD_ARG_ERROR" if normalized == "skill_payload" else "EDIT_TEXT_ERROR"
+        return f"⚠️ {prefix}: {exc}"
     if normalized == "system_repo":
         try:
             from ouroboros.tool_access import resource_root_path
@@ -1351,14 +1486,16 @@ def _edit_text(
                 return "⚠️ EDIT_TEXT_BLOCKED: root=system_repo edits require the active workspace to be the system repo."
         except Exception as exc:
             return f"⚠️ EDIT_TEXT_BLOCKED: could not validate system_repo root: {type(exc).__name__}: {exc}"
-    protected_block = _protected_artifact_write_block(
-        ctx,
-        normalized,
-        [path],
-        bucket=bucket,
-        skill_name=skill_name,
-        prefix="EDIT_TEXT_BLOCKED",
-    )
+    if normalized == "skill_payload":
+        reason = block_reason_for_path(ctx, binding.target_path, "write")
+        protected_block = (
+            f"⚠️ EDIT_TEXT_BLOCKED: protected artifact path blocked: {reason}" if reason else ""
+        )
+    else:
+        protected_block = _protected_artifact_write_block(
+            ctx, normalized, [path], bucket=bucket, skill_name=skill_name,
+            prefix="EDIT_TEXT_BLOCKED",
+        )
     if protected_block:
         return protected_block
     if normalized == "active_workspace" and (_room := project_room_lens_dir(ctx)) is not None:
@@ -1385,34 +1522,45 @@ def _edit_text(
             result += f"\n⚠️ SKILL_SHORT_FORM_IGNORED: {short_form.ignored_reason}."
         return result
     if normalized == "skill_payload":
-        from ouroboros.tools.git import _str_replace_editor
-
-        # Deferral 5: skill payloads live under data/skills/ (not the repo git), so
-        # git._str_replace_editor's git-ls-files shrink check never fires for them. Apply
-        # the data-plane shrink guard here (pre-checking the prospective replacement with
-        # the shared matcher) before delegating, so a payload edit can't silently truncate.
         try:
-            _sp_target = resolve_resource_path(ctx, root=normalized, path=path, bucket=bucket, skill_name=skill_name)
-            if _sp_target.exists():
-                _sp_new, _sp_err = _str_match_replace(
-                    _sp_target.read_text(encoding="utf-8"), old_str, new_str,
-                    _root_display_path(normalized, path), "EDIT_TEXT_ERROR",
+            target = binding.target_path
+            if (
+                _binding_skill_control_plane_path(binding)
+                or is_skill_control_plane_path(target, binding.state_drive_root)
+            ):
+                return (
+                    "⚠️ STR_REPLACE_BLOCKED: skill provenance, launcher seed, "
+                    "marketplace, dependency, and self-authored markers are "
+                    "control-plane state. Edit user-authored payload files instead."
                 )
-                if _sp_err:
-                    return _sp_err
-                if (shrink := _check_data_shrink_guard(_sp_target, _sp_new, force)):
-                    return shrink
-        except Exception:
-            log.debug("skill_payload shrink pre-check skipped", exc_info=True)
-        return _str_replace_editor(
-            ctx,
-            path=path,
-            old_str=old_str,
-            new_str=new_str,
-            bucket=bucket,
-            skill_name=skill_name,
-            display_root=normalized,
-        )
+            text = target.read_text(encoding="utf-8")
+            new_text, match_error = _str_match_replace(
+                text, old_str, new_str, _root_display_path(normalized, path), "EDIT_TEXT_ERROR",
+            )
+            if match_error:
+                return match_error
+            if (shrink := _check_data_shrink_guard(target, new_text, force)):
+                return shrink
+            write_text_atomic(target, new_text)
+            replacement_line = new_text[:new_text.index(new_str)].count("\n") + 1
+            context_start = max(0, replacement_line - 3)
+            context_lines = new_text.splitlines()[
+                context_start:replacement_line + len(new_str.splitlines()) + 2
+            ]
+            context_preview = "\n".join(
+                f"{context_start + index + 1:>4}| {line}"
+                for index, line in enumerate(context_lines)
+            )
+            return (
+                f"✅ Replaced in {_root_display_path(normalized, path)} "
+                f"(line {replacement_line}).\nContext:\n{context_preview}\n\n"
+                "File is on disk but NOT committed.\n"
+                "Run skill_review for this skill before enabling or declaring it ready."
+            )
+        except FileNotFoundError:
+            return f"⚠️ EDIT_TEXT_ERROR: file not found: {_root_display_path(normalized, path)}"
+        except Exception as exc:
+            return f"⚠️ EDIT_TEXT_ERROR: {type(exc).__name__}: {exc}"
     try:
         target = resolve_resource_path(ctx, root=normalized, path=path, bucket=bucket, skill_name=skill_name)
         if normalized == "runtime_data":
@@ -1643,19 +1791,33 @@ from ouroboros.code_search_rg import (  # noqa: E402
 def _code_search(ctx: ToolContext, query: str, path: str = ".",
                  regex: bool = False, max_results: int = 200,
                  include: str = "", root: str = "active_workspace",
-                 bucket: str = "", skill_name: str = "") -> str:
+                 bucket: str = "", skill_name: str = "",
+                 _resolved_binding: ResolvedResourceBinding | None = None) -> str:
     """Search repo text with optional regex, path, glob, and result cap."""
     if not query:
         return "⚠️ SEARCH_ERROR: query is required."
     normalized, block = _access_or_block(ctx, root, "search")
     if block:
         return block
+    try:
+        binding = _direct_resource_binding(
+            ctx, _resolved_binding, root=normalized, operation="search", path=path,
+            bucket=bucket, skill_name=skill_name,
+        )
+    except UserFilesPathBlockedError as exc:
+        return f"⚠️ USER_FILES_PATH_BLOCKED: {exc}"
+    except Exception as exc:
+        return f"⚠️ SEARCH_ERROR: {type(exc).__name__}: {exc}"
     if normalized == "runtime_data" and (b := _project_store_access_block(_normalize_data_read_path(ctx, path))):
         return b
 
     max_results = min(max(1, max_results), _MAX_SEARCH_RESULTS)
     try:
-        root_path = resource_root_path(ctx, normalized, bucket=bucket, skill_name=skill_name)
+        root_path = (
+            binding.base_path
+            if normalized == "skill_payload"
+            else resource_root_path(ctx, normalized, bucket=bucket, skill_name=skill_name)
+        )
     except Exception as exc:
         return f"⚠️ SEARCH_ERROR: {type(exc).__name__}: {exc}"
     if normalized == "active_workspace":
@@ -1675,7 +1837,7 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
         path = normalize_root_relative(root_path, path)
     display_search_path = _root_display_path(normalized, path)
     try:
-        search_root = (
+        search_root = binding.target_path if normalized == "skill_payload" else (
             resolve_user_file_path(ctx, path, allow_protected_descendants=True)
             if normalized == "user_files"
             else (root_path / safe_relpath(path)).resolve()

@@ -296,14 +296,14 @@ def dedupe_marketplace_skill_name(
     treated as a collision) and only rename to dodge a foreign-bucket skill,
     appending ``-<suffix>`` (then a numeric tail) until the identity is free.
     """
-    from ouroboros.skill_loader import _sanitize_skill_name, discover_skills
+    from ouroboros.skill_loader import _sanitize_skill_name, _skill_location_inventory
 
     try:
         bucket_root = target_root.resolve()
     except OSError:
         bucket_root = target_root
     foreign_names: set[str] = set()
-    for skill in discover_skills(drive_root):
+    for skill in _skill_location_inventory(drive_root):
         try:
             in_bucket = skill.skill_dir.resolve().parent == bucket_root
         except OSError:
@@ -480,6 +480,24 @@ def install_skill(
             if new_manifest_hash:
                 adapter_result.provenance["translated_manifest_sha256"] = new_manifest_hash
     target_dir = target_root / adapter_result.target_dirname
+    from ouroboros.skill_loader import _skill_location_conflict_error
+
+    identity_error = _skill_location_conflict_error(
+        drive_root,
+        name=adapter_result.sanitized_name,
+        location="clawhub",
+        target_dir=target_dir,
+    )
+    if identity_error:
+        staged.cleanup()
+        return fail(
+            identity_error,
+            sanitized_name=adapter_result.sanitized_name,
+            summary=summary,
+            archive=archive,
+            staged=staged,
+            adapter=adapter_result,
+        )
     auto_specs = list((adapter_result.provenance.get("install_specs") or {}).get("auto") or [])
     repair_partial_existing = False
     if target_dir.exists() and not overwrite and auto_specs:
@@ -555,11 +573,13 @@ def install_skill(
     # Seed grants.json for core settings so the owner-grant bridge has one file.
     try:
         from ouroboros.skill_loader import (
-            find_skill,
+            load_skill,
             requested_core_setting_keys,
             save_skill_grants,
         )
-        installed_skill = find_skill(drive_root, adapter_result.sanitized_name)
+        # Load the payload that just landed. Global discovery would also load
+        # unrelated same-name checkouts and create their lifecycle state.
+        installed_skill = load_skill(target_dir, drive_root)
         if installed_skill is not None:
             requested = requested_core_setting_keys(
                 list(installed_skill.manifest.env_from_settings or [])
@@ -705,6 +725,21 @@ def update_skill(
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> InstallResult:
     """Reinstall by resolving the original slug from persisted provenance."""
+    from ouroboros.skill_loader import _skill_location_conflict_error
+
+    expected_target = _clawhub_skills_root(drive_root) / sanitized_name
+    identity_error = _skill_location_conflict_error(
+        drive_root,
+        name=sanitized_name,
+        location="clawhub",
+        target_dir=expected_target,
+    )
+    if identity_error:
+        return InstallResult(
+            False,
+            sanitized_name,
+            error=identity_error,
+        )
     record = read_provenance(drive_root, sanitized_name)
 
     def _progress(stage: str) -> None:

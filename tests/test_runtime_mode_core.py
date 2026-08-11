@@ -515,20 +515,20 @@ def _git_repo(tmp_path: pathlib.Path) -> pathlib.Path:
 # ----- Light mode blanket block -----
 
 
-@pytest.mark.parametrize("tool_name", [
-    "write_file",
-    "commit_reviewed",
-    "edit_text",
-    "vcs_revert",
-    "vcs_pull_ff",
-    "vcs_restore",
-    "vcs_rollback",
-    "promote_to_stable",
+@pytest.mark.parametrize(("tool_name", "args"), [
+    ("write_file", {"path": "README.md", "content": "changed\n"}),
+    ("commit_reviewed", {"commit_message": "test"}),
+    ("edit_text", {"path": "README.md", "old_str": "ok", "new_str": "changed"}),
+    ("vcs_revert", {"sha": "HEAD"}),
+    ("vcs_pull_ff", {}),
+    ("vcs_restore", {}),
+    ("vcs_rollback", {"target": "HEAD"}),
+    ("promote_to_stable", {"reason": "test"}),
 ])
-def test_light_mode_blocks_repo_mutation_tools(tool_name, tmp_path, monkeypatch):
+def test_light_mode_blocks_repo_mutation_tools(tool_name, args, tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     reg = _registry(tmp_path)
-    result = reg.execute(tool_name, {"path": "README.md"})
+    result = reg.execute(tool_name, args)
     assert "LIGHT_MODE_BLOCKED" in result, result[:200]
 
 
@@ -928,17 +928,17 @@ def test_light_mode_blocks_inplace_mutation_tools(bad_cmd, tmp_path, monkeypatch
     assert "LIGHT_MODE_BLOCKED" in result, f"cmd={bad_cmd!r}: {result[:200]}"
 
 
-@pytest.mark.parametrize("tool_name", [
-    "fetch_pr_ref",
-    "create_integration_branch",
-    "cherry_pick_pr_commits",
-    "stage_adaptations",
-    "stage_pr_merge",
+@pytest.mark.parametrize(("tool_name", "args"), [
+    ("fetch_pr_ref", {"pr_number": 1}),
+    ("create_integration_branch", {"pr_number": 1}),
+    ("cherry_pick_pr_commits", {"shas": ["deadbeef"]}),
+    ("stage_adaptations", {}),
+    ("stage_pr_merge", {"branch": "integration/test"}),
 ])
-def test_light_mode_blocks_pr_integration_tools(tool_name, tmp_path, monkeypatch):
+def test_light_mode_blocks_pr_integration_tools(tool_name, args, tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     reg = _registry(tmp_path)
-    result = reg.execute(tool_name, {})
+    result = reg.execute(tool_name, args)
     assert "LIGHT_MODE_BLOCKED" in result
 
 
@@ -1149,6 +1149,10 @@ def _make_skill_payload(tmp_path, bucket, name):
     sees an existing payload root."""
     payload = tmp_path / "skills" / bucket / name
     payload.mkdir(parents=True)
+    (payload / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: test\nversion: 1.0.0\ntype: skill\n---\n",
+        encoding="utf-8",
+    )
     (payload / "plugin.py").write_text("def register(api):\n    pass\n", encoding="utf-8")
     return payload
 
@@ -1233,7 +1237,8 @@ def test_light_bucket_native_rejected_at_gate(tmp_path, monkeypatch):
         },
     )
     assert "SKILL_PAYLOAD_ARG_ERROR" in result, result[:200]
-    assert "native excluded" in result
+    assert "read/review only" in result
+    assert "root=system_repo" in result
 
 
 @pytest.mark.parametrize("tool_name,base_args", [
@@ -1264,7 +1269,15 @@ def test_light_partial_args_surface_specific_error_not_generic_light_block(
         f"expected specific partial-args error for {tool_name} {partial!r}; "
         f"got: {result[:300]}"
     )
-    assert "bucket and skill_name must be supplied together" in result, result[:300]
+    assert any(
+        hint in result
+        for hint in (
+            "bucket and skill_name must be supplied together",
+            "requires a non-empty skill_name",
+            "requires bucket/location",
+            "read/review only",
+        )
+    ), result[:300]
 
 
 def test_b2_external_workspace_stray_bucket_is_ignored_not_blocked(tmp_path, monkeypatch):

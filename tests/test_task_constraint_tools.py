@@ -11,6 +11,7 @@ def _ctx(tmp_path):
     repo.mkdir()
     skill = drive / "skills" / "external" / "alpha"
     skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# alpha\n", encoding="utf-8")
     return ToolContext(repo_dir=repo, drive_root=drive, task_constraint=TaskConstraint(mode="skill_repair", skill_name="alpha", payload_root="skills/external/alpha", allow_enable=False)), skill
 
 
@@ -255,6 +256,7 @@ def test_light_mode_allows_skill_payload_write_file(tmp_path, monkeypatch):
     repo.mkdir()
     skill = drive / "skills" / "external" / "alpha"
     skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# alpha\n", encoding="utf-8")
     registry = ToolRegistry(repo_dir=repo, drive_root=drive)
     monkeypatch.setattr(cfg, "get_runtime_mode", lambda: "light")
 
