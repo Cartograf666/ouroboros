@@ -36,6 +36,7 @@ def _ctx(tmp_path):
 
     return SimpleNamespace(
         repo_dir=tmp_path,
+        drive_root=tmp_path,
         drive_logs=lambda: pathlib.Path(str(tmp_path)),
     )
 

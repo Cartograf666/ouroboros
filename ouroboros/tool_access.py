@@ -1210,8 +1210,7 @@ def canonical_data_root(ctx: Any) -> pathlib.Path:
         text = str(candidate or "").strip()
         if text:
             return pathlib.Path(text).resolve(strict=False)
-    drive_root = getattr(ctx, "drive_root", None) or getattr(ctx, "repo_dir", ".")
-    return pathlib.Path(drive_root).resolve(strict=False)
+    return pathlib.Path(getattr(ctx, "drive_root")).resolve(strict=False)
 
 
 def normalize_runtime_data_path(data_root: pathlib.Path, path: str) -> str:

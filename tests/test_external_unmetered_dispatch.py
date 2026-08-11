@@ -41,6 +41,7 @@ def _prepare_script_skill(
     monkeypatch: pytest.MonkeyPatch,
     *,
     model_capable: bool = True,
+    state_root: pathlib.Path | None = None,
 ):
     skills_root = tmp_path / "skills"
     manifest = None
@@ -63,10 +64,11 @@ def _prepare_script_skill(
         skills_root, "alpha", script_body="print('ok')\n", manifest=manifest,
     )
     ctx = _make_ctx(tmp_path)
-    _mark_reviewed_and_enabled(ctx.drive_root, skill_dir, "alpha")
+    lifecycle_root = state_root or ctx.drive_root
+    _mark_reviewed_and_enabled(lifecycle_root, skill_dir, "alpha")
     if model_capable:
         save_skill_grants(
-            ctx.drive_root,
+            lifecycle_root,
             "alpha",
             ["OPENROUTER_API_KEY"],
             content_hash=compute_content_hash(skill_dir),
@@ -83,9 +85,11 @@ def _prepare_script_skill(
 
 
 def test_skill_exec_discloses_once_with_canonical_lineage(tmp_path, monkeypatch):
-    ctx, _skill_dir = _prepare_script_skill(tmp_path, monkeypatch)
     budget_root = tmp_path / "canonical-budget"
     budget_root.mkdir()
+    ctx, _skill_dir = _prepare_script_skill(
+        tmp_path, monkeypatch, state_root=budget_root,
+    )
     ctx.task_id = "child-task"
     ctx.budget_drive_root = str(budget_root)
     ctx.task_metadata = {
