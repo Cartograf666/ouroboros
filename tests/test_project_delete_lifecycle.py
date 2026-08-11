@@ -415,3 +415,64 @@ def test_a_checkout_that_survives_is_disclosed_on_the_tombstone_and_to_the_owner
     assert out["branch"] in entry["delete_error"]
     assert told and told[0][0] == "racer"
     assert str(checkout) in told[0][1]
+
+
+def test_a_disclosure_too_long_to_fit_says_what_it_left_out(tmp_path):
+    """P1: the one text that may NOT lose part of itself in silence.
+
+    `_orphaned_checkouts_note` names each surviving folder and branch because a
+    tombstoned project is on no surface that could show them — and then cut the
+    joined lines with a flat `[:2000]`. Reproduced at 30 survivors: 13 checkouts
+    disappeared from the only record naming them and the sentence ended mid-word,
+    with nothing saying anything had been dropped. A cap over an owner-facing
+    disclosure about lost work is a bound, not a licence to lose the tail.
+    """
+    from supervisor.task_lifecycle import _orphaned_checkouts_note
+
+    kept = [
+        {"thread_id": i,
+         "path": f"/Users/owner/Ouroboros/thread_worktrees/bigproject__{i}",
+         "branch": f"thread/feature-{i}", "reason": "unmerged_work"}
+        for i in range(1, 31)
+    ]
+    note = _orphaned_checkouts_note(kept)
+
+    named = [row for row in kept if f"thread {row['thread_id']}: {row['path']}" in note]
+    dropped = [row for row in kept if row not in named]
+    assert dropped, "this reproduction needs the budget to actually bite"
+    # Whatever is named is named WHOLE — the bound falls on an entry boundary, so
+    # no checkout is half-identified by a path cut in the middle.
+    for row in named:
+        assert f"{row['path']} (branch {row['branch']}) — unmerged_work" in note
+    # ...and everything else is DECLARED: how many, which threads, and where the
+    # unabridged list is.
+    assert f"{len(dropped)} more are still on disk and NOT named above" in note
+    for row in dropped:
+        assert str(row["thread_id"]) in note
+    assert "in the app log" in note
+    # The total is still stated up front, so the count never shrinks to what fit.
+    assert note.startswith(f"{len(kept)} thread checkouts could not be removed")
+
+
+def test_a_bounded_delete_error_reaches_the_row_with_its_omission_marker(tmp_path):
+    """The registry's own backstop bounds `delete_error`; it must not cut silently
+    either, and it must be roomy enough not to re-cut a note that already declared
+    its own omissions."""
+    from ouroboros.projects_registry import (
+        begin_project_deletion,
+        complete_project_deletion,
+        create_project,
+    )
+
+    drive = tmp_path / "drive"
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    create_project(drive, "verbose", name="Verbose", working_dir=str(folder))
+    begin_project_deletion(drive, "verbose")
+    original = "x" * 12000
+    entry = complete_project_deletion(drive, "verbose", delete_error=original)
+
+    stored = entry["delete_error"]
+    assert len(stored) < len(original), "the field is still bounded"
+    assert "OMISSION NOTE" in stored, "...but the bound announces itself"
+    assert str(len(original)) in stored, "the original length is part of the disclosure"

@@ -16,9 +16,16 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from ouroboros.utils import utc_now_iso
+from ouroboros.utils import truncate_review_artifact, utc_now_iso
 
 log = logging.getLogger(__name__)
+
+#: Character budget for the orphaned-checkout disclosure written onto a tombstoned
+#: project row and sent to the owner. A bound, never a silent cut: entries are
+#: dropped whole and declared by count and thread id (see
+#: :func:`_orphaned_checkouts_note`), and prose goes through the
+#: ``truncate_review_artifact`` SSOT, which carries the omission marker.
+ORPHANED_NOTE_LIMIT = 2000
 
 
 #: How long a quiesce pass waits before re-reading the live set.
@@ -1162,10 +1169,11 @@ def _sweep_project_checkouts(drive_root: object, project_id: str) -> str:
         _queue_module().log.warning(
             "Project %s: thread checkout sweep failed", project_id, exc_info=True,
         )
-        return (
+        return truncate_review_artifact(
             "the thread checkouts could not be swept "
-            f"({type(exc).__name__}: {exc}), so any that exist are still on disk."
-        )[:2000]
+            f"({type(exc).__name__}: {exc}), so any that exist are still on disk.",
+            limit=ORPHANED_NOTE_LIMIT,
+        )
 
 
 def _orphaned_checkouts_note(kept: List[Dict[str, Any]]) -> str:
@@ -1174,23 +1182,53 @@ def _orphaned_checkouts_note(kept: List[Dict[str, Any]]) -> str:
     Names each folder and branch rather than counting them: the project is about to
     become invisible on every surface, so this text is the only thing that can
     still point the owner at work only they can reach now.
+
+    Which is exactly why it may not be cut silently (BIBLE P1, DEVELOPMENT.md "No
+    silent truncation"). A flat ``[:2000]`` over the joined lines dropped whole
+    checkouts out of the only record that names them — reproduced at 30 survivors,
+    where 13 vanished and the sentence ended mid-word — with no marker saying so.
+    A disclosure about work the owner can no longer reach through the app is the
+    last text that may lose part of itself in silence. So the bound is taken at an
+    ENTRY boundary, never mid-entry, and whatever does not fit is DECLARED: the
+    count, the thread ids (short, and the key to finding the folder), and where the
+    unabridged list is. ``log.warning`` in the caller writes that full list, and
+    says so here rather than being a record nobody knows exists.
     """
     lines = []
     for item in kept:
         path = str(item.get("path") or "").strip() or "(path unknown)"
         branch = str(item.get("branch") or "").strip()
         reason = str(item.get("reason") or "removal_failed")
-        lines.append(
+        lines.append((
+            item.get("thread_id"),
             f"thread {item.get('thread_id')}: {path}"
             + (f" (branch {branch})" if branch else "")
-            + f" — {reason}"
-        )
+            + f" — {reason}",
+        ))
     count = len(lines)
-    return (
+    head = (
         f"{count} thread checkout{'' if count == 1 else 's'} could not be removed and "
         f"{'is' if count == 1 else 'are'} still on disk; the project is deleted, so "
-        "nothing in the app can reach them any more. " + "; ".join(lines)
-    )[:2000]
+        "nothing in the app can reach them any more. "
+    )
+    named: List[str] = []
+    omitted: List[str] = []
+    used = len(head)
+    for thread_id, line in lines:
+        if named and used + len(line) + 2 > ORPHANED_NOTE_LIMIT:
+            omitted.append(str(thread_id))
+            continue
+        named.append(line)
+        used += len(line) + 2
+    text = head + "; ".join(named)
+    if omitted:
+        text += (
+            f". {len(omitted)} more are still on disk and NOT named above "
+            f"(thread{'' if len(omitted) == 1 else 's'} {', '.join(omitted)}); "
+            "their full paths and branches are in the app log, on the "
+            "\"tombstoned with … thread checkout(s) still on disk\" warning."
+        )
+    return text
 
 
 def _tell_owner_about_orphaned_checkouts(project_id: str, note: str) -> None:

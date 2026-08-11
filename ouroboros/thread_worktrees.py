@@ -51,7 +51,9 @@ from ouroboros.subagent_worktrees import (
     safe_path_component,
     worktree_ops_lock,
 )
-from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
+from ouroboros.utils import (
+    atomic_write_json, read_json_dict, truncate_review_artifact, utc_now_iso,
+)
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +69,11 @@ _LOCK = threading.RLock()
 # (branch-off is a later phase)"; T3 IS that phase, and branch-off, merge-back,
 # the checkout diff and the inspected removal all reach it.
 _ROOT_ENV = "OUROBOROS_THREAD_WORKTREE_ROOT"
+#: Character bound for a surviving checkout's `reason` and for the git text a
+#: failed inspection reports. Both go through the `truncate_review_artifact`
+#: SSOT, so an overflow carries its omission marker instead of vanishing.
+_KEPT_REASON_LIMIT = 200
+_GIT_TEXT_LIMIT = 500
 
 
 def thread_worktree_root() -> Path:
@@ -344,7 +351,9 @@ def inspect_thread_worktree(row: Dict[str, Any]) -> Dict[str, Any]:
         )
         if status.returncode != 0:
             # Not a checkout any more (or git refused): unsafe by construction.
-            out["error"] = (status.stderr or "git status failed").strip()[:500]
+            out["error"] = truncate_review_artifact(
+                (status.stderr or "git status failed").strip(), limit=_GIT_TEXT_LIMIT,
+            )
             out["dirty"] = True
             return out
         files = [line for line in status.stdout.splitlines() if line.strip()]
@@ -363,12 +372,14 @@ def inspect_thread_worktree(row: Dict[str, Any]) -> Dict[str, Any]:
                 wt_path, "rev-list", "--count", *tips, "--not", reference, check=False,
             )
             if ahead.returncode != 0:
-                out["error"] = (ahead.stderr or "git rev-list failed").strip()[:500]
+                out["error"] = truncate_review_artifact(
+                    (ahead.stderr or "git rev-list failed").strip(), limit=_GIT_TEXT_LIMIT,
+                )
                 out["dirty"] = True
                 return out
             out["unmerged_commits"] = int((ahead.stdout or "0").strip() or 0)
     except Exception as exc:
-        out["error"] = str(exc)[:500]
+        out["error"] = truncate_review_artifact(str(exc), limit=_GIT_TEXT_LIMIT)
         out["dirty"] = True
     return out
 
@@ -713,7 +724,13 @@ def remove_project_thread_worktrees(data_dir: Any, project_id: Any) -> Dict[str,
             )
         except Exception as exc:  # noqa: BLE001 — an orphan must never be silent
             log.warning("Project deletion could not remove checkout %s#%s", project_id, tid, exc_info=True)
-            kept.append({**survivor, "reason": f"{type(exc).__name__}: {exc}"[:200]})
+            # Bounded, not silently cut: this reason is the only account of WHY a
+            # folder the tombstone can no longer reach survived, so an overflow
+            # arrives with the SSOT omission marker rather than losing its tail in
+            # silence (BIBLE P1, DEVELOPMENT.md "No silent truncation").
+            kept.append({**survivor, "reason": truncate_review_artifact(
+                f"{type(exc).__name__}: {exc}", limit=_KEPT_REASON_LIMIT,
+            )})
             continue
         if outcome.get("removed"):
             removed.append(tid)
@@ -798,7 +815,10 @@ def _drop_clean_branch(repo: Path, branch: str, holds_commits: bool) -> tuple:
     except Exception as exc:
         return False, f"the branch could not be deleted: {type(exc).__name__}: {exc}"
     if dropped.returncode != 0:
-        return False, (dropped.stderr or dropped.stdout or "git refused to delete the branch").strip()[:300]
+        return False, truncate_review_artifact(
+            (dropped.stderr or dropped.stdout or "git refused to delete the branch").strip(),
+            limit=_GIT_TEXT_LIMIT,
+        )
     return True, ""
 
 

@@ -55,7 +55,9 @@ from ouroboros.project_threads_registry import (
     restore_thread,
     thread_is_visible,
 )
-from ouroboros.utils import atomic_write_json, iter_jsonl_objects, read_json_dict, utc_now_iso
+from ouroboros.utils import (
+    atomic_write_json, iter_jsonl_objects, read_json_dict, truncate_review_artifact, utc_now_iso,
+)
 
 log = logging.getLogger(__name__)
 
@@ -74,6 +76,10 @@ PROJECT_NAME_MAX = 80
 PROJECT_ACTIVE = "active"
 PROJECT_DELETING = "deleting"
 PROJECT_TOMBSTONED = "tombstoned"
+
+#: Character bound for the durable ``delete_error`` disclosure. A BOUND, not a
+#: silent cut: overflow rides the ``truncate_review_artifact`` omission marker.
+DELETE_ERROR_LIMIT = 4000
 PROJECT_LIFECYCLES = frozenset({PROJECT_ACTIVE, PROJECT_DELETING, PROJECT_TOMBSTONED})
 _DEPRECATED_CHAT_IDS_EVENTS: set[str] = set()
 
@@ -952,7 +958,9 @@ def fail_project_deletion(
         data = _load(drive_root)
         for entry in data["projects"]:
             if entry.get("id") == pid and entry.get("lifecycle") == PROJECT_DELETING:
-                entry["delete_error"] = str(error or "deletion did not quiesce")[:2000]
+                entry["delete_error"] = truncate_review_artifact(
+                    str(error or "deletion did not quiesce"), limit=DELETE_ERROR_LIMIT,
+                )
                 _save(drive_root, data)
                 return dict(entry)
     return None
@@ -971,11 +979,19 @@ def complete_project_deletion(
     surviving checkout would be a folder and a ``thread/*`` branch nothing can
     reach, previously announced by a ``log.warning`` alone. It is written onto the
     row here, and the caller also tells the owner in chat — never silently.
+
+    The field is BOUNDED, never silently cut: a flat ``[:2000]`` over a note that
+    names surviving folders and branches dropped whole checkouts out of the only
+    record that points at them, and ended the sentence mid-word. The caller
+    already bounds its list at an entry boundary and declares what it left out;
+    this is the string backstop for anything else written here, and it goes
+    through the ``truncate_review_artifact`` SSOT so an overflow arrives with its
+    omission marker attached (DEVELOPMENT.md "No silent truncation").
     """
     pid = sanitize_project_id(project_id)
     if not pid:
         return None
-    note = str(delete_error or "")[:2000]
+    note = truncate_review_artifact(str(delete_error or ""), limit=DELETE_ERROR_LIMIT)
     with _file_write_lock(_registry_path(drive_root)):
         data = _load(drive_root)
         for entry in data["projects"]:
