@@ -347,9 +347,12 @@ def test_release_workflow_orders_smoke_sbom_attestation_and_draft_verification()
     assert "--check clean_shutdown" in workflow
     assert "--check shared_libraries" in workflow
     assert 'APP_ROOT="$HOME_DIR/Ouroboros"' in workflow
-    assert 'APPIMAGE_RUNTIME_PID="$(ps -o ppid= -p "$LAUNCHER_PID"' in workflow
+    assert 'APPIMAGE_CUSTODIAN_PID="$(ps -o ppid= -p "$LAUNCHER_PID"' in workflow
+    assert 'APPIMAGE_RUNTIME_PID="$(ps -o ppid= -p "$APPIMAGE_CUSTODIAN_PID"' in workflow
     assert 'kill -0 "$APPIMAGE_RUNTIME_PID"' in workflow
-    assert "Wait on that owning process instead" in workflow
+    assert 'APPIMAGE_PRIVATE_BASE="${APPIMAGE_RUNTIME_ROOT%/*}"' in workflow
+    assert 'if [ -e "$APPIMAGE_PRIVATE_BASE" ]; then' in workflow
+    assert "runtime death orders the cleanup" in workflow
     assert 'OUROBOROS_APP_ROOT="$APP_ROOT"' not in workflow
     assert 'test -x "$MOUNT/Install CLI.command"' in workflow
     assert 'test -L "$MOUNT/Applications"' in workflow

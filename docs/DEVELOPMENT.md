@@ -1686,7 +1686,13 @@ Linux additionally emits an AppImage built by a version- and digest-pinned
 it for metadata and SBOM inspection, then uses real extract-and-run invocations
 to verify product version, CLI dispatch, the browser-fallback launcher, gateway
 readiness, payload lifetime after `run --start`, shared libraries, and graceful
-shutdown. This smoke deliberately makes no native GTK/Qt claim: packaged native
+shutdown. A nested extract-and-run relaunch receives a private temporary base;
+its marker-gated `AppRun` waits as the payload custodian, restores the caller's
+`TMPDIR` before launch, and removes the verified extraction plus the empty private
+base after the launcher exits. The release smoke proves the resulting type-2
+runtime → custodian → launcher process chain and waits on the runtime before it
+requires both paths to be absent. Ordinary FUSE launches retain direct `exec`.
+This smoke deliberately makes no native GTK/Qt claim: packaged native
 webview coverage remains a separate Linux distribution contract.
 `OUROBOROS_SKIP_PLAYWRIGHT_INSTALL_DEPS=1` is only a local-builder escape hatch
 for hosts whose system packages are managed separately: it skips Playwright's

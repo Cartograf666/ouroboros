@@ -94,6 +94,25 @@ def read_text(path: pathlib.Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def resolve_path_allow_missing(path: pathlib.Path) -> Optional[pathlib.Path]:
+    """Resolve a path while allowing a missing tail but rejecting unusable ancestry.
+
+    Python 3.13 changed ``Path.resolve(strict=False)`` so a symlink loop no longer
+    raises and instead returns a partially resolved path. Probe strict resolution
+    first to keep loops, unreadable parents, and non-directory ancestors typed as
+    unusable; only an ordinary missing component earns the allow-missing fallback.
+    """
+    try:
+        return pathlib.Path(path).resolve(strict=True)
+    except FileNotFoundError:
+        try:
+            return pathlib.Path(path).resolve(strict=False)
+        except (OSError, ValueError, RuntimeError, TypeError):
+            return None
+    except (OSError, ValueError, RuntimeError, TypeError):
+        return None
+
+
 def write_text(path: pathlib.Path, content: str) -> None:
     # Full-file overwrite -> atomic (temp-sibling + os.replace), so a crash mid-write never
     # leaves a truncated file (G, v6.39). Strictly safer for every caller of this overwrite
@@ -985,4 +1004,3 @@ def truncate_review_artifact(text: str | None, limit: int = 4000) -> str:
     if len(text) - limit <= len(marker):
         return text
     return text[:limit] + marker
-

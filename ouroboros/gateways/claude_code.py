@@ -38,6 +38,7 @@ from ouroboros.usage_accounting import (
     settle_attempt,
     usage_scope,
 )
+from ouroboros.utils import resolve_path_allow_missing
 
 log = logging.getLogger(__name__)
 
@@ -335,7 +336,7 @@ def _resolved(value: Any, base: Optional[pathlib.Path] = None) -> Optional[pathl
         target = pathlib.Path(value)
         if base is not None and not target.is_absolute():
             target = base / target
-        return target.resolve()
+        return resolve_path_allow_missing(target)
     except (OSError, ValueError, RuntimeError, TypeError):
         return None
 

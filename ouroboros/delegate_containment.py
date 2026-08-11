@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from ouroboros import delegate_custody as custody
+from ouroboros.utils import resolve_path_allow_missing
 
 _TERMINAL_STATES = custody.TERMINAL_STATES
 
@@ -35,8 +36,12 @@ _UNKNOWN_ACCESS_RANK = 99
 
 def _resolved(path: Any) -> Optional[pathlib.Path]:
     try:
-        return pathlib.Path(str(path)).resolve() if str(path or "").strip() else None
-    except (OSError, ValueError, RuntimeError):
+        return (
+            resolve_path_allow_missing(pathlib.Path(str(path)))
+            if str(path or "").strip()
+            else None
+        )
+    except (OSError, ValueError, RuntimeError, TypeError):
         return None
 
 
@@ -165,5 +170,4 @@ def _inside_operator_home(applied: pathlib.Path, real_home: pathlib.Path) -> boo
     entire /v2 control API. Both resolved, so a symlink cannot launder it.
     """
     return applied == real_home or real_home in applied.parents
-
 

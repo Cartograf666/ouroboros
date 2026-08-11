@@ -1101,10 +1101,10 @@ class TestReadGuard:
                                "tool_input": {"paths": [str(tmp_path), "/etc/hosts"]}}, "t", None))
         assert out, "a path inside a list escaped the read fence"
 
-        # An unresolvable path denies, whatever makes it unresolvable: `OSError` alone
-        # missed an embedded null (`ValueError`, legal in a JSON string) and a symlink
-        # loop (`RuntimeError`). A guard that raises out of the PreToolUse callback
-        # delivers no decision at all — the one outcome a fence must never produce.
+        # An unresolvable path denies, whatever makes it unresolvable: embedded nulls
+        # and symlink loops have changed their exact `Path.resolve()` failure behaviour
+        # across supported Python versions. A guard that raises out of the PreToolUse
+        # callback delivers no decision at all — the one outcome a fence must never produce.
         import os as _os
 
         _os.symlink(tmp_path / "loop_b", tmp_path / "loop_a")
@@ -1112,6 +1112,9 @@ class TestReadGuard:
         for bad in ("/etc/passwd\x00", str(tmp_path / "loop_a" / "x")):
             assert self._run(guard({"tool_name": "Read",
                                     "tool_input": {"file_path": bad}}, "t", None)), bad
+        missing = tmp_path / "missing" / "leaf"
+        assert self._run(guard({"tool_name": "Read",
+                                "tool_input": {"file_path": str(missing)}}, "t", None)) == {}
 
         # In-workspace values still pass, whatever they are called.
         inside = tmp_path / "a.txt"

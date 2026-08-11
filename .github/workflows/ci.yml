@@ -732,14 +732,20 @@ jobs:
             exit 1
           fi
           APPIMAGE_RUNTIME_ROOT="${LAUNCHER_EXE%/usr/lib/ouroboros/Ouroboros}"
-          APPIMAGE_RUNTIME_PID="$(ps -o ppid= -p "$LAUNCHER_PID" | tr -d '[:space:]')"
+          APPIMAGE_PRIVATE_BASE="${APPIMAGE_RUNTIME_ROOT%/*}"
+          APPIMAGE_CUSTODIAN_PID="$(ps -o ppid= -p "$LAUNCHER_PID" | tr -d '[:space:]')"
+          if [ -z "$APPIMAGE_CUSTODIAN_PID" ] || ! kill -0 "$APPIMAGE_CUSTODIAN_PID" 2>/dev/null; then
+            echo "Could not identify the AppRun custodian for launcher $LAUNCHER_PID" >&2
+            exit 1
+          fi
+          APPIMAGE_RUNTIME_PID="$(ps -o ppid= -p "$APPIMAGE_CUSTODIAN_PID" | tr -d '[:space:]')"
           if [ -z "$APPIMAGE_RUNTIME_PID" ] || ! kill -0 "$APPIMAGE_RUNTIME_PID" 2>/dev/null; then
-            echo "Could not identify the AppImage runtime that owns launcher $LAUNCHER_PID" >&2
+            echo "Could not identify the AppImage runtime that owns custodian $APPIMAGE_CUSTODIAN_PID" >&2
             exit 1
           fi
           APPIMAGE_RUNTIME_EXE="$(readlink "/proc/$APPIMAGE_RUNTIME_PID/exe")"
           if [ "$APPIMAGE_RUNTIME_EXE" != "$APPIMAGE" ]; then
-            echo "Launcher parent is not the stable AppImage runtime: $APPIMAGE_RUNTIME_EXE" >&2
+            echo "Custodian parent is not the stable AppImage runtime: $APPIMAGE_RUNTIME_EXE" >&2
             exit 1
           fi
 
@@ -754,9 +760,10 @@ jobs:
             echo "AppImage launcher did not shut down after SIGTERM" >&2
             exit 1
           fi
-          # The type-2 runtime removes its extraction after the launcher exits
-          # and only then terminates. Wait on that owning process instead of
-          # racing a fixed pathname cleanup interval.
+          # The marker-gated AppRun custodian waits for the launcher, removes
+          # the private extraction, and exits. The type-2 runtime reaps that
+          # custodian before it terminates, so runtime death orders the cleanup
+          # proof without racing a fixed pathname interval.
           for _ in $(seq 1 240); do
             ! kill -0 "$APPIMAGE_RUNTIME_PID" 2>/dev/null && break
             sleep 0.5
@@ -765,8 +772,18 @@ jobs:
             echo "AppImage runtime did not finish cleanup after launcher shutdown" >&2
             exit 1
           fi
+          if kill -0 "$APPIMAGE_CUSTODIAN_PID" 2>/dev/null; then
+            echo "AppRun custodian remained alive after its AppImage runtime exited" >&2
+            exit 1
+          fi
           if [ -e "$APPIMAGE_RUNTIME_ROOT" ]; then
-            echo "AppImage runtime left its extraction behind: $APPIMAGE_RUNTIME_ROOT" >&2
+            echo "AppRun custodian left its extraction behind: $APPIMAGE_RUNTIME_ROOT" >&2
+            cat "$CLI_LOG" >&2
+            exit 1
+          fi
+          if [ -e "$APPIMAGE_PRIVATE_BASE" ]; then
+            echo "AppRun custodian left its private runtime root behind: $APPIMAGE_PRIVATE_BASE" >&2
+            cat "$CLI_LOG" >&2
             exit 1
           fi
           if [ -e "$PID_FILE" ]; then

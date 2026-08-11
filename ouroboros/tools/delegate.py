@@ -36,7 +36,7 @@ from ouroboros import delegate_progress as progress
 from ouroboros.delegate_custody import RunCustody as _RunCustody
 from ouroboros.tool_capabilities import tool_result_limit
 from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for
-from ouroboros.utils import truncate_review_artifact
+from ouroboros.utils import resolve_path_allow_missing, truncate_review_artifact
 # The staged-output + read-receipt cluster lives in its own module (size gate);
 # re-exported here because sibling code, the tests and the convergence census all
 # name it on THIS surface, and `_READ_COVERAGE` must stay the same object.
@@ -600,8 +600,8 @@ def _resolved(path: Any) -> Optional[pathlib.Path]:
     """Resolve a path, or None when it cannot be resolved at all (null byte, symlink
     loop, unreadable parent). One predicate, so no call site re-enumerates the set."""
     try:
-        return pathlib.Path(str(path)).resolve()
-    except (OSError, ValueError, RuntimeError):
+        return resolve_path_allow_missing(pathlib.Path(str(path)))
+    except (OSError, ValueError, RuntimeError, TypeError):
         return None
 
 
@@ -653,9 +653,9 @@ def _mutating_run_root(ctx: ToolContext, authority: "DelegatedRunShape") -> tupl
             "has none. Refusing rather than falling back to the repository root.",
         )
     # "Can this path be resolved at all" is ONE question, not an exception set to
-    # re-enumerate: an embedded null raises ValueError and a symlink loop RuntimeError,
-    # and either escaping here would abort delegate_start with a traceback instead of the
-    # typed refusal this function exists to produce.
+    # re-enumerate: embedded nulls and symlink loops vary in exact exception behaviour
+    # across supported Python versions, and either escaping here would abort
+    # delegate_start instead of returning the typed refusal this function exists to produce.
     resolved_root, resolved_grant = _resolved(root), _resolved(granted)
     same = resolved_root is not None and resolved_root == resolved_grant
     if not same:

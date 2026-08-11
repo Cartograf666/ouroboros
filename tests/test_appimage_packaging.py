@@ -86,21 +86,28 @@ def test_apprun_exposes_cli_without_writing_to_the_mount(tmp_path: pathlib.Path)
     assert result.stdout.strip() == str(appdir / "usr/lib/ouroboros/_internal")
 
 
-@pytest.mark.parametrize("original_tmpdir", [None, "/caller/tmp"])
-def test_apprun_restores_tmpdir_before_payload(tmp_path: pathlib.Path, original_tmpdir: str | None):
-    appdir = tmp_path / "AppDir"
-    cli = appdir / "usr/lib/ouroboros/bin/ouroboros"
-    cli.parent.mkdir(parents=True)
-    cli.write_text(
+@pytest.mark.parametrize(
+    ("original_tmpdir", "payload_status"),
+    [(None, 0), ("/caller/tmp", 37)],
+)
+def test_apprun_custodian_restores_environment_and_removes_private_runtime(
+    tmp_path: pathlib.Path,
+    original_tmpdir: str | None,
+    payload_status: int,
+):
+    private_base = tmp_path / "ouroboros-appimage-runtime-test"
+    appdir = private_base / "appimage_extracted_test"
+    observed = tmp_path / "payload-environment.txt"
+    launcher = appdir / "usr/lib/ouroboros/Ouroboros"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text(
         "#!/bin/sh\n"
-        "if [ \"${TMPDIR+x}\" = x ]; then printf 'set:%s\\n' \"$TMPDIR\"; else printf 'unset\\n'; fi\n"
+        "if [ \"${TMPDIR+x}\" = x ]; then value=set:$TMPDIR; else value=unset; fi\n"
         "if env | grep -q '^OUROBOROS_APPIMAGE_'; then exit 9; fi\n"
-        "exit 0\n",
+        "printf '%s\\n' \"$value\" > \"$OBSERVED_PATH\"\n"
+        "exit \"$TEST_PAYLOAD_STATUS\"\n",
         encoding="utf-8",
     )
-    cli.chmod(0o755)
-    launcher = appdir / "usr/lib/ouroboros/Ouroboros"
-    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     launcher.chmod(0o755)
     apprun = appdir / "AppRun"
     apprun.write_bytes((REPO / "packaging/appimage/AppRun").read_bytes())
@@ -108,21 +115,88 @@ def test_apprun_restores_tmpdir_before_payload(tmp_path: pathlib.Path, original_
     env = {
         **os.environ,
         "APPDIR": str(appdir),
-        "TMPDIR": "/private/extraction",
+        "TMPDIR": str(private_base),
         "OUROBOROS_APPIMAGE_RESTORE_TMPDIR": "1",
         "OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR_SET": "1" if original_tmpdir is not None else "0",
         "OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR": original_tmpdir or "",
+        "OBSERVED_PATH": str(observed),
+        "TEST_PAYLOAD_STATUS": str(payload_status),
     }
 
     result = subprocess.run(
-        [str(apprun), "--cli", "--help"],
+        [str(apprun)],
         env=env,
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
     )
 
-    assert result.stdout.strip() == (f"set:{original_tmpdir}" if original_tmpdir is not None else "unset")
+    assert result.returncode == payload_status
+    assert observed.read_text(encoding="utf-8").strip() == (
+        f"set:{original_tmpdir}" if original_tmpdir is not None else "unset"
+    )
+    assert not appdir.exists()
+    assert not private_base.exists()
+
+
+def test_apprun_custodian_refuses_unrelated_private_runtime(tmp_path: pathlib.Path):
+    private_base = tmp_path / "ouroboros-appimage-runtime-test"
+    private_base.mkdir()
+    sentinel = private_base / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    appdir = tmp_path / "elsewhere" / "appimage_extracted_test"
+    launcher = appdir / "usr/lib/ouroboros/Ouroboros"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    apprun = appdir / "AppRun"
+    apprun.write_bytes((REPO / "packaging/appimage/AppRun").read_bytes())
+    apprun.chmod(0o755)
+
+    result = subprocess.run(
+        [str(apprun)],
+        env={
+            **os.environ,
+            "APPDIR": str(appdir),
+            "TMPDIR": str(private_base),
+            "OUROBOROS_APPIMAGE_RESTORE_TMPDIR": "1",
+            "OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR_SET": "0",
+            "OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR": "",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "outside its private runtime root" in result.stderr
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert appdir.is_dir()
+
+
+def test_apprun_unmarked_desktop_path_keeps_exec_pid_and_appdir(tmp_path: pathlib.Path):
+    appdir = tmp_path / "AppDir"
+    pid_output = tmp_path / "launcher.pid"
+    launcher = appdir / "usr/lib/ouroboros/Ouroboros"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$PID_OUTPUT\"\n",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+    apprun = appdir / "AppRun"
+    apprun.write_bytes((REPO / "packaging/appimage/AppRun").read_bytes())
+    apprun.chmod(0o755)
+
+    process = subprocess.Popen(
+        [str(apprun)],
+        env={**os.environ, "APPDIR": str(appdir), "PID_OUTPUT": str(pid_output)},
+    )
+    process_pid = process.pid
+    assert process.wait(timeout=10) == 0
+
+    assert int(pid_output.read_text(encoding="utf-8")) == process_pid
+    assert appdir.is_dir()
 
 
 def test_appimage_builder_pins_tool_and_embedded_runtime():

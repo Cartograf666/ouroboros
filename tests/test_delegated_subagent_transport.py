@@ -1933,14 +1933,15 @@ def _plain_ctx(tmp_path):
 def test_an_unresolvable_write_root_is_a_typed_refusal_not_a_traceback(tmp_path):
     """"Can this path be resolved at all" is ONE question, not an exception set.
 
-    `Path.resolve()` raises `ValueError` on an embedded null and `RuntimeError` on a
-    symlink loop, neither of which is an `OSError`. Either escaping `_mutating_run_root`
+    Embedded nulls and symlink loops have changed their exact `Path.resolve()` failure
+    behaviour across supported Python versions. Either escaping `_mutating_run_root`
     aborts `delegate_start` with a traceback instead of the typed refusal the function
     exists to produce — and a guard that raises delivers no decision at all.
     """
     import os
 
     from ouroboros.contracts.task_constraint import TaskConstraint
+    from ouroboros.delegate_containment import _resolved as containment_resolved
     from ouroboros.subagents import delegated_run_shape
     from ouroboros.tools.delegate import _mutating_run_root, _resolved
     from ouroboros.tools.registry import ToolContext
@@ -1948,8 +1949,12 @@ def test_an_unresolvable_write_root_is_a_typed_refusal_not_a_traceback(tmp_path)
     os.symlink(tmp_path / "b", tmp_path / "a")
     os.symlink(tmp_path / "a", tmp_path / "b")
     assert _resolved(tmp_path / "a" / "x") is None, "a symlink loop must resolve to None"
+    assert containment_resolved(tmp_path / "a" / "x") is None
     assert _resolved("/etc/passwd\x00") is None, "an embedded null must resolve to None"
     assert _resolved(tmp_path) == tmp_path.resolve(), "an ordinary path still resolves"
+    missing = tmp_path / "missing" / "leaf"
+    assert _resolved(missing) == missing.resolve(strict=False)
+    assert containment_resolved(missing) == missing.resolve(strict=False)
 
     workspace = tmp_path.parent / f"ws-{tmp_path.name}"
     workspace.mkdir()
