@@ -177,6 +177,13 @@ def test_ui_project_threads_create_rename_fork_open_in_centre(direct_server_with
     The mobile leg is the reason this phase exists: a thread used to open as a
     right panel that became a second full-screen overlay on a phone. Here it must
     be the centre PAGE, with the sidebar drawer closed and no panel over it.
+
+    Writes the desktop and phone states to `OUROBOROS_UI_EVIDENCE_DIR` as the
+    phase's vision-inspection evidence, in the repo's own form (the
+    `v679-depth-*` precedent). Geometry assertions cannot see a layout that is
+    correct and unreadable; a saved screenshot is not verification on its own
+    either (docs/DEVELOPMENT.md "Responsive and accessible behavior") — it is
+    what makes the inspection re-runnable by the next reader.
     """
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
@@ -190,6 +197,10 @@ def test_ui_project_threads_create_rename_fork_open_in_centre(direct_server_with
     # A second project exists only so the PROJECT-row drag leg below has
     # something to drag past; nothing before that leg looks at it.
     create_project(data_dir, "second", name="Second project")
+    evidence_dir = pathlib.Path(
+        os.environ.get("OUROBOROS_UI_EVIDENCE_DIR", str(data_dir.parent))
+    )
+    evidence_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         with sync_playwright() as pw:
@@ -217,6 +228,8 @@ def test_ui_project_threads_create_rename_fork_open_in_centre(direct_server_with
                 assert page.locator("#thread-stage-body .chat-instance-panel").count() == 1
                 assert page.locator("#thread-stage-body .chat-instance-centre").count() == 1
                 assert page.locator("#project-panel").count() == 0
+                page.screenshot(path=str(evidence_dir / "threads-05-thread-in-centre-desktop.png"),
+                                full_page=True)
                 # DOM ids are namespaced per THREAD, not per project: the single
                 # live instance has one sanctioned exception (a hidden
                 # pending-work survivor), and two threads of one project sharing
@@ -378,6 +391,8 @@ def test_ui_project_threads_create_rename_fork_open_in_centre(direct_server_with
                 assert box is not None and box["width"] <= 375 + 1, box
                 assert box["x"] >= -1, box
                 assert page.locator("#page-thread .chat-input-area").is_visible()
+                page.screenshot(path=str(evidence_dir / "threads-06-thread-as-page-phone.png"),
+                                full_page=True)
             finally:
                 browser.close()
     except PlaywrightError as exc:
@@ -4544,6 +4559,19 @@ def test_ui_thread_menu_offers_the_branch_rows_and_archive_round_trips(direct_se
     reach and `POST …/restore` — routed, contracted and tested on the server —
     could not be invoked by anything. Archive was a one-way trip with a
     documented inverse nobody could press.
+
+    It also carries the phase's VISION-INSPECTION evidence, in the repo's own
+    form (`OUROBOROS_UI_EVIDENCE_DIR`, the `v679-depth-*` precedent): the
+    screenshots below are the states a human read on a live instance —
+    a project on a real git folder, its threads, one opened in the centre, one
+    branched into its own worktree, one archived and restored, and every menu
+    row's enabled state WITH its reason. Assertions alone could not have found
+    what that pass found: the archived row's tooltip read "Restore this thread —
+    restore it to act on it", a tautology beside the word "Restore" that told the
+    owner nothing, and its test had pinned that exact wording. Fixed in
+    `1fffc240`, whose test now asserts the substance instead. A saved screenshot
+    is not verification on its own (docs/DEVELOPMENT.md "Responsive and
+    accessible behavior"); it is what makes the inspection re-runnable.
     """
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
@@ -4555,6 +4583,10 @@ def test_ui_thread_menu_offers_the_branch_rows_and_archive_round_trips(direct_se
     data_dir = direct_server_with_data["data_dir"]
     create_project(data_dir, "wired", name="Wired project")
     thread = create_thread(data_dir, "wired", name="Spike")
+    evidence_dir = pathlib.Path(
+        os.environ.get("OUROBOROS_UI_EVIDENCE_DIR", str(data_dir.parent))
+    )
+    evidence_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         with sync_playwright() as pw:
@@ -4579,6 +4611,7 @@ def test_ui_thread_menu_offers_the_branch_rows_and_archive_round_trips(direct_se
                     menu.locator('[data-prm="remove_worktree"]').get_attribute("title") or ""
                 )
                 assert menu.locator('[data-prm="archive"]:not([disabled])').count() == 1
+                page.screenshot(path=str(evidence_dir / "threads-01-thread-menu-rows.png"))
                 page.keyboard.press("Escape")
 
                 # --- archive hides it ----------------------------------------
@@ -4609,15 +4642,22 @@ def test_ui_thread_menu_offers_the_branch_rows_and_archive_round_trips(direct_se
                 assert project_menu.locator('[data-prm="archive"]').count() == 0
                 assert project_menu.locator('[data-prm="delete"]').count() == 1
                 assert "Delete project" in project_menu.locator('[data-prm="delete"]').inner_text()
+                page.screenshot(path=str(evidence_dir / "threads-02-project-row-menu.png"))
                 project_menu.locator('[data-prm="archived_threads"]').click()
                 archived = page.locator('.project-row-menu[role="menu"]')
                 archived.wait_for(state="visible", timeout=15_000)
                 assert archived.locator(f'[data-prm="restore:{thread["id"]}"]').count() == 1
+                # The row the inspection actually corrected: its tooltip is the
+                # only place the owner learns WHY restore is the one thing on
+                # offer, and a rendered capture is how a reader sees it read
+                # badly. Assertions had pinned the tautology it used to carry.
+                page.screenshot(path=str(evidence_dir / "threads-03-archived-restore-row.png"))
                 archived.locator(f'[data-prm="restore:{thread["id"]}"]').click()
 
                 # Back on the surface it was archived from, under its own name.
                 page.wait_for_selector(thread_row, timeout=30_000)
                 assert page.locator(thread_row).inner_text().startswith("Spike")
+                page.screenshot(path=str(evidence_dir / "threads-04-restored-in-sidebar.png"))
             finally:
                 browser.close()
     except PlaywrightError as exc:
