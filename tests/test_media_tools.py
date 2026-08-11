@@ -148,12 +148,21 @@ def test_youtube_transcript_is_web_gated():
     assert "youtube_transcript" in _WEB_TOOLS
 
 
-def test_media_tools_visible_to_workspace_tasks():
-    """The new media tools must be in the workspace allowlist, else a top-level workspace task
-    cannot see/execute them despite the prompt/docs advertising them (scope review finding)."""
-    from ouroboros.tools.registry import _WORKSPACE_ALLOWED_TOOLS
-    assert "ocr_pdf" in _WORKSPACE_ALLOWED_TOOLS
-    assert "youtube_transcript" in _WORKSPACE_ALLOWED_TOOLS
+def test_media_tools_visible_to_workspace_tasks(tmp_path):
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+    system, workspace, data = tmp_path / "system", tmp_path / "workspace", tmp_path / "data"
+    for path in (system, workspace, data):
+        path.mkdir()
+    registry = ToolRegistry(system, data)
+    registry.set_context(ToolContext(
+        repo_dir=system,
+        drive_root=data,
+        workspace_root=workspace,
+        workspace_mode="external",
+    ))
+    assert registry.get_schema_by_name("ocr_pdf") is not None
+    assert registry.get_schema_by_name("youtube_transcript") is not None
 
 
 def test_staged_dotfile_name_is_artifact_store_readable():

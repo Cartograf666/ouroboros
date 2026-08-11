@@ -233,8 +233,11 @@ passing code as chat text. A project task promoted while the project has NO
 working folder gets one auto-provisioned and bound as its active workspace
 (a durable git tree under the subagent-projects root): paths, shell cwd and
 full task-local git then resolve in the project tree natively, memory runs on
-a forked child drive, and self-repo reads need explicit `root="system_repo"`.
-Pass `workspace="none"` to opt a task out and run folder-less. Evolution
+a forked child drive, and file tools default to that active workspace. Self-repo
+reads and writes use explicit `root="system_repo"`; an installed skill uses
+explicit `root="skill_payload"` with `bucket` + `skill_name`. Pass
+`workspace="none"` only to opt a task out of project-folder focus and run
+folder-less. Evolution
 remains mine alone and waits until running project tasks finish.
 
 ---

@@ -47,11 +47,14 @@ transport-specific decisions do not flow back into core policy.
 - CLI commands parse, call the existing gateway/scheduler, and render
   text or typed JSON/JSONL/SSE. They do not create a second task state machine.
 - External workspace tasks keep governance bound to the system repository while
-  contextual tools resolve through `ToolContext.active_repo_dir()`. Admission
+  contextual tools default through `ToolContext.active_repo_dir()`. Admission
   rejects overlap with the system repo/data and records a read-only preflight.
-- Workspace execution returns durable artifacts and patch diagnostics; it does
-  not grant commit, restart, runtime-control, or review-state authority over
-  Ouroboros. `executor_ref` selects a process backend, not an implicit sandbox.
+- Project focus changes the default target, not the ordinary top-level tool
+  surface. Generic VCS selects active/system explicitly; advisory, reviewed
+  commit, rollback, promotion, restart, and runtime control keep their intrinsic
+  system-repository contracts and existing gates. Workspace finalization still
+  returns durable patch artifacts. `executor_ref` selects a process backend, not
+  an implicit sandbox.
 - Project-local installs may run within the workspace policy. Global/system
   installs remain safety-reviewed, and `sudo` is non-interactive (`sudo -n`).
 - Do not add a second scheduler for operator tooling or a generic CLI file
@@ -720,7 +723,7 @@ Before every commit, verify the following:
 - [ ] No gratuitous abstract layers (Bible P7)
 
 #### Structural Rules
-- [ ] New Tool? `get_tools()` exports it using the `ToolEntry` pattern from `registry.py`, an explicit entry is added to `ouroboros/safety.py::TOOL_POLICY` (`POLICY_SKIP` for trusted built-ins, `POLICY_CHECK` for opaque or outward-facing ones), AND the intended visibility is declared in `ouroboros/tool_capabilities.py` (`CORE_TOOL_NAMES`, local-readonly/acting subagent allowlists, parallel/truncation sets as appropriate). If workspace tasks should see the tool, update the workspace allowlist in `tools/registry.py` too; a tool added to a child profile MUST also be in that allowlist — both child profiles are invariant-tested subsets of it (`tests/test_tool_capabilities.py`, 2026-08-10 saga: profile-visible but workspace-hidden delegate verbs made delegation physically impossible exactly where children run). Without the policy entry the tool falls through to `DEFAULT_POLICY = POLICY_CHECK` and pays a light-model LLM call per invocation, and without the capability/allowlist wiring a packaged/visible tool can still be unreachable to subagents or workspace tasks. **A tool that WRITES the repo working tree needs the GUARD surfaces too, not only the visibility ones:** add it to `_ROOT_ARG_REPO_WRITE_TOOLS` (the single set behind the acting-no-workspace fence, the protected-write gate and the acting root-enum narrowing) and make sure its target paths are canonicalized — via `_PATH_NORMALIZED_TOOLS` if it takes a top-level `path`, or via `canonical_repo_relative_path` + `_payload_write_paths` if its paths ride inside the payload. Visibility lists are all green while these are missing, so the gap does not surface as a failing test: `apply_patch`/`edit_batch` shipped a protected-path bypass that way (a guard reading `repo/BIBLE.md` while the write landed on `BIBLE.md`). Tests must exercise the REAL guard chain — a test that monkeypatches the resolver proves the mechanics, not the fence.
+- [ ] New Tool? `get_tools()` exports it using the `ToolEntry` pattern from `registry.py`, an explicit entry is added to `ouroboros/safety.py::TOOL_POLICY` (`POLICY_SKIP` for trusted built-ins, `POLICY_CHECK` for opaque or outward-facing ones), and the intended capability class is declared in `ouroboros/tool_capabilities.py` (`CORE_TOOL_NAMES`, local-readonly/acting child profiles, parallel/truncation sets as appropriate). Ordinary top-level tasks share the registered built-in surface; add a tool to a child profile only when that narrower principal should receive it, and test schema plus execution behavior rather than mirroring names into another catalog. Without the policy entry the tool falls through to `DEFAULT_POLICY = POLICY_CHECK` and pays a light-model LLM call per invocation. **A tool that WRITES the repo working tree needs the GUARD surfaces too, not only the visibility ones:** add it to `_ROOT_ARG_REPO_WRITE_TOOLS` (the single set behind the acting-no-workspace fence, the protected-write gate and the acting root-enum narrowing) and make sure its target paths are canonicalized — via `_PATH_NORMALIZED_TOOLS` if it takes a top-level `path`, or via `canonical_repo_relative_path` + `_payload_write_paths` if its paths ride inside the payload. Visibility checks can all be green while these are missing, so tests must exercise the real guard chain, not only a mocked resolver.
 - [ ] New Gateway (if extracted)? Contains no business logic, only transport.
 - [ ] New memory/data files? Should they appear in LLM context (`context.py`)?
 

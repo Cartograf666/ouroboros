@@ -60,7 +60,7 @@ data are private (commercial *results* are published). Our 70-task subset
 **Integrity rules we enforce locally (not official defaults).** (a) Public Pro Docker
 images have leaked future git history (official **issue #93**); we strip it before
 solve (`strip_gold_history.sh`) — a *local* defense, not an official guarantee.
-(b) We run with `web_search` (and the browser/vision tools) OFF via the adapter's
+(b) We run with `web_search` (and the browser/vision/transcript tools) OFF via the adapter's
 `--disable-tools` policy — that tool policy, not the network, is what actually keeps the
 solver off the upstream fix. Treat it as *our* legitimacy choice: nothing official
 requires it.
@@ -226,8 +226,10 @@ within one instance, aligned with the TB/GAIA templates; NOT independent
 attempts with selection), and `OUROBOROS_SAFETY_MODE=light` (the LLM safety
 pass adds cost/latency inside an isolated jail while the deterministic guards
 do the protecting; the LLM check stays for integration tools).
-`claude_code_edit` stays in the default `--disable-tools` list: benches measure
-the single-model Ouroboros harness.
+`claude_code_edit` and `switch_model` stay in the default `--disable-tools` list:
+benches measure the single-model Ouroboros harness. The retired edit name keeps
+withholding its delegated coding successor through the task-contract compatibility
+mapping; ordinary same-model `schedule_subagent` decomposition remains available.
 
 E1v2 contract:
 

@@ -124,13 +124,8 @@ def test_vlm_and_screenshot_available_to_subagents():
         ACTING_SUBAGENT_TOOL_NAMES,
         LOCAL_READONLY_SUBAGENT_TOOL_NAMES,
     )
-    from ouroboros.tools.registry import _WORKSPACE_ALLOWED_TOOLS
-
-    # available_tools()/schemas()/execute() AND-compose the workspace allowlist with the
-    # subagent allowlists for a WORKSPACE local-readonly/acting subagent, so a tool must be
-    # in ALL THREE to stay discoverable/executable (vlm_query was missing from the
-    # workspace allowlist, so workspace subagents could not see/run it despite the relax).
+    # Child profiles remain the explicit narrowing layer regardless of whether
+    # their assigned worktree is represented as a workspace.
     for name in ("analyze_screenshot", "vlm_query", "browse_page", "browser_action"):
         assert name in LOCAL_READONLY_SUBAGENT_TOOL_NAMES, name
         assert name in ACTING_SUBAGENT_TOOL_NAMES, name
-        assert name in _WORKSPACE_ALLOWED_TOOLS, name

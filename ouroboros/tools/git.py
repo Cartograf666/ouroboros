@@ -29,6 +29,7 @@ from ouroboros.tools.registry import (
     _authorized_managed_update_resolver,
     active_repo_dir_for,
 )
+from ouroboros.tool_access import ResolvedResourceBinding, build_resolved_resource_binding
 from ouroboros.tools.claude_advisory_review import advisory_gate_unavailable
 from ouroboros.tools.commit_gate import (
     _check_advisory_freshness,
@@ -2339,12 +2340,65 @@ def _limit_git_output(text: str, max_chars: int = 0) -> str:
     return text[:limit] + f"\n⚠️ OUTPUT_TRUNCATED: git output limited to {limit} characters by max_chars."
 
 
-def _git_status(ctx: ToolContext, path: str = "", max_chars: int = 0) -> str:
+def _vcs_binding(
+    ctx: ToolContext,
+    binding: Optional[ResolvedResourceBinding],
+    *,
+    root: str = "system_repo",
+    path: str = ".",
+) -> ResolvedResourceBinding:
+    """Return the dispatch binding, with a system-repo fallback for direct callers.
+
+    Public Tool API calls always receive a registry-built binding. The fallback
+    preserves the historical system-repo target for internal/direct helper calls
+    without making handler-local target selection part of the public contract.
+    """
+
+    resolved = binding or build_resolved_resource_binding(
+        ctx,
+        root=root,
+        operation="vcs",
+        path=path or ".",
+    )
+    if resolved.operation != "vcs" or resolved.root not in {"active_workspace", "system_repo"}:
+        raise ValueError(
+            "generic VCS tools require a vcs binding on active_workspace or system_repo"
+        )
+    return resolved
+
+
+def _vcs_result(text: str, binding: ResolvedResourceBinding) -> str:
+    receipt = f"VCS target: root={binding.root}; repo={binding.base_path}"
+    rendered = str(text or "").rstrip()
+    return f"{rendered}\n\n{receipt}" if rendered else receipt
+
+
+def _binding_relative_path(binding: ResolvedResourceBinding, requested: str) -> str:
+    if not str(requested or "").strip():
+        return ""
     try:
+        relative = binding.target_path.relative_to(binding.base_path)
+    except ValueError as exc:
+        raise ValueError("VCS path escapes the selected repository") from exc
+    return str(relative) if str(relative) != "." else ""
+
+
+def _git_status(
+    ctx: ToolContext,
+    path: str = "",
+    max_chars: int = 0,
+    root: str = "system_repo",
+    _resolved_binding: Optional[ResolvedResourceBinding] = None,
+) -> str:
+    try:
+        binding = _vcs_binding(ctx, _resolved_binding, root=root, path=path or ".")
         cmd = ["git", "status", "--porcelain"]
-        if str(path or "").strip():
-            cmd.extend(["--", safe_relpath(str(path))])
-        return _limit_git_output(run_cmd(cmd, cwd=active_repo_dir_for(ctx)), max_chars)
+        if relative := _binding_relative_path(binding, path):
+            cmd.extend(["--", safe_relpath(relative)])
+        return _vcs_result(
+            _limit_git_output(run_cmd(cmd, cwd=binding.base_path), max_chars),
+            binding,
+        )
     except Exception as e:
         return f"⚠️ GIT_ERROR: {_sanitize_git_error(str(e))}"
 
@@ -2356,9 +2410,12 @@ def _git_diff(
     stat: bool = False,
     name_only: bool = False,
     max_chars: int = 0,
+    root: str = "system_repo",
+    _resolved_binding: Optional[ResolvedResourceBinding] = None,
 ) -> str:
     try:
-        repo_dir = active_repo_dir_for(ctx)
+        binding = _vcs_binding(ctx, _resolved_binding, root=root, path=path or ".")
+        repo_dir = binding.base_path
         cmd = ["git", "diff"]
         if staged:
             cmd.append("--staged")
@@ -2366,14 +2423,14 @@ def _git_diff(
             cmd.append("--name-only")
         elif stat:
             cmd.append("--stat")
-        if str(path or "").strip():
-            cmd.extend(["--", safe_relpath(str(path))])
+        if relative := _binding_relative_path(binding, path):
+            cmd.extend(["--", safe_relpath(relative)])
         from ouroboros.protected_artifacts import shell_block_reason as protected_artifact_shell_block_reason
 
         protected_block = protected_artifact_shell_block_reason(ctx, cmd, cwd=str(repo_dir), default_cwd=repo_dir)
         if protected_block:
-            return protected_block
-        return _limit_git_output(run_cmd(cmd, cwd=repo_dir), max_chars)
+            return _vcs_result(protected_block, binding)
+        return _vcs_result(_limit_git_output(run_cmd(cmd, cwd=repo_dir), max_chars), binding)
     except Exception as e:
         return f"⚠️ GIT_ERROR: {_sanitize_git_error(str(e))}"
 
@@ -2430,38 +2487,54 @@ def _ff_pull(repo_dir: pathlib.Path) -> str:
     return "\n".join(lines)
 
 
-def _pull_from_remote(ctx: ToolContext) -> str:
-    return _ff_pull(pathlib.Path(ctx.repo_dir))
+def _pull_from_remote(
+    ctx: ToolContext,
+    root: str = "system_repo",
+    _resolved_binding: Optional[ResolvedResourceBinding] = None,
+) -> str:
+    try:
+        binding = _vcs_binding(ctx, _resolved_binding, root=root)
+        return _vcs_result(_ff_pull(binding.base_path), binding)
+    except Exception as e:
+        return f"⚠️ PULL_ERROR: {_sanitize_git_error(str(e))}"
 
 
 def _restore_to_head(ctx: ToolContext, confirm: bool = False,
-                     paths: Optional[List[str]] = None) -> str:
-    repo_dir = pathlib.Path(ctx.repo_dir)
+                     paths: Optional[List[str]] = None,
+                     root: str = "system_repo",
+                     _resolved_binding: Optional[ResolvedResourceBinding] = None) -> str:
+    try:
+        binding = _vcs_binding(ctx, _resolved_binding, root=root)
+    except Exception as e:
+        return f"⚠️ RESTORE_ERROR: {_sanitize_git_error(str(e))}"
+    repo_dir = binding.base_path
     try:
         status = run_cmd(["git", "status", "--porcelain"], cwd=repo_dir).strip()
     except Exception as e:
-        return f"⚠️ RESTORE_ERROR: git status failed: {e}"
+        return _vcs_result(f"⚠️ RESTORE_ERROR: git status failed: {e}", binding)
     if not status:
-        return "Nothing to restore — working directory is already clean."
+        return _vcs_result("Nothing to restore — working directory is already clean.", binding)
     dirty_files = [
         path
         for line in status.splitlines()
         for path in _review_paths_from_porcelain_line(line)
     ]
-    affected_protected = protected_paths_in(dirty_files)
-    if paths:
+    affected_protected = protected_paths_in(dirty_files) if binding.root == "system_repo" else []
+    if paths and binding.root == "system_repo":
         for p in paths:
             norm = normalize_repo_path(p)
             if is_protected_runtime_path(norm):
-                return (
+                return _vcs_result(
                     f"⚠️ RESTORE_BLOCKED: Cannot restore protected file: {norm}. "
-                    "Protected core/contract/release paths must be changed through reviewed commits."
+                    "Protected core/contract/release paths must be changed through reviewed commits.",
+                    binding,
                 )
     elif affected_protected:
-        return (
+        return _vcs_result(
             f"⚠️ RESTORE_BLOCKED: Uncommitted changes touch protected file(s): "
             f"{format_protected_paths(affected_protected)}. "
-            f"Use paths= to restore specific non-critical files, or resolve manually."
+            f"Use paths= to restore specific non-critical files, or resolve manually.",
+            binding,
         )
     if not confirm:
         try:
@@ -2482,43 +2555,56 @@ def _restore_to_head(ctx: ToolContext, confirm: bool = False,
                 preview.append(f"  {f}")
         preview.append("")
         preview.append("Call again with confirm=true to proceed.")
-        return "\n".join(preview)
+        return _vcs_result("\n".join(preview), binding)
     if paths:
         safe_paths = [os.path.normpath(p.strip().lstrip("./")) for p in paths if p.strip()]
         if not safe_paths:
-            return "⚠️ RESTORE_ERROR: No valid paths provided."
+            return _vcs_result("⚠️ RESTORE_ERROR: No valid paths provided.", binding)
         try:
             run_cmd(["git", "checkout", "HEAD", "--"] + safe_paths, cwd=repo_dir)
         except Exception as e:
-            return f"⚠️ RESTORE_ERROR: git checkout failed: {e}"
+            return _vcs_result(f"⚠️ RESTORE_ERROR: git checkout failed: {e}", binding)
         try:
             run_cmd(["git", "clean", "-fd", "--"] + safe_paths, cwd=repo_dir)
         except Exception:
             pass
-        return f"Restored {len(safe_paths)} path(s) to HEAD."
+        return _vcs_result(f"Restored {len(safe_paths)} path(s) to HEAD.", binding)
     else:
         try:
             run_cmd(["git", "checkout", "HEAD", "--", "."], cwd=repo_dir)
         except Exception as e:
-            return f"⚠️ RESTORE_ERROR: git checkout failed: {e}"
+            return _vcs_result(f"⚠️ RESTORE_ERROR: git checkout failed: {e}", binding)
         try:
             run_cmd(["git", "clean", "-fd"], cwd=repo_dir)
         except Exception:
             pass
-        return "All uncommitted changes discarded. Working directory matches HEAD."
+        return _vcs_result(
+            "All uncommitted changes discarded. Working directory matches HEAD.",
+            binding,
+        )
 
 
-def _revert_commit(ctx: ToolContext, sha: str, confirm: bool = False) -> str:
-    repo_dir = pathlib.Path(ctx.repo_dir)
+def _revert_commit(
+    ctx: ToolContext,
+    sha: str,
+    confirm: bool = False,
+    root: str = "system_repo",
+    _resolved_binding: Optional[ResolvedResourceBinding] = None,
+) -> str:
+    try:
+        binding = _vcs_binding(ctx, _resolved_binding, root=root)
+    except Exception as e:
+        return f"⚠️ REVERT_ERROR: {_sanitize_git_error(str(e))}"
+    repo_dir = binding.base_path
     sha = sha.strip()
     if not sha:
-        return "⚠️ REVERT_ERROR: sha parameter is required."
+        return _vcs_result("⚠️ REVERT_ERROR: sha parameter is required.", binding)
     try:
         full_sha = run_cmd(
             ["git", "rev-parse", "--verify", sha], cwd=repo_dir,
         ).strip()
     except Exception:
-        return f"⚠️ REVERT_ERROR: Commit '{sha}' not found."
+        return _vcs_result(f"⚠️ REVERT_ERROR: Commit '{sha}' not found.", binding)
     try:
         parents = run_cmd(
             ["git", "rev-list", "--parents", "-1", full_sha], cwd=repo_dir,
@@ -2526,9 +2612,10 @@ def _revert_commit(ctx: ToolContext, sha: str, confirm: bool = False) -> str:
     except Exception:
         parents = [full_sha]
     if len(parents) > 2:
-        return (
+        return _vcs_result(
             f"⚠️ REVERT_ERROR: Commit {sha[:8]} is a merge commit ({len(parents)-1} parents). "
-            "git revert on merge commits requires specifying a parent."
+            "git revert on merge commits requires specifying a parent.",
+            binding,
         )
     try:
         changed_files = run_cmd(
@@ -2537,13 +2624,14 @@ def _revert_commit(ctx: ToolContext, sha: str, confirm: bool = False) -> str:
         ).strip().splitlines()
     except Exception:
         changed_files = []
-    protected_changes = protected_paths_in(changed_files)
+    protected_changes = protected_paths_in(changed_files) if binding.root == "system_repo" else []
     if protected_changes:
-        return (
+        return _vcs_result(
             f"⚠️ REVERT_BLOCKED: Commit {sha[:8]} touches protected file(s): "
             f"{format_protected_paths(protected_changes)}. "
             "Direct vcs_revert cannot create protected-path commits; stage the intended "
-            "revert manually and use commit_reviewed so the normal triad + scope review covers it."
+            "revert manually and use commit_reviewed so the normal triad + scope review covers it.",
+            binding,
         )
     try:
         commit_msg = run_cmd(
@@ -2558,21 +2646,23 @@ def _revert_commit(ctx: ToolContext, sha: str, confirm: bool = False) -> str:
             ).strip()
         except Exception:
             diff_stat = "(could not generate diff)"
-        return (
+        return _vcs_result(
             f"This will revert commit {full_sha[:8]}:\n"
             f"  Message: {commit_msg}\n"
             f"  Files changed:\n{diff_stat}\n\n"
             "A new commit will be created that undoes these changes.\n"
-            "Call again with confirm=true to proceed."
+            "Call again with confirm=true to proceed.",
+            binding,
         )
     try:
         status = run_cmd(["git", "status", "--porcelain"], cwd=repo_dir).strip()
     except Exception:
         status = ""
     if status:
-        return (
+        return _vcs_result(
             "⚠️ REVERT_ERROR: Working directory is not clean.\n"
-            "Commit or discard changes first (use vcs_restore), then retry."
+            "Commit or discard changes first (use vcs_restore), then retry.",
+            binding,
         )
     lock = _acquire_git_lock(ctx)
     try:
@@ -2583,10 +2673,13 @@ def _revert_commit(ctx: ToolContext, sha: str, confirm: bool = False) -> str:
                 run_cmd(["git", "revert", "--abort"], cwd=repo_dir)
             except Exception:
                 pass
-            return f"⚠️ REVERT_ERROR: git revert failed: {e}"
+            return _vcs_result(f"⚠️ REVERT_ERROR: git revert failed: {e}", binding)
     finally:
         _release_git_lock(lock)
-    return f"Reverted commit {full_sha[:8]}: {commit_msg}\nNew revert commit created."
+    return _vcs_result(
+        f"Reverted commit {full_sha[:8]}: {commit_msg}\nNew revert commit created.",
+        binding,
+    )
 
 
 def get_tools() -> List[ToolEntry]:
@@ -2627,18 +2720,20 @@ def get_tools() -> List[ToolEntry]:
         }, _repo_commit_push, is_code_tool=True),
         ToolEntry("vcs_status", {
             "name": "vcs_status",
-            "description": "git status --porcelain for the active repo/workspace",
+            "description": "git status --porcelain for the selected repository.",
             "parameters": {"type": "object", "properties": {
-                "path": {"type": "string", "default": "", "description": "Optional path filter relative to the active repo/workspace"},
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo"], "default": "active_workspace", "description": "Omit for the active project workspace; use system_repo for Ouroboros source."},
+                "path": {"type": "string", "default": "", "description": "Optional path filter relative to the selected repository"},
                 "max_chars": {"type": "integer", "default": 0, "description": "Optional output character limit; 0 means no explicit limit"},
             }, "required": []},
         }, _git_status, is_code_tool=True),
         ToolEntry("vcs_diff", {
             "name": "vcs_diff",
-            "description": "git diff for the active repo/workspace (use staged=true to see staged changes after git add)",
+            "description": "git diff for the selected repository (use staged=true to see staged changes after git add).",
             "parameters": {"type": "object", "properties": {
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo"], "default": "active_workspace", "description": "Omit for the active project workspace; use system_repo for Ouroboros source."},
                 "staged": {"type": "boolean", "default": False, "description": "If true, show staged changes (--staged)"},
-                "path": {"type": "string", "default": "", "description": "Optional path filter relative to the active repo/workspace"},
+                "path": {"type": "string", "default": "", "description": "Optional path filter relative to the selected repository"},
                 "stat": {"type": "boolean", "default": False, "description": "If true, show --stat output"},
                 "name_only": {"type": "boolean", "default": False, "description": "If true, show --name-only output"},
                 "max_chars": {"type": "integer", "default": 0, "description": "Optional output character limit; 0 means no explicit limit"},
@@ -2646,21 +2741,25 @@ def get_tools() -> List[ToolEntry]:
         }, _git_diff, is_code_tool=True),
         ToolEntry("vcs_pull_ff", {
             "name": "vcs_pull_ff",
-            "description": "Fetch from origin and fast-forward merge. Safe: never rewrites history.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
+            "description": "Fetch from origin and fast-forward merge in the selected repository. Safe: never rewrites history.",
+            "parameters": {"type": "object", "properties": {
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo"], "default": "active_workspace", "description": "Omit for the active project workspace; use system_repo for Ouroboros source."},
+            }, "required": []},
         }, _pull_from_remote, is_code_tool=True, mutates_worktree=True),
         ToolEntry("vcs_restore", {
             "name": "vcs_restore",
-            "description": "Discard uncommitted changes, restoring to last committed state (HEAD).",
+            "description": "Discard uncommitted changes in the selected repository, restoring to HEAD.",
             "parameters": {"type": "object", "properties": {
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo"], "default": "active_workspace", "description": "Omit for the active project workspace; use system_repo for Ouroboros source."},
                 "confirm": {"type": "boolean", "description": "Must be true to execute."},
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "Specific files to restore"},
             }, "required": ["confirm"]},
         }, _restore_to_head, is_code_tool=True, mutates_worktree=True),
         ToolEntry("vcs_revert", {
             "name": "vcs_revert",
-            "description": "Revert a specific commit by creating a new undo commit. Safe: no history rewrite.",
+            "description": "Revert a commit in the selected repository by creating a new undo commit. Safe: no history rewrite.",
             "parameters": {"type": "object", "properties": {
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo"], "default": "active_workspace", "description": "Omit for the active project workspace; use system_repo for Ouroboros source."},
                 "sha": {"type": "string", "description": "Commit SHA to revert"},
                 "confirm": {"type": "boolean", "description": "Must be true to execute."},
             }, "required": ["sha", "confirm"]},

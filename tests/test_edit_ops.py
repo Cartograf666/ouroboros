@@ -404,7 +404,7 @@ def test_repo_write_new_file_has_no_diff_section(tmp_path):
 # governance rails: envelopes, advisory staleness (P3), force disclosure
 # ---------------------------------------------------------------------------
 
-def test_capability_envelopes_pin_new_tools():
+def test_capability_profiles_pin_new_tools():
     # Write-capable lanes see the tools; the read-only subagent lane and the
     # heal-mode allowlist must NOT (P3: the read-only lane stays write-free,
     # and heal mode edits skill payloads, which these tools refuse).
@@ -413,12 +413,11 @@ def test_capability_envelopes_pin_new_tools():
         CORE_TOOL_NAMES,
         LOCAL_READONLY_SUBAGENT_TOOL_NAMES,
     )
-    from ouroboros.tools.registry import _HEAL_MODE_ALLOWED_TOOLS, _WORKSPACE_ALLOWED_TOOLS
+    from ouroboros.tools.registry import _HEAL_MODE_ALLOWED_TOOLS
 
     for name in ("apply_patch", "edit_batch"):
         assert name in CORE_TOOL_NAMES
         assert name in ACTING_SUBAGENT_TOOL_NAMES
-        assert name in _WORKSPACE_ALLOWED_TOOLS
         assert name not in LOCAL_READONLY_SUBAGENT_TOOL_NAMES
         assert name not in _HEAL_MODE_ALLOWED_TOOLS
 

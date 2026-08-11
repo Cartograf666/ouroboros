@@ -546,17 +546,17 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
     # target is THIS task's own child — a cancel must not rewrite an unrelated task's
     # parent_decision and hide it from its real parent's reminder (D#7 safety).
     own = _is_own_child(ctx, status_drive_root, tid)
-    # Subagent isolation: a CONSTRAINED caller (workspace/subagent task that can schedule
-    # children) may cancel ONLY its own children — never an arbitrary task id. The
-    # owner-level orchestrator (self_modification / operator_control) keeps general cancel.
+    # Subagent isolation: a delegated child may cancel only its own children.
+    # Project focus does not narrow an ordinary top-level principal; workspace
+    # parents keep the same task-control authority as other top-level tasks.
     if not own:
         try:
             from ouroboros.tool_access import active_tool_profile
 
             if active_tool_profile(ctx) in (
-                "workspace_task", "external_workspace_task", "acting_subagent", "local_readonly_subagent",
+                "acting_subagent", "local_readonly_subagent",
             ):
-                return f"⚠️ cancel_task: {tid} is not a child of this task — a constrained task may only cancel its own children."
+                return f"⚠️ cancel_task: {tid} is not a child of this task — a delegated task may only cancel its own children."
         except Exception:
             log.debug("cancel_task lineage profile check failed for %s", tid, exc_info=True)
     # Latch a cancel-intent status so the parent's find_child_tasks view treats the child
@@ -593,7 +593,7 @@ def get_tools() -> list[ToolEntry]:
     return [
         ToolEntry("cancel_task", {
             "name": "cancel_task",
-            "description": "Stop a running/scheduled child task by ID. Give a short reason — it is "
+            "description": "Stop a running/scheduled task by ID. Delegated children may target only their own children. Give a short reason — it is "
                            "recorded on the shared task-tree ledger and the child's result, so a "
                            "stopped child is an auditable decision, not a silent disappearance.",
             "parameters": {"type": "object", "properties": {

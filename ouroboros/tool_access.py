@@ -227,8 +227,11 @@ _TOP_LEVEL_PRINCIPAL_POLICY: dict[str, set[str]] = {
 
 _POLICY: dict[str, dict[str, set[str]]] = {
     "local_readonly_subagent": {
-        "active_workspace": set(_READ_OPS),
-        "system_repo": set(_READ_OPS),
+        # vcs_status/vcs_diff are explicit read-only child tools. The child
+        # name profile withholds every mutating VCS primitive; this operation
+        # grant lets their target binding resolve without widening that surface.
+        "active_workspace": set(_READ_OPS) | {"vcs"},
+        "system_repo": set(_READ_OPS) | {"vcs"},
         "runtime_data": {"read", "list"},
         "task_drive": {"read", "list"},
         "artifact_store": {"read", "list"},
@@ -557,6 +560,12 @@ def filesystem_affordance_map(ctx: Any, *, runtime_mode: str = "") -> dict[str, 
         "git_readonly_subcommands": git_readonly_subcommands,
         "light_gated_roots": sorted(light_gated_roots),
     }
+    if "active_workspace" in policy:
+        result["default_root"] = "active_workspace"
+    if "skill_payload" in policy:
+        result["skill_payload_selector"] = (
+            "root=skill_payload requires bucket + skill_name"
+        )
     _room = project_room_lens_dir(ctx)
     if _room is not None:
         # Room-lens disclosure (v6.61.3): in this chat, active_workspace READS and

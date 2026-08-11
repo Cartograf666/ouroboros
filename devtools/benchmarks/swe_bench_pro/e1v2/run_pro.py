@@ -817,9 +817,10 @@ def main() -> int:
                     help="per-task solve memory mode (shared|forked|empty); empty = entrypoint default "
                          "(empty child drive, v6.56.0 — the measured artifact is the harness, not carried memory).")
     ap.add_argument("--disable-tools",
-                    default="web_search,browse_page,browser_action,analyze_screenshot,vlm_query,view_image,claude_code_edit",
+                    default="web_search,browse_page,browser_action,analyze_screenshot,vlm_query,view_image,youtube_transcript,claude_code_edit,switch_model",
                     help="comma-separated tools withheld from the solve task. Default disables web/browser/vision "
-                         "and claude_code_edit. Drop view_image from the list to allow native inline vision.")
+                         "and youtube transcript lookup, the external coding gateway, and model switching. "
+                         "Drop view_image from the list to allow native inline vision.")
     ap.add_argument("--absorb-max", type=int, default=1800,
                     help="max wait for absorbed evolution cycle after a task (seconds). Cycle = "
                          "separate evolution task (review triad) plus os.execvpe restart.")

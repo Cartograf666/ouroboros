@@ -689,12 +689,20 @@ def test_verify_string_check_no_safe_subject_bypass(monkeypatch):
     assert msg_str == "LLM_REACHED"  # string check forced through the LLM review
 
 
-def test_verify_and_record_reachable_in_workspace_mode():
-    # F2 (review #1): the FR3 flagship must be callable by a top-level workspace task
-    # (the benchmark /app context where verify-before-done matters most).
-    from ouroboros.tools.registry import _WORKSPACE_ALLOWED_TOOLS
+def test_verify_and_record_reachable_in_workspace_mode(tmp_path):
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
 
-    assert "verify_and_record" in _WORKSPACE_ALLOWED_TOOLS
+    system, workspace, data = tmp_path / "system", tmp_path / "workspace", tmp_path / "data"
+    for path in (system, workspace, data):
+        path.mkdir()
+    registry = ToolRegistry(system, data)
+    registry.set_context(ToolContext(
+        repo_dir=system,
+        drive_root=data,
+        workspace_root=workspace,
+        workspace_mode="external",
+    ))
+    assert registry.get_schema_by_name("verify_and_record") is not None
 
 
 def test_verify_and_record_is_shell_guarded_not_process_command():

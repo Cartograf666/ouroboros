@@ -358,9 +358,9 @@ def preflight_delegate_visibility(
     real toolset is materialized, BEFORE the first paid LLM round.
 
     The dispatch resolution proves the ROUTE is healthy; it does not prove the
-    child's toolset carries the delegate verbs (workspace filters, contract
-    disabled_tools or future policy drift can hide them — the Phase A allowlist
-    widening closed one instance of the class, not the class). The e9108a09c6574184
+    child's toolset carries the delegate verbs (its delegated-child profile,
+    contract disabled_tools, credential/resource availability, or future policy
+    drift can hide them). The e9108a09c6574184
     audit: nine children dispatched as nannies with the verbs invisible made zero
     delegated runs and burned ~$29-54 of metered API while telemetry said harness.
 

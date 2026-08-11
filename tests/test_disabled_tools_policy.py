@@ -189,13 +189,16 @@ def test_registry_arg_aliases_and_public_tool_arg_errors(tmp_path):
     assert seen["max_results"] == 2
     assert seen["binding"] is not None
 
-    def _private_vcs_status(ctx, path="", max_chars=0):
-        seen["vcs_status"] = (path, max_chars)
+    def _private_vcs_status(
+        ctx, path="", max_chars=0, root="system_repo", _resolved_binding=None,
+    ):
+        seen["vcs_status"] = (path, max_chars, root, _resolved_binding)
         return "status-ok"
 
     reg.override_handler("vcs_status", _private_vcs_status)
     assert reg.execute("vcs_status", {"root": "system_repo", "path": "."}) == "status-ok"
-    assert seen["vcs_status"] == (".", 0)
+    assert seen["vcs_status"][:3] == (".", 0, "system_repo")
+    assert seen["vcs_status"][3].root == "system_repo"
 
     result = reg.execute("search_code", {"dir": "."})
     assert "TOOL_ARG_ERROR (search_code)" in result
