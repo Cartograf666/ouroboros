@@ -48,7 +48,7 @@
   <div class="site-shell">
     <nav class="site-nav" aria-label="Primary navigation">
       <a class="brand" href="#top" aria-label="Ouroboros home"><img src="/assets/icon_1024.png" alt=""><span>Ouroboros</span></a>
-      <div class="nav-links"><a href="#work">Work</a><a href="/benchmarks/">Benchmarks</a><a href="/install/">Install</a><a href="#evolution">Evolution</a><a href="/about/">About</a></div>
+      <div class="nav-links"><a href="#work">Work</a><a href="/paper/">Paper</a><a href="/benchmarks/">Benchmarks</a><a href="/install/">Install</a><a href="#evolution">Evolution</a><a href="/about/">About</a></div>
       <div class="nav-actions"><a class="btn btn-quiet" href="https://github.com/razzant/ouroboros">GitHub</a><a class="btn btn-primary" href="https://github.com/razzant/ouroboros/releases/latest">Download</a></div>
     </nav>
 
@@ -99,7 +99,7 @@
           <figure class="media-panel reveal"><img src="/assets/bench-osworld.svg?v=26e6cdc7db" alt="Self-reported OSWorld-Verified results: Ouroboros 90.69% with Claude Opus-5 and 83.27% with Claude Sonnet-4.6" loading="lazy" width="1800" height="1000"><figcaption><span>OSWorld-Verified · 90.69% · self-reported</span><span><a href="https://huggingface.co/datasets/razzant/ouroboros-osworld-verified-opus5">Full traces</a></span></figcaption></figure>
           <figure class="media-panel reveal"><img src="/assets/bench-cl-bench.svg?v=633474d172" alt="Self-reported CL-Bench result: Ouroboros normalized reward 0.2301 with Claude Sonnet-4.6, rank 1" loading="lazy" width="1800" height="760"><figcaption><span>CL-Bench · 0.2301 · self-reported rank #1</span><span><a href="https://github.com/pgasawa/continual-learning-bench/pull/10">Open submission</a> · <a href="https://huggingface.co/datasets/razzant/ouroboros-clbench-traces">Full traces</a></span></figcaption></figure>
         </div>
-        <p class="bench-note reveal">The <a href="https://huggingface.co/datasets/razzant/swepro-luna-matched-pair">SWE-bench Pro matched-pair traces</a> support the statistical comparison with Codex CLI. A separate GAIA campaign reports 129/165 for Ouroboros and 131/165 for Claude Code, with strict pass@1 at 128/165 for both; its scrubbed trace capsule is still pending. Adapters, run scripts, and per-benchmark methodology live in <a href="https://github.com/razzant/ouroboros/tree/ouroboros/devtools/benchmarks">devtools/benchmarks</a>, and the full story with audits is in the <a href="https://habr.com/ru/companies/airi/articles/1065428/">launch write-up</a>.</p>
+        <p class="bench-note reveal">The <a href="https://huggingface.co/datasets/razzant/swepro-luna-matched-pair">SWE-bench Pro matched-pair traces</a> support the statistical comparison with Codex CLI. A separate GAIA campaign reports 129/165 for Ouroboros and 131/165 for Claude Code, with strict pass@1 at 128/165 for both; its scrubbed trace capsule is still pending. Adapters, run scripts, and per-benchmark methodology live in <a href="https://github.com/razzant/ouroboros/tree/ouroboros/devtools/benchmarks">devtools/benchmarks</a>. The <a href="/paper/">technical report</a> describes the system, campaigns, corrections, and limitations.</p>
       </section>
 
       <section class="chapter run-chapter" id="run" aria-labelledby="run-title">
@@ -161,7 +161,7 @@
       </section>
     </main>
 
-    <footer class="site-footer"><span>Ouroboros · open source</span><span><a href="/about/">About</a> · <a href="/install/">Install</a> · <a href="/benchmarks/">Benchmarks</a> · <a href="/llms.txt">llms.txt</a> · <a href="https://github.com/razzant/ouroboros/releases">Releases</a> · <a href="https://github.com/razzant/ouroboros/blob/ouroboros/CONTRIBUTING.md">Contributing</a> · <a href="/history/first-48-hours/">First 48 hours</a></span></footer>
+    <footer class="site-footer"><span>Ouroboros · open source</span><span><a href="/paper/">Paper</a> · <a href="/about/">About</a> · <a href="/install/">Install</a> · <a href="/benchmarks/">Benchmarks</a> · <a href="/llms.txt">llms.txt</a> · <a href="https://github.com/razzant/ouroboros/releases">Releases</a> · <a href="https://github.com/razzant/ouroboros/blob/ouroboros/CONTRIBUTING.md">Contributing</a> · <a href="/history/first-48-hours/">First 48 hours</a></span></footer>
   </div>
   <button class="motion-toggle" type="button" aria-label="Pause motion" aria-pressed="false"><span aria-hidden="true">Ⅱ</span><span class="motion-label">Pause motion</span></button>
   <script type="module" src="/src/ouroboros.js"></script>

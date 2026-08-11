@@ -10,6 +10,7 @@ Ouroboros publishes self-reported benchmark results with status labels and links
 
 ## Start here
 
+- [Technical report](https://ouroboros-agent.ai/paper/): Paper metadata, authors, citation, code, and public evidence links.
 - [About](https://ouroboros-agent.ai/about/): What Ouroboros is and how it works.
 - [Install](https://ouroboros-agent.ai/install/): Packaged downloads and source setup.
 - [Benchmark evidence](https://ouroboros-agent.ai/benchmarks/): Scores, publication status, runs, traces, and methodology.

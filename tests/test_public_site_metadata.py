@@ -8,7 +8,6 @@ import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from pathlib import Path
 
-
 REPO = Path(__file__).resolve().parents[1]
 SITE = REPO / "site"
 DOCS = REPO / "docs"
@@ -16,6 +15,7 @@ ORIGIN = "https://ouroboros-agent.ai"
 INDEXABLE = {
     "/": SITE / "index.html",
     "/about/": SITE / "about" / "index.html",
+    "/paper/": SITE / "paper" / "index.html",
     "/install/": SITE / "install" / "index.html",
     "/benchmarks/": SITE / "benchmarks" / "index.html",
     "/history/first-48-hours/": SITE / "history" / "first-48-hours" / "index.html",
@@ -75,18 +75,32 @@ def test_indexable_pages_have_canonical_social_metadata():
 
 
 def test_json_ld_is_valid_and_current():
-    for relative in ("index.html", "install/index.html", "benchmarks/index.html"):
+    for relative in ("index.html", "paper/index.html", "install/index.html", "benchmarks/index.html"):
         page = _parse(SITE / relative)
         assert page.json_ld, relative
         documents = [json.loads(value) for value in page.json_ld]
         assert all(document.get("@context") == "https://schema.org" for document in documents)
     homepage = json.loads(_parse(SITE / "index.html").json_ld[0])
     install = json.loads(_parse(SITE / "install/index.html").json_ld[0])
+    paper = json.loads(_parse(SITE / "paper/index.html").json_ld[0])
     assert homepage["sameAs"] == "https://github.com/razzant/ouroboros"
     assert "huggingface.co/razzant" not in json.dumps(homepage)
     assert "softwareVersion" not in homepage
     assert "softwareVersion" not in install
     assert install["downloadUrl"] == "https://github.com/razzant/ouroboros/releases/latest"
+    assert paper["@type"] == "ScholarlyArticle"
+    assert paper["headline"] == "Ouroboros: A Self-Developing Frontier Coding Agent with Reviewed Core Evolution"
+    assert paper["datePublished"] == "2026-08-08"
+    assert [author["name"] for author in paper["author"]] == [
+        "Anton Razzhigaev",
+        "Andrei Gritsaev",
+        "Andrei Kaznacheev",
+        "Nikita Dragunov",
+        "Roman Yampolskiy",
+        "Andrei Kuznetsov",
+    ]
+    assert "https://arxiv.org/abs/2608.08311" in paper["sameAs"]
+    assert "https://huggingface.co/papers/2608.08311" in paper["sameAs"]
 
 
 def test_sitemap_exactly_matches_indexable_html():
@@ -112,6 +126,7 @@ def test_llms_file_is_a_small_absolute_navigation_map():
             linked_urls.append(match.group(1))
     assert f"{ORIGIN}/install/" in linked_urls
     assert f"{ORIGIN}/benchmarks/" in linked_urls
+    assert f"{ORIGIN}/paper/" in linked_urls
     for url in linked_urls:
         assert url.startswith((ORIGIN, "https://github.com/", "https://api.github.com/"))
 
@@ -225,9 +240,26 @@ def test_navigation_keeps_accessible_home_and_contributor_links():
             assert 'class="brand"' in html and 'aria-label="Ouroboros home"' in html
     homepage = (SITE / "index.html").read_text(encoding="utf-8")
     assert "CONTRIBUTING.md" in homepage
+    assert 'href="/paper/"' in homepage
     benchmarks = (SITE / "benchmarks" / "index.html").read_text(encoding="utf-8")
     assert 'class="table-scroll" tabindex="0" role="region"' in benchmarks
     assert 'aria-label="Ouroboros benchmark results"' in benchmarks
+
+
+def test_paper_page_exposes_citation_metadata_and_bibtex():
+    path = SITE / "paper" / "index.html"
+    html = path.read_text(encoding="utf-8")
+    page = _parse(path)
+
+    assert page.meta["citation_title"] == (
+        "Ouroboros: A Self-Developing Frontier Coding Agent with Reviewed Core Evolution"
+    )
+    assert page.meta["citation_publication_date"] == "2026/08/08"
+    assert page.meta["citation_arxiv_id"] == "2608.08311"
+    assert page.meta["citation_doi"] == "10.48550/arXiv.2608.08311"
+    assert page.meta["citation_pdf_url"] == "https://arxiv.org/pdf/2608.08311"
+    assert "@techreport{razzhigaev2026ouroboros" in html
+    assert "archivePrefix = {arXiv}" in html
 
 
 def test_og_preview_has_declared_dimensions_and_current_status():
