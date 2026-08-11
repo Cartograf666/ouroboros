@@ -2489,7 +2489,9 @@ def _git_diff(
             cmd.extend(["--", safe_relpath(relative)])
         from ouroboros.protected_artifacts import shell_block_reason as protected_artifact_shell_block_reason
 
-        protected_block = protected_artifact_shell_block_reason(ctx, cmd, cwd=str(repo_dir), default_cwd=repo_dir)
+        protected_block = protected_artifact_shell_block_reason(
+            ctx, cmd, cwd=str(repo_dir), default_cwd=repo_dir, binding=binding,
+        )
         if protected_block:
             return _vcs_result(protected_block, binding)
         return _vcs_result(_limit_git_output(run_cmd(cmd, cwd=repo_dir), max_chars), binding)

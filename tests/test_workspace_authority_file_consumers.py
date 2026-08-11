@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import subprocess
 
 import pytest
 
@@ -328,3 +329,126 @@ def test_protected_name_is_judged_by_physical_repo_target(tmp_path, monkeypatch)
     assert system_result.startswith("⚠️ CORE_PROTECTION_BLOCKED")
     assert (workspace / "BIBLE.md").read_text(encoding="utf-8") == "project changed\n"
     assert (system_repo / "BIBLE.md").read_text(encoding="utf-8") == "system\n"
+
+
+def _protected_workspace_registry(tmp_path, monkeypatch):
+    import ouroboros.safety as safety
+
+    system_repo = tmp_path / "system"
+    workspace = tmp_path / "project"
+    data = tmp_path / "data"
+    for item in (system_repo, workspace, data):
+        item.mkdir()
+    for repo in (system_repo, workspace):
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    contract = {
+        "resource_policy": {
+            "protected_artifacts": [{
+                "id": "reference",
+                "paths": ["secret.py"],
+                "role": "black_box_reference",
+            }],
+        },
+    }
+    ctx = ToolContext(
+        repo_dir=system_repo,
+        system_repo_dir=system_repo,
+        drive_root=data,
+        workspace_root=workspace,
+        workspace_mode="external",
+        task_contract=contract,
+        task_metadata={"task_contract": contract},
+    )
+    registry = ToolRegistry(repo_dir=system_repo, drive_root=data)
+    registry.set_context(ctx)
+    monkeypatch.setattr(safety, "check_safety", lambda *args, **kwargs: (True, ""))
+    return registry, ctx, system_repo, workspace, data
+
+
+def test_relative_protected_artifact_uses_explicit_system_binding_across_file_tools(
+    tmp_path, monkeypatch,
+):
+    registry, _ctx, system_repo, workspace, _data = _protected_workspace_registry(
+        tmp_path, monkeypatch,
+    )
+    (system_repo / "secret.py").write_text("def hidden_marker():\n    return 42\n", encoding="utf-8")
+    (system_repo / "public.py").write_text("PUBLIC = 1\n", encoding="utf-8")
+    (workspace / "secret.py").write_text("PROJECT = 1\n", encoding="utf-8")
+
+    read_result = registry.execute(
+        "read_file", {"root": "system_repo", "path": "secret.py"},
+    )
+    write_result = registry.execute(
+        "write_file",
+        {"root": "system_repo", "path": "secret.py", "content": "CHANGED = 1\n"},
+    )
+    edit_result = registry.execute(
+        "edit_text",
+        {
+            "root": "system_repo",
+            "path": "secret.py",
+            "old_str": "return 42",
+            "new_str": "return 43",
+        },
+    )
+    search_result = registry.execute(
+        "search_code",
+        {"root": "system_repo", "path": ".", "query": "hidden_marker"},
+    )
+    public_result = registry.execute(
+        "read_file", {"root": "system_repo", "path": "public.py"},
+    )
+
+    for result in (read_result, write_result, edit_result):
+        assert "RESOURCE_POLICY_BLOCKED" in result
+    assert "secret.py" not in search_result
+    assert "PUBLIC = 1" in public_result
+    assert "return 42" in (system_repo / "secret.py").read_text(encoding="utf-8")
+
+
+def test_query_and_vcs_diff_use_the_same_explicit_system_protected_binding(
+    tmp_path, monkeypatch,
+):
+    registry, _ctx, system_repo, _workspace, _data = _protected_workspace_registry(
+        tmp_path, monkeypatch,
+    )
+    secret = system_repo / "secret.py"
+    secret.write_text("def hidden_marker():\n    return 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "secret.py"], cwd=system_repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"],
+        cwd=system_repo,
+        check=True,
+    )
+    secret.write_text("def hidden_marker():\n    return 2\n", encoding="utf-8")
+
+    query_result = registry.execute(
+        "query_code",
+        {"root": "system_repo", "op": "definition", "query": "hidden_marker"},
+    )
+    diff_result = registry.execute("vcs_diff", {"root": "system_repo"})
+
+    assert "secret.py" not in query_result
+    assert "RESOURCE_POLICY_BLOCKED" in diff_result
+
+
+def test_relative_protected_artifact_uses_exact_skill_binding(tmp_path, monkeypatch):
+    registry, ctx, _system_repo, _workspace, data = _protected_workspace_registry(
+        tmp_path, monkeypatch,
+    )
+    skill = _skill(data, "external", "alpha")
+    ctx.task_contract["resource_policy"]["protected_artifacts"][0]["paths"] = ["tool.py"]
+    ctx.task_metadata["task_contract"] = ctx.task_contract
+
+    result = registry.execute(
+        "read_file",
+        {
+            "root": "skill_payload",
+            "bucket": "external",
+            "skill_name": "alpha",
+            "path": "tool.py",
+        },
+    )
+
+    assert "RESOURCE_POLICY_BLOCKED" in result
+    assert (skill / "tool.py").read_text(encoding="utf-8") == "VALUE = 1\n"

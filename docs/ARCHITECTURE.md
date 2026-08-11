@@ -419,7 +419,7 @@ A pre-existing cross-platform residual remains: shutdown admission is not atomic
 │   │   │   ├── .scratch_manifest.json ← (v6.52.2) declared ephemeral `scratch=[...]` {abs_path: sha256} fingerprints; a matching untracked file is excluded from the workspace patch only while its content still matches (never a deliverable)
 	│   │   │   └── <artifact files> ← Canonical task artifacts, including workspace patches, verification ledgers, and copied external deliverables
 	│   │   └── artifact_versions/<task_id>/ ← Non-manifest recovery history for overwritten user-visible deliverables (last 5 versions per artifact name)
-	│   ├── task_drives/<task_id>/ ← Task-scoped scratch for direct tasks and light-mode run_script defaults; startup prunes terminal tasks after the headless retention window
+	│   ├── task_drives/<task_id>/ ← Task-scoped scratch for direct tasks and explicit task_drive process targets; startup prunes terminal tasks after the headless retention window
 	│   ├── task_trees/<root_task_id>/blackboard.jsonl ← (v6.38.0) Task-tree coordination ledger: append-only swarm blackboard + child→parent beacons (tree_note/tree_read), scoped to the whole tree; EPHEMERAL coordination (distinct from the durable project journal)
 	│   ├── state/
 │   │   ├── state.json  ← Runtime state and compatibility cost projection (never the monetary authority)

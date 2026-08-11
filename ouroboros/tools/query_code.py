@@ -83,7 +83,12 @@ def _safe_path(repo_root: pathlib.Path, path: str) -> str:
         raise ValueError(f"path escapes root: {path}") from exc
 
 
-def _visible_file(ctx: ToolContext, repo_root: pathlib.Path, rel_path: str) -> bool:
+def _visible_file(
+    ctx: ToolContext,
+    repo_root: pathlib.Path,
+    rel_path: str,
+    binding: ResolvedResourceBinding | None = None,
+) -> bool:
     try:
         target = (repo_root / rel_path).resolve(strict=False)
     except Exception:
@@ -96,12 +101,18 @@ def _visible_file(ctx: ToolContext, repo_root: pathlib.Path, rel_path: str) -> b
     except Exception:
         pass
     return not (
-        block_reason_for_path(ctx, target, "read_bytes")
-        or block_reason_for_path(ctx, target, "static_introspection")
+        block_reason_for_path(ctx, target, "read_bytes", binding)
+        or block_reason_for_path(ctx, target, "static_introspection", binding)
     )
 
 
-def _inventory_rows(ctx: ToolContext, inventory: Any, repo_root: pathlib.Path, opts: dict[str, Any]) -> list[str]:
+def _inventory_rows(
+    ctx: ToolContext,
+    inventory: Any,
+    repo_root: pathlib.Path,
+    opts: dict[str, Any],
+    binding: ResolvedResourceBinding | None = None,
+) -> list[str]:
     from ouroboros.code_intelligence import (
         impact_files,
         relevant_files,
@@ -121,30 +132,38 @@ def _inventory_rows(ctx: ToolContext, inventory: Any, repo_root: pathlib.Path, o
     rows: list[str] = []
     if op in {"symbols", "definition"}:
         for file, symbol in symbol_definitions(inventory, query, path=path, kind=kind or "any"):
-            if _visible_file(ctx, repo_root, file.path):
+            if _visible_file(ctx, repo_root, file.path, binding):
                 rows.append(f"{file.path}:{symbol.line_start} {symbol.kind} {symbol.signature or symbol.name}")
     elif op == "references":
         for file, ref in symbol_references(inventory, query, path=path):
-            if _visible_file(ctx, repo_root, file.path):
+            if _visible_file(ctx, repo_root, file.path, binding):
                 rows.append(f"{file.path}:{ref.line} {query}{' in ' + ref.enclosing if ref.enclosing else ''}")
     elif op in {"callers", "callees"}:
         iterator = symbol_callers(inventory, query, path=path) if op == "callers" else symbol_callees(inventory, query, path=path)
         for file, call in iterator:
-            if _visible_file(ctx, repo_root, file.path):
+            if _visible_file(ctx, repo_root, file.path, binding):
                 rows.append(f"{file.path}:{call.line} {call.enclosing + ' -> ' if call.enclosing else ''}{call.name}")
     elif op == "impact":
         for file, reason in impact_files(inventory, path or query, depth=depth):
-            if _visible_file(ctx, repo_root, file.path):
+            if _visible_file(ctx, repo_root, file.path, binding):
                 rows.append(f"{file.path}  {reason}")
     elif op == "relevant_files":
         for idx, (file, score, reason) in enumerate(relevant_files(inventory, query, limit=min(_MAX_LIMIT, offset + limit)), 1):
-            if _visible_file(ctx, repo_root, file.path):
+            if _visible_file(ctx, repo_root, file.path, binding):
                 top_symbols = ", ".join(symbol.name for symbol in file.symbols[:5])
                 rows.append(f"{idx}. {file.path} score={score:.2f} reason={reason}{' symbols=' + top_symbols if top_symbols else ''}")
     return rows
 
 
-def _structural(ctx: ToolContext, repo_root: pathlib.Path, query: str, path: str, lang: str, limit: int) -> list[str]:
+def _structural(
+    ctx: ToolContext,
+    repo_root: pathlib.Path,
+    query: str,
+    path: str,
+    lang: str,
+    limit: int,
+    binding: ResolvedResourceBinding | None = None,
+) -> list[str]:
     # Conservative first step: use tree-sitter when available, otherwise a Python
     # ast fallback plus literal matching. Query may be a tree-sitter S-expression
     # like "(function_definition)" or a node type such as "FunctionDef".
@@ -223,7 +242,7 @@ def _structural(ctx: ToolContext, repo_root: pathlib.Path, query: str, path: str
             rel = fp.relative_to(repo_root).as_posix()
         except ValueError:
             continue
-        if not _visible_file(ctx, repo_root, rel):
+        if not _visible_file(ctx, repo_root, rel, binding):
             continue
         if not ts_node_type:
             continue
@@ -353,12 +372,14 @@ def _query_code(
 
     try:
         if op == "structural":
-            rows = _structural(ctx, repo_root, query, scoped_path, str(lang or "any"), limit)
+            rows = _structural(
+                ctx, repo_root, query, scoped_path, str(lang or "any"), limit, binding
+            )
         else:
             from ouroboros.code_intelligence import build_code_inventory
             from ouroboros.protected_artifacts import protected_artifact_paths
 
-            exclude_paths: list[pathlib.Path] = list(protected_artifact_paths(ctx))
+            exclude_paths: list[pathlib.Path] = list(protected_artifact_paths(ctx, binding))
             persist = True
             if exclude_paths or normalized_root == "user_files":
                 # Do not cache an external/ephemeral user_files target's inventory
@@ -376,7 +397,10 @@ def _query_code(
             except Exception:
                 pass
             inventory = build_code_inventory(repo_root, drive_root=pathlib.Path(ctx.drive_root), persist=persist, exclude_paths=exclude_paths)
-            inventory.files = [file for file in inventory.files if _visible_file(ctx, repo_root, file.path)]
+            inventory.files = [
+                file for file in inventory.files
+                if _visible_file(ctx, repo_root, file.path, binding)
+            ]
             if op == "digest":
                 # Whole-repo map (folded from the former codebase_digest tool):
                 # a compact file/symbol inventory to orient in an unfamiliar repo.
@@ -385,7 +409,7 @@ def _query_code(
             rows = _inventory_rows(ctx, inventory, repo_root, {
                 "op": op, "query": query, "path": scoped_path, "kind": kind,
                 "depth": depth, "limit": limit, "offset": offset,
-            })
+            }, binding)
     except Exception as exc:
         return f"⚠️ QUERY_CODE_ERROR: {type(exc).__name__}: {exc}"
 

@@ -907,6 +907,8 @@ _TARGET_BINDING_OPERATIONS = {
     "query_code": "search",
     "write_file": "write",
     "edit_text": "edit",
+    "apply_patch": "edit",
+    "edit_batch": "edit",
     **{name: "vcs" for name in _GENERIC_VCS_TARGET_TOOLS},
 }
 _SKILL_LIFECYCLE_TARGET_TOOLS = frozenset({
@@ -1063,6 +1065,16 @@ def _build_builtin_target_binding(ctx: Any, name: str, args: dict[str, Any]) -> 
         return tuple(
             _one(str(item.get("path") or ""))
             for item in args.get("files") or []
+            if isinstance(item, dict)
+        )
+    if name == "apply_patch":
+        from ouroboros.tools.edit_ops import patch_target_paths
+
+        return tuple(_one(path) for path in patch_target_paths(str(args.get("patch") or "")))
+    if name == "edit_batch":
+        return tuple(
+            _one(str(item.get("path") or ""))
+            for item in args.get("edits") or []
             if isinstance(item, dict)
         )
     return _one(str(args.get("path") or "."))
@@ -3240,7 +3252,7 @@ class ToolRegistry:
                 canonical_repo_relative_path(self._ctx, root_name, p)
                 for p in _payload_write_paths(name, args)
             ]
-            if resolved_binding is not None and name in {"write_file", "edit_text"}:
+            if resolved_binding is not None:
                 protected_target = (
                     _binding_set_targets_system_repo(self._ctx, resolved_binding)
                     or acting_self_worktree

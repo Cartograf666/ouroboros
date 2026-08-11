@@ -27,7 +27,6 @@ from ouroboros.tool_access import (
     normalize_runtime_data_path,
     project_room_lens_dir,
     UserFilesPathBlockedError,
-    resolve_resource_path,
     user_files_path_block_reason,
 )
 from ouroboros.utils import atomic_write_json, read_text, safe_relpath, utc_now_iso, write_text_atomic
@@ -1036,32 +1035,6 @@ def _join_write_results(results: List[str]) -> str:
     return rendered
 
 
-def _protected_artifact_write_block(
-    ctx: ToolContext,
-    root: str,
-    paths: List[str],
-    *,
-    bucket: str = "",
-    skill_name: str = "",
-    prefix: str,
-) -> str:
-    """Legacy repo-only batch guard for apply_patch/edit_batch embedded paths."""
-    for rel_path in paths:
-        if not str(rel_path or "").strip():
-            continue
-        try:
-            target = resolve_resource_path(
-                ctx, root=root, path=str(rel_path),
-                bucket=bucket, skill_name=skill_name,
-            )
-        except Exception:
-            continue
-        reason = block_reason_for_path(ctx, target, "write")
-        if reason:
-            return f"⚠️ {prefix}: protected artifact path blocked: {reason}"
-    return ""
-
-
 def _annotate_reread(ctx: ToolContext, target: Any, start_line: int, max_lines: int, result: str,
                      start_char: int = 0) -> str:
     """Append an advisory hint when the SAME file slice is re-read unchanged.
@@ -1118,7 +1091,7 @@ def _read_file(
     except Exception as exc:
         return f"⚠️ READ_FILE_ERROR: {type(exc).__name__}: {exc}"
     target = binding.target_path
-    protected_block = block_reason_for_path(ctx, target, "read_bytes")
+    protected_block = block_reason_for_path(ctx, target, "read_bytes", binding)
     if protected_block:
         return protected_block
     if normalized == "system_repo":
@@ -1206,7 +1179,7 @@ def _list_files(
     except Exception as exc:
         return f"⚠️ LIST_FILES_ERROR ({type(exc).__name__}): {exc}"
     protected_list_block = block_reason_for_path(
-        ctx, binding.target_path, "static_introspection"
+        ctx, binding.target_path, "static_introspection", binding
     )
     if protected_list_block:
         return protected_list_block
@@ -1292,7 +1265,7 @@ def _write_file(
     protected_block = next((
         f"⚠️ WRITE_FILE_BLOCKED: protected artifact path blocked: {reason}"
         for item in binding_items
-        if (reason := block_reason_for_path(ctx, item.target_path, "write"))
+        if (reason := block_reason_for_path(ctx, item.target_path, "write", item))
     ), "")
     if protected_block:
         return protected_block
@@ -1447,7 +1420,7 @@ def _edit_text(
     except Exception as exc:
         prefix = "SKILL_PAYLOAD_ARG_ERROR" if normalized == "skill_payload" else "EDIT_TEXT_ERROR"
         return f"⚠️ {prefix}: {exc}"
-    reason = block_reason_for_path(ctx, binding.target_path, "write")
+    reason = block_reason_for_path(ctx, binding.target_path, "write", binding)
     protected_block = (
         f"⚠️ EDIT_TEXT_BLOCKED: protected artifact path blocked: {reason}" if reason else ""
     )
@@ -1793,10 +1766,14 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
             search_root.relative_to(root_path.resolve(strict=False))
         except ValueError:
             return f"⚠️ SEARCH_ERROR: path escapes root: {display_search_path}"
-    protected_root_block = block_reason_for_path(ctx, search_root, "static_introspection")
+    protected_root_block = block_reason_for_path(
+        ctx, search_root, "static_introspection", binding
+    )
     if protected_root_block:
         return protected_root_block
-    protected_root_read_block = block_reason_for_path(ctx, search_root, "read_bytes")
+    protected_root_read_block = block_reason_for_path(
+        ctx, search_root, "read_bytes", binding
+    )
     if protected_root_read_block and search_root.is_file():
         return protected_root_read_block
     subagent_readonly = is_restricted_subagent_profile(ctx)
@@ -1821,7 +1798,7 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
         return not (
             (subagent_readonly and _local_readonly_resource_block(ctx, normalized, fp, root_path, action="SEARCH"))
             or (normalized == "user_files" and user_files_path_block_reason(ctx, fp))
-            or block_reason_for_path(ctx, fp, "read_bytes")
+            or block_reason_for_path(ctx, fp, "read_bytes", binding)
             or _is_search_skippable(fp)
         )
 
@@ -1917,7 +1894,7 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
                 continue
             if normalized == "user_files" and user_files_path_block_reason(ctx, fp):
                 continue
-            if block_reason_for_path(ctx, fp, "read_bytes"):
+            if block_reason_for_path(ctx, fp, "read_bytes", binding):
                 protected_omitted += 1
                 continue
 
