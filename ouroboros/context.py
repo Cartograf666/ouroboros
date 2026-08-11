@@ -937,29 +937,41 @@ def _shared_past_beyond_scan(
     oldest = str((scanned[0] or {}).get("ts") or "")
     capped = len(scanned) >= _PROJECT_THREAD_SCAN
     bindings = bound or {}
-    beyond, out_of_window = [], False
+    out_of_window, not_reached = [], []
     for chat, cutoff in sorted(ancestors):
         if oldest and cutoff and oldest > cutoff:
-            beyond.append(chat)
-            out_of_window = True
+            out_of_window.append(chat)
             continue
         if not capped:
             continue
         reach = _ancestor_reach(scanned, chat, cutoff, bindings)
         if reach is None or reach == 0:
-            beyond.append(chat)
+            not_reached.append(chat)
+    beyond = sorted(out_of_window + not_reached)
     if not beyond:
         return ""
     named = ", ".join(str(chat) for chat in beyond)
-    why = (
+    # Each GROUP carries its OWN reason. One reason covering every named ancestor
+    # stopped being true the moment two of them qualified differently — a fork of
+    # a fork whose grandparent is wholly out of the window while its parent's rows
+    # run into the window edge was told, in one sentence, something that could
+    # only be true of one of them.
+    reasons = []
+    if out_of_window:
+        reasons.append(
+            f"for chat {', '.join(str(c) for c in out_of_window)}, this window begins "
+            f"at {oldest}, after the point the fork was taken"
+        )
+    if not_reached:
         # Deliberately NOT "older rows exist": a live file of exactly the cap length
         # with no archive behind it has none, and a disclosure must not assert what
         # it cannot see. "Anything older was not read" is true either way.
-        f"the {len(scanned)}-row window scanned here is full and does not reach back "
-        "past where those rows begin, so anything older than it was not read"
-        if not out_of_window else
-        f"this window begins at {oldest}, after the point the fork was taken"
-    )
+        reasons.append(
+            f"for chat {', '.join(str(c) for c in not_reached)}, the {len(scanned)}-row "
+            "window scanned here is full and does not reach back past where those rows "
+            "begin, so anything older than it was not read"
+        )
+    why = "; and ".join(reasons)
     return (
         f"This thread is a FORK of chat {named}, and the shared past it inherits may "
         f"not be complete below: {why}. This view filters ONE bounded tail of the "

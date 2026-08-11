@@ -922,3 +922,30 @@ def test_the_notice_also_fires_when_the_window_starts_after_the_fork(tmp_path):
     assert gaps, sections
     assert "after the point the fork was taken" in gaps[0]
     assert str(parent_chat) in gaps[0]
+
+
+def test_two_ancestors_failing_differently_each_get_their_own_reason(tmp_path):
+    """A fork of a fork can reach one ancestor and miss the other entirely, and
+    one sentence covering both could only ever be true of one of them."""
+    from ouroboros import context as ctx
+    from ouroboros.thread_history import ThreadLens
+
+    lens = ThreadLens(
+        chat_id=300, project_id="p", thread_id=3,
+        cutoffs={300: "", 200: "2026-08-20T00:00:00Z", 100: "2026-01-01T00:00:00Z"},
+        order=[300, 200, 100],
+    )
+    # A FULL window of the parent's own rows: it runs into the window edge, while
+    # the grandparent's cutoff is older than anything the window could hold.
+    scanned = [
+        {"chat_id": 200, "ts": "2026-08-05T00:00:00Z"}
+        for _ in range(ctx._PROJECT_THREAD_SCAN)
+    ]
+    note = ctx._shared_past_beyond_scan(lens, scanned, {})
+
+    assert "for chat 100, this window begins at 2026-08-05T00:00:00Z" in note
+    assert "after the point the fork was taken" in note
+    assert "for chat 200, the 4000-row window scanned here is full" in note
+    assert "does not reach back past where those rows begin" in note
+    # Both are named as ancestors of this fork, once each.
+    assert note.count("100") >= 1 and note.count("200") >= 1
