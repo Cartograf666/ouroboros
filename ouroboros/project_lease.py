@@ -48,10 +48,17 @@ candidate compared against a narrow held lane matched nothing and entered the
 folder, and a placeless RUNNING holder stopped blocking a folder-bearing
 candidate. So a project-scoped candidate whose folder is UNRESOLVABLE
 (:func:`_folder_unresolvable`) is not leasable while any lane is held, and while
-the map is missing a candidate that names a folder still queues behind a narrow
-lane of its OWN project. An unknown folder queues; it never runs parallel by
-accident (I3). Everything else is unchanged: a real map — even an empty one —
-keeps the honest narrow key for the genuinely file-less project.
+the map is missing a candidate that names a folder queues behind ANY narrow lane
+that is held — not only one belonging to its OWN project. Comparing the
+candidate's own project key alone left the hole in the covering branch itself: a
+narrow lane says "this running writer's folder is unknown", so a candidate naming
+``/w/shared`` under a DIFFERENT project id, and a projectless one naming it,
+matched nothing and were admitted, while the same-project candidate beside them
+queued. Projects may share a folder, which is why the lane is folder-keyed at
+all. An unknown folder queues; it never runs parallel by accident (I3).
+Everything else is unchanged: a real map — even an empty one — keeps the honest
+narrow key for the genuinely file-less project, and a RESOLVED folder lane never
+blocks a candidate writing in a different folder.
 
 **Purity.** These functions run under the supervisor queue lock on every
 assignment pass, so they NEVER touch the filesystem: normalization here is
@@ -523,10 +530,22 @@ def candidate_is_leasable(
     unreadable registry), which is not the same as "no project has one" and must
     not narrow the key: see the module docstring. While the map is missing, a
     project-scoped candidate that names no folder is not leasable at all if
-    anything holds a lane, and one that DOES name a folder still queues behind a
-    narrow lane of its own project — the placeless holder may be writing in
-    exactly that folder. "Cannot tell" queues; it never runs in parallel by
-    accident.
+    anything holds a lane, and one that DOES name a folder queues behind ANY
+    narrow lane that is held — not merely a narrow lane of its own project.
+    "Cannot tell" queues; it never runs in parallel by accident.
+
+    That last rule used to compare only the candidate's OWN project key, which
+    left the hole in the one place the fail-closed branch exists to cover. A
+    narrow ``(project_id, "")`` lane means "this running task's folder is
+    unknown", and the answer to "is it the folder this candidate names?" is
+    exactly as unknown: the holder's registered ``working_dir`` may BE that
+    folder, and two projects may even share one (the lane is folder-keyed for
+    precisely that reason). So a candidate naming ``/w/shared`` under another
+    project id, and a PROJECTLESS candidate naming it, both matched nothing and
+    were admitted straight into a folder a live writer may hold — while the
+    same-project candidate beside them was correctly queued. Under an unreadable
+    map every unresolved project lane conflicts with every folder-bearing
+    candidate, because nothing available here can prove they are disjoint.
     """
     for lane in running_lanes or ():
         if not (isinstance(lane, tuple) and len(lane) == 2):
@@ -539,7 +558,10 @@ def candidate_is_leasable(
     if project_workspaces is None:
         if _folder_unresolvable(candidate, project_workspaces):
             return not bool(running_lanes)
-        if (_task_project_id(candidate), "") in (running_lanes or ()):
+        # The candidate names a folder; a NARROW held lane names a project whose
+        # folder this module cannot read. Disjointness is unprovable in both
+        # directions, so it queues — whatever project the narrow lane belongs to.
+        if any(pid for pid, _root in (running_lanes or ())):
             return False
     return _computed_lane(candidate, project_workspaces) not in running_lanes
 

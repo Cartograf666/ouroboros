@@ -274,13 +274,57 @@ def test_an_unreadable_folder_map_never_admits_a_second_writer():
     assert candidate_is_leasable(folder_candidate, held_narrow, None) is False
     assert candidate_is_leasable(folder_candidate, held_narrow, {}) is True   # honest narrow key
 
-    # It is not a wildcard: another project is untouched either way, and an
-    # unscoped task never serializes.
-    other = {"id": "t3", "project_id": "beta", "workspace_root": "/w/beta"}
-    assert candidate_is_leasable(other, held_narrow, None) is True
+    # An unscoped task never serializes, and nothing held means nothing to queue
+    # behind.
     assert candidate_is_leasable({"id": "t4"}, held_narrow, None) is True
-    # Nothing held: an unknown folder does not queue behind nothing.
     assert candidate_is_leasable(placeless_holder, set(), None) is True
+
+
+def test_an_unresolved_project_lane_blocks_every_folder_bearing_candidate():
+    """The half of I3 that was left open: only the candidate's OWN project key
+    was compared against the narrow lanes.
+
+    A narrow `(project_id, "")` lane means "this RUNNING writer's folder could
+    not be read". Asking whether it is the folder a candidate names is exactly
+    as unanswerable — the holder's registered `working_dir` may BE that folder,
+    and two projects may share one, which is why the lane is folder-keyed at
+    all. So a candidate naming `/w/shared` under ANOTHER project id, and a
+    PROJECTLESS candidate naming it, were both admitted straight into a folder a
+    live writer may hold, while the same-project candidate beside them queued.
+    Two writers in one folder is the one thing the lane exists to prevent.
+    """
+    from ouroboros.project_lease import candidate_is_leasable, running_project_lanes
+
+    placeless_holder = {"id": "t1", "project_id": "alpha"}
+    held_narrow = running_project_lanes([{"task": placeless_holder}], None)
+    assert held_narrow == {("alpha", "")}
+
+    cross_project = {"id": "t2", "project_id": "beta", "workspace_root": "/w/shared"}
+    projectless = {"id": "t3", "workspace_root": "/w/shared"}
+    assert candidate_is_leasable(cross_project, held_narrow, None) is False
+    assert candidate_is_leasable(projectless, held_narrow, None) is False
+    # ...including a folder that has nothing to do with alpha: the map is
+    # unreadable, so "nothing to do with" is not a fact anything here holds.
+    assert candidate_is_leasable(
+        {"id": "t5", "project_id": "beta", "workspace_root": "/w/beta"}, held_narrow, None,
+    ) is False
+
+    # It is still not a wildcard. With a REAL map (even an empty one) the narrow
+    # key is honest again and a different folder runs...
+    assert candidate_is_leasable(cross_project, held_narrow, {}) is True
+    assert candidate_is_leasable(projectless, held_narrow, {}) is True
+    # ...and an unreadable map with only RESOLVED folder lanes held blocks only
+    # the folder it actually names.
+    held_folder = running_project_lanes(
+        [{"task": {"id": "r", "project_id": "alpha", "workspace_root": "/w/alpha"}}], None,
+    )
+    assert held_folder == {("", os.path.normcase("/w/alpha"))}
+    assert candidate_is_leasable(
+        {"id": "t6", "project_id": "beta", "workspace_root": "/w/beta"}, held_folder, None,
+    ) is True
+    assert candidate_is_leasable(
+        {"id": "t7", "project_id": "beta", "workspace_root": "/w/alpha"}, held_folder, None,
+    ) is False
 
 
 def test_assign_tasks_hands_the_lease_None_when_the_registry_cannot_be_read(tmp_path, monkeypatch):
