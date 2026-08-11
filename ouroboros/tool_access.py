@@ -1339,6 +1339,21 @@ def resource_root_path(
     raise ValueError(f"unknown root {root!r}")
 
 
+def binding_targets_system_repo(
+    ctx: Any, binding: ResolvedResourceBinding | None,
+) -> bool:
+    """Whether a selected logical root physically lands on Ouroboros source."""
+
+    if binding is None:
+        return False
+    try:
+        return pathlib.Path(binding.base_path).resolve(strict=False) == resource_root_path(
+            ctx, "system_repo",
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def _resolve_target_in_selected_base(
     ctx: Any,
     *,

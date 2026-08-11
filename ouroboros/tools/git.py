@@ -29,7 +29,11 @@ from ouroboros.tools.registry import (
     _authorized_managed_update_resolver,
     active_repo_dir_for,
 )
-from ouroboros.tool_access import ResolvedResourceBinding, build_resolved_resource_binding
+from ouroboros.tool_access import (
+    ResolvedResourceBinding,
+    binding_targets_system_repo,
+    build_resolved_resource_binding,
+)
 from ouroboros.tools.claude_advisory_review import advisory_gate_unavailable
 from ouroboros.tools.commit_gate import (
     _check_advisory_freshness,
@@ -2519,8 +2523,9 @@ def _restore_to_head(ctx: ToolContext, confirm: bool = False,
         for line in status.splitlines()
         for path in _review_paths_from_porcelain_line(line)
     ]
-    affected_protected = protected_paths_in(dirty_files) if binding.root == "system_repo" else []
-    if paths and binding.root == "system_repo":
+    targets_system = binding_targets_system_repo(ctx, binding)
+    affected_protected = protected_paths_in(dirty_files) if targets_system else []
+    if paths and targets_system:
         for p in paths:
             norm = normalize_repo_path(p)
             if is_protected_runtime_path(norm):
@@ -2624,7 +2629,11 @@ def _revert_commit(
         ).strip().splitlines()
     except Exception:
         changed_files = []
-    protected_changes = protected_paths_in(changed_files) if binding.root == "system_repo" else []
+    protected_changes = (
+        protected_paths_in(changed_files)
+        if binding_targets_system_repo(ctx, binding)
+        else []
+    )
     if protected_changes:
         return _vcs_result(
             f"⚠️ REVERT_BLOCKED: Commit {sha[:8]} touches protected file(s): "

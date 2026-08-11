@@ -44,6 +44,23 @@ def _registry(tmp_path: pathlib.Path):
     return registry, ctx, system, project
 
 
+def _plain_registry(tmp_path: pathlib.Path):
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+    system = _repo(tmp_path / "plain-system", "plain-system")
+    data = tmp_path / "plain-data"
+    data.mkdir()
+    ctx = ToolContext(
+        repo_dir=system,
+        system_repo_dir=system,
+        drive_root=data,
+        task_id="plain-vcs-binding-test",
+    )
+    registry = ToolRegistry(system, data)
+    registry.set_context(ctx)
+    return registry, system
+
+
 @pytest.fixture(autouse=True)
 def _allow_safety(monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *_a, **_k: (True, ""))
@@ -121,6 +138,18 @@ def test_restore_protects_names_only_for_explicit_system_root(tmp_path):
     assert (system / "BIBLE.md").read_text(encoding="utf-8") == "system change\n"
 
 
+def test_restore_protects_plain_default_when_active_workspace_is_system(tmp_path):
+    registry, system = _plain_registry(tmp_path)
+    (system / "BIBLE.md").write_text("system change\n", encoding="utf-8")
+
+    result = registry.execute(
+        "vcs_restore", {"paths": ["BIBLE.md"], "confirm": True},
+    )
+
+    assert "RESTORE_BLOCKED" in result
+    assert (system / "BIBLE.md").read_text(encoding="utf-8") == "system change\n"
+
+
 def test_revert_protects_names_only_for_explicit_system_root(tmp_path):
     registry, _ctx, system, project = _registry(tmp_path)
     for repo, text in ((system, "system commit\n"), (project, "project commit\n")):
@@ -141,6 +170,19 @@ def test_revert_protects_names_only_for_explicit_system_root(tmp_path):
     assert "REVERT_BLOCKED" not in project_result
     assert "New revert commit created" in project_result
     assert (project / "BIBLE.md").read_text(encoding="utf-8") == "project base\n"
+
+
+def test_revert_protects_plain_default_when_active_workspace_is_system(tmp_path):
+    registry, system = _plain_registry(tmp_path)
+    (system / "BIBLE.md").write_text("system commit\n", encoding="utf-8")
+    _git(system, "add", "BIBLE.md")
+    _git(system, "commit", "-qm", "change Bible")
+    sha = _git(system, "rev-parse", "HEAD")
+
+    result = registry.execute("vcs_revert", {"sha": sha, "confirm": True})
+
+    assert "REVERT_BLOCKED" in result
+    assert (system / "BIBLE.md").read_text(encoding="utf-8") == "system commit\n"
 
 
 def test_pull_uses_the_same_selected_binding_as_other_generic_vcs(tmp_path, monkeypatch):

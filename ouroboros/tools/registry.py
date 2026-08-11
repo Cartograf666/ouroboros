@@ -54,6 +54,7 @@ from ouroboros.artifacts import task_artifact_dir_path, task_id_for_artifacts
 from ouroboros.protected_artifacts import shell_block_reason as protected_artifact_shell_block_reason
 from ouroboros.git_shell_policy import run_shell_git_block_reason, workspace_git_safety_violation
 from ouroboros.tool_access import (
+    binding_targets_system_repo,
     build_resolved_resource_binding,
     canonical_repo_relative_path,
     is_external_workspace,
@@ -1053,20 +1054,6 @@ def _binding_error_text(name: str, root: str, exc: Exception) -> str:
         "vcs_revert": "REVERT_ERROR",
     }
     return f"⚠️ {prefixes.get(name, 'TOOL_ERROR')}: {type(exc).__name__}: {detail}"
-
-
-def _binding_targets_system_repo(ctx: Any, binding: Any) -> bool:
-    """Whether a resolved target physically lands on the Ouroboros source tree."""
-
-    if binding is None:
-        return False
-    try:
-        return (
-            pathlib.Path(binding.base_path).resolve(strict=False)
-            == system_repo_dir_for(ctx).resolve(strict=False)
-        )
-    except (OSError, TypeError, ValueError):
-        return False
 
 
 def _payload_dispatch_constraint(
@@ -3080,7 +3067,7 @@ class ToolRegistry:
         )
         target_bound_vcs = name in _GENERIC_VCS_TARGET_TOOLS
         if target_bound_vcs:
-            light_targets_system = _binding_targets_system_repo(
+            light_targets_system = binding_targets_system_repo(
                 self._ctx, resolved_binding,
             ) or acting_self_worktree
         elif name in _SYSTEM_INTRINSIC_REPO_MUTATION_TOOLS:
