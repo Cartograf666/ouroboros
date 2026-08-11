@@ -1559,7 +1559,7 @@ def test_local_readonly_subagent_task_drive_and_skill_payload_filters(tmp_path):
     data.mkdir()
     (data / "settings.json").write_text('{"OPENROUTER_API_KEY":"secret"}', encoding="utf-8")
     (data / "skills" / "external" / "alpha").mkdir(parents=True)
-    (data / "skills" / "external" / "alpha" / "skill.md").write_text("hello", encoding="utf-8")
+    (data / "skills" / "external" / "alpha" / "SKILL.md").write_text("hello", encoding="utf-8")
     registry = ToolRegistry(repo_dir=repo, drive_root=data)
     registry.set_context(
         ToolContext(
@@ -1577,7 +1577,7 @@ def test_local_readonly_subagent_task_drive_and_skill_payload_filters(tmp_path):
     assert "TOOL_ACCESS_BLOCKED" in traversal or "READ_FILE_ERROR" in traversal or "TOOL_ARG_ERROR" in traversal
     skill_payload_read = registry.execute(
         "read_file",
-        {"root": "skill_payload", "bucket": "external", "skill_name": "alpha", "path": "skill.md"},
+        {"root": "skill_payload", "bucket": "external", "skill_name": "alpha", "path": "SKILL.md"},
     )
     # v6.70.0 (owner-approved): read-only scouts may READ skill payloads — a scout
     # sent to review a skill used to be structurally blind to it. Mutation stays
