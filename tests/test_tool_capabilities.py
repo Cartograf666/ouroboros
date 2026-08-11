@@ -657,7 +657,9 @@ def test_workspace_parent_can_call_task_acceptance_review_only(tmp_path, monkeyp
 
     registry.override_handler("task_acceptance_review", lambda ctx=None, **_kwargs: "review-ok")
     assert registry.execute("task_acceptance_review", {}) == "review-ok"
-    assert "WORKSPACE_MODE_BLOCKED" in registry.execute("commit_reviewed", {})
+    assert "WORKSPACE_MODE_BLOCKED" in registry.execute(
+        "commit_reviewed", {"commit_message": "nope"}
+    )
 
 
 def test_local_readonly_subagent_allows_enabled_extension_tool(tmp_path, monkeypatch):

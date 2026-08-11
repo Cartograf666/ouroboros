@@ -1072,13 +1072,16 @@ class TestSandboxCoversRepoWrite:
     def test_sandbox_mentions_repo_write(self):
         registry = _get_registry_module()
         source = inspect.getsource(registry.ToolRegistry.execute)
-        assert "write_file" in source
+        assert "_ROOT_ARG_REPO_WRITE_TOOLS" in source
+        assert "write_file" in registry._ROOT_ARG_REPO_WRITE_TOOLS
 
     def test_sandbox_checks_files_param(self):
         """Sandbox must check files array for safety-critical paths."""
         registry = _get_registry_module()
-        source = inspect.getsource(registry.ToolRegistry.execute)
-        assert "files" in source
+        assert registry._payload_write_paths(
+            "write_file",
+            {"files": [{"path": "BIBLE.md", "content": "x"}]},
+        ) == ["BIBLE.md"]
 
 
 # --- index-full instruction fix ---
