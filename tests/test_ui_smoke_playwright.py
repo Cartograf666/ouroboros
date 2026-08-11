@@ -4560,18 +4560,27 @@ def test_ui_thread_menu_offers_the_branch_rows_and_archive_round_trips(direct_se
     could not be invoked by anything. Archive was a one-way trip with a
     documented inverse nobody could press.
 
-    It also carries the phase's VISION-INSPECTION evidence, in the repo's own
-    form (`OUROBOROS_UI_EVIDENCE_DIR`, the `v679-depth-*` precedent): the
-    screenshots below are the states a human read on a live instance —
-    a project on a real git folder, its threads, one opened in the centre, one
-    branched into its own worktree, one archived and restored, and every menu
-    row's enabled state WITH its reason. Assertions alone could not have found
-    what that pass found: the archived row's tooltip read "Restore this thread —
-    restore it to act on it", a tautology beside the word "Restore" that told the
-    owner nothing, and its test had pinned that exact wording. Fixed in
-    `1fffc240`, whose test now asserts the substance instead. A saved screenshot
-    is not verification on its own (docs/DEVELOPMENT.md "Responsive and
-    accessible behavior"); it is what makes the inspection re-runnable.
+    It also carries this phase's VISION-INSPECTION evidence, in the repo's own
+    form (`OUROBOROS_UI_EVIDENCE_DIR`, the `v679-depth-*` precedent). Stated
+    precisely, because evidence that overclaims is worse than none:
+
+    * the CAPTURES below are four states — the thread menu with every row's
+      enabled state and its reason, the project row's own menu, the archived row
+      that offers restore, and the thread back in the sidebar after it;
+    * the manual pass that produced this test covered more than the captures do
+      (a project attached to a real git folder, a thread branched into its own
+      worktree, and the centre-chat and phone layouts — the last two captured by
+      `test_ui_project_threads_create_rename_fork_open_in_centre`). Branch-off
+      has no capture here because this fixture's project has no git folder to
+      branch from.
+
+    What no assertion could have found is what that pass found: the archived
+    row's tooltip read "Restore this thread — restore it to act on it", a
+    tautology beside the word "Restore" that told the owner nothing, and its own
+    test had pinned that exact wording. Fixed in `1fffc240`, whose test now
+    asserts the substance. A saved screenshot is not verification on its own
+    (docs/DEVELOPMENT.md "Responsive and accessible behavior"); it is what makes
+    the inspection re-runnable by the next reader.
     """
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
