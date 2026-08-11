@@ -169,6 +169,7 @@ def test_light_mode_allows_normal_skill_str_replace_without_repair_constraint(tm
     repo.mkdir()
     skill = drive / "skills" / "clawhub" / "alpha"
     skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# alpha\n", encoding="utf-8")
     target = skill / "plugin.py"
     target.write_text("VALUE = 1\n", encoding="utf-8")
     registry = ToolRegistry(repo_dir=repo, drive_root=drive)
@@ -193,6 +194,7 @@ def test_light_mode_blocks_normal_skill_sidecar_str_replace(tmp_path, monkeypatc
     repo.mkdir()
     skill = drive / "skills" / "ouroboroshub" / "alpha"
     skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# alpha\n", encoding="utf-8")
     sidecar = skill / ".ouroboroshub.json"
     sidecar.write_text('{"version":"1"}\n', encoding="utf-8")
     registry = ToolRegistry(repo_dir=repo, drive_root=drive)
@@ -217,6 +219,7 @@ def test_light_mode_blocks_review_excluded_skill_dirs(tmp_path, monkeypatch):
     repo.mkdir()
     target_dir = drive / "skills" / "external" / "alpha" / "node_modules"
     target_dir.mkdir(parents=True)
+    (target_dir.parent / "SKILL.md").write_text("# alpha\n", encoding="utf-8")
     target = target_dir / "dep.js"
     target.write_text("VALUE = 1\n", encoding="utf-8")
     registry = ToolRegistry(repo_dir=repo, drive_root=drive)

@@ -19,8 +19,12 @@ from ouroboros.skill_loader import (
     SkillReviewState,
     auto_grant_if_enabled,
     compute_content_hash,
-    find_skill,
     save_review_state,
+)
+from ouroboros.tool_access import (
+    ResolvedResourceBinding,
+    build_resolved_resource_binding,
+    load_bound_skill,
 )
 from ouroboros.skill_review_history import (
     append_history as _append_skill_review_history,
@@ -59,8 +63,6 @@ from ouroboros.utils import (
 )
 
 log = logging.getLogger(__name__)
-
-
 # The reviewable skill payload is bound by ONE pack-level token budget (reusing the
 # review stack's SSOT REVIEW_PROMPT_TOKEN_BUDGET) instead of arbitrary per-file /
 # file-count BYTE caps: a 76 KB data file or a 41-file skill is fully reviewable when
@@ -69,12 +71,10 @@ log = logging.getLogger(__name__)
 # prompt (governance docs + checklist + framing) so the SKILL pack alone is bounded.
 _SKILL_PACK_TOKEN_HEADROOM = 120_000
 
-
 def _skill_pack_token_budget() -> int:
     """Estimated-token budget for the assembled skill file pack alone (SSOT
     REVIEW_PROMPT_TOKEN_BUDGET minus headroom for the rest of the reviewer prompt)."""
     return max(1, REVIEW_PROMPT_TOKEN_BUDGET - _SKILL_PACK_TOKEN_HEADROOM)
-
 
 _SKILL_CHECKLIST_SECTION = "Skill Review Checklist"
 
@@ -89,7 +89,6 @@ _LOADABLE_BINARY_EXTENSIONS = frozenset(
         ".exe", ".bin",                    # generic executables
     }
 )
-
 
 class _SkillFileOverBudget(RuntimeError):
     """Raised when a SINGLE skill file alone exceeds the reviewer token budget, so it
@@ -107,7 +106,6 @@ class _SkillFileOverBudget(RuntimeError):
         self.relpath = relpath
         self.tokens = tokens
         self.budget = budget
-
 
 class _SkillFileUnreadable(RuntimeError):
     """Raised when a runtime-reachable file cannot be read; review fails closed."""
@@ -671,12 +669,15 @@ def _run_deterministic_preflight(
     content_hash: str,
     *,
     persist: bool,
+    binding: ResolvedResourceBinding | None = None,
 ) -> Optional[SkillReviewOutcome]:
     """Run deterministic checks before spending tri-model review tokens."""
     preflight_raw = ""
     try:
         from ouroboros.tools.skill_preflight import _handle_skill_preflight
-        preflight_raw = _handle_skill_preflight(ctx, skill=skill.name)
+        preflight_raw = _handle_skill_preflight(
+            ctx, skill=skill.name, _resolved_binding=binding,
+        )
         preflight = json.loads(preflight_raw)
     except Exception:
         preflight = {"ok": True}
@@ -1294,27 +1295,23 @@ def review_skill(
     *,
     persist: bool = True,
     review_rebuttal: str = "",
+    _resolved_binding: ResolvedResourceBinding | None = None,
 ) -> SkillReviewOutcome:
     """Run tri-model review on one skill, optionally persisting the verdict."""
-    # Deferred import avoids the wide review.py graph until this tool runs.
     from ouroboros.tools.review import _handle_multi_model_review
     from ouroboros.config import get_review_models
-
-    drive_root = pathlib.Path(getattr(ctx, "drive_root", pathlib.Path.home() / "Ouroboros" / "data"))
-    skill = find_skill(drive_root, skill_name)
+    try:
+        binding = _resolved_binding or build_resolved_resource_binding(
+            ctx, root="skill_payload", operation="review", path=".", skill_name=skill_name,
+        )
+    except Exception as exc:
+        return SkillReviewOutcome(skill_name=skill_name, status=STATUS_PENDING, error=str(exc))
+    drive_root = binding.state_drive_root
+    skill = load_bound_skill(binding)
     if skill is None:
-        return SkillReviewOutcome(
-            skill_name=skill_name,
-            status=STATUS_PENDING,
-            error=f"Skill {skill_name!r} not found in the external skills checkout",
-        )
+        return SkillReviewOutcome(skill_name=skill_name, status=STATUS_PENDING, error=f"Skill {skill_name!r} not found")
     if skill.load_error:
-        return SkillReviewOutcome(
-            skill_name=skill_name,
-            status=STATUS_PENDING,
-            error=f"Skill manifest could not be parsed: {skill.load_error}",
-        )
-
+        return SkillReviewOutcome(skill_name=skill_name, status=STATUS_PENDING, error=f"Skill manifest could not be parsed: {skill.load_error}")
     from ouroboros.skill_loader import SkillPayloadUnreadable
     try:
         content_hash = compute_content_hash(
@@ -1407,6 +1404,7 @@ def review_skill(
         skill,
         content_hash,
         persist=persist,
+        binding=binding,
     )
     if preflight_outcome is not None:
         return preflight_outcome

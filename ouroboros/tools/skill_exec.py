@@ -31,6 +31,11 @@ from ouroboros.skill_loader import (
 from ouroboros.skill_review import review_skill as _review_skill_impl
 from ouroboros.skill_review_status import normalize_skill_review_status
 from ouroboros.tools.registry import ToolContext, ToolEntry
+from ouroboros.tool_access import (
+    ResolvedResourceBinding,
+    build_resolved_resource_binding,
+    canonical_data_root,
+)
 from ouroboros.tools.shell import (
     _active_subprocesses,
     _kill_process_group,
@@ -448,11 +453,14 @@ def _resolve_script_path(
 
 def _skill_tool_preflight(
     ctx: ToolContext,
+    binding: ResolvedResourceBinding | None = None,
 ) -> Optional[str]:
+    if binding is not None:
+        return None
     repo_path = get_skills_repo_path()
     if repo_path:
         return None
-    if discover_skills(pathlib.Path(getattr(ctx, "drive_root", "")), repo_path=""):
+    if discover_skills(canonical_data_root(ctx), repo_path=""):
         return None
     return (
         "⚠️ SKILLS_UNAVAILABLE: No skills are discoverable. Point "
@@ -465,7 +473,7 @@ def _handle_list_skills(ctx: ToolContext, **_kwargs: Any) -> str:
     err = _skill_tool_preflight(ctx)
     if err:
         return err
-    drive_root = pathlib.Path(ctx.drive_root)
+    drive_root = canonical_data_root(ctx)
     summary = summarize_skills(drive_root)
     return json.dumps(summary, ensure_ascii=False, indent=2)
 
@@ -474,12 +482,20 @@ def _handle_review_skill(
     ctx: ToolContext,
     skill: str = "",
     review_rebuttal: str = "",
+    _resolved_binding: ResolvedResourceBinding | None = None,
     **_kwargs: Any,
 ) -> str:
     skill_name = str(skill or "").strip()
     if not skill_name:
         return "⚠️ SKILL_REVIEW_ERROR: 'skill' argument is required."
-    err = _skill_tool_preflight(ctx)
+    try:
+        binding = _resolved_binding or build_resolved_resource_binding(
+            ctx, root="skill_payload", operation="review", path=".",
+            skill_name=skill_name,
+        )
+    except Exception as exc:
+        return f"⚠️ SKILL_REVIEW_ERROR: {exc}"
+    err = _skill_tool_preflight(ctx, binding)
     if err:
         return err
     from ouroboros.skill_review import (
@@ -495,16 +511,20 @@ def _handle_review_skill(
                 review_ctx,
                 review_name,
                 review_rebuttal=review_rebuttal,
+                _resolved_binding=binding,
             )
-        return _review_skill_impl(review_ctx, review_name)
+        return _review_skill_impl(
+            review_ctx, review_name, _resolved_binding=binding,
+        )
 
     payload = run_skill_review_lifecycle_blocking(
         ctx,
         skill_name,
         source="tool",
         review_impl=_review_with_optional_rebuttal,
+        _resolved_binding=binding,
     )
-    drive_root = pathlib.Path(getattr(ctx, "drive_root", pathlib.Path.home() / "Ouroboros" / "data"))
+    drive_root = binding.state_drive_root
     content_hash = str(payload.get("content_hash") or "")
     attempt_idx = _count_attempts_for_content(drive_root, skill_name, content_hash) if content_hash else 1
     if attempt_idx <= 0:
@@ -589,7 +609,7 @@ def _handle_skill_exec(
     if err:
         return err
 
-    drive_root = pathlib.Path(ctx.drive_root)
+    drive_root = canonical_data_root(ctx)
     loaded = find_skill(drive_root, skill_name)
     if loaded is None:
         return (
@@ -900,7 +920,7 @@ def _handle_toggle_skill(
     if err:
         return err
 
-    drive_root = pathlib.Path(ctx.drive_root)
+    drive_root = canonical_data_root(ctx)
     from ouroboros.skill_lifecycle_queue import skill_lifecycle_file_lock
 
     with skill_lifecycle_file_lock(drive_root):
@@ -969,13 +989,18 @@ def _handle_toggle_skill(
             gate = skill_review_gate(loaded.review.status, stale=stale)
             return json.dumps({"skill": loaded.name, "enabled": False, "review_status": loaded.review.status, "review_gate": gate, "executable_review": gate["executable_review"], "extension_action": extension_action, "extension_reason": extension_reason, "message": f"Skill {loaded.name!r} was not persisted as disabled because its sanitized identity collides with another skill directory. Rename one of the directories first."}, ensure_ascii=False, indent=2)
         save_enabled(drive_root, loaded.name, coerced)
+        loaded.enabled = coerced
         extension_action = None
         extension_reason = "not_extension"
         extension_load_error_msg = ""
         from ouroboros import extension_loader
         if loaded.manifest.is_extension() or loaded.name in extension_loader.snapshot()["extensions"]:
             from ouroboros.config import load_settings as _load_settings
-            live_state = extension_loader.reconcile_extension(loaded.name, drive_root, _load_settings, retry_load_error=True, revert_enabled_on_error=coerced)
+            live_state = extension_loader.reconcile_extension(
+                loaded.name, drive_root, _load_settings,
+                selected_skill=loaded, retry_load_error=True,
+                revert_enabled_on_error=coerced,
+            )
             extension_action = live_state.get("action")
             extension_reason = str(live_state.get("reason") or "")
             extension_load_error_msg = str(live_state.get("load_error") or "")

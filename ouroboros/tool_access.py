@@ -1201,6 +1201,39 @@ def canonical_data_root(ctx: Any) -> pathlib.Path:
     return pathlib.Path(getattr(ctx, "drive_root")).resolve(strict=False)
 
 
+def normalize_runtime_data_path(data_root: pathlib.Path, path: str) -> str:
+    """Normalize historical runtime-data prefixes before physical binding."""
+    norm = str(path or ".").strip().replace("\\", "/")
+    if norm.startswith("./"):
+        norm = norm[2:]
+    root_text = str(pathlib.Path(data_root)).rstrip("/")
+    root_without_lead = root_text.lstrip("/")
+    if root_without_lead and norm.lstrip("/").startswith(root_without_lead):
+        stripped = norm.lstrip("/")
+        return stripped[len(root_without_lead):].lstrip("/") or "."
+    if norm.startswith(".tmp-data-") or norm.lstrip("/").startswith(".tmp-data-"):
+        candidate = norm.lstrip("/")
+        first_slash = candidate.find("/")
+        if first_slash > 0:
+            after = candidate[first_slash + 1:]
+            return after[len("data/"):] if after.startswith("data/") else after
+    return norm or "."
+
+
+def load_bound_skill(binding: ResolvedResourceBinding) -> Any:
+    """Load the frozen payload target while preserving lifecycle provenance."""
+    from ouroboros.skill_loader import _classify_skill_source, load_skill
+
+    loaded = load_skill(binding.base_path, binding.state_drive_root)
+    if loaded is not None:
+        loaded.source = _classify_skill_source(
+            binding.base_path,
+            location=binding.source,
+            drive_root=binding.state_drive_root,
+        )
+    return loaded
+
+
 def canonical_repo_relative_path(ctx: Any, root: str, path: str) -> str:
     """Collapse a repo-lane path to the spelling its GUARDS must judge.
 
@@ -1239,7 +1272,7 @@ def _skill_payload_base(
     operation: Operation,
     location: str,
     skill_name: str,
-    allow_missing_external: bool = False,
+    allow_missing: bool = False,
 ) -> tuple[pathlib.Path, str, str]:
     """Select one physical skill package without reading lifecycle state."""
 
@@ -1251,14 +1284,21 @@ def _skill_payload_base(
 
     requested_location = str(location or "").strip().lower()
     allowed_locations = {"external", "clawhub", "ouroboroshub", "native", "user_repo"}
-    if requested_location not in allowed_locations:
+    canonical_name = _sanitize_skill_name(skill_name)
+    if not str(skill_name or "").strip() or canonical_name == "_unnamed":
+        raise ValueError("root=skill_payload requires a non-empty skill_name")
+    state_root = canonical_data_root(ctx)
+    candidates = _skill_location_inventory(state_root)
+    if not requested_location and operation == "review":
+        identity = tuple(item for item in candidates if item.name == canonical_name)
+        if not identity:
+            raise ValueError(f"skill {canonical_name!r} was not found")
+        requested_location = identity[0].location
+    elif requested_location not in allowed_locations:
         raise ValueError(
             "root=skill_payload requires bucket/location in "
             "external|clawhub|ouroboroshub|native|user_repo"
         )
-    canonical_name = _sanitize_skill_name(skill_name)
-    if not str(skill_name or "").strip() or canonical_name == "_unnamed":
-        raise ValueError("root=skill_payload requires a non-empty skill_name")
     if requested_location in {"native", "user_repo"} and profile not in _TOP_LEVEL_PRINCIPAL_PROFILES:
         raise ValueError(
             f"profile={profile} cannot select skill location={requested_location}"
@@ -1268,8 +1308,6 @@ def _skill_payload_base(
             "installed native skills are read/review only; edit their seed via root=system_repo"
         )
 
-    state_root = canonical_data_root(ctx)
-    candidates = _skill_location_inventory(state_root)
     selected = _select_skill_location(
         candidates,
         name=canonical_name,
@@ -1278,10 +1316,14 @@ def _skill_payload_base(
     )
     if selected is not None:
         return selected.skill_dir.resolve(strict=False), selected.location, selected.name
-    if requested_location == "external" and operation == "write" and allow_missing_external:
+    if (
+        operation == "write"
+        and allow_missing
+        and requested_location in {"external", "clawhub", "ouroboroshub"}
+    ):
         return (
-            (state_root / "skills" / "external" / canonical_name).resolve(strict=False),
-            "external",
+            (state_root / "skills" / requested_location / canonical_name).resolve(strict=False),
+            requested_location,
             canonical_name,
         )
     raise ValueError(
@@ -1372,7 +1414,9 @@ def _resolve_target_in_selected_base(
         )
     resolved_base = pathlib.Path(base_path).resolve(strict=False)
     path_text = str(path or ".")
-    if root in {"active_workspace", "system_repo"}:
+    if root == "runtime_data":
+        path_text = normalize_runtime_data_path(resolved_base, path_text)
+    elif root in {"active_workspace", "system_repo"}:
         path_text = normalize_root_relative(resolved_base, path_text)
     resolved = (resolved_base / safe_relpath(path_text)).resolve(strict=False)
     try:
@@ -1399,6 +1443,63 @@ def build_resolved_resource_binding(
     if not decision.allow:
         raise ValueError(decision.reason)
 
+    # Migration-additive legacy: edit_text outside a project workspace and explicit
+    # runtime_data skill paths historically accepted canonical data-bucket spellings.
+    # Resolve those forms here so guard and mutator still share one frozen target.
+    workspace_active = False
+    try:
+        workspace_active = bool(getattr(ctx, "is_workspace_mode")())
+    except (AttributeError, TypeError):
+        pass
+    legacy_data_form = (
+        normalized == "runtime_data" and operation in {"write", "edit"}
+    ) or (
+        normalized == "active_workspace" and operation == "edit" and not workspace_active
+    )
+    if legacy_data_form:
+        from ouroboros.contracts.skill_payload_policy import (
+            SkillPayloadPathError,
+            resolve_skill_payload_target,
+        )
+
+        legacy_state_root = canonical_data_root(ctx)
+        try:
+            normalization_root = (
+                resource_root_path(ctx, "runtime_data")
+                if normalized == "runtime_data"
+                else legacy_state_root
+            )
+            legacy_path = normalize_runtime_data_path(normalization_root, path)
+            legacy = resolve_skill_payload_target(legacy_state_root, legacy_path)
+        except SkillPayloadPathError:
+            legacy = None
+        if legacy is not None:
+            base, legacy_source, legacy_name = _skill_payload_base(
+                ctx,
+                profile=profile,
+                operation=operation,
+                location=legacy.bucket,
+                skill_name=legacy.skill,
+                allow_missing=operation == "write",
+            )
+            target = _resolve_target_in_selected_base(
+                ctx,
+                root="skill_payload",
+                base_path=base,
+                path=legacy.rel_path,
+                operation=operation,
+            )
+            return ResolvedResourceBinding(
+                profile=profile,
+                root=normalized,
+                operation=operation,
+                base_path=base,
+                target_path=target,
+                source=legacy_source,
+                skill_name=legacy_name,
+                state_drive_root=legacy_state_root,
+            )
+
     source = str(normalized)
     selected_name = ""
     room = (
@@ -1414,8 +1515,12 @@ def build_resolved_resource_binding(
             from ouroboros.contracts.skill_payload_policy import constraint_bucket_skill
 
             expected_bucket, expected_skill = constraint_bucket_skill(constraint)
-            if not selected_bucket and not selected_skill:
-                selected_bucket, selected_skill = expected_bucket, expected_skill
+            if (
+                not selected_bucket
+                and (not selected_skill or selected_skill == expected_skill)
+            ):
+                selected_bucket = expected_bucket
+                selected_skill = selected_skill or expected_skill
             elif (selected_bucket, selected_skill) != (expected_bucket, expected_skill):
                 raise ValueError(
                     "SKILL_REDIRECT_BLOCKED: active skill_repair payload is "
@@ -1430,7 +1535,7 @@ def build_resolved_resource_binding(
             operation=operation,
             location=selected_bucket,
             skill_name=selected_skill,
-            allow_missing_external=(
+            allow_missing=(
                 operation == "write"
                 and selected_bucket.lower() == "external"
                 and _is_skill_create_signal(path)
@@ -1438,6 +1543,7 @@ def build_resolved_resource_binding(
         )
     elif room is not None:
         base = room
+        source = "project_room"
     else:
         base = resource_root_path(ctx, normalized)
     target = _resolve_target_in_selected_base(

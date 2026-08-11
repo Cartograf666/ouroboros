@@ -1559,6 +1559,7 @@ def test_explicit_data_skills_path_wins_over_stale_bucket_skill_name(tmp_path, m
     repo.mkdir()
     skill = drive / "skills" / "external" / "alpha"
     skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# alpha\n", encoding="utf-8")
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     reg = ToolRegistry(repo_dir=repo, drive_root=drive)
 

@@ -28,6 +28,11 @@ from ouroboros.tools.registry import (
     ToolEntry,
     _authorized_managed_update_resolver,
     active_repo_dir_for,
+    system_repo_dir_for,
+)
+from ouroboros.tool_access import (
+    ResolvedResourceBinding,
+    build_resolved_resource_binding,
 )
 from ouroboros.tool_access import (
     ResolvedResourceBinding,
@@ -1267,17 +1272,30 @@ def _format_commit_result(ctx, commit_message, push_status, test_warning):
     return result
 
 
-def _check_shrink_guard(ctx: ToolContext, file_path: str, new_content: str, force: bool = False) -> Optional[str]:
+def _binding_repo_rel(binding: ResolvedResourceBinding) -> str:
+    return binding.target_path.relative_to(binding.base_path).as_posix()
+
+
+def _binding_targets_system_repo(ctx: ToolContext, binding: ResolvedResourceBinding) -> bool:
+    return binding.base_path.resolve(strict=False) == system_repo_dir_for(ctx).resolve(strict=False)
+
+
+def _check_shrink_guard(
+    binding: ResolvedResourceBinding,
+    new_content: str,
+    force: bool = False,
+) -> Optional[str]:
     """Block likely accidental tracked-file truncation unless force=True."""
     if force:
         return None
     try:
-        target = ctx.repo_path(file_path)
+        target = binding.target_path
+        file_path = _binding_repo_rel(binding)
         if not target.exists():
             return None
         result = subprocess.run(
             ["git", "ls-files", "--error-unmatch", safe_relpath(file_path)],
-            cwd=str(active_repo_dir_for(ctx)), capture_output=True, text=True,
+            cwd=str(binding.base_path), capture_output=True, text=True,
         )
         if result.returncode != 0:
             return None
@@ -1300,7 +1318,10 @@ def _check_shrink_guard(ctx: ToolContext, file_path: str, new_content: str, forc
 def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
                 files: Optional[List[Dict[str, str]]] = None,
                 force: bool = False,
-                display_root: str = "active_workspace") -> str:
+                display_root: str = "active_workspace",
+                _resolved_binding: (
+                    ResolvedResourceBinding | tuple[ResolvedResourceBinding, ...] | None
+                ) = None) -> str:
     """Write file(s) to the repo working directory without committing."""
     write_list: List[Dict[str, str]] = []
     if files:
@@ -1320,10 +1341,27 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
     if not write_list:
         return "⚠️ WRITE_ERROR: nothing to write."
 
-    for e in write_list:
-        norm = normalize_repo_path(e["path"])
+    try:
+        if _resolved_binding is None:
+            binding_items = tuple(
+                build_resolved_resource_binding(
+                    ctx, root=display_root, operation="write", path=e["path"],
+                )
+                for e in write_list
+            )
+        elif isinstance(_resolved_binding, tuple):
+            binding_items = _resolved_binding
+        else:
+            binding_items = (_resolved_binding,)
+        if len(binding_items) != len(write_list):
+            return "⚠️ WRITE_ERROR: resolved target count does not match files."
+    except Exception as exc:
+        return f"⚠️ WRITE_ERROR: could not resolve target: {type(exc).__name__}: {exc}"
+
+    for e, binding in zip(write_list, binding_items):
+        norm = normalize_repo_path(_binding_repo_rel(binding))
         if (
-            not ctx.is_workspace_mode()
+            _binding_targets_system_repo(ctx, binding)
             and is_protected_runtime_path(norm)
             and not mode_allows_protected_write(_current_runtime_mode())
             and not _authorized_managed_update_resolver(ctx)
@@ -1348,12 +1386,13 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
     syntax_bypass_notes: List[str] = []
     from ouroboros.tools.edit_ops import _syntax_check
 
-    for e in write_list:
-        syntax_err = _syntax_check(safe_relpath(e["path"]), e["content"])
+    for e, binding in zip(write_list, binding_items):
+        rel_path = _binding_repo_rel(binding)
+        syntax_err = _syntax_check(rel_path, e["content"])
         if not syntax_err:
             continue
         if force:
-            syntax_bypass_notes.append(f"{safe_relpath(e['path'])}: {syntax_err}")
+            syntax_bypass_notes.append(f"{rel_path}: {syntax_err}")
             continue
         return (
             f"⚠️ WRITE_BLOCKED_SYNTAX: {syntax_err} for '{e['path']}'. "
@@ -1364,19 +1403,20 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
     written = []
     written_paths: List[str] = []
     overwrite_diffs: List[str] = []
-    for e in write_list:
-        shrink_warning = _check_shrink_guard(ctx, e["path"], e["content"], force=force)
+    for e, binding in zip(write_list, binding_items):
+        rel_path = _binding_repo_rel(binding)
+        shrink_warning = _check_shrink_guard(binding, e["content"], force=force)
         if shrink_warning:
             if written:
                 _invalidate_advisory(
                     ctx,
                     changed_paths=written_paths,
-                    mutation_root=active_repo_dir_for(ctx),
+                    mutation_root=binding_items[0].base_path,
                     source_tool="write_file",
                 )
             return shrink_warning
         try:
-            target = ctx.repo_path(e["path"])
+            target = binding.target_path
             old_content: Optional[str] = None
             if target.exists():
                 try:
@@ -1385,18 +1425,18 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
                     old_content = None
             target.parent.mkdir(parents=True, exist_ok=True)
             write_text(target, e["content"])
-            written.append(f"{display_root}:{safe_relpath(e['path'])} ({len(e['content'])} chars)")
-            written_paths.append(e["path"])
+            written.append(f"{display_root}:{rel_path} ({len(e['content'])} chars)")
+            written_paths.append(rel_path)
             if old_content is not None and old_content != e["content"]:
                 from ouroboros.tools.edit_ops import _unified_diff
 
-                overwrite_diffs.append(_unified_diff(safe_relpath(e["path"]), old_content, e["content"], cap=120))
+                overwrite_diffs.append(_unified_diff(rel_path, old_content, e["content"], cap=120))
         except Exception as exc:
             if written:
                 _invalidate_advisory(
                     ctx,
                     changed_paths=written_paths,
-                    mutation_root=active_repo_dir_for(ctx),
+                    mutation_root=binding_items[0].base_path,
                     source_tool="write_file",
                 )
             already = ", ".join(written) if written else "(none)"
@@ -1408,11 +1448,12 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
     _invalidate_advisory(
         ctx,
         changed_paths=written_paths,
-        mutation_root=active_repo_dir_for(ctx),
+        mutation_root=binding_items[0].base_path,
         source_tool="write_file",
     )
     summary = ", ".join(written)
-    if ctx.is_workspace_mode():
+    system_target = _binding_targets_system_repo(ctx, binding_items[0])
+    if ctx.is_workspace_mode() and not system_target:
         result = (
             f"✅ Written {len(written)} file(s): {summary}\n"
             "Files are on disk in the active workspace. Do not commit; the headless runner will emit a patch artifact."
@@ -1423,6 +1464,7 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
             "Files are on disk but NOT committed. Run commit_reviewed when ready.\n"
             "⚠️ Advisory pre-review is now stale — run advisory_review before commit_reviewed."
         )
+    result += f"\nResolved root: {binding_items[0].base_path}"
     if syntax_bypass_notes:
         result += (
             "\n⚠️ SYNTAX_GUARD_BYPASSED (force=true): "
@@ -1433,7 +1475,12 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
             "\nDiff vs the previous version (verify it matches your intent):\n"
             + "\n".join(overwrite_diffs)
         )
-    protected_written = [] if ctx.is_workspace_mode() else protected_paths_in(written_paths)
+    if system_target and any(pathlib.PurePosixPath(item).parts[:1] == ("skills",) for item in written_paths):
+        result += (
+            "\nℹ️ Native seed boundary: system_repo/skills changed; the installed "
+            "data/skills/native copy remains unchanged until launcher reseed."
+        )
+    protected_written = protected_paths_in(written_paths) if system_target else []
     if protected_written and mode_allows_protected_write(_current_runtime_mode()):
         result += "\n\n" + core_patch_notice(protected_written)
     return result
@@ -1447,6 +1494,8 @@ def _str_replace_editor(
     bucket: str = "",
     skill_name: str = "",
     display_root: str = "active_workspace",
+    force: bool = False,
+    _resolved_binding: ResolvedResourceBinding | None = None,
 ) -> str:
     """Replace exactly one occurrence of old_str with new_str in a file."""
     if not path or not path.strip():
@@ -1454,30 +1503,15 @@ def _str_replace_editor(
     if not old_str:
         return "⚠️ STR_REPLACE_ERROR: old_str is required (cannot be empty)."
 
-    norm = normalize_repo_path(path)
-    if (
-        not ctx.is_workspace_mode()
-        and is_protected_runtime_path(norm)
-        and not mode_allows_protected_write(_current_runtime_mode())
-        and not _authorized_managed_update_resolver(ctx)
-    ):
-        return protected_write_block_message(
-            path=norm,
-            runtime_mode=_current_runtime_mode(),
-            action="edit",
-        )
-
     existing_tc = normalize_task_constraint(getattr(ctx, "task_constraint", None))
     data_skill_target = None
     task_constraint = existing_tc
     short_form = None
-    if ctx.is_workspace_mode():
-        try:
-            target = ctx.repo_path(path)
-        except ValueError as e:
-            return f"⚠️ PATH_ERROR: {e}"
-        invalidation_root = active_repo_dir_for(ctx)
-    else:
+    binding = _resolved_binding
+    if binding is not None:
+        target = binding.target_path
+        invalidation_root = binding.base_path
+    elif not ctx.is_workspace_mode():
         short_form = decide_payload_short_form(
             bucket=bucket,
             skill_name=skill_name,
@@ -1493,7 +1527,7 @@ def _str_replace_editor(
             return f"⚠️ SKILL_REDIRECT_BLOCKED: {redirect_err}"
         task_constraint = existing_tc if existing_tc and existing_tc.mode == "skill_repair" else synth or existing_tc
 
-    if not ctx.is_workspace_mode() and task_constraint and task_constraint.mode == "skill_repair" and task_constraint.payload_root:
+    if binding is None and not ctx.is_workspace_mode() and task_constraint and task_constraint.mode == "skill_repair" and task_constraint.payload_root:
         try:
             target = resolve_payload_path(pathlib.Path(ctx.drive_root), task_constraint, path)
             data_skill_target = target
@@ -1506,7 +1540,7 @@ def _str_replace_editor(
                 "control-plane state. Edit user-authored payload files instead."
             )
         invalidation_root = pathlib.Path(ctx.drive_root)
-    elif not ctx.is_workspace_mode():
+    elif binding is None and not ctx.is_workspace_mode():
         data_skill_target = _data_skill_path(path, pathlib.Path(ctx.drive_root))
         if data_skill_target is not None:
             if is_skill_control_plane_path(data_skill_target, pathlib.Path(ctx.drive_root).resolve(strict=False)):
@@ -1517,12 +1551,30 @@ def _str_replace_editor(
                 )
             target = data_skill_target
             invalidation_root = pathlib.Path(ctx.drive_root)
-        else:
-            try:
-                target = ctx.repo_path(path)
-            except ValueError as e:
-                return f"⚠️ PATH_ERROR: {e}"
-            invalidation_root = active_repo_dir_for(ctx)
+    if binding is None and data_skill_target is None:
+        try:
+            binding = build_resolved_resource_binding(
+                ctx, root=display_root, operation="edit", path=path,
+            )
+        except Exception as exc:
+            return f"⚠️ PATH_ERROR: {exc}"
+        target = binding.target_path
+        invalidation_root = binding.base_path
+
+    rel_path = _binding_repo_rel(binding) if binding is not None else safe_relpath(path)
+    system_target = bool(binding and _binding_targets_system_repo(ctx, binding))
+    norm = normalize_repo_path(rel_path)
+    if (
+        system_target
+        and is_protected_runtime_path(norm)
+        and not mode_allows_protected_write(_current_runtime_mode())
+        and not _authorized_managed_update_resolver(ctx)
+    ):
+        return protected_write_block_message(
+            path=norm,
+            runtime_mode=_current_runtime_mode(),
+            action="edit",
+        )
 
     if not target.exists():
         return f"⚠️ STR_REPLACE_ERROR: file not found: {path}"
@@ -1544,7 +1596,11 @@ def _str_replace_editor(
         # carries the force escape hatch.)
         from ouroboros.tools.core import _check_data_shrink_guard
 
-        _shrink_block = _check_data_shrink_guard(target, new_content)
+        _shrink_block = _check_data_shrink_guard(target, new_content, force)
+        if _shrink_block:
+            return _shrink_block
+    elif binding is not None:
+        _shrink_block = _check_shrink_guard(binding, new_content, force)
         if _shrink_block:
             return _shrink_block
     try:
@@ -1561,24 +1617,31 @@ def _str_replace_editor(
 
     _invalidate_advisory(
         ctx,
-        changed_paths=[path],
+        changed_paths=[rel_path],
         mutation_root=invalidation_root,
         source_tool="edit_text",
     )
     result = (
-        f"✅ Replaced in {display_root}:{safe_relpath(path)} (line {replacement_line}).\n"
+        f"✅ Replaced in {display_root}:{rel_path} (line {replacement_line}).\n"
         f"Context:\n{context_preview}\n\n"
         "File is on disk but NOT committed."
     )
+    if binding is not None:
+        result += f"\nResolved root: {binding.base_path}"
     if short_form is not None and short_form.ignored_reason:
         result += f"\n⚠️ SKILL_SHORT_FORM_IGNORED: {short_form.ignored_reason}."
-    if data_skill_target is None and ctx.is_workspace_mode():
+    if data_skill_target is None and ctx.is_workspace_mode() and not system_target:
         result += "\nDo not commit; the headless runner will emit a patch artifact."
     elif data_skill_target is None:
         result += "\nRun commit_reviewed when ready.\n⚠️ Advisory pre-review is now stale — run advisory_review before commit_reviewed."
     else:
         result += "\nRun skill_review for this skill before enabling or declaring it ready."
-    if not ctx.is_workspace_mode() and is_protected_runtime_path(norm) and mode_allows_protected_write(_current_runtime_mode()):
+    if system_target and pathlib.PurePosixPath(rel_path).parts[:1] == ("skills",):
+        result += (
+            "\nℹ️ Native seed boundary: system_repo/skills changed; the installed "
+            "data/skills/native copy remains unchanged until launcher reseed."
+        )
+    if system_target and is_protected_runtime_path(norm) and mode_allows_protected_write(_current_runtime_mode()):
         result += "\n\n" + core_patch_notice([norm])
     return result
 

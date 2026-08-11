@@ -1148,6 +1148,7 @@ def test_heal_review_does_not_reconcile_live_extension(tmp_path, monkeypatch):
     skills_root = tmp_path / "skills"
     skills_root.mkdir()
     monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    _build_skill(ctx.drive_root / "skills" / "external", "alpha")
     _set_skill_repair(ctx, "alpha", "skills/external/alpha")
     calls = []
 

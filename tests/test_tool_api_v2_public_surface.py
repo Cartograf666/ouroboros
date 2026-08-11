@@ -1310,7 +1310,7 @@ def test_invalid_workspace_overlap_blocked_at_tool_boundary(tmp_path, monkeypatc
     assert "forged-workspace-probe" not in case_result
 
 
-def test_system_repo_write_blocks_when_active_workspace_differs(tmp_path, monkeypatch):
+def test_system_repo_write_targets_system_when_active_workspace_differs(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     repo = tmp_path / "repo"
     active = tmp_path / "workspace"
@@ -1323,9 +1323,10 @@ def test_system_repo_write_blocks_when_active_workspace_differs(tmp_path, monkey
 
     result = registry.execute("write_file", {"root": "system_repo", "path": "x.txt", "content": "x"})
 
-    assert "WRITE_FILE_BLOCKED" in result
+    assert result.startswith("✅ Written")
+    assert "system_repo:x.txt" in result
     assert not (active / "x.txt").exists()
-    assert not (repo / "x.txt").exists()
+    assert (repo / "x.txt").read_text(encoding="utf-8") == "x"
 
 
 def test_light_mode_blocks_interpreter_inline_repo_writes(tmp_path, monkeypatch):
