@@ -292,6 +292,46 @@ def test_extensions_index_collision_row_skips_lifecycle_projections(
     assert not (drive_root / "state").exists()
 
 
+def test_extensions_index_collision_does_not_reconcile_stale_review_job(
+    tmp_path, monkeypatch,
+):
+    import ouroboros.skill_review_runner as review_runner
+
+    checkout = tmp_path / "user-skills"
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(checkout))
+    client, drive_root, patches = _make_client(tmp_path, monkeypatch)
+    _write_ext(
+        drive_root / "skills" / "external", "alpha",
+        permissions=[], plugin="def register(api):\n    pass\n",
+    )
+    _write_ext(
+        checkout, "alpha", permissions=[],
+        plugin="def register(api):\n    pass\n",
+    )
+    job_path = review_runner.review_job_state_path(drive_root, "alpha")
+    job_path.write_text(json.dumps({
+        "status": "running",
+        "skill": "alpha",
+        "content_hash": "old-hash",
+        "job_id": "stale-alpha",
+        "started_at": "2020-01-01T00:00:00+00:00",
+        "last_heartbeat_at": "2020-01-01T00:00:00+00:00",
+        "pid": 999999,
+    }), encoding="utf-8")
+    before = job_path.read_bytes()
+    monkeypatch.setattr(review_runner, "_pid_alive", lambda _pid: False)
+
+    try:
+        response = client.get("/api/extensions")
+        assert response.status_code == 200
+        assert len(response.json()["skills"]) == 2
+        assert all("collision" in row["load_error"].lower() for row in response.json()["skills"])
+        assert job_path.read_bytes() == before
+        assert not (job_path.parent / "review_history.jsonl").exists()
+    finally:
+        _stop_patches(patches)
+
+
 def test_api_extension_manifest_returns_metadata(tmp_path, monkeypatch):
     skills_root = tmp_path / "skills"
     plugin = "def register(api):\n    pass\n"

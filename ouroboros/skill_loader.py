@@ -1071,6 +1071,17 @@ def _skill_location_inventory(
     )
 
 
+def skill_identity_collision_names(
+    drive_root: pathlib.Path,
+    repo_path: str | None = None,
+) -> frozenset[str]:
+    """Return ambiguous canonical identities without loading payload state."""
+    counts: Dict[str, int] = {}
+    for candidate in _skill_location_inventory(drive_root, repo_path=repo_path):
+        counts[candidate.name] = counts.get(candidate.name, 0) + 1
+    return frozenset(name for name, count in counts.items() if count > 1)
+
+
 def _select_skill_location(
     candidates: tuple[_SkillLocationCandidate, ...],
     *,

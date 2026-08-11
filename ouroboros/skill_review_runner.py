@@ -26,6 +26,7 @@ from ouroboros.skill_loader import (
     find_skill,
     review_status_allows_execution,
     save_enabled,
+    skill_identity_collision_names,
     skill_review_gate,
     skill_state_dir,
 )
@@ -387,12 +388,17 @@ def reconcile_stale_review_jobs(
     root = pathlib.Path(drive_root) / "state" / "skills"
     if not root.exists():
         return 0
+    collision_names = skill_identity_collision_names(
+        pathlib.Path(drive_root), repo_path=get_skills_repo_path(),
+    )
     count = 0
     for path in root.glob("*/review_job.json"):
+        skill_name = path.parent.name
+        if skill_name in collision_names:
+            continue
         before = _read_review_job(path)
         if str(before.get("status") or "") != "running":
             continue
-        skill_name = path.parent.name
         mark_stale_review_job_interrupted(
             pathlib.Path(drive_root),
             skill_name,
