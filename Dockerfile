@@ -3,7 +3,10 @@
 #   docker build -t ouroboros-web .
 #   docker run --rm -p 8765:8765 ouroboros-web
 
+FROM ghcr.io/astral-sh/uv:0.12.1 AS uv
 FROM python:3.10-slim
+
+COPY --from=uv /uv /uvx /bin/
 
 # System dependencies (git + Playwright/Chromium native libs installed via playwright install-deps)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -14,9 +17,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV APP_HOME=/app
 WORKDIR ${APP_HOME}
 
-# Install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Resolve only from the reviewed lock. Keeping dependencies in their own layer
+# lets source edits reuse the expensive Python package and browser downloads.
+ENV UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1 \
+    PATH="/app/.venv/bin:$PATH"
+COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --no-dev --extra browser --no-install-project
 
 # Install all Playwright native system dependencies for Chromium/WebKit (authoritative list from Playwright)
 RUN python3 -m playwright install-deps chromium webkit
@@ -26,6 +33,7 @@ RUN PLAYWRIGHT_BROWSERS_PATH=0 python3 -m playwright install chromium webkit
 
 # Copy application
 COPY . .
+RUN uv sync --locked --no-dev --extra browser --no-editable
 
 # Default environment
 ENV OUROBOROS_SERVER_HOST=0.0.0.0 \

@@ -13,6 +13,12 @@ if ! command -v "$HOST_PYTHON_CMD" >/dev/null 2>&1; then
     HOST_PYTHON_CMD=python
 fi
 
+if ! command -v uv >/dev/null 2>&1; then
+    echo "ERROR: uv is required for locked dependency installation."
+    echo "Install uv 0.12.1: curl -LsSf https://astral.sh/uv/0.12.1/install.sh | sh"
+    exit 1
+fi
+
 echo "=== Building Ouroboros for Linux (v${VERSION}) ==="
 
 if [ ! -f "python-standalone/bin/python3" ]; then
@@ -44,10 +50,13 @@ echo "--- Creating portable-Python launcher build environment ---"
 BUILD_VENV="build/linux-pyinstaller-venv"
 "$PORTABLE_PYTHON" -m venv "$BUILD_VENV"
 BUILD_PYTHON="$BUILD_VENV/bin/python"
-"$BUILD_PYTHON" -m pip install -q -r requirements-launcher.txt "pyinstaller>=6.0"
+BUILD_REQUIREMENTS="$BUILD_VENV/build-requirements.txt"
+uv export --locked --no-dev --extra browser --extra desktop --extra build \
+    --no-emit-project --no-hashes --no-annotate --output-file "$BUILD_REQUIREMENTS"
+uv pip install --python "$BUILD_PYTHON" -q -r "$BUILD_REQUIREMENTS"
 
 echo "--- Installing agent dependencies into python-standalone ---"
-"$PORTABLE_PYTHON" -m pip install -q -r requirements.txt
+uv pip install --python "$PORTABLE_PYTHON" -q -r requirements-runtime.lock
 
 echo "--- Fetching exact Claudexor runtime seed ---"
 "$PORTABLE_PYTHON" scripts/fetch_claudexor_runtime.py --output-dir claudexor-runtime

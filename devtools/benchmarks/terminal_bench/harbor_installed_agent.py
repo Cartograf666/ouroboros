@@ -533,9 +533,9 @@ PY
               export PIP_CACHE_DIR={_CONTAINER_PIP_CACHE}
               mkdir -p "$PIP_CACHE_DIR" 2>/dev/null || true
               python -m pip install --upgrade pip setuptools wheel
-              python -m pip install -r {_CONTAINER_SRC}/requirements.txt || {{
+              python -m pip install -r {_CONTAINER_SRC}/requirements-runtime.lock || {{
                 echo "install: requirements install failed; retrying without optional tree-sitter code-intel deps (lazy runtime import, degrades gracefully)"
-                grep -ivE 'tree[-_]sitter' {_CONTAINER_SRC}/requirements.txt > /tmp/ouro_reqs_no_treesitter.txt
+                grep -ivE 'tree[-_]sitter' {_CONTAINER_SRC}/requirements-runtime.lock > /tmp/ouro_reqs_no_treesitter.txt
                 python -m pip install -r /tmp/ouro_reqs_no_treesitter.txt
               }}
               python -m pip install -e {_CONTAINER_SRC} --no-deps

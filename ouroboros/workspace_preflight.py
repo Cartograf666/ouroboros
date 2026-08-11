@@ -48,6 +48,8 @@ _MANIFEST_NAMES = (
     "setup.py",
     "setup.cfg",
     "requirements.txt",
+    "requirements-runtime.lock",
+    "uv.lock",
     "tox.ini",
     "go.mod",
     "Cargo.toml",

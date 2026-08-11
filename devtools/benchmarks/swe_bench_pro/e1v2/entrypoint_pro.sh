@@ -73,7 +73,7 @@ if [ "${OBO_INSTALL_IN_IMAGE:-0}" = "1" ]; then
       echo "install-in-image: python after apk:  ${PY_AFTER:-unknown}" >&2
       "$PYBIN" -c "import xml.parsers.expat, pyexpat" || { echo "SOLVE_INFRA_SUSPECT reason=pyexpat_abi_mismatch" >&2; exit 87; }
       "$PYBIN" -m pip --version || { echo "SOLVE_INFRA_SUSPECT reason=pip_bootstrap_failed" >&2; exit 87; }
-      grep -ivE '^(playwright|playwright-stealth)([<=>[:space:]].*)?$' /opt/ouroboros-ro/requirements.txt > /tmp/reqs_musl.txt
+      grep -ivE '^(playwright|playwright-stealth)([<=>[:space:]].*)?$' /opt/ouroboros-ro/requirements-runtime.lock > /tmp/reqs_musl.txt
       if ! "$PYBIN" -m pip install --break-system-packages -r /tmp/reqs_musl.txt; then
         echo "install-in-image: musl requirements failed; retrying without tree-sitter" >&2
         "$PYBIN" -m pip --version || { echo "SOLVE_INFRA_SUSPECT reason=pip_bootstrap_failed" >&2; exit 87; }

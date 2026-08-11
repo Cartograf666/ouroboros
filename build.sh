@@ -24,6 +24,12 @@ DMG_PATH="dist/$DMG_NAME"
 
 echo "=== Building Ouroboros.app ==="
 
+if ! command -v uv >/dev/null 2>&1; then
+    echo "ERROR: uv is required for locked dependency installation."
+    echo "Install uv 0.12.1: curl -LsSf https://astral.sh/uv/0.12.1/install.sh | sh"
+    exit 1
+fi
+
 if [ ! -f "python-standalone/bin/python3" ]; then
     echo "ERROR: python-standalone/ not found."
     echo "Run first: bash scripts/download_python_standalone.sh"
@@ -44,10 +50,14 @@ if [ ! -f "ripgrep-standalone/bin/rg" ]; then
 fi
 
 echo "--- Installing launcher dependencies ---"
-pip install -q -r requirements-launcher.txt
+BUILD_REQUIREMENTS="$(mktemp "${TMPDIR:-/tmp}/ouroboros-build-requirements.XXXXXX")"
+trap 'rm -f "$BUILD_REQUIREMENTS"' EXIT
+uv export --locked --no-dev --extra browser --extra desktop --extra build \
+    --no-emit-project --no-hashes --no-annotate --output-file "$BUILD_REQUIREMENTS"
+uv pip install --python python3 -q -r "$BUILD_REQUIREMENTS"
 
 echo "--- Installing agent dependencies into python-standalone ---"
-python-standalone/bin/pip3 install -q -r requirements.txt
+uv pip install --python python-standalone/bin/python3 -q -r requirements-runtime.lock
 
 echo "--- Fetching exact Claudexor runtime seed ---"
 python-standalone/bin/python3 scripts/fetch_claudexor_runtime.py --output-dir claudexor-runtime

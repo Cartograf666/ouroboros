@@ -404,6 +404,26 @@ class TestHandleAdvisoryPreReviewSurfacesPreflightBlocked:
         assert result["status"] == "preflight_blocked"
         assert "Version History exceeds" in result["error"]
 
+    def test_release_metadata_preflight_blocks_stale_uv_lock(self, tmp_path):
+        from ouroboros.tools import claude_advisory_review as adv
+
+        repo = _make_agent_repo(tmp_path)
+        _write_release_files(repo, version="5.99.0-rc.1")
+        (repo / "uv.lock").write_text(
+            '[[package]]\nname = "ouroboros"\nversion = "5.98.0"\n'
+            'source = { editable = "." }\n',
+            encoding="utf-8",
+        )
+
+        result = adv._release_metadata_preflight(
+            repo,
+            "v5.99.0-rc.1: release",
+            ["VERSION"],
+        )
+
+        assert result is not None
+        assert "uv.lock" in result
+
     def test_changed_diff_without_version_blocks_before_sdk(self, tmp_path, monkeypatch):
         from ouroboros.tools import claude_advisory_review as adv
         import json as _json

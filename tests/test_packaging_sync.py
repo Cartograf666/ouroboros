@@ -12,6 +12,7 @@ def test_version_file_and_pyproject_are_synced():
     version = (REPO / "VERSION").read_text(encoding="utf-8").strip()
     pyproject = (REPO / "pyproject.toml").read_text(encoding="utf-8")
     package_json = (REPO / "web" / "package.json").read_text(encoding="utf-8")
+    uv_lock = (REPO / "uv.lock").read_text(encoding="utf-8")
 
     # ``VERSION`` holds the author-facing spelling (``4.50.0-rc.1`` /
     # ``4.50.0``); ``pyproject.toml`` must carry the PEP 440-canonical
@@ -22,6 +23,7 @@ def test_version_file_and_pyproject_are_synced():
     pyproject_version = _normalize_pep440(version)
     assert f'version = "{pyproject_version}"' in pyproject
     assert f'"version": "{version}"' in package_json
+    assert f'name = "ouroboros"\nversion = "{pyproject_version}"' in uv_lock
 
 
 def test_push_to_remote_push_tags_compatibility(monkeypatch):
@@ -116,14 +118,25 @@ def test_readme_documents_release_tag_prerequisite_for_build_scripts():
     assert "git tag -a" in readme
 
 
-def test_readme_documents_packaged_cli_installer_and_source_venv():
+def test_readme_documents_packaged_cli_installer_and_locked_source_env():
     readme = (REPO / "README.md").read_text(encoding="utf-8")
 
     assert "Install CLI.command" in readme
     assert "./Ouroboros/bin/install-ouroboros-cli" in readme
     assert r"Ouroboros\bin\install-ouroboros-cli.cmd" in readme
-    assert "python3.11 -m venv .venv" in readme
+    assert "uv sync --locked --extra browser --group dev" in readme
+    assert "https://astral.sh/uv/0.12.1/install.sh" in readme
+    assert "https://astral.sh/uv/0.12.1/install.ps1" in readme
     assert "ouroboros run --start \"2+2?\"" in readme
+
+
+def test_legacy_requirements_file_is_only_a_runtime_lock_pointer():
+    lines = [
+        line.strip()
+        for line in (REPO / "requirements.txt").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert lines == ["-r requirements-runtime.lock"]
 
 
 def test_readme_prioritizes_macos_dmg_install_and_model_access():

@@ -27,6 +27,10 @@ New-Item -ItemType Directory -Force -Path $env:PYTHONPYCACHEPREFIX | Out-Null
 
 Write-Host "=== Building Ouroboros for Windows (v${Version}) ==="
 
+if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+    throw 'uv 0.12.1 is required. Install it with: powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/0.12.1/install.ps1 | iex"'
+}
+
 if (-not (Test-Path "python-standalone\python.exe")) {
     Write-Host "ERROR: python-standalone\ not found."
     Write-Host "Run first: powershell -ExecutionPolicy Bypass -File scripts/download_python_standalone.ps1"
@@ -42,8 +46,17 @@ if (-not (Test-Path "node-standalone\node.exe")) {
 }
 
 Write-Host "--- Installing launcher dependencies ---"
-Invoke-NativeChecked "Launcher dependency installation" {
-    python -m pip install -q -r requirements-launcher.txt
+$BuildRequirements = Join-Path ([IO.Path]::GetTempPath()) "ouroboros-build-requirements-$PID.txt"
+Invoke-NativeChecked "Build dependency export" {
+    uv export --locked --no-dev --extra browser --extra desktop --extra build `
+        --no-emit-project --no-hashes --no-annotate --output-file $BuildRequirements
+}
+try {
+    Invoke-NativeChecked "Launcher dependency installation" {
+        uv pip install --python python -q -r $BuildRequirements
+    }
+} finally {
+    Remove-Item -Force -ErrorAction SilentlyContinue $BuildRequirements
 }
 
 if (-not (Test-Path "ripgrep-standalone\rg.exe")) {
@@ -55,7 +68,7 @@ if (-not (Test-Path "ripgrep-standalone\rg.exe")) {
 
 Write-Host "--- Installing agent dependencies into python-standalone ---"
 Invoke-NativeChecked "Agent dependency installation" {
-    & "python-standalone\python.exe" -m pip install -q -r requirements.txt
+    uv pip install --python "python-standalone\python.exe" -q -r requirements-runtime.lock
 }
 
 Write-Host "--- Fetching exact Claudexor runtime seed ---"

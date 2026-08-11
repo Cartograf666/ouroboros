@@ -124,7 +124,7 @@ def test_pip_install_target_args_only_for_the_embedded_interpreter(tmp_path):
 
 def _install_deps_context(tmp_path, interpreter, returncode, sink):
     (tmp_path / "repo").mkdir()
-    (tmp_path / "repo" / "requirements.txt").write_text("anyio\n", encoding="utf-8")
+    (tmp_path / "repo" / "requirements-runtime.lock").write_text("anyio\n", encoding="utf-8")
     calls = []
 
     def _run(command, **kwargs):
@@ -280,6 +280,12 @@ def test_windows_python_download_pins_the_release_checksum():
     text = (REPO_ROOT / "scripts" / "download_python_standalone.ps1").read_text(encoding="utf-8")
     assert "Get-FileHash -Algorithm SHA256" in text
     assert "throw" in text.split("Get-FileHash", 1)[1]
+
+
+def test_windows_python_download_checks_native_dependency_install_exits():
+    text = (REPO_ROOT / "scripts" / "download_python_standalone.ps1").read_text(encoding="utf-8")
+    assert "Agent dependency installation failed with exit code" in text
+    assert "llama-cpp-python installation failed with exit code" in text
 
 
 # --------------------------------------------------------------------------

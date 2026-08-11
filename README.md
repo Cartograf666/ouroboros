@@ -166,35 +166,70 @@ Benchmark adapters, run scripts, and per-benchmark methodology live in [`devtool
 
 ---
 
+## Install the isolated CLI with uv
+
+For a user-level CLI/server install without cloning a working tree, uv can
+build Ouroboros directly from the contribution branch:
+
+```bash
+uv tool install "git+https://github.com/razzant/ouroboros.git@ouroboros"
+ouroboros --help
+```
+
+The tool environment is isolated and exposes the `ouroboros` and
+`ouroboros-web` commands. Update or remove it with:
+
+```bash
+uv tool upgrade ouroboros
+uv tool uninstall ouroboros
+```
+
+This Git-branch form follows the latest `ouroboros` commit and resolves the
+dependencies declared in `pyproject.toml`; `uv tool install` does not consume
+the repository's `uv.lock`. Replacing `ouroboros` after the `@` with a reviewed
+full commit SHA pins the Ouroboros source revision, but dependencies are still
+resolved from `pyproject.toml`. Use the source setup below for a lock-verified
+environment, development, repository tests, and the complete browser extras,
+or use a platform release artifact for the packaged desktop runtime.
+
+---
+
 ## Run from Source
 
 ### Requirements
 
 - Python 3.10+
+- uv 0.12.1 (the exact resolver version pinned by this checkout)
 - macOS, Linux, or Windows
 - Git
 - [GitHub CLI (`gh`)](https://cli.github.com/), optional unless you use GitHub integration
 
 ### Setup
 
+Install the pinned resolver version:
+
 ```bash
-git clone https://github.com/razzant/ouroboros.git
-cd ouroboros
-python3.11 -m venv .venv      # any Python >= 3.10 is OK
-source .venv/bin/activate
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -r requirements.txt
-python -m pip install -e . --no-deps
+curl -LsSf https://astral.sh/uv/0.12.1/install.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-py -3.11 -m venv .venv      # any Python >= 3.10 is OK
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/0.12.1/install.ps1 | iex"
+```
+
+```bash
+git clone https://github.com/razzant/ouroboros.git
+cd ouroboros
+uv sync --locked --extra browser --group dev
+source .venv/bin/activate
+```
+
+Windows PowerShell:
+
+```powershell
+uv sync --locked --extra browser --group dev
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -r requirements.txt
-python -m pip install -e . --no-deps
 ```
 
 ### Run
@@ -253,6 +288,20 @@ The server binds to `127.0.0.1:8765` by default. Read [`docs/DEPLOYMENT.md`](doc
 
 ```bash
 make test
+```
+
+`pyproject.toml` is the direct-dependency authority and `uv.lock` is the
+cross-platform resolution lock. Release builds install the generated
+`requirements-runtime.lock` compatibility export into embedded interpreters
+that intentionally ship pip rather than uv. Build-only requirements are
+exported ephemerally from `uv.lock` and are not committed. The tiny
+`requirements.txt` file is only a pointer to that export for already-released
+managed updaters; it is not a second dependency declaration. After changing
+dependencies, refresh the reviewed lock and runtime export with:
+
+```bash
+uv lock
+uv export --locked --no-dev --extra browser --no-emit-project --no-hashes --no-annotate --output-file requirements-runtime.lock
 ```
 
 ---

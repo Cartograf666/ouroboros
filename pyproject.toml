@@ -29,6 +29,9 @@ dependencies = [
     "openai>=1.66.0",
     "gigachat>=0.2.1,<0.3",
     "requests",
+    # Runtime self-update and install paths execute ``sys.executable -m pip``.
+    # uv-created source/tool environments do not seed pip unless it is declared.
+    "pip",
     "httpx",
     "ddgs",
     "dulwich",
@@ -43,7 +46,8 @@ dependencies = [
     # Runtime, not test-only: the hermetic commit gate's parallel pass hard-blocks
     # with PREFLIGHT_PLUGIN_MISSING rather than degrading to serial, so a wheel /
     # `pip install .` that carries pytest without these cannot commit at all.
-    # Floors kept in step with requirements.txt and _REQUIRED_PREFLIGHT_PLUGINS.
+    # Floors kept in step with _REQUIRED_PREFLIGHT_PLUGINS. These remain runtime
+    # dependencies because the packaged hermetic commit gate invokes them.
     "pytest-xdist>=3.5",
     "pytest-timeout>=2.1",
     "claude-agent-sdk>=0.1.60",
@@ -74,9 +78,29 @@ Issues = "https://github.com/razzant/ouroboros/issues"
 [project.optional-dependencies]
 claude-sdk = ["claude-agent-sdk>=0.1.60"]
 browser = ["playwright", "playwright-stealth"]
+desktop = [
+    "pywebview==5.4",
+    "pythonnet==3.0.5; platform_system == 'Windows'",
+    "clr_loader==0.2.7.post0; platform_system == 'Windows'",
+]
 local-model = ["llama-cpp-python"]
 build = ["pyinstaller>=6.0"]
-all = ["claude-agent-sdk>=0.1.60", "playwright", "playwright-stealth", "llama-cpp-python", "huggingface_hub"]
+all = [
+    "claude-agent-sdk>=0.1.60",
+    "playwright",
+    "playwright-stealth",
+    "pywebview==5.4",
+    "pythonnet==3.0.5; platform_system == 'Windows'",
+    "clr_loader==0.2.7.post0; platform_system == 'Windows'",
+    "llama-cpp-python",
+    "huggingface_hub",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.12"]
+
+[tool.uv]
+required-version = "==0.12.1"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
