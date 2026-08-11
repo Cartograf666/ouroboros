@@ -1108,6 +1108,19 @@ def _binding_state_drive_root(ctx: Any, binding: Any) -> pathlib.Path:
     return pathlib.Path(ctx.drive_root)
 
 
+def _light_binding_failure_redirect(name: str, args: dict[str, Any]) -> str:
+    """Project an existing light-mode UX redirect after a failed target bind."""
+
+    try:
+        from ouroboros.config import get_runtime_mode
+
+        if get_runtime_mode() == "light":
+            return light_cognitive_or_root_redirect(name, args) or ""
+    except Exception:
+        pass
+    return ""
+
+
 def _binding_error_text(name: str, root: str, exc: Exception) -> str:
     detail = str(exc)
     if detail.startswith("SKILL_REDIRECT_BLOCKED:"):
@@ -2326,7 +2339,18 @@ class ToolRegistry:
                         [*allowed_relative_roots, *allowed_data_roots],
                     ):
                         continue
-                    if not re.match(r"^[A-Za-z]:[\\/]", candidate) and not candidate.startswith("\\\\"):
+                    windows_drive_path = bool(re.match(r"^[A-Za-z]:[\\/]", candidate))
+                    unc_path = candidate.startswith("\\\\")
+                    # On the native Windows host, resolve drive paths exactly as
+                    # POSIX paths are resolved below. This canonicalizes directory
+                    # symlinks/junctions before containment: a workspace alias stays
+                    # allowed, while an in-workspace spelling whose nested link exits
+                    # the root is blocked. Keep lexical handling for foreign Windows
+                    # spellings seen on POSIX and for UNC paths (which may require a
+                    # network lookup merely to evaluate the guard).
+                    if (not windows_drive_path and not unc_path) or (
+                        os.name == "nt" and windows_drive_path
+                    ):
                         try:
                             resolved = pathlib.Path(candidate).resolve(strict=False)
                         except Exception:
@@ -3154,6 +3178,9 @@ class ToolRegistry:
             try:
                 resolved_binding = _build_builtin_target_binding(self._ctx, name, args)
             except Exception as exc:
+                redirect = _light_binding_failure_redirect(name, args)
+                if redirect:
+                    return redirect
                 operation = _target_binding_operation(name, args)
                 if operation in {"shell", "service"}:
                     return shell_cwd_block_message(
