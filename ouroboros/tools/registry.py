@@ -1079,6 +1079,16 @@ def _binding_set_targets_system_repo(ctx: Any, binding: Any) -> bool:
     return bool(items) and all(binding_targets_system_repo(ctx, item) for item in items)
 
 
+def _binding_set_is_light_restricted(ctx: Any, binding: Any) -> bool:
+    """Whether light mode must treat this file/VCS target as internal state."""
+    items = _binding_items(binding)
+    return bool(items) and all(
+        binding_targets_system_repo(ctx, item)
+        or (item.root == "runtime_data" and item.source == "runtime_data")
+        for item in items
+    )
+
+
 def _binding_state_drive_root(ctx: Any, binding: Any) -> pathlib.Path:
     items = _binding_items(binding)
     if items:
@@ -2475,11 +2485,7 @@ class ToolRegistry:
         # Light-mode checks follow the selected physical target, not whether a
         # project workspace happens to be attached.
         if runtime_mode == "light":
-            targets_system = (
-                _binding_set_targets_system_repo(self._ctx, binding)
-                or acting_self_worktree
-            )
-            if targets_system and light_shell_repo_mutation(
+            if light_shell_repo_mutation(
                 raw_cmd,
                 repo_dir=system_repo_dir_for(self._ctx),
                 cwd=str(args.get("cwd") or ""),
@@ -3136,6 +3142,14 @@ class ToolRegistry:
             try:
                 resolved_binding = _build_builtin_target_binding(self._ctx, name, args)
             except Exception as exc:
+                operation = _target_binding_operation(name, args)
+                if operation in {"shell", "service"}:
+                    return shell_cwd_block_message(
+                        self._ctx,
+                        str(args.get("cwd") or ""),
+                        operation=operation,
+                        error=exc,
+                    )
                 return _binding_error_text(
                     name,
                     str(args.get("root") or "active_workspace"),
@@ -3194,7 +3208,7 @@ class ToolRegistry:
         )
         if resolved_binding is not None and name not in _SYSTEM_INTRINSIC_REPO_MUTATION_TOOLS:
             light_targets_system = (
-                _binding_set_targets_system_repo(self._ctx, resolved_binding)
+                _binding_set_is_light_restricted(self._ctx, resolved_binding)
                 or acting_self_worktree
             )
         elif name in _SYSTEM_INTRINSIC_REPO_MUTATION_TOOLS:

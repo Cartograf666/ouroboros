@@ -210,7 +210,7 @@ def test_light_mode_blocks_normal_skill_sidecar_str_replace(tmp_path, monkeypatc
     assert sidecar.read_text(encoding="utf-8") == '{"version":"1"}\n'
 
 
-def test_light_mode_blocks_review_excluded_skill_dirs(tmp_path, monkeypatch):
+def test_review_excluded_skill_dirs_stay_blocked_in_light_mode(tmp_path, monkeypatch):
     from ouroboros import config as cfg
     from ouroboros.tools.registry import ToolRegistry
 
@@ -230,7 +230,7 @@ def test_light_mode_blocks_review_excluded_skill_dirs(tmp_path, monkeypatch):
         {"path": "skills/external/alpha/node_modules/dep.js", "old_str": "VALUE = 1", "new_str": "VALUE = 2"},
     )
 
-    assert "LIGHT_MODE_BLOCKED" in result
+    assert "STR_REPLACE_BLOCKED" in result
     assert target.read_text(encoding="utf-8") == "VALUE = 1\n"
 
 

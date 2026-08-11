@@ -483,7 +483,7 @@ def _repo_read(
                 f"from the data root. If you need the raw file, call "
                 f"`read_file(root='runtime_data', path='memory/{base}')`."
             )
-        raise
+        return f"⚠️ NOT_FOUND: file does not exist: {target}"
     return _render_line_slice(display_path or path, content, max_lines=max_lines, start_line=start_line)
 
 

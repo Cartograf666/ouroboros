@@ -319,8 +319,9 @@ def test_registry_guard_and_handler_receive_same_resolved_verify_argv(tmp_path, 
         captured["guard"] = list(guarded["cmd"])
         return guarded
 
-    def capture_handler(_ctx, contract_kind, check, **kwargs):
+    def capture_handler(_ctx, contract_kind, check, _resolved_binding=None, **kwargs):
         assert contract_kind == "explicit_command"
+        assert _resolved_binding is not None
         captured["handler"] = list(check)
         return "ok"
 
@@ -358,7 +359,8 @@ def test_registry_uses_current_process_python_before_server_bootstrap(
     registry.set_context(ctx)
     observed = {}
 
-    def handler(_ctx, cmd, **_kwargs):
+    def handler(_ctx, cmd, _resolved_binding=None, **_kwargs):
+        assert _resolved_binding is not None
         observed["cmd"] = cmd
         return "ok"
 
