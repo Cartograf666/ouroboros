@@ -27,10 +27,13 @@ PROTECTED_RUNTIME_PATHS_LOWER = frozenset(
 SHELL_WRITE_INDICATORS = (
     "rm ", "rm\t", ">", "sed -i", "tee ", "truncate",
     "mv ", "cp ", "chmod ", "chown ", "unlink ", "delete", "trash",
-    "rsync ", "write_text", "open(", ".write(", ".writelines(",
+    "rsync ", "write_text", ".write(", ".writelines(",
     "os.remove(", "os.unlink(", "os.mkdir(", "os.makedirs(", "sort -o",
     "writefilesync", "appendfilesync", "createwritestream",
 )
+# Preserve the longstanding coarse ``open(`` signal without matching it as the
+# suffix of another callable such as ``urlopen(``.
+_OPEN_CALL_WRITE_INDICATOR_RE = re.compile(r"(?<![A-Za-z0-9_])open\(")
 _SAFE_STDIO_REDIRECT_TOKENS = frozenset({
     ">/dev/null",
     "1>/dev/null",
@@ -634,8 +637,8 @@ def runtime_data_write_targets(
 
 
 # SHELL-level write signals only (redirects, pipeline writers, file utilities):
-# the interpreter-CODE tokens of SHELL_WRITE_INDICATORS (open(/.write(/os.remove(
-# etc.) are deliberately absent — for interpreter commands those are re-judged by
+# interpreter-CODE signals (open(/.write(/os.remove( etc.) are deliberately absent
+# — for interpreter commands those are re-judged by
 # the regex+AST refinement, and the coarse `open(` token otherwise classified a
 # read-only open() as writeish, keeping the old full mention scan alive for the
 # exact GAIA read class this refinement exists to fix (review round 8).
@@ -869,8 +872,11 @@ def shell_has_write_indicator(raw_cmd: Any) -> bool:
     filtered_text = " ".join(filtered_tokens)
     for token in _SAFE_STDIO_REDIRECT_TOKENS:
         text = text.replace(token, " ")
-    return any(indicator in filtered_text for indicator in SHELL_WRITE_INDICATORS) or any(
-        indicator in text for indicator in SHELL_WRITE_INDICATORS if indicator != ">"
+    return (
+        any(indicator in filtered_text for indicator in SHELL_WRITE_INDICATORS)
+        or bool(_OPEN_CALL_WRITE_INDICATOR_RE.search(filtered_text))
+        or any(indicator in text for indicator in SHELL_WRITE_INDICATORS if indicator != ">")
+        or bool(_OPEN_CALL_WRITE_INDICATOR_RE.search(text))
     )
 
 
