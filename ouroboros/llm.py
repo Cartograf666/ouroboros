@@ -2302,6 +2302,7 @@ class LLMClient:
         allow_server_web_search: bool = False,
         response_format: Optional[Dict[str, Any]] = None,
         cache_affinity: str = "",
+        bypass_response_cache: bool = False,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Single LLM call returning (message, usage); no_proxy avoids macOS fork proxy crashes.
 
@@ -2327,6 +2328,7 @@ class LLMClient:
                     allow_server_web_search=allow_server_web_search,
                     response_format=response_format,
                     cache_affinity=cache_affinity,
+                    bypass_response_cache=bypass_response_cache,
                 )
             usage["ledger_attempt_ids"] = list(attempt_ids)
             return message, usage
@@ -3544,6 +3546,7 @@ class LLMClient:
         allow_server_web_search: bool = False,
         response_format: Optional[Dict[str, Any]] = None,
         cache_affinity: str = "",
+        bypass_response_cache: bool = False,
     ) -> Dict[str, Any]:
         messages = self._normalize_system_message_placement(messages)
         resolved_model = str(target.get("resolved_model") or "")
@@ -3607,6 +3610,13 @@ class LLMClient:
                     for tool in self._sanitize_chat_completion_tools(tools)
                 ]
                 kwargs["tool_choice"] = tool_choice
+            if bypass_response_cache:
+                # Must ride in extra_body: the OpenAI SDK rejects unknown top-level
+                # kwargs with TypeError, so a raw `cache=` argument never reaches
+                # the wire.
+                _eb = kwargs.setdefault("extra_body", {})
+                if isinstance(_eb, dict):
+                    _eb["cache"] = {"no-cache": True}
             self._apply_rejected_param_cache(kwargs, str(target.get("usage_model") or resolved_model))
             return kwargs
 
@@ -3692,6 +3702,15 @@ class LLMClient:
             kwargs["temperature"] = temperature
         if response_format:
             kwargs["response_format"] = dict(response_format)
+        if bypass_response_cache:
+            # A retry of a byte-identical request only helps when nothing between
+            # us and the model caches responses.  A gateway response cache (e.g.
+            # LiteLLM `cache: true`) otherwise replays the SAME failed body for
+            # every attempt, so the whole transient-retry budget never reaches the
+            # model.  `cache.no-cache` is LiteLLM's documented per-request opt-out
+            # and must ride in extra_body — the OpenAI SDK raises TypeError on
+            # unknown top-level kwargs.  Servers that do not know the field ignore it.
+            extra_body["cache"] = {"no-cache": True}
         server_web_tool = (
             self._openrouter_main_web_search_tool()
             if (tools and allow_server_web_search)
@@ -4145,6 +4164,7 @@ class LLMClient:
         allow_server_web_search: bool = False,
         response_format: Optional[Dict[str, Any]] = None,
         cache_affinity: str = "",
+        bypass_response_cache: bool = False,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Send remote chat; no_proxy uses a one-shot client and skips OS proxy lookup."""
         if target.get("provider") == "anthropic":
@@ -4170,6 +4190,7 @@ class LLMClient:
                     allow_server_web_search=allow_server_web_search,
                     response_format=response_format,
                     cache_affinity=cache_affinity,
+                    bypass_response_cache=bypass_response_cache,
                 )
                 prompt_cache_ttl = self._normalize_payload_cache_ttl(target, kwargs)
                 resp = self._create_chat_completion_with_retries(
@@ -4196,6 +4217,7 @@ class LLMClient:
             allow_server_web_search=allow_server_web_search,
             response_format=response_format,
             cache_affinity=cache_affinity,
+            bypass_response_cache=bypass_response_cache,
         )
         if timeout and timeout > 0:
             # Cached clients are built without a timeout; honor the caller's

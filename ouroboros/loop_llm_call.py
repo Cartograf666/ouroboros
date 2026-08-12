@@ -119,6 +119,11 @@ def fold_retrieval_usage(accumulated_usage: Dict[str, Any], usage: Dict[str, Any
 # large) keep failing fast. There is NO cross-model fallback here — the same
 # request is retried on the SAME model.
 _TRANSIENT_RETRY_KINDS = frozenset({"provider_transient", "provider_incomplete_response"})
+# Every attempt in call_llm_with_retry rebuilds the SAME request, so a response
+# cache in front of the provider (e.g. a LiteLLM proxy with `cache: true`) replays
+# the identical failed body and the retry budget above never reaches the model.
+# Hence `bypass_response_cache=attempt > 0` there: retries opt out of the cache,
+# while the first attempt still benefits from a warm one.
 # Error kinds that put a model on the F1 fallback cooldown. Superset of the same-model
 # retry kinds: a body-error 429 (HTTP 200 with an error in the body — the canonical
 # cloud.ru/OpenRouter rate-limit shape) is classified "rate_limit", which must cool the
@@ -878,6 +883,7 @@ def call_llm_with_retry(
                 "use_local": use_local,
                 "allow_server_web_search": bool(allow_server_web_search),
             }
+            kwargs["bypass_response_cache"] = attempt > 0
             if tools:
                 kwargs["tools"] = tools
             try:
