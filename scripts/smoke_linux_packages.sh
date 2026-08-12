@@ -1,6 +1,6 @@
 #!/bin/bash
 # Install the built .deb and .rpm in stock distro containers and check that the
-# packaged CLI and desktop launcher actually run after a real install.
+# installed systemd unit, packaged CLI, and desktop launcher after a real install.
 #
 # Two lanes, because they carry different risk:
 #
@@ -44,6 +44,12 @@ smoke_package() {
             command -v git >/dev/null
             test -f /usr/share/applications/ouroboros.desktop
             test -f /usr/share/pixmaps/ouroboros.png
+            test -s /usr/lib/systemd/user/ouroboros.service
+            grep -Fqx 'ExecStart=/opt/ouroboros/Ouroboros' \
+              /usr/lib/systemd/user/ouroboros.service
+            grep -Fqx 'KillMode=control-group' \
+              /usr/lib/systemd/user/ouroboros.service
+            ! grep -q '^Restart=' /usr/lib/systemd/user/ouroboros.service
             test -x /opt/ouroboros/Ouroboros
             ouroboros --help >/dev/null
             mkdir -p /tmp/ouroboros-smoke-home /tmp/ouroboros-smoke-data

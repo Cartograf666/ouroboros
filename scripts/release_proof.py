@@ -52,6 +52,7 @@ PACKAGE_SMOKE_CHECKS = frozenset(
         "runtime_dependency",
         "packaged_cli_help",
         "desktop_entry",
+        "systemd_user_unit",
         "desktop_launcher_start",
     }
 )

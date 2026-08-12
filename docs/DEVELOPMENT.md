@@ -1758,8 +1758,10 @@ leak into the desktop launcher's libpython, then wraps that proven x86_64
 payload into `.deb`, generic `.rpm`, and RED OS 8 `.rpm` assets. Their metadata
 declares Git, which packaged bootstrap requires; the gating smoke installs
 through `apt` or `dnf` in Ubuntu 22.04/Fedora 42 and proves dependency
-resolution, desktop integration, the real packaged CLI, and a bounded
-desktop-launcher start. Vendor
+resolution, desktop integration, the installed opt-in systemd user unit and
+its launcher/cgroup/no-restart contract, the real packaged CLI, and a bounded
+desktop-launcher start. The unit never activates during package installation;
+the launcher remains the sole restart and panic-policy owner. Vendor
 image smokes for Astra Linux and RED OS are non-blocking evidence, and their
 outcome is reported without becoming release authority. The separate
 Claudexor platform gate repeats that fixture path on ordinary branch changes and
