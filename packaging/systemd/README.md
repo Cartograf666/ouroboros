@@ -1,157 +1,98 @@
-# Running Ouroboros under systemd
+# Running native Linux packages under systemd
 
-Without a unit file, Ouroboros started from a desktop launcher lands in a
-transient `systemd-run` scope with a generated name such as
-`run-p497094-i8877010.scope`.  Stopping it then requires discovering that name
-first:
+The native `.deb` and `.rpm` packages ship an optional systemd user unit with a
+stable name. It is an alternative way to launch Ouroboros when an operator wants
+to use `systemctl --user`; the ordinary desktop entry still starts Ouroboros
+directly and is not controlled by this unit.
 
-```bash
-cat /proc/$(pgrep -f '/opt/ouroboros/Ouroboros' | head -1)/cgroup
-systemctl --user stop run-p497094-i8877010.scope
+Choose one launch path for an instance. If Ouroboros is already running from the
+desktop entry, close it before starting the unit; the single-instance lock is
+shared by both paths.
+
+## Scope
+
+The packaged unit is supported only for the native `.deb` and `.rpm` layout. It
+starts the release-reviewed launcher at `/opt/ouroboros/Ouroboros`, the same
+entry point as the packaged desktop file. Source checkouts, AppImages, and
+tarballs have different locations and are deliberately outside this unit's
+contract.
+
+The package installs the unit at:
+
+```text
+/usr/lib/systemd/user/ouroboros.service
 ```
 
-The name changes on every start, so it cannot be scripted.  `pkill` is not a
-substitute: the launcher spawns `server.py` and a pool of workers, and killing
-only the parent leaves the workers holding port 8765, so the next start fails
-with `address already in use`.
+Installation never enables or starts it. Starting a desktop agent remains an
+explicit user decision.
 
-The unit here gives a stable name instead.
+## Use
 
-## Install
-
-The `.deb` and `.rpm` packages ship this unit at
-`/usr/lib/systemd/user/ouroboros.service`, so after a package install it is
-already available by name — nothing further is needed:
+Start or stop the packaged runtime explicitly:
 
 ```bash
 systemctl --user start ouroboros
+systemctl --user stop ouroboros
+systemctl --user restart ouroboros
+systemctl --user status ouroboros
 ```
 
-### The packages ship the unit but never enable it
-
-This is deliberate. Launching a desktop agent is the user's decision, not the
-package manager's: the `.desktop` entry already covers the usual case, and a
-package that starts an agent on install would run it for every account on the
-machine, including ones that never asked for it.
-
-So installing the package only makes the name available. Two separate actions
-follow, and they are not the same:
+To start it automatically with the user session:
 
 ```bash
-systemctl --user start ouroboros          # run it now, once
-systemctl --user enable --now ouroboros   # run it now AND on every login
+systemctl --user enable --now ouroboros
 ```
 
-Use `enable` only if the agent should come up with the session. To undo it:
+Undo that choice with:
 
 ```bash
 systemctl --user disable --now ouroboros
 ```
 
-Add `loginctl enable-linger $USER` on top of `enable` if the agent must
-survive logout — otherwise the user session, and the unit with it, ends when the
-last session closes.
-
-The packaging tests enforce this: `systemctl enable` and `systemctl start` must
-not appear in the build scripts (`tests/test_release_proof.py`).
-
-### Other install methods
-
-For a source checkout, an AppImage, or the tarball, install it by hand:
-
-```bash
-mkdir -p ~/.config/systemd/user
-install -m 644 packaging/systemd/ouroboros.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now ouroboros
-```
-
-A unit in `~/.config/systemd/user` takes precedence over the packaged one, which
-is the supported way to override `ExecStart` for a headless host.
-
-## Use
-
-```bash
-systemctl --user start ouroboros
-systemctl --user stop ouroboros
-systemctl --user restart ouroboros      # picks up local source changes
-systemctl --user status ouroboros
-journalctl --user -u ouroboros -f
-```
+`loginctl enable-linger "$USER"` is an additional, system-level owner choice
+when the user service must survive logout. Without linger, the user manager and
+its services end with the last session.
 
 ## Readiness
 
-`active` in `systemctl` only means the process launched.  Two later milestones
-matter, and they are not the same one:
+`systemctl --user is-active ouroboros` proves only that the launcher process is
+running. `/api/state` reporting `supervisor_ready: true` is necessary before
+task admission, but it is not sufficient: the worker pool has a separate
+admission state and may still return a typed HTTP 503.
 
-| Signal | Means | Enough to submit a task? |
-|---|---|---|
-| HTTP answers | web layer up | no |
-| `workers=N/N` in `ouroboros status` | worker pool filled | **no** |
-| `supervisor_ready: true` in `/api/state` | supervisor up | yes |
+A successful task admission is the authoritative proof that work was accepted.
+Automation may use a bounded retry policy for the specific typed 503 condition
+it supports; it must not treat process activity or HTTP reachability alone as
+proof that a task entered the queue. `ouroboros status` remains useful for
+checking the loaded branch, SHA, and worker projection.
 
-Submitting before the supervisor is up is rejected:
+## Logs
 
-```text
-error: HTTP 503: supervisor is still starting
-```
-
-The authoritative check:
+The journal shows user-service lifecycle and launcher output:
 
 ```bash
-until curl -sf -m 5 http://127.0.0.1:8765/api/state |
-      python3 -c 'import sys,json; sys.exit(0 if json.load(sys.stdin).get("supervisor_ready") else 1)'
-do sleep 2; done
+journalctl --user -u ouroboros -f
 ```
 
-`/api/state` also carries `supervisor_error`, which explains a supervisor that
-never becomes ready.
+Ouroboros also keeps its normal application logs under
+`~/Ouroboros/data/logs/`, including `launcher.log` and `agent_stdout.log`.
 
-Scripts that submit work anyway should retry on the 503 rather than poll — the
-in-repo benchmark wrapper does exactly that
-(`devtools/benchmarks/harness_bench_fast/ouroboros_cli_wrapper.py`): up to 18
-retries, ten seconds apart, treating the code as a startup race rather than a
-task failure.
+## Lifecycle ownership
 
-`ouroboros status` remains useful for a different question — which revision is
-loaded:
+The unit intentionally has no systemd restart policy. The launcher already owns
+managed restart, its bounded crash fuse, panic semantics, and final cleanup.
+Adding a second restart owner would let systemd undo a panic stop or restart a
+runtime that the launcher deliberately stopped.
 
-```bash
-ouroboros status
-# Ouroboros 6.96.2 at http://127.0.0.1:8765
-# branch=ouroboros sha=160a5c43 workers=10/10
-```
+`KillMode=control-group` sends the stop signal to the complete process tree
+started by the unit, including the launcher, server, and workers.
+`TimeoutStopSec=120` does not defer that signal and does not promise that an
+in-flight tool call will finish. It is the upper bound systemd waits before
+escalating to `SIGKILL`, giving the launcher's bounded cleanup time to complete.
 
-The `sha=` field confirms a restart actually picked up edited local sources.
+## Why this is a user unit
 
-## Why a user unit and not a system one
-
-State lives in `$HOME/Ouroboros` and the desktop build needs the user's
-session.  A system unit runs as a different user and would silently use a
-different data directory.
-
-Run `loginctl enable-linger $USER` if the agent must keep running after
-logout.
-
-## Headless hosts
-
-Replace `ExecStart` with the CLI server:
-
-```ini
-ExecStart=/usr/local/bin/ouroboros server
-```
-
-Both entry points share the same `$HOME/Ouroboros` state directory.
-
-## Notes on the settings in the unit
-
-`KillMode=control-group` is what makes a plain `stop` sufficient — SIGTERM
-reaches the whole process group, workers included.
-
-`TimeoutStopSec=120` leaves room for a tool call in flight; a long prompt on a
-modest GPU takes minutes, and a shorter timeout turns a normal stop into a
-`SIGKILL`.
-
-`StartLimitBurst=5` / `StartLimitIntervalSec=300` stop a crash loop instead of
-letting it run indefinitely.  A port conflict otherwise produces dozens of
-restarts and buries the first, real error in the journal.
+Ouroboros state lives in the invoking user's `~/Ouroboros` directory and the
+desktop launcher uses that user's session. A system unit would run under a
+different identity or require a second state/permission contract, so the native
+packages ship only this opt-in user service.
