@@ -732,11 +732,17 @@ def test_revoked_mailbox_control_is_never_delivered(tmp_path):
 def test_cancel_and_timeout_paths_share_one_salvage_helper():
     lifecycle = (REPO_ROOT / "supervisor" / "task_lifecycle.py").read_text(encoding="utf-8")
     reaper = (REPO_ROOT / "supervisor" / "task_reaper.py").read_text(encoding="utf-8")
+    delivery = (REPO_ROOT / "supervisor" / "terminal_delivery.py").read_text(encoding="utf-8")
     assert "salvaged_output_note" in reaper
     running = lifecycle.split("def _finish_captured_running", 1)[1].split("\ndef ", 1)[0]
-    assert "salvaged_output_note" in running
+    # Phase A: the running kill path salvages through the shared delivery-seam
+    # helper (terminal_delivery.salvage_cancelled_output), which wraps the SAME
+    # underlying salvaged_output_note the reaper uses.
+    assert "_salvage_cancelled_output(" in running
+    helper = delivery.split("def salvage_cancelled_output", 1)[1].split("\ndef ", 1)[0]
+    assert "salvaged_output_note" in helper
     # The rescue must precede the write, which precedes the drive removal.
-    assert running.index("salvaged_output_note") < running.index("write_task_result(")
+    assert running.index("_salvage_cancelled_output(") < running.index("write_task_result(")
 
 
 def test_cancelled_result_carries_the_salvaged_output(tmp_path, monkeypatch):

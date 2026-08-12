@@ -91,49 +91,19 @@ _PLAN_REVIEW_PHASES = {
     "reviewed",
 }
 
-# A completed payload that loses an explicit cancellation race is not a child
-# result anymore.  Keep lifecycle identity, lineage, metadata, and settled cost,
-# but do not leave the discarded answer/evaluation visible through the raw or
-# public task-result projection.  Cancellation callers may supply replacement
-# fields (for example a cancelled outcome axis or missing-artifact bundle).
-_COMPLETED_PAYLOAD_FIELDS = frozenset({
-    "result",
-    "final_answer",
-    "trace_summary",
-    "trace_refs",
-    "loop_outcome",
-    "outcome_axes",
-    "reason_code",
-    "failure",
-    "review_status",
-    "review_evidence",
-    "review_projection",
-    "verification_ledger",
-    "artifact_bundle",
-    "artifacts",
-    "artifact_status",
-    "artifact_error",
-    "subagent_envelope",
-    "root_phase_checkpoint",
-    "swarm_efficiency",
-})
-
-
 def cancellation_blocks_child_result(result: Any) -> bool:
     """Return whether canonical cancellation forbids child-drive promotion.
 
-    The budget-drive lifecycle is authoritative as soon as cancel intent is
-    latched. Readers and copy-back paths must consult this before touching a
-    possibly late child result or its artifacts, including a custom child root
-    that survived cleanup.
+    Only a supervisor-SETTLED ``cancelled`` blocks: cancel INTENT no longer rides
+    the canonical status (it lives in the durable ``cancel_intents`` projection),
+    and natural completion WINS a late cancel (owner decision 4=A, 2026-08-11) —
+    a child that finished before the teardown keeps its completed result and
+    artifacts, so copy-back paths must promote it rather than refuse it.
     """
 
     if not isinstance(result, dict):
         return False
-    return str(result.get("status") or "").strip().lower() in {
-        STATUS_CANCEL_REQUESTED,
-        STATUS_CANCELLED,
-    }
+    return str(result.get("status") or "").strip().lower() == STATUS_CANCELLED
 
 
 def resolve_task_lineage(
@@ -218,11 +188,13 @@ def _is_status_regression(existing_status: str, new_status: str) -> bool:
     if existing in _TRULY_TERMINAL_STATUSES:
         return new != existing
     if existing == STATUS_CANCEL_REQUESTED:
-        # Once cancellation is requested, never let a late success/duplicate (or
-        # an unknown/unranked status) mask it: a worker finishing right after the
-        # cancel latch must not flip the task to "completed". Allow only the real
-        # teardown outcomes (cancelled/failed) or a same-status rewrite.
-        return new not in (STATUS_CANCEL_REQUESTED, STATUS_CANCELLED, STATUS_FAILED)
+        # LEGACY read-path only (pre-intent files): the latch status is no longer
+        # written — cancel intent lives in the durable ``cancel_intents``
+        # projection. Natural completion WINS (owner decision 4=A): any terminal
+        # write, including a racing ``completed``, may land over an old latch;
+        # only a regression to scheduled/running is refused.
+        new_rank = _STATUS_RANK.get(new)
+        return new_rank is not None and new_rank < _STATUS_RANK[STATUS_CANCEL_REQUESTED]
     existing_rank = _STATUS_RANK.get(existing)
     new_rank = _STATUS_RANK.get(new)
     if existing_rank is None or new_rank is None:
@@ -287,50 +259,37 @@ def write_task_result(
     results_drive_root: Any,
     task_id: str,
     status: str,
-    *,
-    _explicit_cancellation: bool = False,
     **fields: Any,
 ) -> Dict[str, Any]:
     """Merge-write a task result under a per-file lock.
 
     Worker processes, the supervisor thread, and gateway handlers all
     read-modify-write the same ``task_results/<id>.json``; the lock makes the
-    monotonic-status guard evaluate the CURRENT on-disk status (closing the
-    "cancel_requested latch erased by a concurrent completed write" window).
-    ``_explicit_cancellation`` is the sole narrow override: an explicit cancel
-    may replace a racing ``completed`` result, but no other terminal transition.
+    monotonic-status guard evaluate the CURRENT on-disk status, so the winner of
+    a concurrent terminal race is decided by the monotonic reducer, not timing.
+    Terminal statuses are sticky: natural completion WINS a late cancel (owner
+    decision 4=A) — there is deliberately no override that lets a cancellation
+    replace an already-completed result (discarding a result is a separate
+    explicit parent action, ``discard_child_result``).
     """
     path = task_result_path(results_drive_root, task_id)
     explicit_ts = str(fields.pop("ts", "") or "")
 
     def _merge(existing: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         # Monotonic lifecycle: never let a stale scheduled/running mirror
-        # overwrite a cancel-intent latch or a terminal outcome. This is the
-        # structural guard against "ghost" tasks that keep reporting
-        # scheduled/running after they were cancelled or finished.
+        # overwrite a terminal outcome. This is the structural guard against
+        # "ghost" tasks that keep reporting scheduled/running after they were
+        # cancelled or finished.
         existing_status = str(existing.get("status") or "")
-        cancellation_wins_completed = bool(
-            _explicit_cancellation
-            and existing_status == STATUS_COMPLETED
-            and status in {STATUS_CANCEL_REQUESTED, STATUS_CANCELLED}
-        )
-        if (
-            existing
-            and _is_status_regression(existing_status, status)
-            and not cancellation_wins_completed
-        ):
+        if existing and _is_status_regression(existing_status, status):
             # Surface the blocked transition: when debugging a "stuck" task this
             # is the only signal that a stale/late write was intentionally dropped.
             log.debug("Blocked status regression %s -> %s for task %s",
                       existing.get("status"), status, task_id)
             return None
-        base = dict(existing)
-        if cancellation_wins_completed:
-            for field in _COMPLETED_PAYLOAD_FIELDS:
-                base.pop(field, None)
         now = utc_now_iso()
         return {
-            **base,
+            **existing,
             **fields,
             "task_id": task_id,
             "status": status,
@@ -1290,12 +1249,80 @@ def fail_tasks(results_drive_root: Any, tasks: Any, *, reason_code: str, result:
         # use budget_drive_root, so the waiter reading THAT root sees the result (a child
         # outside results_drive_root would otherwise keep hanging — the bug this fixes).
         root = (task or {}).get("budget_drive_root") or results_drive_root
+        # The cancel-intent PROJECTION lives at the canonical supervisor data root
+        # (every ingress writes it through queue.DRIVE_ROOT == results_drive_root),
+        # never at a child's budget_drive_root (GR3-11b) — resolving intents at the
+        # child root would miss every intent for a split-drive child.
+        intent_root = results_drive_root
         try:
-            # Honor a pending cancel request: terminalize as CANCELLED (the right reason),
+            # Honor pending cancel intent: terminalize as CANCELLED (the right reason),
             # not as budget_exhausted — the budget drain must not relabel a cancellation.
+            # Both carriers are consulted: the durable intent projection (the live
+            # authority) and the legacy ``cancel_requested`` status latch (old files).
             existing = load_task_result(root, tid) or {}
-            if str(existing.get("status") or "") == STATUS_CANCEL_REQUESTED:
-                write_task_result(root, tid, STATUS_CANCELLED, result="Cancelled before start.")
+            legacy_latch = str(existing.get("status") or "") == STATUS_CANCEL_REQUESTED
+            has_intent = False
+            if not legacy_latch:
+                try:
+                    from ouroboros.cancel_intents import has_active_intent
+
+                    has_intent = has_active_intent(intent_root, tid)
+                except Exception:
+                    has_intent = False
+            if legacy_latch or has_intent:
+                # AR2-2 settle-owner unity: CLAIM before settle, the same fence
+                # custody holds. A refused claim (or one that cannot be read)
+                # means a live custody owns this teardown — skip the task; that
+                # owner writes the terminal, settles, and emits its task_done.
+                claim: Dict[str, Any] = {}
+                if has_intent:
+                    try:
+                        from ouroboros.cancel_intents import claim_intent
+
+                        claim = claim_intent(intent_root, tid, owner="fail_tasks") or {}
+                    except Exception:
+                        claim = {"claim_refused": True}
+                    if claim.get("claim_refused"):
+                        continue
+                try:
+                    stored = write_task_result(
+                        root, tid, STATUS_CANCELLED, result="Cancelled before start.",
+                    ) or {}
+                except Exception:
+                    # Nothing durable happened: release the claim so the watchdog
+                    # re-feeds custody instead of waiting out a dead claim.
+                    if claim.get("request_id"):
+                        try:
+                            from ouroboros.cancel_intents import release_claim
+
+                            release_claim(
+                                intent_root, tid, error="budget-drain cancel persistence failed",
+                                expected_generation=claim.get("generation"),
+                                request_id=str(claim.get("request_id") or ""),
+                            )
+                        except Exception:
+                            log.debug("fail_tasks: claim release failed for %s", tid, exc_info=True)
+                    raise
+                try:
+                    from ouroboros.cancel_intents import settle_intent
+
+                    stored_status = str(stored.get("status") or STATUS_CANCELLED)
+                    # Fenced by this drain's OWN claim (no-op + forensic row on a
+                    # mismatch); the stored status decides the honest outcome. A
+                    # scope=cascade intent is refused atomically inside the settle
+                    # (GR3-1: the cascade postcondition is its only settle owner)
+                    # and this drain's claim is auto-released in the same write.
+                    settle_intent(
+                        intent_root, tid,
+                        outcome=("cancelled" if stored_status == STATUS_CANCELLED
+                                 else "already_settled"),
+                        detail=("budget drain before start" if stored_status == STATUS_CANCELLED
+                                else stored_status),
+                        expected_generation=claim.get("generation"),
+                        request_id=str(claim.get("request_id") or ""),
+                    )
+                except Exception:
+                    log.debug("fail_tasks: intent settle failed for %s", tid, exc_info=True)
             else:
                 write_task_result(root, tid, STATUS_FAILED, reason_code=reason_code, result=result)
             written += 1

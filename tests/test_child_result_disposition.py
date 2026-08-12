@@ -646,15 +646,58 @@ def test_cancellation_wins_and_late_scratch_result_is_deleted(tmp_path):
     ) == "cancelled"
 
 
-def test_cancel_latch_blocks_custom_child_read_and_artifact_copy(
+def test_legacy_cancel_requested_latch_is_pending_not_handled(tmp_path):
+    """GR2-8c: only a SETTLED ``cancelled`` counts as a handled disposition.
+
+    The legacy ``cancel_requested`` STATUS is an unsettled latch — intent, not
+    outcome (phase A moved intent to the durable cancel_state projection).
+    Treating it as "cancelled" suppressed the parent's pending-child handoff
+    reminder for a child the supervisor was still tearing down; such a child
+    must stay visible as cancel-pending until custody settles it.
+    """
+    from ouroboros.loop import _child_disposition_state
+    from ouroboros.task_results import STATUS_CANCEL_REQUESTED, write_task_result
+    from ouroboros.task_status import load_effective_task_result
+
+    child_id = "legacy-latch-child"
+    write_task_result(
+        tmp_path,
+        child_id,
+        STATUS_CANCEL_REQUESTED,
+        parent_task_id="parent1",
+        root_task_id="parent1",
+        delegation_role="subagent",
+        parent_decision="cancelled",
+        result="wedged in the pre-redesign latch",
+    )
+
+    effective = load_effective_task_result(tmp_path, child_id)
+    assert _child_disposition_state(effective) != "cancelled", (
+        "an unsettled latch must not read as a handled cancellation"
+    )
+    # ...and the same row with a SETTLED cancelled status IS handled.
+    write_task_result(tmp_path, child_id, "cancelled", parent_decision="cancelled")
+    assert _child_disposition_state(
+        load_effective_task_result(tmp_path, child_id)
+    ) == "cancelled"
+
+
+def test_settled_cancel_blocks_custom_child_read_and_artifact_copy(
     tmp_path, monkeypatch
 ):
+    """Only a SUPERVISOR-SETTLED ``cancelled`` blocks child-drive promotion.
+
+    Re-pinned for the phase-A cancel redesign: the blocking authority used to be
+    the cancel-INTENT latch, which is exactly what erased a child that had
+    already finished. The settled outcome still blocks (the task's terminal truth
+    is decided); the legacy latch no longer does — see the test below.
+    """
     import pathlib
 
     import ouroboros.headless as headless
     import ouroboros.task_status as task_status
     from ouroboros.task_results import (
-        STATUS_CANCEL_REQUESTED,
+        STATUS_CANCELLED,
         load_task_result,
         write_task_result,
     )
@@ -680,19 +723,19 @@ def test_cancel_latch_blocks_custom_child_read_and_artifact_copy(
     write_task_result(
         parent,
         child_id,
-        STATUS_CANCEL_REQUESTED,
+        STATUS_CANCELLED,
         parent_task_id="parent1",
         root_task_id="parent1",
         delegation_role="subagent",
         parent_decision="cancelled",
-        result="canonical cancellation request",
+        result="canonical settled cancellation",
         trace_summary="canonical cancellation trace",
         child_drive_root=str(custom_child),
     )
     canonical = load_task_result(parent, child_id) or {}
 
     # A surviving custom child root models failed scratch cleanup. Neither the
-    # effective reader nor copy-back may even read it once cancellation is latched.
+    # effective reader nor copy-back may even read it once cancellation SETTLED.
     real_load = load_task_result
     observed_roots: list[pathlib.Path] = []
 
@@ -706,8 +749,8 @@ def test_cancel_latch_blocks_custom_child_read_and_artifact_copy(
     monkeypatch.setattr(headless, "load_task_result", guarded_load)
 
     effective = task_status.load_effective_task_result(parent, child_id)
-    assert effective["status"] == STATUS_CANCEL_REQUESTED
-    assert effective["result"] == "canonical cancellation request"
+    assert effective["status"] == STATUS_CANCELLED
+    assert effective["result"] == "canonical settled cancellation"
     assert effective["trace_summary"] == "canonical cancellation trace"
     assert "child_status" not in effective
     assert not effective.get("artifacts")
@@ -726,12 +769,68 @@ def test_cancel_latch_blocks_custom_child_read_and_artifact_copy(
     assert load_task_result(parent, child_id) == canonical
 
 
-def test_cancel_latch_blocks_finalizer_before_workspace_or_child_reads(
-    tmp_path, monkeypatch
-):
+def test_legacy_cancel_latch_no_longer_blocks_child_promotion(tmp_path):
+    """A pre-redesign ``cancel_requested`` file must NOT bury a finished child.
+
+    This is the incident itself: the latch counted as terminal, so the post-kill
+    re-check read it back and the child's completed answer was deleted with its
+    drive. Completion wins now (owner 4=A) — an old latch file is a cancel
+    REQUEST, and a child that finished first keeps its result.
+    """
     import ouroboros.headless as headless
+    import ouroboros.task_status as task_status
     from ouroboros.task_results import (
         STATUS_CANCEL_REQUESTED,
+        STATUS_COMPLETED,
+        load_task_result,
+        write_task_result,
+    )
+
+    parent = tmp_path / "parent"
+    custom_child = tmp_path / "child-drive"
+    child_id = "legacy-latch-child"
+    write_task_result(
+        custom_child,
+        child_id,
+        STATUS_COMPLETED,
+        result="the finished child answer",
+        trace_summary="did the work",
+    )
+    write_task_result(
+        parent,
+        child_id,
+        STATUS_CANCEL_REQUESTED,
+        parent_task_id="parent1",
+        root_task_id="parent1",
+        delegation_role="subagent",
+        result="legacy cancellation request",
+        child_drive_root=str(custom_child),
+    )
+
+    copied = headless.copy_child_task_result(
+        parent,
+        {
+            "id": child_id,
+            "drive_root": str(custom_child),
+            "delegation_role": "subagent",
+        },
+    )
+    assert copied is not None and copied["status"] == STATUS_COMPLETED
+    assert copied["result"] == "the finished child answer"
+    stored = load_task_result(parent, child_id) or {}
+    assert stored["status"] == STATUS_COMPLETED
+    # The effective read surfaces the promoted completion, not the old latch.
+    effective = task_status.load_effective_task_result(parent, child_id)
+    assert effective["status"] == STATUS_COMPLETED
+
+
+def test_settled_cancel_blocks_finalizer_before_workspace_or_child_reads(
+    tmp_path, monkeypatch
+):
+    """Same re-pin for artifact finalization: SETTLED cancelled blocks, latch does not."""
+    import ouroboros.headless as headless
+    from ouroboros.task_results import (
+        STATUS_CANCELLED,
         load_task_result,
         write_task_result,
     )
@@ -747,12 +846,12 @@ def test_cancel_latch_blocks_finalizer_before_workspace_or_child_reads(
     write_task_result(
         parent,
         child_id,
-        STATUS_CANCEL_REQUESTED,
+        STATUS_CANCELLED,
         parent_task_id="parent1",
         root_task_id="parent1",
         delegation_role="subagent",
         parent_decision="cancelled",
-        result="canonical cancellation request",
+        result="canonical settled cancellation",
         trace_summary="canonical cancellation trace",
         child_drive_root=str(custom_child),
         workspace_root=str(workspace),

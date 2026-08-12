@@ -2042,13 +2042,16 @@ def _isolation_stub(monkeypatch, *, run_dir, engine_version=CLAUDEXOR_DELEGATED_
     return cancelled
 
 
-def _write_attempt(run_dir, *, isolated, home_dir, attempt="a01", mechanism="seatbelt"):
+def _write_attempt(run_dir, *, isolated, home_dir, attempt="a01", mechanism="seatbelt",
+                   unavailable_reason=None):
     """One clean `attempt.yaml`, in Claudexor's own applied-facts shape.
 
     `mechanism=None` is the record an engine writes when it applied NO OS boundary —
     3.3.0/3.3.1, which have no confinement fields at all, and any host whose engine
     ships a mechanism it cannot use here. It is a supported outcome, not a malformed
     record, which is why it is a parameter of the ordinary helper.
+    `unavailable_reason` is the engine's typed explanation for a missing boundary
+    (phase A3) — telemetry the disclosure amplifies, never an admission token.
     """
     attempt_dir = run_dir / "attempts" / attempt
     attempt_dir.mkdir(parents=True, exist_ok=True)
@@ -2059,6 +2062,8 @@ def _write_attempt(run_dir, *, isolated, home_dir, attempt="a01", mechanism="sea
         record["confinement_mechanism"] = mechanism
         record["confinement_profile_digest"] = "sha256:" + "0" * 64
         record["confinement_verified_denied_path"] = "/Users/op/.claudexor/v3/daemon"
+    if unavailable_reason is not None:
+        record["confinement_unavailable_reason"] = unavailable_reason
     lines = [f"{k}: {json.dumps(v)}" for k, v in record.items()]
     (attempt_dir / "attempt.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -2258,24 +2263,24 @@ def test_asking_for_a_scoped_home_is_not_evidence_that_one_was_applied(tmp_path,
     assert out["status"] == "progress", out
     assert cancelled == {}
 
-    # (e) P34P1.5, refined by the 2026-08-07 live incident: a HOME NESTED inside the
-    # operator's own home is a breach ONLY without a proven OS boundary. A bare
-    # `$HOME/tmp/harness` keeps `~/.claudexor/v3/daemon/token` reachable by a relative
-    # walk (DELEGATED_ADMISSION.md §8) — but the engine ROOTS every scoped home under
-    # its runtime dir, which lives under $HOME on every host it supports, so the
-    # spatial rule alone cancelled every real delegated agent run ever started, one of
-    # them provably seatbelt-confined with the daemon directory as its verified DENIED
-    # path. mechanism=None models the boundary-less engine record.
+    # (e) Phase A3 (Poltergeist sprint, grok-simplified rule): a HOME NESTED inside
+    # the operator's own home is NOT a breach — with OR without a recorded OS
+    # boundary. The engine roots every scoped home under its runtime dir, which
+    # lives under $HOME on every host it supports, and on a host with no boundary
+    # mechanism (every non-macOS host today) it CANNOT record one — so the old
+    # nested-without-mechanism rule cancelled every mutating Linux run post-factum
+    # (the colleague's issue-2 class). The boundary-less nested shape flows to the
+    # EXISTING disclosed-unconfined path instead; only a recorded FALSE and the
+    # equality case above stay faults. mechanism=None models the boundary-less
+    # engine record.
     for nested in (home / "tmp" / "harness", home / "sub", home / "a" / "b" / "c"):
         nested.mkdir(parents=True, exist_ok=True)
         cancelled = _isolation_stub(monkeypatch, run_dir=run_dir)
         _write_attempt(run_dir, isolated=True, home_dir=str(nested), mechanism=None)
         out = _waiting(tmp_path, monkeypatch)
-        assert out["reason"] == "home_isolation_not_applied", (nested, out)
-        assert cancelled["reason"] == "home_isolation_not_applied"
+        assert out["status"] == "progress" and cancelled == {}, (nested, out)
 
-    # ...while the SAME nested home WITH the proven boundary (the engine's own layout,
-    # exactly the live run the old rule cancelled) is left alone.
+    # ...and the SAME nested home WITH the proven boundary stays fine too.
     nested = home / ".claudexor-runtime" / "projects" / "x" / "home"
     nested.mkdir(parents=True, exist_ok=True)
     cancelled = _isolation_stub(monkeypatch, run_dir=run_dir)
@@ -2345,6 +2350,7 @@ def test_an_attempt_that_recorded_no_home_fact_is_not_a_containment_fault(tmp_pa
     # unconfined attempt is an unconfined run.
     assert out["containment"] == {
         "verified": False, "attempts": 2, "disclosed": 1, "os_boundary": "",
+        "nested_under_operator_home": False,
         "note": "not every attempt of this run recorded a harness-HOME fact, so its "
                 "confinement is UNPROVEN — do not report it as isolated",
     }, out
@@ -2382,6 +2388,7 @@ def test_the_relayed_result_never_claims_an_isolation_no_artifact_proves(tmp_pat
     payload = _terminal_payload("run-1", detail, delegated_run_shape(True))
     assert payload["containment"] == {
         "verified": True, "attempts": 1, "disclosed": 1, "os_boundary": "seatbelt",
+        "nested_under_operator_home": False,
         "note": "every attempt recorded a scoped harness HOME outside the operator's own "
                 "AND an applied seatbelt boundary, proven against a path it denies",
     }
@@ -2469,6 +2476,62 @@ def test_a_run_with_no_os_boundary_is_disclosed_in_three_places_and_still_allowe
     events = [json.loads(line) for line in
               (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()]
     assert len([e for e in events if e["type"] == "delegate_run_unconfined"]) == 1, events
+
+
+def test_linux_shaped_run_is_disclosed_unconfined_with_the_engines_reason_not_cancelled(
+    tmp_path, monkeypatch,
+):
+    """Phase A3, the exact incident shape: a Linux host has no boundary mechanism,
+    so the engine records `home_isolated: true`, a scoped home NESTED under $HOME,
+    NO mechanism, and its typed `confinement_unavailable_reason`. The run must NOT
+    be cancelled post-factum (the old rule cancelled every mutating Linux run);
+    the reason AMPLIFIES the unconfined disclosure — parent payload and durable
+    record — and is never an admission token."""
+    from ouroboros.subagents import delegated_run_shape
+    from ouroboros.tools.delegate import _terminal_payload
+
+    run_dir = tmp_path / "run-1"
+    home = tmp_path / "operator-home"
+    nested = home / ".claudexor-runtime" / "projects" / "x" / "home"
+    nested.mkdir(parents=True)
+    monkeypatch.setattr(cx, "operator_home", lambda: home)
+
+    _write_attempt(
+        run_dir, isolated=True, home_dir=str(nested), mechanism=None,
+        unavailable_reason="no_boundary_mechanism_for_host: linux",
+    )
+    # The run keeps reporting progress — no cancellation.
+    cancelled = _isolation_stub(monkeypatch, run_dir=run_dir)
+    out = _waiting(tmp_path, monkeypatch)
+    assert out["status"] == "progress" and cancelled == {}, out
+
+    # Parent payload: unconfined, with the engine's own reason beside the note.
+    detail = {"summary": {"state": "succeeded", "runDir": str(run_dir)}}
+    containment = _terminal_payload("run-1", detail, delegated_run_shape(True))["containment"]
+    assert containment["verified"] is False and containment["os_boundary"] == ""
+    assert containment["confinement_unavailable_reason"] == "no_boundary_mechanism_for_host: linux"
+    assert "no_boundary_mechanism_for_host: linux" in containment["note"]
+
+    # Durable record: the unconfined row carries the same reason.
+    cancelled = _isolation_stub(monkeypatch, run_dir=run_dir, state="succeeded")
+    out = _waiting(tmp_path, monkeypatch)
+    assert out["status"] == "terminal" and cancelled == {}, out
+    events = [json.loads(line) for line in
+              (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    unconfined = [e for e in events if e["type"] == "delegate_run_unconfined"]
+    assert len(unconfined) == 1, events
+    assert unconfined[0]["confinement_unavailable_reason"] == "no_boundary_mechanism_for_host: linux"
+
+    # The reason is NOT an admission token: a recorded FALSE stays a fault even
+    # when a reason sits beside it.
+    _write_attempt(
+        run_dir, isolated=False, home_dir=str(home), mechanism=None,
+        unavailable_reason="no_boundary_mechanism_for_host: linux",
+    )
+    cancelled = _isolation_stub(monkeypatch, run_dir=run_dir)
+    out = _waiting(tmp_path, monkeypatch)
+    assert out["reason"] == "home_isolation_not_applied", out
+    assert cancelled["reason"] == "home_isolation_not_applied"
 
 
 def test_the_child_is_told_its_boundary_is_a_request_and_not_a_fact(tmp_path, monkeypatch):

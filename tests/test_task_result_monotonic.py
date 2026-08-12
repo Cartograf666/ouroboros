@@ -1,9 +1,13 @@
-"""Monotonic lifecycle guard for write_task_result (v6.7.0-rc.1).
+"""Monotonic lifecycle guard for write_task_result (v6.7.0-rc.1; cancel redesign
+phase A, 2026-08-11).
 
 Pins the "ghost subagent" / status-corruption protections:
-- a stale scheduled/running mirror cannot overwrite a cancel-intent or terminal
-- a terminal status is sticky against a *different* terminal status
-- cancel_requested still advances to the real terminal
+- a stale scheduled/running mirror cannot overwrite a terminal or a legacy latch
+- a terminal status is sticky against a *different* terminal status — including
+  cancelled-over-completed: natural completion WINS (owner 4=A), there is no
+  explicit-cancellation override any more
+- a LEGACY ``cancel_requested`` latch (pre-intent files) yields to ANY terminal,
+  including a racing ``completed``
 - normal forward progress and same-status enrichment are unaffected
 """
 
@@ -61,67 +65,54 @@ def test_cancel_requested_blocks_running_but_allows_cancelled(drive):
     assert _status(drive, "t") == tr.STATUS_CANCELLED
 
 
-def test_cancel_requested_not_masked_by_late_completion(drive):
-    # A worker finishing just after the cancel latch must NOT flip the task to
-    # "completed" — the requested cancel wins.
+def test_legacy_cancel_latch_yields_to_natural_completion(drive):
+    # Phase A (owner 4=A): natural completion WINS. A worker finishing after a
+    # LEGACY cancel latch flips the task to "completed" and keeps its result —
+    # cancel means "stop spending", never "discard the result".
     tr.write_task_result(drive, "t", tr.STATUS_CANCEL_REQUESTED)
     tr.write_task_result(drive, "t", tr.STATUS_COMPLETED, result="late success")
-    assert _status(drive, "t") == tr.STATUS_CANCEL_REQUESTED
-    # ...but a real teardown crash (failed) or the cancellation itself may land.
+    assert _status(drive, "t") == tr.STATUS_COMPLETED
+    # ...and once completed, a late cancelled write is refused (sticky terminal).
     tr.write_task_result(drive, "t", tr.STATUS_CANCELLED)
-    assert _status(drive, "t") == tr.STATUS_CANCELLED
+    assert _status(drive, "t") == tr.STATUS_COMPLETED
+    # A legacy latch still advances to the real teardown outcome when no natural
+    # completion raced it.
+    tr.write_task_result(drive, "u", tr.STATUS_CANCEL_REQUESTED)
+    tr.write_task_result(drive, "u", tr.STATUS_CANCELLED)
+    assert _status(drive, "u") == tr.STATUS_CANCELLED
 
 
-def test_explicit_cancellation_wins_only_a_completed_race(drive):
+def test_completed_result_survives_a_late_cancellation(drive):
+    # Phase A: the explicit-cancellation completed-overwrite is REMOVED. A late
+    # cancel must neither flip the status nor strip the completed payload
+    # (discarding a kept result is a separate explicit parent action).
     tr.write_task_result(
         drive,
         "won-race",
         tr.STATUS_COMPLETED,
-        result="late child result",
-        final_answer="late answer",
-        trace_summary="late trace",
-        artifacts=[{"name": "late.txt"}],
+        result="real child result",
+        final_answer="real answer",
+        trace_summary="real trace",
+        artifacts=[{"name": "real.txt"}],
         artifact_bundle={"status": "ready"},
         outcome_axes={"objective": {"status": "solved"}},
-        failure={"message": "stale"},
         review_evidence={"verdict": "PASS"},
         root_phase_checkpoint={"post_task_synthesis": "completed"},
         cost_usd=1.25,
         parent_task_id="parent",
     )
     tr.write_task_result(
-        drive,
-        "won-race",
-        tr.STATUS_CANCEL_REQUESTED,
-        _explicit_cancellation=True,
-        result="owner cancelled",
+        drive, "won-race", tr.STATUS_CANCELLED, result="owner cancelled",
     )
-    cancelled = tr.load_task_result(drive, "won-race")
-    assert cancelled["status"] == tr.STATUS_CANCEL_REQUESTED
-    assert cancelled["result"] == "owner cancelled"
-    assert cancelled["cost_usd"] == 1.25
-    assert cancelled["parent_task_id"] == "parent"
-    for field in (
-        "final_answer",
-        "trace_summary",
-        "artifacts",
-        "artifact_bundle",
-        "outcome_axes",
-        "failure",
-        "review_evidence",
-        "root_phase_checkpoint",
-    ):
-        assert field not in cancelled
-    tr.write_task_result(drive, "won-race", tr.STATUS_COMPLETED, result="stale completion")
-    assert _status(drive, "won-race") == tr.STATUS_CANCEL_REQUESTED
+    kept = tr.load_task_result(drive, "won-race")
+    assert kept["status"] == tr.STATUS_COMPLETED
+    assert kept["result"] == "real child result"
+    assert kept["final_answer"] == "real answer"
+    assert kept["artifacts"] == [{"name": "real.txt"}]
+    assert kept["cost_usd"] == 1.25
 
     tr.write_task_result(drive, "failed", tr.STATUS_FAILED, result="real failure")
-    tr.write_task_result(
-        drive,
-        "failed",
-        tr.STATUS_CANCELLED,
-        _explicit_cancellation=True,
-    )
+    tr.write_task_result(drive, "failed", tr.STATUS_CANCELLED)
     assert _status(drive, "failed") == tr.STATUS_FAILED
 
 

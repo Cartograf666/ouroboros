@@ -109,14 +109,24 @@ def test_remove_subagent_drive_does_not_promote_custom_late_result(tmp_path):
 
 
 def test_cancel_running_subagent_removes_drive_source():
-    # The cancellation custody family lives in task_lifecycle (queue re-exports it).
-    src = _read("supervisor/task_lifecycle.py")
-    assert "remove_subagent_task_drive(q.DRIVE_ROOT, str(task_id))" in src
-    assert "delegation_role" in src  # gated on subagent role
+    # The cancellation custody family lives in task_lifecycle; its settlement
+    # PUBLICATION half (where the drive cleanup runs) was split into
+    # supervisor/cancel_publication.py at the module-size boundary.
+    custody_src = _read("supervisor/task_lifecycle.py")
+    publish_src = _read("supervisor/cancel_publication.py")
+    assert "remove_subagent_task_drive(q.DRIVE_ROOT, str(task_id))" in publish_src
+    assert "delegation_role" in publish_src  # gated on subagent role
     # ORDER matters: the drive may only be reclaimed after the process is confirmed
-    # dead, or a still-running worker loses its scratch out from under it.
-    death_check = src.index("survived kill escalation")
-    assert src.index("remove_subagent_task_drive") > death_check
+    # dead, or a still-running worker loses its scratch out from under it. The
+    # death confirmation lives in custody, which only then calls the publish
+    # step; inside the publish step the cleanup follows the terminal emit.
+    assert "survived kill escalation" in custody_src
+    assert custody_src.index("survived kill escalation") < custody_src.index(
+        "_publish_cancelled_task(\n"
+    )
+    assert publish_src.index("_emit_cancel_task_done") < publish_src.index(
+        "remove_subagent_task_drive"
+    )
 
 
 # ───────────────────────── #9: orphan worker reaping ────────────────────────

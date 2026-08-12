@@ -551,8 +551,16 @@
 /**
  * GET /api/tasks/{task_id} — the public task-result envelope (open shape;
  * stored task-result keys pass through) plus additive typed projections.
+ * cancel_state is the phase-A cancel projection: "pending" while a durable
+ * cancel intent is open and the supervisor teardown has not settled (status
+ * itself honestly stays running/scheduled); absent otherwise. The UI renders
+ * the interim "Cancelling…" from this field, never from a status value.
+ * cancel_reason rides beside it when the intent carries a reason (the WHY of
+ * the pending cancellation); absent when no reason was recorded.
  * @typedef {Object} TaskDetailResponse
  * @property {TaskCostBreakdown=} cost_breakdown
+ * @property {string=} cancel_state
+ * @property {string=} cancel_reason
  * @property {string=} error
  */
 
@@ -713,4 +721,4 @@
  * @property {?boolean} check_ok
  */
 
-export const GATEWAY_CONTRACT_VERSION = '6.97.2';
+export const GATEWAY_CONTRACT_VERSION = '6.98.0';

@@ -122,6 +122,37 @@ def test_cancel_404_contract_both_modes(tmp_path, monkeypatch):
     assert cascade.json()["error"] == "task not found or not active"
 
 
+def test_intent_write_failure_refuses_both_cancel_modes(tmp_path, monkeypatch):
+    """AR2-1 (owner 1=A, fail-closed like the agent tool lane): a failed durable
+    cancel-intent write REFUSES the cancel with a typed 503 — custody is never
+    invoked on an unfenced teardown and nothing is torn down."""
+    queue, pending = _isolate_queue(
+        monkeypatch, tmp_path,
+        [{"id": "root", "chat_id": 0, "root_task_id": "root"}],
+    )
+    custody_calls: list = []
+    monkeypatch.setattr(
+        queue, "cancel_task_custody",
+        lambda tid, **_kw: custody_calls.append(tid) or queue.CANCEL_CANCELLED,
+    )
+    monkeypatch.setattr(
+        queue, "cancel_task_by_id",
+        lambda tid, **_kw: custody_calls.append(tid) or True,
+    )
+    monkeypatch.setattr(
+        "ouroboros.cancel_intents.request_cancel",
+        lambda *_a, **_kw: (_ for _ in ()).throw(OSError("intent store io")),
+    )
+    with _client(tmp_path) as client:
+        plain = client.post("/api/tasks/root/cancel")
+        cascade = client.post("/api/tasks/root/cancel", json={"cascade": True})
+    for response in (plain, cascade):
+        assert response.status_code == 503
+        assert response.json()["reason_code"] == "cancel_intent_write_failed"
+    assert custody_calls == [], "no teardown without the durable intent"
+    assert [task["id"] for task in pending] == ["root"]
+
+
 def test_cascade_repeat_after_full_cancel_is_404(tmp_path, monkeypatch):
     _isolate_queue(
         monkeypatch,
@@ -299,7 +330,9 @@ def test_cascade_answers_only_after_the_teardown_and_reports_an_unsettled_tree(t
     import ouroboros.gateway.tasks as tasks_mod
 
     order: list[str] = []
-    monkeypatch.setattr("supervisor.task_lifecycle.task_subtree_is_live", lambda tid: True)
+    # GR3-11a: the endpoint consults the liveness pre-check through the
+    # supervisor.queue re-export (the single public import surface).
+    monkeypatch.setattr("supervisor.queue.task_subtree_is_live", lambda tid: True)
     monkeypatch.setattr(
         tasks_mod, "_run_cascade_cancel",
         lambda task_id: (order.append("teardown"), True)[1],
@@ -351,3 +384,65 @@ def test_plain_cancel_of_an_already_finished_task_keeps_the_legacy_404(tmp_path,
     with _client(tmp_path) as client:
         response = client.post("/api/tasks/root/cancel")
     assert response.status_code == 404
+
+
+def test_cascade_ingress_mints_the_cascade_scope_itself(tmp_path, monkeypatch):
+    """GR2-1a: the HTTP cascade endpoint mints its durable intent WITH
+    ``scope=cascade`` at the ingress — even when the supervisor's own
+    ``mark_intent_scope`` stamp never runs (the crash-before-stamp window), a
+    watchdog replay of the intent re-runs a CASCADE, never a single cancel."""
+    import ouroboros.gateway.tasks as tasks_mod
+
+    _isolate_queue(monkeypatch, tmp_path, [
+        {"id": "root", "chat_id": 0, "root_task_id": "root"},
+        {"id": "kid", "chat_id": 0, "root_task_id": "root", "parent_task_id": "root"},
+    ])
+    # The supervisor-side second line of defense is DEAD in this shape.
+    monkeypatch.setattr("ouroboros.cancel_intents.mark_intent_scope",
+                        lambda *_a, **_kw: False)
+    seen: dict = {}
+
+    def _capture_teardown(task_id):
+        from ouroboros.cancel_intents import active_intent
+
+        seen.update(active_intent(tmp_path, task_id) or {})
+        return True
+
+    monkeypatch.setattr(tasks_mod, "_run_cascade_cancel", _capture_teardown)
+    with _client(tmp_path) as client:
+        response = client.post("/api/tasks/root/cancel", json={"cascade": True})
+
+    assert response.status_code == 200
+    assert seen.get("scope") == "cascade", (
+        "the ingress-minted intent must already carry the cascade scope"
+    )
+    assert seen.get("source") == "http_cascade"
+
+
+def test_cascade_over_a_settled_root_leaves_a_replayable_intent_on_crash(tmp_path, monkeypatch):
+    """GR2-1b: a cascade over an ALREADY-SETTLED root with live descendants
+    mints a durable cascade coordination intent — after a simulated crash
+    mid-sweep (teardown reports unsettled) that intent survives as the
+    watchdog's replay trigger for the descendants."""
+    import ouroboros.gateway.tasks as tasks_mod
+
+    from ouroboros.cancel_intents import active_intent
+    from ouroboros.task_results import write_task_result
+
+    _isolate_queue(monkeypatch, tmp_path, [
+        {"id": "kid", "chat_id": 7, "root_task_id": "root", "parent_task_id": "root"},
+    ])
+    write_task_result(tmp_path, "root", "failed", result="root died on budget")
+    write_task_result(tmp_path, "kid", "scheduled")
+    # Crash mid-sweep: the teardown never settles the tree.
+    monkeypatch.setattr(tasks_mod, "_run_cascade_cancel", lambda task_id: False)
+
+    with _client(tmp_path) as client:
+        response = client.post("/api/tasks/root/cancel", json={"cascade": True})
+
+    assert response.status_code == 503, "an unsettled tree is never acknowledged"
+    row = active_intent(tmp_path, "root")
+    assert row is not None and row["scope"] == "cascade", (
+        "the settled-root cascade intent must survive the crash as the "
+        "watchdog's replay trigger for the live descendants"
+    )

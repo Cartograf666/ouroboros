@@ -285,6 +285,13 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     "deep_self_review_error": (False, "agent.py:743 review-stage error on a review task"),
     "worker_pool_unavailable": (False, "gateway/tasks.py managed-task admission refusal"),
     "worker_pool_state_unavailable": (False, "gateway/tasks.py fail-closed admission inspection"),
+    # Phase-A AR2-1: the HTTP cancel ingress refuses (503) when the durable
+    # cancel-intent write fails — an ingress refusal about a CANCEL request; the
+    # task itself keeps running untouched, so no trial ever terminalizes with it.
+    "cancel_intent_write_failed": (False, "gateway/tasks.py fail-closed cancel ingress refusal; never a task terminal"),
+    # GR4-8: the corrupt-projection flavor of the same ingress refusal — still a
+    # refusal about a CANCEL request (503), never a task terminal.
+    "cancel_intent_projection_corrupt": (False, "gateway/tasks.py fail-closed cancel ingress refusal (corrupt projection); never a task terminal"),
 }
 
 _REASON_CODE_LITERAL = re.compile(

@@ -104,25 +104,30 @@ def _home_isolation_breach(detail: Dict[str, Any]) -> Optional[_Breach]:
     attempt (``harness_home_isolated`` / ``harness_home_dir``) and projects it onto no
     ``/v2`` response, so the artifact is the only witness there is.
 
-    A FAULT NEEDS A FACT, and the fact can legitimately be absent. Current Claudexor
-    spreads the applied facts into ``attemptFailureRecord`` too, so an errored attempt
-    usually carries them — but ``harness_home_isolated`` is the one optional member, left
-    out when the attempt died before its home was decided, and an older engine wrote no
-    HOME fields on a failure record at all. "a01 errored, a02 repaired it" is the ordinary
-    path of the converge loop an ``agent`` run takes, so reading a missing fact as a fault
-    cancels a
-    correctly confined, finished, successful run and tells the nanny an ordinary harness
-    failure was a containment fault it must not retry. That is the same line
-    ``_widened_access`` draws for an undisclosed access profile: absence of evidence is
-    not evidence. What is UNPROVEN is reported as unproven, by ``_containment_evidence``
-    — it is not enforced as a breach.
+    THE RULE IS TWO EXACT FACTS (phase A3, Poltergeist sprint — the simplified
+    form): a breach is ONLY a recorded ``harness_home_isolated: false``, or an
+    applied home EQUAL to the operator's own (the claim is the lie, whatever
+    boundary sits beside it). Everything else is reported, not enforced:
 
-    A MISSING OS BOUNDARY IS NOT A BREACH EITHER, and that is a decision rather than an
-    omission. The engine applies one only where it has a mechanism for the host, so
-    faulting on its absence would refuse the lane on every host that has none — cutting
-    a capability to avoid a risk the child already carries, since it holds a shell in
-    this worktree either way. It is disclosed instead, in all three places
-    (AGENTS.md "Disclose instead of forbid"). Only a recorded FALSE stays a fault.
+    - A MISSING fact stays absence. Current Claudexor spreads the applied facts
+      into ``attemptFailureRecord`` too, but ``harness_home_isolated`` is the one
+      optional member, omitted when the attempt died before its home was decided
+      — "a01 errored, a02 repaired it" is the ordinary converge loop, and reading
+      absence as a fault cancelled healthy finished runs. Unproven is REPORTED by
+      ``_containment_evidence``, never enforced.
+    - A scoped home NESTED under ``$HOME`` — with or without a recorded OS
+      boundary — is NOT a breach. The engine roots every scoped home under its
+      runtime dir, which lives under ``$HOME`` on every host it supports, and on
+      hosts with no boundary mechanism (every non-macOS host today) it CANNOT
+      record one, so the old nested-without-mechanism rule cancelled every
+      mutating Linux run post-factum (the colleague's issue-2 class). The nested
+      shape flows to the EXISTING disclosed-unconfined path instead
+      (``delegate_run_unconfined`` + the three-place disclosure): the child
+      already holds a shell in this worktree, and the marginal step from "shell"
+      to "``~``-relative token reachability" does not justify cutting the lane on
+      every boundary-less host (AGENTS.md "Disclose instead of forbid";
+      Proportionality). ``confinement_unavailable_reason`` from the same attempt
+      artifact amplifies that disclosure — telemetry, never an admission token.
     """
     from ouroboros.gateways.claudexor import attempt_containment, operator_home
 
@@ -136,38 +141,57 @@ def _home_isolation_breach(detail: Dict[str, Any]) -> Optional[_Breach]:
     for attempt in attempts:
         if attempt.home_isolated is None:
             continue
-        applied = (_resolved(attempt.home_dir)
-                   if attempt.home_isolated and attempt.home_dir else None)
-        # A scoped home NESTED under $HOME with a PROVEN OS boundary on the same
-        # attempt is the engine's own layout, not a breach: it roots every scoped
-        # home under its runtime dir, which lives under $HOME on every supported
-        # host, so the any-depth spatial test alone refused every real delegated
-        # agent run (2026-08-07: a seatbelt-confined attempt whose verified DENIED
-        # path was the daemon token directory was cancelled). Without the proven
-        # boundary the spatial rule stands, and EQUALITY is never excused — an
-        # "isolated" home naming the operator's own verbatim is the lie itself.
-        inside = real_home is not None and _inside_operator_home(applied, real_home) \
-            if applied is not None else False
-        proven_nested = bool(attempt.boundary_mechanism) and applied != real_home
-        if applied is None or (inside and not proven_nested):
+        if attempt.home_isolated is False:
             return _Breach(
                 "home_isolation_not_applied",
-                "The delegated run asked for a scoped harness HOME and the engine ran "
-                "it in the operator's own home instead, where the Claudexor daemon "
-                "token grants the entire control API.",
+                "The delegated run asked for a scoped harness HOME and the engine "
+                "recorded that none was applied, leaving the harness in the "
+                "operator's own home, where the Claudexor daemon token grants the "
+                "entire control API.",
+                {"attempt_id": attempt.attempt_id, "harness_home_dir": attempt.home_dir,
+                 "harness_home_isolated": attempt.home_isolated},
+            )
+        applied = _resolved(attempt.home_dir) if attempt.home_dir else None
+        # EQUALITY is never excused: an "isolated" home naming the operator's own
+        # verbatim is the lie itself. Both sides resolved, so a symlink cannot
+        # launder it. (Nested-under-$HOME is the engine's own layout — disclosed,
+        # not refused; see the docstring.)
+        if applied is not None and real_home is not None and applied == real_home:
+            return _Breach(
+                "home_isolation_not_applied",
+                "The delegated run claims an isolated harness HOME that IS the "
+                "operator's own home, where the Claudexor daemon token grants the "
+                "entire control API.",
                 {"attempt_id": attempt.attempt_id, "harness_home_dir": attempt.home_dir,
                  "harness_home_isolated": attempt.home_isolated},
             )
     return None
 
 
-def _inside_operator_home(applied: pathlib.Path, real_home: pathlib.Path) -> bool:
-    """Did the 'scoped' HOME land in the operator's own home, at any depth?
+def home_nested_under_operator_home(detail: Dict[str, Any]) -> bool:
+    """Did any attempt's applied scoped HOME land INSIDE the operator's own home?
 
-    Equality alone was the whole check, so ``$HOME/tmp/harness`` passed as isolated —
-    while ``docs/DELEGATED_ADMISSION.md`` §8 calls that a breach, and rightly:
-    ``~/.claudexor/v3/daemon/token`` stays reachable by a relative walk, which is the
-    entire /v2 control API. Both resolved, so a symlink cannot launder it.
+    NOT a breach (see ``_home_isolation_breach``) — the engine roots every scoped
+    home under its runtime dir, which lives under ``$HOME``. It is a REPORTING
+    fact, and one the evidence reader must never drop: a nested home leaves
+    ``~/.claudexor/v3/daemon/token`` reachable by absolute path, so a run that
+    also recorded an OS boundary was being promoted to ``verified: true`` with a
+    note claiming a home "outside the operator's own" — and, because the durable
+    unconfined row is only emitted for runs with no boundary, the disclosure
+    disappeared entirely. Absence of the fact stays absence: a run that recorded
+    no home is unproven, not nested.
     """
-    return applied == real_home or real_home in applied.parents
+    from ouroboros.gateways.claudexor import attempt_containment, operator_home
+
+    run_dir = str(custody.summary_of(detail).get("runDir") or "")
+    if not run_dir:
+        return False
+    real_home = _resolved(operator_home())
+    if real_home is None:
+        return False
+    for attempt in attempt_containment(run_dir):
+        applied = _resolved(attempt.home_dir) if attempt.home_dir else None
+        if applied is not None and real_home in applied.parents:
+            return True
+    return False
 

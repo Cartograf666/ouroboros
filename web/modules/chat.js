@@ -10,6 +10,7 @@ import {
     isGroupedTaskEvent,
     normalizeLogTs,
     summarizeChatLiveEvent,
+    taskCancelPending,
     taskOutcomeSeverity,
     taskTerminalPhase,
 } from './log_events.js';
@@ -1567,12 +1568,63 @@ export function createChatInstance({
         record.cancelRunBtn = btn;
     }
 
+    // Interim "Cancelling…" phase (phase A cancel redesign): the durable cancel
+    // intent is recorded and the supervisor is confirming the teardown — the
+    // card stays honestly LIVE (never an instant "Cancelled" lie) and resolves
+    // on the settled task_done: Cancelled, or Completed when the run finished
+    // first (completion wins).
+    function markLiveCardCancelPending(taskId = '') {
+        const record = liveCardRecords.get(String(taskId || '').trim());
+        if (!record || record.finished || !record.phaseEl) return;
+        record.phaseEl.dataset.phase = 'working';
+        record.phaseEl.textContent = 'Cancelling…';
+        record.phaseEl.className = 'chat-live-phase working cancelling';
+    }
+
+    // Snapshot / restore of the live phase element around the optimistic
+    // "Cancelling…" mark (GR2-8a): a cancel request that FAILS must not leave
+    // the optimistic phase lying on a card whose cancellation is not pending.
+    function captureLiveCardPhase(record) {
+        if (!record?.phaseEl) return null;
+        return {
+            phase: record.phaseEl.dataset.phase,
+            text: record.phaseEl.textContent,
+            className: record.phaseEl.className,
+        };
+    }
+
+    function restoreLiveCardPhase(record, snapshot) {
+        if (!record?.phaseEl || !snapshot || record.finished) return;
+        record.phaseEl.dataset.phase = snapshot.phase;
+        record.phaseEl.textContent = snapshot.text;
+        record.phaseEl.className = snapshot.className;
+    }
+
+    // Task-detail reconciliation for the cancel flow (GR2-8b): the typed
+    // cancel_state projection is consulted FIRST — a live task wedged in the
+    // legacy `cancel_requested` STATUS latch (intent, not outcome) must show
+    // as cancel-pending, not resolve as a terminal "Cancelled" while the
+    // supervisor is still tearing it down. Only genuinely settled statuses
+    // (or an intent-free legacy latch, which is history awaiting boot
+    // migration) fall through to the terminal seam.
+    function reconcileCancelCardFromDetail(record, taskId, stored) {
+        if (!stored || record.finished) return;
+        if (taskCancelPending(stored)) {
+            markLiveCardCancelPending(taskId);
+            return;
+        }
+        const status = String(stored?.status || '');
+        if (['completed', 'failed', 'cancelled', 'cancel_requested', 'rejected_duplicate'].includes(status)) {
+            finishLiveCard(taskId, taskTerminalPhase(stored));
+        }
+    }
+
     async function cancelRunFromCard(record) {
         const taskId = String(record?.groupId || '').trim();
         if (!taskId || record.finished) return;
         const confirmed = await openConfirmDialog({
             title: 'Cancel this run?',
-            body: 'Cancel this run and all its subagents? Unfinished results and artifacts may be lost.',
+            body: 'Cancel this run and all its subagents? A run that already finished keeps its result; unfinished work is salvaged best-effort.',
             confirmLabel: 'Cancel run',
             cancelLabel: 'Keep running',
             danger: true,
@@ -1583,6 +1635,8 @@ export function createChatInstance({
         if (record.finished) return;
         const btn = record.cancelRunBtn;
         if (btn) btn.disabled = true;
+        const priorPhase = captureLiveCardPhase(record);
+        markLiveCardCancelPending(taskId);
         try {
             // Answered only after the teardown finished, so a resolved promise
             // means the run is really down; a refusal throws and is toasted below.
@@ -1595,10 +1649,7 @@ export function createChatInstance({
                 const stored = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`).then(
                     (resp) => (resp && typeof resp.json === 'function' && resp.ok !== false) ? resp.json() : null,
                 );
-                const status = String(stored?.status || '');
-                if (!record.finished && ['completed', 'failed', 'cancelled', 'cancel_requested', 'rejected_duplicate'].includes(status)) {
-                    finishLiveCard(taskId, taskTerminalPhase(stored));
-                }
+                reconcileCancelCardFromDetail(record, taskId, stored);
             } catch {
                 // The card still resolves on its own frame if one arrives.
             }
@@ -1625,11 +1676,7 @@ export function createChatInstance({
                     const stored = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`).then(
                         (resp) => (resp && typeof resp.json === 'function' && resp.ok !== false) ? resp.json() : null,
                     );
-                    const status = String(stored?.status || '');
-                    if (record.finished || !status) return;
-                    if (['completed', 'failed', 'cancelled', 'cancel_requested', 'rejected_duplicate'].includes(status)) {
-                        finishLiveCard(taskId, taskTerminalPhase(stored));
-                    }
+                    reconcileCancelCardFromDetail(record, taskId, stored);
                 } catch {
                     // The card still resolves on its own frame if one arrives;
                     // nothing worse than the pre-resync behavior.
@@ -1637,7 +1684,36 @@ export function createChatInstance({
                 return;
             }
             showToast(`Cancel failed: ${exc?.message || exc}`, 'error');
+            // GR3-10: reconcile the durable detail BEFORE touching the button —
+            // a non-404 failure can sit over a task whose durable record is
+            // already terminal (finish the card, button stays gone) or whose
+            // durable intent really is pending (keep the button disabled and
+            // the honest "Cancelling…"). Only a genuinely-live, non-pending
+            // task gets its prior phase restored and the button re-enabled.
+            let stored = null;
+            try {
+                stored = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`).then(
+                    (resp) => (resp && typeof resp.json === 'function' && resp.ok !== false) ? resp.json() : null,
+                );
+            } catch {
+                // Typed state unreachable — handled by the null guard below.
+            }
+            if (stored === null) {
+                // GR4-5: the detail fetch itself failed, so NOTHING was proven —
+                // restoring the prior phase and re-enabling Cancel would assert
+                // "not pending" without evidence. Keep the pending presentation
+                // and the disabled button; the next reconcile/poll (or the
+                // task_done frame) resolves the card either way.
+                return;
+            }
+            // The shared seam: pending keeps the interim, a terminal record
+            // finishes the card (same path replay uses).
+            reconcileCancelCardFromDetail(record, taskId, stored);
+            const stillPending = Boolean(taskCancelPending(stored));
+            if (record.finished || stillPending) return;
+            // Only a fetched, live, non-pending detail restores the button.
             if (btn) btn.disabled = false;
+            restoreLiveCardPhase(record, priorPhase);
         }
     }
 

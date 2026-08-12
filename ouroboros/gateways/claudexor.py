@@ -623,12 +623,19 @@ class AttemptContainment:
     indistinguishable from an engine that applied nothing, and the consequence of
     reading it that way is a DISCLOSURE rather than a refusal. That direction is safe;
     the opposite one would let an unconfined run pass as confined.
+
+    ``confinement_unavailable_reason`` — the engine's own typed explanation for a
+    missing boundary (e.g. no mechanism exists for this host), read from the SAME
+    attempt artifact. Telemetry that AMPLIFIES the unconfined disclosure — never
+    an admission token: an old engine that writes nothing here changes no
+    decision, and a reason's presence never excuses a recorded FALSE.
     """
 
     attempt_id: str
     home_isolated: Optional[bool]
     home_dir: str
     boundary_mechanism: str = ""
+    confinement_unavailable_reason: str = ""
 
 
 def attempt_containment(run_dir: str) -> List[AttemptContainment]:
@@ -677,6 +684,9 @@ def attempt_containment(run_dir: str) -> List[AttemptContainment]:
             home_isolated=raw if isinstance(raw, bool) else None,
             home_dir=str(record.get("harness_home_dir") or ""),
             boundary_mechanism=mechanism if (mechanism and proven) else "",
+            confinement_unavailable_reason=str(
+                record.get("confinement_unavailable_reason") or ""
+            ).strip(),
         ))
     return applied
 

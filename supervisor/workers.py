@@ -2071,7 +2071,22 @@ def respawn_worker(wid: int) -> bool:
 
 def _drop_cancelled_pending() -> None:
     """Remove pending tasks cancelled/finished between scheduling and assignment
-    so a cancelled subagent never actually starts. Caller holds _queue_lock."""
+    so a cancelled subagent never actually starts. Caller holds _queue_lock.
+
+    The pre-assignment consult of the durable cancel-intent projection (phase A):
+    a task with an active intent (or a legacy ``cancel_requested`` latch file) is
+    settled as ``cancelled`` with a reconstructed — usually confirmed pre-start
+    zero — cost, never assigned to a worker.
+
+    It settles under the SAME rules ``cancel_task_custody`` follows, because it
+    cannot call custody (the caller already holds ``_queue_lock``, which custody
+    takes): the STORED status decides the outcome (a task that completed keeps
+    its result), a durable write that FAILS leaves the intent active for the
+    watchdog instead of publishing a cancellation that was never persisted, and
+    the intent's ``requested_by`` stamps ``parent_decision`` at the OUTCOME — a
+    parent whose reminder is silenced by that field would otherwise keep nagging
+    about a child it cancelled itself.
+    """
     if not PENDING:
         return
     try:
@@ -2081,6 +2096,20 @@ def _drop_cancelled_pending() -> None:
         )
     except Exception:
         return
+    try:
+        from ouroboros.cancel_intents import (
+            active_intents, claim_intent, release_claim, settle_intent,
+        )
+
+        intents = active_intents(DRIVE_ROOT)
+    except Exception:
+        intents = {}
+        settle_intent = claim_intent = release_claim = None
+    try:
+        from supervisor.task_lifecycle import _intent_outcome_fields
+    except Exception:
+        def _intent_outcome_fields(_intent):  # type: ignore[misc]
+            return {}
     survivors: List[Dict[str, Any]] = []
     dropped: List[str] = []
     for t in PENDING:
@@ -2092,12 +2121,81 @@ def _drop_cancelled_pending() -> None:
                 status = str((existing or {}).get("status") or "")
             except Exception:
                 status = ""
-        if status == STATUS_CANCEL_REQUESTED:
+        if tid and (status == STATUS_CANCEL_REQUESTED or tid in intents):
+            # AR2-2 settle-owner unity: the drop CLAIMS the intent before it
+            # settles, the same fence custody holds. A REFUSED claim means a
+            # live custody attempt owns this teardown (it claimed on a capture
+            # miss while the enqueue raced): the task still leaves the queue —
+            # it must not be assigned — but the claim owner writes the terminal,
+            # settles, and emits; a parallel settle here is the double-settle
+            # the fence exists to stop.
+            claim: Dict[str, Any] = {}
+            if claim_intent is not None and tid in intents:
+                try:
+                    claim = claim_intent(DRIVE_ROOT, tid, owner="pending_drop") or {}
+                except Exception:
+                    claim = {"claim_refused": True}
+                if claim.get("claim_refused"):
+                    dropped.append(tid)
+                    continue
+            intent = claim or intents.get(tid) or {}
             try:
-                write_task_result(DRIVE_ROOT, tid, STATUS_CANCELLED, result="Cancelled before start.")
+                cost_fields = reconstruct_task_cost(tid, fields=True)
             except Exception:
+                cost_fields = {"cost_accounting_status": "unavailable",
+                               "cost_final": False, "cost_usd": None}
+            stored: Dict[str, Any] = {}
+            write_failed = False
+            try:
+                stored = write_task_result(
+                    DRIVE_ROOT, tid, STATUS_CANCELLED,
+                    result="Cancelled before start.", **cost_fields,
+                    **_intent_outcome_fields(intent),
+                ) or {}
+            except Exception:
+                write_failed = True
                 log.debug("Failed to finalize cancelled pending task %s", tid, exc_info=True)
-            _emit_task_done_terminal(t, tid, "cancelled")
+            if write_failed:
+                # Nothing durable happened. The task leaves the queue (it must
+                # not be assigned) but the intent stays ACTIVE — the held claim
+                # is RELEASED so the watchdog re-feeds custody, which writes the
+                # real terminal; a settle+task_done here would publish a
+                # cancellation that is not on disk.
+                if release_claim is not None and claim.get("request_id"):
+                    try:
+                        release_claim(
+                            DRIVE_ROOT, tid, error="pending-drop persistence failed",
+                            expected_generation=claim.get("generation"),
+                            request_id=str(claim.get("request_id") or ""),
+                        )
+                    except Exception:
+                        log.debug("pending-drop claim release failed for %s", tid, exc_info=True)
+                dropped.append(tid)
+                continue
+            stored_status = str(stored.get("status") or STATUS_CANCELLED)
+            if settle_intent is not None and tid in intents:
+                try:
+                    # Fenced by this drop's OWN claim: a settle from a claim that
+                    # was taken over is a no-op plus a forensic row. A
+                    # scope=cascade intent — including one durably WIDENED after
+                    # this loop's snapshot was read — is refused ATOMICALLY
+                    # inside the settle (GR3-1: the cascade postcondition is its
+                    # only settle owner) and this drop's claim is auto-released
+                    # in the same write so the watchdog re-feeds the cascade.
+                    settle_intent(
+                        DRIVE_ROOT, tid,
+                        outcome="cancelled" if stored_status == STATUS_CANCELLED else "already_settled",
+                        detail=("dropped before assignment" if stored_status == STATUS_CANCELLED
+                                else stored_status),
+                        expected_generation=claim.get("generation"),
+                        request_id=str(claim.get("request_id") or ""),
+                    )
+                except Exception:
+                    log.debug("Failed to settle cancel intent for pending %s", tid, exc_info=True)
+            # The STORED status, never a blanket "cancelled": the monotonic guard
+            # refuses our write when the task settled on its own, and the card
+            # must resolve to what actually happened (completion wins).
+            _emit_task_done_terminal(t, tid, stored_status, cost_fields=cost_fields)
             dropped.append(tid)
             continue
         if status in _TRULY_TERMINAL_STATUSES:

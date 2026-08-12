@@ -185,6 +185,34 @@ def stage_task_attachments(
     return manifest
 
 
+def remove_staged_attachments(manifest: Any) -> int:
+    """Unlink files a ``stage_task_attachments`` call just staged (GR2-9).
+
+    Used when the admission that motivated the staging is REFUSED after the
+    fact (the transactional cancel-pending re-check): the inputs must not
+    linger in the artifact store of a task the supervisor is tearing down.
+    Only entries carrying the staged ``abs_path`` this module wrote are
+    touched. Never raises; returns the number of files removed.
+    """
+    removed = 0
+    if not isinstance(manifest, list):
+        return removed
+    for entry in manifest:
+        if not isinstance(entry, dict):
+            continue
+        staged = str(entry.get("abs_path") or "").strip()
+        if not staged:
+            continue
+        try:
+            path = pathlib.Path(staged)
+            if path.is_file() and _ATTACHMENTS_SUBDIR in path.parts:
+                path.unlink(missing_ok=True)
+                removed += 1
+        except Exception:
+            log.debug("remove_staged_attachments: could not remove %s", staged, exc_info=True)
+    return removed
+
+
 def artifact_store_path_block_reason(path: pathlib.Path) -> str:
     """Return a block reason for task-artifact control/provenance paths."""
 

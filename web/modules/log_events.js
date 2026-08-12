@@ -233,12 +233,26 @@ function describeStartupChecks(checks) {
     return shortText(parts.join(' | '), 240);
 }
 
+// Typed pending-cancel projection (phase A cancel redesign): a durable cancel
+// intent is open and the supervisor teardown has not settled yet. This is NOT a
+// terminal severity — the status stays running/scheduled and the record carries
+// cancel_state="pending"; the card shows an interim "Cancelling…" and resolves
+// on the settled task_done (Cancelled, or Completed when the run finished first).
+export function taskCancelPending(record) {
+    const status = String(record?.status || '').toLowerCase();
+    const settled = ['completed', 'failed', 'cancelled', 'rejected_duplicate'].includes(status);
+    return !settled && String(record?.cancel_state || '') === 'pending';
+}
+
 export function taskOutcomeSeverity(evt) {
     const lifecycle = String(evt.outcome_axes?.lifecycle?.status || evt.status || '').toLowerCase();
     // v6.82 (P5): a cancelled task is neither Done nor Failed — it is honestly
     // Cancelled. Checked first: forced teardown routinely leaves failure-shaped
     // side facts (e.g. artifacts missing on a cancelled workspace task) that must
     // not relabel an owner-requested cancellation as a failure.
+    // 'cancel_requested' as a STATUS is legacy replay only (phase A moved cancel
+    // intent to the durable cancel_state projection); old task_done frames and
+    // pre-redesign history rows keep resolving as Cancelled.
     if (lifecycle === 'cancelled' || lifecycle === 'cancel_requested') {
         return 'cancelled';
     }

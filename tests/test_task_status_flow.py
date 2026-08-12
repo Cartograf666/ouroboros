@@ -106,13 +106,15 @@ def test_schedule_task_falls_back_to_pending_events_when_live_queue_unavailable(
     assert event_queue.events == []
 
 
-def test_cancel_task_latches_cancel_requested_and_emits_live(tmp_path):
+def test_cancel_task_writes_durable_intent_and_emits_live(tmp_path):
+    """Phase A: the cancel_task tool records a DURABLE intent, never a status."""
+    from ouroboros.cancel_intents import active_intent
     from ouroboros.tools.join_ledger import _cancel_task
     from ouroboros.task_results import (
-        STATUS_CANCEL_REQUESTED, STATUS_RUNNING, load_task_result, write_task_result,
+        STATUS_RUNNING, load_task_result, write_task_result,
     )
+    from ouroboros.task_status import load_effective_task_result
 
-    # Pre-existing running status: the latch must advance running -> cancel_requested.
     write_task_result(tmp_path, "child42", STATUS_RUNNING, result="working")
     event_queue = _FakeEventQueue()
     ctx = SimpleNamespace(
@@ -121,20 +123,33 @@ def test_cancel_task_latches_cancel_requested_and_emits_live(tmp_path):
         is_direct_chat=False, is_workspace_mode=lambda: False,
     )
 
-    result = _cancel_task(ctx, "child42")
+    result = _cancel_task(ctx, "child42", reason="not needed")
 
     assert "Cancel requested" in result
-    # The latch is actually written (a missing write_task_result import would
-    # silently skip this and leave the status at running).
-    assert load_task_result(tmp_path, "child42")["status"] == STATUS_CANCEL_REQUESTED
+    # The canonical status is NOT touched — intent lives in the projection.
+    assert load_task_result(tmp_path, "child42")["status"] == STATUS_RUNNING
+    intent = active_intent(tmp_path, "child42")
+    assert intent is not None and intent["state"] == "requested"
+    assert intent["reason"] == "not needed"
+    # The typed public projection rides every effective read.
+    effective = load_effective_task_result(tmp_path, "child42")
+    assert effective["status"] == STATUS_RUNNING
+    assert effective["cancel_state"] == "pending"
     # And the cancel is emitted live (not buffered to round end).
     assert any(e.get("type") == "cancel_task" and e.get("task_id") == "child42" for e in event_queue.events)
+    # Idempotent: a second request reuses the intent instead of re-minting.
+    again = _cancel_task(ctx, "child42")
+    assert "idempotent" in again
+    assert active_intent(tmp_path, "child42")["request_id"] == intent["request_id"]
 
 
-def test_explicit_cancel_wins_when_child_completed_before_latch(tmp_path, monkeypatch):
+def test_natural_completion_wins_a_late_cancel(tmp_path, monkeypatch):
+    """Phase A (owner 4=A): a child that finished before the teardown KEEPS its
+    completed result and artifacts; the cancel settles as already_settled and
+    the durable intent is closed — never the old completed-overwrite."""
+    from ouroboros.cancel_intents import active_intent
     from ouroboros.outcomes import public_task_result
     from ouroboros.task_results import (
-        STATUS_CANCELLED,
         STATUS_COMPLETED,
         load_task_result,
         write_task_result,
@@ -142,6 +157,7 @@ def test_explicit_cancel_wins_when_child_completed_before_latch(tmp_path, monkey
     from ouroboros.tools.join_ledger import _cancel_task
     from supervisor import queue as queue_module
     from supervisor import workers
+    from supervisor import task_lifecycle
 
     write_task_result(
         tmp_path,
@@ -151,9 +167,9 @@ def test_explicit_cancel_wins_when_child_completed_before_latch(tmp_path, monkey
         root_task_id="parent123",
         delegation_role="subagent",
         result="finished in the cancellation race",
-        final_answer="late answer",
-        trace_summary="late trace",
-        artifacts=[{"name": "late.txt"}],
+        final_answer="kept answer",
+        trace_summary="kept trace",
+        artifacts=[{"name": "kept.txt"}],
         artifact_bundle={"status": "ready"},
         outcome_axes={
             "execution": {"status": "ok"},
@@ -175,7 +191,19 @@ def test_explicit_cancel_wins_when_child_completed_before_latch(tmp_path, monkey
         is_workspace_mode=lambda: False,
     )
 
-    assert "Cancel requested" in _cancel_task(ctx, "fast-child")
+    # GR7-1a: "Nothing to cancel" needs a FRESH snapshot that positively
+    # proves no live ownership — a missing snapshot fails OPEN and mints.
+    from ouroboros.utils import atomic_write_json, utc_now_iso
+
+    atomic_write_json(
+        tmp_path / "state" / "queue_snapshot.json",
+        {"ts": utc_now_iso(), "running": [], "pending": []},
+    )
+    # The child had ALREADY finished, so the tool mints no intent at all: an
+    # intent on a settled task would show a "Cancelling…" badge on a finished
+    # card until the watchdog cleaned it up, and there is nothing to tear down.
+    assert "Nothing to cancel" in _cancel_task(ctx, "fast-child")
+    assert active_intent(tmp_path, "fast-child") is None
     monkeypatch.setattr(queue_module, "DRIVE_ROOT", tmp_path)
     monkeypatch.setattr(queue_module, "PENDING", [])
     monkeypatch.setattr(queue_module, "RUNNING", {})
@@ -185,16 +213,20 @@ def test_explicit_cancel_wins_when_child_completed_before_latch(tmp_path, monkey
 
     assert queue_module.cancel_task_by_id("fast-child") is True
     stored = load_task_result(tmp_path, "fast-child")
-    assert stored["status"] == STATUS_CANCELLED
+    assert stored["status"] == STATUS_COMPLETED
     assert stored["cost_usd"] == 0.75
-    assert stored["parent_task_id"] == "parent123"
-    assert stored.get("final_answer") is None
-    assert stored.get("trace_summary") is None
-    assert stored.get("artifacts") is None
+    assert stored["result"] == "finished in the cancellation race"
+    assert stored["final_answer"] == "kept answer"
+    assert stored["artifacts"] == [{"name": "kept.txt"}]
+    # Completion wins WITHOUT a parent_decision stamp: discarding a kept result
+    # stays a separate explicit action (discard_child_result).
+    assert "parent_decision" not in stored
+    # The durable intent settled (already_settled) — nothing left pending.
+    assert active_intent(tmp_path, "fast-child") is None
     public = public_task_result(stored)
-    assert public["outcome_axes"]["execution"]["status"] == "cancelled"
-    assert public["outcome_axes"]["objective"]["status"] == "not_evaluated"
-    assert public["outcome_axes"]["review"]["status"] == "skipped"
+    assert public["outcome_axes"]["execution"]["status"] == "ok"
+    # The typed custody outcome (not the boolean facade) reports already_settled.
+    assert task_lifecycle.cancel_task_custody("fast-child") == task_lifecycle.CANCEL_ALREADY_SETTLED
 
 
 def test_cancel_workspace_task_records_terminal_artifact_state(tmp_path, monkeypatch):
@@ -867,8 +899,8 @@ def test_wait_for_effective_tasks_keeps_polling_cancel_requested(tmp_path):
     waited = wait_for_effective_tasks(tmp_path, ["cancelling1"], timeout_sec=0)
     assert waited["all_terminal"] is False
     assert waited["timed_out"] is True
-    # The latch is reported as ITSELF — a known live state, never terminal/unknown.
-    assert waited["live_child_status"]["cancelling1"] == STATUS_CANCEL_REQUESTED
+    # A pending cancellation is reported as the typed state — never terminal/unknown.
+    assert waited["live_child_status"]["cancelling1"] == "cancel_pending"
 
     # Once the supervisor settles it, the same wait completes normally.
     write_task_result(tmp_path, "cancelling1", STATUS_CANCELLED, result="cancelled")

@@ -542,6 +542,15 @@ def preserve_salvaged_output(preserve_root: pathlib.Path, task_id: str, text: st
     return str(path)
 
 
+def preserved_salvage_path(preserve_root: pathlib.Path, task_id: str) -> str:
+    """The durable full-salvage copy path for a task, or "" when none exists."""
+    safe_task = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(task_id or "")).strip("_")
+    if not safe_task:
+        return ""
+    path = _observability_root(pathlib.Path(preserve_root)) / SALVAGED_OUTPUT_DIR / f"{safe_task}.txt"
+    return str(path) if path.is_file() else ""
+
+
 def salvaged_output_note(
     drive_root: pathlib.Path,
     task_id: str,

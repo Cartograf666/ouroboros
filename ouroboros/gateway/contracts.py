@@ -795,6 +795,16 @@ class TaskDetailResponse(TypedDict, total=False):
     stored task-result keys pass through) plus additive typed projections."""
 
     cost_breakdown: TaskCostBreakdown
+    # Poltergeist phase A cancel projection (additive-optional): ``"pending"``
+    # while a durable cancel intent is open and the supervisor teardown has not
+    # settled — the status itself honestly stays running/scheduled. Absent on
+    # settled results and on tasks nobody asked to cancel. The UI renders the
+    # interim "Cancelling…" from this field, never from a status value.
+    cancel_state: str
+    # Rides beside ``cancel_state`` when the intent carries a reason (GR2-11):
+    # the WHY of the pending cancellation (owner text, "subtree cancellation of
+    # <root>", "evolution stopped", …). Absent when no reason was recorded.
+    cancel_reason: str
     error: str
 
 

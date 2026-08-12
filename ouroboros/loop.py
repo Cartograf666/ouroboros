@@ -1252,9 +1252,9 @@ def _task_acceptance_subtree_snapshot(
             if status in SETTLED_STATUSES:
                 projected["child_result_sha256"] = _child_result_sha256(row)
             compact.append(projected)
-        # Acceptance needs true quiescence. ``cancel_requested`` is terminal for
-        # parent handoff reminders but the worker may still be exiting, so it is
-        # deliberately excluded here via SETTLED_STATUSES.
+        # Acceptance needs true quiescence: SETTLED statuses only. A child with a
+        # pending durable cancel intent stays non-quiescent until the supervisor
+        # custody settles it (guaranteed by the cancel-intent watchdog).
         queue_rows = [
             {
                 "task_id": str(row.get("task_id") or ""),
@@ -3843,10 +3843,15 @@ def _child_disposition_state(child: Dict[str, Any]) -> str:
 
     # Explicit cancellation is lifecycle authority and wins every completion
     # race. Late scratch results are intentionally not projected or recovered.
+    # Only a SETTLED ``cancelled`` counts as handled (GR2-8c): the legacy
+    # ``cancel_requested`` STATUS is an unsettled latch — intent, not outcome
+    # (phase A moved intent to the durable cancel_state projection). Treating
+    # it as done suppressed the handoff reminder for a child the supervisor
+    # was still tearing down; such a child now stays visible as cancel-pending
+    # until custody settles it.
     if (
         str(child.get("parent_decision") or "").strip().lower() == "cancelled"
-        and str(child.get("status") or "").strip().lower()
-        in {"cancel_requested", "cancelled"}
+        and str(child.get("status") or "").strip().lower() == "cancelled"
     ):
         return "cancelled"
     try:

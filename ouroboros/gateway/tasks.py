@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -967,7 +968,7 @@ def _run_cascade_cancel(task_id: str) -> bool:
             # terminal between the pre-check and this call) is the benign case the
             # UI already handles, and reporting it would train the owner to ignore
             # the real "refused to cancel" signal.
-            from supervisor.task_lifecycle import task_subtree_is_live
+            from supervisor.queue import task_subtree_is_live
 
             if task_subtree_is_live(task_id):
                 _record_cascade_incident(task_id, "task_cancel_cascade_noop")
@@ -1010,12 +1011,101 @@ async def api_task_cancel(request: Request) -> JSONResponse:
     if raw_cascade is not None and not isinstance(raw_cascade, bool):
         return json_error("cascade must be a boolean", 400, task_id=task_id)
     cascade = raw_cascade is True
+
+    def _record_http_intent(
+        source: str, *, cascade_scope: bool = False, allow_settled: bool = False,
+    ) -> bool:
+        """ALL cancel ingress goes through the durable intent (owner batch-4 1=A):
+        the intent survives a lost event/crash mid-teardown and the supervisor
+        watchdog re-feeds it into custody. FAIL-CLOSED (AR2-1, mirroring the
+        agent tool lane): a cancel whose durable intent could not be recorded is
+        REFUSED — teardown without the intent would recreate exactly the
+        unfenced, unreplayable cancel the redesign removes.
+
+        The cascade endpoint mints with ``scope=cascade`` AT THE INGRESS
+        (GR2-1a): a crash before the supervisor's own scope stamp would
+        otherwise leave a single-scope intent that a watchdog replay runs as a
+        single cancel, settling the root while its descendants keep running.
+        It also mints over an ALREADY-SETTLED root (GR2-1b): a settled root
+        with live descendants still needs the durable cascade coordination
+        intent — it is the watchdog's replay trigger for the descendants and
+        settles only when the cascade's no-live postcondition passes.
+
+        ``allow_settled`` (GR6-1) is the single lane's LIVE-OWNERSHIP fact: a
+        settled RESULT with a live worker (post-task cognition still spending)
+        must still mint, or the ingress no-ops while the worker burns —
+        ``already_settled`` is terminal only when no live ownership remains.
+
+        Returns "" on success, or a typed refusal kind: "projection_corrupt"
+        (GR4-8 — the projection FILE is malformed; a retry cannot succeed
+        until it is repaired) vs "write_failed" (transient — retry)."""
+        try:
+            from supervisor.queue import DRIVE_ROOT as _drive_root
+
+            from ouroboros.cancel_intents import (
+                CancelIntentProjectionCorrupt,
+                SCOPE_CASCADE,
+                request_cancel,
+            )
+        except Exception:
+            log.warning("HTTP cancel-intent machinery unavailable for %s", task_id,
+                        exc_info=True)
+            return "write_failed"
+        try:
+            request_cancel(
+                _drive_root, task_id, source=source,
+                **({"scope": SCOPE_CASCADE} if cascade_scope else {}),
+                allow_settled_target=bool(cascade_scope or allow_settled),
+            )
+            return ""
+        except CancelIntentProjectionCorrupt:
+            log.error("HTTP cancel refused for %s: intent projection corrupt", task_id)
+            return "projection_corrupt"
+        except Exception:
+            log.warning("HTTP cancel-intent write failed for %s; cancel refused",
+                        task_id, exc_info=True)
+            return "write_failed"
+
+    def _intent_write_refused(kind: str) -> JSONResponse:
+        if kind == "projection_corrupt":
+            # GR4-8: honest wording — "retry" cannot succeed while the file is
+            # malformed. The corrupt state/cancel_intents.json was PRESERVED
+            # (never overwritten) and a projection_corrupt_refused forensic row
+            # was recorded in logs/supervisor.jsonl.
+            return json_error(
+                "the cancel-intent projection (state/cancel_intents.json) is corrupt; "
+                "nothing was cancelled and retrying cannot succeed until the file is "
+                "repaired — the malformed file was preserved (no overwrite) and a "
+                "projection_corrupt_refused forensic row was recorded in "
+                "logs/supervisor.jsonl",
+                503, task_id=task_id, reason_code="cancel_intent_projection_corrupt",
+            )
+        return json_error(
+            "durable cancel intent could not be recorded; nothing was cancelled — retry",
+            503, task_id=task_id, reason_code="cancel_intent_write_failed",
+        )
+
     if not cascade:
         try:
             from supervisor.queue import (
                 CANCEL_CANCELLED, CANCEL_FAILED, cancel_task_custody,
+                task_has_live_ownership as _live_ownership,
+                task_subtree_is_live as _live_check,
             )
 
+            # Intent only for a LIVE task: the plain path's legacy contract
+            # answers 404 for an inactive id, and an intent minted for a dead id
+            # would sit open until the watchdog settles it as not_found.
+            # LIVE OWNERSHIP (GR6-1) widens the gate: a settled result whose
+            # worker is still alive is not "inactive" — the intent is minted
+            # with ``allow_settled`` so custody kills the spending worker.
+            live_own = await asyncio.to_thread(_live_ownership, task_id)
+            if live_own or await asyncio.to_thread(_live_check, task_id):
+                refused = await asyncio.to_thread(functools.partial(
+                    _record_http_intent, "http_single", allow_settled=live_own,
+                ))
+                if refused:
+                    return _intent_write_refused(refused)
             # The TYPED outcome, not a boolean: a task whose worker refused to die
             # is neither cancelled nor absent, and answering 404 for it would tell
             # the caller the task is gone while it keeps running.
@@ -1044,10 +1134,28 @@ async def api_task_cancel(request: Request) -> JSONResponse:
     # idempotent (the per-task cancel finalizes-on-miss) and a fully-cancelled tree
     # is no longer live, so it answers 404 like any other inactive task.
     try:
-        from supervisor.task_lifecycle import task_subtree_is_live
+        from supervisor.queue import (
+            task_has_live_ownership as _cascade_live_ownership,
+            task_subtree_is_live,
+        )
 
-        if not await asyncio.to_thread(task_subtree_is_live, task_id):
+        # GR7-1b: the 404 pre-check consults the SAME live-ownership predicate
+        # the single lane uses. `task_subtree_is_live` deliberately excludes a
+        # settled-but-RUNNING root (so the cascade postcondition can converge
+        # over a winding-down finalizer), which made this pre-check answer 404
+        # for a settled root whose worker was still burning post-task
+        # cognition — before any intent was minted. A settled-but-LIVE root
+        # proceeds to mint + custody (the kill path preserves the stored
+        # result); a genuinely settled-AND-dead tree keeps the 404 envelope.
+        if not await asyncio.to_thread(
+            _cascade_live_ownership, task_id,
+        ) and not await asyncio.to_thread(task_subtree_is_live, task_id):
             return json_error("task not found or not active", 404, task_id=task_id)
+        refused = await asyncio.to_thread(
+            functools.partial(_record_http_intent, "http_cascade", cascade_scope=True),
+        )
+        if refused:
+            return _intent_write_refused(refused)
         settled = await asyncio.to_thread(_run_cascade_cancel, task_id)
         if not settled:
             # The teardown refused or failed while the subtree is STILL live: an

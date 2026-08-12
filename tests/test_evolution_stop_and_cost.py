@@ -3,7 +3,8 @@ cost reconstruction.
 
 Covers:
   - reconstruct_task_cost using the durable physical-attempt ledger by task_id;
-  - cancel_running_evolution_tasks cancelling only evolution workers;
+  - stop_evolution_tasks cancelling only evolution tasks (pending AND running)
+    through the durable-intent + typed-custody ingress;
   - the hard-timeout retry gate: a killed evolution task is NOT re-enqueued when
     the campaign is stopped, IS re-enqueued when still enabled, and either way
     records reconstructed cost/rounds (never zeros).
@@ -66,7 +67,10 @@ def test_reconstruct_task_cost_never_fabricates_zero_when_ledger_unavailable(
         state.reconstruct_task_cost("paid-task")
 
 
-def test_cancel_running_evolution_tasks_cancels_only_evolution(monkeypatch):
+def test_stop_evolution_tasks_cancels_only_evolution_pending_and_running(monkeypatch):
+    """GR2-13: PENDING evolution tasks go through the same durable-intent +
+    typed-custody ingress as running ones (never an in-place prune), and only
+    evolution tasks are touched."""
     import supervisor.queue as q
 
     monkeypatch.setattr(q, "RUNNING", {
@@ -74,13 +78,54 @@ def test_cancel_running_evolution_tasks_cancels_only_evolution(monkeypatch):
         "task2": {"task": {"type": "task"}},
         "evo3": {"task": {"type": "evolution"}},
     })
-    cancelled = []
-    monkeypatch.setattr(q, "cancel_task_by_id", lambda tid: cancelled.append(tid) or True)
+    monkeypatch.setattr(q, "PENDING", [
+        {"id": "evo-pending", "type": "evolution"},
+        {"id": "plain-pending", "type": "chat"},
+    ])
+    intents: list = []
+    monkeypatch.setattr(
+        "ouroboros.cancel_intents.request_cancel",
+        lambda root, tid, **kw: intents.append((tid, kw.get("source"))) or {},
+    )
+    custody: list = []
+    monkeypatch.setattr(q, "cancel_task_custody",
+                        lambda tid, **_kw: custody.append(tid) or q.CANCEL_CANCELLED)
 
-    out = q.cancel_running_evolution_tasks("test stop")
+    out = q.stop_evolution_tasks("test stop")
 
-    assert sorted(out) == ["evo1", "evo3"]
-    assert sorted(cancelled) == ["evo1", "evo3"]
+    assert sorted(out["cancelled"]) == ["evo-pending", "evo1", "evo3"]
+    assert sorted(custody) == ["evo-pending", "evo1", "evo3"]
+    assert sorted(tid for tid, _src in intents) == ["evo-pending", "evo1", "evo3"]
+    assert all(src == "evolution_stop" for _tid, src in intents)
+    assert not any(bucket for key, bucket in out.items() if key != "cancelled")
+
+
+def test_stop_evolution_tasks_reports_settled_and_failed_honestly(monkeypatch):
+    """GR2-13: 'cancelled' names only CANCEL_CANCELLED outcomes; already-settled
+    and failed teardowns are separate buckets, and the report composer marks the
+    stop incomplete only for still-live tasks."""
+    import supervisor.queue as q
+
+    monkeypatch.setattr(q, "RUNNING", {
+        "evo-done": {"task": {"type": "evolution"}},
+        "evo-stuck": {"task": {"type": "evolution"}},
+    })
+    monkeypatch.setattr(q, "PENDING", [])
+    monkeypatch.setattr("ouroboros.cancel_intents.request_cancel",
+                        lambda root, tid, **kw: {})
+    outcomes = {"evo-done": q.CANCEL_ALREADY_SETTLED, "evo-stuck": q.CANCEL_FAILED}
+    monkeypatch.setattr(q, "cancel_task_custody", lambda tid, **_kw: outcomes[tid])
+
+    out = q.stop_evolution_tasks("test stop")
+
+    assert out["cancelled"] == []
+    assert out["already_settled"] == ["evo-done"]
+    assert out["failed"] == ["evo-stuck"]
+    lines, incomplete = q.evolution_stop_report(out)
+    assert incomplete is True
+    assert any("Already settled" in line and "evo-done" in line for line in lines)
+    assert any("INCOMPLETE" in line and "evo-stuck" in line for line in lines)
+    assert not any(line.startswith("🛑 Cancelled") for line in lines)
 
 
 def _drive_hard_timeout(tmp_path, monkeypatch, *, evolution_enabled):

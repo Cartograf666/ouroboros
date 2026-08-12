@@ -77,20 +77,22 @@ def test_owner_visible_incidents_use_canonical_message_seam() -> None:
         assert "bridge.send_message(" not in source
 
 
-def test_cancel_failure_is_progress_incident_not_chat_bubble() -> None:
+def test_cancel_failure_is_progress_incident_not_chat_bubble(monkeypatch) -> None:
+    import supervisor.queue as q
     from supervisor.events import _handle_cancel_task
 
     sent = []
+    # Phase A: the handler drives the TYPED custody outcome directly (the boolean
+    # facade collapsed already_settled into a false "✅ cancel").
+    monkeypatch.setattr(
+        q, "cancel_task_custody",
+        lambda task_id, **_kw: q.CANCEL_FAILED if task_id == "cancel-me" else q.CANCEL_NOT_FOUND,
+    )
 
     class _Ctx:
         @staticmethod
         def load_state():
             return {"owner_chat_id": 9}
-
-        @staticmethod
-        def cancel_task_by_id(task_id):
-            assert task_id == "cancel-me"
-            return False
 
         @staticmethod
         def send_with_budget(*args, **kwargs):
@@ -100,7 +102,9 @@ def test_cancel_failure_is_progress_incident_not_chat_bubble() -> None:
 
     assert len(sent) == 1
     args, kwargs = sent[0]
-    assert args == (9, "❌ cancel cancel-me (event)")
+    assert args[0] == 9
+    assert args[1].startswith("❌ cancel cancel-me")
+    assert "watchdog" in args[1]  # the intent stays open and is retried
     assert kwargs == {
         "is_progress": True,
         "task_id": "cancel-me",

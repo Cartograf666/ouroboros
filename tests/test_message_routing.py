@@ -160,6 +160,31 @@ class TestForwardToWorkerTool(unittest.TestCase):
             self.assertTrue(mailbox.exists())
             self.assertIn("continue", mailbox.read_text(encoding="utf-8"))
 
+    def test_forward_to_worker_refuses_while_cancellation_is_pending(self):
+        """AR2-6: the effective status honestly stays ``running`` while a durable
+        cancel intent is open, so the status checks pass — the steering write is
+        refused typed instead of feeding a task mid-teardown."""
+        from types import SimpleNamespace
+        from ouroboros.cancel_intents import request_cancel
+        from ouroboros.task_results import STATUS_RUNNING, write_task_result
+        from ouroboros.tools.core import _forward_to_worker
+
+        with tempfile.TemporaryDirectory() as tmp:
+            parent_drive = pathlib.Path(tmp) / "parent"
+            write_task_result(
+                parent_drive, "child2", STATUS_RUNNING,
+                parent_task_id="parent1", root_task_id="parent1", result="running",
+            )
+            request_cancel(parent_drive, "child2", reason="tearing down")
+            ctx = SimpleNamespace(drive_root=parent_drive, task_id="parent1")
+
+            refused = _forward_to_worker(ctx, "child2", "keep going")
+
+            self.assertIn("TASK_CANCEL_PENDING", refused)
+            self.assertFalse(
+                (parent_drive / "memory" / "owner_mailbox" / "child2.jsonl").exists(),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

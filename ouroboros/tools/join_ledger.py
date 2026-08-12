@@ -20,7 +20,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict
 
-from ouroboros.task_results import validate_task_id, write_task_result
+from ouroboros.task_results import validate_task_id
 from ouroboros.task_status import load_effective_task_result
 from ouroboros.task_tree_ledger import (
     CHILD_RESULT_DISPOSITIONS,
@@ -559,43 +559,94 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
                 return f"⚠️ cancel_task: {tid} is not a child of this task — a delegated task may only cancel its own children."
         except Exception:
             log.debug("cancel_task lineage profile check failed for %s", tid, exc_info=True)
-    # Latch a cancel-intent status so the parent's find_child_tasks view treats the child
-    # as terminal immediately (stops the handoff reminder re-injecting "still scheduled").
+    # Durable cancel intent — the ONE ingress (phase A, owner batch-4 1=A). The
+    # canonical status never carries intent: the supervisor's cancellation
+    # custody claims this intent, tears the task down, and settles the terminal
+    # outcome (writing parent_decision only at that OUTCOME — never here, so a
+    # child that finishes before the kill keeps its completed result; completion
+    # wins, and discarding a kept result stays a separate explicit action).
+    intent: Dict[str, Any] = {}
+    # GR6-1 live-ownership check at the ingress: the durable terminal result
+    # is persisted BEFORE post-task cognition ends, so a settled STATUS with a
+    # live RUNNING row means a worker still spending — the mint must not
+    # no-op as ``already_settled`` over it. Worker-side, the queue snapshot is
+    # the ownership projection (the live maps belong to the supervisor).
+    live_ownership = False
     try:
-        from ouroboros.task_results import STATUS_CANCEL_REQUESTED
+        from ouroboros.task_status import task_has_live_queue_ownership
 
-        fields: Dict[str, Any] = {
-            "result": f"Cancellation requested by agent; awaiting supervisor teardown.{(' Reason: ' + reason_text) if reason_text else ''}",
-        }
-        if own:
-            fields["parent_decision"] = "cancelled"
-            fields["parent_decision_reason"] = reason_text
-        write_task_result(
+        live_ownership = task_has_live_queue_ownership(status_drive_root, tid)
+    except Exception:
+        log.debug("cancel_task live-ownership read failed for %s", tid, exc_info=True)
+    try:
+        from ouroboros.cancel_intents import CancelIntentProjectionCorrupt, request_cancel
+
+        intent = request_cancel(
             status_drive_root,
             tid,
-            STATUS_CANCEL_REQUESTED,
-            _explicit_cancellation=True,
-            **fields,
+            reason=reason_text,
+            source="agent_tool",
+            requested_by=str(getattr(ctx, "task_id", "") or "") if own else "",
+            allow_settled_target=live_ownership,
+        )
+    except CancelIntentProjectionCorrupt:
+        # GR4-8: a corrupt projection is not a transient — "retry" cannot
+        # succeed until the file is repaired. The malformed file was preserved
+        # (never overwritten) and a projection_corrupt_refused forensic row was
+        # recorded in logs/supervisor.jsonl.
+        log.error("cancel_task refused for %s: intent projection corrupt", tid)
+        return (
+            f"⚠️ CANCEL_INTENT_PROJECTION_CORRUPT: the cancel-intent projection "
+            f"(state/cancel_intents.json) is corrupt; nothing was cancelled for {tid} "
+            "and retrying cannot succeed until the file is repaired. The malformed "
+            "file was preserved (no overwrite) and a projection_corrupt_refused "
+            "forensic row was recorded in logs/supervisor.jsonl."
         )
     except Exception:
-        log.debug("Failed to latch cancel_requested status for %s", tid, exc_info=True)
+        log.debug("Failed to record durable cancel intent for %s", tid, exc_info=True)
+        return (
+            f"⚠️ CANCEL_INTENT_WRITE_FAILED: durable cancel intent for {tid} could not "
+            "be recorded; nothing was cancelled. Retry, or report the failure."
+        )
+    if intent.get("already_settled"):
+        # Completion wins (owner 4=A): nothing to tear down, and minting an intent
+        # for a settled task would show a false "Cancelling…" state on a finished
+        # card until the watchdog cleaned it up.
+        return (
+            f"Nothing to cancel: {tid} had already finished ({intent.get('status')}). "
+            "Its result is preserved — use discard_child_result if you want to drop it."
+        )
     if own:
-        _record_child_decision_beacon(ctx, tid, f"cancelled child {tid}" + (f": {reason_text}" if reason_text else ""))
-    # Emit live so the supervisor processes the cancellation within one loop tick.
+        _record_child_decision_beacon(
+            ctx, tid,
+            f"requested cancellation of child {tid}" + (f": {reason_text}" if reason_text else ""),
+        )
+    # Emit live so the supervisor processes the cancellation within one loop tick;
+    # the durable intent survives a lost event (the supervisor watchdog re-feeds it).
     from ouroboros.tools.control import _emit_control_event
 
     emitted = _emit_control_event(ctx, {"type": "cancel_task", "task_id": tid, "reason": reason_text, "ts": utc_now_iso()})
     note = " (live)" if emitted == "live" else " (deferred to round end)"
-    return f"Cancel requested: {tid}{(' — ' + reason_text) if reason_text else ''}{note}"
+    already = " (already requested earlier — idempotent)" if intent.get("already_requested") else ""
+    return (
+        f"Cancel requested: {tid}{(' — ' + reason_text) if reason_text else ''}{note}{already}. "
+        "cancel_state=pending until the supervisor confirms teardown; a child that "
+        "already finished keeps its completed result (use discard_child_result to drop it)."
+    )
 
 
 def get_tools() -> list[ToolEntry]:
     return [
         ToolEntry("cancel_task", {
             "name": "cancel_task",
-            "description": "Stop a running/scheduled task by ID. Delegated children may target only their own children. Give a short reason — it is "
-                           "recorded on the shared task-tree ledger and the child's result, so a "
-                           "stopped child is an auditable decision, not a silent disappearance.",
+            "description": "Request cancellation of a running/scheduled task by ID (durable intent; "
+                           "the supervisor confirms teardown and settles the outcome — the child shows "
+                           "cancel_state=pending until then). A child that already finished keeps its "
+                           "completed result: cancel means 'stop spending', not 'discard the result' "
+                           "(use discard_child_result for that). Delegated children may target only "
+                           "their own children. Give a short reason — it is recorded on the shared "
+                           "task-tree ledger, so a stopped child is an auditable decision, not a "
+                           "silent disappearance.",
             "parameters": {"type": "object", "properties": {
                 "task_id": {"type": "string"},
                 "reason": {"type": "string", "default": "", "description": "Why you are stopping it (recorded for the tree + review)."},

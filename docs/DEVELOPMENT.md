@@ -958,7 +958,88 @@ Before every commit, verify the following:
   control-plane, private-range, and DNS-rebind denial preserved. See ARCHITECTURE.md.)
 - Effective task status belongs in `ouroboros/task_status.py`. Do not duplicate
   child-drive merge or terminality in gateways/tools. Task waits use
-  `SETTLED_STATUSES`; `cancel_requested` is not settled. `wait_task` and
+  `SETTLED_STATUSES`. Cancel INTENT is never a status value (Poltergeist phase A):
+  every cancel ingress — tool, HTTP single/cascade, evolution stop (pending AND
+  running evolution tasks; never an in-place queue prune), project
+  delete, cascade descendants, boot migration — writes a durable intent through
+  `ouroboros/cancel_intents.request_cancel` (nothing is minted for an
+  already-settled task WITH NO LIVE OWNERSHIP — a settled RESULT does not mean
+  a dead WORKER (GR6-1): the terminal result is persisted before post-task
+  cognition ends, so every ingress checks live physical ownership
+  (`supervisor.queue.task_has_live_ownership` in-process; the queue-snapshot
+  twin `task_status.task_has_live_queue_ownership` worker-side) and passes
+  `allow_settled_target` while a RUNNING row / busy worker remains, letting
+  custody kill the still-spending process while completion-wins preserves the
+  stored result; the cascade-coordination shape does the same for a settled
+  root with live descendants: `scope=cascade` with `allow_settled_target` —
+  the watchdog's replay trigger for the subtree, settled only by the cascade's
+  no-live postcondition; the recorded scope is WIDEN-ONLY, cascade never
+  narrows back to single) and FAILS CLOSED when that write fails: a cancel
+  without a durable, watchdog-replayable intent is refused with a typed error,
+  never run unfenced — an evolution-stop task whose intent write fails is KEPT
+  and the stop reported INCOMPLETE.
+  Timeout reaping is deliberately NOT a cancel ingress (owner decision: 1=A
+  covers explicit cancellation; the reaper keeps its own custody protocol over
+  the shared `reaping` slot marker and mints no intents). Effective reads
+  project the intent as
+  `cancel_state: "pending"` (plus `cancel_reason` when the intent carries one),
+  the supervisor's `cancel_task_custody` is the one
+  settle owner — it claims the intent BEFORE any custody mutation (a refused
+  claim is `failed` with zero mutation, so racing custodies can never
+  double-settle through the capture-miss lane), its claim is EXCLUSIVE while
+  alive (a claimant the pid probe proves alive is NEVER abandoned by age; only
+  a provably dead pid, or age-stale with liveness unknown, is recoverable),
+  every intent mutation is
+  fenced by the claim generation, so a second ingress cannot double-settle and a
+  taken-over attempt cannot revert the new owner, and the claim is re-verified
+  (pid + generation) immediately before the durable terminal write — a claim
+  lost across the kill/join window aborts the publication (deliberately ONE
+  re-read at the one write that matters, not a renewable-lease subsystem —
+  rejected by owner scope); the secondary settle
+  sites (pre-assignment pending drop, budget-drain `fail_tasks` — whose intent
+  reads resolve at the CANONICAL supervisor root, never a child's
+  `budget_drive_root`) hold the SAME
+  claim/generation fence and yield to a live claim owner. A `scope=cascade`
+  intent is settled EXCLUSIVELY by the cascade's no-live postcondition: every
+  other settle site is refused atomically against the CURRENT durable scope
+  (a mid-flight widen beats a stale claim snapshot; the refused claimant's
+  claim is auto-released for the watchdog), and the postcondition always owes
+  the tree's one summary BEFORE it settles — including the replay/already-down
+  path — while re-judging stale sweep failures against the current durable
+  status. Natural
+  completion WINS a
+  late cancel (a completed result is
+  never overwritten or stripped — discarding is the parent's separate explicit
+  `discard_child_result`). The owner's terminal answer is registered as OWED in
+  the durable outbox BEFORE the intent settles (a crash between settle and send
+  replays instead of losing both the watchdog trigger and the answer); a
+  registration that could not be made durable leaves the intent OPEN on the
+  cancel path and is a typed `terminal_delivery_unregistered` disclosure on the
+  normal path — never a silent gap. On the natural path the owed row is
+  registered immediately BEFORE the durable result write (projection-over-
+  replay: a crash in the window leaves an owed row boot replay delivers; no
+  boot scan over task_results).   The intent and delivery registries read STRICT:
+  a corrupt projection refuses the mutation loudly instead of collapsing to
+  `{}` and overwriting every active row — and strictness reaches ROWS, not
+  just containers (GR6-3): a malformed pending/intent row or `delivered`
+  entry refuses the mutation (bytes kept) and the enforcement reads
+  (watchdog sweep, outbox replay) disclose loudly once, then quarantine the
+  row. The unreconciled-delegated-runs disclosure is outcome-INDEPENDENT
+  (GR6-5a) and rides completed/failed deliveries too; an EXISTING-but-
+  unreadable custody log audits as the typed
+  `delegated_run_state_unknown:custody_log_unreadable` marker, never as
+  cleanly reconciled (GR6-4); and the cascade digest enumerates descendants
+  by ancestry rooted at the cancelled node, so a mid-tree cascade lists its
+  grandchildren and non-subagent descendants (GR6-2).
+  `task_done` is validated through the DURABLE result
+  UNCONDITIONALLY for every non-ephemeral event — a blank event status (the
+  primary producer's shape) validates exactly like a settled claim, a settled
+  claim over a non-settled row is the same lifecycle fault as a non-settled
+  claim, and the copy-back exception path neither skips the validation nor
+  synthesizes a `completed` row for a task that never wrote one (only
+  `interrupted` keeps its restore-path exemption). The legacy
+  `cancel_requested` status survives on a
+  read-path only. `wait_task` and
   `get_task_result` keep the full handoff plus a bounded verification-receipt
   projection: every outstanding red/masked receipt first, then newest rows, with
   an exact omitted count; read the canonical store and fall back to the recorded
@@ -1173,7 +1254,7 @@ Before every commit, verify the following:
 - [ ] Changes to `loop.py` or other task state-machine logic include adversarial tests for malformed output, false-completion prevention, replay/log durability, and failure modes — not just the happy path.
 - [ ] Audit/checkpoint rounds must not silently reuse the normal final-answer path unless that invariant is explicitly tested and documented.
 - [ ] Keep a complete loop-local `DeliveryCandidate` once a substantive answer exists. A service round may return `keep`, or `replace` plus the complete replacement answer; allow one repair for malformed control, then preserve the prior complete answer and mark finalization degraded. A FORCED finalization (budget/round/deadline/provider/children rails) resolves an armed control purely and without retry instead: valid keep/replace is honored, anything malformed preserves the retained candidate with a typed degraded reason, and the protocol JSON itself never reaches chat or the durable result. A service notice alone does not change evidence. Owner messages, tool effects, child results, and verification receipts advance the evidence revision and require fresh delivery/acceptance binding. Finalize task-scoped service outputs/errors before host acceptance and require a complete replacement when that evidence changes; keep the `finally` path as idempotent cleanup only. This control must not bypass verification, acceptance, safety, skill-finalization, deadline, child-handoff, the unconditional `FINAL ANSWER:` latch, or the task-level answer protocol.
-- [ ] Every direct child result needs an exact-hash disposition through the existing `tree_note(kind="decision")` tagged payload (`type=child_result_disposition`, child id, `integrated | irrelevant | deferred`, complete-result SHA-256; note text is rationale). One call may instead carry a `children` array of such entries (batch form): each entry is validated exactly like the single form, invalid entries are rejected individually by index while valid ones record. The typed task-tree row is the sole authority; task-result disposition fields are derived reads, never a mirrored write. The join-ledger helper alone validates lineage and current content. Stale or malformed payloads change nothing. `deferred` suppresses only the unchanged reminder and forces an honest degraded/best-effort terminal answer until the item is resolved. Explicit cancellation wins a late-completion race and bounded child scratch is removed without preserving another copy.
+- [ ] Every direct child result needs an exact-hash disposition through the existing `tree_note(kind="decision")` tagged payload (`type=child_result_disposition`, child id, `integrated | irrelevant | deferred`, complete-result SHA-256; note text is rationale). One call may instead carry a `children` array of such entries (batch form): each entry is validated exactly like the single form, invalid entries are rejected individually by index while valid ones record. The typed task-tree row is the sole authority; task-result disposition fields are derived reads, never a mirrored write. The join-ledger helper alone validates lineage and current content. Stale or malformed payloads change nothing. `deferred` suppresses only the unchanged reminder and forces an honest degraded/best-effort terminal answer until the item is resolved. Natural completion WINS a late cancellation (owner decision 4=A, 2026-08-11): a child that settled its own completed result keeps it — payload, artifacts, and cost — and the cancel settles as already-settled; discarding a kept result is the parent's separate explicit `discard_child_result`. A cancelled (not completed) child still has its salvageable output preserved on the canonical drive before its bounded scratch is removed. Only a SETTLED `cancelled` status counts as a handled cancellation disposition: a child wedged in the legacy `cancel_requested` STATUS latch is intent, not outcome — it stays visible in the parent's handoff reminder as cancel-pending until custody settles it.
 - [ ] Host task acceptance is root-only. Queued/headless/scheduled roots are reviewed in `auto` and `required`; direct eligibility is the union of `outcomes.turn_has_reviewable_effects` and a typed deliverable/criterion. Ordinary read-only tool activity, pure conversation, and meta/routing controls are not reviewed, and child reviews remain advisory. Eligibility must use structured facts, never keywords (Bible P3/P5). For an eligible root under `auto|required`, agent-callable `task_acceptance_review` validates/stores evidence and optional agent disposition but makes zero reviewer calls; it returns `deferred_to_host_acceptance`, `authoritative=false`, and the evidence revision. The call itself never widens eligibility; child and `off` behavior remain unchanged.
 - [ ] Before root acceptance, atomically fence new descendants under the queue lock and prove recursive subtree quiescence from the existing task-status SSOT. Split-drive ACK, subtree, and acceptance-timing reads/writes use canonical `budget_drive_root`. Preserve the prior verdict until the replacement is recorded. A revision must explicitly reopen the fence; terminal/degraded outcomes seal it.
 - [ ] The host runs the authoritative acceptance panel once per unchanged candidate-hash/evidence-revision/fence binding. Task-acceptance actors receive one substantive call and at most two physical attempts total. Record transport status, parse status, and valid-response semantic verdict separately, with actor model/provider, role, coverage, panel id, quorum contribution, reason, enforcement impact, and binding hashes. Public task/event/UI records receive only the compact projection; full model payloads remain in private audit storage. `adaptive_quorum` applies; any contributing FAIL fails, DEGRADED abstains (the reviewer verdict vocabulary `PASS|FAIL|DEGRADED` is NOT narrowable — `_contract_valid_actors`, the deliberate-DEGRADED capsule rail and the host's core-overflow DEGRADED all depend on it), and no quorum is a terminal HOST decision. The host acceptance decision itself is written ONLY by `loop._set_acceptance_decision` and has exactly three owner-facing states — `accepted | revision_requested | finalized_unaccepted` — each with a typed `reason` from an existing structured fact; an unknown status fails closed to `finalized_unaccepted` keeping its raw token as the reason. When you add a writer, add its reason to the closed set AND check every value-keyed reader: `outcomes.derive_loop_outcome` keys the eligible-but-skipped degradation on the status+reason PAIR (`review_skipped_deadline_reserve` plus the closed forced-rail `ACCEPTANCE_BYPASS_REASONS`), and breaking that pairing is a silent false green. Forced exits stamp their typed bypass record in the common terminal recorder (`_record_forced_acceptance_bypass`) as a pure ledger write — never a fence, panel, extra round, or prompt text on a forced path, and never overwriting an existing host decision — with ONE exception (owner decision Q2A, 2026-08-10): the forced `children_unabsorbed` rail still runs the acceptance panel for an acceptance-eligible root when the subtree is quiescent, with the undispositioned-children debt included in the evidence packet; because that rail cannot take another round, a requested revision terminalizes as `finalized_unaccepted` with the typed `revision_unavailable_on_forced_rail` reason, while the process outcome stays best-effort `children_unabsorbed`. The agent may write only `agent_disposition`/`agent_rationale`, merged into the host decision, never replacing it. Clean requires PASS + solved + supported criterion evidence. Chat and Logs must use the same severity reducer, and degraded review or best-effort/degraded objective must never render as green solved. Do not add task scope review or reuse the commit gate.

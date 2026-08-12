@@ -31,7 +31,7 @@ from ouroboros.config import (
 from ouroboros.contracts.task_contract import attach_task_contract, build_task_contract, normalize_allowed_resources
 from ouroboros.schedule_contract import RESERVED_TEMPLATE_FIELDS, schedule_slug
 from ouroboros.skill_loader import skill_identity_collision_names
-from ouroboros.outcomes import normalize_outcome_axes, terminal_outcome_axes
+from ouroboros.outcomes import terminal_outcome_axes
 from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
 from supervisor.evolution_lifecycle import (
     _read_evolution_campaign,
@@ -913,18 +913,37 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                     log.warning("Failed to terminalize fenced snapshot task %s", task_id, exc_info=True)
                 continue
             # Never resurrect a terminal/cancelled task as a ghost pending entry.
-            try:
-                existing = load_task_result(DRIVE_ROOT, str(task.get("id")))
-                existing_status = str(existing.get("status") or "") if existing else ""
-                # Terminal OR cancel-intent — both must not be resurrected as pending.
-                if existing_status in _TRULY_TERMINAL_STATUSES or existing_status == STATUS_CANCEL_REQUESTED:
+            # AR2-10 (§8-A1): the intent projection is consulted UNDER the queue
+            # lock at restore — the "no active intent" read and the enqueue form
+            # one serialized step against assignment/drop, the same invariant the
+            # pre-assignment consult keeps. Boot-time and contention-free;
+            # _queue_lock is an RLock, so enqueue_task's own acquisition stays
+            # re-entrant.
+            with _queue_lock:
+                skip_revival = False
+                try:
+                    existing = load_task_result(DRIVE_ROOT, str(task.get("id")))
+                    existing_status = str(existing.get("status") or "") if existing else ""
+                    # Terminal OR cancel-intent — both must not be resurrected as
+                    # pending. Intent lives in the durable projection (phase A);
+                    # the status check covers legacy latch files.
+                    if existing_status in _TRULY_TERMINAL_STATUSES or existing_status == STATUS_CANCEL_REQUESTED:
+                        skip_revival = True
+                    else:
+                        from ouroboros.cancel_intents import has_active_intent
+
+                        if has_active_intent(DRIVE_ROOT, str(task.get("id"))):
+                            # Left for cancellation custody/watchdog to settle —
+                            # never a pending revival racing its own teardown.
+                            skip_revival = True
+                except Exception:
+                    log.debug("Snapshot restore terminal-status check failed for %s", task.get("id"), exc_info=True)
+                if skip_revival:
                     skipped_terminal += 1
                     continue
-            except Exception:
-                log.debug("Snapshot restore terminal-status check failed for %s", task.get("id"), exc_info=True)
-            # These tasks already existed when the root pause was snapshotted.
-            # Restore them behind the root marker; only new admission is fenced.
-            admitted = enqueue_task(task, restoring_snapshot=True)
+                # These tasks already existed when the root pause was snapshotted.
+                # Restore them behind the root marker; only new admission is fenced.
+                admitted = enqueue_task(task, restoring_snapshot=True)
             if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
                 blocked_restore.append(str(task.get("id") or ""))
                 continue
@@ -962,10 +981,6 @@ def _emit_cancel_task_done(
     task: Optional[Dict[str, Any]],
     task_id: str,
     *,
-    cost_usd: float = 0.0,
-    total_rounds: int = 0,
-    prompt_tokens: int = 0,
-    completion_tokens: int = 0,
     cost_fields: Optional[Dict[str, Any]] = None,
     status: str = "cancelled",
 ) -> None:
@@ -974,8 +989,10 @@ def _emit_cancel_task_done(
     ``status`` carries the STORED terminal truth: when a worker wrote its own
     natural result just before the kill, the card must resolve to THAT outcome
     rather than be left unresolved until a reload.
-    Cost fields carry reconstructed totals so a cancelled evolution cycle records
-    its real spend in the campaign tally instead of zeros."""
+    ``cost_fields`` is the caller's accounting authority — a reconstructed
+    ledger projection or a CONFIRMED pre-start zero. An absent projection emits
+    an honest nullable unknown; the old default fabricated a final $0 for every
+    cancel (Poltergeist A1.10, owner 10=B)."""
     try:
         from supervisor import workers
         chat_id = int((task or {}).get("chat_id") or 0) if isinstance(task, dict) else 0
@@ -990,9 +1007,8 @@ def _emit_cancel_task_done(
                     review_trigger="supervisor_terminal",
                 ),
                 **(cost_fields or {
-                    "cost_accounting_status": "available", "cost_final": True,
-                    "cost_usd": cost_usd, "total_rounds": total_rounds,
-                    "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                    "cost_accounting_status": "unavailable", "cost_final": False,
+                    "cost_usd": None,
                 }),
                 "metadata": (task or {}).get("metadata") if isinstance((task or {}).get("metadata"), dict) else {},
         })
@@ -1000,59 +1016,23 @@ def _emit_cancel_task_done(
         log.debug("Failed to emit task_done for cancelled task %s", task_id, exc_info=True)
 
 
-def _is_workspace_task_record(record: Dict[str, Any] | None) -> bool:
-    if not isinstance(record, dict):
-        return False
-    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    return bool(str(record.get("workspace_root") or "").strip() or str(metadata.get("workspace_root") or "").strip())
-
-
-def _cancel_result_fields(
-    task: Dict[str, Any] | None,
-    *,
-    existing: Dict[str, Any] | None = None,
-    result: str,
-    **fields: Any,
-) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {**fields, "result": result}
-    if not (_is_workspace_task_record(task) or _is_workspace_task_record(existing)):
-        return payload
-    try:
-        from ouroboros.headless import ARTIFACT_STATUS_MISSING
-        from ouroboros.outcomes import artifact_bundle_from_result
-
-        base: Dict[str, Any] = {}
-        if isinstance(existing, dict):
-            base.update(existing)
-        if isinstance(task, dict):
-            base.update(task)
-        payload["artifact_status"] = ARTIFACT_STATUS_MISSING
-        payload.setdefault("artifact_error", "Task cancelled before workspace patch finalization.")
-        base.update(payload)
-        base["status"] = "cancelled"
-        base["artifact_status"] = ARTIFACT_STATUS_MISSING
-        base.pop("artifact_bundle", None)
-        bundle = artifact_bundle_from_result(base)
-        payload["artifact_bundle"] = bundle
-        axes = normalize_outcome_axes(base)
-        artifact_axis = dict(axes.get("artifacts") or {})
-        artifact_axis["status"] = ARTIFACT_STATUS_MISSING
-        axes["artifacts"] = artifact_axis
-        payload["outcome_axes"] = axes
-    except Exception:
-        log.debug("Failed to build cancelled artifact fields for task %s", (task or existing or {}).get("id") or (task or existing or {}).get("task_id"), exc_info=True)
-    return payload
-
-
-# Cancellation custody lives in supervisor.task_lifecycle (module-size boundary);
-# re-exported so `supervisor.queue` stays the single import surface for callers.
+# Cancellation custody and the terminal-cancel result-field builder live in
+# supervisor.task_lifecycle (module-size boundary); re-exported so
+# `supervisor.queue` stays the single import surface for callers.
 from supervisor.task_lifecycle import (  # noqa: E402, F401 -- intentional public re-exports
     CANCEL_ALREADY_SETTLED,
     CANCEL_CANCELLED,
     CANCEL_FAILED,
     CANCEL_NOT_FOUND,
     _CANCEL_TERMINALIZED,
+    _cancel_result_fields,
     cancel_task_custody,
+    task_has_live_ownership,
+    task_subtree_is_live,
+)
+from supervisor.queue_transitions import (  # noqa: E402, F401 -- intentional public re-exports
+    evolution_stop_report,
+    stop_evolution_tasks,
 )
 
 
@@ -1061,30 +1041,9 @@ def _cancel_task_by_id_single(task_id: str) -> bool:
     return cancel_task_custody(task_id) in {CANCEL_CANCELLED, CANCEL_ALREADY_SETTLED}
 
 
-def cancel_running_evolution_tasks(reason: str = "evolution stopped") -> List[str]:
-    """Cancel any RUNNING evolution task so ``/evolve stop`` ends the live cycle.
-
-    Pending evolution tasks are pruned by the callers; this covers the worker
-    that is already mid-cycle. Reuses :func:`cancel_task_by_id`, so the task ends
-    as terminal ``cancelled`` (kill_pid_tree, no re-enqueue) and a cancelled
-    ``task_done`` resolves the UI card — the normal success finalizer never runs.
-    Returns the cancelled task ids.
-    """
-    cancelled: List[str] = []
-    for task_id, meta in list(RUNNING.items()):
-        if not isinstance(meta, dict):
-            continue
-        task = meta.get("task") if isinstance(meta.get("task"), dict) else {}
-        if str(task.get("type") or "") != "evolution":
-            continue
-        try:
-            if cancel_task_by_id(task_id):
-                cancelled.append(task_id)
-        except Exception:
-            log.warning(
-                "Failed to cancel running evolution task %s (%s)", task_id, reason, exc_info=True
-            )
-    return cancelled
+# Evolution-stop transitions (GR2-13) live in supervisor.queue_transitions
+# (module-size boundary); re-exported below with the other transition helpers
+# so `supervisor.queue` stays the single import surface for callers.
 
 
 def enforce_task_timeouts() -> None:

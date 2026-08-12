@@ -1976,6 +1976,22 @@ def _forward_to_worker(ctx: ToolContext, task_id: str, message: str) -> str:
         return f"⚠️ TASK_NOT_ACTIVE: task {tid} is already {status}."
     if status != STATUS_RUNNING:
         return f"⚠️ TASK_NOT_ACTIVE: task {tid} is {status or 'unknown'}, not running."
+    # AR2-6: no NEW steering writes while a cancellation is pending. The
+    # effective status honestly stays ``running`` (cancel_state=pending rides
+    # beside it), so the checks above pass — consult the same predicate the
+    # steer_task/mailbox routes use, covering BOTH carriers (durable intent +
+    # legacy latch), and refuse typed.
+    try:
+        from ouroboros.cancel_intents import cancel_pending
+
+        if cancel_pending(status_drive_root, tid):
+            return (
+                f"⚠️ TASK_CANCEL_PENDING: task {tid} has a pending cancellation — the "
+                "supervisor is tearing it down; the message was NOT delivered. Wait for "
+                "the settled outcome or start a new task."
+            )
+    except Exception:
+        log.debug("forward_to_worker cancel-pending check failed for %s", tid, exc_info=True)
     current_task_id = str(getattr(ctx, "task_id", "") or "").strip()
     target_parent = str(data.get("parent_task_id") or "").strip()
     target_root = str(data.get("root_task_id") or "").strip()

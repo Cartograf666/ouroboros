@@ -738,7 +738,9 @@ def test_workspace_focus_does_not_turn_top_level_cancel_into_child_only(tmp_path
         task_id="parent",
     )
     monkeypatch.setattr(join_ledger, "_is_own_child", lambda *_a, **_k: False)
-    monkeypatch.setattr(join_ledger, "write_task_result", lambda *_a, **_k: None)
+    # NB: no ``write_task_result`` patch — the cancel tool no longer writes a
+    # status latch at all (phase A: it records a durable cancel INTENT), and the
+    # symbol is not imported here any more, so patching it raised AttributeError.
     monkeypatch.setattr("ouroboros.tools.control._emit_control_event", lambda *_a, **_k: "live")
 
     assert join_ledger._cancel_task(ctx, "foreign-task").startswith("Cancel requested")

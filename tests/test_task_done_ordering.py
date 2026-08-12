@@ -192,8 +192,12 @@ class TestSupervisorTaskDoneAuditTrail:
             "ts": "2026-04-02T12:00:00Z",
         }
         ctx = MockCtx()
-        # Need task_results dir for the fallback write
-        (tmp_path / "task_results").mkdir()
+        # A durable SETTLED result precedes every honest task_done (GR2-3: the
+        # supervisor validates the event against the disk unconditionally — a
+        # blank-status event over an absent row is a lifecycle fault, refused).
+        from ouroboros.task_results import write_task_result as _write_result
+
+        _write_result(tmp_path, "test_td", "completed", result="done")
 
         # Seed the physical-attempt authority.  The task_done transport's
         # compatibility cost field must not override ledger truth.

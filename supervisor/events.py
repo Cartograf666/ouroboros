@@ -945,9 +945,26 @@ def _handle_typing_start(evt: Dict[str, Any], ctx: Any) -> None:
 # live queue (before blocking post-task) AND in the buffered return — queue.put
 # is not a delivery receipt, so neither copy is dropped worker-side; instead
 # both carry the same delivery_id and the second one is suppressed here. The
-# set is in-memory only: a supervisor restart also kills the worker queues, so
-# no duplicate can straddle a restart.
+# in-memory deque is a fast-path cache; the durable registry
+# (``supervisor.terminal_delivery``, phase A2) is the LOGICAL dedupe shared by
+# the natural, cancel, and reap delivery paths and survives a restart.
 _DELIVERED_MESSAGE_IDS: "deque[str]" = deque(maxlen=256)
+
+
+def _register_delivered(ctx: Any, delivery_id: str) -> None:
+    """Durably mark one delivery id as delivered — and clear what it owed.
+
+    Both halves of the same fact: the id joins the restart-surviving registry AND
+    leaves the pending outbox in one write, so a replay can never re-send an
+    answer that landed (phase A2/F7). Fail-soft: a registry write must never cost
+    a delivery that already happened.
+    """
+    try:
+        from supervisor.terminal_delivery import register_delivery
+
+        register_delivery(ctx.DRIVE_ROOT, delivery_id)
+    except Exception:
+        log.debug("durable delivery registration failed", exc_info=True)
 
 
 def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
@@ -955,7 +972,24 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
         delivery_id = str(evt.get("delivery_id") or "")
         if delivery_id and delivery_id in _DELIVERED_MESSAGE_IDS:
             log.debug("send_message suppressed as duplicate (delivery_id=%s)", delivery_id)
+            # This copy is suppressed because the FIRST one was sent, so record
+            # that durably: it also clears any pending-outbox row, which would
+            # otherwise be replayed (and suppressed again) until it gave up.
+            _register_delivered(ctx, delivery_id)
             return
+        if delivery_id:
+            try:
+                from supervisor.terminal_delivery import already_delivered
+
+                if already_delivered(ctx.DRIVE_ROOT, delivery_id):
+                    log.debug(
+                        "send_message suppressed as durably delivered (delivery_id=%s)",
+                        delivery_id,
+                    )
+                    return
+            except Exception:
+                # Fail open toward delivery — never lose an answer to a dedupe read.
+                log.debug("durable delivery dedupe read failed", exc_info=True)
         log_text = evt.get("log_text")
         fmt = str(evt.get("format") or "")
         is_progress = bool(evt.get("is_progress"))
@@ -1025,9 +1059,11 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
         )
         # Registered only AFTER a successful send: if the live copy's send
         # raises, the buffered copy must NOT be suppressed later — "never
-        # lost" outranks "never doubled".
+        # lost" outranks "never doubled". The durable registration is the
+        # restart-surviving half of the same rule.
         if delivery_id:
             _DELIVERED_MESSAGE_IDS.append(delivery_id)
+            _register_delivered(ctx, delivery_id)
     except Exception as e:
         ctx.append_jsonl(
             ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
@@ -1285,6 +1321,64 @@ def _task_done_review_projection(
     return value if isinstance(value, dict) and value.get("panels") else {}
 
 
+def _close_campaign_after_owner_stop(exclude_task_id: str = "") -> None:
+    """GR3-3 owner-stop backstop: close the campaign once its live task settled.
+
+    An INCOMPLETE ``/evolve off`` / ``toggle_evolution(False)`` deliberately
+    leaves the campaign OPEN over the still-live evolution task (closing it
+    would declare a clean terminal that did not happen); the durable
+    ``evolution_owner_stopped`` state flag blocks new cycles meanwhile. Every
+    evolution terminal routes through ``_handle_evolution_task_done``, so this
+    runs at exactly the moment the deferred close becomes honest — and no-ops
+    whenever the owner never stopped or the campaign is already terminal.
+    Never raises.
+
+    GR4-6: the close is gated on NO OTHER evolution task being live — the
+    multi-live incomplete-stop shape settles ONE task at a time, and closing
+    on the first terminal would declare a clean stop over the others.
+    ``exclude_task_id`` names the task whose terminal is being processed (its
+    RUNNING row is popped only later, by ``_finish_task_done_dispatch``).
+    """
+    try:
+        from supervisor.evolution_lifecycle import (
+            _read_evolution_campaign,
+            complete_evolution_campaign,
+        )
+        from supervisor.state import load_state
+
+        if not bool(load_state().get("evolution_owner_stopped")):
+            return
+        if _read_evolution_campaign().get("status") not in {"active", "paused"}:
+            return
+        from supervisor.queue import PENDING, RUNNING, _queue_lock
+
+        with _queue_lock:
+            live = [
+                str(task.get("id") or "")
+                for task in PENDING
+                if isinstance(task, dict) and str(task.get("type") or "") == "evolution"
+            ] + [
+                str(tid)
+                for tid, meta in RUNNING.items()
+                if isinstance(meta, dict)
+                and isinstance(meta.get("task"), dict)
+                and str(meta["task"].get("type") or "") == "evolution"
+            ]
+        live = [tid for tid in live if tid and tid != str(exclude_task_id or "")]
+        if live:
+            log.info(
+                "owner-stop campaign close deferred: evolution task(s) still live: %s",
+                live,
+            )
+            return
+        complete_evolution_campaign(
+            "owner stop completed after the live evolution task settled",
+            status="stopped",
+        )
+    except Exception:
+        log.debug("owner-stop campaign close backstop failed", exc_info=True)
+
+
 def _handle_evolution_task_done(
     ctx: Any,
     *,
@@ -1356,6 +1450,13 @@ def _handle_evolution_task_done(
     except Exception:
         log.debug("Failed to update evolution campaign state", exc_info=True)
         return
+    finally:
+        # GR3-3: runs on EVERY evolution terminal — including rejected/replay
+        # early returns above — so an owner stop that had to leave the campaign
+        # open (still-live task) gets its deferred terminal close here.
+        # GR4-6: the settling task is excluded from the liveness gate — its
+        # RUNNING row is popped only later by _finish_task_done_dispatch.
+        _close_campaign_after_owner_stop(exclude_task_id=str(task_id or ""))
 
     axes = normalize_outcome_axes({
         "status": task_done_event.get("status"),
@@ -1640,7 +1741,265 @@ def _finish_task_done_dispatch(
         log.warning("Failed to store task result in events: %s", exc)
 
 
+def _resolve_lifecycle_fault(
+    evt: Dict[str, Any], ctx: Any, evt_status: str, *, detail: str = "",
+) -> None:
+    """Give a refused ``task_done`` an OWNER, or the worker slot wedges.
+
+    Refusing the publication is right — the incident published a cancel latch as
+    a terminal — but a refusal alone leaves the task in RUNNING with its worker
+    still marked busy and nothing scheduled to finish it. Two cases:
+
+    - A durable cancel intent (or a legacy ``cancel_requested`` latch) exists:
+      cancellation custody and the watchdog already own this task, so the row
+      stays exactly where it is and they settle it honestly.
+    - Nothing owns it: the event is a genuine lifecycle bug, so the task is
+      TERMINALIZED as ``failed`` with a typed reason and the slot is released.
+      A wedged worker costs strictly more than an honest infra failure.
+
+    ``detail`` overrides the default event-status wording — the durable-result
+    fault (AR2-3) refuses an event whose OWN status looks settled.
+    """
+    task_id = str(evt.get("task_id") or "").strip()
+    if not task_id:
+        return
+    try:
+        from ouroboros.cancel_intents import cancel_pending
+
+        if cancel_pending(ctx.DRIVE_ROOT, task_id):
+            log.info(
+                "task_done lifecycle fault for %s left to cancellation custody (cancel pending)",
+                task_id,
+            )
+            return
+    except Exception:
+        log.debug("lifecycle-fault cancel-pending check failed for %s", task_id, exc_info=True)
+    detail = detail or (
+        f"Worker published a non-settled task_done ({evt_status!r}) and no cancellation "
+        "owns this task; the supervisor terminalized it so the slot is not wedged."
+    )
+    # Capture the RUNNING row BEFORE the dispatch below pops it: it carries the
+    # routing facts (chat/lineage/type) the terminal frame needs.
+    task_row: Dict[str, Any] = {}
+    try:
+        running = getattr(ctx, "RUNNING", None)
+        meta = running.get(task_id) if isinstance(running, dict) else None
+        if isinstance(meta, dict) and isinstance(meta.get("task"), dict):
+            task_row = dict(meta["task"])
+    except Exception:
+        task_row = {}
+    # GR4-3: the synthetic terminal fires the SAME assisted-update hooks the
+    # normal task_done path reaches — an orphaned managed-update transaction or
+    # a held assisted writer gate would otherwise survive a lifecycle-fault
+    # terminal until an unrelated task released them.
+    try:
+        event_metadata = evt.get("metadata")
+        task_metadata = (
+            task_row.get("metadata")
+            if isinstance(task_row.get("metadata"), dict)
+            else event_metadata if isinstance(event_metadata, dict) else None
+        )
+        from supervisor.update_merge import (
+            abort_orphaned_assisted_tx,
+            release_assisted_writer_gate_after_task,
+        )
+
+        abort_orphaned_assisted_tx(str(task_id), task_metadata)
+        release_assisted_writer_gate_after_task(task_metadata)
+    except Exception:
+        log.debug("assisted-merge orphan watchdog failed (lifecycle fault)", exc_info=True)
+    stored: Dict[str, Any] = {}
+    try:
+        from ouroboros.task_results import STATUS_FAILED, write_task_result
+
+        write_task_result(
+            ctx.DRIVE_ROOT, task_id, STATUS_FAILED,
+            reason_code="task_done_lifecycle_fault",
+            result=detail,
+            outcome_axes=infra_failed_axes(
+                "task_done_lifecycle_fault", review_trigger="supervisor_terminal",
+            ),
+        )
+        stored = load_task_result(ctx.DRIVE_ROOT, task_id) or {}
+    except Exception:
+        # GR3-6: durable persistence FAILED — retain lifecycle ownership. The
+        # row stays in RUNNING and the slot stays busy: releasing them over a
+        # non-settled durable truth would recreate the exact wedge this seam
+        # closes (task invisible, nothing scheduled to finish it). The next
+        # fault/watchdog pass retries.
+        log.error(
+            "Failed to terminalize lifecycle-fault task %s; retaining lifecycle "
+            "ownership (no slot release)", task_id, exc_info=True,
+        )
+        return
+    # GR3-6: the synthetic terminal goes through the NORMAL dispatch seam —
+    # terminal UI frame, acceptance-fence clearing, campaign/project hooks,
+    # RUNNING/slot bookkeeping, snapshot — instead of the old private partial
+    # copy (RUNNING pop + slot clear only), which resolved nothing owner-visible.
+    status = str(stored.get("status") or "failed")
+    task_type = str(evt.get("task_type") or task_row.get("type") or "")
+    task_done_event: Dict[str, Any] = {
+        "ts": utc_now_iso(),
+        "type": "task_done",
+        "task_id": task_id,
+        "task_type": task_type,
+        "chat_id": int(
+            evt.get("chat_id") or task_row.get("chat_id") or stored.get("chat_id") or 0
+        ),
+        "status": status,
+        "reason_code": str(stored.get("reason_code") or "task_done_lifecycle_fault"),
+        "outcome_axes": normalize_outcome_axes(stored),
+    }
+    try:
+        task_done_event.update(_authoritative_terminal_cost(
+            task_id, task_row, stored, evt, pathlib.Path(ctx.DRIVE_ROOT),
+        ))
+    except Exception:
+        log.debug("lifecycle-fault cost projection failed for %s", task_id, exc_info=True)
+    try:
+        append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", task_done_event)
+    except Exception:
+        log.warning("Failed to log lifecycle-fault task_done to events.jsonl", exc_info=True)
+    if task_type == "evolution":
+        _handle_evolution_task_done(
+            ctx, evt=evt, task_id=task_id, task=task_row,
+            task_done_event=task_done_event,
+            outcome_axes=task_done_event.get("outcome_axes") or {},
+            cost=task_done_event.get("cost_usd"),
+            rounds=task_done_event.get("total_rounds"),
+        )
+    # GR4-3: the cooperative-checkpoint hooks fire for the synthetic terminal
+    # exactly as the normal path fires them — a lifecycle-fault root would
+    # otherwise never checkpoint its coop tree, and a faulted last subagent
+    # would never trigger the tree-quiescence checkpoint.
+    try:
+        if task_row and str(task_row.get("delegation_role") or "") != "subagent":
+            _checkpoint_coop_roots_on_root_done(ctx, task_row, task_id)
+    except Exception:
+        log.debug("coop root-done checkpoint failed (lifecycle fault)", exc_info=True)
+    _finish_task_done_dispatch(
+        evt, ctx,
+        task_id=task_id, worker_id=evt.get("worker_id"),
+        task=task_row, final_task_result=stored, task_done_event=task_done_event,
+    )
+    try:
+        if task_row and str(task_row.get("delegation_role") or "") == "subagent":
+            _maybe_checkpoint_coop_on_tree_quiescence(ctx, task_row, task_id)
+    except Exception:
+        log.debug("coop quiescence checkpoint failed (lifecycle fault)", exc_info=True)
+
+
+def _task_done_durable_fault(evt: Dict[str, Any], ctx: Any, task_id: Any) -> bool:
+    """AR2-3 / GR2-3 (§8-A1): validate ``task_done`` through the DURABLE result.
+
+    UNCONDITIONAL for every non-ephemeral task_done: the durable post-copy-back
+    result must be settled (or the formalized ``interrupted`` transient),
+    regardless of what the event's own status field says. The original AR2-3
+    check gated on a settled event CLAIM — and the PRIMARY producer
+    (``agent_task_pipeline``) emits task_done with a blank status, so ordinary
+    completions bypassed validation entirely; a blank-status event over a
+    running/absent row sailed through to publication. A blank status is now
+    validated exactly like a settled claim: the worker asserted "done" and the
+    disk must agree. Refused + forensic row; the existing fault-resolution
+    path decides slot fate. Two exemptions stand: ephemeral turns (their event
+    IS their terminal outcome — no durable lifecycle) and an ``interrupted``
+    event status (its owner is the snapshot restore/requeue path). Never
+    raises.
+    """
+    try:
+        if bool(evt.get("_ephemeral")) or not task_id:
+            return False
+        evt_status = str(evt.get("status") or "").strip().lower()
+        from ouroboros.task_results import STATUS_INTERRUPTED
+        from ouroboros.task_status import SETTLED_STATUSES
+
+        if evt_status == STATUS_INTERRUPTED:
+            return False  # formalized transient: the restore/requeue path owns the row
+        if evt_status and evt_status not in SETTLED_STATUSES:
+            return False  # non-settled claims were already refused at the gate
+        try:
+            durable_status = str(
+                (load_task_result(ctx.DRIVE_ROOT, str(task_id)) or {}).get("status") or ""
+            ).strip().lower()
+        except Exception:
+            # An unreadable row is not proof of a fault; fail open toward the
+            # ordinary dispatch (its own missing-result fallback still runs).
+            log.debug("task_done durable validation read failed for %s", task_id, exc_info=True)
+            return False
+        if durable_status in SETTLED_STATUSES or durable_status == STATUS_INTERRUPTED:
+            return False
+        log.error(
+            "task_done for %s claims settled %r but the durable result is %r; "
+            "refused (durable lifecycle fault)",
+            task_id, evt_status or "(blank)", durable_status or "absent",
+        )
+        try:
+            ctx.append_jsonl(
+                ctx.DRIVE_ROOT / "logs" / "events.jsonl",
+                {
+                    "ts": utc_now_iso(),
+                    "type": "task_done_invalid_status",
+                    "task_id": str(task_id),
+                    "status": evt_status,
+                    "durable_status": durable_status,
+                    "worker_id": evt.get("worker_id"),
+                },
+            )
+        except Exception:
+            log.debug("task_done_invalid_status record failed", exc_info=True)
+        _resolve_lifecycle_fault(
+            evt, ctx, evt_status,
+            detail=(
+                f"Worker published task_done claiming settled {evt_status or '(blank)'!r} "
+                f"while the durable result is {durable_status or 'absent'!r} (not settled) "
+                "and no cancellation owns this task; the supervisor terminalized it so the "
+                "slot is not wedged."
+            ),
+        )
+        return True
+    except Exception:
+        log.debug("task_done durable validation failed open for %s", task_id, exc_info=True)
+        return False
+
+
 def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
+    # Phase A1.7: ``task_done`` asserts a SETTLED outcome. A non-settled status
+    # (the incident's shape: the cancel latch published as a terminal) is a
+    # durable LIFECYCLE FAULT — recorded loudly, RUNNING/worker state NOT
+    # released (the row stays visible for custody/watchdog to settle honestly),
+    # never a crash. Two deliberate exemptions: ephemeral direct-chat decision
+    # turns (no durable task-result lifecycle — their event IS their terminal
+    # outcome), and ``interrupted`` — the FORMALIZED transient the update/restart
+    # teardown publishes for this generation (A1.11): its owner is the snapshot
+    # restore/requeue path, and the effective-status orphan reconcile terminal-
+    # izes a retry-less leftover, so it can never wedge the way the latch did.
+    # The durable half of the same law (AR2-3) runs after the child copy-back:
+    # a SETTLED event claim over a NON-settled durable row is refused too.
+    _evt_status = str(evt.get("status") or "").strip().lower()
+    if _evt_status and not bool(evt.get("_ephemeral")):
+        from ouroboros.task_results import STATUS_INTERRUPTED as _INTERRUPTED
+        from ouroboros.task_status import SETTLED_STATUSES as _SETTLED
+
+        if _evt_status not in _SETTLED and _evt_status != _INTERRUPTED:
+            log.error(
+                "task_done with non-settled status %r for %s refused (lifecycle fault)",
+                _evt_status, evt.get("task_id"),
+            )
+            try:
+                ctx.append_jsonl(
+                    ctx.DRIVE_ROOT / "logs" / "events.jsonl",
+                    {
+                        "ts": utc_now_iso(),
+                        "type": "task_done_invalid_status",
+                        "task_id": str(evt.get("task_id") or ""),
+                        "status": _evt_status,
+                        "worker_id": evt.get("worker_id"),
+                    },
+                )
+            except Exception:
+                log.debug("task_done_invalid_status record failed", exc_info=True)
+            _resolve_lifecycle_fault(evt, ctx, _evt_status)
+            return
     task_id = evt.get("task_id")
     wid = evt.get("worker_id")
     meta = ctx.RUNNING.get(str(task_id or ""), {}) if task_id else {}
@@ -1675,6 +2034,15 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
 
             if task:
                 copy_child_task_result(ctx.DRIVE_ROOT, task)
+            # AR2-3 (§8-A1): task_done is validated through the DURABLE result,
+            # not the event's own status claim. The read sits AFTER the child
+            # copy-back (split-drive tasks settle on the child drive first) and
+            # BEFORE artifact finalization, which would default-stamp a
+            # fabricated ``completed`` row for a workspace task that never
+            # wrote one — exactly the shape this refusal must catch.
+            if _task_done_durable_fault(evt, ctx, task_id):
+                return
+            if task:
                 if not task_is_readonly_subagent(task):
                     finalize_task_artifacts(ctx.DRIVE_ROOT, task)
                 if str(task.get("delegation_role") or "") != "subagent":
@@ -1685,22 +2053,36 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
                 from ouroboros.outcomes import artifact_bundle_from_result
 
                 existing = load_task_result(ctx.DRIVE_ROOT, str(task_id)) or {}
-                fields = {
-                    "artifact_status": ARTIFACT_STATUS_FAILED,
-                    "artifact_error": f"{type(exc).__name__}: {exc}",
-                    "artifact_finalized_at": utc_now_iso(),
-                }
-                provisional = {**existing, **fields}
-                fields["artifact_bundle"] = artifact_bundle_from_result(provisional)
-                write_task_result(
-                    ctx.DRIVE_ROOT,
-                    str(task_id),
-                    str(existing.get("status") or "completed"),
-                    **fields,
-                )
+                # GR2-3b: annotate ONLY a row that exists. The old fallback
+                # defaulted a MISSING row's status to "completed" — a copy-back
+                # exception then minted a fabricated completion that the
+                # monotonic guard defended and the durable validation below
+                # would read back as settled. A task with no durable result
+                # stays absent here and is judged by the fault seam instead.
+                if existing and str(existing.get("status") or ""):
+                    fields = {
+                        "artifact_status": ARTIFACT_STATUS_FAILED,
+                        "artifact_error": f"{type(exc).__name__}: {exc}",
+                        "artifact_finalized_at": utc_now_iso(),
+                    }
+                    provisional = {**existing, **fields}
+                    fields["artifact_bundle"] = artifact_bundle_from_result(provisional)
+                    write_task_result(
+                        ctx.DRIVE_ROOT,
+                        str(task_id),
+                        str(existing.get("status") or ""),
+                        **fields,
+                    )
             except Exception:
                 pass
             log.warning("Failed to finalize headless artifacts for task %s", task_id, exc_info=True)
+            # GR2-3b: an exception on the copy-back path must not SKIP the
+            # durable validation — the incident shape is precisely a task_done
+            # whose durable truth never landed. (When the exception came from
+            # artifact finalization AFTER a passed validation, this re-check is
+            # an idempotent read that passes again.)
+            if _task_done_durable_fault(evt, ctx, task_id):
+                return
         try:
             final_task_result = load_task_result(ctx.DRIVE_ROOT, str(task_id)) or {}
         except Exception:
@@ -2829,6 +3211,42 @@ def _handle_routing_manual_target(evt: Dict[str, Any], ctx: Any) -> None:
     )
 
 
+def _refuse_steering_while_cancelling(
+    ctx: Any, evt: Dict[str, Any], target: str, chat_id: int, *, notify: bool = True,
+) -> bool:
+    """Whether a cancellation owns this task — refuse the steering write if so.
+
+    Checked TWICE on purpose: once up front (cheap, off the lock) and once inside
+    the transaction that admits the message to the mailbox. Between those two
+    points the queue lock is taken and the durable liveness re-checked, which is
+    exactly the window a cancel ingress lands in; a single up-front check would
+    let a message reach a task the supervisor is already tearing down.
+    """
+    try:
+        from ouroboros.cancel_intents import cancel_pending
+
+        if not cancel_pending(ctx.DRIVE_ROOT, target):
+            return False
+    except Exception:
+        log.debug("steer_task cancel-pending check failed", exc_info=True)
+        return False
+    _emit_routing_receipt(
+        ctx, evt, action="steer_task", target=target, status="rejected",
+        reason="cancel_pending",
+    )
+    if notify and chat_id:
+        try:
+            ctx.send_with_budget(
+                chat_id,
+                f"⚠️ Couldn't steer task {target} — its cancellation is pending "
+                "(the supervisor is tearing it down). Wait for the settled "
+                "outcome or start a new task.",
+            )
+        except Exception:
+            log.debug("steer_task cancel-pending notice failed", exc_info=True)
+    return True
+
+
 def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
     """Deliver an agent-chosen steering message to an addressable owner root.
 
@@ -2844,6 +3262,13 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
     except (TypeError, ValueError):
         chat_id = 0
     if not target or not message:
+        return
+    # Phase A: refuse NEW steering writes while a cancellation is pending —
+    # steering a task mid-teardown would race the kill and imply the task will
+    # act on the message. BOTH carriers are consulted (durable intent + the
+    # legacy ``cancel_requested`` status latch of pre-migration files). Typed
+    # refusal, owner-visible.
+    if _refuse_steering_while_cancelling(ctx, evt, target, chat_id):
         return
     direct_agent = None
     direct_lock = None
@@ -2931,7 +3356,9 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
     queue_lock_held = False
     fence_generation_changed = False
     delivered = False
+    cancel_pending_refused = False
     active_fence = None
+    staged_manifest: list = []
     try:
         from supervisor.queue import ACCEPTANCE_FENCES, _queue_lock, _task_drive_for_task
         from ouroboros.owner_mailbox import write_owner_message, KIND_OWNER_TEXT
@@ -2955,7 +3382,13 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
             from ouroboros.artifacts import stage_task_attachments
             from ouroboros.gateway.tasks import _render_attachment_lines
 
-            rendered = _render_attachment_lines(stage_task_attachments(drive, target, uploads))
+            # Staging runs after the up-front cancel check (top of this handler)
+            # but BEFORE the transactional re-check below — so the manifest is
+            # kept and the re-check refusal removes the just-staged inputs
+            # (GR2-9) instead of leaving orphaned files in the artifact store
+            # of a task the supervisor is tearing down.
+            staged_manifest = stage_task_attachments(drive, target, uploads)
+            rendered = _render_attachment_lines(staged_manifest)
             if rendered:
                 attachment_note = f"\n\n[ATTACHMENTS]\n{rendered}\n[END_ATTACHMENTS]"
         if not direct_active:
@@ -2980,25 +3413,36 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
                     reason="acceptance_fence_sealed",
                 )
                 return
-        if not write_owner_message(
-            drive,
-            f"{message}{attachment_note}",
-            target,
-            msg_id=msg_id,
-            kind=KIND_OWNER_TEXT,
-        ):
-            raise OSError("owner mailbox append was not durable")
-        if direct_active:
-            direct_agent._owner_message_generation = int(
-                getattr(direct_agent, "_owner_message_generation", 0) or 0
-            ) + 1
+        # Re-check INSIDE the admission transaction: the up-front check runs
+        # before the queue lock is taken, and a cancel ingress lands in exactly
+        # that window. Held under the same lock as the write, so the refusal and
+        # the admission cannot both win. No early return here (GR2-9): the
+        # refusal falls through so the staged-input removal and the owner
+        # notice run AFTER the lock is released (a chat send is not something
+        # to hold the global queue lock for — and the old `return` skipped the
+        # notice entirely).
+        if _refuse_steering_while_cancelling(ctx, evt, target, chat_id, notify=False):
+            cancel_pending_refused = True
         else:
-            if isinstance(active_fence, dict) and str(active_fence.get("status") or "") == "active":
-                active_fence["owner_message_generation"] = int(
-                    active_fence.get("owner_message_generation") or 0
+            if not write_owner_message(
+                drive,
+                f"{message}{attachment_note}",
+                target,
+                msg_id=msg_id,
+                kind=KIND_OWNER_TEXT,
+            ):
+                raise OSError("owner mailbox append was not durable")
+            if direct_active:
+                direct_agent._owner_message_generation = int(
+                    getattr(direct_agent, "_owner_message_generation", 0) or 0
                 ) + 1
-                fence_generation_changed = True
-        delivered = True
+            else:
+                if isinstance(active_fence, dict) and str(active_fence.get("status") or "") == "active":
+                    active_fence["owner_message_generation"] = int(
+                        active_fence.get("owner_message_generation") or 0
+                    ) + 1
+                    fence_generation_changed = True
+            delivered = True
     except Exception:
         log.warning("steer_task delivery failed for task %s", target, exc_info=True)
         _emit_routing_receipt(
@@ -3010,6 +3454,26 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
             _queue_lock.release()
         if direct_lock_held:
             direct_lock.release()
+    if cancel_pending_refused:
+        # GR2-9: the message was refused, so the inputs staged for it must not
+        # linger in the dying task's artifact store.
+        if staged_manifest:
+            try:
+                from ouroboros.artifacts import remove_staged_attachments
+
+                remove_staged_attachments(staged_manifest)
+            except Exception:
+                log.debug("staged-attachment cleanup failed for %s", target, exc_info=True)
+        if chat_id:
+            try:
+                ctx.send_with_budget(
+                    chat_id,
+                    f"⚠️ Couldn't steer task {target} — its cancellation is pending "
+                    "(the supervisor is tearing it down). Wait for the settled "
+                    "outcome or start a new task.",
+                )
+            except Exception:
+                log.debug("steer_task cancel-pending notice failed", exc_info=True)
     if delivered:
         if fence_generation_changed:
             ctx.persist_queue_snapshot(reason="acceptance_fence_owner_message")
@@ -3479,27 +3943,54 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
 
 
 def _handle_cancel_task(evt: Dict[str, Any], ctx: Any) -> None:
+    """Drive one agent-requested cancel through custody — TYPED outcome end to end.
+
+    Phase A1.12: the old boolean facade collapsed ``already_settled`` into the
+    same "✅ cancel" as a real teardown — a lie when the child had finished on its
+    own and kept its completed result. Each typed outcome now gets its honest
+    acknowledgement, and ✅ is sent only after a CONFIRMED teardown + durable
+    settled write."""
     task_id = str(evt.get("task_id") or "").strip()
     st = ctx.load_state()
     owner_chat_id = st.get("owner_chat_id")
-    ok = ctx.cancel_task_by_id(task_id) if task_id else False
-    if owner_chat_id:
-        if ok:
-            ctx.send_with_budget(
-                int(owner_chat_id),
-                f"✅ cancel {task_id or '?'} (event)",
-            )
-        else:
-            ctx.send_with_budget(
-                int(owner_chat_id),
-                f"❌ cancel {task_id or '?'} (event)",
-                is_progress=True,
-                task_id=task_id,
-                progress_meta={
-                    "task_incident": "cancellation_fault",
-                    "toast_once": f"{task_id or 'unknown'}:cancellation_fault",
-                },
-            )
+    from supervisor.queue import (
+        CANCEL_ALREADY_SETTLED, CANCEL_CANCELLED, CANCEL_NOT_FOUND, cancel_task_custody,
+    )
+
+    outcome = cancel_task_custody(task_id) if task_id else CANCEL_NOT_FOUND
+    if not owner_chat_id:
+        return
+    if outcome == CANCEL_CANCELLED:
+        ctx.send_with_budget(
+            int(owner_chat_id),
+            f"✅ cancel {task_id or '?'}: teardown confirmed, outcome settled (event)",
+        )
+    elif outcome == CANCEL_ALREADY_SETTLED:
+        settled_status = str(
+            (load_task_result(ctx.DRIVE_ROOT, task_id) or {}).get("status") or "settled"
+        )
+        ctx.send_with_budget(
+            int(owner_chat_id),
+            f"ℹ️ cancel {task_id or '?'}: the task had already finished "
+            f"({settled_status}) — its result is preserved, nothing was torn down (event)",
+        )
+    elif outcome == CANCEL_NOT_FOUND:
+        ctx.send_with_budget(
+            int(owner_chat_id),
+            f"⚠️ cancel {task_id or '?'}: no such live task (event)",
+        )
+    else:
+        ctx.send_with_budget(
+            int(owner_chat_id),
+            f"❌ cancel {task_id or '?'} did not settle — the task is still live; "
+            "the durable cancel intent stays open and the supervisor watchdog retries (event)",
+            is_progress=True,
+            task_id=task_id,
+            progress_meta={
+                "task_incident": "cancellation_fault",
+                "toast_once": f"{task_id or 'unknown'}:cancellation_fault",
+            },
+        )
 
 
 def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
@@ -3514,11 +4005,35 @@ def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
             if st.get("owner_chat_id"):
                 ctx.send_with_budget(int(st["owner_chat_id"]), block)
             return
+        # GR4-6: clear the durable owner-stop flag BEFORE the campaign is
+        # minted. The old order (campaign first, flag cleared in a later state
+        # write) left a window where the owner-stop backstop — fired by an old
+        # evolution task settling — read flag=True + campaign=active and closed
+        # the FRESH campaign. This clear is owner-authorized (the owner is
+        # explicitly starting evolution). GR5-1: the prior value is captured in
+        # the same locked write so a failed start can restore it.
+        from supervisor.state import update_state as _update_state
+
+        _prior_owner_stop = {"value": False}
+
+        def _clear_owner_stop(live: Dict[str, Any]) -> None:
+            _prior_owner_stop["value"] = bool(live.get("evolution_owner_stopped"))
+            live["evolution_owner_stopped"] = False
+
+        _update_state(_clear_owner_stop)
         try:
             if not start_evolution_campaign(str(evt.get("objective") or ""), source="agent_tool"):
                 raise RuntimeError("campaign write was refused")
         except Exception:
             log.warning("Failed to start evolution campaign from agent tool", exc_info=True)
+            # GR5-1: the start FAILED, so the pre-mint clear was not an
+            # owner-authorized state change after all. Restore the CAPTURED
+            # prior value — leaving it cleared would let the post-task
+            # promotion pipeline (apply_pending_request reads the flag)
+            # autonomously re-arm evolution the owner believes is off, and an
+            # unconditional True would invent a stop that never happened.
+            _update_state(lambda live: live.__setitem__(
+                "evolution_owner_stopped", _prior_owner_stop["value"]))
             st = ctx.load_state()
             if st.get("owner_chat_id"):
                 ctx.send_with_budget(
@@ -3541,32 +4056,60 @@ def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
         live["post_task_autostop"] = False
 
     st = update_state(_toggle_evolution)
+    stop_lines: list = []
+    stop_incomplete = False
     if not enabled:
-        # Cancel the live evolution worker BEFORE the terminal campaign close below:
+        # Cancel live evolution work BEFORE the terminal campaign close below:
         # complete_evolution_campaign runs the per-cycle worktree cleanup, which skips
         # while a task still holds the shared worktree — so the running cycle must be gone
-        # first (pruning PENDING alone leaves a mid-cycle task running and eligible for retry).
-        from supervisor.queue import cancel_running_evolution_tasks
+        # first. PENDING evolution tasks go through the SAME durable intent + typed
+        # custody (GR2-13) — the old in-place prune left them with no intent, no
+        # terminal result and no task_done, and intent-write failures vanished from
+        # the caller's view while Evolution was still declared stopped.
+        from supervisor.queue import evolution_stop_report, stop_evolution_tasks
         from ouroboros.post_task_evolution import drop_pending_request
         from supervisor import state as _evo_state
 
         # Fast path; the evolution_owner_stopped flag is the durable backstop.
         drop_pending_request(_evo_state.DRIVE_ROOT)
-        cancel_running_evolution_tasks("disabled via agent tool")
-        ctx.PENDING[:] = [t for t in ctx.PENDING if str(t.get("type")) != "evolution"]
+        stopped = stop_evolution_tasks("disabled via agent tool")
         ctx.sort_pending()
         ctx.persist_queue_snapshot(reason="evolve_off_via_tool")
+        stop_lines, stop_incomplete = evolution_stop_report(stopped)
     try:
         from supervisor.evolution_lifecycle import complete_evolution_campaign
 
         if not enabled:
-            # Terminal close (not a resumable pause), so a later /evolve start mints fresh.
-            complete_evolution_campaign("disabled via agent tool", status="stopped")
+            if stop_incomplete:
+                # GR3-3: an INCOMPLETE stop leaves the campaign OPEN — the
+                # durable evolution_owner_stopped flag already blocks new
+                # cycles, and the settle-time owner-stop backstop below
+                # (_close_campaign_after_owner_stop) closes the campaign once
+                # the live task settles. Closing it now would declare a clean
+                # terminal over still-live evolution work.
+                log.warning(
+                    "Evolution stop is incomplete; campaign left open for the "
+                    "settle-time owner-stop backstop",
+                )
+            else:
+                # Terminal close (not a resumable pause), so a later /evolve start mints fresh.
+                complete_evolution_campaign("disabled via agent tool", status="stopped")
     except Exception:
         log.debug("Failed to update evolution campaign toggle state", exc_info=True)
     if st.get("owner_chat_id"):
-        state_str = "ON" if enabled else "OFF — post-task auto-evolution also paused until /evolve start"
-        ctx.send_with_budget(int(st["owner_chat_id"]), f"🧬 Evolution: {state_str} (via agent tool)")
+        owner_chat = int(st["owner_chat_id"])
+        for line in stop_lines:
+            ctx.send_with_budget(owner_chat, line)
+        if enabled:
+            state_str = "ON"
+        elif stop_incomplete:
+            state_str = ("OFF (mode disabled) — but the stop is INCOMPLETE: see the "
+                         "still-live task(s) above. The campaign stays open until "
+                         "they settle. Post-task auto-evolution stays paused until "
+                         "/evolve start")
+        else:
+            state_str = "OFF — post-task auto-evolution also paused until /evolve start"
+        ctx.send_with_budget(owner_chat, f"🧬 Evolution: {state_str} (via agent tool)")
 
 
 def _handle_toggle_consciousness(evt: Dict[str, Any], ctx: Any) -> None:

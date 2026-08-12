@@ -303,7 +303,14 @@ def test_toggle_evolution_off_wires_owner_stop(tmp_path, monkeypatch):
                         lambda reason="", *, status="stopped": calls["complete"].append((reason, status)))
     monkeypatch.setattr(lifecycle, "start_evolution_campaign",
                         lambda *a, **k: calls["start"].append((a, k)))
-    monkeypatch.setattr(queue, "cancel_running_evolution_tasks", lambda *a, **k: [])
+    stop_calls: list = []
+    monkeypatch.setattr(
+        queue, "stop_evolution_tasks",
+        lambda reason="": stop_calls.append(reason) or {
+            "cancelled": [], "already_settled": [], "not_found": [],
+            "failed": [], "intent_write_failed": [],
+        },
+    )
 
     ctx = types.SimpleNamespace(
         PENDING=[{"type": "evolution"}, {"type": "task"}],
@@ -320,7 +327,9 @@ def test_toggle_evolution_off_wires_owner_stop(tmp_path, monkeypatch):
     assert calls["complete"] == [("disabled via agent tool", "stopped")]  # terminal, not pause
     assert calls["start"] == []
     assert not (tmp_path / "state" / "post_task_evolution_request.json").exists()  # request dropped
-    assert ctx.PENDING == [{"type": "task"}]              # evolution task pruned from the queue
+    # GR2-13: pending evolution tasks are cancelled through the durable-intent +
+    # typed-custody stop (stop_evolution_tasks), never pruned in place.
+    assert stop_calls == ["disabled via agent tool"]
 
 
 def test_toggle_evolution_on_clears_owner_stop(tmp_path, monkeypatch):

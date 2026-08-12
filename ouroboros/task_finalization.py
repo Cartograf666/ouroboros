@@ -28,6 +28,7 @@ _SEALED_FINAL_TEXT_PROMPT_CHARS = 4000
 
 def deliver_final_message_live(
     event_queue: Any, pending_events: List[Dict[str, Any]], task_id: str,
+    *, drive_root: Any = None,
 ) -> bool:
     """Send the buffered FINAL ``send_message`` through the live worker queue.
 
@@ -44,6 +45,14 @@ def deliver_final_message_live(
     live-transport failure only the buffered copy exists; if the worker dies
     during post-task only the live copy ever left; in the normal case the live
     copy arrives first and the post-return drain's copy is suppressed.
+
+    §8-A2 (ONE seam for normal/cancel/reap): when ``drive_root`` names the
+    CANONICAL data root, the answer is registered as OWED in the durable outbox
+    (``supervisor/terminal_delivery.py``, cross-process locked — safe from the
+    worker) BEFORE it is enqueued, so a supervisor crash between the put and
+    the send is replayed on boot/tick instead of losing both copies. The same
+    ``delivery_id`` dedupe guarantees nothing double-delivers. Fail-soft: a
+    registration failure only costs the crash insurance, never the send.
     """
     tid = str(task_id or "")
     final = fallback = None
@@ -57,6 +66,17 @@ def deliver_final_message_live(
         return False
     digest = hashlib.sha256(str(final.get("text") or "").encode("utf-8")).hexdigest()[:16]
     final["delivery_id"] = f"final:{tid}:{digest}"
+    if drive_root is not None and str(drive_root).strip() and final.get("chat_id"):
+        # OWED before ENQUEUED. Rows without a chat id are not registered (the
+        # replay could never send them, so they would only age into a false
+        # "delivery gave up" disclosure), and an EMPTY root is refused rather
+        # than resolved relative to the process CWD.
+        try:
+            from supervisor.terminal_delivery import register_pending_delivery
+
+            register_pending_delivery(pathlib.Path(drive_root), dict(final))
+        except Exception:
+            log.debug("final-answer owed registration failed for %s", tid, exc_info=True)
     try:
         event_queue.put(dict(final))
     except Exception:
@@ -66,6 +86,43 @@ def deliver_final_message_live(
         )
         return False
     return True
+
+
+def register_final_answer_owed(
+    task: Dict[str, Any], send_event: Dict[str, Any], *, env_drive_root: Any,
+) -> None:
+    """GR2-5 (§8-A2, ONE outbox for EVERY root): owe the final answer durably.
+
+    Called right after durable result persistence for every non-ephemeral ROOT,
+    regardless of the blocking/nonblocking post-task split: the nonblocking
+    lane used to buffer the send with NO delivery_id and NO owed registration,
+    so a worker crash before the buffered drain lost the owner's answer with
+    nothing to replay. Mints the canonical ``final:<tid>:<digest>`` id onto the
+    buffered event and registers it in the durable outbox; the registry's
+    delivery_id dedupe keeps the normal path single-send
+    (``deliver_final_message_live`` re-registers idempotently and the send
+    handler suppresses the second copy). Fail-soft: registration is crash
+    insurance, never a gate on the send. Rows without a chat id are skipped
+    (the replay could never send them), and an EMPTY canonical root is refused
+    rather than resolved relative to the process CWD (AR2-4).
+    """
+    if not send_event.get("chat_id"):
+        return
+    try:
+        # The CANONICAL data root the supervisor's boot/tick replay reads: the
+        # parent/budget root for split children, the task's own drive for an
+        # ordinary root (whose ``budget_drive_root`` is legitimately empty).
+        outbox_root = str(task.get("budget_drive_root") or env_drive_root or "").strip()
+        if not outbox_root:
+            return
+        from supervisor.terminal_delivery import register_pending_delivery
+
+        tid = str(task.get("id") or "")
+        digest = hashlib.sha256(str(send_event.get("text") or "").encode("utf-8")).hexdigest()[:16]
+        send_event["delivery_id"] = f"final:{tid}:{digest}"
+        register_pending_delivery(pathlib.Path(outbox_root), dict(send_event))
+    except Exception:
+        log.debug("final-answer owed registration failed for %s", task.get("id"), exc_info=True)
 
 
 def build_sealed_final_package(result_row: Any, final_text: str) -> Dict[str, Any]:

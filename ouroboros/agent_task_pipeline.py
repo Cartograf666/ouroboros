@@ -46,6 +46,7 @@ from ouroboros.task_finalization import (
     build_sealed_final_package,
     build_swarm_efficiency as _build_swarm_efficiency,  # moved (module ceiling); tests import it here
     deliver_final_message_live,
+    register_final_answer_owed,
     sealed_final_prompt_section,
 )
 
@@ -757,6 +758,18 @@ def emit_task_results(
         log.debug("Failed to collect review evidence", exc_info=True)
 
     if not _ephemeral:
+        # GR2-5 (§8-A2, ONE outbox for EVERY root) + GR3-5 (ordering closes the
+        # persist→register crash window): the final answer enters the durable
+        # outbox — the owed row embeds the full payload — immediately BEFORE
+        # the durable result write, regardless of the blocking/nonblocking
+        # post-task split below. Registered-then-crashed leaves an owed row
+        # boot replay delivers (projection-over-replay: no boot scan of
+        # task_results is ever needed); the old stored-then-crashed order left
+        # a terminal result nobody would ever deliver. The nonblocking lane
+        # used to buffer the send with no delivery_id and no owed registration
+        # at all. Seam + dedup: ouroboros/task_finalization.py.
+        if _is_root_post_task(task):
+            register_final_answer_owed(task, send_event, env_drive_root=env.drive_root)
         _store_task_result(
             env, task, text, usage, llm_trace, review_evidence=review_evidence,
             loop_outcome=loop_outcome, cost_fields=task_cost_fields,
@@ -772,6 +785,12 @@ def emit_task_results(
         "type": "task_done",
         "task_id": task.get("id"),
         "task_type": task.get("type"),
+        # GR2-3c: the DURABLE status rides the event for honesty — the
+        # supervisor validates every non-ephemeral task_done against the
+        # durable row either way, but a stamped status makes the event
+        # self-describing instead of a blank assertion. Ephemeral turns keep
+        # a blank status (they have no durable lifecycle).
+        "status": str(stored_result.get("status") or ""),
         # CW3: tells the supervisor's task_done handler to NOT synthesize a durable
         # missing-result task_result for a transient decision turn (which has none).
         "_ephemeral": _ephemeral,
@@ -936,7 +955,14 @@ def _dispatch_root_post_task(
         or project_task
     )
     if blocking and event_queue is not None:
-        deliver_final_message_live(event_queue, pending_events, str(task.get("id") or ""))
+        # The CANONICAL data root — what the supervisor's boot/tick outbox
+        # replay reads (§8-A2): the parent/budget root for split children, the
+        # task's own drive for an ordinary root (whose ``budget_drive_root``
+        # field is legitimately empty).
+        deliver_final_message_live(
+            event_queue, pending_events, str(task.get("id") or ""),
+            drive_root=budget_drive_root or env.drive_root,
+        )
     # Sealed ground truth for summary/reflection: what the owner actually
     # received + the durable result's own artifact facts (Q4A).
     sealed_final = build_sealed_final_package(

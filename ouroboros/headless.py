@@ -380,8 +380,9 @@ def prune_task_trees(
 def remove_subagent_task_drive(parent_drive_root: pathlib.Path, task_id: str) -> bool:
     """Immediately remove a subagent's child drive (used on cancel/timeout).
 
-    Cancellation wins: late results are discarded with bounded scratch.
-    Returns whether anything was removed.
+    Completion wins (phase A, owner 4=A): callers run this only AFTER the settled
+    publication (result copied back, salvage preserved on the canonical drive), so
+    removal drops bounded scratch, never a kept answer. Returns whether it removed.
     """
     parent = pathlib.Path(parent_drive_root)
     try:

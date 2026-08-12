@@ -64,8 +64,8 @@ from ouroboros.delegate_containment import (  # noqa: E402
     _ACCESS_UNVERIFIED,  # noqa: F401  (re-export: tests address it through this module)
     _Breach,
     _home_isolation_breach,
-    _inside_operator_home,  # noqa: F401  (re-export)
     _widened_access,
+    home_nested_under_operator_home,
 )
 _POLL_INTERVAL_SEC = 3.0
 # Claudexor's own schema bound on maxSeconds (packages/schema/src/control.ts).
@@ -198,6 +198,14 @@ def _containment_breach(detail: Dict[str, Any], authority: "DelegatedRunShape") 
     return None
 
 
+_NESTED_HOME_NOTE = (
+    "The scoped harness HOME for this run sits INSIDE the operator's own home, which is "
+    "where the engine roots its scoped homes. That is allowed and the run's work is usable, "
+    "but it is not isolation from the operator's home: everything there — credential stores "
+    "and the Claudexor daemon token included — stays readable at its absolute path. Do NOT "
+    "describe this run as running in an isolated home"
+)
+
 _NO_BOUNDARY_NOTE = (
     "NO OS-ENFORCED BOUNDARY was applied to this run. The engine reported no confinement "
     "mechanism for it, so the only containment it had is a scoped HOME — a redirect of "
@@ -244,8 +252,25 @@ def _containment_evidence(detail: Dict[str, Any]) -> Dict[str, Any]:
     # is an unconfined run.
     mechanisms = sorted({attempt.boundary_mechanism for attempt in attempts})
     boundary = mechanisms[0] if attempts and len(mechanisms) == 1 and mechanisms[0] else ""
+    # A3: the engine's own typed reason for a missing boundary — an AMPLIFIER of
+    # the unconfined disclosure (why there is no mechanism on this host), parsed
+    # from the same attempt artifact. Telemetry only, never an admission token.
+    unavailable_reasons = sorted({
+        attempt.confinement_unavailable_reason
+        for attempt in attempts if attempt.confinement_unavailable_reason
+    })
+    # A3: a scoped home NESTED under the operator's own is allowed (the engine's
+    # own layout — disclosed, never refused), but it is NOT "outside the
+    # operator's own": the daemon token stays reachable at its absolute path.
+    # Recorded on the report and honoured by every branch below, so a run that
+    # ALSO carries an OS boundary can no longer be promoted to verified with a
+    # note that contradicts its own artifact — and so `_record_containment` keeps
+    # emitting the durable unconfined row for it.
+    nested = home_nested_under_operator_home(detail)
     report = {"verified": False, "attempts": len(attempts), "disclosed": disclosed,
-              "os_boundary": boundary}
+              "os_boundary": boundary, "nested_under_operator_home": nested}
+    if unavailable_reasons:
+        report["confinement_unavailable_reason"] = "; ".join(unavailable_reasons)
     breach = _home_isolation_breach(detail)
     if breach is not None:
         return {**report, "note": breach.detail}
@@ -257,8 +282,23 @@ def _containment_evidence(detail: Dict[str, Any]) -> Dict[str, Any]:
         return {**report, "note":
                 "not every attempt of this run recorded a harness-HOME fact, so its "
                 "confinement is UNPROVEN — do not report it as isolated"}
+    if nested:
+        note = _NESTED_HOME_NOTE
+        if boundary:
+            note += (
+                f" (an {boundary} boundary WAS applied — weigh it as the real containment, "
+                "but the scoped HOME is not one)"
+            )
+        if unavailable_reasons:
+            note += " (engine-declared reason: " + "; ".join(unavailable_reasons) + ")"
+        return {**report, "note": note}
     if not boundary:
-        return {**report, "note": _NO_BOUNDARY_NOTE}
+        note = _NO_BOUNDARY_NOTE
+        if unavailable_reasons:
+            note += (
+                " (engine-declared reason: " + "; ".join(unavailable_reasons) + ")"
+            )
+        return {**report, "note": note}
     return {**report, "verified": True, "note":
             f"every attempt recorded a scoped harness HOME outside the operator's own AND "
             f"an applied {boundary} boundary, proven against a path it denies"}
@@ -332,9 +372,16 @@ def _record_containment(ctx: ToolContext, entry: Optional[_RunCustody],
     "Once per run" is now a DURABLE fact rather than a process-local one: the custody
     entry is replayed from the event log, so a restarted worker polling an already
     terminal run does not append a second identical finding.
+
+    A NESTED scoped home is disclosed even when an OS boundary WAS recorded (A3):
+    the boundary is real containment, the scoped home is not, and suppressing the
+    row for that shape left the one durable line that says "this ran with the
+    operator's home reachable" unwritten.
     """
     containment = payload.get("containment")
-    if not isinstance(containment, dict) or containment.get("os_boundary"):
+    if not isinstance(containment, dict):
+        return
+    if containment.get("os_boundary") and not containment.get("nested_under_operator_home"):
         return
     if entry is not None and entry.containment_disclosed:
         return
@@ -342,10 +389,13 @@ def _record_containment(ctx: ToolContext, entry: Optional[_RunCustody],
         "run_id": entry.run_id if entry is not None else "",
         "route": entry.route_id if entry is not None else "",
         "state": str(payload.get("state") or ""),
-        "os_boundary": "",
+        "os_boundary": str(containment.get("os_boundary") or ""),
         "attempts": containment.get("attempts"),
         "home_disclosed": containment.get("disclosed"),
+        "nested_under_operator_home": bool(containment.get("nested_under_operator_home")),
         "note": containment.get("note"),
+        **({"confinement_unavailable_reason": containment["confinement_unavailable_reason"]}
+           if containment.get("confinement_unavailable_reason") else {}),
     })
     if entry is not None:
         entry.containment_disclosed = True

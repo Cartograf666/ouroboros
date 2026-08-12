@@ -206,16 +206,22 @@ older than 3.3.2 put no applied facts on `attemptFailureRecord` at all). A missi
 collapses to "no boundary", because the consequence there is a DISCLOSURE. Each silence is read
 in the direction whose failure mode is recoverable.
 
-**A recorded home INSIDE the operator's own home is a breach only without a proven
-boundary** (refined 2026-08-07 by the first live delegated agent run). The engine roots
-every scoped home under its own runtime dir, which lives under `$HOME` on every host it
-supports — so a nested scoped home accompanied by a PROVEN OS boundary
-(`confinement_mechanism` + `confinement_verified_denied_path`, read as one fact) is the
-engine's ordinary layout, not a fault; the any-depth spatial rule alone cancelled a run
-whose verified DENIED path was the daemon token directory itself. Two shapes stay
-cancelled as containment faults: a home EQUAL to the operator's own (the claim is the
-lie, whatever boundary sits beside it), and a nested home with NO proven boundary (the
-token stays reachable by a relative walk).
+**A breach is exactly two facts** (simplified 2026-08-11, Poltergeist phase A3; the
+2026-08-07 refinement went one step further): a recorded `harness_home_isolated: false`,
+or an applied home EQUAL to the operator's own (the claim is the lie, whatever boundary
+sits beside it). A scoped home NESTED under `$HOME` is NOT a breach — with or without a
+recorded boundary. The engine roots every scoped home under its own runtime dir, which
+lives under `$HOME` on every host it supports, and on a host with no boundary mechanism
+(every non-macOS host today) it CANNOT record one — so the former nested-without-mechanism
+rule cancelled every mutating Linux run post-factum while the work was already done and
+healthy. The boundary-less nested shape flows to the existing disclosed-unconfined path
+below instead: the token stays reachable by a relative walk and the disclosure SAYS so,
+but the child already holds a shell in this worktree, and cutting the lane on every
+boundary-less host costs more than the marginal step it prevents (AGENTS.md "Disclose
+instead of forbid"). The engine's typed `confinement_unavailable_reason` — read from the
+SAME attempt artifact — rides the disclosure as an amplifier (why this host has no
+mechanism); it is telemetry, never an admission token, and its presence never excuses a
+recorded FALSE.
 
 Where no boundary was applied, the fact is written LOUDLY into three places (AGENTS.md
 "Disclose instead of forbid"):

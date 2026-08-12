@@ -626,15 +626,21 @@ def test_terminal_emitter_names_no_cost_field_and_forwards_an_unknown_one(tmp_pa
     )
 
     events = []
+    _orig_get_event_q = workers.get_event_q
     workers.get_event_q = lambda: SimpleNamespace(put=events.append)
-    future = dict(_real_projection(tmp_path), a_field_invented_after_this_commit=7)
-    assert workers._emit_task_done_terminal(None, "t1", "failed", cost_fields=future) is True
-    assert events[-1]["a_field_invented_after_this_commit"] == 7
-    assert events[-1]["non_final_rows"] == 0
-    # The projection carries `ledger_integrity_degraded: False` on a healthy
-    # task; forwarding it would put a "degraded" key on every clean terminal
-    # event. The flag is a disclosure, so it appears only when it discloses.
-    assert "ledger_integrity_degraded" not in events[-1]
+    try:
+        future = dict(_real_projection(tmp_path), a_field_invented_after_this_commit=7)
+        assert workers._emit_task_done_terminal(None, "t1", "failed", cost_fields=future) is True
+        assert events[-1]["a_field_invented_after_this_commit"] == 7
+        assert events[-1]["non_final_rows"] == 0
+        # The projection carries `ledger_integrity_degraded: False` on a healthy
+        # task; forwarding it would put a "degraded" key on every clean terminal
+        # event. The flag is a disclosure, so it appears only when it discloses.
+        assert "ledger_integrity_degraded" not in events[-1]
+    finally:
+        # Direct assignment (not monkeypatch) polluted every later test in the
+        # process — the manager-backed event-bus tests received this namespace.
+        workers.get_event_q = _orig_get_event_q
 
 
 def test_terminal_emitter_still_withholds_an_unavailable_projection(tmp_path, monkeypatch):
@@ -660,7 +666,7 @@ def test_terminal_emitter_still_withholds_an_unavailable_projection(tmp_path, mo
     assert unavailable["cost_usd"] is None
 
     events = []
-    workers.get_event_q = lambda: SimpleNamespace(put=events.append)
+    monkeypatch.setattr(workers, "get_event_q", lambda: SimpleNamespace(put=events.append))
     assert workers._emit_task_done_terminal(None, "t1", "failed", cost_fields=unavailable) is True
     emitted = events[-1]
     assert emitted["cost_accounting_status"] == "unavailable"

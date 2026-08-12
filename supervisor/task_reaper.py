@@ -391,6 +391,126 @@ def _hold_wedged_worker(task_id: str, task_type: str, worker_id: int, terminal_r
             log.debug("Reaper: failed to send wedged owner notification for %s", task_id, exc_info=True)
 
 
+def _emit_reap_task_done(
+    workers_mod: Any, task: Dict[str, Any], task_id: str, task_type: str,
+    terminal_reason: str, recon_fields: Dict[str, Any], terminal_metadata: Any,
+) -> None:
+    """The non-retry reap's terminal event — emitted AFTER the salvage delivery
+    (AR2-5a): the salvage registers the owner's answer as OWED in the durable
+    outbox first, so a crash between the two can no longer resolve the card
+    while losing the answer. task_done itself is covered by the durable
+    terminal result plus boot reconciliation. Fail-soft."""
+    try:
+        done_chat_id = int(task.get("chat_id") or 0) if isinstance(task, dict) else 0
+        workers_mod.get_event_q().put({
+                "type": "task_done", "task_id": task_id, "task_type": task_type,
+                "chat_id": done_chat_id, "status": "failed", "reason_code": terminal_reason,
+                "outcome_axes": terminal_outcome_axes(lifecycle="failed", execution=EXECUTION_INFRA_FAILED, reason_code=terminal_reason, review_trigger="supervisor_terminal"),
+                **recon_fields,
+                "metadata": terminal_metadata,
+        })
+    except Exception:
+        log.debug("Reaper: failed to emit task_done for %s", task_id, exc_info=True)
+
+
+def _deliver_reap_salvage(
+    _q: Any, task: Dict[str, Any], task_id: str, terminal_reason: str,
+    unreconciled_runs: Optional[list] = None,
+) -> None:
+    """A2: a NON-RETRY reap delivers the salvaged answer through the shared
+    durable outbox seam (a retryable reap deliberately delivers nothing — the
+    retry will produce the real answer). Same seam, same dedupe as the cancel
+    path; roots only, a child's result flows to its parent. Fail-soft.
+    ``unreconciled_runs`` (GR5-2) rides the same message as the kill path's
+    disclosure — a reap that left delegated runs open must say so."""
+    if str(task.get("delegation_role") or "") == "subagent":
+        return
+    try:
+        from ouroboros.observability import latest_llm_response_text, preserved_salvage_path
+        from supervisor.terminal_delivery import deliver_unreviewed_salvage
+
+        salvage_text = latest_llm_response_text(
+            pathlib.Path(_q._task_drive_for_task(task, task_id)), task_id,
+        )
+        deliver_unreviewed_salvage(
+            pathlib.Path(_q.DRIVE_ROOT), task, task_id,
+            outcome=f"stopped by {terminal_reason}",
+            salvaged_text=salvage_text,
+            preserved_path=preserved_salvage_path(pathlib.Path(_q.DRIVE_ROOT), task_id),
+            unreconciled_runs=list(unreconciled_runs or []),
+        )
+    except Exception:
+        log.debug("Reaper: salvage delivery failed for %s", task_id, exc_info=True)
+
+
+def _finish_self_finalized_task(
+    _q: Any, workers_mod: Any, task: Dict[str, Any], task_id: str, task_type: str,
+    self_status: str, _existing: Optional[Dict[str, Any]], terminal_metadata: Any,
+    unreconciled_runs: Optional[list] = None,
+) -> None:
+    """Honor a worker's OWN terminal result found after the kill (never clobber
+    it or enqueue a retry) and finish everything its death interrupted.
+
+    A mirrored child result (copy_child_task_result sets artifact_status to
+    'finalizing' for workspace tasks) still needs the artifact finalization the
+    normal task_done path runs in _handle_task_done. The reaper already
+    terminalized the task, so it is no longer in RUNNING and that path finds no
+    task to finalize — complete it here. Rescue ONLY a stuck non-terminal
+    artifact state: re-running finalize on an already-terminal result can
+    regress it to FAILED (e.g. the workspace was cleaned up). Readonly
+    subagents have no durable artifacts and are skipped (shared gate).
+    """
+    try:
+        from ouroboros.headless import (
+            ARTIFACT_STATUS_FINALIZING,
+            ARTIFACT_STATUS_PENDING,
+            finalize_task_artifacts,
+            task_is_readonly_subagent,
+        )
+
+        _art = str((_existing or {}).get("artifact_status") or "").strip().lower()
+        if _art in {ARTIFACT_STATUS_PENDING, ARTIFACT_STATUS_FINALIZING} and not task_is_readonly_subagent(task):
+            finalize_task_artifacts(pathlib.Path(_q.DRIVE_ROOT), task)
+    except Exception:
+        log.debug("Reaper: artifact finalize for self-finalized %s failed", task_id, exc_info=True)
+
+    # GR3-5: the worker may equally have died BEFORE its final answer was
+    # delivered (or before the buffered send ever left) — an already-terminal
+    # recovery that emits only task_done resolves the card while the owner's
+    # answer stays on disk forever. Route the recovery through the SAME
+    # owed-registration delivery seam the cancel miss lane uses:
+    # owed-before-enqueued, deduped by the shared delivery_id, so a copy the
+    # worker already delivered is suppressed durably. Fail-soft.
+    try:
+        from supervisor.terminal_delivery import deliver_miss_lane_outcome
+
+        deliver_miss_lane_outcome(
+            pathlib.Path(_q.DRIVE_ROOT),
+            pathlib.Path(_q._task_drive_for_task(task, task_id)),
+            # The durable row wins; the queue task row backfills routing
+            # facts (chat/lineage/role) a sparse result may not carry.
+            {**(task if isinstance(task, dict) else {}), **(_existing or {})},
+            task_id, self_status,
+            unreconciled_runs=list(unreconciled_runs or []),
+        )
+    except Exception:
+        log.debug("Reaper: terminal delivery for self-finalized %s failed", task_id, exc_info=True)
+
+    # The worker may have died before emitting its task_done (and the crash
+    # detector now skips reaping slots): emit an idempotent task_done so the
+    # UI card resolves.
+    try:
+        done_chat_id = int(task.get("chat_id") or 0) if isinstance(task, dict) else 0
+        workers_mod.get_event_q().put({
+                "type": "task_done", "task_id": task_id, "task_type": task_type,
+                "chat_id": done_chat_id, "status": self_status,
+                "reason_code": str((_existing or {}).get("reason_code") or ""),
+                "metadata": terminal_metadata,
+        })
+    except Exception:
+        log.debug("Reaper: failed to emit task_done for self-finalized %s", task_id, exc_info=True)
+
+
 def reap_timed_out_task(job: Dict[str, Any]) -> None:
     """Full teardown for a timed-out task, run OFF the supervisor loop (Variant A).
 
@@ -446,6 +566,19 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
     except Exception:
         log.debug("Reaper: failed to archive service logs for %s", task_id, exc_info=True)
 
+    # GR5-2: the killed worker's graceful ``release_task_runs`` never ran, so
+    # its open delegated (Claudexor) runs would keep mutating while the retry
+    # starts — and the orphan sweep never fires, because the retried task keeps
+    # the owner "alive". Reconcile custody NOW (the same seam + post-reconcile
+    # open_runs/pending_invocations re-audit the cancel kill path uses), BEFORE
+    # the retry/respawn decision; still-open runs are disclosed on the reap
+    # outcome (result field + the typed ``delegated_runs_unreconciled`` event
+    # the shared helper emits). Custody reconciliation only — the reaper mints
+    # no cancel intents (owner-declined). Fail-soft: the helper never raises.
+    from supervisor.cancel_publication import _reconcile_delegated_runs_on_kill
+
+    unreconciled = _reconcile_delegated_runs_on_kill(_q, task_id)
+
     from ouroboros.task_results import (
         STATUS_FAILED,
         STATUS_INTERRUPTED,
@@ -481,40 +614,10 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
             log.debug("Reaper: child-drive terminal re-check failed for %s", task_id, exc_info=True)
 
     if self_status:
-        # A mirrored child result (copy_child_task_result above sets artifact_status to
-        # 'finalizing' for workspace tasks) still needs the artifact finalization the normal
-        # task_done path runs in _handle_task_done. The reaper already terminalized the task,
-        # so it is no longer in RUNNING and that path finds no task to finalize — complete it
-        # here. Rescue ONLY a stuck non-terminal artifact state: re-running finalize on an
-        # already-terminal result can regress it to FAILED (e.g. the workspace was cleaned
-        # up). Readonly subagents have no durable artifacts and are skipped (shared gate).
-        try:
-            from ouroboros.headless import (
-                ARTIFACT_STATUS_FINALIZING,
-                ARTIFACT_STATUS_PENDING,
-                finalize_task_artifacts,
-                task_is_readonly_subagent,
-            )
-
-            _art = str((_existing or {}).get("artifact_status") or "").strip().lower()
-            if _art in {ARTIFACT_STATUS_PENDING, ARTIFACT_STATUS_FINALIZING} and not task_is_readonly_subagent(task):
-                finalize_task_artifacts(pathlib.Path(_q.DRIVE_ROOT), task)
-        except Exception:
-            log.debug("Reaper: artifact finalize for self-finalized %s failed", task_id, exc_info=True)
-
-        # Honor the worker's own terminal result — do NOT clobber it or enqueue a retry.
-        # The worker may have died before emitting its task_done (and the crash detector
-        # now skips reaping slots), so emit an idempotent task_done so the UI card resolves.
-        try:
-            done_chat_id = int(task.get("chat_id") or 0) if isinstance(task, dict) else 0
-            workers_mod.get_event_q().put({
-                    "type": "task_done", "task_id": task_id, "task_type": task_type,
-                    "chat_id": done_chat_id, "status": self_status,
-                    "reason_code": str((_existing or {}).get("reason_code") or ""),
-                    "metadata": terminal_metadata,
-            })
-        except Exception:
-            log.debug("Reaper: failed to emit task_done for self-finalized %s", task_id, exc_info=True)
+        _finish_self_finalized_task(
+            _q, workers_mod, task, task_id, task_type, self_status,
+            _existing, terminal_metadata, unreconciled,
+        )
     else:
         # 3. Reconstruct real cost/rounds from durable llm_usage (the killed worker never
         #    finalized; the event would otherwise carry zeros and understate metrics).
@@ -562,6 +665,9 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                 ),
                 superseded_by=retry_task_id if retry_task_id and retry_task_id != task_id else "",
                 retry_task_id=retry_task_id if retry_task_id else "",
+                # GR5-2: the reap outcome discloses the delegated runs the
+                # custody reconcile above could not settle.
+                **({"delegated_runs_unreconciled": unreconciled} if unreconciled else {}),
                 **recon_fields,
                 result=(
                     f"Task killed by {terminal_reason} after {int(runtime_sec)}s. Retrying."
@@ -659,17 +765,13 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                 log.debug("Reaper: failed to send owner notification for %s", task_id, exc_info=True)
 
         if not requeued:
-            try:
-                done_chat_id = int(task.get("chat_id") or 0) if isinstance(task, dict) else 0
-                workers_mod.get_event_q().put({
-                        "type": "task_done", "task_id": task_id, "task_type": task_type,
-                        "chat_id": done_chat_id, "status": "failed", "reason_code": terminal_reason,
-                        "outcome_axes": terminal_outcome_axes(lifecycle="failed", execution=EXECUTION_INFRA_FAILED, reason_code=terminal_reason, review_trigger="supervisor_terminal"),
-                        **recon_fields,
-                        "metadata": terminal_metadata,
-                })
-            except Exception:
-                log.debug("Reaper: failed to emit task_done for %s", task_id, exc_info=True)
+            # AR2-5a ordering: salvage first (it registers the answer as OWED in
+            # the durable outbox), only then task_done — see _emit_reap_task_done.
+            _deliver_reap_salvage(_q, task, task_id, terminal_reason, unreconciled)
+            _emit_reap_task_done(
+                workers_mod, task, task_id, task_type, terminal_reason,
+                recon_fields, terminal_metadata,
+            )
 
     # 5. Respawn a fresh worker for the slot; on failure, CLEAR reaping so the crash detector
     #    can recover the slot on a later tick instead of stranding it permanently.

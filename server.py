@@ -312,8 +312,13 @@ def _stage_mailbox_attachments(
     task_id: str,
     task_metadata: Any,
     image_data: Any = None,
-) -> str:
-    """Stage one routed turn's files into the existing task artifact store."""
+) -> tuple[str, list]:
+    """Stage one routed turn's files into the existing task artifact store.
+
+    Returns ``(attachment_note, staged_manifest)`` — the manifest is kept so a
+    refused admission (the cancel-pending re-check inside the mailbox
+    transaction) can remove exactly the files this call staged (GR2-9).
+    """
     metadata = task_metadata if isinstance(task_metadata, dict) else {}
     uploads = list(metadata.get("chat_attachment_uploads") or [])
     temp_source: Optional[pathlib.Path] = None
@@ -337,13 +342,14 @@ def _stage_mailbox_attachments(
             log.warning("Unable to stage routed inline image for task %s", task_id, exc_info=True)
     try:
         if not uploads:
-            return ""
+            return "", []
         from ouroboros.artifacts import stage_task_attachments
         from ouroboros.gateway.tasks import _render_attachment_lines
 
         manifest = stage_task_attachments(ctx.DRIVE_ROOT, task_id, uploads)
         rendered = _render_attachment_lines(manifest)
-        return f"\n\n[ATTACHMENTS]\n{rendered}\n[END_ATTACHMENTS]" if rendered else ""
+        note = f"\n\n[ATTACHMENTS]\n{rendered}\n[END_ATTACHMENTS]" if rendered else ""
+        return note, manifest
     finally:
         if temp_source is not None:
             try:
@@ -436,8 +442,45 @@ def _route_project_chat_to_running_task(
                 return ""
         task_drive = pathlib.Path(ctx.DRIVE_ROOT) if direct_lock_held else _task_drive_for_task(task_obj, tid)
         msg_id = f"{client_message_id}:{tid}" if client_message_id else None
+        staged_manifest: list = []
+        cancel_refused_in_txn = False
+
+        def _drop_staged_inputs() -> None:
+            # GR2-9: the admission was refused, so the files staged for this
+            # message must not linger in the dying task's artifact store.
+            if not staged_manifest:
+                return
+            try:
+                from ouroboros.artifacts import remove_staged_attachments
+
+                remove_staged_attachments(staged_manifest)
+            except Exception:
+                log.debug("staged-attachment cleanup failed for %s", tid, exc_info=True)
+
         try:
-            attachment_note = _stage_mailbox_attachments(ctx, tid, task_metadata, image_data)
+            # GR2-9 ordering: check cancellation BEFORE staging — the old order
+            # copied the owner's files into the artifact store of a task whose
+            # cancellation was already pending, then refused the message. The
+            # cheap up-front check runs off the lock; the transactional
+            # re-checks below still run and remove the staged inputs on refusal.
+            from ouroboros.cancel_intents import cancel_pending
+
+            if cancel_pending(ctx.DRIVE_ROOT, tid):
+                log.info("Mailbox follow-up refused for %s: cancel pending (pre-staging)", tid)
+                return ""
+            attachment_note, staged_manifest = _stage_mailbox_attachments(
+                ctx, tid, task_metadata, image_data,
+            )
+            if direct_lock_held:
+                # AR2-6 (fable): the direct-agent lane used to skip the
+                # cancel-pending admission check the queue lane makes below — a
+                # direct turn whose cancellation is pending must not accept a
+                # new owner message either. Same predicate, same honest
+                # fall-through to the direct chat lane.
+                if cancel_pending(ctx.DRIVE_ROOT, tid):
+                    log.info("Mailbox follow-up refused for %s: cancel pending (direct lane)", tid)
+                    _drop_staged_inputs()
+                    return ""
             if not direct_lock_held:
                 _queue_lock.acquire()
                 queue_lock_held = True
@@ -447,6 +490,15 @@ def _route_project_chat_to_running_task(
                     for row in list(getattr(ctx, "PENDING", []) or [])
                 )
                 if live_meta is None and not still_pending:
+                    return ""
+                # Phase A: a task whose cancellation is PENDING must not accept a
+                # new owner message — same refusal the steer_task route makes,
+                # checked inside this admission transaction. Falling through to
+                # the direct lane is the honest outcome: the follow-up is
+                # answered in chat instead of handed to a dying task.
+                if cancel_pending(ctx.DRIVE_ROOT, tid):
+                    log.info("Mailbox follow-up refused for %s: cancel pending", tid)
+                    cancel_refused_in_txn = True
                     return ""
                 fence_root = str(task_obj.get("root_task_id") or tid)
                 active_fence = ACCEPTANCE_FENCES.get(fence_root)
@@ -471,12 +523,71 @@ def _route_project_chat_to_running_task(
                 _queue_lock.release()
             if direct_lock_held:
                 direct_lock.release()
+            if cancel_refused_in_txn:
+                # After the lock release: unlinking staged files is file I/O the
+                # global queue lock should not wait on.
+                _drop_staged_inputs()
         if fence_generation_changed:
             persist_queue_snapshot(reason="acceptance_fence_owner_message")
         return tid
     except Exception:
         log.debug("Mailbox follow-up routing failed; falling back to direct lane", exc_info=True)
     return ""
+
+
+def _owner_evolution_stop(ctx: Any, chat_id: int) -> str:
+    """The ``/evolve off`` stop transaction; returns the final status wording.
+
+    Cancels live evolution work BEFORE the terminal campaign close:
+    ``complete_evolution_campaign`` runs the per-cycle worktree cleanup, which
+    skips while a task still holds the shared worktree — so the running cycle
+    must be gone first. PENDING evolution tasks go through the SAME durable
+    intent + typed custody (GR2-13); the old in-place prune left them with no
+    intent, no terminal result and no ``task_done``, and a stop with still-live
+    leftovers was declared clean.
+    """
+    stop_incomplete = False
+    try:
+        from supervisor.queue import evolution_stop_report, stop_evolution_tasks
+        from ouroboros.post_task_evolution import drop_pending_request
+
+        # Fast path: drop any queued post-task promotion so it cannot re-arm on
+        # the next boot tick (the evolution_owner_stopped flag is the durable backstop).
+        drop_pending_request(ctx.DRIVE_ROOT)
+        stopped = stop_evolution_tasks("disabled via owner chat")
+        ctx.sort_pending()
+        ctx.persist_queue_snapshot(reason="evolve_off")
+        stop_lines, stop_incomplete = evolution_stop_report(stopped)
+        for line in stop_lines:
+            ctx.send_with_budget(chat_id, line)
+    except Exception:
+        log.warning("Evolution stop transaction failed", exc_info=True)
+        stop_incomplete = True
+    try:
+        from supervisor.evolution_lifecycle import complete_evolution_campaign
+
+        if stop_incomplete:
+            # GR3-3: an INCOMPLETE stop must not close the campaign — a terminal
+            # "stopped" over still-live evolution work declares a clean ending
+            # that did not happen. The campaign stays open; the durable
+            # evolution_owner_stopped flag already blocks new cycles, and the
+            # owner-stop backstop (supervisor/events.py, on the live task's own
+            # settle) closes the campaign once nothing is live.
+            log.warning(
+                "Evolution stop is incomplete; campaign left open for the "
+                "settle-time owner-stop backstop",
+            )
+        else:
+            # Terminal close (not a resumable pause): /evolve start mints a FRESH
+            # campaign rather than resurrecting this one.
+            complete_evolution_campaign("disabled via owner chat", status="stopped")
+    except Exception:
+        log.warning("Failed to update evolution campaign state", exc_info=True)
+    if stop_incomplete:
+        return ("OFF (mode disabled) — but the stop is INCOMPLETE: see the "
+                "still-live task(s) above. The campaign stays open until they "
+                "settle. Post-task auto-evolution stays paused until /evolve start")
+    return "OFF — post-task auto-evolution also paused until /evolve start"
 
 
 def _clip_marked(value: str, limit: int) -> str:
@@ -877,10 +988,36 @@ def _start_supervisor_liveness_watchdog(liveness: list, stop_event=None) -> None
     threading.Thread(target=_watch, name="supervisor-liveness-watchdog", daemon=True).start()
 
 
+_LAST_CANCEL_INTENT_SWEEP = [0.0]
+
+
 def _periodic_supervisor_maintenance(last_custody_reap: list, last_review_reconcile: list) -> None:
-    """Throttled periodic upkeep extracted from the supervisor loop: custody reap
-    of orphaned task-scoped processes (every 600s) + review-job zombie reconcile
-    (every 300s). Each cadence gates itself via its own last-run marker."""
+    """Throttled periodic upkeep extracted from the supervisor loop: cancel-intent
+    watchdog (every 20s), custody reap of orphaned task-scoped processes (every
+    600s) + review-job zombie reconcile (every 300s). Each cadence gates itself
+    via its own last-run marker."""
+    if time.time() - _LAST_CANCEL_INTENT_SWEEP[0] > 20:
+        _LAST_CANCEL_INTENT_SWEEP[0] = time.time()
+        try:
+            # Phase A watchdog: re-feed open durable cancel intents into custody
+            # (the ONE settle owner) so a lost control event can no longer wedge
+            # a cancellation forever — the Poltergeist incident class.
+            from supervisor.task_lifecycle import sweep_cancel_intents
+
+            outcomes = sweep_cancel_intents()
+            if outcomes:
+                log.info("Cancel-intent watchdog settled: %s", outcomes)
+        except Exception:
+            log.debug("Cancel-intent watchdog sweep failed", exc_info=True)
+        try:
+            # Phase A2/F7: re-enqueue terminal answers registered as OWED whose
+            # send never got confirmed (a crash between settle and send used to
+            # lose the owner's answer forever — the incident class itself).
+            from supervisor.terminal_delivery import replay_pending_deliveries
+
+            replay_pending_deliveries(DATA_DIR)
+        except Exception:
+            log.debug("Pending terminal-delivery replay failed", exc_info=True)
     if time.time() - last_custody_reap[0] > 600:
         last_custody_reap[0] = time.time()
         try:
@@ -930,6 +1067,28 @@ def _startup_custody_sweep() -> None:
     except Exception:
         log.debug("Process custody startup reap failed", exc_info=True)
     _reconcile_delegated_runs(set())
+    try:
+        # Phase A boot migration: legacy ``cancel_requested`` status latches
+        # become ordinary durable cancel intents; the supervisor watchdog then
+        # drives each through custody to a real settled outcome.
+        from ouroboros.cancel_intents import migrate_legacy_cancel_latches
+
+        migrated = migrate_legacy_cancel_latches(DATA_DIR)
+        if migrated:
+            log.info("Migrated %d legacy cancel latch(es) to durable intents: %s",
+                     len(migrated), migrated)
+    except Exception:
+        log.debug("Legacy cancel-latch migration failed", exc_info=True)
+    try:
+        # Boot half of the durable terminal outbox: an answer that was registered
+        # as owed but whose send never completed (crash between settle and send)
+        # is re-enqueued exactly once — the delivered registry suppresses a copy
+        # that actually landed.
+        from supervisor.terminal_delivery import replay_pending_deliveries
+
+        replay_pending_deliveries(DATA_DIR)
+    except Exception:
+        log.debug("Boot replay of pending terminal deliveries failed", exc_info=True)
 
 
 def _scoped_task_metadata(project_id: str, task_metadata: Any) -> Any:
@@ -1426,16 +1585,34 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
                 objective = text.split(None, 2)[2].strip()
             if turn_on:
                 from supervisor.evolution_lifecycle import evolution_block_reason, start_evolution_campaign
+                from supervisor.state import update_state as _evo_update_state
 
                 block = evolution_block_reason()
                 if block:
                     ctx.send_with_budget(chat_id, block)
                     continue
+                # GR4-6: clear the durable owner-stop flag BEFORE the campaign is
+                # minted — the old order (campaign first, flag cleared in the later
+                # save_state below) left a window where the owner-stop backstop,
+                # fired by an old evolution task settling, read flag=True +
+                # campaign=active and closed the FRESH campaign. Owner-authorized
+                # clear (the owner is explicitly starting evolution). GR5-1: the
+                # prior value is captured FIRST so a failed start can restore it.
+                _prior_owner_stop = bool(ctx.load_state().get("evolution_owner_stopped"))
+                _evo_update_state(lambda live: live.__setitem__("evolution_owner_stopped", False))
                 try:
                     if not start_evolution_campaign(objective, source="owner_chat"):
                         raise RuntimeError("campaign write was refused")
                 except Exception:
                     log.warning("Failed to start evolution campaign", exc_info=True)
+                    # GR5-1: the start FAILED, so the pre-mint clear was not an
+                    # owner-authorized state change after all. Restore the CAPTURED
+                    # prior value — leaving it cleared would let the post-task
+                    # promotion pipeline (apply_pending_request reads the flag)
+                    # autonomously re-arm evolution the owner believes is off, and
+                    # an unconditional True would invent a stop that never happened.
+                    _evo_update_state(lambda live, _v=_prior_owner_stop: live.__setitem__(
+                        "evolution_owner_stopped", _v))
                     ctx.send_with_budget(chat_id, "⚠️ Evolution stayed OFF: campaign state could not be created.")
                     continue
             st2 = ctx.load_state()
@@ -1451,37 +1628,10 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
             # autostop, which would disable the owner's campaign after one cycle.
             st2["post_task_autostop"] = False
             ctx.save_state(st2)
-            if not turn_on:
-                # Cancel the live evolution worker BEFORE the terminal campaign close below:
-                # complete_evolution_campaign runs the per-cycle worktree cleanup, which skips
-                # while a task still holds the shared worktree — so the running cycle must be
-                # gone first (pruning PENDING alone leaves a mid-cycle task running).
-                from supervisor.queue import cancel_running_evolution_tasks
-                from ouroboros.post_task_evolution import drop_pending_request
-
-                # Fast path: drop any queued post-task promotion so it cannot re-arm on
-                # the next boot tick (the evolution_owner_stopped flag is the durable backstop).
-                drop_pending_request(ctx.DRIVE_ROOT)
-                cancelled = cancel_running_evolution_tasks("disabled via owner chat")
-                ctx.PENDING[:] = [t for t in ctx.PENDING if str(t.get("type")) != "evolution"]
-                ctx.sort_pending()
-                ctx.persist_queue_snapshot(reason="evolve_off")
-                if cancelled:
-                    ctx.send_with_budget(
-                        chat_id,
-                        f"🛑 Cancelled running evolution task(s): {', '.join(cancelled)}",
-                    )
-            try:
-                from supervisor.evolution_lifecycle import complete_evolution_campaign
-
-                if not turn_on:
-                    # Terminal close (not a resumable pause): /evolve start mints a FRESH
-                    # campaign rather than resurrecting this one.
-                    complete_evolution_campaign("disabled via owner chat", status="stopped")
-            except Exception:
-                log.warning("Failed to update evolution campaign state", exc_info=True)
-            _evo_msg = "ON" if turn_on else "OFF — post-task auto-evolution also paused until /evolve start"
-            ctx.send_with_budget(chat_id, f"🧬 Evolution campaign: {_evo_msg}")
+            ctx.send_with_budget(
+                chat_id,
+                f"🧬 Evolution campaign: {'ON' if turn_on else _owner_evolution_stop(ctx, chat_id)}",
+            )
         elif lowered.startswith("/bg"):
             parts = lowered.split()
             action = parts[1] if len(parts) > 1 else "status"

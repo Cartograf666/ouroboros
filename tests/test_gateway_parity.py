@@ -273,8 +273,11 @@ def test_skill_delete_contract_matches_runtime_shape():
 
 
 def test_v682_cancellation_contract_fields_are_mirrored_in_both_languages():
-    """The additive cancellation ABI (v6.82) must exist in BOTH mirrors: the
-    host-attested cancelable marker and the cancel endpoint's cascade echo."""
+    """The additive cancellation ABI (v6.82 + phase A) must exist in BOTH
+    mirrors: the host-attested cancelable marker, the cancel endpoint's cascade
+    echo, and the phase-A ``cancel_state`` pending projection on the task
+    detail envelope (AR2-8; the field-level parity loop above pins the exact
+    TaskDetailResponse key set in both languages)."""
     repo = pathlib.Path(__file__).resolve().parents[1]
     python_contract = (repo / "ouroboros" / "gateway" / "contracts.py").read_text(encoding="utf-8")
     js_contract = (repo / "web" / "modules" / "api_types.js").read_text(encoding="utf-8")
@@ -283,6 +286,41 @@ def test_v682_cancellation_contract_fields_are_mirrored_in_both_languages():
     assert "cascade: bool" in python_contract
     assert "@property {boolean=} cancelable" in js_contract
     assert "@property {boolean=} cascade" in js_contract
+    assert "cancel_state: str" in python_contract
+    assert "@property {string=} cancel_state" in js_contract
+    # GR2-11: the intent's reason is public beside the state, in both mirrors.
+    assert "cancel_reason: str" in python_contract
+    assert "@property {string=} cancel_reason" in js_contract
+
+
+def test_task_detail_serves_the_cancel_state_projection(tmp_path):
+    """AR2-8 runtime half: an ACTIVE durable cancel intent rides the effective
+    task read as ``cancel_state: "pending"`` (with ``cancel_reason`` beside it
+    when the intent carries one — GR2-11) and passes through the public
+    projection ``api_task_get`` serves; a settled task never carries it."""
+    from ouroboros.cancel_intents import request_cancel
+    from ouroboros.outcomes import public_task_result
+    from ouroboros.task_results import write_task_result
+    from ouroboros.task_status import load_effective_task_result
+
+    write_task_result(tmp_path, "cs1", "running", result="working")
+    request_cancel(tmp_path, "cs1", reason="stop")
+    payload = public_task_result(load_effective_task_result(tmp_path, "cs1"))
+    assert payload["cancel_state"] == "pending"
+    assert payload["cancel_reason"] == "stop"
+
+    # A reason-less intent serves the state alone — no empty-string field.
+    write_task_result(tmp_path, "cs3", "running", result="working")
+    request_cancel(tmp_path, "cs3")
+    payload = public_task_result(load_effective_task_result(tmp_path, "cs3"))
+    assert payload["cancel_state"] == "pending"
+    assert "cancel_reason" not in payload
+
+    write_task_result(tmp_path, "cs2", "completed", result="done")
+    request_cancel(tmp_path, "cs2")  # completion wins: nothing minted
+    payload = public_task_result(load_effective_task_result(tmp_path, "cs2"))
+    assert "cancel_state" not in payload
+    assert "cancel_reason" not in payload
 
 
 def test_task_detail_cost_breakdown_emission_matches_contract(monkeypatch, tmp_path):

@@ -206,6 +206,28 @@ def daemon_says_absent(exc: Any) -> bool:
     return int(getattr(exc, "status_code", 0) or 0) == 404
 
 
+def custody_log_unreadable(drive_root: Any) -> bool:
+    """Whether the custody event log EXISTS but cannot be opened (GR6-4).
+
+    ``_iter_rows`` swallows its own ``OSError`` — the right behavior for the
+    fail-soft readers — but the KILL/MISS/REAP AUDIT must not let an
+    unreadable log audit as "cleanly reconciled": ABSENT is a positively
+    established empty state (no custody row could exist), while
+    existing-but-unreadable means the open-run answer is UNKNOWN. Same probe
+    the evidence reader (``task_execution_evidence``) already uses; its own
+    semantics are unchanged.
+    """
+    path = event_log_path(drive_root)
+    try:
+        if not path.exists():
+            return False
+        with path.open("rb"):
+            pass
+    except OSError:
+        return True
+    return False
+
+
 def _iter_rows(path: pathlib.Path, tail_bytes: Optional[int] = None) -> Iterator[Dict[str, Any]]:
     try:
         with path.open("rb") as handle:
@@ -1130,6 +1152,28 @@ def release_task_runs(drive_root: Any, task_id: str, *,
     return _reconcile_each(drive_root, held, gateway_factory) if held else []
 
 
+def reconcile_task_runs(drive_root: Any, task_id: str, *,
+                        gateway_factory: Optional[Callable[[], Any]] = None) -> List[Dict[str, Any]]:
+    """Settle or cancel ONE task's open runs from the DURABLE rows (kill path).
+
+    The supervisor-side twin of ``release_task_runs`` for a task whose worker was
+    just KILLED (cancellation custody / reap): the graceful loop-exit release runs
+    inside the worker and therefore never ran, and its in-process memo died with
+    the process, so the durable custody rows are the only complete view. Covers
+    pending invocations the same way the orphan sweep does. Cheap when the task
+    delegated nothing: the replay finds no open run and no transport is touched.
+    """
+    mine = str(task_id or "")
+    if not mine:
+        return []
+    held = [c for c in open_runs(drive_root) if c.task_id == mine]
+    stray = [record for record in pending_invocations(drive_root)
+             if record["task_id"] == mine]
+    if not held and not stray:
+        return []
+    return _reconcile_each(drive_root, held, gateway_factory, pending=stray)
+
+
 def reconcile_orphaned_runs(
     drive_root: Any,
     running_task_ids: Optional[set] = None,
@@ -1328,6 +1372,7 @@ __all__ = [
     "UNKNOWN",
     "cancel_and_verify",
     "close_absent_run",
+    "custody_log_unreadable",
     "custody_root",
     "daemon_says_absent",
     "disclosed_spend",
@@ -1348,6 +1393,7 @@ __all__ = [
     "record_settled_unread",
     "record_started",
     "release_task_runs",
+    "reconcile_task_runs",
     "retire_project",
     "run_timing",
     "settle_run",
