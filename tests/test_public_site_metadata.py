@@ -8,6 +8,8 @@ import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from pathlib import Path
 
+import yaml
+
 REPO = Path(__file__).resolve().parents[1]
 SITE = REPO / "site"
 DOCS = REPO / "docs"
@@ -128,7 +130,24 @@ def test_llms_file_is_a_small_absolute_navigation_map():
     assert f"{ORIGIN}/benchmarks/" in linked_urls
     assert f"{ORIGIN}/paper/" in linked_urls
     for url in linked_urls:
-        assert url.startswith((ORIGIN, "https://github.com/", "https://api.github.com/"))
+        assert url == "https://claudexor.ai/" or url.startswith(
+            (ORIGIN, "https://github.com/", "https://api.github.com/")
+        )
+
+
+def test_public_surfaces_explain_the_claudexor_relationship():
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    homepage = (SITE / "index.html").read_text(encoding="utf-8")
+    llms = (SITE / "public" / "llms.txt").read_text(encoding="utf-8")
+    generated_homepage = (DOCS / "index.html").read_text(encoding="utf-8")
+    generated_llms = (DOCS / "llms.txt").read_text(encoding="utf-8")
+
+    for surface in (readme, homepage, llms, generated_homepage, generated_llms):
+        assert "https://claudexor.ai/" in surface
+        assert "https://github.com/razzant/claudexor" in surface
+    assert "Ouroboros owns the task, memory, review, and final integration" in readme
+    assert 'aria-labelledby="claudexor-card-title"' in homepage
+    assert "durable execution evidence" in homepage
 
 
 def test_install_manifest_discovers_releases_without_future_asset_hashes():
@@ -327,3 +346,30 @@ def test_site_changes_trigger_branch_ci():
     assert "pnpm --dir site build" in workflow
     assert "git status --porcelain --untracked-files=all -- docs/" in workflow
     assert "git diff --exit-code -- docs/" in workflow
+
+
+def test_claudexor_dependency_snapshot_is_pin_derived_and_least_privilege():
+    path = REPO / ".github" / "workflows" / "dependency-graph.yml"
+    text = path.read_text(encoding="utf-8")
+    workflow = yaml.load(text, Loader=yaml.BaseLoader)
+
+    assert workflow["permissions"] == {"contents": "write"}
+    assert workflow["on"]["push"]["branches"] == ["main", "ouroboros"]
+    assert workflow["on"]["push"]["paths"] == [
+        "ouroboros/claudexor_runtime_pin.json",
+        ".github/workflows/dependency-graph.yml",
+    ]
+    assert workflow["on"]["workflow_dispatch"] == {}
+    assert "pull_request" not in workflow["on"]
+    assert "secrets." not in text
+    assert "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" in text
+    assert 'pin["release"]["version"]' in text
+    assert 'tag = f"v{version}"' in text
+    assert 'f"pkg:github/razzant/claudexor@{tag}"' in text
+    assert '"relationship": "direct"' in text
+    assert '"scope": "runtime"' in text
+    assert 'pin["release"]["build_sha"]' in text
+    assert 'pin["release"]["archive_url"]' in text
+    assert '"scanned"' in text
+    assert 'X-GitHub-Api-Version: 2026-03-10' in text
+    assert "dependency-graph/snapshots" in text
