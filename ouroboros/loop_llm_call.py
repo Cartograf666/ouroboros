@@ -119,11 +119,6 @@ def fold_retrieval_usage(accumulated_usage: Dict[str, Any], usage: Dict[str, Any
 # large) keep failing fast. There is NO cross-model fallback here — the same
 # request is retried on the SAME model.
 _TRANSIENT_RETRY_KINDS = frozenset({"provider_transient", "provider_incomplete_response"})
-# Every attempt in call_llm_with_retry rebuilds the SAME request, so a response
-# cache in front of the provider (e.g. a LiteLLM proxy with `cache: true`) replays
-# the identical failed body and the retry budget above never reaches the model.
-# Hence `bypass_response_cache=attempt > 0` there: retries opt out of the cache,
-# while the first attempt still benefits from a warm one.
 # Error kinds that put a model on the F1 fallback cooldown. Superset of the same-model
 # retry kinds: a body-error 429 (HTTP 200 with an error in the body — the canonical
 # cloud.ru/OpenRouter rate-limit shape) is classified "rate_limit", which must cool the
@@ -838,7 +833,7 @@ def call_llm_with_retry(
     execution_id = str(accumulated_usage.setdefault("execution_id", new_execution_id()))
     round_id = f"{execution_id}:round:{round_idx}"
     transient_budget = _attempt_loop_budget(max_retries, attempt_cap)
-
+    response_cache_bypass_requested = False
     for attempt in range(transient_budget):
         accumulated_usage["_llm_attempts_used"] = attempt + 1
         llm_call_id = new_call_id("llm")
@@ -882,8 +877,8 @@ def call_llm_with_retry(
                 "max_tokens": MAIN_LOOP_MAX_TOKENS,
                 "use_local": use_local,
                 "allow_server_web_search": bool(allow_server_web_search),
+                "bypass_response_cache": response_cache_bypass_requested,
             }
-            kwargs["bypass_response_cache"] = attempt > 0
             if tools:
                 kwargs["tools"] = tools
             try:
@@ -901,6 +896,7 @@ def call_llm_with_retry(
                         "max_tokens": MAIN_LOOP_MAX_TOKENS,
                         "use_local": bool(use_local),
                         "allow_server_web_search": bool(allow_server_web_search),
+                        "response_cache_bypass_requested": response_cache_bypass_requested,
                     },
                     manifest={
                         "execution_id": execution_id,
@@ -910,14 +906,13 @@ def call_llm_with_retry(
                         "attempt": attempt + 1,
                         "model": model,
                         "reasoning_effort": effort,
+                        "response_cache_bypass_requested": response_cache_bypass_requested,
                         **_context_fit_event_fields(accumulated_usage),
                     },
                 )
             except Exception:
                 log.debug("Failed to persist LLM request observability payload", exc_info=True)
-            # #4 self-DoS guard: cap concurrent calls to THIS model route (excess worker
-            # threads wait, bounded by the deadline, instead of storming a rate limit). Wraps
-            # ONLY the provider call — not the retry loop, not the backoff. Fail-soft.
+            # Cap only the provider call, not retries/backoff; fail-soft and deadline-bounded.
             with model_concurrency.model_call_slot(model, use_local, deadline_ts):
                 resp_msg, usage = llm.chat(**kwargs)
             msg = resp_msg
@@ -996,8 +991,9 @@ def call_llm_with_retry(
                     task_type=task_type, content=content, tool_calls=tool_calls,
                     request_ref=request_ref, response_ref=response_ref, transient_budget=transient_budget,
                 )
-                # Transient response glitches (and transient body errors) retry the SAME model
-                # within the transient budget, deadline-bounded; a PERMANENT body error fails fast.
+                if event_type == "provider_incomplete_response":
+                    response_cache_bypass_requested = True
+                # Transient response glitches retry the same model; permanent body errors fail fast.
                 if not permanent_body_error and attempt < transient_budget - 1:
                     if _sleep_within_deadline(
                         min(2.0 ** attempt, _TRANSIENT_BACKOFF_CAP_SEC), deadline_ts

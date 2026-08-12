@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -10,7 +11,6 @@ import os
 import re
 import threading
 import time
-import copy
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ouroboros.provider_models import (
@@ -1203,7 +1203,7 @@ class LLMClient:
         target: Dict[str, Any],
         exc: BaseException,
     ) -> Optional[Dict[str, Any]]:
-        """Remove only an explicitly rejected cache-affinity parameter once."""
+        """Remove only an explicitly rejected cache control or affinity once."""
         provider = str(target.get("provider") or "").strip().lower()
         extra_body = payload.get("extra_body")
         param = ""
@@ -1215,6 +1215,12 @@ class LLMClient:
             and "session_id" in extra_body
         ):
             param = "session_id"
+        elif (
+            provider == "openai-compatible"
+            and isinstance(extra_body, dict)
+            and "cache" in extra_body
+        ):
+            param = "cache"
         if not param:
             return None
 
@@ -1246,11 +1252,11 @@ class LLMClient:
         else:
             retry_extra = retry_payload.get("extra_body")
             if isinstance(retry_extra, dict):
-                retry_extra.pop("session_id", None)
+                retry_extra.pop(param, None)
             if not retry_extra:
                 retry_payload.pop("extra_body", None)
         log.warning(
-            "Retrying %s once without unsupported prompt-cache parameter %s",
+            "Retrying %s once without unsupported cache parameter %s",
             str(target.get("usage_model") or target.get("resolved_model") or "(unknown model)"),
             param,
         )
@@ -3610,7 +3616,7 @@ class LLMClient:
                     for tool in self._sanitize_chat_completion_tools(tools)
                 ]
                 kwargs["tool_choice"] = tool_choice
-            if bypass_response_cache:
+            if bypass_response_cache and provider == "openai-compatible":
                 # Must ride in extra_body: the OpenAI SDK rejects unknown top-level
                 # kwargs with TypeError, so a raw `cache=` argument never reaches
                 # the wire.
@@ -3702,15 +3708,6 @@ class LLMClient:
             kwargs["temperature"] = temperature
         if response_format:
             kwargs["response_format"] = dict(response_format)
-        if bypass_response_cache:
-            # A retry of a byte-identical request only helps when nothing between
-            # us and the model caches responses.  A gateway response cache (e.g.
-            # LiteLLM `cache: true`) otherwise replays the SAME failed body for
-            # every attempt, so the whole transient-retry budget never reaches the
-            # model.  `cache.no-cache` is LiteLLM's documented per-request opt-out
-            # and must ride in extra_body — the OpenAI SDK raises TypeError on
-            # unknown top-level kwargs.  Servers that do not know the field ignore it.
-            extra_body["cache"] = {"no-cache": True}
         server_web_tool = (
             self._openrouter_main_web_search_tool()
             if (tools and allow_server_web_search)
