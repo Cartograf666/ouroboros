@@ -18,6 +18,11 @@ Ouroboros publishes self-reported benchmark results with status labels and links
 - [Constitution](https://github.com/razzant/ouroboros/blob/ouroboros/BIBLE.md): Identity and governing principles.
 - [Releases](https://github.com/razzant/ouroboros/releases): Published versions and assets.
 
+## Related software
+
+- [Claudexor](https://claudexor.ai/): The local execution layer Ouroboros uses for delegated coding and hosted-agent review.
+- [Claudexor source](https://github.com/razzant/claudexor): Routing, execution, and durable evidence for connected coding harnesses.
+
 ## Machine-readable resources
 
 - [Install metadata](https://ouroboros-agent.ai/install.json): Stable release discovery, artifact name templates, and verification metadata.
