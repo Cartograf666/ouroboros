@@ -1049,7 +1049,8 @@ Before every commit, verify the following:
   projection: every outstanding red/masked receipt first, then newest rows, with
   an exact omitted count; read the canonical store and fall back to the recorded
   child drive before copy-back. `wait_tasks` stays batch-compact:
-  `task_id, status, cost_usd, child_result_sha256, outcome_axes, result,
+  `task_id, status, cost_usd (+ its honest alias accounted_upper_bound_usd and
+  cost_final — C2), child_result_sha256, outcome_axes, result,
   trace_summary, capability_delta when disclosable, duplicate_of`; it points to
   the hash-addressed full result rather than re-inlining trace/ledger forensics.
   Unknown ids are probed across result, queue, and tree-ledger authorities and

@@ -226,13 +226,55 @@ export function formatUsdWhole(value) {
 }
 
 export function formatUsd2(value) {
+    // Null/undefined is UNKNOWN, never $0.00 (C2): `Number(null)` is 0 and the
+    // old NaN fallback also printed $0.00, so an absent cost wore a receipt.
+    if (value === null || value === undefined || value === '') return '—';
     const num = Number(value);
-    return Number.isFinite(num) ? `$${num.toFixed(2)}` : '$0.00';
+    return Number.isFinite(num) ? `$${num.toFixed(2)}` : '—';
 }
 
 export function formatUsd4(value) {
+    // A REAL zero is a fact and prints as $0.0000; only an ABSENT/unparseable
+    // amount renders as nothing (C2 null policy — the `> 0` test used to hide a
+    // genuine free round exactly like an unknown one).
+    if (value === null || value === undefined || value === '') return '';
     const num = Number(value);
-    return Number.isFinite(num) && num > 0 ? `$${num.toFixed(4)}` : '';
+    return Number.isFinite(num) ? `$${num.toFixed(4)}` : '';
+}
+
+// The additive/deprecated cost name pairs, mirrored from
+// `ouroboros/cost_projection.py` — the browser reads the same pairs the
+// producers write.
+export const COST_ALIAS_PAIRS = [
+    ['accounted_upper_bound_usd', 'cost_usd'],
+    ['accounted_upper_bound_usd_with_children', 'cost_usd_with_children'],
+];
+
+/**
+ * The ONE precedence rule for an additive/deprecated cost pair, shared by every
+ * reader: THE DEPRECATED NAME WINS when both keys are present, exactly as
+ * `cost_projection.resolve_cost_pair` decides it on the Python side. Two seams
+ * answering this differently is how one surface showed the honest name while
+ * another showed a diverged alias for the same record.
+ * Returns null when neither name is present or the value is not finite.
+ */
+export function resolveCostPair(payload, newName, oldName) {
+    const source = payload || {};
+    const has = (key) => Object.prototype.hasOwnProperty.call(source, key);
+    const raw = has(oldName) ? source[oldName] : (has(newName) ? source[newName] : null);
+    if (raw === null || raw === undefined || raw === '') return null;
+    const num = Number(raw);
+    return Number.isFinite(num) ? num : null;
+}
+
+/** This task's own accounted upper bound (null when unknown). */
+export function accountedUpperBound(payload) {
+    return resolveCostPair(payload, ...COST_ALIAS_PAIRS[0]);
+}
+
+/** The subtree accounted upper bound incl. children (null when unknown). */
+export function accountedUpperBoundWithChildren(payload) {
+    return resolveCostPair(payload, ...COST_ALIAS_PAIRS[1]);
 }
 
 export function renderMarkdown(text) {

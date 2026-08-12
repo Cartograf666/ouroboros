@@ -913,6 +913,28 @@ def _data_write(
         marker_path = marker_payload[2] / _SELF_AUTHORED_MARKER
         should_mark_self_authored = not marker_path.exists()
 
+    # X3 hash-bind: the ADMITTED repair task's payload writes CAS-check the
+    # repair's own hash chain (covers overwrite AND append — an append drifts
+    # the payload exactly like an overwrite). Foreign lanes pass through.
+    _repair_cas_constraint = (
+        task_constraint
+        if task_constraint and task_constraint.mode == "skill_repair"
+        and str(getattr(task_constraint, "skill_name", "") or "")
+        else None
+    )
+    if _repair_cas_constraint is not None:
+        from ouroboros.skill_repair_admission import repair_write_cas_error
+
+        _cas = repair_write_cas_error(
+            pathlib.Path(ctx.drive_root), _repair_cas_constraint,
+            task_id=str(getattr(ctx, "task_id", "") or ""),
+            # The TASK's own constraint decides whether the binding is mandatory:
+            # a short-form `bucket`+`skill_name` selector synthesizes the same
+            # constraint shape for an ordinary payload edit, and that lane must
+            # not need a repair admission.
+            repair_task=bool(existing_tc and existing_tc.mode == "skill_repair"))
+        if _cas:
+            return _cas
     p.parent.mkdir(parents=True, exist_ok=True)
     if mode == "overwrite":
         # Deferral 5: block likely-accidental truncation of an existing data-plane file
@@ -923,6 +945,12 @@ def _data_write(
     else:
         with p.open("a", encoding="utf-8") as f:
             f.write(content)  # append is intentionally NOT atomized
+    if _repair_cas_constraint is not None:
+        from ouroboros.skill_repair_admission import advance_repair_expected_hash
+
+        advance_repair_expected_hash(
+            pathlib.Path(ctx.drive_root), _repair_cas_constraint,
+            task_id=str(getattr(ctx, "task_id", "") or ""))
     if should_mark_self_authored and marker_path is not None:
         from ouroboros.skill_loader import compute_content_hash
 

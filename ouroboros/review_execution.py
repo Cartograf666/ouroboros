@@ -78,7 +78,7 @@ class ReviewSessionWaitingOnUser(RuntimeError):
     itself (BR2-2); anything unverified says the run may still be live, and a
     verify read that finds the run already SUCCEEDED never raises this at all
     (completion wins). Answering support for hosted review lanes is a
-    deliberate non-goal (owner: no acceptance host-wait; PHASE_B_NOTES).
+    deliberate non-goal (owner: no acceptance host-wait; see docs/ARCHITECTURE.md).
     """
 
 

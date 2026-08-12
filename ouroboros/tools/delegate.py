@@ -29,17 +29,16 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import logging
-import pathlib
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ouroboros import delegate_custody as custody
 from ouroboros import delegate_progress as progress
 from ouroboros.delegate_custody import RunCustody as _RunCustody
 from ouroboros.tool_capabilities import tool_result_limit
-from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for
-from ouroboros.utils import resolve_path_allow_missing, truncate_within_limit
+from ouroboros.tools.registry import ToolContext, ToolEntry
+from ouroboros.utils import truncate_within_limit
 # The staged-output + read-receipt cluster lives in its own module (size gate);
 # re-exported here because sibling code, the tests and the convergence census all
 # name it on THIS surface, and `_READ_COVERAGE` must stay the same object.
@@ -83,6 +82,22 @@ from ouroboros.delegate_shared import (  # noqa: F401
     _fail,
     _owned_run,
 )
+# The C1 integration seam (mutation authority, execution snapshots, retry binding,
+# terminal patch capture) lives in its own module (size gate); re-exported here
+# (same objects) because sibling code and the tests address it on THIS surface.
+# `_fail` is NOT re-imported from it — the one shared refusal author is
+# `delegate_shared._fail`, which delegate_integration itself imports.
+from ouroboros.tools.delegate_integration import (  # noqa: F401
+    _CAPTURE_DELEGATED_SNAPSHOT,
+    _capture_block,
+    _capture_terminal_patch,
+    _mutation_authority,
+    _provision_snapshot,
+    _resolve_retry_invocation,
+    _resolved,
+    _retry_binding_refusal,
+    _validated_invocation,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ouroboros.subagents import DelegatedRunShape
@@ -108,8 +123,6 @@ _CLAUDEXOR_MAX_SECONDS = 604_800
 # The process-local memo of the durable custody rows (the authority lives in the module
 # above); re-bound here because sibling code and tests name it on this surface.
 _CUSTODY = custody._CUSTODY
-
-
 
 
 
@@ -218,13 +231,19 @@ def _derive_authority(ctx: ToolContext) -> "DelegatedRunShape":
     Claudexor pick the mechanism (fs sandbox, tool allowlist, ...) — no harness branch.
 
     The SHAPE itself belongs to ``subagents.delegated_run_shape``, which the dispatcher
-    also reads: this function only answers "is this an acting child", which is the one
-    part that needs the live ``ToolContext``.
+    also reads: this function only answers "does this task hold a mutating surface",
+    which is the one part that needs the live ``ToolContext``. Two authorities qualify
+    (B5, owner 2=A): an ACTING CHILD with a valid write surface, and the ROOT of an
+    EXTERNAL-WORKSPACE task — the root already holds write+shell inside the project,
+    so its delegated runs carry the same mutating shape, bounded by the same
+    workspace; ``_mutation_authority`` (``tools.delegate_integration``) validates the
+    concrete target either way.
     """
     from ouroboros.subagents import delegated_run_shape
     from ouroboros.tool_access import active_tool_profile
 
-    return delegated_run_shape(active_tool_profile(ctx) == "acting_subagent")
+    profile = active_tool_profile(ctx)
+    return delegated_run_shape(profile in ("acting_subagent", "external_workspace_task"))
 
 
 def _containment_breach(detail: Dict[str, Any], authority: "DelegatedRunShape") -> Optional[_Breach]:
@@ -579,77 +598,6 @@ def _delivered_terminal_payload(ctx: ToolContext, run_id: str, detail: Dict[str,
 # -- tools --------------------------------------------------------------------
 
 
-def _resolved(path: Any) -> Optional[pathlib.Path]:
-    """Resolve a path, or None when it cannot be resolved at all (null byte, symlink
-    loop, unreadable parent). One predicate, so no call site re-enumerates the set."""
-    try:
-        return resolve_path_allow_missing(pathlib.Path(str(path)))
-    except (OSError, ValueError, RuntimeError, TypeError):
-        return None
-
-
-def _mutating_run_root(ctx: ToolContext, authority: "DelegatedRunShape") -> tuple[str, str]:
-    """The directory the run may write, cross-checked against the authority that allowed it.
-
-    AUTHORITY and ROOT came from two different predicates and were never compared.
-    Authority is derived from `task_constraint` via `active_tool_profile`; the root came
-    from `active_repo_dir_for`, and `ToolContext.active_repo_dir()` falls back to
-    `repo_dir` — the LIVE Ouroboros source tree — whenever `is_workspace_mode()` is false,
-    which `workspace_mode_block_reason` makes happen for an overlapping worktree root or a
-    task record missing its workspace fields. In that state the host would have handed an
-    external shell `workspace_write` + `live` on its own repository, and every per-tool
-    guard is irrelevant because the harness is a shell, not a tool. The registry already
-    hard-blocks `write_file`/`run_command` and their coding siblings in exactly that state; this
-    verb was simply not on the list.
-
-    A mutating run therefore requires an ACTIVE workspace whose root is the very
-    `write_root` the constraint granted. Disagreement is a typed refusal, never a
-    best-effort guess. Read-only runs keep the ordinary active root: they write nothing.
-    """
-    root = str(active_repo_dir_for(ctx))
-    if authority.access != "workspace_write":
-        return root, ""
-    constraint = getattr(ctx, "task_constraint", None)
-    granted = str(
-        (constraint.get("write_root") if isinstance(constraint, dict)
-         else getattr(constraint, "write_root", "")) or ""
-    ).strip()
-    if not granted:
-        return "", _fail(
-            "delegate_start", "write_root_missing",
-            "This child is allowed to write, but its task constraint names no write_root, "
-            "so there is no directory the host can honestly confine the run to.",
-        )
-    # AGREEMENT IS NOT ENOUGH: `active_repo_dir_for` falls back to `repo_dir` when
-    # workspace mode is off, so a constraint whose write_root happens to name that same
-    # directory made the comparison pass and handed a shell the live repository — the
-    # very case this guard was written for. Require the workspace to be genuinely ACTIVE.
-    # ONE predicate, the one the registry already owns. `workspace_mode_block_reason`
-    # returns "" precisely WHEN `workspace_mode` is empty, so "no block reason" is
-    # satisfied by the absence of a workspace — the condition was true in exactly the
-    # case it was written to refuse. `is_workspace_mode()` is the question actually
-    # being asked, and `active_repo_dir()` branches on that same call.
-    if not (callable(getattr(ctx, "is_workspace_mode", None)) and ctx.is_workspace_mode()):
-        return "", _fail(
-            "delegate_start", "workspace_not_active",
-            "A delegated run may only WRITE inside an ACTIVE workspace, and this task "
-            "has none. Refusing rather than falling back to the repository root.",
-        )
-    # "Can this path be resolved at all" is ONE question, not an exception set to
-    # re-enumerate: embedded nulls and symlink loops vary in exact exception behaviour
-    # across supported Python versions, and either escaping here would abort
-    # delegate_start instead of returning the typed refusal this function exists to produce.
-    resolved_root, resolved_grant = _resolved(root), _resolved(granted)
-    same = resolved_root is not None and resolved_root == resolved_grant
-    if not same:
-        return "", _fail(
-            "delegate_start", "write_root_mismatch",
-            "The active root and the granted write_root disagree, so the run would write "
-            "somewhere this task was never given. Refusing rather than guessing.",
-            active_root=root, granted_write_root=granted,
-        )
-    return root, ""
-
 def _start_request(ctx: ToolContext, route: Any, authority: "DelegatedRunShape",
                    root: str, text: str, seconds: int, instructions: str) -> Dict[str, Any]:
     """The POST body for one delegated run, built from the derived SHAPE.
@@ -711,58 +659,12 @@ def _start_request(ctx: ToolContext, route: Any, authority: "DelegatedRunShape",
     return request
 
 
-def _validated_invocation(drive: Any, retry_token: str, task_id: str,
-                          text: str) -> Tuple[Optional[Dict[str, Any]], str]:
-    """The stored invocation a retry may replay, or the typed refusal that stops it.
-
-    Six ways a token is not replayable, each answered by name: no record, another
-    task's, already bound, definitely refused (its id is retired — replaying wedges a
-    permanent 409), no canonical body, prompt disagrees. One author for all six.
-    """
-    record = custody.invocation_record(drive, retry_token)
-    if record is None:
-        return None, _fail("delegate_start", "unknown_invocation",
-                           "retry_of names an invocation with no durable record on this "
-                           "drive. Start a new run with a plain delegate_start.",
-                           retry_of=retry_token)
-    if record["task_id"] != task_id:
-        return None, _fail("delegate_start", "invocation_not_owned",
-                           "retry_of names another task's invocation. A delegated start "
-                           "may only be retried by the task that requested it.",
-                           retry_of=retry_token)
-    if record["state"] == "started":
-        return None, _fail("delegate_start", "invocation_already_started",
-                           "That invocation already bound a run — do not re-post it. "
-                           "Wait on the existing run instead.",
-                           retry_of=retry_token, run_id=record["run_id"])
-    if record["state"] == "failed_definite":
-        return None, _fail("delegate_start", "invocation_definitely_refused",
-                           "That invocation was definitively refused by the daemon; its "
-                           "id is retired. Start a new run with a plain delegate_start.",
-                           retry_of=retry_token)
-    body = record["request"]
-    if not isinstance(body, dict) or not body:
-        return None, _fail("delegate_start", "invocation_request_unrecorded",
-                           "That invocation's durable row carries no canonical request "
-                           "body, so it cannot be replayed byte-identically. Start a "
-                           "new run with a plain delegate_start.",
-                           retry_of=retry_token)
-    if str(body.get("prompt") or "") != text:
-        return None, _fail("delegate_start", "retry_prompt_mismatch",
-                           "retry_of replays the RECORDED invocation, but the prompt "
-                           "you passed differs from the one it sent. Pass the original "
-                           "prompt to retry, or drop retry_of to start a new run.",
-                           retry_of=retry_token)
-    return record, ""
-
-
 def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = None,
                     retry_of: Optional[str] = None) -> str:
     from ouroboros.claudexor_daemon import ensure_owned_gateway
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
     from ouroboros.subagents import (
-        DelegatedRunShape, DelegationRoute, get_subagent_harness,
-        resolve_subagent_executor, route_health,
+        get_subagent_harness, resolve_subagent_executor, route_health,
     )
 
     text = str(prompt or "").strip()
@@ -782,6 +684,11 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     drive = custody.custody_root(ctx)
     owned_project_id = ""
     invocation_id = ""
+    # C1 isolation binding facts — empty for read-only runs and until resolved.
+    snapshot_id = ""
+    baseline_sha = ""
+    target_root = ""
+    authority_source = ""
     # ONE logical invocation id per INTENDED invocation, and reuse ONLY by explicit
     # token — never by content-matching, because two identical intentions are still
     # two intentions (the owner's contract: an intended new start is a NEW id). An
@@ -794,49 +701,16 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     retry_token = str(retry_of or "").strip()
     recovering = bool(retry_token)
     if recovering:
-        # The stored invocation is the SINGLE SOURCE of EVERY fact about a retry — the
-        # health-checked route, the shape, the root, the project, the lookup key — not
-        # only of the wire bytes: re-deriving any of them POSTed the recorded body while
-        # the record and the parent's result described a configuration the run never had.
-        # Validated BEFORE any daemon call, so a refused token registers nothing.
-        record, refusal = _validated_invocation(
-            drive, retry_token, str(getattr(ctx, "task_id", "") or ""), text)
+        # The stored invocation is the SINGLE SOURCE of EVERY fact about a retry
+        # (route, shape, root, project, key, C1 binding — see
+        # _resolve_retry_invocation). Validated BEFORE any daemon call, so a
+        # refused token registers nothing.
+        binding, refusal = _resolve_retry_invocation(ctx, drive, retry_token, text)
         if refusal:
             return refusal
-        request_body = record["request"]
-        execution = (request_body.get("execution")
-                     if isinstance(request_body.get("execution"), dict) else {})
-        scope = request_body.get("scope") if isinstance(request_body.get("scope"), dict) else {}
-        route = DelegationRoute(route_id=str(request_body.get("primaryHarness") or ""),
-                                model=str(request_body.get("model") or ""),
-                                effort=str(request_body.get("effort") or ""))
-        authority = DelegatedRunShape(access=str(request_body.get("access") or ""),
-                                      mode=str(request_body.get("mode") or ""),
-                                      isolation=str(execution.get("isolation") or ""),
-                                      delegated=bool(execution.get("delegated")))
-        root = str(scope.get("root") or "")
-        key = str(record.get("idempotency_key") or "")
-        project_id = str(record.get("project_id") or "")
-        owned_project_id = project_id if record.get("project_owned") else ""
-        seconds = int(request_body.get("maxSeconds") or 0)
+        (request_body, route, authority, root, key, project_id, owned_project_id,
+         seconds, snapshot_id, target_root, baseline_sha, authority_source) = binding
         invocation_id = retry_token
-        if authority.access == "workspace_write":
-            # The replay will WRITE at the recorded root, so containment is re-asked
-            # against the task's PRESENT workspace — and the answer must be the very
-            # root the invocation recorded. A workspace that moved between the
-            # attempts makes the replay a write into a tree this task no longer
-            # holds, which is a refusal, never a re-derivation.
-            current_root, root_error = _mutating_run_root(ctx, authority)
-            if root_error:
-                return root_error
-            resolved_current, resolved_recorded = _resolved(current_root), _resolved(root)
-            if resolved_current is None or resolved_current != resolved_recorded:
-                return _fail(
-                    "delegate_start", "retry_root_divergence",
-                    "This retry replays a MUTATING invocation recorded against a root "
-                    "this task no longer holds: the active write root has moved since "
-                    "the original attempt. Start a new run for the current root.",
-                    retry_of=retry_token, recorded_root=root, active_root=current_root)
     else:
         route = get_subagent_harness()
         if route is None:
@@ -879,9 +753,23 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             )
 
         if not recovering:
-            root, root_error = _mutating_run_root(ctx, authority)
+            record_auth, root_error = _mutation_authority(ctx, authority)
             if root_error:
                 return root_error
+            invocation_id = custody.new_invocation_id()
+            root = record_auth["target_root"]
+            if authority.access == "workspace_write":
+                # C1: the run executes in a PRIVATE snapshot of the authority target,
+                # never in the shared tree. Provisioned (and durably registered)
+                # BEFORE the start intent below; scope.root becomes the snapshot.
+                target_root = record_auth["target_root"]
+                authority_source = record_auth["source"]
+                snapshot, snap_error = _provision_snapshot(ctx, drive, target_root, invocation_id)
+                if snap_error:
+                    return snap_error
+                snapshot_id = snapshot.snapshot_id
+                baseline_sha = snapshot.baseline_sha
+                root = snapshot.path
             existing_project = gateway.find_project_id(root)
             project_id = existing_project or gateway.register_project(root)
             owned_project_id = "" if existing_project else project_id
@@ -894,7 +782,6 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             key = custody.idempotency_key(getattr(ctx, "task_id", ""), route.route_id, access,
                                           authority.mode, authority.isolation, root, text,
                                           instructions)
-            invocation_id = custody.new_invocation_id()
             seconds = _bounded_max_seconds(ctx, max_seconds)
             request_body = _start_request(ctx, route, authority, root, text, seconds, instructions)
         lineage = getattr(ctx, "task_metadata", {}) or {}
@@ -908,7 +795,14 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             # invocation (P34R.2: worker died between the accepted POST and
             # record_started) can still attribute its ledger row to the task tree.
             root_task_id=str(lineage.get("root_task_id") or ""),
-            parent_task_id=str(lineage.get("parent_task_id") or ""))
+            parent_task_id=str(lineage.get("parent_task_id") or ""),
+            # The C1 isolation binding, durable BEFORE the POST: the canonical request
+            # above carries scope.root = execution root, and these name the snapshot,
+            # the baseline and the authority target so a retry reproduces the exact
+            # binding and the startup GC can see a pending invocation's snapshot.
+            snapshot_id=snapshot_id, execution_root=(root if snapshot_id else ""),
+            baseline_sha=baseline_sha, target_root=target_root,
+            authority_source=authority_source)
         if not requested:
             # The POST is CONDITIONAL on the durable request row: launching anyway
             # would start an overpowered run that nothing durable names, and a worker
@@ -926,7 +820,8 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                 **_retire_orphaned_registration(ctx, gateway, owned_project_id,
                                                 definite_refusal=not recovering,
                                                 reason="start_request_row_unwritable",
-                                                invocation_id=invocation_id))
+                                                invocation_id=invocation_id,
+                                                snapshot_id=("" if recovering else snapshot_id)))
         handle = gateway.start_run(request_body, idempotency_key=invocation_id)
         # A 202 answers with `jobId` and no `runId` when the run has not bound a run dir
         # inside the daemon's start timeout. The run IS durably enqueued and will execute,
@@ -964,7 +859,8 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                      **_retire_orphaned_registration(ctx, gateway, owned_project_id,
                                                      definite_refusal=definite,
                                                      reason=str(getattr(exc, "code", "")),
-                                                     invocation_id=invocation_id))
+                                                     invocation_id=invocation_id,
+                                                     snapshot_id=("" if recovering else snapshot_id)))
     except BaseException as exc:
         # EVERY pre-custody exit leaves a durable disposition, including the ones no
         # typed handler claims (a bug here, a timeout, a signal). NEVER retired: an
@@ -1001,6 +897,11 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         ledger_root=str(drive),
         idempotency_key=key,
         invocation_id=invocation_id,
+        snapshot_id=snapshot_id,
+        execution_root=(root if snapshot_id else ""),
+        baseline_sha=baseline_sha,
+        target_root=target_root,
+        authority_source=authority_source,
     ), shape={
         # The shape rides on the SAME durable row as custody, so a forensic reader never
         # has to join two events to learn what authority a run was started with.
@@ -1008,11 +909,25 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         "effort": route.effort, "access": access, "mode": authority.mode,
         "isolation": authority.isolation, "delegated": authority.delegated, "root": root,
         "max_seconds": seconds,
+        "capture_mode": (_CAPTURE_DELEGATED_SNAPSHOT if snapshot_id else ""),
     })
-    # The AUTHORITY guidance and the CUSTODY warning are independent facts about the same
-    # start, so both are said. An undurable custody row is the louder one and goes first:
-    # a nanny that walks away from an uncustodied MUTATING run leaves a live shell in its
-    # own worktree that nothing outside this process can name.
+    return _started_payload(handle, run_id, route, access, authority, root,
+                            durable=durable, recovering=recovering,
+                            snapshot_id=snapshot_id, target_root=target_root,
+                            baseline_sha=baseline_sha)
+
+
+def _started_payload(handle: Dict[str, Any], run_id: str, route: Any, access: str,
+                     authority: "DelegatedRunShape", root: str, *, durable: bool,
+                     recovering: bool, snapshot_id: str, target_root: str,
+                     baseline_sha: str) -> str:
+    """The one author of delegate_start's started result (note + payload).
+
+    The AUTHORITY guidance and the CUSTODY warning are independent facts about the same
+    start, so both are said. An undurable custody row is the louder one and goes first:
+    a nanny that walks away from an uncustodied MUTATING run leaves a live shell in its
+    own worktree that nothing outside this process can name.
+    """
     note = "" if durable else (
         "CUSTODY IS NOT DURABLE: the run started, but its custody row could not be written, "
         "so nothing outside this worker can wait on, cancel or settle it. Do not walk away "
@@ -1021,17 +936,20 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         "You are the nanny and the host. Poll with delegate_wait; the run's own "
         "claims are evidence to check, not a verified result."
         + (
-            " This run edits YOUR OWN working tree in place, so its changes become "
-            "part of the patch you hand up — read them before you claim them, and "
-            "never let it commit. It was ASKED to run under a scoped HOME and an "
-            "OS-enforced boundary; whether the engine applied either is a per-run "
-            "fact that delegate_wait reads back from the run's own artifacts. A "
-            "host with no boundary mechanism runs it anyway and says so there."
+            " This run edits a PRIVATE SNAPSHOT of your write root, not the shared "
+            "tree: at terminal its diff is captured for you, and NOTHING lands in "
+            "the shared tree until you explicitly integrate_delegated_patch(run_id="
+            "...) to apply or reject it — read the captured diff before you claim "
+            "it, and never let the run commit. It was ASKED to run under a scoped "
+            "HOME and an OS-enforced boundary; whether the engine applied either is "
+            "a per-run fact that delegate_wait reads back from the run's own "
+            "artifacts. A host with no boundary mechanism runs it anyway and says "
+            "so there."
             if authority.isolation == "live" else
             " This run cannot write anything: it reads and answers."
         )
     )
-    return json.dumps({
+    payload = {
         "status": "started" if durable else "started_uncustodied",
         "run_id": run_id,
         "run_dir": handle.get("runDir"),
@@ -1049,12 +967,21 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         "root": root,
         "custody_durable": durable,
         "note": note,
-    }, ensure_ascii=False, indent=2)
+    }
+    if snapshot_id:
+        # The C1 binding, stated where the nanny can read it: the run's scope.root is
+        # the EXECUTION snapshot; the authority target receives nothing until the
+        # explicit apply.
+        payload["execution_root"] = root
+        payload["authority_target_root"] = target_root
+        payload["baseline_id"] = baseline_sha
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def _retire_orphaned_registration(ctx: ToolContext, gateway: Any, project_id: str, *,
                                   definite_refusal: bool, reason: str,
-                                  invocation_id: str = "") -> Dict[str, Any]:
+                                  invocation_id: str = "",
+                                  snapshot_id: str = "") -> Dict[str, Any]:
     """Retire a registration this start created but never bound to a run.
 
     Only when the daemon gave a DEFINITE negative answer (a 4xx refusal): a transport
@@ -1071,6 +998,17 @@ def _retire_orphaned_registration(ctx: ToolContext, gateway: Any, project_id: st
     presents the same key and lands on whatever the daemon really has. Written even
     with no registration to retire, because the invocation's fate is its own fact.
     """
+    if snapshot_id and definite_refusal:
+        # The C1 execution snapshot THIS attempt provisioned. Only a definite refusal
+        # proves no run can be live against it; an unknown outcome keeps it — the
+        # pending invocation names it durably, and the startup GC reconciles it.
+        try:
+            from ouroboros.subagent_worktrees import remove_execution_snapshot
+
+            remove_execution_snapshot(snapshot_id)
+        except Exception:
+            log.warning("Failed to retire delegated execution snapshot %s", snapshot_id,
+                        exc_info=True)
     retired = False
     if project_id and definite_refusal:
         try:
@@ -1282,6 +1220,13 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                 settlement = custody.settle_run(custody.custody_root(ctx), gateway, entry, detail)
                 payload = _delivered_terminal_payload(ctx, rid, detail, authority, entry, gateway)
                 payload["settlement"] = settlement
+                # C1: a mutating run's changes live in its private snapshot until the
+                # nanny explicitly integrates them. Captured HERE, durably, on every
+                # terminal observation (idempotent), cancelled runs included — a
+                # cancelled run's partial work is salvage material, not garbage.
+                capture = _capture_terminal_patch(ctx, entry)
+                if capture is not None:
+                    payload["workspace_capture"] = capture
                 # The «last delegated run» settings receipt (Subagents section):
                 # requested vs applied model, written ONLY when THIS call performed
                 # a SUCCESSFUL settlement — a later wait re-reading an already-settled
@@ -1441,11 +1386,14 @@ def get_tools() -> List[ToolEntry]:
                 "terminal `cost` block from delegate_wait before you treat this as free; "
                 "it also costs time, quota and a worker slot. Your working root, "
                 "access profile and route come from YOUR task authority; you cannot widen "
-                "them, and there is no argument here that would let you try. If you are a "
-                "MUTATING subagent the run edits your own working tree in place, so its "
-                "changes ride out in the patch you hand to your parent — read them before "
-                "you claim them, and never let it commit, because a moved HEAD invalidates "
-                "your whole patch. If you are read-only it can only read and answer. "
+                "them, and there is no argument here that would let you try. If you hold "
+                "a MUTATING shape the run executes in a PRIVATE SNAPSHOT of your write "
+                "root — it never edits the shared tree in place. Its diff is captured at "
+                "terminal (delegate_wait's workspace_capture block) and reaches your tree "
+                "ONLY when you explicitly call integrate_delegated_patch(run_id=..., "
+                "decision='apply'|'reject'); read the captured diff before applying, and "
+                "never let the run commit inside its snapshot. If you are read-only it "
+                "can only read and answer. "
                 "Returns a run_id: watch it with delegate_wait, stop it with "
                 "delegate_cancel. The run's output is a CLAIM you must check — you are the "
                 "host, so verification receipts are still yours to write. If no route is "

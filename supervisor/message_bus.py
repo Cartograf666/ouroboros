@@ -33,6 +33,34 @@ def coerce_chat_identity(value: Any, default: int = 1) -> int:
         return default
 
 
+def notification_chat_route(*candidates: Any) -> Optional[int]:
+    """The first DELIVERABLE chat among ``candidates``, or None when there is none.
+
+    ONE normalizer for every "where does this notice go" decision (C4), because
+    the numeric id is not a boolean: **0 is the Skill Review panel** — a real
+    destination — while **1 is Main** and a NEGATIVE id is synthetic A2A traffic
+    that must never enter a human stream (`chat_id_policy`). Every producer that
+    tested `if chat_id:` therefore did two wrong things at once: it dropped a
+    panel-bound notice entirely, and it re-routed panel work to the owner chat.
+
+    Membership decides: an ABSENT candidate (None / "" / unparseable) and a
+    SUPPRESSED one (negative) both fall through to the next candidate, so a
+    caller can express "the task's own chat, else the owner chat" as the argument
+    order. None comes back only when no candidate is deliverable.
+    """
+    for candidate in candidates:
+        if candidate is None or (isinstance(candidate, str) and not candidate.strip()):
+            continue
+        try:
+            value = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if is_a2a_chat_id(value):
+            continue
+        return value
+    return None
+
+
 def init(
     drive_root,
     total_budget_limit: float,

@@ -9,6 +9,8 @@
 This wrapper preserves that contract and delegates to ``ouroboros run`` with the
 current working directory as the external workspace root. The wrapper writes
 per-task logs outside the transient benchmark workspace so they survive cleanup.
+Downstream the prompt is handed to ``ouroboros run`` via ``--prompt-file`` (the
+durable ``prompt.txt`` in the log dir), never as an argv tail (E2BIG hygiene).
 """
 
 from __future__ import annotations
@@ -143,7 +145,8 @@ def main(argv: list[str] | None = None) -> int:
     log_dir = log_root / run_id
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    (log_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+    prompt_path = log_dir / "prompt.txt"
+    prompt_path.write_text(prompt, encoding="utf-8")
     summary_path = log_dir / "summary.json"
     result_json = log_dir / "ouroboros-task-result.json"
     started = time.time()
@@ -186,7 +189,9 @@ def main(argv: list[str] | None = None) -> int:
     ]
     if not args.no_start_server:
         cmd.append("--start")
-    cmd.append(prompt)
+    # E2BIG hygiene (C5): the prompt already lives on disk above; it travels to
+    # `ouroboros run` as a file, never as an argv tail.
+    cmd.extend(["--prompt-file", str(prompt_path)])
 
     def _run_once() -> subprocess.CompletedProcess[str]:
         return subprocess.run(

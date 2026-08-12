@@ -142,7 +142,13 @@
  * @property {boolean=} ephemeral_decision
  * @property {string=} task_incident
  * @property {string=} toast_once
+ * @property {boolean=} task_id_pending
+ *   X3: a repair receipt whose managed task id does not exist yet (minted at
+ *   promotion) — typed truth instead of an invented id.
  * @property {Object=} lifecycle
+ * @property {Object=} lifecycle_pointer
+ *   C4 multi-chat dedupe: a duplicate lifecycle initiator's typed pointer to the
+ *   job that already owns the routing ({job_id, kind, target, status, chat_id}).
  * @property {string=} subagent_event
  * @property {string=} subagent_task_id
  * @property {string=} root_task_id
@@ -166,8 +172,8 @@
  * @property {Object=} execution_evidence
  *   The completion-seam EVIDENCE the route decision is reconciled against:
  *   {delegated_runs_started, delegated_runs_settled, delegated_runs_succeeded,
- *   delegated_run_failure_states, evidence_read_failed, subscription_cost_usd,
- *   subscription_cost_estimated, harness_models}.
+ *   delegated_runs_failed, delegated_run_failure_states, evidence_read_failed,
+ *   subscription_cost_usd, subscription_cost_estimated, harness_models}.
  *   Terminal frames only; absent = "no evidence yet", never "ran natively".
  *   `evidence_read_failed: true` = the custody log exists but could not be
  *   read — zero counts are then UNKNOWN, never a "no run" receipt.
@@ -186,6 +192,11 @@
  *   v6.82 (P5): host-attested — this frame's task is a supervisor-queue task that
  *   POST /api/tasks/{id}/cancel can force-cancel (never set for direct-chat turns).
  * @property {?number=} cost_usd
+ * @property {?number=} accounted_upper_bound_usd
+ *   C2: the additive HONEST name for cost_usd — an accounted upper bound, not a
+ *   settled receipt. Same value as the deprecated alias, null when unknown.
+ * @property {?number=} accounted_upper_bound_usd_with_children
+ *   C2: honest name for cost_usd_with_children (same value, null when unknown).
  * @property {"available"|"unavailable"=} cost_accounting_status
  * @property {string=} cost_accounting_error
  * @property {boolean=} cost_final
@@ -198,6 +209,10 @@
  *   v6.87.48: the count of OPEN ledger rows — the disclosed cause of `cost_final: false`,
  *   which can hold with every dollar bucket at zero (an estimated $0.00, or a dispatched
  *   row whose reservation is exactly zero).
+ * @property {?boolean=} ledger_integrity_degraded
+ *   C12: the ledger's INTEGRITY marker, produced by the cost authority all along but
+ *   named in no carry list — an amount computed over a degraded ledger used to reach the
+ *   surface indistinguishable from one computed over a sound ledger.
  * @property {string=} result
  * @property {boolean=} result_truncated
  * @property {string=} trace_summary
@@ -541,6 +556,9 @@
  * @property {number} children_usd
  * @property {number} unattributed_usd
  * @property {number} delegated_disclosed_usd
+ * @property {number} accounted_upper_bound_usd
+ *   C2: the explicit subtree total under its honest name — an accounted UPPER
+ *   BOUND (own + children + unattributed), not a settled receipt.
  * @property {number} subscription_sessions
  * @property {number} unknown_unmetered
  * @property {number} non_final_rows
@@ -721,4 +739,4 @@
  * @property {?boolean} check_ok
  */
 
-export const GATEWAY_CONTRACT_VERSION = '6.99.0';
+export const GATEWAY_CONTRACT_VERSION = '6.100.0';

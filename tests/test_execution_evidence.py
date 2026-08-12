@@ -61,6 +61,7 @@ class TestCustodyAggregation:
             "delegated_runs_started": 0,
             "delegated_runs_settled": 0,
             "delegated_runs_succeeded": 0,
+            "delegated_runs_failed": 0,
             "delegated_run_failure_states": [],
             "evidence_read_failed": False,
             "subscription_cost_usd": None,
@@ -122,6 +123,7 @@ class TestCustodyAggregation:
         evidence = custody.task_execution_evidence(drive, "child-1")
         assert evidence["delegated_runs_started"] == 1
         assert evidence["delegated_runs_succeeded"] == 0
+        assert evidence["delegated_runs_failed"] == 1
         assert evidence["delegated_run_failure_states"] == ["failed"]
         # A succeeded run counts on the success axis and adds no failure state.
         _emit_started(drive, "run-2")
@@ -152,6 +154,7 @@ class TestEnvelopeReconciliation:
             "delegated_runs_started": 0,
             "delegated_runs_settled": 0,
             "delegated_runs_succeeded": 0,
+            "delegated_runs_failed": 0,
             "delegated_run_failure_states": [],
             "evidence_read_failed": False,
             "subscription_cost_usd": None,
@@ -263,7 +266,10 @@ class TestActualSubstrate:
         assert substrate_result_fields(envelope) == {
             "actual_substrate": "harness_attempted",
             "delegated_runs_started": 1,
+            "delegated_runs_settled": 0,
             "delegated_runs_succeeded": 0,
+            "delegated_runs_failed": 0,
+            "native_contribution": "unknown",
         }
         assert substrate_result_fields({}) == {}  # no substrate claim, no fields
 

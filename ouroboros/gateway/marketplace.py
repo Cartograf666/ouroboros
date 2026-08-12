@@ -365,15 +365,22 @@ def _maybe_enqueue_marketplace_auto_repair(
             },
             trailing_newline=True,
         )
-        visible_task_id = f"skill_repair_{skill.name}_{content_hash[:8]}"
+        # X3: no invented task ids. `ui_send` enqueues a message the router
+        # promotes into a managed task LATER — no task id exists yet here, and
+        # the old synthetic `skill_repair_<name>_<hash8>` string looked exactly
+        # like one. The receipt says the truth: enqueued, id pending.
         bridge.broadcast({
             "type": "chat",
             "role": "system",
-            "content": f"Repair task queued for {skill.name}. Ouroboros will inspect the skill payload and re-run review.",
+            "content": (
+                f"Repair task queued for {skill.name} (task id pending promotion). "
+                "Ouroboros will inspect the skill payload and re-run review."
+            ),
             "ts": utc_now_iso(),
             "source": "skill_repair",
             "system_type": "skill_repair",
-            "task_id": visible_task_id,
+            "task_id": "",
+            "task_id_pending": True,
         })
         return True
     except Exception:

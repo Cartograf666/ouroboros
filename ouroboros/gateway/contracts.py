@@ -85,10 +85,17 @@ class ChatOutbound(TypedDict):
     markdown: NotRequired[bool]
     is_progress: NotRequired[bool]
     task_id: NotRequired[str]
+    # X3: a repair receipt whose managed task id does not exist yet (the router
+    # mints it at promotion). Typed truth instead of an invented id.
+    task_id_pending: NotRequired[bool]
     ephemeral_decision: NotRequired[bool]
     task_incident: NotRequired[str]
     toast_once: NotRequired[str]
     lifecycle: NotRequired[Dict[str, Any]]
+    # C4 multi-chat dedupe: a duplicate lifecycle initiator's typed pointer to
+    # the job that already owns the routing ({job_id, kind, target, status,
+    # chat_id}); the first initiator's chat keeps the progress stream.
+    lifecycle_pointer: NotRequired[Dict[str, Any]]
     subagent_event: NotRequired[str]
     subagent_task_id: NotRequired[str]
     root_task_id: NotRequired[str]
@@ -132,6 +139,12 @@ class ChatOutbound(TypedDict):
     # Monetary projections are nullable when the physical-attempt ledger cannot
     # be read.  ``None`` is deliberately distinct from a confirmed $0 result.
     cost_usd: NotRequired[Optional[float]]
+    # C2 (owner 10=B): the additive HONEST names — accounted upper bounds, not
+    # settled receipts. Same values as the deprecated cost_usd[_with_children]
+    # aliases (ouroboros/cost_projection.py is the one author); the aliases stay
+    # outbound because their removal is a separate approved ABI break.
+    accounted_upper_bound_usd: NotRequired[Optional[float]]
+    accounted_upper_bound_usd_with_children: NotRequired[Optional[float]]
     cost_accounting_status: NotRequired[Literal["available", "unavailable"]]
     cost_accounting_error: NotRequired[str]
     cost_final: NotRequired[bool]
@@ -143,6 +156,11 @@ class ChatOutbound(TypedDict):
     # v6.87.48: count of OPEN ledger rows — the disclosed cause of
     # ``cost_final: false``, which can hold with every dollar bucket at zero.
     non_final_rows: NotRequired[Optional[int]]
+    # C12: the ledger's own INTEGRITY marker. The cost authority has always
+    # produced it (`reconstruct_task_cost`), but no carry list named it, so an
+    # amount computed over a degraded ledger reached every surface looking exactly
+    # like one computed over a sound ledger.
+    ledger_integrity_degraded: NotRequired[Optional[bool]]
     result: NotRequired[str]
     result_truncated: NotRequired[bool]  # P3: WS preview was capped; fetch full via task id
     trace_summary: NotRequired[str]
@@ -783,6 +801,9 @@ class TaskCostBreakdown(TypedDict):
     children_usd: float
     unattributed_usd: float
     delegated_disclosed_usd: float
+    # C2: the explicit subtree total under its honest name —
+    # own + children + unattributed, an accounted UPPER BOUND, not a receipt.
+    accounted_upper_bound_usd: float
     subscription_sessions: int
     unknown_unmetered: int
     non_final_rows: int

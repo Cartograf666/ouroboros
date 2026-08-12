@@ -3204,7 +3204,8 @@ class ToolRegistry:
                     "workspace; write only to root=task_drive, root=artifact_store, or root=user_files. "
                     "active_workspace/system_repo map to the live Ouroboros repo and are blocked."
                 )
-            if name in ("run_command", "run_script", "start_service", "integrate_subagent_patch"):
+            if name in ("run_command", "run_script", "start_service",
+                        "integrate_subagent_patch", "integrate_delegated_patch"):
                 return (
                     "⚠️ ACTING_NO_WORKSPACE_BLOCKED: shell/coding/service/integration tools need an "
                     "isolated workspace (their default target is the live repo). Schedule a self_worktree "

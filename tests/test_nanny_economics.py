@@ -113,7 +113,11 @@ def test_retry_replays_the_stored_wire_body_not_a_rebuilt_one():
     recovering_branch = src.split("if recovering:", 1)[1].split("else:", 1)[0]
     assert "_assignment_instructions" not in recovering_branch
     assert "_start_request" not in recovering_branch
-    assert 'record["request"]' in recovering_branch
+    # C1 extracted the stored-record read into `_resolve_retry_invocation`
+    # (re-exported on the delegate surface); the recovering branch must go
+    # through it, and the resolver itself is what replays the STORED body.
+    assert "_resolve_retry_invocation" in recovering_branch
+    assert 'record["request"]' in inspect.getsource(delegate._resolve_retry_invocation)
 
 
 # -- B1.2/B1.3: proportional reminder ------------------------------------------

@@ -44,6 +44,12 @@ class LifecycleJob:
     status: str = "queued"
     message: str = ""
     error: str = ""
+    # C4 (owner batch-4 3=A): the chat this job's progress belongs to. A
+    # TASK-BOUND job (a review started by an agent tool) carries the task's own
+    # chat; a truly UNBOUND job (HTTP/gateway lifecycle actions) stays 0 — the
+    # Skill Review panel chat. Note Main is chat 1, the panel is 0 — the two
+    # must never be conflated (contracts/chat_id_policy.py).
+    chat_id: int = 0
     queued_at: str = field(default_factory=_now_iso)
     started_at: str = ""
     finished_at: str = ""
@@ -57,6 +63,7 @@ class LifecycleJob:
             "target": self.target,
             "source": self.source,
             "dedupe_key": self.dedupe_key,
+            "chat_id": int(self.chat_id or 0),
             "status": self.status,
             "message": self.message,
             "error": self.error,
@@ -119,6 +126,20 @@ def _chat_task_id(job: LifecycleJob) -> str:
     return f"skill_lifecycle_{job.kind}_{suffix or 'skill'}_{job_suffix or 'job'}"
 
 
+def _effective_chat_id(job: LifecycleJob) -> int:
+    """The human chat this job reports to: its bound task chat, else panel 0.
+
+    Routed through the ONE notification normalizer (C4): 0 is the Skill Review
+    panel — a valid destination, not "no chat" — and a negative id is A2A traffic
+    that must never reach a human stream, so an A2A-initiated job reports to the
+    panel like an unbound one.
+    """
+    from supervisor.message_bus import notification_chat_route
+
+    route = notification_chat_route(job.chat_id, 0)
+    return int(route if route is not None else 0)
+
+
 def _notify_chat_progress(job: LifecycleJob, phase: str) -> None:
     try:
         from supervisor.message_bus import send_with_budget
@@ -127,11 +148,43 @@ def _notify_chat_progress(job: LifecycleJob, phase: str) -> None:
         lifecycle = job.to_dict()
         lifecycle["phase"] = str(phase or "")
         send_with_budget(
-            0,
+            _effective_chat_id(job),
             f"Skill {job.kind}: `{job.target}` — {phase}{f' — {detail}' if detail else ''}",
             is_progress=True,
             task_id=_chat_task_id(job),
             progress_meta={"lifecycle": lifecycle},
+        )
+    except Exception:
+        return
+
+
+def _notify_duplicate_pointer(requested: LifecycleJob, existing: LifecycleJob) -> None:
+    """C4 multi-chat dedupe: the FIRST initiator owns the routing; a duplicate
+    caller from ANOTHER chat gets a typed pointer ack in its own chat instead of
+    silence (or a second progress stream)."""
+    # Membership, not truthiness: a PANEL caller (chat 0) is a real initiator and
+    # gets its pointer too — `if not requested_chat` silently dropped exactly the
+    # duplicate this ack exists for. Only an identical route needs no pointer:
+    # that stream already carries the original job's progress.
+    requested_chat = _effective_chat_id(requested)
+    if requested_chat == _effective_chat_id(existing):
+        return
+    try:
+        from supervisor.message_bus import send_with_budget
+
+        send_with_budget(
+            requested_chat,
+            f"Skill {existing.kind}: `{existing.target}` — already {existing.status} "
+            f"(job {existing.id}); progress reports in its original chat.",
+            is_progress=True,
+            task_id=_chat_task_id(existing),
+            progress_meta={"lifecycle_pointer": {
+                "job_id": existing.id,
+                "kind": existing.kind,
+                "target": existing.target,
+                "status": existing.status,
+                "chat_id": _effective_chat_id(existing),
+            }},
         )
     except Exception:
         return
@@ -265,12 +318,21 @@ async def run_lifecycle_job(
     source: str = "",
     message: str = "",
     dedupe_key: str = "",
+    chat_id: int = 0,
     options: LifecycleJobOptions | None = None,
 ) -> Any:
-    """Run runner through the lifecycle lane with optional progress updates."""
+    """Run runner through the lifecycle lane with optional progress updates.
+
+    ``chat_id`` binds the job's progress to the initiating task's chat (C4);
+    0 (the default) reports to the Skill Review panel chat.
+    """
 
     global _active
     opts = options or LifecycleJobOptions()
+    try:
+        _chat = int(chat_id or 0)
+    except (TypeError, ValueError):
+        _chat = 0
     job = LifecycleJob(
         id=f"skill-job-{uuid.uuid4().hex}",
         kind=str(kind or "operation"),
@@ -278,8 +340,13 @@ async def run_lifecycle_job(
         source=str(source or ""),
         dedupe_key=str(dedupe_key or ""),
         message=str(message or ""),
+        chat_id=_chat,
     )
-    _register_dedupe(job)
+    try:
+        _register_dedupe(job)
+    except DuplicateLifecycleJobError as duplicate:
+        _notify_duplicate_pointer(job, duplicate.job)
+        raise
     _notify_chat_progress(job, "queued")
     if opts.progress_target is not None:
         opts.progress_target.bind(job)
@@ -402,6 +469,7 @@ def run_lifecycle_job_blocking(
     source: str = "",
     message: str = "",
     dedupe_key: str = "",
+    chat_id: int = 0,
     options: LifecycleJobOptions | None = None,
 ) -> Any:
     """Run a lifecycle job from a synchronous tool handler.
@@ -424,6 +492,7 @@ def run_lifecycle_job_blocking(
             source=source,
             message=message,
             dedupe_key=dedupe_key,
+            chat_id=chat_id,
             runner=_runner,
             options=options,
         )

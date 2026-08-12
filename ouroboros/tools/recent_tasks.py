@@ -53,13 +53,20 @@ def _task_record(
         return None, {"path": str(path), "error": error}
     data = effective_task_result(drive_root, data)
     result = str(data.get("result") or "")
+    from ouroboros.cost_projection import cost_projection
+
+    _cost = cost_projection(data)
     record: Dict[str, Any] = {
         "task_id": str(data.get("task_id") or path.stem),
         "ts": str(data.get("ts") or ""),
         "status": str(data.get("status") or ""),
         "outcome_axes": normalize_outcome_axes(data),
         "description": str(data.get("description") or ""),
-        "cost_usd": data.get("cost_usd", 0),
+        # SSOT cost projection (C2): honest null (never a fabricated $0), the
+        # additive honest name beside the deprecated alias, finality unfabricated.
+        "cost_usd": _cost["cost_usd"],
+        "accounted_upper_bound_usd": _cost["accounted_upper_bound_usd"],
+        "cost_final": _cost["cost_final"],
         "total_rounds": data.get("total_rounds"),
         "result_preview": _preview(result),
     }

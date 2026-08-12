@@ -790,6 +790,22 @@ def _handle_skill_exec(
     except Exception:
         log.debug("Could not augment skill env with isolated dependencies", exc_info=True)
 
+    # E2BIG hygiene (C5): byte-accurate argv+env budget against the REAL exec
+    # environment, checked before spawn. Type validation above proves the args
+    # are scalars; only this proves the kernel will accept them. There is no
+    # automatic file/stdin fallback here — a skill accepts bulk input via files
+    # only when its own manifest/interface says so — so an over-budget call is
+    # a typed refusal telling the caller to use the skill's file inputs.
+    from ouroboros.argv_budget import argv_budget_excess
+
+    _argv_excess = argv_budget_excess(cmd, env=env)
+    if _argv_excess:
+        return (
+            f"⚠️ SKILL_EXEC_ARGV_TOO_LARGE: refusing to spawn {loaded.name!r}: "
+            f"{_argv_excess} Write bulk payloads to a file the skill reads "
+            "instead of passing them as args."
+        )
+
     # TOCTOU narrowing: re-hash the payload immediately before spawn. The
     # gate-time hash above ran before grants/env/deps resolution — a write
     # landing in that window would execute unreviewed code under a PASS verdict.

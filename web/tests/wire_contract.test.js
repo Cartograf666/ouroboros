@@ -55,7 +55,14 @@ test('every accounting field the costs page reads is a field the history endpoin
     assert.deepEqual(missing, [], `costs.js reads server fields that are never emitted: ${missing}`);
     // `cost_final`'s disclosed cause must travel WITH the flag, in both directions.
     assert.ok(emitted.has('non_final_rows') && read.has('non_final_rows'));
-    assert.ok(pythonTupleNames(taskResults, 'TASK_COST_META_FIELDS').has('non_final_rows'));
+    // The durable/replay carry list is no longer a hand-typed copy: it is DERIVED
+    // from the cost SSOT (C12), so assert the SSOT owns the name and that
+    // task_results really derives from it — a re-typed literal there is the drift
+    // this test exists to catch.
+    const openness = pythonTupleNames(repoFile('ouroboros/cost_projection.py'), 'COST_OPENNESS_FIELDS');
+    assert.ok(openness.has('non_final_rows') && openness.has('ledger_integrity_degraded'));
+    assert.match(taskResults, /TASK_COST_META_FIELDS = tuple\(/);
+    assert.match(taskResults, /COST_OPENNESS_FIELDS/);
 });
 
 test('the live progress path forwards every progress field the endpoint emits and the chat UI consumes', () => {

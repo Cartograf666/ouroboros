@@ -350,6 +350,43 @@ def build_health_invariants(env: Any) -> str:
         pass
 
     try:
+        from ouroboros.delegate_custody import undisposed_patches
+
+        drive_root = getattr(env, "drive_root", None) or env.drive_path("state").parent
+        for run in undisposed_patches(drive_root):
+            # C1: a settled mutating run's work lives in its private snapshot (and its
+            # captured patch, once one exists) until someone explicitly applies or
+            # rejects it. The GC preserves the material, but preserved-and-invisible is
+            # how an orphaned run's work sits on disk forever — so the pending
+            # disposition stays a visible obligation until the PATCH_DISPOSED row
+            # clears it. The wording follows the entry's REAL capture state (C1-R2):
+            # a run reconciled over an absent daemon settled with NO capture (its
+            # state was unknowable then), and claiming "captured" there would be a
+            # receipt over work the child might still have been writing.
+            if run.patch_captured:
+                state_clause = (
+                    f"settled with its changes captured from a private snapshot of "
+                    f"{run.target_root or '?'}"
+                )
+                persist_clause = "The snapshot and patch persist until that disposition."
+            else:
+                state_clause = (
+                    f"settled with its work preserved in its private snapshot of "
+                    f"{run.target_root or '?'} (no patch captured yet — "
+                    f"integrate_delegated_patch captures it at disposition)"
+                )
+                persist_clause = "The snapshot persists until that disposition."
+            checks.append(
+                f"WARNING: DELEGATED PATCH AWAITS DISPOSITION — run {run.run_id or '?'} "
+                f"(owner task {run.task_id or '?'}) {state_clause} and no apply/reject "
+                f"recorded. Nothing reaches the shared tree by itself: decide with "
+                f"integrate_delegated_patch(run_id='{run.run_id}', decision='apply'|'reject'). "
+                f"{persist_clause}"
+            )
+    except Exception:
+        pass
+
+    try:
         from ouroboros.delegate_custody import open_containment_faults
 
         drive_root = getattr(env, "drive_root", None) or env.drive_path("state").parent

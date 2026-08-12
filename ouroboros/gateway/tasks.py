@@ -864,6 +864,9 @@ def _task_cost_breakdown_view(drive_root: pathlib.Path, result: Dict[str, Any]) 
         "children_usd": round(max(0.0, float(subtree) - own - unattributed), 6),
         "unattributed_usd": round(unattributed, 6),
         "delegated_disclosed_usd": round(float(delegated.get("settled_usd") or 0.0), 6),
+        # C2: the explicit subtree total under its honest name — an accounted
+        # UPPER BOUND (own + children + unattributed), not a settled receipt.
+        "accounted_upper_bound_usd": round(float(subtree), 6),
         "subscription_sessions": sessions,
         "unknown_unmetered": breakdown.get("unknown_unmetered"),
         "non_final_rows": breakdown.get("non_final_rows"),

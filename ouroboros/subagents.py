@@ -1280,6 +1280,11 @@ def build_subagent_envelope(
         # The FACT beside the plan (Q1A): harness_used / harness_attempted /
         # native_only, always beside the execution_evidence counts above.
         envelope["actual_substrate"] = str(actual_substrate)
+        # C3 (additive): the counters are delegated-run FACTS; the metered/native
+        # work interleaved beside them is not measurable from custody rows, so no
+        # share, ratio, or dominance claim is derivable — said here so no reader
+        # invents one from the enum.
+        envelope["native_contribution"] = "unknown"
     return envelope
 
 
@@ -1329,7 +1334,12 @@ def substrate_result_fields(envelope: Mapping[str, Any]) -> Dict[str, Any]:
     return {
         "actual_substrate": str(envelope["actual_substrate"]),
         "delegated_runs_started": int(ev.get("delegated_runs_started") or 0),
+        "delegated_runs_settled": int(ev.get("delegated_runs_settled") or 0),
         "delegated_runs_succeeded": int(ev.get("delegated_runs_succeeded") or 0),
+        "delegated_runs_failed": int(ev.get("delegated_runs_failed") or 0),
+        # C3: delegated-run facts only — the native contribution is unknown and
+        # no share is derivable (owner-approved replacement for harness_share).
+        "native_contribution": "unknown",
     }
 
 

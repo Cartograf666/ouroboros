@@ -11,6 +11,7 @@ import time
 from dataclasses import replace
 from typing import Any, Callable, Dict, List
 
+from ouroboros.cost_projection import cost_projection
 from ouroboros.task_results import (
     TASK_COST_META_FIELDS,
     STATUS_COMPLETED,
@@ -273,65 +274,15 @@ def _pre_synthesis_usage_snapshot(
     return snapshot
 
 
-def _synthesis_cost_usd(usage: Dict[str, Any]) -> float | None:
-    """Prefer the subtree snapshot; preserve legacy callers without one."""
-    key = "cost_usd_with_children" if "cost_usd_with_children" in usage else "cost"
-    value = usage.get(key)
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed >= 0 and parsed == parsed else None
-
-
-def _synthesis_cost_text(usage: Dict[str, Any]) -> str:
-    cost = _synthesis_cost_usd(usage)
-    if cost is None:
-        return "cost unavailable (non-final)" if "cost_usd_with_children" in usage else "cost unknown"
-    if bool(usage.get("cost_with_children_partial")):
-        return f"${cost:.2f} subtree cost snapshot (non-final)"
-    return f"${cost:.2f}"
-
-
-_SYNTHESIS_USAGE_PROMPT_FIELDS = (
-    "cost_usd_with_children",
-    "reserved_usd",
-    "unresolved_upper_bound_usd",
-    "unknown_unmetered",
-    "ledger_integrity",
-    "cost_snapshot_at",
-    "cost_final",
-    "cost_with_children_partial",
-    "cost_accounting_status",
-    "reason_code",
-    "outcome_axes",
+# The synthesis cost/snapshot renderers live in `ouroboros/synthesis_cost_text.py`
+# (extracted at this module's size ceiling); re-exported here because the
+# synthesis prompts, the tests and monkeypatch targets name them on THIS surface.
+from ouroboros.synthesis_cost_text import (  # noqa: F401,E402
+    _SYNTHESIS_USAGE_PROMPT_FIELDS,
+    _synthesis_cost_text,
+    _synthesis_cost_usd,
+    _synthesis_usage_snapshot_text,
 )
-
-
-def _synthesis_usage_snapshot_text(usage: Dict[str, Any]) -> str:
-    """Render the bounded root snapshot section shared by synthesis prompts."""
-    if not (
-        "cost_usd_with_children" in usage
-        and str(usage.get("cost_snapshot_at") or "").strip()
-        and usage.get("cost_final") is False
-        and usage.get("cost_with_children_partial") is True
-    ):
-        return ""
-    projection = {
-        field: usage.get(field)
-        for field in _SYNTHESIS_USAGE_PROMPT_FIELDS
-    }
-    payload = json.dumps(projection, ensure_ascii=False, indent=2, default=str)
-    return (
-        "## Shared pre-synthesis cost and outcome snapshot\n"
-        "`cost_usd_with_children` is accounted subtree cost only. `reserved_usd` and\n"
-        "`unresolved_upper_bound_usd` are separate non-final exposure fields; do not add\n"
-        "them to or describe them as already included in the accounted total. This snapshot is non-final:\n"
-        "summary/reflection calls happen after it. Never turn null/unavailable values into zero.\n"
-        "`outcome_axes` is canonical task truth: never describe objective best_effort,\n"
-        "degraded, or fail — or a non-pass review axis — as clean success.\n"
-        f"{payload}\n\n"
-    )
 
 
 def _compact_review_projection(llm_trace: Dict[str, Any]) -> Dict[str, Any]:
@@ -530,7 +481,11 @@ def recover_pending_root_post_task_synthesis(
             recovered += 1
             continue
         usage = {
-            "cost": float(task.get("cost_usd") or 0),
+            # Null stays NULL (C2): `float(... or 0)` turned a task whose cost was
+            # never accounted into a confident "$0.00" in the recovered synthesis —
+            # a fabricated receipt for the one path (restart recovery) where the
+            # amount is least likely to be known.
+            "cost": cost_projection(task)["accounted_upper_bound_usd"],
             "rounds": int(task.get("total_rounds") or 0),
             "reason_code": str(task.get("reason_code") or ""),
             "outcome_axes": task.get("outcome_axes") or {},
@@ -711,6 +666,12 @@ def emit_task_results(
             "reserved_usd": None, "unresolved_upper_bound_usd": None,
             "unknown_unmetered": None,
         }
+    # SSOT cost naming (C2): both spellings on every terminal frame this
+    # pipeline emits (the reconstruct path already aliases; the unavailable
+    # fallback above must not ship without the honest name).
+    from ouroboros.cost_projection import with_cost_aliases
+
+    task_cost_fields = with_cost_aliases(task_cost_fields)
     if _is_root_post_task(task) and not _root_post_task_already_completed(env, task):
         task_cost_fields["cost_final"] = False
     if not _ephemeral:
@@ -997,7 +958,9 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
     """
     try:
         trace_summary = build_trace_summary(llm_trace)
-        cost_fields = dict(cost_fields or {
+        from ouroboros.cost_projection import with_cost_aliases
+
+        cost_fields = with_cost_aliases(cost_fields or {
             "cost_accounting_status": "unavailable", "cost_final": False,
             "cost_accounting_error": "ledger_projection_missing",
             "cost_usd": None, "total_rounds": None,
@@ -1107,6 +1070,7 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
             # ``outcome_axes.review`` remains the canonical structured axis.
             review_status=dict(outcome_axes.get("review") or {}),
             cost_usd_with_children=_cost_with_children,
+            accounted_upper_bound_usd_with_children=_cost_with_children,
             cost_with_children_partial=_cost_partial,
             task_contract=task_contract,
             loop_outcome=loop_outcome,

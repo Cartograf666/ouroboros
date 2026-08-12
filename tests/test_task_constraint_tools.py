@@ -15,6 +15,26 @@ def _ctx(tmp_path):
     return ToolContext(repo_dir=repo, drive_root=drive, task_constraint=TaskConstraint(mode="skill_repair", skill_name="alpha", payload_root="skills/external/alpha", allow_enable=False)), skill
 
 
+def _admit_repair(ctx, skill):
+    """Mint the X3 repair admission these direct-constraint tests bypass.
+
+    Production repair tasks are admitted through the promote seam
+    (supervisor/workers.py), which records the binding fail-closed before the
+    task exists; tests that build the ``skill_repair`` constraint directly must
+    mint the same binding or every payload write is a typed
+    SKILL_REPAIR_STALE refusal. Call AFTER all direct payload setup writes —
+    the admission pins the payload state the repair starts from.
+    """
+    from ouroboros.skill_loader import compute_content_hash
+    from ouroboros.skill_repair_admission import record_repair_admission
+
+    ctx.task_id = getattr(ctx, "task_id", "") or "repair-constraint-test"
+    record_repair_admission(
+        ctx.drive_root, "alpha", task_id=ctx.task_id,
+        base_content_hash=compute_content_hash(skill),
+    )
+
+
 def test_payload_relative_resolver_accepts_short_paths(tmp_path):
     ctx, skill = _ctx(tmp_path)
     assert resolve_payload_path(ctx.drive_root, ctx.task_constraint, "plugin.py") == skill / "plugin.py"
@@ -25,6 +45,7 @@ def test_str_replace_editor_uses_payload_relative_path(tmp_path):
     ctx, skill = _ctx(tmp_path)
     target = skill / "plugin.py"
     target.write_text("hello = 1\n", encoding="utf-8")
+    _admit_repair(ctx, skill)
     result = _str_replace_editor(ctx, "plugin.py", "hello = 1", "hello = 2")
     assert "Replaced" in result
     assert target.read_text(encoding="utf-8") == "hello = 2\n"
@@ -33,6 +54,7 @@ def test_str_replace_editor_uses_payload_relative_path(tmp_path):
 
 def test_data_write_uses_payload_relative_path(tmp_path):
     ctx, skill = _ctx(tmp_path)
+    _admit_repair(ctx, skill)
     result = _data_write(ctx, "new_file.py", "VALUE = 1\n")
     assert "OK:" in result
     assert (skill / "new_file.py").read_text(encoding="utf-8") == "VALUE = 1\n"
@@ -87,6 +109,7 @@ def test_repair_data_write_manifest_does_not_create_self_authored_markers(tmp_pa
     from ouroboros import config as cfg
     ctx, skill = _ctx(tmp_path)
     monkeypatch.setattr(cfg, "DATA_DIR", ctx.drive_root)
+    _admit_repair(ctx, skill)
     result = _data_write(ctx, "SKILL.md", "---\nname: alpha\ndescription: x\nversion: 0.1\ntype: instruction\n---\n")
     assert "OK:" in result
     assert not (skill / ".self_authored.json").exists()

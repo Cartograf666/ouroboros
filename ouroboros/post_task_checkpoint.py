@@ -7,6 +7,7 @@ import pathlib
 import threading
 from typing import Any, Dict
 
+from ouroboros.cost_projection import with_cost_aliases
 from ouroboros.task_results import (
     STATUS_COMPLETED,
     load_task_result,
@@ -101,6 +102,13 @@ def set_root_post_task_checkpoint(env: Any, task: Dict[str, Any], status: str) -
                     "cost_usd": None,
                     "cost_usd_with_children": None,
                 })
+        # SSOT cost naming (C2/F12): re-converge the alias pairs as the LAST step,
+        # after every branch above has finished mutating the deprecated spellings
+        # (`reconstruct_task_cost` aliases at ITS seam, then the subtree refresh
+        # and the unavailable fallback edit `cost_usd[_with_children]` only) —
+        # otherwise this producer persists a DIVERGED pair: an honest name still
+        # carrying the pre-refresh amount beside a corrected alias.
+        cost_fields = with_cost_aliases(cost_fields)
         try:
             checkpoint = dict(checkpoint) if isinstance(checkpoint, dict) else {
                 "phase": "task_acceptance", "status": "not_required", "pass_index": 0,

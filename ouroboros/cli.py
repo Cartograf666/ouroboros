@@ -158,8 +158,30 @@ def _status_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_prompt(args: argparse.Namespace) -> str:
+    """Positional prompt XOR ``--prompt-file`` (C5 E2BIG hygiene).
+
+    A benchmark-scale prompt on argv risks the kernel's exec limits, so bulk
+    prompts travel as a file — or stdin via ``--prompt-file -`` — and the two
+    transports are exclusive so a stray positional word can never silently
+    shadow (or be shadowed by) the file.
+    """
+    positional = " ".join(args.prompt).strip()
+    prompt_file = str(getattr(args, "prompt_file", "") or "").strip()
+    if prompt_file and positional:
+        raise CLIError("pass the prompt either positionally or via --prompt-file, not both")
+    if prompt_file:
+        if prompt_file == "-":
+            return sys.stdin.read().strip()
+        try:
+            return pathlib.Path(prompt_file).expanduser().read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise CLIError(f"--prompt-file {prompt_file!r} is unreadable: {exc}")
+    return positional
+
+
 def _run_command(args: argparse.Namespace) -> int:
-    prompt = " ".join(args.prompt).strip()
+    prompt = _resolve_prompt(args)
     if not prompt:
         raise CLIError("run requires a prompt")
     if str(args.delegation_role or "root").strip().lower() != "root":
@@ -498,6 +520,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--actor-id", default="cli")
     run.add_argument("--delegation-role", default="root")
+    run.add_argument(
+        "--prompt-file",
+        default="",
+        help="read the task prompt from this file ('-' = stdin); mutually "
+        "exclusive with the positional prompt (E2BIG hygiene for bulk prompts)",
+    )
     run.add_argument("prompt", nargs=argparse.REMAINDER)
     run.set_defaults(func=_run_command)
 

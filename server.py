@@ -1091,6 +1091,56 @@ def _startup_custody_sweep() -> None:
         log.debug("Boot replay of pending terminal deliveries failed", exc_info=True)
 
 
+def _prune_delegated_snapshots() -> None:
+    """C1 delegated execution snapshots: GC cross-checked against custody.
+
+    A snapshot stays while its run is open/undisposed OR a pending invocation
+    names it; everything else (disposed, closed, refused) is torn down with its
+    pinned baseline ref. Fail-soft like every startup prune step — the guard
+    lives here so the startup sequence never dies on a GC error.
+
+    FAIL-CLOSED on an unreadable custody log (CR1-1): the keep-set comes from
+    replaying the custody rows, and ``_iter_rows`` swallows its own OSError —
+    right for the fail-soft readers, but here an unreadable log replays as
+    "no open runs", the keep-set goes EMPTY, and the prune destroys every
+    live snapshot with the child's only copy of its work. GC may delete only
+    over PROVEN settled && patch_disposed; an UNKNOWN custody state skips the
+    destructive prune entirely and says so loudly."""
+    try:
+        from ouroboros import delegate_custody as _delegate_custody
+        from ouroboros import subagent_worktrees as _snap_worktrees
+        from supervisor.state import append_jsonl
+
+        if _delegate_custody.custody_log_unreadable(DATA_DIR):
+            log.warning(
+                "Delegated snapshot prune SKIPPED: custody event log exists but "
+                "cannot be read, so open snapshots are unknowable (fail-closed)")
+            if not append_jsonl(DATA_DIR / "logs" / "events.jsonl", {
+                "ts": utc_now_iso(),
+                "type": "delegated_snapshot_prune_skipped",
+                "reason": "custody_log_unreadable",
+            }):
+                # CR2-2: the log is unwritable too — the promised durable row
+                # could not land. Escalate loudly; the skip itself already
+                # protects the open snapshots, so this stays fail-soft.
+                log.error(
+                    "Delegated snapshot prune skip could NOT be recorded durably: "
+                    "the delegated_snapshot_prune_skipped row was not written "
+                    "(custody event log unwritable). Open snapshots remain "
+                    "protected by the skip itself.")
+            return
+        snapshot_report = _snap_worktrees.prune_execution_snapshots(
+            _delegate_custody.open_snapshot_ids(DATA_DIR))
+        if snapshot_report.get("removed"):
+            append_jsonl(DATA_DIR / "logs" / "events.jsonl", {
+                "ts": utc_now_iso(),
+                "type": "delegated_snapshot_prune",
+                "report": snapshot_report,
+            })
+    except Exception:
+        log.debug("Delegated execution snapshot prune failed", exc_info=True)
+
+
 def _scoped_task_metadata(project_id: str, task_metadata: Any) -> Any:
     """Bind a chat frame's task_metadata to the thread's project via chat_id (the
     SSOT). A registered project chat scopes to its OWN project, overriding any
@@ -1906,6 +1956,8 @@ def _run_supervisor(settings: dict) -> None:
                 })
         except Exception:
             log.debug("Subagent worktree prune failed", exc_info=True)
+
+        _prune_delegated_snapshots()
 
         try:
             from ouroboros.observability import prune_observability_blobs

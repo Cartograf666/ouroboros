@@ -80,6 +80,24 @@ OUTPUT_CONSUMED = "delegate_run_output_consumed"
 # read to EOF: the "launched and never collected" class, named at the moment it becomes
 # permanent instead of inferred later from a field nobody joined.
 SETTLED_UNREAD = "delegate_run_settled_unread"
+# C1 (delegated-run isolation): a MUTATING run executes in a private snapshot of the
+# authority target tree, and its diff is captured durably at terminal, then EXPLICITLY
+# applied or rejected into the target by the nanny. These two rows are that lifecycle:
+# capture is idempotent (the flag replays), disposition is the fact that releases the
+# snapshot for GC. A run whose snapshot was never disposed keeps its snapshot and its
+# captured patch on disk — conflict material persists until an explicit resolution.
+PATCH_CAPTURED = "delegate_run_patch_captured"
+PATCH_DISPOSED = "delegate_run_patch_disposed"
+# CR1-3 (phase-A owed-before-sent doctrine, one row earlier than the disposition):
+# the APPLY-INTENT row lands BEFORE the target tree is mutated, and the RESOLVED
+# row lands only when the attempt is KNOWN to have left the tree unmutated (drift
+# refusal, atomic apply failure, clean revert). An intent with neither a resolution
+# nor a disposition replays as AMBIGUOUS: the tree may carry the patch (crash after
+# apply, before the disposition row), and a later reject/apply must refuse typed
+# instead of pretending "not applied" — that pretence recorded a false rejection
+# and deleted the snapshot over a modified, staged tree.
+PATCH_APPLY_STARTED = "delegate_run_patch_apply_started"
+PATCH_APPLY_RESOLVED = "delegate_run_patch_apply_resolved"
 
 # Cheap prefilter: every custody row's type starts with this, so a multi-hundred-MB
 # event log is scanned without JSON-parsing the 99.9% of lines that are not ours.
@@ -146,6 +164,26 @@ class RunCustody:
     output_complete: bool = False
     output_sha: str = ""
     output_consumed: bool = False
+    # C1 isolation binding for a MUTATING run: the private execution root the run was
+    # scoped to, the baseline commit its diff is measured from, and the AUTHORITY
+    # target tree its patch is destined for. ``snapshot_id`` keys the worktree-service
+    # registry entry (it equals the invocation id that provisioned it). All durable and
+    # replayed: a retry reproduces the exact binding, the terminal capture knows where
+    # to diff, and the startup GC can tell a live snapshot from a disposable one.
+    snapshot_id: str = ""
+    execution_root: str = ""
+    baseline_sha: str = ""
+    target_root: str = ""
+    authority_source: str = ""
+    # Capture/disposition lifecycle (replayed): capture happens once at terminal;
+    # ``patch_disposed`` is "" until the nanny explicitly applies ("applied") or
+    # rejects ("rejected") the captured patch — only then may the snapshot be removed.
+    patch_captured: bool = False
+    patch_disposed: str = ""
+    # CR1-3: an apply-intent row exists with no resolution and no disposition —
+    # the target tree MAY carry the patch (crash between apply and the disposition
+    # row), so any later disposition over this run is ambiguous until inspected.
+    patch_apply_pending: bool = False
 
 
 # Process-local MEMOIZATION of the rows above — never the authority. A miss falls
@@ -266,6 +304,11 @@ def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
             ledger_root=str(row.get("ledger_root") or ""),
             idempotency_key=str(row.get("idempotency_key") or ""),
             invocation_id=str(row.get("invocation_id") or ""),
+            snapshot_id=str(row.get("snapshot_id") or ""),
+            execution_root=str(row.get("execution_root") or ""),
+            baseline_sha=str(row.get("baseline_sha") or ""),
+            target_root=str(row.get("target_root") or ""),
+            authority_source=str(row.get("authority_source") or ""),
         )
         # An idempotent re-start writes a SECOND started row for the same run. Replacing
         # the entry wholesale would forget that the run was already settled and put it
@@ -281,6 +324,9 @@ def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
             entry.output_complete = previous.output_complete
             entry.output_sha = previous.output_sha
             entry.output_consumed = previous.output_consumed
+            entry.patch_captured = previous.patch_captured
+            entry.patch_disposed = previous.patch_disposed
+            entry.patch_apply_pending = previous.patch_apply_pending
         state[run_id] = entry
         return
     custody = state.get(run_id)
@@ -318,6 +364,18 @@ def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
         # A stale ack row (older than the current staging) must not bless new bytes.
         if not ack_sha or not custody.output_sha or ack_sha == custody.output_sha:
             custody.output_consumed = True
+    elif kind == PATCH_CAPTURED:
+        custody.patch_captured = True
+    elif kind == PATCH_APPLY_STARTED:
+        custody.patch_apply_pending = True
+    elif kind == PATCH_APPLY_RESOLVED:
+        custody.patch_apply_pending = False
+    elif kind == PATCH_DISPOSED:
+        disposition = str(row.get("disposition") or "")
+        if disposition:
+            custody.patch_disposed = disposition
+            # A recorded disposition completes the apply-intent story too.
+            custody.patch_apply_pending = False
     elif kind == SETTLED:
         custody.ledger_recorded = True
         custody.project_owned = False
@@ -356,97 +414,103 @@ def lookup(drive_root: Any, task_id: str, run_id: str) -> Tuple[str, Optional[Ru
     return OWNED, custody
 
 
-def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
-    """Aggregate ONE task's delegated-run facts from the durable custody rows.
+# The read-side evidence projection lives in `ouroboros/delegate_evidence.py`
+# (extracted at this module's size ceiling); re-exported here because the
+# completion seam, the tests and monkeypatch targets name it on THIS surface.
+from ouroboros.delegate_evidence import task_execution_evidence  # noqa: F401,E402
 
-    The completion-seam reconciliation reads this: `executor_route` is a DISPATCH
-    decision, these rows are the EVIDENCE of what actually ran, and the two are
-    compared exactly once (``subagents.envelope_from_task``) instead of in every
-    reader. ``subscription_cost_usd`` is the sum of DISCLOSED settled spend and
-    ``None`` while nothing settled or any settled run left its spend undisclosed —
-    unknown never renders as zero.
+
+def delegated_capture_dir(drive_root: Any, task_id: str, run_id: str) -> pathlib.Path:
+    """The canonical artifact directory for ONE delegated run's captured patch.
+
+    Named here (custody owns durable naming) so the terminal capture and the
+    explicit apply/reject seam cannot disagree about where the patch lives. Under
+    the task's artifact store on the CANONICAL drive, so the capture survives
+    child-drive pruning exactly like the custody rows themselves.
     """
-    tid = str(task_id or "")
-    started: set = set()
-    settled: set = set()
-    succeeded: set = set()
-    failure_states: List[str] = []
-    models: List[str] = []
-    cost_total, cost_known, cost_estimated = 0.0, True, False
-    # Scope finding (a5e59bdf gate): an UNREADABLE log must not collapse into
-    # the same zero-count result as a proven empty one — a reader would then
-    # accuse a nanny of "zero attempts" on evidence it never saw. A missing
-    # file IS a positively-established empty state (no row could exist);
-    # existing-but-unreadable is not, and _iter_rows swallows its own OSError.
-    evidence_read_failed = False
-    _log_path = event_log_path(drive_root)
-    try:
-        if _log_path.exists():
-            with _log_path.open("rb"):
-                pass
-    except OSError:
-        evidence_read_failed = True
-    for row in _iter_rows(_log_path):
-        if str(row.get("task_id") or "") != tid:
-            continue
-        run_id = str(row.get("run_id") or "")
-        if not run_id:
-            continue
-        kind = str(row.get("type") or "")
-        if kind == STARTED:
-            started.add(run_id)
-        elif kind == CLOSED_ABSENT and run_id not in settled:
-            # Closed-without-settlement is still TERMINAL: leaving it in the
-            # started-minus-settled gap would read as "still executing" to the
-            # pending/settled readers (nanny reminder) forever. No ledger row was
-            # written, so its spend is undisclosed, never zero.
-            settled.add(run_id)
-            failure_states.append("closed_absent")
-            cost_known = False
-        elif kind == SETTLED and run_id not in settled:
-            settled.add(run_id)
-            state = str(row.get("state") or "")
-            if state in SUCCEEDED_STATES:
-                succeeded.add(run_id)
-            elif state:
-                failure_states.append(state)
-            if row.get("spend_disclosed") and row.get("cost_usd") is not None:
-                try:
-                    cost_total += float(row.get("cost_usd") or 0.0)
-                except (TypeError, ValueError):
-                    cost_known = False
-                if row.get("spend_estimated"):
-                    cost_estimated = True
-            else:
-                cost_known = False
-        # ENGINE-reported models only (SETTLED rows): a STARTED row carries the
-        # requested pin, and with an owner default model that pin is routinely
-        # non-empty — listing it would name a model that never executed.
-        if kind == SETTLED:
-            model = str(row.get("model") or "")
-            if model and model not in models:
-                models.append(model)
-    return {
-        # A settled row whose started row fell out of the log is still a run that ran.
-        "delegated_runs_started": len(started | settled),
-        "delegated_runs_settled": len(settled),
-        # The terminal-state axis (F4, 2026-08-10 saga): a run that STARTED and
-        # FAILED is an ATTEMPTED route, not a refusal to delegate. Readers (the
-        # nanny nudge, the forced-path note, the completion seam) must be able to
-        # tell "never tried" from "tried and the run died" without re-parsing the
-        # event log; the forced-path nanny note keys on the succeeded count to
-        # stop nagging over finished work.
-        "delegated_runs_succeeded": len(succeeded),
-        "delegated_run_failure_states": sorted(set(failure_states)),
-        # True only when the canonical log EXISTS but could not be opened —
-        # zero counts are then "unknown", not "established" (additive key).
-        "evidence_read_failed": evidence_read_failed,
-        "subscription_cost_usd": round(cost_total, 6) if (settled and cost_known) else None,
-        # The settlement row's own estimated/final distinction, carried instead of
-        # dropped: an estimated sum must never render as an exact receipt.
-        "subscription_cost_estimated": bool(settled and cost_known and cost_estimated),
-        "harness_models": models,
-    }
+    from ouroboros.artifacts import DELEGATED_CAPTURE_PREFIX, task_artifact_dir_path
+
+    safe_run = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(run_id or ""))[:64]
+    return task_artifact_dir_path(drive_root, str(task_id or "")) / DELEGATED_CAPTURE_PREFIX / (safe_run or "run")
+
+
+def record_patch_captured(drive_root: Any, custody: RunCustody, **payload: Any) -> bool:
+    """Durably mark a terminal mutating run's patch as captured (idempotent flag)."""
+    custody.patch_captured = True
+    return emit(drive_root, PATCH_CAPTURED, {
+        "run_id": custody.run_id, "task_id": custody.task_id,
+        "snapshot_id": custody.snapshot_id, **payload,
+    })
+
+
+def record_patch_disposed(drive_root: Any, custody: RunCustody, *, disposition: str,
+                          **payload: Any) -> bool:
+    """Durably record the EXPLICIT apply/reject disposition of a captured patch.
+
+    This is the row that releases the execution snapshot for cleanup: until it
+    lands, the snapshot and the captured patch persist as conflict material.
+    """
+    custody.patch_disposed = str(disposition or "")
+    custody.patch_apply_pending = False  # a disposition completes the intent story
+    return emit(drive_root, PATCH_DISPOSED, {
+        "run_id": custody.run_id, "task_id": custody.task_id,
+        "snapshot_id": custody.snapshot_id, "disposition": str(disposition or ""),
+        **payload,
+    })
+
+
+def record_patch_apply_started(drive_root: Any, custody: RunCustody, **payload: Any) -> bool:
+    """Durably record the APPLY INTENT before the target tree is mutated (CR1-3).
+
+    Returns whether the row LANDED, and the caller must not mutate when it did
+    not: an apply whose intent row never reached the disk leaves a crash window
+    where a modified tree replays as "never applied" — the false-rejection class
+    this row exists to close. Same doctrine as ``record_start_requested``.
+    """
+    landed = emit(drive_root, PATCH_APPLY_STARTED, {
+        "run_id": custody.run_id, "task_id": custody.task_id,
+        "snapshot_id": custody.snapshot_id, **payload,
+    })
+    if landed:
+        custody.patch_apply_pending = True
+    return landed
+
+
+def record_patch_apply_resolved(drive_root: Any, custody: RunCustody, *, reason: str,
+                                **payload: Any) -> bool:
+    """Resolve an apply intent whose attempt is PROVEN to have left the tree
+    unmutated (drift refusal, atomic apply failure, clean revert).
+
+    Memory clears regardless of the row's fate — the caller just observed the
+    unmutated outcome — so an in-process retry stays open; a failed write only
+    means a post-restart replay stays ambiguous, which is the fail-closed
+    direction. A disposition row resolves the intent too (see ``_apply``).
+    """
+    custody.patch_apply_pending = False
+    return emit(drive_root, PATCH_APPLY_RESOLVED, {
+        "run_id": custody.run_id, "task_id": custody.task_id,
+        "snapshot_id": custody.snapshot_id, "reason": str(reason or ""),
+        **payload,
+    })
+
+
+def open_snapshot_ids(drive_root: Any) -> set:
+    """Snapshot ids custody still holds OPEN — the startup GC's keep-set.
+
+    A snapshot is open while its run is unsettled OR its captured patch has no
+    explicit disposition, and while a PENDING invocation names it (the POST may
+    have bound a live run the worker died before recording). Everything else is
+    disposable.
+    """
+    ids: set = set()
+    for custody in replay(drive_root).values():
+        if custody.snapshot_id and not (custody.settled and custody.patch_disposed):
+            ids.add(custody.snapshot_id)
+    for record in pending_invocations(drive_root):
+        snap = str(record.get("snapshot_id") or "")
+        if snap:
+            ids.add(snap)
+    return ids
 
 
 def run_timing(drive_root: Any, run_id: str) -> Tuple[str, int]:
@@ -537,6 +601,14 @@ def invocation_record(drive_root: Any, invocation_id: str) -> Optional[Dict[str,
                 "project_id": str(row.get("project_id") or ""),
                 "project_owned": bool(row.get("project_owned")),
                 "idempotency_key": str(row.get("idempotency_key") or ""),
+                # The C1 isolation binding: a retry reproduces EXACTLY these — the
+                # snapshot, the execution root, the baseline and the authority
+                # target the original attempt bound — never a re-derivation.
+                "snapshot_id": str(row.get("snapshot_id") or ""),
+                "execution_root": str(row.get("execution_root") or ""),
+                "baseline_sha": str(row.get("baseline_sha") or ""),
+                "target_root": str(row.get("target_root") or ""),
+                "authority_source": str(row.get("authority_source") or ""),
             }
         elif kind == STARTED:
             state, run_id = "started", str(row.get("run_id") or "")
@@ -587,6 +659,13 @@ def record_started(drive_root: Any, custody: RunCustody,
         "ledger_root": custody.ledger_root,
         "idempotency_key": custody.idempotency_key,
         "invocation_id": custody.invocation_id,
+        # The C1 isolation binding rides the SAME row (empty for read-only runs):
+        # a binding recorded separately can lose one half of itself to a crash.
+        "snapshot_id": custody.snapshot_id,
+        "execution_root": custody.execution_root,
+        "baseline_sha": custody.baseline_sha,
+        "target_root": custody.target_root,
+        "authority_source": custody.authority_source,
         **(shape or {}),
     })
 
@@ -969,6 +1048,22 @@ def settled_unread_outputs(drive_root: Any) -> List[RunCustody]:
             if settled_output_unread(custody)]
 
 
+def undisposed_patches(drive_root: Any) -> List[RunCustody]:
+    """Settled mutating runs whose snapshot work awaits an explicit apply/reject.
+
+    The C1 counterpart of ``settled_unread_outputs``: a run that executed in a
+    private snapshot and settled — through the nanny OR through reconciliation —
+    holds real work that reaches the shared tree only via
+    ``integrate_delegated_patch``. Until that disposition lands, the snapshot and
+    the captured patch persist (the GC keeps them), and this projection keeps the
+    obligation VISIBLE instead of letting an orphaned run's work sit on disk
+    forever, preserved but findable by nobody. Self-clearing: the
+    ``PATCH_DISPOSED`` row flips ``patch_disposed`` in the very replay this reads.
+    """
+    return [custody for custody in replay(drive_root).values()
+            if custody.snapshot_id and custody.settled and not custody.patch_disposed]
+
+
 def record_containment_fault(drive_root: Any, custody: RunCustody, reason: str,
                              detail: str = "", **facts: Any) -> None:
     """A run we tried to stop and could not verify stopped is a LOUD, durable incident.
@@ -1137,6 +1232,17 @@ def pending_invocations(drive_root: Any) -> List[Dict[str, Any]]:
                 "idempotency_key": str(row.get("idempotency_key") or ""),
                 "root_task_id": str(row.get("root_task_id") or ""),
                 "parent_task_id": str(row.get("parent_task_id") or ""),
+                # The FULL C1 isolation binding, not just the GC key: recovery
+                # re-records it on the bound run's STARTED row, so the snapshot
+                # stays custody-visible after the invocation stops being pending.
+                # snapshot_id alone was carried before, and a recovered run then
+                # replayed bindingless — the startup GC read its snapshot as
+                # closed and deleted the child's uncaptured work with it.
+                "snapshot_id": str(row.get("snapshot_id") or ""),
+                "execution_root": str(row.get("execution_root") or ""),
+                "baseline_sha": str(row.get("baseline_sha") or ""),
+                "target_root": str(row.get("target_root") or ""),
+                "authority_source": str(row.get("authority_source") or ""),
             }
         elif kind == STARTED:
             state[invocation_id] = "started"
@@ -1311,7 +1417,17 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
         # The sweep runs against the canonical root; a recovered run's ledger row
         # belongs there like every other (P34R.1).
         ledger_root=str(drive_root),
-        idempotency_key=str(record["idempotency_key"]), invocation_id=invocation_id)
+        idempotency_key=str(record["idempotency_key"]), invocation_id=invocation_id,
+        # The C1 isolation binding survives recovery VERBATIM: the recovered run
+        # executes in the snapshot the original attempt provisioned (the replayed
+        # body's scope.root), so its STARTED row must name that binding or the
+        # snapshot — and the child's work in it — becomes GC food the moment the
+        # invocation stops being pending.
+        snapshot_id=str(record.get("snapshot_id") or ""),
+        execution_root=str(record.get("execution_root") or ""),
+        baseline_sha=str(record.get("baseline_sha") or ""),
+        target_root=str(record.get("target_root") or ""),
+        authority_source=str(record.get("authority_source") or ""))
     record_started(drive_root, custody, shape={
         # The stored invocation is the single source of a replay's facts — the same
         # doctrine the explicit retry path follows.
@@ -1338,6 +1454,39 @@ def _retire_recovered_registration(gateway: Any, record: Dict[str, Any]) -> bool
         return False
 
 
+def _capture_stranded_patch(drive_root: Any, run: RunCustody) -> Dict[str, Any]:
+    """Capture a reconciled mutating run's diff into the ordinary patch artifact.
+
+    The reconcile path is the ONLY terminal observer a dead-owner run gets, so
+    without this the child's work stayed in the snapshot with no captured patch
+    and no apply/reject material — stranded, invisible, and one binding loss away
+    from GC. Called ONLY where a terminal receipt PROVES the run is over (C1-R2):
+    a run closed absent/unreadable has unknowable state, and freezing a patch
+    there would put a "captured" receipt over work the child might still be
+    writing — those runs are captured lazily at disposition instead. Reuses the
+    one existing capture primitive (idempotent, durable ``PATCH_CAPTURED`` row);
+    capture ONLY — the apply/reject decision belongs to a live owner and is NEVER
+    taken by a sweep. Fail-soft: a capture error is disclosed in the reconcile
+    row, and the snapshot persists either way because the run has no recorded
+    disposition.
+    """
+    if not (run.execution_root and run.settled and not run.patch_disposed):
+        return {}
+    try:
+        from ouroboros.tools.delegate_integration import capture_terminal_patch_for_drive
+
+        block = capture_terminal_patch_for_drive(drive_root, run) or {}
+    except Exception:
+        log.warning("Reconcile patch capture failed for %s", run.run_id, exc_info=True)
+        return {"patch_capture": "failed", "patch_disposition": "pending"}
+    return {"patch_capture": str(block.get("status") or ""),
+            "patch_artifact": block.get("patch_artifact"),
+            # The typed disposition-pending disclosure: this rides the durable
+            # RECONCILED row, and the health surface (``undisposed_patches``)
+            # keeps the fact visible until an explicit apply/reject lands.
+            "patch_disposition": "pending"}
+
+
 def _reconcile_one(drive_root: Any, gateway: Any, custody: RunCustody) -> Dict[str, Any]:
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
@@ -1350,6 +1499,14 @@ def _reconcile_one(drive_root: Any, gateway: Any, custody: RunCustody) -> Dict[s
         else:
             record_containment_fault(drive_root, custody, "reconcile_unreadable", f"{exc.code}: {exc}")
             result = {"run_id": custody.run_id, "task_id": custody.task_id, "action": "unreadable"}
+        # NO capture here (C1-R2): an absent run's state is unknowable from this
+        # daemon — across the D30 owned-daemon provisioning boundary the child may
+        # still be alive and WRITING to the snapshot, and an eager capture would
+        # freeze a potentially incomplete patch which the idempotent capture core
+        # would then serve forever. Custody closes, the snapshot stays preserved
+        # (undisposed, so the GC keeps it), the obligation surfaces through
+        # ``undisposed_patches()``, and the capture happens at disposition
+        # (``integrate_delegated_patch``) — the honest latest-possible point.
         emit(drive_root, RECONCILED, result)
         return result
     if is_terminal(detail):
@@ -1363,10 +1520,20 @@ def _reconcile_one(drive_root: Any, gateway: Any, custody: RunCustody) -> Dict[s
         # is where that fact becomes durable instead of inferred.
         result = {"run_id": custody.run_id, "task_id": custody.task_id, "action": "settled",
                   "settled": settled["settled"], **output_disposition(custody)}
+        # The C1 half: a TERMINAL DETAIL proves the run is over, so the sweep — its
+        # last terminal observer — captures the diff eagerly here.
+        result.update(_capture_stranded_patch(drive_root, custody))
     else:
         cancelled = cancel_and_verify(drive_root, gateway, custody, "owner_task_gone")
         result = {"run_id": custody.run_id, "task_id": custody.task_id, "action": "cancelled",
                   "outcome": cancelled["outcome"], **output_disposition(custody)}
+        # Capture ONLY on a verified terminal receipt (the read-back proved the run
+        # over). A cancel merely requested leaves the run live and its snapshot
+        # still being written; a cancel confirmed by ABSENCE proves nothing about
+        # the run (same unknowable-state doctrine as above) — both leave the
+        # capture to disposition.
+        if cancelled["state"] in TERMINAL_STATES:
+            result.update(_capture_stranded_patch(drive_root, custody))
     emit(drive_root, RECONCILED, result)
     return result
 
@@ -1386,6 +1553,7 @@ __all__ = [
     "custody_log_unreadable",
     "custody_root",
     "daemon_says_absent",
+    "delegated_capture_dir",
     "disclosed_spend",
     "emit",
     "idempotency_key",
@@ -1395,11 +1563,16 @@ __all__ = [
     "new_invocation_id",
     "open_containment_faults",
     "open_runs",
+    "open_snapshot_ids",
     "output_disposition",
     "pending_invocations",
     "reconcile_orphaned_runs",
     "record_containment_fault",
     "record_output_consumed",
+    "record_patch_apply_resolved",
+    "record_patch_apply_started",
+    "record_patch_captured",
+    "record_patch_disposed",
     "record_start_requested",
     "record_settled_unread",
     "record_started",
@@ -1412,4 +1585,5 @@ __all__ = [
     "settled_unread_outputs",
     "summary_of",
     "task_execution_evidence",
+    "undisposed_patches",
 ]

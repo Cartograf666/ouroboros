@@ -1598,10 +1598,36 @@ def _str_replace_editor(
         _shrink_block = _check_shrink_guard(binding, new_content, force)
         if _shrink_block:
             return _shrink_block
+    # X3 hash-bind: the ADMITTED repair task's payload edits CAS-check the
+    # repair's own hash chain; drift outside the repair is a typed stale
+    # terminalization, never a silent write over foreign changes.
+    _repair_cas_constraint = (
+        task_constraint
+        if task_constraint and task_constraint.mode == "skill_repair"
+        and str(getattr(task_constraint, "skill_name", "") or "")
+        else None
+    )
+    if _repair_cas_constraint is not None:
+        from ouroboros.skill_repair_admission import repair_write_cas_error
+
+        _cas = repair_write_cas_error(
+            pathlib.Path(ctx.drive_root), _repair_cas_constraint,
+            task_id=str(getattr(ctx, "task_id", "") or ""),
+            # Mandatory only for a real repair TASK; a synthesized short-form
+            # selector on an ordinary edit lane is not an admitted repair.
+            repair_task=bool(existing_tc and existing_tc.mode == "skill_repair"))
+        if _cas:
+            return _cas
     try:
         write_text(target, new_content)
     except Exception as e:
         return f"⚠️ STR_REPLACE_ERROR: write failed for {path}: {e}"
+    if _repair_cas_constraint is not None:
+        from ouroboros.skill_repair_admission import advance_repair_expected_hash
+
+        advance_repair_expected_hash(
+            pathlib.Path(ctx.drive_root), _repair_cas_constraint,
+            task_id=str(getattr(ctx, "task_id", "") or ""))
 
     replacement_line = new_content[:new_content.index(new_str)].count('\n') + 1
     context_start = max(0, replacement_line - 3)

@@ -334,8 +334,41 @@ def _enqueue_retry(
     return False, attempt, blocked_reason
 
 
+def _incident_chat_id(task: Any, owner_chat_id: int) -> Optional[int]:
+    """C4: an incident notice belongs to the TASK'S OWN chat; the owner chat is
+    only the absent-binding fallback (the same precedence queue.py already uses
+    for grace episodes).
+
+    Routed through the ONE notification normalizer, so membership decides instead
+    of truthiness: chat **0 is the Skill Review panel** and a task bound there
+    keeps its incident there (the old `> 0` test both re-routed it to the owner
+    AND then refused to send, because `if owner_chat_id:` drops 0 as well). A
+    negative (A2A/internal) chat is suppressed and falls through to the owner
+    fallback; ``None`` means there is no deliverable route at all."""
+    from supervisor.message_bus import notification_chat_route
+
+    return notification_chat_route(
+        task.get("chat_id") if isinstance(task, dict) else None,
+        # A 0/absent owner chat is "not configured", not the panel — only an
+        # explicit TASK binding routes to 0.
+        owner_chat_id or None,
+    )
+
+
+def _stop_detail(ceiling_reached: bool, deadline_reached: bool, orchestrator: bool) -> str:
+    """The one human sentence for WHY a reaped task will not be retried."""
+    if ceiling_reached:
+        return "Absolute ceiling reached; task stopped."
+    if deadline_reached:
+        return "Absolute deadline reached; task stopped."
+    if orchestrator:
+        return ("Idle with live children (orchestrator); stopped without a "
+                "blind retry to avoid replaying the subtree.")
+    return "Retry limit exhausted, task stopped."
+
+
 def _hold_wedged_worker(task_id: str, task_type: str, worker_id: int, terminal_reason: str,
-                        runtime_sec: float, owner_chat_id: int) -> None:
+                        runtime_sec: float, notify_chat_id: Optional[int]) -> None:
     """Strict fail-closed handling for a worker that would not confirm dead after repeated kills:
     persist a durable STATUS_RUNNING result so the task is reconcilable on the next generation (the
     custody reaper terminalizes the orphan after a worker_boot) instead of vanishing into limbo, then
@@ -371,10 +404,10 @@ def _hold_wedged_worker(task_id: str, task_type: str, worker_id: int, terminal_r
         )
     except Exception:
         log.debug("Reaper: failed to log task_reaper_wedged for %s", task_id, exc_info=True)
-    if owner_chat_id:
+    if notify_chat_id is not None:
         try:
             send_with_budget(
-                owner_chat_id,
+                notify_chat_id,
                 (
                     f"⚠️ A timed-out worker (task {task_id}) did not die after repeated kills. Its slot is "
                     f"held unavailable and the task is left running to avoid racing a still-live process. "
@@ -556,7 +589,8 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
         # task). A durable STATUS_RUNNING result is persisted so the task is reconciled (not lost in
         # limbo) on the next generation — the custody reaper terminalizes the orphan after a
         # worker_boot. Surface it loudly so the owner can /restart if truly wedged.
-        _hold_wedged_worker(task_id, task_type, worker_id, terminal_reason, runtime_sec, owner_chat_id)
+        _hold_wedged_worker(task_id, task_type, worker_id, terminal_reason, runtime_sec,
+                            _incident_chat_id(task, owner_chat_id))
         return
 
     try:
@@ -734,28 +768,22 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
 
         # Guarded: a notification failure (e.g. a torn-down bus during shutdown) must NOT
         # abort the reaper before respawn, or the slot would stay reaping=True forever.
-        if owner_chat_id:
+        # C4: the notice goes to the TASK'S chat; owner chat only as absent-binding fallback.
+        incident_chat_id = _incident_chat_id(task, owner_chat_id)
+        if incident_chat_id is not None:
             try:
                 if requeued:
                     send_with_budget(
-                        owner_chat_id,
+                        incident_chat_id,
                         f"🛑 {terminal_reason}: task {task_id} killed after {int(runtime_sec)}s.\n"
                         f"Worker {worker_id} restarted. Task queued for retry attempt={new_attempt}.",
                         is_progress=True, task_id=task_id,
                         progress_meta={"task_incident": "task_reaper_retry", "toast_once": incident_toast_once},
                     )
                 else:
-                    if ceiling_reached:
-                        stop_detail = "Absolute ceiling reached; task stopped."
-                    elif deadline_reached:
-                        stop_detail = "Absolute deadline reached; task stopped."
-                    elif orchestrator:
-                        stop_detail = ("Idle with live children (orchestrator); stopped without a "
-                                       "blind retry to avoid replaying the subtree.")
-                    else:
-                        stop_detail = "Retry limit exhausted, task stopped."
+                    stop_detail = _stop_detail(ceiling_reached, deadline_reached, orchestrator)
                     send_with_budget(
-                        owner_chat_id,
+                        incident_chat_id,
                         f"🛑 {terminal_reason}: task {task_id} killed after {int(runtime_sec)}s.\n"
                         f"Worker {worker_id} restarted. {stop_detail}",
                         is_progress=True, task_id=task_id,

@@ -14,7 +14,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Literal, Optional
 
-from ouroboros.artifacts import task_artifact_dir_path, task_id_for_artifacts
+from ouroboros.artifacts import (delegated_capture_read_target,
+                                 task_artifact_dir_path, task_id_for_artifacts)
 from ouroboros.tool_capabilities import ACTING_SUBAGENT_MODE, LOCAL_READONLY_SUBAGENT_MODE
 from ouroboros.contracts.task_constraint import VALID_WRITE_SURFACES, normalize_task_constraint
 from ouroboros.shell_parse import is_absolute_path_text
@@ -1406,6 +1407,14 @@ def _resolve_target_in_selected_base(
         path_text = normalize_runtime_data_path(resolved_base, path_text)
     elif root in {"active_workspace", "system_repo"}:
         path_text = normalize_root_relative(resolved_base, path_text)
+    if root == "artifact_store" and operation in _READ_OPS:
+        # C1 delegated captures (CR1-2): written on the CANONICAL drive, read from
+        # a CHILD drive_root — re-anchor (see `delegated_capture_read_target`).
+        anchored = delegated_capture_read_target(
+            canonical_data_root(ctx), task_id_for_artifacts(ctx),
+            safe_relpath(path_text), resolved_base)
+        if anchored is not None:
+            return anchored
     resolved = (resolved_base / safe_relpath(path_text)).resolve(strict=False)
     try:
         resolved.relative_to(resolved_base)

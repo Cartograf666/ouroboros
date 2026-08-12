@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import pathlib
-import re
 import shutil
 import subprocess
 import tempfile
@@ -64,67 +63,33 @@ _ARTIFACT_LIFECYCLE_FIELDS = {
     "artifact_bundle",
     "artifact_finalized_at",
 }
-# v6.35.0 (T7): bumped to 2 with binary + size + junk-artifact hygiene so the
-# real-usage workspace.patch (consumed by subagents / PR integration) never
-# carries a compiled `go build` binary, a Redis dump, or other untracked build
-# junk. Kept consistent with the bench capture_patch.sh JUNK_RE + numstat
-# binary detection. This is patch-transport hygiene only (artifact path/extension
-# + git's own binary verdict), never code/content inference (Bible P5).
-_PATCH_EXCLUDE_RULES_VERSION = 2
-_PATCH_MAX_UNTRACKED_FILE_BYTES = 5 * 1024 * 1024  # 5 MiB per untracked file
+# The PURE patch/snapshot eligibility rules (env/cache dirs, junk artifacts,
+# incidental lockfiles, credential-shaped names) live in their own module (size
+# gate); re-exported here (same objects) because project_sources, coop_checkpoint
+# and the tests address them on THIS surface. The I/O checks and the combined
+# `untracked_capture_veto_reason` predicate stay below, beside the git helpers.
+from ouroboros.workspace_patch_rules import (  # noqa: F401
+    _ANY_SEGMENT_EXCLUDE_DIRS,
+    _LOCKFILE_MANIFESTS,
+    _PATCH_EXCLUDE_RULES_VERSION,
+    _PATCH_JUNK_RE,
+    _PATCH_MAX_UNTRACKED_FILE_BYTES,
+    _SENSITIVE_EXAMPLE_SUFFIXES,
+    _SENSITIVE_FILENAMES,
+    _SENSITIVE_KEY_NAMES,
+    _TOP_LEVEL_EXCLUDE_DIRS,
+    _incidental_lockfile_excludes,
+    _lockfile_manifest_for,
+    _patch_exclude_reason,
+    _sensitive_untracked_reason,
+)
+
 # v6.52.2: the task-scoped manifest of {ABSOLUTE_path: sha256} fingerprints the agent declared via
 # run_command/run_script `scratch=[...]` (ephemeral verification files). The patch capture below
 # EXCLUDES a matching untracked path ONLY while its current content still matches the recorded sha
 # (so a later real file at the same path is not dropped). SSOT for the name; ouroboros.artifacts
 # imports this (headless is the lower-level module).
 SCRATCH_MANIFEST_NAME = ".scratch_manifest.json"
-_TOP_LEVEL_EXCLUDE_DIRS = {".ouroboros", ".venv", "venv", "env"}
-_ANY_SEGMENT_EXCLUDE_DIRS = {
-    ".cache",
-    ".mypy_cache",
-    ".npm",
-    ".pnpm-store",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".tox",
-    ".yarn",
-    "__pycache__",
-    "node_modules",
-}
-# Junk file tails / build dirs the dir-sets above don't already cover; the same
-# JUNK_RE the bench capture_patch.sh uses (devtools/benchmarks/swe_bench_pro/).
-_PATCH_JUNK_RE = re.compile(
-    r"appendonlydir|\.rdb$|\.aof$|\.manifest$|\.log$|\.tmp$|\.pid$|\.sock$"
-    r"|\.pyc$|\.pyo$|^(dist|build)/|\.DS_Store|(^|/)\.coverage$"
-    r"|coverage\.xml$|(^|/)htmlcov/"
-)
-_LOCKFILE_MANIFESTS = {
-    "package-lock.json": "package.json",
-    "npm-shrinkwrap.json": "package.json",
-    "yarn.lock": "package.json",
-    "pnpm-lock.yaml": "package.json",
-    "go.sum": "go.mod",
-    "Cargo.lock": "Cargo.toml",
-    "poetry.lock": "pyproject.toml",
-    "Pipfile.lock": "Pipfile",
-    "composer.lock": "composer.json",
-    "Gemfile.lock": "Gemfile",
-}
-_SENSITIVE_EXAMPLE_SUFFIXES = (".example", ".sample", ".template", ".dist")
-_SENSITIVE_KEY_NAMES = {"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
-_SENSITIVE_FILENAMES = {
-    ".git-credentials",
-    ".netrc",
-    ".npmrc",
-    ".pypirc",
-    "aws-credentials.json",
-    "credentials",
-    "credentials.json",
-    "gcp-service-account.json",
-    "service-account.json",
-    "secrets.json",
-    "token.json",
-}
 _GIT_UNBORN_HEAD = "(unborn)"
 
 
@@ -1413,43 +1378,6 @@ def _write_patch_separator(fh: BinaryIO, hasher: Any) -> int:
     return len(data)
 
 
-def _patch_exclude_reason(rel: str) -> str:
-    posix = str(rel).replace("\\", "/")
-    parts = pathlib.PurePosixPath(posix).parts
-    if not parts:
-        return ""
-    if parts[0] in _TOP_LEVEL_EXCLUDE_DIRS:
-        return f"top-level env/cache directory: {parts[0]}"
-    for part in parts:
-        if part in _ANY_SEGMENT_EXCLUDE_DIRS:
-            return f"env/cache directory segment: {part}"
-    if _PATCH_JUNK_RE.search(posix):
-        return f"junk artifact: {posix}"
-    return ""
-
-
-def _lockfile_manifest_for(rel: str) -> str:
-    posix = str(rel).replace("\\", "/")
-    path = pathlib.PurePosixPath(posix)
-    manifest = _LOCKFILE_MANIFESTS.get(path.name)
-    return path.with_name(manifest).as_posix() if manifest else ""
-
-
-def _incidental_lockfile_excludes(changed_paths: List[str]) -> set[str]:
-    changed = {str(path or "").replace("\\", "/") for path in changed_paths if str(path or "").strip()}
-    lock_to_manifest = {
-        path: manifest
-        for path in changed
-        for manifest in [_lockfile_manifest_for(path)]
-        if manifest
-    }
-    if not lock_to_manifest:
-        return set()
-    if not (changed - set(lock_to_manifest)):
-        return set()
-    return {path for path, manifest in lock_to_manifest.items() if manifest not in changed}
-
-
 def _untracked_blob_exclude_reason(root: pathlib.Path, rel: str) -> str:
     """Reason to drop an untracked file from the workspace patch when it is a
     build/runtime BINARY or exceeds the per-file size cap. Keeps real-usage
@@ -1475,23 +1403,24 @@ def _untracked_blob_exclude_reason(root: pathlib.Path, rel: str) -> str:
     return ""
 
 
-def _sensitive_untracked_reason(rel: str) -> str:
-    name = pathlib.PurePosixPath(str(rel).replace("\\", "/")).name
-    lower = name.lower()
-    is_dotenv_secret = lower.startswith(".env") or lower.endswith(".env") or ".env." in lower
-    if is_dotenv_secret and not lower.endswith(_SENSITIVE_EXAMPLE_SUFFIXES):
-        return "dotenv secret"
-    if lower in _SENSITIVE_KEY_NAMES or lower in _SENSITIVE_FILENAMES:
-        return "credential filename"
-    parts = lower.replace(".", " ").replace("-", " ").replace("_", " ").split()
-    if (
-        any(part in {"secret", "secrets", "credential", "credentials", "token"} for part in parts)
-        or ("service" in parts and "account" in parts)
-    ) and lower.endswith((".json", ".yaml", ".yml", ".toml", ".ini", ".txt")):
-        return "credential-like filename"
-    if lower.endswith((".pem", ".key", ".p12", ".pfx")):
-        return "private key or certificate"
-    return ""
+def untracked_capture_veto_reason(root: pathlib.Path, rel: str) -> str:
+    """Why an untracked file must NOT ride into a workspace snapshot or patch.
+
+    The delegated-run baseline snapshot
+    (``subagent_worktrees.provision_execution_snapshot``) asks the SAME three
+    checks, in the SAME order, that ``write_workspace_patch_artifacts`` applies
+    to untracked files: sensitive/credential-shaped names first, then the
+    static junk rules, then the binary/size veto. One combined predicate here so
+    the snapshot and the patch cannot drift apart about eligibility.
+    Returns the human-readable reason, or "" when the file is eligible.
+    """
+    reason = _sensitive_untracked_reason(rel)
+    if reason:
+        return reason
+    reason = _patch_exclude_reason(rel)
+    if reason:
+        return reason
+    return _untracked_blob_exclude_reason(root, rel)
 
 
 def _preflight_head_from_task(task: Dict[str, Any]) -> str:

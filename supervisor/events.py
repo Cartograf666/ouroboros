@@ -30,6 +30,7 @@ from ouroboros.task_results import (
     load_task_result,
     write_task_result,
 )
+from ouroboros.cost_projection import carry_cost_meta, with_cost_aliases
 from ouroboros.outcomes import infra_failed_axes, normalize_outcome_axes
 from ouroboros.subagents import intended_lane as intended_subagent_lane
 from ouroboros.contracts.task_contract import build_task_contract, normalize_allowed_resources
@@ -1312,7 +1313,12 @@ def _authoritative_terminal_cost(
     if is_root and post_status in {"pending_once", "running"}:
         projection["cost_final"] = False
         projection["cost_with_children_partial"] = True
-    return projection
+    # SSOT cost naming (C2): re-converge the additive/deprecated alias pairs at
+    # this outer seam — the branches above legitimately mutate the deprecated
+    # names, and the honest names must leave carrying the same values. This is
+    # deliberately the LAST statement: any cost mutation added after it would
+    # persist a diverged pair.
+    return with_cost_aliases(projection)
 
 
 def _task_done_review_projection(
@@ -1613,6 +1619,10 @@ def _finish_task_done_dispatch(
             trace_text = str(effective_result.get("trace_summary") or "")
             constraint = effective_result.get("task_constraint")
             constraint = constraint if isinstance(constraint, dict) else {}
+            # The `cost_usd: None` seed keeps the frame's long-standing shape
+            # (both alias spellings always present, null when unknown) even for a
+            # terminal event that carried no cost field at all.
+            _cost_meta = carry_cost_meta({"cost_usd": None, **task_done_event})
             progress_meta = {
                 "subagent_event": subagent_event,
                 "subagent_task_id": str(task_id or ""),
@@ -1622,7 +1632,24 @@ def _finish_task_done_dispatch(
                 "subagent_role": str(task.get("role") or ""),
                 "write_surface": str(constraint.get("surface") or ""),
                 "status": status,
-                "cost_usd": task_done_event.get("cost_usd"),
+                # C2/C12: both alias spellings plus EVERY openness/integrity
+                # marker accounting recorded. The VALUES come from the cost SSOT
+                # (`_cost_meta` above) so a marker added there arrives here too;
+                # the KEYS stay literal because a ChatOutbound frame's key set
+                # must be statically checkable (tests/test_contracts.py) — and
+                # `tests/test_cost_projection.py` fails if this literal ever
+                # stops covering the SSOT. The hand-picked list this replaces
+                # dropped `reserved_usd`, `unresolved_upper_bound_usd` and the
+                # ledger integrity marker, leaving an unexplained "not final".
+                "cost_usd": _cost_meta.get("cost_usd"),
+                "accounted_upper_bound_usd": _cost_meta.get("accounted_upper_bound_usd"),
+                "cost_with_children_partial": _cost_meta.get("cost_with_children_partial"),
+                "unknown_unmetered": _cost_meta.get("unknown_unmetered"),
+                "non_final_rows": _cost_meta.get("non_final_rows"),
+                "reserved_usd": _cost_meta.get("reserved_usd"),
+                "unresolved_upper_bound_usd": _cost_meta.get("unresolved_upper_bound_usd"),
+                "ledger_integrity_degraded": _cost_meta.get("ledger_integrity_degraded"),
+                "cost_accounting_error": _cost_meta.get("cost_accounting_error"),
                 "cost_accounting_status": str(
                     task_done_event.get("cost_accounting_status") or "unavailable"
                 ),
@@ -1728,17 +1755,13 @@ def _finish_task_done_dispatch(
                 result="",
                 **({
                     key: task_done_event[key]
-                    for key in (
-                        "cost_usd",
-                        "total_rounds",
-                        "prompt_tokens",
-                        "completion_tokens",
-                        "cost_accounting_status",
-                        "cost_final",
-                        "cost_accounting_error",
-                    )
+                    for key in ("total_rounds", "prompt_tokens", "completion_tokens")
                     if key in task_done_event
                 }),
+                # C12: the accounting fields come from the cost SSOT, so a marker
+                # added there (reserved/unresolved/ledger integrity) reaches this
+                # fallback result too instead of being dropped by a stale list.
+                **carry_cost_meta(task_done_event),
                 ts=evt.get("ts", ""),
             )
     except Exception as exc:

@@ -422,9 +422,12 @@ def _peek_task(ctx: ToolContext, task_id: str, view: str = "summary") -> str:
     status_drive_root = _status_drive_root(ctx)
     data = load_effective_task_result(status_drive_root, tid) or {}
     status = str(data.get("status") or "unknown")
-    cost = data.get("cost_usd", 0) or 0
+    # SSOT cost projection (C2): a missing/unknown cost says "unknown", never a
+    # confident $0.00, and an open amount is labelled as the upper bound it is.
+    from ouroboros.cost_projection import cost_display
+
     parts = [
-        f"Task {tid} [{status}] cost=${float(cost):.2f} (peek — NOT absorbed)",
+        f"Task {tid} [{status}] cost={cost_display(data)} (peek — NOT absorbed)",
         f"child_result_sha256={_child_result_sha256(data)}",
     ]
     # Latest beacons this child posted to the shared ledger (partial_finding / blocker /

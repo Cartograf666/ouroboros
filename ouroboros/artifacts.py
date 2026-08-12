@@ -10,7 +10,7 @@ import uuid
 import zipfile
 from datetime import datetime, timezone
 from hashlib import sha256
-from typing import Any, Dict, Iterable, List, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 from ouroboros.utils import atomic_write_json, read_json_dict
 from ouroboros.headless import ARTIFACT_STATUS_READY, SCRATCH_MANIFEST_NAME, task_artifacts_dir
@@ -230,6 +230,41 @@ def task_artifact_dir_path(drive_root: Union[pathlib.Path, str], task_id: str, *
     """Return the task artifact directory without creating it unless requested."""
 
     return task_artifacts_dir(pathlib.Path(drive_root), validate_task_id(task_id), create=create)
+
+
+# The artifact-store subdir delegated-run captures live in (the naming SSOT
+# `delegate_custody.delegated_capture_dir` builds on this dir).
+DELEGATED_CAPTURE_PREFIX = "delegated_runs"
+
+
+def delegated_capture_read_target(
+    canonical_root: Any, task_id: str, rel_text: str, resolved_base: pathlib.Path,
+) -> Optional[pathlib.Path]:
+    """Canonical-drive anchor for READS of delegated-run capture artifacts (CR1-2).
+
+    The capture writer always writes under the CANONICAL (budget) drive
+    (`delegate_custody.custody_root` — the capture must survive child-drive
+    pruning), while a child task's ``artifact_store`` base resolves from the
+    CHILD's drive_root — so a split-drive nanny that owns the run got NOT_FOUND
+    for its own patch/manifest and could only dispose blindly. Reads of exactly
+    the capture prefix (the owning task's own capture dir, never a broader
+    surface) re-anchor here. Returns None when the path is not a capture path
+    or the base already IS canonical (ordinary single-drive tasks).
+    """
+    prefix = DELEGATED_CAPTURE_PREFIX
+    if rel_text != prefix and not rel_text.startswith(prefix + "/"):
+        return None
+    canonical_base = task_artifact_dir_path(
+        canonical_root, task_id, create=False,
+    ).resolve(strict=False)
+    if canonical_base == pathlib.Path(resolved_base):
+        return None
+    anchored = (canonical_base / rel_text).resolve(strict=False)
+    try:
+        anchored.relative_to(canonical_base)
+    except ValueError as exc:
+        raise ValueError(f"path escapes {canonical_base}") from exc
+    return anchored
 
 
 def task_id_for_artifacts(ctx: Any) -> str:

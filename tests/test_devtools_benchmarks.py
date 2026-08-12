@@ -626,13 +626,22 @@ def test_gaia_solver_disable_tools_before_prompt(monkeypatch, tmp_path):
     monkeypatch.setattr(ouroboros_solver.subprocess, "run", fake_run)
     result = ouroboros_solver.run_ouroboros("question", sample_id="sample")
     assert result["final_answer"] == "ok"
+    # --disable-tools stays BEFORE the prompt transport on argv: the REMAINDER
+    # positional would otherwise swallow it (the original bug class), and with
+    # the C5 file transport a later flag must still never shadow it.
+    assert seen["cmd"].index("--disable-tools") < seen["cmd"].index("--prompt-file")
     parser = cli.build_parser()
     ns = parser.parse_args(seen["cmd"][3:])
     assert ns.disable_tools == ["web_search,claude_code_edit"]
     assert ns.result_json_out
+    # C5 E2BIG hygiene: the prompt travels as a FILE, never as an argv tail.
+    assert not ns.prompt
+    prompt_path = Path(ns.prompt_file)
+    assert prompt_path.is_file()
+    prompt_text = prompt_path.read_text(encoding="utf-8")
     # The prompt is the question plus the official GAIA "FINAL ANSWER:" protocol suffix.
-    assert ns.prompt and ns.prompt[0].startswith("question")
-    assert "FINAL ANSWER:" in ns.prompt[0]
+    assert prompt_text.startswith("question")
+    assert "FINAL ANSWER:" in prompt_text
 
 
 def test_gaia_solver_retries_transient_supervisor_startup(monkeypatch, tmp_path):

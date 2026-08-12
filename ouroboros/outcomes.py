@@ -421,7 +421,9 @@ _EFFECT_PROCESS_TOOLS = frozenset({"run_command", "run_script", "start_service"}
 # gateway; the set stays so the projection shape (and its consumers) hold.
 _EFFECT_CODING_TOOLS = frozenset()
 # Parent integration of a child's patch stages a repo mutation -> reviewable work.
-_EFFECT_INTEGRATION_TOOLS = frozenset({"integrate_subagent_patch"})
+# The nanny's explicit apply of a delegated run's captured diff (C1) is the same
+# class of staged mutation and rides the same gate.
+_EFFECT_INTEGRATION_TOOLS = frozenset({"integrate_subagent_patch", "integrate_delegated_patch"})
 
 
 def reviewable_effect_projection(llm_trace: Dict[str, Any]) -> List[Dict[str, Any]]:

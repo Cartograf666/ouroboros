@@ -1215,7 +1215,8 @@ Accessibility tree (may be empty/truncated):
         screenshot_path, local_screenshot = self._save_screenshot(obs)
         prompt = self._prompt(instruction, obs, screenshot_path, max_steps=max_steps)
         step = self.step_idx
-        (self.result_dir / f"prompt_step_{step:03d}.txt").write_text(prompt, encoding="utf-8")
+        prompt_path = self.result_dir / f"prompt_step_{step:03d}.txt"
+        prompt_path.write_text(prompt, encoding="utf-8")
 
         env = os.environ.copy()
         # NB: `ouroboros run --url` submits over the gateway, so these env vars
@@ -1251,7 +1252,11 @@ Accessibility tree (may be empty/truncated):
             "--quiet",
             *(["--disable-tools", self.disable_tools] if self.disable_tools else []),
             *([ "--attach", screenshot_path ] if screenshot_path else []),
-            prompt,
+            # E2BIG hygiene (C5): the per-step prompt (a11y tree + history) can be
+            # huge; it already lives on disk above, so it travels as a file, never
+            # as an argv tail.
+            "--prompt-file",
+            str(prompt_path),
         ]
         timed_out = False
         try:

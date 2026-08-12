@@ -941,6 +941,16 @@ def _delegating_ctx(tmp_path, *, acting: bool):
     # `workspace_mode_block_reason` refuses, and the refusal is correct.
     worktree = tmp_path.parent / f"wt-{tmp_path.name}"
     worktree.mkdir(exist_ok=True)
+    if acting and not (worktree / ".git").exists():
+        # C1: a mutating run's authority target must be a git tree — the private
+        # execution snapshot is a worktree of it, at a baseline built from it.
+        import subprocess as _sp
+
+        _sp.run(["git", "init"], cwd=str(worktree), capture_output=True, check=True)
+        (worktree / "README.md").write_text("seed\n", encoding="utf-8")
+        _sp.run(["git", "add", "-A"], cwd=str(worktree), capture_output=True, check=True)
+        _sp.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "seed"],
+                cwd=str(worktree), capture_output=True, check=True)
     constraint = TaskConstraint(
         mode="acting_subagent" if acting else "local_readonly_subagent",
         surface="self_worktree" if acting else "",
@@ -982,6 +992,9 @@ def _started_request(tmp_path, *, acting: bool, monkeypatch,
 
     _Stub.engine_version = engine_version
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
+    # C1: mutating starts provision a private execution snapshot under the
+    # worktree-service root; keep it inside the test tmp tree.
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_WORKTREE_ROOT", str(tmp_path / "snap_root"))
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
     delegate._CUSTODY.clear()
     payload = json.loads(delegate._delegate_start(_delegating_ctx(tmp_path, acting=acting), "edit the README"))
@@ -990,14 +1003,26 @@ def _started_request(tmp_path, *, acting: bool, monkeypatch,
     return seen.get("request"), payload
 
 
-def test_a_mutating_child_runs_live_in_the_nannys_own_worktree(tmp_path, monkeypatch):
-    # `live` is what makes the EXISTING workspace-patch capture see the harness's edits:
-    # the harness writes the nanny's own tree, so no new patch plumbing exists at all.
+def test_a_mutating_child_runs_live_in_a_private_snapshot_not_the_shared_tree(tmp_path, monkeypatch):
+    # C1: `live` still means the harness edits its scope root in place — but that root
+    # is a PRIVATE execution snapshot of the nanny's write root. The shared tree gets
+    # nothing until the nanny explicitly integrates the captured diff.
+    import pathlib as _pl
+
     request, payload = _started_request(tmp_path, acting=True, monkeypatch=monkeypatch)
     assert request["access"] == "workspace_write"
     assert request["mode"] == "agent"
     assert request["execution"] == {"isolation": "live", "delegated": True}
-    assert request["scope"] == {"kind": "project", "root": str(tmp_path.parent / f"wt-{tmp_path.name}")}
+    worktree = tmp_path.parent / f"wt-{tmp_path.name}"
+    assert request["scope"]["kind"] == "project"
+    scope_root = _pl.Path(str(request["scope"]["root"]))
+    assert scope_root.resolve() != worktree.resolve(), "the run must NEVER scope the shared tree"
+    assert scope_root.resolve().is_relative_to((tmp_path / "snap_root").resolve())
+    assert payload["execution_root"] == str(request["scope"]["root"])
+    assert _pl.Path(payload["authority_target_root"]).resolve() == worktree.resolve()
+    assert payload["baseline_id"], "the baseline commit is the binding's third leg"
+    # The snapshot genuinely carries the target's current state.
+    assert (scope_root / "README.md").read_text(encoding="utf-8") == "seed\n"
     assert payload["access"] == "workspace_write" and payload["isolation"] == "live"
 
 
@@ -1166,7 +1191,7 @@ def test_a_mutating_run_requires_an_ACTIVE_workspace_not_merely_agreement(tmp_pa
     """
     from ouroboros.contracts.task_constraint import TaskConstraint
     from ouroboros.subagents import delegated_run_shape
-    from ouroboros.tools.delegate import _mutating_run_root
+    from ouroboros.tools.delegate import _mutation_authority
     from ouroboros.tools.registry import ToolContext
 
     repo = tmp_path / "repo"
@@ -1178,10 +1203,10 @@ def test_a_mutating_run_requires_an_ACTIVE_workspace_not_merely_agreement(tmp_pa
     )
     ctx.workspace_root = None
     ctx.workspace_mode = ""
-    root, refusal = _mutating_run_root(
+    record, refusal = _mutation_authority(
         ctx, delegated_run_shape(True))
     assert refusal and "workspace_not_active" in refusal, refusal
-    assert root == ""
+    assert record == {}
 
 
 def test_a_widened_run_is_cancelled_and_typed_not_reported_as_progress(tmp_path, monkeypatch):
@@ -1943,7 +1968,7 @@ def test_an_unresolvable_write_root_is_a_typed_refusal_not_a_traceback(tmp_path)
     from ouroboros.contracts.task_constraint import TaskConstraint
     from ouroboros.delegate_containment import _resolved as containment_resolved
     from ouroboros.subagents import delegated_run_shape
-    from ouroboros.tools.delegate import _mutating_run_root, _resolved
+    from ouroboros.tools.delegate import _mutation_authority, _resolved
     from ouroboros.tools.registry import ToolContext
 
     os.symlink(tmp_path / "b", tmp_path / "a")
@@ -1965,10 +1990,10 @@ def test_an_unresolvable_write_root_is_a_typed_refusal_not_a_traceback(tmp_path)
     )
     ctx.workspace_root = str(workspace)
     ctx.workspace_mode = "self_worktree"
-    root, refusal = _mutating_run_root(
+    record, refusal = _mutation_authority(
         ctx, delegated_run_shape(True))
     assert refusal and "write_root_mismatch" in refusal, refusal
-    assert root == ""
+    assert record == {}
 
 
 def test_an_inactive_workspace_is_refused_even_when_the_root_is_set(tmp_path):
@@ -1984,7 +2009,7 @@ def test_an_inactive_workspace_is_refused_even_when_the_root_is_set(tmp_path):
     from ouroboros.contracts.task_constraint import TaskConstraint
     from ouroboros.tool_access import workspace_mode_block_reason
     from ouroboros.subagents import delegated_run_shape
-    from ouroboros.tools.delegate import _mutating_run_root
+    from ouroboros.tools.delegate import _mutation_authority
     from ouroboros.tools.registry import ToolContext
 
     repo = tmp_path / "repo"
@@ -2000,11 +2025,11 @@ def test_an_inactive_workspace_is_refused_even_when_the_root_is_set(tmp_path):
     assert workspace_mode_block_reason(ctx) == "", "the old predicate's leg is satisfied here"
     assert ctx.is_workspace_mode() is False, "yet the workspace is genuinely inactive"
 
-    root, refusal = _mutating_run_root(
+    record, refusal = _mutation_authority(
         ctx, delegated_run_shape(True))
     assert refusal, "an inactive workspace must be refused"
     assert "workspace_not_active" in refusal, refusal
-    assert root == ""
+    assert record == {}
 
 
 # -- 5. the delegated-run marker and the containment it must actually deliver ----

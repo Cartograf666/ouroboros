@@ -1,4 +1,11 @@
-import { escapeHtmlAttr, escapeHtmlText as escapeHtml, formatUsdWhole, renderMarkdown } from './utils.js';
+import {
+    accountedUpperBound,
+    accountedUpperBoundWithChildren,
+    escapeHtmlAttr,
+    escapeHtmlText as escapeHtml,
+    formatUsdWhole,
+    renderMarkdown,
+} from './utils.js';
 import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
@@ -142,12 +149,16 @@ export function taskCostMeta(payload = {}) {
     const hasAccountingEvidence = [
         'cost_accounting_status', 'cost_final',
         'cost_usd_with_children', 'cost_with_children_partial',
+        'accounted_upper_bound_usd', 'accounted_upper_bound_usd_with_children',
         'reserved_usd', 'unresolved_upper_bound_usd', 'unknown_unmetered',
     ].some(has);
     if (!hasAccountingEvidence) return [];
     if (payload.cost_accounting_status === 'unavailable') return ['cost unavailable'];
 
-    const own = optionalFiniteNumber(payload.cost_usd);
+    // C2/F12: ONE precedence resolver, shared with the Python seams and with
+    // log_events — the deprecated alias wins a diverged pair, so the read side
+    // and the write side never pick opposite winners for the same record.
+    const own = accountedUpperBound(payload);
     const finalKnown = payload.cost_final === true;
     const pendingKnown = payload.cost_final === false
         || payload.cost_with_children_partial === true
@@ -159,7 +170,7 @@ export function taskCostMeta(payload = {}) {
         meta.push(`cost=$${own.toFixed(2)}${pendingKnown && !finalKnown ? ' (pending)' : ''}`);
     }
 
-    const subtree = optionalFiniteNumber(payload.cost_usd_with_children);
+    const subtree = accountedUpperBoundWithChildren(payload);
     if (subtree !== null && (
         own === null || subtree !== own || payload.cost_with_children_partial === true
     )) {
@@ -2770,6 +2781,8 @@ export function createChatInstance({
             executor_route: msg?.executor_route || '',
             status: msg?.status || '',
             cost_usd: msg?.cost_usd,
+            accounted_upper_bound_usd: msg?.accounted_upper_bound_usd,
+            accounted_upper_bound_usd_with_children: msg?.accounted_upper_bound_usd_with_children,
             cost_accounting_status: msg?.cost_accounting_status,
             cost_accounting_error: msg?.cost_accounting_error,
             cost_final: msg?.cost_final,
@@ -2778,6 +2791,7 @@ export function createChatInstance({
             reserved_usd: msg?.reserved_usd,
             unresolved_upper_bound_usd: msg?.unresolved_upper_bound_usd,
             unknown_unmetered: msg?.unknown_unmetered,
+            non_final_rows: msg?.non_final_rows,
             result: msg?.result || '',
             trace_summary: msg?.trace_summary || '',
             error: msg?.error || '',
@@ -2939,6 +2953,8 @@ export function createChatInstance({
             result: evt.result || '',
             error: evt.error || '',
             cost_usd: evt.cost_usd,
+            accounted_upper_bound_usd: evt.accounted_upper_bound_usd,
+            accounted_upper_bound_usd_with_children: evt.accounted_upper_bound_usd_with_children,
             cost_accounting_status: evt.cost_accounting_status,
             cost_accounting_error: evt.cost_accounting_error,
             cost_final: evt.cost_final,
@@ -2947,6 +2963,7 @@ export function createChatInstance({
             reserved_usd: evt.reserved_usd,
             unresolved_upper_bound_usd: evt.unresolved_upper_bound_usd,
             unknown_unmetered: evt.unknown_unmetered,
+            non_final_rows: evt.non_final_rows,
         }, evt.ts || evt.timestamp || new Date().toISOString());
         return true;
     }

@@ -89,6 +89,23 @@ def _set_skill_repair(ctx: ToolContext, name: str = "alpha", payload_root: str =
     ctx.task_constraint = TaskConstraint(mode="skill_repair", skill_name=name, payload_root=payload_root, allow_enable=False, allow_review=True)
 
 
+def _admit_repair(ctx: ToolContext, name: str, payload_root: str) -> None:
+    """Bind the repair to the payload state it is admitted against (X3/F8).
+
+    A repair TASK now writes only under its admission record: the promote seam
+    records it for every real repair, and a task without one is typed STALE
+    rather than silently unverified. These heal-mode tests drive the constraint
+    directly, so they mint the same binding the promote seam would.
+    """
+    from ouroboros.skill_repair_admission import record_repair_admission
+
+    ctx.task_id = ctx.task_id or "repair-heal-test"
+    record_repair_admission(
+        ctx.drive_root, name, task_id=ctx.task_id,
+        base_content_hash=compute_content_hash(ctx.drive_root / payload_root),
+    )
+
+
 def _mark_reviewed_and_enabled(drive_root: pathlib.Path, skill_dir: pathlib.Path, name: str):
     content_hash = compute_content_hash(skill_dir)
     save_enabled(drive_root, name, True)
@@ -954,6 +971,7 @@ def test_heal_context_allows_payload_tools_and_review(tmp_path):
     ctx = _make_ctx(tmp_path)
     _set_skill_repair(ctx, "alpha", "skills/external/alpha")
     _build_skill(ctx.drive_root / "skills" / "external", "alpha")
+    _admit_repair(ctx, "alpha", "skills/external/alpha")
     registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
     registry._ctx = ctx
 
@@ -976,6 +994,7 @@ def test_heal_context_allows_ouroboroshub_payload_tools(tmp_path):
     ctx = _make_ctx(tmp_path)
     _set_skill_repair(ctx, "nanobanana", "skills/ouroboroshub/nanobanana")
     _build_skill(ctx.drive_root / "skills" / "ouroboroshub", "nanobanana")
+    _admit_repair(ctx, "nanobanana", "skills/ouroboroshub/nanobanana")
     registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
     registry._ctx = ctx
 

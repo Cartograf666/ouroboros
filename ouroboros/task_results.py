@@ -9,6 +9,7 @@ import pathlib
 import re
 from typing import Any, Callable, Dict, List, Optional
 
+from ouroboros.cost_projection import COST_ALIAS_PAIRS, COST_OPENNESS_FIELDS
 from ouroboros.utils import read_json_dict, update_json_locked, utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -28,19 +29,21 @@ STATUS_CANCELLED = "cancelled"
 # STATUS_CANCELLED write still lands.
 STATUS_CANCEL_REQUESTED = "cancel_requested"
 
-# The ten flat task-scope cost fields shared by live task events, progress-row
+# The flat task-scope cost fields shared by live task events, progress-row
 # replay, task_summary chat rows, and the persisted result written here (v6.82
 # P1) — one home, so no consumer grows a divergent literal list.
-# ``non_final_rows`` rides with ``cost_final`` because it is that flag's DISCLOSED
-# CAUSE: `cost_final: false` can hold with every dollar bucket at zero, and a
-# surface that shows the flag without the count shows an unexplained "not final".
-# Both contract mirrors already declared the field; only this list did not carry
-# it, so it never reached the surface that declares it (v6.89.0 panel D2).
-TASK_COST_META_FIELDS = (
-    "cost_usd", "cost_accounting_status", "cost_accounting_error", "cost_final",
-    "cost_usd_with_children", "cost_with_children_partial", "reserved_usd",
-    "unresolved_upper_bound_usd", "unknown_unmetered", "non_final_rows",
-)
+# DERIVED from the cost SSOT (``ouroboros/cost_projection.py``) rather than
+# re-typed: both alias spellings (C2, owner 10=B — the additive HONEST names for
+# what ``cost_usd[_with_children]`` always were, plus the deprecated aliases that
+# stay outbound until a separately approved ABI break) and EVERY accounting
+# openness/integrity marker. Hand-maintained copies are how a marker reaches one
+# surface and not the next: ``non_final_rows`` rides with ``cost_final`` because
+# it is that flag's DISCLOSED CAUSE (v6.89.0 panel D2), and
+# ``ledger_integrity_degraded`` was produced by the authority but named in no
+# list at all, so it never reached any surface.
+TASK_COST_META_FIELDS = tuple(dict.fromkeys(
+    [name for pair in COST_ALIAS_PAIRS for name in pair] + list(COST_OPENNESS_FIELDS)
+))
 
 # Monotonic lifecycle ordering. A write that would move a task *backwards* past
 # the cancel-intent latch or a terminal status is ignored, so a stale

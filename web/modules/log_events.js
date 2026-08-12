@@ -1,4 +1,4 @@
-import { formatUsd4 } from './utils.js';
+import { accountedUpperBound, accountedUpperBoundWithChildren, formatUsd4 } from './utils.js';
 
 export const LOG_CATEGORIES = {
     tools: { label: 'Tools', color: 'var(--blue)' },
@@ -447,7 +447,7 @@ export function summarizeLogEvent(evt) {
             meta: taskMeta(
                 evt.model || '',
                 formatLogTokens(evt),
-                formatLogMoney(evt.cost_usd || evt.cost),
+                formatLogMoney(evt.cost_usd ?? evt.cost),
                 evt.response_kind === 'tool_calls' ? `${evt.tool_call_count || 0} tool calls` : evt.response_kind || '',
             ),
         });
@@ -471,7 +471,7 @@ export function summarizeLogEvent(evt) {
             meta: taskMeta(
                 evt.model || '',
                 formatLogTokens(evt),
-                formatLogMoney(evt.cost_usd || evt.cost),
+                formatLogMoney(evt.cost_usd ?? evt.cost),
                 evt.category || '',
             ),
         });
@@ -524,7 +524,9 @@ export function summarizeLogEvent(evt) {
         const artifactStatus = evt.artifact_bundle?.status || evt.artifact_status || '';
         const reviewDetails = formatReviewProjection(evt.review_projection);
         const unavailable = evt.cost_accounting_status === 'unavailable';
-        const ownValue = evt.cost_usd ?? evt.cost;
+        // C13: the SHARED accessor and its null policy — same alias precedence as
+        // chat.js and the Python seams, and a REAL $0 prints instead of vanishing.
+        const ownValue = accountedUpperBound(evt) ?? (evt.cost ?? null);
         const ownCost = unavailable
             ? 'cost unavailable'
             : (ownValue != null ? `${formatLogMoney(ownValue)}${evt.cost_final === false ? ' (pending)' : ''}` : '');
@@ -537,8 +539,8 @@ export function summarizeLogEvent(evt) {
                 ownCost,
                 // v6.57.0 (P6b): show the recursive cost incl. children when it adds up to
                 // more than this task's own spend, so a parent isn't under-reported.
-                (Number(evt.cost_usd_with_children || 0) > Number(evt.cost_usd || evt.cost || 0))
-                    ? `+children=${formatLogMoney(evt.cost_usd_with_children)}${evt.cost_with_children_partial ? ' (partial)' : ''}`
+                (accountedUpperBoundWithChildren(evt) ?? -1) > (ownValue ?? 0)
+                    ? `+children=${formatLogMoney(accountedUpperBoundWithChildren(evt))}${evt.cost_with_children_partial ? ' (partial)' : ''}`
                     : '',
                 evt.total_rounds ? `${evt.total_rounds} rounds` : '',
                 formatLogTokens(evt),
@@ -548,8 +550,8 @@ export function summarizeLogEvent(evt) {
 
     if (t === 'task_cost_finalized') {
         const unavailable = evt.cost_accounting_status === 'unavailable';
-        const ownCost = unavailable ? 'cost unavailable' : formatLogMoney(evt.cost_usd);
-        const subtreeCost = unavailable ? '' : formatLogMoney(evt.cost_usd_with_children);
+        const ownCost = unavailable ? 'cost unavailable' : formatLogMoney(accountedUpperBound(evt));
+        const subtreeCost = unavailable ? '' : formatLogMoney(accountedUpperBoundWithChildren(evt));
         return view(unavailable ? 'warn' : 'metrics', 'Task cost finalized', {
             meta: taskMeta(ownCost, subtreeCost ? `subtree=${subtreeCost}` : '', evt.post_task_status || ''),
         });
@@ -640,7 +642,7 @@ export function summarizeLogEvent(evt) {
 
     return view('info', shortText(t, 120), {
         body: shortText(evt.text || evt.error || evt.result_preview || compactJson(evt.args || evt.task || evt.checks, 260), 260),
-        meta: taskMeta(evt.model || '', formatLogMoney(evt.cost_usd || evt.cost)),
+        meta: taskMeta(evt.model || '', formatLogMoney(evt.cost_usd ?? evt.cost)),
     });
 }
 
@@ -939,12 +941,14 @@ export function summarizeChatLiveEvent(evt) {
         const phase = taskTerminalPhase(evt);
         const reviewDetails = formatReviewProjection(evt.review_projection);
         const unavailable = evt.cost_accounting_status === 'unavailable';
-        const ownValue = evt.cost_usd ?? evt.cost;
+        // C13: the SHARED accessor and its null policy — same alias precedence as
+        // chat.js and the Python seams, and a REAL $0 prints instead of vanishing.
+        const ownValue = accountedUpperBound(evt) ?? (evt.cost ?? null);
         const ownCost = unavailable
             ? 'cost unavailable'
             : (ownValue != null ? `${formatLogMoney(ownValue)}${evt.cost_final === false ? ' (pending)' : ''}` : '');
-        const childrenCost = (Number(evt.cost_usd_with_children || 0) > Number(evt.cost_usd || evt.cost || 0))
-            ? `+children=${formatLogMoney(evt.cost_usd_with_children)}${evt.cost_with_children_partial ? ' (partial)' : ''}`
+        const childrenCost = (accountedUpperBoundWithChildren(evt) ?? -1) > (ownValue ?? 0)
+            ? `+children=${formatLogMoney(accountedUpperBoundWithChildren(evt))}${evt.cost_with_children_partial ? ' (partial)' : ''}`
             : '';
         return chatView({
             phase,
@@ -967,8 +971,8 @@ export function summarizeChatLiveEvent(evt) {
 
     if (t === 'task_cost_finalized') {
         const unavailable = evt.cost_accounting_status === 'unavailable';
-        const ownCost = unavailable ? 'cost unavailable' : formatLogMoney(evt.cost_usd);
-        const subtreeCost = unavailable ? '' : formatLogMoney(evt.cost_usd_with_children);
+        const ownCost = unavailable ? 'cost unavailable' : formatLogMoney(accountedUpperBound(evt));
+        const subtreeCost = unavailable ? '' : formatLogMoney(accountedUpperBoundWithChildren(evt));
         return chatView({
             phase: unavailable ? 'warn' : 'done',
             headline: unavailable ? 'Cost accounting unavailable' : 'Done',

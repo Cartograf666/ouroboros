@@ -1010,16 +1010,23 @@ def _handoff_snippet(value: Any) -> Dict[str, Any]:
 def format_handoff_message(children: List[Dict[str, Any]]) -> str:
     from ouroboros.tools.join_ledger import _child_result_sha256
 
+    from ouroboros.cost_projection import cost_projection
+
     payload = []
     for child in children:
         result_info = _handoff_snippet(child.get("result"))
         trace_info = _handoff_snippet(child.get("trace_summary"))
+        _cost = cost_projection(child)
         payload.append({
             "task_id": str(child.get("task_id") or child.get("id") or ""),
             "status": str(child.get("status") or ""),
             "role": str(child.get("role") or ""),
             "description": str(child.get("description") or child.get("objective") or ""),
-            "cost_usd": child.get("cost_usd", 0),
+            # SSOT cost projection (C2): honest null — a child with no accounting
+            # reads null here, never a fabricated $0 — plus the additive name.
+            "cost_usd": _cost["cost_usd"],
+            "accounted_upper_bound_usd": _cost["accounted_upper_bound_usd"],
+            "cost_final": _cost["cost_final"],
             "artifact_status": str(child.get("artifact_status") or ""),
             "terminal_result_status": (
                 str(child.get("child_status") or "")
@@ -1114,13 +1121,11 @@ def format_subagent_absorption_message(
     ]
     spent = 0
     omitted = 0
+    from ouroboros.cost_projection import cost_display
+
     for child in terminal:
         cid = str(child.get("task_id") or child.get("id") or "")
         role = str(child.get("role") or "")
-        try:
-            cost = float(child.get("cost_usd") or 0.0)
-        except (TypeError, ValueError):
-            cost = 0.0
         result = str(child.get("result") or "").strip()
         terminal_status = str(child.get("child_status") or "")
         status_suffix = (
@@ -1130,7 +1135,8 @@ def format_subagent_absorption_message(
         )
         lines.append(
             f"\n## child {cid} ({role}) — status={child.get('status')}{status_suffix}, "
-            f"cost=${cost:.4f}, child_result_sha256={_child_result_sha256(child)}"
+            # SSOT cost projection (C2): unknown says unknown, never $0.0000.
+            f"cost={cost_display(child, decimals=4)}, child_result_sha256={_child_result_sha256(child)}"
         )
         if result and spent + len(result) <= budget_chars:
             lines.append(result)

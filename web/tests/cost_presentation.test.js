@@ -9,6 +9,12 @@ import {
     taskCostProjection,
 } from '../modules/chat.js';
 import { costDashboardPresentation } from '../modules/costs.js';
+import { summarizeLogEvent } from '../modules/log_events.js';
+import {
+    accountedUpperBound,
+    accountedUpperBoundWithChildren,
+    formatUsd4,
+} from '../modules/utils.js';
 
 test('header starts loading and fails closed when ledger money is unavailable', () => {
     assert.deepEqual(headerBudgetPresentation(), {
@@ -213,4 +219,43 @@ test('a cost-only frame never moves the card’s Latest clock', () => {
     const source = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
     assert.match(source, /record\.latestActivityTs \? `Latest \$\{record\.latestActivityTs\}`/);
     assert.match(source, /if \(ts && \(summary\.human \|\| activityCandidate\)\) record\.latestActivityTs = ts/);
+});
+
+test('one precedence rule: the deprecated alias wins a diverged pair, in every reader', () => {
+    // F7: chat.js used to prefer the additive name while the Python write seam
+    // re-converged on the deprecated one, so the same record read differently on
+    // the two sides of the wire. Both now ask the shared resolver.
+    const diverged = {
+        cost_usd: 1, accounted_upper_bound_usd: 9,
+        cost_accounting_status: 'available', cost_final: true,
+    };
+    assert.equal(accountedUpperBound(diverged), 1);
+    assert.deepEqual(taskCostMeta(diverged), ['cost=$1.00']);
+    // The additive name alone still reads (a producer that only writes it).
+    assert.equal(accountedUpperBound({ accounted_upper_bound_usd: 9 }), 9);
+    assert.equal(accountedUpperBound({}), null);
+    assert.equal(accountedUpperBoundWithChildren(
+        { cost_usd_with_children: 2, accounted_upper_bound_usd_with_children: 7 }), 2);
+});
+
+test('log events read the shared cost names and stop hiding a real $0', () => {
+    // F13: log_events read ONLY the deprecated names, with falsy coercion — a
+    // genuine $0.0000 round rendered as nothing, indistinguishable from unknown.
+    assert.equal(formatUsd4(0), '$0.0000');
+    assert.equal(formatUsd4(null), '');
+    assert.equal(formatUsd4(undefined), '');
+    const finalized = summarizeLogEvent({
+        type: 'task_cost_finalized',
+        accounted_upper_bound_usd: 0,
+        accounted_upper_bound_usd_with_children: 1.5,
+        post_task_status: 'completed',
+    });
+    assert.ok(finalized.meta.includes('$0.0000'), JSON.stringify(finalized.meta));
+    assert.ok(finalized.meta.includes('subtree=$1.5000'), JSON.stringify(finalized.meta));
+    const done = summarizeLogEvent({
+        type: 'task_done', status: 'completed',
+        accounted_upper_bound_usd: 0, cost_final: true,
+        cost_accounting_status: 'available',
+    });
+    assert.ok(done.meta.includes('$0.0000'), JSON.stringify(done.meta));
 });

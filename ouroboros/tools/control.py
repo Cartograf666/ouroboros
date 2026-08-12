@@ -2094,7 +2094,6 @@ def _get_task_result(ctx: ToolContext, task_id: str) -> str:
         return f"Task {task_id}: unknown or not yet registered"
     status = data.get("status", "unknown")
     result = data.get("result", "")
-    cost = data.get("cost_usd", 0)
     trace = data.get("trace_summary", "")
     try:
         from ouroboros.outcomes import read_verification_receipts
@@ -2122,9 +2121,13 @@ def _get_task_result(ctx: ToolContext, task_id: str) -> str:
     from ouroboros.tools.join_ledger import _child_result_sha256
 
     child_result_sha256 = _child_result_sha256(data)
+    # SSOT cost projection (C2): unknown never renders as $0.00 (and a null in
+    # the stored result no longer crashes the f-string with a TypeError).
+    from ouroboros.cost_projection import cost_display
+
     if status == STATUS_COMPLETED:
         output = (
-            f"Task {task_id} [{status}]: cost=${cost:.2f}\n"
+            f"Task {task_id} [{status}]: cost={cost_display(data)}\n"
             f"child_result_sha256={child_result_sha256}\n\n"
             f"[SUBTASK_OUTCOME]\n{outcome_summary}\n[/SUBTASK_OUTCOME]\n\n"
             f"[BEGIN_SUBTASK_OUTPUT]\n{result}\n[END_SUBTASK_OUTPUT]"
@@ -2361,14 +2364,18 @@ def _children_roster_projection(
         )
     except Exception:
         return empty
+    from ouroboros.cost_projection import cost_projection
+
     roster: List[Dict[str, Any]] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
+        _cost = cost_projection(row)
         roster.append({
             "task_id": str(row.get("task_id") or row.get("id") or ""),
             "status": row.get("status"),
-            "cost_usd": row.get("cost_usd"),
+            "cost_usd": _cost["cost_usd"],
+            "accounted_upper_bound_usd": _cost["accounted_upper_bound_usd"],
             "child_result_sha256": _child_result_sha256(row),
             "outcome_axes": normalize_outcome_axes(row),
         })
@@ -2392,6 +2399,7 @@ def _wait_for_tasks(
     if not isinstance(task_ids, list) or not task_ids:
         return "⚠️ TOOL_ARG_ERROR (wait_tasks): task_ids must be a non-empty list."
     from ouroboros.config import MAX_ACTIVE_SUBAGENTS_HARD_CAP
+    from ouroboros.cost_projection import cost_projection
 
     if len(task_ids) > MAX_ACTIVE_SUBAGENTS_HARD_CAP:
         return (
@@ -2496,10 +2504,16 @@ def _wait_for_tasks(
             if not isinstance(data, dict):
                 public_tasks[str(tid)] = data
                 continue
+            # SSOT cost projection (C2): honest null (never a confirmed-looking $0),
+            # the additive honest name beside the deprecated alias, and finality
+            # only when the child's own record claims it.
+            _cost = cost_projection(data)
             projected: Dict[str, Any] = {
                 "task_id": str(data.get("task_id") or data.get("id") or tid),
                 "status": data.get("status"),
-                "cost_usd": data.get("cost_usd"),  # absent accounting projects null, never a confirmed-looking $0
+                "cost_usd": _cost["cost_usd"],
+                "accounted_upper_bound_usd": _cost["accounted_upper_bound_usd"],
+                "cost_final": _cost["cost_final"],
                 "child_result_sha256": _child_result_sha256(data),
                 "outcome_axes": normalize_outcome_axes(data),
                 "result": data.get("result"),
@@ -2540,11 +2554,16 @@ def _wait_for_tasks(
                         # zero counts — absence means "no evidence yet", not
                         # "no runs".
                         _ee["delegated_runs_started"] = int(_evidence.get("delegated_runs_started") or 0)
+                        _ee["delegated_runs_settled"] = int(_evidence.get("delegated_runs_settled") or 0)
                         _ee["delegated_runs_succeeded"] = int(_evidence.get("delegated_runs_succeeded") or 0)
+                        _ee["delegated_runs_failed"] = int(_evidence.get("delegated_runs_failed") or 0)
                     # The substrate claim rides only when the envelope made one.
                     _substrate = str(data.get("actual_substrate") or _envelope.get("actual_substrate") or "")
                     if _substrate:
                         _ee["actual_substrate"] = _substrate
+                        # C3: counters are delegated-run facts; the native
+                        # (metered) contribution beside them is unknown.
+                        _ee["native_contribution"] = "unknown"
                 projected["execution_evidence"] = _ee
             public_tasks[str(tid)] = projected
         waited["tasks"] = public_tasks

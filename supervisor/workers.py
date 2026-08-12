@@ -420,12 +420,22 @@ def _canonical_promoted_repair_constraint(value: Any) -> tuple[Optional[dict], s
         return None, "invalid_skill_repair_constraint"
     if not payload_dir.is_dir():
         return None, "skill_repair_payload_missing"
+    # X3 (owner 11=B): the repair is admitted against ONE exact payload state.
+    # An unreadable payload cannot anchor a hash chain — fail closed here, not
+    # after the task has already spent rounds.
+    try:
+        from ouroboros.skill_loader import compute_content_hash
+
+        base_content_hash = compute_content_hash(payload_dir)
+    except Exception:
+        return None, "skill_repair_payload_unreadable"
     return {
         "mode": canonical.mode,
         "skill_name": canonical.skill_name,
         "payload_root": canonical.payload_root,
         "allow_enable": False,
         "allow_review": True,
+        "_base_content_hash": base_content_hash,
     }, ""
 
 
@@ -524,6 +534,25 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         **_promoted_force_plan_metadata(evt),
     }
     if repair_constraint is not None:
+        # X3: bind the admission hash to the REAL task id, durably, before the
+        # task exists anywhere else — every payload write CAS-checks this chain.
+        # FAIL CLOSED, like the unreadable-payload branch above: a repair admitted
+        # without its binding CAS-checks nothing (every later check no-ops), which
+        # is precisely the drift-blind repair this mechanism replaces.
+        _base_content_hash = str(repair_constraint.pop("_base_content_hash", "") or "")
+        try:
+            from ouroboros.skill_repair_admission import record_repair_admission
+
+            record_repair_admission(
+                DRIVE_ROOT, str(repair_constraint.get("skill_name") or ""),
+                task_id=tid, base_content_hash=_base_content_hash)
+        except Exception:
+            log.warning("Failed to record skill repair admission for %s", tid, exc_info=True)
+            return {
+                "status": "needs_manual_target",
+                "reason": "skill_repair_admission_unwritable",
+                "task_id": tid,
+            }
         # Must be present before attach_task_contract so the managed root task
         # enters execution with its confined repair profile, never ephemeral.
         task["task_constraint"] = repair_constraint

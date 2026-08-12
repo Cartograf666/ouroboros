@@ -300,6 +300,15 @@ def _append_interrupted_review_progress(
 ) -> None:
     reason = str(payload.get("interrupt_reason") or "interrupted")
     job_id = str(payload.get("job_id") or "")
+    # C4: the interrupted row belongs to the SAME chat the review's other rows
+    # went to — the payload records the initiator's chat (see `_review_provenance`
+    # and the sibling chat.jsonl writer). Routed through the ONE notification
+    # normalizer: a missing or A2A/internal (negative) chat falls back to the
+    # Skill Review panel (0), never to a human stream.
+    from supervisor.message_bus import notification_chat_route
+
+    _route = notification_chat_route(payload.get("chat_id"), 0)
+    chat_id = int(_route if _route is not None else 0)
     lifecycle = {
         "id": job_id,
         "kind": "review",
@@ -321,7 +330,7 @@ def _append_interrupted_review_progress(
             "task_id": _review_lifecycle_chat_task_id(skill_name, job_id),
             "is_progress": True,
             "direction": "out",
-            "chat_id": 0,
+            "chat_id": chat_id,
             "user_id": 0,
             "text": text,
             "content": text,
@@ -1167,6 +1176,9 @@ def run_skill_review_lifecycle_blocking(
             source=source,
             message=f"Reviewing {skill_name}",
             dedupe_key=dedupe_key,
+            # C4: a review started from a task-bound tool reports to that task's
+            # chat; API/panel callers carry chat 0 and stay on the panel.
+            chat_id=int(provenance.get("chat_id") or 0),
             runner=_run_review,
             options=LifecycleJobOptions(
                 drive_root=drive_root,

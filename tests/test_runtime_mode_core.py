@@ -1374,6 +1374,20 @@ def _ctx_with_skill_repair(tmp_path, skill_name: str, bucket: str = "external"):
         skill_name=skill_name,
         payload_root=f"skills/{bucket}/{skill_name}",
     )
+    # X3/F8: a repair TASK writes only under its admission binding (the promote
+    # seam records one for every real repair, and a repair without one is typed
+    # STALE rather than silently unverified). Mint the same binding here so these
+    # tests keep exercising runtime-mode routing rather than the CAS gate.
+    payload_dir = tmp_path / "skills" / bucket / skill_name
+    if payload_dir.is_dir():
+        from ouroboros.skill_loader import compute_content_hash
+        from ouroboros.skill_repair_admission import record_repair_admission
+
+        reg._ctx.task_id = str(getattr(reg._ctx, "task_id", "") or "repair-runtime-mode-test")
+        record_repair_admission(
+            tmp_path, skill_name, task_id=reg._ctx.task_id,
+            base_content_hash=compute_content_hash(payload_dir),
+        )
     return reg
 
 

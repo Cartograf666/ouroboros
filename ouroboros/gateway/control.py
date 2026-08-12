@@ -155,7 +155,13 @@ async def api_command(request: Request) -> JSONResponse:
             if visible_task_id:
                 _RECENT_VISIBLE_COMMANDS[visible_task_id] = time.monotonic()
             if visible_text:
-                task_id = visible_task_id or "skill_repair"
+                # X3: no invented ids. `visible_task_id` is a caller-supplied
+                # UI correlation key; when the caller has none there is no task
+                # id yet (`ui_send` returns nothing — the router mints the id at
+                # promotion), and the old bare "skill_repair" literal was a
+                # fabricated id persisted into the durable chat log. The typed
+                # truth is an empty id plus the pending marker.
+                task_id = visible_task_id
                 ts = utc_now_iso()
                 payload = {
                     "type": "chat",
@@ -166,6 +172,8 @@ async def api_command(request: Request) -> JSONResponse:
                     "system_type": "skill_repair",
                     "task_id": task_id,
                 }
+                if not task_id:
+                    payload["task_id_pending"] = True
                 broadcast_ws_sync(payload)
                 log_chat(
                     "system",

@@ -37,6 +37,11 @@ _LOCK_NAME = ".worktree_ops.lock"
 _LOCK_TIMEOUT_SEC = 120.0
 _LOCK_STALE_SEC = 600.0
 _BRANCH_PREFIX = "subagent/"
+# Delegated-run execution snapshots (C1): registry `kind` and the protected
+# baseline ref namespace. The ref pins the baseline commit against GC for as
+# long as the snapshot lives; it is deleted with the snapshot.
+_KIND_DELEGATED_EXEC = "delegated_exec"
+_BASELINE_REF_PREFIX = "refs/ouroboros/delegated/"
 
 # Serializes worktree mutations within this process; the on-disk lock serializes
 # across processes (parent worker, supervisor startup prune, etc.).
@@ -340,6 +345,265 @@ def remove_genesis_project(path: str, *, projects_root: Optional[Any] = None) ->
     return True
 
 
+@dataclass(frozen=True)
+class ExecutionSnapshotHandle:
+    """A private, disposable execution root for ONE mutating delegated run.
+
+    The snapshot is a detached ``git worktree`` of the AUTHORITY TARGET tree,
+    checked out at a synthetic BASELINE commit that captures the target's real
+    current state: tracked + staged changes plus eligible untracked files
+    (sensitive/credential-shaped, junk and oversized-binary untracked files are
+    vetoed by the same predicate the workspace-patch capture uses). The run
+    writes ONLY here; its diff against ``baseline_sha`` is its whole
+    contribution, and the nanny applies or rejects that diff into the target
+    tree explicitly — never automatically.
+    """
+
+    snapshot_id: str
+    task_id: str
+    path: str
+    target_root: str
+    baseline_ref: str
+    baseline_sha: str
+    baseline_tree: str
+    manifest_digest: str
+    target_head: str
+    created_at: float
+    entry_count: int = 0
+    excluded_untracked: tuple = ()
+
+
+def _git_env_index(index_path: Path) -> Dict[str, str]:
+    env = dict(os.environ)
+    env["GIT_INDEX_FILE"] = str(index_path)
+    return env
+
+
+def _git_env(repo_dir: Path, *args: str, env: Dict[str, str],
+             check: bool = True, input_bytes: bytes = b"") -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(repo_dir),
+        capture_output=True,
+        check=check,
+        env=env,
+        input=input_bytes if input_bytes else None,
+    )
+
+
+def provision_execution_snapshot(
+    *,
+    target_root: Any,
+    task_id: Any,
+    snapshot_id: str,
+    worktree_root: Optional[Any] = None,
+    data_dir: Optional[Any] = None,
+) -> ExecutionSnapshotHandle:
+    """Snapshot ``target_root``'s REAL current tree into a private execution root.
+
+    Baseline construction never touches the target's own index, HEAD or working
+    files: a TEMPORARY index is seeded from HEAD, ``git add -A`` stages the
+    real tree (tracked + staged + untracked, ``.gitignore`` respected), the
+    vetoed untracked files are removed from that index, and the resulting tree
+    is committed as a synthetic baseline pinned by a ref under
+    ``refs/ouroboros/delegated/``. The execution root is a detached worktree at
+    that commit, registered durably BEFORE the caller records any start intent,
+    and removed only by an explicit disposition (``remove_execution_snapshot``)
+    or by the startup GC after custody says the run is closed.
+    """
+    from ouroboros.headless import untracked_capture_veto_reason
+
+    target = Path(target_root).resolve()
+    if not (target / ".git").exists():
+        raise ValueError(f"delegated execution snapshot target {target} is not a git working tree")
+    root = _resolve_root(worktree_root)
+    data_root = _data_dir(data_dir)
+    if _is_within(root, target) or _is_within(target, root):
+        raise ValueError(f"subagent worktree root {root} overlaps the snapshot target {target}")
+    if _is_within(root, data_root) or _is_within(data_root, root):
+        raise ValueError(f"subagent worktree root {root} overlaps runtime data {data_root}")
+    snap = str(snapshot_id or "").strip()
+    if not snap:
+        raise ValueError("snapshot_id is required for a delegated execution snapshot")
+    safe_snap = _safe_name(snap)
+    safe_task = _safe_name(task_id)
+    with _ops_lock(root):
+        wt_path = (root / f"dlg_{safe_task}_{safe_snap[:16]}").resolve()
+        baseline_ref = f"{_BASELINE_REF_PREFIX}{safe_snap}"
+        # Clear any stale checkout/ref left by a crashed earlier attempt of the
+        # SAME snapshot id (idempotent re-provision).
+        _remove_paths(target, wt_path, "", allowed_root=root)
+        _git(target, "update-ref", "-d", baseline_ref, check=False)
+        head_proc = _git(target, "rev-parse", "--verify", "HEAD", check=False)
+        target_head = head_proc.stdout.strip() if head_proc.returncode == 0 else ""
+        index_path = root / f".baseline_index_{safe_snap[:16]}_{os.getpid()}"
+        env = _git_env_index(index_path)
+        try:
+            if target_head:
+                _git_env(target, "read-tree", target_head, env=env)
+            else:
+                _git_env(target, "read-tree", "--empty", env=env)
+            # ELIGIBILITY IS DECIDED BEFORE ANYTHING IS HASHED. `git add -A` writes a
+            # blob for EVERY untracked file into the target's object database —
+            # including `.env` / `credentials.json` — and removing the index entry
+            # afterwards does not unwrite the object: the execution worktree shares
+            # that ODB, so a vetoed secret stayed readable there by hash. The staged
+            # set is therefore computed first (tracked/staged paths from the REAL
+            # index, plus only the ELIGIBLE untracked ones) and fed to plumbing that
+            # touches nothing else. NUL-delimited stdin: byte-safe and immune to argv
+            # limits.
+            real_env = dict(os.environ)
+            indexed = [
+                p for p in _git_env(target, "ls-files", "-z", env=real_env)
+                .stdout.decode("utf-8", errors="surrogateescape").split("\0") if p
+            ]
+            untracked_raw = _git_env(
+                target, "ls-files", "-z", "--others", "--exclude-standard",
+                env=real_env,
+            ).stdout.decode("utf-8", errors="surrogateescape")
+            excluded: List[Dict[str, str]] = []
+            eligible: List[str] = []
+            for rel in (p for p in untracked_raw.split("\0") if p):
+                reason = untracked_capture_veto_reason(target, rel)
+                if reason:
+                    excluded.append({"path": rel, "reason": reason})
+                else:
+                    eligible.append(rel)
+            staged_paths = indexed + eligible
+            if staged_paths:
+                # `--add --remove` stages each named path's CURRENT worktree content
+                # (and drops the entry when the file is gone), which is exactly what
+                # `git add -A` did for these paths — without visiting any other file.
+                _git_env(
+                    target, "update-index", "-z", "--add", "--remove", "--stdin", env=env,
+                    input_bytes=b"\0".join(
+                        p.encode("utf-8", errors="surrogateescape") for p in staged_paths) + b"\0")
+            tree_sha = _git_env(target, "write-tree", env=env).stdout.decode("utf-8").strip()
+            manifest_raw = _git_env(target, "ls-tree", "-r", "-z", tree_sha,
+                                    env=dict(os.environ)).stdout
+            import hashlib
+            manifest_digest = hashlib.sha256(manifest_raw).hexdigest()
+            entry_count = sum(1 for chunk in manifest_raw.split(b"\0") if chunk)
+            commit_args = ["commit-tree", tree_sha, "-m",
+                           f"ouroboros: delegated-run baseline {snap}"]
+            if target_head:
+                commit_args[2:2] = ["-p", target_head]
+            baseline_sha = _git_env(
+                target, *commit_args,
+                env={**env,
+                     "GIT_AUTHOR_NAME": "Ouroboros", "GIT_AUTHOR_EMAIL": "ouroboros@localhost",
+                     "GIT_COMMITTER_NAME": "Ouroboros", "GIT_COMMITTER_EMAIL": "ouroboros@localhost"},
+            ).stdout.decode("utf-8").strip()
+        finally:
+            try:
+                index_path.unlink()
+            except OSError:
+                pass
+        _git(target, "update-ref", baseline_ref, baseline_sha)
+        try:
+            wt_path.parent.mkdir(parents=True, exist_ok=True)
+            _git(target, "worktree", "add", "--detach", str(wt_path), baseline_sha)
+        except Exception:
+            # Do not leak the pinned baseline ref when the checkout failed.
+            _git(target, "update-ref", "-d", baseline_ref, check=False)
+            raise
+        handle = ExecutionSnapshotHandle(
+            snapshot_id=snap,
+            task_id=str(task_id or ""),
+            path=str(wt_path),
+            target_root=str(target),
+            baseline_ref=baseline_ref,
+            baseline_sha=baseline_sha,
+            baseline_tree=tree_sha,
+            manifest_digest=manifest_digest,
+            target_head=target_head,
+            created_at=time.time(),
+            entry_count=entry_count,
+            excluded_untracked=tuple(excluded),
+        )
+        entries = [e for e in _load_registry(data_dir) if e.get("path") != str(wt_path)]
+        record = asdict(handle)
+        record["kind"] = _KIND_DELEGATED_EXEC
+        record["excluded_untracked"] = excluded
+        entries.append(record)
+        _save_registry(entries, data_dir)
+        return handle
+
+
+def find_execution_snapshot(snapshot_id: str, data_dir: Optional[Any] = None) -> Optional[Dict[str, Any]]:
+    """The registry record for a delegated execution snapshot, or None."""
+    snap = str(snapshot_id or "").strip()
+    if not snap:
+        return None
+    for entry in _load_registry(data_dir):
+        if entry.get("kind") == _KIND_DELEGATED_EXEC and entry.get("snapshot_id") == snap:
+            return entry
+    return None
+
+
+def remove_execution_snapshot(
+    snapshot_id: str,
+    *,
+    worktree_root: Optional[Any] = None,
+    data_dir: Optional[Any] = None,
+) -> bool:
+    """Tear down one delegated execution snapshot: worktree, baseline ref, registry row.
+
+    Call ONLY after the run's disposition (patch applied, rejected, or the
+    startup GC proved the run closed): the snapshot plus its captured patch are
+    the conflict-resolution material and must survive until then.
+    """
+    entry = find_execution_snapshot(snapshot_id, data_dir)
+    if entry is None:
+        return False
+    root = _resolve_root(worktree_root)
+    with _ops_lock(root):
+        target = Path(str(entry.get("target_root") or "."))
+        _remove_paths(target, Path(str(entry.get("path") or "")), "", allowed_root=root)
+        ref = str(entry.get("baseline_ref") or "")
+        if ref.startswith(_BASELINE_REF_PREFIX):
+            try:
+                _git(target, "update-ref", "-d", ref, check=False)
+            except Exception:
+                pass
+        survivors = [e for e in _load_registry(data_dir) if not (
+            e.get("kind") == _KIND_DELEGATED_EXEC and e.get("snapshot_id") == entry.get("snapshot_id")
+        )]
+        _save_registry(survivors, data_dir)
+    return True
+
+
+def prune_execution_snapshots(
+    open_snapshot_ids: set,
+    *,
+    worktree_root: Optional[Any] = None,
+    data_dir: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Startup GC for delegated execution snapshots, cross-checked with custody.
+
+    ``open_snapshot_ids`` is the set of snapshot ids that custody still holds
+    OPEN (an undisposed run or a pending invocation). Those are KEPT regardless
+    of age — the snapshot and its patch persist until explicit disposition. A
+    snapshot custody does not hold open is removed; a registry row whose
+    checkout directory is already gone is unregistered (with its baseline ref
+    deleted) either way.
+    """
+    open_ids = {str(s) for s in (open_snapshot_ids or set())}
+    removed: List[str] = []
+    kept: List[str] = []
+    for entry in list(_load_registry(data_dir)):
+        if entry.get("kind") != _KIND_DELEGATED_EXEC:
+            continue
+        snap = str(entry.get("snapshot_id") or "")
+        path_exists = bool(entry.get("path")) and Path(str(entry.get("path"))).exists()
+        if snap in open_ids and path_exists:
+            kept.append(snap)
+            continue
+        if remove_execution_snapshot(snap, worktree_root=worktree_root, data_dir=data_dir):
+            removed.append(snap)
+    return {"removed": removed, "kept": kept}
+
+
 def remove_worktree(
     *,
     task_id: str = "",
@@ -391,6 +655,14 @@ def prune_orphans(
     repos: set[str] = set()
     with _ops_lock(root):
         for entry in _load_registry(data_dir):
+            if entry.get("kind") == _KIND_DELEGATED_EXEC:
+                # Delegated execution snapshots have their OWN lifecycle: they persist
+                # until the run's explicit patch disposition, and the startup GC
+                # (`prune_execution_snapshots`) cross-checks custody for open runs and
+                # pending invocations. Age/path heuristics here must not eat them —
+                # and their baseline ref needs deleting, which this loop cannot do.
+                kept.append(entry)
+                continue
             repo_dir = str(entry.get("repo_dir") or "")
             wt_path = str(entry.get("path") or "")
             created = float(entry.get("created_at") or 0)

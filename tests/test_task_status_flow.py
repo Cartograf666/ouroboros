@@ -761,6 +761,9 @@ def test_wait_for_tasks_projects_execution_evidence_for_harness_children(tmp_pat
     payload = json.loads(_wait_for_tasks(ctx, ["harnesskid", "nativekid"], timeout_sec=0))
 
     assert payload["tasks"]["harnesskid"]["execution_evidence"] == {
+        "delegated_runs_settled": 0,
+        "delegated_runs_failed": 0,
+        "native_contribution": "unknown",
         "dispatch_executor": "harness",
         "actual_substrate": "native_only",
         "delegated_runs_started": 0,
@@ -969,8 +972,11 @@ def test_wait_for_tasks_flags_unknown_ids_and_attaches_children_roster(tmp_path)
     # only — no result/trace envelope fields, absent accounting projects null.
     roster = payload["children_roster"]
     assert [row["task_id"] for row in roster] == ["realchild1"]
-    assert set(roster[0]) == {"task_id", "status", "cost_usd", "child_result_sha256", "outcome_axes"}
+    assert set(roster[0]) == {"task_id", "status", "cost_usd", "accounted_upper_bound_usd",
+                              "child_result_sha256", "outcome_axes"}
     assert roster[0]["cost_usd"] == 0.55
+    # C2: the additive honest name carries the SAME value as the alias.
+    assert roster[0]["accounted_upper_bound_usd"] == 0.55
     # Nothing was capped away, and the projection SAYS so (BIBLE P1).
     assert payload["children_roster_omitted"] == 0
 
@@ -1005,7 +1011,8 @@ def test_children_roster_projection_discloses_the_capped_tail(tmp_path):
     assert len(roster) == 30  # the cap holds — the surface stays compact
     assert projected["children_roster_omitted"] == total - 30  # …and is disclosed
     assert all(
-        set(row) == {"task_id", "status", "cost_usd", "child_result_sha256", "outcome_axes"}
+        set(row) == {"task_id", "status", "cost_usd", "accounted_upper_bound_usd",
+                     "child_result_sha256", "outcome_axes"}
         for row in roster
     )
 
