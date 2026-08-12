@@ -327,11 +327,57 @@ def _baseline_refs(phase: str) -> tuple:
     return _PRE_COMMIT_BASELINE_REFS if phase == PRE_COMMIT_PHASE else _TESTS_BASELINE_REFS
 
 
-def _ref_tracks_tests(repo: pathlib.Path, ref: str) -> bool:
-    listed = _run_git(repo, ["ls-tree", "-r", "--name-only", ref, "--", "tests"])
-    if listed.returncode != 0:
-        return False  # no such ref (root commit, empty repository)
-    return bool((listed.stdout or "").strip())
+def _baseline_commit_oids(
+    repo: pathlib.Path, refs: Sequence[str]
+) -> tuple[tuple[str, str], ...]:
+    """Resolve the phase baselines without mistaking unreadable history for absence."""
+    # Deliberately do not peel here: rev-parse returns the ref's recorded OID
+    # even when the commit object itself is missing. A quiet rc=1 with no output
+    # can mean either an unborn HEAD or a broken ref, so only a successfully read
+    # symbolic HEAD proves the former; every other failure is an operational
+    # error the caller must hard-block.
+    resolved = _run_git(repo, ["rev-parse", "--verify", "--quiet", "HEAD"])
+    if resolved.returncode != 0:
+        if (
+            resolved.returncode == 1
+            and not (resolved.stdout or "").strip()
+            and not (resolved.stderr or "").strip()
+        ):
+            symbolic = _run_git(repo, ["symbolic-ref", "--quiet", "HEAD"])
+            if symbolic.returncode == 0 and (symbolic.stdout or "").strip():
+                return ()
+            detail = (
+                symbolic.stderr.strip()
+                or symbolic.stdout.strip()
+                or f"exit {symbolic.returncode}"
+            )
+            raise RuntimeError(f"git could not prove HEAD is unborn: {detail}")
+        detail = (
+            resolved.stderr.strip()
+            or resolved.stdout.strip()
+            or f"exit {resolved.returncode}"
+        )
+        raise RuntimeError(f"git could not resolve HEAD: {detail}")
+
+    head_oid = (resolved.stdout or "").strip()
+    head_commit = _run_git(repo, ["cat-file", "commit", head_oid])
+    if head_commit.returncode != 0:
+        detail = (
+            head_commit.stderr.strip()
+            or head_commit.stdout.strip()
+            or f"exit {head_commit.returncode}"
+        )
+        raise RuntimeError(f"git could not read HEAD commit {head_oid}: {detail}")
+
+    headers = (head_commit.stdout or "").partition("\n\n")[0].splitlines()
+    first_parent = next(
+        (line.removeprefix("parent ") for line in headers if line.startswith("parent ")),
+        None,
+    )
+    by_ref = {"HEAD": head_oid}
+    if first_parent is not None:
+        by_ref["HEAD~1"] = first_parent
+    return tuple((ref, by_ref[ref]) for ref in refs if ref in by_ref)
 
 
 def _head_tracks_tests(repo: pathlib.Path, refs: Sequence[str] = _TESTS_BASELINE_REFS) -> bool:
@@ -343,7 +389,20 @@ def _head_tracks_tests(repo: pathlib.Path, refs: Sequence[str] = _TESTS_BASELINE
     phase baseline — see above; it defaults to the post-commit pair, which is the
     conservative direction for a caller that does not say.
     """
-    return any(_ref_tracks_tests(repo, ref) for ref in refs)
+    for ref, oid in _baseline_commit_oids(repo, refs):
+        listed = _run_git(repo, ["ls-tree", "-r", "--name-only", oid, "--", "tests"])
+        if listed.returncode != 0:
+            detail = (
+                listed.stderr.strip()
+                or listed.stdout.strip()
+                or f"exit {listed.returncode}"
+            )
+            raise RuntimeError(
+                f"git could not read tests/ from baseline {ref} ({oid}): {detail}"
+            )
+        if (listed.stdout or "").strip():
+            return True
+    return False
 
 
 def _apply_diff(worktree: pathlib.Path, diff_text: "str | bytes") -> None:
@@ -1076,7 +1135,19 @@ def run_hermetic_pytest(
         # all-passes-empty hard block below never ran and the change that
         # deleted the gate sailed through it.
         baseline_refs = _baseline_refs(phase)
-        if _head_tracks_tests(repo, baseline_refs):
+        try:
+            baseline_tracks_tests = _head_tracks_tests(repo, baseline_refs)
+        except (RuntimeError, subprocess.SubprocessError, OSError) as exc:
+            return _diagnosis(
+                "⚠️ PRE_PUSH_TEST_ERROR: PREFLIGHT_TESTS_BASELINE_UNREADABLE (hard block): "
+                f"could not read {' or '.join(baseline_refs)}",
+                "The working tree just lost its tests/ directory and git could not read "
+                "one of the baseline refs well enough to say whether that loss is real. "
+                "Treating an unreadable ref as 'never tracked tests' would let this "
+                "candidate through the gate it exists to trip. This is not a test failure.",
+                str(exc), max_output,
+            )
+        if baseline_tracks_tests:
             return (
                 "⚠️ PRE_PUSH_TEST_ERROR: the candidate change removes the entire tests/ tree "
                 f"that {' or '.join(baseline_refs)} carries. The preflight cannot verify "

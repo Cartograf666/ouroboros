@@ -87,6 +87,14 @@ def _commit_all(repo: pathlib.Path) -> None:
     )
 
 
+def _delete_loose_object(repo: pathlib.Path, oid: str) -> None:
+    obj_path = repo / ".git" / "objects" / oid[:2] / oid[2:]
+    assert obj_path.exists(), (
+        "fixture assumption: a fresh repo keeps this object loose"
+    )
+    obj_path.unlink()
+
+
 def _make_repo(tmp_path: pathlib.Path, files: dict[str, str]) -> pathlib.Path:
     """Init a tiny git repo whose `tests/` holds only the given probe files."""
     repo = tmp_path / "repo"
@@ -2197,6 +2205,40 @@ def test_a_gate_blocked_update_tx_is_never_promoted_by_boot_recovery():
     )
 
 
+def test_an_unborn_head_is_proven_absent_not_unreadable(
+    tmp_path, two_pass_env, stub_passes
+):
+    from ouroboros.preflight_runner import run_hermetic_pytest
+
+    events = stub_passes([])
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "checkout", "-b", "ouroboros")
+
+    assert run_hermetic_pytest(repo, timeout=120) is None
+    assert [event[0] for event in events].count("pass") == 0
+
+
+def test_a_broken_head_ref_does_not_masquerade_as_unborn(
+    tmp_path, two_pass_env, stub_passes
+):
+    """A quiet rev-parse rc=1 is ambiguous until symbolic HEAD is readable."""
+    from ouroboros.preflight_runner import PRE_COMMIT_PHASE, run_hermetic_pytest
+
+    events = stub_passes([])
+    repo = _make_repo(tmp_path, {"tests/test_plain.py": "def test_ok():\n    assert True\n"})
+    _git(repo, "rm", "-r", "--quiet", "tests")
+    (repo / ".git" / "refs" / "heads" / "ouroboros").write_text(
+        "not-an-object-id\n", encoding="utf-8"
+    )
+
+    result = run_hermetic_pytest(repo, timeout=120, phase=PRE_COMMIT_PHASE)
+    assert result is not None
+    assert "PREFLIGHT_TESTS_BASELINE_UNREADABLE" in result
+    assert [event[0] for event in events].count("pass") == 0
+
+
 def test_a_repository_that_never_had_tests_is_still_out_of_scope(tmp_path, two_pass_env, stub_passes):
     """...and the control: the block keys on the committed history carrying a
     suite, not on the working tree lacking one, so a repo with no test suite at
@@ -2235,6 +2277,82 @@ def test_the_post_commit_baseline_reaches_back_exactly_one_commit(tmp_path, two_
 
     assert not _head_tracks_tests(repo), "the baseline reached back more than one commit"
     assert run_hermetic_pytest(repo, timeout=120) is None
+    assert [event[0] for event in events].count("pass") == 0
+
+
+def test_an_unreadable_baseline_tree_hard_blocks_instead_of_reading_as_no_tests(
+    tmp_path, two_pass_env, stub_passes
+):
+    """`ls-tree` returning nonzero is not on its own evidence a ref is absent:
+    git fails that way too when the ref resolves fine but its tree cannot be
+    read (a corrupt or missing object, a permissions/IO error). Reading that
+    failure as "this ref never tracked tests" lets a candidate that deletes
+    tests/ sail through the hard block below merely because git could not
+    read a real, resolvable ref's tree. The corrupted ref here is HEAD~1,
+    which legitimately carries the suite the deletion commit removed."""
+    from ouroboros.preflight_runner import run_hermetic_pytest
+
+    events = stub_passes([])
+    repo = _make_repo(tmp_path, {"tests/test_plain.py": "def test_ok():\n    assert True\n"})
+    tree_oid = subprocess.run(
+        ["git", "rev-parse", "HEAD:tests"], cwd=str(repo),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    _git(repo, "rm", "-r", "--quiet", "tests")
+    _commit_all(repo)
+
+    _delete_loose_object(repo, tree_oid)
+
+    result = run_hermetic_pytest(repo, timeout=120)
+    assert result is not None, "an unreadable baseline ref must hard-block, not silently pass"
+    assert "PREFLIGHT_TESTS_BASELINE_UNREADABLE" in result
+    assert [event[0] for event in events].count("pass") == 0
+
+
+def test_an_unreadable_head_commit_hard_blocks_the_pre_commit_baseline(
+    tmp_path, two_pass_env, stub_passes
+):
+    from ouroboros.preflight_runner import PRE_COMMIT_PHASE, run_hermetic_pytest
+
+    events = stub_passes([])
+    repo = _make_repo(tmp_path, {"tests/test_plain.py": "def test_ok():\n    assert True\n"})
+    head_oid = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    _git(repo, "rm", "-r", "--quiet", "tests")
+    _delete_loose_object(repo, head_oid)
+
+    result = run_hermetic_pytest(repo, timeout=120, phase=PRE_COMMIT_PHASE)
+    assert result is not None
+    assert "PREFLIGHT_TESTS_BASELINE_UNREADABLE" in result
+    assert [event[0] for event in events].count("pass") == 0
+
+
+def test_an_unreadable_first_parent_hard_blocks_the_post_commit_baseline(
+    tmp_path, two_pass_env, stub_passes
+):
+    from ouroboros.preflight_runner import run_hermetic_pytest
+
+    events = stub_passes([])
+    repo = _make_repo(tmp_path, {"tests/test_plain.py": "def test_ok():\n    assert True\n"})
+    parent_oid = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    _git(repo, "rm", "-r", "--quiet", "tests")
+    _commit_all(repo)
+    _delete_loose_object(repo, parent_oid)
+
+    result = run_hermetic_pytest(repo, timeout=120)
+    assert result is not None
+    assert "PREFLIGHT_TESTS_BASELINE_UNREADABLE" in result
     assert [event[0] for event in events].count("pass") == 0
 
 
