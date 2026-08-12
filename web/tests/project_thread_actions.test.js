@@ -275,6 +275,41 @@ test('a clean checkout removes without an acknowledgement; unmerged work does no
     assert.deepEqual(risky.evidence, ['a.txt', 'b.txt']);
 });
 
+test('the removal prompt states the TRUE dirty count, not the length of the listing', () => {
+    // `dirty_files` is bounded at 200 by the server; `dirty_files_total` is how
+    // many there are. Counting the slice announced 800 modified files as 200 in
+    // the sentence immediately before an irreversible removal.
+    const listed = Array.from({ length: 200 }, (_, i) => ` M f${i}.txt`);
+    const bounded = removalPrompt({ dirty_files: listed, dirty_files_total: 800, unmerged_commits: 0 });
+    assert.equal(bounded.needsAcknowledgement, true);
+    assert.match(bounded.text, /800 uncommitted file changes/);
+    assert.ok(!/200 uncommitted file changes/.test(bounded.text), bounded.text);
+    assert.match(bounded.text, /Only the first 200 of those files are listed here\./);
+    assert.equal(bounded.evidence.length, 200);
+
+    // Exactly at the cap leaves nothing out, so it says nothing.
+    const exact = removalPrompt({ dirty_files: listed, dirty_files_total: 200, unmerged_commits: 0 });
+    assert.match(exact.text, /200 uncommitted file changes/);
+    assert.ok(!/Only the first/.test(exact.text), exact.text);
+
+    // One file, singular, and no omission note.
+    const one = removalPrompt({ dirty_files: [' M a.txt'], dirty_files_total: 1, unmerged_commits: 0 });
+    assert.match(one.text, /1 uncommitted file change\./);
+    assert.ok(!/Only the first/.test(one.text), one.text);
+
+    // A payload without the field reads as "the listing IS the set" — the old
+    // behaviour, never an under-count of what is in hand.
+    const legacy = removalPrompt({ dirty_files: ['a.txt', 'b.txt'], unmerged_commits: 0 });
+    assert.match(legacy.text, /2 uncommitted file changes/);
+    assert.ok(!/Only the first/.test(legacy.text), legacy.text);
+
+    // And a merge SUCCESS counts the same way, so the two never disagree.
+    assert.match(
+        successText({ merged: true, checkout_left_behind: listed, dirty_files_total: 800 }),
+        /800 uncommitted changes stayed in the checkout/,
+    );
+});
+
 test('an unreadable checkout is UNSAFE — "cannot tell" is never "nothing to lose"', () => {
     const prompt = removalPrompt({ error: 'not a git repository', dirty_files: [], unmerged_commits: 0 });
     assert.equal(prompt.needsAcknowledgement, true);

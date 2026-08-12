@@ -283,13 +283,33 @@ def _project_head(row: Dict[str, Any]) -> str:
     return (head.stdout or "").strip() if head.returncode == 0 else ""
 
 
+#: How many dirty entries an inspection LISTS. The bound stays — an unbounded
+#: list on an owner-facing envelope is its own problem — but it is a display
+#: bound only: ``dirty_files_total`` carries the honest size of the set beside
+#: it, and every sentence that states a number states that one.
+_DIRTY_FILES_SHOWN = 200
+
+
 def inspect_thread_worktree(row: Dict[str, Any]) -> Dict[str, Any]:
     """What removing this worktree would DESTROY — the evidence a removal needs.
 
-    Returns ``{exists, dirty, dirty_files, unmerged_commits, unmerged_against,
-    error}``. Never raises: an unreadable checkout reports ``error`` and is
-    treated as unsafe (``dirty``), because "cannot tell" must never read as
-    "nothing to lose".
+    Returns ``{exists, dirty, dirty_files, dirty_files_total, unmerged_commits,
+    unmerged_against, error}``. Never raises: an unreadable checkout reports
+    ``error`` and is treated as unsafe (``dirty``), because "cannot tell" must
+    never read as "nothing to lose".
+
+    ``dirty_files`` is BOUNDED at :data:`_DIRTY_FILES_SHOWN` entries and
+    ``dirty_files_total`` is the true count, always present beside it. The list
+    is for showing; the number is what every owner-facing sentence must state.
+    A bare ``files[:200]`` with no total is exactly the silent truncation
+    DEVELOPMENT.md forbids, and it did not stay harmless: a long-running agent
+    leaves ordinary modified TRACKED files, and 800 of them made the removal
+    refusal — the sentence immediately before an irreversible delete — tell the
+    owner "200 uncommitted file changes". The safety gate held (the checkout is
+    still refused, the acknowledgement is still required) but the magnitude the
+    owner decides on was wrong by a factor of four. A wholly-ignored DIRECTORY
+    does not do it, because git collapses ``node_modules/`` to one entry; it
+    takes plain modified files, which is the ordinary case.
 
     IGNORED files are counted as dirty (``--ignored=matching``, the ``!!``
     entries). ``git status --porcelain`` alone hides exactly the files a thread's
@@ -324,8 +344,8 @@ def inspect_thread_worktree(row: Dict[str, Any]) -> Dict[str, Any]:
     A10's evidence has to be true when it is READ, not merely harmless.
     """
     out: Dict[str, Any] = {
-        "exists": False, "dirty": False, "dirty_files": [], "unmerged_commits": 0,
-        "unmerged_against": "", "error": "",
+        "exists": False, "dirty": False, "dirty_files": [], "dirty_files_total": 0,
+        "unmerged_commits": 0, "unmerged_against": "", "error": "",
     }
     wt_path = Path(str(row.get("path") or ""))
     if not wt_path.is_dir():
@@ -358,7 +378,10 @@ def inspect_thread_worktree(row: Dict[str, Any]) -> Dict[str, Any]:
             return out
         files = [line for line in status.stdout.splitlines() if line.strip()]
         out["dirty"] = bool(files)
-        out["dirty_files"] = files[:200]
+        # The TRUE count first, then the bounded listing — never the length of
+        # the slice standing in for the size of the set.
+        out["dirty_files_total"] = len(files)
+        out["dirty_files"] = files[:_DIRTY_FILES_SHOWN]
         reference = _project_head(row) or str(row.get("base_sha") or "")
         if reference:
             out["unmerged_against"] = reference
@@ -394,8 +417,17 @@ def checkout_work_at_risk(inspection: Dict[str, Any]) -> Dict[str, Any]:
     """Split what a checkout holds into work that CANNOT be rebuilt, and the rest.
 
     Returns ``{at_risk, unmerged_commits, tracked_files, untracked_files,
-    ignored_files, unreadable}``. A pure read over an existing inspection — it
-    asks nothing of git and never touches the disk.
+    ignored_files, omitted_files, unreadable}``. A pure read over an existing
+    inspection — it asks nothing of git and never touches the disk.
+
+    The three file lists are split out of the inspection's BOUNDED listing, so
+    their lengths are counts of what was shown, not of what is there.
+    ``omitted_files`` is the difference (``dirty_files_total`` minus the entries
+    actually listed) and exists so the deletion copy — which states each of those
+    lengths — can disclose that it is not stating the whole set. Without it the
+    delete refusal would have gone on saying "changes to 200 files git is
+    tracking" about 800 of them, in the same release that taught the removal
+    refusal to say 800.
 
     ``inspect_thread_worktree`` deliberately counts an ignored ``node_modules/``
     as dirt, because REMOVING the checkout destroys it and A10's prompt must say
@@ -433,12 +465,17 @@ def checkout_work_at_risk(inspection: Dict[str, Any]) -> Dict[str, Any]:
             tracked.append(line)
     unreadable = str(inspection.get("error") or "").strip()
     commits = int(inspection.get("unmerged_commits") or 0)
+    # An inspection that predates `dirty_files_total` (or one hand-built by a
+    # caller) reads as "the listing IS the set" — the old behaviour, never a
+    # negative omission.
+    total = int(inspection.get("dirty_files_total") or 0)
     return {
         "at_risk": bool(commits > 0 or tracked or unreadable),
         "unmerged_commits": commits,
         "tracked_files": tracked,
         "untracked_files": untracked,
         "ignored_files": ignored,
+        "omitted_files": max(0, total - len(files)),
         "unreadable": unreadable,
     }
 

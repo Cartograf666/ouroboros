@@ -148,6 +148,23 @@ def _refused(reason: str, message: str, **extra: Any) -> Dict[str, Any]:
     return {"ok": False, "reason": reason, "message": message, **extra}
 
 
+#: How many dirty entries an envelope CARRIES. A display bound, never the
+#: answer to "how many are there" — `dirty_files_total` rides beside every
+#: bounded listing this module emits so no client counts the slice.
+_DIRTY_FILES_SENT = 200
+
+
+def _dirty_total(inspection: Dict[str, Any]) -> int:
+    """The true number of dirty entries an inspection found.
+
+    Falls back to the listing's own length for an inspection that predates the
+    field, which is the old behaviour and never an under-count of what is
+    actually in hand.
+    """
+    listed = len(inspection.get("dirty_files") or [])
+    return max(listed, int(inspection.get("dirty_files_total") or 0))
+
+
 def _live_thread_refusal(thread: Dict[str, Any], project_id: str) -> Optional[Dict[str, Any]]:
     """Refuse a git operation on a thread that is fenced or already gone.
 
@@ -900,7 +917,10 @@ def _checkout_ahead_refusal(
             "merge anyway knowing it stays in the checkout.",
             project_id=pid, thread_id=tid, branch=branch,
             path=str(checkout), inspection=inspection,
-            dirty_files=list(inspection.get("dirty_files") or [])[:200],
+            dirty_files=list(inspection.get("dirty_files") or [])[:_DIRTY_FILES_SENT],
+            # The bounded list never travels without the true size of the set it
+            # was cut from, or a client counts the slice.
+            dirty_files_total=_dirty_total(inspection),
             # A10's consent shape, reused: the refusal names the flag that
             # answers it, so the owner is never stuck with only "no".
             acknowledgeable=True,
@@ -1065,7 +1085,8 @@ def merge_back_thread(
                 REASON_LOCAL_TREE_DIRTY,
                 "The project folder has uncommitted changes. Commit or stash them "
                 "first — merging on top of them would blur which work came from where.",
-                project_id=pid, thread_id=tid, branch=branch, dirty_files=dirty[:200],
+                project_id=pid, thread_id=tid, branch=branch,
+                dirty_files=dirty[:_DIRTY_FILES_SENT], dirty_files_total=len(dirty),
             )
 
         # A9's LAST precondition, and the one only the checkout can answer: is the
@@ -1082,8 +1103,10 @@ def merge_back_thread(
         if ahead is not None:
             return ahead
         # Named on the SUCCESS too: acknowledging work stays behind is not the same
-        # as forgetting it did.
-        left_behind = list(inspection.get("dirty_files") or [])[:200]
+        # as forgetting it did — and how MUCH stayed behind is the same honest
+        # count the refusals state, not the length of the listing.
+        left_behind = list(inspection.get("dirty_files") or [])[:_DIRTY_FILES_SENT]
+        left_behind_total = _dirty_total(inspection)
 
         before = _git(repo_dir, "rev-parse", "HEAD")
         head_before = (before.stdout or "").strip() if before.returncode == 0 else ""
@@ -1153,6 +1176,8 @@ def merge_back_thread(
             # when the owner acknowledged it, and said out loud there rather than left
             # for them to rediscover in a folder they have stopped looking at.
             "checkout_left_behind": left_behind,
+            #: The true size of that set — `checkout_left_behind` is the listing.
+            "dirty_files_total": left_behind_total,
             "location": thread_location(data_root, pid, tid),
         }
 

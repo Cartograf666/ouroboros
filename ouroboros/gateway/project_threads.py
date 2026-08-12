@@ -319,15 +319,25 @@ def _removal_message(
         commits = int(inspection.get("unmerged_commits") or 0)
         if commits:
             parts.append(f"{commits} commit{'s' if commits != 1 else ''} the project folder never received")
-        if inspection.get("dirty_files"):
-            parts.append(f"{len(inspection['dirty_files'])} uncommitted file changes")
+        # The TRUE number of dirty entries, never the length of the bounded
+        # listing the inspection carries. This sentence is the last thing an
+        # owner reads before acknowledging an irreversible removal, and it used
+        # to state the cap: 800 modified files were announced as 200.
+        listed = len(inspection.get("dirty_files") or [])
+        dirty_total = max(listed, int(inspection.get("dirty_files_total") or 0))
+        if dirty_total:
+            parts.append(_plural(dirty_total, "uncommitted file change"))
         if inspection.get("error"):
             parts.append("a checkout that could not be read, so its contents are unknown")
         detail = " and ".join(parts) if parts else "work the project folder never received"
-        return (
-            f"This checkout still holds {detail}. Removing it deletes that work. "
-            "Merge it back first, or confirm you want it gone."
-        )
+        sentences = [f"This checkout still holds {detail}. Removing it deletes that work."]
+        if dirty_total > listed:
+            sentences.append(
+                f"Only the first {listed} of those files are listed here." if listed
+                else "None of those files are listed here."
+            )
+        sentences.append("Merge it back first, or confirm you want it gone.")
+        return " ".join(sentences)
     if reason == "unknown":
         return "This thread has no checkout to remove."
     if reason == "project_busy":
@@ -652,6 +662,20 @@ def _plural(count: int, noun: str) -> str:
     return f"{count} {noun}{'' if count == 1 else 's'}"
 
 
+def _omission_clause(risk: Dict[str, Any]) -> str:
+    """The sentence a per-category count owes when the listing was bounded.
+
+    ``checkout_work_at_risk`` splits a BOUNDED listing, so its category lengths
+    are counts of what was shown. Which category the unlisted entries fall into
+    is not knowable from the listing, so this states the one thing that is true:
+    how many were left out. Empty — not "0 more" — when nothing was.
+    """
+    omitted = int(risk.get("omitted_files") or 0)
+    if not omitted:
+        return ""
+    return f" {_plural(omitted, 'further changed file')} in that checkout {'is' if omitted == 1 else 'are'} not listed here."
+
+
 def _delete_refusal_message(risk: Dict[str, Any]) -> str:
     """Why a deletion will NOT go ahead — naming the work that is actually at stake.
 
@@ -672,9 +696,9 @@ def _delete_refusal_message(risk: Dict[str, Any]) -> str:
         parts.append("a checkout that could not be read, so its contents are unknown")
     detail = " and ".join(parts) if parts else "work the project folder never received"
     return (
-        f"This thread's checkout holds {detail}. Deleting the thread would delete that "
-        "folder, and a deleted thread has no surface left that could reach it — so the "
-        "delete stops here. Merge the work back, or remove the checkout explicitly "
+        f"This thread's checkout holds {detail}.{_omission_clause(risk)} Deleting the thread "
+        "would delete that folder, and a deleted thread has no surface left that could reach "
+        "it — so the delete stops here. Merge the work back, or remove the checkout explicitly "
         "(Remove checkout…, which asks you to confirm first), then delete the thread."
     )
 
@@ -694,8 +718,8 @@ def _delete_confirm_message(risk: Dict[str, Any]) -> str:
         parts.append(f"{_plural(len(risk['untracked_files']), 'file')} git is not tracking")
     return (
         f"This thread's checkout holds {' and '.join(parts)} — nothing committed, and "
-        "nothing changed in a file git is tracking. Deleting the thread deletes that "
-        "folder with them. Confirm to delete both."
+        f"nothing changed in a file git is tracking.{_omission_clause(risk)} Deleting the "
+        "thread deletes that folder with them. Confirm to delete both."
     )
 
 

@@ -482,6 +482,12 @@
  * removal that would destroy work, decision for the git_init_required offer.
  * worktree_kept is stated explicitly on a successful merge because A10 turns on
  * it: merging back never removes the checkout.
+ * dirty_files_total is the TRUE size of whichever bounded listing rides along
+ * (dirty_files, checkout_left_behind, and the inspection's own dirty_files):
+ * the lists are capped so the envelope cannot grow without bound, the count
+ * never is. Render the count from it, never from list.length — counting the
+ * slice told an owner "200 uncommitted file changes" about 800 of them, in the
+ * sentence immediately before an irreversible removal.
  * @typedef {Object} ThreadWorktreeResponse
  * @property {boolean=} ok
  * @property {string=} reason
@@ -498,6 +504,8 @@
  * @property {Object=} snapshot_commit
  * @property {string[]=} conflicts
  * @property {string[]=} dirty_files
+ * @property {number=} dirty_files_total present whenever a bounded file listing
+ *   is — the number every owner-facing sentence states
  * @property {boolean=} merged
  * @property {string=} head_before
  * @property {string=} head_after

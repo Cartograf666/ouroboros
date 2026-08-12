@@ -214,6 +214,17 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     assert re.search(r"@property \{string\} deprecation_notice\b", text), (
         "OwnerScopeReviewFloorResponse.deprecation_notice must be declared for the browser"
     )
+    # The bounded-listing count: a `[:N]` slice on an owner-facing envelope must
+    # travel with the TRUE size of the set (DEVELOPMENT.md, "No silent
+    # truncation"). It is a NUMBER on both sides — a client left to reach for
+    # `dirty_files.length` is a client that states the CAP as the magnitude,
+    # which is exactly what the removal refusal did with 800 modified files.
+    assert "dirty_files_total" in get_type_hints(ThreadWorktreeResponse, include_extras=True), (
+        "ThreadWorktreeResponse must declare dirty_files_total beside dirty_files"
+    )
+    assert re.search(r"@property \{number=\} dirty_files_total\b", text), (
+        "ThreadWorktreeResponse.dirty_files_total must be a JSDoc number in the browser mirror"
+    )
     assert re.search(r"@property \{boolean=\} force_plan\b", text), "ChatInbound missing force_plan"
     for field in ("model_lane", "requested_model_lane", "effective_model_lane", "model", "task_group_id"):
         assert re.search(rf"@property \{{string=\}} {field}\b", text), f"ChatOutbound missing {field}"

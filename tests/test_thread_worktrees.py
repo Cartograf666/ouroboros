@@ -773,7 +773,8 @@ def test_checkout_work_at_risk_separates_the_unlosable_from_the_rebuildable():
     assert clean["at_risk"] is False
     assert clean == {
         "at_risk": False, "unmerged_commits": 0, "tracked_files": [],
-        "untracked_files": [], "ignored_files": [], "unreadable": "",
+        "untracked_files": [], "ignored_files": [], "omitted_files": 0,
+        "unreadable": "",
     }
 
     rebuildable = checkout_work_at_risk({
@@ -1078,3 +1079,162 @@ def test_a_refused_removal_still_destroys_nothing(repo, tmp_path, wt_root):
     assert refused["reason"] == "unmerged_work"
     assert (checkout / "unsaved.txt").read_text(encoding="utf-8") == "only copy\n"
     assert get_thread_worktree(tmp_path / "data", "racer", 1) is not None
+
+
+def test_the_removal_refusal_states_the_TRUE_number_of_dirty_files(repo, tmp_path, wt_root):
+    """The count in the sentence immediately before an irreversible removal.
+
+    `inspect_thread_worktree` bounds `dirty_files` at 200 — an unbounded list on
+    an owner-facing envelope is its own problem — and the removal refusal counted
+    the SLICE. A long-running agent leaves ordinary modified TRACKED files, so
+    800 of them were announced to the owner as "200 uncommitted file changes":
+    the qualitative claim stayed true and the acknowledgement was still required,
+    but the magnitude the owner decided on was wrong by a factor of four.
+
+    A wholly-ignored DIRECTORY does not reproduce it — git collapses
+    `node_modules/` to one entry. It takes plain files, which is the ordinary
+    case.
+    """
+    from pathlib import Path
+
+    from ouroboros.gateway.project_threads import _removal_message
+
+    (repo / ".gitignore").write_text("*.log\n", encoding="utf-8")
+    for i in range(400):
+        (repo / f"f{i}.txt").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "400 tracked files")
+
+    handle = _provision(repo, tmp_path, wt_root)
+    checkout = Path(handle.path)
+    for i in range(400):
+        (checkout / f"f{i}.txt").write_text("edited by the agent\n", encoding="utf-8")
+        (checkout / f"a{i}.log").write_text("noise\n", encoding="utf-8")
+
+    inspection = inspect_thread_worktree(get_thread_worktree(tmp_path / "data", "racer", 1))
+
+    assert inspection["dirty"] is True
+
+    # The sentence the owner reads, asserted FIRST: against f05d429d it says
+    # "200 uncommitted file changes" about 800 of them.
+    message = _removal_message("unmerged_work", inspection)
+
+    assert "800 uncommitted file changes" in message, message
+    assert "200 uncommitted file changes" not in message, message
+    # ...and the shorter list is disclosed rather than left to imply the count.
+    assert "Only the first 200 of those files are listed here." in message, message
+
+    assert inspection["dirty_files_total"] == 800, inspection["dirty_files_total"]
+    assert len(inspection["dirty_files"]) == 200, "the listing itself stays bounded"
+
+    # The refusal itself is unchanged: this was never a hole in the safety gate,
+    # only in what the gate SAID.
+    refused = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1, worktree_root=wt_root,
+    )
+    assert refused["removed"] is False
+    assert refused["reason"] == "unmerged_work"
+    # And the inspection the ROUTE builds its copy from carries the same total,
+    # so the sentence the owner actually receives is this one.
+    assert _removal_message(refused["reason"], refused["inspection"]) == message
+
+
+def test_the_removal_sentence_reads_correctly_at_every_boundary():
+    """0, 1, exactly at the cap, and one past it — a pure read, no git."""
+    from ouroboros.gateway.project_threads import _removal_message
+
+    none_dirty = _removal_message(
+        "unmerged_work",
+        {"dirty_files": [], "dirty_files_total": 0, "unmerged_commits": 2, "error": ""},
+    )
+    assert "uncommitted file change" not in none_dirty, none_dirty
+    assert "Only the first" not in none_dirty, none_dirty
+
+    one = _removal_message(
+        "unmerged_work",
+        {"dirty_files": [" M a.txt"], "dirty_files_total": 1, "unmerged_commits": 0, "error": ""},
+    )
+    assert "1 uncommitted file change." in one, one
+    assert "1 uncommitted file changes" not in one, one
+    assert "Only the first" not in one, one
+
+    exactly = _removal_message(
+        "unmerged_work",
+        {"dirty_files": [f" M f{i}.txt" for i in range(200)], "dirty_files_total": 200,
+         "unmerged_commits": 0, "error": ""},
+    )
+    assert "200 uncommitted file changes" in exactly, exactly
+    assert "Only the first" not in exactly, "nothing was left out at exactly the cap"
+
+    one_past = _removal_message(
+        "unmerged_work",
+        {"dirty_files": [f" M f{i}.txt" for i in range(200)], "dirty_files_total": 201,
+         "unmerged_commits": 0, "error": ""},
+    )
+    assert "201 uncommitted file changes" in one_past, one_past
+    assert "Only the first 200 of those files are listed here." in one_past, one_past
+
+    # A count with an EMPTY listing never renders "Only the first 0 …". The
+    # producer cannot make this shape, but a sentence that reads as nonsense is
+    # still a sentence the owner was shown.
+    listless = _removal_message(
+        "unmerged_work",
+        {"dirty_files": [], "dirty_files_total": 5, "unmerged_commits": 0, "error": ""},
+    )
+    assert "5 uncommitted file changes" in listless, listless
+    assert "None of those files are listed here." in listless, listless
+    assert "Only the first 0" not in listless, listless
+
+    # An inspection that never carried the field reads as "the listing IS the
+    # set" — the old behaviour, never an under-count of what is in hand.
+    legacy = _removal_message(
+        "unmerged_work",
+        {"dirty_files": [" M a.txt", " M b.txt"], "unmerged_commits": 0, "error": ""},
+    )
+    assert "2 uncommitted file changes" in legacy, legacy
+    assert "Only the first" not in legacy, legacy
+
+
+def test_the_delete_copy_discloses_what_its_per_category_counts_left_out():
+    """`checkout_work_at_risk` splits a BOUNDED listing, so its category lengths
+    count what was SHOWN. Which category the unlisted entries fall into is not
+    knowable from the listing, so the copy states the one thing that is true:
+    how many were left out. Without it the delete refusal would have gone on
+    saying "200 files" in the same release that taught the removal refusal 800.
+    """
+    from ouroboros.gateway.project_threads import (
+        _delete_confirm_message,
+        _delete_refusal_message,
+    )
+    from ouroboros.thread_worktrees import checkout_work_at_risk
+
+    tracked = checkout_work_at_risk({
+        "dirty": True,
+        "dirty_files": [f" M f{i}.txt" for i in range(200)],
+        "dirty_files_total": 800,
+        "unmerged_commits": 0,
+        "error": "",
+    })
+    assert tracked["omitted_files"] == 600
+    refusal = _delete_refusal_message(tracked)
+    assert "changes to 200 files git is tracking" in refusal, refusal
+    assert "600 further changed files in that checkout are not listed here." in refusal, refusal
+
+    ignored = checkout_work_at_risk({
+        "dirty": True,
+        "dirty_files": [f"!! a{i}.log" for i in range(200)],
+        "dirty_files_total": 201,
+        "unmerged_commits": 0,
+        "error": "",
+    })
+    assert ignored["at_risk"] is False
+    confirm = _delete_confirm_message(ignored)
+    assert "1 further changed file in that checkout is not listed here." in confirm, confirm
+
+    # Nothing omitted says nothing — never "0 more files".
+    whole = checkout_work_at_risk({
+        "dirty": True, "dirty_files": ["!! a.log"], "dirty_files_total": 1,
+        "unmerged_commits": 0, "error": "",
+    })
+    assert whole["omitted_files"] == 0
+    assert "not listed here" not in _delete_confirm_message(whole)

@@ -160,7 +160,10 @@ export function successText(outcome) {
         // did, so the SUCCESS says it again rather than leaving the owner to
         // rediscover it in a folder they have stopped looking at.
         if (!behind.length) return base;
-        const n = behind.length;
+        // The listing is bounded; how much stayed behind is not. Counting the
+        // slice here would have disagreed with the refusal that preceded it.
+        const declared = Number(outcome.dirty_files_total);
+        const n = Number.isFinite(declared) ? Math.max(behind.length, declared) : behind.length;
         return `${base} ${n} uncommitted change${n === 1 ? '' : 's'} stayed in the checkout — a merge brings commits only.`;
     }
     if (outcome?.removed) {
@@ -223,9 +226,17 @@ export function snapshotReceipt(outcome) {
  * Returns `{needsAcknowledgement, text, evidence}`. When the inspection could
  * not be read, this treats it as unsafe and says so — "cannot tell" must never
  * be rendered as "nothing to lose".
+ *
+ * `dirty_files` is a BOUNDED listing and `dirty_files_total` is how many there
+ * are; this prompt is the last thing between the owner and an irreversible
+ * removal, so it states the total and discloses that the list is shorter.
+ * `dirty_files.length` was the same false magnitude the server refusal used to
+ * state — 800 modified files rendered as 200.
  */
 export function removalPrompt(inspection) {
     const dirty = Array.isArray(inspection?.dirty_files) ? inspection.dirty_files.filter(Boolean) : [];
+    const declared = Number(inspection?.dirty_files_total);
+    const total = Number.isFinite(declared) ? Math.max(dirty.length, declared) : dirty.length;
     const commits = Number(inspection?.unmerged_commits || 0);
     const error = String(inspection?.error || '').trim();
     if (error) {
@@ -235,7 +246,7 @@ export function removalPrompt(inspection) {
             evidence: [error],
         };
     }
-    if (!dirty.length && !commits) {
+    if (!total && !commits) {
         return {
             needsAcknowledgement: false,
             text: 'This checkout has no unmerged work. Removing it deletes only the folder.',
@@ -244,10 +255,16 @@ export function removalPrompt(inspection) {
     }
     const parts = [];
     if (commits) parts.push(`${commits} commit${commits === 1 ? '' : 's'} the project folder never received`);
-    if (dirty.length) parts.push(`${dirty.length} uncommitted file change${dirty.length === 1 ? '' : 's'}`);
+    if (total) parts.push(`${total} uncommitted file change${total === 1 ? '' : 's'}`);
+    let omitted = '';
+    if (total > dirty.length) {
+        omitted = dirty.length
+            ? ` Only the first ${dirty.length} of those files are listed here.`
+            : ' None of those files are listed here.';
+    }
     return {
         needsAcknowledgement: true,
-        text: `Removing this checkout deletes ${parts.join(' and ')}.`,
+        text: `Removing this checkout deletes ${parts.join(' and ')}.${omitted}`,
         evidence: dirty,
     };
 }

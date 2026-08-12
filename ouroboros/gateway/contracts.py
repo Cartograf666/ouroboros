@@ -634,6 +634,15 @@ class ThreadWorktreeResponse(TypedDict, total=False):
 
     ``worktree_kept`` is stated explicitly on a successful merge because A10 turns
     on it: merging back never removes the checkout.
+
+    ``dirty_files_total`` is the TRUE size of whichever bounded file listing this
+    envelope carries — ``dirty_files`` on a refusal, ``checkout_left_behind`` on
+    a merge that acknowledged work staying put, and the same number the
+    ``inspection`` sub-object states. The lists are capped so an envelope cannot
+    grow without bound; the count never is, because every owner-facing sentence
+    that names a magnitude names this one. Counting the slice told an owner "200
+    uncommitted file changes" about 800 of them, in the sentence immediately
+    before an irreversible removal.
     """
 
     ok: bool
@@ -651,6 +660,8 @@ class ThreadWorktreeResponse(TypedDict, total=False):
     snapshot_commit: Dict[str, Any]
     conflicts: List[str]
     dirty_files: List[str]
+    #: Present whenever a bounded file listing is — the count the copy states.
+    dirty_files_total: int
     merged: bool
     head_before: str
     head_after: str

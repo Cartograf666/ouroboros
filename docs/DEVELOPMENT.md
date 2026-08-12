@@ -583,6 +583,14 @@ If a core governance artifact cannot fit in the available context budget:
   must be accompanied by an explicit omitted COUNT, and — where the slice touches an
   identity that something downstream compares — a durable hash or reference for the
   full set (see `_outcome_receipts.receipt_identity_projection`).
+  The count is owed by every surface that states a MAGNITUDE, not just by the
+  producer: `thread_worktrees.inspect_thread_worktree` bounds `dirty_files` at 200
+  and ships `dirty_files_total` beside it (mirrored on `ThreadWorktreeResponse` and
+  in `api_types.js`) precisely because the removal refusal — the sentence
+  immediately before an irreversible delete — rendered `len(dirty_files)` and told
+  an owner "200 uncommitted file changes" about 800 of them. When you add a
+  `[:N]`, grep every consumer: an emptiness test over the slice stays correct, a
+  `len()` over it does not.
 
 ### Invariant: Owner-facing surfaces show the full text (v6.70.0)
 
