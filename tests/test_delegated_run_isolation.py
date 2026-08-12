@@ -1164,7 +1164,8 @@ class TestStartupGCFailClosed:
         monkeypatch.setattr(srv, "DATA_DIR", data)
         return srv, data, snaps
 
-    @pytest.mark.skipif(os.geteuid() == 0, reason="permission bits do not bind root")
+    @pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0,
+                        reason="POSIX permission-bit semantics; skipped on Windows and under root")
     def test_unreadable_custody_log_skips_the_prune_and_discloses(self, tmp_path, monkeypatch):
         srv, data, snaps = self._server_gc(tmp_path, monkeypatch)
         target = _seed_target(tmp_path)
@@ -1195,7 +1196,8 @@ class TestStartupGCFailClosed:
         assert rows and rows[-1]["reason"] == "custody_log_unreadable"
         custody._CUSTODY.clear()
 
-    @pytest.mark.skipif(os.geteuid() == 0, reason="permission bits do not bind root")
+    @pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0,
+                        reason="POSIX permission-bit semantics; skipped on Windows and under root")
     def test_unwritable_skip_row_escalates_to_error_and_still_skips(
             self, tmp_path, monkeypatch, caplog):
         # CR2-2: a COMPLETELY inaccessible custody log (mode 000) still skips

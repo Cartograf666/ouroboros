@@ -54,8 +54,14 @@ class TestArgvBudget:
         # F9: `copy_strings` measures the string WITH its NUL, so the largest
         # string that still execs is limit-1 content bytes. `content > limit` let
         # the exact-boundary case through and E2BIG'd at exec.
-        assert argv_budget_excess(["prog", "x" * (PER_ARG_LIMIT_BYTES - 1)], env={}) == ""
-        exact = argv_budget_excess(["prog", "x" * PER_ARG_LIMIT_BYTES], env={})
+        # An explicit generous total limit isolates the per-arg check: on Windows
+        # the real total budget (32K chars) is smaller than one max POSIX arg, so
+        # without it the TOTAL clause fires first and this boundary is untestable.
+        roomy = PER_ARG_LIMIT_BYTES * 4
+        assert argv_budget_excess(["prog", "x" * (PER_ARG_LIMIT_BYTES - 1)], env={},
+                                  limit_bytes=roomy) == ""
+        exact = argv_budget_excess(["prog", "x" * PER_ARG_LIMIT_BYTES], env={},
+                                   limit_bytes=roomy)
         assert "argv[1]" in exact and "including its NUL" in exact
 
     def test_oversized_env_string_is_named(self):
