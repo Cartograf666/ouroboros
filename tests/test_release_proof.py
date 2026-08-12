@@ -302,6 +302,13 @@ def test_linux_packages_ship_the_systemd_user_unit():
     assert "grep -Fqx 'KillMode=control-group'" in smoke
     assert "! grep -q '^Restart='" in smoke
 
+    for proof_id in (
+        "linux-deb-amd64",
+        "linux-rpm-x86_64",
+        "linux-rpm-red80-x86_64",
+    ):
+        assert "systemd_user_unit" in release_proof.REQUIRED_SMOKE_CHECKS[proof_id]
+
     # Nothing may activate it on install.
     for forbidden in (
         "systemctl enable",
@@ -416,6 +423,7 @@ def test_release_workflow_orders_smoke_sbom_attestation_and_draft_verification()
     assert "bash scripts/smoke_linux_packages.sh" in workflow
     assert "--check package_install" in workflow
     assert "--check runtime_dependency" in workflow
+    assert "--check systemd_user_unit" in workflow
     assert "--check desktop_launcher_start" in workflow
     assert "release-artifacts/ouroboros_*_amd64.deb" in workflow
     assert "release-artifacts/ouroboros-*-1.x86_64.rpm" in workflow

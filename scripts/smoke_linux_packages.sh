@@ -1,6 +1,6 @@
 #!/bin/bash
 # Install the built .deb and .rpm in stock distro containers and check that the
-# packaged CLI and desktop launcher actually run after a real install.
+# installed systemd unit, packaged CLI, and desktop launcher after a real install.
 #
 # Two lanes, because they carry different risk:
 #

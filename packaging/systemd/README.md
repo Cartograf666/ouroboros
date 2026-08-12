@@ -88,7 +88,8 @@ runtime that the launcher deliberately stopped.
 started by the unit, including the launcher, server, and workers.
 `TimeoutStopSec=120` does not defer that signal and does not promise that an
 in-flight tool call will finish. It is the upper bound systemd waits before
-escalating to `SIGKILL`, giving the launcher's bounded cleanup time to complete.
+escalating to `SIGKILL` while remaining cgroup processes follow their own
+shutdown paths.
 
 ## Why this is a user unit
 

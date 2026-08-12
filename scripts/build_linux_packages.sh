@@ -4,7 +4,8 @@
 # package manager instead of unpacking the tarball by hand.
 #
 # Both packages carry the exact same payload as the tarball, installed to
-# /opt/ouroboros with a /usr/bin/ouroboros symlink and a desktop entry.
+# /opt/ouroboros with a /usr/bin/ouroboros symlink, a desktop entry, and an
+# opt-in systemd user unit.
 #
 # Usage: bash build_linux_packages.sh [payload-dir] [output-dir]
 set -euo pipefail
