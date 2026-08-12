@@ -326,6 +326,12 @@ def test_effective_delegation_budget_honors_require_lane_and_scope():
 
     allowed = effective_delegation_budget({}, unresolved_constraints=[row], role="critic", requested_lane="heavy", intended_lane="heavy")
     assert allowed.ok is True
+    # F9 (sol #1): a PASSING admission under an applicable require_lane carries
+    # the verified lane out, so the scheduler can stamp it onto the child record
+    # and the dispatch-time policy default cannot override it.
+    assert allowed.required_lane == "heavy"
+    # A non-applicable constraint (role mismatch) contributes no required lane.
+    assert ignored.required_lane == ""
 
 
 def test_reaper_finalizes_stuck_artifact_on_self_finalized_result(tmp_path, monkeypatch):

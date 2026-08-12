@@ -23,7 +23,7 @@ from ouroboros.tool_capabilities import (
     LOCAL_READONLY_SUBAGENT_TOOL_NAMES,
 )
 
-NANNY_TOOLS = {"delegate_start", "delegate_wait", "delegate_cancel"}
+NANNY_TOOLS = {"delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer"}
 
 
 @pytest.fixture(autouse=True)
@@ -3478,6 +3478,53 @@ def test_cancel_never_claims_more_than_a_terminal_receipt_proves(
     assert bool(faults) is (expected == "failed"), (expected, faults)
 
 
+def test_cancel_and_verify_carries_the_verify_reads_terminal_detail(tmp_path):
+    """BR2-1, purely additive: when the verify read discovers a terminal state,
+    the already-read run detail rides the result as the OPTIONAL `terminal_detail`
+    key, so a caller consuming a discovered natural terminal (completion wins)
+    never depends on a second fetch after settlement. The key is ABSENT on every
+    other outcome — the historical six-key shape is untouched — and it never
+    rides the emitted cancel-outcome event."""
+    import ouroboros.delegate_custody as dc
+
+    detail = {"lastSeq": 9, "summary": {"state": "succeeded", "spendUsd": 0.0,
+                                        "inputTokens": 1, "outputTokens": 1}}
+
+    class _Finished:
+        def cancel_run(self, rid, reason=""):
+            return {"accepted": True, "status": "accepted"}
+        def get_run(self, rid, **_kw):
+            return detail
+
+    entry = dc.RunCustody(run_id="run-td", task_id="t-a", route_id="r", model="m",
+                          project_id="p", project_owned=False, root_task_id="t-a",
+                          ledger_root=str(tmp_path))
+    dc.record_started(tmp_path, entry)
+    out = dc.cancel_and_verify(tmp_path, _Finished(), entry, "test")
+    assert out["outcome"] == "confirmed" and out["state"] == "succeeded"
+    assert out["terminal_detail"] == detail
+
+    class _Live:
+        def cancel_run(self, rid, reason=""):
+            return {"accepted": True, "status": "accepted"}
+        def get_run(self, rid, **_kw):
+            return {"lastSeq": 3, "summary": {"state": "running"}}
+
+    entry2 = dc.RunCustody(run_id="run-td2", task_id="t-a", route_id="r", model="m",
+                           project_id="p", project_owned=False, root_task_id="t-a",
+                           ledger_root=str(tmp_path))
+    dc.record_started(tmp_path, entry2)
+    out2 = dc.cancel_and_verify(tmp_path, _Live(), entry2, "test")
+    assert out2["outcome"] == "requested"
+    assert set(out2) == {"outcome", "accepted", "control_status", "state",
+                         "fault_reason", "detail"}, out2
+
+    rows = [json.loads(line) for line in
+            (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
+    outcomes = [r for r in rows if r.get("type") == "delegate_run_cancel_outcome"]
+    assert outcomes and all("terminal_detail" not in r for r in outcomes)
+
+
 def test_an_unverifiable_cancel_is_a_loud_durable_incident(tmp_path, monkeypatch):
     """A cancel that never reached the daemon left a typed refusal and nothing else: an
     overpowered mutating run stayed live with no durable trace and no owner-visible
@@ -4710,17 +4757,31 @@ def test_a_breach_whose_cancel_was_never_verified_is_not_reported_as_cancelled(
 def test_the_configured_wait_ceiling_cannot_promise_more_than_the_tool_can_serve():
     """`OUROBOROS_DELEGATE_WAIT_MAX_SEC` accepted up to 86,400 while `delegate_wait`'s
     own per-call executor timeout is 2100 and the tool is neither per-call-timeout
-    configurable nor deadline-clamped — so everything above 2100 bought a KILLED tool
-    call instead of the graceful typed no-progress return the wait exists to give.
-    The two numbers are pinned together here so they cannot drift apart again."""
+    configurable nor deadline-clamped — so everything above the window max bought a
+    KILLED tool call instead of the graceful typed no-progress return the wait
+    exists to give. F5 (grok blocking): the window max is a HARD 1800, decoupled
+    from the ToolEntry timeout, and the whole chain is STRICT —
+    window (1800) < tool-kill (2100) < lease absolute ceiling (2400) — so a full
+    window plus its teardown always fits under the executor timeout, and the
+    executor timeout always fits under the idle-rail lease."""
     import os
 
-    from ouroboros.config import DELEGATE_WAIT_CEILING_SEC, get_delegate_wait_max_sec
+    from ouroboros.config import (
+        DELEGATE_WAIT_CEILING_SEC,
+        DELEGATE_WAIT_WINDOW_MAX_SEC,
+        get_delegate_wait_max_sec,
+    )
+    from ouroboros.delegate_progress import EXTERNAL_WAIT_LEASE_CEILING_SEC
     from ouroboros.loop_tool_execution import _DEADLINE_CLAMPED_TOOLS, _PER_CALL_TIMEOUT_TOOLS
     from ouroboros.tools.delegate import get_tools
 
     entry = next(e for e in get_tools() if e.schema["name"] == "delegate_wait")
     assert DELEGATE_WAIT_CEILING_SEC == entry.timeout_sec
+    # The strict inequality chain, pinned by value so no member can drift onto
+    # another: a window EQUAL to the executor timeout has zero teardown margin.
+    assert DELEGATE_WAIT_WINDOW_MAX_SEC < DELEGATE_WAIT_CEILING_SEC < EXTERNAL_WAIT_LEASE_CEILING_SEC
+    assert (DELEGATE_WAIT_WINDOW_MAX_SEC, DELEGATE_WAIT_CEILING_SEC,
+            EXTERNAL_WAIT_LEASE_CEILING_SEC) == (1800, 2100, 2400)
     # ...and neither escape hatch applies to this tool, which is why the ToolEntry
     # value really is the bound. The task deadline is a separate concern and is
     # honoured INSIDE the tool (see the wait-window test below), which is why the
@@ -4731,7 +4792,10 @@ def test_the_configured_wait_ceiling_cannot_promise_more_than_the_tool_can_serve
     previous = os.environ.get("OUROBOROS_DELEGATE_WAIT_MAX_SEC")
     os.environ["OUROBOROS_DELEGATE_WAIT_MAX_SEC"] = "7200"
     try:
-        assert get_delegate_wait_max_sec() == DELEGATE_WAIT_CEILING_SEC
+        # The configurable max clamps to the hard window max — NOT to the
+        # ToolEntry timeout: raising the executor timeout must never silently
+        # widen the askable window.
+        assert get_delegate_wait_max_sec() == DELEGATE_WAIT_WINDOW_MAX_SEC
     finally:
         if previous is None:
             os.environ.pop("OUROBOROS_DELEGATE_WAIT_MAX_SEC", None)
@@ -6032,3 +6096,48 @@ def test_shared_project_retirement_defers_quietly_for_non_canonical_sharers(tmp_
     assert custody_a.project_owned is False
     assert "delegate_run_project_retired" in _event_types(tmp_path)
     dc._CUSTODY.clear()
+
+
+# ---------------------------------------------------------------------------
+# BR1-2: the delegate split has no import cycle — one-way seams only
+# ---------------------------------------------------------------------------
+
+
+def test_delegate_split_modules_import_standalone_without_the_facade():
+    """The module split's seam pattern is ONE-WAY: an extracted module never
+    imports the facade back. `delegate_interactions` used to import `_fail` /
+    `_emit` / `_owned_run` from `ouroboros.tools.delegate` — a cycle with the
+    facade's own top-level import of the cluster. Each extracted module must
+    import standalone in a FRESH interpreter, and none of them may pull the
+    facade into sys.modules as a side effect."""
+    import subprocess
+    import sys
+
+    for module in ("ouroboros.delegate_shared",
+                   "ouroboros.delegate_interactions",
+                   "ouroboros.delegate_output",
+                   "ouroboros.delegate_progress",
+                   "ouroboros.delegate_containment",
+                   "ouroboros.delegate_custody"):
+        probe = (
+            f"import sys; import {module}; "
+            "assert 'ouroboros.tools.delegate' not in sys.modules, "
+            f"'{module} pulled the facade back in'"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True, text=True, timeout=120,
+        )
+        assert result.returncode == 0, (
+            f"{module} failed to import standalone: {result.stderr}")
+
+
+def test_facade_reexports_are_the_same_objects_as_their_owners():
+    """Monkeypatch targets keep working only when the facade re-export IS the
+    owner's object — probe identity, not just importability."""
+    from ouroboros import delegate_shared
+    from ouroboros.tools import delegate
+
+    assert delegate._fail is delegate_shared._fail
+    assert delegate._emit is delegate_shared._emit
+    assert delegate._owned_run is delegate_shared._owned_run

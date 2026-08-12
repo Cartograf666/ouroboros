@@ -49,6 +49,7 @@ from ouroboros.outcomes import infra_failed_axes
 from ouroboros.subagents import (
     CapabilityDelta,
     SubagentExecutorResolution,
+    SubagentLaneResolution,
     SUBAGENT_RESOLUTION_FIELDS,
     SubagentDispatch,
     capability_delta_disclosures,
@@ -61,12 +62,18 @@ _worker_boot_logged = False
 _worker_boot_lock = threading.Lock()
 
 
-def dispatch_executor_note(decision: Optional[SubagentExecutorResolution]) -> str:
+def dispatch_executor_note(decision: Optional[SubagentExecutorResolution],
+                           lane: Optional["SubagentLaneResolution"] = None) -> str:
     """The child's VISIBLE marker for a substrate decision it did not make ('' = silent).
 
     The rule table's `auto` rows are only honest if the child can see which way they
     went: a nanny must know to delegate, and a child that fell back to metered tokens
     must know its route was unavailable rather than discovering it by spending.
+
+    ``lane`` is the same dispatch's lane resolution: a nanny that landed on the
+    LIGHT lane by policy is told so, with the sanctioned escalation
+    (``switch_model`` for real acceptance judgment) named beside it — a policy the
+    child cannot see is a policy it will fight by accident.
     """
     if decision is None or decision.blocked:
         return ""
@@ -81,8 +88,25 @@ def dispatch_executor_note(decision: Optional[SubagentExecutorResolution]) -> st
             "not zero); every token YOU think on is metered API money. "
             "While the lane is healthy, delegate everything you can — even small tasks — "
             "with delegate_start / delegate_wait, and verify what comes back rather than "
-            "believing it."
+            "believing it. After a delegated run SUCCEEDS, your job is to VERIFY and "
+            "INTEGRATE its output — never to rebuild the same work yourself on metered "
+            "tokens. Follow-up work (fixes, the next increment, a retry with a corrected "
+            "prompt) is delegated too, with a new delegate_start; your own metered rounds "
+            "are for judgment — acceptance, integration, honest settlement — not for "
+            "co-building around a $0 run. If your run asks a question (delegate_wait "
+            "returns waiting_on_user), answer it from the task context with "
+            "delegate_answer; a question above your authority — money, scope, external "
+            "actions — goes to your human via progress while you keep waiting (a timeout_at "
+            "question benign-declines at the engine timeout; timeout_at=null waits until answered)."
         )
+        if lane is not None and lane.provenance == "policy" and lane.effective_lane == "light":
+            note += (
+                " You run on the LIGHT model lane by dispatch policy: custody chores "
+                "(starting runs, waiting, reading results, relaying) belong on this "
+                "cheap lane. For a genuine acceptance or integration judgment you may "
+                "raise your own power with switch_model and drop back after — that is "
+                "the sanctioned escalation, not a workaround."
+            )
         if decision.reset_at:
             note += (
                 f" The route's plan window is currently spent and resets at "
@@ -346,8 +370,11 @@ def resolve_dispatch_axes(task: Dict[str, Any]) -> Optional[SubagentDispatch]:
     return dispatch
 
 
-# The dispatched harness contract needs the FULL verb set: a child that can
-# start a run but not wait on or cancel it is still broken.
+# The dispatched harness contract needs the whole CUSTODY verb set: a child that
+# can start a run but not wait on or cancel it is still broken. `delegate_answer`
+# is deliberately NOT part of this preflight — a nanny without it is degraded
+# (questions benign-decline at the engine timeout), never custody-broken, and
+# failing a dispatch over a missing convenience verb would cost real work.
 _DELEGATE_VERBS = ("delegate_start", "delegate_wait", "delegate_cancel")
 
 
@@ -413,18 +440,39 @@ def preflight_delegate_visibility(
         # UNKNOWN, not disproven.
         reason = "delegate_visibility_unverified"
 
-    executor = "blocked" if pinned else "native"
+    if not pinned:
+        # F10 (sol #2): the auto fallback runs NATIVE, so lane/model/effort are
+        # re-resolved WITHOUT the harness light-lane policy — a native child of
+        # a heavy parent must not stay on policy-light with a cheap model. The
+        # re-resolution lives with the other dispatch policy in `subagents`.
+        from ouroboros.subagents import preflight_native_fallback_dispatch
+
+        return _stamp(preflight_native_fallback_dispatch(task, dispatch, reason))
     return _stamp(dataclasses.replace(
         dispatch,
-        executor=executor,
+        executor="blocked",
         route="",
         delta=_append_reason(dispatch.delta, reason,
-                             effective_executor=executor, reduced=True),
+                             effective_executor="blocked", reduced=True),
         executor_resolution=dataclasses.replace(
             dispatch.executor_resolution,
-            executor=executor, reason=reason, reset_at="",
+            executor="blocked", reason=reason, reset_at="",
         ),
     ))
+
+
+def reset_nanny_economics_marks(ctx: Any, *, route_dispatched: bool) -> None:
+    """Reset EVERY nanny-economics mark for a fresh dispatch (F4).
+
+    DEFENSIVE, not load-bearing: ``_prepare_task_context`` builds a FRESH
+    ToolContext per task, so nothing stale can leak today — this states the
+    marks' lifecycle in one place and keeps it true even if a refactor ever
+    reuses a context (leaked cursors would mute or misfire the reminder)."""
+    ctx._nanny_route_dispatched = bool(route_dispatched)
+    ctx._nanny_finalization_injected = False
+    ctx._nanny_metered_progress = None
+    ctx._nanny_delegate_baseline = None
+    ctx._nanny_reminder_mark = None
 
 
 def emit_dispatch_resolution(
@@ -747,19 +795,22 @@ class OuroborosAgent:
 
     def _run_delegate_preflight(
         self, drive_logs: Any, task: Dict[str, Any], dispatch: Optional[SubagentDispatch],
-    ) -> Optional[SubagentDispatch]:
+    ) -> Tuple[Optional[SubagentDispatch], bool]:
         """Q1A capability preflight (2026-08-10 amendments): the REAL toolset now
         exists — verify a harness dispatch can actually see its delegate verbs
         before any paid LLM round. An amendment re-records the same durable and
         live surfaces the original resolution wrote (events row, RUNNING record,
         supervisor mirror), so all of them keep telling one story; a blocked pin
-        flows into the existing cap_info blocked terminal and spends nothing."""
+        flows into the existing cap_info blocked terminal and spends nothing.
+        Returns the (possibly amended) dispatch and whether it amended — the
+        caller re-syncs its already-built metadata projection and ToolContext
+        overrides off the amended record (F10)."""
         dispatch, amended = preflight_delegate_visibility(self.tools, task, dispatch)
         if amended:
             _record_executor_resolution(drive_logs, task, dispatch)
             self._persist_running_record(task)
             emit_dispatch_resolution(self._event_queue, task, dispatch)
-        return dispatch
+        return dispatch, amended
 
     def _capture_mutation_baseline(self, task: Dict[str, Any], task_metadata: Dict[str, Any]) -> None:
         """Mutation-attribution baseline: snapshot the system repo's clean/dirty
@@ -970,7 +1021,22 @@ class OuroborosAgent:
         # per-model concurrency semaphore (ouroboros/model_concurrency.py), not by routing.
         self.tools.set_context(ctx)
 
-        dispatch = self._run_delegate_preflight(drive_logs, task, dispatch)
+        dispatch, _preflight_amended = self._run_delegate_preflight(drive_logs, task, dispatch)
+        if _preflight_amended:
+            # F10 sync: the metadata projection + ToolContext model override
+            # above were built from the resolution the preflight just falsified;
+            # re-sync them off the re-stamped record so the loop runs the
+            # re-resolved model/lane, not the harness policy's cheap one.
+            for _key in ("effective_model_lane", "model", "use_local_model",
+                         "reasoning_effort", "subagent_envelope"):
+                if task.get(_key) is not None:
+                    task_metadata[_key] = task.get(_key)
+            with self._owner_message_admission_lock:
+                self._current_task_metadata = dict(task_metadata)
+            if str(task_metadata.get("delegation_role") or "").lower() == "subagent":
+                ctx.task_model_override = str(task_metadata.get("model") or "").strip()
+                if "use_local_model" in task_metadata:
+                    ctx.task_use_local_override = bool(task_metadata.get("use_local_model"))
         self._capture_mutation_baseline(task, task_metadata)
 
         self._emit_typing_start()
@@ -1009,20 +1075,20 @@ class OuroborosAgent:
         # metered thinking), and an `auto` child that fell back to metered spend
         # must be able to say so instead of discovering it by spending.
         _exec_note = dispatch_executor_note(
-            dispatch.executor_resolution if dispatch is not None else None
+            dispatch.executor_resolution if dispatch is not None else None,
+            lane=dispatch.lane if dispatch is not None else None,
         )
         if _exec_note:
             messages.append({"role": "user", "content": _exec_note})
         # The nanny postcondition's input fact for the loop's finalization seam:
-        # THIS task was dispatched onto the delegated substrate. Reset per
-        # dispatch — the worker's ctx outlives tasks, a stale latch would mute
-        # the nudge for the next one.
-        self.tools._ctx._nanny_route_dispatched = bool(
+        # THIS task was dispatched onto the delegated substrate. ALL economics
+        # marks reset together per dispatch (F4) — defensive, since the
+        # ToolContext above is freshly built per task; see the helper.
+        reset_nanny_economics_marks(self.tools._ctx, route_dispatched=bool(
             dispatch is not None
             and dispatch.executor_resolution is not None
             and dispatch.executor_resolution.executor == "harness"
-        )
-        self.tools._ctx._nanny_finalization_injected = False
+        ))
 
         budget_remaining = None
         budget_accounting_status = "available"

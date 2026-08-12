@@ -33,6 +33,12 @@ class DelegationBudgetDecision:
     budget: Dict[str, Any]
     reason_code: str = ""
     detail: str = ""
+    # The lane an applicable, non-advisory `require_lane` constraint verified
+    # this admission against (F9/sol #1). Empty when no such constraint applied.
+    # Carried out so the scheduler can stamp it onto the child record: the
+    # dispatch-time policy default (auto+harness ⇒ light) must not override a
+    # lane the admission gate just enforced.
+    required_lane: str = ""
 
 
 def _constraint_payload(row: Any) -> Dict[str, Any]:
@@ -77,6 +83,7 @@ def effective_delegation_budget(
     """
 
     budget = dict(declared_budget if isinstance(declared_budget, dict) else {})
+    required_lane_applied = ""
     missing = [str(cap or "").strip() for cap in missing_capabilities or [] if str(cap or "").strip()]
     if missing:
         return DelegationBudgetDecision(
@@ -123,6 +130,8 @@ def effective_delegation_budget(
         if directive == "require_lane":
             scope = payload.get("scope")
             required_lane = str(scope.get("lane") if isinstance(scope, dict) else scope or "").strip()
+            if required_lane:
+                required_lane_applied = required_lane
             if required_lane and required_lane != str(intended_lane or "").strip():
                 return DelegationBudgetDecision(
                     False,
@@ -176,7 +185,7 @@ def effective_delegation_budget(
                     )
     if effective_max is not None:
         budget["max_children"] = effective_max
-    return DelegationBudgetDecision(True, budget)
+    return DelegationBudgetDecision(True, budget, required_lane=required_lane_applied)
 
 
 def normalize_required_capabilities(value: Any) -> tuple[list[str], str]:

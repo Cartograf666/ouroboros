@@ -731,11 +731,11 @@ def persist_queue_snapshot(reason: str = "") -> bool:
                 "allowed_resources": t.get("allowed_resources"), "deadline_at": t.get("deadline_at"),
                 "task_contract": t.get("task_contract"),
                 # Scheduling INTENT survives a restart and is all a PENDING child has;
-                # `parent_model_lane` above all, because an omitted lane inherits it and
-                # only the parent knew it. The derived half rides along for a RUNNING row.
+                # `parent_model_lane` and the F9 admission fact `required_model_lane`
+                # above all (R2-3). Pinned to SUBAGENT_INTENT_FIELDS by test_model_slot.
                 "model_lane": t.get("model_lane"), "parent_model_lane": t.get("parent_model_lane"),
                 "requested_model_lane": t.get("requested_model_lane"),
-                "requested_executor": t.get("requested_executor"),
+                "required_model_lane": t.get("required_model_lane"), "requested_executor": t.get("requested_executor"),
                 "effective_model_lane": t.get("effective_model_lane"),
                 "model": t.get("model"), "use_local_model": t.get("use_local_model"),
                 "effective_executor": t.get("effective_executor"), "tool_profile": t.get("tool_profile"),
@@ -1182,9 +1182,8 @@ def _enforce_task_timeouts_locked(
             float(get_per_call_timeout_ceiling_sec()) + 120.0,
         )
         # deep_self_review runs a single long 1M-context LLM call with NO intermediate
-        # progress events (no tool loop), so the idle timer governs it from started_at.
-        # Preserve its prior ~60min tolerance (the retired effective_hard=3600) so a
-        # legitimately long review is not idle-killed mid-call.
+        # progress events (no tool loop), so the idle timer governs it from started_at;
+        # its prior ~60min tolerance is preserved so it is not idle-killed mid-call.
         if task_type == "deep_self_review":
             idle_timeout = max(idle_timeout, 3600.0)
         abs_ceiling = float(get_task_abs_ceiling_sec())
@@ -1192,17 +1191,22 @@ def _enforce_task_timeouts_locked(
         idle_sec = max(0.0, now - last_progress_at)
         subtree_progressing = _subtree_progressing(task_id, now, idle_timeout)
         own_progress = idle_sec < idle_timeout
-        # Keep an orchestrator alive while it (a) makes own progress, (b) has a freshly
-        # progressing RUNNING descendant, OR (c) has a QUEUED descendant still waiting for a
-        # worker — killing it then would orphan the queued subtree. Only the abs ceiling /
-        # explicit deadline / budget are unconditional.
-        progressing = own_progress or subtree_progressing or _has_pending_descendant(task_id)
+        # B3 external-wait lease: a held delegate_wait window over a live delegated run
+        # is legitimate silence (hard-bounded by events._handle_external_wait_lease);
+        # it spares ONLY this idle rail — ceiling/deadline/budget/cancel never consult it.
+        lease_ts = meta.get("external_wait_lease_until")
+        # Keep an orchestrator alive on own progress, a freshly progressing RUNNING
+        # descendant, a QUEUED descendant (a kill would orphan the queued subtree), or a
+        # live external-wait lease; only abs ceiling / explicit deadline / budget are
+        # unconditional.
+        progressing = (own_progress or subtree_progressing or _has_pending_descendant(task_id)
+                       or (isinstance(lease_ts, (int, float)) and float(lease_ts) > now))
         ceiling_reached = runtime_sec >= abs_ceiling
 
         # Hard axes (deadline_at, abs ceiling) stop the task regardless of activity; the
-        # idle/subtree gate only spares a task that has NO explicit deadline and is still
-        # progressing. This honors an explicit/caller deadline promptly while never letting
-        # the removed blanket wall-clock kill a productively-waiting orchestrator.
+        # idle/subtree gate only spares a still-progressing task with NO explicit deadline
+        # — an explicit/caller deadline is honored promptly, while no blanket wall-clock
+        # kills a productively-waiting orchestrator.
         if not ceiling_reached and not deadline_reached and progressing:
             # An outstanding episode outlives this reprieve or is withdrawn by it; the
             # rule (own progress answers the request, sparing only suspends its clock)
@@ -1240,19 +1244,15 @@ def _enforce_task_timeouts_locked(
         if finalization_requested_at > 0 and now - finalization_requested_at < FINALIZATION_GRACE_SEC:
             continue
 
-        # NOTE: the "worker self-finalized at the idle boundary" case is handled by the
-        # reaper's POST-KILL terminal re-check (which kills+joins the process FIRST, then
-        # honors an on-disk terminal result and emits an idempotent task_done). We do NOT
-        # short-circuit here: freeing the slot inline without killing the still-possibly-
-        # running process would let assign_tasks reuse it mid-flight and could drop the
-        # terminal event, leaving the live card unresolved.
+        # NOTE: "worker self-finalized at the idle boundary" is handled by the reaper's
+        # POST-KILL terminal re-check (kill+join FIRST, then honor an on-disk terminal
+        # result, idempotent task_done). No short-circuit here: freeing the slot inline
+        # would let assign_tasks reuse it mid-flight and could drop the terminal event.
 
         # Variant A: hand the ENTIRE teardown to the background reaper so the loop tick
-        # stays fast AND — critically — the terminal result write + retry enqueue happen
-        # only AFTER the reaper has killed/joined the old process (a still-alive worker can
-        # no longer race a concurrently-assigned retry; for a subagent the retry reuses the
-        # same id/drive). Decisions that need live RUNNING state (orchestrator -> no blind
-        # retry; the retry id) are frozen HERE under the lock and passed in the job.
+        # stays fast and the terminal write + retry enqueue happen only AFTER kill/join
+        # (no race with a concurrently-assigned retry; a subagent retry reuses id/drive).
+        # Live-RUNNING decisions (orchestrator -> no blind retry; retry id) freeze HERE.
         if task_type == "evolution":
             from supervisor.evolution_lifecycle import update_evolution_transaction
             if not update_evolution_transaction(task_id, dispatch_status="reaping"):

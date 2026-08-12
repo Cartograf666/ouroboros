@@ -2194,7 +2194,9 @@ def cache_horizon_note(ctx: Any, elapsed_sec: Any) -> str:
     at the shipped default TTL ``1h`` (3600s horizon) only ``wait_tasks`` (7200s
     clamp) can genuinely emit it; ``wait_task`` clamps at exactly 3600s and can
     only cross by a poll overshoot of a couple of seconds, and ``delegate_wait``
-    clamps at ``config.DELEGATE_WAIT_CEILING_SEC`` (2100s) and cannot cross at all.
+    clamps its WINDOW at ``config.DELEGATE_WAIT_WINDOW_MAX_SEC`` (1800s; the
+    2100s ToolEntry ceiling above it is the kill timeout, not the window — F5)
+    and cannot cross at all.
     At ``5m`` all three emit it. Pinned by
     tests/test_cache_optimization.py::test_cache_horizon_reachability_matches_the_wait_clamps —
     the call sites stay on all three because the tier is an owner setting, not a

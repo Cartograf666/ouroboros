@@ -124,10 +124,30 @@ def test_top_level_workspace_focus_has_tool_and_schema_parity(tmp_path, monkeypa
     names, schemas = snapshots["workspace"]
     assert names == schemas
     assert {
-        "delegate_start", "delegate_wait", "delegate_cancel",
+        "delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
         "switch_model", "send_photo", "send_video", "send_file",
         "commit_reviewed", "promote_chat_to_task", "vcs_restore",
     } <= names
+
+    # Successor of the retired _WORKSPACE_ALLOWED_TOOLS subset invariant: the
+    # workspace surface is now the full registry, so every child-profile tool
+    # must be a registered, workspace-visible name. Guards the 2026-08-10 saga
+    # shape (a profile tool invisible exactly where children are spawned) —
+    # delegate_answer riding only the child profiles would silently degrade
+    # workspace-scoped nannies to the engine's benign decline.
+    from ouroboros.tool_capabilities import (
+        ACTING_SUBAGENT_TOOL_NAMES,
+        LOCAL_READONLY_SUBAGENT_TOOL_NAMES,
+    )
+
+    assert LOCAL_READONLY_SUBAGENT_TOOL_NAMES <= names, (
+        f"read-only child tools missing from the workspace tool surface: "
+        f"{sorted(LOCAL_READONLY_SUBAGENT_TOOL_NAMES - names)}"
+    )
+    assert ACTING_SUBAGENT_TOOL_NAMES <= names, (
+        f"acting child tools missing from the workspace tool surface: "
+        f"{sorted(ACTING_SUBAGENT_TOOL_NAMES - names)}"
+    )
 
 
 @pytest.mark.parametrize("workspace_mode", ["", "project", "external"])

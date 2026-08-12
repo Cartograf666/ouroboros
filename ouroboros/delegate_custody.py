@@ -1060,8 +1060,12 @@ def cancel_and_verify(drive_root: Any, gateway: Any, custody: RunCustody, reason
     state = str(summary_of(detail).get("state") or "")
     if state in TERMINAL_STATES:
         settle_run(drive_root, gateway, custody, detail)
+        # The verify read's own detail rides the result (BR2-1, purely additive):
+        # a caller consuming a discovered natural terminal (completion wins) must
+        # not depend on a SECOND fetch succeeding after the run is settled.
         return _cancel_result(drive_root, custody, CANCEL_CONFIRMED, accepted=accepted,
-                              control_status=control_status, state=state)
+                              control_status=control_status, state=state,
+                              terminal_detail=detail)
     if control_error:
         return _cancel_result(drive_root, custody, CANCEL_CONTAINMENT_FAULT, accepted=False,
                               control_status=control_status, state=state,
@@ -1077,7 +1081,8 @@ def cancel_and_verify(drive_root: Any, gateway: Any, custody: RunCustody, reason
 
 def _cancel_result(drive_root: Any, custody: RunCustody, outcome: str, *, accepted: bool,
                    control_status: str, state: str, fault_reason: str = "",
-                   detail: str = "") -> Dict[str, Any]:
+                   detail: str = "",
+                   terminal_detail: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     emit(drive_root, CANCEL_OUTCOME, {
         "run_id": custody.run_id, "task_id": custody.task_id, "outcome": outcome,
         "accepted": accepted, "control_status": control_status, "state": state,
@@ -1086,8 +1091,14 @@ def _cancel_result(drive_root: Any, custody: RunCustody, outcome: str, *, accept
         record_containment_fault(drive_root, custody, fault_reason, detail)
     elif outcome == CANCEL_CONFIRMED:
         resolve_containment_fault(drive_root, custody, "verified_terminal")
-    return {"outcome": outcome, "accepted": accepted, "control_status": control_status,
-            "state": state, "fault_reason": fault_reason, "detail": detail}
+    result = {"outcome": outcome, "accepted": accepted, "control_status": control_status,
+              "state": state, "fault_reason": fault_reason, "detail": detail}
+    # BR2-1, backward-compatible: the key exists only when a verify read produced
+    # the run detail — absent otherwise, so every pre-existing consumer of the
+    # six-key shape is untouched (the emit above deliberately excludes it too).
+    if terminal_detail is not None:
+        result["terminal_detail"] = terminal_detail
+    return result
 
 
 # -- reconciliation ------------------------------------------------------------

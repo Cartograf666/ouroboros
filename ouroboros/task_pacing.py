@@ -38,6 +38,16 @@ from ouroboros.utils import append_jsonl, iter_jsonl_objects, utc_now_iso
 
 _ACCEPTANCE_REVIEW_RESERVE_FLOOR_SEC = 200.0
 _ACCEPTANCE_REVIEW_EWMA_ALPHA = 0.5
+
+# Proportional nanny-economics reminder thresholds (poltergeist phase B; owner
+# decision 2=B: NO absolute round cap — reminders only, sized to the measured
+# burn). A harness-dispatched child whose OWN metered rounds (or dollars) since
+# its last delegated-run activity cross either threshold hears the reminder,
+# re-armed per further threshold-width of rounds; a well-behaved custodian never
+# does. Here and not in prompt text, so the prompt states measurements and the
+# policy has one home (this module is the pacing-threshold SSOT).
+NANNY_REMINDER_ROUNDS = 8
+NANNY_REMINDER_USD = 2.0
 _ACCEPTANCE_TIMING_EVENT = "task_acceptance_review_timing"
 log = logging.getLogger(__name__)
 

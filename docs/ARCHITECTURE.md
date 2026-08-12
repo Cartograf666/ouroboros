@@ -1,4 +1,4 @@
-# Ouroboros v6.98.0 — Architecture & Reference
+# Ouroboros v6.99.0 — Architecture & Reference
 
 This file is NOT a changelog. Version history lives in README.md, git tags, and commit log.
 
@@ -104,6 +104,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── delegate_output.py  ← Staged-output + read-receipt cluster for delegated runs (extracted from tools/delegate.py for the module-size gate; delegate.py re-exports it so sibling code and tests keep one name): `_stage_full_output` writes the WHOLE terminal detail atomically under the task drive (`delegated_runs/<run>.json`, sha256 + byte length recorded), and `acknowledge_staged_output_read` — hooked into `read_file`'s task_drive path — credits DELIVERED character ranges until contiguous EOF coverage, then writes the once-per-run durable `delegate_run_output_consumed` row (disclosure, never a gate)
       ├── delegate_containment.py ← Containment verification for one delegated run (extracted whole from tools/delegate.py for the module-size gate, v6.90.0): `_widened_access` reads the ENGINE-derived effective access back off the run and names a wider-than-asked profile; `_home_isolation_breach` verifies the applied scoped HOME off the attempt artifacts against TWO EXACT FACTS (phase A3, 2026-08-11): a recorded `harness_home_isolated: false`, or an applied home EQUAL to the operator's own. Nothing else is enforced — a home NESTED under `$HOME` is the engine's own layout on boundary-less hosts and flows to the disclosed-unconfined path (`home_nested_under_operator_home` reports it, and the evidence reader keeps `verified: false` plus the durable unconfined row even when an OS boundary WAS recorded, so a nested home is never relabelled as isolation); absence of either fact stays absence, reported as unproven rather than enforced
       ├── delegate_progress.py ← What a delegated run did during ONE `delegate_wait` window (extracted from tools/delegate.py for the module-size gate): `WindowObservations` records every journal-cursor advance and `emit` pushes it to the LIVE progress surface (`ctx.emit_progress_fn`) at observation time, while `window_payload` hands the model the whole sequence once, at expiry — the timer is what the model waits out, never the human's stream. A batch is read off the DATA (the longest overlap between the previous tail and this one), never off `lastSeq` or the tail's length — a harness may publish several timeline rows per cursor step, or move the cursor without publishing any. The advance list is bounded inside the `delegate_wait` result budget by shedding event LABELS oldest-first, each shedding disclosed on its row, then by shedding from the HEAD behind an omission marker; the spine (one row per advance, `seq` + `at_sec`) yields whole only when the rest of the payload leaves no room for even the floor, and says so through that same marker. `poll_bound` is the ONE place a read bound is computed — what the window has left, floored at `SHORT_POLL_TIMEOUT_SEC` and never raised above the gateway's own read default — and the two entry points that use it differ only in what SILENCE means: `bounded_poll` (every poll from the opening one on, while the window still has time) lets a `ClaudexorUnavailable` propagate — with ONE narrow exception (v6.90.0): the engine's transient Git atomic-object ENOENT (`is_transient_git_object_race`: ENOENT naming `.git/objects/…/tmp_obj_*`) gets a single immediate re-read, the same tolerance the CI platform gate already carried while the production poll kept failing, `expiring_poll` (the last poll of a spent window) swallows it into a graceful expiry
+      ├── delegate_interactions.py ← Interactive-question cluster for delegated runs (extracted from tools/delegate.py for the module-size gate; delegate.py re-exports it): the process-local reported-question memo (`_REPORTED_INTERACTIONS` — a known question does not re-trigger the immediate return; popped on a delivered/already_resolved answer so the next wait re-reports promptly), the bounded inline projection `_bounded_interactions` (EVERY harness-authored DISPLAY scalar bounded — question, options, header, source, timestamps — cuts counted; the answer keys ride whole, see below), the immediate typed `waiting_on_user` payload (full set spills whole to the task drive under an interaction-addressed immutable name `<run>.<sha12>.interactions.json` with a sha256/size receipt; a compact `advances` ride-along keeps the cut-short window's journal sequence), and `_delegate_answer` (strict pre-POST row validation — string-only labels, non-empty label-or-freeText per row, no coercion; the answer keys `interaction_id`/`question_id` ride WHOLE, never truncated; engine-typed outcomes relayed verbatim; only a PAYLOAD-SEMANTIC 4xx — 400/409/413/422 — maps to the `rejected` shape, a spent subscription window is the distinct `subscription_window_exhausted` outcome carrying `reset_at`, and `delivery_unknown` is reserved for transport death/5xx plus every other non-definite status and carries a bounded detail re-read; a `timeout_at`-bearing question benign-declines at the engine timeout while `timeout_at=null` waits until answered; an internal monotonic deadline strictly below the ToolEntry timeout budgets handshake/POST/re-read and returns typed on exhaustion without further wire calls)
       ├── subagents.py         ← Subagent axis vocabularies (model lane / executor), the single dispatch-time resolution (`resolve_subagent_dispatch` → `capability_delta`), and structured lineage/usage envelopes
       ├── subagent_worktrees.py ← Acting self_worktree lifecycle: provision/remove/prune isolated git worktrees (outside repo/ and data/) + durable registry (state/subagent_worktrees.json) + cross-process ops lock; startup orphan reconciliation; also provisions durable from-scratch genesis projects (provision_genesis_project, never registry/GC)
       ├── artifacts.py         ← Task-scoped artifact helpers shared by user-file tools, process outputs, and outcome finalization. (v6.52.0, P1) `stage_task_attachments` stages every task's INPUT attachments (CLI/API, desktop chat, and other external callers) into the agent-readable `artifact_store/attachments/` (skips secret SOURCES via the tool_access SSOT blocklist, bounded), returning a manifest of `read_file(root='artifact_store', path='attachments/<name>')` entries; `collect_task_artifact_records` EXCLUDES that subdir so staged inputs are never recorded as deliverables. (v6.52.2) `record_task_scratch`/`read_task_scratch_fingerprints` persist {abs_path: sha256} FINGERPRINTS of the run_command/run_script `scratch=[...]` ephemeral-verification files to `.scratch_manifest.json` (written to BOTH budget + live drive roots) so `headless.write_workspace_patch_artifacts` EXCLUDES a file from the workspace patch ONLY while its current content still matches (a later real file at the same path is never dropped). (v6.56.0) scratch declarations are IDEMPOTENT/ADOPTABLE: re-declaring a manifest path is ok, and an existing untracked in-cwd file may be adopted — its sha is recorded via the same SSOT writer at declaration time, so the sha-gate still excludes it only while unmodified (tracked / outside-cwd / outside-worktree declarations stay blocked); the undeclared-output guard stat-verifies candidates POST-exec (exists + mtime ≥ start−slack) for both run_command and run_script, so import strings/CLI flags/heredoc bodies no longer read as writes
@@ -119,6 +120,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── preflight_runner.py  ← Hermetic reviewed-change pytest gate: disposable git worktree, ONE hardened candidate capture (`git diff --binary --no-ext-diff --no-textconv --no-color --src-prefix=a/ --dst-prefix=b/ HEAD` applied as RAW BYTES, identically for every index state including an unfinished merge — whose unmerged entries the former staged+unstaged pair could only render as contentless stubs and `--cc` hunks `git apply` rejects or silently drops; capture/apply failure is the typed hard block PREFLIGHT_CANDIDATE_ASSEMBLY, never a test verdict; the honest bound is an exact tracked projection of the live worktree plus its safe non-ignored untracked entries), temp data/settings/pycache env, and live OUROBOROS_*/secret-class scrub so review tests cannot inherit operator behavior or mutate live repo/data. Runs CI's own two-pass split in that one worktree (parallel `not serial` with `-n auto --dist loadscope --max-worker-restart=0 --timeout=300`, then a flag-free `serial` pass) under ONE total budget, with `LANE_EXCLUSION_EXPR` as the marker-lane SSOT; a dead xdist worker and a missing xdist/timeout plugin are distinct named hard blocks, never a retry and never a silent serial fallback
       ├── review_substrate.py  ← Reviewer-slot coordinator used by task acceptance and planning helpers; duplicate model ids remain independent slots. Actor records keep transport status, parse status, semantic verdict, model/provider, role, coverage, quorum contribution, reason, enforcement impact, and review-binding hashes distinct; only a compact projection reaches task/event/UI records. Task acceptance enforces adaptive quorum, one substantive call and no more than two physical attempts per actor, metric-grounded criterion evidence, provenance, and a public-info-only anti-cheat boundary. Commit/triad/scope P3 orchestration remains a separate one-pass contract. (v6.87.21) Slot execution has ONE seam: `_run_slot` builds an immutable `ReviewAssignment` and binds it ONCE through `review_execution._review_route_executor` — the single place a transport is chosen (closed `ReviewRouteKind`: `api_chat` and `agent_session` — never a vendor/harness name), bound before the first send so the durable prompt record is written from the route's own lazily rendered projection; `_execute_slot_attempt` is the single physical-attempt seam that runs the already-bound executor, and the route's executor returns a typed `ReviewAttemptResult`. Attempt rails, persistence, parsing, actor projection and quorum stay above the seam and are route-agnostic; a route that cannot deliver raises the typed `ReviewRouteUnavailable` on its own slot instead of falling back to another transport. Prompt assembly lives BELOW the seam: `ApiChatReviewExecutor` renders the historical messages lazily and memoizes them, so the durable prompt record and both permitted physical sends share one byte-identical rendering (pinned by a golden digest test) and a non-API route never assembles an API pack. Everything below the seam — route vocabulary, assignment, attempt result, executors, and the api_chat prompt renderers — lives in `review_execution.py`, which never imports the coordinator back; `review_substrate` re-exports the historical renderer names for existing callers. (phase 5) `AgentSessionReviewExecutor` delivers a slot as ONE delegated read-only Claudexor session through the shared `run_delegated_review_session` nanny loop (custody, settlement, verified-cancel time cap, D7 full-artifact read; the delegated advisory rides the same loop). Its typed verdict follows D19: `outputSchema` is asked only when the route's own live manifest (`GET /v2/harnesses`) declares structured output — the agent-capability catalog's harness rows carry no such field at all, so reading it there answered False for every route — trusted only on the run's own `outputConformance == "passed"` (never run success); otherwise the strict parser first, then LIGHT-MODEL extraction canonicalizes narrative to the review's own contract — bare `[]` or a findings array — so a session's clean verdict survives `empty_array_is_verified_clean` unchanged, with every extraction-instead-of-schema landing disclosed as `capability_delta` (actor usage + durable event). Per-row delivery comes from `OUROBOROS_REVIEW_ROUTES` / `OUROBOROS_SCOPE_REVIEW_ROUTES` with the session target in `OUROBOROS_REVIEW_SESSION_ROUTE` (falling back to `OUROBOROS_SUBAGENT_HARNESS`); task acceptance and plan review are pinned `api_chat` (D15). The advisory route is `OUROBOROS_ADVISORY_REVIEW_ROUTE` (`api` | `agent_session`), and every `ANTHROPIC_API_KEY` check on the advisory path is route-dependent — the api route requires the key exactly as before. Scope session delivery is assembled by `tools/scope_review_session.py` from the SAME `build_scope_review_prompt` builder (retrieval pointers instead of packs, canonical docs as `generate_doc_nav_map` navigation maps); its coverage manifest is forensics, never a gate: `host_file_read_attestation: unobserved` is a non-blocking disclosed fact (the host does not see which files the session opened — a provenance limit, not a coverage finding), and the api-only ≥1M window floor does not apply to the agentic-delivery session mode, which BIBLE P3 admits as an ALTERNATE AUTHORITATIVE delivery mode once its window is sourced at ≥200K (D16).
       ├── review_execution.py  ← (v6.87.21, phase 5) Review execution BELOW the substrate's seam: the closed route vocabulary (`ReviewRouteKind`: `api_chat` and `agent_session` — never a vendor/harness name), the immutable `ReviewAssignment`, the per-route executors returning a typed `ReviewAttemptResult` (a route that cannot deliver raises the typed `ReviewRouteUnavailable` on its own slot, never a fallback to another transport), the api_chat prompt renderers (rendered lazily and memoized so the durable prompt record and both permitted physical sends share one byte-identical rendering), and `AgentSessionReviewExecutor` with the shared `run_delegated_review_session` nanny loop and the D19 typed-verdict order — see the `review_substrate.py` row above for the seam's coordinator side and the full phase-5 contract. One-way dependency: this module never imports the coordinator back; `review_substrate.py` re-exports the historical renderer names for existing callers.
+      ├── review_slot_cancel.py ← Hosted-review slot poller's cancel-honesty helpers (extracted from `review_execution.py` at the module-size gate; `review_execution` imports them and the poll loop stays there): early-termination decision for a parked question (`_interaction_outlives_slot`), the verified slot cancel reporting only what it PROVED (`_slot_cancel_outcome` — outcome + state + the verify read's own `terminal_detail` when carried), honest attribution wording (`_cancel_honesty_clause` — "host-cancelled" only on a `confirmed` receipt whose state is the cancel's own; a confirmed `failed`/`interrupted` is attributed to the run's OWN terminal, BR2-2), and completion-wins consumption of a discovered natural success (`_natural_success_terminal` — the carried detail is used as-is, a re-read gets one bounded retry, and a still-unreadable detail raises the typed `ReviewSessionSucceededResultUnavailable` naming the settled custody row and the capture surfaces instead of "may still be live", BR2-1).
       ├── reviewer_slot_config.py ← Structured reviewer-slot SSOT: stable slot ids, route targets, per-slot effort, legacy projections, save/runtime validation, and disclosure-only last-effective execution records. Malformed configuration loudly refuses commit, scope, advisory, plan, and skill review; task acceptance deliberately retains the projected legacy/default API panel.
       ├── review_state.py      ← Durable advisory pre-review state (advisory_review.json)
       ├── reviewer_window.py   ← Reviewer context-window SSOT for every review surface (triad, scope, plan, deep self-review): ONE typed `ReviewerWindow` per ROUTE (window/status/stale/observed_at + computed `blocking_authority_allowed`, v6.87.44) with a metadata-only probe serialised by a per-route lock and rate-limited by `probe`'s own evidence TTL, never by a process-lifetime memo that would outlive the record (v6.87.45), fail-closed sub-floor when no evidence exists, and output/tokenizer reserves scaled to a sub-1M window so a small-window slot gets a fit-sized pack instead of a zero limit (v6.87.22; replaces the hardcoded 1M assumption each surface carried)
@@ -244,7 +246,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── project_journal.py ← Thin per-project journal/workpad tools (v6.32.0): journal_write/read (durable milestone memory), workpad_read/write (scratch page), journal_tail_digest (context injection); over-limit writes are rejected, never silently sliced
       │   ├── task_tree.py     ← (v6.38.0) Task-tree coordination tools tree_note/tree_read (the swarm blackboard + child→parent beacons; storage/kind SSOT in ouroboros/task_tree_ledger.py)
       │   ├── join_ledger.py   ← Soft-join decision authority: validates direct lineage and exact current child-result hashes for tagged `tree_note(kind="decision")` dispositions (`integrated`, `irrelevant`, `deferred`) — single-child or batch `children` array form, each batch entry validated individually — appends the sole authoritative task-tree row, rejects stale hashes as `CHILD_RESULT_STALE`, and keeps `peek_task`, `discard_child_result`, constraint override, cancellation, and shared child-decision helpers. The hash covers status, full result, trace summary, artifact status, and stable artifact identities, not cost/timestamps/queue diagnostics/parent decisions; task-result fields are derived read projections only.
-      │   ├── delegate.py     ← Nanny verbs for DELEGATED subagent cognition on the owner's already-paid Claudexor session: `delegate_start` (host-derived authority — access profile, run mode, isolation and the `delegated` scoped-HOME marker all follow the calling task's own authority via `subagents.delegated_run_shape`; no argument can widen them), a time-bounded `delegate_wait` (progress cursor, containment verification against the run's OWN artifacts, terminal payload bounded inside `tool_result_limit` with the full result staged to the task drive and read back to EOF), and `delegate_cancel` (four typed outcomes — nothing claims terminal without a receipt). Run LIFECYCLE, custody, settlement and reconciliation are `ouroboros/delegate_custody.py`; transport is `gateways/claudexor.py`; route policy is `ouroboros/subagents.py`. This module is nanny BEHAVIOUR only
+      │   ├── delegate.py     ← Nanny verbs for DELEGATED subagent cognition on the owner's already-paid Claudexor session: `delegate_start` (host-derived authority — access profile, run mode, isolation and the `delegated` scoped-HOME marker all follow the calling task's own authority via `subagents.delegated_run_shape`; no argument can widen them), a time-bounded `delegate_wait` (progress cursor, containment verification against the run's OWN artifacts, terminal payload bounded inside `tool_result_limit` with the full result staged to the task drive and read back to EOF), `delegate_cancel` (four typed outcomes — nothing claims terminal without a receipt), and `delegate_answer` (the run's pending interactive question answered by its own nanny — custody-gated like cancel, typed outcomes; the cluster lives in `ouroboros/delegate_interactions.py`). Run LIFECYCLE, custody, settlement and reconciliation are `ouroboros/delegate_custody.py`; transport is `gateways/claudexor.py`; route policy is `ouroboros/subagents.py`. This module is nanny BEHAVIOUR only
       │   └── subagent_integration.py ← integrate_subagent_patch: parent's manifest-first integration of an acting subagent's workspace.patch. For self_worktree children it applies into ctx.active_repo_dir() (sha256-verified, 3-way --index, protected-path gated, top-only lineage check, genesis refused), stages but never commits. For external_workspace children it verifies the child wrote in the same active external workspace and records an audited verdict without re-applying the patch; (v6.58.0) a NON-workspace parent integrating a COOP child (write_root = a host-minted tree under the subagent-projects root) gets a read-only verification + a SUCCESSFUL `coop_already_in_tree` no-op verdict instead of a parent-missing error — the work is already in the shared tree, which `coop_checkpoint.checkpoint_commit_coop_roots` checkpoint-commits at root finalization. Also compare_subagent_patches: read-only best-of-N helper that shows several children's candidate patches side by side for LLM-first synthesis
       ├── process_containment.py ← `ProcessContainer` for the hermetic gate: env-token membership (`OURO_PROC_CONTAINER_*`, /proc environ on Linux, `ps -E` on macOS, kill-on-close Job Object on Windows), read from LIVE kernel state at reap time; an alive or undeterminable member is an honest hard-block answer, never a kill guarantee. Policy layer over platform_layer's OS primitives
       └── platform_layer.py    ← Cross-platform process/path/locking helpers (incl. Windows Job Object ABI with explicit argtypes/restype)
@@ -1150,13 +1152,14 @@ The owned daemon remains session-scoped and stop remains own-only-if-self-starte
 an attached or foreign process is never killed. This lifecycle changes only daemon
 delivery; delegated-run custody below still follows the durable run receipts.
 
-**Three nanny verbs** (`tools/delegate.py`), registered in both delegated-child
+**Four nanny verbs** (`tools/delegate.py`), registered in both delegated-child
 profiles as well as the ordinary top-level catalog: `delegate_start`,
-`delegate_wait`, `delegate_cancel`. There is deliberately no `hurry`:
-Claudexor's only control verb is `cancel`, and cancelling a reviewer destroys the very
-verdict the hurry wanted. `delegate_wait` is time-bounded and progress-aware — it
-returns early on a terminal state or a containment fault, and otherwise HOLDS its
-window: a real advance of the run's JOURNAL cursor (`lastSeq`) is streamed to the human
+`delegate_wait`, `delegate_cancel`, `delegate_answer`. There is deliberately no
+`hurry`: Claudexor's only control verb is `cancel`, and cancelling a reviewer destroys
+the very verdict the hurry wanted. `delegate_wait` is time-bounded and progress-aware —
+it returns early on a terminal state, a containment fault, or a NEW pending interactive
+question, and otherwise HOLDS its window: a real advance of the run's JOURNAL cursor
+(`lastSeq`) is streamed to the human
 immediately (`ouroboros/delegate_progress.py` → `ctx.emit_progress_fn`) and recorded,
 then handed to the model once at expiry as the `advances` sequence. SSE `: ping`
 keepalives still cannot pose as progress: they never reach the cursor. Returning on the
@@ -1175,7 +1178,60 @@ gracefully instead of failing the tool. Any EARLIER failure stays the typed
 dies mid-window has no expiry to report, and relaying it as a completed quiet wait would
 invent both the duration and the silence. A silent non-terminal run returns a typed
 `no_progress` reason so the nanny keeps reading its mailbox; the hard kill stays with
-the task watchdog.
+the task watchdog. While a wait holds its window it also grants a typed
+**external-wait lease** (`external_wait_lease` supervisor event): the idle rail —
+and ONLY the idle rail — spares a leased task, because a bounded host-side hold
+over a live delegated run is legitimate silence; the WORKER bounds the lease by
+min(window+grace, task deadline, the run's own `maxSeconds` horizon,
+`delegate_progress.EXTERNAL_WAIT_LEASE_CEILING_SEC`); the supervisor's own clamp is
+exactly one — it re-clamps the stored expiry to
+`now + EXTERNAL_WAIT_LEASE_CEILING_SEC` against a malformed worker value, and
+re-derives none of the other bounds. Each grant carries a unique `lease_id` and
+the release names it, so a stale release from an abandoned wait thread cannot
+blank a newer grant; the lease is released in the wait's own `finally`, and never
+consulted by the explicit deadline, the absolute ceiling, budget fences, or
+cancel.
+
+**A run's question is the nanny's to answer** (owner decision 7=A). The engine's
+run detail carries `pendingInteractions` — the full question text, header, options
+and `multi_select`, read by the ONE normalizer `gateways.claudexor.pending_interactions`
+— and `delegate_wait` returns IMMEDIATELY with a typed `status="waiting_on_user"`
+payload when a NEW interaction appears, instead of burning the rest of the window
+(and up to the engine's whole answer timeout) in dead metered polling. An oversized
+question set spills WHOLE to `task_drive` with a sha256/size receipt and a counted
+bounded preview inline; the answer keys (`interaction_id` / `question_id`) ride
+WHOLE, never truncated, because they are echoed verbatim into `delegate_answer`. A
+question the model has already been shown does not
+re-trigger the immediate return — a nanny that escalated to its owner keeps holding
+windows instead of busy-looping, with the known question riding every expiry
+payload — and the engine's interaction timeout (benign decline; the run continues
+on stated assumptions) is the backstop only for a question that CARRIES a
+`timeout_at`: a null `timeout_at` means no automatic expiry — the run waits until
+answered. `delegate_answer` is custody-gated like
+cancel and relays the engine's OWN typed outcomes (`delivered` /
+`already_resolved` / `not_found` / `rejected` — the last only for a
+payload-semantic 4xx: 400/409/413/422); a spent subscription window is the
+distinct `subscription_window_exhausted` outcome carrying `reset_at`; an
+ambiguous transport becomes
+`delivery_unknown` with a re-read of the detail, and a different answer is never
+auto-retried. The policy the nanny carries: answer from the task context it holds;
+a question above its authority (money, scope, external actions) is surfaced to the
+owner via progress while the nanny keeps waiting. Hosted REVIEW slots are
+non-interactive by contract, so their poller handles a parked question
+conditionally: a question whose engine expiry provably lands before the slot
+deadline is waited out on the slot's own clock (the engine benign-declines and
+the session resumes); otherwise the slot terminates early and typed
+(`review_session_waiting_on_user`, cancelled through the verified-cancel path
+with the outcome reported honestly — "host-cancelled" only on a verified
+receipt, and a verify read that finds the run already succeeded consumes that
+terminal as the slot's ordinary result). The codex lane has
+no mid-run channel: a terminal with `outcome_facts.reason=input_required` is
+answered by a plain NEW `delegate_start` carrying the assignment plus the answers —
+never the engine's rerun/decision verb, which would start a run outside this
+task's custody trail. `delegate_answer` is deliberately absent from
+`agent.preflight_delegate_visibility`'s required set: a nanny without it is
+degraded (a `timeout_at`-bearing question benign-declines; one without waits),
+never custody-broken.
 
 **Execution rule table** (`subagents.resolve_subagent_executor`, pure over supplied
 health facts): `auto` + no route → native; `auto` + healthy → nanny; `auto` + an
@@ -1201,10 +1257,35 @@ marker** into the child's own context (`agent.dispatch_executor_note`): a nanny 
 to decide its delegation plan FIRST — right after its objective/constraints — with typed
 cost classes (a subscription-lane run has known-zero marginal cost when the route reports
 its settled spend as $0; the child's own tokens are metered API money; never "free"
-unqualified), and a child that fell back to metered tokens is told its route was
-unavailable instead of discovering it by spending. `subagents.route_health` is the ONE
+unqualified), that a SUCCESSFUL delegated run is verified and integrated rather than
+rebuilt (follow-up work is delegated too), and a child that fell back to metered tokens
+is told its route was unavailable instead of discovering it by spending.
+`subagents.route_health` is the ONE
 manifest reader, shared by the dispatcher and by `delegate_start`, so the two cannot
 disagree about the same route.
+
+**Nanny economics are delegation-first.** The executor axis is resolved BEFORE the
+lane, and a harness-dispatched child whose request said `auto` lands on the LIGHT
+model lane by dispatch policy — its own rounds are custody chores around a $0 run;
+an explicit lane always wins, a native child keeps plain inheritance, and the lane's
+`provenance` (`requested` / `inherited` / `policy`) rides the capability delta so
+the decision source stays readable. An admission-verified `require_lane` delegation
+constraint suppresses that light policy default too: admission stamps the verified
+lane onto the child record as `required_model_lane` (a `SUBAGENT_INTENT_FIELDS`
+member, so it survives the queue snapshot), and the dispatch honors it — the lane
+the gate verified is the lane dispatched. The child raises itself with `switch_model` for
+genuine acceptance judgment; the switch is a per-round override visible in
+`llm_usage` rows and never rewrites the dispatch record. The child's
+objective/expected_output from its immutable task contract ride STRUCTURALLY in the
+host-authored `instructions` of every delegated run, so the nanny does not copy its
+contract into each prompt (the retry path still replays the stored wire body
+byte-identically). And the old permanent nudge silence after one successful run is
+gone: the loop keeps a per-round baseline of exact delegate tool-call transitions,
+and a nanny whose OWN metered rounds/$ since the last delegated-run activity cross
+the `task_pacing.NANNY_REMINDER_*` thresholds hears a proportional plain-user-message
+reminder — repeating per threshold-width, never a cap (owner decision 2=B) — both
+periodically (self-checkpoint style) and at finalization
+(`NANNY_METERED_OVERRUN`).
 
 A second, later check closes the class the dispatch table cannot see: the route can be
 healthy while the child's MATERIALIZED toolset hides the delegate verbs (child profile,
@@ -1215,7 +1296,12 @@ harness-dispatched child cannot see ALL THREE delegate verbs (`delegate_start`,
 `delegate_wait`, `delegate_cancel` — a child that can start but not wait is still
 broken): an AUTO-resolved dispatch falls back LOUDLY to native (typed
 `delegate_tools_invisible` capability delta, the same durable/live surfaces
-re-recorded — events row, RUNNING record, supervisor mirror); an EXPLICITLY pinned
+re-recorded — events row, RUNNING record, supervisor mirror). That fallback
+RE-RESOLVES lane, model, and effort off the NATIVE policy
+(`subagents.preflight_native_fallback_dispatch`) — the harness light-lane default
+must not survive onto a child that now thinks on metered tokens — and re-syncs the
+task record, metadata, `ToolContext` override, envelope, and live projection to the
+re-resolution. An EXPLICITLY pinned
 harness ends unrun through `agent.executor_blocked_outcome` with the distinct
 `delegate_tools_invisible` reason code — the fix is tool policy, not waiting for the
 route. A broken toolset introspection follows the same split: pinned fails CLOSED
@@ -1318,7 +1404,9 @@ is rejected, and it cannot change route, root, access, or permissions. There is 
 access, mode, isolation, root, or scope argument, so the child can request work but
 cannot choose its powers. Every delegated run also carries host-authored `instructions` stating
 the same prohibitions an ordinary subagent has — no commit or history move, no
-self-review, no runtime controls, skills or memory, no writes outside the root. Those
+self-review, no runtime controls, skills or memory, no writes outside the root — plus
+the hosting task's own contract objective/expected_output (host-read, host-authored:
+the model can neither widen nor forge the assignment block). Those
 are a statement; the enforcement is the access profile plus the patch capture. And
 because Claudexor DERIVES effective access rather than echoing the request,
 `delegate_wait` verifies rather than assumes: every fetched run detail goes through

@@ -18,6 +18,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from ouroboros.config import DELEGATE_WAIT_CEILING_SEC
 from ouroboros.utils import truncate_review_artifact
 
 log = logging.getLogger(__name__)
@@ -255,6 +256,79 @@ class WindowObservations:
         return [_omission_marker(spine[dropped - 1]["seq"], dropped)] + kept
 
 
+# Typed external-wait lease (poltergeist phase B, B3). While `delegate_wait`
+# holds its bounded window over a live delegated run, the supervisor's IDLE rail
+# is spared — and ONLY the idle rail: the explicit deadline, the absolute
+# ceiling, every budget fence, and cancel are untouched. The lease is pure
+# metadata with a hard expiry (no background thread holds anything): the worker
+# grants it for one window, bounded by min(task deadline, the run's own
+# maxSeconds horizon, this absolute ceiling), and releases it when the wait
+# returns. The ceiling exceeds the delegate_wait ToolEntry timeout (2100s, which
+# DELEGATE_WAIT_CEILING_SEC equals) by +300 headroom so a full window plus its
+# own teardown can never be idle-killed mid-hold.
+DELEGATE_WAIT_LEASE_GRACE_SEC = 120
+EXTERNAL_WAIT_LEASE_CEILING_SEC = DELEGATE_WAIT_CEILING_SEC + 300
+
+
+def external_wait_lease_until(ctx: Any, window: int,
+                              run_started_at: Any, run_max_seconds: int) -> float:
+    """When the idle-rail lease for ONE wait window must expire (epoch seconds).
+
+    Bounded by construction, never open-ended: the window itself plus a teardown
+    grace, clamped under the task's own explicit deadline, under the run's own
+    ``maxSeconds`` horizon (a run past its cap is not a healthy wait target), and
+    under the absolute lease ceiling. Unknown facts simply do not narrow — they
+    never widen.
+    """
+    import time as _time
+
+    from ouroboros.deadline_utils import parse_deadline_ts
+
+    now = _time.time()
+    grace = float(DELEGATE_WAIT_LEASE_GRACE_SEC)
+    candidates = [now + float(window) + grace,
+                  now + float(EXTERNAL_WAIT_LEASE_CEILING_SEC)]
+    meta = getattr(ctx, "task_metadata", {})
+    meta = meta if isinstance(meta, dict) else {}
+    deadline = parse_deadline_ts(meta.get("deadline_at"))
+    if deadline is not None:
+        candidates.append(deadline.timestamp())
+    if run_started_at is not None and run_max_seconds:
+        candidates.append(run_started_at.timestamp() + float(run_max_seconds) + grace)
+    return min(candidates)
+
+
+def emit_external_wait_lease(ctx: Any, run_id: str, until_ts: float,
+                             lease_id: str = "") -> None:
+    """Grant (``until_ts`` in the future) or release (``0.0``) the idle-rail lease.
+
+    A typed supervisor event, not synthetic progress: the idle enforcer keeps
+    judging REAL progress, and this lease only tells it that a bounded host-side
+    hold over a delegated run is a legitimate silence. It spares nothing else —
+    deadline, absolute ceiling, budget fences, and cancel all cut through it.
+    Best-effort by design: a lost lease costs at worst one idle-timeout episode,
+    never correctness, and no wait may fail because its lease could not be spoken.
+
+    ``lease_id`` is the grant's identity (F5b): each wait window mints one, and
+    its release names the same id, so the supervisor can refuse a release from
+    an abandoned, timed-out wait thread that would otherwise blank a NEWER
+    grant made by the task's next wait.
+    """
+    q = getattr(ctx, "event_queue", None)
+    if q is None:
+        return
+    try:
+        q.put_nowait({
+            "type": "external_wait_lease",
+            "task_id": str(getattr(ctx, "task_id", "") or ""),
+            "run_id": str(run_id or ""),
+            "until_ts": float(until_ts),
+            "lease_id": str(lease_id or ""),
+        })
+    except Exception:
+        log.debug("external-wait lease emission failed", exc_info=True)
+
+
 def poll_bound(seconds_left: float) -> float:
     """What one call inside a clamped window may ASK the transport for.
 
@@ -356,6 +430,60 @@ def rendered_window(**kwargs: Any) -> str:
     return json.dumps(window_payload(**kwargs), ensure_ascii=False, indent=2)
 
 
+def waiting_expiry_clause(pending: Optional[List[Dict[str, Any]]]) -> str:
+    """The honest expiry clause for a waiting note, keyed on the rows' own
+    ``timeout_at`` (R2-7e). The engine benign-declines an unanswered question
+    only when the row carries a ``timeout_at``; a null one means NO automatic
+    expiry, and a note promising a benign decline there teaches the nanny to
+    wait for a timeout that never comes. Claimed only when EVERY visible row
+    carries one; rows absent entirely (a bare ``waitingOnUser`` flag) prove no
+    expiry either."""
+    rows = [row for row in (pending or []) if isinstance(row, dict)]
+    if rows and all(str(row.get("timeout_at") or "").strip() for row in rows):
+        return ("the engine timeout benign-declines it (each row's timeout_at; "
+                "the run then continues on stated assumptions)")
+    return ("timeout_at is null here, so there is NO automatic expiry — the "
+            "run waits until answered")
+
+
+def _fitted_pending(payload: Dict[str, Any], pending: List[Dict[str, Any]],
+                    budget: int) -> None:
+    """Install a MEASURED pending-interactions projection onto ``payload`` (F2).
+
+    The same shed discipline as the immediate ``waiting_on_user`` payload: rows
+    shed from the TAIL with the cut COUNTED (``interactions_omitted``), measured
+    on the rendered payload rather than estimated — two probes put a
+    bounded-per-field projection at 24 459 and 51 719 chars against a 15 000
+    budget, and the generic truncator then cut the JSON mid-structure. When even
+    ONE row cannot fit, the rows yield entirely to the counted marker plus a
+    pointer at the recoverable copy: the full set was already returned by the
+    immediate ``waiting_on_user`` payload (staged whole to the task drive with a
+    sha256 receipt when it spilled), and the run itself still holds it — an
+    unparseable payload recovers nothing.
+    """
+    if not pending:
+        return
+    rows = list(pending)
+    while rows:
+        payload["pending_interactions"] = rows
+        omitted = len(pending) - len(rows)
+        if omitted:
+            payload["interactions_omitted"] = omitted
+        else:
+            payload.pop("interactions_omitted", None)
+        if len(json.dumps(payload, ensure_ascii=False, indent=2)) <= budget:
+            return
+        rows = rows[:-1]
+    payload.pop("pending_interactions", None)
+    payload["interactions_omitted"] = len(pending)
+    payload["interactions_note"] = (
+        "the pending question set could not fit this payload even one row at a "
+        "time; the run is still PAUSED on it — the full set was delivered by the "
+        "immediate waiting_on_user return (staged to the task drive when it "
+        "spilled), or re-read it with delegate_wait"
+    )
+
+
 def live_line(run_id: str, advance: _Advance) -> str:
     titles = " · ".join(
         str(row.get("title") or row.get("type") or "") for row in advance.events
@@ -401,8 +529,20 @@ def window_payload(
     detail: Dict[str, Any],
     seen: WindowObservations,
     budget: int,
+    pending_interactions: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """What the model is handed when the window expires without a terminal state."""
+    """What the model is handed when the window expires without a terminal state.
+
+    ``pending_interactions`` is the caller's BOUNDED question projection (B4): a
+    known question the model chose not to answer keeps riding every expiry payload
+    beside the ``waiting_on_user`` boolean, so a nanny that escalated to its human
+    is re-shown what the run is paused on instead of a bare flag. MEASURED into
+    the payload in BOTH branches (F2) — through ``_fitted_pending``'s shed
+    discipline, before the advance list is sized — so it can never push the
+    result past the budget: per-field bounds alone left a many-question set at
+    24k/51k chars against a 15k budget, exactly on the early ``no_progress``
+    return that used to skip measurement entirely.
+    """
     payload: Dict[str, Any] = {
         "status": "progress" if seen.advances else "no_progress",
         "run_id": run_id,
@@ -415,10 +555,27 @@ def window_payload(
     }
     if not seen.advances:
         payload["reason"] = "non_terminal_and_no_new_session_events_within_wait_window"
-        payload["note"] = ("The run is alive but silent. Decide: keep waiting (call again), "
-                           "or delegate_cancel if it is stuck.")
+        # A run PAUSED on its own question is not "stuck" (owner 7=A / F13): the
+        # generic delegate_cancel hint invited cancelling a run that is simply
+        # waiting to be answered. The waiting state gets its own note.
+        payload["note"] = (
+            ("The run is alive and PAUSED on the question(s) it already asked "
+             "(waiting_on_user; see pending_interactions). Decide: answer with "
+             "delegate_answer, escalate to your human via a progress message, or "
+             f"keep waiting (call again) — {waiting_expiry_clause(pending_interactions)}. "
+             "Do not cancel a run merely because it asked a question.")
+            if waiting_on_user else
+            ("The run is alive but silent. Decide: keep waiting (call again), "
+             "or delegate_cancel if it is stuck."))
+        _fitted_pending(payload, list(pending_interactions or []), budget)
         return payload
     payload["timeline_tail"] = timeline_tail(detail)
+    # The pending questions are measured in FIRST, against a budget that reserves
+    # the closing note and the advance list's floor marker, so an oversized
+    # question set can never push the rendered result past the limit (F2) — the
+    # advance-fit loop below then sizes itself against what is actually left.
+    _fitted_pending(payload, list(pending_interactions or []),
+                    budget - _NOTE_RESERVE_CHARS - _MIN_ADVANCE_BUDGET_CHARS)
     # The advance list gets what is LEFT, measured — not a fixed share. A fixed share
     # bounded only itself: `timeline_tail` carries harness-authored text (three fields,
     # each capped at 300 chars, twelve rows) and can reach most of the limit on its own,
@@ -460,4 +617,13 @@ def window_payload(
         "Call delegate_wait again with since_seq=last_seq to keep watching; "
         "`quiet_for_sec` is how long it has been silent at the end of the window."
     )
+    if waiting_on_user:
+        # F13: the paused state earns its own instruction here too — never the
+        # generic keep-watching line alone while a question sits unanswered.
+        # The expiry claim is keyed on the rows' own timeout_at (R2-7e).
+        payload["note"] += (
+            " The run is PAUSED on a question: answer it (delegate_answer), "
+            f"escalate to your human, or keep waiting — "
+            f"{waiting_expiry_clause(pending_interactions)}; do not cancel over it."
+        )
     return payload

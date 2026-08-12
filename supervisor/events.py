@@ -485,6 +485,9 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
     # values for them through here is what made two records of the same child.
     requested_model_lane = str(fields.get("requested_model_lane") or fields.get("model_lane") or "auto")
     parent_model_lane = str(fields.get("parent_model_lane") or "")
+    # An ADMISSION fact, not a derivation (F9): the lane an applicable
+    # non-advisory `require_lane` constraint verified this child against.
+    required_model_lane = str(fields.get("required_model_lane") or "")
     requested_executor = str(fields.get("requested_executor") or "").strip().lower() or "auto"
     task_group_id = str(fields.get("task_group_id") or "")
     task_group = fields.get("task_group") if isinstance(fields.get("task_group"), dict) else {}
@@ -519,6 +522,7 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
         "model_lane": requested_model_lane,
         "requested_model_lane": requested_model_lane,
         "parent_model_lane": parent_model_lane,
+        "required_model_lane": required_model_lane,
         "requested_executor": requested_executor,
         "task_group_id": task_group_id,
         "task_group": task_group,
@@ -3644,6 +3648,10 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
         )
         return
 
+    # The lane an applicable, non-advisory require_lane constraint verified this
+    # admission against (F9): stamped onto the child record so the dispatch-time
+    # policy default cannot override the lane the gate just enforced.
+    required_model_lane = ""
     if delegation_role == "subagent":
         try:
             from ouroboros.tool_access import subagent_profile_satisfies
@@ -3680,6 +3688,7 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             if isinstance(task_contract, dict) and decision.budget:
                 task_contract = {**task_contract, "delegation_budget": decision.budget}
                 result_fields["task_contract"] = task_contract
+            required_model_lane = str(getattr(decision, "required_lane", "") or "")
         except Exception:
             log.debug("Delegation reconciliation failed open for %s", tid, exc_info=True)
 
@@ -3821,6 +3830,7 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             "model_lane": requested_model_lane,
             "requested_model_lane": requested_model_lane,
             "parent_model_lane": parent_model_lane,
+            "required_model_lane": required_model_lane,
             "requested_executor": requested_executor,
             "task_group_id": task_group_id,
             "task_group": task_group,
@@ -4362,8 +4372,57 @@ def _handle_acceptance_fence(evt: Dict[str, Any], ctx: Any) -> None:
         # reviewing against a possibly-racing subtree.
         log.error("Could not acknowledge acceptance-fence transition", exc_info=True)
 
+def _handle_external_wait_lease(evt: Dict[str, Any], ctx: Any) -> None:
+    """Typed idle-rail lease (poltergeist phase B, B3): a worker holding a bounded
+    ``delegate_wait`` window over a live delegated run declares that its silence
+    is a legitimate host-side hold, not idleness.
+
+    The lease spares ONLY the idle rail (`_enforce_task_timeouts_locked` reads
+    ``external_wait_lease_until`` into its ``progressing`` disjunction); the
+    explicit deadline, the absolute ceiling, budget fences and cancel are
+    untouched. The expiry is re-clamped here against the absolute ceiling so a
+    malformed worker value can never mint an unbounded reprieve, and a release
+    (``until_ts <= 0``) drops the lease immediately — but only when it NAMES the
+    stored grant's ``lease_id`` (F5b lease identity). Mutate IN PLACE — see
+    ``_handle_llm_usage``: a write-back would resurrect a task a cross-thread
+    cancel popped between the get and the write.
+    """
+    task_id = str(evt.get("task_id") or "")
+    _running = getattr(ctx, "RUNNING", None)
+    if not task_id or not isinstance(_running, dict):
+        return
+    meta = _running.get(task_id)
+    if not isinstance(meta, dict):
+        return
+    try:
+        until = float(evt.get("until_ts") or 0.0)
+    except (TypeError, ValueError):
+        until = 0.0
+    lease_id = str(evt.get("lease_id") or "")
+    if until > 0:
+        from ouroboros.delegate_progress import EXTERNAL_WAIT_LEASE_CEILING_SEC
+
+        meta["external_wait_lease_until"] = min(
+            until, time.time() + float(EXTERNAL_WAIT_LEASE_CEILING_SEC))
+        meta["external_wait_lease_run_id"] = str(evt.get("run_id") or "")
+        meta["external_wait_lease_id"] = lease_id
+    else:
+        # A release must NAME the grant it retires (F5b): an abandoned,
+        # executor-killed wait thread's late release event would otherwise blank
+        # the NEWER grant the task's next wait just made. A release without an
+        # id (legacy emitter), or one matching the stored grant (or a stored
+        # grant without an id), clears as before.
+        stored = str(meta.get("external_wait_lease_id") or "")
+        if lease_id and stored and stored != lease_id:
+            return
+        meta.pop("external_wait_lease_until", None)
+        meta.pop("external_wait_lease_run_id", None)
+        meta.pop("external_wait_lease_id", None)
+
+
 EVENT_HANDLERS = {
     "llm_usage": _handle_llm_usage,
+    "external_wait_lease": _handle_external_wait_lease,
     "budget_pause": _handle_budget_pause,
     "budget_root_fence": _handle_budget_root_fence,
     "task_heartbeat": _handle_task_heartbeat,

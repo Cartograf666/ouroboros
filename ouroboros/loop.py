@@ -3056,6 +3056,190 @@ def _maybe_inject_cost_budget_milestone(
     return True
 
 
+# The verbs whose call IS delegated-run activity for the nanny-economics baseline.
+# Exact tool-call transitions, observed in the loop as they happen — never a scan
+# of the custody log or events.jsonl (the baseline must be free to read per round).
+_DELEGATE_ACTIVITY_TOOLS = frozenset({
+    "delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
+})
+
+
+def _note_nanny_delegate_activity(
+    ctx: Any, round_idx: int, accumulated_usage: Dict[str, Any],
+    tool_calls: List[Dict[str, Any]],
+) -> None:
+    """Advance the nanny's metered-progress marker, and its delegate-activity baseline
+    when this round actually touched a delegated run.
+
+    Two process-local marks on the ToolContext, written once per round: what the task
+    has spent so far (round index + accumulated cost), and where that stood at the
+    LAST delegate-verb call. Their difference is the whole input of the proportional
+    reminder — the poltergeist children burned $87 of opus rounds co-building around
+    their $0 runs, and nothing measured the burn while it happened.
+    """
+    if not getattr(ctx, "_nanny_route_dispatched", False):
+        return
+    try:
+        cost = float(accumulated_usage.get("cost") or 0.0)
+    except (TypeError, ValueError):
+        cost = 0.0
+    mark = {"round": int(round_idx), "cost": cost}
+    ctx._nanny_metered_progress = mark
+    verbs = set()
+    for call in tool_calls or []:
+        fn = call.get("function") if isinstance(call, dict) else None
+        name = str((fn or {}).get("name") or "").strip() if isinstance(fn, dict) else ""
+        if name in _DELEGATE_ACTIVITY_TOOLS:
+            verbs.add(name)
+    if not verbs:
+        return
+    if verbs == {"delegate_wait"}:
+        # R2-5: a wait is WATCHING, not delegating — it advances only the ROUND
+        # half of the baseline. Preserving the COST half keeps the dollar axis
+        # cumulative across waits: the reviewer's probe ($0.24/round with a
+        # ritual wait every 7 rounds — incident burn rate) re-zeroed BOTH axes
+        # at every wait and never heard the reminder, while a genuinely-holding
+        # nanny (waits plus pennies per round) stays under the dollar threshold
+        # anyway.
+        prior = getattr(ctx, "_nanny_delegate_baseline", None)
+        prior_cost = float(prior.get("cost") or 0.0) if isinstance(prior, dict) else 0.0
+        ctx._nanny_delegate_baseline = {"round": mark["round"], "cost": prior_cost}
+    else:
+        ctx._nanny_delegate_baseline = dict(mark)
+    # Delegate activity also RE-ARMS the reminder: the fire cursor is
+    # cleared so a cooldown earned BEFORE this activity can never mute
+    # the reminder for burn that happens AFTER it (gemini, fix F1).
+    ctx._nanny_reminder_mark = None
+
+
+def _nanny_metered_since_delegate_activity(ctx: Any) -> Tuple[int, float]:
+    """(rounds, dollars) this task's OWN metered loop has spent since the last
+    delegate-verb call — zero before the first round is marked."""
+    progress = getattr(ctx, "_nanny_metered_progress", None)
+    progress = progress if isinstance(progress, dict) else {}
+    baseline = getattr(ctx, "_nanny_delegate_baseline", None)
+    baseline = baseline if isinstance(baseline, dict) else {}
+    try:
+        rounds = max(0, int(progress.get("round") or 0) - int(baseline.get("round") or 0))
+    except (TypeError, ValueError):
+        rounds = 0
+    try:
+        cost = max(0.0, float(progress.get("cost") or 0.0) - float(baseline.get("cost") or 0.0))
+    except (TypeError, ValueError):
+        cost = 0.0
+    return rounds, cost
+
+
+def _nanny_reminder_due(ctx: Any, round_idx: int) -> Tuple[int, float, bool]:
+    """The measured burn plus whether the proportional reminder is due THIS round.
+
+    Due when EITHER axis (rounds or dollars, ``task_pacing.NANNY_REMINDER_*``) has
+    crossed its threshold since the last delegate-verb call. The re-arm is
+    DUAL-AXIS too (fix F1, five reviewers converged): after a firing, the next one
+    waits until a further threshold-width has accrued on EITHER axis since that
+    firing — the old single round-spacing gate muted a fast dollar burn outright
+    (a $2+ tail at round 2 never fired, because ``round_idx - 0 < 8``). The FIRST
+    firing has no spacing gate at all, and delegate activity clears the fire
+    cursor (``_note_nanny_delegate_activity``) so a pre-activity cooldown never
+    mutes post-activity burn. Proportional and repeating, never a cap (owner
+    decision 2=B)."""
+    from ouroboros.task_pacing import NANNY_REMINDER_ROUNDS, NANNY_REMINDER_USD
+
+    rounds, cost = _nanny_metered_since_delegate_activity(ctx)
+    if rounds < NANNY_REMINDER_ROUNDS and cost < NANNY_REMINDER_USD:
+        return rounds, cost, False
+    mark = getattr(ctx, "_nanny_reminder_mark", None)
+    if not isinstance(mark, dict):
+        return rounds, cost, True  # first firing: no spacing gate
+    progress = getattr(ctx, "_nanny_metered_progress", None)
+    progress = progress if isinstance(progress, dict) else {}
+    try:
+        rounds_since_fire = int(progress.get("round") or 0) - int(mark.get("round") or 0)
+    except (TypeError, ValueError):
+        rounds_since_fire = 0
+    try:
+        cost_since_fire = float(progress.get("cost") or 0.0) - float(mark.get("cost") or 0.0)
+    except (TypeError, ValueError):
+        cost_since_fire = 0.0
+    if rounds_since_fire >= NANNY_REMINDER_ROUNDS or cost_since_fire >= NANNY_REMINDER_USD:
+        return rounds, cost, True
+    return rounds, cost, False
+
+
+def _nanny_burn_phrase(rounds: int, cost: float) -> str:
+    return (f"{rounds} of your own metered LLM rounds (~${cost:.2f})" if cost > 0
+            else f"{rounds} of your own metered LLM rounds")
+
+
+def _maybe_inject_nanny_economics_reminder(
+    round_idx: int,
+    messages: List[Dict[str, Any]],
+    tools: ToolRegistry,
+    emit_progress: Callable[[str], None],
+    *,
+    event_queue: Optional[queue.Queue] = None,
+    task_id: str = "",
+    drive_logs: Optional[pathlib.Path] = None,
+) -> bool:
+    """The periodic half of the nanny-economics reminder (poltergeist phase B).
+
+    A plain user-message reminder in the existing self-checkpoint style — the loop's
+    checkpoints are ordinary user turns, never protocol (ARCHITECTURE: "Loop
+    self-checkpoints remain plain user-message reminders"). It fires between rounds,
+    while the burn is happening, because the finalization nudge alone arrives only
+    after the money is spent. Proportional and unbounded in count: each further
+    threshold-width of metered rounds re-arms it (owner 2=B — no round cap)."""
+    ctx = tools._ctx
+    if not getattr(ctx, "_nanny_route_dispatched", False):
+        return False
+    rounds, cost, due = _nanny_reminder_due(ctx, round_idx)
+    if not due:
+        return False
+    # The fire cursor is the metered-progress mark AT this firing (round + cost),
+    # so the dual-axis re-arm in `_nanny_reminder_due` measures both axes from
+    # the same instant. Cleared on delegate activity.
+    _progress_mark = getattr(ctx, "_nanny_metered_progress", None)
+    ctx._nanny_reminder_mark = (dict(_progress_mark) if isinstance(_progress_mark, dict)
+                                else {"round": int(round_idx), "cost": 0.0})
+    # R2-7c: before the first delegate verb there IS no "last delegated-run
+    # activity" — the burn is measured from the task's start, and the wording
+    # says so instead of implying an activity that never happened.
+    _baseline_known = isinstance(getattr(ctx, "_nanny_delegate_baseline", None), dict)
+    since_phrase = ("since your last delegated-run activity" if _baseline_known
+                    else "since this task started (no delegated-run activity yet)")
+    # BR1-3: never an unconditional "$0" claim — the owner's wording law is
+    # typed cost classes: known-zero only on a settled $0 spend, never "free"
+    # unqualified (estimated/undisclosed spend is never zero).
+    reminder = (
+        "[NANNY ECONOMICS REMINDER]\n"
+        f"You are a harness-dispatched NANNY and you have spent {_nanny_burn_phrase(rounds, cost)} "
+        f"{since_phrase}. A subscription-lane delegated run has known-zero "
+        "marginal cost only when its settled spend reports $0 (estimated or "
+        "undisclosed spend is never zero); every round you think yourself is "
+        "metered API money.\n"
+        "This is a reminder, not a stop. Consider: delegate the remaining work "
+        "(delegate_start / delegate_wait — follow-up work and fixes are delegated too), "
+        "and keep your own rounds for judgment: acceptance, integration, honest "
+        "settlement. A deliberate switch_model raise for that judgment is "
+        "sanctioned — finish it and drop back. If this work genuinely must run "
+        "on metered tokens, continue deliberately and say why in your result."
+    )
+    _append_or_merge_user_message(messages, reminder)
+    emit_progress(
+        f"Nanny economics: {rounds} metered round(s)"
+        + (f" (~${cost:.2f})" if cost > 0 else "")
+        + (" since the last delegated-run activity" if _baseline_known
+           else " since task start")
+    )
+    _emit_checkpoint_event(event_queue, task_id, drive_logs, {
+        "checkpoint_kind": "nanny_economics_reminder",
+        "round": round_idx,
+        "metered_rounds_since_delegate_activity": rounds,
+        "metered_cost_since_delegate_activity_usd": round(cost, 4),
+    })
+    return True
+
+
 def _inject_round_checkpoints(
     *,
     round_idx: int,
@@ -3088,7 +3272,11 @@ def _inject_round_checkpoints(
         accumulated_usage=accumulated_usage,
         event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
     )
-    return bool(checkpoint or time_budget or cost_budget)
+    nanny_economics = _maybe_inject_nanny_economics_reminder(
+        round_idx, messages, tools, emit_progress,
+        event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
+    )
+    return bool(checkpoint or time_budget or cost_budget or nanny_economics)
 
 
 def _last_assistant_text(messages: List[Dict[str, Any]]) -> str:
@@ -5650,6 +5838,18 @@ def _forced_delegation_note(tools_ctx: Any, llm_trace: Dict[str, Any]) -> str:
     started = int(evidence.get("delegated_runs_started") or 0)
     settled = int(evidence.get("delegated_runs_settled") or 0)
     if int(evidence.get("delegated_runs_succeeded") or 0):
+        # The proportional silence must not extend to FORCED exits (grok / F16):
+        # a wrap-up forced by an overrun still owes the parent the honest-spend
+        # line. One shot, riding the single forced prompt — never a re-loop.
+        rounds, cost = _nanny_metered_since_delegate_activity(tools_ctx)
+        from ouroboros.task_pacing import NANNY_REMINDER_ROUNDS, NANNY_REMINDER_USD
+
+        if rounds >= NANNY_REMINDER_ROUNDS or cost >= NANNY_REMINDER_USD:
+            return (
+                "\nNOTE: your delegated run(s) succeeded, but you have since spent "
+                f"{_nanny_burn_phrase(rounds, cost)} with no delegated-run activity. "
+                "Account for that metered spend honestly in your answer."
+            )
         return ""
     if started > settled:
         return (
@@ -6032,7 +6232,25 @@ def _nanny_finalization_message(
     except Exception:
         log.debug("nanny nudge: custody evidence read failed", exc_info=True)
     if evidence.get("delegated_runs_succeeded"):
-        return ""  # the route WAS used and worked (e.g. in an earlier execution)
+        # The route WAS used and worked — but "used once" is not a permanent
+        # license: the poltergeist children each ran ONE successful $0 run and
+        # then co-built for tens of opus rounds around it while this early
+        # return kept the nudge silent forever. The silence is now proportional
+        # to the measured burn since the last delegated-run activity; a nanny
+        # that delegated recently (or spent little since) still hears nothing.
+        rounds, cost = _nanny_metered_since_delegate_activity(tools._ctx)
+        from ouroboros.task_pacing import NANNY_REMINDER_ROUNDS, NANNY_REMINDER_USD
+
+        if rounds < NANNY_REMINDER_ROUNDS and cost < NANNY_REMINDER_USD:
+            return ""
+        return (
+            "⚠️ NANNY_METERED_OVERRUN: your delegated run(s) succeeded, but you have "
+            f"since spent {_nanny_burn_phrase(rounds, cost)} with no delegated-run "
+            "activity. A successful run is verified and integrated, not rebuilt. If "
+            "the remaining work is substantive, delegate it (a new delegate_start); "
+            "if you are wrapping up, keep the wrap-up short and account for the "
+            "metered spend honestly in your result."
+        )
     started = int(evidence.get("delegated_runs_started") or 0)
     if not started and (evidence.get("evidence_read_failed") or not evidence):
         # Zero attempts is an ACCUSATION and needs positively-established
@@ -7045,6 +7263,9 @@ def run_llm_loop(
             tool_calls = msg.get("tool_calls") or []
             content = msg.get("content")
             _latch_final_answer_marker(llm_trace, content, current_tool_calls=tool_calls)
+            # F12: EVERY LLM response marks metered nanny progress (expensive
+            # no-tool rounds count); the delegate BASELINE moves post-tools only.
+            _note_nanny_delegate_activity(tools._ctx, round_idx, accumulated_usage, [])
             if not tool_calls:
                 final_result = _no_tool_final_answer(
                     content, limit_ctx, llm_trace, tools, incoming_messages,
@@ -7065,6 +7286,13 @@ def run_llm_loop(
             handle_tool_calls(
                 tool_calls, tools, drive_logs, task_id, stateful_executor,
                 messages, llm_trace, emit_progress
+            )
+
+            # Nanny-economics baseline (poltergeist phase B): mark this round's
+            # metered progress, and re-baseline when the round touched a
+            # delegated run. Exact tool-call transitions — no log scans.
+            _note_nanny_delegate_activity(
+                tools._ctx, round_idx, accumulated_usage, tool_calls,
             )
 
             _prepare_post_tool_budget_context(

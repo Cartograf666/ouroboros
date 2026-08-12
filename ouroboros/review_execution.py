@@ -22,6 +22,13 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional
 
+from ouroboros.review_slot_cancel import (  # noqa: F401 — re-exported seam surface
+    ReviewSessionSucceededResultUnavailable,
+    _cancel_honesty_clause,
+    _interaction_outlives_slot,
+    _natural_success_terminal,
+    _slot_cancel_outcome,
+)
 from ouroboros.triad_review import (
     ACCEPTANCE_SURFACE_RULES,
     REVIEW_JSON_ARRAY_CONTRACT,
@@ -54,6 +61,24 @@ class ReviewRouteUnavailable(RuntimeError):
 
     A missing route fails loudly on its own slot; it never falls back to another
     route, model, or profile.
+    """
+
+
+class ReviewSessionWaitingOnUser(RuntimeError):
+    """A delegated review session parked on an interactive question (F18).
+
+    Review slots are non-interactive by contract: nothing host-side answers a
+    reviewer's AskUserQuestion, so waiting out the engine's answer timeout burns
+    the whole slot budget in silence. The poller terminates the slot EARLY —
+    cancelled through the verified-cancel path under the typed reason
+    ``review_session_waiting_on_user`` — and this failure names the pending
+    question plus the cancel's HONEST outcome (BR1-1): "host-cancelled" only on
+    a ``confirmed`` verified receipt whose terminal is the cancel's own — a
+    confirmed natural ``failed``/``interrupted`` is attributed to the run
+    itself (BR2-2); anything unverified says the run may still be live, and a
+    verify read that finds the run already SUCCEEDED never raises this at all
+    (completion wins). Answering support for hosted review lanes is a
+    deliberate non-goal (owner: no acceptance host-wait; PHASE_B_NOTES).
     """
 
 
@@ -1074,19 +1099,61 @@ def _poll_session_terminal(gateway: Any, custody: Any, custody_drive: Any, entry
 
     The nanny owns the time cap: on expiry the run is cancelled through the
     verified-cancel path (an unverified stop must not read as stopped) and the
-    slot fails as an ordinary timeout on its own row."""
+    slot fails as an ordinary timeout on its own row.
+
+    A session that parks on an interactive question terminates the slot EARLY
+    (F18) — but only when the question has no engine expiry inside the slot's
+    remaining budget (``_interaction_outlives_slot``): review slots are
+    non-interactive, so such a question can only burn the slot in silence. The
+    run is cancelled through the same verified path under its own typed reason
+    and the failure names the pending question. A question whose ``timeout_at``
+    provably lands first is left to the engine's benign decline and the poll
+    continues (R2-2).
+
+    Both cancel sites are HONEST about what the cancel proved (BR1-1): the
+    typed outcome rides the raise, and a verify read that discovers a natural
+    SUCCESS terminal returns it as the slot's ordinary result instead of
+    raising over it — completion wins, no host-side waiting added."""
+    from ouroboros.gateways.claudexor import pending_interactions as _cx_pending
+
     deadline = time.monotonic() + max(1.0, float(seconds))
     detail = gateway.get_run(run_id)
     while not custody.is_terminal(detail):
+        pending = _cx_pending(detail)
+        if (pending or bool(custody.summary_of(detail).get("waitingOnUser"))) \
+                and _interaction_outlives_slot(
+                    (pending[0] if pending else {}).get("timeout_at"), deadline):
+            first = pending[0] if pending else {}
+            question = ""
+            for q in first.get("questions") or []:
+                question = str(q.get("question") or "").strip()
+                if question:
+                    break
+            outcome, state, carried = _slot_cancel_outcome(
+                gateway, custody, custody_drive, entry, run_id,
+                "review_session_waiting_on_user")
+            settled = _natural_success_terminal(gateway, custody, run_id, state, carried)
+            if settled is not None:
+                return settled
+            named = str(first.get("interaction_id") or "")
+            raise ReviewSessionWaitingOnUser(
+                f"delegated review session {run_id} paused on an interactive question"
+                + (f" ({named}: {question[:300]!r})" if named or question else "")
+                + " — review slots are non-interactive, so the slot terminated "
+                  "early and typed ("
+                + _cancel_honesty_clause(outcome, state)
+                + ") instead of silently burning its whole budget waiting"
+            )
         if time.monotonic() >= deadline:
-            try:
-                custody.cancel_and_verify(custody_drive, gateway, entry, "review_slot_timeout")
-            except Exception:
-                log.warning("Failed to cancel a timed-out review session %s",
-                            run_id, exc_info=True)
+            outcome, state, carried = _slot_cancel_outcome(
+                gateway, custody, custody_drive, entry, run_id, "review_slot_timeout")
+            settled = _natural_success_terminal(gateway, custody, run_id, state, carried)
+            if settled is not None:
+                return settled
             raise TimeoutError(
                 f"delegated review session {run_id} exceeded the slot budget "
-                f"of {seconds:g}s"
+                f"of {seconds:g}s ("
+                + _cancel_honesty_clause(outcome, state) + ")"
             )
         time.sleep(min(_SESSION_POLL_SEC, max(0.0, deadline - time.monotonic())))
         detail = gateway.get_run(run_id)
@@ -1099,7 +1166,7 @@ def _full_session_text(gateway: Any, run_id: str, detail: Dict[str, Any]) -> str
     The resolver fetches and verifies the full artifact when the engine reports
     truncation; an unresolvable full text refuses rather than judging a
     head-cut transcript."""
-    from ouroboros.tools.delegate import _resolve_full_primary_output
+    from ouroboros.delegate_output import _resolve_full_primary_output
 
     primary = detail.get("primaryOutput")
     primary, full_ok, disclosure = _resolve_full_primary_output(gateway, run_id, primary)

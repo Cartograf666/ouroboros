@@ -479,6 +479,52 @@ class ClaudexorGateway:
             raise self._problem(response)
         return response.content
 
+    def answer_interaction(self, run_id: str, interaction_id: str,
+                           answers: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """POST /v2/runs/:id/interactions/:iid/answer — deliver one answer set.
+
+        ``answers`` rows are already in the wire shape (``questionId`` /
+        ``selectedLabels`` / ``freeText`` — the strict ``ControlInteractionAnswerRequest``);
+        this method is transport, not translation.
+
+        The engine's reply is TYPED at every HTTP status it owns: 200 carries
+        ``{accepted, status: "delivered"}``, and a 404/409 refusal carries the SAME
+        ``ControlInteractionAnswerResponse`` shape with ``status`` ``not_found`` /
+        ``already_resolved`` / ``rejected`` (daemon-server answers the route with the
+        parsed response at 200/404/409). Any body carrying one of those statuses is
+        returned as the ANSWER it is — an engine's ``already_resolved`` is a fact,
+        not an outage. What still raises ``ClaudexorUnavailable``: transport
+        failures, a bodyless 404 (``no such run``), the 501 of an engine build with
+        no answer service, and any other refusal without a typed status.
+        """
+        from urllib.parse import quote
+
+        path = (f"/v2/runs/{quote(str(run_id), safe='')}"
+                f"/interactions/{quote(str(interaction_id), safe='')}/answer")
+        try:
+            response = self._client.request("POST", path,
+                                            json={"answers": list(answers or [])})
+        except httpx.HTTPError as exc:
+            raise ClaudexorUnavailable(
+                "daemon_unreachable",
+                f"Claudexor daemon unreachable: {type(exc).__name__}: {exc}",
+            ) from exc
+        body: Any = None
+        if response.content:
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+        if isinstance(body, dict) and str(body.get("status") or "") in (
+                "delivered", "not_found", "already_resolved", "rejected"):
+            return body
+        if response.status_code >= 400:
+            raise self._problem(response)
+        raise ClaudexorUnavailable(
+            "malformed_response",
+            f"interaction answer returned no typed status (HTTP {response.status_code})",
+        )
+
     def cancel_run(self, run_id: str, *, reason: str = "") -> Dict[str, Any]:
         control: Dict[str, Any] = {"kind": "cancel"}
         if reason:
@@ -602,6 +648,51 @@ class ClaudexorGateway:
         return body if isinstance(body, dict) else {}
 
 
+def pending_interactions(detail: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The run detail's live interactive questions, normalized and complete.
+
+    ``GET /v2/runs/:id`` carries ``pendingInteractions`` — full
+    ``ControlPendingInteraction`` rows with the question TEXT, header, options and
+    ``multi_select``, not just the ``summary.waitingOnUser`` boolean the old wait
+    kept. This is the ONE reader of that wire shape: snake_case keys out, absent
+    strings normalized to ``None``/empty, rows without an interaction id dropped
+    (an unanswerable row is noise, not a question). Purely shape translation — no
+    truncation here; bounding belongs to the delivery layer that knows its budget.
+    """
+    rows = detail.get("pendingInteractions") if isinstance(detail, dict) else None
+    out: List[Dict[str, Any]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        questions: List[Dict[str, Any]] = []
+        for question in row.get("questions") or []:
+            if not isinstance(question, dict):
+                continue
+            questions.append({
+                "question_id": str(question.get("id") or ""),
+                "question": str(question.get("question") or ""),
+                "header": str(question.get("header") or "") or None,
+                "options": [
+                    {"label": str(option.get("label") or ""),
+                     "description": str(option.get("description") or "") or None}
+                    for option in (question.get("options") or [])
+                    if isinstance(option, dict)
+                ],
+                "multi_select": bool(question.get("multi_select")),
+            })
+        interaction_id = str(row.get("interactionId") or "")
+        if not interaction_id:
+            continue
+        out.append({
+            "interaction_id": interaction_id,
+            "source_tool": str(row.get("sourceTool") or "") or None,
+            "requested_at": str(row.get("requestedAt") or ""),
+            "timeout_at": str(row.get("timeoutAt") or "") or None,
+            "questions": questions,
+        })
+    return out
+
+
 # -- applied-fact artifacts ----------------------------------------------------
 
 
@@ -702,4 +793,5 @@ __all__ = [
     "discover_daemon_at",
     "engine_at_least",
     "operator_home",
+    "pending_interactions",
 ]

@@ -466,7 +466,8 @@ def test_cache_horizon_reachability_matches_the_wait_clamps():
 
     Each wait tool caps its own window, so the line's availability is per-tool and
     per-TTL: at the shipped '1h' default only wait_tasks (7200s) can genuinely emit
-    it, wait_task sits exactly on the 3600s horizon and delegate_wait (2100s ceiling)
+    it, wait_task sits exactly on the 3600s horizon and delegate_wait (1800s window
+    max — the wait's REAL clamp since F5a, not the 2100s ToolEntry kill timeout)
     cannot reach it at all; at '5m' all three do. The stream report advertised it as
     a live capability of all three at the default — this pin makes the truth loud and
     fails if a clamp, the ceiling, or the tier scale moves without revisiting it."""
@@ -474,7 +475,7 @@ def test_cache_horizon_reachability_matches_the_wait_clamps():
     import re
     from types import SimpleNamespace
 
-    from ouroboros.config import DELEGATE_WAIT_CEILING_SEC
+    from ouroboros.config import DELEGATE_WAIT_WINDOW_MAX_SEC
     from ouroboros.llm import cache_ttl_seconds
     from ouroboros.tools import control as control_mod
     from ouroboros.tools.control import cache_horizon_note
@@ -487,9 +488,9 @@ def test_cache_horizon_reachability_matches_the_wait_clamps():
     ceilings = {
         "wait_task": _clamp(control_mod._wait_for_task),
         "wait_tasks": _clamp(control_mod._wait_for_tasks),
-        "delegate_wait": DELEGATE_WAIT_CEILING_SEC,
+        "delegate_wait": DELEGATE_WAIT_WINDOW_MAX_SEC,
     }
-    assert ceilings == {"wait_task": 3600, "wait_tasks": 7200, "delegate_wait": 2100}
+    assert ceilings == {"wait_task": 3600, "wait_tasks": 7200, "delegate_wait": 1800}
 
     def _emits(tier, ceiling):
         ctx = SimpleNamespace(_accumulated_usage={"_last_prompt_cache_ttl": tier})

@@ -1414,6 +1414,37 @@ def test_one_resolution_writes_every_derived_field(tmp_path, monkeypatch):
     assert resolve_dispatch_axes(root) is None
     assert "capability_delta" not in root
 
+
+def test_queue_snapshot_projects_every_scheduling_intent_field(monkeypatch, tmp_path):
+    """R2-3 (F9 delta): a PENDING child's queue-snapshot row is all a restarted
+    supervisor has, so an intent field missing from the projection is silently
+    dropped across restart — `required_model_lane` was, re-opening the
+    auto+harness⇒light default over a gate-verified lane. Walk
+    SUBAGENT_INTENT_FIELDS against the REAL projection so no future intent
+    field can be dropped the same way."""
+    import json as _json
+
+    from ouroboros.subagents import SUBAGENT_INTENT_FIELDS
+    from supervisor import queue as queue_mod
+
+    pending: list = []
+    running: dict = {}
+    queue_mod.init_queue_refs(pending, running, {"value": 0})
+    monkeypatch.setattr(queue_mod, "QUEUE_SNAPSHOT_PATH",
+                        tmp_path / "queue_snapshot.json")
+    task = {"id": "t-intent-pin", "type": "task"}
+    sentinels = {name: f"sentinel-{i}" for i, name in enumerate(SUBAGENT_INTENT_FIELDS)}
+    task.update(sentinels)
+    pending.append(task)
+    assert queue_mod.persist_queue_snapshot(reason="intent-field-pin") is True
+    snapshot = _json.loads((tmp_path / "queue_snapshot.json").read_text(encoding="utf-8"))
+    row = snapshot["pending"][0]["task"]
+    for name, value in sentinels.items():
+        assert row.get(name) == value, (
+            f"scheduling intent field {name!r} is missing from the pending "
+            "queue-snapshot projection (supervisor/queue.py) — a restart would "
+            "silently drop it")
+
 def test_a_stored_auto_parent_lane_is_the_lane_of_record_not_the_cheapest(monkeypatch):
     """A task record can legitimately carry the literal `auto` as its effective lane —
     the supervisor falls that field back to the REQUESTED lane, which is `auto`
@@ -1455,3 +1486,185 @@ def test_prompt_block_omits_the_broken_below_phrase_on_an_executor_only_delta():
         SimpleNamespace(delta=_Delta(), executor_resolution=None))
     assert "BELOW what your parent asked" not in block
     assert block == ""  # nothing else to say either: the executor note owns it
+
+
+# ---------------------------------------------------------------- B2: light-lane nanny policy
+
+
+def _harness_ready_dispatch(monkeypatch):
+    """Force the executor axis to a healthy harness route without a live daemon."""
+    route = subagents.DelegationRoute(route_id="codex")
+    monkeypatch.setattr(
+        subagents, "dispatch_executor_resolution",
+        lambda task: subagents.resolve_subagent_executor("auto", route=route),
+    )
+
+
+def test_auto_lane_on_harness_executor_defaults_to_light_by_policy(monkeypatch):
+    """B2 (poltergeist phase B): a harness-dispatched child whose request said
+    `auto` is a NANNY — its own rounds are custody chores around a $0 delegated
+    run, so the dispatch policy resolves it to the LIGHT lane instead of the
+    parent's expensive lane, and the provenance says the POLICY answered."""
+    monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
+    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "provider::cheap")
+    _harness_ready_dispatch(monkeypatch)
+
+    dispatch = subagents.resolve_subagent_dispatch(
+        {"id": "c1", "type": "task", "requested_model_lane": "auto",
+         "parent_model_lane": "main"},
+        task_type="task",
+    )
+    assert dispatch.executor == "harness"
+    assert dispatch.lane.effective_lane == "light"
+    assert dispatch.lane.model == "provider::cheap"
+    assert dispatch.lane.provenance == "policy"
+    assert dispatch.delta.as_dict()["lane_provenance"] == "policy"
+    # Not a reduction relative to itself: the policy IS the resolved baseline.
+    assert dispatch.lane.reduced is False
+
+
+def test_explicit_lane_always_wins_over_the_harness_policy(monkeypatch):
+    monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
+    monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "provider::strong")
+    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "provider::cheap")
+    _harness_ready_dispatch(monkeypatch)
+
+    dispatch = subagents.resolve_subagent_dispatch(
+        {"id": "c2", "type": "task", "requested_model_lane": "heavy"},
+        task_type="task",
+    )
+    assert dispatch.executor == "harness"
+    assert dispatch.lane.effective_lane == "heavy"
+    assert dispatch.lane.model == "provider::strong"
+    assert dispatch.lane.provenance == "requested"
+
+
+def test_a_required_lane_wins_over_the_harness_policy_default(monkeypatch):
+    """F9 (sol #1) admission→dispatch consistency: a child ADMITTED under a
+    satisfied `require_lane` constraint (auto request, parent on the required
+    lane) carries `required_model_lane` on its record — and the dispatch policy
+    default (auto+harness ⇒ light) must NOT apply over it. With the policy
+    suppressed, `auto` inherits the parent's lane, which is exactly the lane the
+    gate verified; the provenance honestly says "inherited"."""
+    monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
+    monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "provider::strong")
+    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "provider::cheap")
+    _harness_ready_dispatch(monkeypatch)
+
+    dispatch = subagents.resolve_subagent_dispatch(
+        {"id": "c-req", "type": "task", "requested_model_lane": "auto",
+         "parent_model_lane": "heavy", "required_model_lane": "heavy"},
+        task_type="task",
+    )
+    assert dispatch.executor == "harness"
+    assert dispatch.lane.effective_lane == "heavy"
+    assert dispatch.lane.model == "provider::strong"
+    assert dispatch.lane.provenance == "inherited"
+
+    # Stored garbage in the field is ignored — the policy applies as usual.
+    garbage = subagents.resolve_subagent_dispatch(
+        {"id": "c-junk", "type": "task", "requested_model_lane": "auto",
+         "parent_model_lane": "heavy", "required_model_lane": "warp-lane"},
+        task_type="task",
+    )
+    assert garbage.lane.effective_lane == "light"
+    assert garbage.lane.provenance == "policy"
+
+
+def test_preflight_native_fallback_reresolves_without_the_harness_policy(monkeypatch):
+    """F10 (sol #2, probe `native light policy`): a harness dispatch falsified at
+    the toolset preflight falls back to NATIVE — and must not stay on the
+    policy-light lane/cheap model the harness resolution chose. The fallback
+    re-resolves lane/model/effort as a native dispatch would (parent
+    inheritance), and the record, delta and envelope all describe it."""
+    from types import SimpleNamespace
+
+    from ouroboros.agent import preflight_delegate_visibility, resolve_dispatch_axes
+
+    monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
+    monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "provider::strong")
+    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "provider::cheap")
+    _harness_ready_dispatch(monkeypatch)
+
+    task = {"id": "c-fb", "type": "task", "delegation_role": "subagent",
+            "requested_model_lane": "auto", "parent_model_lane": "heavy",
+            "requested_executor": "auto"}
+    dispatch = resolve_dispatch_axes(task)
+    assert dispatch.lane.effective_lane == "light"  # the harness policy, pre-preflight
+    assert task["model"] == "provider::cheap"
+
+    tools = SimpleNamespace(available_tools=lambda: ["read_file", "web_search"])
+    amended, changed = preflight_delegate_visibility(tools, task, dispatch)
+    assert changed is True
+    assert amended.executor == "native"
+    # Lane and model re-resolved WITHOUT the harness policy: parent inheritance.
+    assert amended.lane.effective_lane == "heavy"
+    assert amended.lane.model == "provider::strong"
+    assert amended.lane.provenance == "inherited"
+    # Every stamped surface tells the re-resolved story.
+    assert task["effective_model_lane"] == "heavy"
+    assert task["model"] == "provider::strong"
+    assert task["effective_executor"] == "native"
+    assert task["capability_delta"]["effective_lane"] == "heavy"
+    assert task["capability_delta"]["lane_provenance"] == "inherited"
+    assert "delegate_tools_invisible" in task["capability_delta"]["reason"]
+    assert task["capability_delta"]["reduced"] is True
+    assert task["subagent_envelope"]["effective_lane"] == "heavy"
+    assert task["subagent_envelope"]["model"] == "provider::strong"
+    assert task["subagent_envelope"]["effective_executor"] == "native"
+
+
+def test_native_child_keeps_plain_inheritance(monkeypatch):
+    monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
+    monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "provider::strong")
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "")
+
+    dispatch = subagents.resolve_subagent_dispatch(
+        {"id": "c3", "type": "task", "requested_model_lane": "auto",
+         "parent_model_lane": "heavy"},
+        task_type="task",
+    )
+    assert dispatch.executor == "native"
+    assert dispatch.lane.effective_lane == "heavy"
+    assert dispatch.lane.provenance == "inherited"
+
+
+def test_policy_light_with_an_empty_light_slot_lands_main_and_says_so(monkeypatch):
+    """The provenance names the DECISION source even when the slot outcome moves
+    the effective lane: policy said light, no light slot exists, the model is
+    Main — and the record must carry both facts, not blend them."""
+    monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
+    monkeypatch.delenv("OUROBOROS_MODEL_LIGHT", raising=False)
+    _harness_ready_dispatch(monkeypatch)
+
+    dispatch = subagents.resolve_subagent_dispatch(
+        {"id": "c4", "type": "task", "requested_model_lane": "auto"},
+        task_type="task",
+    )
+    assert dispatch.lane.provenance == "policy"
+    assert dispatch.lane.resolved_from == "light"
+    assert dispatch.lane.effective_lane == "main"
+    assert dispatch.lane.model == "provider::main"
+
+
+def test_switch_model_never_rewrites_the_dispatch_lane_record(monkeypatch, tmp_path):
+    """B2 acceptance-model provenance: the nanny raising itself for an acceptance
+    round is a ToolContext override (visible per-round in llm_usage rows), never a
+    rewrite of the durable dispatch resolution — the record keeps saying which
+    lane the child was DISPATCHED on."""
+    from ouroboros.tools.control import _switch_model
+    from ouroboros.tools.registry import ToolContext
+
+    monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
+    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "provider::cheap")
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    record = {"effective_model_lane": "light", "model": "provider::cheap",
+              "capability_delta": {"lane_provenance": "policy"}}
+    ctx.task_metadata = dict(record)
+
+    out = _switch_model(ctx, model="provider::main")
+    assert "OK: switching" in out
+    assert ctx.active_model_override == "provider::main"
+    # The durable dispatch record is untouched — acceptance-round provenance is
+    # read from llm_usage (each round carries the REAL model), not from here.
+    assert {k: ctx.task_metadata[k] for k in record} == record

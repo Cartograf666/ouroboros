@@ -851,22 +851,22 @@ def get_subagent_worktree_root() -> str:
     return raw or os.path.expanduser(os.path.join("~", "Ouroboros", "subagent_worktrees"))
 
 
-# The delegate_wait ToolEntry's own per-call timeout: a configured ceiling above it
-# buys a KILLED tool call, not a longer wait. Pinned to that ToolEntry by test.
+# delegate_wait's ToolEntry per-call timeout (above it a configured ceiling buys a
+# KILLED call, not a longer wait; pinned by test) and the hard max WINDOW per call
+# (F5): 1800 < 2100 (kill) < 2400 (lease) — decoupled, a raised timeout never widens it.
 DELEGATE_WAIT_CEILING_SEC = 2100
+DELEGATE_WAIT_WINDOW_MAX_SEC = 1800
 
 
 def get_delegate_wait_max_sec() -> int:
-    """Ceiling for a caller-supplied ``delegate_wait`` window, in seconds."""
+    """delegate_wait window ceiling: the setting NARROWS, never widens past 1800."""
     return _clamped_number_setting(
-        "OUROBOROS_DELEGATE_WAIT_MAX_SEC", low=1, high=DELEGATE_WAIT_CEILING_SEC, cast=int)
+        "OUROBOROS_DELEGATE_WAIT_MAX_SEC", low=1, high=DELEGATE_WAIT_WINDOW_MAX_SEC, cast=int)
 
 
 def get_delegate_wait_sec() -> int:
-    """Default WINDOW one ``delegate_wait`` call holds, in seconds.
-
-    Not a quiet cutoff: the wait holds this long and returns the advances it saw,
-    so this also bounds how long the nanny stays out of its own mailbox."""
+    """Default WINDOW one ``delegate_wait`` call holds — not a quiet cutoff: the
+    wait holds, returns its advances, and bounds the nanny's mailbox absence."""
     return _clamped_number_setting(
         "OUROBOROS_DELEGATE_WAIT_SEC", low=1, high=get_delegate_wait_max_sec(), cast=int)
 

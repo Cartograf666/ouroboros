@@ -109,7 +109,7 @@ EXPECTED_TOOLS = [
     "send_user_message", "update_identity", "toggle_evolution",
     "toggle_consciousness", "switch_model", "get_task_result",
     "wait_task", "wait_tasks", "tree_note", "tree_read",
-    "delegate_start", "delegate_wait", "delegate_cancel",
+    "delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
     "read_file", "list_files", "write_file", "edit_text",
     "apply_patch", "edit_batch",
     "send_photo", "send_video", "send_file", "search_code", "query_code", "forward_to_worker",

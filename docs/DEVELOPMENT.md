@@ -582,6 +582,11 @@ If a core governance artifact cannot fit in the available context budget:
   damage, so below it the text passes through whole. A local re-implementation loses
   the floor and can return a value LONGER than the input it "shortened" (a `…[+N
   chars]` marker is 11 characters, so any overflow under that grew the field).
+  The two bounded-string primitives serve different contracts:
+  `truncate_review_artifact` produces DISPLAY previews of review artifacts (its
+  anti-waste floor may return the text whole), while `truncate_within_limit`
+  enforces a STRICT wire/prompt bound — the omission marker lands INSIDE the
+  limit and the result never exceeds it.
 - Bounding a LIST is subject to the same rule as bounding a string: a `[:N]` slice
   must be accompanied by an explicit omitted COUNT, and — where the slice touches an
   identity that something downstream compares — a durable hash or reference for the
@@ -768,7 +773,7 @@ Before every commit, verify the following:
 - Project-room promotion with no working folder and no `workspace="none"` opt-out idempotently provisions a standalone git repo through `ensure_project_workspace`, then runs the ordinary workspace admission checks. Never provision over a non-empty broken binding or an unreadable registry; those cases fail loudly. Binding affects tool profile, memory, lease, and preflight, not the Max-mode Architecture projection.
 - Keep policy denials separate from execution failures: `user_files_path_blocked`, `cwd_blocked`, and `artifact_output_undeclared` are non-failure outcomes, while failure to register an explicitly declared output remains `artifact_output_error`.
 - The DEFAULT (non-workspace) shell lane carries the SAME target-aware git policy in every runtime mode including light (Q4=A sandbox unwind): mutating git is blocked only when it targets the Ouroboros runtime (system repo / any data drive — bidirectional, casefold, symlink-resolved containment; `commit_reviewed` is the remedy for self-repo changes), read-only git works everywhere including at the system repo, `allowed_resources.network=false` still fences network git subcommands, and acting `self_worktree` children keep the strict no-commit policy. `git init`/`commit`/`push` in `~/projects`, `/tmp`, an attached project folder, or a host-minted coop tree is legitimate task work, not a violation.
-- `claude_code_edit` is RETIRED (D10, owner-approved migration, phase 6.4): the SDK edit gateway's job moved to the delegated coding path — a mutating subagent (`schedule_subagent`) whose nanny drives the session with `delegate_start`/`delegate_wait`/`delegate_cancel`, on the owner's subscription when a harness route is configured. Compatibility is one-way and permanent: a saved task contract carrying `disabled_tools=["claude_code_edit"]` also withholds the successor `delegate_start` (registry `_disabled_tools`), and the frozen `GET /api/claude-code/status` + `POST /api/claude-code/install` endpoints stay — the Claude runtime still powers the api-route advisory review. Do not resurrect the tool name.
+- `claude_code_edit` is RETIRED (D10, owner-approved migration, phase 6.4): the SDK edit gateway's job moved to the delegated coding path — a mutating subagent (`schedule_subagent`) whose nanny drives the session with `delegate_start`/`delegate_wait`/`delegate_answer`/`delegate_cancel`, on the owner's subscription when a harness route is configured. Compatibility is one-way and permanent: a saved task contract carrying `disabled_tools=["claude_code_edit"]` also withholds the successor `delegate_start` (registry `_disabled_tools`), and the frozen `GET /api/claude-code/status` + `POST /api/claude-code/install` endpoints stay — the Claude runtime still powers the api-route advisory review. Do not resurrect the tool name.
 - Do not recommend `runtime_data/uploads`, skill payloads, or owner state directories as generic artifact transport.
 
 #### Runtime Cleanup / Retention

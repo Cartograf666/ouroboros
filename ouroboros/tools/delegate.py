@@ -6,9 +6,11 @@ API tokens it starts a Claudexor run, watches it, and brings the result home. Be
 the nanny IS the host, verification receipts stay host-authored and the harness's
 output is a claim, not proof.
 
-Three verbs, not four (TZ revision): ``delegate_start``, a time-bounded
-``delegate_wait``, and ``delegate_cancel``. There is no ``hurry`` — Claudexor's only
-control verb is ``cancel``, and cancelling a reviewer destroys the verdict you wanted.
+Four verbs: ``delegate_start``, a time-bounded ``delegate_wait``,
+``delegate_cancel``, and ``delegate_answer`` (a run's pending interactive question is
+answered by its own nanny — owner decision 7=A, poltergeist phase B). There is still
+no ``hurry`` — Claudexor's only control verb is ``cancel``, and cancelling a reviewer
+destroys the verdict you wanted.
 
 Read-only and mutating children share ONE nanny and ONE transport. The only difference
 is the access profile the HOST derives from the calling task's authority (``readonly``
@@ -29,6 +31,7 @@ import json
 import logging
 import pathlib
 import time
+import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from ouroboros import delegate_custody as custody
@@ -36,18 +39,49 @@ from ouroboros import delegate_progress as progress
 from ouroboros.delegate_custody import RunCustody as _RunCustody
 from ouroboros.tool_capabilities import tool_result_limit
 from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for
-from ouroboros.utils import resolve_path_allow_missing, truncate_review_artifact
+from ouroboros.utils import resolve_path_allow_missing, truncate_within_limit
 # The staged-output + read-receipt cluster lives in its own module (size gate);
 # re-exported here because sibling code, the tests and the convergence census all
 # name it on THIS surface, and `_READ_COVERAGE` must stay the same object.
 from ouroboros.delegate_output import (  # noqa: F401
     _ARTIFACT_SUBDIR,
+    _BULK_FIELDS,
+    _PAYLOAD_ENVELOPE_HEADROOM,
+    _PREVIEW_PREFIX_SLACK,
+    _PREVIEW_STEPS,
     _READ_COVERAGE,
     _READ_COVERAGE_MAX_KEYS,
+    _STRUCTURED_FIELDS,
     _covered_whole,
+    _preview_payload,
+    _resolve_full_primary_output,
     _safe_run_filename,
     _stage_full_output,
     acknowledge_staged_output_read,
+)
+# The interactive-question cluster (waiting_on_user + delegate_answer) lives in
+# its own module too (size gate); re-exported here because the wait loop, the
+# tests and sibling code name it on THIS surface, and `_REPORTED_INTERACTIONS`
+# must stay the same object.
+from ouroboros.delegate_interactions import (  # noqa: F401
+    _ANSWER_NOTES,
+    _REPORTED_INTERACTIONS,
+    _answer_delivery_unknown,
+    _bounded_interactions,
+    _delegate_answer,
+    _interactions_are_news,
+    _normalized_answers,
+    _waiting_on_user_payload,
+)
+# The refusal/emit/ownership helpers live in the neutral leaf
+# `ouroboros/delegate_shared.py` (moved to break the facade back-edge:
+# delegate_interactions needs them, and an extracted module never imports the
+# facade back); re-exported here because sibling code, the tests and
+# monkeypatch targets name them on THIS surface.
+from ouroboros.delegate_shared import (  # noqa: F401
+    _emit,
+    _fail,
+    _owned_run,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -75,46 +109,8 @@ _CLAUDEXOR_MAX_SECONDS = 604_800
 # above); re-bound here because sibling code and tests name it on this surface.
 _CUSTODY = custody._CUSTODY
 
-# Room inside the delivery budget for the JSON scaffold and the delivery block itself.
-_PAYLOAD_ENVELOPE_HEADROOM = 2_000
-_PREVIEW_STEPS = (6_000, 3_000, 1_200, 400, 0)
-_BULK_FIELDS = ("final_summary", "primary_output")
-_STRUCTURED_FIELDS = ("outcome_banner", "outcome_facts", "output_conformance", "failure")
 
 
-def _fail(tool: str, code: str, detail: str, **extra: Any) -> str:
-    payload = {"status": "refused", "tool": tool, "reason": code, "detail": detail, **extra}
-    return json.dumps(payload, ensure_ascii=False, indent=2)
-
-
-def _emit(ctx: ToolContext, kind: str, payload: Dict[str, Any]) -> None:
-    custody.emit(custody.custody_root(ctx), kind, {
-        "task_id": str(getattr(ctx, "task_id", "") or ""), **payload,
-    })
-
-
-def _owned_run(ctx: ToolContext, tool: str, run_id: str) -> Tuple[Optional[str], Optional[_RunCustody]]:
-    """Resolve custody for a run, or return a typed refusal payload.
-
-    The daemon bearer token grants the ENTIRE Claudexor API, so a run id is not a
-    capability the way a file descriptor is — anything that can name a run can reach it,
-    read it, or CANCEL it, and cancelling a reviewer destroys the verdict that was the
-    point of running it. Ownership is therefore replayed from the durable start row:
-    a restarted worker keeps its runs, and an id with NO durable record is UNKNOWN
-    (refused as unresolvable), which is a different fact from a run that demonstrably
-    belongs to someone else.
-    """
-    status, entry = custody.lookup(custody.custody_root(ctx), str(getattr(ctx, "task_id", "") or ""), run_id)
-    if status == custody.UNKNOWN:
-        return _fail(tool, "run_ownership_unknown",
-                     "No durable record of that run id exists on this drive, so ownership "
-                     "cannot be established. Unknown ownership is refused, not waved through.",
-                     run_id=run_id), None
-    if status == custody.FOREIGN:
-        return _fail(tool, "run_not_owned",
-                     "That run belongs to another task. A delegated run may only be "
-                     "waited on or cancelled by the task that started it.", run_id=run_id), None
-    return None, entry
 
 
 # Layered onto every lane by Claudexor (native system-prompt channel per harness, so no
@@ -129,7 +125,12 @@ _HOST_INSTRUCTIONS = (
     "takes the diff of this tree and integrates it itself, and a moved HEAD invalidates "
     "that diff and destroys your work. Do not review or accept your own change, do not "
     "touch the host's runtime controls, skills, or memory, and do not write outside "
-    "this root."
+    "this root. If your environment offers a way to ask your host a clarifying "
+    "question, you may use it: your host may answer from its task context; a question "
+    "that carries an engine expiry times out benignly if unanswered — continue with "
+    "stated assumptions rather than blocking — while one without an expiry waits until "
+    "answered. If your harness cannot ask mid-run, do NOT end the run to ask — "
+    "state your assumption and continue."
 )
 
 # DESTINATION 2 of the disclosure (AGENTS.md "Disclose instead of forbid": the durable
@@ -152,11 +153,61 @@ _UNPROVEN_BOUNDARY_INSTRUCTION = (
 )
 
 
-def _host_instructions(authority: "DelegatedRunShape") -> str:
-    """The system-prompt text this run's shape earns. One builder, no dialect."""
+# Per-field bound on the contract text that rides the host instructions: the
+# objective/expected_output of a task contract are prose, and an unbounded field
+# would let one verbose contract dominate the run's system-prompt channel.
+_ASSIGNMENT_FIELD_CHARS = 4_000
+
+
+def _assignment_instructions(ctx: ToolContext) -> str:
+    """The nanny's own objective/expected_output, riding STRUCTURALLY with the run.
+
+    From the IMMUTABLE task contract (delegation-first economics, poltergeist phase
+    B): the child's goal reaches the delegated run in the host-authored
+    ``instructions``, so the nanny does not have to copy its contract into every
+    ``prompt`` it writes — the prompt states the specific assignment, and this block
+    states the task it serves. Host-authored and host-read: the model cannot widen
+    or forge it, and a missing contract simply contributes nothing.
+    """
+    contract = getattr(ctx, "task_contract", None)
+    if not isinstance(contract, dict) or not contract:
+        meta = getattr(ctx, "task_metadata", {})
+        meta = meta if isinstance(meta, dict) else {}
+        raw = meta.get("task_contract")
+        contract = raw if isinstance(raw, dict) else {}
+    objective = str(contract.get("objective") or "").strip()
+    expected = str(contract.get("expected_output") or "").strip()
+    parts: List[str] = []
+    # STRICT bound with the marker INSIDE the budget (F11/sol #9): the generic
+    # preview helper's anti-waste floor let a 4050-char field through whole
+    # against a 4000 budget, and its marker landed BEYOND the limit — right for
+    # display previews, wrong for a bounded prompt-channel field.
+    if objective:
+        parts.append(
+            "HOST TASK OBJECTIVE (the immutable contract of the task hosting this "
+            "run — your prompt below is one assignment inside it): "
+            + truncate_within_limit(objective, _ASSIGNMENT_FIELD_CHARS)
+        )
+    if expected:
+        parts.append(
+            "HOST EXPECTED OUTPUT: "
+            + truncate_within_limit(expected, _ASSIGNMENT_FIELD_CHARS)
+        )
+    return "\n\n".join(parts)
+
+
+def _host_instructions(authority: "DelegatedRunShape", assignment: str = "") -> str:
+    """The system-prompt text this run's shape earns. One builder, no dialect.
+
+    ``assignment`` is the host-authored contract block (``_assignment_instructions``);
+    appended last so the prohibitions stay the opening statement.
+    """
+    text = _HOST_INSTRUCTIONS
     if authority.delegated:
-        return _HOST_INSTRUCTIONS + _UNPROVEN_BOUNDARY_INSTRUCTION
-    return _HOST_INSTRUCTIONS
+        text += _UNPROVEN_BOUNDARY_INSTRUCTION
+    if assignment:
+        text += "\n\n" + assignment
+    return text
 
 
 def _derive_authority(ctx: ToolContext) -> "DelegatedRunShape":
@@ -330,6 +381,20 @@ def _terminal_payload(run_id: str, detail: Dict[str, Any],
     }
     if authority.delegated:
         payload["containment"] = _containment_evidence(detail)
+    facts = payload.get("outcome_facts")
+    if isinstance(facts, dict) and str(facts.get("reason") or "") == "input_required":
+        # The codex-shaped question (B4): that lane has no mid-run channel, so a
+        # question arrives as this TERMINAL. There is deliberately NO rerun verb
+        # here — the engine's rerun_with_feedback would start a run outside this
+        # task's custody trail — so the honest answer path is a plain new start.
+        payload["input_required_note"] = (
+            "This run ended NEEDING INPUT (outcome_facts.reason=input_required — "
+            "see outcome_facts.work_state.required_inputs). Its harness has no "
+            "mid-run question channel, so the question arrives as this terminal. Answer it by "
+            "starting a plain NEW delegate_start whose prompt carries the original "
+            "assignment plus the answers; custody of the new run stays with you. "
+            "Do not look for a rerun/decision verb — none exists on this surface."
+        )
     return payload
 
 
@@ -440,138 +505,6 @@ def _reported_cost(summary: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # -- output delivery -----------------------------------------------------------
-
-
-def _preview_payload(full: Dict[str, Any], text: str, artifact: Optional[Dict[str, Any]],
-                     budget: int, consumed: bool = False, full_ok: bool = True,
-                     full_note: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Shrink the inline view until it FITS, and say so in typed fields.
-
-    The bulk fields are renamed to ``*_preview`` rather than silently shortened: a
-    consumer reading ``primary_output`` gets nothing instead of a cut string it would
-    mistake for the whole answer.
-
-    ``consumed`` is the DURABLE fact (the D7 acknowledgement row exists), never an
-    assumption: on first delivery it is False, and a re-wait on the same terminal run
-    reports True only after the artifact really was read whole. ``full_ok`` is whether
-    the staged content is the VERIFIED full result; ``full_note`` is the typed
-    disclosure of how the engine's bounded primary-output preview was (or was not)
-    resolved to the full artifact.
-    """
-    delivery: Dict[str, Any] = {
-        "complete": False,
-        "consumed": bool(consumed),
-        "inline_is_preview": True,
-        "total_chars": len(text),
-        "artifact": artifact,
-        "read_next": ({"tool": "read_file", "root": artifact["root"], "path": artifact["path"],
-                       "start_line": 1, "max_lines": 2000} if artifact else None),
-        "note": (
-            (("PARTIAL inline, but the staged artifact has already been read whole — the "
-              "durable acknowledgement exists, so this result counts as obtained."
-              if consumed else
-              "PARTIAL. The inline fields are a bounded preview; the whole terminal payload "
-              "is the artifact above. Read it in chunks with read_file(root=..., path=..., "
-              "start_line=N, max_lines=M) — start_line is a stable cursor over an immutable "
-              "file — until your reads have covered EVERY character, contiguously. Delivery "
-              "is char-bounded: a window longer than the tool-result budget is cut at "
-              "delivery, and the cut remainder only counts as read once you advance WITHIN "
-              "it via start_char. A review or research result is NOT consumed, and must not "
-              "be reported as its verdict, until the whole artifact has been read.")
-             if full_ok else
-             "PARTIAL and INCOMPLETE AT THE SOURCE: the engine reported its primary output "
-             "as a bounded preview and the full artifact could not be matched to the size "
-             "or the preview the run itself reported (see primary_output_full; the engine "
-             "publishes no content hash for it, so that match is the whole of the check). "
-             "Treat this result as incomplete evidence, not as "
-             "the verdict; it can never be acknowledged as fully read.")
-            if artifact else
-            "PARTIAL and UNRECOVERABLE INLINE: the full payload could not be staged to the "
-            "task drive. Treat this result as incomplete evidence, not as the verdict."
-        ),
-    }
-    if full_note is not None:
-        delivery["primary_output_full"] = full_note
-    payload: Dict[str, Any] = {}
-    for preview_chars in _PREVIEW_STEPS:
-        payload = {key: value for key, value in full.items() if key not in _BULK_FIELDS}
-        for field in _BULK_FIELDS:
-            raw = full.get(field)
-            if raw is None:
-                continue
-            body = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
-            payload[f"{field}_preview"] = body[:preview_chars]
-        for field in _STRUCTURED_FIELDS:
-            value = payload.get(field)
-            if value is not None and len(json.dumps(value, ensure_ascii=False)) > preview_chars:
-                payload[field] = {"omitted": "see output_delivery.artifact"}
-        payload["output_delivery"] = delivery
-        # Same threshold as the complete branch: the headroom covers the JSON scaffold
-        # and the settlement block the caller appends afterwards.
-        if len(json.dumps(payload, ensure_ascii=False, indent=2)) <= budget - _PAYLOAD_ENVELOPE_HEADROOM:
-            return payload
-    return payload
-
-
-# Tolerance for the preview-prefix consistency check below: the engine redacts the
-# preview over a bounded prefix window with a 1 KiB overlap, so a secret spanning the
-# preview boundary may redact differently in the full serve than in the preview tail.
-_PREVIEW_PREFIX_SLACK = 2_048
-
-
-def _resolve_full_primary_output(gateway: Any, run_id: str,
-                                 primary: Any) -> Tuple[Any, bool, Optional[Dict[str, Any]]]:
-    """Resolve the engine's bounded primary-output preview to the verified FULL text.
-
-    ``primaryOutput.text`` on the run detail is a 256 KiB PREVIEW (control-api
-    ``PRIMARY_OUTPUT_PREVIEW_BYTES``), with ``bytes`` (on-disk size) and ``truncated``
-    beside it. A truncated preview must NEVER be staged, delivered or acknowledged as
-    the result: the full file is fetched from ``GET /v2/runs/:id/artifacts/<path>`` and
-    verified against what the run reported before it may wear the plain name.
-
-    The engine reports NO content hash for the primary output, so verification is what
-    the contract actually offers: the served size equal to the reported ``bytes``
-    (exact), or — because the artifact route serves text through ``redactSecrets``,
-    which can legally change the length — the fetched text carrying the preview as its
-    prefix (up to a bounded slack at the preview boundary, where the engine's own
-    redaction overlap can differ). Anything less keeps the preview, marked incomplete,
-    with a typed disclosure — never a partial result wearing a full one's name.
-
-    Returns ``(primary_output, full_ok, disclosure)``; ``disclosure`` is None when the
-    engine never reported a truncation.
-    """
-    if not isinstance(primary, dict) or primary.get("truncated") is not True:
-        return primary, True, None
-    path = str(primary.get("path") or "")
-    reported_bytes = primary.get("bytes")
-    preview_text = primary.get("text") if isinstance(primary.get("text"), str) else ""
-    disclosure: Dict[str, Any] = {"requested": True, "fetched": False, "verified": "",
-                                  "path": path, "reported_bytes": reported_bytes}
-    if not path or gateway is None:
-        disclosure["reason"] = "no_artifact_path" if not path else "no_transport"
-        return primary, False, disclosure
-    try:
-        raw = gateway.get_run_artifact(run_id, path)
-    except Exception as exc:
-        disclosure["reason"] = truncate_review_artifact(
-            f"{getattr(exc, 'code', type(exc).__name__)}: {exc}", 300)
-        return primary, False, disclosure
-    disclosure["fetched"] = True
-    disclosure["fetched_bytes"] = len(raw)
-    full_text = raw.decode("utf-8", errors="replace")
-    if isinstance(reported_bytes, int) and not isinstance(reported_bytes, bool) \
-            and len(raw) == reported_bytes:
-        disclosure["verified"] = "size"
-    else:
-        prefix = preview_text[:max(0, len(preview_text) - _PREVIEW_PREFIX_SLACK)]
-        if prefix and full_text.startswith(prefix) and len(full_text) >= len(preview_text):
-            disclosure["verified"] = "preview_prefix"
-        else:
-            disclosure["reason"] = "verification_failed_size_and_prefix"
-            return primary, False, disclosure
-    resolved = {**primary, "text": full_text, "truncated": False,
-                "full_fetched": True, "verified_by": disclosure["verified"]}
-    return resolved, True, disclosure
 
 
 def _delivered_terminal_payload(ctx: ToolContext, run_id: str, detail: Dict[str, Any],
@@ -718,24 +651,28 @@ def _mutating_run_root(ctx: ToolContext, authority: "DelegatedRunShape") -> tupl
     return root, ""
 
 def _start_request(ctx: ToolContext, route: Any, authority: "DelegatedRunShape",
-                   root: str, text: str, seconds: int) -> Dict[str, Any]:
+                   root: str, text: str, seconds: int, instructions: str) -> Dict[str, Any]:
     """The POST body for one delegated run, built from the derived SHAPE.
 
     Extracted so the caller stays inside the method-size gate, and so the body has ONE
-    author: the shape decides the mode, the instructions and whether the delegated
-    marker rides along, and nothing here re-derives any of them.
+    author: the shape decides the mode and whether the delegated marker rides along,
+    and nothing here re-derives either.
 
-    ``seconds`` arrives PRE-BOUNDED rather than being derived here: a transport retry
-    of a pending invocation must present a byte-identical body for the engine's replay
-    match, and the deadline-derived bound changes with the clock, so the caller decides
-    whether to recompute it or replay the recorded one.
+    ``seconds`` and ``instructions`` arrive PRE-BUILT rather than being derived here:
+    a transport retry of a pending invocation must present a byte-identical body for
+    the engine's replay match, and both the deadline-derived bound and the
+    contract-derived instructions can change between calls, so the caller decides
+    whether to recompute them or replay the recorded ones (the retry path never calls
+    this function at all — it replays the stored canonical body verbatim).
     """
     request: Dict[str, Any] = {
         "prompt": text,
-        # Built from the SHAPE, so a mutating delegated child is told that its
-        # boundary is a request and not a fact — the same disclosure the durable
-        # record and the parent's result carry, in the one place the child can read.
-        "instructions": _host_instructions(authority),
+        # Built from the SHAPE plus the task contract, so a mutating delegated
+        # child is told that its boundary is a request and not a fact — the same
+        # disclosure the durable record and the parent's result carry, in the one
+        # place the child can read — and the nanny's own objective rides along
+        # structurally (`_assignment_instructions`).
+        "instructions": instructions,
         # The engine's default authPreference is `auto` = subscription-first WITH
         # policy fallback to a paid API key. That fallback is invisible to us and
         # would be settled at a confident $0.00 — the one shape the ledger must
@@ -948,11 +885,18 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             existing_project = gateway.find_project_id(root)
             project_id = existing_project or gateway.register_project(root)
             owned_project_id = "" if existing_project else project_id
+            # The canonical ASSIGNMENT — prompt plus host-authored instructions —
+            # is digested together: two starts whose prompts agree but whose
+            # contract blocks differ are two different logical starts. The digest
+            # is the LOOKUP identity only; the wire key stays the invocation id,
+            # and a retry replays the STORED body byte-identically regardless.
+            instructions = _host_instructions(authority, _assignment_instructions(ctx))
             key = custody.idempotency_key(getattr(ctx, "task_id", ""), route.route_id, access,
-                                          authority.mode, authority.isolation, root, text)
+                                          authority.mode, authority.isolation, root, text,
+                                          instructions)
             invocation_id = custody.new_invocation_id()
             seconds = _bounded_max_seconds(ctx, max_seconds)
-            request_body = _start_request(ctx, route, authority, root, text, seconds)
+            request_body = _start_request(ctx, route, authority, root, text, seconds, instructions)
         lineage = getattr(ctx, "task_metadata", {}) or {}
         lineage = lineage if isinstance(lineage, dict) else {}
         requested = custody.record_start_requested(
@@ -1235,6 +1179,13 @@ def _halt_breached_run(ctx: ToolContext, gateway: Any, entry: _RunCustody,
     )
 
 
+# The typed external-wait lease lives in `delegate_progress` (the wait-liveness
+# module); re-bound here because the wait's own seams and the tests name it on
+# this surface, exactly like the staged-output cluster above.
+_external_wait_lease_until = progress.external_wait_lease_until
+_emit_external_wait_lease = progress.emit_external_wait_lease
+
+
 def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None,
                    since_seq: Optional[int] = None) -> str:
     """Time-bounded, progress-aware wait (docs/DEVELOPMENT.md "Timeout & Wait Control").
@@ -1262,7 +1213,11 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
     time is the typed refusal it was, never a wait reported as quiet.
     """
     from ouroboros.config import get_delegate_wait_max_sec, get_delegate_wait_sec
-    from ouroboros.gateways.claudexor import ClaudexorGateway, ClaudexorUnavailable
+    from ouroboros.gateways.claudexor import (
+        ClaudexorGateway,
+        ClaudexorUnavailable,
+        pending_interactions as _cx_pending,
+    )
 
     rid = str(run_id or "").strip()
     if not rid:
@@ -1300,6 +1255,16 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
     # (an old row, an unknown run) stay null — never invented.
     _started_ts, _run_max_seconds = custody.run_timing(custody.custody_root(ctx), rid)
     _started_at = parse_deadline_ts(_started_ts)
+    # The idle-rail lease for THIS hold: granted before the loop, released in the
+    # finally below — the supervisor's idle enforcer spares a leased task while
+    # every other rail (deadline, ceiling, budget, cancel) still cuts through.
+    # The grant carries a unique lease_id (F5b) and the release names the SAME
+    # id, so an abandoned, executor-killed wait thread's late release can never
+    # blank a newer grant made by this task's next wait.
+    _lease_id = uuid.uuid4().hex
+    _emit_external_wait_lease(
+        ctx, rid, _external_wait_lease_until(ctx, window, _started_at, _run_max_seconds),
+        lease_id=_lease_id)
     try:
         detail = progress.bounded_poll(gateway, rid, deadline - time.monotonic())
         baseline = int(since_seq) if since_seq is not None else int(detail.get("lastSeq") or 0)
@@ -1361,13 +1326,25 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                 # a silently blocking wait would starve.
                 progress.emit(ctx, rid, seen.record(detail, last_seq, int(time.monotonic() - started)))
                 baseline = last_seq          # so the NEXT advance is counted once
+            pending = _cx_pending(detail)
+            if pending and _interactions_are_news(rid, pending):
+                # A NEW question returns IMMEDIATELY: the old wait kept only the
+                # waitingOnUser boolean and showed it at window expiry, so a paused
+                # run burned the rest of the window (up to the engine's whole
+                # answer timeout) in dead metered polling. A question the model
+                # ALREADY saw does not re-trigger — a nanny that escalated to its
+                # human keeps holding windows instead of busy-looping, and the
+                # engine timeout stays the backstop.
+                return _waiting_on_user_payload(ctx, rid, state, last_seq, pending,
+                                                seen=seen)
             def _expired() -> str:
                 rendered = progress.rendered_window(
                     run_id=rid, state=state, last_seq=last_seq, window=window,
                     elapsed_seconds=(None if _started_at is None else max(0, int(
                         (_dt.datetime.now(tz=_dt.timezone.utc) - _started_at).total_seconds()))),
                     max_seconds=_run_max_seconds or None,
-                    waiting_on_user=bool(summary.get("waitingOnUser")),
+                    waiting_on_user=bool(summary.get("waitingOnUser")) or bool(pending),
+                    pending_interactions=_bounded_interactions(pending) if pending else None,
                     detail=detail, seen=seen,
                     budget=tool_result_limit("delegate_wait"))
                 from ouroboros.tools.control import cache_horizon_note
@@ -1395,6 +1372,7 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
     except ClaudexorUnavailable as exc:
         return _fail("delegate_wait", exc.code, str(exc), run_id=rid)
     finally:
+        _emit_external_wait_lease(ctx, rid, 0.0, lease_id=_lease_id)
         gateway.close()
 
 
@@ -1503,9 +1481,15 @@ def get_tools() -> List[ToolEntry]:
                 "returns a typed no-progress reason. Keepalives are not progress. Calling "
                 "again with a tiny wait_sec to 'check' is a busy-poll: it costs a "
                 "full-context round per call and buys nothing, because this call already "
-                "waited. Pass since_seq=last_seq to keep following. A large terminal "
-                "result is delivered as a bounded preview plus an artifact: read "
-                "output_delivery and finish reading the artifact before you rely on it."
+                "waited. Pass since_seq=last_seq to keep following. A run that asks its "
+                "user a question returns IMMEDIATELY as status='waiting_on_user' with "
+                "the full question set (interaction/question ids ride WHOLE, never "
+                "truncated): answer it with delegate_answer, or escalate to your "
+                "human and keep waiting (a question with a timeout_at benign-declines "
+                "at the engine timeout; timeout_at=null waits until answered). A "
+                "large terminal result is delivered as a bounded preview plus an "
+                "artifact: read output_delivery and finish reading the artifact before "
+                "you rely on it."
             ),
             "parameters": {"type": "object", "required": ["run_id"], "properties": {
                 "run_id": {"type": "string", "description": "Run id from delegate_start."},
@@ -1531,6 +1515,49 @@ def get_tools() -> List[ToolEntry]:
                 "reason": {"type": "string", "description": "Why you are stopping it."},
             }},
         }, lambda ctx, run_id, reason="": _delegate_cancel(ctx, run_id, reason), timeout_sec=120),
+        ToolEntry("delegate_answer", {
+            "name": "delegate_answer",
+            "description": (
+                "Answer a delegated run's pending interactive question — the "
+                "status='waiting_on_user' payload from delegate_wait names the "
+                "interaction_id and its questions. Only the task that started the run "
+                "may answer. Policy: answer from the task context you already hold; a "
+                "question ABOVE your authority (spending money, changing scope, "
+                "external actions) is not yours to guess — surface it to your human "
+                "via progress and keep waiting; an unanswered question with a "
+                "timeout_at benign-declines at the engine timeout (the run continues "
+                "on stated assumptions), while timeout_at=null waits until answered. "
+                "Typed outcomes: delivered; already_resolved (the run moved on — do "
+                "not re-post); not_found; rejected (a definite engine refusal of "
+                "these rows — HTTP 400/409/413/422 only — fix them); "
+                "subscription_window_exhausted (a distinct outcome carrying reset_at "
+                "— the answer did NOT land; retry the SAME answers after reset_at); "
+                "delivery_unknown "
+                "(transport died mid-answer — re-check with delegate_wait and NEVER "
+                "post a different answer for the same interaction). Codex-lane runs "
+                "have no mid-run questions: a run that ENDS needing input "
+                "(outcome_facts.reason=input_required) is answered with a plain NEW "
+                "delegate_start whose prompt carries the assignment plus the answers "
+                "— there is no rerun/decision verb, and custody stays with you."
+            ),
+            "parameters": {"type": "object",
+                           "required": ["run_id", "interaction_id", "answers"],
+                           "properties": {
+                "run_id": {"type": "string", "description": "Run id from delegate_start."},
+                "interaction_id": {"type": "string", "description":
+                    "The interaction being answered, from the waiting_on_user payload."},
+                "answers": {"type": "array", "items": {"type": "object", "properties": {
+                    "question_id": {"type": "string", "description":
+                        "The question's id from the waiting_on_user payload."},
+                    "selected_labels": {"type": "array", "items": {"type": "string"},
+                                        "description": "Labels of the chosen option(s)."},
+                    "free_text": {"type": "string", "description":
+                        "Free-text answer; omit when options were selected."},
+                }, "required": ["question_id"]}, "description":
+                    "One row per question you are answering."},
+            }},
+        }, lambda ctx, run_id, interaction_id, answers: _delegate_answer(
+            ctx, run_id, interaction_id, answers), timeout_sec=120),
     ]
 
 

@@ -1004,3 +1004,25 @@ def truncate_review_artifact(text: str | None, limit: int = 4000) -> str:
     if len(text) - limit <= len(marker):
         return text
     return text[:limit] + marker
+
+
+def truncate_within_limit(text: str | None, limit: int) -> str:
+    """A STRICT disclosed bound: the result NEVER exceeds ``limit`` characters,
+    with the omission marker INSIDE the budget.
+
+    For fields whose limit is a hard wire/prompt budget rather than a display
+    preference. ``truncate_review_artifact``'s anti-waste floor deliberately lets
+    a small overflow pass through whole and appends its marker BEYOND the limit —
+    right for logs and previews, wrong for a bounded field: a 4050-char
+    assignment field rode through at 4050 against a 4000 budget (sol #9 probe),
+    and a 50k harness-authored header rode a "bounded" projection to 3x the tool
+    budget. Disclosure survives — the marker states the cut and the original
+    length — but the budget wins. A limit too small to hold the marker returns a
+    bare prefix: at that scale the marker WOULD BE the content."""
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    marker = f"\n⚠️ OMISSION NOTE: truncated at {limit} chars; original length {len(text)}"
+    if limit <= len(marker):
+        return text[:max(0, limit)]
+    return text[: limit - len(marker)] + marker
