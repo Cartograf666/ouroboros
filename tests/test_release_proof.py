@@ -265,6 +265,40 @@ def test_linux_rpm_stage_recreates_the_absolute_cli_symlink():
     ) in builder
 
 
+def test_linux_packages_ship_the_systemd_user_unit():
+    """Both packages must carry the unit, and neither may enable it.
+
+    Without the unit a packaged install has no stable name to stop: the desktop
+    launcher lands in a transient scope whose name changes every start, and
+    killing only the parent leaves workers holding port 8765.  Shipping it must
+    stay inert, though — enabling or starting a desktop agent from a package
+    postinst would be wrong.
+    """
+    builder = (REPO / "scripts" / "build_linux_packages.sh").read_text(encoding="utf-8")
+    unit = (REPO / "packaging" / "systemd" / "ouroboros.service").read_text(encoding="utf-8")
+
+    # deb stage
+    assert (
+        'install -m 644 packaging/systemd/ouroboros.service'
+    ) in builder
+    assert '"$ROOT/usr/lib/systemd/user"' in builder
+    # rpm stage
+    assert '"%{buildroot}/usr/lib/systemd/user"' in builder
+    assert '/usr/lib/systemd/user/ouroboros.service' in builder
+
+    # A user unit, not a system one: state lives in $HOME.
+    assert "WantedBy=default.target" in unit
+    # Stopping must reach the worker pool, not just the launcher.
+    assert "KillMode=control-group" in unit
+
+    # Nothing may activate it on install.
+    for forbidden in ("systemctl enable", "systemctl --user enable", "systemctl start"):
+        assert forbidden not in builder, (
+            f"packaging must not run {forbidden!r}: enabling a desktop agent "
+            "from a package is the user's decision"
+        )
+
+
 def test_linux_package_smoke_starts_the_desktop_launcher_on_ubuntu_22_04():
     smoke = (REPO / "scripts" / "smoke_linux_packages.sh").read_text(encoding="utf-8")
 

@@ -1,0 +1,42 @@
+[Unit]
+# systemd USER unit: Ouroboros keeps its state in the invoking user's home
+# ($HOME/Ouroboros) and, in desktop mode, needs that user's session.  A system
+# unit would run as another user and silently use a different data directory.
+#
+# Install:  systemctl --user enable --now ouroboros
+# Stop:     systemctl --user stop ouroboros
+# Logs:     journalctl --user -u ouroboros -f
+Description=Ouroboros agent runtime
+Documentation=https://github.com/razzant/ouroboros
+After=network-online.target
+Wants=network-online.target
+# Do not fight a persistent failure: five restarts inside five minutes stops the
+# unit instead of looping forever (a crash loop on a bound port otherwise racks
+# up dozens of restarts and buries the real error in the journal).
+# Both keys belong in [Unit] on systemd >= 229.
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+# Desktop build.  For a headless host replace with the CLI server, e.g.
+#   ExecStart=/usr/local/bin/ouroboros server
+# Both write to the same $HOME/Ouroboros state directory.
+ExecStart=/opt/ouroboros/Ouroboros
+
+# The launcher spawns server.py plus a pool of workers.  KillMode=control-group
+# (the default) stops the whole cgroup, which is what makes a plain
+# `systemctl --user stop ouroboros` sufficient — otherwise the workers survive
+# and keep port 8765 bound, and the next start fails with "address already in
+# use".
+KillMode=control-group
+KillSignal=SIGTERM
+# Long-running tool calls (a 45k-token prompt on a modest GPU takes minutes)
+# must not be cut short by an impatient stop.
+TimeoutStopSec=120
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -51,7 +51,8 @@ STAGE="$(cd "$OUTDIR" && pwd)/.package-stage"
 ROOT="$STAGE/root"
 rm -rf "$STAGE"
 trap 'rm -rf "$STAGE"' EXIT
-mkdir -p "$ROOT/opt" "$ROOT/usr/bin" "$ROOT/usr/share/applications" "$ROOT/usr/share/pixmaps"
+mkdir -p "$ROOT/opt" "$ROOT/usr/bin" "$ROOT/usr/share/applications" \
+    "$ROOT/usr/share/pixmaps" "$ROOT/usr/lib/systemd/user"
 
 if ! cp -al "$PAYLOAD" "$ROOT/opt/ouroboros" 2>/dev/null; then
     echo "Hardlink staging is unavailable; copying the payload once instead."
@@ -62,6 +63,12 @@ fi
 # root, so a plain /usr/bin symlink is all either package needs.
 ln -s /opt/ouroboros/bin/ouroboros "$ROOT/usr/bin/ouroboros"
 cp assets/icon_1024.png "$ROOT/usr/share/pixmaps/ouroboros.png"
+# systemd USER unit, not a system one: state lives in $HOME/Ouroboros and the
+# desktop build needs the user's session.  Shipping it only makes
+# `systemctl --user start|stop ouroboros` available by a stable name — there is
+# no [Install] activation here, so nothing is enabled or started on install.
+install -m 644 packaging/systemd/ouroboros.service \
+    "$ROOT/usr/lib/systemd/user/ouroboros.service"
 cat > "$ROOT/usr/share/applications/ouroboros.desktop" <<EOF
 [Desktop Entry]
 Type=Application
@@ -132,7 +139,8 @@ mkdir -p \
   "%{buildroot}/opt" \
   "%{buildroot}/usr/bin" \
   "%{buildroot}/usr/share/applications" \
-  "%{buildroot}/usr/share/pixmaps"
+  "%{buildroot}/usr/share/pixmaps" \
+  "%{buildroot}/usr/lib/systemd/user"
 # Keep the multi-gigabyte payload hardlinked inside the output-local stage,
 # but recreate the absolute CLI symlink explicitly. Some rpmbuild/cp
 # combinations try to hardlink its missing target when copying the whole root.
@@ -142,6 +150,8 @@ cp -a "$ROOT/usr/share/applications/ouroboros.desktop" \
   "%{buildroot}/usr/share/applications/ouroboros.desktop"
 cp -a "$ROOT/usr/share/pixmaps/ouroboros.png" \
   "%{buildroot}/usr/share/pixmaps/ouroboros.png"
+cp -a "$ROOT/usr/lib/systemd/user/ouroboros.service" \
+  "%{buildroot}/usr/lib/systemd/user/ouroboros.service"
 
 %files
 %defattr(-,root,root,-)
@@ -149,6 +159,7 @@ cp -a "$ROOT/usr/share/pixmaps/ouroboros.png" \
 /usr/bin/ouroboros
 /usr/share/applications/ouroboros.desktop
 /usr/share/pixmaps/ouroboros.png
+/usr/lib/systemd/user/ouroboros.service
 
 %changelog
 EOF
