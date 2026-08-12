@@ -13,6 +13,8 @@ the same request replayed later succeeded.
 
 from __future__ import annotations
 
+import pytest
+
 
 class TestBuildRemoteKwargsCacheOptOut:
     def test_no_cache_field_absent_by_default(self):
@@ -183,6 +185,62 @@ class TestRetryLoopRequestsCacheOptOut:
             2,
             tmp_path,
             "task-transient-cache",
+            1,
+            None,
+            {},
+        )
+
+        assert msg["content"] == "recovered"
+        assert [call["bypass_response_cache"] for call in calls] == [False, False]
+
+    @pytest.mark.parametrize(("kind", "code"), [("rate_limit", 429), ("provider_transient", 503)])
+    def test_transient_body_error_does_not_request_litellm_cache_bypass(
+        self, kind, code, tmp_path, monkeypatch,
+    ):
+        import time
+
+        from ouroboros.llm import LLMClient
+        from ouroboros.loop_llm_call import call_llm_with_retry
+
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+        target = {
+            "provider": "openai-compatible",
+            "resolved_model": "local-reason",
+            "usage_model": "openai-compatible/local-reason",
+            "supports_openrouter_extensions": False,
+        }
+        body_error_msg, body_error_usage = LLMClient(api_key="test")._normalize_remote_response(
+            {
+                "id": f"body-error-{code}",
+                "choices": [],
+                "error": {"code": code, "message": "transient provider error"},
+                "usage": {},
+            },
+            target,
+            skip_cost_fetch=True,
+        )
+        assert body_error_usage["provider_error"]["kind"] == kind
+        calls = []
+
+        class BodyErrorThenSuccessfulLLM:
+            def chat(self, **kwargs):
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    return body_error_msg, body_error_usage
+                return (
+                    {"content": "recovered", "tool_calls": [], "finish_reason": "stop"},
+                    {"provider": "openai-compatible", "resolved_model": "local-reason"},
+                )
+
+        msg, _cost = call_llm_with_retry(
+            BodyErrorThenSuccessfulLLM(),
+            [{"role": "user", "content": "hi"}],
+            "openai-compatible::local-reason",
+            None,
+            "medium",
+            2,
+            tmp_path,
+            f"task-body-error-{code}",
             1,
             None,
             {},

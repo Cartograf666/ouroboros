@@ -991,7 +991,7 @@ def call_llm_with_retry(
                     task_type=task_type, content=content, tool_calls=tool_calls,
                     request_ref=request_ref, response_ref=response_ref, transient_budget=transient_budget,
                 )
-                if event_type == "provider_incomplete_response":
+                if event_type == "provider_incomplete_response" and not usage.get("provider_error"):
                     response_cache_bypass_requested = True
                 # Transient response glitches retry the same model; permanent body errors fail fast.
                 if not permanent_body_error and attempt < transient_budget - 1:
