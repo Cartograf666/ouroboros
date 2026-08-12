@@ -92,6 +92,9 @@ def _delete_loose_object(repo: pathlib.Path, oid: str) -> None:
     assert obj_path.exists(), (
         "fixture assumption: a fresh repo keeps this object loose"
     )
+    # git stores loose objects read-only; Windows refuses to unlink a
+    # read-only file (WinError 5), so lift the bit first.
+    obj_path.chmod(0o644)
     obj_path.unlink()
 
 
