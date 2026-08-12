@@ -292,7 +292,10 @@ class TestCaptureAndIntegrate:
 
         target, ctx, handle = self._provisioned(tmp_path, monkeypatch)
         exec_root = pathlib.Path(handle.path)
-        odd = 'we"ird na me.txt'
+        # NTFS forbids '"' in filenames (Errno 22), so Windows exercises the
+        # same git-quoting path with a legal odd name: spaces + an apostrophe
+        # still force quoted pathspecs through the capture/apply cycle.
+        odd = "we'ird na me.txt" if os.name == "nt" else 'we"ird na me.txt'
         (exec_root / odd).write_text("odd\n", encoding="utf-8")
         # A pure rename of a tracked file (content preserved -> git reports it as
         # a rename, the empty-path + two-fields shape of --numstat -z).
