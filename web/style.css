@@ -7087,6 +7087,24 @@ textarea.chat-input {
     color: var(--danger, #e5534b);
 }
 
+/* An UNAVAILABLE thread action is GREYED, not merely inert. Those rows carry
+   `disabled` plus a `title` naming the reason — but with no rule here they
+   rendered at full contrast, with `cursor: pointer` and a live hover, so
+   `Merge back` on a thread with no checkout looked exactly like `Fork` and its
+   reason lived only in a tooltip nobody has cause to open. The DOM assertions
+   were green throughout; it was found by LOOKING at the rendered menu, which is
+   what the vision pass is for. Same shape as `.skills-menu-item:disabled`
+   above, neutralised hover included — a row that lights up under the pointer
+   reads as clickable whatever its attributes say. */
+.project-row-menu button:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
+
+.project-row-menu button:disabled:hover {
+    background: transparent;
+}
+
 /* New Project dialog */
 .new-project-dialog {
     max-width: 560px;

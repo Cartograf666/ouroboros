@@ -321,3 +321,27 @@ def test_inline_nav_glyphs_byte_match_the_canonical_page_icons():
         )
         checked += 1
     assert checked == 6
+
+
+def test_an_unavailable_thread_menu_row_is_greyed_not_only_inert():
+    """T4 vision pass: `disabled` in the DOM is not a visible state.
+
+    The thread menu greys an action it cannot offer and keeps its reason on the
+    row (rather than omitting it, which teaches nothing). `.project-row-menu
+    button` had no `:disabled` rule at all, so `Merge back` on a thread with no
+    checkout rendered at full contrast with `cursor: pointer` and a live hover —
+    indistinguishable from `Fork` beside it, with the reason only in a tooltip.
+    Every DOM assertion was green; only the rendered menu showed it.
+
+    Pinned here because the failure is invisible to the Playwright DOM checks
+    that already cover this menu: `[disabled]` was — and still is — present.
+    """
+    css = _read("web/style.css")
+    assert ".project-row-menu button:disabled {" in css
+    disabled_rule = css.split(".project-row-menu button:disabled {", 1)[1].split("}", 1)[0]
+    assert "opacity" in disabled_rule
+    assert "cursor: not-allowed" in disabled_rule
+    # ...and the hover must not light a row the owner cannot use.
+    assert ".project-row-menu button:disabled:hover {" in css
+    hover_rule = css.split(".project-row-menu button:disabled:hover {", 1)[1].split("}", 1)[0]
+    assert "background: transparent" in hover_rule
