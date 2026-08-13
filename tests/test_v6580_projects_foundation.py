@@ -16,7 +16,20 @@ def _init_git_repo(path: pathlib.Path) -> None:
     (path / "README.md").write_text("x\n", encoding="utf-8")
     subprocess.run(["git", "add", "-A"], cwd=str(path), check=True)
     subprocess.run(
-        ["git", "-c", "user.name=t", "-c", "user.email=t@local", "commit", "-qm", "init"],
+        [
+            "git",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@local",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
+            "commit",
+            "-qm",
+            "init",
+        ],
         cwd=str(path), check=True,
     )
 
@@ -135,8 +148,13 @@ def test_resolve_room_workspace_loud_fails_on_broken_working_dir(tmp_path):
 
     def _chmod_and_retry(func, path, _exc):
         # Windows: git object files are read-only; plain rmtree hits WinError 5.
-        os.chmod(path, stat.S_IWRITE)
-        func(path)
+        # Git maintenance may remove a transient lock between rmtree's failed
+        # unlink and this callback; an already-absent path is cleanup success.
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except FileNotFoundError:
+            pass
 
     shutil.rmtree(gone, onerror=_chmod_and_retry)  # the folder disappears after registration
 
@@ -205,7 +223,20 @@ def _coop_tree_with_child_work(projects_root: pathlib.Path) -> tuple[pathlib.Pat
     (tree / "app.py").write_text("print('v1')\n", encoding="utf-8")
     subprocess.run(["git", "add", "-A"], cwd=str(tree), check=True)
     subprocess.run(
-        ["git", "-c", "user.name=t", "-c", "user.email=t@local", "commit", "-qm", "child work"],
+        [
+            "git",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@local",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
+            "commit",
+            "-qm",
+            "child work",
+        ],
         cwd=str(tree), check=True,
     )
     patch = subprocess.run(

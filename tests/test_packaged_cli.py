@@ -22,6 +22,11 @@ def _make_bundle_root(tmp_path: pathlib.Path, root: pathlib.Path | None = None) 
     return root
 
 
+def _set_test_home(monkeypatch, home: pathlib.Path) -> None:
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+
+
 def test_packaged_cli_resolves_bundle_from_nested_bin(tmp_path):
     from ouroboros import packaged_cli
 
@@ -268,7 +273,7 @@ def test_installer_plan_chooses_user_local_path_dir(tmp_path, monkeypatch):
     home = tmp_path / "home"
     target_dir = home / ".local" / "bin"
     target_dir.mkdir(parents=True)
-    monkeypatch.setenv("HOME", str(home))
+    _set_test_home(monkeypatch, home)
     monkeypatch.setenv("PATH", str(target_dir))
 
     plan = plan_posix_install(root)
@@ -286,7 +291,7 @@ def test_installer_plan_ignores_ambient_path_dirs(tmp_path, monkeypatch):
     harness_dir.mkdir(parents=True)
     system_dir = tmp_path / "system-bin"
     system_dir.mkdir()
-    monkeypatch.setenv("HOME", str(home))
+    _set_test_home(monkeypatch, home)
     monkeypatch.setenv("PATH", os.pathsep.join([str(harness_dir), str(system_dir)]))
 
     plan = plan_posix_install(root)
@@ -309,7 +314,7 @@ def test_installer_default_migrates_owned_shadowing_shim(tmp_path, monkeypatch, 
     os.chmod(root / "bin" / "ouroboros", 0o755)
     os.chmod(old_root / "bin" / "ouroboros", 0o755)
     os.symlink(old_root / "bin" / "ouroboros", old_shim)
-    monkeypatch.setenv("HOME", str(home))
+    _set_test_home(monkeypatch, home)
     monkeypatch.setenv("PATH", os.pathsep.join([str(harness_dir), str(target_dir)]))
 
     plan = plan_posix_install(root)
@@ -344,7 +349,7 @@ def test_installer_keeps_unowned_shadowing_command(tmp_path, monkeypatch, capsys
     earlier_command = harness_dir / "ouroboros"
     earlier_command.write_text("#!/bin/sh\necho foreign\n", encoding="utf-8")
     os.chmod(earlier_command, 0o755)
-    monkeypatch.setenv("HOME", str(home))
+    _set_test_home(monkeypatch, home)
     monkeypatch.setenv("PATH", os.pathsep.join([str(harness_dir), str(target_dir)]))
 
     plan = plan_posix_install(root)
@@ -372,7 +377,7 @@ def test_installer_explicit_target_does_not_migrate_owned_shadow(tmp_path, monke
     explicit_dir = home / "bin"
     old_shim = harness_dir / "ouroboros"
     os.symlink(old_root / "bin" / "ouroboros", old_shim)
-    monkeypatch.setenv("HOME", str(home))
+    _set_test_home(monkeypatch, home)
     monkeypatch.setenv("PATH", os.pathsep.join([str(harness_dir), str(explicit_dir)]))
 
     plan = plan_posix_install(root, target_dir=explicit_dir)
@@ -398,7 +403,7 @@ def test_installer_removes_old_shim_only_after_new_install_succeeds(tmp_path, mo
     target_dir = home / ".local" / "bin"
     old_shim = harness_dir / "ouroboros"
     os.symlink(old_root / "bin" / "ouroboros", old_shim)
-    monkeypatch.setenv("HOME", str(home))
+    _set_test_home(monkeypatch, home)
     monkeypatch.setenv("PATH", os.pathsep.join([str(harness_dir), str(target_dir)]))
     plan = plan_posix_install(root)
 
