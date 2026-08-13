@@ -88,20 +88,35 @@ def test_real_architecture_map_exposes_all_h4_groups():
         title="ARCHITECTURE.md",
         rel_path="docs/ARCHITECTURE.md",
     )
-    expected = (
+    tool_children = (
         "Web access mechanisms (three distinct paths — do not conflate)",
         "Context fitting, retry, and compaction",
         "Vision and local image evidence",
         "Background consciousness and Evolution",
+    )
+    planning_children = (
         "Plan construction and review",
         "Deep self-review",
         "Post-task reflection",
         "Durable memory and project focus",
     )
-    for title in expected:
+    for title in (*tool_children, *planning_children):
         assert f"    - {title} — lines " in m
-    assert "  - Tool capability and execution — lines 891-989" in m
-    assert "  - Planning, deep review, reflection, memory — lines 1921-1969" in m
+
+    def _range(indent: str, title: str) -> tuple[int, int]:
+        prefix = f"{indent}- {title} — lines "
+        row = next(line for line in m.splitlines() if line.startswith(prefix))
+        start, end = row.removeprefix(prefix).split("-", 1)
+        return int(start), int(end)
+
+    for parent_title, children in (
+        ("Tool capability and execution", tool_children),
+        ("Planning, deep review, reflection, memory", planning_children),
+    ):
+        parent_start, parent_end = _range("  ", parent_title)
+        child_ranges = [_range("    ", title) for title in children]
+        assert all(parent_start < start <= end <= parent_end for start, end in child_ranges)
+        assert parent_end == child_ranges[-1][1]
 
 
 def test_nav_map_no_heading_fallback_names_all_supported_depths():
