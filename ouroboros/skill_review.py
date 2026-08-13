@@ -936,17 +936,11 @@ def _run_skill_advisory_pre_review(ctx: Any, *, skill_name: str, file_pack: str)
         import os
         # Reuse advisory routing without adding a second persistent state machine.
         from ouroboros.tools import claude_advisory_review as advisory
-        # Pytest and private-runner suppression is not route unavailability and
-        # must remain silent. Keep it ahead of configuration evaluation so a
-        # malformed optional lane cannot leak into private test execution.
+        # Keep private/test suppression silent and ahead of config evaluation.
         if os.environ.get("PYTEST_CURRENT_TEST") or not hasattr(advisory, "_run_claude_advisory"):
             return {}
-        # Availability, not just the key (#123 twin): the api route needs the
-        # key, the delegated route does not, and a DISABLED advisory slot is a
-        # standing owner decision that must not be overridden here — dispatching
-        # anyway would spend review budget the owner switched off. A malformed
-        # config counts as unavailable: skill advisory is OPTIONAL and fail-open,
-        # it must never hard-block skill review.
+        # Respect route-aware availability and the owner's disabled-slot choice.
+        # This advisory is optional, so malformed config remains fail-open.
         try:
             unavailable_reason = advisory.advisory_gate_unavailability_reason()
         except ValueError:
