@@ -109,7 +109,8 @@ def test_git_capture_repairs_corrupt_index(monkeypatch, tmp_path):
 
     calls = {"status": 0, "rebuild": 0}
 
-    def fake_run(cmd, cwd=None, capture_output=False, text=False, check=False, env=None):
+    def fake_run(cmd, cwd=None, capture_output=False, text=False, check=False, env=None,
+                 timeout=None):
         if cmd == ["git", "status", "--porcelain"]:
             calls["status"] += 1
             if calls["status"] == 1:
@@ -135,6 +136,75 @@ def test_git_capture_repairs_corrupt_index(monkeypatch, tmp_path):
     assert calls["status"] == 2
     assert calls["rebuild"] == 1
     assert any(path.name.startswith("index.corrupt.") for path in git_dir.iterdir())
+
+
+def test_git_capture_times_out_instead_of_hanging(monkeypatch, tmp_path):
+    """Issue #182: a hung git process (fsmonitor deadlock, an unresponsive
+    filesystem) must not stall the rescue/rollback graph indefinitely. A
+    genuinely slow process under a small timeout returns a typed failure
+    quickly rather than blocking for its full runtime."""
+    monkeypatch.setattr(git_ops, "REPO_DIR", tmp_path)
+
+    started = time.monotonic()
+    rc, stdout, stderr = git_ops.git_capture(["sleep", "5"], timeout=0.2)
+    elapsed = time.monotonic() - started
+
+    assert rc == git_ops.FETCH_TIMEOUT_RC
+    assert stdout == ""
+    assert "timed out" in stderr
+    assert elapsed < 4  # well under the 5s sleep; proves it did not wait it out
+
+
+def test_git_capture_default_timeout_is_unbounded(monkeypatch, tmp_path):
+    """Every call site other than the rescue graph passes no timeout at all;
+    confirm that shape (timeout=None) still runs a slow-but-finishing command
+    to completion instead of accidentally inheriting a bound."""
+    monkeypatch.setattr(git_ops, "REPO_DIR", tmp_path)
+
+    rc, stdout, stderr = git_ops.git_capture(["sleep", "0.3"])
+
+    assert rc == 0
+    assert stdout == ""
+    assert stderr == ""
+
+
+def test_rescue_git_capture_bounds_with_rescue_timeout(monkeypatch):
+    """rescue_git_capture must forward RESCUE_GIT_TIMEOUT_SECS to git_capture;
+    every rescue/rollback call site relies on this, not on its own timeout."""
+    captured = {}
+
+    def fake_git_capture(cmd, *, timeout=None):
+        captured["cmd"] = cmd
+        captured["timeout"] = timeout
+        return 0, "", ""
+
+    monkeypatch.setattr(git_ops, "git_capture", fake_git_capture)
+
+    rc, stdout, stderr = git_ops.rescue_git_capture(["git", "status", "--porcelain"])
+
+    assert captured["cmd"] == ["git", "status", "--porcelain"]
+    assert captured["timeout"] == git_ops.RESCUE_GIT_TIMEOUT_SECS
+    assert (rc, stdout, stderr) == (0, "", "")
+
+
+def test_collect_repo_sync_state_uses_rescue_bounded_capture(monkeypatch):
+    """The rescue/rollback graph must go through the bounded wrapper, not the
+    unbounded default: this is what actually closes #182 end to end."""
+    calls = []
+
+    def fake_rescue_git_capture(cmd):
+        calls.append(cmd)
+        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return 0, "ouroboros", ""
+        return 0, "", ""
+
+    monkeypatch.setattr(git_ops, "rescue_git_capture", fake_rescue_git_capture)
+    monkeypatch.setattr(git_ops, "_has_remote", lambda name=None: False)
+
+    git_ops._collect_repo_sync_state()
+
+    assert ["git", "rev-parse", "--abbrev-ref", "HEAD"] in calls
+    assert ["git", "status", "--porcelain"] in calls
 
 
 def test_checkout_and_reset_removes_stale_index_lock(monkeypatch, tmp_path):
@@ -510,7 +580,7 @@ def test_checkout_and_reset_blocks_when_status_read_is_unreadable(monkeypatch, t
     events = []
     monkeypatch.setattr(git_ops, "append_jsonl", lambda path, payload: events.append(payload))
 
-    def fake_capture(cmd):
+    def fake_capture(cmd, *, timeout=None):
         if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
             return 0, "ouroboros", ""
         if cmd == ["git", "status", "--porcelain"]:
@@ -1323,7 +1393,7 @@ def test_collect_repo_sync_state_prefers_managed_remote(monkeypatch):
     )
     monkeypatch.setattr(git_ops, "_has_remote", lambda name=None: name in (None, "managed"))
 
-    def fake_git_capture(cmd):
+    def fake_git_capture(cmd, *, timeout=None):
         if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
             return 0, "ouroboros", ""
         if cmd == ["git", "status", "--porcelain"]:
@@ -1544,7 +1614,7 @@ def test_rescue_hook_treats_unreadable_status_as_dirty(monkeypatch, tmp_path):
     durable supervisor.jsonl line before returning the pointer."""
     calls = []
 
-    def fake_git_capture(cmd):
+    def fake_git_capture(cmd, *, timeout=None):
         if cmd == ["git", "status", "--porcelain"]:
             return 128, "", "fatal: unreadable index"
         if cmd[:3] == ["git", "rev-parse", "-q"]:

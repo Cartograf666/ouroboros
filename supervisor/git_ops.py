@@ -195,13 +195,20 @@ def _clear_update_intent() -> bool:
         return False
     return True
 
-def git_capture(cmd: List[str]) -> Tuple[int, str, str]:
+def git_capture(cmd: List[str], *, timeout: Optional[float] = None) -> Tuple[int, str, str]:
     # Same reason as utils.run_cmd: this stderr is PARSED (`_maybe_repair_git_index`
     # matches English git diagnostics), so the operator's locale must not decide
     # whether a repairable index error is recognised.
+    # ``timeout`` is None for every existing call site: a bound here is a
+    # behavior change, so it stays opt-in rather than a default that would
+    # silently retime callers that never asked for one. See RESCUE_GIT_TIMEOUT_SECS.
     env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
     for _attempt in range(2):
-        r = subprocess.run(cmd, cwd=str(REPO_DIR), capture_output=True, text=True, env=env)
+        try:
+            r = subprocess.run(cmd, cwd=str(REPO_DIR), capture_output=True, text=True,
+                               env=env, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return FETCH_TIMEOUT_RC, "", f"git timed out after {timeout:.0f}s: {' '.join(cmd)}"
         stderr = (r.stderr or "").strip()
         if r.returncode == 0:
             return r.returncode, (r.stdout or "").strip(), stderr
@@ -215,6 +222,21 @@ from supervisor import update_source as _update_source
 
 FETCH_TIMEOUT_RC, _git_network_bounded = _update_source.FETCH_TIMEOUT_RC, _update_source._git_network_bounded
 _managed_update_target, git_fetch_bounded = _update_source._managed_update_target, _update_source.git_fetch_bounded
+
+# Bound for every git process reached from rescue_before_destructive_rollback.
+# Matches the existing precedent in review_binary_context.py's staged-diff
+# capture (timeout=300); not applied to git_capture's other call sites.
+RESCUE_GIT_TIMEOUT_SECS = 300.0
+
+
+def rescue_git_capture(cmd: List[str]) -> Tuple[int, str, str]:
+    """``git_capture`` bounded by ``RESCUE_GIT_TIMEOUT_SECS``, rescue path only.
+
+    A timeout returns through the normal nonzero-rc shape, which every caller
+    in the rescue graph already treats as a warning rather than a hard stop:
+    fail-open, never a stall.
+    """
+    return git_capture(cmd, timeout=RESCUE_GIT_TIMEOUT_SECS)
 
 
 def _resolve_managed_update_target(
@@ -433,13 +455,13 @@ def _collect_repo_sync_state() -> Dict[str, Any]:
         "warnings": [],
     }
 
-    rc, branch, err = git_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    rc, branch, err = rescue_git_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"])
     if rc == 0 and branch:
         state["current_branch"] = branch
     elif err:
         state["warnings"].append(f"branch_error:{err}")
 
-    rc, dirty, err = git_capture(["git", "status", "--porcelain"])
+    rc, dirty, err = rescue_git_capture(["git", "status", "--porcelain"])
     if rc == 0 and dirty:
         state["dirty_lines"] = [ln for ln in dirty.splitlines() if ln.strip()]
     elif rc != 0:
@@ -456,7 +478,7 @@ def _collect_repo_sync_state() -> Dict[str, Any]:
             upstream = f"{managed_remote}/{managed_branch}"
 
     if not upstream and _has_remote("origin"):
-        rc, up, err = git_capture(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+        rc, up, err = rescue_git_capture(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
         if rc == 0 and up:
             upstream = up
         else:
@@ -466,7 +488,7 @@ def _collect_repo_sync_state() -> Dict[str, Any]:
                 state["warnings"].append(f"upstream_error:{err}")
 
     if upstream:
-        rc, unpushed, err = git_capture(["git", "log", "--oneline", f"{upstream}..HEAD"])
+        rc, unpushed, err = rescue_git_capture(["git", "log", "--oneline", f"{upstream}..HEAD"])
         if rc == 0 and unpushed:
             state["unpushed_lines"] = [ln for ln in unpushed.splitlines() if ln.strip()]
         elif rc != 0 and err:
@@ -480,7 +502,7 @@ def _copy_untracked_for_rescue(dst_root: pathlib.Path, max_files: int = 200,
     out: Dict[str, Any] = {
         "copied_files": 0, "skipped_files": 0, "copied_bytes": 0, "truncated": False,
     }
-    rc, txt, err = git_capture(["git", "ls-files", "--others", "--exclude-standard"])
+    rc, txt, err = rescue_git_capture(["git", "ls-files", "--others", "--exclude-standard"])
     if rc != 0:
         out["error"] = err or "git ls-files failed"
         return out
@@ -547,7 +569,7 @@ def _create_rescue_snapshot(branch: str, reason: str,
         "path": str(rescue_dir),
     }
 
-    rc_status, status_txt, _ = git_capture(["git", "status", "--porcelain"])
+    rc_status, status_txt, _ = rescue_git_capture(["git", "status", "--porcelain"])
     if rc_status == 0:
         atomic_write_text(rescue_dir / "status.porcelain.txt",
                           status_txt + ("\n" if status_txt else ""))
@@ -567,6 +589,7 @@ def _create_rescue_snapshot(branch: str, reason: str,
             ["git", "diff", "--binary", "--no-ext-diff", "--no-textconv", "--no-color",
              "--src-prefix=a/", "--dst-prefix=b/", "HEAD"],
             cwd=str(REPO_DIR), capture_output=True, env=capture_env,
+            timeout=RESCUE_GIT_TIMEOUT_SECS,
         )
         if diff_proc.returncode == 0:
             _atomic_write_bytes(rescue_dir / "changes.diff", diff_proc.stdout or b"")
@@ -583,7 +606,7 @@ def _create_rescue_snapshot(branch: str, reason: str,
     # changes (it omits untracked files, which the copy below preserves). Purely
     # additive: failure here never blocks the reset and the diff/untracked copy
     # remain the primary recovery artifacts.
-    rc_stash, stash_sha, stash_err = git_capture(["git", "stash", "create", f"rescue:{reason}"])
+    rc_stash, stash_sha, stash_err = rescue_git_capture(["git", "stash", "create", f"rescue:{reason}"])
     stash_sha = stash_sha.strip()
     if rc_stash != 0:
         # rc==0 with an empty sha is LEGITIMATE (nothing to stash / untracked-only
@@ -592,7 +615,7 @@ def _create_rescue_snapshot(branch: str, reason: str,
         info["rescue_stash_error"] = stash_err or "git stash create failed"
     elif stash_sha:
         ref_name = f"refs/rescue/{rescue_dir.name}"
-        rc_ref, _, ref_err = git_capture(["git", "update-ref", ref_name, stash_sha])
+        rc_ref, _, ref_err = rescue_git_capture(["git", "update-ref", ref_name, stash_sha])
         if rc_ref == 0:
             info["rescue_ref"] = ref_name
             info["rescue_commit"] = stash_sha
@@ -604,12 +627,12 @@ def _create_rescue_snapshot(branch: str, reason: str,
     # together with changes.diff (a plain worktree-vs-HEAD diff that DOES carry
     # in-progress resolutions) they make the merge state operator-recoverable.
     try:
-        rc_mh, merge_head, _mh_err = git_capture(
+        rc_mh, merge_head, _mh_err = rescue_git_capture(
             ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"]
         )
         if rc_mh == 0 and merge_head.strip():
             info["merge_head"] = merge_head.strip()
-            rc_u, unmerged_txt, _u_err = git_capture(["git", "ls-files", "-u"])
+            rc_u, unmerged_txt, _u_err = rescue_git_capture(["git", "ls-files", "-u"])
             if rc_u == 0 and unmerged_txt:
                 atomic_write_text(rescue_dir / "unmerged.txt", unmerged_txt + "\n")
                 # Unique conflicted PATHS (stage 1/2/3 rows collapse to one path).
@@ -618,7 +641,7 @@ def _create_rescue_snapshot(branch: str, reason: str,
                 })
             # --git-path: in a linked worktree .git is a FILE, so a naive
             # .git/MERGE_MSG probe would silently drop the message.
-            rc_p, msg_rel, _p_err = git_capture(["git", "rev-parse", "--git-path", "MERGE_MSG"])
+            rc_p, msg_rel, _p_err = rescue_git_capture(["git", "rev-parse", "--git-path", "MERGE_MSG"])
             merge_msg_path = (REPO_DIR / msg_rel) if rc_p == 0 and msg_rel else (
                 _git_dir() / "MERGE_MSG"
             )
@@ -700,8 +723,8 @@ def rescue_before_destructive_rollback(reason: str, *, context: str = "rollback"
     bookkeeping stays with the caller (update_merge); this helper only talks to
     git and the supervisor log."""
     try:
-        rc_status, dirty, _status_err = git_capture(["git", "status", "--porcelain"])
-        rc_mh, merge_head, _mh_err = git_capture(
+        rc_status, dirty, _status_err = rescue_git_capture(["git", "status", "--porcelain"])
+        rc_mh, merge_head, _mh_err = rescue_git_capture(
             ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"]
         )
         merge_in_progress = rc_mh == 0 and bool(merge_head.strip())
