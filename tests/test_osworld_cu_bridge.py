@@ -1337,17 +1337,23 @@ def test_osworld_methodology_preregisters_the_dedup_rule_and_defers_the_lane_gen
     assert "--allow-dirty-seed" in text
 
 
-def test_module_grandfather_matcher_basename_and_relpath():
+def test_module_grandfather_matcher_uses_exact_repo_relative_paths():
     from ouroboros.review import module_is_grandfathered
-    # repo-relative entry matches its rel path AND the repo/-prefixed section path
+    # Exact runtime helpers accept only actual repo-relative paths. Compatibility
+    # section-prefix decoding belongs solely to compute_complexity_metrics.
     assert module_is_grandfathered("skills/unix_computer_use/plugin.py")
-    assert module_is_grandfathered("repo/skills/unix_computer_use/plugin.py")
+    assert not module_is_grandfathered("repo/skills/unix_computer_use/plugin.py")
     # a DIFFERENT plugin.py (future skill) is NOT exempted by the path-qualified entry
     assert not module_is_grandfathered("skills/other_skill/plugin.py")
     assert not module_is_grandfathered("repo/skills/other_skill/plugin.py")
-    # legacy bare-basename entries still match
-    assert module_is_grandfathered("repo/ouroboros/server.py")
+    # Root server.py is an exact manifest path; a nested same-basename is not.
     assert module_is_grandfathered("server.py")
+    assert not module_is_grandfathered("repo/server.py")
+    assert not module_is_grandfathered("ouroboros/server.py")
+    assert not module_is_grandfathered("repo/ouroboros/server.py")
+    # The tools/control.py debt cannot leak to gateway/control.py.
+    assert module_is_grandfathered("ouroboros/tools/control.py")
+    assert not module_is_grandfathered("ouroboros/gateway/control.py")
 
 
 def test_cu_bridge_publication_failure_never_erases_an_obtained_score(tmp_path, monkeypatch):
