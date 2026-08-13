@@ -1,4 +1,4 @@
-# Ouroboros v6.100.0 — Architecture & Reference
+# Ouroboros v6.101.0 — Architecture & Reference
 
 This file is NOT a changelog. Version history lives in README.md, git tags, and commit log.
 
@@ -1678,24 +1678,25 @@ Task acceptance is a root-owned post-delivery system, separate from the P3 commi
 
 Rationale: diff reviewers catch line-level mistakes; scope reviewer catches cross-module contracts and forgotten touchpoints. Running both on the same staged snapshot prevents one reviewer result from hiding the other.
 
-Structural smoke gates (deterministic, BIBLE P3 "codebase size" component): the
-constants live in `ouroboros/review.py` (`MAX_TOTAL_FUNCTIONS`,
-`MAX_MODULE_LINES`/`GRANDFATHERED_OVERSIZED_MODULES`, `MAX_FUNCTION_LINES`) and
-are enforced by `tests/test_smoke.py` both in CI (quick-test on every push) and
-in the hermetic pytest preflight whenever self-commit test policy applies.
-`tests/`, `devtools/`, and the release-reviewed outer `launcher.py` are excluded from the
-function-count walk; grandfathered modules are an explicit debt register, not a
-loophole. Growth must be acknowledged: raising a gate value requires a
-deliberate edit of the constant with a one-line justification (never hardcode
-the number elsewhere). These gates caught externally merged PRs that bypassed
-the in-process review path — they are the last deterministic line of the immune
-system, so weakening them requires the owner's explicit decision.
+Structural smoke gates are a deterministic BIBLE P3 codebase-size component.
+`ouroboros/review.py::iter_gated_modules` is the one source inventory for smoke,
+`codebase_health`, census, and the UTF-8 byte gate. Its Git candidate is cached plus
+nonignored untracked files; exact-ref census injects immutable Git blobs. Module scope
+is Python everywhere (including `tests/` and `devtools/`) plus first-party
+`web/**/*.js` (including `web/tests/`), with vendored/minified payloads excluded. The
+function iterator preserves the narrower runtime scope and exact lexical qualnames.
 
-The module-size gate also covers `web/**/*.js` (perf/lifecycle sprint) via the
-SSOT predicate `ouroboros/review.py::is_gated_js_module`, shared by both
-consumers (the smoke gate and `codebase_health`): line-count only (no JS
-function-length scan), excluding `web/tests/` and vendored/minified payloads;
-`web/modules/chat.js` is the registered grandfathered JS debt (rel-path-keyed).
+`ouroboros/size_ratchet_manifest.py` is a generated, data-only debt register consumed
+through AST literals, never Python import execution. It records exact repo-relative
+module debt above 1600 lines, exact `(path, qualname)` function debt above 300 lines,
+the exact-current 1001-1500 band with rationale authority for new or re-entered paths,
+and exact byte debt above 200,000 UTF-8 bytes. `scripts/regenerate_size_ratchet.py`
+bootstraps only from an exact Git source SHA and updates the live candidate. Validation
+proves bootstrap contents against that immutable tree, audits every first-parent
+candidate tree and manifest transition through `HEAD`, then compares the working tree;
+debt can shrink but cannot be swapped, re-entered without its required authority, grow
+on the byte axis, or survive as a stale record. `MAX_TOTAL_FUNCTIONS` remains the coarse
+runtime ceiling and any raise requires its one-line campaign rationale.
 The same sprint added a deterministic hot-store growth health invariant:
 `agent_startup_checks.py::hot_store_growth_notes` (surfaced in every task
 context by `context.py::build_health_invariants` and reported once per worker
@@ -2217,7 +2218,7 @@ Claude Runtime Status appears when an Anthropic key exists or when backend/runti
 
 The local `ouroboros-stable` ref also remains a recovery fallback maintained by explicit promotion; that local role does not select the official QA feed. Colab seeds it from the already validated shared Stable release when possible and otherwise from the selected validated channel, then leaves it pinned until promotion. Launcher metadata describes bootstrap provenance only. Runtime status, preflight, Colab bootstrap, and apply resolve the selected channel and exact fetched SHA themselves, so an older frozen launcher cannot silently redirect updates. Stable additionally requires the shared plain release tag; QA and Development do not use version comparison as an admission gate.
 
-The main CI workflow has five roles: fork-safe quick checks with no provider secrets; the full cross-platform matrix; provider integration when secrets exist; official-skill install, preflight, review, dependency, and keyless execution smoke; and tag-triggered build/release. Secret-bearing skill review runs before any step that imports downloaded plugin code, and a missing required key is red rather than skipped. Release jobs build three platform archives, an AppImage, and three native Linux package assets, verify each final asset, produce checksums, SBOMs and source-bound attestations, and recheck the remote annotated tag against the event SHA before draft creation and publication.
+The main CI workflow has five roles: fork-safe quick checks with no provider secrets; the full cross-platform matrix; provider integration when secrets exist; official-skill install, preflight, review, dependency, and keyless execution smoke; and tag-triggered build/release. Quick and full checkouts fetch complete history because the size ratchet fails closed unless its immutable bootstrap and every first-parent transition are locally provable. Secret-bearing skill review runs before any step that imports downloaded plugin code, and a missing required key is red rather than skipped. Release jobs build three platform archives, an AppImage, and three native Linux package assets, verify each final asset, produce checksums, SBOMs and source-bound attestations, and recheck the remote annotated tag against the event SHA before draft creation and publication.
 
 Quick pull-request jobs are read-only and never use `pull_request_target`. The live catalog skill lane is intentionally a release dependency: it proves that the published payloads still install on this runtime, while keeping provider credentials out of every process that imports payload code. This external-service dependency is an explicit owner trade-off rather than an accidental source of flaky authority.
 

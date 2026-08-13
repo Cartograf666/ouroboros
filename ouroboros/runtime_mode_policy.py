@@ -30,6 +30,7 @@ FROZEN_CONTRACT_PATHS = frozenset({
     "tests/test_contracts.py",
     "docs/CHECKLISTS.md",
     "ouroboros/gateway/contracts.py",
+    "ouroboros/size_ratchet_manifest.py",
 })
 
 RELEASE_INVARIANT_PATHS = frozenset({

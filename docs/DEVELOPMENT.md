@@ -315,18 +315,28 @@ reroute.
 
 P7 makes context fit a maintenance constraint, not a line-count aesthetic.
 
-- Python and first-party `web/**/*.js` modules target roughly 1000 lines. The
-  deterministic hard gate is 1600 lines for paths not listed in
-  `ouroboros/review.py::GRANDFATHERED_OVERSIZED_MODULES`; that code-owned set is
-  the debt SSOT. Vendored/minified assets and `web/tests/` are excluded.
+- Python modules everywhere (including `tests/` and `devtools/`) and first-party
+  `web/**/*.js` modules (including `web/tests/`) target roughly 1000 lines. The
+  deterministic hard gate is 1600 lines for exact repo-relative paths not listed
+  in `ouroboros/size_ratchet_manifest.py::GIANT_PATHS`; stale or newly oversized
+  entries fail. Vendored/minified assets are excluded. The same production
+  iterator drives smoke, health, census, and the 200,000-byte ratchet. Sources
+  decode as strict UTF-8 and normalize line endings to canonical POSIX LF before
+  line and UTF-8-byte counts, so checkout policy cannot change the inventory.
+- The exact-current 1001-1500-line band lives in `BAND_PATHS`. A new or
+  re-entered path requires a nonblank rationale. `BYTE_DEBT` stores exact counts
+  above 200,000 UTF-8 bytes and is shrink-only; regenerate both with
+  `scripts/regenerate_size_ratchet.py`.
 - Every non-grandfathered Python function or method fails the deterministic gate
   above 300 lines; exceptions live in
-  `ouroboros/review.py::GRANDFATHERED_OVERSIZED_FUNCTIONS`. Methods above 150
+  exact `(repo-relative path, lexical qualname)` keys in
+  `ouroboros/size_ratchet_manifest.py::FUNCTION_DEBT`. Methods above 150
   lines are a decomposition signal. JavaScript currently has only the module
   line-count gate.
 - Runtime Python function/method count is checked against
-  `ouroboros/review.py::MAX_TOTAL_FUNCTIONS`; tracked `devtools/` is outside
-  that runtime-health count but remains reviewable when touched.
+  `ouroboros/review.py::MAX_TOTAL_FUNCTIONS`; the function iterator preserves
+  the pre-v7 runtime scope (tests/devtools excluded) while module gates include
+  those trees.
 - More than eight parameters is a decomposition signal applied by BIBLE and
   reviewer checklist 2(c), not a deterministic size-test gate. Existing
   baseline debt is not retroactively a failing tree. Any advisory ratchet must
@@ -721,8 +731,8 @@ Before every commit, verify the following:
 - [ ] **Tool** (`{verb}_{noun}`): thin LLM-callable wrapper. Validates input, formats output.
 
 #### Module Size & Complexity
-- [ ] Module stays near one context window (~1000 lines target; 1600 hard gate unless explicitly grandfathered debt)
-- [ ] No non-grandfathered Python function or method exceeds the 300-line hard gate (`GRANDFATHERED_OVERSIZED_FUNCTIONS` is the exception SSOT); methods above 150 lines trigger decomposition review
+- [ ] Module stays near one context window (~1000 lines target; exact-path 1600 hard-gate debt is checked in, stale entries fail, and new/re-entered 1001-1500 paths carry a rationale)
+- [ ] No non-grandfathered Python function or method exceeds the 300-line hard gate (`FUNCTION_DEBT` exact `(path, qualname)` keys are the exception SSOT); methods above 150 lines trigger decomposition review
 - [ ] Total Python function count stays under the current smoke hard gate (consult `ouroboros/review.py::MAX_TOTAL_FUNCTIONS` for the active value; bump with a comment if a feature requires more headroom)
 - [ ] More than eight parameters is a decomposition signal; consider a typed context object, but do not claim a hard gate or mark existing baseline debt noncompliant
 - [ ] No gratuitous abstract layers (Bible P7)
