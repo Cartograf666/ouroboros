@@ -5409,20 +5409,30 @@ def test_a_daemon_that_dies_mid_window_is_refused_not_reported_as_a_quiet_wait(
 
 def test_a_daemon_that_dies_only_at_the_spent_window_poll_still_expires_gracefully(
         tmp_path, monkeypatch):
-    """The other half of the same split, and the reason it is a split rather than a
-    removal. Once the window IS spent there is nothing left to wait for, so a daemon that
-    cannot answer the last poll is this window's expiry — the graceful typed payload,
-    built on what the wait already holds — and never a transport refusal raised out of a
-    tool that is still holding a live, possibly overpowered, run."""
+    """A failed final poll expires a spent window instead of refusing the wait, and preserves prior progress too."""
+    from types import SimpleNamespace
+
+    import ouroboros.tools.delegate as delegate
+
+    clock = {"now": 0.0}
+
+    def sleep(seconds):
+        clock["now"] += seconds
+
+    monkeypatch.setattr(
+        delegate,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock["now"], sleep=sleep),
+    )
     stub = _DiesAfter(answers=1)
 
-    out, elapsed = _wait_against_a_streaming_run(
+    out, _ = _wait_against_a_streaming_run(
         _nanny_ctx(tmp_path), tmp_path, monkeypatch, wait_sec=1, stub=stub)
 
     assert out["status"] == "progress", out
     assert out["waited_sec"] == 1, out
     assert stub.seq == 2, f"the spent window still owes its last poll: {stub.seq}"
-    assert 0.9 <= elapsed < 6.0, elapsed
+    assert clock["now"] == pytest.approx(1.0)
 
 
 def test_the_last_poll_of_a_spent_window_is_bounded_not_skipped(tmp_path, monkeypatch):

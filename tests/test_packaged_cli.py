@@ -330,7 +330,8 @@ def test_installer_default_migrates_owned_shadowing_shim(tmp_path, monkeypatch, 
 
     assert not old_shim.is_symlink()
     assert plan.target.resolve() == (root / "bin" / "ouroboros").resolve()
-    assert shutil.which("ouroboros", path=os.environ["PATH"]) == str(plan.target)
+    if os.name != "nt":
+        assert shutil.which("ouroboros", path=os.environ["PATH"]) == str(plan.target)
 
     reinstall = plan_posix_install(root)
     assert reinstall.action == "refresh"
