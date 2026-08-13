@@ -936,6 +936,11 @@ def _run_skill_advisory_pre_review(ctx: Any, *, skill_name: str, file_pack: str)
         import os
         # Reuse advisory routing without adding a second persistent state machine.
         from ouroboros.tools import claude_advisory_review as advisory
+        # Pytest and private-runner suppression is not route unavailability and
+        # must remain silent. Keep it ahead of configuration evaluation so a
+        # malformed optional lane cannot leak into private test execution.
+        if os.environ.get("PYTEST_CURRENT_TEST") or not hasattr(advisory, "_run_claude_advisory"):
+            return {}
         # Availability, not just the key (#123 twin): the api route needs the
         # key, the delegated route does not, and a DISABLED advisory slot is a
         # standing owner decision that must not be overridden here — dispatching
@@ -943,11 +948,16 @@ def _run_skill_advisory_pre_review(ctx: Any, *, skill_name: str, file_pack: str)
         # config counts as unavailable: skill advisory is OPTIONAL and fail-open,
         # it must never hard-block skill review.
         try:
-            if advisory.advisory_gate_unavailable():
-                return {}
+            unavailable_reason = advisory.advisory_gate_unavailability_reason()
         except ValueError:
-            return {}
-        if os.environ.get("PYTEST_CURRENT_TEST") or not hasattr(advisory, "_run_claude_advisory"):
+            unavailable_reason = "invalid_advisory_configuration"
+        if unavailable_reason is not None:
+            _emit_skill_advisory_warning(
+                ctx,
+                skill_name=skill_name,
+                status="unavailable",
+                error=unavailable_reason,
+            )
             return {}
         repo_dir = pathlib.Path(getattr(ctx, "repo_dir", _REPO_ROOT) or _REPO_ROOT)
         drive_root = pathlib.Path(getattr(ctx, "drive_root", repo_dir) or repo_dir)

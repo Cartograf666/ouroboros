@@ -889,6 +889,42 @@ def test_repo_commit_schema_has_skip_advisory_param():
     assert "skip_advisory_review" in props
 
 
+def test_advisory_choice_guidance_is_shared_across_model_facing_schemas():
+    adv_mod = _get_advisory_module()
+    git_mod = _get_git_module()
+    advisory_tools = {tool.name: tool for tool in adv_mod.get_tools()}
+    git_tools = {tool.name: tool for tool in git_mod.get_tools()}
+
+    advisory_tool = advisory_tools["advisory_review"]
+    status_tool = advisory_tools["review_status"]
+    commit_tool = git_tools["commit_reviewed"]
+    alias_tool = git_tools["vcs_commit_reviewed"]
+    advisory_skip = advisory_tool.schema["parameters"]["properties"]["skip_advisory_review"]
+    commit_skip = commit_tool.schema["parameters"]["properties"]["skip_advisory_review"]
+    alias_skip = alias_tool.schema["parameters"]["properties"]["skip_advisory_review"]
+
+    guidance = adv_mod.ADVISORY_REVIEW_CHOICE_GUIDANCE
+    surfaces = [
+        advisory_tool.schema["description"],
+        advisory_skip["description"],
+        status_tool.schema["description"],
+        commit_tool.schema["description"],
+        commit_skip["description"],
+        alias_tool.schema["description"],
+        alias_skip["description"],
+    ]
+    assert all(guidance in surface for surface in surfaces)
+    assert all("skip_advisory_review=True" in surface for surface in surfaces)
+    assert "bypasses only the requirements for advisory freshness" in guidance
+    assert "records remain visible" in guidance
+    assert "removes only advisory" not in guidance
+    assert commit_tool.schema["description"] == alias_tool.schema["description"]
+    assert commit_skip["description"] == alias_skip["description"]
+    assert "advisory-readiness projection" in status_tool.schema["description"]
+    assert "not the full commit gate" in status_tool.schema["description"]
+    assert "bypass the entire commit gate" not in " ".join(surfaces).lower()
+
+
 def test_advisory_auto_bypass_on_missing_key(tmp_path, monkeypatch):
     """advisory_pre_review must auto-bypass with audit when ANTHROPIC_API_KEY is absent."""
     import json
