@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -10,7 +11,6 @@ import os
 import re
 import threading
 import time
-import copy
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ouroboros.provider_models import (
@@ -1203,7 +1203,7 @@ class LLMClient:
         target: Dict[str, Any],
         exc: BaseException,
     ) -> Optional[Dict[str, Any]]:
-        """Remove only an explicitly rejected cache-affinity parameter once."""
+        """Remove only an explicitly rejected cache control or affinity once."""
         provider = str(target.get("provider") or "").strip().lower()
         extra_body = payload.get("extra_body")
         param = ""
@@ -1215,6 +1215,12 @@ class LLMClient:
             and "session_id" in extra_body
         ):
             param = "session_id"
+        elif (
+            provider == "openai-compatible"
+            and isinstance(extra_body, dict)
+            and "cache" in extra_body
+        ):
+            param = "cache"
         if not param:
             return None
 
@@ -1246,11 +1252,11 @@ class LLMClient:
         else:
             retry_extra = retry_payload.get("extra_body")
             if isinstance(retry_extra, dict):
-                retry_extra.pop("session_id", None)
+                retry_extra.pop(param, None)
             if not retry_extra:
                 retry_payload.pop("extra_body", None)
         log.warning(
-            "Retrying %s once without unsupported prompt-cache parameter %s",
+            "Retrying %s once without unsupported cache parameter %s",
             str(target.get("usage_model") or target.get("resolved_model") or "(unknown model)"),
             param,
         )
@@ -2302,6 +2308,7 @@ class LLMClient:
         allow_server_web_search: bool = False,
         response_format: Optional[Dict[str, Any]] = None,
         cache_affinity: str = "",
+        bypass_response_cache: bool = False,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Single LLM call returning (message, usage); no_proxy avoids macOS fork proxy crashes.
 
@@ -2327,6 +2334,7 @@ class LLMClient:
                     allow_server_web_search=allow_server_web_search,
                     response_format=response_format,
                     cache_affinity=cache_affinity,
+                    bypass_response_cache=bypass_response_cache,
                 )
             usage["ledger_attempt_ids"] = list(attempt_ids)
             return message, usage
@@ -3544,6 +3552,7 @@ class LLMClient:
         allow_server_web_search: bool = False,
         response_format: Optional[Dict[str, Any]] = None,
         cache_affinity: str = "",
+        bypass_response_cache: bool = False,
     ) -> Dict[str, Any]:
         messages = self._normalize_system_message_placement(messages)
         resolved_model = str(target.get("resolved_model") or "")
@@ -3607,6 +3616,13 @@ class LLMClient:
                     for tool in self._sanitize_chat_completion_tools(tools)
                 ]
                 kwargs["tool_choice"] = tool_choice
+            if bypass_response_cache and provider == "openai-compatible":
+                # Must ride in extra_body: the OpenAI SDK rejects unknown top-level
+                # kwargs with TypeError, so a raw `cache=` argument never reaches
+                # the wire.
+                _eb = kwargs.setdefault("extra_body", {})
+                if isinstance(_eb, dict):
+                    _eb["cache"] = {"no-cache": True}
             self._apply_rejected_param_cache(kwargs, str(target.get("usage_model") or resolved_model))
             return kwargs
 
@@ -4145,6 +4161,7 @@ class LLMClient:
         allow_server_web_search: bool = False,
         response_format: Optional[Dict[str, Any]] = None,
         cache_affinity: str = "",
+        bypass_response_cache: bool = False,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Send remote chat; no_proxy uses a one-shot client and skips OS proxy lookup."""
         if target.get("provider") == "anthropic":
@@ -4170,6 +4187,7 @@ class LLMClient:
                     allow_server_web_search=allow_server_web_search,
                     response_format=response_format,
                     cache_affinity=cache_affinity,
+                    bypass_response_cache=bypass_response_cache,
                 )
                 prompt_cache_ttl = self._normalize_payload_cache_ttl(target, kwargs)
                 resp = self._create_chat_completion_with_retries(
@@ -4196,6 +4214,7 @@ class LLMClient:
             allow_server_web_search=allow_server_web_search,
             response_format=response_format,
             cache_affinity=cache_affinity,
+            bypass_response_cache=bypass_response_cache,
         )
         if timeout and timeout > 0:
             # Cached clients are built without a timeout; honor the caller's

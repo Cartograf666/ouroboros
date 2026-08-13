@@ -916,6 +916,15 @@ Retry budgets are failure-class specific. Empty/incomplete responses and transie
 
 Prompt caching is stable-first. Governance and task-stable contracts precede mutable evidence; review builders disclose the stable/dynamic boundary and keep untrusted payloads outside the governance cache block. Provider-specific cache hints are sent only where supported and receive one exact retry without the rejected hint. Rejection evidence is durable and route-specific. Cache identity must not weaken exact review bindings or create a second review authority.
 
+Gateway response-cache recovery is narrower and reactive. The first call remains
+cacheable; only a main-loop `provider_incomplete_response` arms a fresh-response
+request for later attempts. The generic `openai-compatible` route is Ouroboros's
+gateway/proxy route, so only it renders LiteLLM's documented
+`extra_body.cache.no-cache` control. A strict compatible endpoint that explicitly
+rejects `cache` receives the existing one exact cache-parameter removal retry.
+Direct providers and OpenRouter never receive this LiteLLM field; no URL/model
+heuristic or parallel gateway-capability subsystem is introduced.
+
 #### Vision and local image evidence
 
 `analyze_screenshot` and `vlm_query` are bounded secondary-model calls through `LLMClient.vision_query`; `view_image` attaches a local image natively to the active conversation. Send-time image routing works on a copy of the transcript so captioning or placeholder conversion never mutates canonical history. Image payloads are validated, capped/downscaled, and confined to readable roots derived from the Tool API policy matrix plus the protected-artifact rule; URLs and inline base64 are not accepted as local paths.
