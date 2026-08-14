@@ -1345,28 +1345,46 @@ evidence alone) rides the envelope beside `effective_executor`, a harness dispat
 
 **Read-only and mutating children share one nanny and one transport.** The only
 difference is the run shape, and the shape has ONE owner —
-`subagents.delegated_run_shape`, which answers a single question: is this an acting
-child? `tools/delegate._derive_authority` asks it of the live `ToolContext`
-(`tool_access.active_tool_profile`) and `subagents.dispatch_executor_resolution` asks it of
-the task record (`tool_access.predicted_subagent_profile`); neither reassembles the shape,
+`subagents.delegated_run_shape`. For the generic lane it answers a single question —
+is this an acting child? — asked of the live `ToolContext` by
+`tools/delegate._derive_authority` (`tool_access.active_tool_profile`) and of
+the task record by `subagents.dispatch_executor_resolution`
+(`tool_access.predicted_subagent_profile`); neither reassembles the shape,
 because a profile changed in one place and an isolation or a marker left behind in the
-other is silent and unsafe in exactly one branch.
+other is silent and unsafe in exactly one branch. The EXACT-RESOURCE lane is the
+second, explicit entry: `delegate_start(root="skill_payload", bucket, skill_name)`
+selects one installed non-native skill payload, authorized through a fresh
+`ResolvedResourceBinding` for `skill_payload.write` (top-level task profiles only)
+rather than through the acting-child question.
 
 | task authority | access | mode | isolation | `execution.delegated` |
 |---|---|---|---|---|
 | acting subagent (valid write surface) | `workspace_write` | `agent` | `live` | `true` |
 | ROOT of an external-workspace task (validated active workspace) | `workspace_write` | `agent` | `live` | `true` |
+| top-level task selecting an exact skill payload (`root="skill_payload"`) | `workspace_write` | `agent` | `live` | `true` |
 | anything else, including a fail-closed subagent | `readonly` | `ask` | envelope (default) | not sent |
 
 WHERE a mutating run's changes are destined and how they travel is the second,
 separate record — the unified host-derived **mutation authority**
-(`tools/delegate._mutation_authority`), never model-supplied:
+(`tools/delegate._mutation_authority` / `_payload_mutation_authority`), never
+model-supplied:
 
 | source | `target_root` derivation | `capture_mode` |
 |---|---|---|
 | `acting_constraint` | the child's own `task_constraint.write_root`, required to equal the genuinely ACTIVE workspace root | `delegated_snapshot` |
 | `external_workspace_root` | the root task's validated active external workspace (a root holds no acting constraint — owner 2=A: it already holds write+shell inside the project; the prior gap was per-run provenance, which the snapshot+explicit-apply below records) | `delegated_snapshot` |
+| `skill_payload` | the exact payload the fresh `skill_payload.write` binding resolved; the durable record also carries the semantic `resource_ref` (source/skill_name/CAS baseline hash) that retry and apply re-resolve | `delegated_snapshot` |
 | `readonly` | ordinary active root (nothing to write) | `none` |
+
+A payload target gets a STANDALONE private Git snapshot
+(`subagent_worktrees.provision_payload_snapshot`): the live payload is never
+initialized as Git; the loader-visible inventory is copied out, committed as a
+synthetic baseline, and the run is scoped there. At disposition the apply is a
+LIVE, index-free `git apply` into the non-Git payload guarded by a whole-payload
+content-hash CAS (drift = typed conflict; identical content = idempotent applied),
+with reserved lifecycle/control paths and escaping-symlink candidates refusing the
+WHOLE apply; a successful apply queues the extension reconcile and the skill's
+existing review becomes STALE for the new content hash.
 
 **A mutating run executes in a PRIVATE EXECUTION SNAPSHOT, never in the shared
 tree** (C1, owner 3=A — metered children keep sharing the tree; only delegated runs
@@ -1560,13 +1578,18 @@ above. Four things follow, and they are one mechanism, not four:
   success and never enforced as a breach.
 
 **The model cannot widen its own authority.** `delegate_start` exposes `prompt`,
-`max_seconds`, and recovery-only `retry_of`. The retry may replay only the same task's
+`max_seconds`, recovery-only `retry_of`, and the exact-resource selector
+(`root="skill_payload"` + `bucket` + `skill_name`). The retry may replay only the same task's
 stored canonical body under its original idempotency key; prompt or ownership mismatch
 is rejected, and it cannot change route, root, access, or permissions. There is no
-access, mode, isolation, root, or scope argument, so the child can request work but
-cannot choose its powers. Every delegated run also carries host-authored `instructions` stating
+access, mode, isolation, or scope argument, and the selector NAMES a resource rather
+than granting one — it is authorized through the same `skill_payload.write` cell as a
+direct payload write, so the child can request work but cannot choose its powers.
+Every delegated run also carries host-authored `instructions` stating
 the same prohibitions an ordinary subagent has — no commit or history move, no
-self-review, no runtime controls, skills or memory, no writes outside the root — plus
+self-review, no runtime controls, skills or memory, no writes outside the root (a
+payload run's variant instead states the truth that editing THAT skill's
+user-authored files in the private copy IS the assignment) — plus
 the hosting task's own contract objective/expected_output (host-read, host-authored:
 the model can neither widen nor forge the assignment block). Those
 are a statement; the enforcement is the access profile plus the patch capture. And
