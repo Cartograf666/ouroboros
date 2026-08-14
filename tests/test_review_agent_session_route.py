@@ -246,6 +246,27 @@ def test_schema_conformant_clean_verdict_survives(tmp_path, fake_route):
     assert gateway.start_keys[0]  # the invocation id rode the wire
 
 
+def test_structured_session_compares_the_parsed_model_not_the_harness_spec(
+    tmp_path, fake_route,
+):
+    fake_route.detail = _terminal_detail('{"findings": []}', conformance="passed", model="anthropic::claude-fable-5")
+    result = run_review_request(
+        _agent_request(),
+        slots=[_agent_slot(
+            model="fake-review=anthropic/claude-fable-5",
+            session_target="fake-review=anthropic/claude-fable-5",
+        )],
+        drive_root=tmp_path,
+        llm=FakeLLM(),
+    )
+
+    reasons = {
+        item.get("reason")
+        for item in result.actors[0]["usage"].get("capability_delta", [])
+    }
+    assert "session_route_resolves_its_own_model" not in reasons
+
+
 def test_schema_is_not_asked_when_the_manifest_does_not_declare_it(tmp_path, fake_route):
     fake_route.manifest_capabilities = {}
     fake_route.detail = _terminal_detail("[]")

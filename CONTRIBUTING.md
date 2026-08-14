@@ -1,80 +1,68 @@
 # Contributing to Ouroboros
 
-Thank you for helping Ouroboros evolve. This guide explains how to prepare a
-pull request that is easy to understand, reproduce, review, and integrate.
+This guide is written for coding agents and people. Before editing, read it in
+full and follow it as the repository's pull-request workflow. If an agent is
+implementing an issue, the agent itself must perform the preparation,
+verification, separate-context review, and PR evidence steps below.
 
 The short version:
 
-1. Base your work on the lowercase `ouroboros` branch and open the pull request
-   against `ouroboros`, not `main` or `ouroboros-stable`.
-2. Read the project governance and engineering documents before making a
-   substantive change.
-3. Keep the pull request focused, test the changed behavior, and show rendered
-   evidence for visible UI changes.
-4. Do not bump the project version. Maintainers assign the final release
-   version when integrating the pull request.
-5. Optionally attach a current triad + scope review packet to enter the faster
-   review path.
+1. Read the project before changing it.
+2. Branch from and open the pull request against lowercase `ouroboros`.
+3. Keep one coherent scope, test it, and do not bump the version.
+4. Freeze the final committed diff and review it in a separate agent context.
+5. Record exact verification and review evidence in the pull request.
 
 The pull request template in
 [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) mirrors
 this flow.
 
-## Read the Project Before Changing It
+## 1. Read the Project Before Editing
 
-For substantive changes, read these files **in full** before designing or
+For a substantive change, read these files **in full** before designing or
 editing:
 
 - [`BIBLE.md`](BIBLE.md) — constitutional principles and design priorities.
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — the current structural and
-  operational map, including the rationale for non-obvious decisions.
-- [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — engineering conventions,
-  module boundaries, testing guidance, and the commit/review protocol.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — structure, data flows, and
+  rationale for non-obvious decisions.
+- [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — engineering, testing, and
+  review conventions.
 - [`docs/CHECKLISTS.md`](docs/CHECKLISTS.md) — the review checklist single
   source of truth.
 
-Use the existing modules, contracts, and single sources of truth described in
-those documents before introducing a new mechanism. If a coding agent is doing
-the work, give it the same instruction explicitly. A useful starting prompt is:
+Reuse the modules, contracts, and authorities those documents name. Do not
+invent a parallel mechanism when the repository already has one. A useful
+first instruction for a coding agent is:
 
-> Before editing, read BIBLE.md, docs/ARCHITECTURE.md,
-> docs/DEVELOPMENT.md, and docs/CHECKLISTS.md in full. Follow their current
-> principles and reuse the architecture and existing extension seams instead
-> of inventing parallel mechanisms. Keep the change focused and verify it
-> against the repository's tests and review checklist.
+> Read CONTRIBUTING.md, BIBLE.md, docs/ARCHITECTURE.md,
+> docs/DEVELOPMENT.md, and docs/CHECKLISTS.md in full before editing. Follow
+> their current architecture and keep the requested change focused.
 
-These documents are authoritative descriptions of the current project, not
-immutable external rules. A pull request may improve `BIBLE.md`, the
-architecture, development practices, or review checklists. Explain why the
-change is needed, what invariant it preserves or intentionally evolves, and
-keep related code, tests, and documentation consistent. Constitutional changes
-must also respect the change process and semantic protections stated in
-`BIBLE.md` itself.
+These documents may themselves be improved, but constitutional changes must
+follow the semantic change process in `BIBLE.md`, and behavior, tests, and
+documentation must remain consistent.
 
-## Choose a Focused Change
+## 2. Prepare One Focused Change
 
-Prefer one coherent purpose per pull request. The description should make the
-following clear:
+Keep one coherent purpose per pull request. Make the description state:
 
 - the problem or opportunity;
-- what changed and why this approach fits the existing architecture;
+- what changed and why it fits the existing architecture;
 - what is deliberately out of scope;
-- compatibility, migration, safety, or operational risks;
-- the exact verification performed and its result.
+- important compatibility, migration, safety, or operational risks;
+- exact verification and its result.
 
-For a broad, ambiguous, security-sensitive, constitutional, or
-direction-changing proposal, opening an issue or discussion first can avoid
-expensive rework. Small, well-understood fixes do not need ceremonial design
-work.
+Open an issue or discussion first for a broad, ambiguous, constitutional, or
+direction-changing proposal. Small, well-understood fixes do not need
+ceremonial design work.
 
-Do not commit local settings, API keys, runtime state, logs, caches, benchmark
-runs, generated review runs, or build artifacts. Runtime data belongs outside
-the git repository.
+Never commit local settings, credentials, runtime state, logs, caches,
+benchmark runs, generated review runs, or build artifacts.
 
-## Branch and Pull Request Flow
+## 3. Branch from `ouroboros` and Do Not Bump the Version
 
 Keep an `upstream` remote pointed at the official repository and start from the
-latest working branch:
+latest contribution branch:
 
 ```bash
 git remote add upstream https://github.com/razzant/ouroboros.git  # once
@@ -82,155 +70,96 @@ git fetch upstream
 git switch -c your-focused-branch upstream/ouroboros
 ```
 
-If `upstream` already exists, verify it instead of adding it again. Before final
-verification and review evidence, update your branch and resolve any drift:
+If `upstream` exists, verify it instead of adding it again. Open the pull
+request against lowercase `ouroboros`, not `main` or `ouroboros-stable`.
+
+Before the first push, update the branch and resolve drift:
 
 ```bash
 git fetch upstream
 git rebase upstream/ouroboros
 ```
 
-Open the pull request with the base branch set to lowercase `ouroboros`.
-`main` is the stable public/update branch, and `ouroboros-stable` is the QA
-promotion branch. Neither is the contribution target.
+After publishing the branch, do not rewrite its remote history. Bring later
+target changes in with a normal merge, or coordinate a replacement with a
+maintainer. Any update invalidates earlier review evidence.
 
-Keep the worktree clean when producing final evidence: commit the intended
-changes on your pull request branch, then confirm that `git status --short` is
-empty. The contributor review command examines a committed base-to-head range;
-it does not approve uncommitted edits.
+External contributors do not allocate release versions. Leave `VERSION`, the
+project version in `pyproject.toml`, the editable root in `uv.lock`, the version
+in `web/package.json`, `GATEWAY_CONTRACT_VERSION`, the README badge and Version
+History, the named installer links in README and both install pages, the
+Architecture version header, and release tags unchanged.
+Maintainers assign collision-free release metadata on the final landing tree.
 
-### Do not bump the version
+Commit the intended change before producing final evidence, then require
+`git status --short` to be empty. Review evidence covers a committed
+base-to-head range, never uncommitted edits.
 
-External contributors should not edit release-only version carriers for a
-normal pull request: `VERSION`, the package versions, README badge/history,
-the architecture version header, or release tags. Ouroboros treats an
-integrated commit as a release, but maintainers assign the collision-free
-version during final integration, normally while squash-integrating the pull
-request. This avoids unrelated version conflicts between concurrent
-contributions.
+## 4. Verify the Change
 
-You may still update ordinary README or architecture content when the behavior
-or structure changes; leave only the release number to the maintainer.
-
-## Verification
-
-Install the source environment using
-[`README.md` → Run from Source](README.md#run-from-source). The default local
-suite is documented in [`README.md` → Run Tests](README.md#run-tests):
+Use [`README.md` → Run from Source](README.md#run-from-source) for setup. Run
+focused tests while developing, then the default local suite when practical:
 
 ```bash
 make test
 ```
 
-Run the narrowest relevant tests while developing, then the repository's
-default local test suite when practical. Record the exact commands and
-outcomes in the pull request; “tests pass” without a command is not
-reproducible evidence. Follow the marker and environment guidance in
-[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for integration, browser,
-portable, and skill-smoke lanes.
+Record exact commands, outcomes, and producer exit codes. If a check could not
+run, record `NOT_RUN` and the reason instead of claiming it passed.
 
-### Mark non-parallel-safe tests `serial`
+Tests that spawn a real process, bind a real port, or mutate module-level
+global state must be marked `@pytest.mark.serial`. A merely slow test must be
+made faster or split, not moved to the unbounded serial pass. See
+[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for the CI split and isolation
+rules.
 
-CI and the maintainers' hermetic commit gate both run the suite as **two
-passes**: a parallel `-m "not serial" -n auto` pass, then a `serial` pass. So
-your test runs concurrently with unrelated tests unless you say otherwise.
+For a visible UI change, inspect at least one relevant rendered user flow and
+attach before/after screenshots or equivalent evidence. A saved screenshot
+that was not inspected is not visual verification.
 
-If a test spawns a real OS process, binds a real port, or mutates a
-module-level global or registry, mark it `@pytest.mark.serial`. Everything else
-must be parallel-safe: use `tmp_path` rather than fixed `/tmp/...` paths,
-`monkeypatch.setenv`/`setattr` rather than bare `os.environ[...] =`, assume no
-execution order, and restore any module global you touch.
+## 5. Review the Frozen Diff in a Separate Agent Context
 
-This is not a style preference. An unmarked real-process test does not merely
-flake — it can kill an xdist worker, which fails that worker's whole co-located
-batch and surfaces as failures in files you never touched. The commit gate
-reports a dead worker as a `PARALLEL_WORKER_CRASH` **hard block** and never
-retries it, so the fix is never a re-run.
+Before opening a substantive PR, the authoring agent must hand the final
+committed diff to a **separate agent context**. Use a subagent, new task, or
+fresh agent session. Reviewing in the authoring conversation does not count.
 
-A dead worker has two causes, and the gate's message tells you which one you
-have. If the worker crashed, the marker is the fix. If the parallel pass's 300s
-per-test timeout killed it, the fix is to make that test faster or split it —
-**do not** mark a merely-slow test `serial`, because the serial pass carries no
-per-test timeout, so the hang would simply move into the one lane that cannot
-bound it. See [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) “The commit gate
-mirrors the CI split” and item 18 of
-[`docs/CHECKLISTS.md`](docs/CHECKLISTS.md).
+Give the reviewer the issue or goal, non-goals, exact base and head SHAs, and
+repository access. The reviewer must not edit the candidate. Use this compact
+instruction:
 
-Add or update tests for changed behavior. If a test cannot be run in your
-environment, say which one and why rather than marking it as passed.
+```text
+Review the final pull request diff from <base SHA> to <head SHA>. Do not edit.
 
-For a visible UI change:
+Read CONTRIBUTING.md. For a substantive change, read BIBLE.md,
+docs/ARCHITECTURE.md, docs/DEVELOPMENT.md, and docs/CHECKLISTS.md in full.
+Inspect the complete diff, touched files, relevant callers, tests, and docs.
 
-1. Open at least one relevant real user flow in an available browser.
-2. Inspect the rendered result, including the states and viewport sizes that
-   matter for the change.
-3. Attach before/after screenshots or equivalent evidence and state what was
-   actually inspected.
-
-A saved screenshot that nobody inspected is not visual verification. Mobile
-or WebKit evidence is risk-driven rather than mandatory for every UI change.
-
-## Optional Fast Path: Triad + Scope Review
-
-A contributor-supplied triad + scope packet is optional, but it materially
-reduces the work needed to evaluate a pull request. A current, complete packet
-places the pull request on the faster review path. A pull request without one
-may still be considered, but Ouroboros and the maintainers must reproduce the
-review and may need to revise the change manually; that path is slower and the
-pull request is more likely to be deferred when maintainer capacity is limited.
-
-Neither a clean packet nor its absence decides acceptance. A passing review is
-evidence, not a promise to merge, and maintainers may rerun it or request
-additional changes.
-
-If the pull request changes the review substrate itself — for example the
-review script, reviewer configuration, review checklists, or production review
-code — its contributor packet is diagnostic only. A maintainer must rerun the
-review from a trusted target-base implementation before integration.
-
-### What the contributor review runs
-
-The checked-in
-[`scripts/run_external_review.py`](scripts/run_external_review.py) contributor
-mode runs the production triad and scope review over the committed range from
-the target base to your branch head. It deliberately:
-
-- resolves the reviewer models and reasoning efforts from the shipped defaults
-  in the target `ouroboros` revision, not from values modified by the pull
-  request;
-- routes every triad and scope reviewer through OpenRouter;
-- applies the clean blocking contract for the contributor packet;
-- does **not** run the Claude advisory pre-review and does not require an
-  Anthropic key;
-- records the exact base/head binding and full reviewer evidence without
-  committing or modifying the reviewed branch.
-
-Triad completeness follows Ouroboros's production quorum contract together
-with an authoritative scope verdict; it does not require every configured
-actor to respond. The packet preserves actor statuses and degraded reasons, so
-any failed, partial, or unparsable actor must still be disclosed even when the
-remaining actors satisfy quorum.
-
-Do not override the reviewer models, scope-review model, reasoning efforts, or
-provider. The value of this packet is that every contributor uses the review
-configuration selected by the current target version of Ouroboros.
-
-### Produce a packet
-
-First fetch and rebase on the current target, commit the final change, and
-confirm the worktree is clean. Configure your own `OPENROUTER_API_KEY` without
-placing it in a command argument, tracked file, shell history, or attachment.
-Also set `TOTAL_BUDGET` to a positive finite USD ceiling that you explicitly
-authorize for this run; contributor mode fails before model calls when that
-ceiling is missing or invalid. The review calls may incur OpenRouter charges,
-so use a key with sufficient remaining provider balance and check current
-pricing before choosing the ceiling. For example:
-
-```bash
-export TOTAL_BUDGET="<authorized USD ceiling>"
+Return findings first with severity and exact file/line references, then checks
+performed, coverage limitations, and one verdict: PASS, NEEDS_CHANGES, or
+INCOMPLETE. Do not report PASS when required material was unavailable.
 ```
 
-Then run from the repository root:
+Reproduce material findings when possible. Fix confirmed problems, and briefly
+record why any finding was rejected or deferred. Any code change, rebase, or
+conflict resolution makes the old review stale; review the new final range.
+Stop when no material finding remains rather than chasing an unbounded review
+loop.
+
+If no separate agent context is available, do not substitute same-context
+self-review. Mark the review `NOT_RUN` and explain why in the PR.
+
+### Optional project-native review command
+
+Ouroboros can produce the same evidence in a structured SHA-bound packet. Its
+contributor mode uses the reviewer slots actually configured on the machine:
+`api_chat`, `agent_session`, or a mixture.
+
+Configured API slots need their provider credentials and a positive finite
+`TOTAL_BUDGET`. Agent-session slots need their configured agent route and
+account to be available. The wrapper checks route-specific readiness where it
+has a reliable probe; the selected route reports other failures explicitly.
+
+From a clean committed branch:
 
 ```bash
 python scripts/run_external_review.py \
@@ -242,77 +171,56 @@ python scripts/run_external_review.py \
   --scope "<scope>"
 ```
 
-The script creates:
+The command creates `review-evidence.json`, `full-output.txt`, and
+`review-packet.zip`. The packet records the configured slots, observed
+route/model/profile facts, absent telemetry, base/head/tree/diff hashes,
+verdicts, and incomplete or degraded actors. It fails closed when the declared
+slot route and observable execution receipt disagree or cannot be correlated.
 
-- `review-evidence.json` — machine-readable base/head, configuration, actor,
-  verdict, and outcome evidence;
-- `full-output.txt` — full human-readable triad and scope output;
-- `review-packet.zip` — the attachment-ready packet.
+Applied reasoning effort is not currently exposed by every route. The packet
+records configured effort as requested and leaves effective effort absent
+rather than presenting the request as observed fact.
 
-Use the fresh output directory printed by the command. Review packets are
-operator artifacts: attach them to the pull request, but do not add them to the
-git diff.
+If the PR changes the review script or review substrate, its local packet is
+diagnostic only. A maintainer must rerun from trusted target-base code.
 
-### Attach and summarize the evidence
+## 6. Open the Pull Request
 
-In the pull request's **Review evidence** section:
+Complete the PR template with:
 
-1. Attach `review-packet.zip` and, when useful for quick inspection,
-   `review-evidence.json` and `full-output.txt`.
-2. Record the reviewed base SHA and head SHA.
-3. Record the exact command/profile and the resolved reviewer model IDs.
-4. Summarize every triad actor verdict, the aggregate triad result, and the
-   scope verdict.
-5. Disclose known advisory findings, accepted trade-offs, infrastructure
-   failures, skipped coverage, or other non-clean conditions. Do not present a
-   failed or incomplete run as a pass.
+- summary, scope, and non-goals;
+- exact verification commands and outcomes;
+- authoring agent/context;
+- separate review agent/context and model when exposed;
+- reviewed base SHA and head SHA;
+- verdict, findings, and their disposition;
+- checks, coverage limitations, and full output or artifact link;
+- `NOT_RUN` plus a reason for unavailable verification or review.
 
-The evidence is valid only for the recorded head and base. Rerun it after any
-code change, rebase, conflict resolution, or other change to the reviewed
-range. Do not cherry-pick only favorable actor outputs or substitute a
-screenshot for the raw records.
+Review output is public evidence. Inspect attachments for credentials, private
+paths, or unrelated local data. Attach generated packets; never commit them.
+Do not cherry-pick only favorable reviewer output or hide failed actors.
 
-### Protect secrets and private data
+A clean review is evidence, not a promise to merge. It does not authorize a
+commit, push, merge, release, or publication.
 
-Treat review output as public before uploading it. Attach only the generated
-packet, not the review drive, local observability store, `settings.json`, or an
-environment dump. Inspect the packet for API keys, authorization headers,
-credentials, private paths, or unrelated local data even when automatic
-redaction reports success.
+## Final Checklist
 
-If redaction is necessary, preserve all verdicts and finding structure and
-state exactly what was removed. Never upload a secret and never commit a
-credential in order to make review reproducible; revoke any credential that
-was exposed.
+- [ ] The PR targets `ouroboros` and is current with its recorded base.
+- [ ] The PR has one coherent purpose and explicit non-goals.
+- [ ] The required project documents were read in full.
+- [ ] Relevant tests and UI evidence are recorded honestly.
+- [ ] No release-version carrier was changed.
+- [ ] No secret, runtime state, generated run, or build artifact is in the diff.
+- [ ] The final range was reviewed in a separate agent context, or `NOT_RUN` is
+      recorded with a reason.
+- [ ] Findings, limitations, and follow-up work are disclosed.
 
-## Pull Request Checklist
+## Maintainer Boundary
 
-Before marking the pull request ready for review, confirm that:
-
-- the base branch is `ouroboros` and the branch is current with its intended
-  base revision;
-- the pull request has one coherent purpose with explicit non-goals;
-- the description explains the architectural fit and important trade-offs;
-- relevant tests pass, with exact commands and outcomes recorded;
-- behavior and architecture documentation are updated where necessary;
-- visible UI changes include inspected rendered-flow evidence;
-- no version or release-only carrier was bumped by the contributor;
-- no secrets, local state, logs, caches, generated runs, or build artifacts are
-  present in the diff;
-- triad + scope evidence is attached and current, or the reason it was not run
-  is stated honestly;
-- limitations, unresolved findings, and follow-up work are disclosed.
-
-Disclosure of coding-agent assistance is optional. If you include it, name the
-agent/model, what it changed, and what a human or independent process verified.
-Agent use is context, not a positive or negative quality signal.
-
-## What Happens After Submission
-
-Maintainers may reproduce tests, rerun triad + scope review, ask for a smaller
-diff, request changes, or integrate the contribution with additional fixes and
-the final release-version update. Review evidence accelerates that process but
-does not replace maintainer judgment or Ouroboros's own governance gates.
+Maintainers may reproduce tests, request a smaller diff, add integration fixes,
+and rerun the project's final review on the exact landing tree. They choose the
+landing parent and release version while preserving contributor authorship.
 
 Contributions are licensed under the repository's
 [`LICENSE`](LICENSE). By submitting a contribution, you confirm that you have

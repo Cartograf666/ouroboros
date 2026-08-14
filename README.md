@@ -18,6 +18,8 @@ Ouroboros is an open-source, general-purpose AI agent whose identity, durable me
 
 It runs as a native desktop app or through a headless CLI. The runtime keeps its repository, durable memory, history, and interface on your machine, while model inference can use remote APIs you configure or a local GGUF model.
 
+> **Changing Ouroboros? Coding agents and people must read [CONTRIBUTING.md](CONTRIBUTING.md) before editing.** It defines the required project context, verification, and separate-agent review flow.
+
 ## Download Ouroboros
 
 > **Just want to use Ouroboros? Click the download for your platform below. You do not need to clone this repository or install Python or uv.**
@@ -435,11 +437,11 @@ not paraphrase it.
 ## Contributing
 
 External contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md)
-for the complete workflow. Open pull requests against the lowercase
-`ouroboros` branch and leave release-version allocation to maintainers. A
-current OpenRouter triad + scope packet is the optional fast path; pull
-requests without one remain welcome but require more maintainer-side review
-and integration work.
+for the complete agent-first workflow. Open pull requests against lowercase
+`ouroboros`, leave release-version allocation to maintainers, and have a
+separate agent context review the final diff. Any coding harness or configured
+review route may produce the evidence; if none is available, record `NOT_RUN`
+and the reason.
 
 ---
 

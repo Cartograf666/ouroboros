@@ -695,19 +695,35 @@ Architecture owns the dataflow; this section owns operator sequence. Finish all
 edits, run focused tests, run the advisory when useful, then freeze and review
 the exact candidate. Do not interleave edits with repeated review calls.
 
-### External PR readiness is not commit authorization
+### External PR review is not commit authorization
 
-`scripts/run_external_review.py --contributor` reviews a clean committed
-base-to-head proposal with target-base reviewer defaults and emits shareable
-evidence. It establishes readiness and exact base/head/diff facts; it does not
-authorize an operator to commit, push, merge, or publish. A proposal changing
-the review substrate cannot self-attest its own fast path. Maintainers choose
-the landing parent and release version, preserve authorship, and run the normal
-final exact-candidate gate. `CONTRIBUTING.md` owns the contribution procedure.
-Accordingly, a pull request into `ouroboros` leaves `VERSION`,
-`pyproject.toml`, the editable root version in `uv.lock`, `web/package.json`,
-`web/modules/api_types.js::GATEWAY_CONTRACT_VERSION`, the README badge, and
-the Architecture header byte-identical to its target. At integration,
+The authoring agent freezes the final committed base-to-head range and gives it
+to a separate agent context for read-only review. Any coding harness or provider
+may supply that independent context; same-conversation self-review does not.
+Unavailable review is recorded as `NOT_RUN`, never silently presented as clean.
+`CONTRIBUTING.md` owns the public procedure and evidence fields.
+
+`scripts/run_external_review.py --contributor` is an optional structured
+producer for the same evidence. It preserves and freezes the machine's
+configured `api_chat` and `agent_session` triad/scope rows, then binds each row
+to its dispatched prompt receipt and observed response receipt. The shareable
+packet records exact base/head/tree/diff hashes, route/model/profile facts,
+terminal settlement and capability-delta facts, telemetry limitations, and
+full redacted agent-session transcripts. Missing, tampered, drifted,
+unprovable, or contradictory identity/terminal receipts make the packet
+`INCOMPLETE`. Non-identity capability deltas remain explicit degradation
+evidence and do not override the production actor-status/quorum result. A
+proposal changing this review substrate still requires a trusted-target rerun.
+
+This evidence establishes readiness; it does not authorize commit, push, merge,
+or publication. Maintainers choose the landing parent and release version,
+preserve authorship, and run the normal final exact-candidate gate. Accordingly,
+a pull request into `ouroboros` leaves `VERSION`, `pyproject.toml`, the editable
+root version in `uv.lock`, `web/package.json`,
+`web/modules/api_types.js::GATEWAY_CONTRACT_VERSION`, the README badge and
+latest Version History row, the named direct-download links in README and both
+install pages, and the Architecture header byte-identical to its target. At
+integration,
 `ouroboros/tools/release_sync.py::sync_release_metadata()` projects the chosen
 version and `version_carrier_desyncs()` verifies those carriers; changelog prose
 remains a deliberate maintainer edit. The same projection owns the seven public
