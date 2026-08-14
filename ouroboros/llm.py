@@ -45,6 +45,49 @@ _VALID_CACHE_TTLS = frozenset({"5m", "1h"})
 
 # Only explicit wire tiers have a knowable horizon; bare "default" does not.
 _CACHE_TTL_SECONDS = {"5m": 300, "1h": 3600}
+_TYPED_CONTEXT_OVERFLOW_CODES = frozenset({
+    "context_length_exceeded",
+    "context_window_exceeded",
+    "model_context_window_exceeded",
+    "prompt_too_long",
+    "input_too_long",
+})
+
+
+def _structured_error_values(payload: Any) -> Set[str]:
+    if not isinstance(payload, dict):
+        return set()
+    nodes = [payload]
+    if isinstance(payload.get("error"), dict):
+        nodes.append(payload["error"])
+    return {
+        str(node.get(key) or "").strip().lower()
+        for node in nodes
+        for key in ("code", "type")
+        if str(node.get(key) or "").strip()
+    }
+
+
+def _is_structured_context_overflow_exception(exc: BaseException) -> bool:
+    """Read only facts attached to this exception; never a stale ContextVar."""
+    values = {
+        str(getattr(exc, key, "") or "").strip().lower()
+        for key in ("code", "type")
+        if str(getattr(exc, key, "") or "").strip()
+    }
+    values.update(_structured_error_values(getattr(exc, "body", None)))
+    capture = getattr(exc, "physical_attempt_capture", None)
+    if capture is not None:
+        values.update({
+            str(getattr(capture, key, "") or "").strip().lower()
+            for key in ("provider_code", "provider_error_type")
+            if str(getattr(capture, key, "") or "").strip()
+        })
+    return bool(values & _TYPED_CONTEXT_OVERFLOW_CODES)
+
+
+def _is_structured_context_overflow_body(error: Any) -> bool:
+    return bool(_structured_error_values(error) & _TYPED_CONTEXT_OVERFLOW_CODES)
 
 
 def cache_ttl_seconds(applied_ttl: Any) -> Optional[int]:
@@ -1039,11 +1082,7 @@ class LLMClient:
 
     @staticmethod
     def _set_payload_effort(payload: Dict[str, Any], effort: str) -> None:
-        """Pure setter: write ``effort`` into whichever carrier shape(s) the
-        payload holds — top-level ``reasoning_effort``, ``output_config.effort``,
-        or the OpenRouter nested ``extra_body.reasoning.effort`` (the same shapes
-        ``_payload_effort`` reads). Policy/disclosure live in
-        ``_clamp_effort_for_model``; this only mutates the payload."""
+        """Write effort into each carrier already present in the payload."""
         if "reasoning_effort" in payload:
             payload["reasoning_effort"] = effort
         oc = payload.get("output_config")
@@ -1060,35 +1099,19 @@ class LLMClient:
         exc: BaseException,
     ) -> Optional[Dict[str, Any]]:
         cls = type(self)
+        if _is_structured_context_overflow_exception(exc):
+            return None
         if not cls._parameter_rejection_error(exc):
             return None
         _err_text = str(exc or "").lower()
         _effort_implicated = any(
             k in _err_text for k in ("reasoning_effort", "output_config", "thinking", "reasoning", "effort")
         )
-        # v6.73.2 — a MANDATORY-value rejection is handled EXCLUSIVELY here and
-        # never feeds the drop machinery below: dropping (and durably
-        # remembering) the reasoning carrier would strip effort control for
-        # every lane of this model — including blocking reviewers at high — for
-        # 14 days. Two sub-cases:
-        #   * bottom-tier effort ("none"/"minimal"): "reasoning cannot be
-        #     disabled here" → learn a floor of "low", re-clamp through the ONE
-        #     effort authority (_clamp_effort_for_model, which records the
-        #     learned_floor disclosure), and retry with the carrier PRESERVED.
-        #   * any other effort: the rejection is not about our value being too
-        #     low (e.g. an endpoint objecting to `exclude`); raising cannot help
-        #     and dropping would poison — propagate unrecovered (status quo).
-        # Gated on the NARROW mandatory-value predicate, never on generic
-        # effort mentions: a genuine "reasoning is not supported" rejection at
-        # "none" must still DROP the carrier below (capability-absent and
-        # value-forbidden need OPPOSITE remedies).
+        # A mandatory bottom-tier effort rejection learns a floor. Other
+        # mandatory-value failures propagate rather than poisoning the durable
+        # optional-parameter cache by dropping an effort carrier.
         if cls._mandatory_value_rejection(exc):
             requested = cls._payload_effort(payload)
-            # The floor is EXPLICITLY tied to the effort carrier: the error
-            # text must implicate reasoning/effort AND the payload must carry a
-            # bottom-tier effort. A non-effort mandatory error (e.g.
-            # "response_format is mandatory") never learns a floor — and never
-            # drops either (exclusivity) — it propagates (triad r1).
             if not _effort_implicated or requested not in ("none", "minimal"):
                 return None
             cls._record_effort_floor(model_id, "low")
@@ -1104,51 +1127,24 @@ class LLMClient:
             )
             return retry_payload
         present = {param for param in _OPTIONAL_DROPPABLE_PARAMS if param in payload}
-        # v6.73.2 (triad r1 critical): bind the drop to the parameter(s) the
-        # provider actually NAMED in the error. Historically every present
-        # optional param was dropped AND durably remembered on any match; with
-        # the value-marker families widening the entry surface, an unbound
-        # "temperature must be between 0 and 2" on a direct-OpenAI payload
-        # carrying temperature + reasoning_effort would durably strip effort
-        # control for 14 days. When the text names none of the present params
-        # (e.g. the generic "requested parameter" phrasing), the legacy
-        # drop-all-present fallback is kept — the classifier already required
-        # SOME param signal, and a bare retry maximizes recovery there.
-        # Providers name params in dotted alias forms too ("invalid value for
-        # reasoning.effort" names our reasoning_effort carrier); canonicalize
-        # dots to underscores for the match so an alias never empties _named
-        # and re-triggers the drop-all fallback (triad r2).
+        # Drop only parameters named by the provider. Dotted aliases name the
+        # corresponding underscore carrier; generic rejections keep the legacy
+        # fallback of dropping all present optional parameters once.
         _err_compact = _err_text.replace(".", "_")
         _named = {param for param in present if param in _err_text or param in _err_compact}
-        # The nested OpenRouter carrier is a NAMED candidate too (codex final
-        # review): an error implicating reasoning/effort names THAT carrier —
-        # resolving it here (before the fallback) keeps a nested-carrier error
-        # from emptying _named and drop-all-stripping unrelated neighbors.
         _eb = payload.get("extra_body")
         _nested_reasoning = isinstance(_eb, dict) and isinstance(_eb.get("reasoning"), dict)
         if _nested_reasoning and _effort_implicated:
             _named.add(cls._NESTED_REASONING_PARAM)
             present.add(cls._NESTED_REASONING_PARAM)
         if _named:
-            # thinking + output_config are ONE paired Anthropic effort carrier
-            # (set together at build); a rejection naming either drops both —
-            # a half-carrier (adaptive thinking with no effort, or vice versa)
-            # is not a meaningful degradation target.
+            # Anthropic thinking/output_config form one carrier.
             if _named & {"thinking", "output_config"}:
                 _named |= {"thinking", "output_config"} & present
             present = _named
-        # The OpenRouter lane carries effort NESTED as extra_body.reasoning.effort —
-        # invisible to the top-level scan above, so an xhigh/max rejection there
-        # would neither retry nor learn a ceiling nor disclose (triad r6). Treat the
-        # nested carrier as droppable when the error implicates effort.
-        # (nested-carrier candidacy resolved above, before the named fallback)
         if not present:
             return None
-        # v6.57.0: if the error SPECIFICALLY implicates an effort carrier, learn the
-        # route's ceiling as one step below the requested effort so the NEXT call clamps
-        # immediately (converges over calls; this call still degrades by dropping the
-        # carrier). The text check is required: a GENERIC parameter rejection (e.g. a
-        # temperature-only refusal) must NOT teach a phantom effort ceiling.
+        # Learn a ceiling only from a rejection naming an effort carrier.
         if (
             present & {"reasoning_effort", "output_config", "thinking", cls._NESTED_REASONING_PARAM}
             and _effort_implicated
@@ -1158,8 +1154,6 @@ class LLMClient:
         retry_payload = copy.deepcopy(payload)
         for param in present:
             if param == cls._NESTED_REASONING_PARAM:
-                # Remove ONLY the nested reasoning carrier; provider routing and any
-                # other extra_body keys must survive the retry.
                 _retry_eb = retry_payload.get("extra_body")
                 if isinstance(_retry_eb, dict):
                     _retry_eb.pop("reasoning", None)
@@ -1254,6 +1248,8 @@ class LLMClient:
         exc: BaseException,
     ) -> Optional[Dict[str, Any]]:
         """Remove only an explicitly rejected cache control or affinity once."""
+        if _is_structured_context_overflow_exception(exc):
+            return None
         provider = str(target.get("provider") or "").strip().lower()
         extra_body = payload.get("extra_body")
         param = ""
@@ -1909,13 +1905,9 @@ class LLMClient:
         kwargs: Dict[str, Any],
         exc: Exception,
     ) -> Optional[Dict[str, Any]]:
-        """Structural recovery for provider 400s caused by replaying reasoning
-        metadata: when the request CARRIED replayed reasoning artifacts AND the
-        provider returned 400, strip the artifacts and retry the SAME model once.
-        The trigger is structural (request shape + 400 status), NOT an error-string
-        allowlist — so every provider phrasing of this failure class is covered.
-        ``_reroute_same_model_kwargs`` returns None when no reasoning was present,
-        so a genuine (non-reasoning) 400 still propagates unchanged."""
+        """Strip replayed reasoning once for a non-overflow OpenRouter 400."""
+        if _is_structured_context_overflow_exception(exc):
+            return None
         if not target.get("supports_openrouter_extensions"):
             return None
         if not self._is_http_status(exc, 400):
@@ -2069,7 +2061,9 @@ class LLMClient:
         except Exception:
             return None
         err = self._provider_body_error(resp_dict)
-        if not err or not self._is_transient_body_error(err):
+        if not err or _is_structured_context_overflow_body(err):
+            return None
+        if not self._is_transient_body_error(err):
             return None
         reroute = self._reroute_same_model_kwargs(
             target, kwargs, allow_portable_reasoning=True
@@ -2092,28 +2086,13 @@ class LLMClient:
         kwargs: Dict[str, Any],
         target: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        """Body-error-in-200 twin of the exception-path
-        ``_openrouter_signature_retry_kwargs`` strip-and-retry.
-
-        OpenRouter passes some upstream 400s through the BODY of an HTTP-200
-        response. When such a 400 rejects replayed encrypted reasoning items
-        ("The encrypted content for item rs_... could not be ..."), the request
-        is deterministically poisoned for the current upstream: the classic
-        exception-path strip-and-retry (v6.28.0/v6.37.0) never sees it, and
-        loop_llm_call classifies the typed bad_request as PERMANENT — the task
-        dies (field incidents 2026-07: 14/210 baseline tasks, then whole
-        v6.65.x benchmark waves after 429-reroutes started preserving items).
-        Strip the replayed reasoning metadata once and retry, exactly like the
-        exception path would. Genuine bad_request 400s are untouched: without
-        replayed reasoning metadata ``_reroute_same_model_kwargs`` returns
-        None, and the marker gate keeps unrelated 400s out.
-        """
+        """Strip replayed encrypted reasoning for a non-overflow body 400."""
         try:
             resp_dict = resp.model_dump()
         except Exception:
             return None
         body_err = self._provider_body_error(resp_dict)
-        if not isinstance(body_err, dict):
+        if not isinstance(body_err, dict) or _is_structured_context_overflow_body(body_err):
             return None
         try:
             code = int(body_err.get("code") or 0)
@@ -2136,22 +2115,13 @@ class LLMClient:
         kwargs: Dict[str, Any],
         usage_model: str,
     ) -> Optional[Dict[str, Any]]:
-        """Body-error-in-200 twin of the exception-path parameter-rejection
-        recovery (v6.73.2, triad r3). OpenRouter passes some upstream 400s
-        through the BODY of an HTTP-200; a parameter/value rejection delivered
-        that way ("Reasoning is mandatory ... cannot be disabled",
-        "temperature must be between 0 and 2") would otherwise bypass
-        ``_retry_without_optional_sampling`` entirely and return the dead
-        response. Feed the body-error MESSAGE through the SAME classifier/
-        recovery seam once — floor-or-propagate for mandatory-value, named-drop
-        for the rest — so both transports close the same class. Non-400 and
-        unmatched errors return None (untouched)."""
+        """Apply exception-path parameter recovery to a non-overflow body 400."""
         try:
             resp_dict = resp.model_dump()
         except Exception:
             return None
         body_err = self._provider_body_error(resp_dict)
-        if not isinstance(body_err, dict):
+        if not isinstance(body_err, dict) or _is_structured_context_overflow_body(body_err):
             return None
         try:
             code = int(body_err.get("code") or 0)
@@ -3796,6 +3766,7 @@ class LLMClient:
         if _body_err:
             usage["provider_error"] = {
                 "code": _body_err.get("code"),
+                "type": _body_err.get("type"),
                 "message": str(_body_err.get("message") or "")[:300],
                 "kind": "rate_limit" if self._is_transient_body_error(_body_err) and str(_body_err.get("code")) == "429"
                 else ("provider_transient" if self._is_transient_body_error(_body_err) else "provider_error"),

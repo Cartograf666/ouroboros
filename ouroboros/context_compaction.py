@@ -89,6 +89,16 @@ def _reclaim_tokens_for_byte_delta(byte_delta: int, measurement_density: float) 
     return max(0, math.ceil((max(0, int(byte_delta)) / 4) * density))
 
 
+def _context_tokens_for_messages(
+    messages: Sequence[Mapping[str, Any]], measurement_density: float,
+) -> int:
+    """Use the same bounded message projection and density as ContextFit."""
+    from ouroboros.context_fit import estimate_context_prompt_tokens
+    _reclaim_tokens_for_byte_delta(0, measurement_density)
+    estimate = estimate_context_prompt_tokens(list(messages))
+    return max(0, math.ceil(estimate * float(measurement_density)))
+
+
 def _sha256(value: Any) -> str:
     raw = value if isinstance(value, bytes) else str(value).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
@@ -96,7 +106,6 @@ def _sha256(value: Any) -> str:
 
 def context_reclaim_transcript_sha256(messages: Sequence[Mapping[str, Any]]) -> str:
     """Stable binding of the complete canonical transcript supplied to reclaim."""
-
     return _sha256(_canonical_bytes(list(messages)))
 
 
@@ -127,7 +136,6 @@ def _unique_refs(values: Sequence[Any]) -> Tuple[Dict[str, Any], ...]:
 
 def _summary_projection(value: Any) -> Any:
     """Return every actor-visible byte, replacing only safely-described visuals."""
-
     if isinstance(value, Mapping):
         kind = str(value.get("type") or "").strip().lower()
         if kind in {"image", "image_url"}:
@@ -179,14 +187,13 @@ def _capsule_metadata(message: Mapping[str, Any]) -> Tuple[bool, Optional[Dict[s
         summary_contract_version = int(meta.get("summary_contract_version"))
     except (TypeError, ValueError):
         return True, None
-    source_hashes = meta.get("source_hashes")
-    source_refs = meta.get("source_refs")
-    parts = meta.get("parts")
-    checkpoint_ref = meta.get("checkpoint_ref")
+    source_hashes, source_refs = meta.get("source_hashes"), meta.get("source_refs")
+    parts, checkpoint_ref = meta.get("parts"), meta.get("checkpoint_ref")
     source_unit_sha256 = str(meta.get("source_unit_sha256") or "")
     summary_contract_digest = str(meta.get("summary_contract_digest") or "")
     valid = (
-        version == _CAPSULE_VERSION
+        str(block.get("type") or "") == "text"
+        and version == _CAPSULE_VERSION
         and generation >= 1
         and str(meta.get("retention") or "") == "summarized"
         and bool(str(meta.get("unit_id") or "").strip())
@@ -194,10 +201,8 @@ def _capsule_metadata(message: Mapping[str, Any]) -> Tuple[bool, Optional[Dict[s
         and len(source_unit_sha256) == 64 and set(source_unit_sha256) <= _SHA256_HEX
         and isinstance(source_hashes, list) and bool(source_hashes)
         and source_unit_sha256 in source_hashes
-        and all(
-            isinstance(item, str) and len(item) == 64 and set(item) <= _SHA256_HEX
-            for item in source_hashes
-        )
+        and all(isinstance(item, str) and len(item) == 64 and set(item) <= _SHA256_HEX
+                for item in source_hashes)
         and isinstance(source_refs, list)
         and all(isinstance(item, Mapping) and item for item in source_refs)
         and isinstance(parts, list) and bool(parts)
@@ -207,8 +212,8 @@ def _capsule_metadata(message: Mapping[str, Any]) -> Tuple[bool, Optional[Dict[s
         and any(dict(item) == dict(checkpoint_ref) for item in source_refs)
         and str(meta.get("measurement_basis") or "")
         in {"fresh_route_usage", "fresh_model_usage", "cold_estimate"}
-        and summary_contract_version >= 1
-        and len(summary_contract_digest) == 64 and set(summary_contract_digest) <= _SHA256_HEX
+        and summary_contract_version == _SUMMARY_CONTRACT_VERSION
+        and summary_contract_digest == _SUMMARY_CONTRACT_DIGEST
     )
     if not valid:
         return True, None
@@ -225,7 +230,8 @@ def _capsule_metadata(message: Mapping[str, Any]) -> Tuple[bool, Optional[Dict[s
         source_id = str(part.get("source_id") or "")
         digest = str(part.get("sha256") or "")
         if (not source_id or source_id in seen_source_ids or start != expected_start
-                or end <= start or len(digest) != 64 or not set(digest) <= _SHA256_HEX):
+                or end <= start or len(digest) != 64 or not set(digest) <= _SHA256_HEX
+                or digest not in source_hashes):
             return True, None
         seen_source_ids.add(source_id)
         expected_start = end
@@ -260,16 +266,16 @@ def _unit_from_slice(
             if call_id:
                 refs.append(trace_refs_by_tool_call_id.get(call_id))
     lineage_hashes.extend((raw_sha, source_sha))
-    predicted = _reclaim_tokens_for_byte_delta(
-        len(raw_bytes) - _MIN_CAPSULE_BYTES,
-        measurement_density,
-    )
+    context_size_tokens = _context_tokens_for_messages(raw_messages, measurement_density)
+    capsule_floor = _reclaim_tokens_for_byte_delta(_MIN_CAPSULE_BYTES, measurement_density)
+    predicted = max(0, context_size_tokens - capsule_floor)
     return _AtomicUnit(
         unit_id=f"unit:{start}:{end}:{raw_sha[:16]}",
         start=start,
         end=end,
         raw_sha256=raw_sha,
         raw_size_bytes=len(raw_bytes),
+        context_size_tokens=context_size_tokens,
         source_text=source_text,
         source_sha256=source_sha,
         predicted_reclaim_tokens=predicted,
@@ -286,7 +292,6 @@ def _atomic_units(
     measurement_density: float = 1.0,
 ) -> Tuple[_AtomicUnit, ...]:
     """Find completed tool units and capsules; leave malformed units raw."""
-
     trace_refs = trace_refs_by_tool_call_id or {}
     units: List[_AtomicUnit] = []
     idx = 0
@@ -353,13 +358,25 @@ def _typed_context_overflow(exc: BaseException) -> bool:
             return True
     except Exception:
         pass
-    candidates = [getattr(exc, "kind", None), getattr(exc, "code", None)]
+    candidates = [getattr(exc, key, None) for key in ("kind", "code", "type")]
     body = getattr(exc, "body", None)
-    if isinstance(body, Mapping):
-        candidates.extend((body.get("kind"), body.get("code"), body.get("type")))
-        nested = body.get("error")
+    payloads = [body] if isinstance(body, Mapping) else []
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            response_body = response.json()
+        except Exception:
+            response_body = None
+        if isinstance(response_body, Mapping):
+            payloads.append(response_body)
+    for payload in payloads:
+        candidates.extend(payload.get(key) for key in ("kind", "code", "type"))
+        nested = payload.get("error")
         if isinstance(nested, Mapping):
-            candidates.extend((nested.get("kind"), nested.get("code"), nested.get("type")))
+            candidates.extend(nested.get(key) for key in ("kind", "code", "type"))
+    capture = getattr(exc, "physical_attempt_capture", None)
+    candidates.extend((getattr(capture, "provider_code", None),
+                       getattr(capture, "provider_error_type", None)))
     return any(str(value or "").strip().lower() in _TYPED_CONTEXT_OVERFLOW_CODES for value in candidates)
 
 
@@ -452,10 +469,8 @@ def _call_summarizer(
     usage_total: Dict[str, Any],
 ) -> Dict[str, str]:
     """Summarize complete parts. Typed overflow is never retried unchanged."""
-
     from ouroboros.llm import LLMClient
     from ouroboros.llm_observability import chat_observed
-
     payload = [
         {
             "source_id": part.source_id,
@@ -901,10 +916,9 @@ def compact_tool_history_llm(
     failed_roots: set[str] = set()
     for offset in range(0, len(initial_parts), _BLOCKS_PER_BATCH):
         leaves, batch_map, failed = _map_complete_parts(
-            initial_parts[offset:offset + _BLOCKS_PER_BATCH],
-            drive_root=root, task_id=str(task_id or "context_compaction"), spec=spec,
-            summary_budgets=summary_budgets, usage_total=usage_total,
-        )
+            initial_parts[offset:offset + _BLOCKS_PER_BATCH], drive_root=root,
+            task_id=str(task_id or "context_compaction"), spec=spec,
+            summary_budgets=summary_budgets, usage_total=usage_total)
         for leaf in leaves:
             leaves_by_root[leaf.root_id].append(leaf)
         summaries.update(batch_map)
@@ -928,7 +942,9 @@ def compact_tool_history_llm(
         replacement, capsule_ref = _capsule_message(
             selected, summary, leaves, checkpoint_ref, effective_request,
         )
-        if len(_canonical_bytes([replacement])) >= selected.unit.raw_size_bytes:
+        if _context_tokens_for_messages(
+            [replacement], effective_request.measurement_density,
+        ) >= selected.unit.context_size_tokens:
             memo_candidates.append(selected.negative_memo_key)
             continue
         replacements[selected.unit.start] = (selected.unit.end, replacement, capsule_ref)
@@ -959,16 +975,13 @@ def compact_tool_history_llm(
         capsule_refs.append(capsule_ref)
         idx = end + 1
 
-    before_size = len(_canonical_bytes(messages))
-    after_size = len(_canonical_bytes(rebuilt))
-    if after_size >= before_size:
+    before_tokens = _context_tokens_for_messages(messages, effective_request.measurement_density)
+    after_tokens = _context_tokens_for_messages(rebuilt, effective_request.measurement_density)
+    if after_tokens >= before_tokens:
         receipt = _receipt("no_measurable_shrink", before_sha=before_sha, selection=selection,
                            checkpoint_ref=checkpoint_ref)
         return messages, receipt, usage_total or None
-    reclaimed_tokens = _reclaim_tokens_for_byte_delta(
-        before_size - after_size,
-        effective_request.measurement_density,
-    )
+    reclaimed_tokens = before_tokens - after_tokens
     after_sha = context_reclaim_transcript_sha256(rebuilt)
     return rebuilt, _receipt(
         "applied",

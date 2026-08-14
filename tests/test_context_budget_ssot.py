@@ -18,16 +18,11 @@ def _src(rel: str) -> str:
 def test_agent_context_budget_values_pinned():
     """Values are the SSOT; changing them is a deliberate, visible edit."""
     assert cb.OWNER_LOW_TARGET_TOKENS == 200_000
-    assert cb.EMERGENCY_COMPACTION_CHARS == 1_200_000
-    assert cb.LOW_EMERGENCY_COMPACTION_CHARS == 400_000
-    assert cb.COMPACTION_HYSTERESIS_REGION_GROWTH == 1.2
-    assert cb.COMPACTION_HYSTERESIS_ROUNDS == 10
     assert cb.BG_CONTEXT_WARN_CHARS == 600_000
     assert cb.BG_CONTEXT_MAX_CHARS == 1_200_000
     assert cb.BG_STATE_JSON_WARN_CHARS == 200_000
     assert cb.LARGE_CONTEXT_SECTION_CHARS == 200_000
     assert cb.MAX_RECENT_CHAT_TAIL == 1000
-    assert cb.LOW_EMERGENCY_COMPACTION_CHARS < cb.EMERGENCY_COMPACTION_CHARS
     assert not hasattr(cb, "CONTEXT_SOFT_CAP_TOKENS")
 
 
@@ -75,7 +70,9 @@ def test_call_sites_import_the_ssot_names():
         "COMPACTION_HYSTERESIS_REGION_GROWTH",
         "COMPACTION_HYSTERESIS_ROUNDS",
     ):
-        assert name in loop_src
+        assert not hasattr(cb, name)
+        assert name not in loop_src
+    assert "OWNER_LOW_TARGET_TOKENS" in _src("ouroboros/context_fit.py")
 
     ctx_recent_src = _src("ouroboros/context.py")
     assert "MAX_RECENT_CHAT_TAIL" in ctx_recent_src

@@ -551,12 +551,15 @@ The short-lived Swarm router admits one new root and transfers the intent; it
 never runs `plan_task`, steers an existing task, or publishes the work inline.
 
 **Context mode (Low / Max).** `OUROBOROS_CONTEXT_MODE` controls the Architecture projection in the agent's own context: Max keeps `ARCHITECTURE.md` full for every task class, while Low supplies its lossless navigation map. `DEVELOPMENT.md` is mode-independent and follows the active repository binding. It is full when the task targets Ouroboros's system repository, including self-body and evolution work and a project room with no external binding; a bound external workspace, auto-provisioned external project tree, subagent, or API/CLI/scheduled external surface receives a visible on-demand pointer. Explicit structured overrides remain authoritative. Tier-0 identity and constitutional context stays full in every mode.
-For ordinary Main calls, `context_fit.py` may render Max and Low from one
-immutable captured core and apply exact family+route calibration. Unknown
-routes try Max; there is no silent 200K assumption. Only a confirmed physical
-overflow may retry the same model once with a task-local Low projection, with
-forensic and owner-visible disclosure. This never changes the global context
-mode and never applies to P3 commit/scope review.
+For ordinary Main calls, `context_fit.py` renders Max and Low from one immutable
+captured core and measures the sealed transcript plus live schemas on one
+labelled density basis. Owner Low has an elastic 200K total-context economy
+target; the actual route window remains the physical capacity, so a target miss
+is non-terminal and may send best effort after one useful pass. Predicted Max
+pressure never swaps in Low documents. Only actual provider overflow may use a
+task-local Low projection, followed by at most one same-route call whose final
+context-bearing candidate is strictly smaller with the same response reserve.
+This never changes owner mode or P3 commit/scope review.
 
 ### Invariant: Compaction must earn its rewrite
 
@@ -575,7 +578,9 @@ argument/result omissions. Only typed summarizer context overflow may split a
 source recursively. Missing leaf coverage keeps that whole atomic unit raw,
 while independently covered units may apply. A replacement publishes only
 after transcript/unit binding, complete coverage, checkpoint provenance, and a
-strictly smaller deterministic representation are all proved. Capsules carry
+strictly smaller representation on the caller's ContextFit measurement basis
+are all proved. The bounded image proxy and density must match the requesting
+fit calculation; raw base64 byte count is not token reclaim. Capsules carry
 host-only generation, source-hash, part, checkpoint, and CAS-ref metadata so a
 later pass can recompact them without losing the original provenance union.
 

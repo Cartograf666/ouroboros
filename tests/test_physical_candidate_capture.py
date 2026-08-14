@@ -315,8 +315,9 @@ def test_internal_retry_gets_distinct_attempt_but_stable_context_identity(data_r
     assert finals[0]["candidate_manifest_ref"] != finals[1]["candidate_manifest_ref"]
 
 
-def test_provider_exception_carries_structured_physical_attempt_facts(data_root, monkeypatch):
+def test_provider_exception_carries_structured_physical_attempt_facts(data_root):
     client = LLMClient(api_key="unused")
+    provider_calls = 0
 
     class _Overflow(RuntimeError):
         status_code = 400
@@ -327,24 +328,109 @@ def test_provider_exception_carries_structured_physical_attempt_facts(data_root,
         }}
 
     error = _Overflow("provider rejected request")
-    monkeypatch.setattr(client, "_retry_without_prompt_cache_parameter", lambda *args: None)
-    monkeypatch.setattr(client, "_retry_without_optional_sampling", lambda *args: None)
-    monkeypatch.setattr(client, "_openrouter_signature_retry_kwargs", lambda *args: None)
+
+    def create(**candidate):
+        nonlocal provider_calls
+        provider_calls += 1
+        raise error
+
+    target = {
+        **_target(),
+        "provider": "openrouter",
+        "supports_openrouter_extensions": True,
+    }
     with ua.usage_scope(_scope(data_root, "task-overflow")), pytest.raises(_Overflow) as caught:
         client._create_chat_completion_with_retries(
-            lambda **candidate: (_ for _ in ()).throw(error),
-            {"model": "gpt-5.2", "messages": [{"role": "user", "content": "large"}]},
-            _target(),
+            create,
+            {
+                "model": "gpt-5.2",
+                "messages": [{
+                    "role": "assistant",
+                    "content": "large",
+                    "reasoning_details": [{"type": "reasoning", "text": "signed"}],
+                }],
+                "max_tokens": 123,
+            },
+            target,
         )
+    assert provider_calls == 1
     capture = ua.physical_attempt_capture_from_exception(caught.value)
     assert capture is not None
     assert capture.state == "unresolved"
     assert capture.provider_status_code == 400
     assert capture.provider_code == "context_length_exceeded"
     assert capture.provider_error_type == "invalid_request_error"
+    assert capture.max_completion_tokens == 123
     assert "sk-provider-secret" not in capture.provider_error
     assert capture.candidate_measurement_kind == "canonical_json_v1"
     assert capture.candidate_manifest_ref == _rows(data_root)[-1]["candidate_manifest_ref"]
+
+
+def test_async_structured_overflow_bypasses_transport_recovery(data_root):
+    client = LLMClient(api_key="unused")
+    provider_calls = 0
+
+    class _Overflow(RuntimeError):
+        status_code = 400
+        body = {"error": {"code": "context_window_exceeded", "type": "invalid_request_error"}}
+
+    async def create(**candidate):
+        nonlocal provider_calls
+        provider_calls += 1
+        raise _Overflow("provider rejected request")
+
+    async def run():
+        return await client._create_chat_completion_with_retries_async(
+            create,
+            {
+                "model": "gpt-5.2",
+                "messages": [{
+                    "role": "assistant", "content": "large",
+                    "reasoning_details": [{"type": "reasoning", "text": "signed"}],
+                }],
+                "max_tokens": 456,
+            },
+            {**_target(), "provider": "openrouter", "supports_openrouter_extensions": True},
+        )
+
+    with ua.usage_scope(_scope(data_root, "task-overflow-async")), pytest.raises(_Overflow) as caught:
+        asyncio.run(run())
+    assert provider_calls == 1
+    capture = ua.physical_attempt_capture_from_exception(caught.value)
+    assert capture is not None
+    assert capture.provider_code == "context_window_exceeded"
+    assert capture.max_completion_tokens == 456
+
+
+def test_http_200_structured_overflow_body_is_not_retried(data_root):
+    client = LLMClient(api_key="unused")
+    provider_calls = 0
+
+    class _BodyOverflow(_Response):
+        def __init__(self):
+            self._payload = {"error": {
+                "code": 400,
+                "type": "context_length_exceeded",
+                "message": "temperature must be between 0 and 2",
+            }}
+
+    def create(**candidate):
+        nonlocal provider_calls
+        provider_calls += 1
+        return _BodyOverflow()
+
+    with ua.usage_scope(_scope(data_root, "task-overflow-body")):
+        response = client._create_chat_completion_with_retries(
+            create,
+            {
+                "model": "gpt-5.2",
+                "messages": [{"role": "user", "content": "large"}],
+                "temperature": 3.0,
+            },
+            {**_target(), "provider": "openrouter", "supports_openrouter_extensions": True},
+        )
+    assert provider_calls == 1
+    assert response.model_dump()["error"]["type"] == "context_length_exceeded"
 
 
 def test_precondition_releases_before_dispatch_and_does_not_claim_send(data_root):

@@ -80,6 +80,7 @@ class _AtomicUnit:
     end: int
     raw_sha256: str
     raw_size_bytes: int
+    context_size_tokens: int
     source_text: str
     source_sha256: str
     predicted_reclaim_tokens: int
@@ -111,45 +112,6 @@ class _Part:
     text: str
     sha256: str
 
-# Main-loop emergency tool-history compaction trigger (~300K tokens at chars/4).
-# Remote routine compaction stays off by design; this is the overflow backstop.
-# NECESSITY is judged on this budget in CALIBRATED real tokens (chars/4 × the
-# main-loop measured density, neutral 1.0 cold): on a ~1.7×-dense Claude route
-# the raw-char form silently meant ~500K real tokens, engaging only deep into
-# the task and then thrashing (see the hysteresis constants below).
-#
-# THE NUMBER IS A REAL-TOKEN BUDGET, NOT A CHAR COUNT — say the consequence out
-# loud, because it is the opposite of what the name reads like. The comparison is
-# (chars/4 + tool_schema_tokens) × density > CONST/4, so the transcript the agent
-# may hold shrinks with BOTH density and the tool envelope. Measured fire points
-# (tests/test_loop_compaction.py::test_emergency_trigger_fire_points_are_pinned
-# drives the real decision and pins these):
-#   max, density 1.0, no schemas ......... ~1.20M chars  (the constant, verbatim)
-#   max, density 1.0, 37K schema tokens ... ~1.06M chars  (1.14x earlier)
-#   max, density 1.7, no schemas .......... ~708K chars   (1.70x earlier)
-#   max, density 1.7, 37K schema tokens ... ~559K chars   (2.14x earlier)
-#   low, density 1.7, 37K schema tokens ... ~91K chars    (4.40x earlier)
-# The dense Claude lane (the production main loop) is therefore ~2.1x more eager
-# in max mode than the raw constant suggests — deliberate under the v6.91 owner
-# decision "necessity = total calibrated pressure" (an immutable core otherwise
-# overflows the window with no trigger at all), and affordable only because the
-# UTILITY hysteresis below stops a futile pass from refiring every round. If that
-# eagerness ever has to come down, move the CONSTANT with these numbers in hand;
-# do not density-scale the threshold, which would cancel the calibration out.
-EMERGENCY_COMPACTION_CHARS = 1_200_000
-
-# Emergency-compaction hysteresis (the necessity-vs-utility split). NECESSITY
-# (compact at all?) is total calibrated pressure — the frozen frame (system
-# blocks + tools + protected/kept rounds) counts toward the provider window.
-# UTILITY (can a pass help?) is the COMPACTABLE region only: after a pass that
-# could NOT get the context below the trigger (the frame alone exceeds it —
-# the submarine wave3 shape: 35/35 rounds fired, each pass a light-model call
-# plus a transcript rewrite that collapsed the prompt cache to the static
-# floor), further passes are suppressed until the compactable transcript grows
-# by this factor or this many rounds pass, whichever is first.
-COMPACTION_HYSTERESIS_REGION_GROWTH = 1.2
-COMPACTION_HYSTERESIS_ROUNDS = 10
-
 # Background-consciousness assembled-context guards. P1: fail fast, never
 # silently truncate cognitive artifacts.
 BG_CONTEXT_WARN_CHARS = 600_000   # ~150K tokens: warn but proceed
@@ -161,24 +123,10 @@ BG_STATE_JSON_WARN_CHARS = 200_000
 # WARN threshold for a single oversized governance/knowledge context section.
 LARGE_CONTEXT_SECTION_CHARS = 200_000
 
-# --- Low-profile (≈200K window / local models) overrides -------------------
-# These tighten the live working set in low context mode. They never shorten the
-# memory HORIZON: recent dialogue is only coarsened when older dialogue is
-# already represented by valid consolidation, and tool-history transcript
-# compaction persists a forensic checkpoint before summarizing.
-
 # Raw recent-dialogue tail shown when no valid consolidation can represent older
-# dialogue. Low mode keeps this horizon rather than silently shortening it.
+# dialogue. The universal temporal renderer remains issue #220; this PR neither
+# shortens nor reinterprets that horizon.
 MAX_RECENT_CHAT_TAIL = 1000
-
-# Low fires emergency tool-history compaction earlier (~100K tokens at chars/4)
-# to fit a ~200K window, and (unlike max) also enables remote routine compaction.
-# The owner low/max context MODE is the SSOT for the agent's own operating
-# window (v6.33.0 BIBLE P1): low => this 400K trigger + routine compaction; max
-# => the 1.2M emergency-only trigger. There is no per-model window table; the
-# reactive provider-overflow detector (context.py) is the safety net if a route's
-# real window is smaller than the mode assumes.
-LOW_EMERGENCY_COMPACTION_CHARS = 400_000
 
 # --- Native image blocks (v6.26.0 multimodal chat) ---------------------------
 # Char-equivalent for ONE image block in chars/4 token estimates (~1.1K tokens):

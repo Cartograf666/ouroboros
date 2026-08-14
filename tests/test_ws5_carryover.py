@@ -386,57 +386,13 @@ def test_pacing_interval_in_settings_defaults():
 
 # === Triad+scope review-fix regressions (v6.34.0) ===
 
-# --- v6.64: known-small routes use Low; unknown routes try Max once ---
-
-def test_maybe_downgrade_max_uses_positive_route_evidence(monkeypatch):
-    from types import SimpleNamespace
-    from ouroboros import context as contextmod
+# Predicted route evidence is measurement input, never a global-mode writer or
+# an initial Max-to-Low authority. Functional fit cases are pinned in the Phase
+# 2 matrix; this carryover suite guards deletion of the old compatibility seam.
+def test_predicted_route_downgrade_seam_stays_deleted():
     from ouroboros import loop as loopmod
 
-    seen = {}
-
-    def _known_small(task, *, allow_fetch=False):
-        seen["model"] = task["model"]
-        seen["use_local"] = task["use_local_model"]
-        return {}, SimpleNamespace(status="confirmed", stale=False, window_tokens=16_384)
-
-    monkeypatch.setattr(contextmod, "_context_fit_route", _known_small)
-    # A positively-known small local route selects Low.
-    assert loopmod._maybe_downgrade_max_unconfirmed("max", True, "local-model") == "low"
-    assert seen["use_local"] is True and seen["model"] == "local-model"
-    # Missing remote evidence stays Max until a real overflow proves otherwise.
-    monkeypatch.setattr(
-        contextmod,
-        "_context_fit_route",
-        lambda *_a, **_kw: ({}, SimpleNamespace(status="unprobeable", stale=False, window_tokens=0)),
-    )
-    assert loopmod._maybe_downgrade_max_unconfirmed("max", False, "openai/gpt-5.5") == "max"
-    # A non-max mode is returned untouched.
-    assert loopmod._maybe_downgrade_max_unconfirmed("low", True, "x") == "low"
-
-
-def test_maybe_downgrade_max_keeps_max_when_confirmed(monkeypatch):
-    from types import SimpleNamespace
-    from ouroboros import context as contextmod
-    from ouroboros import loop as loopmod
-
-    monkeypatch.setattr(
-        contextmod, "_context_fit_route",
-        lambda *_a, **_kw: ({}, SimpleNamespace(status="confirmed", stale=False, window_tokens=1_000_000)),
-    )
-    assert loopmod._maybe_downgrade_max_unconfirmed("max", True, "confirmed-local") == "max"
-
-
-def test_maybe_downgrade_max_probe_error_preserves_max(monkeypatch):
-    from ouroboros import context as contextmod
-    from ouroboros import loop as loopmod
-
-    def _boom(*a, **k):
-        raise RuntimeError("probe machinery unavailable")
-
-    monkeypatch.setattr(contextmod, "_context_fit_route", _boom)
-    # Probe failure is unknown and must not fabricate a Low/200K capability.
-    assert loopmod._maybe_downgrade_max_unconfirmed("max", True, "x") == "max"
+    assert not hasattr(loopmod, "_maybe_downgrade_max_unconfirmed")
 
 
 # --- CW3: the ephemeral deny surface is complete (core envelope + non-core mutators) ---

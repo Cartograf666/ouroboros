@@ -68,19 +68,21 @@ def test_vision_query_default_max_tokens():
 def test_summary_and_background_token_budgets():
     """Summary/reflection/background paths must stay above the raised floors."""
     from pathlib import Path
+    from ouroboros import context_compaction
 
     expectations = {
         "ouroboros/tools/review_synthesis.py": "max_tokens=16384",
         "ouroboros/consolidator.py": "max_tokens=16384",
         "ouroboros/reflection.py": "max_tokens=16384",
         "ouroboros/agent_task_pipeline.py": "max_tokens=16384",
-        "ouroboros/context_compaction.py": "max_tokens=32768",
         "ouroboros/tools/skill_publish.py": "max_tokens=8192",
         "ouroboros/consciousness.py": "max_tokens=65536",
     }
     for path, needle in expectations.items():
         src = Path(path).read_text(encoding="utf-8").replace(" ", "")
         assert needle in src, f"{path} must contain {needle}"
+    assert context_compaction._SUMMARY_OUTPUT_TOKENS == 32_768
+    assert context_compaction._summarizer_spec()["output_budget"] == 32_768
 
 
 def test_claude_code_advisory_sdk_max_turns():

@@ -17,20 +17,20 @@ from ouroboros.llm import LLMClient, normalize_reasoning_effort, add_usage
 from ouroboros import task_pacing
 from ouroboros.config import adaptive_quorum, get_context_mode, get_light_model, get_review_enforcement, get_task_review_mode, resolve_effort
 from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_BYPASS_REASONS, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, REASON_DELIVERY_CONTROL_DEGRADED, RESULT_INFRA_FAILED, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
-from ouroboros.observability import new_call_id, persist_call
+from ouroboros.observability import new_execution_id
 from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools, swarm_router_turn
 from ouroboros.tools.registry import ToolRegistry
-from ouroboros.context import build_user_content, estimate_context_prompt_tokens
-from ouroboros.context_budget import (
-    COMPACTION_HYSTERESIS_REGION_GROWTH,
-    COMPACTION_HYSTERESIS_ROUNDS,
-    EMERGENCY_COMPACTION_CHARS,
-    LOW_EMERGENCY_COMPACTION_CHARS,
-)
-from ouroboros.context_compaction import _round_has_protected_content, _tool_round_spans, compact_tool_history_llm
+from ouroboros.context import build_user_content
+from ouroboros.context_budget import ContextReclaimRequest
+from ouroboros.context_compaction import compact_tool_history_llm, context_reclaim_transcript_sha256
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
 from ouroboros.utils import estimate_tokens, truncate_review_artifact
-from ouroboros.usage_accounting import BudgetExceeded
+from ouroboros.usage_accounting import (
+    BudgetExceeded,
+    PhysicalAttemptContext,
+    PhysicalAttemptPreconditionFailed,
+    last_physical_attempt_capture,
+)
 
 from ouroboros.loop_tool_execution import (
     StatefulToolExecutor,
@@ -68,55 +68,7 @@ class _CompactionRoundContext:
     task_id: str
     round_idx: int
     event_queue: Optional[queue.Queue]
-    active_use_local: bool
-    active_context_mode: str
-    checkpoint_injected: bool
     emit_progress: Callable[[str], None]
-    active_model: str = ""
-    # The round's LIVE tool-schema list (the same object enable_tools appends to).
-    # Sent on the wire beside `messages`, so the necessity measure must count it;
-    # optional so existing constructions stay valid (schemas absent => 0 tokens).
-    tool_schemas: Optional[List[Dict[str, Any]]] = None
-
-
-def _estimate_messages_chars(messages: List[Dict[str, Any]]) -> int:
-    """Estimate transcript size over the FULL message list (the system block,
-    when present in ``messages``, is counted too — conservative for the
-    window-derived emergency trigger)."""
-    from ouroboros.context_budget import IMAGE_BLOCK_CHAR_EQUIVALENT
-
-    total = 0
-    for msg in messages:
-        content = msg.get("content")
-        if isinstance(content, str):
-            total += len(content)
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict):
-                    if str(block.get("type") or "") in ("image_url", "image"):
-                        # Vision tokens are billed per tile, not per base64
-                        # char: counting the raw payload made ONE image look
-                        # like ~300K tokens and permanently wedged emergency
-                        # compaction.
-                        total += IMAGE_BLOCK_CHAR_EQUIVALENT
-                        continue
-                    # Count whole multipart blocks, including cache markers.
-                    try:
-                        import json as _json2
-                        total += len(_json2.dumps(block, ensure_ascii=False))
-                    except (TypeError, ValueError):
-                        total += len(str(block))
-        tool_calls = msg.get("tool_calls")
-        if tool_calls:
-            try:
-                import json as _json
-                total += len(_json.dumps(tool_calls, ensure_ascii=False))
-            except (TypeError, ValueError):
-                total += sum(len(str(tc)) for tc in tool_calls)
-        tc_id = msg.get("tool_call_id")
-        if tc_id:
-            total += len(str(tc_id))
-    return total
 
 
 def _provider_failure_hint(accumulated_usage: Dict[str, Any]) -> str:
@@ -128,13 +80,6 @@ def _provider_failure_hint(accumulated_usage: Dict[str, Any]) -> str:
 
 def _provider_recovery_hint(accumulated_usage: Dict[str, Any]) -> str:
     """Explain whether retrying later is likely to help."""
-    if accumulated_usage.get("context_overflow_suggest_low"):
-        return (
-            " ⚠️ The context overflowed the model window. Switching to low context "
-            "mode (Settings → Behavior, or the chat toggle) fits ~200K / local "
-            "models by serving ARCHITECTURE as a navigation map and compacting "
-            "memory sooner — without changing the model or reasoning effort."
-        )
     kind = str(accumulated_usage.get("_last_llm_error_kind") or "").strip()
     if kind == "subscription_window_exhausted":
         reset_at = str(accumulated_usage.get("_last_llm_reset_at") or "").strip()
@@ -619,60 +564,6 @@ def _emit_checkpoint_event(
             append_jsonl(drive_logs / "events.jsonl", {"ts": utc_now_iso(), **payload})
         except Exception:
             pass
-
-
-def _persist_compaction_checkpoint(
-    messages: List[Dict[str, Any]],
-    *,
-    drive_root: Optional[pathlib.Path],
-    drive_logs: pathlib.Path,
-    task_id: str,
-    reason: str,
-    keep_recent: int,
-    round_idx: int,
-    event_queue: Optional[queue.Queue],
-    checkpoint_kind: str = "pre_compaction_transcript",
-    call_type: str = "compaction_checkpoint",
-) -> bool:
-    """Persist the canonical transcript before a deterministic context rebuild."""
-    root = pathlib.Path(drive_root) if drive_root is not None else pathlib.Path(drive_logs).parent
-    call_id = new_call_id("compaction_checkpoint")
-    try:
-        ref = persist_call(
-            root,
-            task_id=task_id,
-            call_id=call_id,
-            call_type=call_type,
-            payload={
-                "reason": reason,
-                "keep_recent": keep_recent,
-                "round": round_idx,
-                "messages": messages,
-            },
-            manifest={
-                "round": round_idx,
-                "reason": reason,
-                "keep_recent": keep_recent,
-            },
-        )
-        _emit_checkpoint_event(event_queue, task_id, drive_logs, {
-            "checkpoint_kind": checkpoint_kind,
-            "round": round_idx,
-            "reason": reason,
-            "keep_recent": keep_recent,
-            "checkpoint_ref": ref.get("manifest_ref"),
-        })
-        return True
-    except Exception:
-        log.debug("Failed to persist pre-compaction transcript checkpoint", exc_info=True)
-        _emit_checkpoint_event(event_queue, task_id, drive_logs, {
-            "checkpoint_kind": checkpoint_kind,
-            "round": round_idx,
-            "reason": reason,
-            "keep_recent": keep_recent,
-            "checkpoint_status": "failed",
-        })
-        return False
 
 
 def _extract_plain_text_from_content(content: Any) -> str:
@@ -2670,14 +2561,23 @@ def _adopt_fallback_route(
         tools._ctx.context_fit_plan = context_fit_plan
         tools._ctx.messages = messages
         tools._ctx.active_context_mode = active_context_mode
-        accumulated_usage["_context_route_fp"] = str(
-            getattr(context_fit_plan, "route_fp", "") or ""
-        )
-        accumulated_usage["_context_prompt_estimate"] = estimate_context_prompt_tokens(
-            messages, tool_schemas,
-        )
-        accumulated_usage["_context_fit_mode"] = active_context_mode
+        # _call_round_model already recorded the accepted candidate's complete
+        # same-basis fit facts. Do not replace them with a raw char estimate.
     return fallback_model, fallback_use_local, context_fit_plan, active_context_mode
+
+
+def _snapshot_context_fit_usage(usage: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: value for key, value in usage.items() if key.startswith("_context_")}
+
+
+def _restore_context_fit_usage(
+    usage: Dict[str, Any],
+    snapshot: Dict[str, Any],
+) -> None:
+    for key in tuple(usage):
+        if key.startswith("_context_"):
+            usage.pop(key, None)
+    usage.update(snapshot)
 
 
 def _run_cross_model_fallback_chain(
@@ -2704,6 +2604,7 @@ def _run_cross_model_fallback_chain(
             _fcd.mark_cooldown(model, use_local)
 
     _cooled(active_model, active_use_local)
+    primary_context_usage = _snapshot_context_fit_usage(accumulated_usage)
     fallback_use_local = os.environ.get("USE_LOCAL_FALLBACK", "").lower() in ("true", "1")
     attempt_cap = _fcd.attempts_per_model()
     msg = None
@@ -2781,15 +2682,8 @@ def _run_cross_model_fallback_chain(
         tools._ctx.context_fit_plan = context_fit_plan
         tools._ctx.messages = messages
         tools._ctx.active_context_mode = active_context_mode
+        _restore_context_fit_usage(accumulated_usage, primary_context_usage)
         _cooled(fallback_model, fallback_use_local)
-    if msg is None and context_fit_plan is not None:
-        accumulated_usage["_context_route_fp"] = str(
-            getattr(context_fit_plan, "route_fp", "") or ""
-        )
-        accumulated_usage["_context_prompt_estimate"] = estimate_context_prompt_tokens(
-            messages, tool_schemas,
-        )
-        accumulated_usage["_context_fit_mode"] = active_context_mode
     return (
         msg,
         active_model,
@@ -3517,286 +3411,67 @@ def _drain_incoming_messages(
     return controls
 
 
-def _emergency_keep_recent(span_count: int) -> int:
-    """Tool rounds an emergency pass keeps (SSOT for the pass and its forecast).
-
-    Halve the history (floor 6), but ALWAYS clamp BELOW the span count or the
-    compactor no-ops (``len(spans) <= keep_recent`` returns the transcript
-    as-is) — a transcript over the emergency byte threshold with only ~50 huge
-    rounds used to never compact at all. With a single round there is nothing
-    older to summarize. One definition, because ``_compaction_floor_chars``
-    forecasts what this same rule will keep; two copies would let the forecast
-    drift from the pass it predicts.
-    """
-    return min(50, max(6, span_count // 2), max(1, span_count - 1))
+def _context_reclaim_negative_memo(tool_ctx: Any) -> set[str]:
+    memo = getattr(tool_ctx, "_context_reclaim_negative_memo", None)
+    if not isinstance(memo, set):
+        memo = set()
+        tool_ctx._context_reclaim_negative_memo = memo
+    return memo
 
 
-def _compaction_floor_chars(messages: List[Dict[str, Any]], spans: List[Tuple[int, int]]) -> int:
-    """Smallest transcript an emergency pass could leave behind.
-
-    The pass can only replace the spans OLDER than ``_emergency_keep_recent``
-    that carry no protected content; the frozen frame (everything before the
-    first tool round), the kept spans AND the protected older spans (the
-    compactor's ``_round_has_protected_content`` skips them raw — same predicate
-    here, one SSOT) survive untouched, and the summaries it writes only ADD to
-    that. So this is a true lower bound: when the floor is already over the
-    trigger, NO pass can get under it and no amount of transcript growth changes
-    that — only a smaller FRAME (a mode change or a context rebuild) can. That
-    is what makes the hysteresis rearm criterion honest: measuring "can a pass
-    help?" on the compactable region alone rearmed on growth the pass itself
-    created (the pass collapses the region to the kept spans, so the very next
-    tool round cleared the growth bar and the pass refired every round — the
-    submarine thrash). Omitting the protected spans was the same lie one layer
-    down: a transcript dominated by an old protected round forecast a reachable
-    trigger the pass could never reach, so every 1.2x region growth bought
-    another futile summarizer pass + cache-destroying rewrite.
-    """
-    if not spans:
-        return _estimate_messages_chars(messages)
-    keep = _emergency_keep_recent(len(spans))
-    frame = messages[: spans[0][0]]
-    kept = messages[spans[-keep][0]:]
-    protected = sum(
-        _estimate_messages_chars(messages[start:end + 1])
-        for start, end in spans[:-keep]
-        if _round_has_protected_content(messages, start, end)
-    )
-    return _estimate_messages_chars(frame) + protected + _estimate_messages_chars(kept)
+def _context_reclaim_passes(tool_ctx: Any) -> set[Tuple[str, str]]:
+    passes = getattr(tool_ctx, "_context_reclaim_passes", None)
+    if not isinstance(passes, set):
+        passes = set()
+        tool_ctx._context_reclaim_passes = passes
+    return passes
 
 
-@dataclass
-class _HysteresisMeasurement:
-    """The arming round's measured pressure facts, folded into one object (the
-    <8-parameter contract). ``region_chars`` is the region the arming round
-    JUDGED (for a futile pass: the region it actually handled, not the collapsed
-    remainder), so the growth bar means "the transcript climbed back past a size
-    already proven insufficient" rather than "the pass shrank the region, so
-    anything is growth"."""
-    pressure_real_tokens: float
-    threshold_real_tokens: float
-    region_chars: int
-    schema_tokens: int
-    density: float
-    floor_real_tokens: Optional[float] = None
+def _context_reclaim_materializations(tool_ctx: Any) -> set[Tuple[str, str]]:
+    materialized = getattr(tool_ctx, "_context_reclaim_materializations", None)
+    if not isinstance(materialized, set):
+        materialized = set()
+        tool_ctx._context_reclaim_materializations = materialized
+    return materialized
 
 
-def _arm_compaction_hysteresis(
-    ctx: _CompactionRoundContext,
-    usage_state: Dict[str, Any],
-    measurement: _HysteresisMeasurement,
-    *,
-    reason: str = "nothing_compactable",
-) -> None:
-    """Suppress emergency compaction until a pass can plausibly help again.
-
-    Two ways a pass fails to earn its cost, both armed here so the disclosure is
-    identical: it ran and could not bring total pressure under the trigger
-    (``emergency_pass_futile``), or the transcript holds under two tool rounds so
-    the compactor would structurally no-op (``nothing_compactable``). One loud
-    line plus a typed checkpoint event, then silence until a pass could help or
-    the round window passes — never a silent stop (BIBLE P1).
-    """
-    pressure_real_tokens = measurement.pressure_real_tokens
-    threshold_real_tokens = measurement.threshold_real_tokens
-    region_chars = measurement.region_chars
-    floor_real_tokens = measurement.floor_real_tokens
-    usage_state["_compaction_hysteresis"] = {"round": ctx.round_idx, "region_chars": region_chars}
-    frame_bound = floor_real_tokens is not None and floor_real_tokens > threshold_real_tokens
-    rearm_clause = (
-        f"{COMPACTION_HYSTERESIS_ROUNDS} rounds pass (the frame alone is over the "
-        "trigger, so transcript growth cannot make a pass able to help)"
-        if frame_bound else
-        f"the compactable transcript grows ≥{COMPACTION_HYSTERESIS_REGION_GROWTH:.1f}x or "
-        f"{COMPACTION_HYSTERESIS_ROUNDS} rounds pass"
-    )
-    ctx.emit_progress(
-        "⚠️ Emergency compaction cannot help: calibrated context "
-        f"≈{pressure_real_tokens / 1000:.0f}K real tokens exceeds the "
-        f"≈{threshold_real_tokens / 1000:.0f}K trigger, but the frozen frame (system "
-        "blocks + tool schemas) plus the protected/kept rounds carry it and cannot "
-        f"be compacted. Further passes suppressed until {rearm_clause}."
-    )
-    _emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
-        "checkpoint_kind": "compaction_hysteresis_armed",
-        "round": ctx.round_idx,
-        "reason": reason,
-        "calibrated_real_tokens": int(pressure_real_tokens),
-        "threshold_real_tokens": int(threshold_real_tokens),
-        "compactable_region_chars": int(region_chars),
-        "tool_schema_tokens": int(measurement.schema_tokens),
-        "token_density": round(float(measurement.density), 3),
-        "floor_real_tokens": None if floor_real_tokens is None else int(floor_real_tokens),
-        "frame_bound": bool(frame_bound),
-    })
+def _context_overflow_retries(tool_ctx: Any) -> set[Tuple[str, str]]:
+    retries = getattr(tool_ctx, "_context_overflow_retries", None)
+    if not isinstance(retries, set):
+        retries = set()
+        tool_ctx._context_overflow_retries = retries
+    return retries
 
 
 def _run_round_compaction(
     messages: List[Dict[str, Any]],
     ctx: _CompactionRoundContext,
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """Run at most one transcript compaction for this round.
-
-    Manual (pending) and emergency compaction always run; routine compaction
-    covers the local lane and owner low context mode (v6.33.0: mode is the SSOT —
-    the per-model small-window remote override was removed with the static window
-    table), and is skipped on self-check checkpoint rounds to avoid a duplicate
-    summarizer call. Each branch persists a forensic checkpoint before compacting
-    (P1: no silent truncation). Returns the possibly-rebound message list and any
-    compaction usage record.
-    """
-    pending_compaction = getattr(ctx.tools._ctx, "_pending_compaction", None)
-    if pending_compaction is not None:
-        if _persist_compaction_checkpoint(
-            messages, drive_root=ctx.drive_root, drive_logs=ctx.drive_logs, task_id=ctx.task_id,
-            reason="manual", keep_recent=int(pending_compaction),
-            round_idx=ctx.round_idx, event_queue=ctx.event_queue,
-        ):
-            messages, usage = compact_tool_history_llm(
-                messages,
-                keep_recent=pending_compaction,
-                drive_root=ctx.drive_root,
-                task_id=ctx.task_id,
-            )
-            ctx.tools._ctx._pending_compaction = None
-            return messages, usage
-        ctx.emit_progress("⚠️ Context compaction skipped: forensic checkpoint could not be persisted.")
+    """Run only an explicit manual reclaim; Main fit owns automatic decisions."""
+    pending = getattr(ctx.tools._ctx, "_pending_compaction", None)
+    if pending is None:
         return messages, None
-
-    # The owner low/max context MODE is the SSOT for the agent's own operating
-    # window (BIBLE P1, v6.33.0): low => 400K-char emergency trigger + routine
-    # compaction; max => 1.2M-char emergency-only (cache-friendly). No per-model
-    # window table; the reactive provider-overflow detector (context.py) drops the
-    # agent to low mode if a route's real window turns out smaller than assumed.
-    #
-    # NECESSITY vs UTILITY (the submarine thrash fix). NECESSITY — should we
-    # compact at all? — is TOTAL calibrated pressure: the frozen frame (system
-    # blocks, TOOL SCHEMAS, protected/kept rounds) counts toward the provider
-    # window even though no pass can shrink it. "Total" is literal: the schemas
-    # travel beside `messages` on the wire (~148K chars on the submarine traces),
-    # so a transcript-only measure would let the trigger fire a whole tool
-    # envelope late — they are added through the context_fit token seam
-    # (tool_schema_tokens), never re-estimated here. The char budget is compared
-    # in CALIBRATED real tokens (main_loop_token_density: neutral 1.0 cold,
-    # measured supersedes — never the review-pack cold-conservative value, which
-    # would demote fresh installs; the v6.80→v6.81 oscillation).
-    # UTILITY — can a pass help, and when should it refire? — is judged on the
-    # FLOOR a pass could reach (frozen frame + the spans it must keep,
-    # `_compaction_floor_chars`), not on the compactable region alone: a pass
-    # that could NOT get below the trigger arms a hysteresis, and one loud
-    # disclosure replaces the per-round light-model call + cache-destroying
-    # rewrite (wave3: 35/35 rounds fired because the LOW trigger sits below the
-    # irreducible low-mode frame). Early rearm (region grew ~20% past the size
-    # already proven insufficient) is admitted ONLY while the floor is under the
-    # trigger — measuring rearm on the region alone let the pass's OWN collapse
-    # of that region clear the growth bar on the very next tool round, so the
-    # thrash survived the first fix (34/35 rounds measured). Above the floor,
-    # only the N-round window refires, which keeps the transcript bounded while
-    # the frame is what carries the pressure. The reactive provider-overflow
-    # low-retry net (one-shot, loop exit path) is deliberately untouched.
-    emergency_chars = LOW_EMERGENCY_COMPACTION_CHARS if ctx.active_context_mode == "low" else EMERGENCY_COMPACTION_CHARS
-    from ouroboros.context_fit import main_loop_token_density, tool_schema_tokens
-
-    density = main_loop_token_density(ctx.drive_root, ctx.active_model)
-    threshold_real_tokens = emergency_chars / 4.0  # the token budget the char constant documents
-    schema_tokens = tool_schema_tokens(ctx.tool_schemas)
-
-    def _pressure(chars: float) -> float:
-        return (chars / 4.0 + schema_tokens) * density
-
-    def _total_pressure(msgs: List[Dict[str, Any]]) -> float:
-        return _pressure(_estimate_messages_chars(msgs))
-
-    pressure_real_tokens = _total_pressure(messages)
-    if pressure_real_tokens > threshold_real_tokens:
-        usage_state = getattr(ctx.tools._ctx, "_accumulated_usage", None)
-        usage_state = usage_state if isinstance(usage_state, dict) else {}
-        spans = _tool_round_spans(messages)
-        region_chars = _estimate_messages_chars(messages[spans[0][0]:]) if spans else 0
-        # Can a pass reach the trigger AT BEST? The floor is frame + kept spans;
-        # summaries only add to it. This is the rearm authority the compactable
-        # region cannot be: the region is exactly what a pass collapses, so
-        # region growth was satisfied by the pass's own output every round.
-        floor_real_tokens = _pressure(_compaction_floor_chars(messages, spans))
-        pass_can_reach_trigger = floor_real_tokens <= threshold_real_tokens
-        hysteresis = usage_state.get("_compaction_hysteresis")
-        if isinstance(hysteresis, dict):
-            armed_region = int(hysteresis.get("region_chars") or 0)
-            armed_round = int(hysteresis.get("round") or 0)
-            # `armed_region + 1` is the floor that makes an EMPTY armed region
-            # behave: a 20%-growth test on zero is `0 < 0`, which never
-            # suppresses, so an over-threshold frame with nothing compactable
-            # re-fired every single round — the exact thrash this arm exists to
-            # stop, just with an empty transcript instead of a full one.
-            grow_to = max(armed_region * COMPACTION_HYSTERESIS_REGION_GROWTH, armed_region + 1)
-            early_rearm = region_chars >= grow_to and pass_can_reach_trigger
-            if not early_rearm and (ctx.round_idx - armed_round) < COMPACTION_HYSTERESIS_ROUNDS:
-                return messages, None  # armed: a pass cannot help yet (disclosed once, on arming)
-            usage_state.pop("_compaction_hysteresis", None)
-        span_count = len(spans)
-        if span_count < 2:
-            # Necessity is real, but the transcript holds at most ONE tool round:
-            # the compactor's `len(spans) <= keep_recent` gate makes the pass a
-            # structural no-op (keep_recent floors at 1). Running it anyway bought
-            # nothing and wrote a forensic checkpoint every round while the frozen
-            # frame alone sat over the trigger — a low-mode task can enter its
-            # first rounds already there. Arm the hysteresis instead: same
-            # disclosure, no per-round work.
-            _arm_compaction_hysteresis(ctx, usage_state, _HysteresisMeasurement(
-                pressure_real_tokens=pressure_real_tokens,
-                threshold_real_tokens=threshold_real_tokens,
-                region_chars=region_chars,
-                schema_tokens=schema_tokens,
-                density=density,
-                floor_real_tokens=floor_real_tokens,
-            ))
-            return messages, None
-        emergency_keep_recent = _emergency_keep_recent(span_count)
-        if _persist_compaction_checkpoint(
-            messages, drive_root=ctx.drive_root, drive_logs=ctx.drive_logs, task_id=ctx.task_id,
-            reason="emergency_context_size", keep_recent=emergency_keep_recent,
-            round_idx=ctx.round_idx, event_queue=ctx.event_queue,
-        ):
-            messages, usage = compact_tool_history_llm(
-                messages,
-                keep_recent=emergency_keep_recent,
-                drive_root=ctx.drive_root,
-                task_id=ctx.task_id,
-            )
-            after_real_tokens = _total_pressure(messages)
-            if after_real_tokens > threshold_real_tokens:
-                # Arm on the region the pass ALREADY HANDLED (pre-pass), not on
-                # the remainder it just collapsed: the collapsed remainder made
-                # the next tool round clear the 1.2x bar on its own.
-                _arm_compaction_hysteresis(ctx, usage_state, _HysteresisMeasurement(
-                    pressure_real_tokens=after_real_tokens,
-                    threshold_real_tokens=threshold_real_tokens,
-                    region_chars=region_chars,
-                    schema_tokens=schema_tokens,
-                    density=density,
-                    floor_real_tokens=_pressure(
-                        _compaction_floor_chars(messages, _tool_round_spans(messages))),
-                ), reason="emergency_pass_futile")
-            return messages, usage
-        ctx.emit_progress("⚠️ Emergency compaction skipped: forensic checkpoint could not be persisted.")
-        return messages, None
-
-    # Routine compaction runs only when local or in low context mode; never on
-    # checkpoint rounds. Max mode relies on emergency compaction alone to preserve
-    # prompt-cache hits (mode is the SSOT — no per-model small-window override).
-    if not ctx.checkpoint_injected and (ctx.active_use_local or ctx.active_context_mode == "low"):
-        if ctx.round_idx > 6 and len(messages) > 40:
-            if _persist_compaction_checkpoint(
-                messages, drive_root=ctx.drive_root, drive_logs=ctx.drive_logs, task_id=ctx.task_id,
-                reason="routine", keep_recent=20,
-                round_idx=ctx.round_idx, event_queue=ctx.event_queue,
-            ):
-                return compact_tool_history_llm(
-                    messages,
-                    keep_recent=20,
-                    drive_root=ctx.drive_root,
-                    task_id=ctx.task_id,
-                )
-    return messages, None
+    ctx.tools._ctx._pending_compaction = None
+    rebuilt, receipt, usage = compact_tool_history_llm(
+        messages,
+        keep_recent=max(0, int(pending)),
+        drive_root=ctx.drive_root or pathlib.Path(ctx.drive_logs).parent,
+        task_id=ctx.task_id,
+        negative_memo=_context_reclaim_negative_memo(ctx.tools._ctx),
+    )
+    _emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
+        "checkpoint_kind": "context_reclaim_manual",
+        "round": ctx.round_idx,
+        "status": receipt.status,
+        "reclaimed_tokens": receipt.reclaimed_tokens,
+        "goal_reached": receipt.goal_reached,
+        "checkpoint_ref": receipt.checkpoint_ref,
+    })
+    if receipt.status in {"checkpoint_failed", "summarizer_failed", "binding_mismatch"}:
+        ctx.emit_progress(
+            f"⚠️ Context compaction kept the transcript unchanged ({receipt.status})."
+        )
+    return rebuilt, usage
 
 
 @dataclass
@@ -5991,49 +5666,11 @@ def _apply_runtime_overrides(
     return active_model, active_use_local, active_effort
 
 
-def _maybe_downgrade_max_unconfirmed(mode: str, use_local: bool, model: str = "", *, allow_fetch: bool = False) -> str:
-    """Select Low only from positive exact-route evidence of a sub-1M window.
-
-    Missing/stale/failed evidence is UNKNOWN, not an invented 200K capability:
-    ordinary tasks try the owner-selected Max projection and may take the single
-    task-local Low retry only after a real provider overflow.  The P3 commit gate
-    has its own fail-closed >=1M contract and never calls this helper.
-    """
-    if mode != "max":
-        return mode
-    try:
-        from ouroboros.capability_evidence import ONE_MILLION, is_known
-        from ouroboros.context import _context_fit_route
-
-        _route, evidence = _context_fit_route(
-            {"model": model, "use_local_model": use_local},
-            allow_fetch=allow_fetch,
-        )
-        if is_known(evidence, require_fresh=True) and int(evidence.window_tokens or 0) < ONE_MILLION:
-            log.info(
-                "Exact route evidence reports a sub-1M context window "
-                "(%s tokens, use_local=%s); using the task-local Low projection.",
-                evidence.window_tokens, use_local,
-            )
-            return "low"
-    except Exception:
-        log.debug("Context-fit capability check unavailable; preserving Max", exc_info=True)
-    return mode
-
-
 def _apply_overrides_and_regate_mode(ctx, active_model, active_use_local, active_effort, active_context_mode):
-    """Apply per-round runtime overrides, then re-gate max-mode at point-of-use if the
-    active route changed (a mid-loop switch_model / local-route change — the start-of-
-    loop gate only saw the initial route). Positive small-window evidence selects Low;
-    unknown evidence remains Max until a real overflow (v6.64)."""
-    _route_before = (active_model, active_use_local)
+    """Apply per-round overrides; route rebind never predicts a mode change."""
     active_model, active_use_local, active_effort = _apply_runtime_overrides(
         ctx, active_model, active_use_local, active_effort,
     )
-    if (active_model, active_use_local) != _route_before:
-        active_context_mode = _maybe_downgrade_max_unconfirmed(
-            get_context_mode(), active_use_local, active_model,
-        )
     return active_model, active_use_local, active_effort, active_context_mode
 
 
@@ -6101,7 +5738,7 @@ def _rebind_context_fit_plan(
     max_projection = project(plan.max_projection)
     low_projection = project(plan.low_projection)
     preferred = preferred_mode if preferred_mode in {"low", "max"} else "max"
-    initial_mode = "low" if preferred == "max" and max_projection.fits_known_window is False else preferred
+    initial_mode = preferred
     rebound = replace(
         plan,
         preferred_mode=preferred,
@@ -6115,15 +5752,8 @@ def _rebind_context_fit_plan(
         max_projection=max_projection,
         low_projection=low_projection,
     )
-    mode = str(rebound.initial_mode_with_tools(tool_schemas) or initial_mode)
-    projected_prompt_tokens = rebound.projected_tokens_with_tools("max", tool_schemas)
-    if preferred == "max" and known_window:
-        max_transcript = rebound.reproject_transcript(messages, "max")
-        projected_prompt_tokens = int(
-            estimate_context_prompt_tokens(max_transcript, tool_schemas) * ratio
-        )
-        if projected_prompt_tokens + int(rebound.output_reserve_tokens or 0) > window_tokens:
-            mode = "low"
+    mode = initial_mode
+    projected_prompt_tokens = rebound.projected_tokens_with_tools(mode, tool_schemas)
     messages[:] = rebound.reproject_transcript(messages, mode)
     tools._ctx.context_fit_plan = rebound
     tools._ctx.messages = messages
@@ -6569,16 +6199,87 @@ class _RoundModelCallContext:
     attempt_cap: Optional[int] = None
 
 
-def _call_round_model(ctx: _RoundModelCallContext) -> Tuple[Any, float, str]:
-    """Dispatch one ordinary round and its single confirmed-overflow Low retry."""
+def _context_fit_round_id(ctx: _RoundModelCallContext) -> str:
+    execution_id = str(ctx.accumulated_usage.setdefault("execution_id", new_execution_id()))
+    return f"{execution_id}:round:{ctx.round_idx}"
+
+
+def _main_context_profile(plan: Any, rendered_mode: str) -> str:
+    if rendered_mode != "low":
+        return "owner_max"
+    # Effective Low is the sizing authority even when a bare env override keeps
+    # owner intent Max for P3. A Low entered only after a real Max overflow is
+    # task-local and therefore does not inherit the economy target T.
+    return "owner_low" if str(getattr(plan, "preferred_mode", "")) == "low" else "task_local_low"
+
+
+def _remember_main_fit(ctx: _RoundModelCallContext, disposition: Any) -> None:
+    measurement = disposition.measurement
+    usage = ctx.accumulated_usage
+    usage["_context_route_fp"] = measurement.route_fp
+    usage["_context_prompt_estimate"] = measurement.estimated_input_tokens
+    usage["_context_fit_mode"] = measurement.rendered_mode
+    usage["_context_profile"] = measurement.profile
+    usage["_context_measurement_basis"] = measurement.measurement_basis
+    usage["_context_measurement_density"] = measurement.measurement_density
+    usage["_context_target_total_tokens"] = measurement.target_total_tokens
+    usage["_context_capacity_total_tokens"] = measurement.capacity_total_tokens
+    usage["_context_target_deficit_tokens"] = measurement.target_deficit_tokens
+    usage["_context_capacity_deficit_tokens"] = measurement.capacity_deficit_tokens
+    usage["_context_reclaim_goal_tokens"] = measurement.reclaim_goal_tokens
+    usage["_context_target_miss"] = disposition.action == "send_target_miss"
+    usage["_context_automatic_pass_used"] = disposition.automatic_pass_used
+    usage["_context_predicted_capacity_miss"] = disposition.predicted_capacity_miss
+
+
+def _measure_round_main_fit(
+    ctx: _RoundModelCallContext,
+    *,
+    automatic_pass_used: bool,
+) -> Any:
     plan = ctx.context_fit_plan
-    if plan is not None and str(ctx.active_model or "") == str(getattr(plan, "model", "") or ""):
-        ctx.accumulated_usage["_context_route_fp"] = str(getattr(plan, "route_fp", "") or "")
-        ctx.accumulated_usage["_context_prompt_estimate"] = estimate_context_prompt_tokens(
-            ctx.messages, ctx.tool_schemas,
-        )
-        ctx.accumulated_usage["_context_fit_mode"] = ctx.active_context_mode
-    msg, cost = call_llm_with_retry(
+    if plan is None or str(ctx.active_model or "") != str(getattr(plan, "model", "") or ""):
+        return None
+    from ouroboros.context_fit import measure_main_fit
+
+    rendered_mode = "low" if ctx.active_context_mode == "low" else "max"
+    disposition = measure_main_fit(
+        plan,
+        ctx.messages,
+        ctx.tool_schemas,
+        drive_root=pathlib.Path(ctx.drive_root or ctx.drive_logs.parent),
+        profile=_main_context_profile(plan, rendered_mode),
+        rendered_mode=rendered_mode,
+        round_id=_context_fit_round_id(ctx),
+        automatic_pass_used=automatic_pass_used,
+    )
+    _remember_main_fit(ctx, disposition)
+    return disposition
+
+
+def _physical_context_for_fit(disposition: Any) -> PhysicalAttemptContext:
+    measurement = disposition.measurement
+    return PhysicalAttemptContext(
+        profile=measurement.profile,
+        rendered_mode=measurement.rendered_mode,
+        measurement_basis=measurement.measurement_basis,
+        route_fp=measurement.route_fp,
+        round_id=measurement.round_id,
+        target_total_tokens=measurement.target_total_tokens,
+        capacity_total_tokens=measurement.capacity_total_tokens,
+        context_target_miss=disposition.action == "send_target_miss",
+        automatic_pass_used=disposition.automatic_pass_used,
+    )
+
+
+def _dispatch_round_model(
+    ctx: _RoundModelCallContext,
+    disposition: Any,
+    *,
+    attempt_cap: Optional[int],
+    candidate_predicate: Optional[Callable[[Any], Any]] = None,
+) -> Tuple[Any, float]:
+    return call_llm_with_retry(
         ctx.llm,
         ctx.messages,
         ctx.active_model,
@@ -6593,72 +6294,204 @@ def _call_round_model(ctx: _RoundModelCallContext) -> Tuple[Any, float, str]:
         ctx.task_type,
         use_local=ctx.active_use_local,
         deadline_ts=_task_deadline_epoch(ctx.tools),
-        attempt_cap=ctx.attempt_cap,
+        attempt_cap=attempt_cap,
         allow_server_web_search=_server_web_allowed_by_task(ctx.tools._ctx),
+        physical_context=(
+            _physical_context_for_fit(disposition) if disposition is not None else None
+        ),
+        candidate_predicate=candidate_predicate,
     )
-    should_retry_low = (
-        msg is None
-        and plan is not None
-        and str(ctx.active_model or "") == str(getattr(plan, "model", "") or "")
-        and str(getattr(plan, "preferred_mode", "")) == "max"
-        and ctx.active_context_mode != "low"
-        and str(ctx.accumulated_usage.get("_last_llm_error_kind") or "") == "context_overflow"
-        and not bool(ctx.accumulated_usage.get("_context_fit_low_retry_used"))
+
+
+def _run_main_reclaim(
+    ctx: _RoundModelCallContext,
+    disposition: Any,
+    *,
+    minimum_goal_tokens: int = 0,
+) -> Any:
+    measurement = disposition.measurement
+    key = (measurement.route_fp, measurement.round_id)
+    passes = _context_reclaim_passes(ctx.tools._ctx)
+    if key in passes:
+        return None
+    request = ContextReclaimRequest(
+        route_fp=measurement.route_fp,
+        round_id=measurement.round_id,
+        transcript_sha256=context_reclaim_transcript_sha256(ctx.messages),
+        measurement_basis=measurement.measurement_basis,
+        measurement_density=measurement.measurement_density,
+        reclaim_goal_tokens=max(
+            int(measurement.reclaim_goal_tokens),
+            max(0, int(minimum_goal_tokens)),
+        ),
+        allow_partial_shrink=True,
     )
-    if not should_retry_low:
-        return msg, cost, ctx.active_context_mode
-    checkpoint_ok = _persist_compaction_checkpoint(
+    rebuilt, receipt, usage = compact_tool_history_llm(
         ctx.messages,
-        drive_root=ctx.drive_root,
-        drive_logs=ctx.drive_logs,
+        request=request,
+        drive_root=pathlib.Path(ctx.drive_root or ctx.drive_logs.parent),
         task_id=ctx.task_id,
-        reason="confirmed_context_overflow_low_retry",
-        keep_recent=max(0, len(_tool_round_spans(ctx.messages))),
-        round_idx=ctx.round_idx,
-        event_queue=ctx.event_queue,
-        checkpoint_kind="pre_context_fit_low_retry",
-        call_type="context_fit_checkpoint",
+        negative_memo=_context_reclaim_negative_memo(ctx.tools._ctx),
     )
-    if not checkpoint_ok:
-        return msg, cost, ctx.active_context_mode
-    ctx.accumulated_usage["_context_fit_low_retry_used"] = True
-    ctx.messages[:] = plan.reproject_transcript(ctx.messages, "low")
+    passes.add(key)
+    # The checkpoint is written only after non-empty selection and immediately
+    # before map/fold, so it also covers a post-summary binding mismatch.
+    if receipt.checkpoint_ref:
+        _context_reclaim_materializations(ctx.tools._ctx).add(key)
+    if usage:
+        _account_compaction_usage(ctx.accumulated_usage, usage, ctx.event_queue, ctx.task_id)
+    if receipt.status == "applied":
+        ctx.messages[:] = rebuilt
+        ctx.tools._ctx.messages = ctx.messages
+        seal_task_transcript(ctx.messages)
+    _emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
+        "type": "context_reclaim",
+        "checkpoint_kind": "context_reclaim_automatic",
+        "round": ctx.round_idx,
+        "route_fp": measurement.route_fp,
+        "round_id": measurement.round_id,
+        "status": receipt.status,
+        "reclaim_goal_tokens": request.reclaim_goal_tokens,
+        "reclaimed_tokens": receipt.reclaimed_tokens,
+        "goal_reached": receipt.goal_reached,
+        "checkpoint_ref": receipt.checkpoint_ref,
+    })
+    return receipt
+
+
+def _measure_after_reclaim(ctx: _RoundModelCallContext) -> Any:
+    """Suppress a second pass while reporting whether a summarizer actually ran."""
+    disposition = _measure_round_main_fit(ctx, automatic_pass_used=True)
+    if disposition is None:
+        return None
+    key = (disposition.measurement.route_fp, disposition.measurement.round_id)
+    used = key in _context_reclaim_materializations(ctx.tools._ctx)
+    if disposition.automatic_pass_used != used:
+        disposition = replace(disposition, automatic_pass_used=used)
+        _remember_main_fit(ctx, disposition)
+    return disposition
+
+
+def _reproject_actual_overflow_low(ctx: _RoundModelCallContext) -> None:
+    if ctx.active_context_mode == "low" or ctx.context_fit_plan is None:
+        return
+    ctx.messages[:] = ctx.context_fit_plan.reproject_transcript(ctx.messages, "low")
+    ctx.active_context_mode = "low"
     ctx.tools._ctx.messages = ctx.messages
     ctx.tools._ctx.active_context_mode = "low"
-    ctx.accumulated_usage["_context_prompt_estimate"] = estimate_context_prompt_tokens(
-        ctx.messages, ctx.tool_schemas,
-    )
-    ctx.accumulated_usage["_context_fit_mode"] = "low"
     _emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
         "checkpoint_kind": "context_fit_low_retry",
         "round": ctx.round_idx,
-        "model": ctx.active_model,
-        "route_fp": str(getattr(plan, "route_fp", "") or ""),
-        "core_sha256": str(getattr(plan, "core_sha256", "") or ""),
-        "preferred_mode": "max",
+        "route_fp": str(getattr(ctx.context_fit_plan, "route_fp", "") or ""),
+        "preferred_mode": str(getattr(ctx.context_fit_plan, "preferred_mode", "") or ""),
         "effective_mode": "low",
-        "toast_once": f"{ctx.task_id}:context-fit-low:{ctx.round_idx}",
         "owner_visible": True,
     })
-    msg, cost = call_llm_with_retry(
-        ctx.llm,
-        ctx.messages,
-        ctx.active_model,
-        ctx.tool_schemas,
-        ctx.active_effort,
-        ctx.max_retries,
-        ctx.drive_logs,
-        ctx.task_id,
-        ctx.round_idx,
-        ctx.event_queue,
-        ctx.accumulated_usage,
-        ctx.task_type,
-        use_local=ctx.active_use_local,
-        deadline_ts=_task_deadline_epoch(ctx.tools),
-        attempt_cap=1,
-        allow_server_web_search=_server_web_allowed_by_task(ctx.tools._ctx),
+
+
+def _failed_capture_is_comparable(capture: Any) -> bool:
+    return bool(
+        capture is not None
+        and capture.state in {"dispatched", "settled", "unresolved"}
+        and capture.candidate_measurement_kind == "canonical_json_v1"
+        and capture.candidate_raw_sha256
+        and capture.candidate_context_size_bytes is not None
+        and capture.physical_context is not None
     )
-    return msg, cost, "low"
+
+
+def _strict_context_shrink_predicate(failed: Any) -> Callable[[Any], bool]:
+    def predicate(request: Any) -> bool:
+        failed_context = failed.physical_context
+        current_context = request.physical_context
+        return bool(
+            request.candidate_measurement_kind == "canonical_json_v1"
+            and request.provider == failed.provider
+            and request.model == failed.model
+            and request.max_completion_tokens == failed.max_completion_tokens
+            and current_context is not None
+            and failed_context is not None
+            and current_context.route_fp == failed_context.route_fp
+            and current_context.round_id == failed_context.round_id
+            and request.candidate_raw_sha256 != failed.candidate_raw_sha256
+            and request.candidate_context_size_bytes is not None
+            and int(request.candidate_context_size_bytes) < int(failed.candidate_context_size_bytes)
+        )
+
+    return predicate
+
+
+def _emit_overflow_retry_skipped(ctx: _RoundModelCallContext, reason: str) -> None:
+    _emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
+        "type": "context_overflow_retry_skipped",
+        "round": ctx.round_idx,
+        "route_fp": str(getattr(ctx.context_fit_plan, "route_fp", "") or ""),
+        "reason": reason,
+    })
+
+
+def _call_round_model(ctx: _RoundModelCallContext) -> Tuple[Any, float, str]:
+    """Measure, optionally reclaim, dispatch, and recover one Main round."""
+    disposition = _measure_round_main_fit(ctx, automatic_pass_used=False)
+    if disposition is not None:
+        key = (disposition.measurement.route_fp, disposition.measurement.round_id)
+        already_reclaimed = key in _context_reclaim_passes(ctx.tools._ctx)
+        if disposition.action == "reclaim_once" and not already_reclaimed:
+            _run_main_reclaim(ctx, disposition)
+            already_reclaimed = True
+        if already_reclaimed:
+            disposition = _measure_after_reclaim(ctx)
+
+    msg, cost = _dispatch_round_model(
+        ctx,
+        disposition,
+        attempt_cap=ctx.attempt_cap,
+    )
+    if msg is not None or str(ctx.accumulated_usage.get("_last_llm_error_kind") or "") != "context_overflow":
+        return msg, cost, ctx.active_context_mode
+
+    # Snapshot immediately: a reclaim summarizer is itself physically receipted
+    # and would otherwise replace the failed Main candidate in the ContextVar.
+    failed_capture = last_physical_attempt_capture()
+    if disposition is None:
+        return msg, cost, ctx.active_context_mode
+    _reproject_actual_overflow_low(ctx)
+    reclaim_key = (disposition.measurement.route_fp, disposition.measurement.round_id)
+    overflow_fit = (
+        _measure_after_reclaim(ctx)
+        if reclaim_key in _context_reclaim_passes(ctx.tools._ctx)
+        else _measure_round_main_fit(ctx, automatic_pass_used=False)
+    )
+    if overflow_fit is None:
+        return msg, cost, ctx.active_context_mode
+    key = (overflow_fit.measurement.route_fp, overflow_fit.measurement.round_id)
+    if key not in _context_reclaim_passes(ctx.tools._ctx):
+        _run_main_reclaim(ctx, overflow_fit, minimum_goal_tokens=1)
+        overflow_fit = _measure_after_reclaim(ctx)
+        if overflow_fit is None:
+            return msg, cost, ctx.active_context_mode
+
+    retries = _context_overflow_retries(ctx.tools._ctx)
+    if key in retries:
+        _emit_overflow_retry_skipped(ctx, "route_round_retry_already_used")
+        return msg, cost, ctx.active_context_mode
+    if not _failed_capture_is_comparable(failed_capture):
+        _emit_overflow_retry_skipped(ctx, "failed_candidate_not_comparable")
+        return msg, cost, ctx.active_context_mode
+    retries.add(key)
+    try:
+        retry_msg, retry_cost = _dispatch_round_model(
+            ctx,
+            overflow_fit,
+            attempt_cap=1,
+            candidate_predicate=_strict_context_shrink_predicate(
+                failed_capture,
+            ),
+        )
+    except PhysicalAttemptPreconditionFailed:
+        _emit_overflow_retry_skipped(ctx, "context_candidate_not_strictly_smaller")
+        return msg, cost, ctx.active_context_mode
+    return retry_msg, retry_cost, ctx.active_context_mode
 
 
 @dataclass
@@ -7041,12 +6874,7 @@ def run_llm_loop(
         active_use_local = bool(ctx.task_use_local_override)
     else:
         active_use_local = os.environ.get("USE_LOCAL_MAIN", "").lower() in ("true", "1")
-    # Root probes exact-route fit; unknown routes get honest Max, never invented 200K.
-    _ctx_meta = getattr(ctx, "task_metadata", {})
-    _is_subagent = (
-        isinstance(_ctx_meta, dict)
-        and str(_ctx_meta.get("delegation_role") or "").strip().lower() == "subagent"
-    )
+    # Unknown routes get one honest call; no synthetic short-window capacity.
     _preferred_context_mode = get_context_mode()
     context_fit_plan = getattr(ctx, "context_fit_plan", None)
     if (
@@ -7055,9 +6883,7 @@ def run_llm_loop(
     ):
         active_context_mode = str(getattr(context_fit_plan, "initial_mode", "") or _preferred_context_mode)
     else:
-        active_context_mode = _maybe_downgrade_max_unconfirmed(
-            _preferred_context_mode, active_use_local, active_model, allow_fetch=not _is_subagent,
-        )
+        active_context_mode = _preferred_context_mode
     llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
     accumulated_usage: Dict[str, Any] = {}
     # Published as a live reference so blocking tools (wait_task/wait_tasks/
@@ -7077,35 +6903,6 @@ def run_llm_loop(
 
     tool_schemas = initial_tool_schemas(tools)
     tool_schemas, _enabled_extra_tools = _setup_dynamic_tools(tools, tool_schemas, messages)
-    if context_fit_plan is not None and str(
-        getattr(context_fit_plan, "preferred_mode", "")
-    ) == _preferred_context_mode:
-        fit_with_tools = getattr(context_fit_plan, "initial_mode_with_tools", None)
-        if callable(fit_with_tools):
-            tool_aware_mode = str(fit_with_tools(tool_schemas) or active_context_mode)
-            if tool_aware_mode != active_context_mode:
-                messages[:] = context_fit_plan.reproject_transcript(messages, tool_aware_mode)
-                active_context_mode = tool_aware_mode
-
-    if _preferred_context_mode == "max" and active_context_mode != "max":
-        # Make the effective-vs-preferred downgrade owner-visible and durable.
-        projected_prompt = 0
-        project_with_tools = getattr(context_fit_plan, "projected_tokens_with_tools", None)
-        if callable(project_with_tools):
-            projected_prompt = int(project_with_tools("max", tool_schemas) or 0)
-        _emit_checkpoint_event(event_queue, task_id, drive_logs, {
-            "checkpoint_kind": "context_mode_downgraded",
-            "preferred_mode": _preferred_context_mode,
-            "effective_mode": active_context_mode,
-            "model": active_model,
-            "use_local": active_use_local,
-            "reason": "known_route_projection_does_not_fit",
-            "route_fp": str(getattr(context_fit_plan, "route_fp", "") or ""),
-            "window_tokens": int(getattr(context_fit_plan, "window_tokens", 0) or 0),
-            "projected_prompt_tokens": projected_prompt,
-            "core_sha256": str(getattr(context_fit_plan, "core_sha256", "") or ""),
-        })
-
     tools._ctx.event_queue = event_queue
     tools._ctx.task_id = task_id
     tools._ctx.messages = messages
@@ -7199,12 +6996,7 @@ def run_llm_loop(
                     task_id=task_id,
                     round_idx=round_idx,
                     event_queue=event_queue,
-                    active_use_local=active_use_local,
-                    active_context_mode=active_context_mode,
-                    checkpoint_injected=_checkpoint_injected,
                     emit_progress=emit_progress,
-                    active_model=active_model,
-                    tool_schemas=tool_schemas,
                 ),
             )
             if tools._ctx.messages is not messages:

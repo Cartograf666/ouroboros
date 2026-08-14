@@ -259,6 +259,7 @@ class PhysicalAttemptCapture:
     provider: str
     state: Literal["reserved", "released", "dispatched", "settled", "unresolved"]
     candidate_measurement_kind: Literal["canonical_json_v1", "opaque"]
+    max_completion_tokens: int = 0
     candidate_raw_sha256: Optional[str] = None
     candidate_raw_size_bytes: Optional[int] = None
     candidate_context_sha256: Optional[str] = None
@@ -1173,6 +1174,7 @@ def _record_attempt_capture(
         provider=reservation.provider,
         state=state,  # type: ignore[arg-type]
         candidate_measurement_kind=request.candidate_measurement_kind,
+        max_completion_tokens=max(0, int(request.max_completion_tokens or 0)),
         candidate_raw_sha256=request.candidate_raw_sha256,
         candidate_raw_size_bytes=request.candidate_raw_size_bytes,
         candidate_context_sha256=request.candidate_context_sha256,

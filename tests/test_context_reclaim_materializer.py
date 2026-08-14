@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import pathlib
+import copy
+from types import SimpleNamespace
 
 import pytest
 
@@ -194,6 +195,25 @@ def test_non_overflow_failure_never_splits_or_retries(monkeypatch, tmp_path):
     assert leaves == ()
     assert summaries == {}
     assert failed == {"unit"}
+
+
+def test_direct_http_response_structured_overflow_is_typed():
+    class Response:
+        def json(self):
+            return {"error": {"code": "context_window_exceeded"}}
+
+    error = RuntimeError("provider rejected summarizer request")
+    error.response = Response()
+    assert cc._typed_context_overflow(error) is True
+
+
+def test_physical_capture_structured_overflow_is_typed():
+    error = RuntimeError("provider rejected summarizer request")
+    error.physical_attempt_capture = SimpleNamespace(
+        provider_code=None,
+        provider_error_type="prompt_too_long",
+    )
+    assert cc._typed_context_overflow(error) is True
 
 
 def test_one_missing_unit_stays_wholly_raw_while_neighbor_applies(monkeypatch, tmp_path):
@@ -477,14 +497,115 @@ def test_fresh_density_selects_one_sufficient_unit_and_receipt_uses_same_basis(
         negative_memo=set(),
     )
 
-    byte_delta = len(cc._canonical_bytes(messages)) - len(cc._canonical_bytes(rebuilt))
-    expected_reclaim = math.ceil((byte_delta / 4) * 2.0)
+    expected_reclaim = (
+        cc._context_tokens_for_messages(messages, 2.0)
+        - cc._context_tokens_for_messages(rebuilt, 2.0)
+    )
     assert receipt.status == "applied"
     assert len(receipt.selected_unit_ids) == 1
     assert rebuilt[1:] == messages[2:]
     assert receipt.reclaimed_tokens == expected_reclaim
     assert receipt.reclaimed_tokens >= goal
     assert receipt.goal_reached is True
+
+
+def test_safe_image_reclaim_uses_bounded_context_basis(monkeypatch, tmp_path):
+    _install_pure_dependencies(monkeypatch)
+    messages = _unit("image-basis", "x")
+    messages[1]["content"] = [{
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64," + "A" * 400_000},
+        "alt": "terminal screenshot showing one failing assertion",
+    }]
+    monkeypatch.setattr(
+        cc,
+        "_call_summarizer",
+        lambda parts, **_kwargs: {
+            part.source_id: "terminal screenshot: one assertion failed" for part in parts
+        },
+    )
+
+    rebuilt, receipt, _ = cc.compact_tool_history_llm(
+        messages,
+        request=_request(messages, 5_000),
+        drive_root=tmp_path,
+        negative_memo=set(),
+    )
+
+    expected = (
+        cc._context_tokens_for_messages(messages, 1.0)
+        - cc._context_tokens_for_messages(rebuilt, 1.0)
+    )
+    assert receipt.status == "applied"
+    assert receipt.reclaimed_tokens == expected
+    assert 0 < receipt.reclaimed_tokens < 5_000
+    assert receipt.goal_reached is False
+
+
+def test_safe_image_does_not_hide_productive_text_neighbor():
+    image_unit = _unit("image-first", "x")
+    image_unit[1]["content"] = [{
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64," + "A" * 400_000},
+        "alt": "terminal screenshot showing one failing assertion",
+    }]
+    text_unit = _unit("text-neighbor", "z")
+    text_unit[0]["tool_calls"][0]["function"]["arguments"] = "a" * 40_000
+    text_unit[1]["content"] = "b" * 40_000
+    messages = [*image_unit, *text_unit]
+
+    units = cc._atomic_units(messages)
+    assert units[0].predicted_reclaim_tokens < 5_000
+    selection, status = cc._select_units(
+        messages,
+        _request(messages, 5_000),
+        keep_recent=0,
+        trace_refs_by_tool_call_id={},
+        negative_memo=set(),
+        spec=_SPEC,
+    )
+    assert status == "applied"
+    assert selection is not None
+    assert [item.unit.unit_id for item in selection.units] == [
+        units[0].unit_id,
+        units[1].unit_id,
+    ]
+
+
+def test_corrupt_capsule_contract_or_lineage_stays_raw(monkeypatch, tmp_path):
+    _install_pure_dependencies(monkeypatch)
+    messages = _unit("capsule", "x")
+    monkeypatch.setattr(
+        cc,
+        "_call_summarizer",
+        lambda parts, **_kwargs: {
+            part.source_id: f"summary {part.sha256}" for part in parts
+        },
+    )
+    rebuilt, receipt, _ = cc.compact_tool_history_llm(
+        messages,
+        request=_request(messages, 100),
+        drive_root=tmp_path,
+        negative_memo=set(),
+    )
+    assert receipt.status == "applied"
+    assert len(cc._atomic_units(rebuilt)) == 1
+
+    corruptions = []
+    wrong_block = copy.deepcopy(rebuilt)
+    wrong_block[0]["content"][0]["type"] = "image_url"
+    corruptions.append(wrong_block)
+    wrong_version = copy.deepcopy(rebuilt)
+    wrong_version[0]["content"][0]["_context_capsule"]["summary_contract_version"] = 999
+    corruptions.append(wrong_version)
+    wrong_digest = copy.deepcopy(rebuilt)
+    wrong_digest[0]["content"][0]["_context_capsule"]["summary_contract_digest"] = "d" * 64
+    corruptions.append(wrong_digest)
+    wrong_part = copy.deepcopy(rebuilt)
+    wrong_part[0]["content"][0]["_context_capsule"]["parts"][0]["sha256"] = "e" * 64
+    corruptions.append(wrong_part)
+
+    assert all(cc._atomic_units(candidate) == () for candidate in corruptions)
 
 
 def test_map_fanout_remains_bounded_at_eight(monkeypatch, tmp_path):
