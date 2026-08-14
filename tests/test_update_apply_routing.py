@@ -367,6 +367,13 @@ def test_assisted_resolver_boots_before_conflicts_reach_live_tree(
     calls = []
     monkeypatch.setattr(git_ops, "BRANCH_DEV", "ouroboros")
     monkeypatch.setattr(git_ops, "_create_rescue_snapshot", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        git_ops, "_collect_repo_sync_state",
+        lambda: {
+            "current_branch": "ouroboros", "dirty_lines": [],
+            "unpushed_lines": [], "warnings": [],
+        },
+    )
     monkeypatch.setattr(git_ops, "git_capture", lambda cmd: (
         (0, "ouroboros", "") if "--abbrev-ref" in cmd else (0, "", "")
     ))
@@ -480,6 +487,13 @@ def test_clean_apply_publishes_smoke_proof_only_after_pass(monkeypatch):
     writes = []
     monkeypatch.setattr(git_ops, "BRANCH_DEV", "ouroboros")
     monkeypatch.setattr(git_ops, "_create_rescue_snapshot", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        git_ops, "_collect_repo_sync_state",
+        lambda: {
+            "current_branch": "ouroboros", "dirty_lines": [],
+            "unpushed_lines": [], "warnings": [],
+        },
+    )
     monkeypatch.setattr(git_ops, "git_capture", lambda cmd: (
         (0, "ouroboros", "")
         if "--abbrev-ref" in cmd

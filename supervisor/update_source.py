@@ -47,43 +47,21 @@ def _git_network_bounded(
     args: List[str], *, timeout: Optional[float] = None
 ) -> Tuple[int, str, str]:
     """Run one non-interactive git network command under the shared ceiling."""
-    from ouroboros.platform_layer import kill_process_tree, subprocess_new_group_kwargs
-    from ouroboros.tools.shell import _active_subprocesses, _subprocess_lock
     from ouroboros.update_channels import get_managed_update_fetch_timeout_sec
     from supervisor import git_ops as _g
 
     limit = float(timeout or get_managed_update_fetch_timeout_sec())
     env = {**os.environ, "LC_ALL": "C", "LANG": "C", "GIT_TERMINAL_PROMPT": "0"}
-    try:
-        proc = subprocess.Popen(
-            ["git", "-c", "http.lowSpeedLimit=1024", "-c", "http.lowSpeedTime=30", *args],
-            cwd=str(_g.REPO_DIR),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-            **subprocess_new_group_kwargs(),
-        )
-    except OSError as exc:
-        return 127, "", str(exc)
-    with _subprocess_lock:
-        _active_subprocesses.add(proc)
-    try:
-        try:
-            out, err = proc.communicate(timeout=limit)
-        except subprocess.TimeoutExpired:
-            kill_process_tree(proc)
-            try:
-                proc.communicate(timeout=10)
-            except Exception:
-                pass
-            return FETCH_TIMEOUT_RC, "", (
-                f"git {' '.join(args[:2])} exceeded {limit:.0f}s and was terminated"
-            )
-        return proc.returncode, (out or "").strip(), (err or "").strip()
-    finally:
-        with _subprocess_lock:
-            _active_subprocesses.discard(proc)
+    rc, out, err = _g._run_git_process_bounded(
+        ["git", "-c", "http.lowSpeedLimit=1024", "-c", "http.lowSpeedTime=30", *args],
+        timeout=limit,
+        cwd=_g.REPO_DIR,
+        env=env,
+        text=True,
+    )
+    if rc == FETCH_TIMEOUT_RC:
+        return rc, "", f"git {' '.join(args[:2])} exceeded {limit:.0f}s and was terminated"
+    return rc, str(out or "").strip(), str(err or "").strip()
 
 
 def git_fetch_bounded(remote_name: str, *, timeout: Optional[float] = None) -> Tuple[int, str, str]:

@@ -1,4 +1,4 @@
-"""Official managed-update channel mapping and bounded fetch settings."""
+"""Official managed-update channel mapping and bounded Git settings."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ UPDATE_CHANNEL_BRANCHES = {
 UPDATE_SETTINGS_DEFAULTS = {
     "OUROBOROS_UPDATE_CHANNEL": "stable",
     "OUROBOROS_MANAGED_UPDATE_FETCH_TIMEOUT_SEC": 300,
+    "OUROBOROS_RESCUE_GIT_TIMEOUT_SEC": 300,
 }
 
 
@@ -42,14 +43,20 @@ def get_update_branch(settings: Mapping[str, Any] | None = None) -> str:
     return UPDATE_CHANNEL_BRANCHES[get_update_channel(settings)]
 
 
-def get_managed_update_fetch_timeout_sec() -> int:
-    """Wall-clock ceiling for official git network operations."""
-    raw = os.environ.get(
-        "OUROBOROS_MANAGED_UPDATE_FETCH_TIMEOUT_SEC",
-        UPDATE_SETTINGS_DEFAULTS["OUROBOROS_MANAGED_UPDATE_FETCH_TIMEOUT_SEC"],
-    )
+def _bounded_timeout_setting(name: str) -> int:
+    raw = os.environ.get(name, UPDATE_SETTINGS_DEFAULTS[name])
     try:
         parsed = int(float(raw))
     except (TypeError, ValueError):
-        parsed = int(UPDATE_SETTINGS_DEFAULTS["OUROBOROS_MANAGED_UPDATE_FETCH_TIMEOUT_SEC"])
+        parsed = int(UPDATE_SETTINGS_DEFAULTS[name])
     return max(30, min(parsed, 1800))
+
+
+def get_managed_update_fetch_timeout_sec() -> int:
+    """Wall-clock ceiling for official git network operations."""
+    return _bounded_timeout_setting("OUROBOROS_MANAGED_UPDATE_FETCH_TIMEOUT_SEC")
+
+
+def get_rescue_git_timeout_sec() -> int:
+    """Per-process wall-clock ceiling inside the rescue graph."""
+    return _bounded_timeout_setting("OUROBOROS_RESCUE_GIT_TIMEOUT_SEC")
