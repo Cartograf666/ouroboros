@@ -867,6 +867,9 @@ def _preflight_check(commit_message: str, staged_files: str,
                     readme_text=_git_show_staged(repo_dir, "README.md"),
                     arch_text=_git_show_staged(repo_dir, "docs/ARCHITECTURE.md"),
                     api_types_text=_git_show_staged(repo_dir, "web/modules/api_types.js"),
+                    download_readme_text=_git_show_staged(repo_dir, "README.md"),
+                    site_install_text=_git_show_staged(repo_dir, "site/install/index.html"),
+                    docs_install_text=_git_show_staged(repo_dir, "docs/install/index.html"),
                     detailed=True,
                 )
                 if desync:

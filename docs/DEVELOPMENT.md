@@ -707,7 +707,20 @@ Accordingly, a pull request into `ouroboros` leaves `VERSION`,
 the Architecture header byte-identical to its target. At integration,
 `ouroboros/tools/release_sync.py::sync_release_metadata()` projects the chosen
 version and `version_carrier_desyncs()` verifies those carriers; changelog prose
-remains a deliberate maintainer edit.
+remains a deliberate maintainer edit. The same projection owns the seven public
+installer filename templates and rewrites the named direct-download links in
+README, the source install page, and its generated Pages copy. Those links use
+the immutable exact tag (`/releases/download/v{VERSION}/...`), not
+`/releases/latest/download/...`: prereleases are excluded from GitHub's latest
+release and a versioned latest-link would therefore fail during an RC. Release
+notes are generated from the same templates only after the seven proof-bound
+assets have been assembled.
+
+The integration branch may therefore name installers that are not published
+yet. Public onboarding does not use that branch: the default README and legacy
+GitHub Pages source are `main` and `main:/docs`. Stable promotion advances
+`main` only after the release and all seven installers are public; if promotion
+does not happen, users stay on the previous working release.
 
 Hermetic preflight uses a disposable worktree, temporary data/settings/pycache,
 and scrubbed runtime/secret-class environment. Tests must rebind imported
