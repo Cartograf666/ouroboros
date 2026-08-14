@@ -1631,13 +1631,16 @@ def test_triad_session_task_carries_criteria_and_nav_maps_not_evidence():
         rebuttal_section="",
         review_history_section="",
         dev_guide_text="# Dev\n\n## Rules\n\ntext\n",
-        architecture_text="# Arch\n\n## Modules\n\ntext\n",
+        architecture_text="## Parent\nbody\n### Child\nbody\n#### Detail\nbody\n",
     )
     assert "## Review Checklist" in task
     assert "## Goal" in task and "## Scope" in task
     assert "git diff --cached" in task           # subject pointer, not the diff
     assert "DEVELOPMENT.md (navigation map)" in task
     assert "ARCHITECTURE.md (navigation map)" in task
+    assert "- Parent — lines 1-6" in task
+    assert "  - Child — lines 3-6" in task
+    assert "    - Detail — lines 5-6" in task
     assert "Read BIBLE.md in full" in task
 
 
