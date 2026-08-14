@@ -245,6 +245,19 @@ def route_fingerprint(
 
 # --- Persistence ---------------------------------------------------------------
 
+def canonical_evidence_root() -> pathlib.Path:
+    """The ONE observation store's root (host data dir, never a child drive).
+
+    Density witnesses are written at settlement through the usage-accounting
+    fallback root (`usage_ledger._drive_root(None)`); readers must resolve the
+    same root, or a forked/child task with its own empty drive would read
+    cold 1.0 forever while its own sends teach the canonical store.
+    """
+    from ouroboros.usage_ledger import _drive_root
+
+    return _drive_root(None)
+
+
 def _store_path(drive_root: Any) -> pathlib.Path:
     return pathlib.Path(drive_root) / "state" / "capability_evidence.json"
 

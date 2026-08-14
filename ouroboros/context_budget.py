@@ -1,8 +1,8 @@
 """Single source of truth for AGENT-context size budgets.
 
 These govern the size of Ouroboros's OWN working context: the main-loop
-assembled prompt, tool-history compaction triggers, and the background
-consciousness context guards.
+assembled prompt, the typed context-reclaim request/receipt contract, and
+the background consciousness context guards.
 
 They are deliberately SEPARATE from the REVIEW-prompt budget family
 (``ouroboros.tools.review_helpers.REVIEW_PROMPT_TOKEN_BUDGET`` and the
@@ -29,6 +29,33 @@ from typing import Any, Dict, Literal, Optional, Tuple
 # route capacity W, requests at most one useful reclaim pass, then sends best
 # effort. Crossing T never creates a task failure.
 OWNER_LOW_TARGET_TOKENS = 200_000
+
+# One overflow vocabulary for every seam that must recognize a CONTEXT-WINDOW
+# overflow (Main provider-code precedence, the local transport, and the
+# summarizer split path). A provider code or message shape added here reaches
+# all three seams at once; per-module copies drifted independently before.
+CONTEXT_OVERFLOW_CODES = frozenset({
+    "context_length_exceeded",
+    "context_window_exceeded",
+    "model_context_window_exceeded",
+    "prompt_too_long",
+    "input_too_long",
+})
+CONTEXT_OVERFLOW_MESSAGE_MARKERS = (
+    "context_length_exceeded",
+    "context length",
+    "maximum context",
+    "prompt is too long",
+    "exceeds the context",
+    "context window",
+    "input is too long",
+)
+
+
+def context_overflow_message(text: Any) -> bool:
+    """True when a provider error message matches the shared overflow markers."""
+    low = str(text or "").lower()
+    return any(marker in low for marker in CONTEXT_OVERFLOW_MESSAGE_MARKERS)
 
 MeasurementBasis = Literal["fresh_route_usage", "fresh_model_usage", "cold_estimate"]
 ReclaimStatus = Literal[

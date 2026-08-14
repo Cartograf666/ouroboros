@@ -229,15 +229,21 @@ def estimate_context_prompt_tokens(
 
 
 def _route_calibration_ratio(
-    drive_root: pathlib.Path,
+    drive_root: Optional[pathlib.Path],
     route_fp: str,
     model: str,
 ) -> float:
-    """Fresh exact-route/model witness, never an event-tail or orphan maximum."""
-    try:
-        from ouroboros.capability_evidence import resolve_main_token_density
+    """Fresh exact-route/model witness, never an event-tail or orphan maximum.
 
-        return float(resolve_main_token_density(drive_root, route_fp, model)[0])
+    ``None`` reads the canonical host evidence root (one observation store).
+    """
+    try:
+        from ouroboros.capability_evidence import (
+            canonical_evidence_root, resolve_main_token_density,
+        )
+
+        root = drive_root if drive_root is not None else canonical_evidence_root()
+        return float(resolve_main_token_density(root, route_fp, model)[0])
     except Exception:
         log.debug("Fresh route token calibration unavailable", exc_info=True)
         return 1.0
@@ -248,16 +254,24 @@ def measure_main_fit(
     messages: List[Dict[str, Any]],
     tools: Optional[List[Dict[str, Any]]],
     *,
-    drive_root: pathlib.Path,
+    drive_root: Optional[pathlib.Path] = None,
     profile: ContextProfile,
     rendered_mode: Literal["max", "low"],
     round_id: str,
     automatic_pass_used: bool = False,
 ) -> MainFitDisposition:
-    """Measure one sealed Main candidate against owner target T and route W."""
-    from ouroboros.capability_evidence import is_known, resolve_main_token_density
+    """Measure one sealed Main candidate against owner target T and route W.
+
+    ``drive_root=None`` reads density from the canonical host evidence root
+    (one observation store) — a child task's own drive must not be consulted.
+    """
+    from ouroboros.capability_evidence import (
+        canonical_evidence_root, is_known, resolve_main_token_density,
+    )
     from ouroboros.context_budget import OWNER_LOW_TARGET_TOKENS
 
+    if drive_root is None:
+        drive_root = canonical_evidence_root()
     density, basis = resolve_main_token_density(drive_root, plan.route_fp, plan.model)
     density = float(density)
     estimated_input = int(math.ceil(estimate_context_prompt_tokens(messages, tools) * density))
@@ -388,8 +402,10 @@ def build_context_fit_plan(
     from ouroboros.loop_llm_call import MAIN_LOOP_MAX_TOKENS
 
     output_reserve = MAIN_LOOP_MAX_TOKENS
+    # One observation store: witnesses are written at settlement into the
+    # canonical host root, so a child task's own drive must not be consulted.
     ratio = _route_calibration_ratio(
-        pathlib.Path(env.drive_root),
+        None,
         str(evidence.route_fp or ""),
         str(route["model"] or ""),
     )

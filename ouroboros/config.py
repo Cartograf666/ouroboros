@@ -202,8 +202,11 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # NOTE: OUROBOROS_OBSERVABILITY_KEEP_RAW (writes UNREDACTED secret-bearing payloads to
     # disk) is intentionally NOT a settings/UI carrier — it is an env-only operator debug
     # override so a self-change or non-owner save can never enable secret logging.
-    # Generative context-window probe (Max gate): on (default) confirms a route's >=1M
-    # window from a FREE over-window reject; *_CHARS sizes the oversized padding.
+    # Generative context-window probe machinery: when enabled AND a caller passes
+    # allow_generative=True, confirms a route's >=1M window from a FREE over-window
+    # reject; *_CHARS sizes the padding. Since the settings-time Max gate retirement
+    # no production surface passes allow_generative=True (dormant; kept for tests
+    # and future explicit owner probes).
     "OUROBOROS_GENERATIVE_PROBE": "1",
     "OUROBOROS_GENERATIVE_PROBE_CHARS": "5000000",
     # Pre-commit review: comma-separated provider-tagged model list

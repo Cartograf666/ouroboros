@@ -376,14 +376,9 @@ def _short_error_text(value: Any, limit: int = 220) -> str:
     return text[: limit - 3] + "..."
 
 
-_CONTEXT_OVERFLOW_MARKERS = (
-    "context_length_exceeded",
-    "context length",
-    "maximum context",
-    "prompt is too long",
-    "exceeds the context",
-    "context window",
-    "input is too long",
+from ouroboros.context_budget import (  # one overflow vocabulary for every seam
+    CONTEXT_OVERFLOW_CODES as _STRUCTURED_CONTEXT_OVERFLOW_CODES,
+    CONTEXT_OVERFLOW_MESSAGE_MARKERS as _CONTEXT_OVERFLOW_MARKERS,
 )
 _OUTPUT_OR_BODY_SIZE_MARKERS = (
     "max_tokens",
@@ -393,13 +388,6 @@ _OUTPUT_OR_BODY_SIZE_MARKERS = (
     "request body too large",
     "body too large",
 )
-_STRUCTURED_CONTEXT_OVERFLOW_CODES = frozenset({
-    "context_length_exceeded",
-    "context_window_exceeded",
-    "model_context_window_exceeded",
-    "prompt_too_long",
-    "input_too_long",
-})
 _NON_RETRYABLE_PROVIDER_MARKERS = {
     "quota_exhausted": (
         "insufficient credits",

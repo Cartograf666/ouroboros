@@ -78,9 +78,11 @@ def test_typed_overflow_recursively_splits_one_gap_free_hashed_source(monkeypatc
     root = "unit:12:13:0123456789abcdef"
     initial = cc._part(root, text)
     attempted_sizes: list[int] = []
+    call_totals: list[int] = []
 
     def bounded(parts, **_kwargs):
         attempted_sizes.extend(len(part.text) for part in parts)
+        call_totals.append(sum(len(part.text) for part in parts))
         if any(len(part.text) > 90 for part in parts):
             raise cc.SummarizerContextOverflow("typed context_length_exceeded")
         return {part.source_id: f"summary:{part.sha256}" for part in parts}
@@ -96,6 +98,11 @@ def test_typed_overflow_recursively_splits_one_gap_free_hashed_source(monkeypatc
     )
 
     assert attempted_sizes.count(len(text)) == 1
+    # CMP-6: an overflowed payload is never resent at the same TOTAL size —
+    # after the first overflowing call every summarizer call must be strictly
+    # smaller (a single-leaf split may not resend both halves in one call).
+    assert call_totals[0] == len(text)
+    assert all(total < len(text) for total in call_totals[1:])
     assert "".join(leaf.text for leaf in leaves) == text
     assert [leaf.start_char for leaf in leaves] == [0, *[leaf.end_char for leaf in leaves[:-1]]]
     assert leaves[-1].end_char == len(text)
@@ -137,6 +144,7 @@ def test_large_actor_input_is_complete_and_gap_free(monkeypatch, tmp_path, paylo
 
     initial = cc._part(unit.unit_id, unit.source_text)
     attempts: set[tuple[tuple[str, int, int, str], ...]] = set()
+    call_totals: list[int] = []
 
     def bounded(parts, **_kwargs):
         identity = tuple(
@@ -145,6 +153,7 @@ def test_large_actor_input_is_complete_and_gap_free(monkeypatch, tmp_path, paylo
         )
         assert identity not in attempts, "typed overflow resent an identical payload"
         attempts.add(identity)
+        call_totals.append(sum(len(part.text) for part in parts))
         if any(len(part.text) > 40_000 for part in parts):
             raise cc.SummarizerContextOverflow("typed context_length_exceeded")
         return {part.source_id: f"summary:{part.sha256}" for part in parts}
@@ -160,6 +169,9 @@ def test_large_actor_input_is_complete_and_gap_free(monkeypatch, tmp_path, paylo
     )
 
     assert "".join(leaf.text for leaf in leaves) == unit.source_text
+    # CMP-6: after the first overflowing call every summarizer call carries a
+    # strictly smaller total payload (no same-size two-half resend).
+    assert all(total < call_totals[0] for total in call_totals[1:])
     assert [leaf.start_char for leaf in leaves] == [
         0,
         *[leaf.end_char for leaf in leaves[:-1]],
@@ -171,6 +183,19 @@ def test_large_actor_input_is_complete_and_gap_free(monkeypatch, tmp_path, paylo
     )
     assert set(summaries) == {leaf.source_id for leaf in leaves}
     assert failed == set()
+
+
+def test_untyped_overflow_message_marker_authorizes_split():
+    """A bare 400 without structured codes still classifies as overflow via the
+    shared message markers (same vocabulary as the Main classification seam);
+    unrelated provider errors stay non-overflow and fail the unit raw."""
+    untyped = RuntimeError(
+        "Error code: 400 - {'error': {'message': 'prompt is too long: "
+        "250000 tokens > 200000 maximum', 'type': 'invalid_request_error'}}"
+    )
+    assert cc._typed_context_overflow(untyped)
+    assert not cc._typed_context_overflow(RuntimeError("429 rate limit exceeded"))
+    assert not cc._typed_context_overflow(RuntimeError("transport reset by peer"))
 
 
 def test_non_overflow_failure_never_splits_or_retries(monkeypatch, tmp_path):

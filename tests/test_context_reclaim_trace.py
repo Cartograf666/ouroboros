@@ -34,6 +34,39 @@ def test_tool_trace_row_carries_exact_tool_call_id_beside_trace_ref():
     assert row["trace_ref"] is trace_ref
 
 
+def test_process_tool_results_accumulates_trace_refs_for_reclaim():
+    """Production wiring: appending a tool result retains its pre-truncation
+    trace ref per tool_call_id on the tool context, and the loop accessor
+    exposes exactly that mapping to compact_tool_history_llm."""
+    from types import SimpleNamespace
+
+    from ouroboros.loop_tool_execution import reclaim_trace_refs
+
+    trace_ref = {"manifest_ref": {"path": "calls/tool.json", "sha256": "b" * 64}}
+    tools = SimpleNamespace(_ctx=SimpleNamespace())
+
+    errors = process_tool_results(
+        [{
+            "fn_name": "read_file",
+            "tool_call_id": "call-retained",
+            "result": "result body",
+            "is_error": False,
+            "args_for_log": {"path": "README.md"},
+            "tool_args": {"path": "README.md"},
+            "trace_ref": trace_ref,
+        }],
+        [],
+        {"tool_calls": []},
+        emit_progress=lambda _message: None,
+        tools=tools,
+    )
+
+    assert errors == 0
+    assert reclaim_trace_refs(tools._ctx) == {"call-retained": trace_ref}
+    # No tools context: still no crash, accessor stays empty.
+    assert reclaim_trace_refs(SimpleNamespace()) == {}
+
+
 def test_materializer_resolves_only_matching_tool_call_trace_refs():
     messages = [
         {

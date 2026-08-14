@@ -57,6 +57,40 @@ def test_call_llm_with_retry_records_last_error(tmp_path):
     assert usage["_last_llm_retry_same_request"] is False
 
 
+class _OverflowStoppedLLM:
+    """Non-empty output whose finish_reason reports a context-window overflow —
+    the successful truncated-generation shape (acceptance row ERR-3)."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, **kwargs):
+        self.calls += 1
+        return (
+            {"content": "partial but useful answer",
+             "finish_reason": "model_context_window_exceeded"},
+            {"provider": "openai", "resolved_model": "openai::gpt-5.5"},
+        )
+
+
+def test_non_empty_overflow_stopped_output_is_kept_without_retry(tmp_path):
+    """ERR-3: a non-empty overflow-stopped response is retained as the delivery
+    candidate — exactly one provider call, no semantic or transient-empty retry."""
+    usage = {}
+    llm = _OverflowStoppedLLM()
+    msg, _cost = call_llm_with_retry(
+        llm,
+        [{"role": "user", "content": "hi"}],
+        "openai::gpt-5.5", None, "medium", 3, tmp_path, "task-1", 1, None, usage, "task",
+        False,
+    )
+    assert llm.calls == 1
+    assert msg is not None
+    assert msg["content"] == "partial but useful answer"
+    assert "_last_llm_error" not in usage
+    assert "_last_llm_error_kind" not in usage
+
+
 class _RateLimitBodyLLM:
     """HTTP-200 response whose BODY carries a 429 (provider_error kind=rate_limit) with a
     present finish_reason — the canonical cloud.ru/OpenRouter rate-limit shape."""

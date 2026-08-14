@@ -11,6 +11,8 @@ import pathlib
 from typing import Any, Dict, List, Literal, Mapping, MutableSet, Optional, Sequence, Tuple
 
 from ouroboros.context_budget import (
+    CONTEXT_OVERFLOW_CODES as _TYPED_CONTEXT_OVERFLOW_CODES,
+    context_overflow_message as _context_overflow_message,
     ContextReclaimReceipt,
     ContextReclaimRequest,
     ReclaimStatus,
@@ -31,13 +33,6 @@ _SUMMARY_OUTPUT_TOKENS = 32_768
 _BLOCKS_PER_BATCH = 8
 _MIN_CAPSULE_BYTES = 512
 _SHA256_HEX = frozenset("0123456789abcdef")
-_TYPED_CONTEXT_OVERFLOW_CODES = frozenset({
-    "context_length_exceeded",
-    "context_window_exceeded",
-    "model_context_window_exceeded",
-    "prompt_too_long",
-    "input_too_long",
-})
 
 _SUMMARY_GUIDANCE = (
     "Summarize each supplied context source without dropping late facts. Preserve "
@@ -377,7 +372,10 @@ def _typed_context_overflow(exc: BaseException) -> bool:
     capture = getattr(exc, "physical_attempt_capture", None)
     candidates.extend((getattr(capture, "provider_code", None),
                        getattr(capture, "provider_error_type", None)))
-    return any(str(value or "").strip().lower() in _TYPED_CONTEXT_OVERFLOW_CODES for value in candidates)
+    if any(str(value or "").strip().lower() in _TYPED_CONTEXT_OVERFLOW_CODES for value in candidates):
+        return True
+    # Untyped shapes: the shared Main markers still authorize the split.
+    return _context_overflow_message(str(exc))
 
 
 def _record_usage(total: Dict[str, Any], usage: Mapping[str, Any]) -> None:
@@ -547,12 +545,16 @@ def _split_part(part: _Part) -> Optional[Tuple[_Part, _Part]]:
     if len(part.text) < 2:
         return None
     midpoint = len(part.text) // 2
-    split_at = part.text.rfind("\n", 1, midpoint + 1)
-    if split_at <= 0:
-        after = part.text.find("\n", midpoint)
-        split_at = after + 1 if 0 <= after < len(part.text) - 1 else midpoint
-    else:
-        split_at += 1
+    # Newline boundary only NEAR the midpoint: a lone newline near an edge
+    # used to produce degenerate 1%/99% splits that re-overflowed unchanged.
+    window = max(1, len(part.text) // 4)
+    before = part.text.rfind("\n", 1, midpoint + 1)
+    after = part.text.find("\n", midpoint, len(part.text) - 1)
+    candidates = [pos + 1 for pos in (before, after)
+                  if pos > 0 and abs((pos + 1) - midpoint) <= window]
+    split_at = min(candidates, key=lambda pos: abs(pos - midpoint)) if candidates else midpoint
+    if split_at <= 0 or split_at >= len(part.text):
+        split_at = midpoint
     if split_at <= 0 or split_at >= len(part.text):
         return None
     left_text = part.text[:split_at]
@@ -588,7 +590,8 @@ def _map_complete_parts(
             split = _split_part(parts[0])
             if split is None:
                 return (), {}, {parts[0].root_id}
-            subsets = (split,)
+            # One call PER half: both halves together equal the failed payload.
+            subsets = ((split[0],), (split[1],))
         leaves: List[_Part] = []
         merged: Dict[str, str] = {}
         failed: set[str] = set()

@@ -189,3 +189,58 @@ def test_bare_env_low_keeps_p3_owner_max_but_gets_main_target(monkeypatch, tmp_p
     monkeypatch.setenv("OUROBOROS_CONTEXT_MODE_AUTO_LOW", "false")
     assert config.get_owner_context_mode() == "low"
     assert scope_review._scope_review_skipped_in_low_context() is True
+
+
+def test_round_fit_reads_density_from_canonical_store_not_child_drive(tmp_path, monkeypatch):
+    """One observation store: a forked/child task with its own empty drive must
+    consume the SAME density witnesses settlement writes into the canonical host
+    root — never reset to cold 1.0 by its local empty drive."""
+    from types import SimpleNamespace
+
+    canonical = tmp_path / "canonical"
+    child = tmp_path / "child-drive"
+    (canonical / "state").mkdir(parents=True)
+    (child / "logs").mkdir(parents=True)
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(canonical))
+
+    from ouroboros import loop
+    from ouroboros.capability_evidence import (
+        canonical_evidence_root,
+        record_token_density,
+    )
+
+    assert canonical_evidence_root() == canonical
+
+    plan = _plan(preferred="low")
+    record_token_density(
+        canonical_evidence_root(),
+        plan.model,
+        prompt_chars=400_000,  # above the 20K noise floor
+        prompt_tokens=180_000,  # density 1.8
+        source="dispatch_usage",
+        route_fp=plan.route_fp,
+    )
+
+    ctx = loop._RoundModelCallContext(
+        llm=None,
+        messages=plan.messages_for("low"),
+        tools=SimpleNamespace(_ctx=SimpleNamespace()),
+        context_fit_plan=plan,
+        active_model=plan.model,
+        tool_schemas=[],
+        active_effort="medium",
+        max_retries=1,
+        drive_logs=child / "logs",
+        task_id="task-canonical-density",
+        round_idx=1,
+        event_queue=None,
+        accumulated_usage={},
+        task_type="task",
+        active_use_local=False,
+        active_context_mode="low",
+        drive_root=child,
+    )
+    disposition = loop._measure_round_main_fit(ctx, automatic_pass_used=False)
+    assert disposition is not None
+    assert disposition.measurement.measurement_basis == "fresh_route_usage"
+    assert abs(disposition.measurement.measurement_density - 1.8) < 1e-6

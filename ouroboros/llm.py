@@ -45,13 +45,10 @@ _VALID_CACHE_TTLS = frozenset({"5m", "1h"})
 
 # Only explicit wire tiers have a knowable horizon; bare "default" does not.
 _CACHE_TTL_SECONDS = {"5m": 300, "1h": 3600}
-_TYPED_CONTEXT_OVERFLOW_CODES = frozenset({
-    "context_length_exceeded",
-    "context_window_exceeded",
-    "model_context_window_exceeded",
-    "prompt_too_long",
-    "input_too_long",
-})
+from ouroboros.context_budget import (
+    CONTEXT_OVERFLOW_CODES,
+    context_overflow_message,
+)
 
 
 def _structured_error_values(payload: Any) -> Set[str]:
@@ -83,11 +80,11 @@ def _is_structured_context_overflow_exception(exc: BaseException) -> bool:
             for key in ("provider_code", "provider_error_type")
             if str(getattr(capture, key, "") or "").strip()
         })
-    return bool(values & _TYPED_CONTEXT_OVERFLOW_CODES)
+    return bool(values & CONTEXT_OVERFLOW_CODES)
 
 
 def _is_structured_context_overflow_body(error: Any) -> bool:
-    return bool(_structured_error_values(error) & _TYPED_CONTEXT_OVERFLOW_CODES)
+    return bool(_structured_error_values(error) & CONTEXT_OVERFLOW_CODES)
 
 
 def cache_ttl_seconds(applied_ttl: Any) -> Optional[int]:
@@ -2559,7 +2556,8 @@ class LLMClient:
             except Exception as exc:
                 last_exc = exc
                 err = str(exc)
-                if "context_length_exceeded" in err:
+                if (_is_structured_context_overflow_exception(exc)
+                        or context_overflow_message(err)):
                     raise LocalContextTooLargeError(err) from exc
                 if attempt == 2:
                     log.warning("Local model request failed: %s", exc)

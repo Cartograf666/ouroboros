@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from ouroboros.llm import LocalContextTooLargeError
 from ouroboros.loop import _provider_recovery_hint
 from ouroboros.loop_llm_call import (
@@ -84,3 +86,40 @@ def test_remote_context_overflow_is_not_logged_as_local_or_global_mode_hint(tmp_
     assert api_error["context_profile"] == "owner_low"
     assert api_error["context_target_miss"] is True
     assert api_error["context_automatic_pass_used"] is True
+
+
+class _StructuredLocalOverflow(RuntimeError):
+    body = {"error": {"code": "context_window_exceeded", "type": "invalid_request_error"}}
+
+
+@pytest.mark.parametrize("overflow_exc", [
+    _StructuredLocalOverflow("provider rejected request"),
+    RuntimeError("Error code: 400 - prompt is too long: 250000 tokens > 200000 maximum"),
+])
+def test_local_transport_stops_unchanged_retry_on_any_overflow_shape(monkeypatch, overflow_exc):
+    """The local path raises LocalContextTooLargeError on the FIRST attempt for
+    every structured overflow code and message marker — an identical over-window
+    payload is never resent (the old path matched one literal code only)."""
+    from ouroboros import llm as llm_mod
+
+    calls = {"n": 0}
+
+    def _fake_execute(request, send, before):
+        calls["n"] += 1
+        raise overflow_exc
+
+    monkeypatch.setattr(llm_mod, "_execute_candidate", _fake_execute)
+    monkeypatch.setattr(llm_mod, "_attempt_request", lambda *a, **k: None)
+    client = llm_mod.LLMClient.__new__(llm_mod.LLMClient)
+    monkeypatch.setattr(client, "_get_local_client", lambda: object(), raising=False)
+    monkeypatch.setattr(
+        client, "_normalize_system_message_placement", lambda m: list(m), raising=False)
+    monkeypatch.setattr(
+        client, "_strip_openrouter_roundtrip_metadata", lambda m: list(m), raising=False)
+    monkeypatch.setattr(
+        client, "_copy_messages_with_cache_policy",
+        lambda m, **k: [dict(x) for x in m], raising=False)
+
+    with pytest.raises(llm_mod.LocalContextTooLargeError):
+        client._chat_local([{"role": "user", "content": "hi"}], None, 512, "auto")
+    assert calls["n"] == 1

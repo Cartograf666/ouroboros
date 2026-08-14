@@ -35,6 +35,8 @@ from ouroboros.usage_accounting import (
 from ouroboros.loop_tool_execution import (
     StatefulToolExecutor,
     handle_tool_calls,
+    reclaim_negative_memo,
+    reclaim_trace_refs,
 )
 from ouroboros.loop_llm_call import call_llm_with_retry, emit_llm_usage_event
 from ouroboros.pricing import estimate_cost_optional
@@ -3411,14 +3413,6 @@ def _drain_incoming_messages(
     return controls
 
 
-def _context_reclaim_negative_memo(tool_ctx: Any) -> set[str]:
-    memo = getattr(tool_ctx, "_context_reclaim_negative_memo", None)
-    if not isinstance(memo, set):
-        memo = set()
-        tool_ctx._context_reclaim_negative_memo = memo
-    return memo
-
-
 def _context_reclaim_passes(tool_ctx: Any) -> set[Tuple[str, str]]:
     passes = getattr(tool_ctx, "_context_reclaim_passes", None)
     if not isinstance(passes, set):
@@ -3457,7 +3451,8 @@ def _run_round_compaction(
         keep_recent=max(0, int(pending)),
         drive_root=ctx.drive_root or pathlib.Path(ctx.drive_logs).parent,
         task_id=ctx.task_id,
-        negative_memo=_context_reclaim_negative_memo(ctx.tools._ctx),
+        negative_memo=reclaim_negative_memo(ctx.tools._ctx),
+        trace_refs_by_tool_call_id=reclaim_trace_refs(ctx.tools._ctx),
     )
     _emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
         "checkpoint_kind": "context_reclaim_manual",
@@ -5715,7 +5710,7 @@ def _rebind_context_fit_plan(
         log.debug("Route-switch capability probe failed; preserving unknown Max", exc_info=True)
         route, evidence = _failed_route_evidence(task)
     ratio = _route_calibration_ratio(
-        pathlib.Path(tools._ctx.drive_root),
+        None,  # canonical evidence root (one observation store)
         str(getattr(evidence, "route_fp", "") or ""),
         str(route.get("model") or model),
     )
@@ -6247,7 +6242,6 @@ def _measure_round_main_fit(
         plan,
         ctx.messages,
         ctx.tool_schemas,
-        drive_root=pathlib.Path(ctx.drive_root or ctx.drive_logs.parent),
         profile=_main_context_profile(plan, rendered_mode),
         rendered_mode=rendered_mode,
         round_id=_context_fit_round_id(ctx),
@@ -6331,7 +6325,8 @@ def _run_main_reclaim(
         request=request,
         drive_root=pathlib.Path(ctx.drive_root or ctx.drive_logs.parent),
         task_id=ctx.task_id,
-        negative_memo=_context_reclaim_negative_memo(ctx.tools._ctx),
+        negative_memo=reclaim_negative_memo(ctx.tools._ctx),
+        trace_refs_by_tool_call_id=reclaim_trace_refs(ctx.tools._ctx),
     )
     passes.add(key)
     # The checkpoint is written only after non-empty selection and immediately
@@ -6939,7 +6934,7 @@ def run_llm_loop(
                 _sanitized = LLMClient.sanitize_reasoning_on_model_switch(messages, _prev_active_model, active_model)
                 if _sanitized is not messages:
                     messages[:] = _sanitized
-            ctx.active_context_mode = active_context_mode  # CW2: switch_model reads this to refuse a sub-1M switch while max-sized
+            ctx.active_context_mode = active_context_mode  # switch_model re-binds the fit plan from this round's mode
             ctx.active_model = active_model  # publish the round's REAL model (incl. switch_model / per-task override) so tools (native screenshot vision-routing) don't read the stale global OUROBOROS_MODEL env
 
             # One forced-wrap-up context per round: consumed by the round-limit

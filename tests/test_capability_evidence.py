@@ -598,6 +598,9 @@ def test_first_successful_call_seeds_density_so_the_next_projection_is_measured(
     _DENSITY_MEMO.clear()
     (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("TOTAL_BUDGET", "500")  # the reservation rail is not under test
+    # One observation store: the plan builder reads density from the CANONICAL
+    # evidence root, so bind it to this test's root before seeding witnesses.
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
     model = "anthropic/claude-fable-5"  # Claude-family, routed through OpenRouter
     core = context_fit.ContextCore(
         base_prompt="p", bible_md="b", architecture_md="a", development_md="d",
