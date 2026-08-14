@@ -16,7 +16,7 @@ import pathlib
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.utils import atomic_write_json, utc_now_iso
 
@@ -454,6 +454,7 @@ def persist_call(
     call_type: str,
     payload: Dict[str, Any],
     manifest: Dict[str, Any] | None = None,
+    keep_raw: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Persist the payload and return refs plus a redacted projection.
 
@@ -463,12 +464,19 @@ def persist_call(
     lands on disk. ``full_payload_redacted=True`` declares this honestly; the
     ``redaction`` manifest lists every rule that fired. Set
     ``OUROBOROS_OBSERVABILITY_KEEP_RAW=1`` for a trusted local debug session to persist
-    the raw payload instead (``full_payload_redacted=False``).
+    the raw payload instead (``full_payload_redacted=False``). ``keep_raw=True``
+    forces that existing private raw-plus-projection path for an authoritative
+    checkpoint; ``None`` preserves the environment/default behavior.
     """
 
     redacted = redact_projection(payload)
-    keep_raw = (os.environ.get("OUROBOROS_OBSERVABILITY_KEEP_RAW") or "").strip().lower() in ("1", "true", "yes", "on")
-    if keep_raw:
+    effective_keep_raw = keep_raw
+    if effective_keep_raw is None:
+        effective_keep_raw = (
+            (os.environ.get("OUROBOROS_OBSERVABILITY_KEEP_RAW") or "").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+    if effective_keep_raw:
         full_ref = write_blob(drive_root, payload, kind="json")
         projection_ref = write_blob(drive_root, redacted.value, kind="json")
         full_redacted = False
@@ -498,6 +506,35 @@ def persist_call(
         "manifest_ref": manifest_ref,
         "redaction": redacted.manifest(),
     }
+
+
+def persist_physical_candidate(
+    drive_root: pathlib.Path,
+    *,
+    task_id: str,
+    attempt_id: str,
+    candidate: Dict[str, Any],
+    candidate_facts: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Persist one inspectable post-transform candidate under its attempt id.
+
+    ``candidate_facts`` describe the pre-redaction canonical object. The normal
+    ``persist_call`` refs describe the redacted-by-default CAS blob; the two
+    digest domains are deliberately labelled rather than equated.
+    """
+    return persist_call(
+        drive_root,
+        task_id=task_id,
+        call_id=attempt_id,
+        call_type="physical_llm_candidate",
+        payload=candidate,
+        manifest={
+            "candidate_manifest_kind": "physical_llm_candidate",
+            "candidate_raw_digest_basis": "canonical_json_v1_pre_redaction",
+            "redacted_projection_digest_basis": "observability_json_v1_post_default_redaction_cas",
+            **dict(candidate_facts),
+        },
+    )
 
 
 def latest_llm_response_text(drive_root: pathlib.Path, task_id: str) -> str:

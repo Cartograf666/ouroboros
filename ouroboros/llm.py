@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -21,9 +22,13 @@ from ouroboros.provider_models import (
 )
 from ouroboros.usage_accounting import (
     AttemptRequest,
+    PhysicalAttemptPreconditionFailed,
+    PhysicalAttemptPreparationFailed,
     UsageAccountingError,
     UsageScope,
     capture_attempt_ids,
+    current_physical_attempt_context,
+    current_physical_attempt_predicate,
     current_usage_scope,
     execute_physical_attempt,
     execute_physical_attempt_async,
@@ -35,52 +40,26 @@ log = logging.getLogger(__name__)
 
 DEFAULT_LIGHT_MODEL = "google/gemini-3.6-flash"
 _FALSE_LIKE_ENV_VALUES = {"", "0", "false", "no", "off"}
-# Provider-valid cache_control TTL values (Anthropic ephemeral cache tiers,
-# passed through by OpenRouter). Anything else is normalized to the bare marker.
+# Provider-valid Anthropic ephemeral-cache tiers.
 _VALID_CACHE_TTLS = frozenset({"5m", "1h"})
 
-# Wall-clock horizon of an APPLIED prompt-cache TTL, keyed by the value the
-# send-time finalizer REPORTS into usage metadata. ONLY the two NAMED tiers have
-# a horizon: they were stamped on the wire, so the number is the recorded fact
-# itself. This is a units conversion — deliberately NOT a route-level predictor
-# that could disagree with the payload after route-filter/promotion/cap.
+# Only explicit wire tiers have a knowable horizon; bare "default" does not.
 _CACHE_TTL_SECONDS = {"5m": 300, "1h": 3600}
 
 
 def cache_ttl_seconds(applied_ttl: Any) -> Optional[int]:
-    """Seconds of provider cache lifetime for a RECORDED applied TTL, else None.
-
-    ``None`` for empty/unknown AND for ``"default"``. ``"default"`` records one
-    fact only — a BARE ephemeral marker went out — and a bare marker names no
-    tier: the finalizer reports it for any payload carrying markers, including
-    routes it never normalizes (a Gemini send keeps bare markers and reports
-    ``"default"``, and Gemini/OpenAI/Grok/DeepSeek retention is implicit and
-    provider-defined, not 5 minutes). Turning that into "300s" would be the
-    second TTL truth this design forbids — a predictor derived from a route the
-    recorded fact does not carry. Readers therefore stay SILENT on a bare
-    marker; silence beats a fabricated horizon (BIBLE P1)."""
+    """Return seconds only for an explicit TTL carried by the candidate."""
     return _CACHE_TTL_SECONDS.get(str(applied_ttl or "").strip().lower())
 
 
 def supports_message_cache_control(model: str) -> bool:
-    """Providers whose OpenRouter route honors message-level cache_control breakpoints.
-
-    Single source of truth for the prompt-cache family check (was an inline hardcoded
-    ``startswith`` list at the request-build site).
-    """
+    """Whether the OpenRouter family honors message cache breakpoints."""
     m = str(model or "").strip().lstrip("~")
     return m.startswith("anthropic/") or m.startswith("google/gemini-")
 
 
 def _route_normalizes_cache_breakpoints(target: Dict[str, Any]) -> bool:
-    """Routes whose assembled payload the send-time finalizer may MUTATE: exactly the
-    Anthropic ephemeral-cache family the two deleted per-builder marking sites served —
-    direct Anthropic plus OpenRouter ``anthropic/*`` (the family fact stays owned by
-    ``supports_message_cache_control``). Every other route — direct OpenAI,
-    OpenAI-compatible, Cloud.ru, MiniMax, GigaChat, unsupported OpenRouter families, and Gemini
-    (whose explicit cache documents no ``ttl`` field, so its markers stay bare) — is
-    observed byte-for-byte, never mutated (Provider Independence).
-    """
+    """Whether the send-time finalizer may normalize cache breakpoints."""
     if str(target.get("provider") or "") == "anthropic":
         return True
     model = str(target.get("resolved_model") or "").strip().lstrip("~")
@@ -92,19 +71,7 @@ def _route_normalizes_cache_breakpoints(target: Dict[str, Any]) -> bool:
 
 
 def _reasoning_signature_portable_across_or_providers(model: str) -> bool:
-    """Families whose replayed reasoning signatures SURVIVE an OpenRouter same-model
-    cross-provider failover — so the ``allow_fallbacks=false`` continuity pin is
-    unnecessary and would only defeat rate-limit resilience by stranding a turn on one
-    throttled upstream when a healthy sibling endpoint could serve it.
-
-    Verified live via a same-model replay probe (2026-06: generate reasoning forcing
-    provider A, replay the assistant turn forcing each sibling provider B, observe HTTP
-    200): Anthropic thinking-block signatures port across Anthropic / Bedrock / Vertex /
-    Azure; Gemini reasoning ports across Google Vertex / AI-Studio; OpenAI
-    encrypted-reasoning items port across OpenAI / Azure. Other families (e.g.
-    ``z-ai/glm``, ``deepseek``) are UNVERIFIED and keep the conservative pin; the reactive
-    ``_openrouter_signature_retry_kwargs`` 400 strip-and-retry is the safety net for every
-    family if a cross-provider switch ever rejects a replayed signature."""
+    """Whether replay signatures are verified portable across same-model providers."""
     m = str(model or "").strip().lstrip("~")
     return (
         m.startswith("anthropic/")
@@ -114,11 +81,8 @@ def _reasoning_signature_portable_across_or_providers(model: str) -> bool:
 
 
 _OR_PROVIDER_PRESETS = {
-    # Everyday resilience: fail over to another PROVIDER of the SAME model on a
-    # rate-limit/5xx (the model — and its context window — is unchanged), while the
-    # default sticky provider keeps the prompt cache warm. No throughput hopping.
+    # Same-model provider failover versus reproducible provider pinning.
     "resilience": {"allow_fallbacks": True},
-    # Reproducibility (fixed-model benchmark runs): pin, no provider failover.
     "repro": {"allow_fallbacks": False},
 }
 
@@ -138,26 +102,11 @@ def _resolve_or_provider() -> Dict[str, Any]:
         return {}
     return dict(parsed) if isinstance(parsed, dict) else {}
 _OPTIONAL_SAMPLING_PARAMS = ("temperature", "top_p", "top_k")
-# Droppable optional request params = sampling + structured-output + effort hint.
-# response_format is request INTENT, not required semantics: every consumer keeps a
-# text-parse fallback (e.g. the safety supervisor's bracket-scan). reasoning_effort
-# is likewise a hint — a provider that names-and-rejects it (e.g. an older model
-# refusing "none") gets the same one-shot strip-and-retry instead of failing the
-# call outright (review round 6: a rejected safety call would fail CLOSED and
-# block benign commands).
-# output_config / thinking are the Anthropic-direct adaptive-thinking effort carriers
-# (v6.57.0); an OLDER Claude that rejects them gets the same strip-and-retry rather than
-# a hard 400 — the effort control degrades gracefully to "no forced thinking".
+# Provider-rejected optional intent may be removed by the one-shot retry ladder.
 _OPTIONAL_DROPPABLE_PARAMS = _OPTIONAL_SAMPLING_PARAMS + (
     "response_format", "reasoning_effort", "output_config", "thinking",
 )
-# Mandatory-value marker family (v6.73.2) — ONE constant consumed by BOTH the
-# broad classifier tuple and _mandatory_value_rejection. If they ever drifted, a
-# new mandatory phrasing added to the classifier alone would pass classification
-# but miss the floor predicate and fall through to the drop machinery — durably
-# stripping the reasoning carrier, the exact poison the exclusivity rule
-# prevents. Bare "required" is deliberately absent (common schema-validation
-# token; a drop-path false positive could durably strip response_format).
+# Shared by the classifier and floor predicate; bare "required" is too broad.
 _MANDATORY_VALUE_MARKERS = ("mandatory", "cannot be disabled", "must be enabled")
 
 
@@ -212,13 +161,7 @@ def _attempt_request(
     *,
     source: Optional[str] = None,
 ) -> AttemptRequest:
-    """Build a secret-free, linear reservation for one physical send.
-
-    ``source`` is semantic attribution, not merely the transport name.  Generic
-    chat sends therefore adopt a bound ``UsageScope`` source (acceptance,
-    planning, synthesis, and so on).  Truly unscoped sends keep the historical
-    ``llm.chat`` fallback.
-    """
+    """Build secret-free facts for one final inspectable candidate."""
     prompt_payload = {
         key: value
         for key, value in payload.items()
@@ -239,18 +182,125 @@ def _attempt_request(
             if bound_scope is not None and bound_scope.source
             else "llm.chat"
         )
+    raw = _canonical_candidate_bytes(payload)
+    context = _canonical_candidate_bytes({
+        key: payload[key] for key in ("system", "messages", "tools", "functions") if key in payload
+    })
     return AttemptRequest(
         model=str(target.get("usage_model") or target.get("resolved_model") or payload.get("model") or ""),
         provider=str(target.get("provider") or "unknown"),
         prompt_tokens_estimate=max(0, prompt_chars // 4),
         max_completion_tokens=int(payload.get("max_completion_tokens") or payload.get("max_tokens") or 0),
         source=str(request_source or ""),
-        # The APPLIED wire TTL for reservation pricing (G3-5): a payload whose
-        # markers say 5m/default must not be admission-priced at the extended 1h
-        # write tier. A marker-free payload writes nothing to cache at all, so
-        # "default" (the base write tier) is already a safe upper bound for it.
-        prompt_cache_ttl=_applied_payload_cache_ttl(payload) or "default",
+        prompt_cache_ttl=_applied_payload_cache_ttl(payload) or "",
+        candidate_raw_sha256=hashlib.sha256(raw).hexdigest(),
+        candidate_raw_size_bytes=len(raw),
+        candidate_context_sha256=hashlib.sha256(context).hexdigest(),
+        candidate_context_size_bytes=len(context),
+        candidate_measurement_kind="canonical_json_v1",
+        physical_context=current_physical_attempt_context(),
     )
+
+
+def _canonical_candidate_bytes(payload: Dict[str, Any]) -> bytes:
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False, default=str,
+    ).encode("utf-8")
+
+
+def _physical_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the send copy with capsule metadata removed only from context turns."""
+    candidate = copy.deepcopy(payload)
+
+    def _strip(value: Any) -> None:
+        if isinstance(value, dict):
+            value.pop("_context_capsule", None)
+            for child in value.values():
+                _strip(child)
+        elif isinstance(value, list):
+            for child in value:
+                _strip(child)
+
+    for key in ("system", "messages"):
+        _strip(candidate.get(key))
+    return candidate
+
+
+def _candidate_before_dispatch(candidate: Dict[str, Any], request: AttemptRequest):
+    """Close over one final candidate without putting it in accounting rows."""
+    predicate = current_physical_attempt_predicate()
+
+    def _persist(reservation):
+        fresh = _attempt_request(
+            {"provider": request.provider, "usage_model": request.model}, candidate,
+            source=request.source,
+        )
+        identity = (
+            fresh.candidate_raw_sha256, fresh.candidate_raw_size_bytes,
+            fresh.candidate_context_sha256, fresh.candidate_context_size_bytes,
+        )
+        expected = (
+            request.candidate_raw_sha256, request.candidate_raw_size_bytes,
+            request.candidate_context_sha256, request.candidate_context_size_bytes,
+        )
+        if identity != expected:
+            raise PhysicalAttemptPreparationFailed(
+                "physical candidate changed before dispatch", attempt_id=reservation.attempt_id,
+            )
+        from ouroboros.observability import persist_physical_candidate
+
+        scope = current_usage_scope()
+        persisted = persist_physical_candidate(
+            reservation.drive_root,
+            task_id=str(scope.task_id if scope is not None else request.task_id),
+            attempt_id=reservation.attempt_id,
+            candidate=candidate,
+            candidate_facts={
+                "candidate_raw_sha256": request.candidate_raw_sha256,
+                "candidate_raw_size_bytes": request.candidate_raw_size_bytes,
+                "candidate_context_sha256": request.candidate_context_sha256,
+                "candidate_context_size_bytes": request.candidate_context_size_bytes,
+                "candidate_measurement_kind": request.candidate_measurement_kind,
+                "physical_context": (
+                    dict(vars(request.physical_context)) if request.physical_context is not None else None
+                ),
+            },
+        )
+        if predicate is not None:
+            try:
+                accepted = predicate(request)
+            except BaseException as exc:
+                # Persistence already succeeded. Preserve the only durable link
+                # even when the host predicate itself raises before returning.
+                try:
+                    exc.candidate_manifest_ref = persisted["manifest_ref"]
+                except Exception:
+                    pass
+                raise
+            if accepted is False:
+                failure = PhysicalAttemptPreconditionFailed(
+                    "physical candidate precondition rejected dispatch",
+                    attempt_id=reservation.attempt_id,
+                )
+                failure.candidate_manifest_ref = persisted["manifest_ref"]
+                raise failure
+        return persisted["manifest_ref"]
+
+    return _persist
+
+
+def _execute_candidate(request: AttemptRequest, send: Any, before_dispatch: Any) -> Any:
+    """Keep existing two-argument injected executors usable."""
+    if "before_dispatch" not in inspect.signature(execute_physical_attempt).parameters:
+        return execute_physical_attempt(request, send)
+    return execute_physical_attempt(request, send, before_dispatch=before_dispatch)
+
+
+async def _execute_candidate_async(request: AttemptRequest, send: Any, before_dispatch: Any) -> Any:
+    if "before_dispatch" not in inspect.signature(execute_physical_attempt_async).parameters:
+        return await execute_physical_attempt_async(request, send)
+    return await execute_physical_attempt_async(request, send, before_dispatch=before_dispatch)
 
 
 def _split_markdown_sections(text: str) -> Tuple[str, List[Tuple[str, str]]]:
@@ -1468,9 +1518,12 @@ class LLMClient:
         }
 
         def _dispatch_probe() -> Any:
-            return execute_physical_attempt(
-                _attempt_request(target, probe_payload, source="capability_probe"),
-                lambda: oai.with_options(timeout=timeout).chat.completions.create(**probe_payload),
+            candidate = _physical_candidate(probe_payload)
+            request = _attempt_request(target, candidate, source="capability_probe")
+            return _execute_candidate(
+                request,
+                lambda: oai.with_options(timeout=timeout).chat.completions.create(**candidate),
+                _candidate_before_dispatch(candidate, request),
             )
 
         try:
@@ -1608,10 +1661,7 @@ class LLMClient:
             else:
                 for block in content:
                     if isinstance(block, dict):
-                        # Anthropic 400s on cache_control set for an EMPTY text block;
-                        # only cache a text block that actually has text (image/tool
-                        # blocks keep their cache_control). Pure removal of an invalid
-                        # cache_control — never rewrites content, so all lanes are safe.
+                        # Strict providers reject cache markers on empty text.
                         empty_text = (
                             block.get("type") == "text"
                             and not str(block.get("text") or "").strip()
@@ -1619,14 +1669,7 @@ class LLMClient:
                         if (allow_message_cache_control
                                 and isinstance(block.get("cache_control"), dict)
                                 and not empty_text):
-                            # A caller-declared cache TTL survives normalization only
-                            # on routes whose upstream documents the field (Anthropic
-                            # ephemeral tiers — the caller passes allow_cache_ttl for
-                            # anthropic/*) and only as a provider-valid value
-                            # ("5m"/"1h"); everywhere else it collapses to the bare
-                            # ephemeral marker (Gemini's explicit cache has a fixed,
-                            # non-refreshing 5m TTL and no documented ttl field —
-                            # an unknown field risks a hard 400 on every call).
+                            # Keep TTL only where the route documents it.
                             ttl = str(block["cache_control"].get("ttl") or "")
                             block["cache_control"] = (
                                 {"type": "ephemeral", "ttl": ttl}
@@ -1635,18 +1678,12 @@ class LLMClient:
                             )
                         else:
                             block.pop("cache_control", None)
-                        # Internal metadata (image eviction captions/paths)
-                        # never leaves the process — strict providers 400 on
-                        # unknown content-block fields.
-                        for key in [k for k in block if str(k).startswith("_")]:
+                        # Known host metadata never leaves the send copy.
+                        for key in ("_caption", "_source_path", "_context_capsule"):
                             block.pop(key, None)
         return cleaned
 
-    # Provider-private reasoning CONTENT blocks (Anthropic/Gemini-via-OpenRouter
-    # shape: content:[{type:"thinking"|"reasoning", signature:...}]) carry a
-    # signature that only the PRODUCING upstream family can validate. Replaying
-    # them to another family is the source of the 400 "Invalid `signature` in
-    # `thinking` block" fallback death.
+    # Provider-private reasoning blocks are valid only on their producing family.
     _REASONING_CONTENT_BLOCK_TYPES = frozenset({"thinking", "reasoning", "redacted_thinking"})
 
     @classmethod
@@ -2487,9 +2524,7 @@ class LLMClient:
                 flatten_tool_content_blocks=True,
             )
         )
-        # Local llama.cpp lane has no vision: replace image blocks with an
-        # explicit placeholder (a raw image_url block would be str()-flattened
-        # into the prompt as base64 noise).
+        # Local llama.cpp has no vision; avoid flattening base64 into the prompt.
         for msg in clean_messages:
             content = msg.get("content")
             if not isinstance(content, list):
@@ -2534,23 +2569,18 @@ class LLMClient:
             kwargs["tools"] = clean_tools
             kwargs["tool_choice"] = tool_choice
         if timeout and timeout > 0:
-            # Honor the caller's per-request timeout on the local lane too
-            # (v6.54.3: the safety-supervisor timeout SSOT must bound every
-            # route safety can use, not only the remote ones).
             kwargs["timeout"] = float(timeout)
 
+        candidate = _physical_candidate(kwargs)
+        local_target = {"provider": "local", "usage_model": "local-model"}
         last_exc: Optional[Exception] = None
         for attempt in range(3):
             try:
-                resp = execute_physical_attempt(
-                    AttemptRequest(
-                        model="local-model",
-                        provider="local",
-                        prompt_tokens_estimate=max(0, _estimate_message_chars(clean_messages) // 4),
-                        max_completion_tokens=local_max,
-                        source="llm.local",
-                    ),
-                    lambda: client.chat.completions.create(**kwargs),
+                request = _attempt_request(local_target, candidate, source="llm.local")
+                resp = _execute_candidate(
+                    request,
+                    lambda: client.chat.completions.create(**candidate),
+                    _candidate_before_dispatch(candidate, request),
                 )
                 last_exc = None
                 break
@@ -3128,24 +3158,14 @@ class LLMClient:
             "messages": anthropic_messages,
             "max_tokens": max_tokens,
         }
-        # v6.57.0 — direct Anthropic honors the configured reasoning effort instead of
-        # silently dropping it (the old `del reasoning_effort` made the effort control a
-        # no-op for direct Opus). Modern Claude (Opus 4.7+/Sonnet 5/Fable-5) uses ADAPTIVE
-        # thinking + top-level `output_config.effort` (manual budget_tokens now 400s), with
-        # levels low|medium|high|xhigh|max — a superset of our scale, so the normalized
-        # value maps 1:1 (none→omit thinking = no forced reasoning). A model that rejects
-        # `output_config`/`thinking` triggers the same param-rejection retry as other
-        # optional params (learned + dropped), so an older Claude never hard-fails on this.
+        # Modern Anthropic uses adaptive thinking plus output_config.effort.
         _eff = self._clamp_effort_for_model(
             str(target.get("usage_model") or target.get("resolved_model") or ""),
             normalize_reasoning_effort(reasoning_effort),
         )
         if _eff and _eff != "none":
             payload["thinking"] = {"type": "adaptive"}
-            # Anthropic's documented effort set is low|medium|high|xhigh|max — it has
-            # no "minimal", so OUR lowest thinking tier maps to the provider's floor
-            # (adversarial r1: the old identity mapping could send an out-of-range
-            # value and poison the route's learned ceiling).
+            # Anthropic has no "minimal" effort; map it to the provider floor.
             payload["output_config"] = {"effort": "low" if _eff == "minimal" else _eff}
         if system:
             payload["system"] = system
@@ -3171,6 +3191,9 @@ class LLMClient:
         request_timeout = float(timeout) if timeout and timeout > 0 else 120
 
         def _send(candidate: Dict[str, Any]):
+            candidate = _physical_candidate(candidate)
+            request = _attempt_request(target, candidate, source="llm.anthropic")
+
             def _post():
                 if no_proxy:
                     # Build a session with proxy detection disabled for macOS fork-safety.
@@ -3188,9 +3211,10 @@ class LLMClient:
                 return sent
 
             try:
-                return execute_physical_attempt(
-                    _attempt_request(target, candidate, source="llm.anthropic"),
+                return _execute_candidate(
+                    request,
                     _post,
+                    _candidate_before_dispatch(candidate, request),
                 )
             except UsageAccountingError:
                 # Central UAE discard, driver parity (triad r4).
@@ -3478,9 +3502,12 @@ class LLMClient:
         # hidden reasoning and return empty content/tool_calls when
         # reasoning_effort is sent. Keep the native path deterministic.
 
-        completion = execute_physical_attempt(
-            _attempt_request(target, payload, source="llm.gigachat"),
-            lambda: client.chat(payload),
+        candidate = _physical_candidate(payload)
+        request = _attempt_request(target, candidate, source="llm.gigachat")
+        completion = _execute_candidate(
+            request,
+            lambda: client.chat(candidate),
+            _candidate_before_dispatch(candidate, request),
         )
         return self._normalize_gigachat_response(completion, target)
 
@@ -3955,10 +3982,13 @@ class LLMClient:
         usage_model = str(target.get("usage_model") or target.get("resolved_model") or "")
 
         def _send(candidate: Dict[str, Any]) -> Any:
+            candidate = _physical_candidate(candidate)
+            request = _attempt_request(target, candidate)
             try:
-                return execute_physical_attempt(
-                    _attempt_request(target, candidate),
+                return _execute_candidate(
+                    request,
                     lambda: create_fn(**candidate),
+                    _candidate_before_dispatch(candidate, request),
                 )
             except UsageAccountingError:
                 # Admission failed pre-dispatch on ANY send (initial, cache
@@ -4058,10 +4088,13 @@ class LLMClient:
         usage_model = str(target.get("usage_model") or target.get("resolved_model") or "")
 
         async def _send(candidate: Dict[str, Any]) -> Any:
+            candidate = _physical_candidate(candidate)
+            request = _attempt_request(target, candidate)
             try:
-                return await execute_physical_attempt_async(
-                    _attempt_request(target, candidate),
+                return await _execute_candidate_async(
+                    request,
                     lambda: create_fn(**candidate),
+                    _candidate_before_dispatch(candidate, request),
                 )
             except UsageAccountingError:
                 # Sync-driver parity: central UAE discard (triad r4).
@@ -4316,15 +4349,21 @@ def openrouter_web_search_server_tool(
             },
         }],
     )
+    candidate = _physical_candidate(payload)
     request = _attempt_request(
         {"provider": "openrouter", "usage_model": model, "resolved_model": model},
-        payload,
+        candidate,
         source="web_search.openrouter",
     )
+    before_dispatch = _candidate_before_dispatch(candidate, request)
     if accounting_scope is None:
-        return execute_physical_attempt(request, lambda: client.chat.completions.create(**payload))
+        return _execute_candidate(
+            request, lambda: client.chat.completions.create(**candidate), before_dispatch,
+        )
     with usage_scope(accounting_scope):
-        return execute_physical_attempt(request, lambda: client.chat.completions.create(**payload))
+        return _execute_candidate(
+            request, lambda: client.chat.completions.create(**candidate), before_dispatch,
+        )
 
 
 def anthropic_web_search_server_tool(
@@ -4345,12 +4384,18 @@ def anthropic_web_search_server_tool(
         tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
         messages=[{"role": "user", "content": query}],
     )
+    candidate = _physical_candidate(payload)
     request = _attempt_request(
         {"provider": "anthropic", "usage_model": model, "resolved_model": model},
-        payload,
+        candidate,
         source="web_search.anthropic",
     )
+    before_dispatch = _candidate_before_dispatch(candidate, request)
     if accounting_scope is None:
-        return execute_physical_attempt(request, lambda: client.messages.create(**payload))
+        return _execute_candidate(
+            request, lambda: client.messages.create(**candidate), before_dispatch,
+        )
     with usage_scope(accounting_scope):
-        return execute_physical_attempt(request, lambda: client.messages.create(**payload))
+        return _execute_candidate(
+            request, lambda: client.messages.create(**candidate), before_dispatch,
+        )

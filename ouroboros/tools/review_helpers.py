@@ -38,9 +38,8 @@ REVIEW_PROMPT_TOKEN_BUDGET = 920_000
 # real Claude scope pack estimated at 739,508 tokens measured 1,166,914 REAL tokens
 # (1.58x) and drew a deterministic 400 "prompt is too long". The density is no longer
 # a hand-set family constant: it is MEASURED per model at the physical send boundary
-# and stored in the capability_evidence ``token_density`` namespace (provenance and
-# cold-start rules live there). It sizes the PROMPT — never the reviewer model or a
-# window floor (BIBLE P3).
+# and stored as timestamped raw witnesses in capability_evidence. It sizes the
+# PROMPT, never the reviewer model or a window floor (BIBLE P3).
 
 
 def calibrated_input_token_limit(
@@ -57,14 +56,12 @@ def calibrated_input_token_limit(
     The STRICTEST of three bounds, so it never exceeds what the historical shape
     allowed: the prompt-size SSOT (``budget_cap``), the density form
     ``(window − output_reserve) / density``, and the historical absolute-margin form
-    ``window − output_reserve − tokenizer_margin``. A model with no observation
-    sizes DOWN from the cold-conservative density, not up from a chars/4 estimate; a
-    MEASURED model uses its own density (stored per model identity as a running
-    maximum, so measurement never loosens that model's cap), and the absolute-margin
-    form keeps every result at or below the pre-measurement cap."""
-    from ouroboros.capability_evidence import resolve_token_density
+    ``window − output_reserve − tokenizer_margin``. The review reducer uses the
+    densest fresh compatible witness with its safety factor, never below the cold
+    1.65 floor; the absolute-margin form remains an independent upper bound."""
+    from ouroboros.capability_evidence import resolve_review_token_density
 
-    density, _ = resolve_token_density(
+    density, _ = resolve_review_token_density(
         drive_root if drive_root is not None else review_drive_root(None), model_id
     )
     return min(
