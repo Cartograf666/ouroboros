@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 def test_query_model_timeout_becomes_error_actor(monkeypatch):
     from ouroboros.tools.review import _query_model
+    from ouroboros.observability import read_blob_ref
+    from ouroboros.tools.review_helpers import review_drive_root
 
     class HangingClient:
         async def chat_async(self, **_kwargs):
@@ -15,7 +17,10 @@ def test_query_model_timeout_becomes_error_actor(monkeypatch):
     monkeypatch.setenv("OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC", "0.01")
 
     model, result, headers = asyncio.run(
-        _query_model(HangingClient(), "fake/reviewer", [], asyncio.Semaphore(1))
+        _query_model(
+            HangingClient(), "fake/reviewer", [], asyncio.Semaphore(1),
+            slot_id="slot_1",
+        )
     )
 
     assert model == "fake/reviewer"
@@ -23,6 +28,12 @@ def test_query_model_timeout_becomes_error_actor(monkeypatch):
     assert result["error"] == "Error: Timeout after 0.01s"
     assert result["prompt_ref"]["manifest_ref"]["path"]
     assert result["response_ref"]["manifest_ref"]["path"]
+    prompt = read_blob_ref(
+        review_drive_root(None), result["prompt_ref"]["redacted_projection_ref"]
+    )
+    assert prompt["slot"]["slot_id"] == "slot_1"
+    assert prompt["slot"]["model"] == "fake/reviewer"
+    assert prompt["slot"]["route"] == "api_chat"
 
 
 def test_query_model_uses_configured_review_effort(monkeypatch):

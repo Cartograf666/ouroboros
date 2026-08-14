@@ -1460,7 +1460,22 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             "cost_estimated": estimated,
         }
         slot_model = str(slot.model or "")
-        if slot_model and facts["model"] and slot_model != facts["model"]:
+        session_target = str(getattr(slot, "session_target", "") or "")
+        from ouroboros.provider_models import normalize_model_identity
+        if session_target:
+            # Structured rows keep the opaque ``harness[=model]`` target in
+            # ``slot.model`` for row identity/display, while the daemon sees
+            # only the parsed model component. Compare like with like: the old
+            # full-spec-vs-model comparison invented a capability delta for
+            # every healthy pinned session row.
+            from ouroboros.subagents import parse_subagent_harness
+
+            parsed_target = parse_subagent_harness(session_target)
+            slot_model = str(getattr(parsed_target, "model", "") or "")
+        if (
+            slot_model and facts["model"]
+            and normalize_model_identity(slot_model) != normalize_model_identity(facts["model"])
+        ):
             self._deltas.append({
                 "kind": "capability_delta",
                 "requested": f"model {slot_model}",

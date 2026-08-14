@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from ouroboros.utils import append_jsonl, utc_now_iso
@@ -555,6 +555,7 @@ def review_query_error_payload(
     messages: list,
     slot_id: str,
     error: str,
+    slot: Any = None,
 ) -> dict:
     """Durable failure envelope for one errored multi-model review row.
 
@@ -570,12 +571,18 @@ def review_query_error_payload(
         drive_root = review_drive_root(ctx)
         task_id = str(getattr(ctx, "task_id", "") or "multi_model_review") if ctx is not None else "multi_model_review"
         call_id = new_call_id(f"review_multi_model_review_{slot_id}_error")
+        prompt_payload = {"messages": messages, "slot_id": slot_id, "model": model}
+        if slot is not None:
+            # Match the normal substrate prompt receipt. The outer asyncio
+            # timeout happens after this ReviewSlot was constructed, so losing
+            # it made a present receipt look absent to provenance binders.
+            prompt_payload["slot"] = asdict(slot)
         payload["prompt_ref"] = persist_call(
             drive_root,
             task_id=task_id,
             call_id=f"{call_id}_prompt",
             call_type="multi_model_review_prompt",
-            payload={"messages": messages, "slot_id": slot_id, "model": model},
+            payload=prompt_payload,
             manifest={"surface": "multi_model_review", "slot_id": slot_id, "model": model, "synthetic": True},
         )
         payload["response_ref"] = persist_call(
