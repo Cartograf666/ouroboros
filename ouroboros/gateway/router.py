@@ -37,6 +37,7 @@ def collect_routes(
         api_skill_lifecycle_queue,
         api_skill_reconcile,
         api_skill_review,
+        api_skill_review_history_detail,
         api_skill_toggle,
     )
     from ouroboros.gateway.files import (
@@ -163,6 +164,11 @@ def collect_routes(
         Route("/api/skills/daemons", endpoint=api_skill_daemons, methods=["GET"]),
         Route("/api/skills/lifecycle-queue", endpoint=api_skill_lifecycle_queue, methods=["GET"]),
         Route("/api/skills/{skill}/review", endpoint=api_skill_review, methods=["POST"]),
+        Route(
+            "/api/skills/{skill}/review-history/{job_id}",
+            endpoint=api_skill_review_history_detail,
+            methods=["GET"],
+        ),
         Route("/api/owner/skills/{skill}/attest-review", endpoint=api_owner_skill_attest_review, methods=["POST"]),
         Route("/api/skills/{skill}/grants", endpoint=api_skill_grants, methods=["POST"]),
         Route("/api/skills/{skill}/reconcile", endpoint=api_skill_reconcile, methods=["POST"]),

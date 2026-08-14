@@ -205,5 +205,5 @@ BYTE_DEBT = {
     "supervisor/events.py": 205328,
     "tests/test_delegated_subagent_transport.py": 320627,
     "tests/test_devtools_benchmarks.py": 328786,
-    "web/modules/chat.js": 234467,
+    "web/modules/chat.js": 232370,
 }

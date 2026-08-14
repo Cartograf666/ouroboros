@@ -1044,6 +1044,7 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "POST /api/skills/{skill}/delete",
     "GET /api/skills/lifecycle-queue",
     "POST /api/skills/{skill}/review",
+    "GET /api/skills/{skill}/review-history/{job_id}",
     "POST /api/skills/{skill}/grants",
     "POST /api/skills/{skill}/reconcile",
     "GET /api/marketplace/clawhub/search",

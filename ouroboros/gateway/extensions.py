@@ -945,6 +945,112 @@ async def api_skill_lifecycle_queue(request: Request) -> JSONResponse:
     return JSONResponse(queue_snapshot())
 
 
+def _skill_review_history_detail_sync(
+    drive_root: pathlib.Path, skill_name: str, job_id: str,
+) -> Dict[str, Any]:
+    """Locate ONE terminal review record by job_id and render its markdown.
+
+    Read-only over the append-only ``review_history.jsonl``. Raw reviewer text
+    never leaves the history file: findings are the already-normalized
+    ``parsed_items`` rows, and degraded (non-responsive) reviewers are
+    disclosed by model + status with a pointer instead of the raw body.
+    """
+    from ouroboros import skill_review_history
+    from ouroboros.skill_review import render_skill_review_block
+    from ouroboros.skill_review_status import (
+        STATUS_BLOCKERS,
+        STATUS_CLEAN,
+        STATUS_PENDING,
+        STATUS_WARNINGS,
+    )
+
+    records = skill_review_history.load_history(drive_root, skill_name, limit=0)
+    if not records:
+        return {"error": "no review history for skill", "status_code": 404}
+    record = next(
+        (row for row in records if str(row.get("job_id") or "") == job_id), None,
+    )
+    if record is None:
+        return {"error": "review record not found", "status_code": 404}
+    raw_actors = [
+        actor for actor in (record.get("raw_actor_records") or [])
+        if isinstance(actor, dict)
+    ]
+    findings = [
+        item
+        for actor in raw_actors
+        for item in (actor.get("parsed_items") or [])
+        if isinstance(item, dict)
+    ]
+    reviewer_models = [
+        model for model in (
+            str(actor.get("model_id") or actor.get("model") or "") for actor in raw_actors
+        ) if model
+    ]
+    degraded_actors = [
+        {
+            "model_id": str(actor.get("model_id") or actor.get("model") or "reviewer"),
+            "status": str(actor.get("status") or "unknown"),
+            "raw_text": "(raw reviewer output withheld from chat; stored in review_history.jsonl)",
+        }
+        for actor in raw_actors
+        if str(actor.get("status") or "") != "responded"
+    ]
+    status = str(record.get("status") or "pending")
+    terminal_reason = str(record.get("terminal_reason") or "")
+    # Interrupted/timeout/failed records carry no review verdict; surface the
+    # terminal reason honestly instead of pretending a review body exists.
+    error_note = "" if status in {
+        STATUS_CLEAN, STATUS_WARNINGS, STATUS_BLOCKERS, STATUS_PENDING,
+    } else (terminal_reason or status)
+    attempt = int(record.get("snapshot_attempt") or 1)
+    outcome = {
+        "skill": skill_name,
+        "status": status,
+        "content_hash": str(record.get("content_hash") or ""),
+        "findings": findings,
+        "reviewer_models": reviewer_models,
+        "review_round": int(record.get("review_round") or attempt),
+        "snapshot_attempt": attempt,
+        "snapshot_revised": bool(record.get("snapshot_revised")),
+        "raw_actor_records": degraded_actors,
+        "error": error_note,
+    }
+    return {
+        "markdown": render_skill_review_block(outcome, attempt_idx=attempt),
+        "status": status,
+        "content_hash": outcome["content_hash"],
+        "job_status": str(record.get("job_status") or ""),
+    }
+
+
+async def api_skill_review_history_detail(request: Request) -> JSONResponse:
+    """GET /api/skills/{skill}/review-history/{job_id} — lazy Chat-card detail.
+
+    Serves the server-rendered normalized review block for the exact terminal
+    record a ``skill_review`` chat row references, so the compact reference
+    row can expand without republishing review bodies into ``chat.jsonl``.
+    """
+    skill_name = str(request.path_params.get("skill") or "").strip()
+    job_id = str(request.path_params.get("job_id") or "").strip()
+    if not skill_name or not job_id:
+        return json_error("missing skill or job id", 400)
+    if _sanitize_skill_name(skill_name) != skill_name:
+        return json_error("unknown skill", 404)
+    try:
+        payload = await asyncio.to_thread(
+            _skill_review_history_detail_sync,
+            _request_drive_root(request), skill_name, job_id,
+        )
+    except Exception as exc:
+        return json_exception(exc)
+    if payload.get("error"):
+        return json_error(
+            str(payload["error"]), int(payload.get("status_code") or 500),
+        )
+    return JSONResponse(payload)
+
+
 async def api_skill_grants(request: Request) -> JSONResponse:
     """Owner grant path for reviewed skill settings keys and host permissions."""
     from ouroboros import extension_loader

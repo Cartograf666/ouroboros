@@ -338,6 +338,35 @@
  */
 
 /**
+ * Additive /api/chat/history row fields on `system_type: "skill_review"` rows:
+ * the exact-job reference the producer already writes into chat.jsonl. A row
+ * carrying a non-empty `job_id` lets the Chat card lazily fetch the rendered
+ * review via GET /api/skills/{skill}/review-history/{job_id}; rows without it
+ * (legacy full-text rows) keep local expansion. All fields are additive and
+ * safely ignorable by renderers.
+ * @typedef {Object} SkillReviewHistoryRowFields
+ * @property {string=} skill
+ * @property {string=} status
+ * @property {string=} content_hash
+ * @property {string=} job_id
+ * @property {number=} review_round
+ * @property {number=} snapshot_attempt
+ */
+
+/**
+ * GET /api/skills/{skill}/review-history/{job_id} response: the
+ * server-rendered normalized review block for ONE terminal review record
+ * (raw reviewer text stays in review_history.jsonl; degraded reviewers are
+ * disclosed by model + status). Errors are `{error}` with a typed 404 for
+ * unknown skill/job or unreadable history.
+ * @typedef {Object} SkillReviewHistoryDetailResponse
+ * @property {string} markdown
+ * @property {string} status
+ * @property {string} content_hash
+ * @property {string} job_status
+ */
+
+/**
  * POST /api/projects body (v6.59.0). ONE source: path (attach; optional init_git
  * attach-snapshot commit — never auto-init), git_url (server-side clone; typed
  * auth_required), with_workspace (genesis), or none (file-less).

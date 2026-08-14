@@ -713,6 +713,7 @@ Every `/api/files/*` operation resolves its requested path and refuses the opera
 | POST | `/api/skills/{skill}/delete` | `gateway.extensions.api_skill_delete` |
 | GET | `/api/skills/lifecycle-queue` | `gateway.extensions.api_skill_lifecycle_queue` |
 | POST | `/api/skills/{skill}/review` | `gateway.extensions.api_skill_review` |
+| GET | `/api/skills/{skill}/review-history/{job_id}` | `gateway.extensions.api_skill_review_history_detail` (read-only lazy detail for a `skill_review` chat reference row: locates the exact terminal record in `state/skills/<skill>/review_history.jsonl` by `job_id` and returns the server-rendered normalized block; raw reviewer text stays in the history file — degraded reviewers disclosed by model + status; typed 404 for missing skill/job or unreadable history) |
 | POST | `/api/owner/skills/{skill}/attest-review` | `gateway.extensions.api_owner_skill_attest_review` (C1, v6.39; v6.43 official-hub extension: OWNER-ONLY — skip the expensive LLM review for the owner's own external/self-authored skill or for a freshly hash-verified official OuroborosHub payload; the deterministic preflight floor still runs, 409 on failure; routes through `run_skill_review_lifecycle` for the post-pass deps/extension reconcile) |
 | POST | `/api/skills/{skill}/grants` | `gateway.extensions.api_skill_grants` |
 | POST | `/api/skills/{skill}/reconcile` | `gateway.extensions.api_skill_reconcile` |
