@@ -63,6 +63,64 @@ def test_plan_class_default_self_repo_is_self_mod(tmp_path):
     assert _resolve_plan_class(ctx, "bogus-class", [])[0] == "self_mod"
 
 
+def test_plan_class_skill_payload_paths_keep_declared_class(tmp_path):
+    # Reproduction of task 7881ad77902d4d25: a skill task running with the
+    # system repo as the active workspace declared `external` and touched only
+    # data-plane skill payload files — that must NOT escalate to self_mod.
+    ctx = _ctx(tmp_path)
+    resolved, note = _resolve_plan_class(ctx, "external", [
+        "data/skills/external/claudexor_quotas/SKILL.md",
+        "data/skills/external/claudexor_quotas/plugin.py",
+        "data/skills/external/claudexor_quotas/widget.js",
+    ])
+    assert (resolved, note) == ("external", "")
+
+
+def test_plan_class_skill_payload_alternate_forms_keep_declared_class(tmp_path):
+    # The frozen-contract predicate accepts `skills/<bucket>/…` and absolute
+    # paths under the data root; both must stay in the declared class too.
+    ctx = _ctx(tmp_path)
+    resolved, note = _resolve_plan_class(ctx, "external", ["skills/external/x/plugin.py"])
+    assert (resolved, note) == ("external", "")
+    abs_payload = str(tmp_path / "data" / "skills" / "external" / "x" / "plugin.py")
+    resolved2, note2 = _resolve_plan_class(ctx, "external", [abs_payload])
+    assert (resolved2, note2) == ("external", "")
+
+
+def test_plan_class_mixed_repo_and_skill_paths_still_escalate(tmp_path):
+    # Repo paths stay significant: a plan touching BOTH the system repo and a
+    # skill payload escalates exactly as before.
+    ctx = _ctx(tmp_path)
+    resolved, note = _resolve_plan_class(ctx, "external", [
+        "ouroboros/loop.py",
+        "data/skills/external/x/plugin.py",
+    ])
+    assert resolved == "self_mod"
+    assert "escalated" in note
+
+
+def test_plan_class_native_bucket_still_escalates(tmp_path):
+    # Native skills are repo-seeded self_mod territory — not exempted.
+    ctx = _ctx(tmp_path)
+    resolved, note = _resolve_plan_class(ctx, "external", [
+        "data/skills/native/x/plugin.py",
+    ])
+    assert resolved == "self_mod"
+    assert "escalated" in note
+
+
+def test_plan_class_drive_resolution_failure_preserves_current_behavior(tmp_path):
+    # A ctx that cannot resolve the data root skips the exemption entirely:
+    # skill paths behave exactly as before the fix (blanket escalation).
+    ctx = _ctx(tmp_path)
+    del ctx.drive_root
+    resolved, note = _resolve_plan_class(ctx, "external", [
+        "data/skills/external/x/plugin.py",
+    ])
+    assert resolved == "self_mod"
+    assert "escalated" in note
+
+
 # --- 5.2 context level default + doc tiering ---------------------------------------
 
 def test_context_level_optional_only_for_non_self_mod():
