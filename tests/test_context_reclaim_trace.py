@@ -67,6 +67,32 @@ def test_process_tool_results_accumulates_trace_refs_for_reclaim():
     assert reclaim_trace_refs(SimpleNamespace()) == {}
 
 
+def test_prune_reclaim_trace_refs_drops_ids_absent_from_transcript():
+    """After a successful reclaim apply, refs whose tool_call_id left the
+    transcript are pruned so the mapping stays bounded by live messages
+    instead of growing for the task lifetime (S1 N-2)."""
+    from types import SimpleNamespace
+
+    from ouroboros.loop_tool_execution import prune_reclaim_trace_refs, reclaim_trace_refs
+
+    ctx = SimpleNamespace(_tool_trace_refs={
+        f"call-{i}": {"manifest_ref": {"path": f"calls/{i}.json", "sha256": "c" * 64}}
+        for i in range(50)
+    })
+    kept = dict(ctx._tool_trace_refs["call-7"])
+    messages = [
+        {"role": "tool", "tool_call_id": "call-7", "content": "still live"},
+        {"role": "assistant", "content": "no tool id"},
+        "not-a-dict",
+    ]
+
+    prune_reclaim_trace_refs(ctx, messages)
+
+    assert reclaim_trace_refs(ctx) == {"call-7": kept}
+    # No refs attribute at all: a no-op, never a crash.
+    prune_reclaim_trace_refs(SimpleNamespace(), messages)
+
+
 def test_materializer_resolves_only_matching_tool_call_trace_refs():
     messages = [
         {

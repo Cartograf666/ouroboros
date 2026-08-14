@@ -24,6 +24,10 @@ def test_untyped_context_scan_excludes_rate_and_output_size_errors():
     assert _is_context_overflow_error(Exception(), "prompt is too long for context window")
     assert not _is_context_overflow_error(Exception(), "429 rate limit exceeded")
     assert not _is_context_overflow_error(Exception(), "Rate limit: too many tokens per minute")
+    # Output-size precedence is applied by the SHARED helper, so the untyped
+    # scan itself rejects output-limit wording that mentions the context window.
+    assert not _is_context_overflow_error(
+        Exception(), "max_tokens 65536 exceeds maximum context length 32768")
 
     for text in (
         "max_tokens 65536 exceeds maximum context length 32768",
@@ -123,3 +127,37 @@ def test_local_transport_stops_unchanged_retry_on_any_overflow_shape(monkeypatch
     with pytest.raises(llm_mod.LocalContextTooLargeError):
         client._chat_local([{"role": "user", "content": "hi"}], None, 512, "auto")
     assert calls["n"] == 1
+
+
+def test_local_output_limit_error_takes_normal_retry_path_not_overflow(monkeypatch):
+    """An OUTPUT-limit rejection ("max_tokens ... exceeds maximum context
+    length ...") must NOT be classified as a context overflow by the local
+    transport: no LocalContextTooLargeError, ordinary bounded retry, and the
+    original provider error surfaces (S1 N-1 misclassification probe)."""
+    from ouroboros import llm as llm_mod
+
+    output_limit_exc = RuntimeError("max_tokens 65536 exceeds maximum context length 32768")
+    calls = {"n": 0}
+
+    def _fake_execute(request, send, before):
+        calls["n"] += 1
+        raise output_limit_exc
+
+    monkeypatch.setattr(llm_mod, "_execute_candidate", _fake_execute)
+    monkeypatch.setattr(llm_mod, "_attempt_request", lambda *a, **k: None)
+    monkeypatch.setattr(llm_mod.time, "sleep", lambda _s: None)
+    client = llm_mod.LLMClient.__new__(llm_mod.LLMClient)
+    monkeypatch.setattr(client, "_get_local_client", lambda: object(), raising=False)
+    monkeypatch.setattr(
+        client, "_normalize_system_message_placement", lambda m: list(m), raising=False)
+    monkeypatch.setattr(
+        client, "_strip_openrouter_roundtrip_metadata", lambda m: list(m), raising=False)
+    monkeypatch.setattr(
+        client, "_copy_messages_with_cache_policy",
+        lambda m, **k: [dict(x) for x in m], raising=False)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        client._chat_local([{"role": "user", "content": "hi"}], None, 512, "auto")
+    assert excinfo.value is output_limit_exc
+    assert not isinstance(excinfo.value, llm_mod.LocalContextTooLargeError)
+    assert calls["n"] == 3

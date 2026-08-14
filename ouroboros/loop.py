@@ -35,6 +35,7 @@ from ouroboros.usage_accounting import (
 from ouroboros.loop_tool_execution import (
     StatefulToolExecutor,
     handle_tool_calls,
+    prune_reclaim_trace_refs,
     reclaim_negative_memo,
     reclaim_trace_refs,
 )
@@ -3466,6 +3467,8 @@ def _run_round_compaction(
         ctx.emit_progress(
             f"⚠️ Context compaction kept the transcript unchanged ({receipt.status})."
         )
+    if receipt.status == "applied":
+        prune_reclaim_trace_refs(ctx.tools._ctx, rebuilt)
     return rebuilt, usage
 
 
@@ -6005,13 +6008,12 @@ def _maybe_inject_finalization_nudges(
             llm_trace["reasoning_notes"].append("Red-verification nudge injected before final response.")
             return True
     if not getattr(tools._ctx, "_verify_masked_nudged", False):
-        # Exit-masking one-shot ADVISORY nudge (v6.52.2): the agent's latest PASSING verify check
-        # can LAUNDER the real exit code (a `| tail`/`grep`/`|| true` pipeline reports exit 0 even
-        # when the underlying runner failed — the false-green tutanota hit). Distinct from the red
-        # nudge (that is "grounding says FAIL"; this is "grounding says PASS but may be laundered").
-        # Ordered AFTER the red nudge. Binary latch; ADVISORY (the agent may still finalize with
-        # reasoning); forced-finalization paths return earlier and bypass it. Flag-driven on the
-        # typed receipt sensor, never content (Bible P5). Benchmark-neutral wording.
+        # Exit-masking one-shot ADVISORY nudge (v6.52.2): a PASSING verify check can
+        # LAUNDER the real exit code (`| tail`/`|| true` reports 0 when the runner
+        # failed — the false-green tutanota hit). Distinct from the red nudge
+        # ("grounding says FAIL" vs "PASS but maybe laundered"); ordered after it.
+        # Binary latch; advisory; forced-finalization paths bypass it. Flag-driven
+        # on the typed receipt sensor, never content (Bible P5).
         _masked_receipt = latest_unreconciled_masked_verification(drive_root, task_id)
         if _masked_receipt is not None:
             tools._ctx._verify_masked_nudged = True
@@ -6339,6 +6341,7 @@ def _run_main_reclaim(
         ctx.messages[:] = rebuilt
         ctx.tools._ctx.messages = ctx.messages
         seal_task_transcript(ctx.messages)
+        prune_reclaim_trace_refs(ctx.tools._ctx, ctx.messages)
     _emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
         "type": "context_reclaim",
         "checkpoint_kind": "context_reclaim_automatic",

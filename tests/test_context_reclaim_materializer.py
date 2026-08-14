@@ -198,6 +198,21 @@ def test_untyped_overflow_message_marker_authorizes_split():
     assert not cc._typed_context_overflow(RuntimeError("transport reset by peer"))
 
 
+def test_output_limit_wording_never_authorizes_summarizer_split():
+    """OUTPUT-size rejections are not window overflows: splitting the batch
+    cannot fix them, so they must fail the unit raw (_UnitSummaryFailure path)
+    instead of authorizing a split. A structured overflow CODE still wins over
+    output wording — same precedence as the shared Main/local seams."""
+    output_limit = RuntimeError("max_tokens 65536 exceeds maximum context length 32768")
+    assert not cc._typed_context_overflow(output_limit)
+
+    class _TypedOverflowWithOutputWording(RuntimeError):
+        body = {"error": {"code": "context_length_exceeded"}}
+
+    assert cc._typed_context_overflow(
+        _TypedOverflowWithOutputWording("max_tokens exceeds maximum context length"))
+
+
 def test_non_overflow_failure_never_splits_or_retries(monkeypatch, tmp_path):
     calls = 0
 

@@ -378,15 +378,8 @@ def _short_error_text(value: Any, limit: int = 220) -> str:
 
 from ouroboros.context_budget import (  # one overflow vocabulary for every seam
     CONTEXT_OVERFLOW_CODES as _STRUCTURED_CONTEXT_OVERFLOW_CODES,
-    CONTEXT_OVERFLOW_MESSAGE_MARKERS as _CONTEXT_OVERFLOW_MARKERS,
-)
-_OUTPUT_OR_BODY_SIZE_MARKERS = (
-    "max_tokens",
-    "maximum tokens",
-    "output tokens",
-    "maximum output",
-    "request body too large",
-    "body too large",
+    context_overflow_message as _context_overflow_message,
+    output_or_body_size_message as _output_or_body_size_message,
 )
 _NON_RETRYABLE_PROVIDER_MARKERS = {
     "quota_exhausted": (
@@ -454,18 +447,19 @@ def _is_rate_limit_text(text: str) -> bool:
 
 
 def _is_context_overflow_error(exc: Exception, safe_error: str) -> bool:
-    """Classify untyped local/remote context-window overflow."""
+    """Classify untyped local/remote context-window overflow.
+
+    The output-size precedence lives inside the SHARED helper, not here, so
+    Main, the local transport, and the summarizer classify identically."""
     if isinstance(exc, LocalContextTooLargeError):
         return True
-    low = str(safe_error or "").lower()
-    if _is_rate_limit_text(low):
+    if _is_rate_limit_text(safe_error):
         return False
-    return any(marker in low for marker in _CONTEXT_OVERFLOW_MARKERS)
+    return _context_overflow_message(safe_error)
 
 
 def _is_output_or_body_size_error(safe_error: str) -> bool:
-    low = str(safe_error or "").lower()
-    return any(marker in low for marker in _OUTPUT_OR_BODY_SIZE_MARKERS)
+    return _output_or_body_size_message(safe_error)
 
 
 def _exception_status_code(exc: Exception) -> Optional[int]:

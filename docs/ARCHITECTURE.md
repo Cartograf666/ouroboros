@@ -1736,7 +1736,10 @@ too long` by every upstream. The ratio is measured rather than keyed to a model-
 family. `usage_accounting.execute_physical_attempt` records timestamped
 `(prompt_chars, real prompt_tokens, route_fp)` witnesses after settlement and outside
 the ledger lock (fail-soft) in the existing `token_density` namespace of
-`capability_evidence.json`. Cache-bearing usage whose provider prompt semantics are
+`capability_evidence.json`. Density evidence lives ONLY in this canonical
+data-root store (`capability_evidence.canonical_evidence_root()`); readers and
+writers must never resolve a per-task child drive, so there are no child-drive
+density stores to drift. Cache-bearing usage whose provider prompt semantics are
 unknown records no witness. The Main reducer uses the newest fresh exact-route
 witness, then newest exact-model witness, then neutral 1.0; it may move either
 direction as current evidence changes. The review reducer uses the densest still-fresh

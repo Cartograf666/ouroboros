@@ -1144,6 +1144,20 @@ def reclaim_negative_memo(tool_ctx: Any) -> set:
     return memo
 
 
+def prune_reclaim_trace_refs(tool_ctx: Any, messages: List[Dict[str, Any]]) -> None:
+    """Drop trace refs whose tool_call_id left the transcript (post-reclaim bound)."""
+    refs = getattr(tool_ctx, "_tool_trace_refs", None)
+    if not isinstance(refs, dict) or not refs:
+        return
+    live = {
+        str(msg.get("tool_call_id"))
+        for msg in messages
+        if isinstance(msg, dict) and msg.get("tool_call_id")
+    }
+    for call_id in [key for key in refs if key not in live]:
+        del refs[call_id]
+
+
 def process_tool_results(
     results: List[Dict[str, Any]],
     messages: List[Dict[str, Any]],

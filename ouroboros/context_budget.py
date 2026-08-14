@@ -10,9 +10,10 @@ They are deliberately SEPARATE from the REVIEW-prompt budget family
 prompts, not the agent's own context. Merging the two would couple unrelated
 concerns and is explicitly avoided.
 
-Constants and frozen context-reclaim records only (no functions), so this
-module stays free against the codebase function-count gate
-(``ouroboros.review.MAX_TOTAL_FUNCTIONS``).
+Constants, frozen context-reclaim records, and pure classification helpers
+only. This module must stay import-pure: no imports from ``ouroboros.llm``,
+``ouroboros.loop*``, or any other runtime module, so every seam can import
+the shared vocabulary without cycles.
 
 Char-based guards assume the ~chars/4 estimate (``ouroboros.utils.estimate_tokens``);
 the comments give the approximate token equivalents.
@@ -50,11 +51,37 @@ CONTEXT_OVERFLOW_MESSAGE_MARKERS = (
     "context window",
     "input is too long",
 )
+# OUTPUT/body-size limits take precedence over overflow markers: a message like
+# "max_tokens 65536 exceeds maximum context length 32768" is an output-limit
+# rejection, not a window overflow — shrinking the prompt cannot fix it.
+OUTPUT_OR_BODY_SIZE_MARKERS = (
+    "max_tokens",
+    "maximum tokens",
+    "output tokens",
+    "maximum output",
+    "request body too large",
+    "body too large",
+)
+
+
+def output_or_body_size_message(text: Any) -> bool:
+    """True when a provider error message names an output/body-size limit."""
+    low = str(text or "").lower()
+    return any(marker in low for marker in OUTPUT_OR_BODY_SIZE_MARKERS)
 
 
 def context_overflow_message(text: Any) -> bool:
-    """True when a provider error message matches the shared overflow markers."""
+    """True when a provider error message matches the shared overflow markers.
+
+    Applies the output-size precedence itself so every seam (Main classifier,
+    local transport, summarizer split) classifies identically: a message that
+    matches an output/body-size marker is NOT a context overflow. Callers check
+    structured overflow codes first; a structured code still wins over this
+    message-level verdict.
+    """
     low = str(text or "").lower()
+    if any(marker in low for marker in OUTPUT_OR_BODY_SIZE_MARKERS):
+        return False
     return any(marker in low for marker in CONTEXT_OVERFLOW_MESSAGE_MARKERS)
 
 MeasurementBasis = Literal["fresh_route_usage", "fresh_model_usage", "cold_estimate"]
