@@ -1115,6 +1115,33 @@ def _unwritten_disposition_text(rid: str, target_root: str, disposition: str,
     )
 
 
+def _dispose_delegated(drive: Any, entry: Any, snapshot_key: str, reason: str,
+                       disposition: str, cleanup: bool) -> tuple[bool, str]:
+    """Record a delegated disposition durably; clean up ONLY if the row landed.
+
+    The snapshot and the captured patch are the run's whole custody trail:
+    releasing them on an UNWRITTEN disposition loses the record that this patch
+    was already handled, and after a restart the same patch could be applied a
+    second time. Module-level: shared by the Git branch and the payload branch
+    (``delegate_integration.integrate_payload_patch``). Returns ``(recorded, note)``.
+    """
+    from ouroboros import delegate_custody as custody
+    from ouroboros.subagent_worktrees import remove_execution_snapshot
+
+    recorded = custody.record_patch_disposed(
+        drive, entry, disposition=disposition, reason=str(reason or ""))
+    if not recorded:
+        return False, ""
+    note = ""
+    if cleanup:
+        try:
+            removed = remove_execution_snapshot(snapshot_key)
+        except Exception:
+            removed = False
+        note = "" if removed else " (snapshot cleanup deferred to the startup GC.)"
+    return True, note
+
+
 def _resolve_acknowledged_intent(drive: Any, entry: Any) -> None:
     """CR2-1: the owner explicitly took over the AMBIGUOUS crash state.
 
@@ -1153,7 +1180,6 @@ def _integrate_delegated_patch(
     flow, whose own guards re-verify the tree. A no-op when nothing is pending.
     """
     from ouroboros import delegate_custody as custody
-    from ouroboros.subagent_worktrees import remove_execution_snapshot
 
     rid = str(run_id or "").strip()
     if not rid:
@@ -1182,31 +1208,21 @@ def _integrate_delegated_patch(
             manifest = loaded if isinstance(loaded, dict) else {}
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             return f"⚠️ INTEGRATE_MANIFEST_UNREADABLE: {manifest_path}: {type(exc).__name__}: {exc}."
+    if entry.authority_source == "skill_payload" or str(manifest.get("capture_kind") or "") == "skill_payload":
+        # The exact-payload branch (R1 item 3) lives in delegate_integration:
+        # fresh semantic rebinding, whole-payload content-hash CAS, reserved-path
+        # whole-apply refusal, and an index-free apply into the live NON-Git
+        # payload — no active-root comparison, no .git requirement, no staging.
+        from ouroboros.tools.delegate_integration import integrate_payload_patch
+
+        return integrate_payload_patch(
+            ctx, drive=drive, entry=entry, rid=rid, decision=decision,
+            reason=reason, cap_dir=cap_dir, manifest=manifest, patch_path=patch_path)
     touched = [str(p) for p in (manifest.get("tracked_changed") or [])]
     touched += [str(p) for p in (manifest.get("untracked_included") or [])]
 
     def _dispose(disposition: str, cleanup: bool) -> tuple[bool, str]:
-        """Record the disposition durably, and clean up ONLY if it landed.
-
-        The snapshot and the captured patch are the run's whole custody trail:
-        releasing them on an UNWRITTEN disposition loses the record that this
-        patch was already handled, and after a restart (where the in-process
-        flag is gone) the same patch could be applied a second time over an
-        already-patched tree. Returns ``(recorded, note)``.
-        """
-        recorded = custody.record_patch_disposed(
-            drive, entry, disposition=disposition, reason=str(reason or ""))
-        if not recorded:
-            return False, ""
-        note = ""
-        if cleanup:
-            removed = False
-            try:
-                removed = remove_execution_snapshot(snapshot_key)
-            except Exception:
-                removed = False
-            note = "" if removed else " (snapshot cleanup deferred to the startup GC.)"
-        return True, note
+        return _dispose_delegated(drive, entry, snapshot_key, reason, disposition, cleanup)
 
     def _unwritten_disposition(disposition: str, applied: bool) -> str:
         return _unwritten_disposition_text(rid, str(entry.target_root), disposition, applied)

@@ -92,6 +92,9 @@ from ouroboros.tools.delegate_integration import (  # noqa: F401
     _capture_block,
     _capture_terminal_patch,
     _mutation_authority,
+    _payload_mutation_authority,
+    _payload_selector_refusal,
+    _provision_payload_snapshot,
     _provision_snapshot,
     _resolve_retry_invocation,
     _resolved,
@@ -660,7 +663,9 @@ def _start_request(ctx: ToolContext, route: Any, authority: "DelegatedRunShape",
 
 
 def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = None,
-                    retry_of: Optional[str] = None) -> str:
+                    retry_of: Optional[str] = None, root: Optional[str] = None,
+                    bucket: Optional[str] = None, skill_name: Optional[str] = None,
+                    _resolved_binding: Any = None) -> str:
     from ouroboros.claudexor_daemon import ensure_owned_gateway
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
     from ouroboros.subagents import (
@@ -670,6 +675,13 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     text = str(prompt or "").strip()
     if not text:
         return _fail("delegate_start", "empty_prompt", "prompt is required")
+    # The EXACT-RESOURCE selector (R1 item 1): the ONLY allowed root is
+    # skill_payload — the selector chooses authority the task already holds
+    # (the existing top-level skill_payload.write cell), it grants nothing.
+    selector_root = str(root or "").strip()
+    selector_refusal = _payload_selector_refusal(selector_root, retry_of, bucket, skill_name)
+    if selector_refusal:
+        return selector_refusal
     if _deadline_expired(ctx):
         # An EXPIRED nanny cannot honestly bound anything: the deadline-less fallback
         # would hand the run the absolute task ceiling, hours past the instant this
@@ -689,6 +701,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     baseline_sha = ""
     target_root = ""
     authority_source = ""
+    resource_ref: Dict[str, Any] = {}
     # ONE logical invocation id per INTENDED invocation, and reuse ONLY by explicit
     # token — never by content-matching, because two identical intentions are still
     # two intentions (the owner's contract: an intended new start is a NEW id). An
@@ -709,8 +722,10 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         if refusal:
             return refusal
         (request_body, route, authority, root, key, project_id, owned_project_id,
-         seconds, snapshot_id, target_root, baseline_sha, authority_source) = binding
+         seconds, snapshot_id, target_root, baseline_sha, authority_source,
+         resource_ref) = binding
         invocation_id = retry_token
+        payload_auth = None
     else:
         route = get_subagent_harness()
         if route is None:
@@ -721,7 +736,17 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                 "Think natively instead — do not wait for a harness that does not exist.",
                 executor=resolution.executor,
             )
-        authority = _derive_authority(ctx)
+        if selector_root:
+            # The exact-resource lane (R1 item 1): authority is a FRESH
+            # ResolvedResourceBinding for skill_payload.write — never a widening
+            # of the generic derivation, which stays byte-identical below.
+            authority, payload_auth, payload_error = _payload_mutation_authority(
+                ctx, drive, bucket, skill_name, _resolved_binding)
+            if payload_error:
+                return payload_error
+        else:
+            authority = _derive_authority(ctx)
+            payload_auth = None
 
     access = authority.access
     try:
@@ -753,23 +778,34 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             )
 
         if not recovering:
-            record_auth, root_error = _mutation_authority(ctx, authority)
-            if root_error:
-                return root_error
+            if payload_auth is not None:
+                record_auth = payload_auth
+            else:
+                record_auth, root_error = _mutation_authority(ctx, authority)
+                if root_error:
+                    return root_error
             invocation_id = custody.new_invocation_id()
             root = record_auth["target_root"]
             if authority.access == "workspace_write":
                 # C1: the run executes in a PRIVATE snapshot of the authority target,
                 # never in the shared tree. Provisioned (and durably registered)
                 # BEFORE the start intent below; scope.root becomes the snapshot.
+                # A payload target gets the STANDALONE snapshot (the live payload
+                # is never initialized as Git); a Git target keeps the worktree
+                # snapshot byte-identically.
                 target_root = record_auth["target_root"]
                 authority_source = record_auth["source"]
-                snapshot, snap_error = _provision_snapshot(ctx, drive, target_root, invocation_id)
+                if authority_source == "skill_payload":
+                    snapshot, snap_error = _provision_payload_snapshot(
+                        ctx, drive, record_auth, invocation_id)
+                else:
+                    snapshot, snap_error = _provision_snapshot(ctx, drive, target_root, invocation_id)
                 if snap_error:
                     return snap_error
                 snapshot_id = snapshot.snapshot_id
                 baseline_sha = snapshot.baseline_sha
                 root = snapshot.path
+                resource_ref = dict(record_auth.get("resource_ref") or {})
             existing_project = gateway.find_project_id(root)
             project_id = existing_project or gateway.register_project(root)
             owned_project_id = "" if existing_project else project_id
@@ -802,7 +838,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             # binding and the startup GC can see a pending invocation's snapshot.
             snapshot_id=snapshot_id, execution_root=(root if snapshot_id else ""),
             baseline_sha=baseline_sha, target_root=target_root,
-            authority_source=authority_source)
+            authority_source=authority_source, resource_ref=resource_ref)
         if not requested:
             # The POST is CONDITIONAL on the durable request row: launching anyway
             # would start an overpowered run that nothing durable names, and a worker
@@ -902,6 +938,13 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         baseline_sha=baseline_sha,
         target_root=target_root,
         authority_source=authority_source,
+        resource_ref=resource_ref,
+        # The GRANTED shape on the custody OBJECT too, not only the row: the
+        # in-process memo answers the same lookups the replay does (R1 item 2).
+        access=access,
+        mode=authority.mode,
+        isolation=authority.isolation,
+        delegated=authority.delegated,
     ), shape={
         # The shape rides on the SAME durable row as custody, so a forensic reader never
         # has to join two events to learn what authority a run was started with.
@@ -1184,9 +1227,20 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
     except ClaudexorUnavailable as exc:
         return _fail("delegate_wait", exc.code, str(exc), run_id=rid)
 
-    # Re-derived from the LIVE context rather than read back from custody: the nanny's
-    # authority is the authority, and a lost custody record must not become a wider run.
-    authority = _derive_authority(ctx)
+    # The GRANTED shape replays from the durable custody row (R1 item 2): the run
+    # was admitted under host-derived authority recorded on its STARTED row, and a
+    # top-level payload delegation has no acting/workspace context to re-derive
+    # from — re-derivation read `readonly` and cancelled the run as widened on its
+    # first wait. Ownership was already proven above (`_owned_run`), and a lost or
+    # legacy custody record (no recorded access) keeps the live derivation, so a
+    # missing record still cannot become a wider run.
+    if entry.access:
+        from ouroboros.subagents import DelegatedRunShape as _Shape
+
+        authority = _Shape(access=entry.access, mode=entry.mode,
+                           isolation=entry.isolation, delegated=entry.delegated)
+    else:
+        authority = _derive_authority(ctx)
     # FACTS against premature cancels: how long the run has actually been going and
     # what its cap really is, from the durable start row. A nanny that cannot see
     # these confabulates "exceeded the cap" out of its own impatience. Absent facts
@@ -1394,6 +1448,15 @@ def get_tools() -> List[ToolEntry]:
                 "decision='apply'|'reject'); read the captured diff before applying, and "
                 "never let the run commit inside its snapshot. If you are read-only it "
                 "can only read and answer. "
+                "A TOP-LEVEL task may instead select ONE exact installed non-native "
+                "skill payload with root='skill_payload' + bucket + skill_name: the "
+                "selector chooses authority you already hold (it grants nothing), the "
+                "run edits a private standalone snapshot of that payload, the LIVE "
+                "payload stays byte-identical until you explicitly "
+                "integrate_delegated_patch, and after an apply the skill's prior "
+                "review is stale — run skill_preflight and skill_review as usual. "
+                "The payload must already exist (for a NEW skill write its manifest "
+                "first), and native skills stay system-repo territory. "
                 "Returns a run_id: watch it with delegate_wait, stop it with "
                 "delegate_cancel. The run's output is a CLAIM you must check — you are the "
                 "host, so verification receipts are still yours to write. If no route is "
@@ -1402,6 +1465,15 @@ def get_tools() -> List[ToolEntry]:
             ),
             "parameters": {"type": "object", "required": ["prompt"], "properties": {
                 "prompt": {"type": "string", "description": "The complete task for the delegated session."},
+                "root": {"type": "string", "enum": ["skill_payload"], "description":
+                    "Optional exact-resource selector: 'skill_payload' delegates ONE "
+                    "installed non-native skill payload you can already write. Omit "
+                    "for ordinary workspace delegation."},
+                "bucket": {"type": "string", "description":
+                    "With root='skill_payload': the payload location "
+                    "(external|clawhub|ouroboroshub|user_repo)."},
+                "skill_name": {"type": "string", "description":
+                    "With root='skill_payload': the exact skill name."},
                 "max_seconds": {"type": "integer", "description":
                     "Wall-clock cap for the run; narrowed to your own remaining deadline. "
                     "Harness runs routinely need 3-5+ minutes end to end, so do not set a "
@@ -1416,7 +1488,11 @@ def get_tools() -> List[ToolEntry]:
                     "Never set it for an intended new run — a plain call always starts a "
                     "NEW invocation, even with an identical prompt."},
             }},
-        }, lambda ctx, prompt, max_seconds=None, retry_of=None: _delegate_start(ctx, prompt, max_seconds, retry_of), timeout_sec=120),
+        }, lambda ctx, prompt, max_seconds=None, retry_of=None, root=None, bucket=None,
+           skill_name=None, _resolved_binding=None: _delegate_start(
+               ctx, prompt, max_seconds, retry_of, root=root, bucket=bucket,
+               skill_name=skill_name, _resolved_binding=_resolved_binding),
+           timeout_sec=120),
         ToolEntry("delegate_wait", {
             "name": "delegate_wait",
             "description": (

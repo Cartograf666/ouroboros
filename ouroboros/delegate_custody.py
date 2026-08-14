@@ -28,7 +28,7 @@ import json
 import logging
 import pathlib
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from ouroboros.utils import append_jsonl, utc_now_iso
@@ -175,6 +175,18 @@ class RunCustody:
     baseline_sha: str = ""
     target_root: str = ""
     authority_source: str = ""
+    # The GRANTED run shape, replayed off the STARTED row that already carries it
+    # (the `shape` dict): delegate_wait replays this as the entitled authority —
+    # re-deriving from live context read `readonly` for a top-level payload run
+    # and cancelled it as widened (R1-2).
+    access: str = ""
+    mode: str = ""
+    isolation: str = ""
+    delegated: bool = False
+    # Host-minted semantic resource reference for an exact-resource run (logical
+    # root, source, skill name, recorded target, baseline payload hash). Consumed
+    # only by retry rebind and owned apply rebind; recovery carries it opaquely.
+    resource_ref: Dict[str, Any] = field(default_factory=dict)
     # Capture/disposition lifecycle (replayed): capture happens once at terminal;
     # ``patch_disposed`` is "" until the nanny explicitly applies ("applied") or
     # rejects ("rejected") the captured patch — only then may the snapshot be removed.
@@ -286,47 +298,54 @@ def _iter_rows(path: pathlib.Path, tail_bytes: Optional[int] = None) -> Iterator
         return
 
 
+# The STARTED row's string facts as ``(RunCustody attribute, row key)`` pairs —
+# one table shared by the replay and the ``record_started`` emit.
+_STARTED_STR_FIELDS: Tuple[Tuple[str, str], ...] = tuple(
+    (attr, "route" if attr == "route_id" else attr) for attr in (
+        "task_id", "route_id", "model", "project_id", "root_task_id",
+        "parent_task_id", "ledger_root", "idempotency_key", "invocation_id",
+        "snapshot_id", "execution_root", "baseline_sha", "target_root",
+        "authority_source", "access", "mode", "isolation",
+    )
+)
+# Progress carried forward from a previous row: an idempotent re-start writes a
+# SECOND started row; replacing wholesale would forget a settlement and put a
+# finished run back into the orphan sweep (which would cancel it).
+_STARTED_PROGRESS_FLAGS: Tuple[str, ...] = (
+    "ledger_recorded", "settled", "containment_disclosed", "unread_disclosed",
+    "output_artifact", "output_complete", "output_sha", "output_consumed",
+    "patch_captured", "patch_disposed", "patch_apply_pending")
+# Binding/authority facts are FIRST-WINS (R1-2): a later idempotent STARTED row
+# may be minted by a context that no longer knows the original binding; the
+# first recorded fact is authoritative and is never erased or retargeted.
+_STARTED_FIRST_WINS_FACTS: Tuple[str, ...] = (
+    "snapshot_id", "execution_root", "baseline_sha", "target_root",
+    "authority_source", "resource_ref", "access", "mode", "isolation", "delegated")
+
+
 def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
     run_id = str(row.get("run_id") or "")
     if not run_id:
         return
     kind = str(row.get("type") or "")
     if kind == STARTED:
+        ref = row.get("resource_ref")
         entry = RunCustody(
             run_id=run_id,
-            task_id=str(row.get("task_id") or ""),
-            route_id=str(row.get("route") or ""),
-            model=str(row.get("model") or ""),
-            project_id=str(row.get("project_id") or ""),
             project_owned=bool(row.get("project_owned")),
-            root_task_id=str(row.get("root_task_id") or ""),
-            parent_task_id=str(row.get("parent_task_id") or ""),
-            ledger_root=str(row.get("ledger_root") or ""),
-            idempotency_key=str(row.get("idempotency_key") or ""),
-            invocation_id=str(row.get("invocation_id") or ""),
-            snapshot_id=str(row.get("snapshot_id") or ""),
-            execution_root=str(row.get("execution_root") or ""),
-            baseline_sha=str(row.get("baseline_sha") or ""),
-            target_root=str(row.get("target_root") or ""),
-            authority_source=str(row.get("authority_source") or ""),
+            delegated=row.get("delegated") is True,
+            resource_ref=dict(ref) if isinstance(ref, dict) else {},
+            **{attr: str(row.get(key) or "") for attr, key in _STARTED_STR_FIELDS},
         )
-        # An idempotent re-start writes a SECOND started row for the same run. Replacing
-        # the entry wholesale would forget that the run was already settled and put it
-        # straight back into the orphan sweep, which would then cancel a finished run.
         previous = state.get(run_id)
         if previous is not None:
-            entry.ledger_recorded = previous.ledger_recorded
-            entry.settled = previous.settled
+            for attr in _STARTED_PROGRESS_FLAGS:
+                setattr(entry, attr, getattr(previous, attr))
             entry.project_owned = previous.project_owned and entry.project_owned
-            entry.containment_disclosed = previous.containment_disclosed
-            entry.unread_disclosed = previous.unread_disclosed
-            entry.output_artifact = previous.output_artifact
-            entry.output_complete = previous.output_complete
-            entry.output_sha = previous.output_sha
-            entry.output_consumed = previous.output_consumed
-            entry.patch_captured = previous.patch_captured
-            entry.patch_disposed = previous.patch_disposed
-            entry.patch_apply_pending = previous.patch_apply_pending
+            for attr in _STARTED_FIRST_WINS_FACTS:
+                prior = getattr(previous, attr)
+                if prior:
+                    setattr(entry, attr, prior)
         state[run_id] = entry
         return
     custody = state.get(run_id)
@@ -609,6 +628,7 @@ def invocation_record(drive_root: Any, invocation_id: str) -> Optional[Dict[str,
                 "baseline_sha": str(row.get("baseline_sha") or ""),
                 "target_root": str(row.get("target_root") or ""),
                 "authority_source": str(row.get("authority_source") or ""),
+                "resource_ref": row.get("resource_ref") if isinstance(row.get("resource_ref"), dict) else {},
             }
         elif kind == STARTED:
             state, run_id = "started", str(row.get("run_id") or "")
@@ -647,25 +667,13 @@ def record_started(drive_root: Any, custody: RunCustody,
     lose one half of itself to a crash between the two writes.
     """
     _CUSTODY[custody.run_id] = custody
+    # The C1 binding and the resource reference ride the SAME row (a binding
+    # recorded separately can lose half of itself to a crash); shape spreads LAST.
     return emit(drive_root, STARTED, {
         "run_id": custody.run_id,
-        "task_id": custody.task_id,
-        "route": custody.route_id,
-        "model": custody.model,
-        "project_id": custody.project_id,
         "project_owned": custody.project_owned,
-        "root_task_id": custody.root_task_id,
-        "parent_task_id": custody.parent_task_id,
-        "ledger_root": custody.ledger_root,
-        "idempotency_key": custody.idempotency_key,
-        "invocation_id": custody.invocation_id,
-        # The C1 isolation binding rides the SAME row (empty for read-only runs):
-        # a binding recorded separately can lose one half of itself to a crash.
-        "snapshot_id": custody.snapshot_id,
-        "execution_root": custody.execution_root,
-        "baseline_sha": custody.baseline_sha,
-        "target_root": custody.target_root,
-        "authority_source": custody.authority_source,
+        "resource_ref": custody.resource_ref or {},
+        **{key: getattr(custody, attr) for attr, key in _STARTED_STR_FIELDS},
         **(shape or {}),
     })
 
@@ -1243,6 +1251,7 @@ def pending_invocations(drive_root: Any) -> List[Dict[str, Any]]:
                 "baseline_sha": str(row.get("baseline_sha") or ""),
                 "target_root": str(row.get("target_root") or ""),
                 "authority_source": str(row.get("authority_source") or ""),
+                "resource_ref": row.get("resource_ref") if isinstance(row.get("resource_ref"), dict) else {},
             }
         elif kind == STARTED:
             state[invocation_id] = "started"
@@ -1427,7 +1436,9 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
         execution_root=str(record.get("execution_root") or ""),
         baseline_sha=str(record.get("baseline_sha") or ""),
         target_root=str(record.get("target_root") or ""),
-        authority_source=str(record.get("authority_source") or ""))
+        authority_source=str(record.get("authority_source") or ""),
+        # Carried opaquely VERBATIM — recovery never re-authorizes a target (R1-2).
+        resource_ref=record.get("resource_ref") if isinstance(record.get("resource_ref"), dict) else {})
     record_started(drive_root, custody, shape={
         # The stored invocation is the single source of a replay's facts — the same
         # doctrine the explicit retry path follows.
