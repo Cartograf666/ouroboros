@@ -514,6 +514,66 @@ def test_next_step_guidance_requires_reaudit_when_obligations_remain():
     assert "rewrite the plan" in lowered
 
 
+@pytest.mark.parametrize(
+    "case_id,status,effective_is_fresh,stale_from_edit,items,open_debts",
+    [
+        ("missing", None, False, False, [], []),
+        ("stale", "fresh", False, True, [], []),
+        ("parse_failure", "parse_failure", False, False, [], []),
+        ("error", "error", False, False, [], []),
+        (
+            "critical",
+            "fresh",
+            True,
+            False,
+            [{"item": "correctness", "verdict": "FAIL", "severity": "critical"}],
+            [],
+        ),
+        ("open_debt", "fresh", True, False, [], [object()]),
+    ],
+)
+def test_next_step_guidance_offers_both_advisory_choices_and_retains_gates(
+    case_id,
+    status,
+    effective_is_fresh,
+    stale_from_edit,
+    items,
+    open_debts,
+):
+    del case_id
+    adv_mod = _get_advisory_module()
+    from ouroboros.review_state import AdvisoryRunRecord, AdvisoryReviewState
+
+    latest = None
+    if status is not None:
+        latest = AdvisoryRunRecord(
+            snapshot_hash="abc123",
+            commit_message="test",
+            status=status,
+            ts="2026-01-01T00:00:00",
+            items=items,
+        )
+    state = AdvisoryReviewState(advisory_runs=[] if latest is None else [latest])
+    message = adv_mod._next_step_guidance(
+        latest=latest,
+        state=state,
+        stale_from_edit=stale_from_edit,
+        stale_from_edit_ts="2026-01-01T00:01:00" if stale_from_edit else None,
+        open_obs=[],
+        open_debts=open_debts,
+        effective_is_fresh=effective_is_fresh,
+    )
+
+    assert adv_mod.ADVISORY_REVIEW_CHOICE_GUIDANCE in message
+    assert "advisory_review" in message
+    assert "skip_advisory_review=True" in message
+    assert "bypasses only the requirements for advisory freshness" in message
+    assert "records remain visible" in message
+    assert "tests, triad review" in message
+    assert "snapshot/fingerprint revalidation" in message
+    assert "final commit/tag/SHA binding" in message
+
+
 def test_skipped_run_hash_mismatch_reported_as_stale(monkeypatch, tmp_path):
     """A skipped run with a different snapshot hash must be reported as stale (hash_mismatch path)."""
     adv_mod = _get_advisory_module()

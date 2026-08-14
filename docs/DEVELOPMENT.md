@@ -476,8 +476,10 @@ escalates to `self_mod` whenever `files_to_touch` resolve under the system repo
 ARCHITECTURE.md — unchanged from the historical contract. Non-self_mod plans
 (an external codebase, a creative deliverable, a research question) receive
 ARCHITECTURE.md as the LOSSLESS navigation map (`context_layout.
-generate_doc_nav_map`: every section + line range, full sections readable on
-demand) — their reviewers judge the plan against its own domain, not ~45K
+generate_doc_nav_map`: every H2-H4 heading + its inclusive complete-subtree
+line range, with parent rows intentionally overlapping descendants and
+`max_lines=B-A+1`; full sections remain readable on demand) — their reviewers
+judge the plan against its own domain, not ~45K
 tokens of self-body detail. Rationale: the full-pack requirement existed to
 protect SELF-modification reasoning; for non-self plans it actively hurt
 review quality (reviewers anchored on runtime internals irrelevant to the
@@ -583,7 +585,8 @@ If a core governance artifact cannot fit in the available context budget:
   scope/advisory review helpers) MUST be listed in
   `UNTRUNCATED_TOOL_RESULTS` or have an explicit per-tool limit; the default
   15KB transport cap is not acceptable for review verdicts.
-- A reference-doc **navigation map** (full sections one `read_file` away) and a
+- A reference-doc **navigation map** (H2-H4 inclusive complete-subtree ranges,
+  with parent rows overlapping descendants and full sections one `read_file` away) and a
   named on-demand pointer are visible, lossless representations — NOT silent
   truncation. The low context mode uses these; it never applies `[:N]` to a doc.
 - String bounding goes through the SSOT `utils.truncate_review_artifact`, never a

@@ -77,6 +77,44 @@ def test_external_review_script_defaults_to_pro_mode():
     assert 'setdefault("OUROBOROS_RUNTIME_MODE", "pro")' in source
 
 
+def test_external_review_advisory_warning_uses_safe_canonical_reason(monkeypatch):
+    import scripts.run_external_review as module
+    from ouroboros.tools import claude_advisory_review as advisory
+
+    monkeypatch.setattr(
+        advisory,
+        "advisory_gate_unavailability_reason",
+        lambda: "agent_session_route_unavailable",
+    )
+    warning = module._advisory_unavailability_warning()
+    assert "agent_session_route_unavailable" in warning
+    assert advisory.ADVISORY_REVIEW_CHOICE_GUIDANCE in warning
+    assert "ANTHROPIC_API_KEY" not in warning
+
+    secret_error = "secret-setting-value-must-not-leak"
+
+    def _malformed():
+        raise ValueError(secret_error)
+
+    monkeypatch.setattr(advisory, "advisory_gate_unavailability_reason", _malformed)
+    warning = module._advisory_unavailability_warning()
+    assert "invalid_advisory_configuration" in warning
+    assert secret_error not in warning
+
+
+def test_external_review_checks_advisory_after_settings_load_without_key_heuristic():
+    import inspect
+    import scripts.run_external_review as module
+
+    main_source = inspect.getsource(module.main)
+    prepare_source = inspect.getsource(module._prepare_review_configuration)
+    assert main_source.index("_prepare_review_configuration(args)") < main_source.index(
+        "_advisory_unavailability_warning()"
+    )
+    assert "_load_settings_into_env()" in prepare_source
+    assert 'if not os.environ.get("ANTHROPIC_API_KEY"' not in main_source
+
+
 def test_external_review_script_resolves_models_and_efforts(monkeypatch):
     for key in (
         "OPENAI_API_KEY",

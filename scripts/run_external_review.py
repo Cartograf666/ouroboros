@@ -19,7 +19,7 @@ ergonomics only:
   paths, which only pro mode may stage for review;
 * OpenRouter key health-check/selection from the named operator pool
   (`limit_remaining` probe; `hope*` keys last; values never printed);
-* the real advisory pre-review in the default operator lane;
+* the configured read-only advisory route in the default operator lane;
 * an explicit contributor profile that excludes Claude advisory, ignores local
   reviewer overrides, forces blocking clean semantics, and emits a redacted
   shareable evidence packet bound to base/head/tree/diff hashes;
@@ -208,6 +208,27 @@ def _load_settings_into_env() -> None:
             "OUROBOROS_SETTINGS_PATH or TOTAL_BUDGET explicitly.",
             file=sys.stderr,
         )
+
+
+def _advisory_unavailability_warning() -> str:
+    """Return a safe route-aware operator warning, or ``""`` when available."""
+    from ouroboros.tools.claude_advisory_review import (
+        ADVISORY_REVIEW_CHOICE_GUIDANCE,
+        advisory_gate_unavailability_reason,
+    )
+
+    try:
+        reason = advisory_gate_unavailability_reason()
+    except ValueError:
+        reason = "invalid_advisory_configuration"
+    if reason is None:
+        return ""
+    return (
+        f"WARN: configured advisory review is unavailable ({reason}). "
+        "The production flow keeps its existing reason-specific behavior; "
+        "inspect advisory.txt and the typed review outcome. "
+        f"{ADVISORY_REVIEW_CHOICE_GUIDANCE}"
+    )
 
 
 def _git_text(args: list[str], *, cwd: pathlib.Path | None = None) -> str:
@@ -1297,15 +1318,12 @@ def main() -> int:
                 file=sys.stderr,
             )
         else:
-            # The default operator lane runs the REAL advisory pre-review. Its
+            # The default operator lane runs the configured advisory route. Its
             # freshness state lives in this run's drive root, so the production
             # cycle below sees a fresh advisory.
-            if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
-                print(
-                    "WARN: no ANTHROPIC_API_KEY — advisory will record an audited "
-                    "bypass and the gate falls back to its hermetic pytest preflight.",
-                    file=sys.stderr,
-                )
+            advisory_warning = _advisory_unavailability_warning()
+            if advisory_warning:
+                print(advisory_warning, file=sys.stderr)
             from ouroboros.tools.claude_advisory_review import _handle_advisory_pre_review
 
             advisory_text = _handle_advisory_pre_review(
