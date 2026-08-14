@@ -1481,6 +1481,12 @@ commit.
 - Floating chrome combines gradient and masked backdrop blur so the blur edge
   does not become a visible seam. The chat composer intentionally keeps blur on
   the input surface and reserves measured message padding around the dock.
+- The Chat model control is a projection over existing authorities, not a
+  second router: save the selected Main route through `/api/settings`, read
+  provider availability from durable real-call outcomes, and read Claude
+  Code/Codex subscription windows through the shared Claudexor status store.
+  Opening or refreshing the control must not spend model quota. An elapsed
+  provider retry hint means `unknown` until a later success, never `available`.
 
 ### Responsive and accessible behavior
 

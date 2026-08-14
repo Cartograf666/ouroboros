@@ -219,6 +219,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── history.py       ← Chat history + cost breakdown endpoint factories
       │   ├── projects.py      ← Multi-project CRUD surface (v6.32.0): GET /api/projects, POST /api/projects, POST /api/projects/from-task (bind an existing task to a new project). (v6.33.0 removed the /sleep + /wake status endpoints.)
       │   └── _helpers.py      ← shared HTTP request root helpers, coercion, and JSON error envelope
+
       ├── tools/               ← Auto-discovered tool plugins
       │   ├── extension_dispatch.py ← Extension tool dispatch helper extracted from registry.py; preserves liveness, safety, async, and out-of-process error contracts
       │   ├── release_sync.py    ← Release-metadata sync library; advisory_review uses sync_release_metadata before provider spend when VERSION is in scope; _preflight_check uses check_history_limit for P9 row caps; agents can also call it directly for version-carrier sync
@@ -581,6 +582,14 @@ Shared frontend primitives prevent pages from acquiring competing contracts. `pa
 ### Chat and Projects
 
 `web/modules/chat.js` owns the canonical message timeline, input recall and draft, attachment staging, runtime controls, budget projection, routing annotations, task cards, child cards, delivered media, and reconnect reconciliation. Every ordinary message has one canonical durable chat row. Project views are lenses over those rows and task bindings; Project conversion does not create a second message, unread event, or cost record. Routing acknowledgements live in a compact sidecar keyed by `client_message_id` and update the existing owner message without adding a synthetic assistant bubble.
+
+The main Chat composer owns a lightweight model-control projection in
+`web/modules/chat_model_control.js`. It reuses `/api/settings` as the sole model
+selection write, combines `/api/model-catalog`, local-model status, and recent
+`llm_round`/`llm_api_error` rows for a read-only availability view, and reuses
+the shared Claudexor status/quota projection for delegated subscriptions. It
+does not probe models by generating text and never turns an expired retry hint
+into an availability claim; only a later successful call proves recovery.
 
 Top-level messages, media bubbles, and task-card roots are ordered by their raw numeric timestamps rather than formatted display text. An insertion precedes only siblings with a strictly later timestamp, so equal timestamps retain arrival order and timestamp-free transient nodes retain append order; the typing indicator remains last. Inserts and synchronous card-height changes share a stable-viewport boundary: a reader near the bottom stays pinned, while a reader examining earlier content keeps the visible message or nested-card anchor at the same screen offset. Scroll position is remembered per chat instance and restored after a Project panel is recreated.
 

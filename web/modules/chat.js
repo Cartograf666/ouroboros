@@ -28,6 +28,7 @@ import {
     loadOlderControlState,
     nextQuotaEscalation,
 } from './chat_render_batch.js';
+import { initChatModelControl } from './chat_model_control.js';
 
 // Row-surface disclosure guard (v6.71.0), pure for node tests: returns the
 // lineKey to toggle for a click landing on `target`, or '' when the click must
@@ -494,6 +495,26 @@ export function createChatInstance({
                 <div class="chat-toolbar-row">
                     <div class="chat-composer-pills" id="chat-composer-pills">
                         <button class="chat-swarm" id="chat-swarm" type="button" data-armed="false" title="Swarm: route your next message into a new managed task, run a deep plan review with plan_task, then delegate when parallel work helps. Auto-disarms after sending.">Swarm</button>
+                        ${isMain ? `
+                        <details class="chat-model-control" id="chat-model-control">
+                            <summary title="Choose the main model for new tasks and inspect observed limits">
+                                <span class="chat-model-dot" aria-hidden="true"></span>
+                                <span data-model-summary>Model · Loading…</span>
+                            </summary>
+                            <div class="chat-model-menu">
+                                <label class="chat-model-field">
+                                    <span>Main model for new tasks</span>
+                                    <select data-model-select aria-label="Main model for new tasks"></select>
+                                </label>
+                                <div class="chat-model-state-row">
+                                    <span class="chat-model-state" data-model-status data-state="loading">Checking…</span>
+                                    <button type="button" class="chat-model-refresh" data-model-refresh>Refresh</button>
+                                </div>
+                                <p class="chat-model-detail" data-model-detail>Reading recent provider results…</p>
+                                <div class="chat-harness-quota" data-harness-quota>Claude Code / Codex · checking subscription limits…</div>
+                                <p class="chat-model-note">Claude Code and Codex are delegated agents, not main-chat models.</p>
+                            </div>
+                        </details>` : ''}
                         <div class="chat-context-mode" id="chat-context-mode" data-context-mode="max" role="group" aria-label="Context size mode" title="Context mode (owner setting). Low fits ~200K / local models; Max is full. Saves immediately; lowering to Low requires Ouroboros to be idle.">
                             <button class="chat-seg" type="button" data-mode="low">Low</button>
                             <button class="chat-seg" type="button" data-mode="max">Max</button>
@@ -541,9 +562,11 @@ export function createChatInstance({
     const fileInput = byId('file-input');
     const attachmentPreview = byId('attachment-preview');
     const scrollBottomBtn = byId('scroll-bottom');
+    const modelControl = byId('chat-model-control');
     let pendingAttachments = [];
     let attachmentsUploading = false;
     let nestedSubagentsExpanded = false;
+    let disposeModelControl = () => {};
 
     // Instance lifecycle (P3): destroy() flips this so rAF loops and late async
     // continuations become no-ops instead of touching a removed DOM subtree.
@@ -551,6 +574,10 @@ export function createChatInstance({
     // Every ws.on subscription's disposer, released together in destroy().
     const wsDisposers = [];
     const onWs = (event, fn) => wsDisposers.push(ws.on(event, fn));
+
+    if (modelControl) {
+        disposeModelControl = initChatModelControl({ root: modelControl, showToast });
+    }
 
     async function loadUiPreferences() {
         try {
@@ -4718,6 +4745,7 @@ export function createChatInstance({
                 if (taskState?.cleanupTimer) clearTimeout(taskState.cleanupTimer);
             }
             if (headerControlInterval) { clearInterval(headerControlInterval); headerControlInterval = null; }
+            try { disposeModelControl(); } catch {}
             liveCardRecords.clear();
             taskUiStates.clear();
             pendingSuggestedNames.clear();
