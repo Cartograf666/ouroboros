@@ -167,6 +167,11 @@ def test_payload_start_provisions_standalone_snapshot_with_semantic_ref(tmp_path
     ref = entry.resource_ref
     assert ref["source"] == "external" and ref["skill_name"] == "alpha"
     assert ref["target_root"] == str(skill.resolve()) and ref["payload_hash"]
+    # Gate fix 3: the child is TOLD editing this payload is its assignment; the
+    # contradictory blanket "skills" ban is narrowed for payload runs only.
+    instructions = str(request["instructions"])
+    assert "PAYLOAD ASSIGNMENT" in instructions and "'alpha'" in instructions
+    assert "runtime controls, skills, or memory" not in instructions
     custody._CUSTODY.clear()
 
 
@@ -207,15 +212,16 @@ def test_native_missing_and_child_targets_refuse_before_any_gateway(tmp_path, mo
         ctx, "x", root="skill_payload", bucket="external", skill_name="ghost"))
     assert out["reason"] == "payload_target_unresolved", out
     assert "manifest" in out["detail"].lower() or "SKILL.md" in out["detail"], out
-    # A read-only CHILD cannot reach payload delegation at all: the binding
-    # itself refuses (no skill_payload.write in its policy row).
+    # A read-only CHILD gets an AUTHORITY denial (Fable F4), not a lookup-
+    # flavored refusal: policy is checked before the binding is even built.
     child = ToolContext(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data",
                         task_constraint=TaskConstraint(mode="local_readonly_subagent"))
     child.task_id = "t-child"
     child.task_metadata = {"parent_task_id": "t-payload"}
     out = json.loads(delegate._delegate_start(
         child, "x", root="skill_payload", bucket="external", skill_name="alpha"))
-    assert out["reason"] == "payload_target_unresolved", out
+    assert out["reason"] == "payload_delegation_forbidden", out
+    assert "AUTHORITY denial" in out["detail"], out
 
 
 def test_second_delegation_on_same_payload_is_refused_cheaply(tmp_path, monkeypatch):
@@ -592,3 +598,305 @@ def test_legacy_disabled_claude_code_edit_blocks_the_selector_call(tmp_path, mon
         "prompt": "x", "root": "skill_payload", "bucket": "external",
         "skill_name": "alpha"})
     assert "RESOURCE_CONSTRAINT_BLOCKED" in blocked and "disabled_tools" in blocked
+
+
+# -- 5-lane gate fix batch ---------------------------------------------------------
+
+
+def test_file_replaced_by_escaping_symlink_rides_as_deletion(tmp_path, monkeypatch):
+    """Gate fix 1b (reviewer repro): plugin.py → /tmp/.../secret.txt symlink in the
+    snapshot must NOT carry stale baseline content or the symlink itself — the
+    inventory drops the escape, so the candidate stages the path as a DELETION."""
+    from ouroboros.tools.delegate import _capture_terminal_patch
+    from ouroboros.tools.subagent_integration import _integrate_delegated_patch
+
+    ctx, skill, handle = _provisioned(tmp_path, monkeypatch)
+    exec_root = pathlib.Path(handle.path)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("SECRET\n", encoding="utf-8")
+    (exec_root / "plugin.py").unlink()
+    os.symlink(str(secret), exec_root / "plugin.py")
+    entry = _payload_entry(handle, skill)
+    capture = _capture_terminal_patch(ctx, entry)
+    assert capture["status"] == "ready_with_changes", capture
+    patch_bytes = pathlib.Path(capture["patch_artifact"]).read_bytes()
+    assert b"deleted file mode 100644" in patch_bytes
+    assert b"120000" not in patch_bytes and b"SECRET" not in patch_bytes
+    out = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
+    assert "✅ Integrated" in out, out
+    # The live payload never receives the symlink; the honest candidate deleted it.
+    assert not (skill / "plugin.py").is_symlink()
+    assert not (skill / "plugin.py").exists()
+    custody._CUSTODY.clear()
+
+
+def test_escaping_symlink_patch_is_refused_whole_at_apply(tmp_path, monkeypatch):
+    """Gate fix 1a: apply-time containment judges the CANDIDATE — a patch hunk
+    introducing a symlink whose target escapes the live payload refuses the
+    WHOLE apply with the candidate preserved."""
+    import hashlib
+
+    from ouroboros.tools.subagent_integration import _integrate_delegated_patch
+
+    ctx, skill, handle, entry, capture = _captured(tmp_path, monkeypatch)
+    assert capture["status"] == "ready_with_changes"
+    # Forge a candidate introducing an escaping symlink (crafted in a scratch
+    # repo; the guard must judge patch CONTENT, not trust capture provenance).
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=scratch, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit",
+                    "--allow-empty", "-q", "-m", "base"], cwd=scratch, check=True)
+    os.symlink("../../secret.txt", scratch / "evil_link")
+    subprocess.run(["git", "add", "-A"], cwd=scratch, check=True)
+    forged = subprocess.run(["git", "diff", "--cached", "--binary", "HEAD"],
+                            cwd=scratch, capture_output=True, check=True).stdout
+    patch_path = pathlib.Path(capture["patch_artifact"])
+    patch_path.write_bytes(forged)
+    manifest_path = pathlib.Path(capture["manifest_artifact"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["sha256"] = hashlib.sha256(forged).hexdigest()
+    manifest["tracked_changed"] = ["evil_link"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    out = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
+    assert "INTEGRATE_DELEGATED_RESERVED_PATHS" in out and "evil_link" in out, out
+    assert not os.path.lexists(skill / "evil_link")
+    assert entry.patch_disposed == ""
+    assert patch_path.exists()                      # candidate preserved
+    assert find_execution_snapshot("snapP") is not None
+    custody._CUSTODY.clear()
+
+
+def test_child_git_config_diff_driver_does_not_execute_at_capture(tmp_path, monkeypatch):
+    """Gate fix 2 (reviewer repro): a snapshot-local `diff.evil.command` written
+    by the child must not execute in the PARENT at capture, and the patch must
+    carry the real content, not driver output."""
+    from ouroboros.tools.delegate import _capture_terminal_patch
+
+    ctx, skill, handle = _provisioned(tmp_path, monkeypatch)
+    exec_root = pathlib.Path(handle.path)
+    pwned = tmp_path / "pwned.txt"
+    (exec_root / ".git" / "config").write_text(
+        "[diff \"evil\"]\n\tcommand = sh -c 'touch %s; echo'\n" % pwned,
+        encoding="utf-8")
+    (exec_root / ".gitattributes").write_text("*.py diff=evil\n", encoding="utf-8")
+    (exec_root / "plugin.py").write_text("VALUE = 2\n", encoding="utf-8")
+    entry = _payload_entry(handle, skill)
+    capture = _capture_terminal_patch(ctx, entry)
+    assert capture["status"] == "ready_with_changes", capture
+    assert not pwned.exists(), "child-controlled git config executed in the parent"
+    patch_bytes = pathlib.Path(capture["patch_artifact"]).read_bytes()
+    assert b"+VALUE = 2" in patch_bytes
+    custody._CUSTODY.clear()
+
+
+def test_payload_instructions_variant_is_payload_only(tmp_path, monkeypatch):
+    """Gate fix 3: ordinary runs keep the blanket ban byte-identically; only a
+    payload run gets the narrowed ban plus the explicit permission block."""
+    from ouroboros.subagents import delegated_run_shape
+    from ouroboros.tools.delegate import _HOST_INSTRUCTIONS, _host_instructions
+
+    ordinary = _host_instructions(delegated_run_shape(False))
+    assert "runtime controls, skills, or memory" in ordinary
+    assert "PAYLOAD ASSIGNMENT" not in ordinary
+    payload = _host_instructions(delegated_run_shape(True), payload_skill="alpha")
+    assert "runtime controls, skills, or memory" not in payload
+    assert "runtime controls or memory" in payload
+    assert "PAYLOAD ASSIGNMENT" in payload and "'alpha'" in payload
+    assert "runtime controls, skills, or memory" in _HOST_INSTRUCTIONS  # source intact
+
+
+def test_idempotent_already_applied_branch_runs_the_finalizer(tmp_path, monkeypatch):
+    """Gate fix 4: the already-applied branch reconciles and reports staleness
+    exactly like a fresh apply (it used to dispose and skip both)."""
+    from ouroboros.extension_reconcile_queue import list_extension_reconcile_requests
+    from ouroboros.tools.subagent_integration import _integrate_delegated_patch
+
+    ctx, skill, handle, entry, capture = _captured(tmp_path, monkeypatch)
+    subprocess.run(["git", "apply", capture["patch_artifact"]], cwd=str(skill),
+                   capture_output=True, check=True)
+    out = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
+    assert "ALREADY carries" in out, out
+    assert "STALE" in out and "skill_review" in out
+    requests = list_extension_reconcile_requests(tmp_path / "data")
+    assert any(r["skill"] == "alpha" for r in requests), requests
+    custody._CUSTODY.clear()
+
+
+def test_reconcile_queue_failure_degrades_the_receipt_honestly(tmp_path, monkeypatch):
+    """Gate fix 4: a failed reconcile queue-write must not claim the extension
+    was reconciled off — the receipt states the failure; the apply stands."""
+    import ouroboros.extension_reconcile_queue as reconcile_queue
+
+    from ouroboros.tools.subagent_integration import _integrate_delegated_patch
+
+    ctx, skill, handle, entry, capture = _captured(tmp_path, monkeypatch)
+
+    def _boom(*_a, **_k):
+        raise OSError("queue disk full")
+
+    monkeypatch.setattr(reconcile_queue, "request_extension_reconcile", _boom)
+    out = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
+    assert "✅ Integrated" in out and "STALE" in out, out
+    assert "could NOT be queued" in out, out
+    assert "reconciled off until re-review" not in out, out
+    assert entry.patch_disposed == "applied"
+    custody._CUSTODY.clear()
+
+
+def test_parallel_starts_on_same_payload_yield_exactly_one_winner(tmp_path, monkeypatch):
+    """Gate fix 5 (reviewer repro): two synchronized parallel starts — one
+    started, the other typed payload_delegation_busy via the atomic claim."""
+    import threading
+
+    import ouroboros.tools.delegate as delegate
+    import ouroboros.tools.delegate_integration as integration
+    from ouroboros.gateways import claudexor as gw
+
+    ctx = _payload_ctx(tmp_path, monkeypatch)
+    _seed_skill(tmp_path / "data")
+    seen: dict = {}
+    monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _StartStub(seen))
+    delegate._CUSTODY.clear()
+    barrier = threading.Barrier(2, timeout=30)
+    real_provision = integration._provision_payload_snapshot
+
+    def _synced(*args, **kwargs):
+        # Both threads pass the cheap early busy check and provision BEFORE
+        # either reaches the claim — the exact reproduced interleaving.
+        result = real_provision(*args, **kwargs)
+        barrier.wait()
+        return result
+
+    monkeypatch.setattr(integration, "_provision_payload_snapshot", _synced)
+    monkeypatch.setattr(delegate, "_provision_payload_snapshot", _synced)
+    results: list = []
+
+    def _one(idx):
+        out = json.loads(delegate._delegate_start(
+            ctx, f"start {idx}", root="skill_payload", bucket="external",
+            skill_name="alpha"))
+        results.append(out)
+
+    threads = [threading.Thread(target=_one, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    statuses = sorted(r["status"] for r in results)
+    assert statuses == ["refused", "started"], results
+    refused = next(r for r in results if r["status"] == "refused")
+    assert refused["reason"] == "payload_delegation_busy", refused
+    custody._CUSTODY.clear()
+
+
+def test_snapshot_root_under_runtime_data_refuses_provisioning(tmp_path):
+    """Gate fix 6 (reviewer repro): a snapshot root resolving inside the runtime
+    data root is refused — no child-writable Git repo inside live state."""
+    data = tmp_path / "data"
+    skill = _seed_skill(data)
+    with pytest.raises(ValueError, match="runtime data"):
+        provision_payload_snapshot(
+            target_root=skill, task_id="t1", snapshot_id="snapBad",
+            worktree_root=data / "state" / "snaps", data_dir=data)
+    assert not (data / "state" / "snaps").exists()
+
+
+def test_registry_save_failure_leaves_no_orphan_snapshot_dir(tmp_path, monkeypatch):
+    """Gate fix 7: a registry-write failure removes the snapshot directory —
+    an unregistered directory would be invisible to disposal/retention."""
+    import ouroboros.subagent_worktrees as worktrees
+
+    data = tmp_path / "data"
+    skill = _seed_skill(data)
+
+    def _boom(*_a, **_k):
+        raise OSError("registry disk full")
+
+    monkeypatch.setattr(worktrees, "_save_registry", _boom)
+    with pytest.raises(OSError, match="registry disk full"):
+        provision_payload_snapshot(
+            target_root=skill, task_id="t1", snapshot_id="snapReg",
+            worktree_root=tmp_path / "snaps", data_dir=data)
+    leftovers = list((tmp_path / "snaps").glob("dlgp_*")) if (tmp_path / "snaps").exists() else []
+    assert leftovers == [], leftovers
+
+
+def test_first_wins_is_keyed_on_the_first_shape_carrying_row(tmp_path):
+    """Gate fix 8b: a recorded delegated=False survives a later True, and an
+    empty resource_ref is never 'filled' by a later row — in BOTH the replay
+    and the in-process memo (8a: same merge, no raw replacement)."""
+    drive = tmp_path
+    custody._CUSTODY.clear()
+    first = custody.RunCustody(run_id="run-f", task_id="t-a", route_id="r")
+    custody.record_started(drive, first, shape={
+        "access": "readonly", "mode": "ask", "isolation": "", "delegated": False})
+    # Later duplicate claims a WIDER shape and a filled-in resource_ref.
+    later = custody.RunCustody(
+        run_id="run-f", task_id="t-a", route_id="r",
+        access="workspace_write", mode="agent", isolation="live", delegated=True,
+        resource_ref={"skill_name": "late", "payload_hash": "hX"})
+    custody.record_started(drive, later, shape={
+        "access": "workspace_write", "mode": "agent", "isolation": "live",
+        "delegated": True})
+    replayed = custody.replay(drive)["run-f"]
+    assert replayed.delegated is False and replayed.access == "readonly"
+    assert replayed.mode == "ask" and replayed.resource_ref == {}
+    status, memo = custody.lookup(drive, "t-a", "run-f")
+    assert status == custody.OWNED
+    assert memo.delegated is False and memo.access == "readonly"
+    assert memo.resource_ref == {}
+    # The memo answers EXACTLY what a restart would replay.
+    for attr in ("access", "mode", "isolation", "delegated", "resource_ref",
+                 "snapshot_id", "target_root", "authority_source"):
+        assert getattr(memo, attr) == getattr(replayed, attr), attr
+    custody._CUSTODY.clear()
+
+
+def test_recovered_pending_invocation_object_carries_the_shape(tmp_path, monkeypatch):
+    """Gate fix 8c: recovery copies access/mode/isolation/delegated onto the
+    in-memory object, not only the resource_ref."""
+    drive = tmp_path
+    custody._CUSTODY.clear()
+    ref = {"root": "skill_payload", "source": "external", "skill_name": "alpha",
+           "target_root": "/x/target", "payload_hash": "h1"}
+    body = {"prompt": "x", "access": "workspace_write", "mode": "agent",
+            "execution": {"isolation": "live", "delegated": True},
+            "scope": {"root": "/x/exec"}, "primaryHarness": "r"}
+    custody.record_start_requested(
+        drive, run_id="", task_id="t-a", idempotency_key="k", invocation_id="invR",
+        max_seconds=60, request=body, project_id="p", project_owned=False,
+        route="r", root_task_id="t-a", parent_task_id="", snapshot_id="snap1",
+        execution_root="/x/exec", baseline_sha="b1", target_root="/x/target",
+        authority_source="skill_payload", resource_ref=ref)
+    record = custody.pending_invocations(drive)[0]
+    monkeypatch.setattr(custody, "_reconcile_one", lambda *_a, **_k: {"ok": True})
+
+    class _Gw:
+        def start_run(self, request, *, idempotency_key=""):
+            return {"runId": "run-rec"}
+
+    custody._recover_pending_invocation(drive, _Gw(), record)
+    obj = custody._CUSTODY["run-rec"]
+    assert obj.access == "workspace_write" and obj.mode == "agent"
+    assert obj.isolation == "live" and obj.delegated is True
+    assert obj.resource_ref == ref and obj.authority_source == "skill_payload"
+    custody._CUSTODY.clear()
+
+
+def test_unknown_root_via_registry_is_typed_unsupported_root(tmp_path, monkeypatch):
+    """Gate fix 9: an unknown root value falls through to the handler's TYPED
+    unsupported_root refusal, never an untyped binding ValueError."""
+    import ouroboros.safety as safety
+    from ouroboros.tools.registry import ToolRegistry
+
+    ctx = _payload_ctx(tmp_path, monkeypatch)
+    _seed_skill(tmp_path / "data")
+    monkeypatch.setattr(safety, "check_safety", lambda *a, **k: (True, ""))
+    registry = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
+    registry.set_context(ctx)
+    out = registry.execute("delegate_start", {
+        "prompt": "x", "root": "repo", "bucket": "external", "skill_name": "alpha"})
+    parsed = json.loads(out)
+    assert parsed["status"] == "refused", parsed
+    assert parsed["reason"] == "unsupported_root", parsed

@@ -1,20 +1,15 @@
 """Durable custody for delegated (Claudexor) runs.
 
 A delegated run is an OVERPOWERED, MUTATING process that Ouroboros does not own the
-process tree of: it lives inside the Claudexor daemon, it survives our worker, and the
-daemon bearer token means anything that can name it can reach it. Custody therefore
-cannot live in a module dict — a worker crash, a restart, an accepted POST whose
-response was lost, or the owning task terminalizing all leave a LIVE run that nothing
-can wait on, cancel or settle, and a process-local dict then refuses the owning task
-itself. ``maxSeconds`` is damage limitation, not custody.
+process tree of: it lives inside the Claudexor daemon and survives our worker, so
+custody cannot live in a module dict — a crash, restart, or lost POST response would
+leave a LIVE run nothing can wait on, cancel or settle. ``maxSeconds`` is damage
+limitation, not custody.
 
 **The authority is the durable record that is already written.** The task's own event
-log (``logs/events.jsonl`` under the canonical data root) already carried
-``delegate_run_started`` as a forensic trail; here it becomes the SSOT. Nothing new is
-stored beside it — the process-local dict below is a pure memoization of these rows, and
-every question (who owns this run, was its ledger row written, is its registration still
-ours, is a cancel unverified) is answered by replaying them. Rows survive a restart, so
-custody does too, and reconciliation is a scan rather than a guess.
+log (``logs/events.jsonl`` under the canonical data root) is the SSOT; the
+process-local dict below is a pure memoization of these rows, and every question is
+answered by replaying them. Rows survive a restart, so custody does too.
 
 Three lookup answers, never two: OWNED, FOREIGN (another task started it) and UNKNOWN
 (no durable record at all). Collapsing UNKNOWN into "not yours" is what made a restarted
@@ -63,39 +58,28 @@ CONTAINMENT_RESOLVED = "delegate_run_containment_resolved"
 RECONCILED = "delegate_run_reconciled"
 OUTPUT_SPILLED = "delegate_run_output_spilled"
 # Owner doctrine D7: a delegated result is OBTAINED only after the artifact is read to
-# EOF. This row is the canonical acknowledgement — written exactly when the read windows
-# have covered the staged artifact CONTINUOUSLY from its first line to its last (a head
-# plus a tail with a skipped middle is not full reading), carrying the byte length and
-# content hash of what was staged. It is only writable at all when what was staged is
-# the verified FULL content (`full_content` on the spill row): the run detail's
-# `primaryOutput.text` is a bounded 256 KiB preview, and acknowledging a preview as the
-# result would be exactly the "received == read" conflation this row exists to end.
-# Owner directive (2026-08-03): consumption is LOAD-BEARING before settlement, so its
-# ABSENCE is now a durable typed fact (``SETTLED_UNREAD`` below) that rides the
-# settlement row, the parent's result and the health invariants until the read happens.
-# It still does not BLOCK settlement — see ``settle_run`` for why a hard gate would
-# deadlock the very flow it is meant to protect.
+# EOF. The canonical acknowledgement — written when the read windows covered the staged
+# artifact CONTINUOUSLY start-to-EOF, hash-bound, and only writable when the staging was
+# the verified FULL content (`full_content`), never the bounded 256 KiB preview.
+# Owner directive (2026-08-03): consumption is LOAD-BEARING before settlement; its
+# ABSENCE is the durable typed fact ``SETTLED_UNREAD`` below. It does not BLOCK
+# settlement — see ``settle_run`` for why a hard gate would deadlock the flow.
 OUTPUT_CONSUMED = "delegate_run_output_consumed"
 # A run whose VERIFIED FULL output was staged, paid for, and settled without ever being
 # read to EOF: the "launched and never collected" class, named at the moment it becomes
 # permanent instead of inferred later from a field nobody joined.
 SETTLED_UNREAD = "delegate_run_settled_unread"
-# C1 (delegated-run isolation): a MUTATING run executes in a private snapshot of the
-# authority target tree, and its diff is captured durably at terminal, then EXPLICITLY
-# applied or rejected into the target by the nanny. These two rows are that lifecycle:
-# capture is idempotent (the flag replays), disposition is the fact that releases the
-# snapshot for GC. A run whose snapshot was never disposed keeps its snapshot and its
-# captured patch on disk — conflict material persists until an explicit resolution.
+# C1 (delegated-run isolation): a MUTATING run executes in a private snapshot; its
+# diff is captured durably at terminal, then EXPLICITLY applied or rejected by the
+# nanny. Capture is idempotent (the flag replays); the disposition row is what
+# releases the snapshot for GC — until then conflict material persists on disk.
 PATCH_CAPTURED = "delegate_run_patch_captured"
 PATCH_DISPOSED = "delegate_run_patch_disposed"
-# CR1-3 (phase-A owed-before-sent doctrine, one row earlier than the disposition):
-# the APPLY-INTENT row lands BEFORE the target tree is mutated, and the RESOLVED
-# row lands only when the attempt is KNOWN to have left the tree unmutated (drift
-# refusal, atomic apply failure, clean revert). An intent with neither a resolution
-# nor a disposition replays as AMBIGUOUS: the tree may carry the patch (crash after
-# apply, before the disposition row), and a later reject/apply must refuse typed
-# instead of pretending "not applied" — that pretence recorded a false rejection
-# and deleted the snapshot over a modified, staged tree.
+# CR1-3 (owed-before-sent, one row earlier than the disposition): APPLY-INTENT lands
+# BEFORE the target tree is mutated; RESOLVED lands only when the attempt is KNOWN to
+# have left the tree unmutated. An intent with neither resolution nor disposition
+# replays as AMBIGUOUS — the tree may carry the patch — and a later reject/apply must
+# refuse typed instead of pretending "not applied" over a modified tree.
 PATCH_APPLY_STARTED = "delegate_run_patch_apply_started"
 PATCH_APPLY_RESOLVED = "delegate_run_patch_apply_resolved"
 
@@ -320,7 +304,30 @@ _STARTED_PROGRESS_FLAGS: Tuple[str, ...] = (
 # first recorded fact is authoritative and is never erased or retargeted.
 _STARTED_FIRST_WINS_FACTS: Tuple[str, ...] = (
     "snapshot_id", "execution_root", "baseline_sha", "target_root",
-    "authority_source", "resource_ref", "access", "mode", "isolation", "delegated")
+    "authority_source", "resource_ref")
+
+
+def _merge_started_into(entry: RunCustody, previous: RunCustody) -> None:
+    """Project a duplicate STARTED fact set onto an existing run — the ONE
+    merge, used by both the durable replay and the in-process memo (gate fix 8).
+
+    Progress always carries forward; binding facts are truthy-first-wins per
+    field; the SHAPE GROUP (access/mode/isolation/delegated) plus the resource
+    reference is first-wins as a UNIT, keyed on the first row that CARRIED a
+    shape — so a recorded ``delegated=False`` survives a later ``True`` and an
+    empty ``resource_ref`` is never "filled" by a later row.
+    """
+    for attr in _STARTED_PROGRESS_FLAGS:
+        setattr(entry, attr, getattr(previous, attr))
+    entry.project_owned = previous.project_owned and entry.project_owned
+    for attr in _STARTED_FIRST_WINS_FACTS:
+        prior = getattr(previous, attr)
+        if prior:
+            setattr(entry, attr, prior)
+    if previous.access:
+        entry.access, entry.mode = previous.access, previous.mode
+        entry.isolation, entry.delegated = previous.isolation, previous.delegated
+        entry.resource_ref = previous.resource_ref
 
 
 def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
@@ -339,13 +346,7 @@ def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
         )
         previous = state.get(run_id)
         if previous is not None:
-            for attr in _STARTED_PROGRESS_FLAGS:
-                setattr(entry, attr, getattr(previous, attr))
-            entry.project_owned = previous.project_owned and entry.project_owned
-            for attr in _STARTED_FIRST_WINS_FACTS:
-                prior = getattr(previous, attr)
-                if prior:
-                    setattr(entry, attr, prior)
+            _merge_started_into(entry, previous)
         state[run_id] = entry
         return
     custody = state.get(run_id)
@@ -642,11 +643,9 @@ def invocation_record(drive_root: Any, invocation_id: str) -> Optional[Dict[str,
 def record_start_requested(drive_root: Any, **payload: Any) -> bool:
     """Durably name the resources a start is about to bind, BEFORE the POST.
 
-    Returns whether the row LANDED, and the caller must not POST when it did not: a
-    start whose request row never reached the disk launches a run that nothing durable
-    names — if the worker dies before ``record_started``, the run is live, mutating,
-    and unfindable. That is the launched-never-collected class at the process level,
-    and refusing to launch is the only honest answer a broken event log leaves.
+    Returns whether the row LANDED; the caller must not POST when it did not —
+    a run whose request row never reached disk is live, mutating and unfindable
+    if the worker dies before ``record_started``.
     """
     return emit(drive_root, START_REQUESTED, payload)
 
@@ -655,17 +654,23 @@ def record_started(drive_root: Any, custody: RunCustody,
                    shape: Optional[Dict[str, Any]] = None) -> bool:
     """Memoize the run and write its authoritative row. Returns whether the row LANDED.
 
-    A start whose row did not land is custodied by this process only: the run is live and
-    overpowered, and after this worker dies nothing can name it, wait on it, cancel it or
-    settle it. The caller holds the object it passed in, so what it needs back from here
-    is the one fact it cannot otherwise know.
-
-    ``shape`` carries the facts custody itself does not need but the forensic record
-    does — the access profile, the run mode, the isolation, whether the delegated
-    marker rode along, and the root the run was scoped to. They live on the same row
-    rather than a second event, because a start whose shape is recorded separately can
-    lose one half of itself to a crash between the two writes.
+    A start whose row did not land is custodied by this process only: after this
+    worker dies nothing can name, wait on, cancel or settle the live run.
+    ``shape`` (access/mode/isolation/delegated/root) rides the SAME row — a shape
+    recorded separately can lose one half of itself to a crash between writes.
+    The memo update goes through the SAME first-wins merge the replay uses (gate
+    fix 8): a duplicate start must not diverge the in-process view from replay.
     """
+    # Fold the row-only shape onto the object first (the row spreads it last),
+    # so the memo and a replay of this same row start from identical facts.
+    for attr in ("access", "mode", "isolation"):
+        if shape and attr in shape:
+            setattr(custody, attr, str(shape.get(attr) or ""))
+    if shape and "delegated" in shape:
+        custody.delegated = shape.get("delegated") is True
+    previous = _CUSTODY.get(custody.run_id)
+    if previous is not None and previous is not custody:
+        _merge_started_into(custody, previous)
     _CUSTODY[custody.run_id] = custody
     # The C1 binding and the resource reference ride the SAME row (a binding
     # recorded separately can lose half of itself to a crash); shape spreads LAST.
@@ -683,16 +688,10 @@ def record_output_consumed(drive_root: Any, custody: RunCustody, *,
                            chars: int, lines: int) -> bool:
     """The canonical D7 acknowledgement: the staged artifact was read whole.
 
-    Written exactly once per STAGED CONTENT (the replayed, hash-bound
-    ``output_consumed`` flag is the guard — a re-stage of different bytes resets it and
-    a fresh acknowledgement is owed), at the moment the read windows have covered the
-    artifact continuously from start to EOF — never at delivery, which is the
-    distinction this row exists to record. Refused outright when the staging was not
-    the verified full content (acknowledging a bounded preview would launder
-    "received" into "read") and when the hash offered is not the currently staged
-    content's — an ack names bytes, never a path. Carries the byte length and content
-    hash of what was staged, so the record says WHAT was acknowledged, not merely that
-    something was.
+    Once per STAGED CONTENT (hash-bound; a re-stage of different bytes resets it),
+    written when the read windows covered the artifact start-to-EOF — never at
+    delivery. Refused when the staging was not verified full content or the hash
+    is not the currently staged content's: an ack names bytes, never a path.
     """
     if not custody.output_complete:
         return False
@@ -1215,13 +1214,11 @@ def open_runs(drive_root: Any) -> List[RunCustody]:
 def pending_invocations(drive_root: Any) -> List[Dict[str, Any]]:
     """Invocations with a durable request row, no bound run, no definite refusal.
 
-    The launched-never-collected class one step EARLIER than ``open_runs``: a POST
-    the daemon may well have ACCEPTED, whose worker died between the wire call and
-    ``record_started``, leaves only the ``START_REQUESTED`` row — no run id anywhere,
-    so the run-keyed replay cannot see it and the retry token never reached a model.
-    Facts come from the FIRST request row (the minting), the same single-source rule
-    ``invocation_record`` follows; a record whose canonical body never landed is not
-    recoverable and is excluded (nothing byte-identical can be replayed)."""
+    The launched-never-collected class one step EARLIER than ``open_runs``: a
+    worker death between the accepted POST and ``record_started`` leaves only the
+    ``START_REQUESTED`` row. Facts come from the FIRST request row (the minting,
+    same rule as ``invocation_record``); a record whose canonical body never
+    landed is excluded (nothing byte-identical can be replayed)."""
     found: Dict[str, Dict[str, Any]] = {}
     state: Dict[str, str] = {}
     for row in _iter_rows(event_log_path(drive_root)):
@@ -1375,13 +1372,10 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
                                 record: Dict[str, Any]) -> Dict[str, Any]:
     """Recover the run (if any) behind an orphaned pending invocation, idempotently.
 
-    The stored canonical body is re-POSTed under the invocation's own wire key: the
-    engine's replay check returns the ORIGINAL handle when the first POST was accepted
-    (byte-identical body, same key), and only starts a fresh run when the daemon truly
-    never saw the invocation — which is the intention the owner recorded, immediately
-    collected below by the ordinary settle-or-cancel path. A definite 4xx retires the
-    invocation and the registration the original attempt owned; an unknown outcome
-    leaves it pending for the next sweep — never destroyed on missing information.
+    The stored canonical body is re-POSTed under the invocation's own wire key:
+    the engine returns the ORIGINAL handle when the first POST was accepted, and
+    starts fresh only when the daemon truly never saw it. A definite 4xx retires
+    the invocation and its registration; an unknown outcome stays pending.
     """
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
@@ -1438,7 +1432,13 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
         target_root=str(record.get("target_root") or ""),
         authority_source=str(record.get("authority_source") or ""),
         # Carried opaquely VERBATIM — recovery never re-authorizes a target (R1-2).
-        resource_ref=record.get("resource_ref") if isinstance(record.get("resource_ref"), dict) else {})
+        resource_ref=record.get("resource_ref") if isinstance(record.get("resource_ref"), dict) else {},
+        # The GRANTED shape on the recovered OBJECT too, not only the row (gate
+        # fix 8c): the memo must answer the same lookups the replay does.
+        access=str(body.get("access") or ""),
+        mode=str(body.get("mode") or ""),
+        isolation=str(execution.get("isolation") or ""),
+        delegated=bool(execution.get("delegated")))
     record_started(drive_root, custody, shape={
         # The stored invocation is the single source of a replay's facts — the same
         # doctrine the explicit retry path follows.

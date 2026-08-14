@@ -1210,9 +1210,8 @@ def _integrate_delegated_patch(
             return f"⚠️ INTEGRATE_MANIFEST_UNREADABLE: {manifest_path}: {type(exc).__name__}: {exc}."
     if entry.authority_source == "skill_payload" or str(manifest.get("capture_kind") or "") == "skill_payload":
         # The exact-payload branch (R1 item 3) lives in delegate_integration:
-        # fresh semantic rebinding, whole-payload content-hash CAS, reserved-path
-        # whole-apply refusal, and an index-free apply into the live NON-Git
-        # payload — no active-root comparison, no .git requirement, no staging.
+        # fresh semantic rebinding, whole-payload CAS, reserved-path whole-apply
+        # refusal, index-free apply into the live NON-Git payload — no staging.
         from ouroboros.tools.delegate_integration import integrate_payload_patch
 
         return integrate_payload_patch(
@@ -1576,8 +1575,13 @@ def get_tools() -> List[ToolEntry]:
                     "record a rejection and discard. Either DURABLY RECORDED disposition "
                     "releases the run's execution snapshot; a CONFLICT (a path drifted since "
                     "the snapshot) keeps snapshot and patch as resolution material you own. "
-                    "Read the captured diff (see delegate_wait's workspace_capture block) "
-                    "before applying — the run's output is a claim, not a verified result."
+                    "For a skill-payload run (delegate_start root='skill_payload') apply is "
+                    "instead a LIVE apply into the non-Git payload, guarded by a whole-payload "
+                    "content-hash CAS — nothing is staged into your active root — and the "
+                    "skill's existing review goes STALE: it must be re-run before the skill "
+                    "is relied on. Read the captured diff (see delegate_wait's "
+                    "workspace_capture block) before applying — the run's output is a claim, "
+                    "not a verified result."
                 ),
                 "parameters": {
                     "type": "object",

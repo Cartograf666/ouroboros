@@ -164,13 +164,15 @@ def _force_rmtree(path: Path) -> None:
         pass
 
 
-def _git(repo_dir: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+def _git(repo_dir: Path, *args: str, check: bool = True,
+         env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", *args],
         cwd=str(repo_dir),
         capture_output=True,
         text=True,
         check=check,
+        env=env,
     )
 
 
@@ -536,6 +538,38 @@ def provision_execution_snapshot(
         return handle
 
 
+def isolated_git_env() -> Dict[str, str]:
+    """A git environment no host or child configuration can shape.
+
+    Parent-side git over a payload snapshot must never consult the system or
+    the user's global config (external diff drivers, textconv, excludes,
+    hooks templates): `GIT_CONFIG_NOSYSTEM` plus a `/dev/null` global leave
+    only command-line `-c` overrides and the repo-local config — which the
+    payload paths reset to a known-good baseline before trusting.
+    """
+    env = dict(os.environ)
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+# The parent-authored known-good config for a standalone payload snapshot.
+# The child holds a shell inside the snapshot and may have edited .git/config
+# during its run (a snapshot-local `diff.<driver>.command` executed in the
+# PARENT process at capture — reproduced); capture overwrites the file with
+# these bytes before any parent-side git command trusts the repository.
+SNAPSHOT_GIT_CONFIG = (
+    "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n"
+    "\tlogallrefupdates = true\n"
+)
+
+
+def reset_snapshot_git_config(exec_root: Path) -> None:
+    """Overwrite a standalone snapshot's .git/config with the parent baseline."""
+    (Path(exec_root) / ".git" / "config").write_text(SNAPSHOT_GIT_CONFIG, encoding="utf-8")
+
+
 def _reproduce_confined_link(target_root: Path, src_link: Path, dest_link: Path) -> bool:
     """Reproduce one payload symlink in the snapshot, or refuse an escape (R1 item 4).
 
@@ -628,8 +662,11 @@ def provision_payload_snapshot(
     root = _resolve_root(worktree_root)
     if _is_within(root, target) or _is_within(target, root):
         raise ValueError(f"subagent worktree root {root} overlaps the snapshot target {target}")
-    # NB: the TARGET legitimately lives inside runtime data (data/skills/...);
-    # only the snapshot ROOT must stay outside repo/data (checked at config).
+    # The TARGET legitimately lives inside runtime data (data/skills/...), but
+    # the snapshot ROOT itself must stay outside BOTH the system repo and the
+    # runtime data root — a snapshot under data/ would put a child-writable
+    # Git repo inside live state (reproduced by review).
+    _assert_root_isolated(root, Path(__file__).resolve().parents[1], _data_dir(data_dir))
     snap = str(snapshot_id or "").strip()
     if not snap:
         raise ValueError("snapshot_id is required for a delegated payload snapshot")
@@ -640,19 +677,24 @@ def provision_payload_snapshot(
         if wt_path.exists():
             _force_rmtree(wt_path)  # idempotent re-provision of the SAME snapshot id
         source_hash = payload_content_hash(target)
+        env = isolated_git_env()
         try:
             entry_count = _copy_payload_inventory(target, wt_path)
-            _git(wt_path, "init")
-            _git(wt_path, "add", "-A")
+            # Fully config-isolated baseline: empty template dir (no user hooks),
+            # no global/system config, no excludes file and forced add so neither
+            # the user's global config nor a payload .gitignore can shape what
+            # the baseline commit records (Fable F1).
+            _git(wt_path, "init", "--template=", env=env)
+            _git(wt_path, "-c", "core.excludesfile=", "add", "-Af", env=env)
             _git(
                 wt_path,
                 "-c", "user.email=ouroboros@localhost", "-c", "user.name=Ouroboros",
                 "commit", "--allow-empty", "-m",
-                f"ouroboros: delegated payload baseline {snap}",
+                f"ouroboros: delegated payload baseline {snap}", env=env,
             )
-            baseline_sha = _git(wt_path, "rev-parse", "HEAD").stdout.strip()
-            baseline_tree = _git(wt_path, "rev-parse", "HEAD^{tree}").stdout.strip()
-            manifest_raw = _git(wt_path, "ls-tree", "-r", "-z", baseline_tree).stdout
+            baseline_sha = _git(wt_path, "rev-parse", "HEAD", env=env).stdout.strip()
+            baseline_tree = _git(wt_path, "rev-parse", "HEAD^{tree}", env=env).stdout.strip()
+            manifest_raw = _git(wt_path, "ls-tree", "-r", "-z", baseline_tree, env=env).stdout
             import hashlib
 
             manifest_digest = hashlib.sha256(
@@ -661,30 +703,32 @@ def provision_payload_snapshot(
                 raise RuntimeError(
                     "the live payload changed while it was being snapshotted "
                     "(another writer raced the copy); retry the delegation")
+            handle = ExecutionSnapshotHandle(
+                snapshot_id=snap,
+                task_id=str(task_id or ""),
+                path=str(wt_path),
+                target_root=str(target),
+                baseline_ref="",
+                baseline_sha=baseline_sha,
+                baseline_tree=baseline_tree,
+                manifest_digest=manifest_digest,
+                target_head="",
+                created_at=time.time(),
+                entry_count=entry_count,
+                standalone=True,
+                payload_hash=source_hash,
+            )
+            # Registry write INSIDE the cleanup scope: an unregistered snapshot
+            # directory would be invisible to disposal/retention (orphan leak).
+            entries = [e for e in _load_registry(data_dir) if e.get("path") != str(wt_path)]
+            record = asdict(handle)
+            record["kind"] = _KIND_DELEGATED_EXEC
+            record["excluded_untracked"] = []
+            entries.append(record)
+            _save_registry(entries, data_dir)
         except Exception:
             _force_rmtree(wt_path)
             raise
-        handle = ExecutionSnapshotHandle(
-            snapshot_id=snap,
-            task_id=str(task_id or ""),
-            path=str(wt_path),
-            target_root=str(target),
-            baseline_ref="",
-            baseline_sha=baseline_sha,
-            baseline_tree=baseline_tree,
-            manifest_digest=manifest_digest,
-            target_head="",
-            created_at=time.time(),
-            entry_count=entry_count,
-            standalone=True,
-            payload_hash=source_hash,
-        )
-        entries = [e for e in _load_registry(data_dir) if e.get("path") != str(wt_path)]
-        record = asdict(handle)
-        record["kind"] = _KIND_DELEGATED_EXEC
-        record["excluded_untracked"] = []
-        entries.append(record)
-        _save_registry(entries, data_dir)
         return handle
 
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import pathlib
+import threading
 from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Tuple
 
 from ouroboros import delegate_custody as custody
@@ -634,6 +635,70 @@ def _payload_selector_refusal(selector_root: str, retry_of: Any, bucket: Any,
     return ""
 
 
+def payload_host_instructions(text: str, skill_name: str) -> str:
+    """The payload-run variant of the host instructions (gate fix 3).
+
+    The generic text bans touching the host's "skills" — for a payload run that
+    blanket ban would contradict the assignment itself, so it is narrowed and an
+    explicit, truthful permission block is appended.
+    """
+    adjusted = text.replace(
+        "do not touch the host's runtime controls, skills, or memory",
+        "do not touch the host's runtime controls or memory")
+    return adjusted + (
+        "\nPAYLOAD ASSIGNMENT: this working tree is a PRIVATE standalone copy of "
+        f"the installed skill payload '{skill_name}'. Editing its user-authored "
+        "files IS your assignment — the prohibition above does not cover this "
+        "copy. Lifecycle/control files (manifest sidecars, review/grants/enabled "
+        "state, .git internals) remain off-limits and any change to them is "
+        "refused whole at apply. Your host reviews the resulting diff and "
+        "explicitly applies it to the live payload afterwards; the skill's "
+        "review then re-runs before the new content is relied on.")
+
+
+# In-process half of the atomic payload start claim; the cross-process half is
+# the O_EXCL lockfile below. Both exist because two parallel delegate_start
+# calls (same process or two workers) must produce exactly ONE started run.
+_PAYLOAD_CLAIM_LOCK = threading.Lock()
+
+
+def claimed_start_request(
+    drive: pathlib.Path, *, claim_target: str, **request_row: Any,
+) -> Tuple[bool, str]:
+    """Write the START_REQUESTED row, atomically fused with the payload busy check.
+
+    Gate fix 5: an unlocked busy read followed by a later request write let two
+    synchronized starts both pass the check and both start. For a payload run
+    (``claim_target`` non-empty) the busy check and the durable request write
+    happen under ONE claim lock, so exactly one caller wins; the loser gets the
+    holder id back and refuses typed. Non-payload rows pass straight through.
+    Returns ``(requested, busy_holder)``.
+    """
+    if not claim_target:
+        return custody.record_start_requested(drive, **request_row), ""
+    from ouroboros.platform_layer import (
+        acquire_exclusive_file_lock,
+        release_exclusive_file_lock,
+    )
+
+    lock_path = pathlib.Path(drive) / "state" / ".payload_delegation_claim.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _PAYLOAD_CLAIM_LOCK:
+        fd = acquire_exclusive_file_lock(lock_path, timeout_sec=20.0, stale_sec=120.0)
+        if fd is None:
+            # Fail CLOSED: without the cross-process half the claim would be a
+            # plain unlocked read again — the exact race this fix removes.
+            return False, "(payload claim lock unavailable — another start holds it)"
+        try:
+            holder = _payload_delegation_busy(drive, pathlib.Path(claim_target))
+            if holder:
+                return False, holder
+            return custody.record_start_requested(drive, **request_row), ""
+        finally:
+            if fd is not None:
+                release_exclusive_file_lock(lock_path, fd)
+
+
 def _payload_mutation_authority(
     ctx: ToolContext, drive: pathlib.Path, bucket: str, skill_name: str,
     binding: Any,
@@ -648,10 +713,22 @@ def _payload_mutation_authority(
     stores durably and retry/apply later re-resolve.
     """
     from ouroboros.subagents import delegated_run_shape
-    from ouroboros.tool_access import build_resolved_resource_binding
+    from ouroboros.tool_access import active_tool_profile, build_resolved_resource_binding
 
     b, s = str(bucket or "").strip(), str(skill_name or "").strip()
     if binding is None:
+        # Policy BEFORE lookup (Fable F4): a caller whose profile cannot hold
+        # payload-write authority gets an authority denial, not a target-
+        # resolution flavor from the binding builder's ValueError.
+        profile = str(active_tool_profile(ctx))
+        if profile not in _PAYLOAD_PRINCIPAL_PROFILES:
+            return None, None, _fail(
+                "delegate_start", "payload_delegation_forbidden",
+                "This is an AUTHORITY denial, not a lookup failure: only an "
+                "ordinary top-level task may delegate skill-payload work. Child, "
+                "acting, repair and ephemeral contexts keep their existing "
+                "narrower gates.",
+                profile=profile)
         try:
             binding = build_resolved_resource_binding(
                 ctx, root="skill_payload", operation="write", path=".",
@@ -817,10 +894,14 @@ def _write_payload_patch_artifacts(
         ARTIFACT_STATUS_READY_WITH_CHANGES,
     )
     from ouroboros.skill_loader import _iter_payload_files
+    from ouroboros.subagent_worktrees import isolated_git_env, reset_snapshot_git_config
     from ouroboros.utils import atomic_write_json, utc_now_iso
 
+    git_env = isolated_git_env()
+    diff_isolation = ("--no-ext-diff", "--no-textconv", "--no-renames")
+
     def _git(*args: str, input_bytes: bytes = b"") -> subprocess.CompletedProcess:
-        return subprocess.run(["git", *args], cwd=str(exec_root),
+        return subprocess.run(["git", *args], cwd=str(exec_root), env=git_env,
                               capture_output=True, input=input_bytes or None)
 
     def _manifest(status: str, **extra: Any) -> Dict[str, Any]:
@@ -833,6 +914,17 @@ def _write_payload_patch_artifacts(
         atomic_write_json(cap_dir / "workspace_patch.json", payload, trailing_newline=True)
         return payload
 
+    # The child held a shell inside this snapshot: neutralize the snapshot-local
+    # .git/config (a child-written `diff.<driver>.command` executed in the PARENT
+    # process — reproduced by review) and run every parent-side git command with
+    # system and global config disabled. Diff commands additionally pin
+    # --no-ext-diff / --no-textconv / --no-renames so no config or attribute can
+    # substitute content, and renames-off keeps the candidate parser total.
+    try:
+        reset_snapshot_git_config(exec_root)
+    except OSError as exc:
+        return _manifest(ARTIFACT_STATUS_FAILED,
+                         note=f"snapshot git config could not be reset: {exc}")
     baseline = str(entry.baseline_sha or "")
     resolved_root = exec_root.resolve()
     # Final loader-visible inventory; raises SkillPayloadUnreadable on
@@ -849,14 +941,25 @@ def _write_payload_patch_artifacts(
         chunk.decode("utf-8", errors="surrogateescape")
         for chunk in (listed.stdout or b"").split(b"\0") if chunk
     ]
-    union = sorted(set(final_rel) | set(baseline_rel))
+    def _z(paths: list) -> bytes:
+        return b"\0".join(
+            p.encode("utf-8", errors="surrogateescape") for p in paths) + b"\0"
+
+    # Only the FINAL loader-visible inventory rides as content. A baseline path
+    # absent from the final inventory is staged as a DELETION even when something
+    # still sits on disk there (e.g. a file replaced by an escaping symlink,
+    # which the inventory drops) — --add --remove over such a path would stage
+    # the on-disk escape artifact itself into the candidate (reproduced).
+    dropped = sorted(set(baseline_rel) - set(final_rel))
     staged = _git("update-index", "-z", "--add", "--remove", "--stdin",
-                  input_bytes=b"\0".join(
-                      p.encode("utf-8", errors="surrogateescape") for p in union) + b"\0")
+                  input_bytes=_z(sorted(final_rel)))
+    if staged.returncode == 0 and dropped:
+        staged = _git("update-index", "-z", "--force-remove", "--stdin",
+                      input_bytes=_z(dropped))
     if staged.returncode != 0:
         detail = (staged.stderr or staged.stdout or b"").decode("utf-8", errors="replace")
         return _manifest(ARTIFACT_STATUS_FAILED, note=f"staging failed: {detail.strip()[:300]}")
-    named = _git("diff", "--cached", "--name-only", "-z", baseline)
+    named = _git("diff", *diff_isolation, "--cached", "--name-only", "-z", baseline)
     if named.returncode != 0:
         detail = (named.stderr or named.stdout or b"").decode("utf-8", errors="replace")
         return _manifest(ARTIFACT_STATUS_FAILED, note=f"diff failed: {detail.strip()[:300]}")
@@ -874,6 +977,8 @@ def _write_payload_patch_artifacts(
                          current_head=current_head)
     non_utf8 = []
     for rel in changed:
+        if rel in dropped:
+            continue  # rides as a deletion; on-disk leftovers are not content
         candidate = resolved_root / rel
         if candidate.is_symlink() or not candidate.is_file():
             continue
@@ -887,13 +992,13 @@ def _write_payload_patch_artifacts(
             note="the candidate adds/modifies non-UTF-8 payload content, which the "
                  "permanent text-only skill contract refuses "
                  f"({', '.join(non_utf8[:5])}); the snapshot is preserved")
-    diff = _git("diff", "--cached", "--binary", baseline)
+    diff = _git("diff", *diff_isolation, "--cached", "--binary", baseline)
     if diff.returncode != 0:
         detail = (diff.stderr or diff.stdout or b"").decode("utf-8", errors="replace")
         return _manifest(ARTIFACT_STATUS_FAILED, note=f"patch emit failed: {detail.strip()[:300]}")
     patch_bytes = diff.stdout or b""
     (cap_dir / "workspace.patch").write_bytes(patch_bytes)
-    stat = _git("diff", "--cached", "--shortstat", baseline)
+    stat = _git("diff", *diff_isolation, "--cached", "--shortstat", baseline)
     return _manifest(
         ARTIFACT_STATUS_READY_WITH_CHANGES,
         sha256=hashlib.sha256(patch_bytes).hexdigest(),
@@ -938,6 +1043,137 @@ def _payload_reserved_paths(
         if is_skill_control_plane_path(live, state_root) or is_skill_owner_state_alias(live, state_root):
             reserved.append(rel)
     return sorted(set(reserved)), ""
+
+
+def _candidate_symlink_escapes(
+    patch_path: pathlib.Path, target: pathlib.Path,
+) -> Tuple[list, str]:
+    """Symlink-introducing patch entries whose target would escape the LIVE payload.
+
+    Containment is judged on the CANDIDATE, not the live preimage (gate fix 1):
+    a hunk that lands a mode-120000 entry gets its link target resolved as it
+    would land under the live payload root; an escaping resolution is refused
+    exactly like a ``../`` path escape. Capture pins ``--no-renames``, so every
+    symlink introduction appears as a full new-file/new-mode hunk and the parse
+    is total; any unparseable symlink entry fails CLOSED as a parse refusal.
+    Returns ``(escaping_rel_paths, parse_refusal)``.
+    """
+    import os
+
+    try:
+        raw = patch_path.read_bytes()
+    except OSError as exc:
+        return [], f"candidate patch unreadable: {exc}"
+    resolved_target = target.resolve()
+    escapes: list = []
+    path, is_link, link_target, in_hunk = "", False, None, False
+
+    def _flush() -> str:
+        nonlocal path, is_link, link_target, in_hunk
+        if is_link:
+            if not path or link_target is None:
+                return "a symlink-introducing patch entry could not be parsed"
+            dest = resolved_target / pathlib.PurePosixPath(path)
+            cand = (pathlib.Path(link_target) if os.path.isabs(link_target)
+                    else dest.parent / link_target)
+            landed = _resolved(cand)
+            if landed is None or not (
+                    landed == resolved_target or resolved_target in landed.parents):
+                escapes.append(path)
+        path, is_link, link_target, in_hunk = "", False, None, False
+        return ""
+
+    for line in raw.split(b"\n"):
+        if line.startswith(b"diff --git "):
+            err = _flush()
+            if err:
+                return [], err
+        elif line in (b"new file mode 120000", b"new mode 120000"):
+            is_link = True
+        elif line.startswith(b"+++ "):
+            name = line[4:].split(b"\t")[0].decode("utf-8", errors="surrogateescape")
+            if name.startswith("b/"):
+                path = name[2:]
+            elif name.startswith('"'):
+                # git-quoted (control/non-ASCII bytes in the name): fail closed
+                # rather than guess the octal unescaping for a symlink entry.
+                path = ""
+        elif line.startswith(b"@@"):
+            in_hunk = True
+        elif is_link and in_hunk and line.startswith(b"+") and link_target is None:
+            link_target = line[1:].decode("utf-8", errors="surrogateescape")
+    err = _flush()
+    if err:
+        return [], err
+    return sorted(set(escapes)), ""
+
+
+def _finalize_payload_apply(
+    ctx: ToolContext, *, rid: str, reason: str, target: pathlib.Path,
+    touched: list, ordered: list, manifest: Dict[str, Any],
+    state_root: pathlib.Path, skill_name: str, dispose: Any, already: bool,
+) -> str:
+    """The ONE post-apply finalizer (gate fix 4): advisory invalidation →
+    extension reconcile → verdict artifact → disposal, in this order, for BOTH
+    the fresh-apply and the already-applied/idempotent outcomes — an earlier
+    attempt may have died after mutating but before invalidation/reconcile.
+    A reconcile queue-write failure degrades the receipt honestly instead of
+    claiming the extension was reconciled off.
+    """
+    from ouroboros.tools.subagent_integration import (
+        _unwritten_disposition_text,
+        _write_verdict,
+    )
+
+    try:
+        from ouroboros.review_state import invalidate_advisory_after_mutation
+
+        invalidate_advisory_after_mutation(
+            pathlib.Path(getattr(ctx, "drive_root", ".")), mutation_root=target,
+            changed_paths=ordered, source_tool="integrate_delegated_patch")
+    except Exception:
+        pass
+    reconcile_err = ""
+    try:
+        # A stale ENABLED extension must stop being live until re-review (R1
+        # item 10); enablement/grants state itself is untouched by delegation.
+        from ouroboros.extension_reconcile_queue import request_extension_reconcile
+
+        request_extension_reconcile(state_root, skill_name,
+                                    reason="delegated_payload_apply", source="worker")
+    except Exception as exc:
+        log.warning("extension reconcile request failed after payload apply %s",
+                    rid, exc_info=True)
+        reconcile_err = f"{type(exc).__name__}: {exc}"
+    verdict_path = _write_verdict(
+        ctx, f"run_{rid}", outcome="applied",
+        reason=reason or ("already applied" if already else ""),
+        files=touched, manifest=manifest, applied=True, conflicts=[], protected=[],
+        target=str(target))
+    recorded, note = dispose("applied", True)
+    if not recorded:
+        return _unwritten_disposition_text(rid, str(target), "applied", True)
+    staleness = (
+        "The payload CONTENT CHANGED, so any prior skill review is now STALE for "
+        "the new content hash: run skill_preflight and skill_review before "
+        "relying on this skill. Enablement and grants were not changed by this "
+        "apply; "
+        + ("a stale enabled extension is reconciled off until re-review."
+           if not reconcile_err else
+           f"WARNING: the extension reconcile could NOT be queued ({reconcile_err})"
+           " — the review staleness above still holds, but a stale enabled "
+           "extension may remain live until the next restart or a manual "
+           "reconcile."))
+    if already:
+        return (f"OK: the live payload ALREADY carries run {rid}'s captured result "
+                f"(content hash match) — recorded as applied, nothing re-applied. "
+                f"Verdict: {verdict_path or '(unwritten)'}.\n{staleness}{note}")
+    return (
+        f"✅ Integrated delegated run {rid}'s patch into the live skill payload "
+        f"{target} ({len(ordered)} file(s)). No .git, index, or staging was created "
+        f"there.\n{str(manifest.get('diffstat') or '').strip()}\n"
+        f"Verdict: {verdict_path or '(unwritten)'}. The standalone snapshot is "
+        f"released.\n{staleness}{note}")
 
 
 def integrate_payload_patch(
@@ -1034,6 +1270,11 @@ def integrate_payload_patch(
     ordered = sorted(patch_touched)
     state_root = pathlib.Path(binding.state_drive_root)
     reserved, escape = _payload_reserved_paths(ordered, target, state_root)
+    if not escape:
+        # The CANDIDATE is judged too: a patch that lands an escaping symlink is
+        # refused whole, exactly like a ../ path escape (gate fix 1).
+        link_escapes, escape = _candidate_symlink_escapes(patch_path, target)
+        reserved = sorted(set(reserved) | set(link_escapes))
     if escape:
         return (f"⚠️ INTEGRATE_DELEGATED_PATH_ESCAPE: run {rid}'s patch was NOT "
                 f"applied — {escape}. The snapshot and the patch are preserved.")
@@ -1044,17 +1285,18 @@ def integrate_payload_patch(
             protected=reserved, target=str(target))
         return (
             f"⚠️ INTEGRATE_DELEGATED_RESERVED_PATHS: run {rid}'s patch touches "
-            f"{len(reserved)} reserved lifecycle/control path(s) "
-            f"({', '.join(reserved[:5])}{' …' if len(reserved) > 5 else ''}), so the "
-            "WHOLE apply is refused — nothing was partially filtered or applied. "
-            "The exact patch and the snapshot are preserved: read the patch, have "
-            "the change redone without reserved paths, or "
+            f"{len(reserved)} reserved lifecycle/control or escaping-symlink "
+            f"path(s) ({', '.join(reserved[:5])}{' …' if len(reserved) > 5 else ''}), "
+            "so the WHOLE apply is refused — nothing was partially filtered or "
+            "applied. The exact patch and the snapshot are preserved: read the "
+            "patch, have the change redone without those paths, or "
             "integrate_delegated_patch(decision='reject') to discard. "
             f"Verdict: {verdict_path or '(unwritten)'}.")
 
     baseline_hash = str((entry.resource_ref or {}).get("payload_hash")
                         or manifest.get("baseline_payload_hash") or "")
     result_hash = str(manifest.get("result_content_hash") or "")
+    skill_name = str((entry.resource_ref or {}).get("skill_name") or "")
     if not baseline_hash:
         return (f"⚠️ INTEGRATE_DELEGATED_BASELINE_UNVERIFIABLE: run {rid} carries no "
                 "recorded baseline payload hash, so drift cannot be judged. Nothing "
@@ -1068,17 +1310,13 @@ def integrate_payload_patch(
     if live_hash != baseline_hash:
         if result_hash and live_hash == result_hash:
             # Already applied (a crashed prior attempt landed the patch before its
-            # disposition row): dispose as applied instead of a false CAS conflict.
-            verdict_path = _write_verdict(
-                ctx, f"run_{rid}", outcome="applied", reason=reason or "already applied",
-                files=touched, manifest=manifest, applied=True, conflicts=[],
-                protected=[], target=str(target))
-            recorded, note = _dispose("applied", cleanup=True)
-            if not recorded:
-                return _unwritten_disposition_text(rid, str(target), "applied", True)
-            return (f"OK: the live payload ALREADY carries run {rid}'s captured result "
-                    f"(content hash match) — recorded as applied, nothing re-applied. "
-                    f"Verdict: {verdict_path or '(unwritten)'}.{note}")
+            # disposition row): dispose as applied instead of a false CAS conflict,
+            # through the SAME finalizer — the prior attempt may have died before
+            # its advisory invalidation and extension reconcile (gate fix 4).
+            return _finalize_payload_apply(
+                ctx, rid=rid, reason=reason, target=target, touched=touched,
+                ordered=ordered, manifest=manifest, state_root=state_root,
+                skill_name=skill_name, dispose=_dispose, already=True)
         verdict_path = _write_verdict(
             ctx, f"run_{rid}", outcome="baseline_drift", reason=reason, files=touched,
             manifest=manifest, applied=False, conflicts=[f"live={live_hash[:12]}",
@@ -1097,8 +1335,11 @@ def integrate_payload_patch(
                 "log and retry. Nothing was changed.")
     # Index-free apply with cwd = the LIVE payload (R1 item 3, probed): no .git,
     # no index, no staging is created in the live payload. Atomic on failure.
+    # Config-isolated like every parent-side git invocation of this surface.
+    from ouroboros.subagent_worktrees import isolated_git_env
+
     proc = subprocess.run(["git", "apply", str(patch_path)], cwd=str(target),
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, env=isolated_git_env())
     if proc.returncode != 0:
         custody.record_patch_apply_resolved(drive, entry, reason="apply_failed")
         stderr = (proc.stderr or proc.stdout or "").strip()
@@ -1112,41 +1353,10 @@ def integrate_payload_patch(
             f"said: {stderr[:600]}\nThe snapshot and the patch are preserved; "
             "reconcile and retry, or integrate_delegated_patch(decision='reject'). "
             f"Verdict: {verdict_path or '(unwritten)'}.")
-    try:
-        from ouroboros.review_state import invalidate_advisory_after_mutation
-
-        invalidate_advisory_after_mutation(
-            pathlib.Path(getattr(ctx, "drive_root", ".")), mutation_root=target,
-            changed_paths=ordered, source_tool="integrate_delegated_patch")
-    except Exception:
-        pass
-    skill_name = str((entry.resource_ref or {}).get("skill_name") or "")
-    try:
-        # A stale ENABLED extension must stop being live until re-review (R1
-        # item 10); enablement/grants state itself is untouched by delegation.
-        from ouroboros.extension_reconcile_queue import request_extension_reconcile
-
-        request_extension_reconcile(state_root, skill_name,
-                                    reason="delegated_payload_apply", source="worker")
-    except Exception:
-        log.warning("extension reconcile request failed after payload apply %s",
-                    rid, exc_info=True)
-    verdict_path = _write_verdict(
-        ctx, f"run_{rid}", outcome="applied", reason=reason, files=touched,
-        manifest=manifest, applied=True, conflicts=[], protected=[], target=str(target))
-    recorded, note = _dispose("applied", cleanup=True)
-    if not recorded:
-        return _unwritten_disposition_text(rid, str(target), "applied", True)
-    return (
-        f"✅ Integrated delegated run {rid}'s patch into the live skill payload "
-        f"{target} ({len(ordered)} file(s)). No .git, index, or staging was created "
-        f"there.\n{str(manifest.get('diffstat') or '').strip()}\n"
-        f"Verdict: {verdict_path or '(unwritten)'}. The standalone snapshot is "
-        "released.\nThe payload CONTENT CHANGED, so any prior skill review is now "
-        "STALE for the new content hash: run skill_preflight and skill_review before "
-        "relying on this skill. Enablement and grants were not changed by this apply; "
-        "a stale enabled extension is reconciled off until re-review."
-        f"{note}")
+    return _finalize_payload_apply(
+        ctx, rid=rid, reason=reason, target=target, touched=touched,
+        ordered=ordered, manifest=manifest, state_root=state_root,
+        skill_name=skill_name, dispose=_dispose, already=False)
 
 
 __all__ = [
@@ -1162,6 +1372,8 @@ __all__ = [
     "_retry_binding_refusal",
     "_validated_invocation",
     "capture_terminal_patch_for_drive",
+    "claimed_start_request",
     "integrate_payload_patch",
     "payload_content_hash",
+    "payload_host_instructions",
 ]

@@ -937,7 +937,11 @@ def _target_binding_operation(name: str, args: dict[str, Any]) -> str | None:
     # CONDITIONAL, never a static map entry (R1 item 1): delegate_start becomes
     # target-bound only when it explicitly selects an exact skill payload; a
     # plain or retry call keeps its current active-workspace behavior untouched.
-    if (name == "delegate_start" and str(args.get("root") or "").strip()
+    # ONLY the known selector value binds here — any other root value falls
+    # through to the handler's TYPED unsupported_root refusal instead of an
+    # untyped ValueError from binding construction (gate fix 9).
+    if (name == "delegate_start"
+            and str(args.get("root") or "").strip() == "skill_payload"
             and not str(args.get("retry_of") or "").strip()):
         return "write"
     return None
