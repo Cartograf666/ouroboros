@@ -10,16 +10,106 @@ They are deliberately SEPARATE from the REVIEW-prompt budget family
 prompts, not the agent's own context. Merging the two would couple unrelated
 concerns and is explicitly avoided.
 
-Constants only (no functions) so this module stays free against the codebase
-function-count gate (``ouroboros.review.MAX_TOTAL_FUNCTIONS``). Profile-keyed
-resolution (the low/max context modes) is layered on later without renaming
-these constants.
+Constants and frozen context-reclaim records only (no functions), so this
+module stays free against the codebase function-count gate
+(``ouroboros.review.MAX_TOTAL_FUNCTIONS``).
 
 Char-based guards assume the ~chars/4 estimate (``ouroboros.utils.estimate_tokens``);
 the comments give the approximate token equivalents.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Literal, Optional, Tuple
+
+# Owner-selected Low's total-context economy/short-window target. This is an
+# elastic target, not a provider admission ceiling: Phase 2 measures the sealed
+# Main input plus its unchanged response reserve against T and the selected
+# route capacity W, requests at most one useful reclaim pass, then sends best
+# effort. Crossing T never creates a task failure.
+OWNER_LOW_TARGET_TOKENS = 200_000
+
+MeasurementBasis = Literal["fresh_route_usage", "fresh_model_usage", "cold_estimate"]
+ReclaimStatus = Literal[
+    "applied", "no_eligible", "no_positive_reclaim", "checkpoint_failed",
+    "summarizer_failed", "no_measurable_shrink", "binding_mismatch",
+]
+
+
+@dataclass(frozen=True)
+class ContextReclaimRequest:
+    route_fp: str
+    round_id: str
+    transcript_sha256: str
+    measurement_basis: MeasurementBasis
+    measurement_density: float
+    reclaim_goal_tokens: int
+    allow_partial_shrink: bool = True
+
+
+@dataclass(frozen=True)
+class ContextReclaimReceipt:
+    status: ReclaimStatus
+    before_transcript_sha256: str
+    after_transcript_sha256: str
+    selection_fingerprint: str
+    selected_unit_ids: Tuple[str, ...]
+    reclaimed_tokens: int
+    goal_reached: bool
+    checkpoint_ref: Optional[Dict[str, Any]]
+    capsule_refs: Tuple[Dict[str, Any], ...]
+
+
+class SummarizerContextOverflow(RuntimeError):
+    """Typed permission to split one summarizer batch or source."""
+
+
+class _UnsafeVisual(ValueError):
+    pass
+
+
+class _UnitSummaryFailure(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class _AtomicUnit:
+    unit_id: str
+    start: int
+    end: int
+    raw_sha256: str
+    raw_size_bytes: int
+    source_text: str
+    source_sha256: str
+    predicted_reclaim_tokens: int
+    generation: int
+    lineage_hashes: Tuple[str, ...]
+    source_refs: Tuple[Dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class _SelectedUnit:
+    unit: _AtomicUnit
+    summary_budget_tokens: int
+    negative_memo_key: str
+
+
+@dataclass(frozen=True)
+class _Selection:
+    units: Tuple[_SelectedUnit, ...]
+    fingerprint: str
+    predicted_reclaim_tokens: int
+
+
+@dataclass(frozen=True)
+class _Part:
+    root_id: str
+    source_id: str
+    start_char: int
+    end_char: int
+    text: str
+    sha256: str
 
 # Main-loop emergency tool-history compaction trigger (~300K tokens at chars/4).
 # Remote routine compaction stays off by design; this is the overflow backstop.
@@ -70,10 +160,6 @@ BG_STATE_JSON_WARN_CHARS = 200_000
 
 # WARN threshold for a single oversized governance/knowledge context section.
 LARGE_CONTEXT_SECTION_CHARS = 200_000
-
-# Main-loop assembled-context soft cap (tokens). A no-op recorder
-# (P1 no-silent-truncation); the live transcript is bounded by compaction below.
-CONTEXT_SOFT_CAP_TOKENS = 200_000
 
 # --- Low-profile (≈200K window / local models) overrides -------------------
 # These tighten the live working set in low context mode. They never shorten the

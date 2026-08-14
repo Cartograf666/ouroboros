@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.config import get_context_mode
 from ouroboros.context_budget import (
-    CONTEXT_SOFT_CAP_TOKENS,
     LARGE_CONTEXT_SECTION_CHARS,
     MAX_RECENT_CHAT_TAIL,
     SCRATCHPAD_SECTION_BUDGET_CHARS,
@@ -53,7 +52,6 @@ from ouroboros.context_layout import architecture_context_section
 from ouroboros.contracts.task_contract import normalize_bool
 from ouroboros.memory import Memory
 from ouroboros.utils import (
-    estimate_tokens,
     get_git_info,
     read_json_dict,
     read_text,
@@ -1369,7 +1367,6 @@ def build_llm_messages(
     memory: Memory,
     task: Dict[str, Any],
     review_context_builder: Optional[Any] = None,
-    soft_cap_tokens: int = CONTEXT_SOFT_CAP_TOKENS,
     ctx: Any = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     # Keep the legacy public shape while publishing the immutable plan on the
@@ -1385,10 +1382,8 @@ def build_llm_messages(
     )
     if ctx is not None:
         ctx.context_fit_plan = plan
-    messages, cap_info = apply_message_token_soft_cap(
-        plan.messages_for(plan.initial_mode), soft_cap_tokens,
-    )
-    cap_info["context_fit"] = {
+    messages = plan.messages_for(plan.initial_mode)
+    cap_info: Dict[str, Any] = {"context_fit": {
         "core_sha256": plan.core_sha256,
         "preferred_mode": plan.preferred_mode,
         "initial_mode": plan.initial_mode,
@@ -1400,24 +1395,5 @@ def build_llm_messages(
         "max_calibrated_tokens": plan.max_projection.calibrated_tokens,
         "low_estimated_tokens": plan.low_projection.estimated_tokens,
         "low_calibrated_tokens": plan.low_projection.calibrated_tokens,
-    }
+    }}
     return messages, cap_info
-
-
-def apply_message_token_soft_cap(
-    messages: List[Dict[str, Any]],
-    soft_cap_tokens: int,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    def _estimate_message_tokens(msg: Dict[str, Any]) -> int:
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            total = sum(estimate_tokens(str(b.get("text", "")))
-                        for b in content if isinstance(b, dict) and b.get("type") == "text")
-            return total + 6
-        return estimate_tokens(str(content)) + 6
-
-    estimated = sum(_estimate_message_tokens(m) for m in messages)
-    info: Dict[str, Any] = {"estimated_tokens_before": estimated, "estimated_tokens_after": estimated, "soft_cap_tokens": soft_cap_tokens, "trimmed_sections": []}
-    if soft_cap_tokens > 0 and estimated > soft_cap_tokens:
-        info["trimmed_sections"].append("disabled_no_silent_truncation")
-    return messages, info

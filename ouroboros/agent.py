@@ -31,7 +31,6 @@ from ouroboros.tools import ToolRegistry
 from ouroboros.tools.registry import ToolContext
 from ouroboros.memory import Memory
 from ouroboros.context import build_llm_messages
-from ouroboros.context_budget import CONTEXT_SOFT_CAP_TOKENS
 from ouroboros.loop import run_llm_loop
 from ouroboros.config import EFFORT_SCALE, resolve_effort
 from ouroboros.agent_startup_checks import (
@@ -1041,26 +1040,11 @@ class OuroborosAgent:
 
         self._emit_typing_start()
 
-        _use_local = os.environ.get("USE_LOCAL_MAIN", "").lower() in ("true", "1")
-        _soft_cap = CONTEXT_SOFT_CAP_TOKENS
-        if _use_local:
-            _local_ctx = int(os.environ.get("LOCAL_MODEL_CONTEXT_LENGTH", "0"))
-            if _local_ctx <= 0:
-                try:
-                    from ouroboros.local_model import get_manager
-                    _local_ctx = get_manager().get_context_length()
-                except Exception:
-                    _local_ctx = 0
-            if _local_ctx <= 0:
-                _local_ctx = 16384
-            _soft_cap = max(2048, _local_ctx // 2)
-
         messages, cap_info = build_llm_messages(
             env=self.env,
             memory=self.memory,
             task=task,
             review_context_builder=lambda: build_review_context(self.env),
-            soft_cap_tokens=_soft_cap,
             ctx=ctx,
         )
         # The second of the three places a reduction must reach (the durable record

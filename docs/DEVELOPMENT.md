@@ -560,17 +560,24 @@ mode and never applies to P3 commit/scope review.
 
 ### Invariant: Compaction must earn its rewrite
 
-Emergency compaction separates necessity from utility. Total calibrated wire
-pressure, including system/context blocks and tool schemas, decides whether
-relief is needed; only the compactable transcript and its best reachable
-post-pass floor decide whether a pass can help. When too few eligible spans
-exist or that floor remains over the trigger, record durable disclosed
-hysteresis instead of repeatedly paying a summarizer and rewriting the prompt.
-The pass's own rewrite cannot satisfy the growth condition: genuine
-compactable-region growth or the bounded round interval must rearm it. Preserve
-the independent reactive provider-overflow retry. This prevents an unchanged
-irreducible frame from destroying cache reuse while still allowing later useful
-compaction.
+Context compaction is a deficit-requested materializer, not an independent
+threshold, timer, route, or retry policy. It first performs pure selection over
+completed atomic units: one assistant tool-call message plus all and only its
+contiguous matching results. User turns are hard boundaries; malformed,
+missing, delayed, duplicated, visually opaque, or corrupt-capsule units remain
+byte-identical. No eligible positive reclaim means no checkpoint, summarizer
+call, or transcript mutation.
+
+For a non-empty selection, persist the exact actor-visible checkpoint before
+calling the summarizer. Summary input covers complete stable hashed chunks with
+gap-free offsets; it never uses head excerpts, long-string markers, or hidden
+argument/result omissions. Only typed summarizer context overflow may split a
+source recursively. Missing leaf coverage keeps that whole atomic unit raw,
+while independently covered units may apply. A replacement publishes only
+after transcript/unit binding, complete coverage, checkpoint provenance, and a
+strictly smaller deterministic representation are all proved. Capsules carry
+host-only generation, source-hash, part, checkpoint, and CAS-ref metadata so a
+later pass can recompact them without losing the original provenance union.
 
 ### Invariant: No silent truncation
 

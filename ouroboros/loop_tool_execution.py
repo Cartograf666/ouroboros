@@ -1160,6 +1160,7 @@ def process_tool_results(
 
         llm_trace["tool_calls"].append({
             "tool": fn_name,
+            "tool_call_id": exec_result["tool_call_id"],
             "args": _safe_args(exec_result["args_for_log"]),
             # Evidence-parity (v6.71.1): store the SAME view the agent saw
             # (per-tool TOOL_RESULT_LIMITS, head-truncated) rather than a hidden
