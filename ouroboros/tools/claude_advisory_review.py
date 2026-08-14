@@ -202,6 +202,8 @@ def _release_metadata_preflight(
         web_package_path = repo_dir / "web" / "package.json"
         arch_path = repo_dir / "docs" / "ARCHITECTURE.md"
         api_types_path = repo_dir / "web" / "modules" / "api_types.js"
+        site_install_path = repo_dir / "site" / "install" / "index.html"
+        docs_install_path = repo_dir / "docs" / "install" / "index.html"
         version_str = version_path.read_text(encoding="utf-8").strip()
         if not is_release_version(version_str):
             return None
@@ -219,6 +221,9 @@ def _release_metadata_preflight(
             readme_text=readme_text,
             arch_text=arch_text,
             api_types_text=api_types_text,
+            download_readme_text=readme_text,
+            site_install_text=(site_install_path.read_text(encoding="utf-8") if site_install_path.exists() else ""),
+            docs_install_text=(docs_install_path.read_text(encoding="utf-8") if docs_install_path.exists() else ""),
             detailed=True,
         )
         if readme_text:

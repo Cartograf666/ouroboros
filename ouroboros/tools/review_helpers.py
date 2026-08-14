@@ -1438,20 +1438,20 @@ def check_worktree_version_sync(repo_dir) -> str:
         version_str = version_path.read_text(encoding="utf-8").strip()
         if not is_release_version(version_str):
             return ""
-        pyproject = repo_dir / "pyproject.toml"
-        uv_lock = repo_dir / "uv.lock"
-        web_package = repo_dir / "web" / "package.json"
-        readme = repo_dir / "README.md"
-        arch = repo_dir / "docs" / "ARCHITECTURE.md"
-        api_types = repo_dir / "web" / "modules" / "api_types.js"
+
+        def _read(rel_path: str) -> str:
+            return path.read_text(encoding="utf-8") if (path := repo_dir / rel_path).exists() else ""
         desync = version_carrier_desyncs(
             version_str,
-            pyproject_text=pyproject.read_text(encoding="utf-8") if pyproject.exists() else "",
-            uv_lock_text=uv_lock.read_text(encoding="utf-8") if uv_lock.exists() else "",
-            web_package_text=web_package.read_text(encoding="utf-8") if web_package.exists() else "",
-            readme_text=readme.read_text(encoding="utf-8") if readme.exists() else "",
-            arch_text=arch.read_text(encoding="utf-8") if arch.exists() else "",
-            api_types_text=api_types.read_text(encoding="utf-8") if api_types.exists() else "",
+            pyproject_text=_read("pyproject.toml"),
+            uv_lock_text=_read("uv.lock"),
+            web_package_text=_read("web/package.json"),
+            readme_text=_read("README.md"),
+            arch_text=_read("docs/ARCHITECTURE.md"),
+            api_types_text=_read("web/modules/api_types.js"),
+            download_readme_text=_read("README.md"),
+            site_install_text=_read("site/install/index.html"),
+            docs_install_text=_read("docs/install/index.html"),
         )
         if desync:
             return f"VERSION={version_str} but {', '.join(desync)} differ. Sync version carriers before committing."

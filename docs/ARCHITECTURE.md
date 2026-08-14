@@ -2248,6 +2248,22 @@ Platform builds precompile bundled Python with unchecked-hash bytecode. Sealing 
 
 The release proof begins with the final DMG, AppImage, tarball, or ZIP rather than its staging directory. Each platform shard checks the embedded repository bundle, packaged CLI, and managed Claudexor seed plus Node by starting the owned daemon, completing a fixture task, and verifying an identity-bound stop. The Linux AppImage is extracted for metadata and SBOM inspection, then run through the FUSE-independent runtime to prove exact version output, CLI dispatch, browser-fallback readiness, payload lifetime after CLI-started relaunch, main-executable libraries, and clean shutdown; its payload remains read-only at runtime. The nested cleanup proof follows the live `runtime → AppRun custodian → launcher` chain, stops the launcher recorded by the PID file, waits for the owning runtime, and requires both the extraction and its private base to be absent. This is browser-fallback evidence, not a claim that the packaged payload contains a native GTK/Qt backend. The macOS smoke also verifies its Finder installation surfaces. On Linux, the proven tarball payload is also wrapped into the three native packages; each receives its own digest-bound package-manager smoke receipt after the installed user unit and its key lifecycle directives, the packaged CLI, and the bounded desktop-launcher start all pass in the package-manager container, plus provenance attestation. A digest-pinned Syft build produces CycloneDX inventories from extracted payload bytes; the tarball inventory is reused for the three native wrappers instead of rescanning identical bytes. GitHub SBOM attestations bind the relevant payload inventory to each final asset. The release job accepts only the seven expected release assets, recalculates their digests, verifies both predicate types, writes the checksum/evidence capsule, and rechecks the remote tag immediately before publication. Signing credentials remain step-scoped and are absent from SBOM and attestation steps.
 
+Public installer naming and links are part of that release projection.
+`release_sync.py::RELEASE_ASSET_TEMPLATES` is the filename SSOT shared by the
+proof builder, README, and the source/generated install pages. A version bump
+rewrites only named download references and `data-release-download` anchors to
+immutable `/releases/download/v{VERSION}/...` URLs; the versioned
+`/releases/latest/download/...` shape is forbidden because GitHub excludes
+prereleases from `latest`. Generated release notes expose direct links only for
+the seven assets already accepted by proof assembly.
+
+The default repository README and legacy GitHub Pages deployment both use the
+stable `main` boundary (`main:/docs` for Pages), not the development
+`ouroboros` branch. Stable promotion advances `main` only after the release is
+published with all seven proof-bound installers. An unreleased development
+VERSION can therefore exist without exposing dead installer links to users;
+an omitted promotion leaves the previous working release public.
+
 ### Docker
 
 Docker runs the web and server runtime without PyWebView. Non-loopback binding requires the explicit network-authentication policy; container packaging does not create a weaker owner boundary.

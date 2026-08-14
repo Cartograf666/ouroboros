@@ -3,20 +3,72 @@
 <a href="https://github.com/oslook/github-trending/blob/1d61d20a46f66a9590286bf23a8ce8db99be3acf/2026-08-04/python_weekly_trending.json"><img src="assets/github-trending.svg" width="250" height="55" alt="GitHub Trending: #9 Python weekly, August 2026"></a>
 
 [![GitHub stars](https://img.shields.io/github/stars/razzant/ouroboros?style=flat&logo=github)](https://github.com/razzant/ouroboros/stargazers)
-[![Downloads](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Frazzant%2Fouroboros%2Fbadges%2Fdownloads.json)](https://github.com/razzant/ouroboros/releases)
+[![Downloads](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Frazzant%2Fouroboros%2Fbadges%2Fdownloads.json)](https://ouroboros-agent.ai/install/)
 [![Website](https://img.shields.io/badge/website-ouroboros--agent.ai-c93545.svg)](https://ouroboros-agent.ai/)
 [![Technical report](https://img.shields.io/badge/technical_report-arXiv%3A2608.08311-b31b1b.svg)](https://arxiv.org/abs/2608.08311)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![macOS 12+](https://img.shields.io/badge/macOS-12%2B-black.svg)](https://github.com/razzant/ouroboros/releases)
-[![Linux](https://img.shields.io/badge/Linux-x86__64-orange.svg)](https://github.com/razzant/ouroboros/releases)
-[![Windows](https://img.shields.io/badge/Windows-x64-blue.svg)](https://github.com/razzant/ouroboros/releases)
+[![macOS 12+](https://img.shields.io/badge/macOS-12%2B-black.svg)][download-macos-arm64]
+[![Linux](https://img.shields.io/badge/Linux-x86__64-orange.svg)](https://ouroboros-agent.ai/install/#linux)
+[![Windows](https://img.shields.io/badge/Windows-x64-blue.svg)][download-windows-x64]
 [![OuroborosHub](https://img.shields.io/badge/OuroborosHub-skills%20marketplace-8A2BE2.svg)](https://github.com/razzant/OuroborosHub)
 [![Version 6.101.1](https://img.shields.io/badge/version-6.101.1-green.svg)](VERSION)
 
 Ouroboros is an open-source, general-purpose AI agent whose identity, durable memory, and history continue across tasks and restarts. It works on external projects, coordinates a live swarm of specialist agents, and can rewrite the implementation it runs on, including its code, architecture, prompts, tools, and dependencies. Reflection can also change how it understands itself without severing that continuity.
 
 It runs as a native desktop app or through a headless CLI. The runtime keeps its repository, durable memory, history, and interface on your machine, while model inference can use remote APIs you configure or a local GGUF model.
+
+## Download Ouroboros
+
+> **Just want to use Ouroboros? Click the download for your platform below. You do not need to clone this repository or install Python or uv.**
+
+- **macOS 12+ on Apple silicon:** [**Download for macOS (.dmg)**][download-macos-arm64]
+- **Windows x64:** [**Download for Windows (.zip)**][download-windows-x64]
+- **Debian, Ubuntu, or Astra Linux x86_64:** [**Download the Debian package (.deb)**][download-linux-deb-amd64]
+- **Fedora or RHEL x86_64:** [**Download the RPM package (.rpm)**][download-linux-rpm-x86_64]
+- **RED OS 8 x86_64:** [**Download the RED OS package (.rpm)**][download-linux-rpm-red80-x86_64]
+- **Other Linux x86_64:** [**Download the portable AppImage**][download-linux-appimage-x86_64] or the [tar.gz archive][download-linux-x86_64]
+
+Files named `SHA256SUMS`, `release-evidence.json`, `release-smoke-*.json`, and `sbom-*.cdx.json` are verification evidence, not additional installers.
+
+### macOS quick start
+
+1. Click [**Download for macOS (.dmg)**][download-macos-arm64]. The current file is named `Ouroboros-<version>.dmg`.
+2. Open the DMG and drag `Ouroboros.app` onto the **Applications** shortcut.
+3. Open Ouroboros from Applications. If Gatekeeper asks, right-click the app and choose **Open**.
+
+<p align="center">
+  <img src="assets/install-macos.png" width="760" alt="Ouroboros DMG window with a large arrow from Ouroboros.app to the Applications shortcut and Install CLI.command below">
+</p>
+
+### Windows quick start
+
+1. Click [**Download for Windows (.zip)**][download-windows-x64].
+2. Extract the ZIP.
+3. Open the extracted `Ouroboros` folder and run `Ouroboros.exe`.
+
+### Linux quick start
+
+- On Debian, Ubuntu, or Astra Linux, download the `.deb` above and run `sudo apt install ./ouroboros_*_amd64.deb`.
+- On Fedora or RHEL, download the generic `.rpm` above and run `sudo dnf install ./ouroboros-*.x86_64.rpm`. RED OS 8 has its own `red80` package.
+- On another x86_64 distribution, download the AppImage, make it executable with `chmod +x Ouroboros-*.AppImage`, and run it. Git must already be installed.
+
+To run tasks, configure at least one supported remote provider API key or a local GGUF model. The first-run wizard guides model access, review policy, and budget setup.
+
+<details>
+<summary>Optional CLI included with desktop downloads</summary>
+
+The desktop packages already contain an optional CLI installer. On macOS, after copying the app to Applications, double-click `Install CLI.command` in the mounted DMG. On Linux use `./Ouroboros/bin/install-ouroboros-cli`; on Windows use `Ouroboros\bin\install-ouroboros-cli.cmd`. These installers create a user-local `ouroboros` command without sudo. You do not need Python or uv.
+
+</details>
+
+[download-macos-arm64]: https://github.com/razzant/ouroboros/releases/download/v6.101.1/Ouroboros-6.101.1.dmg
+[download-windows-x64]: https://github.com/razzant/ouroboros/releases/download/v6.101.1/Ouroboros-6.101.1-windows-x64.zip
+[download-linux-deb-amd64]: https://github.com/razzant/ouroboros/releases/download/v6.101.1/ouroboros_6.101.1_amd64.deb
+[download-linux-rpm-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.101.1/ouroboros-6.101.1-1.x86_64.rpm
+[download-linux-rpm-red80-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.101.1/ouroboros-6.101.1-1.red80.x86_64.rpm
+[download-linux-appimage-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.101.1/Ouroboros-6.101.1-linux-x86_64.AppImage
+[download-linux-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.101.1/Ouroboros-6.101.1-linux-x86_64.tar.gz
 
 Ouroboros bundles [Claudexor](https://github.com/razzant/claudexor) as its local execution layer for delegated coding and hosted-agent review. Ouroboros owns the task, memory, review, and final integration, while Claudexor runs the selected connected coding harness and returns durable execution evidence. [Explore Claudexor](https://claudexor.ai/).
 
@@ -32,89 +84,6 @@ The charts below are self-reported results on Terminal-Bench 2.1, OSWorld-Verifi
   <a href="https://ouroboros-agent.ai/benchmarks/"><img src="assets/bench-osworld.svg" width="375" alt="OSWorld-Verified: Ouroboros against the public leaderboard, including the matched Claude Sonnet-4.6 pair"></a>
   <a href="https://ouroboros-agent.ai/benchmarks/"><img src="assets/bench-cl-bench.svg" width="375" alt="CL-Bench: Ouroboros against in-context learning baselines, Claude Code, and Codex on matched models"></a>
 </p>
-
-## Install
-
-### macOS (Apple silicon)
-
-1. Open the [latest stable release](https://github.com/razzant/ouroboros/releases/latest) and download `Ouroboros-<version>.dmg`.
-2. Open the DMG and drag `Ouroboros.app` onto the **Applications** shortcut.
-3. Open Ouroboros from Applications. If Gatekeeper asks, right-click the app and choose **Open**.
-
-<p align="center">
-  <img src="assets/install-macos.png" width="760" alt="Ouroboros DMG window with a large arrow from Ouroboros.app to the Applications shortcut and Install CLI.command below">
-</p>
-
-Optional CLI: after the app is in Applications, double-click `Install CLI.command` in the mounted DMG. It creates a user-local `ouroboros` command without sudo.
-
-To run tasks, configure at least one supported remote provider API key or a local GGUF model. The first-run wizard guides model access, review policy, and budget setup.
-
-### Linux and Windows
-
-- **Debian / Ubuntu / Astra Linux x86_64:** when the selected release lists `ouroboros_<version>_amd64.deb`, download it and run `sudo apt install ./ouroboros_<version>_amd64.deb`. It installs Git as a package dependency, installs Ouroboros to `/opt/ouroboros`, puts `ouroboros` on `PATH`, and adds a desktop entry plus an opt-in systemd user unit.
-- **Fedora / RHEL x86_64:** when listed, download `ouroboros-<version>-1.x86_64.rpm` and run `sudo dnf install ./ouroboros-<version>-1.x86_64.rpm`. Same layout, Git dependency, and opt-in user unit as the `.deb`.
-- **RED OS 8 x86_64:** when listed, download `ouroboros-<version>-1.red80.x86_64.rpm` and run `sudo dnf install ./ouroboros-<version>-1.red80.x86_64.rpm`. It carries the `red80` release tag. CI attempts non-blocking install-and-run smokes on Astra Linux 1.8 and RED OS 8; inspect the tagged workflow run for their outcome.
-- **Other Linux x86_64:** from the [selected release](https://github.com/razzant/ouroboros/releases), use `Ouroboros-<version>-linux-x86_64.AppImage` when listed: make it executable and run it, or pass `--cli <args>` for the bundled CLI. Git must already be installed. If that release does not list an AppImage, use the extraction-friendly tarball.
-- **Windows x64:** from the [latest stable release](https://github.com/razzant/ouroboros/releases/latest), download `Ouroboros-<version>-windows-x64.zip`, extract it, and run `Ouroboros\Ouroboros.exe`. The optional CLI installer is `Ouroboros\bin\install-ouroboros-cli.cmd`.
-
-Prerelease artifacts stay on their tag pages; `/releases/latest` points to the latest stable release. If bundled browser tools on Linux need host libraries, run `./Ouroboros/_internal/python-standalone/bin/python3 -m playwright install-deps chromium webkit`. See the [full install and verification guide](https://ouroboros-agent.ai/install/) for source setup and release proof files.
-
-The native `.deb` and `.rpm` never enable or start their user service. It is an
-alternative to launching from the desktop entry and controls only instances
-started through `systemctl --user`. See the [systemd user-service guide](packaging/systemd/README.md).
-
-#### Install the Linux AppImage
-
-When a release lists the AppImage, user-level installation means copying the
-portable executable to a stable path and making it executable; it does not need
-root access. Ouroboros bootstrap still requires Git on the host:
-
-```bash
-VERSION=x.y.z
-install -Dm755 "./Ouroboros-${VERSION}-linux-x86_64.AppImage" \
-  "$HOME/Applications/Ouroboros.AppImage"
-"$HOME/Applications/Ouroboros.AppImage"
-```
-
-The embedded desktop file and icon allow compatible AppImage integration tools
-to register that stable path with the application menu. The same file exposes
-the packaged CLI:
-
-```bash
-"$HOME/Applications/Ouroboros.AppImage" --cli status
-```
-
-If FUSE mounting is unavailable, extract and run ephemerally instead:
-
-```bash
-APPIMAGE_EXTRACT_AND_RUN=1 "$HOME/Applications/Ouroboros.AppImage"
-```
-
-Chromium and WebKit binaries are bundled, but their distro-level shared
-libraries remain host dependencies. If a browser engine reports missing
-libraries, use the native `.deb`/`.rpm` package where available, or extract the
-AppImage and let its bundled Playwright report/install the packages required by
-your distribution:
-
-```bash
-"$HOME/Applications/Ouroboros.AppImage" --appimage-extract
-./squashfs-root/usr/lib/ouroboros/_internal/python-standalone/bin/python3 \
-  -m playwright install-deps chromium webkit
-```
-
-Use your existing **Codex, Claude Code, or Cursor subscriptions** for
-delegated coding and review — Ouroboros drives them through
-[Claudexor](https://github.com/razzant/claudexor), its bundled multi-harness
-engine. Connect accounts in **Settings → Agents**; no separate
-install is needed. Works on macOS and Linux. Release artifacts carry the exact
-reviewed engine archive; source checkouts fetch that same pinned archive on
-first use. Connecting an account installs or repairs the engine in the
-foreground, and delegated work does the same lazily. If that checkout or an
-older package lacks the exact tested Node, the same action obtains its
-review-bound official archive too. A newer pinned engine is staged while the
-current daemon keeps running, then activates on its next natural start. This
-also covers upgrades from older Ouroboros versions that did not bundle
-Claudexor.
 
 ---
 
@@ -177,7 +146,55 @@ Benchmark adapters, run scripts, and per-benchmark methodology live in [`devtool
 
 ---
 
-## Install the isolated CLI with uv
+## Advanced installation
+
+Normal desktop users can stop after the download and quick-start instructions above. The options below are for detailed Linux setup, headless use, and development.
+
+### Packaged Linux details
+
+- **Debian / Ubuntu / Astra Linux x86_64:** [download the `.deb`][download-linux-deb-amd64] and run `sudo apt install ./ouroboros_*_amd64.deb`. It installs Git as a package dependency, installs Ouroboros to `/opt/ouroboros`, puts `ouroboros` on `PATH`, and adds a desktop entry plus an opt-in systemd user unit.
+- **Fedora / RHEL x86_64:** [download the generic `.rpm`][download-linux-rpm-x86_64] and run `sudo dnf install ./ouroboros-*.x86_64.rpm`. It uses the same layout, Git dependency, and opt-in user unit as the `.deb`.
+- **RED OS 8 x86_64:** [download the `red80` package][download-linux-rpm-red80-x86_64] and run `sudo dnf install ./ouroboros-*.red80.x86_64.rpm`. CI also attempts non-blocking install-and-run smokes on Astra Linux 1.8 and RED OS 8; inspect the tagged workflow run for their outcome.
+- **Other Linux x86_64:** use the [AppImage][download-linux-appimage-x86_64] or the extraction-friendly [tar.gz archive][download-linux-x86_64]. Git must already be installed.
+
+The native `.deb` and `.rpm` never enable or start their user service. It is an alternative to launching from the desktop entry and controls only instances started through `systemctl --user`. See the [systemd user-service guide](packaging/systemd/README.md).
+
+#### Install the Linux AppImage
+
+User-level installation means copying the portable executable to a stable path and making it executable; it does not need root access. Ouroboros bootstrap still requires Git on the host:
+
+```bash
+VERSION=x.y.z
+install -Dm755 "./Ouroboros-${VERSION}-linux-x86_64.AppImage" \
+  "$HOME/Applications/Ouroboros.AppImage"
+"$HOME/Applications/Ouroboros.AppImage"
+```
+
+The embedded desktop file and icon allow compatible AppImage integration tools to register that stable path with the application menu. The same file exposes the packaged CLI:
+
+```bash
+"$HOME/Applications/Ouroboros.AppImage" --cli status
+```
+
+If FUSE mounting is unavailable, extract and run ephemerally instead:
+
+```bash
+APPIMAGE_EXTRACT_AND_RUN=1 "$HOME/Applications/Ouroboros.AppImage"
+```
+
+Chromium and WebKit binaries are bundled, but their distro-level shared libraries remain host dependencies. If a browser engine reports missing libraries, use the native `.deb`/`.rpm` package where available, or extract the AppImage and let its bundled Playwright report/install the packages required by your distribution:
+
+```bash
+"$HOME/Applications/Ouroboros.AppImage" --appimage-extract
+./squashfs-root/usr/lib/ouroboros/_internal/python-standalone/bin/python3 \
+  -m playwright install-deps chromium webkit
+```
+
+### Connected coding subscriptions
+
+Use your existing **Codex, Claude Code, or Cursor subscriptions** for delegated coding and review. Ouroboros drives them through [Claudexor](https://github.com/razzant/claudexor), its bundled multi-harness engine. Connect accounts in **Settings → Agents**; no separate Claudexor install is needed. Release artifacts carry the exact reviewed engine and Node archives. Source checkouts obtain those same pinned archives on first use.
+
+### Headless CLI with uv
 
 For a user-level CLI/server install without cloning a working tree, uv can
 build Ouroboros directly from the contribution branch:
@@ -203,11 +220,13 @@ resolved from `pyproject.toml`. Use the source setup below for a lock-verified
 environment, development, repository tests, and the complete browser extras,
 or use a platform release artifact for the packaged desktop runtime.
 
----
+<a id="run-from-source"></a>
 
-## Run from Source
+### Develop or run from source
 
-### Requirements
+Clone the repository only when you plan to contribute, modify Ouroboros, run repository tests, or need a lock-verified development checkout. Normal users should use the packaged downloads above.
+
+#### Requirements
 
 - Python 3.10+
 - uv 0.12.1 (the exact resolver version pinned by this checkout)
@@ -215,7 +234,7 @@ or use a platform release artifact for the packaged desktop runtime.
 - Git
 - [GitHub CLI (`gh`)](https://cli.github.com/), optional unless you use GitHub integration
 
-### Setup
+#### Setup
 
 Install the pinned resolver version:
 
@@ -243,7 +262,7 @@ uv sync --locked --extra browser --group dev
 .\.venv\Scripts\Activate.ps1
 ```
 
-### Run
+#### Run
 
 ```bash
 ouroboros server
@@ -251,11 +270,11 @@ ouroboros server
 
 Then open `http://127.0.0.1:8765` in your browser. The setup wizard will guide you through API key configuration.
 
-### Google Colab
+#### Google Colab
 
 Use [`notebooks/colab_quickstart.py`](notebooks/colab_quickstart.py) as a Colab-compatible cell script when you need a source-mode runtime without the desktop UI. It keeps runtime data on Google Drive and preserves the original Colab path without making it the primary installation flow.
 
-### CLI / Headless
+#### CLI / Headless
 
 The `ouroboros` command attaches to the local runtime by default and starts one when `--start` is passed. It exposes managed tasks, progress streams, artifacts, logs, schedules, settings, skills, and evolution controls without duplicating the server's business logic.
 
@@ -272,7 +291,7 @@ ouroboros schedule list
 
 External workspaces must be separate Git worktree roots and may not overlap Ouroboros's own repository or data directory. Patch, streaming, detached-task, and schedule semantics are documented in the CLI help and the canonical [architecture](docs/ARCHITECTURE.md).
 
-### For Agents
+#### For Agents
 
 Another agent, script, or CI job can invoke Ouroboros through the same gateway-backed CLI:
 
@@ -289,13 +308,13 @@ Use `--jsonl` for a machine-readable event stream and `--detach` when the caller
 
 To change Ouroboros itself, follow [CONTRIBUTING.md](CONTRIBUTING.md) and read [BIBLE.md](BIBLE.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md), and [docs/CHECKLISTS.md](docs/CHECKLISTS.md) in full before editing.
 
-### Configuration
+#### Configuration
 
 The first-run wizard and **Settings** configure model access, cognitive roles, local models, review policy, runtime mode, budget, skills, and optional integrations. Ouroboros supports configurable remote providers, compatible endpoints, and local GGUF inference; exact settings and defaults live in [`ouroboros/config.py`](ouroboros/config.py) and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 The server binds to `127.0.0.1:8765` by default. Read [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) before exposing it beyond loopback; non-local binds need `OUROBOROS_NETWORK_PASSWORD` or an explicitly trusted external access layer.
 
-### Run Tests
+#### Run Tests
 
 ```bash
 make test
