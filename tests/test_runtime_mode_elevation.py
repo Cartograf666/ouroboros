@@ -769,13 +769,8 @@ def test_owner_context_mode_endpoint_persists_and_hot_applies(isolated_settings,
         "OUROBOROS_CONTEXT_MODE": "max",
     })
     monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", "max")
-    # Owned by monkeypatch so the endpoint's DIRECT os.environ write is undone at
-    # teardown. This is the only writer of an owner-declared `false`, and leaking it
-    # into the worker process makes every later load_settings() overlay that owner
-    # declaration onto a settings.json that carries none — after which save_settings
-    # correctly refuses the resulting unknown -> false clearing, failing unrelated
-    # tests. Seeded as the SYSTEM value so the endpoint's clearing is observable.
-    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE_AUTO_LOW", "true")
+    # Own the compatibility tombstone because the endpoint writes os.environ directly.
+    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE_AUTO_LOW", "false")
 
     app = Starlette(routes=[Route("/api/owner/context-mode", endpoint=api_owner_context_mode, methods=["POST"])])
     app.state.drive_root = isolated_settings.parent
@@ -789,10 +784,8 @@ def test_owner_context_mode_endpoint_persists_and_hot_applies(isolated_settings,
     assert on_disk["OUROBOROS_CONTEXT_MODE"] == "low"
     assert on_disk["OUROBOROS_RUNTIME_MODE"] == "pro"
     assert os.environ["OUROBOROS_CONTEXT_MODE"] == "low"
-    # An explicit owner selection re-authors the derived flag (v6.80.0): this endpoint
-    # is the ONLY path that may clear it, so `low` chosen here really does mean the P3
-    # scope review is not performed. save_settings refuses the same clearing anywhere
-    # else, which is why the state must be established through THIS path.
+    # Owner selection atomically carries the one-window false provenance tombstone,
+    # so stored Low still means the P3 scope review is not performed.
     assert on_disk["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
     assert os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
 
@@ -889,6 +882,10 @@ def test_every_settings_writer_routes_through_the_shared_prologue():
 
     # (module, function) -> why it may write settings.json without the prologue
     exempt = {
+        ("ouroboros/context_mode_compat.py", "normalize_and_persist_context_mode_compat"):
+            "one-window startup migration: while the settings lock is held, atomically rewrites "
+            "only the raw document's context compatibility pair. Routing through the prologue "
+            "would merge defaults and turn unrelated absence into authorship.",
         ("ouroboros/tools/registry.py", "_restore_owner_files"):
             "immune-system ROLLBACK: rewrites the exact bytes snapshotted before an agent shell "
             "command. It authors no value, and filtering a restore would corrupt it — an "
@@ -905,13 +902,17 @@ def test_every_settings_writer_routes_through_the_shared_prologue():
     writers = {}
     for path in sorted(pathlib.Path("ouroboros").rglob("*.py")) + [pathlib.Path("server.py")]:
         src = path.read_text(encoding="utf-8")
-        if "SETTINGS_PATH" not in src:
+        if "SETTINGS_PATH" not in src and "atomic_write_json" not in src:
             continue
         for node in ast.walk(ast.parse(src)):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             seg = ast.get_source_segment(src, node) or ""
-            if "SETTINGS_PATH" in seg and re.search(r"\.write_text\(|atomic_write_json\(|json\.dump\(", seg):
+            settings_write = (
+                "SETTINGS_PATH" in seg
+                and re.search(r"\.write_text\(|atomic_write_json\(|json\.dump\(", seg)
+            ) or "atomic_write_json(settings_path" in seg
+            if settings_write:
                 writers[(path.as_posix(), node.name)] = "prepare_settings_for_persist" in seg
 
     unrouted = {k for k, routed in writers.items() if not routed and k not in exempt}
@@ -1006,8 +1007,8 @@ def test_env_forwarded_modes_survive_the_documented_startup_path(isolated_settin
     load_settings does not let env author these keys, the dict it returns carries a DEFAULT wherever
     settings.json is silent — and projecting that default overwrote (or popped) a value the launcher
     forwarded on purpose. ``devtools/benchmarks/terminal_bench/harbor_installed_agent.py`` runs the
-    container with NO settings.json at all and forwards ``OUROBOROS_CONTEXT_MODE`` (+ the derived
-    auto-low flag) for context-ablation runs; ``server_runner._patch_settings_ports`` and
+    container with NO settings.json at all and forwards ``OUROBOROS_CONTEXT_MODE`` (plus the
+    explicit false tombstone for owner-Low runs); ``server_runner._patch_settings_ports`` and
     ``run_gaia._resolve_provider_keys`` both document the same "settings.json over env" clobber; and
     ``run_clb`` forwards the context mode and ``OUROBOROS_SAFETY_MODE`` the same way. Projection must
     therefore say only what the FILE says, and stay silent where the file says nothing.
@@ -1021,7 +1022,6 @@ def test_env_forwarded_modes_survive_the_documented_startup_path(isolated_settin
     monkeypatch.setattr(_os, "environ", dict(_os.environ))
     _own_ratchet_env(monkeypatch)
     _os.environ["OUROBOROS_CONTEXT_MODE"] = "low"
-    _os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "true"  # derived/system low, travels with the mode
     _os.environ["OUROBOROS_SAFETY_MODE"] = "light"
 
     # 1. No settings.json at all — the harbor container shape.
@@ -1029,7 +1029,7 @@ def test_env_forwarded_modes_survive_the_documented_startup_path(isolated_settin
     cfg.apply_settings_to_env(cfg.load_settings())
     assert cfg.get_context_mode() == "low", "startup clobbered an env-forwarded context mode"
     assert cfg.get_safety_mode() == "light", "startup clobbered an env-forwarded safety mode"
-    assert _os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "true"
+    assert "OUROBOROS_CONTEXT_MODE_AUTO_LOW" not in _os.environ
     # A bare forwarded `low` is still NOT an owner-declared scope-review skip.
     assert cfg.get_owner_context_mode() == "max"
 
@@ -1045,13 +1045,13 @@ def test_env_forwarded_modes_survive_the_documented_startup_path(isolated_settin
     assert cfg.get_context_mode() == "max"
     assert cfg.get_safety_mode() == "full"
 
-    # 4. The fail-closed exception: env may not author the owner-declared-low CLAIM, which would
-    #    switch the BIBLE P3 scope gate off. Disk is silent about the flag; the claim is cleared.
+    # 4. An explicit forwarded false accompanies a benchmark/operator Low declaration.
+    _os.environ["OUROBOROS_CONTEXT_MODE"] = "low"
     _os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
-    _seed_disk(isolated_settings, {"OUROBOROS_CONTEXT_MODE": "low"})
+    _seed_disk(isolated_settings, {"TOTAL_BUDGET": "10"})
     cfg.apply_settings_to_env(cfg.load_settings())
     assert cfg.get_context_mode() == "low"
-    assert cfg.get_owner_context_mode() == "max", "env alone must not switch the P3 scope gate off"
+    assert cfg.get_owner_context_mode() == "low"
 
 
 def test_agent_save_cannot_end_a_forwarded_mode_mid_run(isolated_settings, monkeypatch):
@@ -1103,7 +1103,7 @@ def test_agent_save_cannot_end_a_forwarded_mode_mid_run(isolated_settings, monke
 def test_env_declared_context_mode_cannot_author_a_lowering(isolated_settings, monkeypatch):
     """A ratchet reads its PREVIOUS value off DISK for every key it guards — env never.
 
-    Round-3 regression: the bypass closed for the derived auto-low flag was still open one key
+    Round-3 regression: the bypass closed for the context provenance tombstone was still open one key
     over. With no ``OUROBOROS_CONTEXT_MODE`` stored, an inherited/forwarded env ``low`` made the
     guard compare ``low -> low`` instead of ``max -> low``, so any caller could persist the
     lowered cognitive horizon without ``allow_context_lowering``. Absent from disk resolves

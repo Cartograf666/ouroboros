@@ -86,6 +86,28 @@ def test_isolated_settings_grant_only_the_declared_providers_credentials():
         assert owner_secret not in out
 
 
+def test_isolated_settings_forward_explicit_context_intent_and_normalize_legacy_state():
+    default = build_isolated_settings(_LIVE)
+    assert "OUROBOROS_CONTEXT_MODE" not in default
+    assert "OUROBOROS_CONTEXT_MODE_AUTO_LOW" not in default
+
+    explicit_low = build_isolated_settings(_LIVE, OUROBOROS_CONTEXT_MODE="low")
+    assert explicit_low["OUROBOROS_CONTEXT_MODE"] == "low"
+    assert explicit_low["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
+
+    explicit_max = build_isolated_settings(_LIVE, OUROBOROS_CONTEXT_MODE="max")
+    assert explicit_max["OUROBOROS_CONTEXT_MODE"] == "max"
+    assert explicit_max["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
+
+    legacy = build_isolated_settings({
+        **_LIVE,
+        "OUROBOROS_CONTEXT_MODE": "low",
+        "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "true",
+    })
+    assert legacy["OUROBOROS_CONTEXT_MODE"] == "max"
+    assert legacy["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
+
+
 def test_declaring_a_direct_provider_slot_grants_exactly_that_provider():
     """The mirror: a run that DOES declare a direct lane must still be able to authenticate.
 

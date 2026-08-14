@@ -1006,7 +1006,6 @@ export function createChatInstance({
         const ctxBtn = byId('context-mode');
         if (ctxBtn && typeof data?.context_mode === 'string') {
             ctxBtn.dataset.contextMode = data.context_mode === 'low' ? 'low' : 'max';
-            ctxBtn.dataset.contextModeAutoLow = data.context_mode_auto_low ? 'true' : 'false';
         }
         const budget = headerBudgetPresentation(data);
         const budgetText = byId('budget-text');
@@ -3905,12 +3904,7 @@ export function createChatInstance({
         if (!seg || contextModeBtn.dataset.disabled === 'true') return;
         const next = seg.dataset.mode === 'low' ? 'low' : 'max';
         const current = contextModeBtn.dataset.contextMode === 'low' ? 'low' : 'max';
-        // A displayed `low` that is a system AUTO-DOWNGRADE is not an owner selection:
-        // re-picking Low must still POST (the endpoint is idempotent and clears the
-        // derived flag), or an unconfirmable-window install stays wedged with scope
-        // review blocking every commit and no reachable way to declare Low.
-        const derivedLow = contextModeBtn.dataset.contextModeAutoLow === 'true';
-        if (next === current && !(next === 'low' && derivedLow)) return;
+        if (next === current) return;
         contextModeBtn.dataset.disabled = 'true';
         const postMode = (mode) => apiFetch('/api/owner/context-mode', {
             method: 'POST',
@@ -3918,41 +3912,7 @@ export function createChatInstance({
             body: JSON.stringify({ mode }),
         });
         try {
-            let resp = await postMode(next);
-            if (!resp.ok) {
-                let payload = {};
-                try { payload = await resp.json(); } catch {}
-                // Max context mode needs the active model's 1M-token window confirmed.
-                // Offer a plain, model-scoped confirmation (kept until the model changes).
-                const ack = payload?.needs_ack;
-                if (next === 'max' && ack && ack.model) {
-                    const ok = await openConfirmDialog({
-                        title: 'Confirm 1M-token context window',
-                        body: `${payload.error || 'Max context mode needs a confirmed 1M-token window.'}\n\n` +
-                            `Confirm that this model supports a 1,000,000-token context window?\n` +
-                            `provider: ${ack.provider || '(default)'}\nmodel: ${ack.model}\n` +
-                            `base_url: ${ack.base_url || '(default)'}\n\n` +
-                            `This applies only to this exact model/provider and is removed if you change it.`,
-                        confirmLabel: 'Confirm window',
-                    });
-                    if (ok) {
-                        const ackResp = await apiFetch('/api/owner/capability-ack', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                provider: ack.provider, model: ack.model,
-                                base_url: ack.base_url, window_tokens: 1000000,
-                                note: 'owner-confirmed via context-mode toggle',
-                            }),
-                        });
-                        if (ackResp.ok) {
-                            resp = await postMode(next);  // retry with the confirmation in place
-                        } else {
-                            showToast('Could not save the confirmation.', 'error');
-                        }
-                    }
-                }
-            }
+            const resp = await postMode(next);
             if (resp.ok) {
                 contextModeBtn.dataset.contextMode = next;
             } else {

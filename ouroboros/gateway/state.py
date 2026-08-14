@@ -129,7 +129,6 @@ async def api_state(request: Request) -> JSONResponse:
     try:
         from ouroboros.config import (
             get_context_mode,
-            get_owner_context_mode,
             get_runtime_mode,
             get_safety_mode,
             get_skills_repo_path,
@@ -178,11 +177,8 @@ async def api_state(request: Request) -> JSONResponse:
             "supervisor_error": get_supervisor_error() if callable(get_supervisor_error) else None,
             "runtime_mode": get_runtime_mode(),
             "context_mode": get_context_mode(),
-            # The effective mode alone cannot tell the owner UI whether a displayed
-            # `low` is theirs or a system auto-downgrade, so a "Low is already
-            # selected" click short-circuited and the derived flag was never cleared
-            # — wedging any install whose route cannot be confirmed >=1M.
-            "context_mode_auto_low": get_owner_context_mode() != get_context_mode(),
+            # Frozen one-window compatibility field. Persistent auto-Low is retired.
+            "context_mode_auto_low": False,
             "safety_mode": get_safety_mode(),
             "skills_repo_configured": bool(get_skills_repo_path()),
             "github_token_configured": snap["github_token_configured"],

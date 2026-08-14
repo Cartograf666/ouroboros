@@ -22,7 +22,7 @@
  * @property {?string} supervisor_error
  * @property {string} runtime_mode
  * @property {string} context_mode
- * @property {boolean} context_mode_auto_low  // effective low is a system auto-downgrade, not an owner selection
+ * @property {boolean} context_mode_auto_low  // frozen compatibility field; always false
  * @property {string} safety_mode
  * @property {boolean} skills_repo_configured
  * @property {boolean} github_token_configured

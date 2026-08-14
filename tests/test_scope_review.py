@@ -2390,8 +2390,8 @@ def test_low_context_mode_skips_scope_review_with_a_typed_evidence_row(monkeypat
     review-evidence surface that carries fail-closed results — so a low-mode commit
     is never forensically confusable with "scope review silently failed" (BIBLE P1).
 
-    The derived auto-low flag must be an EXPLICIT `false` here: an absent flag is
-    UNKNOWN, not an owner declaration, and resolves fail-closed to gate-ON."""
+    The one-window provenance tombstone must be explicit `false` here: bare env
+    Low remains effective sizing Low but resolves owner intent fail-closed to Max."""
     from ouroboros import config
     from ouroboros.tools import review_helpers
     from ouroboros.tools import scope_review as sr

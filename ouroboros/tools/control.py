@@ -2048,28 +2048,6 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
             if model in get_fallback_models() and os.environ.get("USE_LOCAL_FALLBACK", "").lower() in ("true", "1"):
                 use_local = True
 
-        # A confirmed sub-1M route cannot receive the current Max projection. An
-        # unknown route is allowed one honest Max attempt; run_llm_loop rebinds the
-        # immutable core to that exact route and owns the confirmed-overflow Low retry.
-        if str(getattr(ctx, "active_context_mode", "") or "") == "max":
-            try:
-                from ouroboros.gateway.settings import _active_route_confirms_max
-                if _active_route_confirms_max(model=model, use_local=use_local) is False:
-                    return (
-                        f"⚠️ SWITCH_BLOCKED: '{model}' has a confirmed sub-1M context window, but the "
-                        "current transcript was built in Max context mode and would overflow it. Pick a "
-                        ">=1M route, or have the owner lower context mode to Low before switching."
-                    )
-            except Exception:
-                # Fail CLOSED: an errored capability check must not let a max-sized transcript
-                # switch to a possibly-sub-1M route (BIBLE P1 cognitive horizon).
-                log.debug("CW2 switch_model capability guard errored; failing closed", exc_info=True)
-                return (
-                    f"⚠️ SWITCH_BLOCKED: couldn't verify whether '{model}' confirms a >=1M window while "
-                    "the transcript is max-sized — failing closed. Retry, pick a known >=1M route, or have "
-                    "the owner lower context mode to Low first."
-                )
-
         ctx.active_model_override = model
         ctx.active_use_local_override = use_local
         changes.append(f"model={model}{' (local)' if use_local else ''}")

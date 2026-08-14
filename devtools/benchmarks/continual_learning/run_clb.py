@@ -57,6 +57,7 @@ from devtools.benchmarks.common.manifests import (
 )
 from devtools.benchmarks.common.run_roots import assert_outside_repo, live_repo_roots, run_root
 from devtools.benchmarks.common.secrets import load_secret_env, redacted_env_summary
+from ouroboros.context_mode_compat import normalize_context_mode_compat
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
 HERE = pathlib.Path(__file__).resolve().parent
@@ -120,6 +121,11 @@ def render_run_settings(base_path: pathlib.Path, run_dir: pathlib.Path, *, solve
     actually enforces.
     """
     settings = json.loads(pathlib.Path(base_path).expanduser().read_text(encoding="utf-8"))
+    if ("OUROBOROS_CONTEXT_MODE" in settings
+            and "OUROBOROS_CONTEXT_MODE_AUTO_LOW" not in settings):
+        # A benchmark template mode is an explicit operator declaration.
+        settings["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
+    settings = normalize_context_mode_compat(settings)
     bare = _bare_model(solve_model)
     for key in _PINNED_MODEL_KEYS:
         settings[key] = bare
@@ -361,6 +367,7 @@ def _print_fidelity_warnings(fidelity: dict) -> None:
 def _sanitized_child_env(run_dir: pathlib.Path, settings: dict, args: argparse.Namespace) -> dict:
     """Child env for the external runner: strip live-runtime/secret env, add the knobs the
     adapter observes, resolve provider keys env-first (never printed)."""
+    settings = normalize_context_mode_compat(settings)
     env = {
         key: value for key, value in os.environ.items()
         if not key.startswith(("OUROBOROS_", "USE_LOCAL_"))
@@ -397,8 +404,12 @@ def _sanitized_child_env(run_dir: pathlib.Path, settings: dict, args: argparse.N
                   "OUROBOROS_EFFORT_SCOPE_REVIEW", "OUROBOROS_CONTEXT_MODE",
                   "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_MAX_WORKERS"):
         _val = settings.get(_knob)
-        if _val:
-            env[_knob] = str(_val)
+        if _val not in (None, ""):
+            env[_knob] = (
+                "false" if _knob == "OUROBOROS_CONTEXT_MODE_AUTO_LOW"
+                and str(_val).strip().lower() in {"0", "false", "off"}
+                else str(_val)
+            )
     if args.or_provider:
         env["OUROBOROS_OR_PROVIDER"] = args.or_provider
     return env

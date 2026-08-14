@@ -182,7 +182,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     assert re.search(r"@property \{'ok'\|'restart_required'\|'assisted_started'\|'manual'\} status\b", text)
     assert re.search(r"@typedef \{Object\} UpdateApplyErrorResponse.*?@property \{string\} error\b", text, re.S)
     assert re.search(r"@property \{boolean\} context_mode_auto_low\b", text), (
-        "StateResponse.context_mode_auto_low must be a JSDoc boolean — the owner control branches on it"
+        "StateResponse.context_mode_auto_low must remain a JSDoc boolean compatibility field"
     )
     assert re.search(r"@property \{string\} deprecation_notice\b", text), (
         "OwnerScopeReviewFloorResponse.deprecation_notice must be declared for the browser"

@@ -1297,12 +1297,7 @@ def _api_state_payload(tmp_path, monkeypatch):
 
 
 def test_state_response_context_mode_auto_low_crosses_the_wire(tmp_path, monkeypatch):
-    """``context_mode_auto_low`` must reach the browser as a real bool with real semantics.
-
-    The owner control needs to distinguish "the owner chose Low" from "the system auto-downgraded
-    to Low", because a no-op click on an already-selected Low short-circuited and left the derived
-    flag set. A truthy string or a missing key would break that control silently.
-    """
+    """The frozen compatibility field remains a literal JSON false in every mode."""
     import json
     import os
 
@@ -1312,22 +1307,22 @@ def test_state_response_context_mode_auto_low_crosses_the_wire(tmp_path, monkeyp
     for key in ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW"):
         os.environ.pop(key, None)
 
-    # 1. System auto-downgrade: effective low, owner horizon still max -> True.
+    # Effective Low does not imply a persistent system downgrade anymore.
     os.environ["OUROBOROS_CONTEXT_MODE"] = "low"
     payload = _api_state_payload(tmp_path, monkeypatch)
     assert set(payload) == set(StateResponse.__annotations__), (
         "the emitted /api/state payload drifted from the frozen StateResponse contract"
     )
-    assert payload["context_mode_auto_low"] is True
+    assert payload["context_mode_auto_low"] is False
     assert payload["context_mode"] == "low"
-    assert '"context_mode_auto_low": true' in json.dumps(payload), "must serialize as a JSON bool"
+    assert '"context_mode_auto_low": false' in json.dumps(payload), "must serialize as a JSON bool"
 
-    # 2. Owner-declared low (the stored `false` flag): not an auto-downgrade.
+    # Explicit false stays false.
     os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
     payload = _api_state_payload(tmp_path, monkeypatch)
     assert payload["context_mode_auto_low"] is False
 
-    # 3. Plain max: nothing was downgraded.
+    # Plain Max is also false.
     os.environ["OUROBOROS_CONTEXT_MODE"] = "max"
     os.environ.pop("OUROBOROS_CONTEXT_MODE_AUTO_LOW", None)
     payload = _api_state_payload(tmp_path, monkeypatch)

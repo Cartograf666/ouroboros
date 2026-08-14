@@ -137,6 +137,7 @@ BAND_PATHS = {
     "ouroboros/gateway/contracts.py": None,
     "ouroboros/gateway/extensions.py": None,
     "ouroboros/gateway/history.py": None,
+    "ouroboros/gateway/settings.py": "Retiring persistent auto-Low removed the former giant debt; the remaining owner and reviewer settings endpoints stay centralized while tracked in the shrinking band.",
     "ouroboros/gateway/tasks.py": None,
     "ouroboros/launcher_bootstrap.py": None,
     "ouroboros/loop_llm_call.py": None,
@@ -205,5 +206,5 @@ BYTE_DEBT = {
     "supervisor/events.py": 205328,
     "tests/test_delegated_subagent_transport.py": 320627,
     "tests/test_devtools_benchmarks.py": 328786,
-    "web/modules/chat.js": 234467,
+    "web/modules/chat.js": 231893,
 }

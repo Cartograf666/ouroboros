@@ -3122,16 +3122,13 @@ def test_ui_smoke_v679_subagent_depth_zero_round_trips_through_settings(direct_s
             pytest.skip(str(exc))
         raise
 @pytest.mark.ui_browser
-def test_ui_owner_context_mode_autolow_and_scope_review_ack(direct_server_with_data):
-    """Owner-visible v6.80.0 flows, driven in a real browser (BIBLE P3 / UI verification rule).
+def test_ui_owner_context_mode_and_scope_review_ack(direct_server_with_data):
+    """Owner context intent and scope-review ack, driven in a real browser.
 
     Two claimed-complete owner flows that source-string tests cannot certify:
 
-    1. AUTO-LOW RE-SELECTION. When the effective `low` is a SYSTEM auto-downgrade, the segmented
-       control already displays Low, so the old ``next === current`` short-circuit swallowed the
-       click and the derived flag could never be cleared — an install whose route cannot be
-       confirmed >=1M stayed wedged with scope review blocking every commit. Re-picking the
-       displayed Low must still POST the idempotent owner endpoint.
+    1. OWNER MAX. Switching an explicit Low to Max succeeds without a Main-route
+       context-window confirmation; the frozen compatibility field remains false.
     2. SCOPE-REVIEW CAPABILITY ACK. Saving a scope-review slot whose route has no >=1M evidence
        must raise the owner confirm and, on accept, persist a route-scoped capability ack and say
        so in the settings status line.
@@ -3146,11 +3143,10 @@ def test_ui_owner_context_mode_autolow_and_scope_review_ack(direct_server_with_d
     evidence_dir = pathlib.Path(os.environ.get("OUROBOROS_UI_EVIDENCE_DIR", str(data_dir.parent)))
     evidence_dir.mkdir(parents=True, exist_ok=True)
 
-    # Boot into the state under test: effective low that is a system auto-downgrade, not an
-    # owner selection. The derived flag is disk-authored, so it must be in the file before start.
+    # Boot into explicit owner Low with the one-window false provenance tombstone.
     seeded = json.loads(settings_path.read_text(encoding="utf-8"))
     seeded["OUROBOROS_CONTEXT_MODE"] = "low"
-    seeded["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "true"
+    seeded["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
     seeded["OUROBOROS_SCOPE_REVIEW_MODELS"] = seeded["OUROBOROS_MODEL"]
     settings_path.write_text(json.dumps(seeded), encoding="utf-8")
     direct_server_with_data["restart_server"]()
@@ -3158,7 +3154,7 @@ def test_ui_owner_context_mode_autolow_and_scope_review_ack(direct_server_with_d
     with urllib.request.urlopen(f"{url}/api/state", timeout=5) as resp:  # noqa: S310 - local test server
         boot_state = json.loads(resp.read().decode("utf-8"))
     assert boot_state["context_mode"] == "low"
-    assert boot_state["context_mode_auto_low"] is True, "the fixture must boot in the auto-downgraded state"
+    assert boot_state["context_mode_auto_low"] is False
 
     try:
         with sync_playwright() as pw:
@@ -3170,25 +3166,22 @@ def test_ui_owner_context_mode_autolow_and_scope_review_ack(direct_server_with_d
                 page.goto(url, wait_until="domcontentloaded", timeout=60_000)
                 toggle = page.locator("#chat-context-mode")
                 toggle.wait_for(state="visible", timeout=60_000)
-                page.wait_for_function(
-                    "() => document.querySelector('#chat-context-mode')?.dataset.contextModeAutoLow === 'true'",
-                    timeout=30_000,
-                )
                 assert toggle.get_attribute("data-context-mode") == "low"
-                page.screenshot(path=str(evidence_dir / "v6800-autolow-before.png"))
+                page.screenshot(path=str(evidence_dir / "context-mode-low-before.png"))
 
-                # The click the old short-circuit swallowed: Low is ALREADY displayed.
-                toggle.locator('.chat-seg[data-mode="low"]').click()
+                toggle.locator('.chat-seg[data-mode="max"]').click()
                 page.wait_for_function(
-                    "() => document.querySelector('#chat-context-mode')?.dataset.contextModeAutoLow === 'false'",
+                    "() => document.querySelector('#chat-context-mode')?.dataset.contextMode === 'max'",
                     timeout=30_000,
                 )
-                page.screenshot(path=str(evidence_dir / "v6800-autolow-after.png"))
-                # It reached the owner endpoint: the derived flag is cleared on disk and on the wire.
-                assert json.loads(settings_path.read_text(encoding="utf-8"))["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
+                assert page.locator(".confirm-dialog:not([hidden])").count() == 0
+                page.screenshot(path=str(evidence_dir / "context-mode-max-after.png"))
+                persisted = json.loads(settings_path.read_text(encoding="utf-8"))
+                assert persisted["OUROBOROS_CONTEXT_MODE"] == "max"
+                assert persisted["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
                 with urllib.request.urlopen(f"{url}/api/state", timeout=5) as resp:  # noqa: S310
                     after = json.loads(resp.read().decode("utf-8"))
-                assert after["context_mode"] == "low", "confirming Low must not flip the horizon to max"
+                assert after["context_mode"] == "max"
                 assert after["context_mode_auto_low"] is False
 
                 # 2. Scope-review capability notice -> owner confirm -> route-scoped ack.
