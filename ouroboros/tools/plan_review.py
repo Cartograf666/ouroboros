@@ -13,7 +13,6 @@ from datetime import timedelta
 
 from ouroboros.config import SETTINGS_DEFAULTS
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now as _planning_now
-from ouroboros.review_substrate import review_repo_dirs_for
 from ouroboros.task_results import (
     load_plan_review_state,
     mark_current_plan_review_unavailable,
@@ -43,6 +42,7 @@ from ouroboros.tools.plan_review_runtime import (
     record_raw_plan_request_attempt as _record_raw_plan_request_attempt,
     reviewed_handoff_hashes as _reviewed_handoff_hashes,
     resolve_plan_class as _resolve_plan_class,
+    resolve_plan_roots as _resolve_plan_roots,
     run_plan_review_slots as _run_plan_review_slots,
     validate_plan_request_envelope as _validate_plan_request_envelope,
 )
@@ -873,23 +873,6 @@ def _capture_late_planning_audit(ctx: ToolContext, handoffs: dict) -> None:
         "tasks": late_tasks,
     }
     handoffs["artifact"] = _persist_planning_handoffs(ctx, handoffs)
-
-
-def _resolve_plan_roots(
-    ctx: ToolContext, files_to_touch: list,
-) -> tuple[pathlib.Path, pathlib.Path]:
-    """Resolve governance and subject roots without silently mixing them."""
-    governance, subject = review_repo_dirs_for(ctx)
-    for raw in files_to_touch or []:
-        candidate = pathlib.Path(str(raw or ""))
-        resolved = (candidate if candidate.is_absolute() else subject / candidate).resolve(strict=False)
-        try:
-            resolved.relative_to(subject)
-        except ValueError as exc:
-            raise ValueError(
-                f"planned path {raw!r} escapes active subject root {subject}"
-            ) from exc
-    return governance, subject
 
 
 def _planning_evidence_horizon(

@@ -206,6 +206,38 @@ def _plan_raw_result_from_actor(actor: dict, request_model: str) -> dict:
     }
 
 
+def resolve_plan_roots(
+    ctx: ToolContext, files_to_touch: list,
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """Resolve governance and subject roots without silently mixing them."""
+    from ouroboros.contracts.skill_payload_policy import is_skill_payload_path
+    from ouroboros.review_substrate import review_repo_dirs_for
+    from ouroboros.tool_access import canonical_data_root
+
+    governance, subject = review_repo_dirs_for(ctx)
+    try:
+        drive = canonical_data_root(ctx)
+    except Exception:
+        drive = None
+    for raw in files_to_touch or []:
+        text = str(raw or "")
+        # Skill-payload paths live in the DATA plane and are legitimate plan
+        # targets, not subject-root escapes — same frozen predicate as the
+        # classification exemption in resolve_plan_class; a drive-resolution
+        # failure keeps the old blanket rejection.
+        if drive is not None and is_skill_payload_path(drive, text, allow_control_plane=True):
+            continue
+        candidate = pathlib.Path(text)
+        resolved = (candidate if candidate.is_absolute() else subject / candidate).resolve(strict=False)
+        try:
+            resolved.relative_to(subject)
+        except ValueError as exc:
+            raise ValueError(
+                f"planned path {raw!r} escapes active subject root {subject}"
+            ) from exc
+    return governance, subject
+
+
 def resolve_plan_class(ctx: ToolContext, plan_class: str, files_to_touch: list) -> tuple[str, str]:
     """Resolve the declared class and structurally escalate system-repo work."""
     from ouroboros.contracts.skill_payload_policy import is_skill_payload_path

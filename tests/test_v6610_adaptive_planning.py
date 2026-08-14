@@ -109,6 +109,26 @@ def test_plan_class_native_bucket_still_escalates(tmp_path):
     assert "escalated" in note
 
 
+def test_plan_full_flow_admits_payload_paths_and_still_rejects_escapes(tmp_path):
+    # Production order (plan_review handle): _resolve_plan_roots runs BEFORE
+    # classification, and used to raise on an absolute payload path under the
+    # data root — the classifier exemption never got a chance (Sol P2). Both
+    # stages must now pass for payload paths, in both accepted forms.
+    from ouroboros.tools.plan_review import _resolve_plan_roots
+
+    ctx = _ctx(tmp_path)
+    abs_payload = str(tmp_path / "data" / "skills" / "external" / "x" / "plugin.py")
+    for files in ([abs_payload], ["data/skills/external/x/plugin.py"]):
+        _resolve_plan_roots(ctx, files)  # must not raise
+        assert _resolve_plan_class(ctx, "external", files) == ("external", "")
+    # Genuine escapes are still rejected exactly as before, alone or mixed
+    # with a legitimate payload path.
+    with pytest.raises(ValueError, match="escapes active subject root"):
+        _resolve_plan_roots(ctx, ["/etc/passwd"])
+    with pytest.raises(ValueError, match="escapes active subject root"):
+        _resolve_plan_roots(ctx, [abs_payload, "/etc/passwd"])
+
+
 def test_plan_class_drive_resolution_failure_preserves_current_behavior(tmp_path):
     # A ctx that cannot resolve the data root skips the exemption entirely:
     # skill paths behave exactly as before the fix (blanket escalation).
