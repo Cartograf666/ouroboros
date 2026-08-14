@@ -462,7 +462,9 @@ def _start_assisted_merge_fenced(plan: dict) -> JSONResponse:
     """Stage the exact planned merge and enqueue its one reviewed resolver."""
     import uuid as _uuid
 
-    from supervisor.git_ops import BRANCH_DEV, _create_rescue_snapshot, git_capture
+    from supervisor.git_ops import (
+        BRANCH_DEV, _collect_repo_sync_state, _create_rescue_snapshot,
+    )
     from supervisor.state import budget_remaining, load_state
     from supervisor.update_merge import (
         assisted_writer_gate_reason,
@@ -496,13 +498,9 @@ def _start_assisted_merge_fenced(plan: dict) -> JSONResponse:
             status_code=409,
         )
 
-    rc_b, cur_branch, _be = git_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"])
-    rc_s, status_txt, _se = git_capture(["git", "status", "--porcelain"])
-    _create_rescue_snapshot(branch, "ui_update_assisted_merge", {
-        "current_branch": cur_branch if rc_b == 0 else "",
-        "dirty_lines": [ln for ln in status_txt.splitlines() if ln.strip()] if rc_s == 0 else [],
-        "unpushed_lines": [], "warnings": [],
-    })
+    _create_rescue_snapshot(
+        branch, "ui_update_assisted_merge", _collect_repo_sync_state(),
+    )
     if not create_rescue_local_ref(local_snapshot):
         _respawn_workers_after_failed_update()
         return JSONResponse({"error": "could not preserve the local update snapshot"}, status_code=409)
@@ -564,7 +562,9 @@ def _apply_clean_merge_fenced(request: Request, plan: dict) -> JSONResponse:
     """Land one exact clean plan transactionally, then request restart."""
     import uuid
 
-    from supervisor.git_ops import BRANCH_DEV, _create_rescue_snapshot, git_capture
+    from supervisor.git_ops import (
+        BRANCH_DEV, _collect_repo_sync_state, _create_rescue_snapshot, git_capture,
+    )
     from supervisor.update_merge import (
         apply_managed_merge_update,
         update_restart_smoke,
@@ -576,13 +576,9 @@ def _apply_clean_merge_fenced(request: Request, plan: dict) -> JSONResponse:
     if not merge_commit:
         _respawn_workers_after_failed_update()
         return JSONResponse({"error": "clean update plan did not produce a target commit"}, status_code=409)
-    rc_b, cur_branch, _be = git_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"])
-    rc_s, status_txt, _se = git_capture(["git", "status", "--porcelain"])
-    _create_rescue_snapshot(branch, "ui_update_apply_merge", {
-        "current_branch": cur_branch if rc_b == 0 else "",
-        "dirty_lines": [ln for ln in status_txt.splitlines() if ln.strip()] if rc_s == 0 else [],
-        "unpushed_lines": [], "warnings": [],
-    })
+    _create_rescue_snapshot(
+        branch, "ui_update_apply_merge", _collect_repo_sync_state(),
+    )
     attempt_id = uuid.uuid4().hex[:12]
     tx = {
         "pre_update_sha": str(plan.get("base_sha") or ""),

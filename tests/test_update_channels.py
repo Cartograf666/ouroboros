@@ -24,6 +24,29 @@ def test_update_channel_mapping_is_closed_and_defaults_to_stable():
     assert update_channels.get_update_channel({"OUROBOROS_UPDATE_CHANNEL": " NIGHTLY "}) == "stable"
 
 
+def test_git_timeout_settings_share_defaults_clamps_and_env_projection(monkeypatch):
+    from ouroboros import config
+    from ouroboros import update_channels
+
+    getters = {
+        "OUROBOROS_MANAGED_UPDATE_FETCH_TIMEOUT_SEC": (
+            update_channels.get_managed_update_fetch_timeout_sec
+        ),
+        "OUROBOROS_RESCUE_GIT_TIMEOUT_SEC": update_channels.get_rescue_git_timeout_sec,
+    }
+    for name, getter in getters.items():
+        assert config.SETTINGS_DEFAULTS[name] == 300
+        assert name in config.settings_env_keys()
+        monkeypatch.delenv(name, raising=False)
+        assert getter() == 300
+        monkeypatch.setenv(name, "invalid")
+        assert getter() == 300
+        monkeypatch.setenv(name, "1")
+        assert getter() == 30
+        monkeypatch.setenv(name, "9999")
+        assert getter() == 1800
+
+
 def test_update_channel_setting_is_exposed_and_round_trips_in_ui():
     settings_js = (REPO / "web" / "modules" / "settings.js").read_text(encoding="utf-8")
     settings_ui = (REPO / "web" / "modules" / "settings_ui.js").read_text(encoding="utf-8")

@@ -883,11 +883,11 @@ def test_failed_rollback_attempt_drops_marker_and_retry_rescues_fresh_tree(tmp_p
     real_git_capture = git_ops.git_capture
     armed = {"on": True}
 
-    def flaky(cmd):  # one transient failure (index.lock class) on the first reset
+    def flaky(cmd, *, timeout=None):  # one transient failure (index.lock class) on the first reset
         if armed["on"] and cmd == ["git", "reset", "--hard", "HEAD"]:
             armed["on"] = False
             return 1, "", "fatal: Unable to create '.git/index.lock': File exists."
-        return real_git_capture(cmd)
+        return real_git_capture(cmd, timeout=timeout)
 
     monkeypatch.setattr(git_ops, "git_capture", flaky)
 
