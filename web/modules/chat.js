@@ -573,7 +573,13 @@ export function createChatInstance({
     const onWs = (event, fn) => wsDisposers.push(ws.on(event, fn));
 
     if (modelControl) {
-        disposeModelControl = initChatModelControl({ root: modelControl, showToast });
+        disposeModelControl = initChatModelControl({
+            root: modelControl,
+            showToast,
+            onModelChanged: (modelLabel) => {
+                addMessage(`🔄 Модель переключена на: **${modelLabel}**`, 'system', true);
+            },
+        });
     }
 
     async function loadUiPreferences() {

@@ -2562,17 +2562,17 @@ class LLMClient:
                 if isinstance(block, dict) and str(block.get("type") or "") in ("image_url", "image"):
                     content[idx] = {"type": "text", "text": "[image omitted: model has no vision]"}
         local_max = min(max_tokens, 2048)
-        ctx_len = 0
+        ctx_len = 131072
         try:
             from ouroboros.local_model import get_manager
-            ctx_len = get_manager().get_context_length()
-            if ctx_len > 0:
-                local_max = min(max_tokens, max(256, ctx_len // 4))
+            mgr_ctx = get_manager().get_context_length()
+            if mgr_ctx > 0:
+                ctx_len = mgr_ctx
+            local_max = min(max_tokens, max(256, ctx_len // 4))
         except Exception:
             pass
 
-        if ctx_len > 0:
-            clean_messages = self._prepare_messages_for_local_context(clean_messages, ctx_len, local_max)
+        clean_messages = self._prepare_messages_for_local_context(clean_messages, ctx_len, local_max)
 
         for msg in clean_messages:
             content = msg.get("content")

@@ -285,8 +285,11 @@ export function renderMarkdown(text) {
         if (!trimmed) return '';
         const id = thinkingBlocks.length;
         thinkingBlocks.push(trimmed);
-        return `\n\n__THINKING_BLOCK_${id}__\n\n`;
+        return `__THINKING_BLOCK_${id}__`;
     });
+
+    // Strip excessive consecutive newlines to avoid large empty gaps
+    raw = raw.replace(/\n{3,}/g, '\n\n').trim();
 
     let html = escapeHtmlText(raw);
     html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
@@ -319,14 +322,14 @@ export function renderMarkdown(text) {
         return '<div class="md-table-wrap">' + t + '</div>';
     });
 
-    html = html.replace(/__THINKING_BLOCK_(\d+)__/g, function(_, idStr) {
+    html = html.replace(/(?:^|\n*)__THINKING_BLOCK_(\d+)__(?:\n*|$)/g, function(_, idStr) {
         const id = parseInt(idStr, 10);
         const inner = thinkingBlocks[id] || '';
         const innerFormatted = escapeHtmlText(inner).replace(/\n/g, '<br>');
         return `<details class="chat-thinking-block"><summary class="chat-thinking-summary"><span class="chat-thinking-label">Рассуждения</span></summary><div class="chat-thinking-body">${innerFormatted}</div></details>`;
     });
 
-    return html;
+    return html.trim();
 }
 
 export function extractVersions(data) {

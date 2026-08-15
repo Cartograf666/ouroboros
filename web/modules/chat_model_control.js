@@ -313,7 +313,7 @@ function timedPromise(promise, timeoutMs = READ_TIMEOUT_MS) {
     return Promise.race([Promise.resolve(promise).catch(() => null), timeout]);
 }
 
-export function initChatModelControl({ root, showToast = () => {} } = {}) {
+export function initChatModelControl({ root, showToast = () => {}, onModelChanged = () => {} } = {}) {
     if (!root) return () => {};
     const select = root.querySelector('[data-model-select]');
     const summary = root.querySelector('[data-model-summary]');
@@ -510,7 +510,16 @@ export function initChatModelControl({ root, showToast = () => {} } = {}) {
             } catch {}
 
             render();
-            showToast('Model switched for new tasks.', 'success');
+            const current = choices.find((choice) => choice.value === next);
+            const modelLabel = current?.label || (next.startsWith('local_discovered::') ? (next.split('::')[3] || next.split('::')[1]) : next);
+            try {
+                if (typeof onModelChanged === 'function') {
+                    onModelChanged(modelLabel);
+                }
+            } catch (err) {
+                console.warn('onModelChanged error:', err);
+            }
+            showToast(`Модель переключена: ${modelLabel}`, 'success');
         } catch (error) {
             select.value = previous;
             render();
