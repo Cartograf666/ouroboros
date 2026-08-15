@@ -100,12 +100,22 @@ OBJECTIVE_BEST_EFFORT = "best_effort"
 # best-effort promotion turned that into "completed" — a lie that hid a real
 # outage from the owner. The rail stamps infra_failed instead (loop.py
 # _handle_provider_unavailable); salvage text still rides the result body.
+# S3 (Q1/Q3=A, 2026-08-15): the typed rail for the owner's "Wrap up"
+# graceful stop — one bounded tool-less finalization turn requested through the
+# durable stop intent. Distinct from every deadline/budget truncation reason.
+# Defined here, above its first consumer set (module-load order).
+REASON_OWNER_REQUESTED_FINALIZATION = "owner_requested_finalization"
 BEST_EFFORT_REASON_CODES = frozenset({
     "budget_exhausted",
     "round_limit",
     "finalization_grace",
     "deadline_local",
     "children_unabsorbed",
+    # S3 (Q1/Q3=A, 2026-08-15): the owner asked the task to summarize and stop.
+    # A successful owner-requested finalization is an honest best-effort
+    # completion — NEVER recorded as the false ``acceptance_bypassed_deadline``
+    # that reusing finalization_grace would persist (CF-02/REASON-001).
+    REASON_OWNER_REQUESTED_FINALIZATION,
 })
 
 # Typed final-answer protocol marker (machine-readable deliverable payload,
@@ -128,6 +138,12 @@ REASON_TOOL_FAILURE = "tool_failure"
 REASON_DELIVERY_CONTROL_DEGRADED = "delivery_control_degraded"
 REASON_CHILD_RESULTS_DEFERRED = "child_results_deferred"
 REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE = "review_skipped_deadline_reserve"
+# HQ1 (2026-08-15): the owner-hurry acceptance-skip reason. A finite typed
+# acceptance-decision reason ONLY — deliberately NOT a member of
+# ACCEPTANCE_BYPASS_REASON_BY_RAIL (it is an owner-approved skip, not a forced
+# rail), never a lifecycle status, commit-review reason, truncation reason, or
+# BEST_EFFORT reason. ``ouroboros/owner_hurry.py`` is the consumer.
+REASON_ACCEPTANCE_SKIPPED_OWNER_HURRY = "owner_hurry"
 
 # CLOSED mapping: forced-finalization rail (the loop's typed reason_code) -> typed
 # acceptance-bypass reason, stamped by the loop's common forced-finalization recorder
@@ -142,6 +158,9 @@ ACCEPTANCE_BYPASS_REASON_BY_RAIL = {
     "deadline_local": "acceptance_bypassed_deadline",
     "provider_unavailable": "acceptance_bypassed_provider_unavailable",
     "children_unabsorbed": "acceptance_bypassed_children_unabsorbed",
+    # The owner-stop rail bypasses an owed panel because the OWNER asked the
+    # task to wrap up now — its own typed reason, never the deadline's (CF-02).
+    REASON_OWNER_REQUESTED_FINALIZATION: "acceptance_bypassed_owner_requested_finalization",
 }
 ACCEPTANCE_BYPASS_REASONS = frozenset(ACCEPTANCE_BYPASS_REASON_BY_RAIL.values())
 

@@ -1049,12 +1049,12 @@ def test_the_model_has_no_argument_that_could_widen_the_profile():
 
     entry = next(e for e in delegate.get_tools() if e.name == "delegate_start")
     properties = set(entry.schema["parameters"]["properties"])
-    # `retry_of` names an INVOCATION, not authority: the retry path checks ownership
-    # (the requesting task's id on the durable row) and replays a body that was derived
-    # from the same task's own authority, so it can rename nothing and widen nothing.
-    assert properties == {"prompt", "max_seconds", "retry_of"}
-    # Nothing in the schema names authority: no access, mode, isolation, root or scope.
-    assert not properties & {"access", "mode", "isolation", "root", "scope", "write_surface"}
+    # `retry_of` names an INVOCATION, not authority (ownership-checked replay);
+    # root/bucket/skill_name are a SELECTOR resolved through the same
+    # ResolvedResourceBinding authorizer as ordinary writes (R1 item 9).
+    assert properties == {"prompt", "max_seconds", "retry_of", "root", "bucket", "skill_name"}
+    assert entry.schema["parameters"]["properties"]["root"]["enum"] == ["skill_payload"]
+    assert not properties & {"access", "mode", "isolation", "scope", "write_surface", "cwd"}
 
 
 def test_a_read_only_task_cannot_obtain_workspace_write(tmp_path):

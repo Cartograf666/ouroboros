@@ -2993,6 +2993,56 @@ class TestPlanReviewBudgetGate(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Plan Review Results", result)
         self.assertIn("GREEN", result)
 
+    async def test_payload_current_snapshot_reaches_reviewer_packet(self):
+        """The panel sees installed payload bytes, not a false Git-new marker."""
+        import tempfile
+
+        from ouroboros.tools import plan_review as pr
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            repo = root / "repo"
+            drive = root / "data"
+            repo.mkdir()
+            payload = drive / "skills" / "external" / "alpha" / "plugin.py"
+            payload.parent.mkdir(parents=True)
+            payload.write_text("CURRENT_PAYLOAD_SENTINEL = True\n", encoding="utf-8")
+            ctx = _make_ctx(drive)
+            ctx.repo_dir = repo
+            ctx.system_repo_dir = repo
+            reviews = [
+                {"model": model, "text": _review_text("GREEN"), "error": None}
+                for model in ("model-a", "model-b")
+            ]
+            with (
+                patch.object(pr, "_load_plan_checklist", return_value="checklist"),
+                patch.object(pr, "load_governance_doc", return_value=""),
+                patch.object(pr, "_start_planning_swarm", side_effect=_completed_planning_swarm),
+                patch("ouroboros.config.get_review_models", return_value=["model-a", "model-b"]),
+                patch.object(pr, "_get_review_models", return_value=["model-a", "model-b"]),
+                patch.object(pr, "estimate_tokens", return_value=10_000),
+                patch.object(pr, "review_wave_budget_gate", return_value=None),
+                patch.object(
+                    pr, "_run_plan_review_slots", new=AsyncMock(return_value=reviews),
+                ) as slots,
+            ):
+                result = await pr._run_plan_review_async(
+                    ctx,
+                    _plan_request(
+                        "inspect then update the installed skill",
+                        "repair alpha",
+                        ["data/skills/external/alpha/plugin.py"],
+                        context_level="minimal",
+                        plan_class="external",
+                    ),
+                )
+
+        self.assertIn("GREEN", result)
+        reviewer_packet = slots.await_args.args[3]
+        self.assertIn("CURRENT_PAYLOAD_SENTINEL = True", reviewer_packet)
+        self.assertIn("Current skill-payload snapshot (data plane, not Git HEAD)", reviewer_packet)
+        self.assertNotIn("File is new — no HEAD snapshot", reviewer_packet)
+
     async def test_context_level_must_be_agent_chosen_explicitly(self):
         """plan_task must not use host-side auto heuristics for context selection."""
         from ouroboros.tools import plan_review as pr

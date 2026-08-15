@@ -30,6 +30,37 @@ def test_harness_child_finalizing_without_delegation_gets_one_nudge():
     assert _run(ctx, [], []) is False
 
 
+def test_nanny_nudge_stays_out_of_owner_chat_progress(tmp_path):
+    # Owner decision (2026-08-15): the nudge reaches the model as a [SYSTEM
+    # REMINDER] and the durable trace, but never emit_progress (chat ⚠️ lines).
+    # Observability rides a compact typed task_checkpoint on events.jsonl.
+    import json
+    import pathlib
+
+    drive_logs = tmp_path / "logs"
+    drive_logs.mkdir()
+    ctx = SimpleNamespace(
+        _nanny_route_dispatched=True, _nanny_finalization_injected=False,
+        event_queue=None, drive_logs=drive_logs,
+    )
+    msgs: list = []
+    progress: list = []
+    trace = {"reasoning_notes": [], "tool_calls": []}
+    assert _maybe_inject_finalization_nudges(
+        SimpleNamespace(_ctx=ctx), pathlib.Path("."), "t", trace, "done", msgs,
+        progress.append,
+    ) is True
+    assert progress == []
+    assert any("NANNY_DID_NOT_DELEGATE" in m.get("content", "") for m in msgs)
+    assert any("NANNY_DID_NOT_DELEGATE" in n for n in trace["reasoning_notes"])
+    events = [json.loads(line) for line in
+              (drive_logs / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert any(e.get("type") == "task_checkpoint"
+               and e.get("checkpoint_kind") == "nanny_finalization_nudge"
+               and e.get("nanny_code") == "NANNY_DID_NOT_DELEGATE"
+               for e in events)
+
+
 def _tools(ctx_obj, available):
     return SimpleNamespace(_ctx=ctx_obj, available_tools=lambda: list(available))
 

@@ -345,7 +345,8 @@ test('a typed refusal keeps every field the wizard renders', () => {
 // ---------------------------------------------------------------------------
 
 function fakeDom() {
-    const listeners = [];
+    const documentListeners = [];
+    const windowListeners = [];
     const nodes = new Map();
     const make = (id) => {
         const node = {
@@ -368,17 +369,26 @@ function fakeDom() {
     for (const id of ['agents-family-list', 'agents-status-note', 'agents-outcome', 'agents-login-host']) {
         nodes.set(id, make(id));
     }
+    const defaultView = {
+        addEventListener: (type, fn) => windowListeners.push([type, fn]),
+        removeEventListener: (type, fn) => {
+            const idx = windowListeners.findIndex(([t, f]) => t === type && f === fn);
+            if (idx >= 0) windowListeners.splice(idx, 1);
+        },
+    };
     return {
         nodes,
-        listeners,
+        documentListeners,
+        windowListeners,
         doc: {
             hidden: false,
             activeElement: null,
+            defaultView,
             getElementById: (id) => nodes.get(id) || null,
-            addEventListener: (type, fn) => listeners.push([type, fn]),
+            addEventListener: (type, fn) => documentListeners.push([type, fn]),
             removeEventListener: (type, fn) => {
-                const idx = listeners.findIndex(([t, f]) => t === type && f === fn);
-                if (idx >= 0) listeners.splice(idx, 1);
+                const idx = documentListeners.findIndex(([t, f]) => t === type && f === fn);
+                if (idx >= 0) documentListeners.splice(idx, 1);
             },
         },
     };
@@ -408,9 +418,11 @@ test('the step reads the shared store — it never fetches the status endpoint i
     assert.ok(dom.nodes.get('agents-family-list').innerHTML.includes('Codex'));
     assert.match(dom.nodes.get('agents-outcome').textContent, /Codex is connected/);
 
-    assert.equal(await step.dispose(), true);
+    assert.equal(await step.dispose(), 'released');
+    step.detach();
     assert.equal(store.subscriberCount, 0);
-    assert.equal(dom.listeners.length, 0, 'the step must leave no listener behind');
+    assert.equal(dom.documentListeners.length, 0, 'pagehide must never bind to Document');
+    assert.equal(dom.windowListeners.length, 0, 'the step must leave no Window listener behind');
     store.dispose();
 });
 
@@ -419,7 +431,12 @@ test('Connect starts the login through the shared card controller', async (t) =>
     const calls = [];
     const fetchImpl = async (url, init) => {
         calls.push([String(url), init?.method || 'GET']);
-        if (String(url).startsWith('/api/claudexor/login')) return json(200, { job_id: 'j1', job: {} });
+        if (String(url).startsWith('/api/claudexor/login') && (init?.method || 'GET') === 'DELETE') {
+            return json(200, { job: { state: 'cancelled' } });
+        }
+        if (String(url).startsWith('/api/claudexor/login')) {
+            return json(200, { job_id: 'j1', job: { state: 'running' } });
+        }
         return json(200, snapshotWith([]));
     };
     const store = createClaudexorStatusStore({
@@ -447,29 +464,24 @@ test('Connect starts the login through the shared card controller', async (t) =>
     // The login card renders into the step's own host, never a second surface.
     assert.match(dom.nodes.get('agents-login-host').innerHTML, /harness-login-card/);
     await step.dispose();
+    step.detach();
     store.dispose();
 });
 
-test('a sign-in the daemon will not confirm cancelled keeps its owner', async (t) => {
-    // The shared controller answers a CUSTODY verdict: false means the cancel
-    // could not be proven, so it keeps the job id and stays retryable. Settings
-    // awaits that answer. This step used to call the disposer blind, throw the
-    // answer away, and latch itself disposed first — which made the one
-    // documented recovery (call the disposer again) unreachable and left a live
-    // login job with nobody to cancel it.
+test('unknown sign-in cleanup stays retryable until explicit local detach', async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
     let cancels = 0;
     const fetchImpl = async (url, init) => {
         const u = String(url);
         const method = init?.method || 'GET';
         if (u.startsWith('/api/claudexor/login') && method === 'POST') {
-            return json(200, { job_id: 'j1', job: {} });
+            return json(200, { job_id: 'j1', job: { state: 'running' } });
         }
         if (u.startsWith('/api/claudexor/login') && method === 'DELETE') {
             cancels += 1;
             return json(503, { error: 'daemon unreachable' });   // never proven gone
         }
-        if (u.startsWith('/api/claudexor/login')) return json(200, { job_id: 'j1', job: {} });
+        if (u.startsWith('/api/claudexor/login')) return json(200, { job: { state: 'running' } });
         return json(200, snapshotWith([]));
     };
     const store = createClaudexorStatusStore({
@@ -490,18 +502,130 @@ test('a sign-in the daemon will not confirm cancelled keeps its owner', async (t
     handlers[handlers.length - 1]();
     await flush();
 
-    // Custody is NOT released, and the step says so rather than reporting a
-    // clean teardown that did not happen.
-    assert.equal(await step.dispose(), false);
+    assert.equal(await step.dispose(), 'unknown');
     assert.ok(cancels >= 1, 'the disposer must actually attempt the cancel');
 
-    // ...and it is still retryable against the SAME retained job: a second
-    // disposal runs the same proven-cancel path instead of returning early on a
-    // latched flag.
+    // Unknown transport remains retryable against the same attached job.
     const before = cancels;
-    assert.equal(await step.dispose(), false);
-    assert.ok(cancels > before, 'a retained job must stay cancellable');
+    assert.equal(await step.dispose(), 'unknown');
+    assert.ok(cancels > before, 'unknown cleanup must stay retryable');
 
+    step.detach();
+    const detachedAt = cancels;
+    assert.equal(await step.dispose(), 'unknown', 'detach must not fabricate release proof');
+    assert.equal(cancels, detachedAt, 'local detach initiates no further cancel');
+
+    store.dispose();
+});
+
+test('terminal-unconfirmed cleanup is retained without repeating cancel', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    let cancels = 0;
+    const fetchImpl = async (url, init) => {
+        const u = String(url);
+        const method = init?.method || 'GET';
+        if (u === '/api/claudexor/login' && method === 'POST') {
+            return json(200, { job_id: 'j1', job: { state: 'running' } });
+        }
+        if (u.startsWith('/api/claudexor/login') && method === 'DELETE') {
+            cancels += 1;
+            return json(200, {
+                job: { state: 'failed', outcome: { reason: 'termination_unconfirmed' } },
+            });
+        }
+        if (u.startsWith('/api/claudexor/login')) return json(200, { job: { state: 'running' } });
+        return json(200, snapshotWith([]));
+    };
+    const store = createClaudexorStatusStore({
+        fetchImpl,
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+        pollMs: 5000,
+    });
+    const dom = fakeDom();
+    const handlers = [];
+    dom.nodes.get('agents-family-list').buttons = [{
+        getAttribute: () => 'claude',
+        addEventListener: (_type, fn) => handlers.push(fn),
+    }];
+    const step = createAgentsStep({ doc: dom.doc, store, fetchImpl });
+    step.mount();
+    await flush();
+    handlers[handlers.length - 1]();
+    await flush();
+
+    assert.equal(await step.dispose(), 'retained');
+    assert.equal(cancels, 1);
+    assert.equal(await step.dispose(), 'retained');
+    assert.equal(cancels, 1, 'known retained custody must not repeat a pointless cancel');
+    step.detach();
+
+    store.dispose();
+});
+
+test('pagehide binds to Window, preserves bfcache, and detaches late work synchronously', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const calls = [];
+    let resolveCreate;
+    const createResponse = new Promise((resolve) => { resolveCreate = resolve; });
+    const fetchImpl = async (url, init) => {
+        const method = init?.method || 'GET';
+        calls.push([String(url), method]);
+        if (String(url) === '/api/claudexor/login' && method === 'POST') return createResponse;
+        if (String(url).startsWith('/api/claudexor/login')) {
+            return json(200, { job: { state: 'running' } });
+        }
+        return json(200, snapshotWith([]));
+    };
+    const store = createClaudexorStatusStore({
+        fetchImpl,
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+        pollMs: 5000,
+    });
+    const dom = fakeDom();
+    const handlers = [];
+    dom.nodes.get('agents-family-list').buttons = [{
+        getAttribute: () => 'claude',
+        addEventListener: (_type, fn) => handlers.push(fn),
+    }];
+    const step = createAgentsStep({ doc: dom.doc, store, fetchImpl });
+    step.mount();
+    await flush();
+
+    assert.deepEqual(dom.documentListeners, [], 'Document is not the pagehide target');
+    assert.equal(dom.windowListeners.length, 1);
+    const [type, onPageHide] = dom.windowListeners[0];
+    assert.equal(type, 'pagehide');
+    handlers[handlers.length - 1]();
+    await flush();
+
+    onPageHide({ persisted: true });
+    assert.equal(dom.windowListeners.length, 1, 'bfcache keeps the live step mounted');
+
+    const lifecycleBefore = calls.filter(([url]) => url.startsWith('/api/claudexor/login')).length;
+    onPageHide({ persisted: false });
+    assert.equal(dom.nodes.get('agents-login-host').innerHTML, '', 'detach clears the card synchronously');
+    assert.equal(dom.windowListeners.length, 0, 'detach removes the exact captured Window listener');
+    assert.equal(
+        calls.filter(([url]) => url.startsWith('/api/claudexor/login')).length,
+        lifecycleBefore,
+        'departure initiates no create, cancel, or reconcile request',
+    );
+    handlers[handlers.length - 1]();
+    await flush();
+    assert.equal(
+        calls.filter(([url]) => url.startsWith('/api/claudexor/login')).length,
+        lifecycleBefore,
+        'an old Connect handler cannot recreate login work after detach',
+    );
+
+    resolveCreate(json(200, { job_id: 'j1', job: { state: 'running' } }));
+    await flush();
+    assert.equal(dom.nodes.get('agents-login-host').innerHTML, '', 'late create cannot repaint after detach');
+    assert.equal(
+        calls.filter(([url, method]) => url.startsWith('/api/claudexor/login') && method === 'GET').length,
+        0,
+        'late create cannot arm polling after detach',
+    );
     store.dispose();
 });
 
@@ -521,6 +645,6 @@ test('the skip choice is reflected in the outcome the owner reads before finishi
     assert.deepEqual(step.declaration(), {
         subscriptionsConnected: true, skipSubscriptionPresets: true,
     });
-    step.dispose();
+    step.detach();
     store.dispose();
 });

@@ -275,7 +275,9 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
         return version or None
 
     def _host_settings(self) -> dict[str, Any]:
-        return _json_load(self.host_settings_path)
+        from ouroboros.context_mode_compat import normalize_context_mode_compat
+
+        return normalize_context_mode_compat(_json_load(self.host_settings_path))
 
     def _container_secret_injection_allowed(self, settings: dict[str, Any]) -> bool:
         value = os.environ.get(_CONTAINER_SECRET_OPT_IN)
@@ -385,10 +387,9 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
             "OUROBOROS_RETURN_REASONING",
             # Working-context mode (low | max) for context-ablation runs: the
             # container has no settings.json, so without this forward the
-            # runtime silently falls back to the default ("max"). The derived
-            # auto-low flag travels with it: get_owner_context_mode resolves an
-            # absent flag fail-closed, so a bare forwarded `low` is not read as an
-            # owner-declared scope-review skip.
+            # runtime silently falls back to the default ("max"). The one-window
+            # false provenance tombstone travels with an explicit persisted Low;
+            # a bare env Low intentionally remains owner Max for P3.
             "OUROBOROS_CONTEXT_MODE",
             "OUROBOROS_CONTEXT_MODE_AUTO_LOW",
             "TOTAL_BUDGET",
@@ -406,6 +407,17 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
                 value = settings.get(key)
             if value not in (None, ""):
                 env[key] = str(value)
+        marker_key = "OUROBOROS_CONTEXT_MODE_AUTO_LOW"
+        mode_from_env = "OUROBOROS_CONTEXT_MODE" in os.environ
+        marker_source = os.environ.get(marker_key) if mode_from_env else settings.get(marker_key)
+        marker = str(marker_source or "").strip().lower()
+        if marker in {"0", "false", "off"}:
+            env[marker_key] = "false"
+        else:
+            # Context intent is one authority pair.  When mode comes from env, an
+            # absent/legacy env marker cannot inherit false owner provenance from disk.
+            # Keep that Low bare (effective Low, owner Max) and never recreate true.
+            env.pop(marker_key, None)
 
         if self.ouroboros_model:
             env["OUROBOROS_MODEL"] = self.ouroboros_model

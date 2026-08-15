@@ -2,11 +2,24 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 
 import pytest
 
 from ouroboros.context import build_health_invariants, build_runtime_section, build_user_content
+
+
+def test_build_llm_messages_has_no_recorder_only_soft_cap_chain():
+    from ouroboros import context as context_module
+    from ouroboros.context import build_llm_messages
+
+    assert "soft_cap_tokens" not in inspect.signature(build_llm_messages).parameters
+    assert not hasattr(context_module, "apply_message_token_soft_cap")
+    source = inspect.getsource(build_llm_messages)
+    assert "estimated_tokens_before" not in source
+    assert "trimmed_sections" not in source
+    assert "context_fit" in source
 
 
 @pytest.mark.parametrize("enforcement", ["blocking", "advisory"])

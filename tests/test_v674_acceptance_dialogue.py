@@ -16,6 +16,7 @@ from types import SimpleNamespace as NS
 import pytest
 
 import ouroboros.loop as loop_mod
+from ouroboros import task_pacing
 from ouroboros.review_substrate import (
     DIALOGUE_CONTINUE,
     DIALOGUE_STABLE_DISAGREEMENT,
@@ -655,7 +656,7 @@ def test_typed_findings_cannot_resurrect_settled_row_via_content_match():
 def _rails(passes_done, *, cap=6, workspace=False, required_blocking=False):
     snap = NS(has_deadline=False)
     profile = {"max_improvement_passes": cap} if cap is not None else {}
-    return loop_mod._build_acceptance_rails_line_inner(
+    return task_pacing._acceptance_rails_line_inner(
         snap, profile, passes_done, None,
         required_blocking=required_blocking, workspace=workspace,
     )

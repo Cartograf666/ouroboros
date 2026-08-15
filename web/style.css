@@ -372,6 +372,61 @@ body.resizing-panels { user-select: none; }
     padding: 0 var(--space-3) var(--space-2);
 }
 
+/* S3 (Q2/HQ1): the three-action task stop/hurry dropdown (Chat + Activity). */
+.chat-live-actions,
+.activity-row-actions {
+    position: relative;
+}
+
+.task-control-menu {
+    position: absolute;
+    top: calc(100% + var(--space-1));
+    right: 0;
+    z-index: 90;
+    min-width: 220px;
+    padding: var(--space-2);
+    border: 1px solid var(--surface-border);
+    border-radius: var(--radius-md);
+    background: rgba(13, 11, 15, 0.94);
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.34);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+}
+
+.task-control-item {
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 13px;
+    text-align: left;
+    padding: var(--space-2) var(--space-3);
+    cursor: pointer;
+}
+
+.task-control-item:hover:not(:disabled) {
+    color: var(--text-primary);
+    background: var(--surface-control);
+}
+
+.task-control-item.danger {
+    color: rgba(248, 113, 113, 0.95);
+}
+
+.task-control-item:disabled {
+    opacity: 0.6;
+    cursor: default;
+}
+
+/* HQ1 compact card status: hurry applied — a phase chip, never a chat bubble. */
+.chat-live-card[data-owner-hurry] [data-live-phase]::after {
+    content: ' ⏩';
+}
+
 .chat-live-project-btn {
     min-height: 30px;
     padding: 0 var(--space-3);
@@ -1667,6 +1722,30 @@ button.chat-file:hover,
     padding: 0 14px 14px;
     color: rgba(255, 240, 210, 0.82);
     white-space: pre-wrap;
+    /* Full review bodies can run to hundreds of lines: scroll inside the
+       card instead of re-bloating the chat column (owner-picked 60vh). */
+    max-height: 60vh;
+    overflow-y: auto;
+}
+
+.skill-review-error {
+    color: rgba(255, 180, 160, 0.92);
+}
+
+.skill-review-retry {
+    margin-left: 6px;
+    padding: 2px 10px;
+    border: 1px solid rgba(245, 158, 11, 0.55);
+    border-radius: 6px;
+    background: transparent;
+    color: rgba(245, 158, 11, 0.95);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.skill-review-retry:hover {
+    background: rgba(245, 158, 11, 0.12);
 }
 
 .chat-bubble.pending {

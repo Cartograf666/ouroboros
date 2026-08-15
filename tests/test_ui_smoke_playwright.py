@@ -84,9 +84,6 @@ def _run_core_ui_assertions(url: str) -> None:
                 assert "drop-check.txt" in page.locator("#chat-attachment-preview").inner_text(timeout=5_000)
                 input_area_class = page.locator("#chat-input-area").get_attribute("class", timeout=5_000) or ""
                 assert "drag-active" not in input_area_class
-                # v6.32.0 redesign: nav rows use data-nav-page (the old data-page
-                # rail is gone), and on this mobile viewport (390px) the sidebar is
-                # a drawer behind the header toggle — open it before navigating.
                 page.click('[data-mobile-nav-toggle]')
                 page.wait_for_selector('#primary-sidebar.open', timeout=5_000)
                 page.click('[data-nav-page="dashboard"]')
@@ -128,7 +125,6 @@ def test_ui_projects_sidebar_unread_and_keyboard_menu(direct_server_with_data):
                 assert page.locator("#nav-projects-count").inner_text() == "1"
                 assert row.locator(".nav-unread-dot").count() == 1
 
-                # A real room paint advances the monotonic cursor and clears unread.
                 row.click()
                 page.wait_for_selector('#project-panel:not([hidden])', timeout=30_000)
                 page.wait_for_function(
@@ -152,7 +148,6 @@ def test_ui_projects_sidebar_unread_and_keyboard_menu(direct_server_with_data):
                 assert menu.count() == 0
                 assert page.locator(':focus').get_attribute("aria-label") == "Actions for Alpha project"
 
-                # Collapse is keyboard-operable while the add action stays available.
                 toggle = page.locator("#nav-projects-toggle")
                 toggle.focus()
                 toggle.press("Space")
@@ -771,8 +766,6 @@ def test_ui_smoke_phase3_declarative_widgets_and_settings(direct_server_with_dat
                 card.get_by_role("button", name="Data").click()
                 chart = card.locator('[data-widget-chart-key="id:gap-chart"]')
                 chart.wait_for(state="visible", timeout=5_000)
-                # Bounded canvas (v6.71.0): the chart box clamps to 260-360px and
-                # never grows the card unbounded.
                 canvas_box = chart.bounding_box()
                 assert canvas_box and 250 <= canvas_box["height"] <= 370, canvas_box
                 chart_config = json.loads(chart.get_attribute("data-widget-chart-config"))
@@ -780,10 +773,7 @@ def test_ui_smoke_phase3_declarative_widgets_and_settings(direct_server_with_dat
                 assert chart_config["data"]["datasets"][0]["spanGaps"] is False
                 assert chart_config["options"]["spanGaps"] is False
                 assert chart.get_attribute("aria-label") == "Cache hit rate with an intentional gap"
-                # Consumer flow (v6.71.0): a poll refetch updates the SAME live
-                # canvas in place (wrapper adoption keeps Chart.js resize alive),
-                # the config attribute stays fresh, and the SWR status keeps the
-                # content with a 'refreshing' indicator instead of a loading swap.
+                # Poll refetch adopts the live canvas and preserves stale content.
                 chart.evaluate("el => { el.__adoptMarker = 42; }")
                 first_point = chart_config["data"]["datasets"][0]["data"][0]
                 card.get_by_role("button", name="Refresh chart").click()
@@ -818,8 +808,6 @@ def test_ui_smoke_phase3_declarative_widgets_and_settings(direct_server_with_dat
                 unsafe_row = card.locator('.widget-table tbody tr').filter(has_text="Unsafe reference")
                 assert unsafe_row.locator('a').count() == 0
 
-                # Force the supported no-Chart.js path, then re-render through the
-                # same tab lifecycle. The semantic table remains the authority.
                 page.evaluate("window.Chart = undefined")
                 card.get_by_role("button", name="Submit").click()
                 card.get_by_role("button", name="Data").click()
@@ -848,9 +836,6 @@ def test_ui_smoke_phase3_declarative_widgets_and_settings(direct_server_with_dat
                     "element => getComputedStyle(element).maxHeight"
                 ) == "360px"
 
-                # Host layout owns density. A lone data-rich widget uses the
-                # available desktop canvas, its nested data surface spans the
-                # group grid, and real kanban columns share the row.
                 list_box = page.locator('#widgets-list').bounding_box()
                 card_box = card.bounding_box()
                 operations_group = card.locator('.widget-group').filter(has_text="Operations overview")
@@ -862,9 +847,6 @@ def test_ui_smoke_phase3_declarative_widgets_and_settings(direct_server_with_dat
                 assert list_box and card_box and group_box and tabs_box
                 assert todo_box and done_box
                 assert card_box["width"] >= list_box["width"] * 0.9
-                # Rich-content contract (v6.71.0): list markers render INSIDE the
-                # card (the gutter is reserved), and a long unbroken token wraps
-                # instead of overflowing the card box.
                 markdown_block = card.locator('.widget-markdown.ui-rich-content')
                 assert markdown_block.locator('li').count() >= 4
                 first_li_box = markdown_block.locator('li').first.bounding_box()
@@ -879,8 +861,6 @@ def test_ui_smoke_phase3_declarative_widgets_and_settings(direct_server_with_dat
                     full_page=True,
                 )
 
-                # The same real flow must collapse without page-level
-                # horizontal overflow at a narrow viewport.
                 page.set_viewport_size({"width": 430, "height": 932})
                 page.wait_for_timeout(100)
                 assert page.evaluate(
@@ -3122,16 +3102,13 @@ def test_ui_smoke_v679_subagent_depth_zero_round_trips_through_settings(direct_s
             pytest.skip(str(exc))
         raise
 @pytest.mark.ui_browser
-def test_ui_owner_context_mode_autolow_and_scope_review_ack(direct_server_with_data):
-    """Owner-visible v6.80.0 flows, driven in a real browser (BIBLE P3 / UI verification rule).
+def test_ui_owner_context_mode_and_scope_review_ack(direct_server_with_data):
+    """Owner context intent and scope-review ack, driven in a real browser.
 
     Two claimed-complete owner flows that source-string tests cannot certify:
 
-    1. AUTO-LOW RE-SELECTION. When the effective `low` is a SYSTEM auto-downgrade, the segmented
-       control already displays Low, so the old ``next === current`` short-circuit swallowed the
-       click and the derived flag could never be cleared — an install whose route cannot be
-       confirmed >=1M stayed wedged with scope review blocking every commit. Re-picking the
-       displayed Low must still POST the idempotent owner endpoint.
+    1. OWNER MAX. Switching an explicit Low to Max succeeds without a Main-route
+       context-window confirmation; the frozen compatibility field remains false.
     2. SCOPE-REVIEW CAPABILITY ACK. Saving a scope-review slot whose route has no >=1M evidence
        must raise the owner confirm and, on accept, persist a route-scoped capability ack and say
        so in the settings status line.
@@ -3146,11 +3123,10 @@ def test_ui_owner_context_mode_autolow_and_scope_review_ack(direct_server_with_d
     evidence_dir = pathlib.Path(os.environ.get("OUROBOROS_UI_EVIDENCE_DIR", str(data_dir.parent)))
     evidence_dir.mkdir(parents=True, exist_ok=True)
 
-    # Boot into the state under test: effective low that is a system auto-downgrade, not an
-    # owner selection. The derived flag is disk-authored, so it must be in the file before start.
+    # Boot into explicit owner Low with the one-window false provenance tombstone.
     seeded = json.loads(settings_path.read_text(encoding="utf-8"))
     seeded["OUROBOROS_CONTEXT_MODE"] = "low"
-    seeded["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "true"
+    seeded["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
     seeded["OUROBOROS_SCOPE_REVIEW_MODELS"] = seeded["OUROBOROS_MODEL"]
     settings_path.write_text(json.dumps(seeded), encoding="utf-8")
     direct_server_with_data["restart_server"]()
@@ -3158,7 +3134,7 @@ def test_ui_owner_context_mode_autolow_and_scope_review_ack(direct_server_with_d
     with urllib.request.urlopen(f"{url}/api/state", timeout=5) as resp:  # noqa: S310 - local test server
         boot_state = json.loads(resp.read().decode("utf-8"))
     assert boot_state["context_mode"] == "low"
-    assert boot_state["context_mode_auto_low"] is True, "the fixture must boot in the auto-downgraded state"
+    assert boot_state["context_mode_auto_low"] is False
 
     try:
         with sync_playwright() as pw:
@@ -3170,25 +3146,22 @@ def test_ui_owner_context_mode_autolow_and_scope_review_ack(direct_server_with_d
                 page.goto(url, wait_until="domcontentloaded", timeout=60_000)
                 toggle = page.locator("#chat-context-mode")
                 toggle.wait_for(state="visible", timeout=60_000)
-                page.wait_for_function(
-                    "() => document.querySelector('#chat-context-mode')?.dataset.contextModeAutoLow === 'true'",
-                    timeout=30_000,
-                )
                 assert toggle.get_attribute("data-context-mode") == "low"
-                page.screenshot(path=str(evidence_dir / "v6800-autolow-before.png"))
+                page.screenshot(path=str(evidence_dir / "context-mode-low-before.png"))
 
-                # The click the old short-circuit swallowed: Low is ALREADY displayed.
-                toggle.locator('.chat-seg[data-mode="low"]').click()
+                toggle.locator('.chat-seg[data-mode="max"]').click()
                 page.wait_for_function(
-                    "() => document.querySelector('#chat-context-mode')?.dataset.contextModeAutoLow === 'false'",
+                    "() => document.querySelector('#chat-context-mode')?.dataset.contextMode === 'max'",
                     timeout=30_000,
                 )
-                page.screenshot(path=str(evidence_dir / "v6800-autolow-after.png"))
-                # It reached the owner endpoint: the derived flag is cleared on disk and on the wire.
-                assert json.loads(settings_path.read_text(encoding="utf-8"))["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
+                assert page.locator(".confirm-dialog:not([hidden])").count() == 0
+                page.screenshot(path=str(evidence_dir / "context-mode-max-after.png"))
+                persisted = json.loads(settings_path.read_text(encoding="utf-8"))
+                assert persisted["OUROBOROS_CONTEXT_MODE"] == "max"
+                assert persisted["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
                 with urllib.request.urlopen(f"{url}/api/state", timeout=5) as resp:  # noqa: S310
                     after = json.loads(resp.read().decode("utf-8"))
-                assert after["context_mode"] == "low", "confirming Low must not flip the horizon to max"
+                assert after["context_mode"] == "max"
                 assert after["context_mode_auto_low"] is False
 
                 # 2. Scope-review capability notice -> owner confirm -> route-scoped ack.
@@ -3286,12 +3259,8 @@ def test_ui_smoke_superseded_input_dialog_resolves_object_result(direct_server_w
 
 
 @pytest.mark.ui_browser
-def test_ui_smoke_login_start_serialized_and_dismiss_keeps_unproven_job(direct_server_with_data):
-    """C7 (owner-approved): one login start at a time. A second start during
-    the in-flight create POST must not issue a second POST (the lock spans the
-    awaited create); a Dismiss whose cancel the daemon did NOT confirm keeps
-    the card and the job id; a later start against that unproven-live job is
-    refused instead of orphaning it."""
+def test_ui_smoke_login_recovery_reconcile_detach_and_retry_are_explicit(direct_server_with_data):
+    """Recovery lifecycle."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
@@ -3302,55 +3271,123 @@ def test_ui_smoke_login_start_serialized_and_dismiss_keeps_unproven_job(direct_s
             browser = pw.chromium.launch()
             try:
                 page = browser.new_page()
-                posts: list = []
-                deletes: list = []
+                posts: list[str] = []
+                deletes: list[str] = []
+                reconciles: list[str] = []
 
                 def handle_create(route):
-                    posts.append(1)
+                    posts.append(route.request.url)
+                    if len(posts) == 1:
+                        job = '{"state": "running"}'
+                    elif len(posts) == 2:
+                        job = ('{"state": "failed", "outcome": '
+                               '{"reason": "termination_unconfirmed"}}')
+                    else:
+                        job = '{"state": "running"}'
                     route.fulfill(
                         status=200,
                         content_type="application/json",
-                        body='{"job_id": "job-race-1", "job": {"state": "running"},'
-                             ' "attach_command": ""}',
+                        body='{"job_id":"job-recovery","job":' + job + '}',
                     )
 
-                def handle_cancel(route):
-                    deletes.append(1)
-                    route.fulfill(status=503, content_type="application/json",
-                                  body='{"error": "daemon busy"}')
+                def handle_job(route):
+                    if route.request.url.endswith("/reconcile"):
+                        reconciles.append(route.request.url)
+                        if len(reconciles) == 1:
+                            route.fulfill(status=409, content_type="application/json", body=(
+                                '{"error":"still present","code":"setup_termination_unconfirmed",'
+                                '"required_actions":["retry_setup_reconciliation"]}'
+                            ))
+                        else:
+                            route.fulfill(status=200, content_type="application/json", body=(
+                                '{"job":{"state":"failed","outcome":'
+                                '{"reason":"termination_unconfirmed"},'
+                                '"terminationReconciliation":{"status":"empty"}}}'
+                            ))
+                    else:
+                        deletes.append(route.request.url)
+                        route.fulfill(status=200, content_type="application/json", body=(
+                            '{"job":{"state":"failed","outcome":'
+                            '{"reason":"termination_unconfirmed"}}}'
+                        ))
 
                 page.route("**/api/claudexor/login", handle_create)
-                page.route("**/api/claudexor/login/*", handle_cancel)
+                page.route("**/api/claudexor/login/*", handle_job)
+                page.route("**/api/claudexor/login/*/reconcile", handle_job)
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
 
-                card_html = page.evaluate(
+                setup_result = page.evaluate(
                     """
                     async () => {
-                        // The app ships its own #harness-login-card on the
-                        // Settings page — render lands THERE, so drive it.
                         const host = document.getElementById('harness-login-card');
                         if (!host) return 'NO-HOST';
                         const m = await import('/static/modules/harness_accounts.js');
-                        // (1) Two rapid starts: the second must be refused by
-                        // the start lock while the first create is in flight.
+                        const wait = async (sel) => {
+                            for (let i = 0; i < 100; i++) {
+                                const b = host.querySelector(sel);
+                                if (b && !b.disabled) return b;
+                                await new Promise((r) => setTimeout(r, 20));
+                            }
+                        };
                         const p1 = m.startLogin('codex', 'race-a');
-                        const p2 = m.startLogin('codex', 'race-b');
-                        await p1; await p2;
-                        // (2) Dismiss with an unconfirmed cancel (DELETE 503).
+                        const p2 = m.startLogin('codex', 'race-a');
+                        await Promise.all([p1, p2]);
                         host.querySelector('[data-login-dismiss]')?.click();
-                        await new Promise((r) => setTimeout(r, 150));
-                        // (3) A new start against the unproven-live job must
-                        // be refused (cancel still fails with 503).
-                        await m.startLogin('codex', 'race-c');
-                        return host.innerHTML;
+                        (await wait('[data-login-reconcile]'))?.click();
+                        return 'RECONCILE-CLICKED';
                     }
                     """
                 )
-                assert len(posts) == 1, f"exactly one create POST, got {len(posts)}"
-                assert len(deletes) >= 1, "dismiss must attempt the cancel DELETE"
-                assert "Could not cancel" in card_html, (
-                    "the card must stay with an honest error after an unproven cancel"
+                assert setup_result == "RECONCILE-CLICKED"
+                # Deterministic settle wait (a fixed sleep was flaky under load:
+                # the card could still say "Checking…"). The reconcile round-trip
+                # is settled only when the card re-renders the retained-custody
+                # recovery face: the outcome detail note exists (it is absent
+                # before the click) and "Check again" is enabled again.
+                page.wait_for_function(
+                    "() => { const host = document.getElementById('harness-login-card');"
+                    " const btn = host?.querySelector('[data-login-reconcile]');"
+                    " return Boolean(host?.querySelector('[data-login-detail]'))"
+                    " && Boolean(btn) && !btn.disabled; }",
+                    timeout=30_000,
                 )
+                recovery_html = page.evaluate(
+                    "() => document.getElementById('harness-login-card').innerHTML"
+                )
+                assert len(posts) == 1
+                assert len(deletes) == 1
+                assert len(reconciles) == 1
+                assert "Check again" in recovery_html and "job-recovery" in reconciles[0]
+
+                before_detach = (len(posts), len(deletes), len(reconciles))
+                detached_html = page.evaluate(
+                    """async () => {
+                        const h = document.getElementById('harness-login-card');
+                        h.querySelector('[data-login-dismiss]')?.click();
+                        await new Promise((r) => setTimeout(r, 50));
+                        return h.innerHTML;
+                    }"""
+                )
+                assert detached_html == ""
+                assert (len(posts), len(deletes), len(reconciles)) == before_detach
+
+                final_html = page.evaluate(
+                    """async () => {
+                        const h = document.getElementById('harness-login-card');
+                        const m = await import('/static/modules/harness_accounts.js');
+                        await m.startLogin('codex', 'race-a');
+                        h.querySelector('[data-login-reconcile]')?.click();
+                        for (let i = 0; i < 100 && !h.querySelector('[data-login-retry]'); i++)
+                            await new Promise((r) => setTimeout(r, 20));
+                        h.querySelector('[data-login-retry]')?.click();
+                        await new Promise((r) => setTimeout(r, 100));
+                        return h.innerHTML;
+                    }"""
+                )
+                assert len(posts) == 3
+                assert len(deletes) == 1
+                assert len(reconciles) == 2 and all("job-recovery" in u for u in reconciles)
+                assert "Starting" in final_html or "sign-in" in final_html
             finally:
                 browser.close()
     except PlaywrightError as exc:
@@ -3361,14 +3398,7 @@ def test_ui_smoke_login_start_serialized_and_dismiss_keeps_unproven_job(direct_s
 
 @pytest.mark.ui_browser
 def test_ui_smoke_dismiss_overlapping_start_cannot_drop_a_live_job(direct_server_with_data):
-    """C7, semantics updated by the PR-175 merge: dismiss and start share ONE
-    transition QUEUE (it used to be a try-lock that DROPPED the overlapped
-    start — and a dropped Close left the daemon running a sign-in for a card
-    the owner had dismissed). A start attempted while Dismiss awaits its slow
-    cancel DELETE is not lost and not interleaved: it runs AFTER the dismissal
-    settles, so it can neither create a job the dismiss continuation would
-    drop, nor cancel a job it does not own. A further start beside the live
-    job first cancels it (the centralized C7 guard), then creates its own."""
+    """Queued start follows slow Dismiss."""
     import time as _time
 
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
@@ -3394,9 +3424,10 @@ def test_ui_smoke_dismiss_overlapping_start_cannot_drop_a_live_job(direct_server
 
                 def handle_cancel(route):
                     events.append("delete-open")
-                    _time.sleep(0.35)  # hold the DELETE open: the overlap window
+                    _time.sleep(0.35)
                     events.append("delete-done")
-                    route.fulfill(status=200, content_type="application/json", body="{}")
+                    route.fulfill(status=200, content_type="application/json",
+                                  body='{"job":{"state":"cancelled"}}')
 
                 page.route("**/api/claudexor/login", handle_create)
                 page.route("**/api/claudexor/login/*", handle_cancel)
@@ -3408,16 +3439,11 @@ def test_ui_smoke_dismiss_overlapping_start_cannot_drop_a_live_job(direct_server
                         const host = document.getElementById('harness-login-card');
                         if (!host) return { error: 'NO-HOST' };
                         const m = await import('/static/modules/harness_accounts.js');
-                        await m.startLogin('codex', 'ov-a');          // create #1
+                        await m.startLogin('codex', 'ov-a');
                         host.querySelector('[data-login-dismiss]')?.click();
-                        // Queued behind the dismiss: this start lands AFTER the
-                        // slow DELETE settles, and its card renders — the press
-                        // is not lost the way the old try-lock lost it.
                         await m.startLogin('codex', 'ov-b');
                         await new Promise((r) => setTimeout(r, 600));
                         const cardAfterQueuedStart = host.innerHTML.length > 0;
-                        // A start beside the live ov-b job first cancels it
-                        // (the centralized guard), then creates its own.
                         await m.startLogin('codex', 'ov-c');
                         return {
                             cardAfterQueuedStart,
@@ -3427,27 +3453,15 @@ def test_ui_smoke_dismiss_overlapping_start_cannot_drop_a_live_job(direct_server
                     """
                 )
                 assert result.get("error") is None
-                assert result["cardAfterQueuedStart"] is True, (
-                    "the start queued behind the dismiss must land, not vanish"
-                )
-                assert result["finalHasCard"] is True, (
-                    "the final start must stay tracked (its card renders)"
-                )
+                assert result["cardAfterQueuedStart"] is True
+                assert result["finalHasCard"] is True
                 posts = events.count("post")
                 deletes = events.count("delete-open")
-                assert posts == 3, f"three create POSTs (none dropped), got {posts}"
-                assert deletes == 2, (
-                    f"two cancel DELETEs (the dismissed ov-a, then ov-b under the "
-                    f"start guard), got {deletes}"
-                )
-                # The preserved C7 invariant, now as ORDER: the queued start's
-                # POST happens only after the dismissal's DELETE fully settled —
-                # no job is created for a dismiss continuation to drop.
+                assert posts == 3
+                assert deletes == 2
                 first_delete_done = events.index("delete-done")
                 second_post = [i for i, e in enumerate(events) if e == "post"][1]
-                assert first_delete_done < second_post, (
-                    f"the queued start POSTed before the dismiss DELETE settled: {events}"
-                )
+                assert first_delete_done < second_post
             finally:
                 browser.close()
     except PlaywrightError as exc:
@@ -3457,12 +3471,11 @@ def test_ui_smoke_dismiss_overlapping_start_cannot_drop_a_live_job(direct_server
 
 
 @pytest.mark.ui_browser
-def test_ui_smoke_cancel_error_face_recovers_after_successful_poll(direct_server_with_data):
-    """Round b5: the cancel-failure note is TRANSIENT. After a Dismiss whose
-    DELETE failed (503), a recovered daemon whose poll reads the job
-    successfully must clear the note — the card settles on the job's real
-    state instead of staying stuck on the cancel-error face while the account
-    row says connected."""
+@pytest.mark.parametrize("face", ["recovery", "reconciled", "unavailable"])
+def test_ui_smoke_stale_get_cannot_overwrite_login_terminal_faces(
+    direct_server_with_data, face,
+):
+    """Stale GET cannot repaint custody."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
@@ -3473,54 +3486,91 @@ def test_ui_smoke_cancel_error_face_recovers_after_successful_poll(direct_server
             browser = pw.chromium.launch()
             try:
                 page = browser.new_page()
+                creates: list[str] = []
+                deletes: list[str] = []
+                reconciles: list[str] = []
 
                 def handle_create(route):
+                    creates.append(route.request.url)
                     route.fulfill(
                         status=200,
                         content_type="application/json",
-                        body='{"job_id": "job-rec-1", "job": {"state": "running"},'
+                        body='{"job_id": "job-stale", "job": {"state": "running"},'
                              ' "attach_command": ""}',
                     )
 
                 def handle_job(route):
                     if route.request.method == "DELETE":
-                        route.fulfill(status=503, content_type="application/json",
-                                      body='{"error": "daemon busy"}')
+                        deletes.append(route.request.url)
+                        if face == "unavailable":
+                            route.fulfill(status=404, content_type="application/json", body="{}")
+                        else:
+                            route.fulfill(status=200, content_type="application/json", body=(
+                                '{"job":{"state":"failed","outcome":'
+                                '{"reason":"termination_unconfirmed"}}}'
+                            ))
                         return
-                    # The recovered daemon: the poll reads the job fine and it
-                    # has SUCCEEDED while the cancel was failing.
                     route.fulfill(status=200, content_type="application/json",
-                                  body='{"job": {"state": "succeeded"}}')
+                                  body='{"job": {"state": "running"}}')
+
+                def handle_reconcile(route):
+                    reconciles.append(route.request.url)
+                    route.fulfill(status=200, content_type="application/json", body=(
+                        '{"job":{"state":"failed","outcome":'
+                        '{"reason":"termination_unconfirmed"},'
+                        '"terminationReconciliation":{"status":"empty"}}}'
+                    ))
 
                 page.route("**/api/claudexor/login", handle_create)
                 page.route("**/api/claudexor/login/*", handle_job)
+                page.route("**/api/claudexor/login/*/reconcile", handle_reconcile)
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
 
-                page.evaluate(
+                result = page.evaluate(
                     """
-                    async () => {
+                    async (face) => {
+                        const realFetch = window.fetch.bind(window);
+                        let releaseStale;
+                        const stale = new Promise((resolve) => { releaseStale = resolve; });
+                        let gets = 0;
+                        window.fetch = (input, init = {}) => {
+                            const url = String(input?.url || input);
+                            const method = String(init.method || input?.method || 'GET').toUpperCase();
+                            if (method === 'GET' && url.includes('/api/claudexor/login/job-stale')) {
+                                gets += 1;
+                                return stale;
+                            }
+                            return realFetch(input, init);
+                        };
                         const host = document.getElementById('harness-login-card');
                         const m = await import('/static/modules/harness_accounts.js');
-                        await m.startLogin('codex', 'rec-a');
+                        await m.startLogin('codex', 'stale-' + face);
+                        await new Promise((r) => setTimeout(r, 3200));
                         host.querySelector('[data-login-dismiss]')?.click();
-                        await new Promise((r) => setTimeout(r, 150));
-                        window.__cardMidway = host.innerHTML;
+                        await new Promise((r) => setTimeout(r, 100));
+                        if (face === 'reconciled') {
+                            host.querySelector('[data-login-reconcile]')?.click();
+                            await new Promise((r) => setTimeout(r, 100));
+                        }
+                        const before = host.innerHTML;
+                        releaseStale(new Response('{"job":{"state":"running"}}', {
+                            status: 200, headers: { 'Content-Type': 'application/json' },
+                        }));
+                        await new Promise((r) => setTimeout(r, 3400));
+                        return { before, after: host.innerHTML, gets };
                     }
-                    """
+                    """, face,
                 )
-                midway = page.evaluate("() => window.__cardMidway")
-                assert "Could not cancel" in midway, "the failed cancel must be visible first"
-                # The first poll tick lands after ~3s; the successful read must
-                # clear the transient note and settle the real (succeeded) face.
-                page.wait_for_function(
-                    "() => { const h = document.getElementById('harness-login-card');"
-                    " return h && !h.innerHTML.includes('Could not cancel'); }",
-                    timeout=10_000,
-                )
-                final_html = page.evaluate(
-                    "() => document.getElementById('harness-login-card').innerHTML"
-                )
-                assert "Could not cancel" not in final_html
+                assert result["gets"] == 1
+                assert result["before"] == result["after"]
+                marker = {
+                    "recovery": "could not prove",
+                    "reconciled": "no longer blocking",
+                    "unavailable": "no longer available",
+                }[face]
+                assert marker in result["after"]
+                assert len(creates) == 1 and len(deletes) == 1
+                assert len(reconciles) == (1 if face == "reconciled" else 0)
             finally:
                 browser.close()
     except PlaywrightError as exc:
@@ -3530,66 +3580,65 @@ def test_ui_smoke_cancel_error_face_recovers_after_successful_poll(direct_server
 
 
 @pytest.mark.ui_browser
-def test_ui_smoke_refused_retry_keeps_polling_and_recovers(direct_server_with_data):
-    """Round b6[0]: Retry must NOT preemptively stop the poll — when the C7
-    guard refuses the restart (cancel unproven, job live), the old poll is the
-    only recovery path: a later successful GET clears the note and settles the
-    real verdict. Exactly one create POST throughout."""
+def test_ui_smoke_window_pagehide_detaches_login_without_lifecycle_http(direct_server_with_data):
+    """Window pagehide detaches locally."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
 
-    url = direct_server_with_data["url"]
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch()
             try:
                 page = browser.new_page()
-                posts: list = []
-
-                def handle_create(route):
-                    posts.append(1)
-                    route.fulfill(status=200, content_type="application/json",
-                                  body='{"job_id": "job-rp-1", "job": {"state": "running"},'
-                                       ' "attach_command": ""}')
-
-                def handle_job(route):
-                    if route.request.method == "DELETE":
-                        route.fulfill(status=503, content_type="application/json",
-                                      body='{"error": "daemon busy"}')
-                        return
-                    route.fulfill(status=200, content_type="application/json",
-                                  body='{"job": {"state": "succeeded"}}')
-
-                page.route("**/api/claudexor/login", handle_create)
-                page.route("**/api/claudexor/login/*", handle_job)
-                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-
-                midway = page.evaluate(
+                page.goto(direct_server_with_data["url"], wait_until="domcontentloaded")
+                result = page.evaluate(
                     """
                     async () => {
-                        const host = document.getElementById('harness-login-card');
-                        const m = await import('/static/modules/harness_accounts.js');
-                        await m.startLogin('codex', 'rp-a');       // create #1, running
-                        await m.startLogin('codex', 'rp-b');       // guard: DELETE 503 -> refused, error face
-                        const retryBtn = host.querySelector('[data-login-retry]');
-                        if (!retryBtn) return 'NO-RETRY-BUTTON: ' + host.innerHTML.slice(0, 200);
-                        retryBtn.click();                          // the REAL retry handler (mutation site)
-                        await new Promise((r) => setTimeout(r, 250));
-                        return host.innerHTML;
+                        const {createAgentsStep} = await import('/static/modules/onboarding_agents_step.js');
+                        let connect, release;
+                        const pending = new Promise((r) => { release = r; });
+                        const calls = {create: 0, delete: 0, reconcile: 0, get: 0};
+                        const button = {getAttribute: () => 'claude',
+                            addEventListener: (_t, fn) => { connect = fn; }};
+                        const host = {innerHTML: '', querySelector: () => null};
+                        const list = {innerHTML: '', querySelectorAll: () => [button]};
+                        const other = {textContent: '', hidden: false, dataset: {}};
+                        const doc = {defaultView: window, getElementById: (id) =>
+                            id === 'agents-login-host' ? host
+                                : id === 'agents-family-list' ? list : other};
+                        const store = {
+                            accountsKnown: false, snapshot: null, subscribe: () => () => {},
+                            refresh: () => {}, unavailableNote: () => null,
+                        };
+                        const fetchImpl = async (input, init={}) => {
+                            const url=String(input), method=init.method || 'GET';
+                            if (url === '/api/claudexor/login' && method === 'POST') {
+                                calls.create++; return pending;
+                            }
+                            if (url.endsWith('/reconcile')) calls.reconcile++;
+                            else if (method === 'DELETE') calls.delete++; else calls.get++;
+                            return new Response('{"job":{"state":"running"}}', {
+                                status: 200, headers: {'Content-Type':'application/json'}});
+                        };
+                        const step = createAgentsStep({doc, store, fetchImpl});
+                        step.mount(); connect(); await Promise.resolve();
+                        window.dispatchEvent(new PageTransitionEvent('pagehide',{persisted:true}));
+                        const cached=host.innerHTML, before={...calls};
+                        window.dispatchEvent(new PageTransitionEvent('pagehide',{persisted:false}));
+                        const immediate=host.innerHTML;
+                        connect(); await Promise.resolve();
+                        release(new Response('{"job_id":"late","job":{"state":"running"}}',
+                            {status:200,headers:{'Content-Type':'application/json'}}));
+                        await new Promise((r) => setTimeout(r, 50));
+                        return {cached, immediate, final:host.innerHTML, before, after:calls};
                     }
                     """
                 )
-                assert not midway.startswith("NO-RETRY-BUTTON"), midway
-                assert "Could not cancel" in midway, "the refused restart must be visible"
-                page.wait_for_function(
-                    "() => { const h = document.getElementById('harness-login-card');"
-                    " return h && !h.innerHTML.includes('Could not cancel'); }",
-                    timeout=10_000,
-                )
-                assert len(posts) == 1, (
-                    f"the refused restart must not create a second job, got {len(posts)} POSTs"
-                )
+                assert result["cached"]
+                assert result["immediate"] == result["final"] == ""
+                assert result["before"] == result["after"] == dict(
+                    create=1, delete=0, reconcile=0, get=0)
             finally:
                 browser.close()
     except PlaywrightError as exc:
@@ -3600,11 +3649,7 @@ def test_ui_smoke_refused_retry_keeps_polling_and_recovers(direct_server_with_da
 
 @pytest.mark.ui_browser
 def test_ui_smoke_dismiss_overlapping_settle_never_freezes_the_card(direct_server_with_data):
-    """Round b6[1]: a poll tick can settle the job (succeeded) while the
-    dismiss's slow DELETE is still in flight. The cancel continuation must
-    re-check the settle instead of stamping a cancel error AFTER it — the
-    terminal tick schedules no further poll, so that error would freeze the
-    card forever against a connected account row."""
+    """Terminal GET wins over slow Dismiss."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
@@ -3615,34 +3660,41 @@ def test_ui_smoke_dismiss_overlapping_settle_never_freezes_the_card(direct_serve
             browser = pw.chromium.launch()
             try:
                 page = browser.new_page()
+                creates: list[str] = []
+                gets: list[str] = []
+                reconciles: list[str] = []
 
                 def handle_create(route):
+                    creates.append(route.request.url)
                     route.fulfill(status=200, content_type="application/json",
                                   body='{"job_id": "job-os-1", "job": {"state": "running"},'
                                        ' "attach_command": ""}')
 
                 def handle_job(route):
-                    # Only GET polls reach the python route: the DELETE is
-                    # delayed on the JS side (a python-side sleep would
-                    # serialize the handlers and the poll could never overtake
-                    # the DELETE).
+                    gets.append(route.request.url)
                     route.fulfill(status=200, content_type="application/json",
                                   body='{"job": {"state": "succeeded"}}')
 
+                def handle_reconcile(route):
+                    reconciles.append(route.request.url)
+                    route.fulfill(status=500, content_type="application/json", body="{}")
+
                 page.route("**/api/claudexor/login", handle_create)
                 page.route("**/api/claudexor/login/*", handle_job)
+                page.route("**/api/claudexor/login/*/reconcile", handle_reconcile)
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
 
-                final_html = page.evaluate(
+                result = page.evaluate(
                     """
                     async () => {
-                        // JS-side delayed DELETE: truly concurrent with polls.
                         const realFetch = window.fetch.bind(window);
+                        let deletes = 0;
                         window.fetch = (input, init = {}) => {
                             const url = String(input && input.url ? input.url : input);
                             const method = String((init && init.method)
                                 || (input && input.method) || 'GET').toUpperCase();
                             if (method === 'DELETE' && url.includes('/api/claudexor/login/')) {
+                                deletes += 1;
                                 return new Promise((resolve) => setTimeout(() => resolve(
                                     new Response('{"error": "daemon busy"}',
                                         { status: 503,
@@ -3655,16 +3707,17 @@ def test_ui_smoke_dismiss_overlapping_settle_never_freezes_the_card(direct_serve
                         const m = await import('/static/modules/harness_accounts.js');
                         await m.startLogin('codex', 'os-a');
                         host.querySelector('[data-login-dismiss]')?.click();
-                        // The ~3s poll settles the job while the DELETE is
-                        // still pending; the DELETE 503 lands at ~4s.
                         await new Promise((r) => setTimeout(r, 5200));
-                        return host.innerHTML;
+                        return { html: host.innerHTML, deletes,
+                            cardCount: host.querySelectorAll('[data-login-card]').length,
+                            verdict: host.querySelector('[data-login-verdict]')?.textContent.trim() };
                     }
                     """
                 )
-                assert "Could not cancel" not in final_html, (
-                    "a cancel error must never be stamped over an already-settled job"
-                )
+                assert result["cardCount"] == 1
+                assert result["verdict"] == "Connected."
+                assert "Could not cancel" not in result["html"]
+                assert (len(creates), result["deletes"], len(gets), len(reconciles)) == (1, 1, 1, 0)
             finally:
                 browser.close()
     except PlaywrightError as exc:
@@ -3675,9 +3728,9 @@ def test_ui_smoke_dismiss_overlapping_settle_never_freezes_the_card(direct_serve
 
 @pytest.mark.ui_browser
 def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_server_with_data):
-    """v6.82 P5: "Cancel run" renders ONLY on live marker-attested root cards
-    (never on marker-less direct-turn-shaped cards, subagent children, or the
-    reusable background slot), opens a confirm dialog, and a cancelled root
+    """v6.82 P5 / S3 Q2: the stop control renders ONLY on live marker-attested
+    root cards (never marker-less direct-turn cards, subagent children, or the
+    reusable background slot), opens the dropdown, and a cancelled root
     replays as an honest warn-toned "Cancelled" — never a generic "Done"."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
@@ -3734,7 +3787,7 @@ def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_serve
                 live.wait_for(state="attached", timeout=30_000)
                 cancel_btn = live.locator('[data-cancel-run]')
                 cancel_btn.wait_for(state="attached", timeout=30_000)
-                assert cancel_btn.inner_text().strip() == "Cancel run"
+                assert cancel_btn.inner_text().strip() == "Stop…"
                 # Marker-less direct-turn shape, subagent child, reusable slot,
                 # and the finished cancelled root must NOT offer the action.
                 for absent_id in ("direct-turn", "sub-child1", "bg-consciousness", "gone-root"):
@@ -3749,13 +3802,13 @@ def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_serve
                     timeout=30_000,
                 )
                 assert "cancelled" in (gone_phase.get_attribute("class") or "")
-                # Confirm dialog wiring: open, then keep the run running.
+                # Dropdown wiring (S3 Q2): open, then dismiss = keep running.
                 cancel_btn.click()
-                dialog = page.locator('.confirm-dialog')
-                dialog.wait_for(state="visible", timeout=10_000)
-                assert "Cancel this run and all its subagents?" in dialog.inner_text()
-                dialog.locator('[data-confirm-cancel]').last.click()
-                dialog.wait_for(state="detached", timeout=10_000)
+                menu = live.locator('.task-control-menu')
+                menu.wait_for(state="visible", timeout=10_000)
+                assert "Wrap up" in menu.inner_text()
+                page.keyboard.press("Escape")
+                menu.wait_for(state="detached", timeout=10_000)
                 assert cancel_btn.is_enabled()
                 page.screenshot(path=str(data_dir.parent / "cancel-run.png"), full_page=True)
             finally:

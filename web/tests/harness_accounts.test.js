@@ -46,7 +46,7 @@ import {
     loginCardFace,
     loginCardHtml,
     loginInputSupport,
-    loginSettleProven,
+    loginReleaseProven,
     loginStatusLine,
     loginVerdict,
     pollResponseApplies,
@@ -107,14 +107,14 @@ test('a slow first read says it is checking, and an idle daemon is not dressed a
 
 test('the login card explains foreground runtime preparation and retries the same intent', () => {
     const preparing = loginCardHtml({
-        harness: 'claude', profile: '', job: null, preparingRuntime: true,
+        harness: 'claude', profile: '', envelope: null, preparingRuntime: true,
         error: '', verdict: null, confirming: false,
     });
     assert.ok(preparing.includes('Installing or checking Claudexor…'));
     assert.ok(!preparing.includes('data-login-retry'));
 
     const failed = loginCardHtml({
-        harness: 'claude', profile: '', job: null, preparingRuntime: false,
+        harness: 'claude', profile: '', envelope: null, preparingRuntime: false,
         error: 'checksum mismatch', verdict: null, confirming: false,
     });
     assert.ok(failed.includes('checksum mismatch'));
@@ -365,13 +365,15 @@ test('a name normalization would change is shown back, editable, BEFORE any logi
     assert.equal(normalizeProfileName(''), '');
 });
 
-test('the device-code disclosure is found wherever the snapshot nests it', () => {
-    const job = { snapshot: { disclosures: { deviceCode: {
+test('the device-code disclosure is read only from the canonical envelope level', () => {
+    const envelope = { job: { state: 'waiting_for_input' }, deviceCode: {
         flow: 'chatgptDeviceCode', verificationUrl: 'https://auth.example/device', userCode: 'ABCD-1234',
-    } } } };
-    assert.deepEqual(deviceCodeDisclosure(job),
+    } };
+    assert.deepEqual(deviceCodeDisclosure(envelope),
         { url: 'https://auth.example/device', code: 'ABCD-1234', flow: 'chatgptDeviceCode' });
-    assert.equal(deviceCodeDisclosure({ state: 'running' }), null);
+    // Mutation guard: the accidental legacy double-wrap is deliberately dead.
+    assert.equal(deviceCodeDisclosure({ job: { state: 'running', deviceCode: envelope.deviceCode } }), null);
+    assert.equal(deviceCodeDisclosure({ job: { state: 'running' } }), null);
     assert.equal(deviceCodeDisclosure(null), null);
 });
 
@@ -382,35 +384,35 @@ test('a URL-ONLY disclosure renders: the flow discriminates, not the code field'
     // prints. Requiring both fields matched neither, so a published link showed
     // nothing at all; the login card is the whole point of D30's structural face.
     for (const flow of ['oauth_url', 'chatgpt', 'oauth_url_input']) {
-        const job = { snapshot: { disclosures: { deviceCode: {
+        const envelope = { job: { state: 'waiting_for_input' }, deviceCode: {
             flow, verificationUrl: 'https://claude.ai/oauth/authorize?x=1', userCode: '',
-        } } } };
-        assert.deepEqual(deviceCodeDisclosure(job),
+        } };
+        assert.deepEqual(deviceCodeDisclosure(envelope),
             { url: 'https://claude.ai/oauth/authorize?x=1', code: '', flow }, flow);
         // …and the card must actually pick the structural face for it.
-        assert.equal(loginCardFace({ mode: 'attach', attachCommand: 'cmd', job }), 'device', flow);
+        assert.equal(loginCardFace({ mode: 'attach', attachCommand: 'cmd', envelope }), 'device', flow);
     }
     // A node carrying neither is still not a disclosure.
-    assert.equal(deviceCodeDisclosure({ snapshot: { verificationUrl: 'https://a/b' } }), null);
+    assert.equal(deviceCodeDisclosure({ job: {}, verificationUrl: 'https://a/b' }), null);
 });
 
-test('job terminal states are the typed set, success is exactly succeeded', () => {
-    assert.deepEqual(jobStateSummary({ state: 'succeeded' }),
+test('job terminal states are read from the canonical envelope only', () => {
+    assert.deepEqual(jobStateSummary({ job: { state: 'succeeded' } }),
         { state: 'succeeded', phase: '', terminal: true, succeeded: true });
     for (const bad of ['failed', 'cancelled', 'timed_out', 'not_supported', 'interrupted_unknown']) {
-        const summary = jobStateSummary({ state: bad });
+        const summary = jobStateSummary({ job: { state: bad } });
         assert.equal(summary.terminal, true, bad);
         assert.equal(summary.succeeded, false, bad);
     }
-    assert.equal(jobStateSummary({ state: 'waiting_for_input', phase: 'awaiting_user' }).terminal, false);
+    assert.equal(jobStateSummary({ job: { state: 'waiting_for_input', phase: 'awaiting_user' } }).terminal, false);
+    assert.equal(jobStateSummary({ state: 'succeeded' }).terminal, false,
+        'the old bare job shape must not regain compatibility');
 });
 
 test('the POLLED snapshot ENVELOPE is read, so the login poll can actually terminate', () => {
     // GET /v2/setup/jobs/:id/snapshot answers ControlSetupJobSnapshot —
-    // {job, cursor, sequence, deviceCode?} — while POST /v2/setup/jobs answers a
-    // bare ControlSetupJob. Reading only the top level saw a state on the create
-    // response and NEVER on a poll, so the card's terminal banner never rendered
-    // and the 3-second poll ran forever.
+    // {job, cursor, sequence, deviceCode?}. Every Ouroboros operation now wraps
+    // its one bare job the same way, so the controller keeps one reader.
     const envelope = {
         job: { jobId: 'j1', state: 'succeeded', phase: 'completed' },
         cursor: 'c1', sequence: 7,
@@ -419,8 +421,8 @@ test('the POLLED snapshot ENVELOPE is read, so the login poll can actually termi
         { state: 'succeeded', phase: 'completed', terminal: true, succeeded: true });
     assert.equal(jobStateSummary({ job: { state: 'failed', phase: 'login' } }).terminal, true);
     assert.equal(jobStateSummary({ job: { state: 'waiting_for_input' } }).terminal, false);
-    // The bare create-response job keeps working through the same reader.
-    assert.equal(jobStateSummary({ state: 'cancelled' }).terminal, true);
+    // An accidental second envelope never passes as canonical.
+    assert.equal(jobStateSummary({ job: envelope }).terminal, false);
 });
 
 test('account rows consume the REAL schema shape: array of {profile,status,identity} wrappers + harnessAccounts array', () => {
@@ -487,17 +489,17 @@ test('the attach command is DEMOTED: never a card face, only a due fallback', ()
     // an attach-command card body). A job with a command but nothing
     // structured renders the WAITING face; the command surfaces only through
     // attachFallbackDue as a collapsed Advanced affordance.
-    const attachOnly = { attachCommand: 'CLAUDEXOR_CONFIG_DIR=/d claudexor setup attach j1', startedAtMs: 1000, job: { state: 'waiting_for_input' } };
+    const attachOnly = { attachCommand: 'CLAUDEXOR_CONFIG_DIR=/d claudexor setup attach j1', startedAtMs: 1000, envelope: { job: { state: 'waiting_for_input' } } };
     assert.equal(loginCardFace(attachOnly), 'progress');
     // The SAME job once the engine surfaces a structured OAuth disclosure:
     // the structural card wins — no terminal needed.
-    assert.equal(loginCardFace({ ...attachOnly, job: {
-        state: 'waiting_for_input',
-        snapshot: { disclosures: { deviceCode: { flow: 'chatgptDeviceCode', verificationUrl: 'https://a/b', userCode: 'XY-12' } } },
+    assert.equal(loginCardFace({ ...attachOnly, envelope: {
+        job: { state: 'waiting_for_input' },
+        deviceCode: { flow: 'chatgptDeviceCode', verificationUrl: 'https://a/b', userCode: 'XY-12' },
     } }), 'device');
     // Errors outrank everything; nothing at all = progress; no job = none.
-    assert.equal(loginCardFace({ error: 'nope', attachCommand: 'cmd', job: {} }), 'error');
-    assert.equal(loginCardFace({ job: { state: 'running' } }), 'progress');
+    assert.equal(loginCardFace({ error: 'nope', attachCommand: 'cmd', envelope: { job: {} } }), 'error');
+    assert.equal(loginCardFace({ envelope: { job: { state: 'running' } } }), 'progress');
     assert.equal(loginCardFace(null), 'none');
 });
 
@@ -506,18 +508,18 @@ test('card shape 2 keys on the disclosure FLOW string — the typed enum decides
     // flow for a job that also accepts a pasted code (claude's
     // manual-callback path); `oauth_url`/`chatgpt` stay link-only. The enum
     // decides for ANY harness — no boolean sidecar, no name fallback.
-    const withInput = { snapshot: { disclosures: { deviceCode: {
-        flow: 'oauth_url_input', verificationUrl: 'https://platform.claude.com/oauth/authorize?x=1', userCode: '' } } } };
+    const withInput = { job: { state: 'waiting_for_input' }, deviceCode: {
+        flow: 'oauth_url_input', verificationUrl: 'https://platform.claude.com/oauth/authorize?x=1', userCode: '' } };
     assert.equal(loginInputSupport(withInput), true);
     // A URL-only disclosure: shape 1, no input — even when the harness that
     // produced it happens to be claude (the flow is the truth, not the name).
     for (const flow of ['oauth_url', 'chatgpt', 'chatgptDeviceCode']) {
-        const job = { snapshot: { disclosures: { deviceCode: {
-            flow, verificationUrl: 'https://cursor.com/loginDeepControl?x=1', userCode: '' } } } };
-        assert.equal(loginInputSupport(job), false, flow);
+        const envelope = { job: { state: 'waiting_for_input' }, deviceCode: {
+            flow, verificationUrl: 'https://cursor.com/loginDeepControl?x=1', userCode: '' } };
+        assert.equal(loginInputSupport(envelope), false, flow);
     }
     // No disclosure at all: no input field.
-    assert.equal(loginInputSupport({ state: 'running' }), false);
+    assert.equal(loginInputSupport({ job: { state: 'running' } }), false);
     assert.equal(loginInputSupport(null), false);
 });
 
@@ -540,6 +542,11 @@ test('the verdict never contradicts the state, and never fails off a verificatio
     assert.deepEqual(launch, { kind: 'failure', reason: 'launch_failed' });
     assert.equal(loginVerdict({ job: { state: 'timed_out', outcome: { reason: 'timed_out' } } }).kind, 'failure');
     assert.equal(loginVerdict({ job: { state: 'cancelled', outcome: { reason: 'cancelled_by_user' } } }).kind, 'failure');
+    const termination = { state: 'interrupted_unknown',
+        outcome: { reason: 'termination_unconfirmed' } };
+    assert.equal(loginVerdict({ job: termination }).kind, 'recovery');
+    assert.equal(loginVerdict({ job: { ...termination,
+        terminationReconciliation: { status: 'empty' } } }).kind, 'reconciled');
     // Wording: a real failure names its reason in words, no enum glue.
     assert.equal(failureText('launch_failed'), 'Sign-in failed — launch failed.');
 });
@@ -553,7 +560,7 @@ test('the live state line renders plain words and NOTHING on a terminal job', ()
     assert.equal(loginStatusLine({ job: { state: 'waiting_for_input', phase: 'launching' } }), 'Waiting for the sign-in link…');
     assert.equal(loginStatusLine({ job: { state: 'running', phase: 'verifying' } }), 'Checking the sign-in…');
     const disclosed = { job: { state: 'waiting_for_input', phase: 'awaiting_user' },
-        snapshot: { disclosures: { deviceCode: { flow: 'oauth_url', verificationUrl: 'https://a/b', userCode: '' } } } };
+        deviceCode: { flow: 'oauth_url', verificationUrl: 'https://a/b', userCode: '' } };
     assert.equal(loginStatusLine(disclosed), 'Waiting for you to finish signing in in the browser…');
 });
 
@@ -683,7 +690,7 @@ test('confirmLoginLive re-polls live account status briefly instead of trusting 
 });
 
 test('the Advanced fallback is due on a disclosure that never comes, or an engine that predates the modes', () => {
-    const base = { attachCommand: 'CLAUDEXOR_CONFIG_DIR=/d claudexor setup attach j1', startedAtMs: 100000, engineDegraded: false, job: { state: 'waiting_for_input' } };
+    const base = { attachCommand: 'CLAUDEXOR_CONFIG_DIR=/d claudexor setup attach j1', startedAtMs: 100000, engineDegraded: false, envelope: { job: { state: 'waiting_for_input' } } };
     // Inside the grace window: not due — the card just says it is waiting.
     assert.equal(attachFallbackDue(base, 100000 + ATTACH_FALLBACK_MS - 1), false);
     // Window elapsed with no disclosure: due.
@@ -691,8 +698,8 @@ test('the Advanced fallback is due on a disclosure that never comes, or an engin
     // An engine the create answer flagged as pre-disclosure: due immediately.
     assert.equal(attachFallbackDue({ ...base, engineDegraded: true }, 100001), true);
     // A rendered disclosure keeps the fallback hidden (link-first, always)…
-    const disclosed = { ...base, job: { snapshot: { disclosures: { deviceCode: {
-        flow: 'oauth_url', verificationUrl: 'https://a/b', userCode: '' } } } } };
+    const disclosed = { ...base, envelope: { job: { state: 'waiting_for_input' }, deviceCode: {
+        flow: 'oauth_url', verificationUrl: 'https://a/b', userCode: '' } } };
     assert.equal(attachFallbackDue(disclosed, 100000 + ATTACH_FALLBACK_MS * 2), false);
     // …unless the engine is degraded (the input route 404'd mid-flow).
     assert.equal(attachFallbackDue({ ...disclosed, engineDegraded: true }, 100001), true);
@@ -709,8 +716,8 @@ test('the Advanced fallback is due on a disclosure that never comes, or an engin
 function cardWithUrl(url, extra = {}) {
     return {
         harness: 'claude', profile: '', jobId: 'j1', attachCommand: '', startedAtMs: 0,
-        job: { state: 'waiting_for_input', phase: 'awaiting_user',
-            snapshot: { disclosures: { deviceCode: { flow: 'oauth_url', verificationUrl: url, userCode: '' } } } },
+        envelope: { job: { state: 'waiting_for_input', phase: 'awaiting_user' },
+            deviceCode: { flow: 'oauth_url', verificationUrl: url, userCode: '' } },
         ...extra,
     };
 }
@@ -783,9 +790,9 @@ test("a settled non-success verdict carries the engine's own explanation", () =>
     // fixed constants, so nothing else could ever carry it.
     const message = 'codex native session was not ready before the verification'
         + ' deadline: native Codex session is not logged in';
-    // The POLL envelope NESTS the job, which is where the field really lands.
+    // The canonical envelope carries the bare job exactly once.
     const nested = cardWithUrl('https://a.example/b', {
-        job: { job: { state: 'failed', phase: 'completed', message } },
+        envelope: { job: { state: 'failed', phase: 'completed', message } },
         verdict: { kind: 'unconfirmed', reason: 'auth_not_ready' },
     });
     const unconfirmed = loginCardHtml(nested, 0);
@@ -808,44 +815,34 @@ test("a settled non-success verdict carries the engine's own explanation", () =>
 
     // Engine-supplied text is escaped like every other disclosure on this card.
     const hostile = loginCardHtml(cardWithUrl('https://a.example/b', {
-        job: { job: { state: 'failed', message: '<img src=x onerror=alert(1)>' } },
+        envelope: { job: { state: 'failed', message: '<img src=x onerror=alert(1)>' } },
         verdict: { kind: 'unconfirmed', reason: 'auth_not_ready' },
     }), 0);
     assert.ok(!hostile.includes('<img'));
     assert.ok(hostile.includes('&lt;img'));
 
     // jobDetail itself: both levels, trimmed, and total over junk.
-    assert.equal(jobDetail({ message: '  hi  ' }), 'hi');
+    assert.equal(jobDetail({ job: { message: '  hi  ' } }), 'hi');
     assert.equal(jobDetail({ job: { message: 'deep' } }), 'deep');
-    assert.equal(jobDetail({ message: '   ', job: { message: 'deep' } }), 'deep');
-    assert.equal(jobDetail({ message: 42 }), '');
-    assert.equal(jobDetail({}), '');
+    assert.equal(jobDetail({ message: 'legacy' }), '', 'the old bare shape is rejected');
+    assert.equal(jobDetail({ job: { message: 42 } }), '');
+    assert.equal(jobDetail({ job: {} }), '');
     assert.equal(jobDetail(null), '');
 });
 
-test("the engine explanation reaches the card from EITHER envelope level", () => {
-    // The dual-level read is asserted on jobDetail() above, but the RENDER path
-    // was only ever exercised with the POLL envelope ({job:{...}}). CREATE
-    // answers a BARE ControlSetupJob, and the login card holds whichever of the
-    // two last landed on it — `startLogin` writes `data.job` from the create
-    // answer, and the poll tick overwrites it later. So a regression that
-    // reached only one level would leave the other silently mute.
+test("the engine explanation reaches the card only through the canonical envelope", () => {
     const message = 'native Codex session is not logged in';
     const levels = {
-        create_bare_job: { state: 'failed', phase: 'completed', message },
-        poll_envelope: { job: { state: 'failed', phase: 'completed', message } },
+        canonical: { job: { state: 'failed', phase: 'completed', message } },
+        accidental_double_wrap: { job: { job: { state: 'failed', phase: 'completed', message } } },
     };
-    for (const [label, job] of Object.entries(levels)) {
+    for (const [label, envelope] of Object.entries(levels)) {
         const html = loginCardHtml(cardWithUrl('https://a.example/b', {
-            job, verdict: { kind: 'unconfirmed', reason: 'auth_not_ready' },
+            envelope, verdict: { kind: 'unconfirmed', reason: 'auth_not_ready' },
         }), 0);
-        assert.ok(html.includes('data-login-detail'), label);
-        assert.ok(html.includes(message), label);
+        assert.equal(html.includes(message), label === 'canonical', label);
     }
-    // Precedence when BOTH levels speak: the top level wins. Not a preference —
-    // the poll writes the envelope it received, so the outer value is the fresher
-    // reading of the two and must not be shadowed by a stale nested one.
-    assert.equal(jobDetail({ message: 'outer', job: { message: 'inner' } }), 'outer');
+    assert.equal(jobDetail({ message: 'outer', job: { message: 'inner' } }), 'inner');
 });
 
 test("the engine explanation is escaped in full and never truncated", () => {
@@ -856,7 +853,7 @@ test("the engine explanation is escaped in full and never truncated", () => {
     // whose attributes are built by the same interpolation.
     const hostile = `Tom & Jerry's "quoted" <b>bold</b> \`tick\``;
     const html = loginCardHtml(cardWithUrl('https://a.example/b', {
-        job: { job: { state: 'failed', message: hostile } },
+        envelope: { job: { state: 'failed', message: hostile } },
         verdict: { kind: 'failure', reason: 'launch_failed' },
     }), 0);
     for (const raw of ['&', '<', '>', '"', "'", '`']) {
@@ -876,7 +873,7 @@ test("the engine explanation is escaped in full and never truncated", () => {
     // chain a cause onto a summary; nothing bounds their length.
     const long = `${'the daemon explained at length: '.repeat(80)}end.`;
     const longHtml = loginCardHtml(cardWithUrl('https://a.example/b', {
-        job: { job: { state: 'failed', message: long } },
+        envelope: { job: { state: 'failed', message: long } },
         verdict: { kind: 'unconfirmed', reason: 'auth_not_ready' },
     }), 0);
     assert.ok(longHtml.includes(long));
@@ -888,20 +885,20 @@ test('a settled failure with NO engine sentence renders the verdict alone', () =
     // most settled jobs carry no `message` at all, so the common case must add
     // no empty element and — the specific hazard of interpolating an optional
     // field — no stringified `undefined`/`null` where a sentence would go.
-    for (const job of [
+    for (const envelope of [
         { job: { state: 'failed', phase: 'completed' } },          // absent
         { job: { state: 'failed', message: '' } },                 // empty
         { job: { state: 'failed', message: '   ' } },              // whitespace
         { job: { state: 'failed', message: null } },               // explicit null
     ]) {
         const html = loginCardHtml(cardWithUrl('https://a.example/b', {
-            job, verdict: { kind: 'unconfirmed', reason: 'auth_not_ready' },
+            envelope, verdict: { kind: 'unconfirmed', reason: 'auth_not_ready' },
         }), 0);
-        assert.ok(!html.includes('data-login-detail'), JSON.stringify(job));
-        assert.ok(!html.includes('undefined'), JSON.stringify(job));
-        assert.ok(!html.includes('null'), JSON.stringify(job));
+        assert.ok(!html.includes('data-login-detail'), JSON.stringify(envelope));
+        assert.ok(!html.includes('undefined'), JSON.stringify(envelope));
+        assert.ok(!html.includes('null'), JSON.stringify(envelope));
         // The verdict itself is untouched by the missing detail.
-        assert.ok(html.includes(UNCONFIRMED_TEXT), JSON.stringify(job));
+        assert.ok(html.includes(UNCONFIRMED_TEXT), JSON.stringify(envelope));
     }
 });
 
@@ -916,10 +913,10 @@ test('the verify-race incident, composed end to end: recheck runs out and the ca
     // pins the CHAIN, not settleVerdict's own wiring; that remains untested.)
     const message = 'codex native session was not ready before the verification'
         + ' deadline: native Codex session is not logged in';
-    const job = { job: { state: 'failed', phase: 'completed', message, outcome: { reason: 'auth_not_ready' } } };
+    const envelope = { job: { state: 'failed', phase: 'completed', message, outcome: { reason: 'auth_not_ready' } } };
 
     // 1. The job settled failed, but on a reason a verification race fabricates.
-    const verdict = loginVerdict(job);
+    const verdict = loginVerdict(envelope);
     assert.equal(verdict.kind, 'recheck');
     assert.equal(verdict.reason, 'auth_not_ready');
 
@@ -936,7 +933,7 @@ test('the verify-race incident, composed end to end: recheck runs out and the ca
     //    step 3 produced the constant alone, which reads as "wait a moment" for
     //    a job the daemon had already settled terminally.
     const html = loginCardHtml(cardWithUrl('https://a.example/b', {
-        job, verdict: check.confirmed ? { kind: 'success', reason: '' } : { kind: 'unconfirmed', reason: verdict.reason },
+        envelope, verdict: check.confirmed ? { kind: 'success', reason: '' } : { kind: 'unconfirmed', reason: verdict.reason },
     }), 0);
     assert.ok(html.includes(UNCONFIRMED_TEXT));
     assert.ok(html.includes(message));
@@ -953,8 +950,10 @@ test('a poll answer applies only to the job it was captured for, and only while 
     assert.equal(pollResponseApplies(active, { jobId: 'j2' }), false);   // reopened
     assert.equal(pollResponseApplies(active, null), false);              // closed
     assert.equal(pollResponseApplies(null, null), false);
-    assert.equal(pollResponseApplies({ ...active, verdict: { kind: 'success' } },
-        active), false);
+    for (const kind of ['success', 'recovery', 'reconciled', 'unavailable']) {
+        const owned = { ...active, verdict: { kind } };
+        assert.equal(pollResponseApplies(owned, owned), false, kind);
+    }
     const confirming = { jobId: 'j1', confirming: true };
     assert.equal(pollResponseApplies(confirming, confirming), false);
 });
@@ -1034,15 +1033,22 @@ test('a re-render never STEALS focus, and never focuses a field the code already
 // C7: login-job serialization — a new login only after the old one is gone.
 // ---------------------------------------------------------------------------
 
-test('cancelLoginJob reports gone only on ok/404/410; failures and network death are NOT cancelled', async () => {
-    const mk = (status, ok) => async () => ({ ok, status });
-    assert.equal(await cancelLoginJob('job-1', mk(200, true)), true);
-    assert.equal(await cancelLoginJob('job-1', mk(404, false)), true);   // already gone
-    assert.equal(await cancelLoginJob('job-1', mk(410, false)), true);   // already gone
-    assert.equal(await cancelLoginJob('job-1', mk(503, false)), false);  // daemon may still run it
-    assert.equal(await cancelLoginJob('job-1', mk(500, false)), false);
-    assert.equal(await cancelLoginJob('job-1', async () => { throw new Error('net'); }), false);
-    assert.equal(await cancelLoginJob('', async () => { throw new Error('must not be called'); }), true);
+test('cancelLoginJob parses canonical custody evidence instead of treating any 2xx as gone', async () => {
+    const mk = (status, body) => async () => fakeResponse(status, body);
+    assert.equal((await cancelLoginJob('job-1', mk(200, { job: { state: 'cancelled' } }))).status,
+        'released');
+    assert.equal((await cancelLoginJob('job-1', mk(200, { job: { state: 'interrupted_unknown',
+        outcome: { reason: 'termination_unconfirmed' } } }))).status, 'retained');
+    assert.equal((await cancelLoginJob('job-1', mk(200, { job: { state: 'cancelling' } }))).status,
+        'retained');
+    assert.equal((await cancelLoginJob('job-1', mk(200, {}))).status, 'unknown');
+    assert.equal((await cancelLoginJob('job-1', mk(200, { job: {} }))).status, 'unknown');
+    assert.equal((await cancelLoginJob('job-1', mk(404, {}))).status, 'released');
+    assert.equal((await cancelLoginJob('job-1', mk(410, {}))).status, 'released');
+    assert.equal((await cancelLoginJob('job-1', mk(503, { error: 'down' }))).status, 'unknown');
+    assert.equal((await cancelLoginJob('job-1', async () => { throw new Error('net'); })).status, 'unknown');
+    assert.equal((await cancelLoginJob('', async () => { throw new Error('must not be called'); })).status,
+        'released');
 });
 
 test('startLogin centralizes the C7 guard: cancel-or-refuse BEFORE the new login POST', () => {
@@ -1059,23 +1065,23 @@ test('startLogin centralizes the C7 guard: cancel-or-refuse BEFORE the new login
     assert.ok(postAt > -1);
     assert.ok(guardAt < postAt, 'the C7 guard must run before the new login POST');
     const guarded = fn.slice(guardAt, postAt);
-    assert.match(guarded, /if \(!cancelled && !settledMeanwhile\) \{[\s\S]*?return;/,
-        'a failed cancel (with the job still unsettled) must refuse the new login');
+    assert.match(guarded, /result\.status === LOGIN_CUSTODY_UNKNOWN[\s\S]*?return;/,
+        'unknown cancellation evidence must refuse the new login');
 });
 
 
-test('loginSettleProven: only a TERMINAL job snapshot proves the settle — an unconfirmed verdict does NOT', () => {
-    assert.equal(loginSettleProven(null), false);
-    assert.equal(loginSettleProven({}), false);
-    assert.equal(loginSettleProven({ job: { state: 'running' } }), false);
-    // Lost contact: the give-up verdict must NEVER read as proof of settle —
-    // the job may still be live, and treating it as settled would let a
-    // dismiss/restart drop or duplicate a live login (round b7).
-    assert.equal(loginSettleProven({ job: { state: 'running' }, verdict: { kind: 'unconfirmed' } }), false);
-    assert.equal(loginSettleProven({ job: null, verdict: { kind: 'unconfirmed' } }), false);
-    assert.equal(loginSettleProven({ job: { state: 'succeeded' } }), true);
-    assert.equal(loginSettleProven({ job: { state: 'failed' } }), true);
-    assert.equal(loginSettleProven({ job: { state: 'cancelled' } }), true);
+test('the one release predicate rejects unconfirmed termination until reconciliation proves empty', () => {
+    assert.equal(loginReleaseProven(null), false);
+    assert.equal(loginReleaseProven({ job: { state: 'running' } }), false);
+    assert.equal(loginReleaseProven({ job: { state: 'cancelled' } }), true);
+    const retained = { job: { state: 'interrupted_unknown',
+        outcome: { reason: 'termination_unconfirmed' } } };
+    assert.equal(loginReleaseProven(retained), false);
+    assert.equal(loginReleaseProven({ job: { ...retained.job,
+        terminationReconciliation: { status: 'empty' } } }), true);
+    assert.equal(loginReleaseProven(null, { absent: true }), true);
+    assert.equal(loginReleaseProven({ state: 'cancelled' }), false,
+        'old bare jobs do not regain release authority');
 });
 
 test('a harness with no row only says "no account connected" once the store was READ', () => {
@@ -1367,11 +1373,23 @@ function mountSection() {
     return { elements, doc, win };
 }
 
-test('the custody verdict is CONSUMED: a remount is refused while a login may still be live', async () => {
-    // The reviewer's probe: the first cancel answered 503, `first_cancel_proven
-    // : false`, the controller kept its job id — and a remount immediately
-    // created a SECOND live login, because the teardown neither awaited nor
-    // read the verdict.
+function captureCardControls(element) {
+    const controls = new Map();
+    element.querySelector = (selector) => {
+        const marker = selector.match(/\[([^\]]+)\]/)?.[1] || '';
+        if (!marker || !element.innerHTML.includes(marker)) return null;
+        const control = {
+            listeners: [],
+            addEventListener(type, fn) { control.listeners.push([type, fn]); },
+        };
+        controls.set(selector, control);
+        return control;
+    };
+    return (selector, type = 'click') => controls.get(selector)?.listeners
+        .filter(([kind]) => kind === type).map(([, fn]) => fn).at(-1);
+}
+
+test('Settings destroy detaches locally, and explicit Connect recreates the disposed controller', async () => {
     const { elements, doc, win } = mountSection();
     const priorDoc = globalThis.document;
     const priorWin = globalThis.window;
@@ -1380,15 +1398,21 @@ test('the custody verdict is CONSUMED: a remount is refused while a login may st
     globalThis.window = win;
 
     const calls = [];
-    let deleteStatus = 503;
+    let creates = 0;
     // The login controller talks through the app's own apiFetch (global fetch);
     // the status store is injected below, so only login traffic lands here.
     globalThis.fetch = async (url, init = {}) => {
         calls.push(`${init.method || 'GET'} ${url}`);
         if (url === '/api/claudexor/login' && init.method === 'POST') {
-            return fakeResponse(200, { job_id: `job-${calls.length}`, job: { state: 'running' } });
+            creates += 1;
+            return creates === 1
+                ? fakeResponse(200, { job_id: 'fenced-job', job: { state: 'running' } })
+                : fakeResponse(200, { job_id: 'fenced-job', job: {
+                    state: 'interrupted_unknown',
+                    outcome: { reason: 'termination_unconfirmed' },
+                } });
         }
-        if (init.method === 'DELETE') return fakeResponse(deleteStatus, { error: 'daemon unreachable' });
+        if (init.method === 'DELETE') return fakeResponse(200, { job: { state: 'cancelled' } });
         return fakeResponse(200, { job: { state: 'running' } });
     };
     const store = createClaudexorStatusStore({
@@ -1405,32 +1429,95 @@ test('the custody verdict is CONSUMED: a remount is refused while a login may st
     try {
         assert.equal(await initHarnessAccounts({ store }), true, 'a clean mount succeeds');
         await startLogin('codex', '');
-        const creates = () => calls.filter((c) => c === 'POST /api/claudexor/login').length;
-        assert.equal(creates(), 1);
+        assert.equal(creates, 1);
 
-        // The daemon refuses the cancel: custody is retained and REPORTED.
-        assert.equal(await destroyHarnessAccounts(), false,
-            'an unproven cancel must not be answered "released"');
-        assert.ok(calls.some((c) => c.startsWith('DELETE /api/claudexor/login/')),
-            `the teardown really tried: ${calls.join(' | ')}`);
+        const mountedCard = elements['harness-login-card'].innerHTML;
+        const mountedLifecycle = calls.filter((c) => /\/api\/claudexor\/login/.test(c)).length;
+        await store.refresh();
+        assert.equal(elements['harness-login-card'].innerHTML, mountedCard,
+            'ordinary mounted Settings refresh/hide-show does not tear down the card');
+        assert.equal(calls.filter((c) => /\/api\/claudexor\/login/.test(c)).length,
+            mountedLifecycle, 'ordinary mounted Settings activity starts no lifecycle request');
 
-        // …so the remount is refused, and NO second login can be created.
-        assert.equal(await initHarnessAccounts({ store }), false, 'the remount is blocked');
-        assert.equal(creates(), 1, 'no second live login was started beside the first');
+        const lifecycleBefore = calls.filter((c) => /\/api\/claudexor\/login/.test(c)).length;
+        assert.equal(destroyHarnessAccounts(), true);
+        assert.equal(calls.filter((c) => /\/api\/claudexor\/login/.test(c)).length, lifecycleBefore,
+            'exported destroy initiates zero create/DELETE/reconcile requests');
+        assert.equal(elements['harness-login-card'].innerHTML, '');
+        assert.doesNotMatch(elements['agents-service-banner'].textContent, /holding off|could not be cancelled/);
+
+        // A detached old handler/exported call cannot recreate outside a mount.
         await startLogin('codex', '');
-        assert.equal(creates(), 1, 'and a disposed controller still starts nothing');
-        assert.match(elements['agents-service-banner'].textContent, /could not be cancelled/,
-            'the owner is told why the panel is holding off');
+        assert.equal(creates, 1);
 
-        // The daemon comes back: the retained job is cancelled and the section
-        // mounts again — a failed disposer is retryable, not a dead end.
-        deleteStatus = 200;
-        assert.equal(await destroyHarnessAccounts(), true, 'the retry proves the cancel');
+        // Re-init owns no hidden lifecycle mutation. The next explicit Connect
+        // creates exactly once and re-adopts the daemon's same fenced job.
         assert.equal(await initHarnessAccounts({ store }), true);
+        const beforeConnect = creates;
         await startLogin('codex', '');
-        assert.equal(creates(), 2, 'and only now may a new login be created');
+        assert.equal(creates, beforeConnect + 1);
+        assert.match(elements['harness-login-card'].innerHTML, /data-login-reconcile/,
+            'the recreated controller adopted the fence into recovery');
     } finally {
-        await destroyHarnessAccounts();
+        destroyHarnessAccounts();
+        store.dispose();
+        globalThis.document = priorDoc;
+        globalThis.window = priorWin;
+        globalThis.fetch = priorFetch;
+    }
+});
+
+test('Settings explicit Connect recreates a cached controller disposed by recovery-face Close', async () => {
+    const { elements, doc, win } = mountSection();
+    const control = captureCardControls(elements['harness-login-card']);
+    const priorDoc = globalThis.document;
+    const priorWin = globalThis.window;
+    const priorFetch = globalThis.fetch;
+    globalThis.document = doc;
+    globalThis.window = win;
+    let creates = 0;
+    let deletes = 0;
+    const retainedJob = { state: 'interrupted_unknown',
+        outcome: { reason: 'termination_unconfirmed' } };
+    globalThis.fetch = async (url, init = {}) => {
+        if (url === '/api/claudexor/login' && init.method === 'POST') {
+            creates += 1;
+            return fakeResponse(200, { job_id: 'same-fenced-job',
+                job: creates === 1 ? { state: 'running' } : retainedJob });
+        }
+        if (init.method === 'DELETE') {
+            deletes += 1;
+            return fakeResponse(200, { job: retainedJob });
+        }
+        return fakeResponse(200, { job: { state: 'running' } });
+    };
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => fakeResponse(200, {
+            daemon: { state: 'running', engine_version: '3.3.13', runtime: {} },
+            config_dir: '/home/agent', harnesses: [{ id: 'codex' }],
+            profiles: { harnessAccounts: [], profiles: [] }, quota: [],
+        }),
+        doc,
+    });
+    try {
+        await initHarnessAccounts({ store });
+        await startLogin('codex', '');
+        assert.equal(creates, 1);
+
+        await control('[data-login-dismiss]')();
+        assert.equal(deletes, 1);
+        assert.match(elements['harness-login-card'].innerHTML, /data-login-reconcile/);
+
+        const secondClose = control('[data-login-dismiss]')();
+        assert.equal(elements['harness-login-card'].innerHTML, '', 'second Close detaches synchronously');
+        await secondClose;
+        assert.equal(deletes, 1, 'recovery-face Close does not repeat cancel');
+
+        await startLogin('codex', '');
+        assert.equal(creates, 2, 'explicit Connect built a fresh controller and created once');
+        assert.match(elements['harness-login-card'].innerHTML, /data-login-reconcile/);
+    } finally {
+        destroyHarnessAccounts();
         store.dispose();
         globalThis.document = priorDoc;
         globalThis.window = priorWin;

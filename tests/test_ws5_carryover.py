@@ -365,7 +365,7 @@ def test_secret_guard_catches_relative_interpreter_path():
     assert _subagent_shell_targets_secret("cat /tmp/notes.txt") is False
 
 
-# --- CW7: the Max gate route honours USE_LOCAL_MAIN ---
+# --- Exact-route context fitting honours USE_LOCAL_MAIN ---
 
 def test_active_main_route_honours_use_local_main():
     from ouroboros.gateway.settings import _active_main_route
@@ -374,37 +374,6 @@ def test_active_main_route_honours_use_local_main():
     assert local["use_local"] is True and local["provider"] == "local"
     remote = _active_main_route({"OUROBOROS_MODEL": "openai/gpt-5.5", "USE_LOCAL_MAIN": False})
     assert remote["use_local"] is False and remote["provider"] != "local"
-
-
-# --- CW2: the Max-mode contract is enforced on the task path, fail-closed ---
-
-def test_active_route_confirms_max_reports_unknown_without_evidence(monkeypatch, tmp_path):
-    from types import SimpleNamespace
-
-    import ouroboros.capability_evidence as capability_evidence
-    import ouroboros.config as cfg
-    from ouroboros.gateway import settings as smod
-
-    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)  # empty store: no capability evidence
-    monkeypatch.setattr(smod, "_owner_read_settings_raw", lambda: {"OUROBOROS_MODEL": "openai/gpt-5.5"})
-    # No evidence is UNKNOWN, distinct from positive evidence of a sub-1M route.
-    assert smod._active_route_confirms_max() is None
-    monkeypatch.setattr(
-        capability_evidence,
-        "probe",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            status="confirmed", stale=False, window_tokens=200_000,
-        ),
-    )
-    assert smod._active_route_confirms_max() is False
-    monkeypatch.setattr(
-        capability_evidence,
-        "probe",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            status="confirmed", stale=False, window_tokens=1_000_000,
-        ),
-    )
-    assert smod._active_route_confirms_max() is True
 
 
 # --- CW9: the pacing-interval timeout constant lives in the SETTINGS_DEFAULTS SSOT ---
@@ -417,69 +386,16 @@ def test_pacing_interval_in_settings_defaults():
 
 # === Triad+scope review-fix regressions (v6.34.0) ===
 
-# --- v6.64: known-small routes use Low; unknown routes try Max once ---
-
-def test_maybe_downgrade_max_uses_positive_route_evidence(monkeypatch):
-    from types import SimpleNamespace
-    from ouroboros import context as contextmod
+# Predicted route evidence is measurement input, never a global-mode writer or
+# an initial Max-to-Low authority. Functional fit cases are pinned in the Phase
+# 2 matrix; this carryover suite guards deletion of the old compatibility seam.
+def test_predicted_route_downgrade_seam_stays_deleted():
     from ouroboros import loop as loopmod
 
-    seen = {}
-
-    def _known_small(task, *, allow_fetch=False):
-        seen["model"] = task["model"]
-        seen["use_local"] = task["use_local_model"]
-        return {}, SimpleNamespace(status="confirmed", stale=False, window_tokens=16_384)
-
-    monkeypatch.setattr(contextmod, "_context_fit_route", _known_small)
-    # A positively-known small local route selects Low.
-    assert loopmod._maybe_downgrade_max_unconfirmed("max", True, "local-model") == "low"
-    assert seen["use_local"] is True and seen["model"] == "local-model"
-    # Missing remote evidence stays Max until a real overflow proves otherwise.
-    monkeypatch.setattr(
-        contextmod,
-        "_context_fit_route",
-        lambda *_a, **_kw: ({}, SimpleNamespace(status="unprobeable", stale=False, window_tokens=0)),
-    )
-    assert loopmod._maybe_downgrade_max_unconfirmed("max", False, "openai/gpt-5.5") == "max"
-    # A non-max mode is returned untouched.
-    assert loopmod._maybe_downgrade_max_unconfirmed("low", True, "x") == "low"
+    assert not hasattr(loopmod, "_maybe_downgrade_max_unconfirmed")
 
 
-def test_maybe_downgrade_max_keeps_max_when_confirmed(monkeypatch):
-    from types import SimpleNamespace
-    from ouroboros import context as contextmod
-    from ouroboros import loop as loopmod
-
-    monkeypatch.setattr(
-        contextmod, "_context_fit_route",
-        lambda *_a, **_kw: ({}, SimpleNamespace(status="confirmed", stale=False, window_tokens=1_000_000)),
-    )
-    assert loopmod._maybe_downgrade_max_unconfirmed("max", True, "confirmed-local") == "max"
-
-
-def test_maybe_downgrade_max_probe_error_preserves_max(monkeypatch):
-    from ouroboros import context as contextmod
-    from ouroboros import loop as loopmod
-
-    def _boom(*a, **k):
-        raise RuntimeError("probe machinery unavailable")
-
-    monkeypatch.setattr(contextmod, "_context_fit_route", _boom)
-    # Probe failure is unknown and must not fabricate a Low/200K capability.
-    assert loopmod._maybe_downgrade_max_unconfirmed("max", True, "x") == "max"
-
-
-def test_active_route_confirms_max_local_override_reports_unknown(monkeypatch, tmp_path):
-    import ouroboros.config as cfg
-    from ouroboros.gateway import settings as smod
-
-    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)  # empty store: no evidence on disk
-    monkeypatch.setattr(smod, "_owner_read_settings_raw", lambda: {"OUROBOROS_MODEL": "openai/gpt-5.5"})
-    # Pinning to a local route with no local-health evidence remains UNKNOWN.
-    assert smod._active_route_confirms_max(model="local-x", use_local=True) is None
-
-
+# --- CW3: the ephemeral deny surface is complete (core envelope + non-core mutators) ---
 # --- CW3: the ephemeral deny surface is complete (core envelope + non-core mutators) ---
 
 def test_ephemeral_allowlist_excludes_every_mutator_class():
@@ -520,65 +436,22 @@ def test_ephemeral_core_envelope_is_allowlisted_and_mutators_blocked(tmp_path, m
     assert reg.get_schema_by_name("skill_review") is None  # enable_tools can't surface it
 
 
-def test_switch_model_blocks_sub1m_route_while_max(monkeypatch, tmp_path):
-    from ouroboros.gateway import settings as smod
+def test_switch_model_does_not_blanket_gate_on_context_window(monkeypatch, tmp_path):
+    """The loop rebinds/fits the exact route after the override; the tool only selects it."""
     from ouroboros.tools import control
     from ouroboros.tools.registry import ToolContext
 
-    monkeypatch.setattr("ouroboros.llm.LLMClient.available_models", lambda self: ["big-model", "small-model"])
-    monkeypatch.setattr(smod, "_active_route_confirms_max",
-                        lambda settings=None, *, model="", use_local=None, allow_fetch=False: model == "big-model")
-
+    monkeypatch.setattr(
+        "ouroboros.llm.LLMClient.available_models",
+        lambda self: ["small-model"],
+    )
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.active_context_mode = "max"
-    # sub-1M route while the transcript is max-sized -> blocked, override NOT applied
+
     out = control._switch_model(ctx, model="small-model")
-    assert "SWITCH_BLOCKED" in out
-    assert ctx.active_model_override is None
-    # a >=1M route -> allowed
-    out2 = control._switch_model(ctx, model="big-model")
-    assert "SWITCH_BLOCKED" not in out2 and ctx.active_model_override == "big-model"
-    # not max (low transcript) -> a sub-1M switch is fine
-    ctx_low = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
-    ctx_low.active_context_mode = "low"
-    out3 = control._switch_model(ctx_low, model="small-model")
-    assert "SWITCH_BLOCKED" not in out3 and ctx_low.active_model_override == "small-model"
-
-
-def test_switch_model_allows_unknown_route_for_one_max_attempt(monkeypatch, tmp_path):
-    from ouroboros.gateway import settings as smod
-    from ouroboros.tools import control
-    from ouroboros.tools.registry import ToolContext
-
-    monkeypatch.setattr("ouroboros.llm.LLMClient.available_models", lambda self: ["unknown-model"])
-    monkeypatch.setattr(smod, "_active_route_confirms_max", lambda **_kwargs: None)
-    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
-    ctx.active_context_mode = "max"
-
-    out = control._switch_model(ctx, model="unknown-model")
 
     assert "SWITCH_BLOCKED" not in out
-    assert ctx.active_model_override == "unknown-model"
-
-
-def test_switch_model_fails_closed_when_capability_check_errors(monkeypatch, tmp_path):
-    from ouroboros.gateway import settings as smod
-    from ouroboros.tools import control
-    from ouroboros.tools.registry import ToolContext
-
-    monkeypatch.setattr("ouroboros.llm.LLMClient.available_models", lambda self: ["small-model"])
-
-    def _boom(*a, **k):
-        raise RuntimeError("probe down")
-
-    monkeypatch.setattr(smod, "_active_route_confirms_max", _boom)
-    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
-    ctx.active_context_mode = "max"
-    # An errored capability check must FAIL CLOSED (block), not apply the override.
-    out = control._switch_model(ctx, model="small-model")
-    assert "SWITCH_BLOCKED" in out
-    assert ctx.active_model_override is None
-
+    assert ctx.active_model_override == "small-model"
 
 # --- CW3 (claudexor): the ephemeral turn is barred from extension/MCP tools too ---
 
@@ -908,32 +781,3 @@ def test_scope_capability_notice_fires_on_stale_evidence(monkeypatch, tmp_path):
     assert len(notices) == 1 and notices[0]["surface"] == "scope_review"
     # ...and the review-time twin agrees, which is the point of the shared predicate.
     assert ReviewerWindow(1_000_000, "confirmed", stale=True).blocking_authority_allowed is False
-
-
-def test_active_route_max_gate_still_rides_out_a_provider_blip(monkeypatch, tmp_path):
-    """Counterpart guard for the freshness sweep: the gate that would DOWNGRADE the
-    owner's own context mode must NOT start denying on stale evidence. An outage may
-    cost a blocking scope verdict; it may not silently narrow the cognitive horizon."""
-    from types import SimpleNamespace
-
-    import ouroboros.config as cfg
-    from ouroboros.gateway import settings as smod
-
-    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(smod, "_owner_read_settings_raw", lambda: {})
-    monkeypatch.setattr(
-        smod, "_active_main_route",
-        lambda *a, **k: {"provider": "openrouter", "model": "x/y",
-                         "base_url": "", "use_local": False},
-    )
-    monkeypatch.setattr(
-        "ouroboros.capability_evidence.probe",
-        lambda *a, **k: SimpleNamespace(
-            window_tokens=1_000_000, status="confirmed", route_fp="fp", stale=True, ts="",
-            to_json=lambda: {}),
-    )
-    # _active_route_confirms_max asks "is it CURRENTLY known" (hot path, per task) and
-    # answers unknown, which the caller treats as "attempt Max, react to real overflow"
-    # — never as a confirmed sub-1M downgrade.
-    assert smod._active_route_confirms_max() is None
-    assert smod._max_context_block({}) is None, "an outage must not revoke Max mode"

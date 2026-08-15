@@ -14,6 +14,11 @@ import sys
 import time
 from typing import Any, Optional, Sequence
 
+from ouroboros.context_mode_compat import (
+    normalize_and_persist_context_mode_compat,
+    normalize_context_mode,
+    owner_declared_low,
+)
 from ouroboros.platform_layer import pid_lock_acquire as _compat_pid_lock_acquire, pid_lock_release as _compat_pid_lock_release
 from ouroboros.provider_models import compute_direct_review_models_fallback, local_only_review_route_env, migrate_model_value, review_model_uses_local as review_model_uses_local
 from ouroboros.secret_masking import strip_masked_secrets
@@ -33,6 +38,10 @@ RESTART_EXIT_CODE = 42
 PANIC_EXIT_CODE = 99
 AGENT_SERVER_PORT = 8765
 FINALIZATION_GRACE_DEFAULT_SEC = 120
+# Owner finalize-then-stop OUTER safety cap (S3, owner decisions 2026-08-15),
+# from the stop REQUEST; the grace budget above starts only at control DELIVERY
+# (the loop's mailbox drain). No summary by this cap -> honest custody cancel.
+OWNER_STOP_OUTER_CAP_SEC = 600
 # Cadence for intrinsic self-pacing checkpoints when a task has NO deadline_at
 # (e.g. headless benchmark runs). Advisory only — surfaces elapsed/rounds/cost so
 # the model can self-pace; it is not a stop gate. 0 disables.
@@ -197,8 +206,11 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # NOTE: OUROBOROS_OBSERVABILITY_KEEP_RAW (writes UNREDACTED secret-bearing payloads to
     # disk) is intentionally NOT a settings/UI carrier — it is an env-only operator debug
     # override so a self-change or non-owner save can never enable secret logging.
-    # Generative context-window probe (Max gate): on (default) confirms a route's >=1M
-    # window from a FREE over-window reject; *_CHARS sizes the oversized padding.
+    # Generative context-window probe machinery: when enabled AND a caller passes
+    # allow_generative=True, confirms a route's >=1M window from a FREE over-window
+    # reject; *_CHARS sizes the padding. Since the settings-time Max gate retirement
+    # no production surface passes allow_generative=True (dormant; kept for tests
+    # and future explicit owner probes).
     "OUROBOROS_GENERATIVE_PROBE": "1",
     "OUROBOROS_GENERATIVE_PROBE_CHARS": "5000000",
     # Pre-commit review: comma-separated provider-tagged model list
@@ -229,11 +241,10 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # sized for ~200k / local models. Cognitive-horizon knob (BIBLE P1): the agent cannot lower it
     # (owner-only), and it never changes model / reasoning-effort / output-token budgets.
     "OUROBOROS_CONTEXT_MODE": "max",
-    # Derived system state, never an owner choice (see get_owner_context_mode). TRI-STATE,
-    # fail-CLOSED: "" is UNKNOWN, not "the owner chose low". Only an explicit "false" (written by
-    # api_owner_context_mode alone) makes a stored `low` an owner declaration, so a pre-v6.80.0
-    # settings.json and an env allowlist forwarding the mode without this key leave P3's gate ON.
-    "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "",
+    # One-window compatibility tombstone for the retired persistent auto-Low mechanism.
+    # It never sizes or routes context and no runtime writer may set it true.  An explicit
+    # false still distinguishes owner-authored Low from a bare forwarded env Low for P3.
+    "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "false",
     # Optional extra user-managed skills checkout; Ouroboros never clones/pulls it.
     "OUROBOROS_SKILLS_REPO_PATH": "",
     "OUROBOROS_CLAWHUB_REGISTRY_URL": "https://clawhub.ai/api/v1",
@@ -475,11 +486,6 @@ _DIRECT_PROVIDER_REVIEW_RUNS = 3
 
 # Runtime mode and review enforcement are separate axes.
 VALID_RUNTIME_MODES = ("light", "advanced", "pro")
-
-# Context mode is an independent, owner-controlled working-context size profile
-# (low/max). Unlike runtime mode it is NOT boot-pinned — it is not a privilege
-# boundary, so it hot-applies on the next task.
-VALID_CONTEXT_MODES = ("low", "max")
 
 # Lower rank = stricter scope. ``save_settings`` refuses agent self-elevation.
 _RUNTIME_MODE_RANK = {"light": 0, "advanced": 1, "pro": 2}
@@ -1031,19 +1037,13 @@ def get_plan_task_deadline_min_sec() -> float:
     return _clamped_number_setting("OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC", low=30.0, high=3600.0)
 
 
-def normalize_context_mode(value: Any) -> str:
-    """Clamp caller-supplied context mode to the closed enum (low / max)."""
-    default_val = str(SETTINGS_DEFAULTS["OUROBOROS_CONTEXT_MODE"])
-    text = str(value or "").strip().lower()
-    return text if text in VALID_CONTEXT_MODES else default_val
-
-
 def get_context_mode() -> str:
     """The EFFECTIVE working-context mode (low | max) used by context sizing.
 
-    Owner selection, possibly narrowed by the /api/settings model auto-downgrade; the
-    P3 scope gate reads get_owner_context_mode instead. No boot-pin: hot-applies on the
-    next task. The key is dropped from the agent-reachable /api/settings POST (P1)."""
+    Owner selection or an explicitly forwarded benchmark/operator value.  The P3 scope
+    gate reads get_owner_context_mode instead so a bare env Low cannot author owner intent.
+    No boot-pin: hot-applies on the next task. The key is dropped from the
+    agent-reachable /api/settings POST (P1)."""
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_CONTEXT_MODE"])
     return normalize_context_mode(
         os.environ.get("OUROBOROS_CONTEXT_MODE", default_val) or default_val
@@ -1051,20 +1051,15 @@ def get_context_mode() -> str:
 
 
 def get_owner_context_mode() -> str:
-    """The OWNER-SELECTED context mode, ignoring any system auto-downgrade.
+    """The OWNER-SELECTED context mode during the auto-Low compatibility window.
 
-    The P3 scope gate reads THIS, not the effective mode: the agent-reachable
-    /api/settings model auto-downgrade narrows the effective mode without the owner
-    choosing it, and honouring that would let the agent switch an immune gate off.
-
-    The derived flag is TRI-STATE and resolved FAIL-CLOSED: absent or unrecognised is
-    UNKNOWN, never an owner declaration, so it reports `max` and the gate stays ON. Only
-    an explicit stored `false` counts, written by api_owner_context_mode alone (an owner
-    write always clears the flag) — otherwise a pre-v6.80.0 settings.json or an isolated
-    server forwarding the mode alone would read as "the owner switched scope review off"."""
+    Persistent auto-Low is retired, but a bare forwarded env ``low`` still lacks owner
+    provenance and therefore keeps P3 at Max.  Only explicit ``low`` + tombstone ``false``
+    means owner Low.  Raw persisted legacy ambiguity is normalized before environment
+    projection, so this distinction is needed only for env-only benchmark/operator runs."""
     if get_context_mode() != "low":
         return "max"
-    return "low" if _owner_declared_low(os.environ.get("OUROBOROS_CONTEXT_MODE_AUTO_LOW", "")) else "max"
+    return "low" if owner_declared_low(os.environ.get("OUROBOROS_CONTEXT_MODE_AUTO_LOW", "")) else "max"
 
 
 def _settings_file_value(key: str, default: str) -> str:
@@ -1075,7 +1070,8 @@ def _settings_file_value(key: str, default: str) -> str:
         try:
             disk_settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
             if isinstance(disk_settings, dict):
-                return str(disk_settings.get(key, default) or default)
+                value = disk_settings.get(key, default)
+                return str(default if value is None or value == "" else value)
         except (OSError, json.JSONDecodeError):
             pass
     return default
@@ -1093,24 +1089,13 @@ _DISK_AUTHORED_SETTINGS = ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUT
 ENDPOINT_AUTHORED_SETTINGS = frozenset({"OUROBOROS_SUBSCRIPTION_PRESET_VERSION", "OUROBOROS_ONBOARDING_COMPLETED_AT"})
 
 
-def _owner_declared_low(value: Any) -> bool:
-    """True when the derived auto-downgrade flag reads as an OWNER-authored ``low``
-    (get_owner_context_mode's own tri-state: absent/unrecognised is UNKNOWN, not owner)."""
-    return str(value or "").strip().lower() in ("0", "false", "no", "off")
-
-
 def _guard_context_mode_lowering(settings: dict, *, allow_context_lowering: bool = False) -> None:
     """Refuse agent-reachable settings writes that lower the cognitive horizon.
 
-    TWO ratchets on the SAME owner authorisation (``allow_context_lowering``, held only by
-    the dedicated owner endpoint): the mode may not step ``max -> low``, AND the derived
-    auto-downgrade flag may not be CLEARED. Since v6.80.0 that flag is an AUTHORITY BIT —
-    clearing it makes get_owner_context_mode report ``low``, switching the BIBLE P3 scope
-    gate off: the same horizon-lowering spelled through another key. So ``unknown/true ->
-    false`` needs the owner path, while SETTING it true (the system auto-downgrade on the
-    model route) stays free. It belongs HERE because save_settings is the seam every writer
-    funnels through, and a second lexical shell check would not do — a key can always be
-    constructed dynamically (BIBLE P5)."""
+    The mode may not step ``max -> low`` without the dedicated owner endpoint.  During
+    the compatibility window, changing an ambiguous legacy Low marker to false is also
+    refused unless the same write restores Max; that exact Max+false rewrite is the
+    migration and cannot disable the P3 gate."""
     previous_mode = normalize_context_mode(_settings_file_value("OUROBOROS_CONTEXT_MODE", "max"))
     next_mode = normalize_context_mode(settings.get("OUROBOROS_CONTEXT_MODE", previous_mode))
     if previous_mode == "max" and next_mode == "low" and not allow_context_lowering:
@@ -1121,11 +1106,11 @@ def _guard_context_mode_lowering(settings: dict, *, allow_context_lowering: bool
     if allow_context_lowering or "OUROBOROS_CONTEXT_MODE_AUTO_LOW" not in settings:
         return
     previous_flag = _settings_file_value("OUROBOROS_CONTEXT_MODE_AUTO_LOW", "")
-    if _owner_declared_low(settings["OUROBOROS_CONTEXT_MODE_AUTO_LOW"]) and not _owner_declared_low(previous_flag):
+    if (next_mode == "low" and owner_declared_low(settings["OUROBOROS_CONTEXT_MODE_AUTO_LOW"])
+            and not owner_declared_low(previous_flag)):
         raise PermissionError(
             f"OUROBOROS_CONTEXT_MODE_AUTO_LOW clearing refused: {previous_flag or 'unknown'!r} -> 'false'. "
-            "Clearing the derived flag turns a system auto-downgrade into an owner-declared scope-review "
-            "skip — it is owner-controlled, use the dedicated owner endpoint/UI/CLI."
+            "Authoring explicit owner-Low is owner-controlled; use the dedicated owner endpoint/UI/CLI."
         )
 
 
@@ -1142,6 +1127,10 @@ def prepare_settings_for_persist(settings: dict, *, authored_keys: Sequence[str]
     authored = set(authored_keys or ())
     prepared = {k: v for k, v in settings.items() if not (
         k in _DISK_AUTHORED_SETTINGS and k not in authored and not _settings_file_value(k, "")
+        and not (
+            k == "OUROBOROS_CONTEXT_MODE_AUTO_LOW"
+            and _settings_file_value("OUROBOROS_CONTEXT_MODE", "")
+        )
         and str(v) == str(SETTINGS_DEFAULTS.get(k, "")))}
     _guard_context_mode_lowering(prepared, allow_context_lowering=allow_context_lowering)
     _guard_safety_mode_lowering(prepared, allow_safety_lowering=allow_safety_lowering)
@@ -1348,20 +1337,31 @@ RETIRED_SETTING_KEYS: tuple[str, ...] = (
 def load_settings() -> dict:
     fd = _acquire_settings_lock()
     try:
-        return load_settings_lock_held()
+        return load_settings_lock_held(_settings_lock_held=fd is not None)
     finally:
         _release_settings_lock(fd)
 
 
-def load_settings_lock_held() -> dict:
+def load_settings_lock_held(*, _settings_lock_held: bool = True) -> dict:
     """The same read, for a caller that ALREADY holds the settings lock. The lock is not
     re-entrant, so a nested ``load_settings()`` burns the full 2s timeout and then reads
-    anyway; a write-path precondition needs the effective settings as of NOW, so it reads here."""
+    anyway; a write-path precondition needs the effective settings as of NOW, so it reads here.
+
+    ``load_settings`` passes whether it actually acquired the best-effort read lock. Direct
+    callers are lock-owning write preconditions, so the default remains true. A raw context
+    compatibility migration is persisted only while that lock is held; the write contains
+    the raw mapping plus the normalized pair, never a defaults-merged settings document."""
     loaded: dict = {}
     if SETTINGS_PATH.exists():
         try:
             raw = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
+                raw = normalize_and_persist_context_mode_compat(
+                    raw,
+                    settings_path=SETTINGS_PATH,
+                    lock_held=_settings_lock_held,
+                    guard_live_write=_guard_live_settings_write,
+                )
                 loaded = {
                     key: _coerce_setting_value(key, value) if key in SETTINGS_DEFAULTS else value
                     for key, value in raw.items()
@@ -1408,8 +1408,8 @@ def save_settings(
 
     Elevation above the boot baseline is refused after initialization (``allow_elevation`` is then
     inert to agent-reachable subprocesses; production entry points must call
-    ``initialize_runtime_mode_baseline`` before agent code). Context-mode lowering and clearing the
-    derived auto-low flag likewise require the explicit owner path.
+    ``initialize_runtime_mode_baseline`` before agent code). Context-mode lowering likewise
+    requires the explicit owner path; the retired auto-Low key is an inert false tombstone.
     ``onboarding_safety_default`` is a NARROW boolean authorizing exactly one transition —
     a FRESH install (no settings file yet) authoring ``OUROBOROS_SAFETY_MODE="light"``."""
     _guard_live_settings_write()
@@ -1566,11 +1566,11 @@ def apply_settings_to_env(settings: dict) -> None:
     # key is not an owner decision, so overwriting/popping the env entry would clobber a legitimately
     # forwarded value (harbor_installed_agent runs with NO settings.json; server_runner documents the same
     # "settings.json over env" clobber). Silence stays silent. ONE fail-closed exception: env may not author
-    # the owner-declared-low CLAIM (auto-low `false`), which would switch the BIBLE P3 scope gate off.
+    # the explicit-false owner-Low provenance claim, which would switch the BIBLE P3 scope gate off.
     unauthored = {k for k in _DISK_AUTHORED_SETTINGS if not _settings_file_value(k, "")}
     for k in env_keys:
         val = settings.get(k)
-        if k in unauthored and not _owner_declared_low(
+        if k in unauthored and not owner_declared_low(
                 os.environ.get(k) if k == "OUROBOROS_CONTEXT_MODE_AUTO_LOW" else ""):
             continue
         if k == "OUROBOROS_RETURN_REASONING" and val == "":

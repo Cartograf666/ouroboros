@@ -577,6 +577,107 @@ def test_cutoff_omission_surfaces_precise_stop_reason(monkeypatch, tmp_path):
     )
 
 
+def _swarm_ctx(monkeypatch, tmp_path):
+    import queue as _queue
+
+    from ouroboros.tools.registry import ToolContext
+
+    monkeypatch.setenv("OUROBOROS_MAX_WORKERS", "3")
+    monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC", "0")
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "parent1"
+    ctx.task_depth = 0
+    ctx.current_chat_id = 1
+    ctx.event_queue = _queue.Queue()
+    ctx.task_metadata = {"root_task_id": "parent1", "session_id": "s"}
+    return ctx
+
+
+def _swarm_fingerprint(request):
+    return pr._plan_request_fingerprint(
+        plan=request.plan, goal=request.goal, files_to_touch=request.files_to_touch,
+        context_level=request.context_level, context_notes=request.context_notes,
+        plan_class=request.plan_class, scope=request.scope,
+        include_tests=request.include_tests,
+    )
+
+
+def test_cancelled_scout_wave_exits_as_scout_unavailable(monkeypatch, tmp_path):
+    """A stop cascade settles the scout terminal-cancelled; plan_task must then
+    exit promptly as scout-unavailable instead of feeding the paid reviewer
+    panel and consuming the owner's finalize episode (live incident
+    39e0f183/20c37ed3, 2026-08-15). Same retryable no-review outcome as a scout
+    that failed to schedule — not an error that kills the parent."""
+    import ouroboros.tools.control as control
+
+    ctx = _swarm_ctx(monkeypatch, tmp_path)
+
+    def fake_schedule(ctx_arg, _internal=None, **kwargs):
+        records = list(getattr(ctx_arg, "_last_scheduled_subagents", []) or [])
+        records.append({"task_ids": ["scout-1"]})
+        ctx_arg._last_scheduled_subagents = records
+        return "scheduled scout-1"
+
+    monkeypatch.setattr(control, "_schedule_task", fake_schedule)
+    monkeypatch.setattr(pr, "_collect_planning_handoffs", lambda *a, **k: {
+        "wait": {"tasks": {"scout-1": {
+            "status": "cancelled",
+            "result": "Running task cancelled and worker terminated.",
+        }}, "all_terminal": True},
+        "wait_stop_reason": "",
+        "included_task_ids": [],
+        "omissions": [{
+            "task_id": "scout-1", "role": "planning-scout-1", "status": "cancelled",
+            "reason": "terminal_without_usable_handoff:cancelled",
+        }],
+        "artifact": {"path": "x"},
+    })
+    request = pr._PlanReviewRequest(
+        plan="p", goal="g", files_to_touch=[], context_level="minimal",
+    )
+    out = pr._start_planning_swarm(ctx, request, _swarm_fingerprint(request))
+    assert out["started"] is False
+    assert "cancelled" in str(out.get("error") or "")
+
+
+def test_cancelled_sibling_does_not_discard_a_completed_handoff(monkeypatch, tmp_path):
+    """When another scout DID produce a usable handoff, the paid evidence is
+    kept and review proceeds — the cancel exit applies only to a wave with no
+    usable handoff at all."""
+    import ouroboros.tools.control as control
+
+    ctx = _swarm_ctx(monkeypatch, tmp_path)
+    issued = iter(["scout-1", "scout-2"])
+
+    def fake_schedule(ctx_arg, _internal=None, **kwargs):
+        task_id = next(issued)
+        records = list(getattr(ctx_arg, "_last_scheduled_subagents", []) or [])
+        records.append({"task_ids": [task_id]})
+        ctx_arg._last_scheduled_subagents = records
+        return f"scheduled {task_id}"
+
+    monkeypatch.setattr(control, "_schedule_task", fake_schedule)
+    monkeypatch.setattr(pr, "_collect_planning_handoffs", lambda *a, **k: {
+        "wait": {"tasks": {
+            "scout-1": {"status": "completed", "result": "handoff text"},
+            "scout-2": {"status": "cancelled", "result": ""},
+        }, "all_terminal": True},
+        "wait_stop_reason": "",
+        "included_task_ids": ["scout-1"],
+        "omissions": [{
+            "task_id": "scout-2", "role": "planning-scout-2", "status": "cancelled",
+            "reason": "terminal_without_usable_handoff:cancelled",
+        }],
+        "artifact": {"path": "x"},
+    })
+    request = pr._PlanReviewRequest(
+        plan="p2", goal="g", files_to_touch=[], context_level="broad",
+    )
+    out = pr._start_planning_swarm(ctx, request, _swarm_fingerprint(request))
+    assert out["started"] is True
+    assert out["degraded_evidence"] is False
+
+
 def test_plan_task_timeout_budget_invariant():
     """plan_task tool/wrapper budgets must honor the swarm max-wait ceiling and stay
     under the supervisor HARD task timeout (WS-T: a healthy long scout is not cut off

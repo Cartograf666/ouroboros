@@ -28,6 +28,9 @@ from ouroboros.gateway.task_events import (  # noqa: F401
     api_task_events,
     iter_task_events,
 )
+# Re-exported hurry ingress (same module-size split as task_events): route
+# wiring and tests address gateway.tasks.api_task_hurry.
+from ouroboros.gateway.task_hurry import api_task_hurry  # noqa: F401
 from ouroboros.headless import (
     ARTIFACTS_DIR,
     ARTIFACT_STATUS_FAILED,
@@ -987,6 +990,78 @@ def _run_cascade_cancel(task_id: str) -> bool:
 _NO_BODY = object()
 
 
+async def _graceful_stop_acknowledgement(task_id: str, *, cascade: bool) -> JSONResponse:
+    """S3 graceful ingress: durable finalize intent + IMMEDIATE pending ack.
+
+    The socket is NOT held for the (up to) 120-second episode (§12.2 item 2):
+    the durable intent is the whole owner will, one orchestration pass is
+    kicked off a background thread (the ~20s intent sweep is the crash-safe
+    watchdog replay), and the caller gets the typed pending acknowledgement.
+    Stop-now stays available throughout and HARDENS the same intent.
+    """
+    import threading
+
+    from supervisor.queue import (
+        DRIVE_ROOT as _drive_root,
+        task_has_live_ownership as _live_ownership,
+        task_subtree_is_live as _live_check,
+    )
+
+    from ouroboros.cancel_intents import (
+        CancelIntentProjectionCorrupt,
+        SCOPE_CASCADE,
+        STOP_POLICY_FINALIZE,
+        request_cancel,
+        stop_policy,
+    )
+
+    live_own = await asyncio.to_thread(_live_ownership, task_id)
+    if not live_own and not await asyncio.to_thread(_live_check, task_id):
+        return json_error("task not found or not active", 404, task_id=task_id)
+    try:
+        intent = await asyncio.to_thread(functools.partial(
+            request_cancel, _drive_root, task_id,
+            reason="owner requested finalize-then-stop",
+            source="http_graceful", requested_by="owner",
+            requested_stop_policy=STOP_POLICY_FINALIZE,
+            allow_settled_target=bool(cascade or live_own),
+            **({"scope": SCOPE_CASCADE} if cascade else {}),
+        ))
+    except CancelIntentProjectionCorrupt:
+        return json_error(
+            "the cancel-intent projection is corrupt; nothing was requested",
+            503, task_id=task_id, reason_code="cancel_intent_projection_corrupt",
+        )
+    except Exception:
+        return json_error(
+            "durable stop intent could not be recorded; nothing was requested — retry",
+            503, task_id=task_id, reason_code="cancel_intent_write_failed",
+        )
+    if intent.get("already_settled"):
+        return json_error("task not found or not active", 404, task_id=task_id)
+    try:
+        from supervisor.owner_stop import begin_graceful_stop
+
+        threading.Thread(
+            target=begin_graceful_stop, args=(task_id,),
+            name=f"owner-stop-{task_id[:8]}", daemon=True,
+        ).start()
+    except Exception:
+        log.debug("owner-stop ingress thread failed for %s", task_id, exc_info=True)
+    return JSONResponse(
+        {
+            "ok": True,
+            "task_id": task_id,
+            "cancel_state": "pending",
+            # The EFFECTIVE policy: a graceful request over an already-hard
+            # intent never softens it, and the answer says so.
+            "stop_policy": stop_policy(intent),
+            **({"cascade": True} if cascade else {}),
+        },
+        status_code=202,
+    )
+
+
 async def api_task_cancel(request: Request) -> JSONResponse:
     try:
         task_id = validate_task_id(request.path_params.get("task_id"))
@@ -1014,6 +1089,22 @@ async def api_task_cancel(request: Request) -> JSONResponse:
     if raw_cascade is not None and not isinstance(raw_cascade, bool):
         return json_error("cascade must be a boolean", 400, task_id=task_id)
     cascade = raw_cascade is True
+    # S3 (Q1): the OPTIONAL terminalization policy — an INDEPENDENT axis from
+    # cascade (§13.1). Absent/empty stays today's immediate hard cancellation,
+    # byte-identical for every existing caller (benchmarks post empty bodies).
+    raw_policy = body.get("stop_policy")
+    if raw_policy is not None and not isinstance(raw_policy, str):
+        return json_error("stop_policy must be a string", 400, task_id=task_id)
+    stop_policy_value = str(raw_policy or "").strip()
+    if stop_policy_value not in {"", "immediate", "finalize_then_cancel"}:
+        return json_error(
+            "stop_policy must be 'immediate' or 'finalize_then_cancel'",
+            400, task_id=task_id,
+        )
+    if stop_policy_value == "finalize_then_cancel":
+        # Graceful ingress: immediate typed pending acknowledgement; the
+        # synchronous teardown contract below stays hard/legacy-only.
+        return await _graceful_stop_acknowledgement(task_id, cascade=cascade)
 
     def _record_http_intent(
         source: str, *, cascade_scope: bool = False, allow_settled: bool = False,
@@ -1048,6 +1139,7 @@ async def api_task_cancel(request: Request) -> JSONResponse:
             from ouroboros.cancel_intents import (
                 CancelIntentProjectionCorrupt,
                 SCOPE_CASCADE,
+                STOP_POLICY_IMMEDIATE,
                 request_cancel,
             )
         except Exception:
@@ -1059,6 +1151,11 @@ async def api_task_cancel(request: Request) -> JSONResponse:
                 _drive_root, task_id, source=source,
                 **({"scope": SCOPE_CASCADE} if cascade_scope else {}),
                 allow_settled_target=bool(cascade_scope or allow_settled),
+                # §13.1: an omitted/empty-body or explicit-immediate request IS
+                # the immediate policy — it monotonically HARDENS a pending
+                # graceful intent (Stop-now during the wait) and mints a
+                # byte-identical legacy row when no intent exists.
+                requested_stop_policy=STOP_POLICY_IMMEDIATE,
             )
             return ""
         except CancelIntentProjectionCorrupt:
@@ -1344,6 +1441,7 @@ def _supervisor_ready_error(request: Request) -> Optional[JSONResponse]:
 __all__ = [
     "api_task_artifact",
     "api_task_cancel",
+    "api_task_hurry",
     "api_task_resume",
     "api_task_events",
     "api_task_get",

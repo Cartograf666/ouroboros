@@ -16,7 +16,7 @@ import pathlib
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.utils import atomic_write_json, utc_now_iso
 
@@ -454,6 +454,7 @@ def persist_call(
     call_type: str,
     payload: Dict[str, Any],
     manifest: Dict[str, Any] | None = None,
+    keep_raw: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Persist the payload and return refs plus a redacted projection.
 
@@ -463,12 +464,19 @@ def persist_call(
     lands on disk. ``full_payload_redacted=True`` declares this honestly; the
     ``redaction`` manifest lists every rule that fired. Set
     ``OUROBOROS_OBSERVABILITY_KEEP_RAW=1`` for a trusted local debug session to persist
-    the raw payload instead (``full_payload_redacted=False``).
+    the raw payload instead (``full_payload_redacted=False``). ``keep_raw=True``
+    forces that existing private raw-plus-projection path for an authoritative
+    checkpoint; ``None`` preserves the environment/default behavior.
     """
 
     redacted = redact_projection(payload)
-    keep_raw = (os.environ.get("OUROBOROS_OBSERVABILITY_KEEP_RAW") or "").strip().lower() in ("1", "true", "yes", "on")
-    if keep_raw:
+    effective_keep_raw = keep_raw
+    if effective_keep_raw is None:
+        effective_keep_raw = (
+            (os.environ.get("OUROBOROS_OBSERVABILITY_KEEP_RAW") or "").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+    if effective_keep_raw:
         full_ref = write_blob(drive_root, payload, kind="json")
         projection_ref = write_blob(drive_root, redacted.value, kind="json")
         full_redacted = False
@@ -498,6 +506,35 @@ def persist_call(
         "manifest_ref": manifest_ref,
         "redaction": redacted.manifest(),
     }
+
+
+def persist_physical_candidate(
+    drive_root: pathlib.Path,
+    *,
+    task_id: str,
+    attempt_id: str,
+    candidate: Dict[str, Any],
+    candidate_facts: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Persist one inspectable post-transform candidate under its attempt id.
+
+    ``candidate_facts`` describe the pre-redaction canonical object. The normal
+    ``persist_call`` refs describe the redacted-by-default CAS blob; the two
+    digest domains are deliberately labelled rather than equated.
+    """
+    return persist_call(
+        drive_root,
+        task_id=task_id,
+        call_id=attempt_id,
+        call_type="physical_llm_candidate",
+        payload=candidate,
+        manifest={
+            "candidate_manifest_kind": "physical_llm_candidate",
+            "candidate_raw_digest_basis": "canonical_json_v1_pre_redaction",
+            "redacted_projection_digest_basis": "observability_json_v1_post_default_redaction_cas",
+            **dict(candidate_facts),
+        },
+    )
 
 
 def latest_llm_response_text(drive_root: pathlib.Path, task_id: str) -> str:
@@ -537,11 +574,37 @@ def latest_llm_response_text(drive_root: pathlib.Path, task_id: str) -> str:
             message = payload.get("message") if isinstance(payload, dict) else None
             content = message.get("content") if isinstance(message, dict) else None
             text = str(content or "").strip()
-            if text:
+            if text and not _is_delivery_control_payload(text):
                 return text
         except Exception:
             continue
     return ""
+
+
+def _is_delivery_control_payload(text: str) -> bool:
+    """Whether persisted assistant text is the delivery-control PROTOCOL object.
+
+    S3 (RST-05/RAW-001): while the loop's delivery-control latch is armed the
+    model's persisted response is legitimately ``{"delivery_control": ...}``
+    machine protocol, not prose. A hard kill between response persistence and
+    loop-side resolution used to let raw-salvage promote that JSON into the
+    owner-facing terminal result. This is a STRUCTURAL typed-protocol check
+    (exact JSON object carrying the protocol key, optionally in one markdown
+    fence) — never semantic prose classification. Matching payloads stay
+    forensic evidence in the observability store; they are simply not answers.
+    """
+    body = str(text or "").strip()
+    if body.startswith("```"):
+        first_break = body.find("\n")
+        if first_break != -1 and body.endswith("```"):
+            body = body[first_break + 1:-3].strip()
+    if not (body.startswith("{") and body.endswith("}")):
+        return False
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and "delivery_control" in payload
 
 
 SALVAGED_OUTPUT_NOTE_LIMIT = 4000
@@ -616,18 +679,21 @@ def salvaged_output_note(
         return ""
     if not salvaged:
         return ""
+    # S3 honest naming: a raw fragment is the last persisted INTERMEDIATE model
+    # message — never presented as an "answer" (it bypassed review/finalization).
+    label = "Last persisted intermediate model message (salvaged best-effort, unreviewed"
     preview = truncate_review_artifact(salvaged, SALVAGED_OUTPUT_NOTE_LIMIT)
     if preview == salvaged:
-        return "\n\nLast agent output (salvaged best-effort, unreviewed):\n" + salvaged
+        return f"\n\n{label}):\n" + salvaged
     if preserve_root is not None:
         try:
             full_path = preserve_salvaged_output(pathlib.Path(preserve_root), str(task_id), salvaged)
         except Exception:
             full_path = ""
         if full_path:
-            return ("\n\nLast agent output (salvaged best-effort, unreviewed; "
+            return (f"\n\n{label}; "
                     f"full copy preserved at {full_path}):\n" + preview)
-    return "\n\nLast agent output (salvaged best-effort, unreviewed):\n" + salvaged
+    return f"\n\n{label}):\n" + salvaged
 
 
 def prune_observability_blobs(

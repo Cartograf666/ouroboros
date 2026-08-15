@@ -82,6 +82,7 @@ def ensure_reaper_started() -> None:
 
 def request_finalization_grace(
     task_drive: pathlib.Path, task_id: str, terminal_reason: str, *, chat_id: int, stamp: int,
+    control_msg_id: str = "", toast_text: str = "", control_text: str = "",
 ) -> str:
     """Ask a task to finalize cooperatively before the supervisor stops it.
 
@@ -92,15 +93,27 @@ def request_finalization_grace(
     supervisor's terminal-path mechanics so ``queue.py``'s enforce loop keeps
     only the DECISION.
 
+    ``control_msg_id`` (S3, additive): the OWNER-STOP episode derives its
+    control identity deterministically from the durable stop ``request_id``
+    (§12.2 item 5) so a watchdog/restart replay appends the SAME id — the drain
+    dedupes by msg_id, never a duplicate control. Absent = the generic timeout
+    episode's fresh random id, byte-identical to the prior behavior.
+    ``toast_text`` (additive) replaces the generic reached-terminal wording for
+    an owner-requested episode.
+
     Returns the control's msg_id — the grace EPISODE's identity. The caller
     stores it next to the latch so ``withdraw_finalization_grace`` can retract
     exactly this episode; "" means no control is outstanding.
     """
-    control_msg_id = uuid.uuid4().hex
+    control_msg_id = str(control_msg_id or "") or uuid.uuid4().hex
     try:
         from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, write_owner_message
         if not write_owner_message(
-            task_drive, terminal_reason, task_id,
+            # ``control_text`` (additive) lets the owner-stop episode carry its
+            # typed reason plus the bounded child projection in the control
+            # payload while the short ``terminal_reason`` keeps naming the
+            # toast/incident; absent = the reason itself, as before.
+            task_drive, str(control_text or "") or terminal_reason, task_id,
             msg_id=control_msg_id, kind=KIND_FINALIZE_NOW,
         ):
             control_msg_id = ""
@@ -112,7 +125,7 @@ def request_finalization_grace(
         _workers_mod.get_event_q().put({
             "type": "send_message",
             "chat_id": chat_id,
-            "text": (
+            "text": str(toast_text or "") or (
                 f"⏳ Task {task_id} reached {terminal_reason}. "
                 "Finalize artifacts/results now; supervisor will stop the task after the grace window."
             ),
@@ -678,13 +691,20 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
         except Exception:
             log.debug("Reaper: failed to salvage last LLM response for %s", task_id, exc_info=True)
 
-        # A killed worker never reaches the loop's mailbox cleanup — remove the finalize_now
-        # control so a subagent retry (same id/drive) is not instantly force-finalized.
+        # A killed worker never reaches the loop's mailbox cleanup — the ONE
+        # shared retry-reset (§19.7.2 item 11) removes the mailbox (so a
+        # subagent retry on the same id/drive is not instantly force-finalized
+        # and starts with NO executable hurry latch) and archives the current
+        # owner_hurry block into owner_hurry_history[]. Fail-soft inside.
         try:
-            from ouroboros.owner_mailbox import cleanup_task_mailbox
-            cleanup_task_mailbox(_q._task_drive_for_task(task, task_id), task_id)
+            from ouroboros.owner_hurry import retry_reset
+
+            retry_reset(
+                _q._task_drive_for_task(task, task_id), _q.DRIVE_ROOT, task_id,
+                reason=f"reaper_{terminal_reason}",
+            )
         except Exception:
-            log.debug("Reaper: failed to clean owner mailbox for killed task %s", task_id, exc_info=True)
+            log.debug("Reaper: retry reset failed for killed task %s", task_id, exc_info=True)
 
         try:
             write_task_result(

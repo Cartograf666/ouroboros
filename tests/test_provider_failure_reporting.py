@@ -2,6 +2,7 @@ from unittest.mock import patch
 
 from ouroboros.loop import _provider_failure_hint
 from ouroboros.loop_llm_call import call_llm_with_retry, classify_llm_exception
+from ouroboros.usage_accounting import PhysicalAttemptContext
 
 
 class _FailingLLM:
@@ -56,6 +57,40 @@ def test_call_llm_with_retry_records_last_error(tmp_path):
     assert usage["_last_llm_retry_same_request"] is False
 
 
+class _OverflowStoppedLLM:
+    """Non-empty output whose finish_reason reports a context-window overflow —
+    the successful truncated-generation shape (acceptance row ERR-3)."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, **kwargs):
+        self.calls += 1
+        return (
+            {"content": "partial but useful answer",
+             "finish_reason": "model_context_window_exceeded"},
+            {"provider": "openai", "resolved_model": "openai::gpt-5.5"},
+        )
+
+
+def test_non_empty_overflow_stopped_output_is_kept_without_retry(tmp_path):
+    """ERR-3: a non-empty overflow-stopped response is retained as the delivery
+    candidate — exactly one provider call, no semantic or transient-empty retry."""
+    usage = {}
+    llm = _OverflowStoppedLLM()
+    msg, _cost = call_llm_with_retry(
+        llm,
+        [{"role": "user", "content": "hi"}],
+        "openai::gpt-5.5", None, "medium", 3, tmp_path, "task-1", 1, None, usage, "task",
+        False,
+    )
+    assert llm.calls == 1
+    assert msg is not None
+    assert msg["content"] == "partial but useful answer"
+    assert "_last_llm_error" not in usage
+    assert "_last_llm_error_kind" not in usage
+
+
 class _RateLimitBodyLLM:
     """HTTP-200 response whose BODY carries a 429 (provider_error kind=rate_limit) with a
     present finish_reason — the canonical cloud.ru/OpenRouter rate-limit shape."""
@@ -90,7 +125,6 @@ def test_call_llm_with_retry_clears_stale_last_error_on_success(tmp_path):
     usage = {
         "_last_llm_error": "old error",
         "_last_llm_error_kind": "auth_error",
-        "context_overflow_suggest_low": True,
     }
 
     msg, _cost = call_llm_with_retry(
@@ -112,7 +146,103 @@ def test_call_llm_with_retry_clears_stale_last_error_on_success(tmp_path):
     assert msg == {"content": "ok"}
     assert "_last_llm_error" not in usage
     assert "_last_llm_error_kind" not in usage
-    assert "context_overflow_suggest_low" not in usage
+
+
+def test_non_main_call_does_not_project_stale_main_fit_fields(tmp_path):
+    import json
+
+    usage = {
+        "_context_profile": "owner_low",
+        "_context_fit_mode": "low",
+        "_context_target_miss": True,
+    }
+    msg, _cost = call_llm_with_retry(
+        _SuccessfulLLM(), [{"role": "user", "content": "forced"}],
+        "anthropic::claude-sonnet-4-6", None, "medium", 1, tmp_path,
+        "task-forced", 1, None, usage, "task", False,
+        physical_context=None,
+    )
+    assert msg == {"content": "ok"}
+    event = next(
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if '"type": "llm_round"' in line
+    )
+    assert "context_profile" not in event
+    assert "context_target_miss" not in event
+
+
+class _EmptyBodyErrorLLM:
+    def __init__(self, provider_error):
+        self.provider_error = provider_error
+        self.calls = 0
+
+    def chat(self, **kwargs):
+        self.calls += 1
+        return (
+            {"content": "", "tool_calls": [], "finish_reason": "stop"},
+            {"provider_error": self.provider_error},
+        )
+
+
+def test_empty_body_output_or_body_size_is_not_context_recovery(tmp_path):
+    for provider_error in (
+        {"kind": "provider_error", "code": 400,
+         "message": "max_tokens 65536 exceeds maximum context length 32768"},
+        {"kind": "provider_error", "code": 413, "message": "request body too large"},
+    ):
+        usage = {}
+        llm = _EmptyBodyErrorLLM(provider_error)
+        msg, _cost = call_llm_with_retry(
+            llm, [{"role": "user", "content": "hi"}], "openai/gpt-5.5",
+            None, "medium", 1, tmp_path, "task-body-size", 1, None, usage,
+            "task", False, attempt_cap=1,
+        )
+        assert msg is None
+        assert llm.calls == 1
+        assert usage["_last_llm_error_kind"] == "request_too_large"
+
+
+def test_empty_structured_context_overflow_event_carries_fit_projection(tmp_path):
+    usage = {
+        "_context_profile": "owner_low",
+        "_context_fit_mode": "low",
+        "_context_target_miss": True,
+        "_context_automatic_pass_used": True,
+    }
+    llm = _EmptyBodyErrorLLM({
+        "kind": "provider_error",
+        "code": "context_length_exceeded",
+        "type": "invalid_request_error",
+        "message": "input rejected",
+    })
+    msg, _cost = call_llm_with_retry(
+        llm, [{"role": "user", "content": "hi"}], "openai/gpt-5.5",
+        None, "medium", 1, tmp_path, "task-empty-overflow", 1, None, usage,
+        "task", False, attempt_cap=1,
+        physical_context=PhysicalAttemptContext(
+            profile="owner_low",
+            rendered_mode="low",
+            measurement_basis="cold_estimate",
+            route_fp="route",
+            round_id="round-1",
+            target_total_tokens=200_000,
+            capacity_total_tokens=500_000,
+            context_target_miss=True,
+            automatic_pass_used=True,
+        ),
+    )
+    assert msg is None and llm.calls == 1
+    assert usage["_last_llm_error_kind"] == "context_overflow"
+    event = next(
+        __import__("json").loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if '"type": "remote_context_overflow"' in line
+    )
+    assert event["context_profile"] == "owner_low"
+    assert event["context_fit_mode"] == "low"
+    assert event["context_target_miss"] is True
+    assert event["context_automatic_pass_used"] is True
 
 
 def test_call_llm_with_retry_stops_non_retryable_same_request(tmp_path):

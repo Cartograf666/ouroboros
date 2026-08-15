@@ -68,19 +68,21 @@ def test_vision_query_default_max_tokens():
 def test_summary_and_background_token_budgets():
     """Summary/reflection/background paths must stay above the raised floors."""
     from pathlib import Path
+    from ouroboros import context_compaction
 
     expectations = {
         "ouroboros/tools/review_synthesis.py": "max_tokens=16384",
         "ouroboros/consolidator.py": "max_tokens=16384",
         "ouroboros/reflection.py": "max_tokens=16384",
         "ouroboros/agent_task_pipeline.py": "max_tokens=16384",
-        "ouroboros/context_compaction.py": "max_tokens=32768",
         "ouroboros/tools/skill_publish.py": "max_tokens=8192",
         "ouroboros/consciousness.py": "max_tokens=65536",
     }
     for path, needle in expectations.items():
         src = Path(path).read_text(encoding="utf-8").replace(" ", "")
         assert needle in src, f"{path} must contain {needle}"
+    assert context_compaction._SUMMARY_OUTPUT_TOKENS == 32_768
+    assert context_compaction._summarizer_spec()["output_budget"] == 32_768
 
 
 def test_claude_code_advisory_sdk_max_turns():
@@ -273,14 +275,11 @@ def test_calibrated_input_limit_shared_helper(tmp_path, monkeypatch):
     )
     assert limit("anthropic/claude-fable-5") == int(900_000 / 1.65)
 
-    # A model with a genuinely LIGHTER tokenizer keeps its OWN measured density: the
-    # cold-start constant is a Claude-derived cold-path value, not a global floor that
-    # permanently shrinks every other model's pack. The historical absolute-margin form
-    # still bounds the result, so the cap never exceeds the pre-measurement one.
+    # A lighter witness cannot loosen review sizing below the cold-conservative floor.
     record_token_density(
         tmp_path, "openai/gpt-5.5", prompt_chars=chars, prompt_tokens=int(1.0 * chars / 4),
     )
-    assert limit("openai/gpt-5.5") == 1_000_000 - 100_000 - 155_000 == 745_000
+    assert limit("openai/gpt-5.5") == int(900_000 / COLD_START_TOKEN_DENSITY)
 
     # Deep self-review consumes the same helper for its model-aware gate.
     assert "calibrated_input_token_limit" in inspect.getsource(deep_self_review.run_deep_self_review)
@@ -290,15 +289,14 @@ def test_calibrated_input_limit_shared_helper(tmp_path, monkeypatch):
 
 
 def test_measured_density_never_loosens_a_models_own_review_pack_cap(tmp_path, monkeypatch):
-    """Measurement may only ever TIGHTEN a given model's cap — PER MODEL IDENTITY.
+    """A still-fresh dense witness may only tighten a model's review cap.
 
     One normalized identity accumulates observations from every surface (the shipped
     `claude-fable-5` is both the scope reviewer and a triad slot), so a run of doc-only
     commits whose prose-dominated packs measure ~1.1 must not pull a code-heavy model's
-    stored density back down and hand the NEXT code-heavy scope pack a bigger cap — the
-    deterministic 400 this calibration prevents. The guarantee lives in the STORE (a
-    running per-model maximum), not in a global Claude-derived floor: flooring every
-    model at 1.65 permanently shrank the pack of every lighter tokenizer instead.
+    dense witness's TTL and hand the NEXT code-heavy scope pack a bigger cap. The
+    guarantee lives in retained timestamped raw witnesses, plus the 1.65 cold floor;
+    there is no independently refreshed aggregate scalar.
     """
     from ouroboros.capability_evidence import (
         _DENSITY_MEMO,
@@ -330,7 +328,7 @@ def test_measured_density_never_loosens_a_models_own_review_pack_cap(tmp_path, m
     assert tightened <= cold
 
     # A later run of prose-dominated packs measures ~1.1 on the SAME identity: the
-    # stored density is a running maximum, so the cap does NOT loosen back.
+    # the fresh dense witness remains retained, so the cap does NOT loosen back.
     _DENSITY_MEMO.clear()
     record_token_density(
         tmp_path, "anthropic/claude-fable-5",

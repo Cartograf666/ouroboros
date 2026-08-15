@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -43,6 +44,60 @@ class UsageAccountingError(RuntimeError):
 
 class UsageLedgerCorrupt(UsageAccountingError):
     """Raised when durable history is structurally invalid."""
+
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_CANDIDATE_IDENTITY_FIELDS = (
+    "candidate_raw_sha256", "candidate_raw_size_bytes",
+    "candidate_context_sha256", "candidate_context_size_bytes",
+)
+
+
+def _validate_candidate_facts(row: Dict[str, Any], sequence: int) -> None:
+    if "candidate_payload" in row:
+        raise UsageLedgerCorrupt(f"mutable candidate payload in usage row seq={sequence}")
+    present = "candidate_measurement_kind" in row or any(key in row for key in _CANDIDATE_IDENTITY_FIELDS)
+    if not present:
+        return  # pre-feature/legacy rows
+    kind = row.get("candidate_measurement_kind")
+    if kind not in {"canonical_json_v1", "opaque"}:
+        raise UsageLedgerCorrupt(f"invalid candidate_measurement_kind in usage row seq={sequence}")
+    if kind == "opaque":
+        if any(row.get(key) is not None for key in _CANDIDATE_IDENTITY_FIELDS):
+            raise UsageLedgerCorrupt(f"opaque candidate claims identity in usage row seq={sequence}")
+    else:
+        for key in ("candidate_raw_sha256", "candidate_context_sha256"):
+            if not isinstance(row.get(key), str) or not _SHA256_RE.fullmatch(row[key]):
+                raise UsageLedgerCorrupt(f"invalid {key} in usage row seq={sequence}")
+        for key in ("candidate_raw_size_bytes", "candidate_context_size_bytes"):
+            value = row.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise UsageLedgerCorrupt(f"invalid {key} in usage row seq={sequence}")
+    context = row.get("physical_context")
+    if context is not None:
+        if not isinstance(context, dict):
+            raise UsageLedgerCorrupt(f"invalid physical_context in usage row seq={sequence}")
+        if context.get("profile") not in {"owner_max", "owner_low", "task_local_low"}:
+            raise UsageLedgerCorrupt(f"invalid physical_context profile in usage row seq={sequence}")
+        if context.get("rendered_mode") not in {"max", "low"} or context.get("measurement_basis") not in {
+            "fresh_route_usage", "fresh_model_usage", "cold_estimate",
+        }:
+            raise UsageLedgerCorrupt(f"invalid physical_context mode/basis in usage row seq={sequence}")
+        for key in ("target_total_tokens", "capacity_total_tokens"):
+            value = context.get(key)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+                raise UsageLedgerCorrupt(f"invalid physical_context {key} in usage row seq={sequence}")
+        if not all(isinstance(context.get(key), bool) for key in ("context_target_miss", "automatic_pass_used")):
+            raise UsageLedgerCorrupt(f"invalid physical_context flags in usage row seq={sequence}")
+        if not all(isinstance(context.get(key), str) for key in ("route_fp", "round_id")):
+            raise UsageLedgerCorrupt(f"invalid physical_context identity in usage row seq={sequence}")
+    manifest_ref = row.get("candidate_manifest_ref")
+    if manifest_ref is not None and (
+        not isinstance(manifest_ref, dict)
+        or manifest_ref.get("call_id") != row.get("attempt_id")
+        or not _SHA256_RE.fullmatch(str(manifest_ref.get("sha256") or ""))
+    ):
+        raise UsageLedgerCorrupt(f"invalid candidate_manifest_ref in usage row seq={sequence}")
 
 
 def _drive_root(value: pathlib.Path | str | None = None) -> pathlib.Path:
@@ -199,6 +254,7 @@ def _validate_records(
         kind = str(row.get("kind") or "attempt")
         if not attempt_id or state not in {"reserved", "dispatched", *_TERMINAL}:
             raise UsageLedgerCorrupt(f"invalid usage ledger row seq={row.get('seq')}")
+        _validate_candidate_facts(row, sequence)
         for numeric_field in (
             "cost_usd", "reservation_upper_bound_usd", "reservation_usd",
             "max_budget_usd", "global_limit_usd", "root_limit_usd",

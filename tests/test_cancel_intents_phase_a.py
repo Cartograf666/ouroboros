@@ -463,6 +463,7 @@ def test_deliver_unreviewed_salvage_builds_honest_message(tmp_path):
     preserved = tmp_path / "full.txt"
     long_text = "line of salvage\n" * 600
     preserved.write_text(long_text, encoding="utf-8")
+    write_task_result(tmp_path, "task-a", "cancelled", result="stopped")
     queue = _CaptureQueue()
     delivered = td.deliver_unreviewed_salvage(
         tmp_path,
@@ -478,17 +479,31 @@ def test_deliver_unreviewed_salvage_builds_honest_message(tmp_path):
     (event,) = queue.events
     assert event["chat_id"] == 7 and event["task_id"] == "task-a"
     assert event["delivery_id"].startswith("final:task-a:")
+    # Q4 non-mimicry: the receipt is typed SYSTEM end to end.
+    assert event["role"] == "system" and event["system_type"] == "cancel_receipt"
     text = event["text"]
     assert "WITHOUT review" in text
+    assert "last persisted intermediate model message" in text
+    assert "NOT a final answer" in text
     omitted = len(long_text.strip()) - td.SALVAGE_PREVIEW_CHARS
     assert f"{omitted} chars omitted" in text           # exact disclosed count
-    assert str(preserved) in text                       # durable receipt: path
+    assert "1 descendant task(s) were settled with it" in text
+    # Q5=A: the technical facts stay OUT of chat and live in the durable
+    # cancel_receipt block the details panel renders.
+    assert str(preserved) not in text
+    assert "sha256" not in text
+    assert "task's details panel" in text
+    stored = load_task_result(tmp_path, "task-a")
+    receipt = stored["cancel_receipt"]
     full_digest = hashlib.sha256(preserved.read_bytes()).hexdigest()
-    assert len(full_digest) == 64
-    assert f"sha256 {full_digest}" in text, "the receipt must carry the FULL digest"
-    assert f"{preserved.stat().st_size} bytes" in text
-    assert "Subtree digest (1 descendant(s))" in text
-    assert "- c1: cancelled (salvaged output preserved)" in text
+    assert receipt["salvage"]["path"] == str(preserved)
+    assert receipt["salvage"]["sha256"] == full_digest
+    assert receipt["salvage"]["size_bytes"] == preserved.stat().st_size
+    assert receipt["preview_omitted_chars"] == omitted
+    assert receipt["children"] == [
+        {"task_id": "c1", "outcome": "cancelled", "salvaged": True}
+    ]
+    assert receipt["delivery_id"] == event["delivery_id"]
 
     # Second delivery of the same content is suppressed only AFTER registration.
     td.register_delivery(tmp_path, event["delivery_id"])
@@ -501,6 +516,47 @@ def test_deliver_unreviewed_salvage_builds_honest_message(tmp_path):
         event_queue=queue,
     ) is False
     assert queue.events == []
+
+
+def test_real_salvage_block_heals_placeholder_and_survives_replay(tmp_path):
+    """m6-preserved-key: a REAL salvage receipt carries preserved=True, so a
+    late real block heals an early placeholder, while a placeholder replay
+    still never clobbers a persisted real block (the original minor-6 pin)."""
+    from supervisor import terminal_delivery as td
+
+    write_task_result(tmp_path, "task-m6", "cancelled", result="stopped")
+    # An early placeholder persisted first (no durable copy existed yet).
+    td._persist_cancel_receipt(
+        tmp_path, "task-m6",
+        settled_status="cancelled", outcome="cancelled",
+        delivery_id="d-m6", preserved_path="", preview_omitted=0,
+    )
+    stored = load_task_result(tmp_path, "task-m6")
+    assert stored["cancel_receipt"]["salvage"] == {"path": "", "preserved": False}
+
+    # A late REAL salvage block replayed over it -> the real block WINS.
+    preserved = tmp_path / "m6-full.txt"
+    preserved.write_text("the whole salvaged text", encoding="utf-8")
+    td._persist_cancel_receipt(
+        tmp_path, "task-m6",
+        settled_status="cancelled", outcome="cancelled",
+        delivery_id="d-m6", preserved_path=str(preserved), preview_omitted=0,
+    )
+    stored = load_task_result(tmp_path, "task-m6")
+    salvage = stored["cancel_receipt"]["salvage"]
+    assert salvage["path"] == str(preserved)
+    assert salvage["preserved"] is True
+    assert salvage["sha256"] == hashlib.sha256(preserved.read_bytes()).hexdigest()
+    assert salvage["size_bytes"] == preserved.stat().st_size
+
+    # A placeholder replay after the real block -> the real block SURVIVES.
+    td._persist_cancel_receipt(
+        tmp_path, "task-m6",
+        settled_status="cancelled", outcome="cancelled",
+        delivery_id="d-m6", preserved_path="", preview_omitted=0,
+    )
+    stored = load_task_result(tmp_path, "task-m6")
+    assert stored["cancel_receipt"]["salvage"] == salvage
 
 
 def test_completed_outcome_reads_as_result_not_salvage(tmp_path):
@@ -530,6 +586,44 @@ def test_completed_outcome_reads_as_result_not_salvage(tmp_path):
     (event,) = queue.events
     assert event["text"].startswith("⚠️ Task task-c")
     assert "WITHOUT review" in event["text"]
+
+
+def test_receipt_identity_is_the_stop_episode_and_survives_the_settle(tmp_path):
+    """CF-04: the receipt delivery id is ``cancel:<tid>:<request_id>`` — bound
+    to the stop episode, stable across wording changes AND across the settle
+    (the publish half rebuilds after the intent row is gone and must re-derive
+    the SAME id from the owed row the pre-settle half registered)."""
+    from supervisor import terminal_delivery as td
+
+    write_task_result(tmp_path, "ep-1", STATUS_RUNNING, result="working")
+    intent = ci.request_cancel(tmp_path, "ep-1")
+    rid = intent["request_id"]
+
+    # Pre-settle half (owed registration): id comes from the ACTIVE intent.
+    event = td.build_unreviewed_salvage_event(
+        tmp_path, {"chat_id": 4}, "ep-1", outcome="cancelled",
+        salvaged_text="partial work", settled_status="cancelled",
+    )
+    assert event["delivery_id"] == f"cancel:ep-1:{rid}"
+    assert event["role"] == "system" and event["system_type"] == "cancel_receipt"
+    assert td.register_pending_delivery(tmp_path, event) is True
+
+    # Settle removes the active intent; the publish half re-derives the id
+    # from the pending owed row instead of falling back to a content digest.
+    ci.settle_intent(tmp_path, "ep-1", outcome="cancelled", request_id=rid)
+    rebuilt = td.build_unreviewed_salvage_event(
+        tmp_path, {"chat_id": 4}, "ep-1", outcome="cancelled",
+        salvaged_text="partial work", settled_status="cancelled",
+    )
+    assert rebuilt["delivery_id"] == event["delivery_id"]
+
+    # No episode at all (e.g. a reap without an intent): content-derived
+    # fallback keeps the pre-S3 vocabulary.
+    other = td.build_unreviewed_salvage_event(
+        tmp_path, {"chat_id": 4}, "no-episode", outcome="cancelled",
+        salvaged_text="text", settled_status="cancelled",
+    )
+    assert other["delivery_id"].startswith("final:no-episode:")
 
 
 # --------------------------------------------------------------------------
@@ -1265,11 +1359,14 @@ def test_pending_outbox_spaces_replays_with_backoff(tmp_path):
 
 
 def test_salvage_receipt_is_complete_for_a_short_answer_too(tmp_path):
-    """A-F14: a short salvage used to get NO receipt at all."""
+    """A-F14 under Q5=A: every salvage still gets its verification receipt —
+    the exact-completeness half in chat, the path/sha half in the durable
+    ``cancel_receipt`` block the details panel renders."""
     from supervisor import terminal_delivery as td
 
     preserved = tmp_path / "short.txt"
     preserved.write_text("a short but whole answer", encoding="utf-8")
+    write_task_result(tmp_path, "short-task", "cancelled", result="stopped")
     queue = _CaptureQueue()
     td.deliver_unreviewed_salvage(
         tmp_path, {"chat_id": 5}, "short-task", outcome="cancelled",
@@ -1279,20 +1376,26 @@ def test_salvage_receipt_is_complete_for_a_short_answer_too(tmp_path):
     (event,) = queue.events
     digest = hashlib.sha256(preserved.read_bytes()).hexdigest()
     assert "nothing omitted" in event["text"]
-    assert f"sha256 {digest}" in event["text"]
-    assert str(preserved) in event["text"]
+    assert "task's details panel" in event["text"]
+    receipt = load_task_result(tmp_path, "short-task")["cancel_receipt"]
+    assert receipt["salvage"]["sha256"] == digest
+    assert receipt["salvage"]["path"] == str(preserved)
 
-    # An unreadable preservation says so instead of printing nothing.
+    # An unreadable preservation is stamped UNVERIFIED in the durable block
+    # instead of silently claiming a verified copy.
     queue.events.clear()
+    write_task_result(tmp_path, "short-task-2", "cancelled", result="stopped")
     td.deliver_unreviewed_salvage(
         tmp_path, {"chat_id": 5}, "short-task-2", outcome="cancelled",
         salvaged_text="another whole answer", preserved_path=str(tmp_path / "gone.txt"),
         event_queue=queue,
     )
     (event,) = queue.events
-    assert "UNVERIFIED" in event["text"]
+    receipt = load_task_result(tmp_path, "short-task-2")["cancel_receipt"]
+    assert receipt["salvage"].get("unreadable") is True
 
-    # No preserved copy at all is disclosed too.
+    # No preserved copy at all is disclosed in CHAT (the owner must know the
+    # preview is the only copy).
     queue.events.clear()
     td.deliver_unreviewed_salvage(
         tmp_path, {"chat_id": 5}, "short-task-3", outcome="cancelled",

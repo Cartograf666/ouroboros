@@ -293,11 +293,8 @@ def test_token_density_is_measured_throttled_and_bounded(tmp_path, monkeypatch):
     assert abs(get_token_density(tmp_path, "m/one") - 1.5) < 1e-6
     density, source = resolve_token_density(tmp_path, "m/one")
     assert source == "measured"
-    # A model's OWN measured density applies (with the safety factor); the cold-start
-    # constant bounds the COLD path only, so a lighter tokenizer is not permanently
-    # charged a Claude-derived 1.65. calibrated_input_token_limit still bounds the
-    # resulting cap by the historical absolute-margin form.
-    assert abs(density - 1.5 * MEASURED_DENSITY_SAFETY_FACTOR) < 1e-6
+    # Review sizing never becomes looser than its existing cold floor.
+    assert density == COLD_START_TOKEN_DENSITY
 
     # Above the floor, the measured value (with the safety factor) is what applies.
     _DENSITY_MEMO.clear()
@@ -326,12 +323,11 @@ def test_token_density_is_measured_throttled_and_bounded(tmp_path, monkeypatch):
 
     # Throttle: a repeat observation within tolerance must not touch the shared store
     # AT ALL (it is one file behind one lock shared with the scope-review hot path).
-    current = get_token_density(tmp_path, "m/one")
     saves: list = []
     monkeypatch.setattr(ce, "_save", lambda root, data: saves.append(1))
     _DENSITY_MEMO.clear()
     record_token_density(
-        tmp_path, "m/one", prompt_chars=chars, prompt_tokens=int(current * chars / 4),
+        tmp_path, "m/one", prompt_chars=chars, prompt_tokens=int(1.64 * chars / 4),
     )
     assert saves == [], "a within-tolerance repeat must not write the shared store"
     # ...and a real drift IS persisted.
@@ -352,6 +348,127 @@ def test_token_density_is_measured_throttled_and_bounded(tmp_path, monkeypatch):
     density, source = resolve_token_density(tmp_path, "never/seen")
     assert source == "cold_conservative"
     assert density >= COLD_START_TOKEN_DENSITY
+
+
+def test_density_reducers_use_newest_route_or_model_but_densest_review_witness(tmp_path):
+    from ouroboros.capability_evidence import (
+        _DENSITY_MEMO,
+        COLD_START_TOKEN_DENSITY,
+        MEASURED_DENSITY_SAFETY_FACTOR,
+        record_token_density,
+        resolve_main_token_density,
+        resolve_review_token_density,
+    )
+
+    _DENSITY_MEMO.clear()
+    chars = 400_000
+    record_token_density(
+        tmp_path, "m/one", prompt_chars=chars, prompt_tokens=180_000, route_fp="route-a",
+    )
+    record_token_density(
+        tmp_path, "m/one", prompt_chars=chars, prompt_tokens=110_000, route_fp="route-a",
+    )
+
+    assert resolve_main_token_density(tmp_path, "route-a", "m/one") == (
+        1.1, "fresh_route_usage",
+    )
+    assert resolve_main_token_density(tmp_path, "missing-route", "m/one") == (
+        1.1, "fresh_model_usage",
+    )
+    review, source = resolve_review_token_density(tmp_path, "m/one")
+    assert source == "measured"
+    assert review == max(COLD_START_TOKEN_DENSITY, 1.8 * MEASURED_DENSITY_SAFETY_FACTOR)
+    assert resolve_review_token_density(tmp_path, "m/missing") == (
+        review, "cold_conservative",
+    )
+
+    stored = json.loads((tmp_path / "state" / "capability_evidence.json").read_text())
+    assert set(stored["token_density"]["m/one"]) == {"pairs"}
+    assert resolve_main_token_density(tmp_path, "", "never/seen") == (1.0, "cold_estimate")
+
+
+def test_density_memo_does_not_claim_a_witness_when_persistence_failed(tmp_path, monkeypatch):
+    from ouroboros.capability_evidence import _DENSITY_MEMO, record_token_density
+
+    _DENSITY_MEMO.clear()
+    monkeypatch.setattr(ce, "_save", lambda root, data: False)
+    record_token_density(
+        tmp_path, "m/one", prompt_chars=400_000, prompt_tokens=150_000,
+        route_fp="route-a",
+    )
+    assert "m/one\0route-a" not in _DENSITY_MEMO
+
+
+def test_orphan_density_scalar_has_no_authority_without_a_retained_witness(tmp_path):
+    from ouroboros.capability_evidence import (
+        COLD_START_TOKEN_DENSITY,
+        get_token_density,
+        resolve_main_token_density,
+        resolve_review_token_density,
+    )
+
+    ce._save(tmp_path, {"token_density": {"m/one": {
+        "density": 3.0,
+        "observed_at": ce.utc_now_iso(),
+        "pairs": [],
+    }}})
+    assert get_token_density(tmp_path, "m/one") == 0.0
+    assert resolve_main_token_density(tmp_path, "route-a", "m/one") == (1.0, "cold_estimate")
+    assert resolve_review_token_density(tmp_path, "m/one") == (
+        COLD_START_TOKEN_DENSITY, "cold_conservative",
+    )
+
+
+def test_density_retention_preserves_fresh_high_witness_without_refreshing_its_ttl(
+    tmp_path, monkeypatch,
+):
+    import datetime
+
+    from ouroboros.capability_evidence import (
+        _DENSITY_MEMO,
+        COLD_START_TOKEN_DENSITY,
+        _TOKEN_DENSITY_MAX_PAIRS,
+        _TOKEN_DENSITY_TTL_SEC,
+        record_token_density,
+        resolve_main_token_density,
+        resolve_review_token_density,
+    )
+
+    _DENSITY_MEMO.clear()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    old_high_ts = (now - datetime.timedelta(seconds=_TOKEN_DENSITY_TTL_SEC - 60)).isoformat()
+    ce._save(tmp_path, {"token_density": {"m/one": {"pairs": [{
+        "prompt_chars": 400_000,
+        "prompt_tokens": 250_000,
+        "observed_at": old_high_ts,
+        "source": "dispatch_usage",
+        "route_fp": "route-high",
+    }]}}})
+
+    for index, density in enumerate((1.0, 1.1, 1.2, 1.3, 1.4, 1.5)):
+        _DENSITY_MEMO.clear()
+        record_token_density(
+            tmp_path, "m/one", prompt_chars=400_000,
+            prompt_tokens=int(density * 100_000), route_fp=f"route-low-{index}",
+        )
+    stored = json.loads((tmp_path / "state" / "capability_evidence.json").read_text())
+    pairs = stored["token_density"]["m/one"]["pairs"]
+    assert len(pairs) == _TOKEN_DENSITY_MAX_PAIRS
+    assert any(pair["observed_at"] == old_high_ts for pair in pairs)
+
+    monkeypatch.setattr(ce, "utc_now", lambda: now + datetime.timedelta(seconds=120))
+    assert resolve_main_token_density(tmp_path, "route-high", "m/one") == (
+        1.5, "fresh_model_usage",
+    )
+    assert resolve_review_token_density(tmp_path, "m/one") == (
+        COLD_START_TOKEN_DENSITY, "measured",
+    )
+    _DENSITY_MEMO.clear()
+    record_token_density(
+        tmp_path, "m/one", prompt_chars=400_000, prompt_tokens=155_000, route_fp="route-new",
+    )
+    stored = json.loads((tmp_path / "state" / "capability_evidence.json").read_text())
+    assert all(pair["observed_at"] != old_high_ts for pair in stored["token_density"]["m/one"]["pairs"])
 
 
 def test_token_density_is_concurrency_safe_under_bench_like_parallelism(tmp_path):
@@ -481,6 +598,9 @@ def test_first_successful_call_seeds_density_so_the_next_projection_is_measured(
     _DENSITY_MEMO.clear()
     (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("TOTAL_BUDGET", "500")  # the reservation rail is not under test
+    # One observation store: the plan builder reads density from the CANONICAL
+    # evidence root, so bind it to this test's root before seeding witnesses.
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
     model = "anthropic/claude-fable-5"  # Claude-family, routed through OpenRouter
     core = context_fit.ContextCore(
         base_prompt="p", bible_md="b", architecture_md="a", development_md="d",

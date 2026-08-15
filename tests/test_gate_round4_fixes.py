@@ -354,12 +354,18 @@ def test_gr4_4_cascade_digest_reports_the_current_durable_child_state(tmp_path, 
 
     assert owed is True
     (event,) = [e for e in queue.events if e.get("type") == "send_message"]
-    assert "- c4: cancelled" in event["text"], (
-        "GR4-4: the line reports the CURRENT durable status, not the stale sweep outcome"
+    assert "2 descendant task(s) were settled with it" in event["text"]
+    # Q5=A: per-child outcomes live in the durable cancel_receipt block the
+    # details panel renders, not in the chat text.
+    outcomes = {
+        row["task_id"]: row["outcome"]
+        for row in load_task_result(tmp_path, "r4")["cancel_receipt"]["children"]
+    }
+    assert outcomes["c4"] == "cancelled", (
+        "GR4-4: the digest reports the CURRENT durable status, not the stale sweep outcome"
     )
-    assert "- c4: failed" not in event["text"]
     # A child with no settled durable status keeps the sweep's honest outcome.
-    assert "- c5: failed" in event["text"]
+    assert outcomes["c5"] == "failed"
 
 
 # --------------------------------------------------------------------------

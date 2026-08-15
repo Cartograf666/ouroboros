@@ -1444,7 +1444,7 @@ def schedule_subagent_properties() -> Dict[str, Any]:
             "enum": ["read_only", "self_worktree", "external_workspace", "genesis"],
             "description": "read_only (or omit) = read-only child auditing THIS repo. Otherwise the isolated write surface for a MUTATIVE child (see tool description). Acting surfaces require mutative subagents enabled (default ON in advanced/pro).",
         },
-        "write_root": {"type": "string", "description": "For write_surface=external_workspace: the external project directory. OMIT it to build COOPERATIVELY from scratch — the host mints ONE shared git tree the whole subagent tree writes into together (deeper descendants inherit it), and you integrate the result as the sole committer. Ignored for self_worktree and genesis (both auto-provisioned)."},
+        "write_root": {"type": "string", "description": "For write_surface=external_workspace: the external project directory — a REAL external Git working tree, never runtime data. An installed non-Git skill payload is NOT an external workspace: delegate it directly with delegate_start(root='skill_payload', bucket=..., skill_name=...). OMIT write_root to build COOPERATIVELY from scratch — the host mints ONE shared git tree the whole subagent tree writes into together (deeper descendants inherit it), and you integrate the result as the sole committer. Ignored for self_worktree and genesis (both auto-provisioned)."},
         "protected_paths_grant": {"type": "boolean", "default": False, "description": "Allow the child to modify protected paths in its self_worktree. Honored only in pro runtime mode; you still re-check at integration."},
         "external_tool_grants": {"type": "array", "items": {"type": "string"}, "description": "Optional extension/MCP tool names to grant this mutative child. Denied by default."},
         "delegation_intent": {"type": "string", "description": "Optional: tell THIS child whether/how to delegate further (e.g. 'build the whole game; spawn your own children per subsystem and let them spawn too'). Propagated structurally into the child's delegation budget and surfaced in its prompt, so a 'use maximum subagents / grandchildren' intent is not lost. Defaults to inheriting the parent's intent."},
@@ -2047,28 +2047,6 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
             from ouroboros.config import get_fallback_models
             if model in get_fallback_models() and os.environ.get("USE_LOCAL_FALLBACK", "").lower() in ("true", "1"):
                 use_local = True
-
-        # A confirmed sub-1M route cannot receive the current Max projection. An
-        # unknown route is allowed one honest Max attempt; run_llm_loop rebinds the
-        # immutable core to that exact route and owns the confirmed-overflow Low retry.
-        if str(getattr(ctx, "active_context_mode", "") or "") == "max":
-            try:
-                from ouroboros.gateway.settings import _active_route_confirms_max
-                if _active_route_confirms_max(model=model, use_local=use_local) is False:
-                    return (
-                        f"⚠️ SWITCH_BLOCKED: '{model}' has a confirmed sub-1M context window, but the "
-                        "current transcript was built in Max context mode and would overflow it. Pick a "
-                        ">=1M route, or have the owner lower context mode to Low before switching."
-                    )
-            except Exception:
-                # Fail CLOSED: an errored capability check must not let a max-sized transcript
-                # switch to a possibly-sub-1M route (BIBLE P1 cognitive horizon).
-                log.debug("CW2 switch_model capability guard errored; failing closed", exc_info=True)
-                return (
-                    f"⚠️ SWITCH_BLOCKED: couldn't verify whether '{model}' confirms a >=1M window while "
-                    "the transcript is max-sized — failing closed. Retry, pick a known >=1M route, or have "
-                    "the owner lower context mode to Low first."
-                )
 
         ctx.active_model_override = model
         ctx.active_use_local_override = use_local

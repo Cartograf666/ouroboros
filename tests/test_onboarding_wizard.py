@@ -1077,17 +1077,8 @@ def test_onboarding_frontend_exempts_unchanged_prefilled_keys_from_length_check(
     assert len(CONFIGURED_SECRET_PLACEHOLDER) < 10
 
 
-def test_completion_awaits_login_custody_and_keeps_the_retry_handle():
-    """The wizard is the CONSUMER of the step's custody verdict, and the step's
-    own node tests cannot reach it: the wizard body is an IIFE with no exports.
-
-    So the contract is pinned against the source. Two things must hold, and both
-    were broken before the gate found them: completion must not be announced
-    while the disposer is still running (a deferred create POST was answered
-    AFTER the page had already navigated), and the step handle must not be
-    dropped when the verdict is false, because that handle is the only thing
-    that can retry the cancel against the retained job.
-    """
+def test_completion_branches_on_typed_login_custody_before_detach():
+    """The IIFE consumer retries only unknown cleanup, then leaves honestly."""
     source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
 
     body = source.split("async function saveWizardPayload", 1)[1].split("\n    }", 1)[0]
@@ -1096,19 +1087,22 @@ def test_completion_awaits_login_custody_and_keeps_the_retry_handle():
     code = "\n".join(line for line in body.splitlines()
                      if not line.strip().startswith("//"))
 
-    # Awaited, and its answer kept.
-    assert "await agentsStep?.dispose()" in code
+    # Awaited, and its typed answer kept.
+    assert "agentsStep ? await agentsStep.dispose() : 'released'" in code
+    assert "'released'" in code
     # The announcement comes AFTER the disposal, not before it.
     assert code.index("dispose()") < code.index("announceCompletion")
-    # A refused release keeps the handle; only a proven one drops it.
-    assert "released === false" in code
+    assert "custody === 'retained'" in code
+    assert "custody === 'unknown'" in code
+    assert "released === false" not in code
+    # Only unknown cleanup enters the bounded retry loop. A retained result
+    # proceeds directly to local detach because another cancel proves nothing.
+    retry = code.index("for (let attempt = 0; custody === 'unknown'")
+    retained = code.index("custody === 'retained'")
+    detach = code.index("agentsStep?.detach()")
     drop = code.index("agentsStep = null")
-    assert code.index("released === false") < drop, (
-        "the handle must only be dropped on the proven-release branch")
-
-    # And the refusal is RETRIED before the page goes away, because this is the
-    # last moment anything client-side knows the job id. Bounded, so completion
-    # cannot hang on an engine that is simply down.
+    announce = code.index("announceCompletion")
+    assert retry < retained < detach < drop < announce
     assert "LOGIN_RELEASE_RETRIES" in code and "LOGIN_RELEASE_RETRY_MS" in code
     assert source.count("const LOGIN_RELEASE_RETRIES = ") == 1
     retries = int(source.split("const LOGIN_RELEASE_RETRIES = ", 1)[1].split(";", 1)[0])

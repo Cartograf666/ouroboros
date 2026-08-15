@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ouroboros.task_pacing import NANNY_REMINDER_ROUNDS
+from ouroboros.task_pacing import NANNY_FIRST_REMINDER_ROUNDS, NANNY_REMINDER_ROUNDS
 
 
 @pytest.fixture(autouse=True)
@@ -274,6 +274,39 @@ def test_the_cost_axis_alone_can_trigger_the_reminder():
     assert any("metered LLM rounds" in m.get("content", "") for m in msgs)
 
 
+def test_the_reminder_stays_out_of_owner_chat_progress(tmp_path):
+    """Owner decision (2026-08-15): the economics reminder is a model-facing
+    user message plus a typed task_checkpoint event — emit_progress (chat ⚠️
+    lines) stays silent, so the owner chat is not spammed mid-run."""
+    import json
+
+    from ouroboros.task_pacing import NANNY_REMINDER_USD
+    from ouroboros.loop import (
+        _maybe_inject_nanny_economics_reminder,
+        _note_nanny_delegate_activity,
+    )
+
+    ctx = _nanny_ctx()
+    tools = SimpleNamespace(_ctx=ctx)
+    _note_nanny_delegate_activity(ctx, 1, {"cost": 0.0}, [_delegate_call()])
+    _note_nanny_delegate_activity(ctx, 2, {"cost": NANNY_REMINDER_USD}, [])
+    msgs: list = []
+    progress: list = []
+    drive_logs = tmp_path / "logs"
+    drive_logs.mkdir()
+    assert _maybe_inject_nanny_economics_reminder(
+        2, msgs, tools, progress.append,
+        event_queue=None, task_id="t", drive_logs=drive_logs,
+    ) is True
+    assert progress == []
+    assert any("NANNY ECONOMICS REMINDER" in m.get("content", "") for m in msgs)
+    events = [json.loads(line) for line in
+              (drive_logs / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert any(e.get("type") == "task_checkpoint"
+               and e.get("checkpoint_kind") == "nanny_economics_reminder"
+               for e in events)
+
+
 def test_the_rearm_is_dual_axis_a_continuing_dollar_burn_refires_before_8_rounds():
     """F1 (five reviewers converged): after a firing, EITHER a further
     threshold-width of rounds OR a further threshold-width of dollars re-arms.
@@ -397,6 +430,76 @@ def test_zero_baseline_reminder_says_since_task_start():
     assert "since your last delegated-run activity" not in joined
     # The switch_model sanction rides the reminder text (R2-7b).
     assert "switch_model" in joined
+
+
+def test_first_reminder_fires_early_with_zero_delegate_activity():
+    """Owner-approved (2026-08-15): a harness-dispatched nanny that has made NO
+    delegate-verb call hears its FIRST reminder at NANNY_FIRST_REMINDER_ROUNDS
+    regardless of dollars — the live E2E's cheap children finished in 4-8
+    rounds under $0.15 and never heard it."""
+    from ouroboros.loop import (
+        _maybe_inject_nanny_economics_reminder,
+        _note_nanny_delegate_activity,
+    )
+
+    ctx = _nanny_ctx()
+    tools = SimpleNamespace(_ctx=ctx)
+    fired_at = None
+    for round_idx in range(1, NANNY_REMINDER_ROUNDS + 1):
+        # Pennies per round, never a delegate verb: the dollar axis stays cold.
+        _note_nanny_delegate_activity(ctx, round_idx, {"cost": round_idx * 0.01}, [])
+        msgs: list = []
+        if _maybe_inject_nanny_economics_reminder(round_idx, msgs, tools, lambda *_: None):
+            fired_at = round_idx
+            joined = "\n".join(m.get("content", "") for m in msgs)
+            assert "NANNY ECONOMICS REMINDER" in joined
+            assert "since this task started" in joined
+            break
+    assert fired_at == NANNY_FIRST_REMINDER_ROUNDS
+
+
+def test_no_early_fire_once_a_delegate_verb_happened():
+    """The early first-fire is ONLY for a nanny with zero delegate activity:
+    after any delegate verb the ordinary 8-round/$2 dual-axis thresholds apply
+    unchanged, so round NANNY_FIRST_REMINDER_ROUNDS stays silent."""
+    from ouroboros.loop import (
+        _maybe_inject_nanny_economics_reminder,
+        _note_nanny_delegate_activity,
+    )
+
+    ctx = _nanny_ctx()
+    tools = SimpleNamespace(_ctx=ctx)
+    _note_nanny_delegate_activity(ctx, 1, {"cost": 0.0}, [_delegate_call()])
+    fired: list = []
+    for round_idx in range(2, 2 + NANNY_REMINDER_ROUNDS + 1):
+        _note_nanny_delegate_activity(ctx, round_idx, {"cost": 0.05}, [])
+        if _maybe_inject_nanny_economics_reminder(round_idx, [], tools, lambda *_: None):
+            fired.append(round_idx)
+    # Silent through the early horizon; the first fire needs the full
+    # threshold-width of metered rounds since the delegate activity.
+    assert fired == [1 + NANNY_REMINDER_ROUNDS]
+
+
+def test_rearm_after_the_early_first_fire_uses_the_ordinary_thresholds():
+    """Re-arms after the first firing are unchanged: after the early fire at
+    round NANNY_FIRST_REMINDER_ROUNDS, the next one waits a further FULL
+    threshold-width (8 rounds / $2) — the early constant governs only the
+    first firing of a zero-delegation nanny."""
+    from ouroboros.loop import (
+        _maybe_inject_nanny_economics_reminder,
+        _note_nanny_delegate_activity,
+    )
+
+    ctx = _nanny_ctx()
+    tools = SimpleNamespace(_ctx=ctx)
+    fired: list = []
+    for round_idx in range(1, 3 * NANNY_REMINDER_ROUNDS):
+        _note_nanny_delegate_activity(ctx, round_idx, {"cost": 0.0}, [])
+        if _maybe_inject_nanny_economics_reminder(round_idx, [], tools, lambda *_: None):
+            fired.append(round_idx)
+    assert fired[0] == NANNY_FIRST_REMINDER_ROUNDS
+    assert fired[1] - fired[0] == NANNY_REMINDER_ROUNDS
+    assert fired[2] - fired[1] == NANNY_REMINDER_ROUNDS
 
 
 def test_an_expensive_no_tool_round_still_counts(tmp_path):

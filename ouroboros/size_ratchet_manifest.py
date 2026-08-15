@@ -137,6 +137,7 @@ BAND_PATHS = {
     "ouroboros/gateway/contracts.py": None,
     "ouroboros/gateway/extensions.py": None,
     "ouroboros/gateway/history.py": None,
+    "ouroboros/gateway/settings.py": "Retiring persistent auto-Low removed the former giant debt; the remaining owner and reviewer settings endpoints stay centralized while tracked in the shrinking band.",
     "ouroboros/gateway/tasks.py": None,
     "ouroboros/launcher_bootstrap.py": None,
     "ouroboros/loop_llm_call.py": None,
@@ -167,6 +168,7 @@ BAND_PATHS = {
     "tests/test_claude_code_gateway.py": None,
     "tests/test_commit_gate.py": None,
     "tests/test_contracts.py": None,
+    "tests/test_delegated_skill_payload.py": "Sol scope-review fix batch: P1 trust probes (forged index, symlinked git metadata), P2 golden-E2E review close and schema/docs pins joined the existing R1+gate-fix payload suite.",
     "tests/test_evolution_redesign.py": None,
     "tests/test_observability_outcomes_v2.py": None,
     "tests/test_onboarding_complete_endpoint.py": None,
@@ -200,10 +202,9 @@ BYTE_BASELINE_DEBT = {
 }
 
 BYTE_DEBT = {
-    "ouroboros/llm.py": 205432,
-    "ouroboros/loop.py": 335600,
-    "supervisor/events.py": 205328,
-    "tests/test_delegated_subagent_transport.py": 320627,
+    "ouroboros/llm.py": 200307,
+    "ouroboros/loop.py": 321064,
+    "tests/test_delegated_subagent_transport.py": 320623,
     "tests/test_devtools_benchmarks.py": 328786,
-    "web/modules/chat.js": 234467,
+    "web/modules/chat.js": 229431,
 }

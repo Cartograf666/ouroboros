@@ -1810,6 +1810,23 @@ class TestHeadSnapshotSection:
         assert "existing.py" in included  # full snapshot present -> claimable
         assert "NEW_CONTENT_V2" not in result  # HEAD snapshot, not current
 
+    def test_current_payload_snapshot_uses_collision_safe_fence(self, tmp_path):
+        """Fenced examples inside SKILL.md must not escape the snapshot block."""
+        payload = tmp_path / "SKILL.md"
+        payload.write_bytes(b"Example:\n```python\nprint('safe')\n```\n")
+
+        mod = _get_module("ouroboros.tools.review_helpers")
+        result, included = mod.build_head_snapshot_section(
+            tmp_path,
+            ["data/skills/external/alpha/SKILL.md"],
+            current_snapshots={"data/skills/external/alpha/SKILL.md": payload},
+        )
+
+        assert "````md\nExample:" in result
+        assert "\n````\n" in result
+        assert "```python\nprint('safe')\n```" in result
+        assert "data/skills/external/alpha/SKILL.md" in included
+
     def test_deleted_file_shows_old_content(self, tmp_path):
         """Deleted files should show their old HEAD content."""
         subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
@@ -2390,8 +2407,8 @@ def test_low_context_mode_skips_scope_review_with_a_typed_evidence_row(monkeypat
     review-evidence surface that carries fail-closed results — so a low-mode commit
     is never forensically confusable with "scope review silently failed" (BIBLE P1).
 
-    The derived auto-low flag must be an EXPLICIT `false` here: an absent flag is
-    UNKNOWN, not an owner declaration, and resolves fail-closed to gate-ON."""
+    The one-window provenance tombstone must be explicit `false` here: bare env
+    Low remains effective sizing Low but resolves owner intent fail-closed to Max."""
     from ouroboros import config
     from ouroboros.tools import review_helpers
     from ouroboros.tools import scope_review as sr
