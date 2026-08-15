@@ -301,11 +301,16 @@ def test_gr5_4_replay_digest_lists_children_from_the_durable_tree(tmp_path, monk
 
     assert owed is True
     (event,) = [e for e in queue.events if e.get("type") == "send_message"]
-    assert "- c5a: cancelled" in event["text"], (
+    assert "2 descendant task(s) were settled with it" in event["text"]
+    outcomes = {
+        row["task_id"]: row["outcome"]
+        for row in load_task_result(tmp_path, "r5")["cancel_receipt"]["children"]
+    }
+    assert outcomes["c5a"] == "cancelled", (
         "GR5-4: the replay digest enumerates the durable tree, not only the "
         "(empty) sweep outcomes"
     )
-    assert "- c5b: completed" in event["text"]
+    assert outcomes["c5b"] == "completed"
 
 
 def test_gr5_4_sweep_outcome_still_wins_for_a_child_with_no_durable_row(tmp_path, monkeypatch):
@@ -322,7 +327,11 @@ def test_gr5_4_sweep_outcome_still_wins_for_a_child_with_no_durable_row(tmp_path
 
     assert owed is True
     (event,) = [e for e in queue.events if e.get("type") == "send_message"]
-    assert "- c5w: failed" in event["text"], (
+    outcomes = {
+        row["task_id"]: row["outcome"]
+        for row in load_task_result(tmp_path, "r5w")["cancel_receipt"]["children"]
+    }
+    assert outcomes["c5w"] == "failed", (
         "a child with no durable row yet keeps the sweep's honest outcome"
     )
 

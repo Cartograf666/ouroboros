@@ -29,6 +29,7 @@ from supervisor.cancel_publication import (  # noqa: F401 -- intentional public 
     CANCEL_NOT_FOUND,
     _CANCEL_TERMINALIZED,
     _cancel_result_fields,
+    _cascade_delivery_row_locked,
     _deliver_on_miss,
     _is_workspace_task_record,
     _load_result_row,
@@ -433,11 +434,17 @@ def cancel_task_by_id(task_id: str, *, cascade: bool = False) -> bool:
         # A2: sweeps suppress per-task delivery; this is the tree's one message.
         summary_owed = True
         try:
+            from supervisor.owner_stop import graceful_summary_suppressed
             from supervisor.terminal_delivery import deliver_cascade_summary
 
-            summary_owed = deliver_cascade_summary(
-                pathlib.Path(q.DRIVE_ROOT), task_id, root_task_row, all_outcomes,
-            ) is not False
+            # Q4=A: a graceful stop whose root COMPLETED (owner-requested
+            # finalization) is confirmed by the model's own answer + card
+            # state; the cascade receipt would be a duplicate and is
+            # consciously suppressed (typed forensic row inside the helper).
+            if not graceful_summary_suppressed(q, task_id):
+                summary_owed = deliver_cascade_summary(
+                    pathlib.Path(q.DRIVE_ROOT), task_id, root_task_row, all_outcomes,
+                ) is not False
         except Exception:
             log.warning("Cascade summary delivery failed for %s", task_id, exc_info=True)
             summary_owed = False
@@ -509,22 +516,6 @@ def _record_cascade_scope(q: Any, task_id: str) -> None:
             )
         except Exception:
             log.debug("cascade-scope forensic append failed for %s", task_id, exc_info=True)
-
-
-def _cascade_delivery_row_locked(q: Any, task_id: str) -> Dict[str, Any]:
-    """A routing row for a cascade whose ROOT has already left the live maps.
-
-    Caller holds the queue lock. Returns the first live descendant's row (they
-    carry the lineage ``chat_id``), or ``{}`` when the subtree is empty too.
-    """
-    for task in q.PENDING:
-        if isinstance(task, dict) and q._is_descendant_of(task, task_id) and task.get("chat_id"):
-            return dict(task)
-    for meta in q.RUNNING.values():
-        task = meta.get("task") if isinstance(meta, dict) else None
-        if isinstance(task, dict) and q._is_descendant_of(task, task_id) and task.get("chat_id"):
-            return dict(task)
-    return {}
 
 
 def _durable_settled_status(q: Any, task_id: str) -> str:
@@ -1397,6 +1388,7 @@ def sweep_cancel_intents(*, now: Optional[float] = None) -> Dict[str, str]:
         from ouroboros.cancel_intents import (
             INTENT_CLAIMED, SCOPE_CASCADE, active_intents, claim_is_abandoned,
         )
+        from supervisor.owner_stop import OWNER_STOP_HOLDING, sweep_owner_stop_hold
     except Exception:
         return {}
     import time as _time
@@ -1413,6 +1405,11 @@ def sweep_cancel_intents(*, now: Optional[float] = None) -> Dict[str, str]:
     for task_id, intent in intents.items():
         if intent.get("state") == INTENT_CLAIMED and not claim_is_abandoned(intent, now=current):
             continue  # custody in flight; its owner settles or releases
+        if sweep_owner_stop_hold(q, task_id, intent, now=current):
+            # S3 policy-aware hold (§12.2 item 9): the graceful episode owns
+            # this intent until its shared deadline; custody is NOT fed.
+            outcomes[task_id] = OWNER_STOP_HOLDING
+            continue
         raw = str(intent.get("requested_at") or "").replace("Z", "+00:00")
         try:
             requested_ts = datetime.fromisoformat(raw).timestamp()

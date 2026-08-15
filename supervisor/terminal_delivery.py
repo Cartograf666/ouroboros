@@ -785,6 +785,8 @@ def deliver_miss_lane_outcome(
             event = {
                 "type": "send_message", "chat_id": chat_id, "task_id": task_id,
                 "text": core + note, "delivery_id": delivery_id_for(task_id, core),
+                # Host-authored disclosure fact — typed SYSTEM (Q4 non-mimicry).
+                "role": "system", "system_type": "cancel_receipt",
                 "ts": utc_now_iso(),
             }
             owed = register_pending_delivery(pathlib.Path(drive_root), event)
@@ -885,8 +887,8 @@ def deliver_cascade_summary(
         # the digest too. Sweep outcomes win only for ids with no durable row
         # yet (fresh kills whose write is still in flight); every line still
         # reads its CURRENT durable status through ``_durable_child_outcome``
-        # (GR4-4). Bounded exactly as today: ``_children_digest_lines`` caps
-        # the rendered digest at 40 with the exact omitted count.
+        # (GR4-4). Bounded exactly as today: the durable ``cancel_receipt``
+        # block caps the persisted digest at 40 with the exact omitted count.
         merged: Dict[str, str] = {
             str(tid): str(outcome) for tid, outcome in outcomes.items()
         }
@@ -1055,39 +1057,36 @@ def _salvage_receipt(preserved_path: str) -> Dict[str, Any]:
         data = path.read_bytes()
         receipt["size_bytes"] = len(data)
         receipt["sha256"] = hashlib.sha256(data).hexdigest()
+        # The replay guard in _persist_cancel_receipt only lets a block with
+        # preserved=True heal an earlier placeholder — mark the REAL receipt.
+        receipt["preserved"] = True
     except Exception:
         receipt["unreadable"] = True
     return receipt
 
 
-def _receipt_line(preserved_path: str, omitted: int) -> str:
-    """The receipt EVERY non-empty salvage carries — whole or truncated.
+def _preview_note_line(preserved_path: str, omitted: int) -> str:
+    """ONE plain sentence about the preview and where the technical facts live.
 
-    Two halves of one honesty contract, and both were half-kept before: a salvage
-    short enough to fit got no receipt at all (so the owner could not tell a
-    complete answer from a silently-empty preservation), and a long one printed
-    only the first 16 hex of the digest, which cannot verify the file it names.
-    The omitted count is exact (0 when whole), the path is named, and the digest
-    is the FULL 64-hex sha256. A copy that cannot be read back says so.
+    Q5=A: path, sha256, byte count, and the children digest belong in the task
+    DETAILS panel (the durable ``cancel_receipt`` block), never in chat. The
+    chat keeps only the honesty half the owner must see inline: whether the
+    preview is the WHOLE salvage (exact omitted count) and whether a durable
+    full copy exists at all — a silently-truncated or silently-unpreserved
+    fragment must not read as complete.
     """
     omitted_text = (
         f"{omitted} chars omitted from this preview" if omitted
-        else "nothing omitted — this is the whole salvaged answer"
+        else "nothing omitted — this is the whole salvaged text"
     )
     if not str(preserved_path or "").strip():
         return (
             f"[{omitted_text}; NO durable full copy was preserved for this task "
             "(preservation did not run or found nothing)]"
         )
-    receipt = _salvage_receipt(preserved_path)
-    if receipt.get("unreadable"):
-        return (
-            f"[{omitted_text}; full copy was written to {receipt.get('path')} but could "
-            "NOT be read back for a receipt — treat the preservation as UNVERIFIED]"
-        )
     return (
-        f"[{omitted_text}; full copy preserved at {receipt.get('path')} "
-        f"({receipt.get('size_bytes')} bytes, sha256 {receipt.get('sha256')})]"
+        f"[{omitted_text}; the full copy and technical details are in the "
+        "task's details panel]"
     )
 
 
@@ -1114,17 +1113,124 @@ def lineage_chat_id(drive_root: Any, task: Dict[str, Any], task_id: str) -> int:
         return 0
 
 
-def _children_digest_lines(children: List[Dict[str, Any]]) -> List[str]:
-    lines = ["", f"Subtree digest ({len(children)} descendant(s)):"]
-    for child in children[:40]:
-        tid = str(child.get("task_id") or "")
-        outcome = str(child.get("outcome") or "")
-        lines.append(f"- {tid}: {outcome}" + (
-            " (salvaged output preserved)" if child.get("salvaged") else ""
-        ))
-    if len(children) > 40:
-        lines.append(f"- … {len(children) - 40} more descendant(s) omitted (see task cards)")
-    return lines
+def _stop_episode_delivery_id(drive_root: Any, task_id: str) -> str:
+    """CF-04: the receipt's identity is the STOP EPISODE — ``cancel:<tid>:<rid>``.
+
+    Bound to the durable cancel-intent ``request_id``, never to mutable prose,
+    so the id survives wording changes and restart replay. Pre-settle callers
+    (owed registration, miss lane, cascade) read the ACTIVE intent; the
+    publish half rebuilds the event AFTER the settle removed that row, so it
+    re-derives the SAME id from the pending row the pre-settle half already
+    registered. Returns "" when no episode is known (e.g. a reap with no
+    intent) — the content-derived identity remains the fallback.
+    """
+    tid = str(task_id or "")
+    try:
+        from ouroboros.cancel_intents import active_intent
+
+        rid = str((active_intent(pathlib.Path(drive_root), tid) or {}).get("request_id") or "")
+        if rid:
+            return f"cancel:{tid}:{rid}"
+    except Exception:
+        log.debug("stop-episode intent read failed for %s", tid, exc_info=True)
+    try:
+        from ouroboros.utils import read_json_dict
+
+        data = read_json_dict(pathlib.Path(drive_root) / "state" / "terminal_deliveries.json") or {}
+        prefix = f"cancel:{tid}:"
+        owed = [
+            (str(row.get("registered_at") or ""), did)
+            for did, row in _pending_rows(data).items()
+            if isinstance(row, dict) and did.startswith(prefix)
+        ]
+        if owed:
+            return max(owed)[1]
+    except Exception:
+        log.debug("stop-episode owed-row read failed for %s", tid, exc_info=True)
+    return ""
+
+
+def _persist_cancel_receipt(
+    drive_root: Any, task_id: str, *,
+    settled_status: str, outcome: str, delivery_id: str,
+    preserved_path: str, preview_omitted: int,
+    children: Optional[List[Dict[str, Any]]] = None,
+    unreconciled_runs: Optional[List[str]] = None,
+) -> None:
+    """Q5=A: the technical stop facts live in the task DETAILS panel.
+
+    Merges ONE typed ``cancel_receipt`` block into the EXISTING durable task
+    result (``TaskDetailResponse`` is an open shape, so the panel gets it with
+    no contract change): full-copy path + size + full sha256 (or an honest
+    unreadable/unpreserved marker), exact preview-omitted count, the stop
+    reason when the intent is still readable, and the historical children
+    digest for a cascade root. Never creates the result file (a later full
+    write would clobber a block-only row) and never clobbers previously
+    persisted non-empty facts with an emptier rebuild. Fail-soft.
+    """
+    tid = str(task_id or "")
+    try:
+        from ouroboros.task_results import task_result_path
+        from ouroboros.utils import update_json_locked
+
+        block: Dict[str, Any] = {
+            "settled_status": str(settled_status or ""),
+            "outcome": str(outcome or ""),
+            "delivery_id": str(delivery_id or ""),
+            "preview_omitted_chars": int(preview_omitted or 0),
+            "salvage": (
+                _salvage_receipt(preserved_path)
+                if str(preserved_path or "").strip()
+                else {"path": "", "preserved": False}
+            ),
+            "ts": utc_now_iso(),
+        }
+        rows = [
+            {"task_id": str(c.get("task_id") or ""),
+             "outcome": str(c.get("outcome") or ""),
+             "salvaged": bool(c.get("salvaged"))}
+            for c in list(children or []) if isinstance(c, dict)
+        ]
+        if rows:
+            block["children"] = rows[:40]
+            if len(rows) > 40:
+                block["children_omitted"] = len(rows) - 40
+        runs = [str(rid) for rid in (unreconciled_runs or []) if str(rid)]
+        if runs:
+            block["unreconciled_runs"] = runs
+        try:
+            from ouroboros.cancel_intents import active_intent
+
+            reason = str((active_intent(pathlib.Path(drive_root), tid) or {}).get("reason") or "")
+            if reason:
+                block["stop_reason"] = reason
+        except Exception:
+            log.debug("cancel-receipt intent reason read failed for %s", tid, exc_info=True)
+
+        def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            if not isinstance(current, dict) or not current:
+                return None  # no durable row yet — never mint a block-only file
+            merged = dict(current.get("cancel_receipt") or {}) if isinstance(
+                current.get("cancel_receipt"), dict) else {}
+            for key, value in block.items():
+                if (
+                    key == "salvage"
+                    and key in merged
+                    and not (isinstance(value, dict) and value.get("preserved"))
+                ):
+                    # A replay/rebuild without a REAL salvage (the always-truthy
+                    # {"path":"","preserved":False} placeholder) must not clobber
+                    # a previously persisted preserved-copy fact.
+                    continue
+                if value or key not in merged:
+                    merged[key] = value
+            current = dict(current)
+            current["cancel_receipt"] = merged
+            return current
+
+        update_json_locked(task_result_path(pathlib.Path(drive_root), tid), _mutate)
+    except Exception:
+        log.debug("cancel-receipt persistence failed for %s", tid, exc_info=True)
 
 
 def build_unreviewed_salvage_event(
@@ -1154,10 +1260,23 @@ def build_unreviewed_salvage_event(
     summary dedups per INTENT, not per content, because a replay's rebuilt
     digest can differ while still being the same owed message.
 
-    GR7-4: the content-derived identity digests the STABLE lines only (status
-    framing + salvage body + receipt + children digest) — the mutable
-    unreconciled-runs disclosure rides the TEXT but never the id, so a replay
-    whose rebuilt note shrank dedups to one owed message.
+    CF-04 identity: when no explicit id is passed, the receipt binds to the
+    stop episode as ``cancel:<tid>:<request_id>`` (active intent, or the owed
+    row the pre-settle half registered) — stable across wording changes and
+    restart replay. Content-derived ``final:...`` remains the fallback for
+    terminal paths with no cancel episode at all.
+
+    GR7-4: the content-derived fallback digests the STABLE lines only (status
+    framing + salvage body + preview note) — the mutable unreconciled-runs
+    disclosure rides the TEXT but never the id, so a replay whose rebuilt
+    note shrank dedups to one owed message.
+
+    Q4/Q5 presentation: the message is a typed SYSTEM receipt (``role`` +
+    ``system_type`` ride the event end to end — Q4 non-mimicry), a raw
+    fragment is named the last persisted intermediate model message (never an
+    "answer"), and the technical facts (path/sha256/bytes/children digest)
+    live in the durable ``cancel_receipt`` block on the task result — the
+    details panel — not in chat.
     """
     from ouroboros.task_results import STATUS_COMPLETED
 
@@ -1172,19 +1291,24 @@ def build_unreviewed_salvage_event(
     body = str(salvaged_text or "").strip()
     preview, omitted = salvage_preview(body)
     outcome_text = str(outcome or "stopped")
+    descendants = (
+        f" {len(children)} descendant task(s) were settled with it." if children else ""
+    )
     if str(settled_status or "").strip().lower() == STATUS_COMPLETED:
         # Completion-wins (owner 4=A): the kept result is the real answer, not a
         # salvage — but it still bypassed the normal delivery path, so say so.
         lines = [
-            f"✅ Task {tid} {outcome_text}. Its completed result is preserved below.",
+            f"✅ Task {tid} {outcome_text}. Its completed result is preserved below."
+            + descendants,
         ]
     else:
         lines = [
-            f"⚠️ Task {tid} was {outcome_text}. Below is the agent's last answer, "
-            "preserved WITHOUT review (salvaged best-effort).",
+            f"⚠️ Task {tid} was {outcome_text}. Below is the last persisted "
+            "intermediate model message, preserved WITHOUT review (salvaged "
+            "best-effort; NOT a final answer)." + descendants,
         ]
     if preview:
-        lines += ["", preview, "", _receipt_line(preserved_path, omitted)]
+        lines += ["", preview, "", _preview_note_line(preserved_path, omitted)]
     else:
         lines += ["", "(no salvageable agent output was found for this task)"]
     disclosure_lines: List[str] = []
@@ -1216,17 +1340,33 @@ def build_unreviewed_salvage_event(
                 "runs could not be determined. Periodic reconciliation will settle "
                 "any that are still open.",
             ]
-    digest_lines = _children_digest_lines(list(children)) if children else []
     # GR7-4: identity digests the STABLE lines only; the mutable disclosure
-    # rides the text between the salvage body and the children digest.
-    text = "\n".join(lines + disclosure_lines + digest_lines)
-    identity_text = "\n".join(lines + digest_lines)
+    # rides the text after the salvage body.
+    text = "\n".join(lines + disclosure_lines)
+    did = (
+        str(delivery_id or "").strip()
+        or _stop_episode_delivery_id(pathlib.Path(drive_root), tid)
+        or delivery_id_for(tid, "\n".join(lines))
+    )
+    _persist_cancel_receipt(
+        pathlib.Path(drive_root), tid,
+        settled_status=str(settled_status or ""), outcome=outcome_text,
+        delivery_id=did, preserved_path=str(preserved_path or ""),
+        preview_omitted=omitted, children=children,
+        unreconciled_runs=unreconciled_runs,
+    )
     return {
         "type": "send_message",
         "chat_id": chat_id,
         "task_id": tid,
         "text": text,
-        "delivery_id": str(delivery_id or "").strip() or delivery_id_for(tid, identity_text),
+        # Q4 non-mimicry: a host-authored receipt is typed SYSTEM end to end
+        # (live WS frame, chat.jsonl direction, history replay) — it is never
+        # rendered as Ouroboros's own speech. Card-neutral: task_id is a
+        # subject reference; only task-result/task_done closes the card.
+        "role": "system",
+        "system_type": "cancel_receipt",
+        "delivery_id": did,
         "ts": utc_now_iso(),
     }
 

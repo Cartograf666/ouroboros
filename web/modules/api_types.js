@@ -604,10 +604,19 @@
  * the interim "Cancelling…" from this field, never from a status value.
  * cancel_reason rides beside it when the intent carries a reason (the WHY of
  * the pending cancellation); absent when no reason was recorded.
+ * owner_hurry / owner_hurry_history (S3, HQ1): the typed owner-hurry
+ * observability — the current block plus archived prior-attempt rows.
+ * Absent on tasks nobody hurried. Task-detail data only, never chat.
+ * stop_policy (S3, Q1) rides beside a pending cancel_state when the open
+ * intent is the SOFT stop ("finalize_then_cancel") — the UI shows
+ * "Finalizing…" and offers the hard escalation; absent on immediate intents.
  * @typedef {Object} TaskDetailResponse
  * @property {TaskCostBreakdown=} cost_breakdown
  * @property {string=} cancel_state
  * @property {string=} cancel_reason
+ * @property {string=} stop_policy
+ * @property {OwnerHurryProjection=} owner_hurry
+ * @property {OwnerHurryProjection[]=} owner_hurry_history
  * @property {string=} error
  */
 
@@ -668,6 +677,59 @@
  *   v6.82 (P5): echoed only when the request body {"cascade": true} asked for the
  *   subtree cancel, which is complete by the time this answer is sent; the plain
  *   single-task envelope is unchanged.
+ * @property {string=} cancel_state
+ *   S3 (Q1/Q2): "pending" on the 202 acknowledgement of a
+ *   {"stop_policy": "finalize_then_cancel"} request — the durable intent is
+ *   open while the bounded finalization attempt runs. Absent on the legacy
+ *   immediate path.
+ * @property {string=} stop_policy
+ *   The EFFECTIVE policy of the durable intent ("immediate" |
+ *   "finalize_then_cancel"): a graceful request over an already-hard intent
+ *   never softens it, and the answer says so.
+ * @property {string=} error
+ */
+
+/**
+ * POST /api/tasks/{task_id}/hurry — the text-free owner hurry control (HQ1:
+ * no chat message, ever). The body carries ONLY a client-generated stable
+ * request_id (reused on retry); any other field is refused.
+ * @typedef {Object} TaskHurryRequest
+ * @property {string} request_id
+ */
+
+/**
+ * The owner_hurry block on the task result — task-detail observability,
+ * never a chat message. state is the closed vocabulary
+ * requested | applied | not_applied_before_terminal; effects maps each
+ * host-rail effect to its recorded status. History rows carry the same shape
+ * plus archived_at/archived_reason (rolled over on every same-id requeue).
+ * @typedef {Object} OwnerHurryProjection
+ * @property {number=} attempt_key
+ * @property {string=} request_id
+ * @property {string=} requested_by
+ * @property {string=} requested_at
+ * @property {string=} reason
+ * @property {string=} state
+ * @property {Object<string, string>=} effects
+ * @property {string=} applied_at
+ * @property {string=} reconciled_at
+ * @property {string=} archived_at
+ * @property {string=} archived_reason
+ */
+
+/**
+ * Acknowledgement of the typed task-local acceleration control.
+ * duplicate=true is the idempotent shape: the same request_id on the live
+ * attempt (or a different id collapsing onto the one armed latch) returns
+ * the existing acknowledgement without a second control.
+ * @typedef {Object} TaskHurryResponse
+ * @property {boolean} ok
+ * @property {string} task_id
+ * @property {string} request_id
+ * @property {string=} state
+ * @property {number=} attempt_key
+ * @property {boolean=} duplicate
+ * @property {string=} error
  */
 
 /**

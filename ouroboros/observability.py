@@ -574,11 +574,37 @@ def latest_llm_response_text(drive_root: pathlib.Path, task_id: str) -> str:
             message = payload.get("message") if isinstance(payload, dict) else None
             content = message.get("content") if isinstance(message, dict) else None
             text = str(content or "").strip()
-            if text:
+            if text and not _is_delivery_control_payload(text):
                 return text
         except Exception:
             continue
     return ""
+
+
+def _is_delivery_control_payload(text: str) -> bool:
+    """Whether persisted assistant text is the delivery-control PROTOCOL object.
+
+    S3 (RST-05/RAW-001): while the loop's delivery-control latch is armed the
+    model's persisted response is legitimately ``{"delivery_control": ...}``
+    machine protocol, not prose. A hard kill between response persistence and
+    loop-side resolution used to let raw-salvage promote that JSON into the
+    owner-facing terminal result. This is a STRUCTURAL typed-protocol check
+    (exact JSON object carrying the protocol key, optionally in one markdown
+    fence) — never semantic prose classification. Matching payloads stay
+    forensic evidence in the observability store; they are simply not answers.
+    """
+    body = str(text or "").strip()
+    if body.startswith("```"):
+        first_break = body.find("\n")
+        if first_break != -1 and body.endswith("```"):
+            body = body[first_break + 1:-3].strip()
+    if not (body.startswith("{") and body.endswith("}")):
+        return False
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and "delivery_control" in payload
 
 
 SALVAGED_OUTPUT_NOTE_LIMIT = 4000
@@ -653,18 +679,21 @@ def salvaged_output_note(
         return ""
     if not salvaged:
         return ""
+    # S3 honest naming: a raw fragment is the last persisted INTERMEDIATE model
+    # message — never presented as an "answer" (it bypassed review/finalization).
+    label = "Last persisted intermediate model message (salvaged best-effort, unreviewed"
     preview = truncate_review_artifact(salvaged, SALVAGED_OUTPUT_NOTE_LIMIT)
     if preview == salvaged:
-        return "\n\nLast agent output (salvaged best-effort, unreviewed):\n" + salvaged
+        return f"\n\n{label}):\n" + salvaged
     if preserve_root is not None:
         try:
             full_path = preserve_salvaged_output(pathlib.Path(preserve_root), str(task_id), salvaged)
         except Exception:
             full_path = ""
         if full_path:
-            return ("\n\nLast agent output (salvaged best-effort, unreviewed; "
+            return (f"\n\n{label}; "
                     f"full copy preserved at {full_path}):\n" + preview)
-    return "\n\nLast agent output (salvaged best-effort, unreviewed):\n" + salvaged
+    return f"\n\n{label}):\n" + salvaged
 
 
 def prune_observability_blobs(

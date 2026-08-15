@@ -16,7 +16,7 @@ import logging
 from ouroboros.llm import LLMClient, normalize_reasoning_effort, add_usage
 from ouroboros import task_pacing
 from ouroboros.config import adaptive_quorum, get_context_mode, get_light_model, get_review_enforcement, get_task_review_mode, resolve_effort
-from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_BYPASS_REASONS, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, REASON_DELIVERY_CONTROL_DEGRADED, RESULT_INFRA_FAILED, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
+from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_BYPASS_REASONS, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, REASON_DELIVERY_CONTROL_DEGRADED, REASON_OWNER_REQUESTED_FINALIZATION, RESULT_INFRA_FAILED, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
 from ouroboros.observability import new_execution_id
 from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools, swarm_router_turn
 from ouroboros.tools.registry import ToolRegistry
@@ -193,29 +193,18 @@ def _force_plan_decision(
     *,
     hard_rail: str = "",
 ) -> Dict[str, Any]:
-    """Project force-plan finalization from existing review + policy SSOTs."""
+    """Project force-plan finalization from existing review + policy SSOTs.
 
-    metadata = getattr(ctx, "task_metadata", {})
-    metadata = metadata if isinstance(metadata, dict) else {}
-    if not metadata.get("force_plan") or bool(getattr(ctx, "is_ephemeral_turn", False)):
-        return {"required": False, "allow": True, "status": "not_required"}
-    from ouroboros.task_results import load_plan_review_state, plan_review_gate_projection
+    Body extracted to ``owner_hurry.force_plan_decision`` (the hurry latch makes
+    the projection task-locally advisory for reviewed/open/unavailable states —
+    §19.7.2 item 9); unlatched behavior is byte-identical.
+    """
+    from ouroboros.owner_hurry import force_plan_decision
 
-    try:
-        root = pathlib.Path(str(getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
-        task_id = str(getattr(ctx, "task_id", "") or "").strip()
-        state = load_plan_review_state(root, task_id) if task_id else None
-    except (OSError, TimeoutError, ValueError):
-        log.warning("Unable to read durable force-plan review state", exc_info=True)
-        state = None
-    return {
-        "required": True,
-        **plan_review_gate_projection(
-            state,
-            get_review_enforcement(),
-            hard_rail=hard_rail,
-        ),
-    }
+    return force_plan_decision(
+        ctx, _llm_trace, hard_rail=hard_rail,
+        enforcement=get_review_enforcement(),
+    )
 
 
 def _force_plan_reminder(decision: Dict[str, Any]) -> str:
@@ -2119,119 +2108,46 @@ def _record_acceptance_infra_failure(ctx: _TaskAcceptanceContext, exc: Exception
     return False
 
 
-def _build_acceptance_rails_line(
-    budget_snapshot: Any,
-    budget_profile: Dict[str, Any],
-    passes_done: int,
-    loop_rails: Optional[Dict[str, Any]],
-    *,
-    required_blocking: bool,
-    workspace: bool = False,
-) -> str:
-    try:
-        return _build_acceptance_rails_line_inner(
-            budget_snapshot, budget_profile, passes_done, loop_rails,
-            required_blocking=required_blocking, workspace=workspace,
-        )
-    except Exception:
-        # The rails line is advisory context; it must never take down the
-        # acceptance path (fable review r2 #3 — make the docstring true).
-        log.debug("acceptance rails line failed soft", exc_info=True)
-        return ""
+def _prior_acceptance_run(
+    tools_ctx: Any, llm_trace: Dict[str, Any], binding_hash: str,
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Locate the authoritative host run already recorded for this binding:
+    first the trace (survives requeue replay), then the process-local
+    ``_task_acceptance_seen_bindings`` cache. Returns (cache, prior_run)."""
+    seen_bindings = getattr(tools_ctx, "_task_acceptance_seen_bindings", None)
+    if not isinstance(seen_bindings, dict):
+        seen_bindings = {}
+        tools_ctx._task_acceptance_seen_bindings = seen_bindings
+    prior_run = next(
+        (
+            run for run in reversed(llm_trace.get("review_runs") or [])
+            if isinstance(run, dict)
+            and run.get("authority") == "host_root"
+            and not run.get("superseded_by_revision")
+            and str(run.get("binding_hash") or "") == binding_hash
+        ),
+        None,
+    )
+    cached_run = seen_bindings.get(binding_hash)
+    if (
+        prior_run is None
+        and isinstance(cached_run, dict)
+        and not cached_run.get("superseded_by_revision")
+    ):
+        prior_run = cached_run
+    return seen_bindings, prior_run
 
 
-def _build_acceptance_rails_line_inner(
-    budget_snapshot: Any,
-    budget_profile: Dict[str, Any],
-    passes_done: int,
-    loop_rails: Optional[Dict[str, Any]],
-    *,
-    required_blocking: bool,
-    workspace: bool = False,
-) -> str:
-    """One line naming every active termination source with its remaining
-    headroom (v6.74.0 A1, owner Q6): money, time, rounds, review passes. Each
-    rail comes from its real source — the usage ledger projection, the
-    BudgetSnapshot, the loop's round counter, and the pacing pass cap — and an
-    unavailable rail is omitted rather than guessed. For workspace deliveries
-    the line also carries the tree directive (v6.74.4) — a delivery-state
-    instruction, not a termination source. Fail-soft: never raises."""
-    parts: List[str] = []
-    rails = loop_rails if isinstance(loop_rails, dict) else {}
-    try:
-        money_bits: List[str] = []
-        cost = rails.get("task_cost_usd")
-        if cost is not None:
-            money_bits.append(f"${float(cost):.2f} spent this task")
-        try:
-            from ouroboros.usage_accounting import current_usage_scope, usage_projection
-
-            scope = current_usage_scope()
-            if scope is not None and scope.root_task_id:
-                projection = usage_projection(
-                    scope.drive_root, root_task_id=scope.root_task_id,
-                )
-                remaining = projection.get("remaining_known_usd")
-                if remaining is not None:
-                    money_bits.append(f"${float(remaining):.2f} budget left")
-        except Exception:
-            log.debug("rails: budget projection unavailable", exc_info=True)
-        if money_bits:
-            parts.append("money: " + ", ".join(money_bits))
-    except (TypeError, ValueError):
-        pass
-    try:
-        if getattr(budget_snapshot, "has_deadline", False):
-            parts.append(
-                f"time: {max(0.0, budget_snapshot.remaining_sec) / 60:.0f} min left "
-                f"({budget_snapshot.reserve_sec / 60:.0f} min finalization reserve)"
-            )
-    except (TypeError, ValueError):
-        pass
-    try:
-        round_idx = rails.get("round_idx")
-        max_rounds = rails.get("max_rounds")
-        if round_idx is not None and max_rounds:
-            parts.append(f"rounds: {int(round_idx)}/{int(max_rounds)}")
-    except (TypeError, ValueError):
-        pass
-    try:
-        cap = task_pacing.effective_max_improvement_passes(
-            budget_profile,
-            has_deadline=bool(getattr(budget_snapshot, "has_deadline", False)),
-            required_blocking=required_blocking,
-        )
-        if cap is None:
-            parts.append(
-                f"review passes: {int(passes_done)} done, no local count cap "
-                "(deadline/budget rails bind)"
-            )
-        else:
-            passes_part = f"review passes: {int(passes_done)}/{int(cap)}"
-            # v6.74.4 freeze directive (count axis): the pass launched at
-            # cap-1 is the last one improvement_pass_allowed will admit, so
-            # say so. cap==0 never feeds a capsule back; skip the clause, and
-            # passes_done >= cap (supersede-reset re-review) is not a launch.
-            if 0 <= int(passes_done) < int(cap) and int(passes_done) + 1 >= int(cap):
-                passes_part += " — FINAL improvement pass, no further passes will run"
-            parts.append(passes_part)
-    except (TypeError, ValueError):
-        pass
-    try:
-        # v6.74.4: EVERY workspace improvement capsule carries the tree
-        # directive, not just the provably-final one — a deadline/cost rail
-        # can end the loop between capsules (commit triad r1, sol), and the
-        # tree ships as-is on any forced end.
-        if workspace:
-            parts.append(
-                "workspace delivery: the deliverable is your working tree as "
-                "it stands when the task ends — keep it in a VERIFIED state "
-                "(rebuild, verify, and commit if the task calls for a commit) "
-                "and revert unverified edits rather than shipping them"
-            )
-    except (TypeError, ValueError):
-        pass
-    return "; ".join(parts)
+def _direct_context_fence_state(tools_ctx: Any, fence_token: Any) -> Any:
+    """Review-binding fence state: the queue-owned token when present, else the
+    direct-chat generations (no queue fence exists for a direct context)."""
+    if fence_token is not None:
+        return fence_token
+    return {
+        "state": "direct_context",
+        "owner_generation": getattr(tools_ctx, "_task_acceptance_owner_generation", None),
+        "queue_generation": getattr(tools_ctx, "_task_acceptance_fence_generation", None),
+    }
 
 
 def _run_task_acceptance_review_once(
@@ -2298,6 +2214,17 @@ def _run_task_acceptance_review_once(
     }
     if not eligible:
         return False
+    # Owner hurry (§19.7.2 item 8): AFTER structural eligibility is known and
+    # BEFORE acceptance-fence/quiescence/reviewer admission, an armed latch
+    # skips the next otherwise-eligible panel with the typed reason — zero
+    # reviewer calls (an already in-flight panel is never cancelled/relabeled).
+    from ouroboros.owner_hurry import acceptance_skip_applied, effective_budget_profile
+
+    if acceptance_skip_applied(
+        tools._ctx, llm_trace, task_id=task_id, drive_root=drive_root,
+        set_decision=_set_acceptance_decision, emit_progress=emit_progress,
+    ):
+        return False
     fence_ok, _fence_token = _begin_task_acceptance_fence(tools._ctx, task_id)
     if not fence_ok:
         llm_trace["review_decision"] = {
@@ -2332,7 +2259,12 @@ def _run_task_acceptance_review_once(
         )
         emit_progress("Task acceptance review waiting for recursive subtree quiescence.")
         return True
-    budget_profile = task_pacing.resolve_budget_profile(tools._ctx)
+    # §19.7.2 item 7: ONE effective profile (remaining improvement passes -> 0
+    # under an armed hurry latch) feeds EVERY acceptance-pacing read below —
+    # the real improvement_pass_allowed call and the rails display alike.
+    budget_profile = effective_budget_profile(
+        tools._ctx, task_pacing.resolve_budget_profile(tools._ctx),
+    )
     budget_snapshot = task_pacing.build_budget_snapshot(tools._ctx, profile=budget_profile)
     passes_done = int(getattr(tools._ctx, "_task_acceptance_improvement_passes", 0))
     launch_ok, launch_reason = task_pacing.review_launch_allowed(
@@ -2375,7 +2307,7 @@ def _run_task_acceptance_review_once(
         passes_done=passes_done,
         evidence={},
         review_binding={},
-        rails_line=_build_acceptance_rails_line(
+        rails_line=task_pacing.acceptance_rails_line(
             budget_snapshot,
             budget_profile,
             passes_done,
@@ -2392,44 +2324,15 @@ def _run_task_acceptance_review_once(
         from ouroboros.review_substrate import build_review_binding
 
         review_ctx.evidence = _build_host_acceptance_evidence(review_ctx)
-        fence_state: Any = _fence_token
-        if fence_state is None:
-            fence_state = {
-                "state": "direct_context",
-                "owner_generation": getattr(
-                    tools._ctx, "_task_acceptance_owner_generation", None,
-                ),
-                "queue_generation": getattr(
-                    tools._ctx, "_task_acceptance_fence_generation", None,
-                ),
-            }
         review_ctx.review_binding = build_review_binding(
             candidate=content,
             evidence=review_ctx.evidence,
-            fence_token_or_state=fence_state,
+            fence_token_or_state=_direct_context_fence_state(tools._ctx, _fence_token),
         )
         binding_hash = str(review_ctx.review_binding.get("binding_hash") or "")
-        seen_bindings = getattr(tools._ctx, "_task_acceptance_seen_bindings", None)
-        if not isinstance(seen_bindings, dict):
-            seen_bindings = {}
-            tools._ctx._task_acceptance_seen_bindings = seen_bindings
-        prior_run = next(
-            (
-                run for run in reversed(llm_trace.get("review_runs") or [])
-                if isinstance(run, dict)
-                and run.get("authority") == "host_root"
-                and not run.get("superseded_by_revision")
-                and str(run.get("binding_hash") or "") == binding_hash
-            ),
-            None,
+        seen_bindings, prior_run = _prior_acceptance_run(
+            tools._ctx, llm_trace, binding_hash,
         )
-        cached_run = seen_bindings.get(binding_hash)
-        if (
-            prior_run is None
-            and isinstance(cached_run, dict)
-            and not cached_run.get("superseded_by_revision")
-        ):
-            prior_run = cached_run
         reused_result = None
         if prior_run is not None:
             seen_bindings[binding_hash] = prior_run
@@ -3388,11 +3291,20 @@ def _drain_incoming_messages(
             break
 
     if drive_root is not None and task_id:
-        from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, KIND_OWNER_TEXT, drain_owner_entries
+        from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_TEXT, drain_owner_entries
         for entry in drain_owner_entries(drive_root, task_id=task_id, seen_ids=_owner_msg_seen):
             kind = entry.get("kind") or KIND_OWNER_TEXT
             if kind == KIND_FINALIZE_NOW:
                 controls["finalize_now"] = str(entry.get("text") or "deadline")
+                continue
+            if kind == KIND_HURRY:
+                # HQ1 no-chat contract (§19.7.2 item 6): a typed hurry control is
+                # routed structurally — never through _record_owner_directive,
+                # _owner_marked_content, messages, or owner_message_injected.
+                from ouroboros.owner_hurry import apply_latch
+
+                apply_latch(owner_ctx, entry, event_queue=event_queue)
+                controls["hurry"] = str(entry.get("msg_id") or "hurry")
                 continue
             dmsg = entry.get("text") or ""
             _record_owner_directive(
@@ -3549,8 +3461,14 @@ def _handle_forced_finalization(ctx: _RoundLimitContext, reason: str) -> Tuple[s
     The supervisor sends a typed finalize_now control through the owner
     mailbox when the task deadline/hard-timeout is reached; this extracts one
     tool-less best final answer inside the grace window so a deadline NEVER
-    returns emptiness.
+    returns emptiness. An OWNER-STOP control (its payload's first line is the
+    typed ``owner_requested_finalization`` literal, optionally followed by the
+    bounded child projection) routes to its own rail: the owner's stop must
+    never persist the deadline's false reason (CF-02).
     """
+    reason_lines = str(reason or "").splitlines()
+    if reason_lines and reason_lines[0].strip() == REASON_OWNER_REQUESTED_FINALIZATION:
+        return _handle_owner_stop_finalization(ctx, str(reason))
     fallback = f"⚠️ Task reached {reason or 'deadline'}; finalization grace produced no answer."
     prompt = (
         f"[FINALIZE_NOW] The supervisor opened a finalization grace window (reason: {reason or 'deadline'}). "
@@ -3559,6 +3477,49 @@ def _handle_forced_finalization(ctx: _RoundLimitContext, reason: str) -> Tuple[s
         "result is the expected outcome here, not a failure."
     )
     return _forced_final_answer(ctx, prompt=prompt, fallback_text=fallback, reason_code="finalization_grace")
+
+
+def _handle_owner_stop_finalization(
+    ctx: _RoundLimitContext, control_text: str,
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """Owner-requested finalization (Q1/Q3=A): ZERO or ONE tool-less model turn.
+
+    A current valid complete DeliveryCandidate is reused with zero new model
+    turns; otherwise exactly one logical tool-less call runs (transport retries
+    stay governed by the existing call seam, and the generic second semantic
+    refresh is structurally disabled — owner steering is fenced during a
+    pending stop, so no late directive can arrive). The typed
+    ``owner_requested_finalization`` reason flows through the best-effort gate,
+    so a successful synthesis terminalizes ``completed``/best-effort — never the
+    deadline's ``acceptance_bypassed_deadline`` falsehood (CF-02).
+    """
+    live_trace = getattr(ctx, "llm_trace", None)
+    llm_trace = live_trace if isinstance(live_trace, dict) else {}
+    candidate = _current_delivery_candidate(ctx, llm_trace)
+    if candidate is not None:
+        _finalize_forced_services(ctx, llm_trace)
+        ctx.accumulated_usage["execution_status"] = "failed"
+        ctx.accumulated_usage["reason_code"] = REASON_OWNER_REQUESTED_FINALIZATION
+        return _forced_fallback_result(
+            ctx, llm_trace, candidate.full_text, REASON_OWNER_REQUESTED_FINALIZATION,
+            retained_source="owner_stop_retained_candidate",
+        )
+    child_block = "\n".join(str(control_text or "").splitlines()[1:]).strip()
+    prompt = (
+        "[OWNER_STOP] The owner asked this task to summarize and stop now. "
+        "Produce your best final answer NOW from the verified work so far; "
+        "clearly mark anything unverified or incomplete. An honest best-effort "
+        "result is the expected outcome here, not a failure. Do not start new work."
+        + (f"\n\n{child_block}" if child_block else "")
+    )
+    fallback = (
+        "⚠️ The owner requested finalize-then-stop; no final answer could be "
+        "produced inside the grace window."
+    )
+    return _forced_final_answer(
+        ctx, prompt=prompt, fallback_text=fallback,
+        reason_code="owner_requested_finalization", single_semantic_turn=True,
+    )
 
 
 def _handle_provider_unavailable(ctx: _RoundLimitContext) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
@@ -5553,9 +5514,13 @@ def _forced_final_answer(
     prompt: str,
     fallback_text: str,
     reason_code: str,
+    single_semantic_turn: bool = False,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Force one tool-less final answer; stamp the typed forced-finalization
-    reason code (the best_effort outcome gate reads it downstream)."""
+    reason code (the best_effort outcome gate reads it downstream).
+    ``single_semantic_turn`` (owner-stop rail, CF-03): exactly ONE logical
+    model call — the late-owner-directive semantic refresh is disabled because
+    steering is fenced while the stop intent is pending."""
     live_trace = getattr(ctx, "llm_trace", None)
     llm_trace = live_trace if isinstance(live_trace, dict) else {}
     _finalize_forced_services(ctx, llm_trace)
@@ -5566,7 +5531,7 @@ def _forced_final_answer(
     prompt += _forced_delegation_note(tools_ctx, llm_trace)
     _append_or_merge_user_message(ctx.messages, prompt)
     extracted = ""
-    for attempt in range(2):
+    for attempt in range(1 if single_semantic_turn else 2):
         try:
             extracted = _call_forced_model_once(ctx)
         except BudgetExceeded:

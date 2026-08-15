@@ -10,17 +10,33 @@ import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
 import { downloadViaHostBridge, openViaHostBridge } from './ui_helpers.js';
-import { apiClient, apiFetch, cancelTask } from './api_client.js';
+import { apiClient, apiFetch, fetchTaskDetail } from './api_client.js';
 import {
+    OWNER_STOP_DETAIL_MARKER,
+    OWNER_STOP_DONE_HEADLINE,
     formatReviewProjection,
     getLogTaskGroupId,
     isGroupedTaskEvent,
     normalizeLogTs,
+    ownerHurryProjection,
     summarizeChatLiveEvent,
     taskCancelPending,
     taskOutcomeSeverity,
+    taskSoftStopPending,
+    taskStoppedWithSummary,
     taskTerminalPhase,
 } from './log_events.js';
+import {
+    ACTION_FINALIZE,
+    ACTION_HURRY,
+    REUSABLE_TASK_IDS,
+    TASK_CONTROL_TRIGGER_LABEL,
+    cancelRunEligibility,
+    hurryTaskAction,
+    openTaskControlMenu,
+    requestStop,
+    taskControlBusy,
+} from './task_control_menu.js';
 import { openConfirmDialog } from './confirm_dialog.js';
 import { renderSkillReviewDisclosure, wireSkillReviewDisclosure } from './skill_review_card.js';
 import {
@@ -283,10 +299,6 @@ export function projectCollapsedActivity({
     return candidate;
 }
 
-// Logical slots that may host multiple independent cycles (v6.82: hoisted to
-// module scope so cancelRunEligibility shares the same truth as the card layer).
-export const REUSABLE_TASK_IDS = new Set(['bg-consciousness', 'active']);
-
 /**
  * /panic gate (v6.90.3, CRITICAL CONTROL): pure decision helper between the
  * confirm dialog's resolution and sending the panic command. Panic fires on an
@@ -330,35 +342,12 @@ export function isTerminalTaskPhase(phase = '', terminal = false) {
     return Boolean(terminal) || ['done', 'lifecycle_error', 'cancelled'].includes(phase);
 }
 
-/**
- * v6.82 (P5): may this live card offer the "Cancel run" action?
- * Card shape alone cannot answer it — an in-process direct-chat turn mints an
- * ordinary non-reusable, non-subagent card (supervisor/workers.py builds it a
- * real uuid task id) yet has no queue entry to cancel. So eligibility requires
- * the supervisor's host-attested `cancelable` progress-meta marker on top of
- * the structural gates: a ROOT (non-subagent) pooled card, not a reusable slot,
- * not finished, not converted into a project chip.
- */
-export function cancelRunEligibility({
-    groupId = '', isSubagent = false, finished = false, cancelable = false, converted = false,
-} = {}) {
-    return Boolean(cancelable)
-        && !isSubagent
-        && !finished
-        && !converted
-        && Boolean(String(groupId || '').trim())
-        && !REUSABLE_TASK_IDS.has(String(groupId || ''));
-}
-
 function withTaskCostMeta(summary, payload, { replace = false, rawTs = '' } = {}) {
     const projection = taskCostProjection(payload, rawTs);
     // `replace` frames (task_done/task_cost_finalized) never keep the
-    // summarizer's own meta strings — even without accounting evidence a
-    // terminal frame must not render an ungated bare cost string.
-    // Cost renders from the card's STICKY record.costMeta (applyLiveCardState),
-    // never from this frame's meta list: the sticky projection is the SINGLE
-    // cost renderer. Summarizer-built `cost=` strings are dropped
-    // UNCONDITIONALLY — a frame whose payload carries no task-scope accounting
+    // summarizer's own meta strings. Cost renders ONLY from the card's sticky
+    // record.costMeta (applyLiveCardState); summarizer-built `cost=` strings
+    // are dropped UNCONDITIONALLY — a frame without task-scope accounting
     // evidence must show no money at all, not a bare per-call number.
     const base = replace ? { ...summary, meta: [] } : summary;
     const out = projection ? { ...base, costProjection: projection } : { ...base };
@@ -1537,10 +1526,19 @@ export function createChatInstance({
         btn.type = 'button';
         btn.className = 'btn btn-xs btn-danger';
         btn.dataset.cancelRun = '1';
-        btn.textContent = 'Cancel run';
+        btn.textContent = TASK_CONTROL_TRIGGER_LABEL;
+        // S3 (Q2/HQ1): the trigger opens the three-action dropdown; dismissing
+        // it continues the run. While a cancel intent is pending the menu
+        // offers ONLY the hard escalation («Остановить немедленно»).
         btn.addEventListener('click', (event) => {
             event.stopPropagation();
-            cancelRunFromCard(record);
+            openTaskControlMenu(btn, {
+                cancelPending: Boolean(record.cancelPendingPolicy),
+                busy: taskControlBusy(record.groupId),
+                onAction: (action) => (action === ACTION_HURRY
+                    ? hurryTaskAction(record.groupId)
+                    : cancelRunFromCard(record, action)),
+            });
         });
         actions.appendChild(btn);
         record.cancelRunBtn = btn;
@@ -1550,12 +1548,14 @@ export function createChatInstance({
     // intent is recorded and the supervisor is confirming the teardown — the
     // card stays honestly LIVE (never an instant "Cancelled" lie) and resolves
     // on the settled task_done: Cancelled, or Completed when the run finished
-    // first (completion wins).
-    function markLiveCardCancelPending(taskId = '') {
+    // first (completion wins). S3 (Q1): a pending SOFT stop shows "Finalizing…"
+    // instead — a bounded final turn is running before the same intent settles.
+    function markLiveCardCancelPending(taskId = '', soft = false) {
         const record = liveCardRecords.get(String(taskId || '').trim());
         if (!record || record.finished || !record.phaseEl) return;
+        record.cancelPendingPolicy = soft ? 'finalize' : 'immediate';
         record.phaseEl.dataset.phase = 'working';
-        record.phaseEl.textContent = 'Cancelling…';
+        record.phaseEl.textContent = soft ? 'Finalizing…' : 'Cancelling…';
         record.phaseEl.className = 'chat-live-phase working cancelling';
     }
 
@@ -1588,7 +1588,7 @@ export function createChatInstance({
     function reconcileCancelCardFromDetail(record, taskId, stored) {
         if (!stored || record.finished) return;
         if (taskCancelPending(stored)) {
-            markLiveCardCancelPending(taskId);
+            markLiveCardCancelPending(taskId, taskSoftStopPending(stored));
             return;
         }
         const status = String(stored?.status || '');
@@ -1597,42 +1597,38 @@ export function createChatInstance({
         }
     }
 
-    async function cancelRunFromCard(record) {
+    async function cancelRunFromCard(record, action = '') {
         const taskId = String(record?.groupId || '').trim();
         if (!taskId || record.finished) return;
-        const confirmed = await openConfirmDialog({
-            title: 'Cancel this run?',
-            body: 'Cancel this run and all its subagents? A run that already finished keeps its result; unfinished work is salvaged best-effort.',
-            confirmLabel: 'Cancel run',
-            cancelLabel: 'Keep running',
-            danger: true,
-        });
-        if (!confirmed) return;
-        // Completion-wins race: the task may have finished while the dialog was
-        // open — its task_done already resolved the card, nothing to cancel.
-        if (record.finished) return;
+        // Q2: the dropdown itself is the confirmation surface — dismissing it
+        // continued the run, so a selected action executes immediately.
+        const soft = action === ACTION_FINALIZE;
         const btn = record.cancelRunBtn;
         if (btn) btn.disabled = true;
         const priorPhase = captureLiveCardPhase(record);
-        markLiveCardCancelPending(taskId);
+        markLiveCardCancelPending(taskId, soft);
         try {
-            // Answered only after the teardown finished, so a resolved promise
-            // means the run is really down; a refusal throws and is toasted below.
-            await cancelTask(taskId, { cascade: true });
+            // Immediate: answered only after the teardown finished, so a resolved
+            // promise means the run is really down. Soft (Q1): a 202 arrives with
+            // the durable intent open while the bounded finalization runs — the
+            // card stays "Finalizing…". A refusal throws and is toasted below.
+            await requestStop(taskId, action);
             // Backend publication is fail-soft past the durable boundary, so a 200
             // can arrive with the task_done event lost. Reconcile from the durable
             // record through the same terminal seam replay uses — idempotent with
             // a later event, so double resolution is harmless.
             try {
-                const stored = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`).then(
-                    (resp) => (resp && typeof resp.json === 'function' && resp.ok !== false) ? resp.json() : null,
-                );
-                reconcileCancelCardFromDetail(record, taskId, stored);
+                reconcileCancelCardFromDetail(record, taskId, await fetchTaskDetail(taskId));
             } catch {
                 // The card still resolves on its own frame if one arrives.
             }
-            // The card resolves via the existing task_done{status:"cancelled"}
-            // frames; keep the button disabled until that (or removal) happens.
+            // Immediate: the card resolves via the existing task_done frames and
+            // the button stays disabled until then. Soft: the hard escalation
+            // must stay REACHABLE during the wait (Q1), so re-enable the trigger
+            // (the pending menu offers only «Остановить немедленно»).
+            if (btn && !record.finished && record.cancelPendingPolicy === 'finalize') {
+                btn.disabled = false;
+            }
         } catch (exc) {
             // 404 = nothing live anymore (natural completion beat the cancel):
             // graceful no-op, the card resolves on its own terminal frame.
@@ -1651,10 +1647,7 @@ export function createChatInstance({
                 // sit "Working" forever. Ask the durable record and resolve the
                 // card through the same terminal seam replay uses.
                 try {
-                    const stored = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`).then(
-                        (resp) => (resp && typeof resp.json === 'function' && resp.ok !== false) ? resp.json() : null,
-                    );
-                    reconcileCancelCardFromDetail(record, taskId, stored);
+                    reconcileCancelCardFromDetail(record, taskId, await fetchTaskDetail(taskId));
                 } catch {
                     // The card still resolves on its own frame if one arrives;
                     // nothing worse than the pre-resync behavior.
@@ -1670,9 +1663,7 @@ export function createChatInstance({
             // task gets its prior phase restored and the button re-enabled.
             let stored = null;
             try {
-                stored = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`).then(
-                    (resp) => (resp && typeof resp.json === 'function' && resp.ok !== false) ? resp.json() : null,
-                );
+                stored = await fetchTaskDetail(taskId);
             } catch {
                 // Typed state unreachable — handled by the null guard below.
             }
@@ -1692,6 +1683,7 @@ export function createChatInstance({
             // Only a fetched, live, non-pending detail restores the button.
             if (btn) btn.disabled = false;
             restoreLiveCardPhase(record, priorPhase);
+            record.cancelPendingPolicy = '';
         }
     }
 
@@ -2218,15 +2210,12 @@ export function createChatInstance({
     }
 
     // perf2 P4.4 (lazy LINEAGE bodies): a collapsed SUBAGENT timeline is
-    // display:none inside its parent's lineage container, so building its DOM
-    // (and rendering its Markdown bodies) during a bulk replay is pure waste.
-    // The data stays complete in record.items; every timeline DOM writer
-    // defers through this guard while collapsed, and the first
-    // setLiveCardExpanded(true) materializes the whole timeline. TOP-LEVEL
-    // cards render eagerly like the pre-P4 baseline: their (CSS-hidden)
+    // display:none, so building its DOM during a bulk replay is pure waste.
+    // Data stays complete in record.items; DOM writers defer through this
+    // guard while collapsed, and the first setLiveCardExpanded(true)
+    // materializes the timeline. TOP-LEVEL cards render eagerly: their
     // collapsed timeline text is part of the feed DOM contract (ui-smoke
-    // chronology asserts collapsed card textContent), and the deep-lineage
-    // fan-out — the actual replay cost — lives in subagent children.
+    // asserts it), and the deep-lineage fan-out lives in subagent children.
     function deferCollapsedTimeline(record) {
         if (!record) return true;
         if (!record.isSubagent) return false;
@@ -2639,19 +2628,25 @@ export function createChatInstance({
         const terminalPhase = taskTerminalPhase(msg || {});
         const failedResult = severity === 'error';
         // P5: a cancelled root says "Cancelled", never a generic "Done" headline.
+        // №8/Q3: an owner-requested soft stop is a SUCCESS — its own headline,
+        // never warn-styled, with the owner-request marker in the details.
+        const softStopped = taskStoppedWithSummary(msg || {});
         const doneHeadline = severity === 'cancelled'
             ? 'Cancelled'
             : (failedResult && reasonCode
                 ? `Done: ${reasonCode}`
-                : (severity === 'warn'
-                    ? (reasonCode ? `Finished with warnings: ${reasonCode}` : 'Finished with warnings')
-                    : ((record && record.lastHumanHeadline) || 'Done')));
+                : (softStopped
+                    ? OWNER_STOP_DONE_HEADLINE
+                    : (severity === 'warn'
+                        ? (reasonCode ? `Finished with warnings: ${reasonCode}` : 'Finished with warnings')
+                        : ((record && record.lastHumanHeadline) || 'Done'))));
+        const softStopDetail = softStopped ? OWNER_STOP_DETAIL_MARKER : '';
         applyLiveCardState(
             {
                 phase: terminalPhase,
                 headline: doneHeadline,
-                body: reviewDetails,
-                visible: Boolean(reviewDetails),
+                body: [softStopDetail, reviewDetails].filter(Boolean).join('\n'),
+                visible: Boolean(softStopDetail || reviewDetails),
                 human: false,
                 promote: true,
                 terminal: true,
@@ -2703,14 +2698,12 @@ export function createChatInstance({
         const rawTs = msg?.ts || new Date().toISOString();
         if (registerEphemeralDecisionFrame(msg)) return;
         if (!taskId) return;
-        // P5: host-attested cancelable marker (live WS frames AND history replay —
-        // progress rows persist it through _PROGRESS_META_FIELDS). The supervisor
-        // stamps it ONLY on lineage-resolved non-subagent ROOTS (with the RUNNING
-        // row's authoritative lineage on the same frame), so the marker itself is
-        // the truth — re-deriving rootness from frame shape here would wrongly
-        // reject a timeout-retry root, whose root_task_id names the ORIGINAL task
-        // while the endpoint can cancel its current id. A direct-chat turn never
-        // carries the marker.
+        // P5: host-attested cancelable marker (live WS frames AND history replay
+        // via _PROGRESS_META_FIELDS). The supervisor stamps it ONLY on
+        // lineage-resolved non-subagent ROOTS, so the marker is the truth —
+        // re-deriving rootness from frame shape would wrongly reject a
+        // timeout-retry root (root_task_id names the ORIGINAL task while the
+        // endpoint cancels the current id). Direct-chat turns never carry it.
         if (msg?.cancelable === true && msg?.task_id) markTaskCancelable(String(msg.task_id));
         // Subagent lifecycle pings render as child cards linked to the parent;
         // they must not update the parent card's terminal state.
@@ -2943,6 +2936,14 @@ export function createChatInstance({
         if (!taskId) return;
         const eventType = evt.type || evt.event || '';
         const rawTs = evt.ts || evt.timestamp || new Date().toISOString();
+        if (eventType === 'owner_hurry') {
+            // HQ1: compact task-card status ONLY — never a timeline row or any
+            // chat bubble (the summarizer also hides this family, visible=false).
+            if (ownerHurryProjection(evt).applied) {
+                liveCardRecords.get(taskId)?.root?.setAttribute('data-owner-hurry', '1');
+            }
+            return;
+        }
         // A known subagent child's log events update its linked child card.
         if (subagentChildParents.has(taskId)) {
             if (eventType === 'task_done') {
@@ -3593,14 +3594,12 @@ export function createChatInstance({
                     updateMessagesPadding({ preserveStickiness: false });
                     scrollToBottomAfterLayout();
                 } else if (fromReconnect) {
-                    // Rebuild may add old rows ABOVE and new rows BELOW the viewport
-                    // simultaneously. Total scrollHeight delta cannot distinguish the
-                    // two and over-scrolls readers by the height of new bottom content.
-                    // Restore the first visible timestamped node to its prior visual
-                    // offset instead; equal-ts ordinals preserve arrival-order identity.
-                    // Live-card expansion and responsive layout settle on RAF; restore
-                    // after two frames so asynchronous card heights above the anchor
-                    // cannot move the reader immediately after this function resolves.
+                    // Rebuild may add rows both ABOVE and BELOW the viewport; a
+                    // scrollHeight delta cannot tell them apart and over-scrolls
+                    // readers. Restore the first visible timestamped node to its
+                    // prior visual offset instead (equal-ts ordinals keep
+                    // arrival-order identity), after two RAF frames so async
+                    // card heights above the anchor cannot move the reader.
                     await new Promise((resolve) => requestAnimationFrame(
                         () => requestAnimationFrame(resolve)
                     ));

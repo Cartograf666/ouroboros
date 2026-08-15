@@ -1000,6 +1000,9 @@ class OuroborosAgent:
         # references are not serialized state or a new routing authority.
         ctx.owner_message_admission_lock = self._owner_message_admission_lock
         ctx.owner_message_admission_agent = self
+        # The REAL attempt identity for attempt-scoped owner controls (hurry):
+        # task["_attempt"] — timeout_retry_from is NOT an attempt key.
+        ctx.task_attempt = task.get("_attempt")
         if self._event_queue is not None:
             # Optional runtime seam consumed by loop.py.  Unit/direct contexts
             # remain compatible, while production queued tasks establish the

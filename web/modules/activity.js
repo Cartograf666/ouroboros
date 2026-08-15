@@ -5,8 +5,17 @@
 // schedules are READ-ONLY ("managed by skill") because the lifecycle resync would
 // overwrite a direct toggle (supervisor/queue.py) — control those via the skill itself.
 
-import { apiFetch, cancelTask } from './api_client.js';
+import { apiFetch } from './api_client.js';
 import { openConfirmDialog } from './confirm_dialog.js';
+import { taskCancelPending } from './log_events.js';
+import {
+    ACTION_HURRY,
+    TASK_CONTROL_TRIGGER_LABEL,
+    hurryTaskAction,
+    openTaskControlMenu,
+    requestStop,
+    taskControlBusy,
+} from './task_control_menu.js';
 import { showToast } from './toast.js';
 
 function esc(value) {
@@ -53,7 +62,7 @@ export function initActivity({ mount, ws } = {}) {
                     <span class="activity-sub">${meta}</span>
                 </div>
                 <div class="activity-row-actions">
-                    <button type="button" class="btn btn-xs btn-danger" data-act="task-cancel" data-id="${id}">Cancel</button>
+                    <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${id}">${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
                 </div>
             </div>`;
         };
@@ -138,28 +147,49 @@ export function initActivity({ mount, ws } = {}) {
         if (!btn || busy) return;
         const act = btn.dataset.act;
         const id = btn.dataset.id || '';
+        if (act === 'task-control') {
+            // S3 (Q2/HQ1): owner product-wide parity — the SAME three-action
+            // dropdown as the Chat card (one shared module: same actions,
+            // endpoint bindings, request-id retry, and typed refusals).
+            // Dismissing the menu continues the run. The durable detail decides
+            // whether a cancel intent is pending (then only the hard escalation
+            // is offered and hurry is never shown).
+            const stored = await getJson(`/api/tasks/${encodeURIComponent(id)}`);
+            openTaskControlMenu(btn, {
+                cancelPending: taskCancelPending(stored),
+                busy: taskControlBusy(id),
+                onAction: async (action) => {
+                    busy = true;
+                    try {
+                        if (action === ACTION_HURRY) {
+                            // Local toast acknowledgement only — never a chat message.
+                            await hurryTaskAction(id);
+                            return;
+                        }
+                        // Same declared semantics as the chat card (v6.82): the
+                        // task AND its live subtree, so stopping an orchestrator
+                        // never orphans its running subagents. Soft stop answers
+                        // 202 with the intent open; immediate answers after the
+                        // teardown — either way the refresh shows honest state.
+                        await requestStop(id, action);
+                    } catch (exc) {
+                        // A 404 is the documented completion race (the run
+                        // finished on its own); the refresh tells that story.
+                        if (exc?.status !== 404) {
+                            showToast(`Action failed: ${exc?.message || exc}`, 'error');
+                        }
+                    } finally {
+                        busy = false;
+                        await refresh();
+                    }
+                },
+            });
+            return;
+        }
         busy = true;
         btn.disabled = true;
         try {
-            if (act === 'task-cancel') {
-                // Same declared semantics as the chat card's "Cancel run" (v6.82):
-                // the task AND its live subtree, so cancelling an orchestrator here
-                // never orphans its running subagents.
-                const confirmedCancel = await openConfirmDialog({
-                    title: 'Cancel task',
-                    body: 'Cancel this task and all its subagents?',
-                    confirmLabel: 'Cancel task',
-                    cancelLabel: 'Keep running',
-                    danger: true,
-                });
-                if (!confirmedCancel) return;
-                // The endpoint answers only once the teardown is done, so a
-                // successful response means the subtree really is cancelled; a
-                // refusal throws and is surfaced below.
-                // The endpoint answers only after the teardown, so the refresh
-                // below already sees terminal state — no settling delay needed.
-                await cancelTask(id, { cascade: true });
-            } else if (act === 'schedule-delete') {
+            if (act === 'schedule-delete') {
                 const confirmedDelete = await openConfirmDialog({
                     title: 'Delete schedule',
                     body: 'Delete this schedule?',

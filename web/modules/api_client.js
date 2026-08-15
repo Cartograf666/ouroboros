@@ -39,14 +39,51 @@ export function jsonPost(url, payload = {}, options = {}) {
  * Cancel a task. With {cascade:true} the server also cancels the task's live
  * subtree and answers only once that teardown has finished; without it the
  * request stays the synchronous single-task cancel (no body — headless compat).
- * Shared by the Chat live-card "Cancel run" action and the Activity tab.
+ * S3 (Q1/Q2): stopPolicy "finalize_then_cancel" requests the soft
+ * finalize-then-stop episode (202 acknowledgement, cancel_state "pending");
+ * "immediate" (or absent) keeps today's hard cancel byte-identical.
+ * Shared by the Chat live-card stop control and the Activity tab.
  * @param {string} taskId
- * @param {{cascade?: boolean}} [options]
+ * @param {{cascade?: boolean, stopPolicy?: string}} [options]
  * @returns {Promise<import('./api_types.js').TaskCancelResponse>}
  */
-export function cancelTask(taskId, { cascade = false } = {}) {
+export function cancelTask(taskId, { cascade = false, stopPolicy = '' } = {}) {
     const url = `/api/tasks/${encodeURIComponent(taskId)}/cancel`;
-    return cascade ? jsonPost(url, { cascade: true }) : fetchJson(url, { method: 'POST' });
+    const policy = String(stopPolicy || '');
+    const body = {
+        ...(cascade ? { cascade: true } : {}),
+        ...(policy && policy !== 'immediate' ? { stop_policy: policy } : {}),
+    };
+    return Object.keys(body).length ? jsonPost(url, body) : fetchJson(url, { method: 'POST' });
+}
+
+/**
+ * Owner hurry (S3, HQ1): the text-free typed task-local acceleration control.
+ * The body carries ONLY the client-generated stable request_id (reuse the same
+ * id on retry — the acknowledgement is idempotent). This path never creates a
+ * chat message anywhere; the durable facts are the typed owner-mailbox control
+ * and the owner_hurry task-result projection.
+ * @param {string} taskId
+ * @param {string} requestId
+ * @returns {Promise<import('./api_types.js').TaskHurryResponse>}
+ */
+export function hurryTask(taskId, requestId) {
+    return jsonPost(
+        `/api/tasks/${encodeURIComponent(taskId)}/hurry`,
+        { request_id: String(requestId || '') },
+        { rejectOkFalse: true },
+    );
+}
+
+/**
+ * Fetch one task's durable detail record, or null when unreachable — the
+ * shared reconcile read used by the cancel/stop card flows.
+ * @param {string} taskId
+ * @returns {Promise<import('./api_types.js').TaskDetailResponse|null>}
+ */
+export async function fetchTaskDetail(taskId) {
+    const resp = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`);
+    return (resp && typeof resp.json === 'function' && resp.ok !== false) ? resp.json() : null;
 }
 
 export function cleanExtensionRoute(value) {
