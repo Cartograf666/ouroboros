@@ -2464,8 +2464,8 @@ class LLMClient:
         max_tokens: int,
     ) -> List[Dict[str, Any]]:
         available_tokens = max(256, ctx_len - max_tokens - 128)
-        # Safe character ratio for local model: max 40k chars (~15k tokens) for instant prefill
-        target_chars = min(40000, int(available_tokens * 1.5))
+        # Safe character ratio for local model: max 12k chars (~3k tokens) for instant sub-second prefill
+        target_chars = min(12000, int(available_tokens * 1.5))
         total_chars = _estimate_message_chars(messages)
         if total_chars <= target_chars:
             return messages
