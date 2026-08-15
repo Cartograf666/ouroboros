@@ -652,7 +652,8 @@ def payload_capture_git_env(exec_root: Path):
                        capture_output=True, check=True, env=env)
         alternates = control / ".git" / "objects" / "info" / "alternates"
         alternates.parent.mkdir(parents=True, exist_ok=True)
-        alternates.write_text(str(resolved / ".git" / "objects") + "\n", encoding="utf-8")
+        # Byte-exact: text mode would emit CRLF on Windows -> git seeks "objects\r".
+        alternates.write_bytes((str(resolved / ".git" / "objects") + "\n").encode("utf-8"))
         index = control / "index"
         os.close(os.open(index, os.O_CREAT | os.O_WRONLY, 0o600))
         env["GIT_DIR"] = str(control / ".git")

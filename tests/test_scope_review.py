@@ -1813,7 +1813,7 @@ class TestHeadSnapshotSection:
     def test_current_payload_snapshot_uses_collision_safe_fence(self, tmp_path):
         """Fenced examples inside SKILL.md must not escape the snapshot block."""
         payload = tmp_path / "SKILL.md"
-        payload.write_text("Example:\n```python\nprint('safe')\n```\n", encoding="utf-8")
+        payload.write_bytes(b"Example:\n```python\nprint('safe')\n```\n")
 
         mod = _get_module("ouroboros.tools.review_helpers")
         result, included = mod.build_head_snapshot_section(
