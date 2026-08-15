@@ -479,11 +479,8 @@ class LocalModelManager:
                 "--model", model_path,
                 "--port", str(port),
                 "--n_gpu_layers", str(n_gpu_layers),
-                "--flash_attn", "true",
-                "--cache", "true",
-                "--n_batch", "2048",
+                "--n_batch", "1024",
                 "--n_ubatch", "512",
-                "--n_threads_batch", "-1",
             ]
             if chat_format:
                 cmd.extend(["--chat_format", chat_format])
