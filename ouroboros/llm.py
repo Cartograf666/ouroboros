@@ -2459,8 +2459,9 @@ class LLMClient:
         ctx_len: int,
         max_tokens: int,
     ) -> List[Dict[str, Any]]:
-        available_tokens = max(256, ctx_len - max_tokens - 64)
-        target_chars = available_tokens * 3
+        available_tokens = max(256, ctx_len - max_tokens - 128)
+        # Safe character ratio: 1.5 chars per token for multilingual / code content
+        target_chars = int(available_tokens * 1.5)
         total_chars = _estimate_message_chars(messages)
         if total_chars <= target_chars:
             return messages
@@ -2579,9 +2580,6 @@ class LLMClient:
             kwargs["tools"] = clean_tools
             kwargs["tool_choice"] = tool_choice
         if timeout and timeout > 0:
-            # Honor the caller's per-request timeout on the local lane too
-            # (v6.54.3: the safety-supervisor timeout SSOT must bound every
-            # route safety can use, not only the remote ones).
             kwargs["timeout"] = float(timeout)
 
         last_exc: Optional[Exception] = None
@@ -2604,8 +2602,15 @@ class LLMClient:
             except Exception as exc:
                 last_exc = exc
                 err = str(exc)
-                if "context_length_exceeded" in err:
-                    raise LocalContextTooLargeError(err) from exc
+                if "context_length_exceeded" in err or "400" in err:
+                    # Adaptive emergency recovery: drastically reduce system message and retry
+                    for m in clean_messages:
+                        if m.get("role") == "system":
+                            m["content"] = str(m.get("content", ""))[:4000] + "\n[truncated for local context]"
+                            break
+                    kwargs["messages"] = clean_messages
+                    kwargs["max_tokens"] = min(local_max, 1024)
+                    log.warning("Local context overflow detected; retrying with trimmed system prompt")
                 if attempt == 2:
                     log.warning("Local model request failed: %s", exc)
                     raise
