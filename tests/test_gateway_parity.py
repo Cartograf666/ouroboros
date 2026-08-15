@@ -29,6 +29,8 @@ from ouroboros.gateway.contracts import (
     UpdatePreflightResponse,
     UpdateStatusReadyOutbound,
     VideoOutbound,
+    ClaudexorLoginJobProblem,
+    ClaudexorLoginJobResponse,
     ClaudexorStatusReads,
     ClaudexorStatusResponse,
 )
@@ -119,6 +121,8 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "OnboardingCompleteResponse",
         "OnboardingPresetFailureResponse",
         "SettingsPostCommitFailureResponse",
+        "ClaudexorLoginJobResponse",
+        "ClaudexorLoginJobProblem",
     ):
         assert re.search(rf"@typedef \{{Object\}} {name}\b", text), f"api_types.js missing {name}"
     api_client = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "api_client.js").read_text(
@@ -139,10 +143,19 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
                 OnboardingCompleteRequest, OnboardingPresetProjection,
                 OnboardingCompleteResponse, OnboardingPresetFailureResponse,
                 SettingsPostCommitFailureResponse,
+                ClaudexorLoginJobResponse, ClaudexorLoginJobProblem,
                 ClaudexorStatusReads, ClaudexorStatusResponse):
         expected = set(get_type_hints(cls, include_extras=True))
         actual = _js_typedef_fields(text, cls.__name__)
         assert actual == expected, f"{cls.__name__} JSDoc fields drifted: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
+    # Field-set parity alone would accept an optional marker on the two
+    # discriminators. Pin the browser mirror's requiredness as well as names.
+    success_decl = re.search(
+        r"@typedef \{Object\} ClaudexorLoginJobResponse\b([\s\S]*?)\*/", text)
+    problem_decl = re.search(
+        r"@typedef \{Object\} ClaudexorLoginJobProblem\b([\s\S]*?)\*/", text)
+    assert success_decl and "@property {Object} job" in success_decl.group(1)
+    assert problem_decl and "@property {string} error" in problem_decl.group(1)
     # The client's own list of facets. The shared status store is the ONE reader
     # of the `reads` block (`facetReadState`), and STATUS_FACETS is the list its
     # per-facet map and every "did the daemon answer anything at all?" predicate

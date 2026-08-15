@@ -214,7 +214,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── extensions.py    ← extensions/skills HTTP surface (GET /api/extensions, GET /api/extensions/<skill>/manifest, ALL /api/extensions/<skill>/<rest:path>, POST /api/skills/<skill>/toggle, POST /api/skills/<skill>/delete, POST /api/skills/<skill>/review, POST /api/skills/<skill>/grants)
       │   ├── marketplace.py   ← ClawHub + OuroborosHub HTTP surface
       │   ├── mcp.py           ← MCP Settings API surface backed by the shared MCPManager
-      │   ├── claudexor_accounts.py ← (D30) Agent accounts HTTP surface (Settings → Agents → Accounts): FIVE thin proxies of the owned daemon's account truth (GET /api/claudexor/status[?include=models] — side-effect-free daemon/runtime state + harness catalog + credential profiles with both honest verification statuses + quota windows, each facet stamped with its read state so an unread store is never rendered as an empty one; POST /api/claudexor/wake — the OWNER-initiated daemon start behind the panel's Refresh button; no GET and no poll on this surface ever spawns, and Connect (POST /api/claudexor/login) is the other owner-initiated start; POST /api/claudexor/login — one Connect intent that foreground-installs/repairs/updates the exact managed runtime, starts or attaches the owned daemon, then continues its setup job; GET/DELETE /api/claudexor/login/{job_id} — snapshot with the transient device-code disclosure / cancel, plus POST /api/claudexor/login/{job_id}/input — the owner's answer to a prompt the engine is waiting on; DELETE /api/claudexor/credential-profiles/{harness}/{profile_id} — ask the engine to forget one named account, its refusal being the answer; a native CLI login has no such route because this process cannot honestly sign it out). Zero auth logic on this side; the browser never sees the daemon token. The fallback login card is a copy-paste `claudexor setup attach …` command for the user's own terminal — no in-app terminal exists. The snapshot proxy is a VERBATIM pass-through, and that is load-bearing for the card: a `failed` job whose reason is a verification race is judged `recheck` (codex clears its auth store when a login STARTS, so a probe in that window lies), but when the bounded re-check runs out the card's verdict text is a fixed CONSTANT, so the engine's own `message` is the only thing that can say WHY. `harness_accounts.jobDetail()` reads it at both envelope levels and renders it beside a settled non-success verdict only — escaped, never beside "Connected." where a stale message would contradict the outcome, never while the job is pending (the live status line owns the card then), and never truncated (BIBLE P1: this is an owner-facing surface)
+      │   ├── claudexor_accounts.py ← (D30) Agent accounts HTTP surface (Settings → Agents → Accounts): SIX thin proxies of the owned daemon's account truth (GET /api/claudexor/status[?include=models] — side-effect-free daemon/runtime state + harness catalog + credential profiles with honest verification statuses + quota windows, each facet stamped with its read state; POST /api/claudexor/wake — owner-initiated daemon start behind Refresh; POST /api/claudexor/login — one Connect intent that installs/repairs the managed runtime, starts or attaches the owned daemon, then creates or re-adopts its setup job; GET/DELETE /api/claudexor/login/{job_id} — canonical snapshot/cancel; POST /api/claudexor/login/{job_id}/input — the owner's answer to a waiting engine prompt; POST /api/claudexor/login/{job_id}/reconcile — an explicit proof-of-empty check after `termination_unconfirmed`; DELETE /api/claudexor/credential-profiles/{harness}/{profile_id} — ask the engine to forget one named account). Zero auth logic lives here and the browser never sees the daemon token. Create/cancel/input/reconcile wrap one bare job exactly once; snapshot passes the daemon's `{job,cursor,sequence,deviceCode?}` envelope through verbatim, so transient disclosure remains at envelope level instead of being hidden by the former `job.job` shape. A terminal job is not automatically release proof: unreconciled `termination_unconfirmed` retains daemon custody until reconciliation records `status=empty`, while poll/cancel/reconcile 404/410 release only the missing client record. `harness_login_cards.jobDetail()` reads the canonical envelope's one job and renders its escaped, untruncated message only beside a settled non-success verdict, never beside `Connected.` or while the live status line owns the card.
       │   ├── host_service.py  ← Loopback-only Host Service API for reviewed skill callbacks
       │   ├── history.py       ← Chat history + cost breakdown endpoint factories
       │   ├── projects.py      ← Multi-project CRUD surface (v6.32.0): GET /api/projects, POST /api/projects, POST /api/projects/from-task (bind an existing task to a new project). (v6.33.0 removed the /sleep + /wake status endpoints.)
@@ -674,7 +674,7 @@ Accounts are grouped into one card per agent family. Each card header carries th
 
 Connect is link-first and harness-agnostic. A typed disclosure renders the sign-in URL and any one-time code; flows that may need a pasted callback code keep that optional field visible while active because the browser callback may complete without it. An old engine may expose the copy-paste attach command only as a collapsed Advanced fallback in the owner's own terminal. There is no embedded terminal login surface. Terminal job state and the current account row are reconciled so a stale verification read during login cannot claim failure after the account actually connected.
 
-Account status refresh runs immediately and on visible page/tab activation but does not make every hidden page pay for daemon round-trips. Job polling uses one request at a time, begins at the healthy cadence, backs off to a bounded delay on consecutive failures, and after ten consecutive failures stops with an honest unconfirmed state: lost contact does not prove either failure or settlement. One transition lock covers Start, Retry, and Dismiss. A new login begins only after the prior snapshot is terminal or cancellation is proven by success, 404, or 410; a network or server failure retains the card and job id because dropping it could orphan a still-live server job. After each await the handler rechecks whether polling settled the job, so a stale cancel continuation cannot overwrite a terminal result.
+Account status refresh runs immediately and on visible page/tab activation but does not make every hidden page pay for daemon round-trips. Job polling uses one request at a time, begins at the healthy cadence, backs off to a bounded delay on consecutive failures, and after ten consecutive failures stops with an honest unconfirmed state: lost contact does not prove either failure or settlement. One transition lock covers Start, Retry, and Dismiss. A new login begins only once release of the prior job is proven (`loginReleaseProven`): a terminal snapshot whose termination reason is not `termination_unconfirmed`, a reconciliation that found the setup empty, or a job proven absent by 404/410. A terminal `termination_unconfirmed` snapshot keeps the job fenced, and a successful (2xx) cancel response alone is not proof of release; a network or server failure retains the card and job id because dropping it could orphan a still-live server job. After each await the handler rechecks whether polling settled the job, so a stale cancel continuation cannot overwrite a terminal result.
 
 Review lanes edits one structured reviewer configuration. Each triad, scope, or optional advisory row chooses either API delivery or a coding-agent session, then its model, optional credential profile, and effort. API models use free text with catalogue suggestions; agent-session models come from the selected harness. Saved choices that disappear from discovery remain visible as unavailable rather than silently changing to the first option. Capability labels configure nothing; the server-returned limits and last effective execution disclose what a saved row actually ran as, including capability deltas. An unloaded or unreachable view authors no replacement. A successfully loaded empty triad/scope is sent as shown so backend validation returns the real error instead of the browser falsely reporting that nothing changed. A row pinned to an account discovery no longer lists keeps its pin and is disclosed once, above the rows, as unavailable rather than silently rerouted — and only on the word of a facet that was actually read: an account pin answers to the `accounts` facet and a model to `catalog`, and while that facet is unread or failed the row says the pin was not checked instead of "not in discovery". The all-delegated disclosure is neutral routing information: commit and scope review run on subscriptions and wait for capacity rather than falling back to API spend, while plan review, task acceptance and skill review remain API-only on the shipped defaults.
 
@@ -752,6 +752,7 @@ Every `/api/files/*` operation resolves its requested path and refuses the opera
 | GET | `/api/claudexor/login/{job_id}` | `gateway.claudexor_accounts.api_claudexor_login_job` |
 | DELETE | `/api/claudexor/login/{job_id}` | `gateway.claudexor_accounts.api_claudexor_login_job` |
 | POST | `/api/claudexor/login/{job_id}/input` | `gateway.claudexor_accounts.api_claudexor_login_job` |
+| POST | `/api/claudexor/login/{job_id}/reconcile` | `gateway.claudexor_accounts.api_claudexor_login_job_reconcile` |
 | DELETE | `/api/claudexor/credential-profiles/{harness}/{profile_id}` | `gateway.claudexor_accounts.api_claudexor_credential_profile` |
 | POST | `/api/owner/runtime-mode` | `gateway.settings.api_owner_runtime_mode` |
 | POST | `/api/owner/auto-grant` | `gateway.settings.api_owner_auto_grant` |
@@ -1652,6 +1653,18 @@ its envelope promised arrived: a non-object body is collapsed by the transport i
 empty `{}`, an object whose keys have drifted arrives intact, and either would otherwise
 be published as an authoritative nothing.
 
+**Login-job custody and reconciliation.** The daemon remains the sole process/fence
+authority; the browser keeps only the current card's custody evidence. The frozen
+gateway success shape is one top-level `job` plus operation-specific metadata, while
+`ClaudexorLoginJobProblem` carries required `error` and optional stable `code` /
+bounded `required_actions`. Snapshot is already the daemon's canonical envelope and
+is not wrapped again. A terminal state proves release except when its outcome reason is
+`termination_unconfirmed` and no `terminationReconciliation.status=empty` exists.
+Reconcile is an explicit POST, never passive polling: success updates the same job to a
+safe face and a later, separate Connect creates or re-adopts work. Poll/cancel/reconcile
+404/410 mean only that the browser job record is absent and pass through as such; input
+keeps its distinct 404 capability result, and only input/reconcile expose typed 409s.
+
 ### Git and commit review
 
 `tools/git.py` owns repository writes, staging, reviewed commit, rollback or restore, tags, push, and CI follow-up. File-edit tools validate their own atomic write shape; `mutation_attribution.py` captures the root-task baseline and projects only the clean-at-baseline system-repository delta. A changed pre-existing dirty path, stale or missing baseline, or failed scan blocks automatic staging. `commit_reviewed(paths=None)` stages only that attributed candidate, explicit paths must be a subset, and an empty candidate returns `GIT_NO_ATTRIBUTED_CHANGES`; managed update transactions keep their separate typed whole-tree authority.
@@ -2306,6 +2319,14 @@ via `tests/test_contracts.py`.
 
 ### 11.1 What is frozen
 
+The browser-envelope ABI includes `ClaudexorLoginJobResponse` (required
+top-level `job`, operation metadata beside it) and `ClaudexorLoginJobProblem`
+(required `error`, optional `code` and bounded `required_actions`). Their active
+owner is `ouroboros/gateway/contracts.py`, mirrored by
+`web/modules/api_types.js` and pinned by the contract/parity suites; this is an
+additive browser gateway ABI, not a new file in the `ouroboros/contracts/`
+package.
+
 | Contract | File | Anchored by |
 |----------|------|-------------|
 | `ToolContextProtocol` — workspace/task-aware minimum every tool handler relies on (attributes: `repo_dir`, `drive_root`, `budget_drive_root`, `pending_events`, `emit_progress_fn`, `current_chat_id`, `task_id`, `task_metadata`, `task_contract`, `workspace_root`, `workspace_mode`, `project_id`; methods: `repo_path`, `drive_path`, `drive_logs`, `active_repo_dir`, `is_workspace_mode`) | `ouroboros/contracts/tool_context.py` | `ouroboros.tools.registry.ToolContext` must satisfy it (duck-typed check + AST field/method parity) |
@@ -2338,8 +2359,10 @@ via `tests/test_contracts.py`.
 
 Any extension of the ABI MUST:
 
-1. Add the new field/envelope key to the appropriate file under
-   `ouroboros/contracts/`.
+1. Add the new field/envelope key to its active frozen owner:
+   `ouroboros/contracts/` for package protocols, or
+   `ouroboros/gateway/contracts.py` plus `web/modules/api_types.js` for the
+   browser gateway ABI.
 2. Mention the new frozen surface here (Section 11.1 table).
 3. Update `tests/test_contracts.py` so the new surface is enforced.
 

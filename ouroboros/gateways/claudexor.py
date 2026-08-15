@@ -63,12 +63,19 @@ class ClaudexorUnavailable(RuntimeError):
     Carries the machine-readable ``code`` so callers classify instead of matching
     prose. Never raised for an ordinary in-run failure — only for "this transport
     is not usable".
+
+    ``required_actions`` retains the daemon's TOP-LEVEL ``ControlProblem.requiredActions``
+    string list when the refusal carried one (e.g. the reconcile 409's
+    ``retry_setup_reconciliation``), bounded to the daemon's own wire limit. It is
+    a preserved fact for the typed error seam, not a client action framework.
     """
 
-    def __init__(self, code: str, message: str, *, status_code: int = 0) -> None:
+    def __init__(self, code: str, message: str, *, status_code: int = 0,
+                 required_actions: tuple[str, ...] = ()) -> None:
         super().__init__(message)
         self.code = str(code or "claudexor_unavailable")
         self.status_code = int(status_code or 0)
+        self.required_actions = tuple(required_actions or ())
 
 
 class ClaudexorSubscriptionWindowExhausted(ClaudexorUnavailable):
@@ -310,6 +317,7 @@ class ClaudexorGateway:
         code = f"http_{response.status_code}"
         message = response.text[:500]
         context: Dict[str, Any] = {}
+        required_actions: tuple[str, ...] = ()
         try:
             body = response.json()
         except ValueError:
@@ -319,6 +327,19 @@ class ClaudexorGateway:
             message = str(body.get("message") or message)
             raw_context = body.get("context")
             context = raw_context if isinstance(raw_context, dict) else {}
+            # The daemon serializes `requiredActions` at the ControlProblem TOP LEVEL
+            # (`daemon-server` projects the field beside code/message; `problem-safety`
+            # bounds the wire list to at most 16 redacted strings of at most 512 chars).
+            # It is deliberately NOT read from `context`: no producer puts it there, and
+            # a context sniff would resurrect the exact had-it-both-ways bug the reset
+            # classification below documents. The bound is mirrored so a foreign body
+            # cannot balloon the retained tuple.
+            raw_actions = body.get("requiredActions")
+            if isinstance(raw_actions, list):
+                required_actions = tuple(
+                    str(item)[:512] for item in raw_actions[:16]
+                    if isinstance(item, str) and item
+                )
         # The CODE decides, exactly as every other classification on this seam does.
         # Sniffing `context` for a reset key instead had it both ways: no producer puts
         # `resetsAt`/`resets_at`/`cooldownUntil` in a ControlProblem context (a spent
@@ -331,7 +352,8 @@ class ClaudexorGateway:
                 message, reset_at=str(context.get("resetsAt") or ""),
                 status_code=response.status_code,
             )
-        return ClaudexorUnavailable(code, message, status_code=response.status_code)
+        return ClaudexorUnavailable(code, message, status_code=response.status_code,
+                                    required_actions=required_actions)
 
     # -- operations ------------------------------------------------------------
 
@@ -594,9 +616,11 @@ class ClaudexorGateway:
     def setup_job_call(self, job_id: str, op: str, *, value: str = "") -> Dict[str, Any]:
         """One job-scoped setup call: ``snapshot`` (GET; the transient
         device-code/oauth_url disclosure rides it and is never journaled),
-        ``cancel`` (POST), or ``input`` (POST /v2/setup/jobs/{id}/input —
+        ``cancel`` (POST), ``input`` (POST /v2/setup/jobs/{id}/input —
         deliver ONE line of user input, the claude OAuth paste-code, to a
-        login job that awaits it; engine 3.3.7+).
+        login job that awaits it; engine 3.3.7+), or ``reconcile``
+        (POST /v2/setup/jobs/{id}/reconcile — ask the daemon to prove an
+        unconfirmed termination's process group empty; supported floor 3.2.0).
 
         The input value is live login material, the same custody rule as the
         device code: it rides this loopback request once and is never logged,
@@ -613,6 +637,8 @@ class ClaudexorGateway:
             body = self._request("POST", f"{base}/cancel")
         elif op == "input":
             body = self._request("POST", f"{base}/input", json_body={"value": str(value)})
+        elif op == "reconcile":
+            body = self._request("POST", f"{base}/reconcile")
         else:
             raise ValueError(f"unknown setup job op: {op!r}")
         return body if isinstance(body, dict) else {}

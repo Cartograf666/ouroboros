@@ -615,6 +615,31 @@
  */
 
 /**
+ * One canonical login-job success envelope. Every operation carries one bare
+ * daemon job at the top level; operation-specific metadata stays beside it.
+ * Snapshot-only deviceCode is envelope-level, never nested inside job.
+ * @typedef {Object} ClaudexorLoginJobResponse
+ * @property {Object} job
+ * @property {string=} cursor
+ * @property {number=} sequence
+ * @property {Object=} deviceCode
+ * @property {string=} job_id
+ * @property {boolean=} disclosure_native
+ * @property {string=} attach_command
+ * @property {boolean=} ok
+ */
+
+/**
+ * Narrow typed problem envelope for login-job operations. required_actions is
+ * the daemon's bounded top-level continuation list, not a client-side action
+ * framework.
+ * @typedef {Object} ClaudexorLoginJobProblem
+ * @property {string} error
+ * @property {string=} code
+ * @property {Array<string>=} required_actions
+ */
+
+/**
  * @typedef {Object} ScheduledTasksResponse
  * @property {number} schema_version
  * @property {Object[]} tasks

@@ -65,6 +65,7 @@ def collect_routes(
         api_claudexor_credential_profile,
         api_claudexor_login,
         api_claudexor_login_job,
+        api_claudexor_login_job_reconcile,
         api_claudexor_status,
         api_claudexor_wake,
     )
@@ -274,6 +275,11 @@ def collect_routes(
         Route(
             "/api/claudexor/login/{job_id}/input",
             endpoint=api_claudexor_login_job,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/claudexor/login/{job_id}/reconcile",
+            endpoint=api_claudexor_login_job_reconcile,
             methods=["POST"],
         ),
         Route(
