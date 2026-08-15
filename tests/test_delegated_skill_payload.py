@@ -1097,3 +1097,218 @@ def test_registry_and_custody_baseline_disagreement_fails_capture_typed(
     assert capture["status"] == "failed", capture
     assert "disagree on the baseline" in _capture_manifest(capture)["note"]
     custody._CUSTODY.clear()
+
+
+# -- Sol P1 representation batch (raw bytes, modes, post-apply assert) --------------
+
+
+def test_existing_gitattributes_crlf_edit_transports_raw_bytes(tmp_path, monkeypatch):
+    """Sol P1 (reviewer repro a): a payload-authored `.gitattributes text eol=lf`
+    must not forge the staged content — a CRLF edit rides RAW, applies cleanly,
+    and the live raw bytes equal the candidate with equal loader hashes."""
+    from ouroboros.tools.delegate import _capture_terminal_patch
+    from ouroboros.tools.delegate_integration import payload_content_hash
+    from ouroboros.tools.subagent_integration import _integrate_delegated_patch
+
+    ctx = _payload_ctx(tmp_path, monkeypatch)
+    skill = _seed_skill(tmp_path / "data")
+    (skill / ".gitattributes").write_text("notes.txt text eol=lf\n", encoding="utf-8")
+    handle = provision_payload_snapshot(
+        target_root=skill, task_id="t-payload", snapshot_id="snapP")
+    custody._CUSTODY.clear()
+    (pathlib.Path(handle.path) / "notes.txt").write_bytes(b"DONE\r\nWITH CRLF\r\n")
+    entry = _payload_entry(handle, skill)
+    capture = _capture_terminal_patch(ctx, entry)
+    assert capture["status"] == "ready_with_changes", capture
+    manifest = _capture_manifest(capture)
+    assert manifest["tracked_changed"] == ["notes.txt"]
+    out = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
+    assert "✅ Integrated" in out, out
+    assert (skill / "notes.txt").read_bytes() == b"DONE\r\nWITH CRLF\r\n"
+    assert payload_content_hash(skill) == manifest["result_content_hash"]
+    custody._CUSTODY.clear()
+
+
+def test_child_added_gitattributes_and_crlf_file_transport_raw(tmp_path, monkeypatch):
+    """Sol P1 (reviewer repro b): a CHILD-added `.gitattributes` is ordinary raw
+    content and cannot LF-normalize the sibling CRLF file it names."""
+    from ouroboros.tools.delegate import _capture_terminal_patch
+    from ouroboros.tools.delegate_integration import payload_content_hash
+    from ouroboros.tools.subagent_integration import _integrate_delegated_patch
+
+    ctx, skill, handle = _provisioned(tmp_path, monkeypatch)
+    exec_root = pathlib.Path(handle.path)
+    (exec_root / ".gitattributes").write_text("* text eol=lf\n", encoding="utf-8")
+    (exec_root / "table.csv").write_bytes(b"a,b\r\n1,2\r\n")
+    entry = _payload_entry(handle, skill)
+    capture = _capture_terminal_patch(ctx, entry)
+    assert capture["status"] == "ready_with_changes", capture
+    manifest = _capture_manifest(capture)
+    assert set(manifest["tracked_changed"]) == {".gitattributes", "table.csv"}
+    out = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
+    assert "✅ Integrated" in out, out
+    assert (skill / "table.csv").read_bytes() == b"a,b\r\n1,2\r\n"
+    assert payload_content_hash(skill) == manifest["result_content_hash"]
+    custody._CUSTODY.clear()
+
+
+def test_exec_bit_only_flip_is_typed_unreviewable_metadata_change(tmp_path, monkeypatch):
+    """Sol P1 (reviewer repro c): 0644→0755 with identical bytes is invisible to
+    the payload review hash — a typed unreviewable_metadata_change refusal, so
+    the stale review can never stay falsely authoritative through a success."""
+    from ouroboros.tools.delegate import _capture_terminal_patch
+    from ouroboros.tools.subagent_integration import _integrate_delegated_patch
+
+    ctx, skill, handle = _provisioned(tmp_path, monkeypatch)
+    exec_root = pathlib.Path(handle.path)
+    os.chmod(exec_root / "plugin.py", 0o755)
+    entry = _payload_entry(handle, skill)
+    capture = _capture_terminal_patch(ctx, entry)
+    assert capture["status"] == "failed", capture
+    manifest = _capture_manifest(capture)
+    assert manifest.get("refusal_kind") == "unreviewable_metadata_change"
+    assert manifest.get("normalized_mode_paths") == ["plugin.py"]
+    out = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
+    assert "INTEGRATE_DELEGATED_CAPTURE_FAILED" in out, out
+    assert "unreviewable_metadata_change" in out, out
+    assert not os.access(skill / "plugin.py", os.X_OK)   # live payload untouched
+    assert find_execution_snapshot("snapP") is not None  # snapshot preserved
+    custody._CUSTODY.clear()
+
+
+def test_symlink_topology_change_with_equal_loader_hash_is_typed_refusal(
+        tmp_path, monkeypatch):
+    """Sol P1 (reviewer repro d): retargeting a confined symlink between two
+    equal-content files changes the patch but not the loader hash (it reads
+    THROUGH links) — a typed unreviewable_metadata_change refusal, no apply."""
+    from ouroboros.tools.delegate import _capture_terminal_patch
+    from ouroboros.tools.subagent_integration import _integrate_delegated_patch
+
+    ctx = _payload_ctx(tmp_path, monkeypatch)
+    skill = _seed_skill(tmp_path / "data")
+    (skill / "a.txt").write_text("same\n", encoding="utf-8")
+    (skill / "b.txt").write_text("same\n", encoding="utf-8")
+    os.symlink("a.txt", skill / "link.txt")
+    handle = provision_payload_snapshot(
+        target_root=skill, task_id="t-payload", snapshot_id="snapP")
+    custody._CUSTODY.clear()
+    exec_root = pathlib.Path(handle.path)
+    (exec_root / "link.txt").unlink()
+    os.symlink("b.txt", exec_root / "link.txt")
+    entry = _payload_entry(handle, skill)
+    capture = _capture_terminal_patch(ctx, entry)
+    assert capture["status"] == "failed", capture
+    manifest = _capture_manifest(capture)
+    assert manifest.get("refusal_kind") == "unreviewable_metadata_change"
+    assert manifest.get("tracked_changed") == ["link.txt"]
+    out = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
+    assert "INTEGRATE_DELEGATED_CAPTURE_FAILED" in out, out
+    assert os.readlink(skill / "link.txt") == "a.txt"    # live payload untouched
+    custody._CUSTODY.clear()
+
+
+def test_post_apply_hash_mismatch_yields_no_success_and_ambiguous_state(
+        tmp_path, monkeypatch):
+    """Sol P1 (reviewer repro e): if the LIVE loader hash after a real apply is
+    not the recorded result hash, no success receipt is emitted, nothing is
+    disposed (the stale-extension reconcile marker IS still queued — final Sol
+    scope P1), and the PENDING apply intent routes the next integrate to
+    the existing APPLY_AMBIGUOUS owner-recovery machinery."""
+    import ouroboros.tools.delegate_integration as integration
+    from ouroboros.tools.subagent_integration import _integrate_delegated_patch
+
+    ctx, skill, handle, entry, capture = _captured(tmp_path, monkeypatch)
+    assert capture["status"] == "ready_with_changes", capture
+    real = integration.payload_content_hash
+    calls = {"n": 0}
+
+    def _hash_diverges_after_apply(root):
+        calls["n"] += 1     # call 1 = pre-apply CAS check, call 2 = post-apply
+        return "0" * 64 if calls["n"] >= 2 else real(root)
+
+    monkeypatch.setattr(integration, "payload_content_hash", _hash_diverges_after_apply)
+    out = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
+    assert "INTEGRATE_APPLY_HASH_MISMATCH" in out, out
+    assert "✅" not in out and "No success is claimed" in out
+    assert entry.patch_disposed == ""
+    assert find_execution_snapshot("snapP") is not None  # forensics preserved
+    from ouroboros.extension_reconcile_queue import list_extension_reconcile_requests
+
+    assert list_extension_reconcile_requests(tmp_path / "data") != []
+    monkeypatch.setattr(integration, "payload_content_hash", real)
+    again = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
+    assert "INTEGRATE_DELEGATED_APPLY_AMBIGUOUS" in again, again
+    custody._CUSTODY.clear()
+
+
+def test_apply_hash_mismatch_queues_stale_extension_reconcile_marker(
+        tmp_path, monkeypatch):
+    """Final Sol scope P1 («Reconcile stale extensions after apply-hash
+    mismatch»): the mismatch branch used to return before any reconcile
+    queueing, so a stale enabled extension's subscriptions/companions stayed
+    live although the payload DID mutate. The marker must be queued WITHOUT
+    any success/disposition record, APPLY_AMBIGUOUS routing and the forensic
+    material (snapshot + captured patch + verdict) must be preserved."""
+    import ouroboros.tools.delegate_integration as integration
+    from ouroboros.extension_reconcile_queue import list_extension_reconcile_requests
+    from ouroboros.tools.subagent_integration import _integrate_delegated_patch
+
+    ctx, skill, handle, entry, capture = _captured(tmp_path, monkeypatch)
+    assert capture["status"] == "ready_with_changes", capture
+    real = integration.payload_content_hash
+    calls = {"n": 0}
+
+    def _hash_diverges_after_apply(root):
+        calls["n"] += 1     # call 1 = pre-apply CAS check, call 2 = post-apply
+        return "0" * 64 if calls["n"] >= 2 else real(root)
+
+    monkeypatch.setattr(integration, "payload_content_hash", _hash_diverges_after_apply)
+    out = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
+    assert "INTEGRATE_APPLY_HASH_MISMATCH" in out, out
+    # The reconcile marker IS set, typed with the mismatch-specific reason.
+    requests = list_extension_reconcile_requests(tmp_path / "data")
+    assert [r["skill"] for r in requests] == ["alpha"], requests
+    assert requests[0]["reason"] == "delegated_payload_apply_hash_mismatch"
+    # The receipt reports the QUEUED marker and never a completed reconcile.
+    assert "QUEUED" in out and "reconciled off" not in out, out
+    # No success/disposition is recorded; forensic custody is intact.
+    assert "No success is claimed" in out and "✅" not in out
+    assert entry.patch_disposed == ""
+    assert find_execution_snapshot("snapP") is not None
+    assert pathlib.Path(capture["patch_artifact"]).exists()
+    assert "Verdict:" in out, out
+    # The durable apply intent stays PENDING: APPLY_AMBIGUOUS answers next.
+    monkeypatch.setattr(integration, "payload_content_hash", real)
+    again = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
+    assert "INTEGRATE_DELEGATED_APPLY_AMBIGUOUS" in again, again
+    custody._CUSTODY.clear()
+
+
+def test_mismatch_reconcile_queue_failure_keeps_honest_ambiguity(
+        tmp_path, monkeypatch):
+    """A reconcile queue-write failure in the mismatch branch must not fake the
+    marker or a success: the receipt reports the failed queueing, nothing is
+    disposed, and the PENDING intent still routes to APPLY_AMBIGUOUS."""
+    import ouroboros.extension_reconcile_queue as reconcile_queue
+    import ouroboros.tools.delegate_integration as integration
+    from ouroboros.tools.subagent_integration import _integrate_delegated_patch
+
+    ctx, skill, handle, entry, capture = _captured(tmp_path, monkeypatch)
+    real = integration.payload_content_hash
+    calls = {"n": 0}
+
+    def _hash_diverges_after_apply(root):
+        calls["n"] += 1
+        return "0" * 64 if calls["n"] >= 2 else real(root)
+
+    def _boom(*_a, **_k):
+        raise OSError("queue disk full")
+
+    monkeypatch.setattr(integration, "payload_content_hash", _hash_diverges_after_apply)
+    monkeypatch.setattr(reconcile_queue, "request_extension_reconcile", _boom)
+    out = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
+    assert "INTEGRATE_APPLY_HASH_MISMATCH" in out, out
+    assert "could NOT be queued" in out and "✅" not in out, out
+    assert entry.patch_disposed == ""
+    assert find_execution_snapshot("snapP") is not None
+    custody._CUSTODY.clear()

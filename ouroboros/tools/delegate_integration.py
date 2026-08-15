@@ -49,22 +49,13 @@ _CAPTURE_DELEGATED_SNAPSHOT = "delegated_snapshot"
 def _mutation_authority(ctx: ToolContext, authority: "DelegatedRunShape") -> tuple[Dict[str, str], str]:
     """The UNIFIED host-derived authority record for one delegated run (B5).
 
-    ``{"target_root", "source", "capture_mode"}`` — the tree the run's changes are
-    destined for, WHERE that authority came from, and how the changes travel. Two
-    sources exist, validated differently but recorded in one shape:
-
-    - ``acting_constraint``: an acting child derives its target from its own
-      ``task_constraint.write_root``, which must equal the genuinely ACTIVE workspace
-      root (the original guard: `active_repo_dir_for` falls back to the LIVE Ouroboros
-      repo whenever `is_workspace_mode()` is false, and a constraint naming that same
-      directory would hand an external shell the live repository).
-    - ``external_workspace_root``: the ROOT of an external-workspace task holds no
-      acting constraint at all — the old seam answered ``write_root_missing`` here —
-      so its authority derives from its own VALIDATED active workspace: workspace mode
-      external, workspace root resolving to the active root. (Owner 2=A: the root
-      already holds write+shell inside the project; the only prior gap was provenance,
-      which the C1 snapshot + explicit apply now records per run.)
-
+    ``{"target_root", "source", "capture_mode"}``. Two sources, one shape:
+    ``acting_constraint`` (an acting child's ``task_constraint.write_root``,
+    which must equal the genuinely ACTIVE workspace root — `active_repo_dir_for`
+    falls back to the LIVE repo when `is_workspace_mode()` is false) and
+    ``external_workspace_root`` (the ROOT of an external-workspace task, whose
+    authority derives from its own VALIDATED active workspace; owner 2=A — the
+    root already holds write+shell there, the prior gap was provenance).
     Read-only runs return the ordinary active root with ``capture_mode: "none"``.
     Disagreement anywhere is a typed refusal, never a best-effort guess.
     """
@@ -241,16 +232,12 @@ def _resolve_retry_invocation(ctx: ToolContext, drive: pathlib.Path, retry_token
                               text: str) -> Tuple[Optional[_RetryBinding], str]:
     """Rebuild a retried start from its stored invocation, or refuse it typed.
 
-    The stored invocation is the SINGLE SOURCE of EVERY fact about a retry — the
-    health-checked route, the shape, the root, the project, the lookup key — not
-    only of the wire bytes: re-deriving any of them POSTed the recorded body while
-    the record and the parent's result described a configuration the run never had.
-    Validated BEFORE any daemon call, so a refused token registers nothing.
-
-    A MUTATING replay additionally re-proves its C1 binding: the row must carry the
-    snapshot/baseline binding at all (pre-C1 rows are refused), the task's PRESENT
-    workspace must still resolve to the recorded authority target, and the recorded
-    snapshot must still exist on disk — a GC-collected baseline cannot be re-minted.
+    The stored invocation is the SINGLE SOURCE of EVERY retry fact (route, shape,
+    root, project, key), validated BEFORE any daemon call so a refused token
+    registers nothing. A MUTATING replay additionally re-proves its C1 binding:
+    the row must carry the snapshot/baseline binding (pre-C1 rows refused), the
+    task's PRESENT workspace must still resolve to the recorded authority
+    target, and the recorded snapshot must still exist on disk.
     """
     from ouroboros.subagents import DelegatedRunShape, DelegationRoute
 
@@ -397,7 +384,10 @@ def _record_baseline_manifest(drive: pathlib.Path, task_id: str, invocation_id: 
 def _capture_block(entry: _RunCustody, cap_dir: pathlib.Path,
                    manifest: Dict[str, Any]) -> Dict[str, Any]:
     """The terminal-payload projection of one captured run patch (C1)."""
-    from ouroboros.headless import ARTIFACT_STATUS_READY_WITH_CHANGES
+    from ouroboros.headless import (
+        ARTIFACT_STATUS_READY_NO_CHANGES,
+        ARTIFACT_STATUS_READY_WITH_CHANGES,
+    )
 
     status = str(manifest.get("status") or "")
     patch_path = cap_dir / "workspace.patch"
@@ -427,6 +417,10 @@ def _capture_block(entry: _RunCustody, cap_dir: pathlib.Path,
             "captured diff via read_file(root='artifact_store', path=patch_read.path)."
         ),
     }
+    if status not in {ARTIFACT_STATUS_READY_WITH_CHANGES, ARTIFACT_STATUS_READY_NO_CHANGES}:
+        # A failed manifest's own typed note (unreviewable_metadata_change,
+        # non-UTF-8, …) is the actionable fact — never hide it in boilerplate.
+        block["note"] = str(manifest.get("note") or "") or block["note"]
     current_head = str(manifest.get("current_head") or "")
     if current_head and entry.baseline_sha and current_head != entry.baseline_sha:
         # Single-writer snapshot: a moved HEAD can only mean the run itself committed.
@@ -457,20 +451,14 @@ def _capture_terminal_patch(ctx: ToolContext, entry: Optional[_RunCustody]) -> O
 def capture_terminal_patch_for_drive(drive: Any, entry: _RunCustody) -> Optional[Dict[str, Any]]:
     """The drive-rooted core of the terminal capture — same contract, no ToolContext.
 
-    The RECONCILIATION path (owner task gone: orphan sweep, kill-path reconcile,
-    pending-invocation recovery) settles mutating runs from a bare drive root, and
-    a run settled there with no capture strands the child's work in the snapshot
-    with no apply/reject material. One capture author for both paths, so the nanny
-    flow and the sweep cannot drift in what a "captured patch" is. Capture only —
-    the apply/reject DECISION stays with a live owner, never taken here.
-
-    ``patch_captured`` MEANS "a usable patch artifact exists" (C1-R3): the custody
-    row is minted only over a manifest whose own status is ready. A manifest that
-    reports its own failure is returned as the failed block but leaves the row
-    uncaptured, so every retry point (re-wait, sweep, disposition) stays open —
-    and a durable row minted by pre-R3 code over a failed manifest is not trusted
-    either: the replay falls through to a fresh capture instead of serving the
-    failed manifest forever.
+    One capture author for both the nanny flow and the RECONCILIATION path
+    (orphan sweep, kill-path reconcile, pending-invocation recovery), so they
+    cannot drift in what a "captured patch" is; the apply/reject DECISION stays
+    with a live owner, never taken here. ``patch_captured`` MEANS "a usable
+    patch artifact exists" (C1-R3): the custody row is minted only over a
+    ready-status manifest; a failure manifest is returned as the failed block
+    but leaves the row uncaptured (every retry point stays open), and a pre-R3
+    row over a failed manifest falls through to a fresh capture.
     """
     if entry is None or not entry.execution_root:
         return None
@@ -560,12 +548,8 @@ _PAYLOAD_PRINCIPAL_PROFILES = frozenset({
 
 def payload_content_hash(payload_root: Any) -> str:
     """The whole-payload CAS hash — the existing skill-loader inventory hash.
-
-    One definition for snapshot baseline, capture result, and apply-time CAS, so
-    the three comparisons are always about the same byte surface. Raises
-    ``SkillPayloadUnreadable`` (fail-closed) on unreadable or credential-shaped
-    payload files, exactly like the loader itself.
-    """
+    One definition for snapshot baseline, capture result, and apply-time CAS;
+    raises ``SkillPayloadUnreadable`` (fail-closed) exactly like the loader."""
     from ouroboros.skill_loader import compute_content_hash
 
     return compute_content_hash(pathlib.Path(str(payload_root)))
@@ -595,17 +579,12 @@ def _reserved_payload_rel_path(rel: str) -> bool:
 def _payload_delegation_busy(drive: pathlib.Path, target: pathlib.Path) -> str:
     """A run/invocation that still holds THIS payload open, or "" (R1 item 9).
 
-    Cheap and before any snapshot or gateway work: two concurrent delegations
-    against one payload would race the same CAS baseline, so the second is
-    refused while the first has undisposed custody (unsettled run, undisposed
-    patch, or a pending invocation naming the same target).
-
+    Two concurrent delegations against one payload would race the same CAS
+    baseline, so the second is refused while the first has undisposed custody.
     Single-pass (Sol delta, fix 5a): both projections replay ONE pre-read row
-    snapshot. Two separate log reads let the holder's REQUESTED→STARTED
-    transition land between them — invisible to the first pass as a run and to
-    the second as a pending invocation — so a second start slipped through the
-    claim lock. Against one snapshot the holder is in exactly one of the two
-    states and cannot be missed.
+    snapshot — two separate log reads let the holder's REQUESTED→STARTED
+    transition land between them and a second start slipped the claim lock;
+    against one snapshot the holder is in exactly one state, never missed.
     """
     resolved = _resolved(target)
     rows = list(custody._iter_rows(custody.event_log_path(drive)))
@@ -675,11 +654,10 @@ def claimed_start_request(
 ) -> Tuple[bool, str]:
     """Write the START_REQUESTED row, atomically fused with the payload busy check.
 
-    Gate fix 5: an unlocked busy read followed by a later request write let two
-    synchronized starts both pass the check and both start. For a payload run
-    (``claim_target`` non-empty) the busy check and the durable request write
-    happen under ONE claim lock, so exactly one caller wins; the loser gets the
-    holder id back and refuses typed. Non-payload rows pass straight through.
+    Gate fix 5: for a payload run (``claim_target`` non-empty) the busy check
+    and the durable request write happen under ONE claim lock, so exactly one
+    of two synchronized starts wins; the loser gets the holder id back and
+    refuses typed. Non-payload rows pass straight through.
     Returns ``(requested, busy_holder)``.
     """
     if not claim_target:
@@ -714,11 +692,9 @@ def _payload_mutation_authority(
     """The payload counterpart of ``_mutation_authority`` (R1 item 1).
 
     Returns ``(run_shape, authority_record, refusal)``. The authority is a FRESH
-    ``ResolvedResourceBinding`` for ``skill_payload.write`` — the registry builds
-    it privately for a selector-carrying ``delegate_start``; a direct caller
-    (tests, in-process reuse) rebuilds it here through the same one authorizer.
-    The record carries the host-minted semantic ``resource_ref`` that custody
-    stores durably and retry/apply later re-resolve.
+    ``ResolvedResourceBinding`` for ``skill_payload.write`` through the same one
+    authorizer the registry uses; the record carries the host-minted semantic
+    ``resource_ref`` that custody stores durably and retry/apply re-resolve.
     """
     from ouroboros.subagents import delegated_run_shape
     from ouroboros.tool_access import active_tool_profile, build_resolved_resource_binding
@@ -836,12 +812,10 @@ def _rebind_payload_reference(
     tool: str, context: str,
 ) -> Tuple[Optional[pathlib.Path], Optional[Any], str]:
     """Re-resolve a recorded semantic payload reference against CURRENT authority.
-
-    Consumed by retry and by the owned apply (R1 item 3): the fresh binding path
-    must equal the recorded target, so a moved/collided/removed/renamed skill is
-    a typed refusal, never a write through a stale physical path. Returns
-    ``(live_target, fresh_binding, refusal)``.
-    """
+    Retry and the owned apply (R1 item 3) require the fresh binding path to
+    equal the recorded target — a moved/collided/removed skill is a typed
+    refusal, never a write through a stale physical path. Returns
+    ``(live_target, fresh_binding, refusal)``."""
     from ouroboros.tool_access import build_resolved_resource_binding
 
     ref = resource_ref if isinstance(resource_ref, dict) else {}
@@ -905,22 +879,20 @@ def _write_payload_patch_artifacts(
 ) -> Dict[str, Any]:
     """The payload-specific terminal capture (R1 items 5/6), same artifact contract.
 
-    The capture trusts NOTHING under the child-writable snapshot's ``.git``
-    (Sol P1): the baseline commit/tree identity comes from the host-owned
-    snapshot registry, all git runs against a parent-owned control GIT_DIR
-    with a fresh temp index seeded from that recorded commit
-    (``payload_capture_git_env``), and exactly the final loader-visible
-    inventory plus explicit baseline deletions is staged there — a child-forged
-    index-only blob is never read, and child ``.git/config`` is never read or
-    written. ``workspace.patch`` is ``git diff --binary`` (git's binary
-    heuristic cannot veto UTF-8-with-NUL content) plus the
-    ``workspace_patch.json`` manifest against the recorded baseline. Junk the
-    loader excludes never enters the candidate. A candidate add/modify of a
-    genuinely non-UTF-8 file is a typed capture FAILURE (the permanent text-only
-    execution contract); deletions and untouched baseline files are unaffected.
-    Reserved lifecycle/control paths never block capture: they are reported as
-    ``blocked_reserved_paths`` and refused whole at apply (the candidate is
-    always preserved for the parent's decision).
+    Trusts NOTHING under the child-writable snapshot's ``.git`` (Sol P1):
+    baseline identity comes from the host-owned snapshot registry, git runs
+    against a parent-owned control GIT_DIR/temp index seeded from that commit
+    (``payload_capture_git_env``), and exactly the final loader inventory plus
+    explicit baseline deletions is staged there from RAW bytes
+    (``stage_raw_payload_inventory``: no .gitattributes filters; regular modes
+    pinned to baseline/100644; symlinks as 120000 raw targets). A non-empty
+    patch whose result loader hash equals the baseline is a typed
+    ``unreviewable_metadata_change`` refusal. ``workspace.patch`` is
+    ``git diff --binary`` against the recorded baseline. A candidate
+    add/modify of genuinely non-UTF-8 content is a typed FAILURE (permanent
+    text-only contract); reserved lifecycle/control paths never block capture —
+    reported as ``blocked_reserved_paths`` and refused whole at apply, with the
+    candidate always preserved for the parent's decision.
     """
     import hashlib
     import subprocess
@@ -935,6 +907,7 @@ def _write_payload_patch_artifacts(
         find_execution_snapshot,
         payload_capture_git_env,
         payload_git_metadata_refusal,
+        stage_raw_payload_inventory,
     )
     from ouroboros.utils import atomic_write_json, utc_now_iso
 
@@ -1005,34 +978,45 @@ def _write_payload_patch_artifacts(
             detail = (seeded.stderr or seeded.stdout or b"").decode("utf-8", errors="replace")
             return _manifest(ARTIFACT_STATUS_FAILED,
                              note=f"baseline unreadable: {detail.strip()[:300]}")
-        listed = _git("ls-tree", "-r", "--name-only", "-z", baseline)
+        listed = _git("ls-tree", "-r", "-z", baseline)
         if listed.returncode != 0:
             detail = (listed.stderr or listed.stdout or b"").decode("utf-8", errors="replace")
             return _manifest(ARTIFACT_STATUS_FAILED,
                              note=f"baseline unreadable: {detail.strip()[:300]}")
-        baseline_rel = [
-            chunk.decode("utf-8", errors="surrogateescape")
-            for chunk in (listed.stdout or b"").split(b"\0") if chunk
-        ]
+        baseline_modes: Dict[str, str] = {}
+        for chunk in (listed.stdout or b"").split(b"\0"):
+            if not chunk:
+                continue
+            meta, _sep, name = chunk.partition(b"\t")
+            baseline_modes[name.decode("utf-8", errors="surrogateescape")] = (
+                meta.split()[0].decode("ascii", errors="replace"))
 
-        def _z(paths: list) -> bytes:
-            return b"\0".join(
-                p.encode("utf-8", errors="surrogateescape") for p in paths) + b"\0"
-
-        # Only the FINAL loader-visible inventory rides as content. A baseline path
-        # absent from the final inventory is staged as a DELETION even when something
-        # still sits on disk there (e.g. a file replaced by an escaping symlink,
-        # which the inventory drops) — --add --remove over such a path would stage
-        # the on-disk escape artifact itself into the candidate (reproduced).
-        dropped = sorted(set(baseline_rel) - set(final_rel))
-        staged = _git("update-index", "-z", "--add", "--remove", "--stdin",
-                      input_bytes=_z(sorted(final_rel)))
-        if staged.returncode == 0 and dropped:
-            staged = _git("update-index", "-z", "--force-remove", "--stdin",
-                          input_bytes=_z(dropped))
-        if staged.returncode != 0:
-            detail = (staged.stderr or staged.stdout or b"").decode("utf-8", errors="replace")
-            return _manifest(ARTIFACT_STATUS_FAILED, note=f"staging failed: {detail.strip()[:300]}")
+        # Only the FINAL loader-visible inventory rides as content, staged from
+        # RAW bytes (Sol P1 modes/filters: a .gitattributes eol/clean filter must
+        # not forge staged content, and regular-file modes are pinned to
+        # baseline/100644 so an executable-bit flip cannot ride). A baseline path
+        # absent from the final inventory is staged as a DELETION even when
+        # something still sits on disk there (e.g. a file replaced by an escaping
+        # symlink, which the inventory drops).
+        dropped = sorted(set(baseline_modes) - set(final_rel))
+        try:
+            normalized_modes = stage_raw_payload_inventory(
+                exec_root, final_rel, git_env, baseline_modes=baseline_modes)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            detail = getattr(exc, "stderr", b"") or b""
+            detail = detail.decode("utf-8", errors="replace") if isinstance(detail, bytes) else str(detail)
+            return _manifest(ARTIFACT_STATUS_FAILED,
+                             note=f"staging failed: {type(exc).__name__}: "
+                                  f"{(detail or str(exc)).strip()[:300]}")
+        if dropped:
+            removed = _git("update-index", "-z", "--force-remove", "--stdin",
+                           input_bytes=b"\0".join(
+                               p.encode("utf-8", errors="surrogateescape")
+                               for p in dropped) + b"\0")
+            if removed.returncode != 0:
+                detail = (removed.stderr or removed.stdout or b"").decode("utf-8", errors="replace")
+                return _manifest(ARTIFACT_STATUS_FAILED,
+                                 note=f"staging failed: {detail.strip()[:300]}")
         named = _git("diff", *diff_isolation, "--cached", "--name-only", "-z", baseline)
         if named.returncode != 0:
             detail = (named.stderr or named.stdout or b"").decode("utf-8", errors="replace")
@@ -1046,6 +1030,18 @@ def _write_payload_patch_artifacts(
         # invocation against the child GIT_DIR would consult child config again.
         current_head = _snapshot_head_textual(resolved_root)
         if not changed:
+            if normalized_modes:
+                # The run's ONLY change is an executable-bit flip the review
+                # content hash cannot see: refused typed, nothing rides.
+                return _manifest(
+                    ARTIFACT_STATUS_FAILED,
+                    refusal_kind="unreviewable_metadata_change",
+                    normalized_mode_paths=normalized_modes,
+                    note="unreviewable_metadata_change: the run's only change is "
+                         "an executable-bit flip "
+                         f"({', '.join(normalized_modes[:5])}), invisible to the "
+                         "payload review content hash; nothing rides. The "
+                         "snapshot is preserved for inspection.")
             return _manifest(ARTIFACT_STATUS_READY_NO_CHANGES, sha256="", diffstat="",
                              tracked_changed=[], untracked_included=[],
                              blocked_reserved_paths=[], result_content_hash=result_hash,
@@ -1073,6 +1069,20 @@ def _write_payload_patch_artifacts(
             return _manifest(ARTIFACT_STATUS_FAILED, note=f"patch emit failed: {detail.strip()[:300]}")
         patch_bytes = diff.stdout or b""
         (cap_dir / "workspace.patch").write_bytes(patch_bytes)
+        baseline_hash = str((entry.resource_ref or {}).get("payload_hash") or "")
+        if baseline_hash and result_hash == baseline_hash:
+            # Non-empty patch, result hash EQUAL to baseline: the change is
+            # invisible to the review hash (symlink topology / metadata) — a
+            # fresh verdict could not distinguish result from reviewed baseline.
+            return _manifest(
+                ARTIFACT_STATUS_FAILED,
+                refusal_kind="unreviewable_metadata_change",
+                tracked_changed=changed,
+                note="unreviewable_metadata_change: the candidate patch is "
+                     "non-empty but the result payload content hash equals the "
+                     "baseline (the change is invisible to the review hash — "
+                     "e.g. symlink topology or file metadata). The snapshot and "
+                     "the candidate patch are preserved for inspection.")
         stat = _git("diff", *diff_isolation, "--cached", "--shortstat", baseline)
         return _manifest(
             ARTIFACT_STATUS_READY_WITH_CHANGES,
@@ -1084,6 +1094,7 @@ def _write_payload_patch_artifacts(
             blocked_reserved_paths=[p for p in changed if _reserved_payload_rel_path(p)],
             result_content_hash=result_hash,
             current_head=current_head,
+            normalized_mode_paths=normalized_modes,
         )
 
 
@@ -1126,12 +1137,10 @@ def _candidate_symlink_escapes(
     """Symlink-introducing patch entries whose target would escape the LIVE payload.
 
     Containment is judged on the CANDIDATE, not the live preimage (gate fix 1):
-    a hunk that lands a mode-120000 entry gets its link target resolved as it
-    would land under the live payload root; an escaping resolution is refused
-    exactly like a ``../`` path escape. Capture pins ``--no-renames``, so every
-    symlink introduction appears as a full new-file/new-mode hunk and the parse
-    is total; any unparseable symlink entry fails CLOSED as a parse refusal.
-    Returns ``(escaping_rel_paths, parse_refusal)``.
+    a mode-120000 hunk's link target is resolved as it would land under the
+    live payload root; an escape is refused like a ``../`` path escape.
+    ``--no-renames`` keeps the parse total; an unparseable symlink entry fails
+    CLOSED. Returns ``(escaping_rel_paths, parse_refusal)``.
     """
     import os
 
@@ -1261,19 +1270,17 @@ def integrate_payload_patch(
 ) -> str:
     """Apply or reject ONE payload run's captured patch into the LIVE payload (R1 item 3).
 
-    The payload counterpart of the Git apply branch, entered by
-    ``integrate_delegated_patch`` after its owned custody lookup and shared
-    early refusals. Differences from the Git branch, each deliberate: the
-    target is the live NON-Git payload (no active-root comparison, no ``.git``
-    requirement, no staging); target authority is a FRESH exact binding that
-    must equal the recorded target; drift is the whole-payload loader
-    content-hash CAS (already-applied content disposes as applied,
-    idempotently); reserved lifecycle/control destinations refuse the WHOLE
-    apply with the candidate preserved; ``git apply`` runs with the live
-    payload as its cwd (index-free apply writes relative to cwd — probed);
-    a successful apply QUEUES the existing extension reconcile request (a
-    durable marker the server processes asynchronously; the receipt says
-    queued, never reconciled).
+    The payload counterpart of the Git apply branch. Deliberate differences:
+    the target is the live NON-Git payload (no active-root comparison, no
+    staging); target authority is a FRESH exact binding equal to the recorded
+    target; drift is the whole-payload loader content-hash CAS (already-applied
+    disposes idempotently); reserved destinations refuse the WHOLE apply with
+    the candidate preserved; ``git apply`` runs with the live payload as cwd
+    (index-free, probed); after a real apply the LIVE loader hash must equal
+    the recorded result hash or the run fails typed with its apply intent left
+    PENDING (ambiguous machinery); ANY mutating apply outcome — success or
+    post-apply hash mismatch — QUEUES the existing extension reconcile request
+    (receipt says queued, never reconciled).
     """
     import subprocess
 
@@ -1432,6 +1439,63 @@ def integrate_payload_patch(
             f"said: {stderr[:600]}\nThe snapshot and the patch are preserved; "
             "reconcile and retry, or integrate_delegated_patch(decision='reject'). "
             f"Verdict: {verdict_path or '(unwritten)'}.")
+    # Post-apply representation assert (Sol P1): the LIVE loader hash must equal
+    # the recorded result hash before ANY success is claimed. On mismatch no
+    # rollback is pretended: the apply intent stays PENDING (next integrate
+    # answers APPLY_AMBIGUOUS) and all forensic material is preserved.
+    try:
+        live_after = payload_content_hash(target)
+        hash_error = ""
+    except Exception as exc:
+        live_after, hash_error = "", f"{type(exc).__name__}: {exc}"
+    if result_hash and live_after != result_hash:
+        try:
+            from ouroboros.review_state import invalidate_advisory_after_mutation
+
+            invalidate_advisory_after_mutation(
+                pathlib.Path(str(getattr(ctx, "drive_root", "") or ".")),
+                mutation_root=target, changed_paths=ordered,
+                source_tool="integrate_delegated_patch")
+        except Exception:
+            pass
+        reconcile_err = ""
+        try:
+            # Final Sol scope P1: the payload DID mutate, so the stale-extension
+            # rule (R1 item 10) holds despite the mismatch — queue the reconcile
+            # marker while recording NO success and NO disposition.
+            from ouroboros.extension_reconcile_queue import request_extension_reconcile
+
+            request_extension_reconcile(state_root, skill_name,
+                                        reason="delegated_payload_apply_hash_mismatch",
+                                        source="worker")
+        except Exception as exc:
+            log.warning("extension reconcile request failed after apply-hash "
+                        "mismatch %s", rid, exc_info=True)
+            reconcile_err = f"{type(exc).__name__}: {exc}"
+        verdict_path = _write_verdict(
+            ctx, f"run_{rid}", outcome="apply_hash_mismatch", reason=reason,
+            files=touched, manifest=manifest, applied=True,
+            conflicts=[f"live={live_after[:12] or hash_error[:80]}",
+                       f"recorded={result_hash[:12]}"],
+            protected=[], target=str(target))
+        reconciled = (
+            "a stale-extension reconcile marker was still QUEUED (the payload DID "
+            "mutate; the server processes that marker asynchronously)"
+            if not reconcile_err else
+            "WARNING: the stale-extension reconcile marker could NOT be queued "
+            f"({reconcile_err}) — a stale enabled extension may remain live until "
+            "restart or a manual reconcile")
+        return (
+            f"⚠️ INTEGRATE_APPLY_HASH_MISMATCH: run {rid}'s patch WAS applied into "
+            f"{target}, but the live payload loader hash does not equal the recorded "
+            "result content hash — the applied bytes are NOT the reviewed candidate "
+            f"representation ({hash_error or 'hash divergence'}). No success is "
+            f"claimed: nothing was disposed; {reconciled}; the durable "
+            "apply intent stays PENDING, so the next integrate_delegated_patch "
+            "answers APPLY_AMBIGUOUS for explicit owner recovery "
+            "(decision='acknowledge_ambiguous' after inspection). The snapshot and "
+            f"the patch are preserved as forensic material. Verdict: "
+            f"{verdict_path or '(unwritten)'}.")
     return _finalize_payload_apply(
         ctx, rid=rid, reason=reason, target=target, touched=touched,
         ordered=ordered, manifest=manifest, state_root=state_root,

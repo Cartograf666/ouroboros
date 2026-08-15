@@ -152,7 +152,6 @@ BAND_PATHS = {
     "ouroboros/task_results.py": None,
     "ouroboros/task_status.py": None,
     "ouroboros/tools/browser.py": None,
-    "ouroboros/tools/delegate_integration.py": "R1 delegated skill-payload restoration: the exact-resource authority, standalone-snapshot capture adapter, and parent-only payload apply were deliberately placed here to keep delegate.py, delegate_custody.py, and subagent_integration.py under their 1600-line hard gates.",
     "ouroboros/tools/shell_guards.py": None,
     "ouroboros/tools/skill_exec.py": None,
     "ouroboros/utils.py": None,
