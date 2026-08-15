@@ -518,6 +518,47 @@ def test_deliver_unreviewed_salvage_builds_honest_message(tmp_path):
     assert queue.events == []
 
 
+def test_real_salvage_block_heals_placeholder_and_survives_replay(tmp_path):
+    """m6-preserved-key: a REAL salvage receipt carries preserved=True, so a
+    late real block heals an early placeholder, while a placeholder replay
+    still never clobbers a persisted real block (the original minor-6 pin)."""
+    from supervisor import terminal_delivery as td
+
+    write_task_result(tmp_path, "task-m6", "cancelled", result="stopped")
+    # An early placeholder persisted first (no durable copy existed yet).
+    td._persist_cancel_receipt(
+        tmp_path, "task-m6",
+        settled_status="cancelled", outcome="cancelled",
+        delivery_id="d-m6", preserved_path="", preview_omitted=0,
+    )
+    stored = load_task_result(tmp_path, "task-m6")
+    assert stored["cancel_receipt"]["salvage"] == {"path": "", "preserved": False}
+
+    # A late REAL salvage block replayed over it -> the real block WINS.
+    preserved = tmp_path / "m6-full.txt"
+    preserved.write_text("the whole salvaged text", encoding="utf-8")
+    td._persist_cancel_receipt(
+        tmp_path, "task-m6",
+        settled_status="cancelled", outcome="cancelled",
+        delivery_id="d-m6", preserved_path=str(preserved), preview_omitted=0,
+    )
+    stored = load_task_result(tmp_path, "task-m6")
+    salvage = stored["cancel_receipt"]["salvage"]
+    assert salvage["path"] == str(preserved)
+    assert salvage["preserved"] is True
+    assert salvage["sha256"] == hashlib.sha256(preserved.read_bytes()).hexdigest()
+    assert salvage["size_bytes"] == preserved.stat().st_size
+
+    # A placeholder replay after the real block -> the real block SURVIVES.
+    td._persist_cancel_receipt(
+        tmp_path, "task-m6",
+        settled_status="cancelled", outcome="cancelled",
+        delivery_id="d-m6", preserved_path="", preview_omitted=0,
+    )
+    stored = load_task_result(tmp_path, "task-m6")
+    assert stored["cancel_receipt"]["salvage"] == salvage
+
+
 def test_completed_outcome_reads_as_result_not_salvage(tmp_path):
     """GR2-12: the completed-vs-salvage branch keys on the TYPED stored status,
     never on the presentation prose in ``outcome``."""

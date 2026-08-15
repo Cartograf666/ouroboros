@@ -1057,6 +1057,9 @@ def _salvage_receipt(preserved_path: str) -> Dict[str, Any]:
         data = path.read_bytes()
         receipt["size_bytes"] = len(data)
         receipt["sha256"] = hashlib.sha256(data).hexdigest()
+        # The replay guard in _persist_cancel_receipt only lets a block with
+        # preserved=True heal an earlier placeholder — mark the REAL receipt.
+        receipt["preserved"] = True
     except Exception:
         receipt["unreadable"] = True
     return receipt
