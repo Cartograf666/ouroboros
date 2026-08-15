@@ -2516,6 +2516,19 @@ class LLMClient:
                     excess_chars = 0
             break
 
+        # Prune older conversation history if message count is high
+        if len(compacted) > 6:
+            sys_msgs = [m for m in compacted if m.get("role") == "system"]
+            non_sys = [m for m in compacted if m.get("role") != "system"]
+            compacted = sys_msgs + non_sys[-6:]
+
+        # Truncate giant individual non-system messages (e.g. huge file reads) for instant local prefill
+        for msg in compacted:
+            if msg.get("role") != "system":
+                c = msg.get("content")
+                if isinstance(c, str) and len(c) > 4000:
+                    msg["content"] = c[:2000] + "\n...[truncated for local context]...\n" + c[-2000:]
+
         # Ensure strict language consistency rule for local models
         for msg in compacted:
             if msg.get("role") == "system":
