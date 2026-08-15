@@ -656,26 +656,29 @@ class LocalModelManager:
         from ouroboros.utils import in_worker_process
 
         url = f"http://127.0.0.1:{self._port}/v1/models"
-        with requests.Session() as session:
-            if in_worker_process():
-                session.trust_env = False  # fork-safe + localhost never needs a proxy
-            resp = session.get(url, timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
-        models = data.get("data", [])
-        if not models:
-            return {"ok": False, "error": "No models loaded"}
+        try:
+            with requests.Session() as session:
+                if in_worker_process():
+                    session.trust_env = False  # fork-safe + localhost never needs a proxy
+                resp = session.get(url, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            models = data.get("data", [])
+            if not models:
+                return {"ok": False, "error": "No models loaded"}
 
-        model_info = models[0]
-        ctx = model_info.get("meta", {}).get("n_ctx_train", 0)
-        if not ctx:
-            ctx = model_info.get("context_window", 0)
+            model_info = models[0]
+            ctx = model_info.get("meta", {}).get("n_ctx_train", 0)
+            if not ctx:
+                ctx = model_info.get("context_window", 0)
 
-        return {
-            "ok": True,
-            "model_name": model_info.get("id", "unknown"),
-            "context_length": ctx,
-        }
+            return {
+                "ok": True,
+                "model_name": model_info.get("id", "unknown"),
+                "context_length": ctx,
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     def get_context_length(self) -> int:
         """Return cached context length, querying the server if needed."""
