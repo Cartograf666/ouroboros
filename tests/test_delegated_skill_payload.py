@@ -1152,6 +1152,10 @@ def test_child_added_gitattributes_and_crlf_file_transport_raw(tmp_path, monkeyp
     custody._CUSTODY.clear()
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows has no POSIX executable bit: os.chmod cannot flip 0644->0755, "
+           "so the mode-only divergence this test pins cannot exist there")
 def test_exec_bit_only_flip_is_typed_unreviewable_metadata_change(tmp_path, monkeypatch):
     """Sol P1 (reviewer repro c): 0644→0755 with identical bytes is invisible to
     the payload review hash — a typed unreviewable_metadata_change refusal, so
