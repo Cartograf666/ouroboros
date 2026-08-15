@@ -489,7 +489,7 @@ class LocalModelManager:
             if n_ctx > 65536:
                 log.warning("Requested n_ctx=%d exceeds safe Metal limit; clamping to 65536", n_ctx)
                 n_ctx = 65536
-            effective_ctx = n_ctx if n_ctx > 0 else 65536
+            effective_ctx = n_ctx if n_ctx > 0 else 32768
             self._context_length = effective_ctx
             cmd.extend(["--n_ctx", str(effective_ctx)])
 
