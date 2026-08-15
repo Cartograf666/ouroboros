@@ -26,9 +26,9 @@ const menuSrc = readFileSync(new URL('../modules/task_control_menu.js', import.m
 
 test('the dropdown offers exactly the three owner-decided actions, in order', () => {
     assert.deepEqual(taskControlActions(), [ACTION_FINALIZE, ACTION_HURRY, ACTION_STOP_NOW]);
-    assert.equal(TASK_CONTROL_LABELS[ACTION_FINALIZE], 'Подвести итог');
-    assert.equal(TASK_CONTROL_LABELS[ACTION_HURRY], 'Поторопить');
-    assert.equal(TASK_CONTROL_LABELS[ACTION_STOP_NOW], 'Остановить немедленно');
+    assert.equal(TASK_CONTROL_LABELS[ACTION_FINALIZE], 'Wrap up');
+    assert.equal(TASK_CONTROL_LABELS[ACTION_HURRY], 'Hurry up');
+    assert.equal(TASK_CONTROL_LABELS[ACTION_STOP_NOW], 'Stop now');
 });
 
 test('a pending cancel offers ONLY the hard escalation — hurry is never shown then', () => {
@@ -114,7 +114,7 @@ test('taskSoftStopPending distinguishes the soft episode from a hard cancel', ()
 
 test('the chat card re-offers the escalation during a pending soft stop', () => {
     // Q1 pinned at source: after a soft 202 the trigger is re-enabled (the
-    // pending menu offers only «Остановить немедленно»), while an immediate
+    // pending menu offers only "Stop now"), while an immediate
     // stop keeps the button disabled until the terminal frame.
     assert.match(chat, /record\.cancelPendingPolicy === 'finalize'/);
     assert.match(chat, /cancelPending: Boolean\(record\.cancelPendingPolicy\)/);

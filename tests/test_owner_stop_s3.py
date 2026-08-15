@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import json
 import pathlib
+import queue
 import threading
 import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from starlette.applications import Starlette
@@ -26,9 +28,10 @@ from starlette.testclient import TestClient
 
 import ouroboros.cancel_intents as ci
 import supervisor.owner_stop as ostop
+from ouroboros.config import OWNER_STOP_OUTER_CAP_SEC
 from ouroboros.gateway.tasks import api_task_cancel
 from ouroboros.outcomes import REASON_OWNER_REQUESTED_FINALIZATION
-from ouroboros.owner_mailbox import _mailbox_path
+from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, _mailbox_path, write_owner_message
 from ouroboros.task_results import load_task_result, write_task_result
 from ouroboros.utils import utc_now_iso
 
@@ -205,10 +208,20 @@ def test_owner_stop_active_matrix(tmp_path):
     assert ostop.owner_stop_active(
         {**intent, "state": ci.INTENT_CLAIMED}, now=now, grace_sec=120.0,
     ) is False
-    # The immutable deadline passed: the episode no longer owns the intent
-    # (the SWEEP feeds custody) — but the intent stays OPEN, so the
-    # enforcement HOLD deliberately keeps covering the task (MAJOR-B).
-    assert ostop.owner_stop_active(intent, now=now + 121.0, grace_sec=120.0) is False
+    # UNDRAINED (owner 1=A): the grace budget has not started ticking yet —
+    # only the outer request-time cap (2=A) bounds the episode, so 121s after
+    # the request the summary turn is still owed.
+    assert ostop.owner_stop_active(intent, now=now + 121.0, grace_sec=120.0) is True
+    # Past the outer cap the episode no longer owns the intent (the SWEEP
+    # feeds custody) — but the intent stays OPEN, so the enforcement HOLD
+    # deliberately keeps covering the task (MAJOR-B).
+    assert ostop.owner_stop_active(
+        intent, now=now + OWNER_STOP_OUTER_CAP_SEC + 1.0, grace_sec=120.0,
+    ) is False
+    # DRAINED: the grace budget runs from the delivery instant.
+    drained = {**intent, "control_drained_at": utc_now_iso()}
+    assert ostop.owner_stop_active(drained, now=now + 119.0, grace_sec=120.0) is True
+    assert ostop.owner_stop_active(drained, now=now + 121.0, grace_sec=120.0) is False
     assert ostop.owner_stop_open(intent) is True
     assert ostop.owner_stop_open({**intent, "state": ci.INTENT_CLAIMED}) is False
     # Immediate intents never form an episode and are never held.
@@ -273,10 +286,12 @@ def _expiry_enforcement_queue(monkeypatch, tmp_path, task_id, meta):
 
 
 def test_tool_call_spanning_expiry_keeps_the_episode_whole(tmp_path, monkeypatch):
-    """MAJOR-B trace (a): a PROGRESSING task whose tool call spans the episode
-    expiry must not have its episode withdrawn — no control revocation, no
-    false retraction toast — and the custody sweep performs the kill while the
-    undrained summary-turn control stays deliverable."""
+    """MAJOR-B trace (a): a PROGRESSING task whose tool call spans the old
+    request+grace horizon must not have its episode withdrawn — no control
+    revocation, no false retraction toast — and (owner 1=A) the sweep keeps
+    HOLDING while the summary-turn control is undrained, so the late drain
+    still buys the bounded final turn; custody kills only past the effective
+    (drain-anchored, outer-capped) deadline."""
     from supervisor import workers
 
     toasts = []
@@ -319,9 +334,17 @@ def test_tool_call_spanning_expiry_keeps_the_episode_whole(tmp_path, monkeypatch
 
     drained = drain_owner_entries(tmp_path, "t-span")
     assert [e["msg_id"] for e in drained] == [control_id]
-    # Custody remains the SOLE killer at expiry: the sweep hold releases past
-    # the deadline and the generic custody feed proceeds.
-    assert ostop.sweep_owner_stop_hold(q_isolated, "t-span", intent, now=expiry) is False
+    # THE LIVE DEFECT'S FIX (owner 1=A): 50s past the old request+120 horizon
+    # the control is STILL undrained (the tool call is in flight) — the sweep
+    # keeps holding instead of feeding custody, so the final turn stays owed.
+    assert ostop.sweep_owner_stop_hold(q_isolated, "t-span", intent, now=expiry) is True
+    # The loop finally drains the control as the tool call ends: the grace
+    # budget starts HERE, and custody becomes the killer only 120s later.
+    drain_iso = datetime.fromtimestamp(expiry, tz=timezone.utc).isoformat()
+    assert ci.mark_finalize_control_drained(tmp_path, "t-span", drained_at=drain_iso) is True
+    updated = ci.active_intent(tmp_path, "t-span")
+    assert ostop.sweep_owner_stop_hold(q_isolated, "t-span", updated, now=expiry + 119.0) is True
+    assert ostop.sweep_owner_stop_hold(q_isolated, "t-span", updated, now=expiry + 121.0) is False
 
 
 def test_non_progressing_task_at_expiry_is_not_reaped_or_cloned(tmp_path, monkeypatch):
@@ -445,11 +468,12 @@ def test_sweep_feeds_custody_for_settled_pending_or_expired_roots(tmp_path, monk
     assert ostop.sweep_owner_stop_hold(
         _fake_queue(tmp_path, {}), "t-pend", pending_intent, now=now,
     ) is False
-    # Expired deadline: the episode is over; the generic path proceeds.
+    # Expired OUTER cap (undrained control never delivered): the episode is
+    # over; the generic path proceeds.
     expired = dict(_graceful_intent(tmp_path, "t-exp"))
     assert ostop.sweep_owner_stop_hold(
         _fake_queue(tmp_path, {"t-exp": {"task": {"id": "t-exp", "chat_id": 0}}}),
-        "t-exp", expired, now=now + 400.0,
+        "t-exp", expired, now=now + OWNER_STOP_OUTER_CAP_SEC + 100.0,
     ) is False
     # And no episode was armed anywhere along the way.
     for tid in ("t-done", "t-pend", "t-exp"):
@@ -506,14 +530,145 @@ def test_owner_requested_finalization_is_a_best_effort_reason_and_bench_truncati
     assert REASON_OWNER_REQUESTED_FINALIZATION in RUNTIME_TRUNCATION_REASON_CODES
 
 
-def test_owner_stop_deadline_is_immutable_from_requested_at(tmp_path):
+def test_owner_stop_deadline_is_immutable_from_its_anchors(tmp_path):
     requested = utc_now_iso()
     intent = {"requested_at": requested, "stop_policy": ci.STOP_POLICY_FINALIZE}
     deadline = ostop.owner_stop_deadline_ts(intent, 120.0)
     assert deadline > 0
+    # UNDRAINED: the outer request-time cap is the only bound (owner 2=A).
+    assert deadline == ostop._requested_ts(intent) + OWNER_STOP_OUTER_CAP_SEC
     # Progress/heartbeats never extend it: the same intent yields the same deadline.
     assert ostop.owner_stop_deadline_ts(intent, 120.0) == deadline
     assert ostop.owner_stop_deadline_ts({}, 120.0) == 0.0
+    # DRAINED: min(drain + grace, request + outer cap) — grace from delivery…
+    drained = {**intent, "control_drained_at": requested}
+    assert ostop.owner_stop_deadline_ts(drained, 120.0) == (
+        ostop._requested_ts(intent) + 120.0
+    )
+    # …and a drain near the outer cap can never extend the episode past it.
+    late = datetime.fromtimestamp(
+        ostop._requested_ts(intent) + OWNER_STOP_OUTER_CAP_SEC - 10.0, tz=timezone.utc,
+    ).isoformat()
+    assert ostop.owner_stop_deadline_ts(
+        {**intent, "control_drained_at": late}, 120.0,
+    ) == deadline
+
+
+# ---------------------------------------------------------------------------
+# Drain-anchored episode budget + outer cap (owner decisions 2026-08-15, 1=A/2=A)
+# ---------------------------------------------------------------------------
+
+
+def _backdate_intent(tmp_path, task_id, *, seconds):
+    """Move the durable intent's requested_at into the past (test-only)."""
+    path = tmp_path / "state" / "cancel_intents.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    row = data["intents"][task_id]
+    row["requested_at"] = datetime.fromtimestamp(
+        time.time() - seconds, tz=timezone.utc,
+    ).isoformat()
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _production_drain(tmp_path, task_id):
+    """Run the PRODUCTION loop mailbox drain once with a fresh seen-set."""
+    import ouroboros.loop as loop_mod
+
+    return loop_mod._drain_incoming_messages(
+        [], queue.Queue(), tmp_path, task_id, None, set(),
+        owner_ctx=SimpleNamespace(budget_drive_root=str(tmp_path)),
+    )
+
+
+def test_late_drain_starts_the_episode_budget_at_delivery(tmp_path):
+    """(a) The control is drained LONG after the request (a blocking tool call
+    held the round boundary, the live 39e0f183 defect): the grace budget starts
+    at the drain, so the bounded summary turn still runs instead of the episode
+    expiring 120s after the button press."""
+    _graceful_intent(tmp_path, "t-drain")
+    _backdate_intent(tmp_path, "t-drain", seconds=300.0)
+    intent = ci.active_intent(tmp_path, "t-drain")
+    now = time.time()
+    # 300s after the request the episode is STILL active (old semantics: dead).
+    assert ostop.owner_stop_active(intent, now=now, grace_sec=120.0) is True
+    # The PRODUCTION loop drain delivers the control and stamps the intent.
+    control_id = ostop.owner_stop_control_id(intent)
+    assert write_owner_message(
+        tmp_path, REASON_OWNER_REQUESTED_FINALIZATION, "t-drain",
+        msg_id=control_id, kind=KIND_FINALIZE_NOW,
+    )
+    controls = _production_drain(tmp_path, "t-drain")
+    # The control reached the owner-stop rail (the ZERO-or-ONE-turn summary
+    # itself is pinned by the rail tests above)…
+    assert controls["finalize_now"] == REASON_OWNER_REQUESTED_FINALIZATION
+    updated = ci.active_intent(tmp_path, "t-drain")
+    drained_ts = ostop._drained_ts(updated)
+    assert drained_ts > 0
+    # …and the budget runs from the DRAIN: active 119s past it, over at 121s,
+    # after which the task settles through ordinary custody.
+    assert ostop.owner_stop_active(updated, now=drained_ts + 119.0, grace_sec=120.0) is True
+    assert ostop.owner_stop_active(updated, now=drained_ts + 121.0, grace_sec=120.0) is False
+
+
+def test_never_drained_episode_ends_at_the_outer_cap(tmp_path, monkeypatch):
+    """(b) The control is NEVER drained (a tool call hung for the whole
+    episode): the sweep keeps holding until the 10-minute outer cap, then
+    releases so the existing honest custody-cancel path applies unchanged."""
+    from supervisor import workers
+
+    monkeypatch.setattr(
+        workers, "get_event_q", lambda: SimpleNamespace(put=lambda _e: None),
+    )
+    intent = _graceful_intent(tmp_path, "t-hung")
+    now = time.time()
+    running = {"t-hung": {"task": {"id": "t-hung", "chat_id": 0}, "started_at": now}}
+    q_fake = _fake_queue(tmp_path, running)
+    # Undrained far past the old request+120 horizon: the sweep still HOLDS.
+    assert ostop.sweep_owner_stop_hold(q_fake, "t-hung", intent, now=now + 400.0) is True
+    # Past the outer 10-minute cap the hold releases: the generic custody feed
+    # (settled cancelled, receipt stop_reason preserved) proceeds unchanged.
+    assert ostop.sweep_owner_stop_hold(
+        q_fake, "t-hung", intent, now=now + OWNER_STOP_OUTER_CAP_SEC + 1.0,
+    ) is False
+    # The intent stays the single owner will for custody to settle.
+    assert ci.stop_policy(ci.active_intent(tmp_path, "t-hung")) == ci.STOP_POLICY_FINALIZE
+
+
+def test_crash_restart_preserves_both_deadlines(tmp_path):
+    """(c) A worker crash/restart between request and drain — or after the
+    drain — cannot resurrect an unlimited episode: both anchors live on the
+    durable intent, and a restart re-drain never moves the drain stamp."""
+    _graceful_intent(tmp_path, "t-crash")
+    _backdate_intent(tmp_path, "t-crash", seconds=100.0)
+    before = ci.active_intent(tmp_path, "t-crash")
+    outer_deadline = ostop.owner_stop_deadline_ts(before, 120.0)
+    # Pre-drain restart: the re-read durable intent yields the SAME deadline.
+    assert ostop.owner_stop_deadline_ts(
+        ci.active_intent(tmp_path, "t-crash"), 120.0,
+    ) == outer_deadline
+    # The first drain stamps the delivery durably…
+    control_id = ostop.owner_stop_control_id(before)
+    assert write_owner_message(
+        tmp_path, REASON_OWNER_REQUESTED_FINALIZATION, "t-crash",
+        msg_id=control_id, kind=KIND_FINALIZE_NOW,
+    )
+    _production_drain(tmp_path, "t-crash")
+    stamped = ci.active_intent(tmp_path, "t-crash")["control_drained_at"]
+    assert stamped
+    deadline = ostop.owner_stop_deadline_ts(ci.active_intent(tmp_path, "t-crash"), 120.0)
+    assert deadline == ostop._parse_ts(stamped) + 120.0        # under the outer cap
+    # …a post-crash re-drain (fresh seen set — the control is replayable until
+    # terminal cleanup) is a no-op on the stamp: FIRST DRAIN WINS…
+    _production_drain(tmp_path, "t-crash")
+    after = ci.active_intent(tmp_path, "t-crash")
+    assert after["control_drained_at"] == stamped
+    # …and even an explicit later stamp attempt is refused.
+    assert ci.mark_finalize_control_drained(
+        tmp_path, "t-crash", drained_at="2099-01-01T00:00:00+00:00",
+    ) is False
+    assert ostop.owner_stop_deadline_ts(
+        ci.active_intent(tmp_path, "t-crash"), 120.0,
+    ) == deadline
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ prevents.
 ## Naming and boundaries
 
 - Code identifiers, comments, docstrings, and commit messages are English.
+- User-facing product UI strings (web UI labels, toasts, chat/receipt copy) are English as well.
 - Follow PEP 8: modules and variables use `snake_case`, classes use
   `PascalCase`, and constants use `UPPER_SNAKE_CASE`.
 - Name the observable responsibility and authority, not the implementation

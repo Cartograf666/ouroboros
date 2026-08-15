@@ -295,6 +295,57 @@ def request_cancel(
     return dict(minted)
 
 
+def mark_finalize_control_drained(
+    drive_root: Any, task_id: str, *, drained_at: str = "",
+) -> bool:
+    """Record when the loop actually DELIVERED the finalize control to the model.
+
+    S3 owner decision (2026-08-15, 1=A): the finalization-episode budget starts
+    at DELIVERY (the round-boundary mailbox drain), not at the stop request —
+    a task inside a long blocking tool call still gets its bounded final turn.
+    The worker calls this from the production drain; the custody sweep reads
+    ``control_drained_at`` back to compute the effective episode deadline
+    (``supervisor/owner_stop.py``). FIRST DRAIN WINS: a restart re-drain (the
+    control is replayable until terminal cleanup) never moves the stamp, so a
+    worker crash cannot resurrect an unlimited episode. No-op for absent
+    intents and for non-finalize policies. Fail-soft: a projection failure
+    never breaks the round loop. Returns whether THIS call recorded the stamp.
+    """
+    try:
+        tid = _valid_task_id(task_id)
+    except ValueError:
+        return False
+    stamp = str(drained_at or "") or utc_now_iso()
+    recorded: Dict[str, Any] = {}
+
+    def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        recorded.clear()
+        intents = _load_intents(current)
+        row = intents.get(tid)
+        if not isinstance(row, dict) or stop_policy(row) != STOP_POLICY_FINALIZE:
+            return None
+        if str(row.get("control_drained_at") or ""):
+            return None  # first drain wins: the stamp is immutable
+        intents[tid] = {**row, "control_drained_at": stamp}
+        recorded.update(intents[tid])
+        return {"schema_version": _SCHEMA_VERSION, "intents": intents}
+
+    try:
+        update_json_locked(_intents_path(drive_root), _mutate)
+    except Exception:
+        log.debug(
+            "finalize-control drain stamp failed for %s", task_id, exc_info=True,
+        )
+        return False
+    if recorded:
+        _forensic(drive_root, {
+            "event": "finalize_control_drained", "task_id": tid,
+            "request_id": recorded.get("request_id"),
+            "control_drained_at": stamp,
+        })
+    return bool(recorded)
+
+
 def mark_intent_scope(drive_root: Any, task_id: str, scope: str) -> bool:
     """Widen an EXISTING intent's scope; never mints one. Returns whether it changed.
 

@@ -1529,7 +1529,7 @@ export function createChatInstance({
         btn.textContent = TASK_CONTROL_TRIGGER_LABEL;
         // S3 (Q2/HQ1): the trigger opens the three-action dropdown; dismissing
         // it continues the run. While a cancel intent is pending the menu
-        // offers ONLY the hard escalation («Остановить немедленно»).
+        // offers ONLY the hard escalation ("Stop now").
         btn.addEventListener('click', (event) => {
             event.stopPropagation();
             openTaskControlMenu(btn, {
@@ -1625,7 +1625,7 @@ export function createChatInstance({
             // Immediate: the card resolves via the existing task_done frames and
             // the button stays disabled until then. Soft: the hard escalation
             // must stay REACHABLE during the wait (Q1), so re-enable the trigger
-            // (the pending menu offers only «Остановить немедленно»).
+            // (the pending menu offers only "Stop now").
             if (btn && !record.finished && record.cancelPendingPolicy === 'finalize') {
                 btn.disabled = false;
             }

@@ -1,5 +1,5 @@
 // S3 stream-gate fixes: MAJOR-A (owner decision №8/Q3) — an owner-requested
-// finalization renders as the SUCCESS «Остановлено с итогом», never as
+// finalization renders as the SUCCESS "Stopped with summary", never as
 // "Finished with warnings" — and MINOR 7 (Q4) — the cancel_receipt system row
 // keeps the 📋 System render style, never assistant-styled.
 
@@ -39,15 +39,15 @@ test('owner-requested finalization classifies as done, not warn', () => {
     assert.equal(taskOutcomeSeverity({ ...softStop, reason_code: 'deadline' }), 'warn');
 });
 
-test('chat live card headline reads «Остановлено с итогом» with the owner marker', () => {
+test('chat live card headline reads "Stopped with summary" with the owner marker', () => {
     const view = summarizeChatLiveEvent(softStop);
     assert.equal(view.headline, OWNER_STOP_DONE_HEADLINE);
-    assert.equal(view.headline, 'Остановлено с итогом');
+    assert.equal(view.headline, 'Stopped with summary');
     assert.equal(view.phase, 'done');                     // NOT warn-styled
     assert.equal(view.terminal, true);
     assert.ok(view.meta.includes(OWNER_STOP_DETAIL_MARKER));
-    assert.match(OWNER_STOP_DETAIL_MARKER, /итог по просьбе владельца/);
-    assert.match(OWNER_STOP_DETAIL_MARKER, /лучший доступный результат/);
+    assert.match(OWNER_STOP_DETAIL_MARKER, /owner's request/);
+    assert.match(OWNER_STOP_DETAIL_MARKER, /best available result/);
     assert.doesNotMatch(view.headline, /Finished with warnings/);
 });
 

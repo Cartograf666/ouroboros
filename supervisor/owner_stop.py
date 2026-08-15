@@ -43,19 +43,53 @@ _CHILD_PROJECTION_MAX_ROWS = 20
 _CHILD_PROJECTION_PREVIEW_CHARS = 240
 
 
-def _requested_ts(intent: Dict[str, Any]) -> float:
-    raw = str(intent.get("requested_at") or "").replace("Z", "+00:00")
+def _parse_ts(raw: Any) -> float:
+    text = str(raw or "").replace("Z", "+00:00")
     try:
-        parsed = datetime.fromisoformat(raw)
+        parsed = datetime.fromisoformat(text)
         return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).timestamp()
     except (TypeError, ValueError):
         return 0.0
 
 
+def _requested_ts(intent: Dict[str, Any]) -> float:
+    return _parse_ts(intent.get("requested_at"))
+
+
+def _drained_ts(intent: Dict[str, Any]) -> float:
+    """When the loop actually DELIVERED the finalize control to the model.
+
+    Stamped by the worker's production mailbox drain
+    (``cancel_intents.mark_finalize_control_drained``, first drain wins) and
+    read back here by the sweep; 0.0 while the control is still undelivered.
+    """
+    return _parse_ts(intent.get("control_drained_at"))
+
+
 def owner_stop_deadline_ts(intent: Dict[str, Any], grace_sec: float) -> float:
-    """The episode's IMMUTABLE shared deadline: stop request time + grace SSOT."""
+    """The episode's EFFECTIVE deadline (owner decisions 2026-08-15, 1=A + 2=A).
+
+    Two immutable anchors, never extended by progress:
+
+    - before the finalize control is DELIVERED to the model (no durable drain
+      stamp yet): the OUTER safety cap alone applies — stop request time +
+      ``OWNER_STOP_OUTER_CAP_SEC`` — so a task inside a long blocking tool
+      call keeps its bounded final turn instead of being killed 120s after
+      the button press;
+    - after delivery: ``min(drain + grace SSOT, request + outer cap)`` — the
+      episode budget starts ticking at the drain, and the outer cap still
+      bounds the whole episode from the owner's request.
+    """
+    from ouroboros.config import OWNER_STOP_OUTER_CAP_SEC
+
     requested = _requested_ts(intent)
-    return (requested + float(grace_sec)) if requested else 0.0
+    if not requested:
+        return 0.0
+    outer_deadline = requested + float(OWNER_STOP_OUTER_CAP_SEC)
+    drained = _drained_ts(intent)
+    if drained:
+        return min(drained + float(grace_sec), outer_deadline)
+    return outer_deadline
 
 
 def owner_stop_open(intent: Any) -> bool:
@@ -79,13 +113,14 @@ def owner_stop_open(intent: Any) -> bool:
 
 
 def owner_stop_active(intent: Any, *, now: float, grace_sec: float) -> bool:
-    """Whether an OPEN graceful stop episode is still inside its grace window.
+    """Whether an OPEN graceful stop episode is still inside its window.
 
-    Active means OPEN (``owner_stop_open``) plus the shared deadline — measured
-    from the immutable ``requested_at`` — has not passed. Own/descendant
-    progress NEVER extends this deadline (§12.2 item 8). Consulted by the
-    SWEEP only (arm vs feed custody); the enforcement hold deliberately uses
-    the deadline-free ``owner_stop_open`` instead.
+    Active means OPEN (``owner_stop_open``) plus the EFFECTIVE deadline
+    (``owner_stop_deadline_ts``: outer cap before the control is delivered,
+    ``min(drain + grace, request + outer cap)`` after) has not passed.
+    Own/descendant progress NEVER extends either anchor (§12.2 item 8).
+    Consulted by the SWEEP only (arm vs feed custody); the enforcement hold
+    deliberately uses the deadline-free ``owner_stop_open`` instead.
     """
     if not owner_stop_open(intent):
         return False

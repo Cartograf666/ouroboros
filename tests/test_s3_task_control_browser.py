@@ -7,9 +7,9 @@ is asserted against the LIVE chat DOM, not a unit model.
 
 Covered here (both owner surfaces):
   * Chat live card: trigger label, the exact frozen three-action dropdown,
-    dismiss-continues-the-run, «Поторопить» = local toast + stable request_id
-    idempotent retry + ZERO new chat bubbles, «Подвести итог» = "Finalizing…"
-    card with the pending menu collapsed to «Остановить немедленно» only.
+    dismiss-continues-the-run, "Hurry up" = local toast + stable request_id
+    idempotent retry + ZERO new chat bubbles, "Wrap up" = "Finalizing…"
+    card with the pending menu collapsed to "Stop now" only.
   * Activity tab: the SAME shared dropdown (product-wide parity) with the same
     labels and the same no-chat hurry acknowledgement.
 
@@ -32,9 +32,9 @@ direct_server_with_data = _direct_server_with_data
 
 # The frozen owner wording (Q2/HQ1) — asserted verbatim, in order.
 EXPECTED_ACTIONS = [
-    ("finalize", "Подвести итог"),
-    ("hurry", "Поторопить"),
-    ("stop_now", "Остановить немедленно"),
+    ("finalize", "Wrap up"),
+    ("hurry", "Hurry up"),
+    ("stop_now", "Stop now"),
 ]
 
 # One fetch-seam stub shared by both surfaces: captures every mutating control
@@ -144,12 +144,12 @@ def test_s3_chat_card_dropdown_hurry_and_soft_stop(direct_server_with_data):
                 assert trigger.is_enabled()
                 assert page.evaluate("() => window.__s3Calls.length") == 0
 
-                # 2) «Поторопить»: typed control + LOCAL toast; the chat DOM
+                # 2) "Hurry up": typed control + LOCAL toast; the chat DOM
                 #    gains ZERO bubbles (HQ1's no-chat contract, live DOM).
                 trigger.click()
                 menu.wait_for(state="visible", timeout=10_000)
                 menu.locator('[data-task-control="hurry"]').click()
-                toast = page.locator(".toast", has_text="Поторопить: принято")
+                toast = page.locator(".toast", has_text="Hurry up: accepted")
                 toast.wait_for(state="visible", timeout=10_000)
                 calls = page.evaluate("() => window.__s3Calls")
                 assert [c["kind"] for c in calls] == ["hurry"]
@@ -163,7 +163,7 @@ def test_s3_chat_card_dropdown_hurry_and_soft_stop(direct_server_with_data):
                 trigger.click()
                 menu.wait_for(state="visible", timeout=10_000)
                 menu.locator('[data-task-control="hurry"]').click()
-                page.locator(".toast", has_text="уже принято").wait_for(
+                page.locator(".toast", has_text="already accepted").wait_for(
                     state="visible", timeout=10_000,
                 )
                 calls = page.evaluate("() => window.__s3Calls")
@@ -171,9 +171,9 @@ def test_s3_chat_card_dropdown_hurry_and_soft_stop(direct_server_with_data):
                 assert calls[1]["body"]["request_id"] == first_body["request_id"]
                 assert _chat_bubble_count(page) == bubbles_before
 
-                # 4) «Подвести итог»: 202 keeps the card honestly LIVE as
+                # 4) "Wrap up": 202 keeps the card honestly LIVE as
                 #    "Finalizing…", the trigger stays reachable, and the
-                #    pending menu offers ONLY «Остановить немедленно».
+                #    pending menu offers ONLY "Stop now".
                 trigger.click()
                 menu.wait_for(state="visible", timeout=10_000)
                 menu.locator('[data-task-control="finalize"]').click()
@@ -193,7 +193,7 @@ def test_s3_chat_card_dropdown_hurry_and_soft_stop(direct_server_with_data):
                 )
                 trigger.click()
                 menu.wait_for(state="visible", timeout=10_000)
-                assert _menu_labels(menu) == [("stop_now", "Остановить немедленно")]
+                assert _menu_labels(menu) == [("stop_now", "Stop now")]
                 page.keyboard.press("Escape")
                 menu.wait_for(state="detached", timeout=10_000)
                 assert _chat_bubble_count(page) == bubbles_before
@@ -236,7 +236,7 @@ def test_s3_activity_tab_dropdown_parity_and_no_chat_hurry(direct_server_with_da
                     ok: true,
                     queue: {
                         running: [{ id: taskId, type: 'task', runtime_sec: 42,
-                                    task: { id: taskId, title: 'Активная задача' } }],
+                                    task: { id: taskId, title: 'Active task' } }],
                         pending: [],
                     },
                 }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
@@ -276,12 +276,12 @@ def test_s3_activity_tab_dropdown_parity_and_no_chat_hurry(direct_server_with_da
                 menu.wait_for(state="visible", timeout=10_000)
                 assert _menu_labels(menu) == EXPECTED_ACTIONS
 
-                # «Поторопить» from Activity: local toast only, no chat bubble.
+                # "Hurry up" from Activity: local toast only, no chat bubble.
                 # Baseline captured HERE (post-navigation) so async startup
                 # bubbles (awaken banner, history replay) are already settled.
                 bubbles_before = _chat_bubble_count(page)
                 menu.locator('[data-task-control="hurry"]').click()
-                page.locator(".toast", has_text="Поторопить: принято").wait_for(
+                page.locator(".toast", has_text="Hurry up: accepted").wait_for(
                     state="visible", timeout=10_000,
                 )
                 calls = page.evaluate("() => window.__s3Calls")
@@ -289,7 +289,7 @@ def test_s3_activity_tab_dropdown_parity_and_no_chat_hurry(direct_server_with_da
                 assert set(calls[0]["body"].keys()) == {"request_id"}
                 assert _chat_bubble_count(page) == bubbles_before
                 # Belt-and-suspenders: no bubble anywhere mentions the control.
-                assert page.locator(".chat-bubble", has_text="Поторопить").count() == 0
+                assert page.locator(".chat-bubble", has_text="Hurry up").count() == 0
                 page.screenshot(
                     path=str(data_dir.parent / "s3-activity-control.png"), full_page=True,
                 )

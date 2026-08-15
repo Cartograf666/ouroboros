@@ -254,10 +254,10 @@ export function taskSoftStopPending(record) {
 // S3 (owner decision №8/Q3): an owner-requested finalization is a SUCCESSFUL
 // soft stop, not a warning — the owner asked for the summary and received the
 // best available result. The shared terminal seam renders the card headline
-// «Остановлено с итогом» WITHOUT warn styling, and the task details carry the
+// "Stopped with summary" WITHOUT warn styling, and the task details carry the
 // owner-request marker (spec §17).
-export const OWNER_STOP_DONE_HEADLINE = 'Остановлено с итогом';
-export const OWNER_STOP_DETAIL_MARKER = 'итог по просьбе владельца — лучший доступный результат';
+export const OWNER_STOP_DONE_HEADLINE = 'Stopped with summary';
+export const OWNER_STOP_DETAIL_MARKER = "summary at the owner's request — best available result";
 
 export function taskStoppedWithSummary(evt) {
     return String(evt?.reason_code || '') === 'owner_requested_finalization';

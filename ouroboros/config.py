@@ -38,6 +38,10 @@ RESTART_EXIT_CODE = 42
 PANIC_EXIT_CODE = 99
 AGENT_SERVER_PORT = 8765
 FINALIZATION_GRACE_DEFAULT_SEC = 120
+# Owner finalize-then-stop OUTER safety cap (S3, owner decisions 2026-08-15),
+# from the stop REQUEST; the grace budget above starts only at control DELIVERY
+# (the loop's mailbox drain). No summary by this cap -> honest custody cancel.
+OWNER_STOP_OUTER_CAP_SEC = 600
 # Cadence for intrinsic self-pacing checkpoints when a task has NO deadline_at
 # (e.g. headless benchmark runs). Advisory only — surfaces elapsed/rounds/cost so
 # the model can self-pace; it is not a stop gate. 0 disables.

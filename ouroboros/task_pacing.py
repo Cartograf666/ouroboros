@@ -48,6 +48,14 @@ _ACCEPTANCE_REVIEW_EWMA_ALPHA = 0.5
 # policy has one home (this module is the pacing-threshold SSOT).
 NANNY_REMINDER_ROUNDS = 8
 NANNY_REMINDER_USD = 2.0
+# Early FIRST reminder for a harness-dispatched task that has made NO delegate
+# verb call at all (owner-approved 2026-08-15): cheap children finish in 4-8
+# rounds under the dollar threshold and never heard the reminder — live E2E
+# showed 4 children with 0 delegate_start calls doing all research natively.
+# The first firing comes at this round count regardless of dollars; after any
+# delegate activity, and for every re-arm after the first firing, the ordinary
+# dual-axis thresholds above apply unchanged. Same SSOT home as its siblings.
+NANNY_FIRST_REMINDER_ROUNDS = 3
 _ACCEPTANCE_TIMING_EVENT = "task_acceptance_review_timing"
 log = logging.getLogger(__name__)
 

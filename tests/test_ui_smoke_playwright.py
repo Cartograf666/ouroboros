@@ -3806,7 +3806,7 @@ def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_serve
                 cancel_btn.click()
                 menu = live.locator('.task-control-menu')
                 menu.wait_for(state="visible", timeout=10_000)
-                assert "Подвести итог" in menu.inner_text()
+                assert "Wrap up" in menu.inner_text()
                 page.keyboard.press("Escape")
                 menu.wait_for(state="detached", timeout=10_000)
                 assert cancel_btn.is_enabled()

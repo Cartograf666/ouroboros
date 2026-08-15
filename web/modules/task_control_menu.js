@@ -1,12 +1,12 @@
 // S3 (Q2/HQ1): the shared three-action task stop/hurry control.
 //
-// One dropdown of exactly three owner-decided actions — «Подвести итог»
-// (soft finalize-then-stop), «Поторопить» (typed task-local hurry control,
-// NO chat message ever), «Остановить немедленно» (hard stop). Dismissing the
+// One dropdown of exactly three owner-decided actions — "Wrap up"
+// (soft finalize-then-stop), "Hurry up" (typed task-local hurry control,
+// NO chat message ever), "Stop now" (hard stop). Dismissing the
 // menu continues the run (the dismiss affordance replaced the old separate
 // "keep running" confirm). While a cancel intent is already pending, the only
-// offered action is «Остановить немедленно» — the monotonic escalation of the
-// SAME durable stop intent; «Поторопить» is refused then and never offered.
+// offered action is "Stop now" — the monotonic escalation of the
+// SAME durable stop intent; "Hurry up" is refused then and never offered.
 //
 // Chat live cards and the Activity tab consume the SAME module (owner
 // product-wide parity), so eligibility gates differ per surface but the
@@ -45,9 +45,9 @@ export function cancelRunEligibility({
 
 // Frozen owner wording (Q2/HQ1) — exact strings, never localized/reworded here.
 export const TASK_CONTROL_LABELS = Object.freeze({
-    [ACTION_FINALIZE]: 'Подвести итог',
-    [ACTION_HURRY]: 'Поторопить',
-    [ACTION_STOP_NOW]: 'Остановить немедленно',
+    [ACTION_FINALIZE]: 'Wrap up',
+    [ACTION_HURRY]: 'Hurry up',
+    [ACTION_STOP_NOW]: 'Stop now',
 });
 
 /**
@@ -116,7 +116,7 @@ export async function requestHurry(taskId) {
 }
 
 /**
- * The COMPLETE «Поторопить» flow both surfaces share (HQ1): submit the typed
+ * The COMPLETE "Hurry up" flow both surfaces share (HQ1): submit the typed
  * control, acknowledge via LOCAL toast only — success, idempotent duplicate,
  * or a visible typed refusal (e.g. a pending cancel). Never a chat message.
  * @param {string} taskId
@@ -126,11 +126,11 @@ export async function hurryTaskAction(taskId) {
     try {
         const ack = await requestHurry(taskId);
         showToast(ack?.duplicate
-            ? 'Поторопить: уже принято для этой задачи.'
-            : 'Поторопить: принято — задача ускорится на ближайшей границе.', 'ok');
+            ? 'Hurry up: already accepted for this task.'
+            : 'Hurry up: accepted — the task will speed up at the next boundary.', 'ok');
         return true;
     } catch (exc) {
-        showToast(`Поторопить: отказ — ${exc?.message || exc}`, 'error');
+        showToast(`Hurry up: refused — ${exc?.message || exc}`, 'error');
         return false;
     }
 }
