@@ -626,21 +626,25 @@ class LocalModelManager:
                 except Exception:
                     pass
 
-        if proc is None:
-            return
+        if proc is not None:
+            log.info("Stopping local model server (pid=%s)...", proc.pid)
+            terminate_process_tree(proc)
 
-        log.info("Stopping local model server (pid=%s)...", proc.pid)
-        terminate_process_tree(proc)
-
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            log.warning("Local model server did not exit, force-killing")
-            kill_process_tree(proc)
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                pass
+                log.warning("Local model server did not exit, force-killing")
+                kill_process_tree(proc)
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
+
+        try:
+            import subprocess
+            subprocess.run(["pkill", "-9", "-f", f"llama_cpp.server.*--port {self._port}"], capture_output=True)
+        except Exception:
+            pass
 
     def health_check(self) -> Dict[str, Any]:
         """Query local server health and loaded-model info."""

@@ -254,7 +254,7 @@ export function modelSelectionPayload(value) {
             OUROBOROS_MODEL: 'local-model',
             LOCAL_MODEL_SOURCE: source,
             LOCAL_MODEL_FILENAME: filename,
-            LOCAL_MODEL_CONTEXT_LENGTH: 131072,
+            LOCAL_MODEL_CONTEXT_LENGTH: 65536,
         };
     }
     return { OUROBOROS_MODEL: String(value || ''), USE_LOCAL_MAIN: false };
@@ -480,7 +480,7 @@ export function initChatModelControl({ root, showToast = () => {} } = {}) {
                         body: JSON.stringify({
                             source: path,
                             filename,
-                            n_ctx: 131072,
+                            n_ctx: 65536,
                             n_gpu_layers: -1,
                         }),
                     });
