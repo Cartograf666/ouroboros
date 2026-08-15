@@ -7177,6 +7177,10 @@ def run_llm_loop(
                 _merge_finalization_trace(llm_trace, forced_trace)
                 return text, accumulated_usage, llm_trace
 
+            from ouroboros.cancel_intent import cancel_pending
+            if task_id and cancel_pending(drive_root, str(task_id)):
+                return "⏹️ Действие остановлено пользователем.", accumulated_usage, llm_trace
+
             # Typed soft landing (v6.91): the ledger fence stays the untouched
             # backstop; an exhausted ceiling wraps up BEFORE spending a round.
             _soft_land = _soft_land_exhausted_ceiling(limit_ctx, cost_ceiling)

@@ -2850,6 +2850,37 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     opacity: 0.72;
 }
 
+.chat-stop-inline {
+    border: 1px solid rgba(239, 68, 68, 0.4);
+    background: rgba(239, 68, 68, 0.15);
+    color: #ef4444;
+    font-size: var(--composer-control-font-size);
+    font-weight: 700;
+    font-family: inherit;
+    cursor: pointer;
+    padding: 0 10px;
+    height: 100%;
+    border-radius: 999px;
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    box-shadow: var(--composer-control-shadow);
+    transition: color 0.18s, background 0.18s, border-color 0.18s, opacity 0.18s, transform 0.1s;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-right: 4px;
+}
+.chat-stop-inline:hover {
+    background: rgba(239, 68, 68, 0.3);
+    border-color: rgba(239, 68, 68, 0.7);
+    color: #f87171;
+    transform: scale(1.04);
+}
+.chat-stop-inline:active {
+    background: rgba(239, 68, 68, 0.4);
+    transform: scale(0.96);
+}
+
 .chat-send-inline {
     border: 1px solid rgba(232, 93, 111, 0.28);
     background: rgba(232, 93, 111, 0.08);

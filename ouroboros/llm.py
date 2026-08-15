@@ -1265,6 +1265,8 @@ class LLMClient:
     @staticmethod
     def _parse_provider_model(model: str) -> Tuple[str, str]:
         model_name = str(model or "").strip()
+        if model_name.startswith("local_discovered::") or model_name in ("local-model", "__local__") or model_name.endswith(" (local)"):
+            return "local", "local-model"
         for prefix, provider in PROVIDER_PREFIXES:
             if model_name.startswith(prefix):
                 return provider, model_name[len(prefix):].strip()
@@ -1284,11 +1286,26 @@ class LLMClient:
             return f"gigachat/{resolved_model}"
         if provider == "minimax":
             return f"minimax/{resolved_model}"
+        if provider == "local":
+            return "local/local-model"
         return f"openai-compatible/{resolved_model}"
 
     def _resolve_remote_target(self, model: str) -> Dict[str, Any]:
         provider, resolved_model = self._parse_provider_model(model)
         usage_model = self._qualified_model_name(provider, resolved_model)
+
+        if provider == "local":
+            port = int(os.environ.get("LOCAL_MODEL_PORT", "8766"))
+            return {
+                "provider": provider,
+                "resolved_model": "local-model",
+                "usage_model": usage_model,
+                "api_key": "local",
+                "base_url": f"http://127.0.0.1:{port}/v1",
+                "default_headers": {},
+                "supports_openrouter_extensions": False,
+                "supports_generation_cost": False,
+            }
 
         if provider == "openai":
             return {
@@ -2317,8 +2334,9 @@ class LLMClient:
         and GigaChat routes ignore it, and a provider rejection strips it via the
         optional-parameter retry — callers must keep a text-parse fallback."""
         messages = self._normalize_system_message_placement(messages)
+        is_local = use_local or str(model or "").startswith("local_discovered::") or str(model or "") in ("local-model", "__local__") or str(model or "").endswith(" (local)")
         with capture_attempt_ids() as attempt_ids:
-            if use_local:
+            if is_local:
                 message, usage = self._chat_local(
                     messages, tools, max_tokens, tool_choice, timeout=timeout,
                 )
@@ -2358,6 +2376,14 @@ class LLMClient:
         no_proxy = no_proxy or in_worker_process()
         if tools:
             raise ValueError("chat_async does not support tool calls")
+        is_local = str(model or "").startswith("local_discovered::") or str(model or "") in ("local-model", "__local__") or str(model or "").endswith(" (local)")
+        if is_local:
+            with capture_attempt_ids() as attempt_ids:
+                result = await asyncio.to_thread(
+                    self._chat_local, messages, tools, max_tokens, tool_choice, timeout,
+                )
+            result[1]["ledger_attempt_ids"] = list(attempt_ids)
+            return result
         target = self._resolve_remote_target(model)
         if target.get("provider") == "anthropic":
             with capture_attempt_ids() as attempt_ids:

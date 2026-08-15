@@ -531,6 +531,9 @@ export function createChatInstance({
                         <button class="chat-scroll-bottom-btn" id="chat-scroll-bottom" type="button" aria-label="Scroll to latest message" title="Scroll to latest message">
                             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M19 12l-7 7-7-7"/></svg>
                         </button>
+                        <button class="chat-stop-inline" id="chat-stop" type="button" title="Stop execution" style="display: none;">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
+                        </button>
                         <button class="chat-send-inline" id="chat-send" title="Send message">Send</button>
                     </div>
                 </div>
@@ -3914,6 +3917,35 @@ export function createChatInstance({
         if (swarmBtn) swarmBtn.dataset.armed = armed ? 'true' : 'false';
     }
 
+    const stopBtn = byId('stop');
+
+    function syncChatStopButton() {
+        if (!stopBtn) return;
+        const isBusy = sendGroup.dataset.busy === '1' || hasActiveLiveCard() || (typingEl && typingEl.style.display !== 'none');
+        stopBtn.style.display = isBusy ? 'inline-flex' : 'none';
+    }
+
+    async function stopActiveChatAction() {
+        if (stopBtn) stopBtn.disabled = true;
+        try {
+            await apiFetch('/api/chat/stop', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ chat_id: chatId }),
+            });
+            showToast('Stopping active chat action…', 'info');
+            hideTyping();
+            setSendBusy(false);
+        } catch (e) {
+            showToast(`Could not stop action: ${e?.message || e}`, 'error');
+        } finally {
+            if (stopBtn) stopBtn.disabled = false;
+            syncChatStopButton();
+        }
+    }
+
+    stopBtn?.addEventListener('click', stopActiveChatAction);
+
     function setSendBusy(busy, label = '') {
         sendGroup.dataset.busy = busy ? '1' : '0';
         sendBtn.disabled = busy;
@@ -3924,6 +3956,7 @@ export function createChatInstance({
             sendBtn.textContent = 'Send';
             sendBtn.title = 'Send message';
         }
+        syncChatStopButton();
     }
 
     swarmBtn?.addEventListener('click', () => setSwarm(!swarmArmed()));
@@ -4327,6 +4360,7 @@ export function createChatInstance({
             if (isNearBottom()) messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
         setStatus('thinking', 'Thinking...');
+        syncChatStopButton();
     }
 
     function hideTypingIndicatorOnly() {
@@ -4336,6 +4370,7 @@ export function createChatInstance({
             return;
         }
         typingEl.style.display = 'none';
+        syncChatStopButton();
     }
 
     function hideTyping() {
@@ -4343,6 +4378,7 @@ export function createChatInstance({
         if (statusBadge && ['Thinking...', 'Working...'].includes(statusBadge.textContent)) {
             setStatus('online', 'Online');
         }
+        syncChatStopButton();
     }
 
     const isKnownProjectFrame = (msg) => {
@@ -4470,6 +4506,14 @@ export function createChatInstance({
 
     onWs('outbound_sent', (evt) => {
         markPendingDelivered(evt?.clientMessageId || '');
+    });
+
+    onWs('chat_stopped', (evt) => {
+        if (Number(evt?.chat_id ?? 1) === chatId || isMain) {
+            hideTyping();
+            setSendBusy(false);
+            syncChatStopButton();
+        }
     });
 
     onWs('photo', (msg) => {

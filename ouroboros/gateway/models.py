@@ -473,6 +473,14 @@ async def api_local_model_test(request: Request) -> JSONResponse:
         return json_exception(e)
 
 
+async def api_local_model_discovered(_request: Request) -> JSONResponse:
+    try:
+        from ouroboros.local_model import discover_local_models
+        return JSONResponse({"models": discover_local_models()})
+    except Exception as e:
+        return json_exception(e)
+
+
 async def api_openai_compatible_models(request: Request) -> JSONResponse:
     """Proxy GET {baseUrl}/models so the onboarding wizard avoids browser CORS limits."""
     try:

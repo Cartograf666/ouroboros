@@ -33,6 +33,8 @@ PROVIDER_PREFIXES: tuple[tuple[str, str], ...] = (
     ("gigachat::", "gigachat"),
     ("openai-compatible::", "openai-compatible"),
     ("openrouter::", "openrouter"),
+    ("local_discovered::", "local"),
+    ("local::", "local"),
 )
 
 # Primary credential env var per provider (single-key providers).
@@ -42,6 +44,7 @@ PROVIDER_ENV_KEYS: dict[str, str] = {
     "minimax": "MINIMAX_API_KEY",
     "cloudru": "CLOUDRU_FOUNDATION_MODELS_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
+    "local": "",
 }
 
 # Settings whose content-bound grant lets an external skill bypass the core LLM
@@ -101,7 +104,7 @@ CLAUDE_SDK_MODEL_SETTING_KEYS: tuple[str, ...] = ("CLAUDE_CODE_MODEL", "CLAUDE_A
 def provider_for_model(model: str) -> str:
     """Return the execution provider for a model id (``local`` for local lanes)."""
     name = str(model or "").strip()
-    if name.endswith(" (local)"):
+    if name.endswith(" (local)") or name in ("local-model", "__local__") or name.startswith("local_discovered::") or name.startswith("local::"):
         return "local"
     for prefix, provider in PROVIDER_PREFIXES:
         if name.startswith(prefix):

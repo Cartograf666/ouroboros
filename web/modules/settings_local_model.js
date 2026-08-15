@@ -8,7 +8,7 @@ function readLocalModelBody() {
         filename: document.getElementById('s-local-filename').value.trim(),
         port: parseInt(document.getElementById('s-local-port').value, 10) || 8766,
         n_gpu_layers: parseInt(document.getElementById('s-local-gpu-layers').value, 10),
-        n_ctx: parseInt(document.getElementById('s-local-ctx').value, 10) || 16384,
+        n_ctx: parseInt(document.getElementById('s-local-ctx').value, 10) || 131072,
         chat_format: document.getElementById('s-local-chat-format').value.trim(),
     };
 }
@@ -45,6 +45,8 @@ function setProgressBar(fraction) {
 }
 
 export function bindLocalModelControls({ state }) {
+    let _discoveredLoaded = false;
+
     async function updateLocalStatus() {
         if (state.activePage !== 'settings') return;
         try {
@@ -56,6 +58,17 @@ export function bindLocalModelControls({ state }) {
             const isInstalling = d.runtime_status === 'installing';
             const isDownloading = d.status === 'downloading';
             const runtimeMissing = d.runtime_status === 'missing' || d.runtime_status === 'install_error';
+
+            const presetsEl = document.getElementById('s-local-presets');
+            if (presetsEl && Array.isArray(d.discovered_models) && d.discovered_models.length > 0 && !_discoveredLoaded) {
+                _discoveredLoaded = true;
+                const options = ['<option value="">-- Select a discovered GGUF model --</option>'];
+                for (const m of d.discovered_models) {
+                    const sizeStr = m.size_gb ? ` (${m.size_gb} GB)` : '';
+                    options.push(`<option value="${m.path}" data-source="${m.source}" data-filename="${m.filename || ''}">${m.name}${sizeStr}</option>`);
+                }
+                presetsEl.innerHTML = options.join('');
+            }
 
             let text = 'Status: ' + (d.status || 'offline').charAt(0).toUpperCase() + (d.status || 'offline').slice(1);
             if (isReady && d.context_length) text += ` (ctx: ${d.context_length})`;
@@ -106,34 +119,51 @@ export function bindLocalModelControls({ state }) {
         } catch {}
     }
 
+    const presetsSelect = document.getElementById('s-local-presets');
+    if (presetsSelect) {
+        presetsSelect.addEventListener('change', () => {
+            const opt = presetsSelect.selectedOptions[0];
+            if (!opt || !opt.value) return;
+            const src = opt.dataset.source || opt.value;
+            const fn = opt.dataset.filename || '';
+            const srcInput = document.getElementById('s-local-source');
+            const fnInput = document.getElementById('s-local-filename');
+            const ctxInput = document.getElementById('s-local-ctx');
+            const gpuInput = document.getElementById('s-local-gpu-layers');
+            if (srcInput) srcInput.value = src;
+            if (fnInput) fnInput.value = fn;
+            if (ctxInput) ctxInput.value = '131072';
+            if (gpuInput) gpuInput.value = '-1';
+            showToast(`Selected ${opt.textContent.trim()} (Context: 131k / GPU: Full Metal)`, 'info');
+        });
+    }
+
     async function triggerStart() {
         const body = readLocalModelBody();
-        if (!body.source) {
-            showToast('Enter a model source (HuggingFace repo ID or local path)', 'error');
-            return;
-        }
         setTestResult('');
-        setProgressBar(null);
+        setLocalStatus('Starting local model server...', 'muted');
         try {
             const resp = await apiFetch('/api/local-model/start', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(body),
             });
-            const data = await resp.json();
-            if (resp.status === 412 && data.error === 'runtime_missing') {
+            const r = await resp.json();
+            if (r.runtime_status === 'missing') {
+                setLocalStatus('Status: Runtime not installed', 'warn');
                 setInstallBtnVisible(true);
-                setLocalStatus('Local runtime not installed. Click "Install Local Runtime" below.', 'error');
-                setTestResult(
-                    'llama-cpp-python is not installed.\n' +
-                    'Click "Install Local Runtime" to install it automatically,\n' +
-                    'then the model will start automatically.\n\n' +
-                    'Manual install: ' + (data.hint || 'pip install llama-cpp-python[server]'),
-                    'error'
-                );
-            } else if (data.error) {
-                setLocalStatus('Error: ' + data.error, 'error');
+                return;
+            }
+            if (r.runtime_status === 'installing') {
+                state._pendingLocalStart = true;
+                setLocalStatus('Status: Installing local runtime…', 'muted');
+                setInstallBtnVisible(false);
+                return;
+            }
+            if (r.error) {
+                setLocalStatus('Error: ' + r.error, 'error');
             } else {
+                setLocalStatus('Starting...', 'muted');
                 updateLocalStatus();
             }
         } catch (e) {

@@ -947,7 +947,25 @@ async def api_evolution_data(request: Request) -> JSONResponse:
     })
 
 
+async def api_chat_stop(request: Request) -> JSONResponse:
+    try:
+        data = {}
+        try:
+            data = await request.json()
+        except Exception:
+            pass
+        chat_id = int(data.get("chat_id", 1)) if isinstance(data, dict) else 1
+        from supervisor.workers import cancel_active_chat_turn
+        stopped = cancel_active_chat_turn(chat_id)
+        from ouroboros.gateway.ws import broadcast_event
+        broadcast_event({"type": "chat_stopped", "chat_id": chat_id})
+        return JSONResponse({"status": "stopped", "chat_id": chat_id, "active_task_cancelled": stopped})
+    except Exception as e:
+        return json_exception(e)
+
+
 __all__ = [
+    "api_chat_stop",
     "api_command",
     "api_evolution_data",
     "api_git_log",

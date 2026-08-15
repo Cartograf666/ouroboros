@@ -57,6 +57,60 @@ _manager: Optional[LocalModelManager] = None
 _manager_lock = threading.Lock()
 
 
+def discover_local_models() -> list[dict[str, Any]]:
+    """Scan HuggingFace cache and local directories for available .gguf model files."""
+    discovered: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+
+    search_roots = [
+        pathlib.Path.home() / ".cache" / "huggingface" / "hub",
+        pathlib.Path.home() / "models",
+        pathlib.Path.home() / "Downloads",
+        pathlib.Path.home() / ".ollama" / "models",
+    ]
+
+    for root in search_roots:
+        if not root.exists():
+            continue
+        try:
+            for p in root.rglob("*.gguf"):
+                if not p.is_file():
+                    continue
+                resolved_path = str(p.resolve())
+                if resolved_path in seen_paths:
+                    continue
+                seen_paths.add(resolved_path)
+
+                size_gb = round(p.stat().st_size / (1024 ** 3), 2)
+                name = p.stem
+
+                # Infer source repo if in HF cache
+                source = str(p.parent.parent.name) if "models--" in str(p) else name
+                if source.startswith("models--"):
+                    parts = source[len("models--"):].split("--")
+                    source = "/".join(parts) if len(parts) > 1 else parts[0]
+
+                # Clean up name from snapshots/blobs
+                if "snapshots" in str(p) or "blobs" in str(p):
+                    for parent in p.parents:
+                        if parent.name.startswith("models--"):
+                            hf_name = parent.name[len("models--"):].replace("--", "/")
+                            name = hf_name.split("/")[-1]
+                            break
+
+                discovered.append({
+                    "name": name,
+                    "filename": p.name,
+                    "path": resolved_path,
+                    "source": source,
+                    "size_gb": size_gb,
+                })
+        except Exception:
+            continue
+
+    return sorted(discovered, key=lambda m: m["name"])
+
+
 def get_manager() -> LocalModelManager:
     global _manager
     with _manager_lock:
@@ -113,6 +167,7 @@ class LocalModelManager:
             "download_progress": self._download_progress,
             "runtime_status": self._runtime_status,
             "runtime_install_log": self._runtime_install_log[-500:] if self._runtime_install_log else "",
+            "discovered_models": discover_local_models(),
         }
 
     def check_runtime(self) -> bool:

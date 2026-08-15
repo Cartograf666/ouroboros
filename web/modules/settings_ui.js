@@ -720,7 +720,13 @@ export function renderSettingsPage() {
 
                     <div class="form-section">
                         <h3>Local Model Runtime</h3>
-                        <div class="settings-section-copy">Only fill this in when you want Ouroboros to start and route to a GGUF model on this machine.</div>
+                        <div class="settings-section-copy">Select an automatically discovered GGUF model or enter custom HuggingFace repository details.</div>
+                        <div class="form-field" style="margin-bottom: 14px;">
+                            <label>Discovered Local Models (1-Click Select)</label>
+                            <select id="s-local-presets" style="width: 100%; padding: 7px 10px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--input-bg); color: var(--text);">
+                                <option value="">-- Scanning for local GGUF models... --</option>
+                            </select>
+                        </div>
                         <div class="form-grid two">
                             <div class="form-field">
                                 <label>Model Source</label>
@@ -742,7 +748,7 @@ export function renderSettingsPage() {
                             </div>
                             <div class="form-field">
                                 <label>Context Length</label>
-                                <input id="s-local-ctx" type="number" value="16384">
+                                <input id="s-local-ctx" type="number" value="131072">
                             </div>
                             <div class="form-field">
                                 <label>Chat Format</label>

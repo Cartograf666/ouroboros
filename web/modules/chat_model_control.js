@@ -170,6 +170,26 @@ export function buildModelChoices({ settings = {}, catalogItems = [], localStatu
         });
         seen.add(LOCAL_VALUE);
     }
+    if (Array.isArray(localStatus?.discovered_models)) {
+        for (const dm of localStatus.discovered_models) {
+            const dmName = dm.name || basenameWithoutGguf(dm.filename || dm.path);
+            const isCurrent = (localStatus?.model_name && dmName.toLowerCase().includes(localStatus.model_name.toLowerCase())) ||
+                              (localStatus?.model_path && localStatus.model_path === dm.path);
+            const val = `local_discovered::${dm.path}::${dm.source || ''}::${dm.filename || ''}`;
+            if (!isCurrent && !seen.has(val)) {
+                choices.push({
+                    value: val,
+                    label: `Local · ${dmName.replace('-Q4_K_M', '')}`,
+                    status: {
+                        state: 'available',
+                        detail: `${dm.size_gb ? dm.size_gb + ' GB · ' : ''}Local GGUF model on disk; click to start`,
+                        remaining: null, resetAt: '', limit: null, metric: '',
+                    },
+                });
+                seen.add(val);
+            }
+        }
+    }
     const fallbackIsLocal = ['1', 'true', 'yes', 'on'].includes(
         String(settings?.USE_LOCAL_FALLBACK || '').toLowerCase(),
     );
@@ -196,7 +216,20 @@ export function buildModelChoices({ settings = {}, catalogItems = [], localStatu
 }
 
 export function modelSelectionPayload(value) {
-    if (value === LOCAL_VALUE) return { USE_LOCAL_MAIN: true };
+    if (value === LOCAL_VALUE) return { USE_LOCAL_MAIN: true, OUROBOROS_MODEL: 'local-model' };
+    if (typeof value === 'string' && value.startsWith('local_discovered::')) {
+        const parts = value.split('::');
+        const path = parts[1] || '';
+        const source = parts[2] || path;
+        const filename = parts[3] || '';
+        return {
+            USE_LOCAL_MAIN: true,
+            OUROBOROS_MODEL: 'local-model',
+            LOCAL_MODEL_SOURCE: source,
+            LOCAL_MODEL_FILENAME: filename,
+            LOCAL_MODEL_CONTEXT_LENGTH: 131072,
+        };
+    }
     return { OUROBOROS_MODEL: String(value || ''), USE_LOCAL_MAIN: false };
 }
 
@@ -383,14 +416,40 @@ export function initChatModelControl({ root, showToast = () => {} } = {}) {
         }
         select.disabled = true;
         try {
+            const payloadBody = modelSelectionPayload(next);
             const response = await apiFetch('/api/settings', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(modelSelectionPayload(next)),
+                body: JSON.stringify(payloadBody),
             });
             const payload = await responseJson(response);
             if (!response.ok) throw new Error(payload.error || 'Could not save the model');
-            settings = { ...settings, ...modelSelectionPayload(next) };
+            settings = { ...settings, ...payloadBody };
+
+            if (typeof next === 'string' && next.startsWith('local_discovered::')) {
+                const parts = next.split('::');
+                const path = parts[1] || '';
+                const source = parts[2] || path;
+                const filename = parts[3] || '';
+                try {
+                    await apiFetch('/api/local-model/stop', { method: 'POST' });
+                } catch {}
+                try {
+                    await apiFetch('/api/local-model/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            source,
+                            filename,
+                            n_ctx: 131072,
+                            n_gpu_layers: -1,
+                        }),
+                    });
+                } catch (e) {
+                    console.warn('Auto-start local server note:', e);
+                }
+            }
+
             render();
             showToast('Model changed for new tasks.', 'success');
         } catch (error) {

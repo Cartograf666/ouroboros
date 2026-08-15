@@ -967,6 +967,36 @@ def ensure_project_scope(evt: dict, ctx: Any) -> None:
         log.debug("ensure_project_scope: project registration failed for %s", pid, exc_info=True)
 
 
+_active_chat_task_ids: dict[int, str] = {}
+_active_chat_task_lock = threading.Lock()
+
+
+def cancel_active_chat_turn(chat_id: int) -> bool:
+    """Cancel the currently running direct/ephemeral chat task for a chat_id."""
+    with _active_chat_task_lock:
+        task_id = _active_chat_task_ids.get(chat_id)
+    cancelled = False
+    if task_id:
+        try:
+            from ouroboros.cancel_intent import request_cancel
+            request_cancel(
+                DRIVE_ROOT,
+                task_id,
+                source="user_stop",
+                reason="User clicked Stop button in chat.",
+            )
+            cancelled = True
+        except Exception:
+            log.warning("cancel_active_chat_turn: cancel intent write failed for %s", task_id, exc_info=True)
+
+    try:
+        from ouroboros.agent_task_pipeline import cancel_running_tasks_for_chat
+        cancel_running_tasks_for_chat(DRIVE_ROOT, chat_id, reason="User clicked Stop button in chat.")
+    except Exception:
+        pass
+    return cancelled
+
+
 def handle_chat_direct(
     chat_id: int,
     text: str,
@@ -1126,9 +1156,16 @@ def _run_chat_task(
                 DRIVE_ROOT, str(task["id"]), task["text"], broadcast=_broadcast_task_named
             )
         attach_task_contract(task)
-        events = agent.handle_task(task)
-        for e in events:
-            get_event_q().put(e)
+        with _active_chat_task_lock:
+            _active_chat_task_ids[chat_id] = str(task["id"])
+        try:
+            events = agent.handle_task(task)
+            for e in events:
+                get_event_q().put(e)
+        finally:
+            with _active_chat_task_lock:
+                if _active_chat_task_ids.get(chat_id) == str(task["id"]):
+                    _active_chat_task_ids.pop(chat_id, None)
     except Exception as e:
         import traceback
         err_msg = f"⚠️ Error: {type(e).__name__}: {e}"

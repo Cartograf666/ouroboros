@@ -122,7 +122,7 @@ test('model choices retain configured routes, dedupe the catalog, and add the ru
 });
 
 test('selection payload switches the existing main route instead of creating a parallel setting', () => {
-    assert.deepEqual(modelSelectionPayload('__local__'), { USE_LOCAL_MAIN: true });
+    assert.deepEqual(modelSelectionPayload('__local__'), { USE_LOCAL_MAIN: true, OUROBOROS_MODEL: 'local-model' });
     assert.deepEqual(modelSelectionPayload('openai-compatible::gemini-3.5-flash'), {
         OUROBOROS_MODEL: 'openai-compatible::gemini-3.5-flash',
         USE_LOCAL_MAIN: false,
