@@ -2287,6 +2287,51 @@ button.chat-file:hover,
     font-size: 13px;
     line-height: 1.5;
 }
+.chat-thinking-block {
+    margin: 6px 0 10px 0;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.22);
+    overflow: hidden;
+}
+.chat-thinking-summary {
+    cursor: pointer;
+    user-select: none;
+    padding: 6px 10px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-muted, #888);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: rgba(255, 255, 255, 0.03);
+    transition: background 0.15s ease, color 0.15s ease;
+}
+.chat-thinking-summary:hover {
+    color: var(--text-primary, #ddd);
+    background: rgba(255, 255, 255, 0.06);
+}
+.chat-thinking-summary::-webkit-details-marker {
+    display: none;
+}
+.chat-thinking-summary::before {
+    content: "▶";
+    font-size: 9px;
+    transition: transform 0.15s ease;
+    display: inline-block;
+}
+.chat-thinking-block[open] > .chat-thinking-summary::before {
+    transform: rotate(90deg);
+}
+.chat-thinking-body {
+    padding: 8px 12px 10px 12px;
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: rgba(255, 255, 255, 0.65);
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    word-break: break-word;
+    font-style: italic;
+}
 .chat-bubble .message code {
     font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
     font-size: 13px;

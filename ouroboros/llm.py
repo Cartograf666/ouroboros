@@ -2516,6 +2516,22 @@ class LLMClient:
                     excess_chars = 0
             break
 
+        # Ensure strict language consistency rule for local models
+        for msg in compacted:
+            if msg.get("role") == "system":
+                content = msg.get("content")
+                lang_rule = "\n\nCRITICAL: Always respond in the same language as the user's message (e.g. if the user writes in Russian, you MUST reply in Russian)."
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            if "CRITICAL: Always respond in the same language" not in str(block.get("text", "")):
+                                block["text"] = str(block.get("text", "")) + lang_rule
+                            break
+                elif isinstance(content, str):
+                    if "CRITICAL: Always respond in the same language" not in content:
+                        msg["content"] = content + lang_rule
+                break
+
         return compacted
 
     def _chat_local(
