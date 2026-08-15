@@ -1,4 +1,4 @@
-"""Agent accounts HTTP surface (D30): five THIN proxies, zero auth logic.
+"""Agent accounts HTTP surface (D30): six THIN proxies, zero auth logic.
 
 Ouroboros's own Claudexor daemon (``claudexor_daemon.py``) owns every account
 fact — profiles, login jobs, device-code custody, the two honest verification
@@ -6,8 +6,21 @@ statuses, quota windows. The browser cannot talk to the daemon directly (its
 control plane is loopback-Origin-guarded and bearer-token'd; the token must
 never reach a page), so these handlers translate: status aggregation, the
 owner-initiated daemon wake behind the panel's Refresh button, login job
-create, login job read/cancel/input, and credential-profile removal. Nothing
-here interprets a credential and nothing here stores one.
+create, login job read/cancel/input, login job termination reconcile, and
+credential-profile removal. Nothing here interprets a credential and nothing
+here stores one.
+
+Login-job wire contract (frozen, ``ClaudexorLoginJobResponse`` /
+``ClaudexorLoginJobProblem`` in ``gateway/contracts.py``): every operation
+answers ONE envelope with ONE top-level bare ``job`` — create adds its
+create-only metadata beside it, input keeps its ``ok`` bit, and the snapshot
+poll passes the daemon's own ``{job, cursor, sequence, deviceCode?}`` envelope
+through VERBATIM (it already has that shape; wrapping it again was issue #124's
+double ``job.job``). Daemon 404/410 job-absence verdicts pass through for
+poll/cancel/reconcile; typed 409 passes through only for input and reconcile,
+with stable ``code`` plus ``required_actions`` when the engine names the
+continuation. Transport failure, daemon 5xx, and untyped poll/cancel conflicts
+collapse to this proxy's honest 503.
 
 Login shapes ("красота-сначала", D30): a structural link/device-code card
 wherever the engine can host the flow itself — codex device-code today, and
@@ -396,6 +409,22 @@ def _build_login_request(harness: str, profile_id: str, transport: str,
     return request
 
 
+def _login_job_response(job: Dict[str, Any], **metadata: Any) -> Dict[str, Any]:
+    """The ONE producer of the browser login-job success envelope
+    (``ClaudexorLoginJobResponse``): exactly one top-level bare ``job``,
+    operation metadata beside it, never another envelope nested under ``job``.
+
+    Every operation that receives a BARE ``ControlSetupJob`` from the daemon
+    (create, cancel, input, reconcile) wraps it here, once. The snapshot poll
+    deliberately does NOT pass through this producer: the daemon's snapshot
+    answer is ALREADY the canonical ``{job, cursor, sequence, deviceCode?}``
+    envelope, and re-wrapping it produced issue #124's double ``job.job``.
+    """
+    out: Dict[str, Any] = {"job": job}
+    out.update(metadata)
+    return out
+
+
 def _login_create(body: Dict[str, Any]) -> Dict[str, Any]:
     from ouroboros.claudexor_daemon import attach_login_command, ensure_owned_gateway
 
@@ -433,13 +462,13 @@ def _login_create(body: Dict[str, Any]) -> Dict[str, Any]:
             disclosure_native=disclosure_native)
         job = gateway.setup_job_create(request_body)
     job_id = str(job.get("id") or job.get("jobId") or "")
-    out = {"job": job, "job_id": job_id, "disclosure_native": disclosure_native}
+    metadata: Dict[str, Any] = {"job_id": job_id, "disclosure_native": disclosure_native}
     if request_body.get("transport") == "client_pty" and job_id:
         # The fallback card's copy-paste command, run OUTSIDE this UI. Read
         # from the REQUEST actually sent (the non-codex default is forced
         # inside the builder, not in the caller's local variable).
-        out["attach_command"] = attach_login_command(job_id)
-    return out
+        metadata["attach_command"] = attach_login_command(job_id)
+    return _login_job_response(job, **metadata)
 
 
 async def api_claudexor_login(request: Request) -> JSONResponse:
@@ -459,7 +488,14 @@ async def api_claudexor_login(request: Request) -> JSONResponse:
 
 
 def _login_job_call(job_id: str, op: str, value: str = "") -> Dict[str, Any]:
-    from ouroboros.claudexor_daemon import attach_login_command, owned_config_dir
+    """The one internal job-operation dispatcher: EXPLICIT ``op``, never the
+    HTTP method or path spelling, decides what runs. Both job-scoped handlers
+    call it, so the browser envelope has one producer per shape: snapshot is
+    the daemon's canonical envelope VERBATIM (no re-wrap — issue #124 — and no
+    poll-time ``attach_command``: the card deliberately trusts attach metadata
+    only from create); every bare-job answer is wrapped exactly once by
+    ``_login_job_response``."""
+    from ouroboros.claudexor_daemon import owned_config_dir
     from ouroboros.gateways.claudexor import ClaudexorGateway, discover_daemon_at
 
     endpoint = discover_daemon_at(owned_config_dir())
@@ -467,18 +503,64 @@ def _login_job_call(job_id: str, op: str, value: str = "") -> Dict[str, Any]:
         gateway.handshake()
         answer = gateway.setup_job_call(job_id, op, value=value)
     if op == "snapshot":
-        return {"job": answer, "attach_command": attach_login_command(job_id)}
+        return answer
     if op == "input":
-        return {"ok": True, "job": answer}
-    return answer
+        return _login_job_response(answer, ok=True)
+    return _login_job_response(answer)
+
+
+def _login_job_problem(exc: Any, op: str) -> JSONResponse:
+    """Translate one typed daemon refusal into the browser problem envelope
+    (``ClaudexorLoginJobProblem``): required ``error``, optional stable
+    ``code``, optional bounded ``required_actions``.
+
+    The daemon's own job VERDICTS pass through with their status instead of
+    being rewritten as 503: 404/410 mean the job is no longer available —
+    an answer about the JOB record, never about the login outcome or the old
+    process (#151 collapsed these to 503, making the client's already-gone
+    branch unreachable). 409 is OPERATION-SCOPED, never blanket: input keeps
+    its existing typed conflicts, and reconcile passes the engine's typed
+    refusal through — ``setup_termination_unconfirmed`` plus its
+    ``requiredActions`` continuation (``retry_setup_reconciliation``). A 409
+    on poll or cancel has no typed client branch, so it stays the proxy's
+    503 rather than acquiring a new passthrough. Input also keeps its
+    operation-scoped 404 downgrade: ITS 404 means "this engine does not
+    accept sign-in codes for this job", a capability fact, not job absence,
+    so it stays the distinct ``input_not_supported`` code. Everything else —
+    transport failure, daemon 5xx — is this proxy's honest 503: unproven,
+    not a verdict.
+    """
+    status = int(getattr(exc, "status_code", 0) or 0)
+    if op == "input":
+        if status == 404:
+            return json_error(
+                "This engine does not accept sign-in codes for this job "
+                "(input route not available)", 404, code="input_not_supported")
+        if status == 409:
+            # The engine's TYPED input conflicts ride through verbatim —
+            # setup_input_not_applicable (the callback already completed; no
+            # code needed) and setup_input_already_submitted (a repeat the
+            # server refused). Answers, not failures: the card maps the code
+            # to friendly copy.
+            return json_error(str(exc), 409, code=exc.code)
+    elif status in (404, 410) or (status == 409 and op == "reconcile"):
+        extra: Dict[str, Any] = {"code": exc.code}
+        actions = tuple(getattr(exc, "required_actions", ()) or ())
+        if actions:
+            extra["required_actions"] = list(actions)
+        return json_error(str(exc), status, **extra)
+    return json_error(f"{exc.code}: {exc}", 503)
 
 
 async def api_claudexor_login_job(request: Request) -> JSONResponse:
     """The job-scoped login proxy — one endpoint, three verbs:
 
-    - ``GET /api/claudexor/login/{job_id}`` — poll: the snapshot carries the
-      transient disclosure (device code / oauth_url) when the flow has one.
-    - ``DELETE /api/claudexor/login/{job_id}`` — the card's cancel action.
+    - ``GET /api/claudexor/login/{job_id}`` — poll: the daemon's snapshot
+      envelope verbatim; it carries the transient disclosure (device code /
+      oauth_url) at the ENVELOPE level when the flow has one.
+    - ``DELETE /api/claudexor/login/{job_id}`` — the card's cancel action;
+      the answer body carries the resulting job so the client can tell a
+      confirmed terminal state from ``termination_unconfirmed`` custody.
     - ``POST /api/claudexor/login/{job_id}/input`` — forward ONE line of user
       input (the claude OAuth paste-code) to the engine's setup-job input
       route. The value rides through and is never logged or stored here.
@@ -516,22 +598,38 @@ async def api_claudexor_login_job(request: Request) -> JSONResponse:
     try:
         return JSONResponse(await asyncio.to_thread(_login_job_call, job_id, op, value))
     except ClaudexorUnavailable as exc:
-        status = int(getattr(exc, "status_code", 0) or 0)
-        if is_input and status == 404:
-            return json_error(
-                "This engine does not accept sign-in codes for this job "
-                "(input route not available)", 404, code="input_not_supported")
-        if is_input and status == 409:
-            # The engine's TYPED input conflicts ride through verbatim —
-            # setup_input_not_applicable (the callback already completed; no
-            # code needed) and setup_input_already_submitted (a repeat the
-            # server refused). Answers, not failures: the card maps the code
-            # to friendly copy.
-            return json_error(str(exc), 409, code=exc.code)
-        return json_error(f"{exc.code}: {exc}", 503)
+        return _login_job_problem(exc, op)
     except Exception as exc:
         log.exception("api_claudexor_login_job failed (%s)", op)
         return json_error(f"{type(exc).__name__}: Claudexor login job {op} failed")
+
+
+async def api_claudexor_login_job_reconcile(request: Request) -> JSONResponse:
+    """POST /api/claudexor/login/{job_id}/reconcile — the SIXTH thin proxy:
+    ask the daemon to prove an unconfirmed termination's process group empty
+    (``POST /v2/setup/jobs/:id/reconcile``).
+
+    Its own handler because its body contract differs from the sibling POST
+    (/input requires a value; reconcile takes none), but the operation runs
+    through the same explicit-op dispatcher — the path spelling is routing,
+    never the state authority. Success returns the reconciled job in the one
+    browser envelope; an unprovable termination comes back as the daemon's
+    409 ``setup_termination_unconfirmed`` with ``required_actions`` naming
+    the retry continuation. The check itself never creates a login (owner
+    decision 1A: the reconciled face offers a separate explicit retry).
+    """
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    job_id = str(request.path_params.get("job_id") or "").strip()
+    if not job_id:
+        return json_error("job_id is required", 400)
+    try:
+        return JSONResponse(await asyncio.to_thread(_login_job_call, job_id, "reconcile"))
+    except ClaudexorUnavailable as exc:
+        return _login_job_problem(exc, "reconcile")
+    except Exception as exc:
+        log.exception("api_claudexor_login_job_reconcile failed")
+        return json_error(f"{type(exc).__name__}: Claudexor login job reconcile failed")
 
 
 def _remove_credential_profile(harness: str, profile_id: str) -> Dict[str, Any]:
@@ -548,7 +646,7 @@ def _remove_credential_profile(harness: str, profile_id: str) -> Dict[str, Any]:
 async def api_claudexor_credential_profile(request: Request) -> JSONResponse:
     """DELETE /api/claudexor/credential-profiles/{harness}/{profile_id}.
 
-    A FIFTH thin proxy, same rule as the other four: the daemon owns the
+    Another thin proxy, same rule as its siblings: the daemon owns the
     account record, so removing one is its own contract
     (``DELETE /v2/credential-profiles/:harness/:profileId``) and its refusal is
     the answer. Nothing here touches a vendor credential file — a native CLI
@@ -574,6 +672,7 @@ __all__ = [
     "api_claudexor_credential_profile",
     "api_claudexor_login",
     "api_claudexor_login_job",
+    "api_claudexor_login_job_reconcile",
     "api_claudexor_status",
     "api_claudexor_wake",
 ]

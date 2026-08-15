@@ -425,6 +425,7 @@ export function createAgentsStep({
         disposed: false,
         unsubscribe: null,
         pageHideBound: null,
+        pageHideTarget: null,
         listHtml: null,
     };
 
@@ -442,14 +443,23 @@ export function createAgentsStep({
     // machine, exactly the remote/headless first run — would have no way to
     // finish. A dead end is worst at first run, so onboarding mounts the same
     // card Settings mounts.
-    const login = createLoginCardController({
-        host: () => el('agents-login-host'),
-        store,
-        mode: LOGIN_CARD_FULL,
-        doc: getDoc,
-        ...(fetchImpl ? { fetchImpl } : {}),
-        onSettled: () => { store.refresh(); paint(); },
-    });
+    function createLogin() {
+        return createLoginCardController({
+            host: () => el('agents-login-host'),
+            store,
+            mode: LOGIN_CARD_FULL,
+            doc: getDoc,
+            ...(fetchImpl ? { fetchImpl } : {}),
+            onSettled: () => { store.refresh(); paint(); },
+        });
+    }
+
+    let login = createLogin();
+
+    function ensureLogin() {
+        if (!login || login.disposed) login = createLogin();
+        return login;
+    }
 
     function paint() {
         if (state.disposed) return;
@@ -483,13 +493,14 @@ export function createAgentsStep({
                 snapshot,
             });
         }
-        login.render();
+        login?.render();
     }
 
     function bindConnectButtons(list) {
         list.querySelectorAll('[data-agent-connect]').forEach((button) => {
             button.addEventListener('click', () => {
-                login.start(button.getAttribute('data-agent-connect'), '');
+                if (state.disposed) return;
+                ensureLogin().start(button.getAttribute('data-agent-connect'), '');
             });
         });
     }
@@ -509,15 +520,18 @@ export function createAgentsStep({
         if (state.disposed) return;
         if (!state.unsubscribe) {
             state.unsubscribe = store.subscribe(adopt, { visible: isVisible });
-            const document_ = getDoc();
-            if (document_?.addEventListener) {
+            const pageHideTarget = getDoc()?.defaultView;
+            if (pageHideTarget?.addEventListener) {
                 // The wizard never unmounts itself, so the ONE listener this
                 // controller holds is released on a real unload as well as by
                 // dispose(). A bfcache hide (`persisted`) is NOT an unload: the
                 // page can come back, and tearing down here would restore a
                 // wizard whose Agents step no longer reads anything.
-                state.pageHideBound = (event) => { if (!event?.persisted) dispose(); };
-                document_.addEventListener('pagehide', state.pageHideBound);
+                state.pageHideTarget = pageHideTarget;
+                state.pageHideBound = (event) => {
+                    if (event?.persisted !== true) detach();
+                };
+                pageHideTarget.addEventListener('pagehide', state.pageHideBound);
             }
         }
         // A remount rebuilds the DOM the wizard just replaced.
@@ -527,48 +541,43 @@ export function createAgentsStep({
     }
 
     /**
-     * Shut the step down and report whether the LOGIN was actually let go.
+     * Ask the login controller for its exact custody result.
      *
-     * The shared controller's disposer is asynchronous and answers a custody
-     * verdict: `false` means the cancel could not be proven, so it deliberately
-     * retains the job id and stays retryable. Settings awaits that verdict; this
-     * step used to call the disposer blind and return `undefined`, which threw
-     * the answer away — and, worse, latched `state.disposed` first, so the one
-     * documented recovery (call the disposer again) was unreachable from here.
-     * A deferred create POST made that visible: completion was announced while
-     * the POST was still in flight, and a cancel that then answered 503 left a
-     * live login job with no owner.
+     * Cleanup and local departure are deliberately separate. `retained` means
+     * another cancel is pointless; `unknown` remains retryable for the wizard's
+     * existing bounded window. Neither result is rewritten as release proof.
      *
-     * So: the step only latches itself once custody is genuinely released, and
-     * the caller can await the same Boolean the Settings host already reads.
-     *
-     * @returns {Promise<boolean>} whether the login was released.
+     * @returns {Promise<'released'|'retained'|'unknown'>}
      */
     async function dispose() {
-        if (state.disposed) return true;
-        const released = await login.dispose();
-        if (!released) {
-            // Custody is still ours. Leave the step usable so the disposer can
-            // be retried against the same retained job, and keep the listeners
-            // that let the retry render — releasing them here would strand the
-            // job exactly as before.
-            return false;
-        }
+        if (state.disposed) return 'unknown';
+        // The controller remains the custody SSOT even after its own
+        // recovery-face Close: repeated dispose returns its remembered honest
+        // detach status without sending another lifecycle request.
+        return login ? login.dispose() : 'released';
+    }
+
+    /** Leave locally without claiming the daemon released process custody. */
+    function detach() {
+        if (state.disposed) return;
         state.disposed = true;
+        login?.detach();
         if (state.unsubscribe) state.unsubscribe();
         state.unsubscribe = null;
-        const document_ = getDoc();
-        if (state.pageHideBound && document_?.removeEventListener) {
-            document_.removeEventListener('pagehide', state.pageHideBound);
+        if (state.pageHideBound && state.pageHideTarget?.removeEventListener) {
+            state.pageHideTarget.removeEventListener('pagehide', state.pageHideBound);
         }
         state.pageHideBound = null;
-        return true;
+        state.pageHideTarget = null;
+        state.listHtml = null;
+        login = null;
     }
 
     return {
         mount,
         paint,
         dispose,
+        detach,
         get connected() { return [...state.connected]; },
         // The payload the family names are spoken from. The wizard's review
         // step renders the SAME families one screen later, and without this it

@@ -1370,3 +1370,41 @@ def test_owner_scope_review_floor_deprecation_notice_crosses_the_wire(tmp_path, 
     assert "context mode" in notice.lower(), "the notice must name the control that now decides"
     # The owner's customization is stored even though it is enforcement-inert.
     assert json.loads(settings_path.read_text(encoding="utf-8"))["OUROBOROS_SCOPE_REVIEW_FLOOR"] == "advisory"
+
+
+def test_login_job_browser_envelopes_keep_their_required_discriminators():
+    """The recovery UI cannot classify a success without job or a problem
+    without error; operation-specific metadata remains additive."""
+    from typing import get_origin, get_type_hints
+
+    from typing_extensions import Required
+
+    from ouroboros.gateway import contracts
+    from ouroboros.gateway.contracts import (
+        ClaudexorLoginJobProblem,
+        ClaudexorLoginJobResponse,
+    )
+
+    success = get_type_hints(ClaudexorLoginJobResponse, include_extras=True)
+    problem = get_type_hints(ClaudexorLoginJobProblem, include_extras=True)
+    assert get_origin(success["job"]) is Required
+    assert get_origin(problem["error"]) is Required
+    assert set(success) - {"job"} == {
+        "attach_command",
+        "cursor",
+        "deviceCode",
+        "disclosure_native",
+        "job_id",
+        "ok",
+        "sequence",
+    }
+    assert set(problem) - {"error"} == {
+        "code",
+        "required_actions",
+    }
+    assert all(get_origin(annotation) is not Required
+               for key, annotation in success.items() if key != "job")
+    assert all(get_origin(annotation) is not Required
+               for key, annotation in problem.items() if key != "error")
+    assert "ClaudexorLoginJobResponse" in contracts.__all__
+    assert "ClaudexorLoginJobProblem" in contracts.__all__

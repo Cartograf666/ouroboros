@@ -715,13 +715,6 @@ const state = {
     // its accounts. The wake POST itself is the STORE's (single writer).
     wakeError: '',
     wakeBusy: false,
-    // Mount and unmount are SERIALIZED through one chain. Releasing login
-    // custody is asynchronous (a DELETE the daemon has to confirm), so a
-    // fire-and-forget teardown followed by a remount is how one controller
-    // instance came to hold a live job while a second one started another
-    // beside it — the "one live login" invariant held only inside a single
-    // controller.
-    lifecycle: Promise.resolve(true),
 };
 
 /** The tab's ONE service banner; rendered above every section. */
@@ -847,6 +840,7 @@ function renderRows() {
         .map((group) => groupHtml(group, payload, { accountsRead, quotaRead })).join('');
     host.querySelectorAll('[data-harness-login]').forEach((button) => {
         button.addEventListener('click', () => {
+            if (!state.initialized) return;
             const row = button.closest('[data-harness]');
             startLogin(row?.dataset.harness, row?.dataset.profile);
         });
@@ -859,6 +853,7 @@ function renderRows() {
     });
     host.querySelectorAll('[data-family-add]').forEach((button) => {
         button.addEventListener('click', async () => {
+            if (!state.initialized) return;
             // Captured before the await: the status poll replaces the cards
             // while the dialog is open, detaching this button's section.
             const card = button.closest('[data-family]');
@@ -922,7 +917,11 @@ export async function wakeDaemon() {
 }
 
 function ensureLoginCard() {
-    if (state.loginCard) return state.loginCard;
+    if (state.loginCard && !state.loginCard.disposed) return state.loginCard;
+    // `detach()` permanently fences one controller. Explicit Connect after a
+    // destroy/re-init must therefore build a fresh controller instead of
+    // reusing a cached disposed object whose start() correctly does nothing.
+    state.loginCard = null;
     state.loginCard = createLoginCardController({
         host: () => document.getElementById('harness-login-card'),
         store: state.store,
@@ -939,7 +938,7 @@ function ensureLoginCard() {
  * rows, the Add-account dialog and the browser smoke tests all drive it.
  */
 export async function startLogin(harness, profile) {
-    if (!harness) return;
+    if (!harness || !state.initialized) return;
     await ensureLoginCard().start(harness, profile);
 }
 
@@ -949,41 +948,15 @@ export function refreshHarnessStatus() {
 }
 
 /**
- * Mount the section. SERIALIZED with the teardown, and refused while the
- * previous mount still holds login custody.
- *
- * @returns {Promise<boolean>} whether the section is mounted. `false` = a
- *          previous login could not be proven cancelled, so a second one must
- *          not be started beside it; the panel says so and the next mount
- *          retries the cancel.
+ * Mount the section. The exported destroy seam is an honest local detach, so
+ * remount never waits on or invents daemon release proof.
  */
 export function initHarnessAccounts({ store = claudexorStatus } = {}) {
-    state.lifecycle = state.lifecycle.then(() => _init(store), () => _init(store));
-    return state.lifecycle;
+    return _init(store);
 }
 
 async function _init(store) {
-    const released = await _destroy();
-    if (!released) {
-        // The old controller is still holding a job id it could not prove
-        // gone. Mounting now would give the owner a Connect button that starts
-        // a SECOND live login — exactly what the custody verdict exists to
-        // prevent. Say it where the panel's own status line lives; the next
-        // mount re-attempts the cancel (dispose is retryable).
-        //
-        // That line is the tab's ONE service banner. It used to be
-        // `harness-daemon-status`, a node the Agents tab no longer renders, so
-        // this refusal reached the owner as an empty panel that simply never
-        // mounted. Nothing repaints the banner from under this message: the
-        // store subscription is bound below, after the early return.
-        const statusEl = document.getElementById('agents-service-banner');
-        if (statusEl) {
-            statusEl.textContent = 'A previous sign-in could not be cancelled and may still be '
-                + 'running, so this panel is holding off. Reopen this page to retry it.';
-            statusEl.dataset.tone = 'warn';
-        }
-        return false;
-    }
+    _destroy();
     state.store = store;
     state.removeError = '';
     state.wakeError = '';
@@ -991,6 +964,7 @@ async function _init(store) {
     ensureLoginCard();
     document.getElementById('btn-harness-refresh')
         ?.addEventListener('click', () => {
+            if (!state.initialized) return;
             // A sleeping daemon cannot be re-read into existence: there the
             // button is the owner's explicit start. Live, it stays a plain
             // re-read. SAME predicate the LABEL uses (renderRows), so the two
@@ -1020,32 +994,23 @@ async function _init(store) {
 }
 
 /**
- * Tear the section down and REPORT whether login custody was released.
- *
- * @returns {Promise<boolean>} `false` = the controller could not prove its job
- *          cancelled, so it is KEPT (job id and all) and this teardown is
- *          retryable — call again, or mount again, and the same proven-cancel
- *          path runs once more. The onboarding wizard consumes the identical
- *          contract straight off the controller's own `dispose()`.
+ * Tear the exported Settings test/lifecycle seam down synchronously. This is a
+ * local detach only: zero create/cancel/reconcile requests and no claim that a
+ * daemon-owned process stopped. Production Settings remains mounted across
+ * ordinary SPA navigation and never calls this as a leave hook.
  */
 export function destroyHarnessAccounts() {
-    state.lifecycle = state.lifecycle.then(() => _destroy(), () => _destroy());
-    return state.lifecycle;
+    return _destroy();
 }
 
-async function _destroy() {
+function _destroy() {
     for (const dispose of state.disposers.splice(0)) {
         try { dispose(); } catch (err) { /* a broken disposer must not block the rest */ }
     }
     state.initialized = false;
     const card = state.loginCard;
     if (!card) return true;
-    // The verdict is the POINT of the async disposer, and dropping it is how a
-    // remount could start a second live login: the probe had the first cancel
-    // answer 503, the controller keep its job id — and the next mount create
-    // another job beside it. A retained controller is kept on purpose so the
-    // cancel can be retried against the same job.
-    const released = await card.dispose();
-    if (released) state.loginCard = null;
-    return released;
+    card.detach();
+    state.loginCard = null;
+    return true;
 }

@@ -881,6 +881,52 @@ class ClaudexorStatusResponse(TypedDict, total=False):
     error: str
 
 
+class ClaudexorLoginJobResponse(TypedDict, total=False):
+    """The ONE login-job success envelope (frozen browser gateway ABI,
+    issues #124/#151): every ``/api/claudexor/login`` operation — create,
+    snapshot poll, cancel, input, reconcile — answers exactly one top-level
+    bare ``job`` (the daemon's ``ControlSetupJob``), never another envelope
+    nested under it (the double ``job.job`` was issue #124).
+
+    Operation metadata rides BESIDE the job: create adds ``job_id``,
+    ``disclosure_native`` and (fallback engines only) ``attach_command``;
+    input keeps its ``ok`` bit; the snapshot poll is the daemon's own
+    ``{job, cursor, sequence, deviceCode?}`` envelope passed through
+    verbatim, so the transient sign-in disclosure lives at the ENVELOPE
+    level, not inside ``job``. ``job`` is required on every operation; all
+    other keys are operation-scoped."""
+
+    job: Required[Dict[str, Any]]
+    # snapshot-only (daemon envelope verbatim)
+    cursor: str
+    sequence: int
+    deviceCode: Dict[str, Any]
+    # create-only metadata
+    job_id: str
+    disclosure_native: bool
+    attach_command: str
+    # input-only compatibility bit
+    ok: bool
+
+
+class ClaudexorLoginJobProblem(TypedDict, total=False):
+    """The narrow login-job error envelope (frozen beside the success DTO —
+    the recovery UI consumes both sides of one operation contract): required
+    ``error`` prose, optional stable machine ``code``, optional bounded
+    ``required_actions`` naming the engine's continuation (e.g. reconcile's
+    409 ``setup_termination_unconfirmed`` carries
+    ``["retry_setup_reconciliation"]``). Daemon 404/410 job-absence verdicts
+    and the operation-scoped input/reconcile 409s ride this shape with their
+    original status; transport failure and daemon 5xx stay the proxy's 503.
+    Not an action framework: the list mirrors the daemon's own top-level
+    ``ControlProblem.requiredActions`` (at most 16 strings of at most 512
+    chars) and nothing else."""
+
+    error: Required[str]
+    code: str
+    required_actions: List[str]
+
+
 class TaskEvent(TypedDict, total=False):
     seq: int
     source: str
@@ -1102,6 +1148,7 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "GET /api/claudexor/login/{job_id}",
     "DELETE /api/claudexor/login/{job_id}",
     "POST /api/claudexor/login/{job_id}/input",
+    "POST /api/claudexor/login/{job_id}/reconcile",
     "DELETE /api/claudexor/credential-profiles/{harness}/{profile_id}",
     "GET /api/extensions",
     "GET /api/extensions/{skill}/manifest",
@@ -1239,6 +1286,8 @@ __all__ = [
     "ClaudexorReadState",
     "ClaudexorStatusReads",
     "ClaudexorStatusResponse",
+    "ClaudexorLoginJobResponse",
+    "ClaudexorLoginJobProblem",
     "TaskEvent",
     "TaskCancelResponse",
     "TaskHurryRequest",

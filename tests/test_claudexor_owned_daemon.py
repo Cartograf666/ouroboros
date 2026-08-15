@@ -529,6 +529,8 @@ def test_login_create_transport_is_gated_by_the_executed_probe(monkeypatch, tmp_
     handoff."""
     native, sent = _create_login(monkeypatch, tmp_path, {"harness": "claude"},
                                 operations=[_INPUT_OP])
+    assert native["job"] == {"id": "job-1", "state": "queued"}
+    assert "job" not in native["job"], "create must not emit the old job.job envelope"
     assert native["disclosure_native"] is True
     assert "transport" not in sent
     # No client_pty job ⇒ no attach command to demote into Advanced.
@@ -583,6 +585,223 @@ def _input_request(job_id: str, body: dict):
         "headers": [(b"content-type", b"application/json")], "query_string": b"",
         "path_params": {"job_id": job_id},
     }, receive)
+
+
+def _job_request(job_id: str, method: str, suffix: str = ""):
+    from starlette.requests import Request
+
+    return Request({
+        "type": "http", "method": method,
+        "path": f"/api/claudexor/login/{job_id}{suffix}",
+        "headers": [], "query_string": b"", "path_params": {"job_id": job_id},
+    })
+
+
+def _invoke_login_job_handler(op: str, job_id: str = "j1"):
+    import asyncio
+
+    from ouroboros.gateway.claudexor_accounts import (
+        api_claudexor_login_job,
+        api_claudexor_login_job_reconcile,
+    )
+
+    if op == "reconcile":
+        return asyncio.run(api_claudexor_login_job_reconcile(
+            _job_request(job_id, "POST", "/reconcile")))
+    method = "DELETE" if op == "cancel" else "GET"
+    return asyncio.run(api_claudexor_login_job(_job_request(job_id, method)))
+
+
+def test_login_job_success_envelopes_are_single_and_operation_specific(monkeypatch, tmp_path):
+    """Snapshot is already an envelope; bare-job operations wrap exactly once."""
+    from ouroboros import claudexor_daemon as owned
+    from ouroboros.gateway.claudexor_accounts import _login_job_call
+    from ouroboros.gateways import claudexor as gw
+
+    snapshot = {
+        "job": {"id": "j1", "state": "running", "phase": "awaiting_user"},
+        "cursor": "cur-1",
+        "sequence": 7,
+        "deviceCode": {"user_code": "ABCD-EFGH", "verification_uri": "https://example.test"},
+    }
+    bare = {"id": "j1", "state": "cancelled", "outcome": {"reason": "cancelled_by_user"}}
+    seen = []
+
+    class FakeGateway:
+        def __init__(self, endpoint):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def handshake(self, **_kw):
+            return {}
+
+        def setup_job_call(self, job_id, op, *, value=""):
+            seen.append((job_id, op, value))
+            return snapshot if op == "snapshot" else bare
+
+    monkeypatch.setattr(owned, "owned_config_dir", lambda: tmp_path / "cfg")
+    monkeypatch.setattr(gw, "discover_daemon_at", lambda _path: object())
+    monkeypatch.setattr(gw, "ClaudexorGateway", FakeGateway)
+
+    assert _login_job_call("j1", "snapshot") == snapshot
+    assert _login_job_call("j1", "cancel") == {"job": bare}
+    assert _login_job_call("j1", "input", value=" code ") == {"job": bare, "ok": True}
+    assert _login_job_call("j1", "reconcile") == {"job": bare}
+    assert seen == [
+        ("j1", "snapshot", ""),
+        ("j1", "cancel", ""),
+        ("j1", "input", " code "),
+        ("j1", "reconcile", ""),
+    ]
+
+
+def test_control_problem_required_actions_are_top_level_and_bounded():
+    """The typed continuation follows the daemon's exact ControlProblem field."""
+    import httpx
+
+    from ouroboros.gateway.claudexor_accounts import _login_job_problem
+    from ouroboros.gateways.claudexor import ClaudexorGateway
+
+    gateway = object.__new__(ClaudexorGateway)
+    actions = [f"action-{index}-" + ("x" * 600) for index in range(20)]
+    problem = gateway._problem(httpx.Response(409, json={
+        "code": "setup_termination_unconfirmed",
+        "message": "still checking",
+        "requiredActions": actions,
+        "context": {"requiredActions": ["wrong-place"]},
+    }))
+    assert problem.code == "setup_termination_unconfirmed"
+    assert problem.status_code == 409
+    assert len(problem.required_actions) == 16
+    assert problem.required_actions == tuple(item[:512] for item in actions[:16])
+    browser = _login_job_problem(problem, "reconcile")
+    browser_body = json.loads(browser.body)
+    assert browser.status_code == 409
+    assert browser_body["code"] == "setup_termination_unconfirmed"
+    assert browser_body["required_actions"] == list(problem.required_actions)
+
+    nested_only = gateway._problem(httpx.Response(409, json={
+        "code": "setup_termination_unconfirmed",
+        "message": "still checking",
+        "context": {"requiredActions": ["retry_setup_reconciliation"]},
+    }))
+    assert nested_only.required_actions == ()
+    assert "required_actions" not in json.loads(
+        _login_job_problem(nested_only, "reconcile").body)
+
+
+def test_gateway_setup_job_operations_use_the_exact_daemon_routes():
+    from ouroboros.gateways.claudexor import ClaudexorGateway
+
+    gateway = object.__new__(ClaudexorGateway)
+    calls = []
+
+    def request(method, path, *, json_body=None, **_kwargs):
+        calls.append((method, path, json_body))
+        return {"id": "j1", "state": "running"}
+
+    gateway._request = request
+    assert gateway.setup_job_call("j1", "snapshot")["id"] == "j1"
+    assert gateway.setup_job_call("j1", "cancel")["id"] == "j1"
+    assert gateway.setup_job_call("j1", "input", value=" code ")["id"] == "j1"
+    assert gateway.setup_job_call("j1", "reconcile")["id"] == "j1"
+    assert calls == [
+        ("GET", "/v2/setup/jobs/j1/snapshot", None),
+        ("POST", "/v2/setup/jobs/j1/cancel", None),
+        ("POST", "/v2/setup/jobs/j1/input", {"value": " code "}),
+        ("POST", "/v2/setup/jobs/j1/reconcile", None),
+    ]
+
+
+@pytest.mark.parametrize("op", ["snapshot", "cancel", "reconcile"])
+@pytest.mark.parametrize("status", [404, 410])
+def test_login_job_absence_statuses_pass_through(monkeypatch, tmp_path, op, status):
+    """Job absence is a client-custody verdict for exactly these operations."""
+    from ouroboros import claudexor_daemon as owned
+    from ouroboros.gateways import claudexor as gw
+
+    seen = []
+
+    class Missing:
+        def __init__(self, endpoint):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def handshake(self, **_kw):
+            return {}
+
+        def setup_job_call(self, job_id, actual_op, *, value=""):
+            seen.append(actual_op)
+            raise gw.ClaudexorUnavailable(
+                f"http_{status}", "job is no longer available", status_code=status)
+
+    monkeypatch.setattr(owned, "owned_config_dir", lambda: tmp_path / "cfg")
+    monkeypatch.setattr(gw, "discover_daemon_at", lambda _path: object())
+    monkeypatch.setattr(gw, "ClaudexorGateway", Missing)
+
+    response = _invoke_login_job_handler(op)
+    assert response.status_code == status
+    assert json.loads(response.body)["code"] == f"http_{status}"
+    assert seen == [op]
+
+
+@pytest.mark.parametrize("op", ["snapshot", "cancel", "reconcile"])
+def test_login_job_409_is_reconcile_scoped(monkeypatch, tmp_path, op):
+    """Reconcile has a typed 409 continuation; poll/cancel remain unknown 503s."""
+    from ouroboros import claudexor_daemon as owned
+    from ouroboros.gateways import claudexor as gw
+
+    class Unconfirmed:
+        def __init__(self, endpoint):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def handshake(self, **_kw):
+            return {}
+
+        def setup_job_call(self, job_id, actual_op, *, value=""):
+            assert actual_op == op
+            raise gw.ClaudexorUnavailable(
+                "setup_termination_unconfirmed",
+                "process-group emptiness is not proven",
+                status_code=409,
+                required_actions=("retry_setup_reconciliation",),
+            )
+
+    monkeypatch.setattr(owned, "owned_config_dir", lambda: tmp_path / "cfg")
+    monkeypatch.setattr(gw, "discover_daemon_at", lambda _path: object())
+    monkeypatch.setattr(gw, "ClaudexorGateway", Unconfirmed)
+
+    response = _invoke_login_job_handler(op)
+    body = json.loads(response.body)
+    if op == "reconcile":
+        assert response.status_code == 409
+        assert body["code"] == "setup_termination_unconfirmed"
+        assert body["required_actions"] == ["retry_setup_reconciliation"]
+    else:
+        assert response.status_code == 503
+        assert "required_actions" not in body
+
+
+def test_login_reconcile_validates_job_id_before_daemon_work():
+    response = _invoke_login_job_handler("reconcile", job_id="")
+    assert response.status_code == 400
+    assert b"job_id is required" in response.body
 
 
 def test_login_input_endpoint_validates_before_any_daemon_work():
@@ -658,8 +877,8 @@ def test_login_input_engine_404_is_a_typed_capability_gap(monkeypatch, tmp_path)
     """DEGRADED-ENGINE PATH: an engine that predates the input route (or no
     longer knows the job) answers 404; the proxy types it as
     input_not_supported so the card can fall back to the Advanced attach
-    affordance. Every other refusal stays an ordinary 503 — and a 404 on the
-    POLL keeps its ordinary meaning (no capability spin)."""
+    affordance. A 404 on the POLL keeps its ordinary job-absence meaning (no
+    capability spin) and therefore passes through without that input code."""
     import asyncio
 
     from starlette.requests import Request
@@ -693,14 +912,15 @@ def test_login_input_engine_404_is_a_typed_capability_gap(monkeypatch, tmp_path)
     body = json.loads(resp.body)
     assert body["code"] == "input_not_supported"
 
-    # The SAME engine 404 on a GET poll is an ordinary lane refusal (503):
-    # input_not_supported is typed only where the input capability was asked.
+    # The SAME engine 404 on a GET poll is job absence, not an input capability
+    # verdict: preserve the status/code but never relabel it input_not_supported.
     poll = Request({
         "type": "http", "method": "GET", "path": "/api/claudexor/login/j1",
         "headers": [], "query_string": b"", "path_params": {"job_id": "j1"},
     })
     polled = asyncio.run(api_claudexor_login_job(poll))
-    assert polled.status_code == 503
+    assert polled.status_code == 404
+    assert json.loads(polled.body)["code"] == "http_404"
 
     class Down:
         def __init__(self, endpoint):
