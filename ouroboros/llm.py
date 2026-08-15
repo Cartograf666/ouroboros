@@ -2489,10 +2489,29 @@ class LLMClient:
         if compacted_chars <= target_chars:
             return compacted
 
-        raise LocalContextTooLargeError(
-            f"Local model context too large after safe compaction "
-            f"({compacted_chars} chars > target {target_chars})."
-        )
+        # Adaptive secondary trimming: trim system message text blocks from the end to fit target_chars
+        excess_chars = compacted_chars - target_chars
+        for msg in compacted:
+            if msg.get("role") != "system":
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in reversed(content):
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        btext = str(block.get("text", ""))
+                        if len(btext) > 300:
+                            trim = min(len(btext) - 150, excess_chars + 100)
+                            block["text"] = btext[:-trim] + "\n...[truncated for local context]..."
+                            excess_chars -= trim
+                            if excess_chars <= 0:
+                                break
+            elif isinstance(content, str):
+                if len(content) > excess_chars + 300:
+                    msg["content"] = content[:-(excess_chars + 100)] + "\n...[truncated for local context]..."
+                    excess_chars = 0
+            break
+
+        return compacted
 
     def _chat_local(
         self,
