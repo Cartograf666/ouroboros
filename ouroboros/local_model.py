@@ -477,6 +477,7 @@ class LocalModelManager:
             cmd = [
                 python, "-m", "llama_cpp.server",
                 "--model", model_path,
+                "--host", "127.0.0.1",
                 "--port", str(port),
                 "--n_gpu_layers", str(n_gpu_layers),
                 "--n_batch", "1024",
