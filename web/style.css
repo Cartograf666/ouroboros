@@ -1667,6 +1667,30 @@ button.chat-file:hover,
     padding: 0 14px 14px;
     color: rgba(255, 240, 210, 0.82);
     white-space: pre-wrap;
+    /* Full review bodies can run to hundreds of lines: scroll inside the
+       card instead of re-bloating the chat column (owner-picked 60vh). */
+    max-height: 60vh;
+    overflow-y: auto;
+}
+
+.skill-review-error {
+    color: rgba(255, 180, 160, 0.92);
+}
+
+.skill-review-retry {
+    margin-left: 6px;
+    padding: 2px 10px;
+    border: 1px solid rgba(245, 158, 11, 0.55);
+    border-radius: 6px;
+    background: transparent;
+    color: rgba(245, 158, 11, 0.95);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.skill-review-retry:hover {
+    background: rgba(245, 158, 11, 0.12);
 }
 
 .chat-bubble.pending {

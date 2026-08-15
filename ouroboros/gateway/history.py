@@ -701,6 +701,18 @@ def _collect_chat_rows(
             annotation = _user_annotation(role, rec["client_message_id"], chat_annotations)
             if annotation is not None:
                 rec["chat_annotation"] = annotation
+            # Skill-review rows already carry the exact-job reference the
+            # producer writes (v6.66.0 a776639f); pass it through so the Chat
+            # card can lazily fetch the full rendered review. Rows without a
+            # job_id (legacy full-text rows) keep today's behavior.
+            if rec["system_type"] == "skill_review":
+                for key in ("skill", "status", "content_hash", "job_id"):
+                    rec[key] = str(entry.get(key, "") or "")
+                for key in ("review_round", "snapshot_attempt"):
+                    try:
+                        rec[key] = int(entry.get(key) or 0)
+                    except (TypeError, ValueError):
+                        rec[key] = 0
             # Delivered document rows carry lightweight media metadata (no
             # base64); surface a msg_type + download_url so the frontend
             # rebuilds the file bubble on reload instead of a bare text line.

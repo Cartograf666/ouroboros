@@ -206,9 +206,42 @@ def _plan_raw_result_from_actor(actor: dict, request_model: str) -> dict:
     }
 
 
+def resolve_plan_roots(
+    ctx: ToolContext, files_to_touch: list,
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """Resolve governance and subject roots without silently mixing them."""
+    from ouroboros.contracts.skill_payload_policy import is_skill_payload_path
+    from ouroboros.review_substrate import review_repo_dirs_for
+    from ouroboros.tool_access import canonical_data_root
+
+    governance, subject = review_repo_dirs_for(ctx)
+    try:
+        drive = canonical_data_root(ctx)
+    except Exception:
+        drive = None
+    for raw in files_to_touch or []:
+        text = str(raw or "")
+        # Skill-payload paths live in the DATA plane and are legitimate plan
+        # targets, not subject-root escapes — same frozen predicate as the
+        # classification exemption in resolve_plan_class; a drive-resolution
+        # failure keeps the old blanket rejection.
+        if drive is not None and is_skill_payload_path(drive, text, allow_control_plane=True):
+            continue
+        candidate = pathlib.Path(text)
+        resolved = (candidate if candidate.is_absolute() else subject / candidate).resolve(strict=False)
+        try:
+            resolved.relative_to(subject)
+        except ValueError as exc:
+            raise ValueError(
+                f"planned path {raw!r} escapes active subject root {subject}"
+            ) from exc
+    return governance, subject
+
+
 def resolve_plan_class(ctx: ToolContext, plan_class: str, files_to_touch: list) -> tuple[str, str]:
     """Resolve the declared class and structurally escalate system-repo work."""
-    from ouroboros.tool_access import path_is_relative_to
+    from ouroboros.contracts.skill_payload_policy import is_skill_payload_path
+    from ouroboros.tool_access import canonical_data_root, path_is_relative_to
 
     declared = str(plan_class or "").strip().lower()
     if declared not in PLAN_CLASSES:
@@ -224,13 +257,29 @@ def resolve_plan_class(ctx: ToolContext, plan_class: str, files_to_touch: list) 
         active = pathlib.Path(active_repo_dir_for(ctx)).resolve(strict=False)
     except Exception:
         active = system_repo
+    # Skill-payload paths live in the DATA plane (data/skills/<bucket>/…), not
+    # the system repo, so they never make a plan self-modification by
+    # themselves. Classification-only: write gates are unrelated code paths.
+    # A drive-resolution failure skips the exemption (current behavior).
+    try:
+        drive = canonical_data_root(ctx)
+    except Exception:
+        drive = None
+    significant = [
+        text
+        for text in (str(raw or "").strip() for raw in files_to_touch or [])
+        if text and not (
+            drive is not None
+            and is_skill_payload_path(drive, text, allow_control_plane=True)
+        )
+    ]
     touches_system = False
-    if files_to_touch:
+    if significant:
         if active == system_repo:
             touches_system = True
         else:
-            for raw in files_to_touch:
-                candidate = pathlib.Path(str(raw or ""))
+            for raw in significant:
+                candidate = pathlib.Path(raw)
                 resolved = (
                     candidate if candidate.is_absolute() else active / candidate
                 ).resolve(strict=False)

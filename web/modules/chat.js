@@ -22,6 +22,7 @@ import {
     taskTerminalPhase,
 } from './log_events.js';
 import { openConfirmDialog } from './confirm_dialog.js';
+import { renderSkillReviewDisclosure, wireSkillReviewDisclosure } from './skill_review_card.js';
 import {
     createHistoryResyncScheduler,
     createRebuildBatch,
@@ -938,39 +939,6 @@ export function createChatInstance({
         }
         if (isProgress) return '💬 Thought';
         return 'Ouroboros';
-    }
-
-    function summarizeSkillReviewMessage(text) {
-        const raw = String(text || '');
-        const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-        const headline = lines[0] || 'Skill review';
-        const hashLine = lines.find((line) => line.startsWith('content_hash=')) || '';
-        const reviewersLine = lines.find((line) => line.startsWith('Reviewers:')) || '';
-        const findingsLine = lines.find((line) => /^##\s+Findings/.test(line)) || '';
-        const meta = [hashLine, reviewersLine.replace(/^Reviewers:\s*/, ''), findingsLine.replace(/^##\s*/, '')]
-            .filter(Boolean)
-            .map((line) => escapeHtml(line.length > 140 ? `${line.slice(0, 137)}...` : line))
-            .join(' · ');
-        return {
-            headline: escapeHtml(headline.replace(/^#+\s*/, '')),
-            meta,
-        };
-    }
-
-    function renderSkillReviewDisclosure(text) {
-        const summary = summarizeSkillReviewMessage(text);
-        return `
-            <div class="skill-review-disclosure" data-skill-review-disclosure data-expanded="0">
-                <button type="button" class="skill-review-summary-button" data-skill-review-toggle aria-expanded="false">
-                    <span class="skill-review-summary-main">${summary.headline}</span>
-                    <span class="skill-review-summary-side">
-                        <span class="skill-review-meta">${summary.meta}</span>
-                        <span class="skill-review-toggle-label">Show review</span>
-                    </span>
-                </button>
-                <div class="skill-review-full" data-skill-review-full hidden>${renderMarkdown(text)}</div>
-            </div>
-        `;
     }
 
     function setStatus(kind, text) {
@@ -3069,6 +3037,7 @@ export function createChatInstance({
                 senderSessionId,
                 clientMessageId,
                 taskId,
+                skillReview: opts.skillReview || null,
             });
             // Mirror the sessionStorage slice(-200): the in-memory copy exists
             // only to feed that snapshot, so it obeys the same cap (P3).
@@ -3093,7 +3062,7 @@ export function createChatInstance({
         const rendered = role === 'user'
             ? escapeHtml(text)
             : (role === 'system' && systemType === 'skill_review'
-                ? renderSkillReviewDisclosure(text)
+                ? renderSkillReviewDisclosure(text, opts.skillReview || null)
                 : renderMarkdown(text));
         const timeFmt = formatMsgTime(ts);
         const timeHtml = timeFmt ? `<div class="msg-time" title="${escapeHtmlAttr(timeFmt.full)}">${escapeHtml(timeFmt.short)}</div>` : '';
@@ -3104,21 +3073,9 @@ export function createChatInstance({
             ${pendingHtml}
             ${timeHtml}
         `;
-        const skillReviewToggle = bubble.querySelector('[data-skill-review-toggle]');
-        if (skillReviewToggle) {
-            skillReviewToggle.addEventListener('click', () => {
-                const disclosure = bubble.querySelector('[data-skill-review-disclosure]');
-                const full = bubble.querySelector('[data-skill-review-full]');
-                const label = bubble.querySelector('.skill-review-toggle-label');
-                const expanded = disclosure?.dataset.expanded === '1';
-                if (!disclosure || !full) return;
-                disclosure.dataset.expanded = expanded ? '0' : '1';
-                full.hidden = expanded;
-                skillReviewToggle.setAttribute('aria-expanded', expanded ? 'false' : 'true');
-                if (label) label.textContent = expanded ? 'Show review' : 'Hide review';
-                requestAnimationFrame(() => updateMessagesPadding({ preserveStickiness: true }));
-            });
-        }
+        wireSkillReviewDisclosure(bubble, () => {
+            requestAnimationFrame(() => updateMessagesPadding({ preserveStickiness: true }));
+        });
         stampNodeTimestamp(bubble, ts);
         insertMessageNode(bubble, { forceStick: !!opts.forceStick });
         renderRoutingAnnotation(bubble, opts.chatAnnotation);
@@ -3495,6 +3452,9 @@ export function createChatInstance({
                         clientMessageId: msg.client_message_id || '',
                         taskId,
                         chatAnnotation: msg.chat_annotation || null,
+                        skillReview: msg.system_type === 'skill_review' && msg.skill && msg.job_id
+                            ? { skill: msg.skill, jobId: msg.job_id }
+                            : null,
                     });
                 }
                 // Resolve cards whose task is already terminal on the server
@@ -3723,6 +3683,7 @@ export function createChatInstance({
                     senderSessionId: msg.senderSessionId || '',
                     clientMessageId: msg.clientMessageId || '',
                     taskId: msg.taskId || '',
+                    skillReview: msg.skillReview || null,
                 });
             }
         } catch {}
