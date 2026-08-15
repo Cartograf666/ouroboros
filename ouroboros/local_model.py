@@ -480,8 +480,6 @@ class LocalModelManager:
                 "--host", "127.0.0.1",
                 "--port", str(port),
                 "--n_gpu_layers", str(n_gpu_layers),
-                "--n_batch", "1024",
-                "--n_ubatch", "512",
             ]
             if chat_format:
                 cmd.extend(["--chat_format", chat_format])
