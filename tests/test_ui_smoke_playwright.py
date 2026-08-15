@@ -3668,9 +3668,9 @@ def test_ui_smoke_dismiss_overlapping_settle_never_freezes_the_card(direct_serve
 
 @pytest.mark.ui_browser
 def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_server_with_data):
-    """v6.82 P5: "Cancel run" renders ONLY on live marker-attested root cards
-    (never on marker-less direct-turn-shaped cards, subagent children, or the
-    reusable background slot), opens a confirm dialog, and a cancelled root
+    """v6.82 P5 / S3 Q2: the stop control renders ONLY on live marker-attested
+    root cards (never marker-less direct-turn cards, subagent children, or the
+    reusable background slot), opens the dropdown, and a cancelled root
     replays as an honest warn-toned "Cancelled" — never a generic "Done"."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
@@ -3727,7 +3727,7 @@ def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_serve
                 live.wait_for(state="attached", timeout=30_000)
                 cancel_btn = live.locator('[data-cancel-run]')
                 cancel_btn.wait_for(state="attached", timeout=30_000)
-                assert cancel_btn.inner_text().strip() == "Cancel run"
+                assert cancel_btn.inner_text().strip() == "Stop…"
                 # Marker-less direct-turn shape, subagent child, reusable slot,
                 # and the finished cancelled root must NOT offer the action.
                 for absent_id in ("direct-turn", "sub-child1", "bg-consciousness", "gone-root"):
@@ -3742,13 +3742,13 @@ def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_serve
                     timeout=30_000,
                 )
                 assert "cancelled" in (gone_phase.get_attribute("class") or "")
-                # Confirm dialog wiring: open, then keep the run running.
+                # Dropdown wiring (S3 Q2): open, then dismiss = keep running.
                 cancel_btn.click()
-                dialog = page.locator('.confirm-dialog')
-                dialog.wait_for(state="visible", timeout=10_000)
-                assert "Cancel this run and all its subagents?" in dialog.inner_text()
-                dialog.locator('[data-confirm-cancel]').last.click()
-                dialog.wait_for(state="detached", timeout=10_000)
+                menu = live.locator('.task-control-menu')
+                menu.wait_for(state="visible", timeout=10_000)
+                assert "Подвести итог" in menu.inner_text()
+                page.keyboard.press("Escape")
+                menu.wait_for(state="detached", timeout=10_000)
                 assert cancel_btn.is_enabled()
                 page.screenshot(path=str(data_dir.parent / "cancel-run.png"), full_page=True)
             finally:

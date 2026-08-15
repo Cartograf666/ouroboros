@@ -1121,6 +1121,21 @@ Before every commit, verify the following:
   expired cache horizon only from the latest recorded applied `5m`/`1h` TTL;
   absent, bare `default`, or unknown TTL evidence stays silent, and no surface
   predicts the next send's token rewrite.
+- Stop policy and owner hurry (S3). `stop_policy` is an axis on the durable
+  cancel intent, independent of cascade scope: absence means IMMEDIATE (frozen
+  programmatic compatibility), `finalize_then_cancel` is 202-pending plus one
+  bounded owner-stop episode owned by `supervisor/owner_stop.py`, transitions
+  are monotonic (immediate hardens, graceful never softens). The owner hurry
+  control is typed and TASK-LOCAL: `kind=hurry` through the owner mailbox only,
+  never a chat message, never owner prose in `_drain_incoming_messages`, never
+  a global settings mutation, never a P3/commit/review-gate weakening — these
+  hold for every install configuration class. Its durable projection writes
+  ONLY through `update_json_locked` on the `owner_hurry`/`owner_hurry_history`
+  keys (never `write_task_result`), is keyed by `task["_attempt"]`, and every
+  same-id requeue producer (reaper timeout AND crash requeue) must call the
+  ONE shared `owner_hurry.retry_reset`. UI surfaces share
+  `web/modules/task_control_menu.js`; the `owner_hurry` event family is
+  non-chat (`log_events.js` hides it with `visible=false`).
 - `forward_to_worker` may write only to validated running tasks whose lineage
   belongs to the current task/root, and must route forked/empty child subagents
   to the child-drive mailbox.

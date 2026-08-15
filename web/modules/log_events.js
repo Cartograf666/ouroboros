@@ -244,6 +244,29 @@ export function taskCancelPending(record) {
     return !settled && String(record?.cancel_state || '') === 'pending';
 }
 
+// S3 (Q1/Q2): the pending soft stop — same typed pending projection, but the
+// durable intent's policy is finalize_then_cancel, so the card honestly shows
+// "Finalizing…" (a bounded final turn is running) instead of "Cancelling…".
+export function taskSoftStopPending(record) {
+    return taskCancelPending(record) && String(record?.stop_policy || '') === 'finalize_then_cancel';
+}
+
+// S3 (HQ1): the ONE shared projection of a typed owner_hurry event for the
+// task-detail/card surfaces. Never a chat message: chat.js renders only a
+// compact task-card status from this, and the timeline summarizer hides the
+// family (visible=false).
+export function ownerHurryProjection(evt) {
+    const phase = String(evt?.phase || '');
+    return {
+        taskId: String(evt?.task_id || ''),
+        phase,
+        applied: phase === 'applied',
+        label: phase === 'applied' ? 'Owner hurry applied'
+            : phase === 'requested' ? 'Owner hurry requested'
+                : `Owner hurry ${phase || 'event'}`,
+    };
+}
+
 export function taskOutcomeSeverity(evt) {
     const lifecycle = String(evt.outcome_axes?.lifecycle?.status || evt.status || '').toLowerCase();
     // v6.82 (P5): a cancelled task is neither Done nor Failed — it is honestly
@@ -505,6 +528,22 @@ export function summarizeLogEvent(evt) {
         });
     }
 
+    if (t === 'owner_hurry') {
+        // S3 (HQ1): the typed non-chat control family. The LOGS tab is a
+        // diagnostic surface, so the row renders here; chat stays silent (see
+        // the explicit visible=false branch in summarizeChatLiveEvent).
+        const proj = ownerHurryProjection(evt);
+        return view('info', proj.label, {
+            body: shortText(evt.detail, 220),
+            meta: taskMeta(
+                evt.request_id ? `request=${evt.request_id}` : '',
+                evt.attempt_key != null ? `attempt=${evt.attempt_key}` : '',
+                evt.effect ? `effect=${evt.effect}` : '',
+                evt.status ? `status=${evt.status}` : '',
+            ),
+        });
+    }
+
     if (t === 'task_metrics_event' || t === 'task_eval') {
         return view('metrics', 'Task metrics', {
             meta: taskMeta(
@@ -697,6 +736,15 @@ export function summarizeChatLiveEvent(evt) {
     const groupId = getLogTaskGroupId(evt);
     const progressText = describeText(String(evt.content || evt.text || '').replace(/^💬\s*/, ''), 240);
     const key = (...parts) => [t, groupId, ...parts].join(':');
+
+    if (t === 'owner_hurry') {
+        // S3 (HQ1) EXPLICIT hide branch: the typed hurry control family never
+        // renders a chat timeline row or bubble — chat.js paints only a compact
+        // card status from ownerHurryProjection, and the durable facts live in
+        // the task detail. Explicit (not the fallthrough) so a future default
+        // change cannot silently surface the family in chat.
+        return chatView({ visible: false, dedupeKey: key(evt.phase || '', evt.request_id || '') });
+    }
 
     if (evt.lifecycle && typeof evt.lifecycle === 'object') {
         const lifecycle = evt.lifecycle;

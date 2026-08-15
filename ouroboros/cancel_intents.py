@@ -62,6 +62,22 @@ INTENT_CLAIMED = "claimed"
 SCOPE_SINGLE = "single"
 SCOPE_CASCADE = "cascade"
 
+# Terminalization POLICY (S3, Q1 2026-08-15) — an INDEPENDENT axis from scope
+# (§13.1): absence/empty means today's immediate hard cancellation, byte-
+# identical for every existing caller; the explicit graceful value buys the
+# owner-stop finalization episode (one bounded tool-less model turn inside the
+# shared finalization grace) before custody kills. MONOTONIC: an immediate
+# request over a graceful intent HARDENS it in place (same durable stop
+# request, single kill-owner); graceful can never soften an accepted immediate.
+STOP_POLICY_IMMEDIATE = "immediate"
+STOP_POLICY_FINALIZE = "finalize_then_cancel"
+
+
+def stop_policy(intent: Any) -> str:
+    """The intent's terminalization policy; absent/unknown reads IMMEDIATE."""
+    value = str((intent or {}).get("stop_policy") or "") if isinstance(intent, dict) else ""
+    return STOP_POLICY_FINALIZE if value == STOP_POLICY_FINALIZE else STOP_POLICY_IMMEDIATE
+
 # Settle outcomes (forensic vocabulary; the projection row is removed on settle).
 SETTLED_CANCELLED = "cancelled"
 SETTLED_ALREADY_SETTLED = "already_settled"
@@ -135,6 +151,7 @@ def request_cancel(
     requested_by: str = "",
     scope: str = "",
     allow_settled_target: bool = False,
+    requested_stop_policy: str = "",
 ) -> Dict[str, Any]:
     """Record durable cancel intent for ``task_id`` — idempotent per task.
 
@@ -170,6 +187,7 @@ def request_cancel(
     """
     tid = _valid_task_id(task_id)
     reason_text = " ".join(str(reason or "").split())[:500]
+    policy_text = str(requested_stop_policy or "").strip()
     settled = settled_status(drive_root, tid)
     if settled and not allow_settled_target:
         _forensic(drive_root, {
@@ -195,15 +213,30 @@ def request_cancel(
         if isinstance(existing, dict) and existing.get("request_id"):
             minted.update(existing)
             minted["already_requested"] = True
+            updated_row = dict(existing)
+            changed = False
             if scope_text == SCOPE_CASCADE and str(existing.get("scope") or "") != SCOPE_CASCADE:
                 # A single-cancel intent later re-entered through the cascade
                 # ingress must be replayed as a cascade. WIDEN-ONLY (GR2-1d):
                 # cascade → single is never written back — narrowing a recorded
                 # cascade would let a watchdog replay settle the root and leave
                 # its descendants running.
-                row = {**existing, "scope": scope_text}
-                intents[tid] = row
-                minted.update(row)
+                updated_row["scope"] = scope_text
+                changed = True
+            if (
+                policy_text == STOP_POLICY_IMMEDIATE
+                and stop_policy(existing) == STOP_POLICY_FINALIZE
+            ):
+                # MONOTONIC hardening (§12.2 item 10): Stop-now during the
+                # graceful wait tightens the SAME durable stop request — single
+                # kill-owner, no second intent. Graceful over immediate is the
+                # forbidden softening direction and falls through unchanged.
+                updated_row["stop_policy"] = STOP_POLICY_IMMEDIATE
+                updated_row["hardened_at"] = utc_now_iso()
+                changed = True
+            if changed:
+                intents[tid] = updated_row
+                minted.update(updated_row)
                 return {"schema_version": _SCHEMA_VERSION, "intents": intents}
             return None
         row = {
@@ -217,6 +250,8 @@ def request_cancel(
             "generation": 0,
             "scope": scope_text or SCOPE_SINGLE,
         }
+        if policy_text == STOP_POLICY_FINALIZE:
+            row["stop_policy"] = STOP_POLICY_FINALIZE
         intents[tid] = row
         minted.update(row)
         minted["already_requested"] = False
@@ -243,7 +278,13 @@ def request_cancel(
             "request_id": minted.get("request_id"),
             "source": minted.get("source"), "requested_by": minted.get("requested_by"),
             "scope": minted.get("scope"), "reason": reason_text,
+            **({"stop_policy": minted.get("stop_policy")} if minted.get("stop_policy") else {}),
             **({"settled_target_status": settled} if settled else {}),
+        })
+    elif minted.get("hardened_at"):
+        _forensic(drive_root, {
+            "event": "stop_policy_hardened", "task_id": tid,
+            "request_id": minted.get("request_id"), "stop_policy": STOP_POLICY_IMMEDIATE,
         })
     minted.setdefault("already_settled", False)
     return dict(minted)
@@ -759,6 +800,11 @@ def cancel_state_fields(drive_root: Any, task_id: str) -> Dict[str, Any]:
     fields: Dict[str, Any] = {"cancel_state": "pending"}
     if intent.get("reason"):
         fields["cancel_reason"] = str(intent.get("reason") or "")
+    if stop_policy(intent) == STOP_POLICY_FINALIZE:
+        # The minimal reload-visible stop-policy projection (§12.2 item 2): the
+        # card can honestly show "finalizing before stop" instead of the
+        # immediate "Cancelling…" while the graceful episode runs.
+        fields["stop_policy"] = STOP_POLICY_FINALIZE
     return fields
 
 

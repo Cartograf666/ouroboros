@@ -826,6 +826,15 @@ class TaskDetailResponse(TypedDict, total=False):
     # the WHY of the pending cancellation (owner text, "subtree cancellation of
     # <root>", "evolution stopped", …). Absent when no reason was recorded.
     cancel_reason: str
+    # S3 (Q1, additive-optional): rides beside a pending ``cancel_state`` when
+    # the open intent is the SOFT stop ("finalize_then_cancel") — the UI shows
+    # "Finalizing…" and offers the hard escalation. Absent on immediate intents.
+    stop_policy: str
+    # S3 (HQ1, additive-optional): the typed owner-hurry observability — the
+    # current block plus the archived history of prior same-id attempts.
+    # Absent on tasks nobody hurried. Task-detail data only, never chat.
+    owner_hurry: OwnerHurryProjection
+    owner_hurry_history: list[OwnerHurryProjection]
     error: str
 
 
@@ -890,6 +899,65 @@ class TaskCancelResponse(TypedDict, total=False):
     # for the subtree cancel, which is COMPLETE by the time this answer is sent;
     # the plain envelope is unchanged.
     cascade: bool
+    # S3 (Q1/Q2, additive): present on the 202 acknowledgement of a
+    # ``{"stop_policy": "finalize_then_cancel"}`` request — the durable intent
+    # is open ("pending") while the bounded finalization attempt runs;
+    # ``stop_policy`` echoes the EFFECTIVE policy of the durable intent
+    # ("immediate" | "finalize_then_cancel"): a graceful request over an
+    # already-hard intent never softens it, and the answer says so. Absent on
+    # the legacy immediate path, which stays byte-identical.
+    cancel_state: str
+    stop_policy: str
+    error: str
+
+
+class TaskHurryRequest(TypedDict):
+    """``POST /api/tasks/{task_id}/hurry`` — the text-free owner hurry control
+    (HQ1: «без видимого сообщения в чат»).
+
+    The body carries ONLY a client-generated stable ``request_id`` (reused on
+    retry so the acknowledgement is idempotent); any other field is refused.
+    There is deliberately no text and no chat side effect anywhere on this
+    path — the durable facts are the typed owner-mailbox control, the
+    ``owner_hurry`` task-result projection, and one non-chat event."""
+
+    request_id: str
+
+
+class OwnerHurryProjection(TypedDict, total=False):
+    """The ``owner_hurry`` block on the task result — task-detail
+    observability, never a chat message. ``state`` is the closed vocabulary
+    requested | applied | not_applied_before_terminal; ``effects`` maps each
+    host-rail effect to its recorded status. ``owner_hurry_history`` rows
+    carry the same shape plus ``archived_at``/``archived_reason`` (rolled over
+    on every same-id requeue by the shared retry-reset)."""
+
+    attempt_key: int
+    request_id: str
+    requested_by: str
+    requested_at: str
+    reason: str
+    state: str
+    effects: Dict[str, str]
+    applied_at: str
+    reconciled_at: str
+    archived_at: str
+    archived_reason: str
+
+
+class TaskHurryResponse(TypedDict, total=False):
+    """Acknowledgement of the typed task-local acceleration control.
+
+    ``duplicate=True`` is the idempotent shape: the same ``request_id`` on the
+    live attempt (or a different id collapsing onto the one armed latch)
+    returns the existing acknowledgement without a second control."""
+
+    ok: bool
+    task_id: str
+    request_id: str
+    state: str
+    attempt_key: int
+    duplicate: bool
     error: str
 
 
@@ -992,6 +1060,7 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "GET /api/tasks/{task_id}/artifacts/{name}",
     "GET /api/tasks/{task_id}/events",
     "POST /api/tasks/{task_id}/cancel",
+    "POST /api/tasks/{task_id}/hurry",
     "POST /api/tasks/{task_id}/resume",
     "GET /api/schedules",
     "POST /api/schedules",
@@ -1172,6 +1241,9 @@ __all__ = [
     "ClaudexorStatusResponse",
     "TaskEvent",
     "TaskCancelResponse",
+    "TaskHurryRequest",
+    "TaskHurryResponse",
+    "OwnerHurryProjection",
     "LogTailResponse",
     "HTTP_ENDPOINTS",
     "WS_MESSAGE_TYPES",

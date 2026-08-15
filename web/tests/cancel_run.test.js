@@ -9,7 +9,8 @@ import {
     taskOutcomeSeverity,
     taskTerminalPhase,
 } from '../modules/log_events.js';
-import { cancelRunEligibility, isTerminalTaskPhase } from '../modules/chat.js';
+import { isTerminalTaskPhase } from '../modules/chat.js';
+import { cancelRunEligibility } from '../modules/task_control_menu.js';
 
 // --- cancelled severity reducer (added ONCE, consumed everywhere) ---
 
@@ -43,10 +44,12 @@ test('the cancel click shows the honest interim, not an instant Cancelled', () =
     // one consumer path for the typed projection, never an inline status peek).
     const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
     assert.match(chat, /function markLiveCardCancelPending\(/);
-    assert.match(chat, /markLiveCardCancelPending\(taskId\);\n[\s\S]{0,400}await cancelTask\(/);
-    assert.match(chat, /taskCancelPending\(stored\)[\s\S]{0,400}markLiveCardCancelPending\(taskId\)/);
+    assert.match(chat, /markLiveCardCancelPending\(taskId, soft\);\n[\s\S]{0,600}await requestStop\(/);
+    assert.match(chat, /taskCancelPending\(stored\)[\s\S]{0,400}markLiveCardCancelPending\(taskId[,)]/);
     assert.doesNotMatch(chat, /cancel_state === 'pending'/);
     assert.match(chat, /Cancelling…/);
+    // S3 (Q1): the pending SOFT stop shows "Finalizing…" from the same seam.
+    assert.match(chat, /Finalizing…/);
 });
 
 test('cancellation wins over failure-shaped teardown side facts', () => {
@@ -133,10 +136,12 @@ test('Cancel run offered only on live, marker-attested root cards', () => {
 test('both cancel surfaces report a refused cancellation', () => {
     // The endpoint answers only after the teardown, so success needs no extra
     // reporting — but a refusal must never read as a silent no-op click.
+    // S3: both surfaces route through the SHARED requestStop (one endpoint
+    // binding for the dropdown's stop actions).
     const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
     const activity = readFileSync(new URL('../modules/activity.js', import.meta.url), 'utf8');
     for (const source of [chat, activity]) {
-        assert.match(source, /await cancelTask\(/);
+        assert.match(source, /await requestStop\(/);
     }
     // ...and Activity no longer swallows a refused cancel (503) as a no-op click,
     // while keeping the documented 404 completion race graceful.
@@ -167,18 +172,16 @@ test('a 404 cancel reconciles the card from the durable record', () => {
     // card through the SAME terminal seam replay uses — not merely hide a button.
     const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
     const branch = chat.slice(chat.indexOf('cancelableTaskIds.delete(taskId)'));
-    assert.match(branch.slice(0, 1200), /apiFetch\(`\/api\/tasks\/\$\{encodeURIComponent\(taskId\)\}`\)/);
-    assert.match(branch.slice(0, 1600), /reconcileCancelCardFromDetail\(record, taskId, stored\)/);
+    assert.match(branch.slice(0, 1200), /reconcileCancelCardFromDetail\(record, taskId, await fetchTaskDetail\(taskId\)\)/);
 });
 
 test('a successful cancel also reconciles when task_done publication is lost', () => {
     // Durable cancellation precedes fail-soft publication. A 200 with no WS frame
     // must therefore read the stored result before leaving the button disabled.
     const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
-    const success = chat.slice(chat.indexOf('await cancelTask(taskId, { cascade: true })'));
+    const success = chat.slice(chat.indexOf('await requestStop(taskId, action)'));
     const beforeCatch = success.slice(0, success.indexOf('} catch (exc)'));
-    assert.match(beforeCatch, /apiFetch\(`\/api\/tasks\/\$\{encodeURIComponent\(taskId\)\}`\)/);
-    assert.match(beforeCatch, /reconcileCancelCardFromDetail\(record, taskId, stored\)/);
+    assert.match(beforeCatch, /reconcileCancelCardFromDetail\(record, taskId, await fetchTaskDetail\(taskId\)\)/);
 });
 
 // --- GR2-8: cancel-state honesty (failure restore + pending-before-terminal) ---
@@ -197,7 +200,10 @@ test('task-detail reconciliation consults taskCancelPending BEFORE the legacy te
     assert.ok(pendingAt < terminalAt, 'the typed pending check runs before the terminal fallback');
     // ALL reconcile call sites (success, 404, and the GR3-10 non-404 failure)
     // route through the ONE helper (no inline order drift).
-    assert.equal(chat.match(/reconcileCancelCardFromDetail\(record, taskId, stored\);/g).length, 3);
+    assert.equal(
+        chat.match(/reconcileCancelCardFromDetail\(record, taskId, (stored|await fetchTaskDetail\(taskId\))\);/g).length,
+        3,
+    );
 });
 
 test('a failed cancel reconciles through the shared helper before touching the button', () => {
@@ -208,7 +214,7 @@ test('a failed cancel reconciles through the shared helper before touching the b
     // a genuinely-live, non-pending task gets its prior phase restored and
     // the button re-enabled.
     const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
-    assert.match(chat, /const priorPhase = captureLiveCardPhase\(record\);\n\s*markLiveCardCancelPending\(taskId\);/);
+    assert.match(chat, /const priorPhase = captureLiveCardPhase\(record\);\n\s*markLiveCardCancelPending\(taskId, soft\);/);
     const failure = chat.slice(chat.indexOf('showToast(`Cancel failed:'));
     const branch = failure.slice(0, 2200);
     // The shared seam runs BEFORE any button re-enable.

@@ -2801,6 +2801,20 @@ def _ensure_workers_healthy_locked(queue: Any) -> tuple[List[int], bool]:
                             )
                         except Exception:
                             log.debug("Failed to write interrupted status for %s", w.busy_task_id, exc_info=True)
+                        try:
+                            # The ONE shared same-id requeue reset (§19.7.2 item 11):
+                            # the crash-requeue used to clean nothing, so the retried
+                            # attempt inherited the dead attempt's mailbox controls
+                            # and executable owner_hurry latch. Fail-soft inside.
+                            from ouroboros.owner_hurry import retry_reset
+
+                            retry_reset(
+                                queue._task_drive_for_task(task, str(w.busy_task_id)),
+                                DRIVE_ROOT, str(w.busy_task_id),
+                                reason="worker_crash_requeue",
+                            )
+                        except Exception:
+                            log.debug("Crash-requeue retry reset failed for %s", w.busy_task_id, exc_info=True)
                         admitted = queue.enqueue_task(task, front=True)
                         admission_block = (
                             str(admitted.get("_admission_blocked") or "")

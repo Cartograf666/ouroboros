@@ -310,8 +310,16 @@ class LocalChatBridge:
         is_progress: bool = False,
         task_id: str = "",
         progress_meta: Optional[Dict[str, Any]] = None,
+        role: str = "",
+        system_type: str = "",
     ) -> Tuple[bool, str]:
-        """Send text to UI, A2A subscribers, and host event stream."""
+        """Send text to UI, A2A subscribers, and host event stream.
+
+        ``role``/``system_type`` (S3, additive): a host-authored SYSTEM receipt
+        carries its typed role end to end — live WebSocket frame, CHAT_OUTBOUND
+        skill event — so it can never be rendered as Ouroboros's own speech
+        (Q4 non-mimicry). Absent = the historical assistant framing.
+        """
         clean_text = _strip_markdown(text) if not parse_mode else text
         message_ts = ts or utc_now_iso()
         transport = dict(self._chat_transports.get(int(chat_id or 0), {}) or {})
@@ -337,7 +345,7 @@ class LocalChatBridge:
         if self._broadcast_fn and not is_a2a_chat_id(chat_id):
             payload = {
                 "type": "chat",
-                "role": "assistant",
+                "role": str(role or "") or "assistant",
                 "content": clean_text,
                 "markdown": bool(parse_mode),
                 "is_progress": bool(is_progress),
@@ -346,6 +354,8 @@ class LocalChatBridge:
                 "chat_id": int(chat_id or 0),
                 "transport": transport,
             }
+            if system_type:
+                payload["system_type"] = str(system_type)
             if meta:
                 payload.update(meta)
             self._broadcast_fn(payload)
@@ -359,6 +369,10 @@ class LocalChatBridge:
                 "task_id": str(task_id or ""),
                 "transport": transport,
             }
+            if role:
+                event["role"] = str(role)
+            if system_type:
+                event["system_type"] = str(system_type)
             if meta:
                 event.update(meta)
             publish_event(CHAT_OUTBOUND, event)
@@ -663,6 +677,8 @@ def _send_markdown(
     is_progress: bool = False,
     task_id: str = "",
     progress_meta: Optional[Dict[str, Any]] = None,
+    role: str = "",
+    system_type: str = "",
 ) -> Tuple[bool, str]:
     """Send markdown text through the bridge."""
     bridge = get_bridge()
@@ -676,6 +692,8 @@ def _send_markdown(
         is_progress=is_progress,
         task_id=task_id,
         progress_meta=progress_meta,
+        role=role,
+        system_type=system_type,
     )
 
 
@@ -815,7 +833,8 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
                      fmt: str = "",
                      is_progress: bool = False, task_id: str = "",
                      progress_meta: Optional[Dict[str, Any]] = None,
-                     ts: Optional[str] = None) -> None:
+                     ts: Optional[str] = None,
+                     role: str = "", system_type: str = "") -> None:
     st = load_state()
     owner_id = int(st.get("owner_id") or 0)
     _text = str(text or "")
@@ -837,13 +856,17 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
         append_jsonl(DATA_DIR / "logs" / "progress.jsonl", progress_record)
     else:
         log_chat(
-            "out",
+            # S3 (Q4): a typed SYSTEM row persists as direction="system", the
+            # role history replay already maps to a system rendering — so the
+            # receipt survives reload as system, never as Ouroboros's speech.
+            "system" if role == "system" else "out",
             chat_id,
             owner_id,
             text if log_text is None else log_text,
             ts=msg_ts,
             fmt=fmt,
             task_id=task_id,
+            record_type=system_type,
         )
 
     if _text.strip() in ("", "\u200b"):
@@ -861,6 +884,8 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
             is_progress=is_progress,
             task_id=task_id,
             progress_meta=progress_meta,
+            role=role,
+            system_type=system_type,
         )
         return
 
@@ -872,4 +897,6 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
         is_progress=is_progress,
         task_id=task_id,
         progress_meta=progress_meta,
+        role=role,
+        system_type=system_type,
     )

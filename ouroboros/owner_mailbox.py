@@ -17,6 +17,11 @@ _MAILBOX_DIR = "memory/owner_mailbox"
 # are routed structurally (never shown as user prose).
 KIND_OWNER_TEXT = "owner_text"
 KIND_FINALIZE_NOW = "finalize_now"
+# Owner "hurry" control (HQ1, 2026-08-15): a task-local typed acceleration
+# directive — NEVER owner dialogue and NEVER revoked after drain (restart
+# re-drain must restore the attempt latch; only terminal cleanup removes it).
+# Its ``text`` is the parser-required internal reason ("owner_hurry"), not prose.
+KIND_HURRY = "hurry"
 # The mailbox is append-only, so a sender that changes its mind cannot delete the
 # control it already wrote — it appends this retraction naming the target msg_id.
 # Revocations are resolved by the READER over the whole mailbox, so a control that
@@ -122,7 +127,13 @@ def drain_owner_entries(
                 continue
             text = entry.get("text", "")
             if text:
-                entries.append({"msg_id": mid, "text": text, "kind": kind})
+                # ``ts`` is ADDITIVE (2026-08-15 Fable pin): typed controls such
+                # as ``hurry`` carry their request time into the drained entry so
+                # the attempt latch can preserve when the owner actually asked.
+                entries.append({
+                    "msg_id": mid, "text": text, "kind": kind,
+                    "ts": str(entry.get("ts") or ""),
+                })
         return entries
     except Exception:
         log.debug("Failed to read mailbox for task %s", task_id, exc_info=True)

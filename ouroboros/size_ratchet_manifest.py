@@ -203,9 +203,8 @@ BYTE_BASELINE_DEBT = {
 
 BYTE_DEBT = {
     "ouroboros/llm.py": 200307,
-    "ouroboros/loop.py": 321576,
-    "supervisor/events.py": 205328,
+    "ouroboros/loop.py": 321126,
     "tests/test_delegated_subagent_transport.py": 320623,
     "tests/test_devtools_benchmarks.py": 328786,
-    "web/modules/chat.js": 229785,
+    "web/modules/chat.js": 229656,
 }

@@ -1155,8 +1155,22 @@ def _has_pending_descendant(task_id: str) -> bool:
 def _enforce_task_timeouts_locked(
     workers: Any, now: float, owner_chat_id: int, st: Dict[str, Any]
 ) -> None:
+    # ONE typed owner-stop predicate before every generic timeout-grace consumer
+    # (S3 §12.2 item 8): a task inside an ACTIVE owner-requested finalization
+    # episode is bypassed whole — no spare-withdraw, no spare-clock reset, no
+    # second grace episode, no expiry kill, no RUNNING.pop, no reaper enqueue,
+    # no retry scheduling. The episode's own deadline and custody feed live in
+    # supervisor/owner_stop.py + sweep_cancel_intents; the intent stays the one
+    # owner will and custody stays the only killer.
+    from supervisor.owner_stop import running_owner_stop_tasks
+
+    owner_stop_held = running_owner_stop_tasks(
+        DRIVE_ROOT, grace_sec=FINALIZATION_GRACE_SEC, now=now,
+    )
     for task_id, meta in list(RUNNING.items()):
         if not isinstance(meta, dict):
+            continue
+        if str(task_id) in owner_stop_held:
             continue
         task = meta.get("task") if isinstance(meta.get("task"), dict) else {}
         started_at = float(meta.get("started_at") or 0.0)
