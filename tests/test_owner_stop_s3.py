@@ -1,4 +1,4 @@
-"""S3 graceful owner stop («Подвести итог») test matrix — Q1/Q2/Q3=A/Q4=A/Q6=A.
+"""S3 graceful owner stop ("Wrap up") test matrix — Q1/Q2/Q3=A/Q4=A/Q6=A.
 
 Covers the policy axis end to end against production seams: the typed
 ``stop_policy`` vocabulary and its monotonic hardening in
@@ -163,7 +163,7 @@ def test_bad_policy_is_400_and_explicit_immediate_keeps_the_legacy_contract(tmp_
 
 
 def test_graceful_escalates_to_stop_now_through_the_same_intent(tmp_path, monkeypatch):
-    """The owner presses «Остановить немедленно» during the graceful wait: the
+    """The owner presses "Stop now" during the graceful wait: the
     same durable request hardens and the synchronous teardown runs."""
     q = _isolate_queue(
         monkeypatch, tmp_path,
@@ -671,6 +671,61 @@ def test_crash_restart_preserves_both_deadlines(tmp_path):
     ) == deadline
 
 
+def test_zero_grace_is_feature_off_pre_drain_and_post_drain(tmp_path):
+    """M1: ``grace_sec<=0`` means the graceful-stop feature is OFF everywhere
+    (the immediate custody path) — never a request+outer-cap window, not even
+    pre-drain: no episode deadline, no sweep hold, no enforcement bypass."""
+    intent = _graceful_intent(tmp_path, "t-zero")
+    now = time.time()
+    assert ostop.owner_stop_deadline_ts(intent, 0.0) == 0.0
+    assert ostop.owner_stop_active(intent, now=now, grace_sec=0.0) is False
+    # Post-drain too: a drain stamp never resurrects a window under grace 0.
+    assert ci.mark_finalize_control_drained(tmp_path, "t-zero") is True
+    assert ostop.owner_stop_deadline_ts(
+        ci.active_intent(tmp_path, "t-zero"), 0.0,
+    ) == 0.0
+    # The sweep feeds custody immediately; enforcement needs no bypass set.
+    running = {"t-zero": {"task": {"id": "t-zero", "chat_id": 0}, "started_at": now}}
+    q = _fake_queue(tmp_path, running)
+    q.FINALIZATION_GRACE_SEC = 0.0
+    assert ostop.sweep_owner_stop_hold(q, "t-zero", intent, now=now) is False
+    assert ostop.running_owner_stop_tasks(tmp_path, grace_sec=0.0) == set()
+    # A positive grace keeps the normal pre-drain outer-cap window.
+    assert ostop.owner_stop_deadline_ts(intent, 120.0) > 0
+
+
+def test_failed_drain_stamp_retries_once_then_stays_conservative(tmp_path, monkeypatch):
+    """M3: a failing durable drain stamp is retried exactly once; still
+    unconfirmed, the worker emits a typed forensic event and NO extended
+    budget appears anywhere — the undrained intent keeps the conservative
+    request+outer-cap deadline the sweep budgets from."""
+    intent = _graceful_intent(tmp_path, "t-stamp")
+    attempts = []
+
+    def _failing_stamp(*_a, **_k):
+        attempts.append(1)
+        return False
+
+    monkeypatch.setattr(ci, "mark_finalize_control_drained", _failing_stamp)
+    control_id = ostop.owner_stop_control_id(intent)
+    assert write_owner_message(
+        tmp_path, REASON_OWNER_REQUESTED_FINALIZATION, "t-stamp",
+        msg_id=control_id, kind=KIND_FINALIZE_NOW,
+    )
+    controls = _production_drain(tmp_path, "t-stamp")
+    assert controls["finalize_now"] == REASON_OWNER_REQUESTED_FINALIZATION
+    assert len(attempts) == 2                       # one retry, then stop
+    updated = ci.active_intent(tmp_path, "t-stamp")
+    assert not str(updated.get("control_drained_at") or "")
+    # Conservative deadline: undrained -> request + outer cap (sweep semantics).
+    assert ostop.owner_stop_deadline_ts(updated, 120.0) == (
+        ostop._requested_ts(updated) + OWNER_STOP_OUTER_CAP_SEC
+    )
+    events = (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8")
+    assert '"owner_stop_stamp_failed"' in events
+    assert '"t-stamp"' in events
+
+
 # ---------------------------------------------------------------------------
 # Loop owner-stop rail: ZERO or ONE tool-less model turn (Q1/Q3=A, CF-02/CF-03)
 # ---------------------------------------------------------------------------
@@ -724,3 +779,43 @@ def test_owner_stop_rail_without_candidate_spends_exactly_one_turn(tmp_path, mon
     # the bounded durable child projection.
     assert "[OWNER_STOP]" in calls[0]
     assert "[CHILD_RESULTS] kid-1 (cancelled)" in calls[0]
+
+
+def test_expired_control_at_consume_never_starts_a_paid_summary(tmp_path, monkeypatch):
+    """M2: a finalize control consumed only AFTER the effective deadline
+    (undrained -> request + outer cap) must not buy a paid summary turn — the
+    rail returns the honest fallback on the same typed rail and custody
+    settles the episode as today. Inside the window the bounded summary runs."""
+    from tests.test_delivery_forced_finalization import _forced_test_context
+
+    calls = []
+
+    def _paid(*_a, **_k):
+        calls.append(1)
+        return {"role": "assistant", "content": "Paid summary."}, 0.0
+
+    # Inside the window (fresh intent): exactly one paid summary turn runs.
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    loop, _registry, ctx, _trace = _forced_test_context(fresh)
+    monkeypatch.setattr(loop, "call_llm_with_retry", _paid)
+    _graceful_intent(fresh, "parent1")
+    text, usage, _t = loop._handle_forced_finalization(
+        ctx, REASON_OWNER_REQUESTED_FINALIZATION,
+    )
+    assert len(calls) == 1 and "Paid summary." in text
+    # Past the outer cap: ZERO paid turns; the typed reason and the honest
+    # fallback stand (no new outcome invented — custody settles the episode).
+    expired = tmp_path / "expired"
+    expired.mkdir()
+    loop, _registry, ctx2, _trace2 = _forced_test_context(expired)
+    _graceful_intent(expired, "parent1")
+    _backdate_intent(expired, "parent1", seconds=OWNER_STOP_OUTER_CAP_SEC + 30.0)
+    calls.clear()
+    text, usage, _t = loop._handle_forced_finalization(
+        ctx2, REASON_OWNER_REQUESTED_FINALIZATION,
+    )
+    assert calls == []                                  # no paid summary
+    assert usage["reason_code"] == REASON_OWNER_REQUESTED_FINALIZATION
+    assert usage["execution_status"] == "failed"
+    assert "no final answer could be produced" in text

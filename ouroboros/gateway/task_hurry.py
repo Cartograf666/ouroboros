@@ -110,7 +110,7 @@ async def api_task_hurry(request: Request) -> JSONResponse:
             400, task_id=task_id, reason_code="request_id_required",
         )
     if any(key not in {"request_id"} for key in body):
-        # Text-free by contract (HQ1: «без видимого сообщения в чат») — a body
+        # Text-free by contract (HQ1 owner decision: no visible chat message) — a body
         # smuggling text/fields is refused rather than silently dropped.
         return json_error(
             "hurry accepts only {\"request_id\"} — it carries no text",
@@ -153,7 +153,7 @@ async def api_task_hurry(request: Request) -> JSONResponse:
         # after a mailbox write failure + page reload minted a new id)
         # appends idempotently under the effect LATCH's request_id: the drain
         # dedupes by msg_id, so a duplicate line is invisible while a lost
-        # control is healed instead of a false «уже принято» acknowledgement.
+        # control is healed instead of a false "already accepted" acknowledgement.
         latch_request_id = str(block.get("request_id") or "") or request_id
         drive = _task_drive_for_task(task, task_id)
         if not write_owner_message(

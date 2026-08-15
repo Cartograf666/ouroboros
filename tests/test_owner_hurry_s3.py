@@ -191,7 +191,7 @@ def test_same_request_id_is_idempotent_and_different_id_collapses_to_one_latch(t
     # second mailbox CONTROL — the healing append reuses the LATCH's msg_id
     # (hurry:req-a), so the drain still dedupes to one control while a lost
     # first append (mailbox write failure + reload) heals instead of a false
-    # «уже принято». Projection stays owned by the first request.
+    # "already accepted" ack. Projection stays owned by the first request.
     assert other.json()["duplicate"] is True
     assert len(_hurry_rows(tmp_path, "root-3")) == 3      # req-a twice + req-b's heal
     assert all(r["msg_id"] == "hurry:req-a" for r in _hurry_rows(tmp_path, "root-3"))

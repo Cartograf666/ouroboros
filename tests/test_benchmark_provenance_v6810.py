@@ -281,7 +281,7 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     "provider_unavailable": (True, "loop.py:3185 reroute + fallback exhausted"),
     "children_unabsorbed": (True, "loop.py:4071 forced terminal, child results unabsorbed"),
     "llm_api_error": (True, "loop_llm_call.py:630 transport death; never a fair shot"),
-    # S3 owner graceful stop («Подвести итог»): the owner ended the attempt, so
+    # S3 owner graceful stop ("Wrap up"): the owner ended the attempt, so
     # reward 0 is an owner decision, never a fair-shot capability fact (CF-02:
     # reusing finalization_grace would persist the deadline's false reason).
     "owner_requested_finalization": (True, "loop.py _handle_owner_stop_finalization; owner-requested stop"),

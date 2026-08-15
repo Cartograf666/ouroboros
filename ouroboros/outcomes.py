@@ -100,7 +100,7 @@ OBJECTIVE_BEST_EFFORT = "best_effort"
 # best-effort promotion turned that into "completed" — a lie that hid a real
 # outage from the owner. The rail stamps infra_failed instead (loop.py
 # _handle_provider_unavailable); salvage text still rides the result body.
-# S3 (Q1/Q3=A, 2026-08-15): the typed rail for the owner's «Подвести итог»
+# S3 (Q1/Q3=A, 2026-08-15): the typed rail for the owner's "Wrap up"
 # graceful stop — one bounded tool-less finalization turn requested through the
 # durable stop intent. Distinct from every deadline/budget truncation reason.
 # Defined here, above its first consumer set (module-load order).

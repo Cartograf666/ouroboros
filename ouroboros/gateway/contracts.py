@@ -959,7 +959,7 @@ class TaskCancelResponse(TypedDict, total=False):
 
 class TaskHurryRequest(TypedDict):
     """``POST /api/tasks/{task_id}/hurry`` — the text-free owner hurry control
-    (HQ1: «без видимого сообщения в чат»).
+    (HQ1 owner decision, paraphrased: no visible chat message ever).
 
     The body carries ONLY a client-generated stable ``request_id`` (reused on
     retry so the acknowledgement is idempotent); any other field is refused.

@@ -324,12 +324,11 @@ def _check_budget_limits(
                 )
                 if tool_ctx is not None else ""
             )
-            # This early rejection is a forced sink like every other: nothing was
-            # produced, but a queued/headless root still OWED a panel, and returning
-            # here without the record left `eligibility=not_eligible / run_count=0`
-            # — indistinguishable from "no panel was warranted", the exact shape the
-            # typed bypass exists to close. Pure ledger write: no panel, no model
-            # round, no fence (the common recorder is the one seam).
+            # This early rejection is a forced sink like every other: nothing
+            # was produced, but a queued/headless root still OWED a panel, and
+            # returning without the record left `not_eligible / run_count=0` —
+            # indistinguishable from "no panel was warranted". Pure ledger
+            # write: no panel, no model round, no fence.
             _record_forced_finalization(
                 ctx,
                 trace,
@@ -434,14 +433,13 @@ def _resolve_task_cost_ceiling(
     )
 
 
-# Bounded staleness for the two DECIDING cost surfaces (the ceiling check and
-# the milestone note). The free stash is refreshed by every dispatch under this
-# root, so in a fast loop it is at most one round old and this costs zero reads.
-# But ONE round can block for 900s inside wait_tasks while children spend — the
-# exact shape both dead waves had — and the pacing refresh only covers deadline-
-# less tasks, so a round that outlives this bound pays for exactly one real
-# projection read. Still never a per-round read (see the usage_accounting
-# telemetry note and the e4a87344 contention class).
+# Bounded staleness for the two DECIDING cost surfaces (ceiling check and
+# milestone note). The free stash is refreshed by every dispatch under this
+# root — at most one round old, zero reads — but ONE round can block 900s in
+# wait_tasks while children spend (the shape both dead waves had), and the
+# pacing refresh only covers deadline-less tasks, so a round outliving this
+# bound pays for exactly one real projection read. Never per-round (see the
+# usage_accounting telemetry note and the e4a87344 contention class).
 _TREE_ACCOUNTING_MAX_STALE_SEC = 120.0
 
 
@@ -1666,13 +1664,12 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
         },
         task_id=ctx.task_id,
     )
-    # Budget admission for the whole acceptance wave (v6.69.0): a wave that cannot
-    # fit the remaining root budget is declined up front as a terminal DEGRADED
-    # (no-quorum semantics) instead of dying mid-wave with paid partial slots and
-    # a wedged pending review. The estimate renders the REAL per-slot message pair
-    # (a compact guess measured ~2.1x short of the dispatched prompt); the rare
-    # second physical attempt per actor is deliberately not multiplied in — a
-    # fail-open coarse filter for waves that cannot fit, not a hard reservation.
+    # Budget admission for the whole acceptance wave (v6.69.0): a wave that
+    # cannot fit the remaining root budget is declined up front as a terminal
+    # DEGRADED (no-quorum semantics) instead of dying mid-wave. The estimate
+    # renders the REAL per-slot message pair; the rare second physical attempt
+    # is deliberately not multiplied in — a fail-open coarse filter, not a
+    # hard reservation.
     from ouroboros.tools.review_helpers import review_wave_budget_gate
 
     try:
@@ -1804,12 +1801,11 @@ def _apply_task_acceptance_result(
         _record_host_acceptance_run(ctx, result)
     dissent = dissent_findings(result)
     blocking_lane = ctx.mode == "required" and get_review_enforcement() == "blocking"
-    # A REUSED panel (unchanged binding) is the SAME reviewer act applied again:
-    # re-collecting would mutate reviewer-authored state with no new reviewer
-    # input — reopened_count 0→1 mislabels a first presentation as re-raised,
-    # and the changed catalog row shifts the evidence revision, buying a fresh
-    # paid panel for a byte-identical resubmit (fable review r2 #1). The rows
-    # were already collected when this exact panel first applied.
+    # A REUSED panel (unchanged binding) is the SAME reviewer act applied
+    # again: re-collecting would mutate reviewer-authored state with no new
+    # reviewer input, and the shifted evidence revision would buy a fresh paid
+    # panel for a byte-identical resubmit (fable review r2 #1). The rows were
+    # already collected when this exact panel first applied.
     if blocking_lane and not reused:
         _collect_acceptance_obligations(ctx.llm_trace, result)
     open_obligations = _open_acceptance_obligations(ctx.llm_trace) if blocking_lane else []
@@ -1862,10 +1858,10 @@ def _apply_task_acceptance_result(
     if dialogue_terminal:
         # v6.74.0 (A5): a reviewer quorum judged the dialogue no longer
         # actionable (unreachable_here / stable_disagreement). Finalize through
-        # the EXISTING honest path, recording BOTH positions — the reviewers'
-        # findings stay in the run record, the agent's dispositions stay on the
-        # obligation rows — with one owner-visible line. This is reviewer
-        # authorship, not a host timer and not a unilateral agent give-up.
+        # the EXISTING honest path, recording BOTH positions (findings in the
+        # run record, dispositions on the obligation rows) with one owner-
+        # visible line. Reviewer authorship — not a host timer or a
+        # unilateral agent give-up.
         ctx.tools._ctx._task_acceptance_reviewed = True
         _end_task_acceptance_fence(ctx.tools._ctx, outcome="terminal")
         _mark_root_acceptance_checkpoint(
@@ -2028,13 +2024,11 @@ def _apply_task_acceptance_result(
     else:
         _set_acceptance_decision(ctx.llm_trace, {
             # Round-9 CRITICAL 1: fall-through AFTER `task_acceptance_is_clean`
-            # already refused the panel, so it cannot mint `accepted` — ARCH
-            # reserves that state for clean acceptance. Reachable case: a
-            # reviewer claims `solved` while supplying a MISSING criterion with
-            # the improvement-pass cap spent — nothing actionable left, but that
-            # is not "accepted". The typed reason still names WHY the loop stops
-            # (`no_actionable_changes`), tier honesty keeps riding
-            # `outcome_tier`; only the owner-facing state is now the honest one.
+            # refused the panel, so it cannot mint `accepted` (ARCH reserves
+            # that for clean acceptance). Reachable: a reviewer claims `solved`
+            # with a MISSING criterion and the improvement-pass cap spent —
+            # nothing actionable, but not "accepted". The typed reason names
+            # WHY the loop stops; tier honesty keeps riding `outcome_tier`.
             "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
             "reason": "no_actionable_changes",
             "source": "task_acceptance_review",
@@ -2665,13 +2659,12 @@ def _compute_subagent_handoff(tools: Any, drive_root: Any, task_id: str, content
             child for child in children
             if str(child.get("status") or "").strip().lower() not in FINAL_STATUSES
         ]
-        # P5: the reminder is suppressed ONLY by structured signals — a child explicitly
-        # discarded/cancelled (filtered out of `children` above) or absorbed (unchanged
-        # signature = state already seen). NEVER by parsing final PROSE for status words
-        # (a removed keyword gate that could silently orphan a child). Fires once per
-        # CHANGE (a child appearing/progressing/completing re-surfaces it), not every
-        # round; if the agent still finalizes with unhandled children, the no-tool /
-        # forced finalization paths append a loud orphan note via _forced_orphan_note (P1).
+        # P5: the reminder is suppressed ONLY by structured signals — a child
+        # discarded/cancelled (filtered above) or absorbed (unchanged
+        # signature). NEVER by parsing final PROSE for status words. Fires once
+        # per CHANGE, not every round; if the agent still finalizes with
+        # unhandled children, the no-tool / forced finalization paths append a
+        # loud orphan note via _forced_orphan_note (P1).
         _ = nonterminal_children  # (kept for readability; trigger is change-based)
         if children and signature and signature != previous:
             tools._ctx._subagent_handoff_signature = signature
@@ -2879,13 +2872,11 @@ def _note_nanny_delegate_activity(
     if not verbs:
         return
     if verbs == {"delegate_wait"}:
-        # R2-5: a wait is WATCHING, not delegating — it advances only the ROUND
-        # half of the baseline. Preserving the COST half keeps the dollar axis
-        # cumulative across waits: the reviewer's probe ($0.24/round with a
-        # ritual wait every 7 rounds — incident burn rate) re-zeroed BOTH axes
-        # at every wait and never heard the reminder, while a genuinely-holding
-        # nanny (waits plus pennies per round) stays under the dollar threshold
-        # anyway.
+        # R2-5: a wait is WATCHING, not delegating — it advances only the
+        # ROUND half of the baseline. Preserving the COST half keeps the
+        # dollar axis cumulative across waits: re-zeroing BOTH axes at every
+        # wait never heard the reminder ($0.24/round probe), while a genuinely
+        # holding nanny stays under the dollar threshold anyway.
         prior = getattr(ctx, "_nanny_delegate_baseline", None)
         prior_cost = float(prior.get("cost") or 0.0) if isinstance(prior, dict) else 0.0
         ctx._nanny_delegate_baseline = {"round": mark["round"], "cost": prior_cost}
@@ -3244,21 +3235,60 @@ def _mark_owner_stop_control_drained(
 ) -> None:
     """Stamp the owner-stop finalize control's DELIVERY on the durable intent.
 
-    The intent lives on the CANONICAL data root (``budget_drive_root`` first,
-    like the durable result reads — a forked task's mailbox drive differs).
-    Idempotent (first drain wins) and fail-soft: on a stamp failure the sweep
-    keeps budgeting from the outer request-time cap."""
+    The intent lives on the CANONICAL data root (``budget_drive_root`` first;
+    a forked task's mailbox drive differs). Idempotent (first drain wins). A
+    failed stamp is retried ONCE; still unconfirmed, a typed forensic event
+    is appended and no extended budget is assumed: the sweep keeps the
+    request+outer-cap deadline, and ``_owner_stop_window_elapsed`` reads the
+    same unstamped intent, bounding the worker by that anchor."""
     try:
-        from ouroboros.cancel_intents import mark_finalize_control_drained
+        from ouroboros.cancel_intents import active_intent, mark_finalize_control_drained
 
         root = (
             str(getattr(owner_ctx, "budget_drive_root", "") or "")
             or (str(drive_root) if drive_root is not None else "")
         )
-        if root and task_id:
-            mark_finalize_control_drained(pathlib.Path(root), task_id)
+        if not (root and task_id):
+            return
+        root_path = pathlib.Path(root)
+        for _ in range(2):
+            if mark_finalize_control_drained(root_path, task_id):
+                return
+            row = active_intent(root_path, task_id)
+            if isinstance(row, dict) and str(row.get("control_drained_at") or ""):
+                return  # already stamped: the durable anchor is confirmed
+        from ouroboros.utils import append_jsonl, utc_now_iso
+
+        append_jsonl(root_path / "logs" / "events.jsonl", {
+            "ts": utc_now_iso(), "type": "owner_stop_stamp_failed",
+            "task_id": task_id,
+        })
     except Exception:
         log.debug("owner-stop drain stamp failed for %s", task_id, exc_info=True)
+
+
+def _owner_stop_window_elapsed(ctx: "_RoundLimitContext") -> bool:
+    """Whether the durable owner-stop deadline already passed at consume.
+
+    Reads the SAME durable intent the custody sweep budgets from (no drain
+    stamp -> the conservative request+outer-cap anchor). Fail-soft: an
+    unreadable intent keeps the bounded summary running."""
+    try:
+        from ouroboros.cancel_intents import STOP_POLICY_FINALIZE, active_intent, stop_policy
+        from ouroboros.config import get_finalization_grace_sec
+        from supervisor.owner_stop import owner_stop_deadline_ts
+
+        root = getattr(ctx, "status_drive_root", None) or ctx.drive_root
+        if root is None or not ctx.task_id:
+            return False
+        intent = active_intent(pathlib.Path(root), ctx.task_id)
+        if not isinstance(intent, dict) or stop_policy(intent) != STOP_POLICY_FINALIZE:
+            return False
+        deadline = owner_stop_deadline_ts(intent, float(get_finalization_grace_sec()))
+        return time.time() >= deadline if deadline else True
+    except Exception:
+        log.debug("owner-stop window check failed for %s", ctx.task_id, exc_info=True)
+        return False
 
 
 def _drain_incoming_messages(
@@ -3522,6 +3552,20 @@ def _handle_owner_stop_finalization(
             ctx, llm_trace, candidate.full_text, REASON_OWNER_REQUESTED_FINALIZATION,
             retained_source="owner_stop_retained_candidate",
         )
+    fallback = (
+        "⚠️ The owner requested finalize-then-stop; no final answer could be "
+        "produced inside the grace window."
+    )
+    if _owner_stop_window_elapsed(ctx):
+        # An expired control never buys a paid summary: the honest fallback
+        # rides the same typed rail and custody settles it.
+        _finalize_forced_services(ctx, llm_trace)
+        ctx.accumulated_usage["execution_status"] = "failed"
+        ctx.accumulated_usage["reason_code"] = REASON_OWNER_REQUESTED_FINALIZATION
+        return _forced_fallback_result(
+            ctx, llm_trace, fallback, REASON_OWNER_REQUESTED_FINALIZATION,
+            source="owner_stop_window_elapsed",
+        )
     child_block = "\n".join(str(control_text or "").splitlines()[1:]).strip()
     prompt = (
         "[OWNER_STOP] The owner asked this task to summarize and stop now. "
@@ -3529,10 +3573,6 @@ def _handle_owner_stop_finalization(
         "clearly mark anything unverified or incomplete. An honest best-effort "
         "result is the expected outcome here, not a failure. Do not start new work."
         + (f"\n\n{child_block}" if child_block else "")
-    )
-    fallback = (
-        "⚠️ The owner requested finalize-then-stop; no final answer could be "
-        "produced inside the grace window."
     )
     return _forced_final_answer(
         ctx, prompt=prompt, fallback_text=fallback,
@@ -3681,13 +3721,12 @@ def _child_disposition_state(child: Dict[str, Any]) -> str:
     """Return cancellation or the current task-tree exact-hash disposition."""
 
     # Explicit cancellation is lifecycle authority and wins every completion
-    # race. Late scratch results are intentionally not projected or recovered.
-    # Only a SETTLED ``cancelled`` counts as handled (GR2-8c): the legacy
-    # ``cancel_requested`` STATUS is an unsettled latch — intent, not outcome
-    # (phase A moved intent to the durable cancel_state projection). Treating
-    # it as done suppressed the handoff reminder for a child the supervisor
-    # was still tearing down; such a child now stays visible as cancel-pending
-    # until custody settles it.
+    # race. Late scratch results are not projected or recovered. Only a
+    # SETTLED ``cancelled`` counts as handled (GR2-8c): the legacy
+    # ``cancel_requested`` STATUS is an unsettled latch — intent, not outcome.
+    # Treating it as done suppressed the handoff reminder for a child still
+    # being torn down; such a child stays visible as cancel-pending until
+    # custody settles it.
     if (
         str(child.get("parent_decision") or "").strip().lower() == "cancelled"
         and str(child.get("status") or "").strip().lower() == "cancelled"
@@ -4089,14 +4128,13 @@ def _record_forced_acceptance_bypass(
     tools_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
     if tools_ctx is None:
         return
-    # A host decision already recorded (panel ran, pacing skip, supersede) wins;
-    # the bypass record exists only for the no-host-verdict shape. "Host decision"
-    # means a canonical status (`_set_acceptance_decision` fails closed to one) —
-    # NOT the status-less agent-stance dict merged when a root task's
-    # task_acceptance_review is deferred to the host: treating that as a decision
-    # left the forced bypass unrecorded exactly when the panel was still owed. The
-    # stamp flows through `_set_acceptance_decision`, which carries the agent
-    # stance forward rather than overwriting it.
+    # A host decision already recorded (panel ran, pacing skip, supersede)
+    # wins; the bypass record exists only for the no-host-verdict shape.
+    # "Host decision" means a canonical status — NOT the status-less agent-
+    # stance dict merged when task_acceptance_review is deferred to the host:
+    # treating that as a decision left the forced bypass unrecorded exactly
+    # when the panel was still owed. The stamp flows through
+    # `_set_acceptance_decision`, which carries the agent stance forward.
     decision = llm_trace.get("acceptance_decision")
     if isinstance(decision, dict) and str(decision.get("status") or "") in ACCEPTANCE_DECISION_STATUSES:
         return
@@ -4485,14 +4523,13 @@ def _forced_orphan_note(ctx: _RoundLimitContext, *, include_terminal: bool = Tru
             tid = str(c.get("task_id") or c.get("id") or "?")
             st = str(c.get("status") or "?").strip().lower()
             lifecycle = "running" if st not in FINAL_STATUSES else st
-            # W2: a child whose LATEST blackboard decision row names a disposition
-            # that no longer binds the current result was READ and decided — say
-            # that, not the misleading "unread". Say only what the ledger PROVES:
-            # the row EXISTS (the write did NOT fail); the binding to the standing
-            # result did. Scoped to children the projection genuinely left
-            # UNDECIDED: a child the projection carries (deferred / integrated /
-            # irrelevant / discarded / cancelled) is not a failed-binding case,
-            # and "re-submit to close it" would be a false instruction there.
+            # W2: a child whose LATEST blackboard decision row no longer binds
+            # the current result was READ and decided — say that, not "unread".
+            # Say only what the ledger PROVES: the row EXISTS; the binding to
+            # the standing result did not. Scoped to children the projection
+            # genuinely left UNDECIDED: a carried disposition (deferred /
+            # integrated / irrelevant / discarded / cancelled) is not a
+            # failed binding, and "re-submit to close it" would be false there.
             claim = claimed.get(tid) if not _child_disposition_state(c) else None
             if claim is not None:
                 disposition, row_sha = claim
@@ -4910,14 +4947,12 @@ def _no_tool_final_answer(
         messages=messages,
         emit_progress=emit_progress,
     ):
-        # v6.71.1: an acceptance improvement pass is an ORDINARY substantive answer
-        # round (like an owner revision, the `_replace_delivery_candidate` "fresh"
-        # path) — do NOT arm delivery-control here. Arming layered "return exactly
-        # one JSON object" on top of OPEN OBLIGATIONS and the plain-text self-check;
-        # three conflicting finalization instructions froze the model into no-tool
-        # rounds resubmitting the same answer. The next free-form answer re-enters
-        # the acceptance panel, so blocking is not weakened; other lanes (services/
-        # force-plan/handoff) still arm where JSON keep/replace is genuinely needed.
+        # v6.71.1: an acceptance improvement pass is an ORDINARY substantive
+        # answer round — do NOT arm delivery-control here: layering "return
+        # exactly one JSON object" on top of OPEN OBLIGATIONS and the self-
+        # check froze the model into resubmitting the same answer. The next
+        # free-form answer re-enters the acceptance panel, so blocking is not
+        # weakened; other lanes still arm where JSON keep/replace is needed.
         return None
     candidate = getattr(tools._ctx, "_delivery_candidate", None)
     if isinstance(candidate, DeliveryCandidate):
@@ -5397,18 +5432,16 @@ def _resolve_forced_delivery_control(
     While the latch is armed, the one forced answer may legitimately be the
     protocol object ``{"delivery_control": ...}`` — shipped raw it leaked
     protocol JSON into the owner's chat and the durable result. Resolve it
-    before suffix composition and publication, never re-looping
-    (``_resolve_delivery_control`` can inject a repair round, which a hard
-    forced stop must never do): valid ``keep`` = the retained candidate's full
-    text, valid ``replace`` = ``full_answer``, malformed/duplicate/invalid =
-    the retained candidate with the typed degraded reason. Armed protocol
-    intent is ANY parsed object carrying the ``delivery_control`` key
-    (regardless of verb/value) AND any JSON-looking text (stripped text
-    starting with ``{``) that fails to parse — the model was told to answer
-    with the object, so that is a mangled control, never the answer. JSON
-    while NOT armed passes through untouched. Disclosed residual: armed PROSE
-    is indistinguishable from an intentional fresh answer and stands as-is.
-    Clears the latch. Returns ``(resolved_text, degraded_reason)``."""
+    before suffix composition, never re-looping (``_resolve_delivery_control``
+    can inject a repair round, which a hard forced stop must never do): valid
+    ``keep`` = the retained candidate's full text, valid ``replace`` =
+    ``full_answer``, malformed/duplicate/invalid = the retained candidate with
+    the typed degraded reason. Armed protocol intent is ANY parsed object with
+    the ``delivery_control`` key AND any JSON-looking text that fails to parse
+    (the model was told to answer with the object, so that is a mangled
+    control, never the answer). JSON while NOT armed passes through untouched.
+    Disclosed residual: armed PROSE stands as-is. Clears the latch. Returns
+    ``(resolved_text, degraded_reason)``."""
     if tools_ctx is None or not extracted:
         return extracted, ""
     candidate = getattr(tools_ctx, "_delivery_candidate", None)
@@ -5815,10 +5848,9 @@ def _nanny_finalization_message(
 
         # Split-root fix (2026-08-10 amendments): custody WRITES land on the
         # CANONICAL (budget) root, but this read used the loop's drive_root —
-        # the isolated CHILD drive for a split-root subagent, which carries no
-        # custody rows, leaving the nanny blind. Resolve the SAME root the
-        # writers use; the passed drive_root stays the fallback for contexts
-        # custody_root cannot resolve (e.g. unit-test stubs).
+        # a split-root subagent's child drive has no custody rows, leaving
+        # the nanny blind. Resolve the SAME root the writers use; the passed
+        # drive_root stays the fallback (e.g. unit-test stubs).
         try:
             evidence_root = custody_root(tools._ctx)
         except Exception:
@@ -5828,11 +5860,10 @@ def _nanny_finalization_message(
         log.debug("nanny nudge: custody evidence read failed", exc_info=True)
     if evidence.get("delegated_runs_succeeded"):
         # The route WAS used and worked — but "used once" is not a permanent
-        # license: the poltergeist children each ran ONE successful $0 run and
-        # then co-built for tens of opus rounds around it while this early
-        # return kept the nudge silent forever. The silence is now proportional
-        # to the measured burn since the last delegated-run activity; a nanny
-        # that delegated recently (or spent little since) still hears nothing.
+        # license: the poltergeist children each ran ONE successful $0 run,
+        # then co-built for tens of opus rounds while this early return kept
+        # the nudge silent. Silence is now proportional to the measured burn
+        # since the last delegated-run activity.
         rounds, cost = _nanny_metered_since_delegate_activity(tools._ctx)
         from ouroboros.task_pacing import NANNY_REMINDER_ROUNDS, NANNY_REMINDER_USD
 
@@ -5862,11 +5893,10 @@ def _nanny_finalization_message(
     pending = max(0, started - settled)
     if pending:
         # PENDING ≠ FAILED (sol review on b49f8192): a STARTED row with no
-        # settlement may simply still be executing — calling it failed invites a
-        # duplicate concurrent run, and finalizing over it orphans the result.
-        # Takes precedence over the failed message: with a run in flight,
-        # "retry" is the wrong instruction even when an earlier sibling died
-        # (those failures still ride along as a fact).
+        # settlement may still be executing — calling it failed invites a
+        # duplicate run, and finalizing over it orphans the result. Takes
+        # precedence over the failed message: with a run in flight, "retry"
+        # is wrong even when an earlier sibling died (still a fact below).
         failed_note = (
             f" {len(failure_states)} earlier run(s) already ended: {', '.join(failure_states)}."
             if failure_states else ""
@@ -5912,15 +5942,14 @@ def _maybe_inject_finalization_nudges(
         return False
     if (getattr(tools._ctx, "_nanny_route_dispatched", False)
             and not getattr(tools._ctx, "_nanny_finalization_injected", False)):
-        # Nanny postcondition (owner decision, 2026-08-07): a child dispatched onto
-        # the delegated substrate must not finalize as if that decision never
-        # existed. One structural fact, one re-loop; the child stays free to
-        # delegate now OR finalize with a stated typed reason — never a hard gate
-        # on its judgment (P5). A delegate_start in THIS trace no longer short-
-        # circuits the nudge (triad, e84475f2): it rides into the message decision,
-        # where custody evidence distinguishes a failed run (truthful
-        # NANNY_DELEGATED_RUN_FAILED) from a pending/uncustodied attempt (no
-        # message). Suppression cases live in _nanny_finalization_message.
+        # Nanny postcondition (owner decision, 2026-08-07): a child dispatched
+        # onto the delegated substrate must not finalize as if that decision
+        # never existed. One structural fact, one re-loop; the child may still
+        # delegate OR finalize with a typed reason — never a hard gate (P5).
+        # A delegate_start in THIS trace rides into the message decision
+        # (triad, e84475f2), where custody evidence separates a failed run
+        # (NANNY_DELEGATED_RUN_FAILED) from a pending attempt (no message).
+        # Suppression cases live in _nanny_finalization_message.
         _trace_attempted = any(
             str(c.get("tool") or "") == "delegate_start"
             for c in (llm_trace.get("tool_calls") or [])
@@ -5981,12 +6010,11 @@ def _maybe_inject_finalization_nudges(
             llm_trace["reasoning_notes"].append("Red-verification nudge injected before final response.")
             return True
     if not getattr(tools._ctx, "_verify_masked_nudged", False):
-        # Exit-masking one-shot ADVISORY nudge (v6.52.2): a PASSING verify check can
-        # LAUNDER the real exit code (`| tail`/`|| true` reports 0 when the runner
-        # failed — the false-green tutanota hit). Distinct from the red nudge
-        # ("grounding says FAIL" vs "PASS but maybe laundered"); ordered after it.
-        # Binary latch; advisory; forced-finalization paths bypass it. Flag-driven
-        # on the typed receipt sensor, never content (Bible P5).
+        # Exit-masking one-shot ADVISORY nudge (v6.52.2): a PASSING verify
+        # check can LAUNDER the real exit code (`| tail`/`|| true` — the
+        # false-green tutanota hit). Distinct from the red nudge; ordered
+        # after it. Binary latch; advisory; forced paths bypass it. Flag-
+        # driven on the typed receipt sensor, never content (Bible P5).
         _masked_receipt = latest_unreconciled_masked_verification(drive_root, task_id)
         if _masked_receipt is not None:
             tools._ctx._verify_masked_nudged = True
@@ -6050,12 +6078,12 @@ def _maybe_inject_finalization_nudges(
         emit_progress("Verify-before-done nudge injected before final response.")
         llm_trace["reasoning_notes"].append("Verify-before-done nudge injected before final response.")
         return True
-    # A3 one-shot no-op nudge: a declared deliverable (non-empty expected_output) but the
-    # turn made NO tool calls, produced NO reviewable effects, and carries NO FINAL ANSWER
-    # marker — a structural about-to-finalize-without-attempting signal (same condition
-    # family as the M2 expected_output_ungrounded flag). Own latch, ordered AFTER the verify
-    # nudge; never forces acceptance review; forced-finalization paths return earlier and
-    # bypass it. Structural facts only (no refusal-text matching).
+    # A3 one-shot no-op nudge: a declared deliverable (non-empty
+    # expected_output) but the turn made NO tool calls, NO reviewable effects,
+    # NO FINAL ANSWER marker — about-to-finalize-without-attempting (same
+    # family as the M2 expected_output_ungrounded flag). Own latch, AFTER the
+    # verify nudge; never forces acceptance review; forced paths return
+    # earlier. Structural facts only (no refusal-text matching).
     if (
         not getattr(tools._ctx, "_noop_attempt_nudged", False)
         and str(_contract_expected_output(tools._ctx)).strip()
@@ -6083,19 +6111,18 @@ def _maybe_inject_finalization_nudges(
         emit_progress("No-op attempt nudge injected before final response.")
         llm_trace["reasoning_notes"].append("No-op attempt nudge injected before final response.")
         return True
-    # P2 one-shot final-answer-marker nudge: the turn produced REAL work (tool calls or
-    # reviewable effects) AND visible prose, but no FINAL ANSWER marker — the typed
-    # extractor would drop it and a forced/deadline finalization would score empty.
-    # Strengthen the BEHAVIOR (ask the agent to mark its OWN answer) rather than mining
-    # prose into a claimed answer (Bible P5; prose-mining in core harms ordinary users).
-    # Own latch, ordered AFTER verify/red/A3 (grounding outranks formatting); mutually
-    # exclusive with the A3 no-op nudge (the no-work case); forced-finalization paths
-    # return earlier and bypass it. Structural facts only (no content matching). The
-    # protocol gate alone suffices: answer_protocol="final_answer_line" itself declares a
-    # machine-extracted deliverable, so the nudge must not ALSO require a declared
-    # expected_output — GAIA-shaped contracts keep the question in `objective` with
-    # expected_output empty, and that extra gate once suppressed the only salvage surface
-    # (a v6.56.0 run finalized a last-round refusal empty despite 24 tool calls).
+    # P2 one-shot final-answer-marker nudge: the turn produced REAL work AND
+    # visible prose but no FINAL ANSWER marker — the typed extractor would drop
+    # it and a forced/deadline finalization would score empty. Strengthen the
+    # BEHAVIOR (ask the agent to mark its OWN answer), never mine prose into a
+    # claimed answer (Bible P5). Own latch, ordered AFTER verify/red/A3
+    # (grounding outranks formatting); mutually exclusive with the A3 no-op
+    # nudge; forced paths return earlier. Structural facts only. The protocol
+    # gate alone suffices: answer_protocol="final_answer_line" itself declares
+    # a machine-extracted deliverable, so the nudge must not ALSO require a
+    # declared expected_output — GAIA-shaped contracts keep expected_output
+    # empty, and that extra gate once suppressed the only salvage surface
+    # (a v6.56.0 run finalized a last-round refusal empty despite 24 calls).
     if (
         not getattr(tools._ctx, "_final_marker_nudged", False)
         and _answer_protocol_active(tools._ctx)  # v6.60.0: marker nudge is protocol-gated
@@ -6900,11 +6927,11 @@ def run_llm_loop(
                     tool_schemas=tool_schemas,
                 )
             if active_model != _prev_active_model:
-                # A cross-FAMILY switch_model / per-task override mid-conversation:
-                # proactively strip the prior family's provider-private reasoning/
-                # thinking blocks from the canonical history so the new family does
-                # not 400 on a signature it cannot validate (stripping is always
-                # safe — it loses only reasoning continuity). Same family is a no-op.
+                # A cross-FAMILY switch_model / per-task override: strip the
+                # prior family's provider-private reasoning blocks from the
+                # history so the new family does not 400 on a signature it
+                # cannot validate (safe — loses only reasoning continuity).
+                # Same family is a no-op.
                 _sanitized = LLMClient.sanitize_reasoning_on_model_switch(messages, _prev_active_model, active_model)
                 if _sanitized is not messages:
                     messages[:] = _sanitized

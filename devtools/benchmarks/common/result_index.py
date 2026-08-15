@@ -40,7 +40,7 @@ def append_result_index(run_dir: pathlib.Path, row: dict[str, Any]) -> None:
 #   deadline_local       loop.py:3220  loop-local deadline
 #   children_unabsorbed  loop.py:4071  forced terminal with child results unabsorbed
 #   owner_requested_finalization  loop.py (owner-stop rail, S3 2026-08-15): the
-#     owner's «Подвести итог» graceful stop — the attempt was ended by an owner
+#     owner's "Wrap up" graceful stop — the attempt was ended by an owner
 #     request rather than by the agent finishing, so an auditor must never read
 #     it as a fair-shot capability result; derived here with the whole set.
 _TRUNCATION_CODES_NOT_BEST_EFFORT = frozenset({

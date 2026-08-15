@@ -1,4 +1,4 @@
-"""Owner «Поторопить» (hurry) control — typed, task-local, NO CHAT (HQ1, 2026-08-15).
+"""Owner "Hurry up" control — typed, task-local, NO CHAT (HQ1, 2026-08-15).
 
 The owner's hurry click is NOT dialogue: it submits one typed task-bound control
 through the existing durable owner-mailbox rail (``owner_mailbox.KIND_HURRY``)

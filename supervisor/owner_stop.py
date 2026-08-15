@@ -1,4 +1,4 @@
-"""Owner graceful stop («Подвести итог», Q1/Q2/Q3=A/Q6=A, 2026-08-15).
+"""Owner graceful stop ("Wrap up" / finalize-then-stop, Q1/Q2/Q3=A/Q6=A, 2026-08-15).
 
 The policy half of the S3 cancel-finalization design, kept OUT of the pinned
 ``supervisor/task_lifecycle.py`` (which keeps a line-neutral dispatch at the
@@ -79,9 +79,16 @@ def owner_stop_deadline_ts(intent: Dict[str, Any], grace_sec: float) -> float:
     - after delivery: ``min(drain + grace SSOT, request + outer cap)`` — the
       episode budget starts ticking at the drain, and the outer cap still
       bounds the whole episode from the owner's request.
+
+    ``grace_sec<=0`` means the graceful-stop feature is OFF (same semantics
+    as ``running_owner_stop_tasks``): NO episode window exists anywhere,
+    pre-drain included — never a request+outer-cap window. The sweep then
+    feeds custody immediately (the immediate custody path).
     """
     from ouroboros.config import OWNER_STOP_OUTER_CAP_SEC
 
+    if float(grace_sec or 0.0) <= 0:
+        return 0.0
     requested = _requested_ts(intent)
     if not requested:
         return 0.0
@@ -317,7 +324,7 @@ def graceful_summary_suppressed(q: Any, task_id: str) -> bool:
     True only when the root's open cascade intent carries the finalize policy
     AND the root's durable result is COMPLETED — the owner already received the
     model's own final answer through normal delivery, and the card state says
-    «Остановлено с итогом»; a second summary message would be the duplicate Q4
+    "Stopped with summary"; a second summary message would be the duplicate Q4
     forbids. Every other outcome (expiry -> cancelled, failed, replayed crash)
     keeps the tree's ONE receipt. The suppression is recorded as a typed
     forensic row so the crash-order evidence shows a conscious decision.
