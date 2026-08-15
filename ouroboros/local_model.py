@@ -83,20 +83,14 @@ def discover_local_models() -> list[dict[str, Any]]:
 
                 size_gb = round(p.stat().st_size / (1024 ** 3), 2)
                 name = p.stem
+                source = resolved_path
 
-                # Infer source repo if in HF cache
-                source = str(p.parent.parent.name) if "models--" in str(p) else name
-                if source.startswith("models--"):
-                    parts = source[len("models--"):].split("--")
-                    source = "/".join(parts) if len(parts) > 1 else parts[0]
-
-                # Clean up name from snapshots/blobs
-                if "snapshots" in str(p) or "blobs" in str(p):
-                    for parent in p.parents:
-                        if parent.name.startswith("models--"):
-                            hf_name = parent.name[len("models--"):].replace("--", "/")
-                            name = hf_name.split("/")[-1]
-                            break
+                for parent in p.parents:
+                    if parent.name.startswith("models--"):
+                        hf_name = parent.name[len("models--"):].replace("--", "/")
+                        name = hf_name.split("/")[-1]
+                        source = hf_name
+                        break
 
                 discovered.append({
                     "name": name,
@@ -349,7 +343,24 @@ class LocalModelManager:
             expanded = os.path.expanduser(source)
             if os.path.isfile(expanded):
                 return expanded
-            raise FileNotFoundError(f"Local model file not found: {expanded}")
+
+        # Resilient local lookup: check if filename or source basename matches an already discovered GGUF file
+        target_name = (filename or os.path.basename(source)).lower()
+        if target_name:
+            for dm in discover_local_models():
+                dm_path = dm.get("path", "")
+                if dm_path and os.path.isfile(dm_path):
+                    dm_fn = str(dm.get("filename") or "").lower()
+                    dm_name = str(dm.get("name") or "").lower()
+                    if dm_fn and dm_fn == target_name:
+                        log.info("Resolved model from disk by filename: %s", dm_path)
+                        return dm_path
+                    if os.path.basename(dm_path).lower() == target_name:
+                        log.info("Resolved model from disk by basename: %s", dm_path)
+                        return dm_path
+                    if dm_name and (dm_name in target_name or target_name in dm_name):
+                        log.info("Resolved model from disk by model name: %s", dm_path)
+                        return dm_path
 
         try:
             from huggingface_hub import hf_hub_download
