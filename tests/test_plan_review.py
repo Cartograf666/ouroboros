@@ -1572,7 +1572,10 @@ def test_planning_swarm_does_not_duplicate_wave_after_terminal_empty_handoff(mon
 
     monkeypatch.setenv("OUROBOROS_MAX_WORKERS", "3")
     monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC", "0")
-    monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC", "0.25")
+    # Waits are mocked (nothing blocks), but a loaded CI runner can spend more
+    # than 0.25s between the two calls, expiring the first wave's cutoff and
+    # breaking resume (seen flaking on windows-latest); keep the window wide.
+    monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC", "30")
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "parent1"
     ctx.task_depth = 0

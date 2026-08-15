@@ -350,7 +350,12 @@ def test_token_density_is_measured_throttled_and_bounded(tmp_path, monkeypatch):
     assert density >= COLD_START_TOKEN_DENSITY
 
 
-def test_density_reducers_use_newest_route_or_model_but_densest_review_witness(tmp_path):
+def test_density_reducers_use_newest_route_or_model_but_densest_review_witness(
+    tmp_path, monkeypatch,
+):
+    import itertools
+    from datetime import datetime, timedelta, timezone
+
     from ouroboros.capability_evidence import (
         _DENSITY_MEMO,
         COLD_START_TOKEN_DENSITY,
@@ -358,6 +363,16 @@ def test_density_reducers_use_newest_route_or_model_but_densest_review_witness(t
         record_token_density,
         resolve_main_token_density,
         resolve_review_token_density,
+    )
+
+    # Windows clock granularity (~15.6ms) can stamp two back-to-back records
+    # with the SAME observed_at, making "newest" resolution a tie; force
+    # strictly increasing fresh timestamps so recency is deterministic.
+    base = datetime.now(timezone.utc)
+    ticks = itertools.count()
+    monkeypatch.setattr(
+        ce, "utc_now_iso",
+        lambda: (base + timedelta(milliseconds=next(ticks))).isoformat(),
     )
 
     _DENSITY_MEMO.clear()
