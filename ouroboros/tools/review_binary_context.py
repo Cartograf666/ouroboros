@@ -54,9 +54,9 @@ def capture_staged_diff(repo_dir: pathlib.Path, *, unified: int = 3) -> str:
         )
 
 
-def _git_bytes(repo_dir: pathlib.Path, args: list[str]) -> bytes:
+def _git_run(repo_dir: pathlib.Path, args: list[str]) -> subprocess.CompletedProcess | None:
     try:
-        result = subprocess.run(
+        return subprocess.run(
             ["git", *args],
             cwd=repo_dir,
             stdout=subprocess.PIPE,
@@ -64,16 +64,40 @@ def _git_bytes(repo_dir: pathlib.Path, args: list[str]) -> bytes:
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _git_bytes(repo_dir: pathlib.Path, args: list[str]) -> bytes:
+    result = _git_run(repo_dir, args)
+    if result is None or result.returncode != 0:
         return b""
-    return result.stdout if result.returncode == 0 else b""
+    return result.stdout
 
 
-def _tree_entry(repo_dir: pathlib.Path, ref: str, rel: str) -> tuple[str, str]:
-    record = _git_bytes(repo_dir, ["ls-tree", "-z", ref, "--", rel]).split(b"\0", 1)[0]
+def _ref_resolves(repo_dir: pathlib.Path, ref: str) -> bool:
+    """True only if ``ref`` names a real object. MERGE_HEAD outside a merge and
+    an unborn HEAD both resolve to False here, not an error."""
+    result = _git_run(repo_dir, ["rev-parse", "--verify", "--quiet", ref])
+    return result is not None and result.returncode == 0
+
+
+def _tree_entry(repo_dir: pathlib.Path, ref: str, rel: str) -> tuple[str, str, bool]:
+    """Look up ``rel`` in ``ref``'s tree. Returns ``(mode, blob, ok)``.
+
+    ``ok`` is False only when ``ref`` resolves to a real object but the tree
+    read itself failed (corrupt or unreadable object, IO error): a genuine
+    read failure, distinct from the ref simply not existing (no MERGE_HEAD
+    outside a merge, an unborn HEAD) or the path having no entry in a tree
+    that read fine, both of which are a real ``ok=True`` absence.
+    """
+    result = _git_run(repo_dir, ["ls-tree", "-z", ref, "--", rel])
+    if result is None or result.returncode != 0:
+        return "", "", not _ref_resolves(repo_dir, ref)
+    record = (result.stdout or b"").split(b"\0", 1)[0]
     fields = record.partition(b"\t")[0].split()
     if len(fields) < 3:
-        return "", ""
-    return fields[0].decode("ascii"), fields[2].decode("ascii")
+        return "", "", True
+    return fields[0].decode("ascii"), fields[2].decode("ascii"), True
 
 
 def _object_size(repo_dir: pathlib.Path, blob_oid: str) -> str:
@@ -107,8 +131,10 @@ def render_staged_binary_metadata(repo_dir: pathlib.Path, rel: str) -> str | Non
             object_size = _object_size(repo_dir, blob_oid)
             if not object_size:
                 return None
-            _head_mode, head_blob = _tree_entry(repo_dir, "HEAD", rel)
-            _merge_mode, merge_blob = _tree_entry(repo_dir, "MERGE_HEAD", rel)
+            _head_mode, head_blob, head_ok = _tree_entry(repo_dir, "HEAD", rel)
+            _merge_mode, merge_blob, merge_ok = _tree_entry(repo_dir, "MERGE_HEAD", rel)
+            if not head_ok or not merge_ok:
+                return None
             return (
                 "*(binary bytes are represented by exact Git metadata for this review; "
                 "they are not rendered as text)*\n\n"
@@ -123,8 +149,10 @@ def render_staged_binary_metadata(repo_dir: pathlib.Path, rel: str) -> str | Non
     ).split(b"\0")
     if expected_path not in deleted:
         return None
-    head_mode, head_blob = _tree_entry(repo_dir, "HEAD", rel)
-    merge_mode, merge_blob = _tree_entry(repo_dir, "MERGE_HEAD", rel)
+    head_mode, head_blob, head_ok = _tree_entry(repo_dir, "HEAD", rel)
+    merge_mode, merge_blob, merge_ok = _tree_entry(repo_dir, "MERGE_HEAD", rel)
+    if not head_ok or not merge_ok:
+        return None
     parent_blob = head_blob or merge_blob
     object_size = _object_size(repo_dir, parent_blob) if parent_blob else ""
     if not parent_blob or not object_size:
