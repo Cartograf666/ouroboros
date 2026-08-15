@@ -2626,7 +2626,15 @@ class LLMClient:
                             break
                     candidate["messages"] = clean_messages
                     candidate["max_tokens"] = min(local_max, 1024)
-                    log.warning("Local context overflow detected; retrying with trimmed system prompt")
+                if "APIConnectionError" in err or "Connection refused" in err or "ConnectError" in err:
+                    log.warning("Local model server unreachable (attempt %d/3); checking autostart...", attempt + 1)
+                    try:
+                        from ouroboros.config import load_settings
+                        from ouroboros.local_model_autostart import auto_start_local_model
+                        auto_start_local_model(load_settings())
+                        time.sleep(2.5)
+                    except Exception as start_err:
+                        log.debug("Auto-start recovery failed: %s", start_err)
                 if attempt == 2:
                     log.warning("Local model request failed: %s", exc)
                     raise

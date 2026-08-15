@@ -483,7 +483,13 @@ class LocalModelManager:
             ]
             if chat_format:
                 cmd.extend(["--chat_format", chat_format])
-            effective_ctx = n_ctx if n_ctx > 0 else 16384
+            # Apple Silicon Metal memory safety cap:
+            # 65536 tokens (~64k) is the rock-solid safe limit on 48GB unified memory
+            # preventing Metal IOGPU driver memory exhaustion / system reboot.
+            if n_ctx > 65536:
+                log.warning("Requested n_ctx=%d exceeds safe Metal limit; clamping to 65536", n_ctx)
+                n_ctx = 65536
+            effective_ctx = n_ctx if n_ctx > 0 else 65536
             self._context_length = effective_ctx
             cmd.extend(["--n_ctx", str(effective_ctx)])
 
