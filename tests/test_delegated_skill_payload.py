@@ -1211,7 +1211,8 @@ def test_post_apply_hash_mismatch_yields_no_success_and_ambiguous_state(
         tmp_path, monkeypatch):
     """Sol P1 (reviewer repro e): if the LIVE loader hash after a real apply is
     not the recorded result hash, no success receipt is emitted, nothing is
-    disposed/queued, and the PENDING apply intent routes the next integrate to
+    disposed (the stale-extension reconcile marker IS still queued — final Sol
+    scope P1), and the PENDING apply intent routes the next integrate to
     the existing APPLY_AMBIGUOUS owner-recovery machinery."""
     import ouroboros.tools.delegate_integration as integration
     from ouroboros.tools.subagent_integration import _integrate_delegated_patch
@@ -1228,13 +1229,86 @@ def test_post_apply_hash_mismatch_yields_no_success_and_ambiguous_state(
     monkeypatch.setattr(integration, "payload_content_hash", _hash_diverges_after_apply)
     out = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
     assert "INTEGRATE_APPLY_HASH_MISMATCH" in out, out
-    assert "✅" not in out and "QUEUED" not in out
+    assert "✅" not in out and "No success is claimed" in out
     assert entry.patch_disposed == ""
     assert find_execution_snapshot("snapP") is not None  # forensics preserved
     from ouroboros.extension_reconcile_queue import list_extension_reconcile_requests
 
-    assert list_extension_reconcile_requests(tmp_path / "data") == []
+    assert list_extension_reconcile_requests(tmp_path / "data") != []
     monkeypatch.setattr(integration, "payload_content_hash", real)
     again = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
     assert "INTEGRATE_DELEGATED_APPLY_AMBIGUOUS" in again, again
+    custody._CUSTODY.clear()
+
+
+def test_apply_hash_mismatch_queues_stale_extension_reconcile_marker(
+        tmp_path, monkeypatch):
+    """Final Sol scope P1 («Reconcile stale extensions after apply-hash
+    mismatch»): the mismatch branch used to return before any reconcile
+    queueing, so a stale enabled extension's subscriptions/companions stayed
+    live although the payload DID mutate. The marker must be queued WITHOUT
+    any success/disposition record, APPLY_AMBIGUOUS routing and the forensic
+    material (snapshot + captured patch + verdict) must be preserved."""
+    import ouroboros.tools.delegate_integration as integration
+    from ouroboros.extension_reconcile_queue import list_extension_reconcile_requests
+    from ouroboros.tools.subagent_integration import _integrate_delegated_patch
+
+    ctx, skill, handle, entry, capture = _captured(tmp_path, monkeypatch)
+    assert capture["status"] == "ready_with_changes", capture
+    real = integration.payload_content_hash
+    calls = {"n": 0}
+
+    def _hash_diverges_after_apply(root):
+        calls["n"] += 1     # call 1 = pre-apply CAS check, call 2 = post-apply
+        return "0" * 64 if calls["n"] >= 2 else real(root)
+
+    monkeypatch.setattr(integration, "payload_content_hash", _hash_diverges_after_apply)
+    out = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
+    assert "INTEGRATE_APPLY_HASH_MISMATCH" in out, out
+    # The reconcile marker IS set, typed with the mismatch-specific reason.
+    requests = list_extension_reconcile_requests(tmp_path / "data")
+    assert [r["skill"] for r in requests] == ["alpha"], requests
+    assert requests[0]["reason"] == "delegated_payload_apply_hash_mismatch"
+    # The receipt reports the QUEUED marker and never a completed reconcile.
+    assert "QUEUED" in out and "reconciled off" not in out, out
+    # No success/disposition is recorded; forensic custody is intact.
+    assert "No success is claimed" in out and "✅" not in out
+    assert entry.patch_disposed == ""
+    assert find_execution_snapshot("snapP") is not None
+    assert pathlib.Path(capture["patch_artifact"]).exists()
+    assert "Verdict:" in out, out
+    # The durable apply intent stays PENDING: APPLY_AMBIGUOUS answers next.
+    monkeypatch.setattr(integration, "payload_content_hash", real)
+    again = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
+    assert "INTEGRATE_DELEGATED_APPLY_AMBIGUOUS" in again, again
+    custody._CUSTODY.clear()
+
+
+def test_mismatch_reconcile_queue_failure_keeps_honest_ambiguity(
+        tmp_path, monkeypatch):
+    """A reconcile queue-write failure in the mismatch branch must not fake the
+    marker or a success: the receipt reports the failed queueing, nothing is
+    disposed, and the PENDING intent still routes to APPLY_AMBIGUOUS."""
+    import ouroboros.extension_reconcile_queue as reconcile_queue
+    import ouroboros.tools.delegate_integration as integration
+    from ouroboros.tools.subagent_integration import _integrate_delegated_patch
+
+    ctx, skill, handle, entry, capture = _captured(tmp_path, monkeypatch)
+    real = integration.payload_content_hash
+    calls = {"n": 0}
+
+    def _hash_diverges_after_apply(root):
+        calls["n"] += 1
+        return "0" * 64 if calls["n"] >= 2 else real(root)
+
+    def _boom(*_a, **_k):
+        raise OSError("queue disk full")
+
+    monkeypatch.setattr(integration, "payload_content_hash", _hash_diverges_after_apply)
+    monkeypatch.setattr(reconcile_queue, "request_extension_reconcile", _boom)
+    out = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
+    assert "INTEGRATE_APPLY_HASH_MISMATCH" in out, out
+    assert "could NOT be queued" in out and "✅" not in out, out
+    assert entry.patch_disposed == ""
+    assert find_execution_snapshot("snapP") is not None
     custody._CUSTODY.clear()

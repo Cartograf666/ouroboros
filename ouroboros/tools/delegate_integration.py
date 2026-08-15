@@ -1278,8 +1278,9 @@ def integrate_payload_patch(
     the candidate preserved; ``git apply`` runs with the live payload as cwd
     (index-free, probed); after a real apply the LIVE loader hash must equal
     the recorded result hash or the run fails typed with its apply intent left
-    PENDING (ambiguous machinery); a successful apply QUEUES the existing
-    extension reconcile request (receipt says queued, never reconciled).
+    PENDING (ambiguous machinery); ANY mutating apply outcome — success or
+    post-apply hash mismatch — QUEUES the existing extension reconcile request
+    (receipt says queued, never reconciled).
     """
     import subprocess
 
@@ -1457,18 +1458,39 @@ def integrate_payload_patch(
                 source_tool="integrate_delegated_patch")
         except Exception:
             pass
+        reconcile_err = ""
+        try:
+            # Final Sol scope P1: the payload DID mutate, so the stale-extension
+            # rule (R1 item 10) holds despite the mismatch — queue the reconcile
+            # marker while recording NO success and NO disposition.
+            from ouroboros.extension_reconcile_queue import request_extension_reconcile
+
+            request_extension_reconcile(state_root, skill_name,
+                                        reason="delegated_payload_apply_hash_mismatch",
+                                        source="worker")
+        except Exception as exc:
+            log.warning("extension reconcile request failed after apply-hash "
+                        "mismatch %s", rid, exc_info=True)
+            reconcile_err = f"{type(exc).__name__}: {exc}"
         verdict_path = _write_verdict(
             ctx, f"run_{rid}", outcome="apply_hash_mismatch", reason=reason,
             files=touched, manifest=manifest, applied=True,
             conflicts=[f"live={live_after[:12] or hash_error[:80]}",
                        f"recorded={result_hash[:12]}"],
             protected=[], target=str(target))
+        reconciled = (
+            "a stale-extension reconcile marker was still QUEUED (the payload DID "
+            "mutate; the server processes that marker asynchronously)"
+            if not reconcile_err else
+            "WARNING: the stale-extension reconcile marker could NOT be queued "
+            f"({reconcile_err}) — a stale enabled extension may remain live until "
+            "restart or a manual reconcile")
         return (
             f"⚠️ INTEGRATE_APPLY_HASH_MISMATCH: run {rid}'s patch WAS applied into "
             f"{target}, but the live payload loader hash does not equal the recorded "
             "result content hash — the applied bytes are NOT the reviewed candidate "
             f"representation ({hash_error or 'hash divergence'}). No success is "
-            "claimed: nothing was disposed and no reconcile was queued; the durable "
+            f"claimed: nothing was disposed; {reconciled}; the durable "
             "apply intent stays PENDING, so the next integrate_delegated_patch "
             "answers APPLY_AMBIGUOUS for explicit owner recovery "
             "(decision='acknowledge_ambiguous' after inspection). The snapshot and "
