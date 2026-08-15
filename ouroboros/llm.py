@@ -2598,7 +2598,9 @@ class LLMClient:
             kwargs["tools"] = clean_tools
             kwargs["tool_choice"] = tool_choice
         if timeout and timeout > 0:
-            kwargs["timeout"] = float(timeout)
+            kwargs["timeout"] = max(float(timeout), 180.0)
+        else:
+            kwargs["timeout"] = 180.0
 
         candidate = _physical_candidate(kwargs)
         local_target = {"provider": "local", "usage_model": "local-model"}
