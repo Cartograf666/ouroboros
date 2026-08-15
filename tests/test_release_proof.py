@@ -4,6 +4,8 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -16,6 +18,18 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC and SPEC.loader
 release_proof = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(release_proof)
+
+
+def test_release_proof_remains_runnable_without_installed_package():
+    result = subprocess.run(
+        [sys.executable, "-S", str(REPO / "scripts" / "release_proof.py"), "--help"],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def _digest(path: Path) -> str:
@@ -117,14 +131,49 @@ def test_assemble_binds_every_asset_smoke_and_sbom(tmp_path: Path):
     checksum_lines = (release_dir / "SHA256SUMS").read_text().splitlines()
     assert len(checksum_lines) == 3 * len(release_proof.PROOF_IDS)
     assert checksum_lines == sorted(checksum_lines, key=lambda line: line.split("  ", 1)[1])
-    assert "A clear release note." in notes.read_text()
-    assert "The AppImage runs from a user-writable path" in notes.read_text()
-    assert "v6.87.4...v6.87.5" in notes.read_text()
+    notes_text = notes.read_text()
+    assert "A clear release note." in notes_text
+    assert "## Download" in notes_text
+    assert "verification evidence, not additional installers" in notes_text
+    assert "every installable platform artifact, its SBOM, and its smoke receipt" in notes_text
+    assert "Each installable platform artifact has GitHub build provenance" in notes_text
+    assert "/releases/latest" not in notes_text
+    for proof_id in release_proof.PROOF_IDS:
+        assert release_proof.release_asset_download_url(
+            proof_id,
+            "6.87.5",
+            repository="razzant/ouroboros",
+        ) in notes_text
+    assert "v6.87.4...v6.87.5" in notes_text
     commands = evidence["verification"]["attestationCommands"]
     assert len(commands) == 2
     assert all("--source-digest " + "a" * 40 in command for command in commands)
     assert all("--source-ref refs/tags/v6.87.5" in command for command in commands)
     assert "--predicate-type https://cyclonedx.org/bom" in commands[1]
+
+
+def test_prerelease_notes_link_to_the_exact_prerelease_assets(tmp_path: Path):
+    version = "6.87.5-rc.1"
+    release_dir, version_file, readme = _fixture_release(tmp_path, version=version)
+    notes = tmp_path / "notes.md"
+    args = argparse.Namespace(
+        directory=release_dir,
+        version_file=version_file,
+        readme=readme,
+        repository="razzant/ouroboros",
+        tag=f"v{version}",
+        commit="a" * 40,
+        run_url="https://github.com/razzant/ouroboros/actions/runs/1",
+        previous_tag="v6.87.4",
+        generated_at="2026-08-02T00:00:00+00:00",
+        notes_output=notes,
+    )
+
+    release_proof.command_assemble(args)
+
+    text = notes.read_text(encoding="utf-8")
+    assert f"/releases/download/v{version}/" in text
+    assert "/releases/latest" not in text
 
 
 def test_assemble_rejects_smoke_digest_drift(tmp_path: Path):
@@ -265,6 +314,63 @@ def test_linux_rpm_stage_recreates_the_absolute_cli_symlink():
     ) in builder
 
 
+def test_linux_packages_ship_the_systemd_user_unit():
+    """Both packages must carry the inert launcher unit and prove it after install.
+
+    Without the unit a packaged install has no stable name to stop: the desktop
+    launcher lands in a transient scope whose name changes every start, and
+    killing only the parent leaves workers holding port 8765.  Shipping it must
+    stay inert, though — enabling or starting a desktop agent from a package
+    postinst would be wrong.
+    """
+    builder = (REPO / "scripts" / "build_linux_packages.sh").read_text(encoding="utf-8")
+    smoke = (REPO / "scripts" / "smoke_linux_packages.sh").read_text(encoding="utf-8")
+    unit = (REPO / "packaging" / "systemd" / "ouroboros.service").read_text(encoding="utf-8")
+
+    # deb stage
+    assert (
+        'install -m 644 packaging/systemd/ouroboros.service'
+    ) in builder
+    assert '"$ROOT/usr/lib/systemd/user"' in builder
+    # rpm stage
+    assert '"%{buildroot}/usr/lib/systemd/user"' in builder
+    assert '/usr/lib/systemd/user/ouroboros.service' in builder
+
+    # A user unit, not a system one: state lives in $HOME.
+    assert "WantedBy=default.target" in unit
+    # The native launcher remains the only bootstrap/restart/panic owner.
+    assert "ExecStart=/opt/ouroboros/Ouroboros" in unit
+    assert not any(line.startswith("Restart=") for line in unit.splitlines())
+    # Stopping must reach the worker pool, not just the launcher.
+    assert "KillMode=control-group" in unit
+
+    # The digest-bound package smoke verifies the unit from the installed
+    # .deb/.rpm, not only the source staging tree.
+    assert "test -s /usr/lib/systemd/user/ouroboros.service" in smoke
+    assert "grep -Fqx 'ExecStart=/opt/ouroboros/Ouroboros'" in smoke
+    assert "grep -Fqx 'KillMode=control-group'" in smoke
+    assert "! grep -q '^Restart='" in smoke
+
+    for proof_id in (
+        "linux-deb-amd64",
+        "linux-rpm-x86_64",
+        "linux-rpm-red80-x86_64",
+    ):
+        assert "systemd_user_unit" in release_proof.REQUIRED_SMOKE_CHECKS[proof_id]
+
+    # Nothing may activate it on install.
+    for forbidden in (
+        "systemctl enable",
+        "systemctl --user enable",
+        "systemctl start",
+        "systemctl --user start",
+    ):
+        assert forbidden not in builder, (
+            f"packaging must not run {forbidden!r}: enabling a desktop agent "
+            "from a package is the user's decision"
+        )
+
+
 def test_linux_package_smoke_starts_the_desktop_launcher_on_ubuntu_22_04():
     smoke = (REPO / "scripts" / "smoke_linux_packages.sh").read_text(encoding="utf-8")
 
@@ -366,6 +472,7 @@ def test_release_workflow_orders_smoke_sbom_attestation_and_draft_verification()
     assert "bash scripts/smoke_linux_packages.sh" in workflow
     assert "--check package_install" in workflow
     assert "--check runtime_dependency" in workflow
+    assert "--check systemd_user_unit" in workflow
     assert "--check desktop_launcher_start" in workflow
     assert "release-artifacts/ouroboros_*_amd64.deb" in workflow
     assert "release-artifacts/ouroboros-*-1.x86_64.rpm" in workflow

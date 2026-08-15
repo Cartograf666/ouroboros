@@ -113,9 +113,14 @@ def _is_launcher_managed_repo() -> bool:
     return bool(_read_managed_repo_meta())
 
 
-def _list_remotes() -> List[str]:
-    rc, remotes, _ = git_capture(["git", "remote"])
+def _list_remotes(*, capture=None, warnings: Optional[List[str]] = None) -> List[str]:
+    capture_fn = capture or git_capture
+    rc, remotes, error = capture_fn(["git", "remote"])
     if rc != 0:
+        if warnings is not None:
+            warnings.append(
+                f"remotes_error:{error or f'git remote exited {rc} without stderr'}"
+            )
         return []
     return [line.strip() for line in remotes.splitlines() if line.strip()]
 
@@ -195,26 +200,112 @@ def _clear_update_intent() -> bool:
         return False
     return True
 
-def git_capture(cmd: List[str]) -> Tuple[int, str, str]:
+
+def _run_git_process_bounded(
+    cmd: List[str], *, timeout: float, cwd: Optional[pathlib.Path] = None,
+    env: Optional[Dict[str, str]] = None, text: bool = True,
+) -> Tuple[int, Any, Any]:
+    """Run one short-lived Git process and terminate its tree on timeout."""
+    from ouroboros.platform_layer import kill_process_tree, subprocess_new_group_kwargs
+    from ouroboros.tools.shell import _active_subprocesses, _subprocess_lock
+
+    limit = float(timeout)
+    empty = "" if text else b""
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(cwd or REPO_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=text,
+            env=env,
+            **subprocess_new_group_kwargs(),
+        )
+    except OSError as exc:
+        detail = str(exc)
+        return 127, empty, detail if text else detail.encode("utf-8", "replace")
+
+    with _subprocess_lock:
+        _active_subprocesses.add(proc)
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=limit)
+        except subprocess.TimeoutExpired as exc:
+            partial_error = getattr(exc, "stderr", None)
+            kill_process_tree(proc)
+            try:
+                _tail_out, tail_error = proc.communicate(timeout=10)
+            except Exception:
+                tail_error = None
+            raw_detail = tail_error or partial_error or empty
+            if isinstance(raw_detail, bytes):
+                detail = raw_detail.decode("utf-8", "replace").strip()
+            else:
+                detail = str(raw_detail or "").strip()
+            message = (
+                f"git process timed out after {limit:g}s and was terminated: "
+                f"{' '.join(cmd)}"
+            )
+            if detail:
+                message += f" ({detail})"
+            return (
+                FETCH_TIMEOUT_RC,
+                empty,
+                message if text else message.encode("utf-8", "replace"),
+            )
+        return (
+            int(proc.returncode if proc.returncode is not None else 1),
+            stdout if stdout is not None else empty,
+            stderr if stderr is not None else empty,
+        )
+    finally:
+        with _subprocess_lock:
+            _active_subprocesses.discard(proc)
+
+
+def git_capture(cmd: List[str], *, timeout: Optional[float] = None) -> Tuple[int, str, str]:
     # Same reason as utils.run_cmd: this stderr is PARSED (`_maybe_repair_git_index`
     # matches English git diagnostics), so the operator's locale must not decide
     # whether a repairable index error is recognised.
+    # ``timeout`` is None for existing non-rescue call sites: a bound here is a
+    # behavior change, so it stays opt-in rather than silently retiming them.
     env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
     for _attempt in range(2):
-        r = subprocess.run(cmd, cwd=str(REPO_DIR), capture_output=True, text=True, env=env)
-        stderr = (r.stderr or "").strip()
-        if r.returncode == 0:
-            return r.returncode, (r.stdout or "").strip(), stderr
-        if _maybe_repair_git_index(stderr):
+        if timeout is None:
+            result = subprocess.run(
+                cmd, cwd=str(REPO_DIR), capture_output=True, text=True, env=env,
+            )
+            returncode, stdout, raw_stderr = (
+                result.returncode, result.stdout or "", result.stderr or "",
+            )
+        else:
+            returncode, stdout, raw_stderr = _run_git_process_bounded(
+                cmd, timeout=timeout, cwd=REPO_DIR, env=env, text=True,
+            )
+        stderr = str(raw_stderr or "").strip()
+        if returncode == 0:
+            return returncode, str(stdout or "").strip(), stderr
+        if _maybe_repair_git_index(stderr, timeout=timeout):
             continue
-        return r.returncode, (r.stdout or "").strip(), stderr
-    return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+        return returncode, str(stdout or "").strip(), stderr
+    return returncode, str(stdout or "").strip(), stderr
 
 
 from supervisor import update_source as _update_source
 
 FETCH_TIMEOUT_RC, _git_network_bounded = _update_source.FETCH_TIMEOUT_RC, _update_source._git_network_bounded
 _managed_update_target, git_fetch_bounded = _update_source._managed_update_target, _update_source.git_fetch_bounded
+
+def rescue_git_capture(cmd: List[str]) -> Tuple[int, str, str]:
+    """Run ``git_capture`` under the configured rescue-only wall-clock bound.
+
+    A timeout returns through the normal nonzero-rc shape, which every caller
+    in the rescue graph already treats as a warning rather than a hard stop:
+    fail-open, never a stall.
+    """
+    from ouroboros.update_channels import get_rescue_git_timeout_sec
+
+    return git_capture(cmd, timeout=get_rescue_git_timeout_sec())
 
 
 def _resolve_managed_update_target(
@@ -248,7 +339,7 @@ def _stale_git_lock_paths(max_age_sec: float = 15.0) -> List[pathlib.Path]:
     return stale_paths
 
 
-def _maybe_repair_git_index(stderr: str) -> bool:
+def _maybe_repair_git_index(stderr: str, *, timeout: Optional[float] = None) -> bool:
     error_text = str(stderr or "")
     error_lower = error_text.lower()
     repaired = False
@@ -285,19 +376,30 @@ def _maybe_repair_git_index(stderr: str) -> bool:
             log.warning("Failed to back up corrupt git index %s", index_path, exc_info=True)
             return repaired
 
-    rebuild = subprocess.run(
-        ["git", "reset", "--mixed", "HEAD"],
-        cwd=str(REPO_DIR),
-        capture_output=True,
-        text=True,
-    )
-    if rebuild.returncode == 0:
+    rebuild_cmd = ["git", "reset", "--mixed", "HEAD"]
+    rebuild_env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+    if timeout is None:
+        rebuild = subprocess.run(
+            rebuild_cmd,
+            cwd=str(REPO_DIR),
+            capture_output=True,
+            text=True,
+            env=rebuild_env,
+        )
+        rebuild_rc = rebuild.returncode
+        rebuild_error = (rebuild.stderr or "").strip() or (rebuild.stdout or "").strip()
+    else:
+        rebuild_rc, rebuild_stdout, rebuild_stderr = _run_git_process_bounded(
+            rebuild_cmd, timeout=timeout, cwd=REPO_DIR, env=rebuild_env, text=True,
+        )
+        rebuild_error = str(rebuild_stderr or "").strip() or str(rebuild_stdout or "").strip()
+    if rebuild_rc == 0:
         log.warning("Rebuilt git index after corruption in %s", REPO_DIR)
         return True
 
     log.warning(
         "Failed to rebuild git index after corruption: %s",
-        (rebuild.stderr or "").strip() or (rebuild.stdout or "").strip(),
+        rebuild_error,
     )
     return repaired
 
@@ -433,29 +535,34 @@ def _collect_repo_sync_state() -> Dict[str, Any]:
         "warnings": [],
     }
 
-    rc, branch, err = git_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    rc, branch, err = rescue_git_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"])
     if rc == 0 and branch:
         state["current_branch"] = branch
     elif err:
         state["warnings"].append(f"branch_error:{err}")
 
-    rc, dirty, err = git_capture(["git", "status", "--porcelain"])
+    rc, dirty, err = rescue_git_capture(["git", "status", "--porcelain"])
     if rc == 0 and dirty:
         state["dirty_lines"] = [ln for ln in dirty.splitlines() if ln.strip()]
-    elif rc != 0 and err:
-        state["warnings"].append(f"status_error:{err}")
+    elif rc != 0:
+        detail = err or f"git status exited {rc} without stderr"
+        state["warnings"].append(f"status_error:{detail}")
 
+    remotes = set(_list_remotes(
+        capture=rescue_git_capture,
+        warnings=state["warnings"],
+    ))
     upstream = ""
     current_branch = str(state.get("current_branch") or "")
     managed_meta = _read_managed_repo_meta()
     if managed_meta and current_branch not in ("", "HEAD", "unknown"):
         managed_remote = _managed_remote_name(managed_meta)
         managed_branch = _managed_remote_branch_for(current_branch, managed_meta)
-        if managed_branch and _has_remote(managed_remote):
+        if managed_branch and managed_remote in remotes:
             upstream = f"{managed_remote}/{managed_branch}"
 
-    if not upstream and _has_remote("origin"):
-        rc, up, err = git_capture(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+    if not upstream and "origin" in remotes:
+        rc, up, err = rescue_git_capture(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
         if rc == 0 and up:
             upstream = up
         else:
@@ -465,7 +572,7 @@ def _collect_repo_sync_state() -> Dict[str, Any]:
                 state["warnings"].append(f"upstream_error:{err}")
 
     if upstream:
-        rc, unpushed, err = git_capture(["git", "log", "--oneline", f"{upstream}..HEAD"])
+        rc, unpushed, err = rescue_git_capture(["git", "log", "--oneline", f"{upstream}..HEAD"])
         if rc == 0 and unpushed:
             state["unpushed_lines"] = [ln for ln in unpushed.splitlines() if ln.strip()]
         elif rc != 0 and err:
@@ -479,7 +586,7 @@ def _copy_untracked_for_rescue(dst_root: pathlib.Path, max_files: int = 200,
     out: Dict[str, Any] = {
         "copied_files": 0, "skipped_files": 0, "copied_bytes": 0, "truncated": False,
     }
-    rc, txt, err = git_capture(["git", "ls-files", "--others", "--exclude-standard"])
+    rc, txt, err = rescue_git_capture(["git", "ls-files", "--others", "--exclude-standard"])
     if rc != 0:
         out["error"] = err or "git ls-files failed"
         return out
@@ -546,10 +653,16 @@ def _create_rescue_snapshot(branch: str, reason: str,
         "path": str(rescue_dir),
     }
 
-    rc_status, status_txt, _ = git_capture(["git", "status", "--porcelain"])
+    rc_status, status_txt, status_error = rescue_git_capture(
+        ["git", "status", "--porcelain"]
+    )
     if rc_status == 0:
         atomic_write_text(rescue_dir / "status.porcelain.txt",
                           status_txt + ("\n" if status_txt else ""))
+    else:
+        info["warnings"].append(
+            f"snapshot_status_error:{status_error or f'git status exited {rc_status} without stderr'}"
+        )
 
     # changes.diff must survive BYTES end-to-end: on an unmerged index it is the
     # ONLY carrier of in-progress resolutions, and text-mode capture would corrupt
@@ -560,18 +673,27 @@ def _create_rescue_snapshot(branch: str, reason: str,
     # diff.noprefix). GIT_DIFF_OPTS is dropped from the environment because it
     # can carry a context-width override that beats the flags.
     try:
+        from ouroboros.update_channels import get_rescue_git_timeout_sec
+
         capture_env = {k: v for k, v in os.environ.items() if k != "GIT_DIFF_OPTS"}
         capture_env.update({"LC_ALL": "C", "LANG": "C"})
-        diff_proc = subprocess.run(
+        diff_rc, diff_stdout, diff_stderr = _run_git_process_bounded(
             ["git", "diff", "--binary", "--no-ext-diff", "--no-textconv", "--no-color",
              "--src-prefix=a/", "--dst-prefix=b/", "HEAD"],
-            cwd=str(REPO_DIR), capture_output=True, env=capture_env,
+            cwd=REPO_DIR,
+            env=capture_env,
+            text=False,
+            timeout=get_rescue_git_timeout_sec(),
         )
-        if diff_proc.returncode == 0:
-            _atomic_write_bytes(rescue_dir / "changes.diff", diff_proc.stdout or b"")
+        if diff_rc == 0:
+            _atomic_write_bytes(rescue_dir / "changes.diff", diff_stdout or b"")
         else:
-            info["diff_error"] = ((diff_proc.stderr or b"").decode("utf-8", "replace").strip()
-                                  or "git diff failed")
+            raw_error = diff_stderr or b""
+            info["diff_error"] = (
+                raw_error.decode("utf-8", "replace").strip()
+                if isinstance(raw_error, bytes)
+                else str(raw_error).strip()
+            ) or "git diff failed"
     except Exception as diff_exc:
         log.warning("Rescue diff capture failed", exc_info=True)
         info["diff_error"] = repr(diff_exc)
@@ -582,7 +704,7 @@ def _create_rescue_snapshot(branch: str, reason: str,
     # changes (it omits untracked files, which the copy below preserves). Purely
     # additive: failure here never blocks the reset and the diff/untracked copy
     # remain the primary recovery artifacts.
-    rc_stash, stash_sha, stash_err = git_capture(["git", "stash", "create", f"rescue:{reason}"])
+    rc_stash, stash_sha, stash_err = rescue_git_capture(["git", "stash", "create", f"rescue:{reason}"])
     stash_sha = stash_sha.strip()
     if rc_stash != 0:
         # rc==0 with an empty sha is LEGITIMATE (nothing to stash / untracked-only
@@ -591,7 +713,7 @@ def _create_rescue_snapshot(branch: str, reason: str,
         info["rescue_stash_error"] = stash_err or "git stash create failed"
     elif stash_sha:
         ref_name = f"refs/rescue/{rescue_dir.name}"
-        rc_ref, _, ref_err = git_capture(["git", "update-ref", ref_name, stash_sha])
+        rc_ref, _, ref_err = rescue_git_capture(["git", "update-ref", ref_name, stash_sha])
         if rc_ref == 0:
             info["rescue_ref"] = ref_name
             info["rescue_commit"] = stash_sha
@@ -603,29 +725,46 @@ def _create_rescue_snapshot(branch: str, reason: str,
     # together with changes.diff (a plain worktree-vs-HEAD diff that DOES carry
     # in-progress resolutions) they make the merge state operator-recoverable.
     try:
-        rc_mh, merge_head, _mh_err = git_capture(
+        rc_mh, merge_head, mh_error = rescue_git_capture(
             ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"]
         )
         if rc_mh == 0 and merge_head.strip():
             info["merge_head"] = merge_head.strip()
-            rc_u, unmerged_txt, _u_err = git_capture(["git", "ls-files", "-u"])
+            rc_u, unmerged_txt, unmerged_error = rescue_git_capture(
+                ["git", "ls-files", "-u"]
+            )
             if rc_u == 0 and unmerged_txt:
                 atomic_write_text(rescue_dir / "unmerged.txt", unmerged_txt + "\n")
                 # Unique conflicted PATHS (stage 1/2/3 rows collapse to one path).
                 info["unmerged_count"] = len({
                     ln.split("\t", 1)[-1] for ln in unmerged_txt.splitlines() if ln.strip()
                 })
+            elif rc_u != 0:
+                info["warnings"].append(
+                    f"unmerged_index_error:{unmerged_error or f'git ls-files exited {rc_u} without stderr'}"
+                )
             # --git-path: in a linked worktree .git is a FILE, so a naive
             # .git/MERGE_MSG probe would silently drop the message.
-            rc_p, msg_rel, _p_err = git_capture(["git", "rev-parse", "--git-path", "MERGE_MSG"])
+            rc_p, msg_rel, msg_path_error = rescue_git_capture(
+                ["git", "rev-parse", "--git-path", "MERGE_MSG"]
+            )
+            if rc_p != 0:
+                info["warnings"].append(
+                    f"merge_msg_path_error:{msg_path_error or f'git rev-parse exited {rc_p} without stderr'}"
+                )
             merge_msg_path = (REPO_DIR / msg_rel) if rc_p == 0 and msg_rel else (
                 _git_dir() / "MERGE_MSG"
             )
             if merge_msg_path.is_file():
                 atomic_write_text(rescue_dir / "merge_msg.txt",
                                   merge_msg_path.read_text(encoding="utf-8", errors="replace"))
-    except Exception:
+        elif rc_mh != 1 or bool(mh_error.strip()):
+            info["warnings"].append(
+                f"merge_head_error:{mh_error or f'git rev-parse exited {rc_mh} without stderr'}"
+            )
+    except Exception as exc:
         log.warning("Failed to capture merge topology into rescue snapshot", exc_info=True)
+        info["warnings"].append(f"merge_topology_error:{exc!r}")
 
     untracked_meta = _copy_untracked_for_rescue(rescue_dir / "untracked")
     info["untracked"] = untracked_meta
@@ -699,14 +838,26 @@ def rescue_before_destructive_rollback(reason: str, *, context: str = "rollback"
     bookkeeping stays with the caller (update_merge); this helper only talks to
     git and the supervisor log."""
     try:
-        rc_status, dirty, _status_err = git_capture(["git", "status", "--porcelain"])
-        rc_mh, merge_head, _mh_err = git_capture(
+        rc_status, dirty, status_error = rescue_git_capture(
+            ["git", "status", "--porcelain"]
+        )
+        rc_mh, merge_head, merge_head_error = rescue_git_capture(
             ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"]
         )
         merge_in_progress = rc_mh == 0 and bool(merge_head.strip())
-        if rc_status == 0 and not dirty.strip() and not merge_in_progress:
+        merge_absent = rc_mh == 1 and not merge_head_error.strip()
+        if rc_status == 0 and not dirty.strip() and merge_absent:
             return {}
         repo_state = _collect_repo_sync_state()
+        warnings = repo_state.setdefault("warnings", [])
+        if rc_status != 0:
+            warnings.append(
+                f"rollback_status_error:{status_error or f'git status exited {rc_status} without stderr'}"
+            )
+        if not merge_in_progress and not merge_absent:
+            warnings.append(
+                f"merge_head_error:{merge_head_error or f'git rev-parse exited {rc_mh} without a merge head'}"
+            )
         branch = str(repo_state.get("current_branch") or BRANCH_DEV)
         prefix = "managed_update_rollback" if context == "rollback" else "managed_update_rescue"
         info = _create_rescue_snapshot(
@@ -721,6 +872,8 @@ def rescue_before_destructive_rollback(reason: str, *, context: str = "rollback"
             "ts": utc_now_iso(), "type": "managed_update_rescue_captured",
             "reason": reason, "rescue_path": result["path"],
             **({"rescue_ref": result["ref"]} if result["ref"] else {}),
+            **({"warnings": list(info.get("warnings") or [])}
+               if info.get("warnings") else {}),
         }
     except Exception as exc:
         log.warning(
@@ -854,6 +1007,184 @@ def _run_git_resilient(cmd, **kwargs):
     return subprocess.run(cmd, check=check, **kwargs)
 
 
+def _admission_gate_for_unsynced_tree(
+    branch: str, reason: str, policy: str, update_intent_target: str,
+) -> Optional[Tuple[bool, str]]:
+    """Apply unsynced_policy's block/rescue rules for checkout_and_reset.
+
+    Returns ``(False, msg)`` when the reset must stop here, or ``None`` to proceed.
+    """
+    repo_state = _collect_repo_sync_state()
+    dirty_lines = list(repo_state.get("dirty_lines") or [])
+    unpushed_lines = list(repo_state.get("unpushed_lines") or [])
+    unpushed_needs_rescue = bool(update_intent_target and unpushed_lines)
+
+    # A failed status read or an unconsulted MERGE_HEAD used to read as a clean
+    # tree; force the same rescue/block branch a dirty tree takes, matching the
+    # fail-closed read already used for the managed-update rollback path.
+    status_unreadable = any(
+        str(w).startswith("status_error:") for w in (repo_state.get("warnings") or [])
+    )
+    merge_in_progress = False
+    merge_head_unreadable = False
+    # Keep the process-free path for normal clones.  Linked worktrees use a
+    # .git pointer file, so ask Git for the worktree-specific admin path there.
+    git_dir = _git_dir()
+    merge_head_path = git_dir / "MERGE_HEAD"
+    if git_dir.is_file():
+        rc_path, merge_head_rel, _path_err = rescue_git_capture(
+            ["git", "rev-parse", "--git-path", "MERGE_HEAD"]
+        )
+        if rc_path == 0 and merge_head_rel:
+            merge_head_path = REPO_DIR / merge_head_rel
+        else:
+            merge_head_unreadable = True
+
+    # A present file whose content is not a SHA is unreadable, not absent, per
+    # the issue's fix direction.
+    if merge_head_path.is_file():
+        try:
+            merge_head_content = merge_head_path.read_text(encoding="utf-8").strip()
+        except Exception:
+            merge_head_content = ""
+        if re.fullmatch(r"[0-9a-fA-F]{7,64}", merge_head_content):
+            merge_in_progress = True
+        else:
+            merge_head_unreadable = True
+
+    if dirty_lines or unpushed_needs_rescue or status_unreadable or merge_in_progress \
+            or merge_head_unreadable:
+        bits: List[str] = []
+        if unpushed_lines and (dirty_lines or unpushed_needs_rescue):
+            bits.append(f"unpushed={len(unpushed_lines)}")
+        if dirty_lines:
+            bits.append(f"dirty={len(dirty_lines)}")
+        if status_unreadable:
+            bits.append("status_unreadable")
+        if merge_in_progress:
+            bits.append("merge_in_progress")
+        if merge_head_unreadable:
+            bits.append("merge_head_unreadable")
+        detail = ", ".join(bits) if bits else "unsynced"
+        rescue_info: Dict[str, Any] = {}
+        if policy in {"rescue_and_block", "rescue_and_reset"}:
+            try:
+                rescue_info = _create_rescue_snapshot(
+                    branch=branch, reason=reason, repo_state=repo_state)
+            except Exception as e:
+                rescue_info = {"error": repr(e)}
+            if policy == "rescue_and_reset" and rescue_info.get("error"):
+                msg = (
+                    f"Reset blocked ({detail}) because rescue snapshot failed: "
+                    f"{rescue_info.get('error')}. Local changes were left untouched."
+                )
+                append_jsonl(
+                    DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                    {
+                        "ts": utc_now_iso(),
+                        "type": "reset_blocked_rescue_failed",
+                        "target_branch": branch, "reason": reason, "policy": policy,
+                        "current_branch": repo_state.get("current_branch"),
+                        "dirty_count": len(dirty_lines),
+                        "unpushed_count": len(unpushed_lines),
+                        "dirty_preview": dirty_lines[:20],
+                        "unpushed_preview": unpushed_lines[:20],
+                        "warnings": list(repo_state.get("warnings") or []),
+                        "rescue": rescue_info,
+                        "incomplete_reason": "snapshot_error",
+                    },
+                )
+                return False, msg
+            if policy == "rescue_and_reset" and rescue_info.get("diff_error"):
+                msg = (
+                    f"Reset blocked ({detail}) because rescue diff capture failed: "
+                    f"{rescue_info.get('diff_error')}. Local changes were left untouched."
+                )
+                append_jsonl(
+                    DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                    {
+                        "ts": utc_now_iso(),
+                        "type": "reset_blocked_rescue_incomplete",
+                        "target_branch": branch, "reason": reason, "policy": policy,
+                        "current_branch": repo_state.get("current_branch"),
+                        "dirty_count": len(dirty_lines),
+                        "unpushed_count": len(unpushed_lines),
+                        "dirty_preview": dirty_lines[:20],
+                        "unpushed_preview": unpushed_lines[:20],
+                        "warnings": list(repo_state.get("warnings") or []),
+                        "rescue": rescue_info,
+                        "incomplete_reason": "diff_error",
+                    },
+                )
+                return False, msg
+            untracked_rescue_error = _rescue_untracked_incomplete(rescue_info)
+            if policy == "rescue_and_reset" and untracked_rescue_error:
+                msg = (
+                    f"Reset blocked ({detail}) because untracked-file rescue was incomplete: "
+                    f"{untracked_rescue_error}. Local changes were left untouched."
+                )
+                append_jsonl(
+                    DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                    {
+                        "ts": utc_now_iso(),
+                        "type": "reset_blocked_rescue_incomplete",
+                        "target_branch": branch, "reason": reason, "policy": policy,
+                        "current_branch": repo_state.get("current_branch"),
+                        "dirty_count": len(dirty_lines),
+                        "unpushed_count": len(unpushed_lines),
+                        "dirty_preview": dirty_lines[:20],
+                        "unpushed_preview": unpushed_lines[:20],
+                        "warnings": list(repo_state.get("warnings") or []),
+                        "rescue": rescue_info,
+                        "incomplete_reason": "untracked_rescue",
+                        "incomplete_detail": untracked_rescue_error,
+                    },
+                )
+                return False, msg
+        rescue_suffix = ""
+        rescue_path = str(rescue_info.get("path") or "").strip()
+        if rescue_path:
+            rescue_suffix = f" Rescue saved to {rescue_path}."
+        elif policy in {"rescue_and_block", "rescue_and_reset"} and rescue_info.get("error"):
+            rescue_suffix = f" Rescue failed: {rescue_info.get('error')}."
+
+        if policy in {"block", "rescue_and_block"}:
+            msg = f"Reset blocked ({detail}) to protect local changes.{rescue_suffix}"
+            append_jsonl(
+                DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                {
+                    "ts": utc_now_iso(),
+                    "type": "reset_blocked_unsynced_state",
+                    "target_branch": branch, "reason": reason, "policy": policy,
+                    "current_branch": repo_state.get("current_branch"),
+                    "dirty_count": len(dirty_lines),
+                    "unpushed_count": len(unpushed_lines),
+                    "dirty_preview": dirty_lines[:20],
+                    "unpushed_preview": unpushed_lines[:20],
+                    "warnings": list(repo_state.get("warnings") or []),
+                    "rescue": rescue_info,
+                },
+            )
+            return False, msg
+
+        append_jsonl(
+            DRIVE_ROOT / "logs" / "supervisor.jsonl",
+            {
+                "ts": utc_now_iso(),
+                "type": "reset_unsynced_rescued_then_reset",
+                "target_branch": branch, "reason": reason, "policy": policy,
+                "current_branch": repo_state.get("current_branch"),
+                "dirty_count": len(dirty_lines),
+                "unpushed_count": len(unpushed_lines),
+                "dirty_preview": dirty_lines[:20],
+                "unpushed_preview": unpushed_lines[:20],
+                "warnings": list(repo_state.get("warnings") or []),
+                "rescue": rescue_info,
+            },
+        )
+    return None
+
+
 def checkout_and_reset(branch: str, reason: str = "unspecified",
                        unsynced_policy: str = "ignore") -> Tuple[bool, str]:
     managed_meta = _read_managed_repo_meta()
@@ -938,133 +1269,10 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
         policy = "ignore"
 
     if policy != "ignore":
-        repo_state = _collect_repo_sync_state()
-        dirty_lines = list(repo_state.get("dirty_lines") or [])
-        unpushed_lines = list(repo_state.get("unpushed_lines") or [])
-        unpushed_needs_rescue = bool(update_intent_target and unpushed_lines)
-        if dirty_lines or unpushed_needs_rescue:
-            bits: List[str] = []
-            if unpushed_lines and (dirty_lines or unpushed_needs_rescue):
-                bits.append(f"unpushed={len(unpushed_lines)}")
-            if dirty_lines:
-                bits.append(f"dirty={len(dirty_lines)}")
-            detail = ", ".join(bits) if bits else "unsynced"
-            rescue_info: Dict[str, Any] = {}
-            if policy in {"rescue_and_block", "rescue_and_reset"}:
-                try:
-                    rescue_info = _create_rescue_snapshot(
-                        branch=branch, reason=reason, repo_state=repo_state)
-                except Exception as e:
-                    rescue_info = {"error": repr(e)}
-                if policy == "rescue_and_reset" and rescue_info.get("error"):
-                    msg = (
-                        f"Reset blocked ({detail}) because rescue snapshot failed: "
-                        f"{rescue_info.get('error')}. Local changes were left untouched."
-                    )
-                    append_jsonl(
-                        DRIVE_ROOT / "logs" / "supervisor.jsonl",
-                        {
-                            "ts": utc_now_iso(),
-                            "type": "reset_blocked_rescue_failed",
-                            "target_branch": branch, "reason": reason, "policy": policy,
-                            "current_branch": repo_state.get("current_branch"),
-                            "dirty_count": len(dirty_lines),
-                            "unpushed_count": len(unpushed_lines),
-                            "dirty_preview": dirty_lines[:20],
-                            "unpushed_preview": unpushed_lines[:20],
-                            "warnings": list(repo_state.get("warnings") or []),
-                            "rescue": rescue_info,
-                            "incomplete_reason": "snapshot_error",
-                        },
-                    )
-                    return False, msg
-                if policy == "rescue_and_reset" and rescue_info.get("diff_error"):
-                    msg = (
-                        f"Reset blocked ({detail}) because rescue diff capture failed: "
-                        f"{rescue_info.get('diff_error')}. Local changes were left untouched."
-                    )
-                    append_jsonl(
-                        DRIVE_ROOT / "logs" / "supervisor.jsonl",
-                        {
-                            "ts": utc_now_iso(),
-                            "type": "reset_blocked_rescue_incomplete",
-                            "target_branch": branch, "reason": reason, "policy": policy,
-                            "current_branch": repo_state.get("current_branch"),
-                            "dirty_count": len(dirty_lines),
-                            "unpushed_count": len(unpushed_lines),
-                            "dirty_preview": dirty_lines[:20],
-                            "unpushed_preview": unpushed_lines[:20],
-                            "warnings": list(repo_state.get("warnings") or []),
-                            "rescue": rescue_info,
-                            "incomplete_reason": "diff_error",
-                        },
-                    )
-                    return False, msg
-                untracked_rescue_error = _rescue_untracked_incomplete(rescue_info)
-                if policy == "rescue_and_reset" and untracked_rescue_error:
-                    msg = (
-                        f"Reset blocked ({detail}) because untracked-file rescue was incomplete: "
-                        f"{untracked_rescue_error}. Local changes were left untouched."
-                    )
-                    append_jsonl(
-                        DRIVE_ROOT / "logs" / "supervisor.jsonl",
-                        {
-                            "ts": utc_now_iso(),
-                            "type": "reset_blocked_rescue_incomplete",
-                            "target_branch": branch, "reason": reason, "policy": policy,
-                            "current_branch": repo_state.get("current_branch"),
-                            "dirty_count": len(dirty_lines),
-                            "unpushed_count": len(unpushed_lines),
-                            "dirty_preview": dirty_lines[:20],
-                            "unpushed_preview": unpushed_lines[:20],
-                            "warnings": list(repo_state.get("warnings") or []),
-                            "rescue": rescue_info,
-                            "incomplete_reason": "untracked_rescue",
-                            "incomplete_detail": untracked_rescue_error,
-                        },
-                    )
-                    return False, msg
-            rescue_suffix = ""
-            rescue_path = str(rescue_info.get("path") or "").strip()
-            if rescue_path:
-                rescue_suffix = f" Rescue saved to {rescue_path}."
-            elif policy in {"rescue_and_block", "rescue_and_reset"} and rescue_info.get("error"):
-                rescue_suffix = f" Rescue failed: {rescue_info.get('error')}."
-
-            if policy in {"block", "rescue_and_block"}:
-                msg = f"Reset blocked ({detail}) to protect local changes.{rescue_suffix}"
-                append_jsonl(
-                    DRIVE_ROOT / "logs" / "supervisor.jsonl",
-                    {
-                        "ts": utc_now_iso(),
-                        "type": "reset_blocked_unsynced_state",
-                        "target_branch": branch, "reason": reason, "policy": policy,
-                        "current_branch": repo_state.get("current_branch"),
-                        "dirty_count": len(dirty_lines),
-                        "unpushed_count": len(unpushed_lines),
-                        "dirty_preview": dirty_lines[:20],
-                        "unpushed_preview": unpushed_lines[:20],
-                        "warnings": list(repo_state.get("warnings") or []),
-                        "rescue": rescue_info,
-                    },
-                )
-                return False, msg
-
-            append_jsonl(
-                DRIVE_ROOT / "logs" / "supervisor.jsonl",
-                {
-                    "ts": utc_now_iso(),
-                    "type": "reset_unsynced_rescued_then_reset",
-                    "target_branch": branch, "reason": reason, "policy": policy,
-                    "current_branch": repo_state.get("current_branch"),
-                    "dirty_count": len(dirty_lines),
-                    "unpushed_count": len(unpushed_lines),
-                    "dirty_preview": dirty_lines[:20],
-                    "unpushed_preview": unpushed_lines[:20],
-                    "warnings": list(repo_state.get("warnings") or []),
-                    "rescue": rescue_info,
-                },
-            )
+        admission_result = _admission_gate_for_unsynced_tree(
+            branch, reason, policy, update_intent_target)
+        if admission_result is not None:
+            return admission_result
 
     remote_ref_exists = False
     if target_ref:

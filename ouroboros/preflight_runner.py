@@ -1077,6 +1077,100 @@ def _classify_pass_result(
     return _diagnosis(f"⚠️ PRE_PUSH_TEST_ERROR: {head}", "", output, max_output)
 
 
+def _capture_source_index_tree(
+    repo: pathlib.Path,
+    max_output: int,
+) -> tuple[str | None, str | None]:
+    """Return a merged index tree, or ``None`` only for proven unmerged entries."""
+    try:
+        source_index = _run_git(repo, ["write-tree"])
+    except (subprocess.SubprocessError, OSError) as exc:
+        return None, _diagnosis(
+            "⚠️ PRE_PUSH_TEST_ERROR: PREFLIGHT_SOURCE_INDEX (hard block): "
+            "the source index could not be snapshotted",
+            "The disposable preflight cannot reproduce an unreadable source index, "
+            "so no test pass was run. Repair the Git/filesystem error shown below.",
+            str(exc),
+            max_output,
+        )
+    if source_index.returncode == 0:
+        return str(source_index.stdout).strip(), None
+    try:
+        unmerged = _run_git(repo, ["ls-files", "-u"])
+    except (subprocess.SubprocessError, OSError) as exc:
+        return None, _diagnosis(
+            "⚠️ PRE_PUSH_TEST_ERROR: PREFLIGHT_SOURCE_INDEX (hard block): "
+            "the failed source index could not be classified",
+            "The preflight may preserve live resolution semantics only for a proven "
+            "unmerged index. No test pass was run.",
+            str(exc),
+            max_output,
+        )
+    if unmerged.returncode == 0 and str(unmerged.stdout).strip():
+        return None, None
+    return None, _diagnosis(
+        "⚠️ PRE_PUSH_TEST_ERROR: PREFLIGHT_SOURCE_INDEX (hard block): "
+        "the source index could not be snapshotted",
+        "The source `git write-tree` failed without real unmerged entries. "
+        "The disposable preflight cannot reproduce the staged candidate, so no "
+        "test pass was run. Repair the index error shown below.",
+        str(source_index.stderr).strip() or "git write-tree failed",
+        max_output,
+    )
+
+
+def _install_source_index_tree(
+    worktree: pathlib.Path,
+    source_index_tree: str,
+    max_output: int,
+) -> str | None:
+    """Install and verify the immutable source index without updating files."""
+    try:
+        read_tree = _run_git(worktree, ["read-tree", source_index_tree])
+    except (subprocess.SubprocessError, OSError) as exc:
+        return _diagnosis(
+            "⚠️ PRE_PUSH_TEST_ERROR: PREFLIGHT_SOURCE_INDEX (hard block): "
+            "the source index tree could not be installed",
+            "The disposable index must exactly reproduce the source index before "
+            "tests run. No candidate test pass was started.",
+            str(exc),
+            max_output,
+        )
+    if read_tree.returncode != 0:
+        return _diagnosis(
+            "⚠️ PRE_PUSH_TEST_ERROR: PREFLIGHT_SOURCE_INDEX (hard block): "
+            "the source index tree could not be installed",
+            "The disposable index must exactly reproduce the source index before "
+            "tests run. No candidate test pass was started.",
+            read_tree.stderr.strip() or "git read-tree failed",
+            max_output,
+        )
+    try:
+        projected_index = _run_git(worktree, ["write-tree"])
+    except (subprocess.SubprocessError, OSError) as exc:
+        return _diagnosis(
+            "⚠️ PRE_PUSH_TEST_ERROR: PREFLIGHT_SOURCE_INDEX (hard block): "
+            "the disposable index could not be verified",
+            "The source and disposable indexes must have identical `write-tree` "
+            "identities before tests run. No candidate test pass was started.",
+            str(exc),
+            max_output,
+        )
+    if projected_index.returncode == 0 and str(projected_index.stdout).strip() == source_index_tree:
+        return None
+    detail = projected_index.stderr.strip() or (
+        f"expected {source_index_tree}, got {str(projected_index.stdout).strip() or '<empty>'}"
+    )
+    return _diagnosis(
+        "⚠️ PRE_PUSH_TEST_ERROR: PREFLIGHT_SOURCE_INDEX (hard block): "
+        "the disposable index does not match the source index tree",
+        "The source and disposable indexes must have identical `write-tree` "
+        "identities before tests run. No candidate test pass was started.",
+        detail,
+        max_output,
+    )
+
+
 def run_hermetic_pytest(
     repo_dir: pathlib.Path | str,
     *,
@@ -1111,7 +1205,10 @@ def run_hermetic_pytest(
     untracked side keeps ``_copy_untracked``'s long-standing boundaries:
     ignored files are absent, and untracked symlinks are dereferenced to
     regular files (non-file entries skipped), so the candidate is not
-    literally byte-equal to the worktree in those corners.
+    literally byte-equal to the worktree in those corners. When the source index
+    is merged, its exact ``write-tree`` snapshot is also installed into the
+    disposable index (without updating files) and verified before tests run.
+    A genuinely unmerged source index retains the live-resolution projection.
     """
     timeout = _resolve_preflight_timeout(timeout)
     # Checked BEFORE anything runs. `_diagnosis` renders inside this budget, so a
@@ -1156,7 +1253,9 @@ def run_hermetic_pytest(
             )
         return None
     agent_python = os.environ.get("OUROBOROS_AGENT_PYTHON") or sys.executable or "python3"
-
+    source_index_tree, source_index_error = _capture_source_index_tree(repo, max_output)
+    if source_index_error is not None:
+        return source_index_error
     temp_root_path = tempfile.mkdtemp(prefix="ouroboros-preflight-")
     temp_root = pathlib.Path(temp_root_path).resolve(strict=False)
     worktree = temp_root / "repo"
@@ -1194,6 +1293,11 @@ def run_hermetic_pytest(
         if add.returncode != 0:
             return f"⚠️ PRE_PUSH_TEST_ERROR: could not create hermetic worktree: {add.stderr.strip()}"
         worktree_added = True
+
+        if source_index_tree is not None:
+            source_index_error = _install_source_index_tree(worktree, source_index_tree, max_output)
+            if source_index_error is not None:
+                return source_index_error
 
         # ONE capture for every repository state: the tracked delta between
         # HEAD and the live worktree, assembled identically whether the source

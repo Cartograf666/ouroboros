@@ -213,6 +213,26 @@ def _clear_session_route_envs(monkeypatch):
     monkeypatch.delenv("OUROBOROS_SUBAGENT_HARNESS", raising=False)
 
 
+def test_disabled_slot_has_a_stable_reason_and_boolean_projection(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-sentinel")
+    monkeypatch.delenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, raising=False)
+    monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", json.dumps({
+        "triad": [{"slot_id": "t1", "route": {"kind": "api_chat", "target_id": "openai/x"}}],
+        "scope": [{"slot_id": "s1", "route": {"kind": "api_chat", "target_id": "openai/y"}}],
+        "advisory": {"enabled": False, "route": {"kind": "api", "target_id": "sonnet"}},
+    }))
+    assert advisory.advisory_gate_unavailability_reason() == "advisory_slot_disabled"
+    assert advisory.advisory_gate_unavailable() is True
+
+
+def test_keyless_api_slot_has_a_stable_reason_and_boolean_projection(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
+    monkeypatch.delenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, raising=False)
+    assert advisory.advisory_gate_unavailability_reason() == "anthropic_api_key_missing"
+    assert advisory.advisory_gate_unavailable() is True
+
+
 def test_unroutable_session_slot_reports_the_gate_unavailable(monkeypatch):
     """Triad a4 follow-up to #123: kind=agent_session with NO resolvable route
     anywhere (no row target, no shared review/subagent route) structurally
@@ -223,6 +243,7 @@ def test_unroutable_session_slot_reports_the_gate_unavailable(monkeypatch):
     monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
     monkeypatch.setenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, "agent_session")
     _clear_session_route_envs(monkeypatch)
+    assert advisory.advisory_gate_unavailability_reason() == "agent_session_route_unavailable"
     assert advisory.advisory_gate_unavailable() is True
 
 
@@ -234,6 +255,7 @@ def test_session_slot_with_shared_route_reports_the_gate_available(monkeypatch):
     monkeypatch.setenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, "agent_session")
     _clear_session_route_envs(monkeypatch)
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "claude")
+    assert advisory.advisory_gate_unavailability_reason() is None
     assert advisory.advisory_gate_unavailable() is False
 
 
@@ -249,7 +271,17 @@ def test_session_slot_with_its_own_target_reports_the_gate_available(monkeypatch
         "advisory": {"enabled": True,
                      "route": {"kind": "agent_session", "target_id": "codex"}},
     }))
+    assert advisory.advisory_gate_unavailability_reason() is None
     assert advisory.advisory_gate_unavailable() is False
+
+
+def test_malformed_advisory_configuration_keeps_value_error_authority(monkeypatch):
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
+    monkeypatch.setenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, "cursor")
+    with pytest.raises(ValueError):
+        advisory.advisory_gate_unavailability_reason()
+    with pytest.raises(ValueError):
+        advisory.advisory_gate_unavailable()
 
 
 # ---------------------------------------------------------------------------

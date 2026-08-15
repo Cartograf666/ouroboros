@@ -1,8 +1,10 @@
 """Advisory pre-review gate.
 
-Runs a read-only advisory review before multi-model commit review. Findings are
-non-blocking, but ``commit_reviewed`` requires a fresh matching advisory snapshot.
-Any edit after advisory makes it stale.
+Normally runs a cheap read-only advisory review through the configured route
+before multi-model commit review. The LLM may instead choose the audited
+advisory-only skip; tests, triad/scope review, exact-snapshot revalidation, and
+final commit binding remain authoritative. Any edit after advisory makes it
+stale.
 """
 
 from __future__ import annotations
@@ -67,6 +69,18 @@ from ouroboros.review_evidence import build_review_projection, build_review_stat
 log = logging.getLogger(__name__)
 
 _MAX_DIFF_CHARS_ERROR = 500_000  # Fail loudly above this — split the commit
+
+
+ADVISORY_REVIEW_CHOICE_GUIDANCE = (
+    "Normally the LLM runs the cheap advisory_review immediately before "
+    "commit_reviewed. When advisory review is slow, unhealthy, unavailable, or "
+    "low-value, the LLM may deliberately choose skip_advisory_review=True; the "
+    "choice is durably audited. This skip bypasses only the requirements for "
+    "advisory freshness, advisory obligations, and advisory debt; unresolved "
+    "obligation and debt records remain visible, while tests, triad review, "
+    "applicable scope review, snapshot/fingerprint revalidation, and final "
+    "commit/tag/SHA binding still apply."
+)
 
 
 _ADVISORY_PROMPT_MAX_CHARS = 1_600_000  # ~400K tokens; non-blocking skip when exceeded
@@ -202,6 +216,8 @@ def _release_metadata_preflight(
         web_package_path = repo_dir / "web" / "package.json"
         arch_path = repo_dir / "docs" / "ARCHITECTURE.md"
         api_types_path = repo_dir / "web" / "modules" / "api_types.js"
+        site_install_path = repo_dir / "site" / "install" / "index.html"
+        docs_install_path = repo_dir / "docs" / "install" / "index.html"
         version_str = version_path.read_text(encoding="utf-8").strip()
         if not is_release_version(version_str):
             return None
@@ -219,6 +235,9 @@ def _release_metadata_preflight(
             readme_text=readme_text,
             arch_text=arch_text,
             api_types_text=api_types_text,
+            download_readme_text=readme_text,
+            site_install_text=(site_install_path.read_text(encoding="utf-8") if site_install_path.exists() else ""),
+            docs_install_text=(docs_install_path.read_text(encoding="utf-8") if docs_install_path.exists() else ""),
             detailed=True,
         )
         if readme_text:
@@ -620,24 +639,22 @@ def advisory_route_requires_api_key() -> bool:
     return advisory_review_route() == "api"
 
 
-def advisory_gate_unavailable() -> bool:
-    """Whether the commit gate must treat the advisory as bypassed (#123).
+def advisory_gate_unavailability_reason() -> str | None:
+    """Why the advisory cannot run, or ``None`` when it is available.
 
-    Route/slot-aware successor of the bare ANTHROPIC_API_KEY probe: the gate is
-    unavailable when the owner disabled the advisory slot (its audited bypass
-    needs the compensating test preflight), when the configured route is
-    ``api`` and no key is present, or when the delegated (agent_session) route
-    has NO resolvable session route — neither the advisory row's own target nor
-    the shared review/subagent route (mirroring
+    This is the canonical diagnostic projection of the same structured facts
+    used by the commit gate: owner-disabled slot, keyless ``api`` route, or an
+    ``agent_session`` route with neither a parseable advisory target nor a
+    shared review/subagent route (mirroring
     ``run_delegated_review_session``, which refuses that exact state with
-    ``ReviewRouteUnavailable``). An enabled slot that structurally cannot run
-    is as unavailable as a keyless api route. Raises ValueError on a malformed
-    slots/route configuration — each caller owns its fail direction (the
-    pre-commit gate fails closed INTO the compensating preflight)."""
+    ``ReviewRouteUnavailable``). Reasons are stable and safe to expose. Raises
+    ``ValueError`` on malformed slot/route configuration so each caller retains
+    authority over its own fail direction.
+    """
     if not advisory_slot_enabled():
-        return True
+        return "advisory_slot_disabled"
     if advisory_route_requires_api_key():
-        return not os.environ.get("ANTHROPIC_API_KEY", "")
+        return None if os.environ.get("ANTHROPIC_API_KEY", "") else "anthropic_api_key_missing"
     # Delegated route: mirror the runner's resolution order — the slot's own
     # target when it parses, else the shared session route; None there is a
     # typed refusal at run time, so None here is UNAVAILABLE at gate time.
@@ -647,8 +664,18 @@ def advisory_gate_unavailable() -> bool:
 
     _target = str(advisory_slot_config().target_id or "")
     if _target and parse_subagent_harness(_target) is not None:
-        return False
-    return review_session_route() is None
+        return None
+    return "agent_session_route_unavailable" if review_session_route() is None else None
+
+
+def advisory_gate_unavailable() -> bool:
+    """Whether the commit gate must use advisory-bypass compensation (#123).
+
+    The boolean is intentionally only a projection of the canonical reason so
+    diagnostics and gate behavior cannot drift. Malformed configuration keeps
+    the reason helper's ``ValueError`` authority unchanged.
+    """
+    return advisory_gate_unavailability_reason() is not None
 
 
 def _run_advisory_delegated(prompt: str, repo_dir: pathlib.Path, ctx: ToolContext):
@@ -1374,6 +1401,9 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
 
     regroup = "After the first blocked review, stop patching one finding at a time: re-read the full diff, group obligations by root cause, rewrite the plan, finish all remaining edits, then run advisory_review(commit_message='...')."
 
+    def _with_choices(message: str) -> str:
+        return f"{message.rstrip()} {ADVISORY_REVIEW_CHOICE_GUIDANCE}"
+
     if not effective_is_fresh:
         status = str(getattr(latest, "status", "") or "")
         if latest and status in {"tests_preflight_blocked", "preflight_blocked"} and not stale_from_edit:
@@ -1383,26 +1413,34 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
             else:
                 problem = "syntax preflight: a staged .py file has a SyntaxError"
                 fix = "See raw_result for file:line:msg, fix it, and re-run advisory_review."
-            return f"Last advisory run was blocked by {problem}. {fix} {_debt_hint()}".strip()
+            return _with_choices(
+                f"Last advisory run was blocked by {problem}. {fix} {_debt_hint()}".strip()
+            )
         if latest and status == "parse_failure" and not stale_from_edit:
             suffix = (
                 regroup + " Or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
                 if (open_obs or open_debts)
                 else "Re-run: advisory_review(commit_message='...'), or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
             )
-            return f"Last advisory run produced unparseable output (parse_failure). {_debt_hint()}{suffix}"
+            return _with_choices(
+                f"Last advisory run produced unparseable output (parse_failure). {_debt_hint()}{suffix}"
+            )
         if open_obs or open_debts:
             prefix = f"Advisory was invalidated by a worktree edit at {stale_from_edit_ts}. " if stale_from_edit else "Advisory is stale or missing for the current snapshot. "
-            return prefix + _debt_hint() + regroup
+            return _with_choices(prefix + _debt_hint() + regroup)
         if stale_from_edit:
-            return f"Advisory was invalidated by a worktree edit at {stale_from_edit_ts}. Complete ALL remaining edits, then run: advisory_review(commit_message='...')"
+            return _with_choices(
+                f"Advisory was invalidated by a worktree edit at {stale_from_edit_ts}. Complete ALL remaining edits, then run: advisory_review(commit_message='...')"
+            )
         if not state.advisory_runs:
-            return "No advisory run yet. Run: advisory_review(commit_message='...')"
-        return "Advisory is stale (snapshot changed). Run: advisory_review(commit_message='...')"
+            return _with_choices("No advisory run yet. Run: advisory_review(commit_message='...')")
+        return _with_choices("Advisory is stale (snapshot changed). Run: advisory_review(commit_message='...')")
 
     # Advisory is effectively fresh — check obligations and findings
     if open_obs or open_debts:
-        return f"Advisory is current but unresolved review debt remains. {_debt_hint()}commit_reviewed will be blocked until that debt is cleared. Re-read the full diff, group obligations by root cause, and rewrite the plan. Fix the issues, re-run advisory_review so it marks them PASS, or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
+        return _with_choices(
+            f"Advisory is current but unresolved review debt remains. {_debt_hint()}commit_reviewed will be blocked until that debt is cleared. Re-read the full diff, group obligations by root cause, and rewrite the plan. Fix the issues, re-run advisory_review so it marks them PASS, or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
+        )
 
     if latest and latest.status == "skipped":
         return "Advisory was skipped — prompt exceeded the budget gate (prompt too large for advisory). commit_reviewed may proceed. Consider splitting the commit into smaller chunks so advisory can run on the next change."
@@ -1416,7 +1454,9 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
         and str(i.get("severity", "")).lower() == "critical"
     ]
     if fresh_critical:
-        return f"Advisory found {len(fresh_critical)} critical issue(s). Fix ALL critical findings, then re-run advisory_review. Do NOT call commit_reviewed until advisory is fresh with 0 critical findings."
+        return _with_choices(
+            f"Advisory found {len(fresh_critical)} critical issue(s). Fix ALL critical findings, then re-run advisory_review, or deliberately choose the audited advisory skip."
+        )
     return "Advisory is fresh with no critical findings. Proceed with: commit_reviewed(commit_message='...'). ⚠️ Do NOT make any further edits — any edit will make advisory stale."
 
 
@@ -1601,7 +1641,7 @@ def _handle_advisory_pre_review(
     paths: Optional[List[str]] = None,
     skip_tests: bool = False,
 ) -> str:
-    """Run an advisory pre-commit review via Claude Agent SDK (read-only)."""
+    """Run an advisory pre-commit review through the configured read-only route."""
     skip_advisory_pre_review = bool(skip_advisory_review or skip_advisory_pre_review)
     repo_dir = pathlib.Path(ctx.repo_dir)
     drive_root = pathlib.Path(ctx.drive_root)
@@ -1887,13 +1927,23 @@ def get_tools() -> list:
             schema={
                 "name": "advisory_review",
                 "description": (
-                    "Run an advisory pre-commit review via Claude Agent SDK (read-only: Read, Grep, Glob only). MUST be called before commit_reviewed. Returns structured JSON findings. Findings are advisory (non-blocking), but commit_reviewed is blocked when ANY of the following holds: (a) no fresh matching advisory run for the current staged snapshot, (b) open obligations from prior blocked rounds remain unresolved, or (c) repo-scoped commit-readiness debt is still open (see review_status for details). Correct workflow: finish edits -> advisory_review(...) -> commit_reviewed(...) immediately. WARNING: any edit after advisory_review automatically marks advisory as stale and requires re-running it. Use skip_advisory_review=True to bypass the entire commit gate (bypass is durably audited). Open obligations and commit-readiness debt remain in state for review_status but do not block the bypassed commit. NOTE: after 3 genuine review-verdict blocks of a byte-identical staged diff, commit_reviewed refuses further attempts (attempt_cap_reached) until the diff changes or a review_rebuttal is provided."
+                    "Run an advisory pre-commit review through the configured read-only route. "
+                    "Returns structured JSON findings; any edit afterward makes the result stale. "
+                    f"{ADVISORY_REVIEW_CHOICE_GUIDANCE} "
+                    "NOTE: after 3 genuine review-verdict blocks of a byte-identical staged diff, "
+                    "commit_reviewed refuses further attempts (attempt_cap_reached) until the "
+                    "diff changes or a review_rebuttal is provided."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "commit_message": _schema_param("string", "Intended commit message. Used to bind the advisory run to this specific commit."),
-                        "skip_advisory_review": _schema_param("boolean", "Explicitly bypass the advisory review. Bypass is durably audited in events.jsonl. Default: False.", default=False),
+                        "skip_advisory_review": _schema_param(
+                            "boolean",
+                            "Choose the audited advisory-only skip for this call. "
+                            f"{ADVISORY_REVIEW_CHOICE_GUIDANCE} Default: False.",
+                            default=False,
+                        ),
                         "goal": _schema_param("string", "High-level goal of this change. Used to judge completeness."),
                         "scope": _schema_param("string", "Declared scope boundary. Issues outside scope are advisory-only."),
                         "paths": _schema_param("array", "Explicit list of changed file paths. Auto-detected from git status if omitted.", items={"type": "string"}),
@@ -1909,7 +1959,9 @@ def get_tools() -> list:
             schema={
                 "name": "review_status",
                 "description": (
-                    "Show recent advisory pre-review run history. Read-only diagnostic — use to check if a fresh advisory run exists before calling commit_reviewed. Also shows: last commit attempt state (reviewing/blocked/succeeded/failed) with block reason and actionable guidance; whether advisory is stale because of a worktree edit; open obligations from previous blocking rounds; open commit-readiness debt (durable repo-scoped anti-thrashing signal with fields `commit_readiness_debts`, `commit_readiness_debts_count`); `repo_commit_ready` (aligned with the real commit gate: fresh advisory AND no open obligations AND no open debt); `retry_anchor` (non-null, currently `commit_readiness_debt`, when debt is open — start the next retry from that record instead of patching one obligation at a time); and a concrete next_step recommendation. Pass include_raw=true to surface the full per-actor evidence (triad_raw_results, scope_raw_result) for the targeted attempt."
+                    "Show recent advisory pre-review run history. Read-only diagnostic — use to check advisory freshness before commit_reviewed. Also shows: last commit attempt state (reviewing/blocked/succeeded/failed) with block reason and actionable guidance; whether advisory is stale because of a worktree edit; open obligations from previous blocking rounds; open commit-readiness debt (durable repo-scoped anti-thrashing signal with fields `commit_readiness_debts`, `commit_readiness_debts_count`); `repo_commit_ready` (an advisory-readiness projection only: a fresh/bypassed/skipped advisory and no open advisory obligations or debt, not the full commit gate); `retry_anchor` (non-null, currently `commit_readiness_debt`, when debt is open — start the next retry from that record instead of patching one obligation at a time); and a concrete next_step recommendation. "
+                    f"{ADVISORY_REVIEW_CHOICE_GUIDANCE} "
+                    "Pass include_raw=true to surface the full per-actor evidence (triad_raw_results, scope_raw_result) for the targeted attempt."
                 ),
                 "parameters": {
                     "type": "object",

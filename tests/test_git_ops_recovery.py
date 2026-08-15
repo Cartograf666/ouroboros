@@ -1,8 +1,12 @@
 import json
 import os
+import pathlib
 import subprocess
+import sys
 import time
 from types import SimpleNamespace
+
+import pytest
 
 import supervisor.git_ops as git_ops
 
@@ -107,7 +111,8 @@ def test_git_capture_repairs_corrupt_index(monkeypatch, tmp_path):
 
     calls = {"status": 0, "rebuild": 0}
 
-    def fake_run(cmd, cwd=None, capture_output=False, text=False, check=False, env=None):
+    def fake_run(cmd, cwd=None, capture_output=False, text=False, check=False, env=None,
+                 timeout=None):
         if cmd == ["git", "status", "--porcelain"]:
             calls["status"] += 1
             if calls["status"] == 1:
@@ -133,6 +138,173 @@ def test_git_capture_repairs_corrupt_index(monkeypatch, tmp_path):
     assert calls["status"] == 2
     assert calls["rebuild"] == 1
     assert any(path.name.startswith("index.corrupt.") for path in git_dir.iterdir())
+
+
+def test_bounded_git_capture_bounds_corrupt_index_rebuild(monkeypatch, tmp_path):
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    (git_dir / "index").write_text("broken", encoding="utf-8")
+    monkeypatch.setattr(git_ops, "REPO_DIR", tmp_path)
+
+    calls = []
+
+    def fake_bounded(cmd, *, timeout, cwd=None, env=None, text=True):
+        calls.append((cmd, timeout, cwd, text))
+        if cmd == ["git", "status", "--porcelain"] and len(calls) == 1:
+            return 128, "", "fatal: .git/index: index file smaller than expected"
+        if cmd == ["git", "reset", "--mixed", "HEAD"]:
+            return 0, "", ""
+        if cmd == ["git", "status", "--porcelain"]:
+            return 0, " M changed.py\n", ""
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(git_ops, "_run_git_process_bounded", fake_bounded)
+
+    rc, stdout, stderr = git_ops.git_capture(
+        ["git", "status", "--porcelain"], timeout=17,
+    )
+
+    assert (rc, stdout, stderr) == (0, "M changed.py", "")
+    assert [call[0] for call in calls] == [
+        ["git", "status", "--porcelain"],
+        ["git", "reset", "--mixed", "HEAD"],
+        ["git", "status", "--porcelain"],
+    ]
+    assert all(call[1] == 17 for call in calls)
+
+
+@pytest.mark.serial
+def test_git_capture_times_out_instead_of_hanging(monkeypatch, tmp_path):
+    """Issue #182: a hung git process (fsmonitor deadlock, an unresponsive
+    filesystem) must not stall the rescue/rollback graph indefinitely. A
+    genuinely slow process under a small timeout returns a typed failure
+    quickly rather than blocking for its full runtime."""
+    monkeypatch.setattr(git_ops, "REPO_DIR", tmp_path)
+
+    started = time.monotonic()
+    rc, stdout, stderr = git_ops.git_capture(
+        [sys.executable, "-c", "import time; time.sleep(5)"], timeout=0.2,
+    )
+    elapsed = time.monotonic() - started
+
+    assert rc == git_ops.FETCH_TIMEOUT_RC
+    assert stdout == ""
+    assert "timed out" in stderr
+    assert elapsed < 4  # well under the 5s sleep; proves it did not wait it out
+
+
+def test_git_capture_default_timeout_is_unbounded(monkeypatch, tmp_path):
+    """Every call site other than the rescue graph passes no timeout at all;
+    confirm that shape delegates without adding a subprocess timeout."""
+    monkeypatch.setattr(git_ops, "REPO_DIR", tmp_path)
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(git_ops.subprocess, "run", fake_run)
+
+    rc, stdout, stderr = git_ops.git_capture(["git", "status", "--porcelain"])
+
+    assert rc == 0
+    assert stdout == ""
+    assert stderr == ""
+    assert "timeout" not in captured
+
+
+def test_bounded_git_process_kills_tree_and_is_panic_tracked(monkeypatch):
+    import ouroboros.platform_layer as platform_layer
+    from ouroboros.tools import shell
+
+    killed = []
+
+    class HungProcess:
+        returncode = -9
+
+        def __init__(self):
+            self.pid = 12345
+            self.calls = 0
+
+        def communicate(self, timeout=None):
+            assert self in shell._active_subprocesses
+            self.calls += 1
+            if self.calls == 1:
+                raise subprocess.TimeoutExpired(["git", "status"], timeout)
+            return "", "partial diagnostic"
+
+    proc = HungProcess()
+    monkeypatch.setattr(git_ops.subprocess, "Popen", lambda *_a, **_k: proc)
+    monkeypatch.setattr(
+        platform_layer, "kill_process_tree", lambda child: killed.append(child),
+    )
+
+    rc, stdout, stderr = git_ops._run_git_process_bounded(
+        ["git", "status"], timeout=0.01,
+    )
+
+    assert rc == git_ops.FETCH_TIMEOUT_RC
+    assert stdout == ""
+    assert "timed out" in stderr
+    assert "partial diagnostic" in stderr
+    assert killed == [proc]
+    assert proc not in shell._active_subprocesses
+
+
+def test_rescue_git_capture_bounds_with_rescue_timeout(monkeypatch):
+    """The rescue wrapper forwards the one settings-owned timeout authority."""
+    captured = {}
+
+    def fake_git_capture(cmd, *, timeout=None):
+        captured["cmd"] = cmd
+        captured["timeout"] = timeout
+        return 0, "", ""
+
+    from ouroboros import update_channels
+
+    monkeypatch.setattr(git_ops, "git_capture", fake_git_capture)
+    monkeypatch.setattr(update_channels, "get_rescue_git_timeout_sec", lambda: 321)
+
+    rc, stdout, stderr = git_ops.rescue_git_capture(["git", "status", "--porcelain"])
+
+    assert captured["cmd"] == ["git", "status", "--porcelain"]
+    assert captured["timeout"] == 321
+    assert (rc, stdout, stderr) == (0, "", "")
+
+
+def test_collect_repo_sync_state_uses_rescue_bounded_capture(monkeypatch):
+    """The rescue/rollback graph must go through the bounded wrapper, not the
+    unbounded default: this is what actually closes #182 end to end."""
+    calls = []
+
+    def fake_rescue_git_capture(cmd):
+        calls.append(cmd)
+        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return 0, "ouroboros", ""
+        if cmd == ["git", "remote"]:
+            return 0, "origin", ""
+        if cmd == [
+            "git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}",
+        ]:
+            return 0, "origin/ouroboros", ""
+        if cmd == ["git", "log", "--oneline", "origin/ouroboros..HEAD"]:
+            return 0, "", ""
+        return 0, "", ""
+
+    monkeypatch.setattr(git_ops, "rescue_git_capture", fake_rescue_git_capture)
+    monkeypatch.setattr(
+        git_ops, "git_capture",
+        lambda cmd, **_kwargs: (_ for _ in ()).throw(
+            AssertionError(f"unbounded capture escaped rescue graph: {cmd}")
+        ),
+    )
+
+    git_ops._collect_repo_sync_state()
+
+    assert ["git", "rev-parse", "--abbrev-ref", "HEAD"] in calls
+    assert ["git", "status", "--porcelain"] in calls
+    assert ["git", "remote"] in calls
+    assert ["git", "log", "--oneline", "origin/ouroboros..HEAD"] in calls
 
 
 def test_checkout_and_reset_removes_stale_index_lock(monkeypatch, tmp_path):
@@ -494,6 +666,160 @@ def test_checkout_and_reset_does_not_rescue_for_only_managed_ahead_commits(monke
 
     assert ok
     assert message == "ok"
+
+
+def test_checkout_and_reset_blocks_when_status_read_is_unreadable(monkeypatch, tmp_path):
+    """A `git status` failure must not read as a clean tree: the admission gate treats
+    it the same as a genuinely dirty tree, even though dirty_lines itself is empty."""
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+
+    monkeypatch.setattr(git_ops, "REPO_DIR", tmp_path)
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path / "data")
+    monkeypatch.setattr(git_ops, "_has_remote", lambda name=None: False)
+    events = []
+    monkeypatch.setattr(git_ops, "append_jsonl", lambda path, payload: events.append(payload))
+
+    def fake_capture(cmd, *, timeout=None):
+        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return 0, "ouroboros", ""
+        if cmd == ["git", "status", "--porcelain"]:
+            return -9, "", ""
+        if cmd == ["git", "remote"]:
+            return 0, "", ""
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(git_ops, "git_capture", fake_capture)
+    monkeypatch.setattr(
+        git_ops,
+        "_run_git_resilient",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError((args, kwargs))),
+    )
+
+    ok, message = git_ops.checkout_and_reset(
+        "ouroboros", reason="restart", unsynced_policy="block",
+    )
+
+    assert ok is False
+    assert "status_unreadable" in message
+    assert events and events[-1]["type"] == "reset_blocked_unsynced_state"
+    assert events[-1]["dirty_count"] == 0
+    assert events[-1]["warnings"] == ["status_error:git status exited -9 without stderr"]
+
+
+@pytest.mark.serial
+def test_checkout_and_reset_blocks_clean_merge_in_linked_worktree(monkeypatch, tmp_path):
+    """A linked worktree stores MERGE_HEAD outside its .git pointer file."""
+    repo = tmp_path / "repo"
+    linked = tmp_path / "linked"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "config", "user.email", "test@ouroboros")
+    _git(repo, "commit", "--allow-empty", "-qm", "base")
+    _git(repo, "branch", "-M", "main")
+    _git(repo, "branch", "side")
+    _git(repo, "commit", "--allow-empty", "-qm", "main")
+    _git(repo, "worktree", "add", "-q", str(linked), "side")
+    _git(linked, "commit", "--allow-empty", "-qm", "side")
+    _git(linked, "merge", "--no-commit", "--no-ff", "main")
+
+    assert _git(linked, "status", "--porcelain") == ""
+    merge_head = linked / _git(linked, "rev-parse", "--git-path", "MERGE_HEAD")
+    assert merge_head.is_file()
+
+    monkeypatch.setattr(git_ops, "REPO_DIR", linked)
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path / "data")
+
+    ok, message = git_ops.checkout_and_reset(
+        "side", reason="restart", unsynced_policy="block",
+    )
+
+    assert ok is False
+    assert "merge_in_progress" in message
+    assert merge_head.is_file()
+
+
+def test_checkout_and_reset_blocks_on_unreadable_merge_head(monkeypatch, tmp_path):
+    """MERGE_HEAD present but not a resolvable SHA must force the block branch too,
+    not just a clean git-status read."""
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    (git_dir / "MERGE_HEAD").write_text("not-a-sha\n", encoding="utf-8")
+
+    monkeypatch.setattr(git_ops, "REPO_DIR", tmp_path)
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path / "data")
+    monkeypatch.setattr(git_ops, "_has_remote", lambda name=None: False)
+    monkeypatch.setattr(git_ops, "load_state", lambda: {})
+    monkeypatch.setattr(
+        git_ops,
+        "_collect_repo_sync_state",
+        lambda: {
+            "current_branch": "ouroboros",
+            "dirty_lines": [],
+            "unpushed_lines": [],
+            "warnings": [],
+        },
+    )
+    events = []
+    monkeypatch.setattr(git_ops, "append_jsonl", lambda path, payload: events.append(payload))
+
+    def fake_run(cmd, cwd=None, capture_output=False, text=False, check=False, env=None):
+        if cmd[:2] == ["git", "rev-parse"] and cmd[-1] == "HEAD":
+            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(git_ops.subprocess, "run", fake_run)
+
+    ok, message = git_ops.checkout_and_reset(
+        "ouroboros", reason="restart", unsynced_policy="block",
+    )
+
+    assert ok is False
+    assert "merge_head_unreadable" in message
+    assert events and events[-1]["type"] == "reset_blocked_unsynced_state"
+    assert events[-1]["dirty_count"] == 0
+
+
+def test_checkout_and_reset_blocks_on_merge_in_progress(monkeypatch, tmp_path):
+    """A resolvable MERGE_HEAD (an actual in-progress merge) was never consulted by
+    this admission gate before; it must now force the block branch."""
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    (git_dir / "MERGE_HEAD").write_text("a" * 40 + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(git_ops, "REPO_DIR", tmp_path)
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path / "data")
+    monkeypatch.setattr(git_ops, "_has_remote", lambda name=None: False)
+    monkeypatch.setattr(git_ops, "load_state", lambda: {})
+    monkeypatch.setattr(
+        git_ops,
+        "_collect_repo_sync_state",
+        lambda: {
+            "current_branch": "ouroboros",
+            "dirty_lines": [],
+            "unpushed_lines": [],
+            "warnings": [],
+        },
+    )
+    events = []
+    monkeypatch.setattr(git_ops, "append_jsonl", lambda path, payload: events.append(payload))
+
+    def fake_run(cmd, cwd=None, capture_output=False, text=False, check=False, env=None):
+        if cmd[:2] == ["git", "rev-parse"] and cmd[-1] == "HEAD":
+            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(git_ops.subprocess, "run", fake_run)
+
+    ok, message = git_ops.checkout_and_reset(
+        "ouroboros", reason="restart", unsynced_policy="block",
+    )
+
+    assert ok is False
+    assert "merge_in_progress" in message
+    assert events and events[-1]["type"] == "reset_blocked_unsynced_state"
+    assert events[-1]["dirty_count"] == 0
 
 
 def test_checkout_and_reset_applies_explicit_update_intent(monkeypatch, tmp_path):
@@ -1167,13 +1493,13 @@ def test_collect_repo_sync_state_prefers_managed_remote(monkeypatch):
             "managed_remote_branch": "ouroboros",
         },
     )
-    monkeypatch.setattr(git_ops, "_has_remote", lambda name=None: name in (None, "managed"))
-
-    def fake_git_capture(cmd):
+    def fake_git_capture(cmd, *, timeout=None):
         if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
             return 0, "ouroboros", ""
         if cmd == ["git", "status", "--porcelain"]:
             return 0, "", ""
+        if cmd == ["git", "remote"]:
+            return 0, "managed", ""
         if cmd == ["git", "log", "--oneline", "managed/ouroboros..HEAD"]:
             return 0, "abc123 local commit\n", ""
         raise AssertionError(cmd)
@@ -1339,6 +1665,42 @@ def test_create_rescue_snapshot_captures_merge_topology_on_unmerged_index(monkey
     assert (rescue_dir / "merge_msg.txt").exists()
 
 
+def test_rescue_diff_uses_shared_binary_bounded_runner(monkeypatch, tmp_path):
+    from ouroboros import update_channels
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(git_ops, "REPO_DIR", repo)
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path / "data")
+    monkeypatch.setattr(update_channels, "get_rescue_git_timeout_sec", lambda: 41)
+
+    def fake_rescue_capture(cmd):
+        if cmd == ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"]:
+            return 1, "", ""
+        return 0, "", ""
+
+    bounded = []
+
+    def fake_bounded(cmd, *, timeout, cwd=None, env=None, text=True):
+        bounded.append((cmd, timeout, cwd, text))
+        return 0, b"raw diff\n", b""
+
+    monkeypatch.setattr(git_ops, "rescue_git_capture", fake_rescue_capture)
+    monkeypatch.setattr(git_ops, "_run_git_process_bounded", fake_bounded)
+
+    info = git_ops._create_rescue_snapshot(
+        "ouroboros", "bounded-diff",
+        {
+            "current_branch": "ouroboros", "dirty_lines": [],
+            "unpushed_lines": [], "warnings": [],
+        },
+    )
+
+    assert len(bounded) == 1
+    assert bounded[0][1:] == (41, repo, False)
+    assert (pathlib.Path(info["path"]) / "changes.diff").read_bytes() == b"raw diff\n"
+
+
 def test_rescue_changes_diff_preserves_non_utf8_bytes(monkeypatch, tmp_path):
     """changes.diff must survive BYTES end-to-end: on an unmerged index it is the only
     carrier of resolutions, and a text-mode decode would corrupt latin-1 content into
@@ -1390,7 +1752,7 @@ def test_rescue_hook_treats_unreadable_status_as_dirty(monkeypatch, tmp_path):
     durable supervisor.jsonl line before returning the pointer."""
     calls = []
 
-    def fake_git_capture(cmd):
+    def fake_git_capture(cmd, *, timeout=None):
         if cmd == ["git", "status", "--porcelain"]:
             return 128, "", "fatal: unreadable index"
         if cmd[:3] == ["git", "rev-parse", "-q"]:
@@ -1417,6 +1779,60 @@ def test_rescue_hook_treats_unreadable_status_as_dirty(monkeypatch, tmp_path):
     rows = [json.loads(line) for line in log_lines if line.strip()]
     assert rows[-1]["type"] == "managed_update_rescue_captured"
     assert rows[-1]["rescue_path"] == "/r"
+
+
+@pytest.mark.parametrize(
+    ("merge_rc", "merge_error"),
+    [
+        pytest.param(git_ops.FETCH_TIMEOUT_RC, "merge probe timed out", id="timeout"),
+        pytest.param(1, "merge probe failed", id="rc-one-with-diagnostic"),
+    ],
+)
+def test_rescue_hook_does_not_false_clean_on_unreadable_merge_head(
+    monkeypatch, tmp_path, merge_rc, merge_error,
+):
+    """A failed MERGE_HEAD probe is unknown, not proof that no merge exists."""
+    captured_states = []
+
+    def fake_rescue_capture(cmd):
+        if cmd == ["git", "status", "--porcelain"]:
+            return 0, "", ""
+        if cmd == ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"]:
+            return merge_rc, "", merge_error
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(git_ops, "rescue_git_capture", fake_rescue_capture)
+    monkeypatch.setattr(
+        git_ops, "_collect_repo_sync_state",
+        lambda: {
+            "current_branch": "ouroboros", "dirty_lines": [],
+            "unpushed_lines": [], "warnings": [],
+        },
+    )
+    monkeypatch.setattr(
+        git_ops, "_create_rescue_snapshot",
+        lambda branch, reason, state, link_evolution=True: (
+            captured_states.append(dict(state))
+            or {"path": "/r", "ts": "T", "warnings": list(state["warnings"])}
+        ),
+    )
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path / "data")
+
+    result = git_ops.rescue_before_destructive_rollback("merge_probe_failed")
+
+    assert result == {"path": "/r", "ref": "", "ts": "T"}
+    assert captured_states
+    assert captured_states[0]["warnings"] == [
+        f"merge_head_error:{merge_error}"
+    ]
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "data" / "logs" / "supervisor.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert rows[-1]["warnings"] == [f"merge_head_error:{merge_error}"]
 
 
 def test_rescue_hook_clean_tree_without_merge_returns_empty(monkeypatch, tmp_path):

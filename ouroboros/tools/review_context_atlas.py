@@ -44,13 +44,13 @@ _CANONICAL_CONTEXT_DOCS = frozenset({
 })
 
 _REVIEW_STACK_PATHS = frozenset({
+    "ouroboros/size_ratchet_manifest.py",
     "ouroboros/tools/review.py",
     "ouroboros/tools/review_context_atlas.py",
     "ouroboros/tools/scope_review.py",
     "ouroboros/tools/parallel_review.py",
     "ouroboros/tools/review_helpers.py",
     "ouroboros/tools/review_revalidation.py",
-    "ouroboros/tools/triad_review.py",
     "ouroboros/tools/claude_advisory_review.py",
     "ouroboros/tools/plan_review.py",
     # v6.87.21 extracted review execution (route vocabulary, transport dispatch,

@@ -3,7 +3,12 @@ import re
 
 import pytest
 
-from ouroboros.tools.release_sync import _normalize_pep440, check_history_limit
+from ouroboros.tools.release_sync import (
+    RELEASE_ASSET_TEMPLATES,
+    _normalize_pep440,
+    check_history_limit,
+    release_asset_download_url,
+)
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
@@ -141,27 +146,55 @@ def test_legacy_requirements_file_is_only_a_runtime_lock_pointer():
 
 def test_readme_prioritizes_macos_dmg_install_and_model_access():
     readme = (REPO / "README.md").read_text(encoding="utf-8")
+    version = (REPO / "VERSION").read_text(encoding="utf-8").strip()
 
-    install_pos = readme.index("## Install")
+    download_pos = readme.index("## Download Ouroboros")
+    claudexor_pos = readme.index("Ouroboros bundles [Claudexor]")
+    paper_pos = readme.index("The technical report")
+    benchmark_chart_pos = readme.index('src="assets/bench-terminal-bench.svg"')
     origin_pos = readme.index("Ouroboros first booted")
     evolution_image_pos = readme.index('src="assets/evolution.png"')
-    assert install_pos < origin_pos < evolution_image_pos
+    advanced_pos = readme.index("## Advanced installation")
+    assert download_pos < claudexor_pos < paper_pos < benchmark_chart_pos
+    assert download_pos < origin_pos < evolution_image_pos < advanced_pos
+    assert "You do not need to clone this repository or install Python or uv" in readme
     assert "Ouroboros-<version>.dmg" in readme
     assert "drag `Ouroboros.app` onto the **Applications** shortcut" in readme
     assert 'src="assets/install-macos.png"' in readme
     assert "at least one supported remote provider API key or a local GGUF model" in readme
-    assert "https://ouroboros-agent.ai/install/" in readme
+    assert "https://ouroboros-agent.ai/install/#linux" in readme
+    assert (
+        "badges%2Fdownloads.json)](https://ouroboros-agent.ai/install/)"
+        in readme
+    )
+    assert "/releases/latest/download/" not in readme
+    for proof_id in RELEASE_ASSET_TEMPLATES:
+        assert (
+            f"[download-{proof_id}]: {release_asset_download_url(proof_id, version)}"
+            in readme
+        )
 
 
 def test_install_page_matches_macos_quick_start_and_model_prerequisite():
     install_page = (REPO / "site" / "install" / "index.html").read_text(encoding="utf-8")
+    version = (REPO / "VERSION").read_text(encoding="utf-8").strip()
 
     assert 'id="macos-quick-start"' in install_page
-    assert install_page.count('<li>') == 3
-    assert "Ouroboros-&lt;version&gt;.dmg" in install_page
+    macos_section = install_page.split('id="macos-quick-start"', 1)[1].split(
+        "</section>", 1
+    )[0]
+    assert macos_section.count("<li>") == 3
     assert "Applications</strong> shortcut" in install_page
     assert 'src="/assets/install-macos.png?v=' in install_page
     assert "at least one supported remote provider API key or a local GGUF model" in install_page
+    assert "Normal installation does not require cloning the repository, Python, or uv" in install_page
+    assert "verification evidence, not additional installers" in install_page
+    assert install_page.index("platform-downloads") < install_page.index(
+        "Advanced: headless CLI with uv"
+    ) < install_page.index("Develop or run from source")
+    for proof_id in RELEASE_ASSET_TEMPLATES:
+        assert f'data-release-download="{proof_id}"' in install_page
+        assert release_asset_download_url(proof_id, version) in install_page
 
 
 def test_architecture_doc_describes_build_script_release_tag_check():

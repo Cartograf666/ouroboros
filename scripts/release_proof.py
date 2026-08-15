@@ -8,8 +8,21 @@ import datetime as dt
 import hashlib
 import json
 import re
+import runpy
+from functools import partial
 from pathlib import Path
 from typing import Iterable
+
+
+# This script runs in release jobs that intentionally install only Python, not
+# the Ouroboros package. Load the shared release metadata by path so it remains
+# standalone while still using the same naming source as the review gates.
+_RELEASE_SYNC = runpy.run_path(
+    Path(__file__).resolve().parents[1] / "ouroboros" / "tools" / "release_sync.py"
+)
+RELEASE_ASSET_TEMPLATES = _RELEASE_SYNC["RELEASE_ASSET_TEMPLATES"]
+release_asset_download_url = _RELEASE_SYNC["release_asset_download_url"]
+release_asset_name = _RELEASE_SYNC["release_asset_name"]
 
 
 # One build job produces exactly one platform archive, so ``locate`` only ever
@@ -18,17 +31,17 @@ from typing import Iterable
 ARCHIVE_SUFFIXES = (".dmg", ".tar.gz", ".zip")
 RELEASE_ASSET_SUFFIXES = ARCHIVE_SUFFIXES + (".AppImage", ".deb", ".rpm")
 PROOF_IDS = {
-    "macos-arm64": lambda version: f"Ouroboros-{version}.dmg",
-    "linux-x86_64": lambda version: f"Ouroboros-{version}-linux-x86_64.tar.gz",
-    "linux-appimage-x86_64": (
-        lambda version: f"Ouroboros-{version}-linux-x86_64.AppImage"
-    ),
-    "linux-deb-amd64": lambda version: f"ouroboros_{version}_amd64.deb",
-    "linux-rpm-x86_64": lambda version: f"ouroboros-{version}-1.x86_64.rpm",
-    "linux-rpm-red80-x86_64": (
-        lambda version: f"ouroboros-{version}-1.red80.x86_64.rpm"
-    ),
-    "windows-x64": lambda version: f"Ouroboros-{version}-windows-x64.zip",
+    proof_id: partial(release_asset_name, proof_id)
+    for proof_id in RELEASE_ASSET_TEMPLATES
+}
+DOWNLOAD_LABELS = {
+    "macos-arm64": "macOS 12+ on Apple silicon (.dmg)",
+    "windows-x64": "Windows x64 (.zip)",
+    "linux-deb-amd64": "Debian, Ubuntu, or Astra Linux x86_64 (.deb)",
+    "linux-rpm-x86_64": "Fedora or RHEL x86_64 (.rpm)",
+    "linux-rpm-red80-x86_64": "RED OS 8 x86_64 (.rpm)",
+    "linux-appimage-x86_64": "Other Linux x86_64 (AppImage)",
+    "linux-x86_64": "Linux x86_64 archive (.tar.gz)",
 }
 RELEASE_GATES = (
     "full-test",
@@ -52,6 +65,7 @@ PACKAGE_SMOKE_CHECKS = frozenset(
         "runtime_dependency",
         "packaged_cli_help",
         "desktop_entry",
+        "systemd_user_unit",
         "desktop_launcher_start",
     }
 )
@@ -261,6 +275,7 @@ def _release_notes(
     commit: str,
     tag: str,
     previous_tag: str | None,
+    records: Iterable[dict],
 ) -> str:
     short_commit = commit[:12]
     verify_base = (
@@ -271,28 +286,51 @@ def _release_notes(
     lines = [
         f"# Ouroboros {tag}",
         "",
+        "## Download",
+        "",
+        "Choose your platform below. You do not need to clone the repository or install Python or uv.",
+        "",
+    ]
+    records_by_id = {
+        str(record.get("proofId") or ""): record
+        for record in records
+    }
+    for proof_id, label in DOWNLOAD_LABELS.items():
+        record = records_by_id.get(proof_id)
+        if not record:
+            raise ValueError(f"release notes missing verified asset: {proof_id}")
+        name = str(record.get("name") or "")
+        expected_name = release_asset_name(proof_id, version)
+        if name != expected_name:
+            raise ValueError(
+                f"release notes asset mismatch for {proof_id}: {name} != {expected_name}"
+            )
+        url = release_asset_download_url(
+            proof_id,
+            version,
+            repository=repository,
+        )
+        lines.append(f"- **{label}:** [{name}]({url})")
+    lines.extend([
+        "",
+        "Files named `SHA256SUMS`, `release-evidence.json`, `release-smoke-*.json`, "
+        "and `sbom-*.cdx.json` are verification evidence, not additional installers.",
+        "",
+        "## What's new",
+        "",
         description,
-        "",
-        "## Install",
-        "",
-        "Download the package for your platform below. macOS builds currently target Apple silicon.",
-        "",
-        "On Linux, `sudo apt install ./ouroboros_*_amd64.deb` or `sudo dnf install ./ouroboros-*.x86_64.rpm`"
-        " installs to `/opt/ouroboros` and puts `ouroboros` on `PATH`; RED OS 8 has its own"
-        " `.red80.x86_64.rpm`. The AppImage runs from a user-writable path when listed and host Git"
-        " is installed; the `.tar.gz` stays available for extraction-based installs.",
         "",
         "## Release proof",
         "",
         f"This release was built from [`{short_commit}`](https://github.com/{repository}/commit/{commit}).",
         "The release workflow passed the full test matrix, UI and Docker smoke tests, skill smoke tests, and packaged artifact smoke tests before publication.",
         "",
-        "- `SHA256SUMS` covers every release asset, SBOM, and smoke receipt.",
+        "- `SHA256SUMS` covers every installable platform artifact, its SBOM, and its smoke receipt.",
         "- `release-evidence.json` binds the tag, commit, workflow run, artifact hashes, SBOMs, and smoke receipts.",
-        "- Each release asset has GitHub build provenance and SBOM attestations.",
+        "- Each installable platform artifact has GitHub build provenance and a CycloneDX SBOM attestation.",
         f"- Verify build provenance with `{verify_base}`.",
         f"- Verify the CycloneDX attestation with `{verify_base} --predicate-type https://cyclonedx.org/bom`.",
-    ]
+    ])
     if previous_tag:
         lines.extend(
             [
@@ -367,6 +405,7 @@ def command_assemble(args: argparse.Namespace) -> None:
             commit=args.commit,
             tag=args.tag,
             previous_tag=args.previous_tag,
+            records=records,
         ),
         encoding="utf-8",
     )

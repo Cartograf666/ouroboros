@@ -46,9 +46,10 @@ def governance_nav_maps(repo_dir: pathlib.Path, doc_paths: Tuple[str, ...]) -> s
     """The canonical governance docs as navigation maps (5.7).
 
     Session delivery replaces the inlined canonical texts with the atlas idea
-    reduced to a MAP: every ``##``/``###`` heading with its line range, read on
-    demand by the session with its own tools. ``generate_doc_nav_map`` is the
-    one existing mapper — no second repository scanner (§8 item 8)."""
+    reduced to a MAP: every ``##`` through ``####`` heading with its inclusive
+    complete-subtree line range, read on demand by the session with its own tools.
+    ``generate_doc_nav_map`` is the one existing mapper — no second repository
+    scanner (§8 item 8)."""
     from ouroboros.context_layout import generate_doc_nav_map
 
     parts: list[str] = []

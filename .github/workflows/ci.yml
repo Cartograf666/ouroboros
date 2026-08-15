@@ -80,6 +80,8 @@ jobs:
       OUROBOROS_PREFLIGHT_REQUIRE_PLUGINS: "1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: ./.github/actions/setup-python-env
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
@@ -128,6 +130,8 @@ jobs:
       OUROBOROS_PREFLIGHT_REQUIRE_PLUGINS: "1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: ./.github/actions/setup-python-env
       # A command-line `-m` REPLACES the pyproject addopts markexpr, so repeat the default
       # marker-lane exclusions and AND them with the serial split. --timeout guards hangs.
@@ -979,6 +983,7 @@ jobs:
               --check runtime_dependency \
               --check packaged_cli_help \
               --check desktop_entry \
+              --check systemd_user_unit \
               --check desktop_launcher_start
             cp "$PAYLOAD_SBOM" "dist/sbom-$1.cdx.json"
           }

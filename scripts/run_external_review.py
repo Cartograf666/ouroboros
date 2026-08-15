@@ -4,27 +4,17 @@
 The default operator lane runs the REAL production commit-gate cycle
 (advisory → triad → scope) on the staged diff. ``--contributor`` is a separate
 non-committing PR-readiness lane: it reviews the exact committed
-``base_ref..head_ref`` proposal with triad + scope only, using the shipped
-reviewer defaults from the target-base checkout through OpenRouter. A clean
-contributor packet means READY_FOR_INTEGRATION, never merge authorization;
-maintainers still allocate release metadata and run the production gate on the
-final squash landing tree.
+``base_ref..head_ref`` proposal with triad + scope only, using the contributor's
+configured reviewer slots. API and hosted-agent routes share one evidence
+contract. A clean contributor packet means READY_FOR_INTEGRATION, never merge
+authorization; maintainers still allocate release metadata and run the
+production gate on the exact landing tree.
 
-Both lanes reuse the runtime review substrate. The wrapper adds operator
-ergonomics only:
-
-* an isolated detached worktree so the reviewed tree cannot change mid-run;
-* a fresh drive root (never the live data root) for review state/observability;
-* `OUROBOROS_RUNTIME_MODE=pro` by default — release diffs touch protected
-  paths, which only pro mode may stage for review;
-* OpenRouter key health-check/selection from the named operator pool
-  (`limit_remaining` probe; `hope*` keys last; values never printed);
-* the real advisory pre-review in the default operator lane;
-* an explicit contributor profile that excludes Claude advisory, ignores local
-  reviewer overrides, forces blocking clean semantics, and emits a redacted
-  shareable evidence packet bound to base/head/tree/diff hashes;
-* typed exit codes separating infrastructure failures from genuine review
-  blocks.
+Both lanes reuse the runtime substrate in an isolated checkout and non-live
+observability root. The default lane keeps its configured advisory route. The
+contributor lane excludes advisory, freezes configured routes under blocking
+semantics, performs provider-specific readiness checks where supported, and
+emits redacted base/head/tree/diff-bound evidence.
 
 Exit codes:
     0  review passed
@@ -41,7 +31,6 @@ Usage (from repo/):
 """
 from __future__ import annotations
 
-import ast
 import hashlib
 import json
 import math
@@ -79,18 +68,13 @@ _CONTRIBUTOR_LANDING_OBLIGATION_ITEMS = frozenset({
     "version_bump",
     "changelog_and_badge",
 })
-_CONTRIBUTOR_DEFAULT_KEYS = (
-    "OUROBOROS_REVIEW_MODELS",
-    "OUROBOROS_SCOPE_REVIEW_MODELS",
-    "OUROBOROS_EFFORT_REVIEW",
-    "OUROBOROS_EFFORT_SCOPE_REVIEW",
-)
 _REVIEW_SUBSTRATE_PATHS = frozenset({
     "BIBLE.md",
     "docs/ARCHITECTURE.md",
     "docs/CHECKLISTS.md",
     "docs/DEVELOPMENT.md",
     "scripts/run_external_review.py",
+    "scripts/contributor_review_evidence.py",
     "ouroboros/config.py",
     "ouroboros/capability_evidence.py",
     "ouroboros/code_intelligence.py",
@@ -103,6 +87,9 @@ _REVIEW_SUBSTRATE_PATHS = frozenset({
     "ouroboros/provider_models.py",
     "ouroboros/preflight_runner.py",
     "ouroboros/review_execution.py",
+    "ouroboros/review_slot_cancel.py",
+    "ouroboros/reviewer_slot_config.py",
+    "ouroboros/reviewer_window.py",
     "ouroboros/review_substrate.py",
     "ouroboros/review_state.py",
     "ouroboros/runtime_mode_policy.py",
@@ -119,10 +106,19 @@ _REVIEW_SUBSTRATE_PATHS = frozenset({
     "ouroboros/tools/review_context_atlas.py",
     "ouroboros/tools/review_helpers.py",
     "ouroboros/tools/review_revalidation.py",
+    "ouroboros/tools/review_binary_context.py",
     "ouroboros/tools/release_sync.py",
     "ouroboros/tools/review_synthesis.py",
     "ouroboros/tools/scope_review.py",
     "ouroboros/tools/scope_review_contract.py",
+    "ouroboros/tools/scope_review_session.py",
+    "ouroboros/tools/scope_window.py",
+    "ouroboros/claudexor_daemon.py",
+    "ouroboros/delegate_custody.py",
+    "ouroboros/delegate_output.py",
+    "ouroboros/gateways/claudexor.py",
+    "ouroboros/review_evidence.py",
+    "ouroboros/subagents.py",
 })
 _RELEASE_MACHINERY_PATHS = frozenset({
     ".github/workflows/ci.yml",
@@ -138,7 +134,7 @@ _CONTRIBUTOR_CONTRACT = {
     "profile": _CONTRIBUTOR_PROFILE,
     "purpose": "non_committing_external_pr_readiness",
     "commit_authorization": False,
-    "release_metadata_owner": "maintainer_final_squash_landing",
+    "release_metadata_owner": "maintainer_final_landing",
     "version_checklist_rule": (
         "When the proposal leaves release-version values unchanged, treat "
         "version_bump and changelog_and_badge as PASS/Not applicable for this "
@@ -201,13 +197,27 @@ def _load_settings_into_env() -> None:
     _fallback("OPENAI_API_KEY", "openai")
     _fallback("ANTHROPIC_API_KEY", "anthropic")
     _fallback("OPENROUTER_API_KEY", "openrouter")
-    if not os.environ.get("TOTAL_BUDGET", "").strip():
-        print(
-            "WARN: TOTAL_BUDGET is not configured (settings.json not found?) — "
-            "the $10 default will starve a full triad+scope run. Export "
-            "OUROBOROS_SETTINGS_PATH or TOTAL_BUDGET explicitly.",
-            file=sys.stderr,
-        )
+
+
+def _advisory_unavailability_warning() -> str:
+    """Return a safe route-aware operator warning, or ``""`` when available."""
+    from ouroboros.tools.claude_advisory_review import (
+        ADVISORY_REVIEW_CHOICE_GUIDANCE,
+        advisory_gate_unavailability_reason,
+    )
+
+    try:
+        reason = advisory_gate_unavailability_reason()
+    except ValueError:
+        reason = "invalid_advisory_configuration"
+    if reason is None:
+        return ""
+    return (
+        f"WARN: configured advisory review is unavailable ({reason}). "
+        "The production flow keeps its existing reason-specific behavior; "
+        "inspect advisory.txt and the typed review outcome. "
+        f"{ADVISORY_REVIEW_CHOICE_GUIDANCE}"
+    )
 
 
 def _git_text(args: list[str], *, cwd: pathlib.Path | None = None) -> str:
@@ -241,60 +251,8 @@ def _git_bytes(args: list[str], *, cwd: pathlib.Path | None = None) -> bytes:
     return result.stdout
 
 
-def _settings_defaults_at_ref(ref: str) -> dict[str, str]:
-    """Read literal reviewer defaults from the target checkout without executing it."""
-    source = _git_text(["show", f"{ref}:ouroboros/config.py"])
-    tree = ast.parse(source, filename=f"{ref}:ouroboros/config.py")
-    wanted = set(_CONTRIBUTOR_DEFAULT_KEYS)
-    found: dict[str, str] = {}
-    for node in tree.body:
-        if not isinstance(node, ast.Assign):
-            continue
-        if not any(isinstance(target, ast.Name) and target.id == "SETTINGS_DEFAULTS" for target in node.targets):
-            continue
-        if not isinstance(node.value, ast.Dict):
-            break
-        for key_node, value_node in zip(node.value.keys, node.value.values):
-            try:
-                key = ast.literal_eval(key_node)
-            except (TypeError, ValueError):
-                continue
-            if key not in wanted:
-                continue
-            try:
-                value = ast.literal_eval(value_node)
-            except (TypeError, ValueError) as exc:
-                raise RuntimeError(
-                    f"target default {key} is not a literal value at {ref}"
-                ) from exc
-            found[str(key)] = str(value)
-    missing = sorted(wanted - set(found))
-    if missing:
-        raise RuntimeError(
-            f"target config at {ref} is missing reviewer defaults: {', '.join(missing)}"
-        )
-    return found
-
-
-def _split_models(raw: str) -> list[str]:
-    return [part.strip() for part in str(raw or "").split(",") if part.strip()]
-
-
-def _apply_contributor_review_env(defaults: dict[str, str]) -> None:
-    """Force target-base shipped slots through OpenRouter with clean blocking semantics."""
-    models = _split_models(defaults["OUROBOROS_REVIEW_MODELS"])
-    scope_models = _split_models(defaults["OUROBOROS_SCOPE_REVIEW_MODELS"])
-    explicit_non_openrouter = [
-        model for model in [*models, *scope_models]
-        if "::" in model and not model.startswith("openrouter::")
-    ]
-    if explicit_non_openrouter:
-        raise RuntimeError(
-            "target-base reviewer defaults explicitly select non-OpenRouter routes: "
-            + ", ".join(explicit_non_openrouter)
-        )
-    for key, value in defaults.items():
-        os.environ[key] = value
+def _apply_contributor_review_env() -> None:
+    """Pin readiness policy while preserving the contributor's reviewer slots."""
     os.environ["OUROBOROS_REVIEW_ENFORCEMENT"] = "blocking"
     # Scope-review applicability follows the context mode (v6.80.0): pin max so the
     # operator review line always runs the blocking whole-repo scope reviewer, even
@@ -324,96 +282,6 @@ def _require_contributor_budget() -> float:
 
 def _hash_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
-
-
-def _git_file_at_ref(ref: str, path: str) -> str | None:
-    result = subprocess.run(
-        ["git", "show", f"{ref}:{path}"],
-        cwd=str(REPO),
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    return result.stdout if result.returncode == 0 else None
-
-
-def _release_carrier_projection(ref: str) -> dict[str, str]:
-    """Extract release-only values without executing code from either revision."""
-    projection: dict[str, str] = {}
-
-    version = _git_file_at_ref(ref, "VERSION")
-    if version is not None:
-        projection["VERSION"] = version.strip()
-
-    pyproject = _git_file_at_ref(ref, "pyproject.toml")
-    if pyproject is not None:
-        project_match = re.search(
-            r"(?ms)^\[project\]\s*(.*?)(?=^\[|\Z)",
-            pyproject,
-        )
-        version_match = re.search(
-            r'(?m)^version\s*=\s*"([^"]+)"',
-            project_match.group(1) if project_match else "",
-        )
-        if version_match:
-            projection["pyproject.project.version"] = version_match.group(1)
-
-    package = _git_file_at_ref(ref, "web/package.json")
-    if package is not None:
-        try:
-            package_version = str((json.loads(package) or {}).get("version") or "")
-        except Exception:
-            package_version = "<invalid-json>"
-        if package_version:
-            projection["web.package.version"] = package_version
-
-    api_types = _git_file_at_ref(ref, "web/modules/api_types.js")
-    if api_types is not None:
-        match = re.search(
-            r"GATEWAY_CONTRACT_VERSION\s*=\s*['\"]([^'\"]+)['\"]",
-            api_types,
-        )
-        if match:
-            projection["gateway.contract.version"] = match.group(1)
-
-    readme = _git_file_at_ref(ref, "README.md")
-    if readme is not None:
-        badge = re.search(r"\[!\[Version\s+([^\]]+)\]", readme)
-        if badge:
-            projection["readme.badge.version"] = badge.group(1)
-        history = readme.split("## Version History", 1)
-        if len(history) == 2:
-            row = re.search(r"(?m)^\|\s*\d+\.\d+\.\d+[^\n]*$", history[1])
-            if row:
-                projection["readme.latest_history_row"] = row.group(0).strip()
-
-    architecture = _git_file_at_ref(ref, "docs/ARCHITECTURE.md")
-    if architecture is not None:
-        header = re.search(r"(?m)^# Ouroboros v([^\s]+)", architecture)
-        if header:
-            projection["architecture.header.version"] = header.group(1)
-
-    return projection
-
-
-def _release_sensitive_changes(
-    base_sha: str,
-    head_sha: str,
-    changed_paths: list[str],
-) -> dict:
-    base_projection = _release_carrier_projection(base_sha)
-    head_projection = _release_carrier_projection(head_sha)
-    fields = sorted(
-        key
-        for key in set(base_projection) | set(head_projection)
-        if base_projection.get(key) != head_projection.get(key)
-    )
-    machinery = sorted(set(changed_paths) & _RELEASE_MACHINERY_PATHS)
-    return {
-        "changed": bool(fields or machinery),
-        "carrier_fields": fields,
-        "machinery_paths": machinery,
-    }
 
 
 def _contributor_snapshot(base_ref: str, head_ref: str) -> dict:
@@ -446,17 +314,22 @@ def _contributor_snapshot(base_ref: str, head_ref: str) -> dict:
         for line in _git_text(["diff", "--name-only", f"{base_sha}..{head_sha}"]).splitlines()
         if line.strip()
     ]
-    if "VERSION" in changed_paths:
+    from scripts.contributor_review_evidence import release_sensitive_changes
+
+    release_sensitive = release_sensitive_changes(
+        REPO, base_sha, head_sha, changed_paths, _RELEASE_MACHINERY_PATHS
+    )
+    if release_sensitive["carrier_fields"]:
+        changed = ", ".join(release_sensitive["carrier_fields"])
         raise RuntimeError(
-            "contributor proposals must not bump VERSION; maintainers allocate "
-            "collision-free release metadata on the final squash landing"
+            "contributor proposals must not change release-version carriers "
+            f"({changed}); maintainers allocate them on the final landing"
         )
     target_version = _git_text(["show", f"{base_sha}:VERSION"]).strip()
     target_config = _git_bytes(["show", f"{base_sha}:ouroboros/config.py"])
     base_script = _git_bytes(["show", f"{base_sha}:scripts/run_external_review.py"])
     head_script = _git_bytes(["show", f"{head_sha}:scripts/run_external_review.py"])
     substrate_changed = sorted(set(changed_paths) & _REVIEW_SUBSTRATE_PATHS)
-    release_sensitive = _release_sensitive_changes(base_sha, head_sha, changed_paths)
     return {
         "base_ref": base_ref,
         "base_sha": base_sha,
@@ -543,6 +416,7 @@ def _openrouter_key_health(
     token: str,
     *,
     probe_all_models: bool = False,
+    probe_models: list[str] | None = None,
 ) -> tuple[bool, str]:
     """Probe `limit_remaining`, then the exact reviewer model. (healthy, detail)."""
     try:
@@ -570,13 +444,13 @@ def _openrouter_key_health(
             return False, "unreadable_limit"
         if remaining < _OPENROUTER_MIN_REMAINING_USD:
             return False, f"remaining_below_${_OPENROUTER_MIN_REMAINING_USD:g}"
-    probe_models = _review_probe_models()
-    if not probe_models:
+    models = list(probe_models) if probe_models is not None else _review_probe_models()
+    if not models:
         return True, "limit_ok_no_probe_model"
     if not probe_all_models:
-        probe_models = probe_models[:1]
+        models = models[:1]
     details: list[str] = []
-    for model in probe_models:
+    for model in models:
         healthy, detail = _probe_model_for_key(token, model)
         details.append(detail)
         if not healthy:
@@ -588,6 +462,7 @@ def _select_healthy_openrouter_key(
     *,
     required: bool = False,
     probe_all_models: bool = False,
+    probe_models: list[str] | None = None,
 ) -> bool:
     """Pick the first healthy key from the allowed pool (values never printed)."""
     pool = _openrouter_pool()
@@ -601,6 +476,7 @@ def _select_healthy_openrouter_key(
         healthy, detail = _openrouter_key_health(
             token,
             probe_all_models=probe_all_models,
+            probe_models=probe_models,
         )
         print(f"OpenRouter key {name!r}: {detail}", file=sys.stderr)
         if healthy:
@@ -616,42 +492,45 @@ def _select_healthy_openrouter_key(
     return False
 
 
-def _assert_contributor_openrouter_config(
-    resolved_config: dict,
-    expected_defaults: dict[str, str],
-) -> None:
-    """Fail closed unless every resolved contributor actor still routes via OpenRouter."""
+def _assert_contributor_review_config(resolved_config: dict) -> None:
+    """Fail closed unless a complete typed slot plan will reach the review gate."""
+    slots = [
+        *list(resolved_config.get("triad_slots") or []),
+        *list(resolved_config.get("scope_slots") or []),
+    ]
+    if not resolved_config.get("triad_slots") or not resolved_config.get("scope_slots"):
+        raise RuntimeError("contributor review needs at least one triad and scope slot")
+    slot_ids = [str(row.get("slot_id") or "") for row in slots]
+    if any(not slot_id for slot_id in slot_ids) or len(slot_ids) != len(set(slot_ids)):
+        raise RuntimeError("contributor reviewer slot identities are empty or duplicated")
+    invalid = [
+        row for row in slots
+        if str((row.get("route") or {}).get("kind") or "")
+        not in {"api_chat", "agent_session"}
+        or not str((row.get("route") or {}).get("target_id") or "").strip()
+    ]
+    if invalid:
+        raise RuntimeError("contributor reviewer slots contain an invalid route")
+    if resolved_config.get("review_enforcement") != "blocking":
+        raise RuntimeError("contributor review enforcement did not resolve to blocking")
+    if resolved_config.get("context_mode") != "max":
+        raise RuntimeError("contributor scope review did not resolve in max context mode")
+
+
+def _configured_openrouter_models(resolved_config: dict) -> list[str]:
+    """OpenRouter API rows that need the wrapper's provider-specific key probe."""
     from ouroboros.provider_models import provider_for_model
 
-    models = [
-        *list(resolved_config.get("triad_models") or []),
-        *list(resolved_config.get("scope_models") or []),
-    ]
-    non_openrouter = [model for model in models if provider_for_model(str(model)) != "openrouter"]
-    if not models or non_openrouter:
-        detail = ", ".join(str(model) for model in non_openrouter) or "no resolved actors"
-        raise RuntimeError(
-            "contributor review actors did not resolve exclusively through OpenRouter: "
-            + detail
-        )
-    expected = {
-        "triad_models": _split_models(expected_defaults["OUROBOROS_REVIEW_MODELS"]),
-        "scope_models": _split_models(
-            expected_defaults["OUROBOROS_SCOPE_REVIEW_MODELS"]
-        ),
-        "triad_effort": expected_defaults["OUROBOROS_EFFORT_REVIEW"],
-        "scope_effort": expected_defaults["OUROBOROS_EFFORT_SCOPE_REVIEW"],
-    }
-    drift = {
-        key: {"expected": value, "resolved": resolved_config.get(key)}
-        for key, value in expected.items()
-        if resolved_config.get(key) != value
-    }
-    if drift:
-        raise RuntimeError(
-            "resolved contributor actors/efforts drifted from target-base defaults: "
-            + json.dumps(drift, ensure_ascii=False, sort_keys=True)
-        )
+    models: list[str] = []
+    for row in [
+        *list(resolved_config.get("triad_slots") or []),
+        *list(resolved_config.get("scope_slots") or []),
+    ]:
+        route = row.get("route") or {}
+        model = str(route.get("target_id") or "")
+        if route.get("kind") == "api_chat" and provider_for_model(model) == "openrouter":
+            models.append(model.removeprefix("openrouter::"))
+    return list(dict.fromkeys(models))
 
 
 def _create_isolated_checkout(
@@ -703,19 +582,50 @@ def _remove_isolated_checkout(checkout_root: pathlib.Path, checkout: pathlib.Pat
 
 def _actor_records(ctx: object) -> list[dict]:
     """Return physical reviewer actor records without double-counting summaries."""
+    actors = [actor for _, actor in _actor_records_with_surface(ctx)]
+    return actors
+
+
+def _actor_records_with_surface(ctx: object) -> list[tuple[str, dict]]:
+    """Return ``(surface, actor)`` rows for the configured triad and scope slots."""
     actors = [
-        dict(item)
+        ("triad", dict(item))
         for item in (getattr(ctx, "_last_triad_raw_results", []) or [])
         if isinstance(item, dict)
     ]
     scope_raw = getattr(ctx, "_last_scope_raw_result", {}) or {}
     if isinstance(scope_raw, dict) and isinstance(scope_raw.get("raw_results"), list):
-        actors.extend(dict(item) for item in scope_raw["raw_results"] if isinstance(item, dict))
+        actors.extend(
+            ("scope", dict(item))
+            for item in scope_raw["raw_results"]
+            if isinstance(item, dict)
+        )
     elif isinstance(scope_raw, dict) and any(
         key in scope_raw for key in ("slot", "slot_id", "prompt_ref", "response_ref")
     ):
-        actors.append(dict(scope_raw))
+        actors.append(("scope", dict(scope_raw)))
     return actors
+
+
+def _contributor_execution_receipts(
+    ctx: object, resolved_config: dict, review_drive_root: pathlib.Path,
+) -> tuple[list[dict], list[str], list[dict]]:
+    """Bind configured slots to the dispatched and observed execution receipts."""
+    from scripts.contributor_review_evidence import bind_execution_receipts
+
+    live_plan_sha = ""
+    expected_plan_sha = str(resolved_config.get("slot_plan_sha256") or "")
+    if expected_plan_sha:
+        try:
+            live_plan_sha = _slot_plan_sha256(
+                _resolved_review_config(profile=_CONTRIBUTOR_PROFILE)
+            )
+        except Exception as exc:
+            live_plan_sha = f"unreadable:{type(exc).__name__}"
+    return bind_execution_receipts(
+        actors=_actor_records_with_surface(ctx), resolved_config=resolved_config,
+        drive_root=review_drive_root, live_plan_sha256=live_plan_sha,
+    )
 
 
 def _review_evidence_and_cost(ctx: object) -> tuple[list[dict], dict]:
@@ -766,25 +676,72 @@ def _review_evidence_and_cost(ctx: object) -> tuple[list[dict], dict]:
 
 def _resolved_review_config(*, profile: str = "production_commit_gate") -> dict:
     """Return resolved review slots and efforts after settings/env loading."""
-    from ouroboros.config import (
-        get_context_mode,
-        get_review_enforcement,
-        get_review_models,
-        get_scope_review_models,
-        resolve_effort,
-    )
+    from ouroboros.config import get_context_mode, get_review_enforcement
+    from ouroboros.reviewer_slot_config import load_reviewer_slot_config, row_effort
+
+    config = load_reviewer_slot_config()
+
+    def _project(row, surface: str) -> dict:
+        route = {
+            "kind": row.kind,
+            "target_id": row.target_id,
+        }
+        if row.profile_id:
+            route["profile_id"] = row.profile_id
+        return {
+            "slot_id": row.slot_id,
+            "route": route,
+            "effort": row_effort(row, surface),
+        }
+
+    triad_slots = [_project(row, "review") for row in config.triad]
+    scope_slots = [_project(row, "scope_review") for row in config.scope]
 
     return {
         "profile": profile,
-        "provider": "openrouter" if profile == _CONTRIBUTOR_PROFILE else "resolved_per_model",
-        "triad_models": get_review_models(),
-        "triad_effort": resolve_effort("review"),
-        "scope_models": get_scope_review_models(),
-        "scope_effort": resolve_effort("scope_review"),
+        "provider": "configured_per_slot",
+        "slot_config_source": config.source,
+        "triad_slots": triad_slots,
+        "scope_slots": scope_slots,
+        "triad_models": [row["route"]["target_id"] for row in triad_slots],
+        "triad_efforts": [row["effort"] for row in triad_slots],
+        "scope_models": [row["route"]["target_id"] for row in scope_slots],
+        "scope_efforts": [row["effort"] for row in scope_slots],
         "review_enforcement": get_review_enforcement(),
         "context_mode": get_context_mode(),
         "runtime_mode": os.environ.get("OUROBOROS_RUNTIME_MODE", ""),
     }
+
+
+def _slot_plan_payload(resolved_config: dict) -> dict:
+    return {
+        "triad": list(resolved_config.get("triad_slots") or []),
+        "scope": list(resolved_config.get("scope_slots") or []),
+        "advisory": {"enabled": False},
+    }
+
+
+def _slot_plan_sha256(resolved_config: dict) -> str:
+    raw = json.dumps(
+        _slot_plan_payload(resolved_config), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _freeze_contributor_slots(resolved_config: dict) -> dict:
+    """Pin the resolved rows so hot settings cannot change the executing panel."""
+    source = str(resolved_config.get("slot_config_source") or "")
+    raw = json.dumps(
+        _slot_plan_payload(resolved_config), sort_keys=True, separators=(",", ":")
+    )
+    os.environ["OUROBOROS_REVIEWER_SLOTS"] = raw
+    frozen = _resolved_review_config(profile=_CONTRIBUTOR_PROFILE)
+    if _slot_plan_payload(frozen) != _slot_plan_payload(resolved_config):
+        raise RuntimeError("contributor reviewer slot freeze changed the resolved plan")
+    frozen["slot_config_source"] = source
+    frozen["execution_slot_config_source"] = "frozen_structured"
+    frozen["slot_plan_sha256"] = _slot_plan_sha256(frozen)
+    return frozen
 
 
 def _classify_exit(outcome: dict) -> int:
@@ -830,7 +787,7 @@ def _apply_contributor_landing_obligations(
         "status": "passed",
         "message": (
             "Contributor readiness passed with release metadata deferred to the "
-            "maintainer-owned final squash landing."
+            "maintainer-owned final landing."
         ),
         "block_reason": "",
         "pre_fingerprint": outcome.get("pre_fingerprint", {}),
@@ -887,17 +844,32 @@ def _write_contributor_packet(
     elapsed_sec: float,
     triad_raw,
     scope_raw,
+    execution_receipts: list[dict],
+    execution_mismatches: list[str],
+    session_transcripts: list[dict],
     degraded_reasons: list[str],
     replacements: list[tuple[str, str]],
 ) -> pathlib.Path:
     result = _contributor_result(exit_code, snapshot)
+    telemetry_limitations = [
+        f"{item.get('surface')}:{item.get('slot_id')}:observed_model_is_display_label"
+        for item in execution_receipts
+        if item.get("model_verification") == "observed_display_label"
+    ]
+    public_transcripts = _public_projection(session_transcripts, replacements=replacements)
+    for item in public_transcripts:
+        transcript = str(item.get("transcript") or "")
+        item["chars"] = len(transcript)
+        item["sha256"] = hashlib.sha256(
+            transcript.encode("utf-8", "replace")
+        ).hexdigest()
     public_snapshot = {
         key: value
         for key, value in snapshot.items()
         if key != "patch"
     }
     evidence = {
-        "schema_version": 1,
+        "schema_version": 2,
         "review_profile": _CONTRIBUTOR_PROFILE,
         "result": result,
         "complete": exit_code == 0,
@@ -910,6 +882,20 @@ def _write_contributor_packet(
         "reviewed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "snapshot": public_snapshot,
         "review_config": resolved_config,
+        "review_execution": {
+            "receipts": execution_receipts,
+            "mismatches": execution_mismatches,
+            "consistent": not execution_mismatches,
+            "telemetry_limitations": telemetry_limitations,
+            "session_transcript_artifacts": [
+                {key: value for key, value in item.items() if key != "transcript"}
+                for item in public_transcripts
+            ],
+            "effort_note": (
+                "Configured effort is recorded under configured slots. Applied effort "
+                "is null unless the execution route exposes it."
+            ),
+        },
         "review_completeness": {
             "contract": "production_triad_quorum_plus_authoritative_scope",
             "degraded_reasons": list(degraded_reasons),
@@ -920,18 +906,18 @@ def _write_contributor_packet(
         },
         "release_metadata": {
             "contributor_version_bump_required": False,
-            "owner": "maintainer_final_squash_landing",
+            "owner": "maintainer_final_landing",
             "final_production_review_required": True,
         },
         "trust": {
-            "target_base_defaults_used": True,
+            "execution_receipts_consistent": not execution_mismatches,
             "review_substrate_changed": snapshot.get("review_substrate_changed", []),
             "maintainer_trusted_base_rerun_required": bool(
                 snapshot.get("review_substrate_changed")
             ),
             "note": (
-                "Local contributor evidence accelerates triage but is not merge "
-                "authorization or cryptographic proof of execution."
+                "Contributor evidence is not merge authorization or cryptographic "
+                "proof of execution."
             ),
         },
         "production_outcome": outcome,
@@ -966,10 +952,12 @@ def _write_contributor_packet(
     full_output = "\n".join([
         sep, "CONTRIBUTOR REVIEW EVIDENCE", sep,
         json.dumps(public_evidence, indent=2, ensure_ascii=False, default=str),
-        sep, "TRIAD RAW RESULTS (full, redacted)", sep,
+        sep, "TRIAD ACTOR RESULT RECORDS (full, redacted)", sep,
         json.dumps(public_triad, indent=2, ensure_ascii=False, default=str),
-        sep, "SCOPE RAW RESULT (full, redacted)", sep,
+        sep, "SCOPE ACTOR RESULT RECORDS (full, redacted)", sep,
         json.dumps(public_scope, indent=2, ensure_ascii=False, default=str),
+        sep, "AGENT SESSION TRANSCRIPTS (full, redacted)", sep,
+        json.dumps(public_transcripts, indent=2, ensure_ascii=False, default=str),
     ])
     full_output_path.write_text(full_output + "\n", encoding="utf-8")
     packet_path = output_dir / "review-packet.zip"
@@ -1032,9 +1020,9 @@ def _parse_args():
         "--contributor",
         action="store_true",
         help=(
-            "Review the committed base-ref..head-ref proposal with target-base "
-            "shipped OpenRouter triad+scope defaults, blocking clean semantics, "
-            "no Claude advisory, and a shareable evidence packet."
+            "Review the committed base-ref..head-ref proposal with the configured "
+            "triad/scope slots, blocking clean semantics, no Claude advisory, "
+            "and a shareable route-aware evidence packet."
         ),
     )
     parser.add_argument(
@@ -1091,7 +1079,7 @@ def _build_review_request(
             "Review only the exact committed proposal bound by the evidence manifest. "
             "Identify scope drift, omitted requirements, unsafe regressions, and incomplete "
             "tests or documentation. Release version allocation is intentionally deferred "
-            "to the final maintainer squash landing.\n\nContributor-declared scope:\n"
+            "to the final maintainer landing.\n\nContributor-declared scope:\n"
             + (args.scope or "All files in the target-base..head proposal diff.")
         )
         return commit_message, goal, scope
@@ -1113,32 +1101,46 @@ def _build_review_request(
 def _prepare_review_configuration(args) -> tuple[dict | None, str, dict]:
     _load_settings_into_env()
     contributor_snapshot: dict | None = None
-    target_defaults: dict[str, str] | None = None
     review_base_commit = "HEAD"
     if args.contributor:
         contributor_snapshot = _contributor_snapshot(
             args.base_ref or _CONTRIBUTOR_DEFAULT_BASE_REF,
             args.head_ref,
         )
-        target_defaults = _settings_defaults_at_ref(
-            str(contributor_snapshot["base_sha"])
-        )
-        _apply_contributor_review_env(target_defaults)
-        _require_contributor_budget()
-        contributor_snapshot["target_reviewer_defaults"] = target_defaults
+        _apply_contributor_review_env()
         review_base_commit = str(contributor_snapshot["base_sha"])
 
-    _select_healthy_openrouter_key(
-        required=args.contributor,
-        probe_all_models=args.contributor,
-    )
     resolved_config = _resolved_review_config(
         profile=_CONTRIBUTOR_PROFILE if args.contributor else "production_commit_gate"
     )
     if args.contributor:
-        if target_defaults is None:
-            raise RuntimeError("target-base reviewer defaults were not resolved")
-        _assert_contributor_openrouter_config(resolved_config, target_defaults)
+        _assert_contributor_review_config(resolved_config)
+        resolved_config = _freeze_contributor_slots(resolved_config)
+        _assert_contributor_review_config(resolved_config)
+        api_rows = [
+            row for row in [
+                *list(resolved_config.get("triad_slots") or []),
+                *list(resolved_config.get("scope_slots") or []),
+            ]
+            if (row.get("route") or {}).get("kind") == "api_chat"
+        ]
+        if api_rows:
+            _require_contributor_budget()
+        openrouter_models = _configured_openrouter_models(resolved_config)
+        if openrouter_models:
+            _select_healthy_openrouter_key(
+                required=True,
+                probe_all_models=True,
+                probe_models=openrouter_models,
+            )
+    else:
+        if not os.environ.get("TOTAL_BUDGET", "").strip():
+            print(
+                "WARN: TOTAL_BUDGET is not configured; the $10 default can "
+                "starve a full production review.",
+                file=sys.stderr,
+            )
+        _select_healthy_openrouter_key()
     return contributor_snapshot, review_base_commit, resolved_config
 
 
@@ -1293,19 +1295,16 @@ def main() -> int:
         if args.contributor:
             print(
                 "Contributor profile: Claude advisory excluded; running hermetic "
-                "test preflight followed by target-base OpenRouter triad + scope.",
+                "test preflight followed by the configured triad + scope routes.",
                 file=sys.stderr,
             )
         else:
-            # The default operator lane runs the REAL advisory pre-review. Its
+            # The default operator lane runs the configured advisory route. Its
             # freshness state lives in this run's drive root, so the production
             # cycle below sees a fresh advisory.
-            if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
-                print(
-                    "WARN: no ANTHROPIC_API_KEY — advisory will record an audited "
-                    "bypass and the gate falls back to its hermetic pytest preflight.",
-                    file=sys.stderr,
-                )
+            advisory_warning = _advisory_unavailability_warning()
+            if advisory_warning:
+                print(advisory_warning, file=sys.stderr)
             from ouroboros.tools.claude_advisory_review import _handle_advisory_pre_review
 
             advisory_text = _handle_advisory_pre_review(
@@ -1374,23 +1373,21 @@ def main() -> int:
             _remove_isolated_checkout(checkout_root, checkout)
 
     evidence_refs, cost_report = _review_evidence_and_cost(ctx)
+    execution_receipts: list[dict] = []
+    execution_mismatches: list[str] = []
+    session_transcripts: list[dict] = []
+    if contributor_snapshot is not None:
+        execution_receipts, execution_mismatches, session_transcripts = (
+            _contributor_execution_receipts(ctx, resolved_config, review_drive_root)
+        )
     exit_code = _classify_exit(outcome)
-    if (
-        contributor_snapshot is not None
-        and contributor_snapshot.get("review_substrate_changed")
-        and exit_code == 0
-    ):
-        exit_code = 3
-        outcome = {
-            **outcome,
-            "status": "blocked",
-            "block_reason": "trusted_base_rerun_required",
-            "message": (
-                "The proposal changes the review substrate. Its local result is "
-                "preserved, but fast-path readiness requires a maintainer rerun "
-                "from the trusted target-base implementation."
-            ),
-        }
+    if contributor_snapshot is not None:
+        from scripts.contributor_review_evidence import finalize_contributor_outcome
+
+        exit_code, outcome = finalize_contributor_outcome(
+            snapshot=contributor_snapshot, outcome=outcome, exit_code=exit_code,
+            mismatches=execution_mismatches,
+        )
 
     if contributor_snapshot is not None:
         replacements = sorted(
@@ -1414,6 +1411,9 @@ def main() -> int:
             elapsed_sec=time.time() - t0,
             triad_raw=getattr(ctx, "_last_triad_raw_results", []),
             scope_raw=getattr(ctx, "_last_scope_raw_result", {}),
+            execution_receipts=execution_receipts,
+            execution_mismatches=execution_mismatches,
+            session_transcripts=session_transcripts,
             degraded_reasons=list(
                 getattr(ctx, "_review_degraded_reasons", []) or []
             ),

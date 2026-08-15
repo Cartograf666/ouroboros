@@ -58,9 +58,8 @@ _POPEN_ALLOWLIST = {
     "ouroboros/local_model.py",           # custody record added at spawn
     "ouroboros/extension_companion.py",   # custody write-through added at spawn
     "ouroboros/tools/services.py",        # routed through spawn_supervised
-    "supervisor/update_source.py",       # bounded foreground git network calls (waited + killed on timeout)
     "supervisor/update_merge.py",        # bounded pre-restart import/compile smoke
-    "supervisor/git_ops.py",             # bounded dependency sync (waited + panic-tracked)
+    "supervisor/git_ops.py",             # shared bounded Git/dependency helpers (waited + panic-tracked)
     "ouroboros/colab_bootstrap.py",      # bounded Colab clone/fetch helper
 }
 

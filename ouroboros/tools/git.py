@@ -34,7 +34,10 @@ from ouroboros.tool_access import (
     binding_targets_system_repo,
     build_resolved_resource_binding,
 )
-from ouroboros.tools.claude_advisory_review import advisory_gate_unavailable
+from ouroboros.tools.claude_advisory_review import (
+    ADVISORY_REVIEW_CHOICE_GUIDANCE,
+    advisory_gate_unavailable,
+)
 from ouroboros.tools.commit_gate import (
     _check_advisory_freshness,
     _check_overlapping_review_attempt,
@@ -2778,14 +2781,18 @@ def _revert_commit(
 
 
 def get_tools() -> List[ToolEntry]:
+    reviewed_commit_description = (
+        "Commit already-changed files through the unified reviewed commit workflow. "
+        f"{ADVISORY_REVIEW_CHOICE_GUIDANCE}"
+    )
+    skip_advisory_description = (
+        "Choose the audited advisory-only skip for this call. "
+        f"{ADVISORY_REVIEW_CHOICE_GUIDANCE}"
+    )
     return [
         ToolEntry("commit_reviewed", {
             "name": "commit_reviewed",
-            "description": (
-                "Commit already-changed files. Requires a fresh advisory_review run first. "
-                "Includes unified pre-commit multi-model review before commit, "
-                "with configurable Advisory/Blocking enforcement, plus blocking scope review."
-            ),
+            "description": reviewed_commit_description,
             "parameters": {"type": "object", "properties": {
                 "commit_message": {"type": "string"},
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "Optional subset of task-attributed clean-at-baseline paths. Omitted computes the full attributed candidate set; an empty set never stages the whole tree."},
@@ -2793,7 +2800,7 @@ def get_tools() -> List[ToolEntry]:
                 "review_rebuttal": {"type": "string", "default": "",
                     "description": "If previous commit was blocked by reviewers and you disagree, include counter-argument."},
                 "skip_advisory_review": {"type": "boolean", "default": False,
-                    "description": "Bypass advisory pre-review gate (durably audited). Use only when necessary."},
+                    "description": skip_advisory_description},
                 "goal": {"type": "string", "default": "",
                     "description": "High-level goal of this change. Used by scope reviewer to judge completeness."},
                 "scope": {"type": "string", "default": "",
@@ -2802,13 +2809,14 @@ def get_tools() -> List[ToolEntry]:
         }, _repo_commit_push, is_code_tool=True),
         ToolEntry("vcs_commit_reviewed", {
             "name": "vcs_commit_reviewed",
-            "description": "Alias of commit_reviewed for version-control workflows.",
+            "description": reviewed_commit_description,
             "parameters": {"type": "object", "properties": {
                 "commit_message": {"type": "string"},
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "Optional subset of task-attributed clean-at-baseline paths. Omitted computes candidates; empty never means git add -A."},
                 "skip_tests": {"type": "boolean", "default": False, "description": "Skip pre-commit tests."},
                 "review_rebuttal": {"type": "string", "default": ""},
-                "skip_advisory_review": {"type": "boolean", "default": False},
+                "skip_advisory_review": {"type": "boolean", "default": False,
+                    "description": skip_advisory_description},
                 "goal": {"type": "string", "default": ""},
                 "scope": {"type": "string", "default": ""},
             }, "required": ["commit_message"]},

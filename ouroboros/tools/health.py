@@ -1,7 +1,6 @@
 """Codebase health tool — complexity metrics and self-assessment."""
 
 import logging
-import os
 import pathlib
 
 from ouroboros.tools.registry import ToolContext, ToolEntry
@@ -12,18 +11,19 @@ log = logging.getLogger(__name__)
 def _codebase_health(ctx: ToolContext) -> str:
     """Compute and format codebase health report."""
     try:
-        from ouroboros.review import collect_sections, compute_complexity_metrics
+        from ouroboros.review import compute_repo_complexity_metrics
 
         repo_dir = pathlib.Path(ctx.repo_dir)
-        drive_root = pathlib.Path(os.environ.get("DRIVE_ROOT", str(pathlib.Path.home() / "Ouroboros" / "data")))
-
-        sections, stats = collect_sections(repo_dir, drive_root)
-        metrics = compute_complexity_metrics(sections)
+        metrics = compute_repo_complexity_metrics(repo_dir)
+        stats = {
+            "files": metrics["total_files"],
+            "chars": metrics["total_bytes"],
+        }
 
         # Format report
         lines = []
         lines.append("## Codebase Health Report\n")
-        lines.append(f"**Analyzed:** {stats['files']} files, {stats['chars']:,} chars")
+        lines.append(f"**Analyzed:** {stats['files']} files, {stats['chars']:,} UTF-8 bytes")
         if stats.get("truncated"):
             lines.append(f"**Compacted files:** {stats['truncated']}")
         if stats.get("dropped"):
@@ -34,8 +34,7 @@ def _codebase_health(ctx: ToolContext) -> str:
                 + (f" ({preview}{' ...' if len(dropped_paths) > 5 else ''})" if preview else "")
             )
         lines.append(
-            f"**Files:** {metrics['total_files']} ({metrics['py_files']} Python, "
-            f"{metrics.get('js_files', 0)} gated JS)"
+            f"**Files:** {metrics['total_files']} ({metrics['py_files']} Python, {metrics.get('js_files', 0)} gated JS)"
         )
         lines.append(f"**Total lines:** {metrics['total_lines']:,}")
         lines.append(f"**Functions:** {metrics['total_functions']}")
@@ -77,6 +76,7 @@ def _codebase_health(ctx: ToolContext) -> str:
         # Warnings
         target_drift_funcs = metrics.get("target_drift_functions", [])
         target_drift_mods = metrics.get("target_drift_modules", [])
+        grandfathered_funcs = metrics.get("grandfathered_functions", [])
         grandfathered_mods = metrics.get("grandfathered_modules", [])
         oversized_funcs = metrics.get("oversized_functions", [])
         oversized_mods = metrics.get("oversized_modules", [])
@@ -85,6 +85,7 @@ def _codebase_health(ctx: ToolContext) -> str:
         if (
             oversized_funcs
             or oversized_mods
+            or grandfathered_funcs
             or grandfathered_mods
             or target_drift_funcs
             or target_drift_mods
@@ -92,15 +93,19 @@ def _codebase_health(ctx: ToolContext) -> str:
         ):
             lines.append("\n### Complexity Status (Principle 7: Minimalism)")
             if function_count_violation:
-                lines.append(
-                    f"  Hard-limit total functions > {MAX_TOTAL_FUNCTIONS}: {metrics['total_functions']}"
-                )
+                lines.append(f"  Hard-limit total functions > {MAX_TOTAL_FUNCTIONS}: {metrics['total_functions']}")
             if oversized_funcs:
                 lines.append(f"  Hard-limit functions > {MAX_FUNCTION_LINES} lines: {len(oversized_funcs)}")
                 for path, start, length in oversized_funcs:
                     lines.append(f"    - {path}:{start} ({length} lines)")
             elif target_drift_funcs:
                 lines.append(f"  Target-drift functions > {TARGET_FUNCTION_LINES} lines: {len(target_drift_funcs)}")
+            if grandfathered_funcs:
+                lines.append(
+                    f"  Grandfathered functions still above {MAX_FUNCTION_LINES} lines: {len(grandfathered_funcs)}"
+                )
+                for path, start, length in grandfathered_funcs:
+                    lines.append(f"    - {path}:{start} ({length} lines)")
             if oversized_mods:
                 lines.append(f"  Hard-limit modules > {MAX_MODULE_LINES} lines: {len(oversized_mods)}")
                 for path, size in oversized_mods:
@@ -127,9 +132,13 @@ def _codebase_health(ctx: ToolContext) -> str:
 
 def get_tools():
     return [
-        ToolEntry("codebase_health", {
-            "name": "codebase_health",
-            "description": "Get codebase complexity metrics: file sizes, longest functions, modules exceeding limits. Useful for self-assessment per Bible Principle 7 (Minimalism).",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        }, _codebase_health),
+        ToolEntry(
+            "codebase_health",
+            {
+                "name": "codebase_health",
+                "description": "Get codebase complexity metrics: file sizes, longest functions, modules exceeding limits. Useful for self-assessment per Bible Principle 7 (Minimalism).",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+            _codebase_health,
+        ),
     ]

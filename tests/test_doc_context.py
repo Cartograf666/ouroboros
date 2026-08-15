@@ -44,7 +44,8 @@ def _make_env_and_memory(tmpdir: pathlib.Path):
     (repo_dir / "docs" / "ARCHITECTURE.md").write_text(
         "# Ouroboros v5.5.0 — Architecture\n\n## Section A\n\n"
         + _ARCH_BODY_SENTINEL
-        + " alpha\n\n## Section B\n\nbeta\n",
+        + " alpha\n\n### Section A child\n\n#### Section A detail\n\ndetail\n\n"
+        + "## Section B\n\nbeta\n",
         encoding="utf-8",
     )
     (repo_dir / "docs" / "DEVELOPMENT.md").write_text("# DEVELOPMENT.md — Dev Guide", encoding="utf-8")
@@ -250,6 +251,9 @@ def test_low_mode_architecture_is_navigation_map_not_full_body():
     text = _build_system_text(context_mode="low")
     assert "navigation map" in text
     assert "Section A" in text and "Section B" in text  # headings present
+    assert "- Section A — lines 3-12" in text  # parent keeps its complete subtree
+    assert "  - Section A child — lines 7-12" in text
+    assert "    - Section A detail — lines 9-12" in text
     assert _ARCH_BODY_SENTINEL not in text  # full body NOT inlined in low
 
 

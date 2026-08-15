@@ -87,6 +87,7 @@ class FakeGateway:
         self.cancels = []
         self.artifact_gets = []
         self.health_asked = []
+        self.run_gets = []
         self.project_lookups = []
         self.registrations = []
         self.removals = []
@@ -150,6 +151,7 @@ class FakeGateway:
         return {"runId": "run-1", "runDir": "/tmp/fake-run"}
 
     def get_run(self, run_id, **_kw):
+        self.run_gets.append(run_id)
         if FakeGateway.nonterminal:
             return {"summary": {"state": "running"}, "lastSeq": 1}
         return json.loads(json.dumps(FakeGateway.detail))
@@ -242,6 +244,27 @@ def test_schema_conformant_clean_verdict_survives(tmp_path, fake_route):
     # the schema was asked on the EFFECTIVE route (D19).
     assert "outputSchema" in start
     assert gateway.start_keys[0]  # the invocation id rode the wire
+
+
+def test_structured_session_compares_the_parsed_model_not_the_harness_spec(
+    tmp_path, fake_route,
+):
+    fake_route.detail = _terminal_detail('{"findings": []}', conformance="passed", model="anthropic::claude-fable-5")
+    result = run_review_request(
+        _agent_request(),
+        slots=[_agent_slot(
+            model="fake-review=anthropic/claude-fable-5",
+            session_target="fake-review=anthropic/claude-fable-5",
+        )],
+        drive_root=tmp_path,
+        llm=FakeLLM(),
+    )
+
+    reasons = {
+        item.get("reason")
+        for item in result.actors[0]["usage"].get("capability_delta", [])
+    }
+    assert "session_route_resolves_its_own_model" not in reasons
 
 
 def test_schema_is_not_asked_when_the_manifest_does_not_declare_it(tmp_path, fake_route):
@@ -685,6 +708,159 @@ def _custody_rows(drive_root):
             custody.event_log_path(drive_root).read_text().splitlines() if line.strip()]
 
 
+def _seed_started_review_invocation(
+    drive_root, *, invocation_id="inv-started", request_task_id="t-b",
+    custody_task_id="t-b", run_id="run-started",
+):
+    """Write the exact request + STARTED facts an interrupted retry recovers."""
+    route_id = "stored-review"
+    request = {
+        "prompt": "review this",
+        "instructions": "stored review instructions",
+        "authPreference": "subscription",
+        "mode": "ask",
+        "access": "readonly",
+        "scope": {"kind": "project", "root": "/tmp/fake-repo"},
+        "harnesses": [route_id],
+        "primaryHarness": route_id,
+        "maxSeconds": 30,
+        "model": "stored-model",
+        "effort": "xhigh",
+        "outputSchema": {"type": "object"},
+    }
+    assert custody.record_start_requested(
+        drive_root, run_id="", task_id=request_task_id,
+        idempotency_key="stored-logical-key", invocation_id=invocation_id,
+        max_seconds=30, request=request, project_id="proj-owned",
+        project_owned=True, route=route_id, surface="scope_review",
+        slot_id="scope_slot_1", root_task_id="stored-root",
+        parent_task_id="stored-parent",
+    )
+    entry = custody.RunCustody(
+        run_id=run_id, task_id=custody_task_id, route_id=route_id,
+        model="stored-model", project_id="proj-owned", project_owned=True,
+        root_task_id="stored-root", parent_task_id="stored-parent",
+        ledger_root=str(drive_root), idempotency_key="stored-logical-key",
+        invocation_id=invocation_id,
+    )
+    assert custody.record_started(drive_root, entry, shape={
+        "effort": "xhigh", "access": "readonly", "mode": "ask",
+        "isolation": "", "delegated": False, "root": "/tmp/fake-repo",
+        "surface": "scope_review", "slot_id": "scope_slot_1",
+    })
+
+
+def test_started_invocation_recovery_reuses_exact_durable_custody(
+    tmp_path, fake_route, monkeypatch,
+):
+    """#167: an already-STARTED retry is wait-only.
+
+    It reuses the original custody/request identity, ignores current route and
+    quota drift, and never writes a second STARTED row.
+    """
+    from ouroboros import subagents
+
+    invocation_id = "inv-started-happy"
+    _seed_started_review_invocation(tmp_path, invocation_id=invocation_id)
+    custody._CUSTODY.clear()  # prove recovery from the durable rows, not the memo
+    state = {"pending_invocation_id": invocation_id}
+
+    monkeypatch.setenv(REVIEW_SESSION_ROUTE_ENV, "drifted-route=drifted-model:low")
+    health_calls = []
+
+    def _health_must_not_run(*args, **kwargs):
+        health_calls.append((args, kwargs))
+        raise AssertionError("route health is admission, not recovery")
+
+    monkeypatch.setattr(subagents, "route_health", _health_must_not_run)
+    fake_route.detail = _terminal_detail(
+        '{"findings": []}', conformance="passed", model="stored-model",
+    )
+
+    facts = _run_session_directly(tmp_path, retry_state=state)
+
+    gateway = fake_route.instances[-1]
+    assert gateway.start_requests == [] and gateway.start_keys == []
+    assert health_calls == []
+    assert gateway.run_gets == ["run-started"]
+    assert gateway.project_lookups == [] and gateway.registrations == []
+    assert gateway.removals == ["proj-owned"]
+    assert facts["run_id"] == "run-started"
+    assert facts["route_id"] == "stored-review"
+    assert facts["model"] == "stored-model"
+    assert facts["schema_asked"] is True
+    assert facts["custody_durable"] is True
+    assert facts["idempotent_recovery"] is True
+    assert facts["settlement"]["settled"] is True
+    assert state == {}
+
+    rows = _custody_rows(tmp_path)
+    started = [row for row in rows if row["type"] == custody.STARTED]
+    assert len(started) == 1, started
+    assert started[0]["route"] == "stored-review"
+    assert started[0]["model"] == "stored-model"
+    assert started[0]["effort"] == "xhigh"
+    assert started[0]["project_id"] == "proj-owned"
+    assert started[0]["project_owned"] is True
+    assert started[0]["idempotency_key"] == "stored-logical-key"
+    assert custody.open_runs(tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    "case,request_owner,custody_owner,expected_lookup",
+    [
+        ("foreign", "durable-owner", "durable-owner", custody.FOREIGN),
+        ("unknown", "claimant", "claimant", custody.UNKNOWN),
+        ("durable_owner_mismatch", "durable-owner", "claimant", custody.OWNED),
+    ],
+)
+def test_started_invocation_recovery_refuses_unproven_ownership_without_effects(
+    tmp_path, fake_route, monkeypatch, case, request_owner, custody_owner,
+    expected_lookup,
+):
+    """#167: the CURRENT task is claimant, and refusal consumes nothing."""
+    from ouroboros import subagents
+    from ouroboros.review_execution import ReviewRouteUnavailable
+
+    invocation_id = f"inv-started-{case}"
+    _seed_started_review_invocation(
+        tmp_path, invocation_id=invocation_id, request_task_id=request_owner,
+        custody_task_id=custody_owner,
+    )
+    custody._CUSTODY.clear()
+    before = _custody_rows(tmp_path)
+    state = {"pending_invocation_id": invocation_id}
+    lookup_calls = []
+    real_lookup = custody.lookup
+
+    def _tracked_lookup(drive_root, claimant, run_id):
+        lookup_calls.append((drive_root, claimant, run_id))
+        if case == "unknown":
+            return custody.UNKNOWN, None
+        return real_lookup(drive_root, claimant, run_id)
+
+    def _health_must_not_run(*_args, **_kwargs):
+        raise AssertionError("unowned recovery reached route health")
+
+    monkeypatch.setattr(custody, "lookup", _tracked_lookup)
+    monkeypatch.setattr(subagents, "route_health", _health_must_not_run)
+
+    with pytest.raises(ReviewRouteUnavailable, match="corroborate ownership"):
+        _run_session_directly(tmp_path, task_id="claimant", retry_state=state)
+
+    assert [(claimant, run_id) for _drive, claimant, run_id in lookup_calls] == [
+        ("claimant", "run-started")
+    ]
+    if case != "unknown":
+        assert real_lookup(tmp_path, "claimant", "run-started")[0] == expected_lookup
+    assert state == {"pending_invocation_id": invocation_id}
+    assert fake_route.instances == []  # no gateway means no poll, POST, or retirement
+    assert _custody_rows(tmp_path) == before
+    assert not any(row["type"] in (
+        custody.PROJECT_RETIRED, custody.SETTLED, custody.LEDGER_RECORDED,
+    ) for row in before)
+
+
 def test_custody_rows_carry_lineage_from_the_bound_usage_scope(tmp_path, fake_route):
     """#112: BOTH custody writers — the pre-POST request row and the STARTED
     row — carry root/parent from the ambient UsageScope (the coordinator binds
@@ -795,6 +971,7 @@ def test_retry_replays_the_stored_route_and_registers_nothing_new(tmp_path, fake
     attempt already bound, and writing a durable record that contradicted the bytes on
     the wire.
     """
+    from ouroboros import subagents
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
     # Attempt 1: indefinite failure leaves the invocation PENDING.
@@ -808,6 +985,16 @@ def test_retry_replays_the_stored_route_and_registers_nothing_new(tmp_path, fake
     # The environment is RECONFIGURED between the attempts.
     monkeypatch.setenv(REVIEW_SESSION_ROUTE_ENV, "other-route=other-model:high")
     before = [len(i.registrations) for i in fake_route.instances]
+    health_calls = []
+    real_route_health = subagents.route_health
+
+    def _track_route_health(gateway, route_id, shape, *, route_model=""):
+        health_calls.append((route_id, route_model))
+        return real_route_health(
+            gateway, route_id, shape, route_model=route_model,
+        )
+
+    monkeypatch.setattr(subagents, "route_health", _track_route_health)
 
     facts = _run_session_directly(tmp_path, retry_state=state)
 
@@ -817,6 +1004,9 @@ def test_retry_replays_the_stored_route_and_registers_nothing_new(tmp_path, fake
     retry_gateway = fake_route.instances[-1]
     assert retry_gateway.start_requests[0]["primaryHarness"] == "fake-review"
     assert retry_gateway.start_requests[0]["harnesses"] == ["fake-review"]
+    # Pending recovery can still POST, so it remains admission-health gated —
+    # against the STORED route/model, never the drifted current configuration.
+    assert health_calls == [("fake-review", "fake-small")]
     # No project lookup or registration happened on the retry: the original
     # attempt's project rides the record.
     assert retry_gateway.project_lookups == []
@@ -1462,13 +1652,16 @@ def test_triad_session_task_carries_criteria_and_nav_maps_not_evidence():
         rebuttal_section="",
         review_history_section="",
         dev_guide_text="# Dev\n\n## Rules\n\ntext\n",
-        architecture_text="# Arch\n\n## Modules\n\ntext\n",
+        architecture_text="## Parent\nbody\n### Child\nbody\n#### Detail\nbody\n",
     )
     assert "## Review Checklist" in task
     assert "## Goal" in task and "## Scope" in task
     assert "git diff --cached" in task           # subject pointer, not the diff
     assert "DEVELOPMENT.md (navigation map)" in task
     assert "ARCHITECTURE.md (navigation map)" in task
+    assert "- Parent — lines 1-6" in task
+    assert "  - Child — lines 3-6" in task
+    assert "    - Detail — lines 5-6" in task
     assert "Read BIBLE.md in full" in task
 
 

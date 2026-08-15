@@ -143,6 +143,10 @@ def test_skill_advisory_keyless_delegated_route_is_not_skipped(tmp_path, monkeyp
     assert called["n"] == 1, "the delegated keyless advisory attempt must run"
     assert result != {}
     assert result.get("status") == "completed"
+    events_path = ctx.drive_root / "logs" / "events.jsonl"
+    if events_path.exists():
+        rows = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+        assert not any(row.get("type") == "skill_advisory_pre_review_warning" for row in rows)
 
 
 def test_skill_advisory_keyless_api_route_skips_and_malformed_route_skips(tmp_path, monkeypatch):
@@ -165,12 +169,80 @@ def test_skill_advisory_keyless_api_route_skips_and_malformed_route_skips(tmp_pa
     assert skill_review._run_skill_advisory_pre_review(
         ctx, skill_name="weather", file_pack="pack"
     ) == {}
+    events_path = ctx.drive_root / "logs" / "events.jsonl"
+    rows = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    warning = rows[-1]
+    assert warning["type"] == "skill_advisory_pre_review_warning"
+    assert warning["status"] == "unavailable"
+    assert warning["error"] == "anthropic_api_key_missing"
 
     # Malformed route token: unavailable → skip (fail-open), no exception.
-    monkeypatch.setenv("OUROBOROS_ADVISORY_REVIEW_ROUTE", "cursor")
+    malformed_value = "cursor-secret-payload"
+    monkeypatch.setenv("OUROBOROS_ADVISORY_REVIEW_ROUTE", malformed_value)
     assert skill_review._run_skill_advisory_pre_review(
         ctx, skill_name="weather", file_pack="pack"
     ) == {}
+    rows = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 2
+    warning = rows[-1]
+    assert warning["type"] == "skill_advisory_pre_review_warning"
+    assert warning["status"] == "unavailable"
+    assert warning["error"] == "invalid_advisory_configuration"
+    assert malformed_value not in json.dumps(warning)
+
+
+def test_skill_advisory_unroutable_session_warns_and_fails_open(tmp_path, monkeypatch):
+    import ouroboros.skill_review as skill_review
+    from ouroboros.tools import claude_advisory_review as advisory
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
+    monkeypatch.delenv("OUROBOROS_REVIEW_SESSION_ROUTE", raising=False)
+    monkeypatch.delenv("OUROBOROS_SUBAGENT_HARNESS", raising=False)
+    monkeypatch.setenv("OUROBOROS_ADVISORY_REVIEW_ROUTE", "agent_session")
+    monkeypatch.setattr(
+        advisory,
+        "_run_claude_advisory",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an unavailable advisory transport must not be called")
+        ),
+    )
+
+    ctx = _make_ctx(tmp_path)
+    assert skill_review._run_skill_advisory_pre_review(
+        ctx, skill_name="weather", file_pack="pack"
+    ) == {}
+    events_path = ctx.drive_root / "logs" / "events.jsonl"
+    rows = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    warning = rows[-1]
+    assert warning["type"] == "skill_advisory_pre_review_warning"
+    assert warning["status"] == "unavailable"
+    assert warning["error"] == "agent_session_route_unavailable"
+
+
+@pytest.mark.parametrize("guard", ["pytest", "private_runner"])
+def test_skill_advisory_private_guards_precede_availability(tmp_path, monkeypatch, guard):
+    import ouroboros.skill_review as skill_review
+    from ouroboros.tools import claude_advisory_review as advisory
+
+    monkeypatch.setattr(
+        advisory,
+        "advisory_gate_unavailability_reason",
+        lambda: (_ for _ in ()).throw(AssertionError("availability must not be evaluated")),
+    )
+    if guard == "pytest":
+        monkeypatch.setenv("PYTEST_CURRENT_TEST", "sentinel")
+    else:
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        monkeypatch.delattr(advisory, "_run_claude_advisory")
+
+    ctx = _make_ctx(tmp_path)
+    assert skill_review._run_skill_advisory_pre_review(
+        ctx, skill_name="weather", file_pack="pack"
+    ) == {}
+    assert not (ctx.drive_root / "logs" / "events.jsonl").exists()
 
 
 _NEW_SKILL_REVIEW_PASS_ITEMS = [
@@ -1708,6 +1780,13 @@ def test_disabled_advisory_slot_never_dispatches_skill_advisory(monkeypatch, tmp
         ) == {}
         assert calls == [], f"a disabled advisory slot dispatched on the {kind} route"
 
+    events_path = tmp_path / "logs" / "events.jsonl"
+    rows = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    warnings = [row for row in rows if row.get("type") == "skill_advisory_pre_review_warning"]
+    assert len(warnings) == 2
+    assert all(row["status"] == "unavailable" for row in warnings)
+    assert all(row["error"] == "advisory_slot_disabled" for row in warnings)
+
     # Enabled again on the keyless delegated route: it MUST dispatch.
     calls.clear()
     monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", _slots(True, "agent_session"))
@@ -1717,3 +1796,5 @@ def test_disabled_advisory_slot_never_dispatches_skill_advisory(monkeypatch, tmp
         skill_name="s", file_pack="x",
     )
     assert calls == ["dispatched"]
+    final_rows = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    assert final_rows == rows

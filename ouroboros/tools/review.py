@@ -405,6 +405,7 @@ async def _query_model(
 ):
     async with semaphore:
         timeout_sec = _review_model_timeout_sec()
+        slot = None
         try:
             from ouroboros.review_execution import ReviewRouteKind
             from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
@@ -475,12 +476,12 @@ async def _query_model(
             return model, payload, None
         except asyncio.TimeoutError:
             error = f"Error: Timeout after {timeout_sec:g}s"
-            return model, _review_query_error_payload(ctx=ctx, model=model, messages=messages, slot_id=slot_id, error=error), None
+            return model, _review_query_error_payload(ctx=ctx, model=model, messages=messages, slot_id=slot_id, error=error, slot=slot), None
         except Exception as e:
             # Preserve full review errors; helper adds an omission note if needed.
             error_msg = truncate_review_artifact(str(e), limit=4000)
             error = f"Error: {error_msg}"
-            return model, _review_query_error_payload(ctx=ctx, model=model, messages=messages, slot_id=slot_id, error=error), None
+            return model, _review_query_error_payload(ctx=ctx, model=model, messages=messages, slot_id=slot_id, error=error, slot=slot), None
 
 
 async def _multi_model_review_async(content: str, prompt: str,
@@ -867,6 +868,9 @@ def _preflight_check(commit_message: str, staged_files: str,
                     readme_text=_git_show_staged(repo_dir, "README.md"),
                     arch_text=_git_show_staged(repo_dir, "docs/ARCHITECTURE.md"),
                     api_types_text=_git_show_staged(repo_dir, "web/modules/api_types.js"),
+                    download_readme_text=_git_show_staged(repo_dir, "README.md"),
+                    site_install_text=_git_show_staged(repo_dir, "site/install/index.html"),
+                    docs_install_text=_git_show_staged(repo_dir, "docs/install/index.html"),
                     detailed=True,
                 )
                 if desync:

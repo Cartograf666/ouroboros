@@ -309,6 +309,41 @@ def write_blob(drive_root: pathlib.Path, payload: Any, *, kind: str = "json") ->
     }
 
 
+def read_blob_ref(
+    drive_root: pathlib.Path,
+    ref: Dict[str, Any],
+    *,
+    expected_kind: str = "json",
+) -> Any:
+    """Read and verify one content-addressed blob below this drive root."""
+    if not isinstance(ref, dict):
+        raise ValueError("observability blob ref must be an object")
+    kind = str(ref.get("kind") or "")
+    if kind != expected_kind or ref.get("encoding") != "gzip":
+        raise ValueError("observability blob ref has an unexpected kind or encoding")
+    expected_sha = str(ref.get("sha256") or "")
+    try:
+        expected_size = int(ref["size"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("observability blob ref has no valid size") from exc
+    if not expected_sha:
+        raise ValueError("observability blob ref has no sha256")
+
+    root = _observability_root(pathlib.Path(drive_root)).resolve(strict=False)
+    path = pathlib.Path(str(ref.get("path") or "")).resolve(strict=True)
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("observability blob ref points outside its drive") from exc
+    with gzip.open(path, "rb") as handle:
+        raw = handle.read()
+    if len(raw) != expected_size or hashlib.sha256(raw).hexdigest() != expected_sha:
+        raise ValueError("observability blob ref failed size or sha256 verification")
+    if kind == "json":
+        return json.loads(raw.decode("utf-8"))
+    return raw.decode("utf-8", errors="replace")
+
+
 def write_call_manifest(
     drive_root: pathlib.Path,
     *,

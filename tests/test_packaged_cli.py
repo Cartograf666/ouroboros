@@ -22,6 +22,11 @@ def _make_bundle_root(tmp_path: pathlib.Path, root: pathlib.Path | None = None) 
     return root
 
 
+def _set_test_home(monkeypatch, home: pathlib.Path) -> None:
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+
+
 def test_packaged_cli_resolves_bundle_from_nested_bin(tmp_path):
     from ouroboros import packaged_cli
 
@@ -268,13 +273,162 @@ def test_installer_plan_chooses_user_local_path_dir(tmp_path, monkeypatch):
     home = tmp_path / "home"
     target_dir = home / ".local" / "bin"
     target_dir.mkdir(parents=True)
-    monkeypatch.setenv("HOME", str(home))
+    _set_test_home(monkeypatch, home)
     monkeypatch.setenv("PATH", str(target_dir))
 
     plan = plan_posix_install(root)
 
     assert plan.target == target_dir / "ouroboros"
     assert plan.source == root / "bin" / "ouroboros"
+
+
+def test_installer_plan_ignores_ambient_path_dirs(tmp_path, monkeypatch):
+    from ouroboros.packaged_cli_install import plan_posix_install
+
+    root = _make_bundle_root(tmp_path)
+    home = tmp_path / "home"
+    harness_dir = home / ".kimi-code" / "bin"
+    harness_dir.mkdir(parents=True)
+    system_dir = tmp_path / "system-bin"
+    system_dir.mkdir()
+    _set_test_home(monkeypatch, home)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(harness_dir), str(system_dir)]))
+
+    plan = plan_posix_install(root)
+
+    assert plan.target == home / ".local" / "bin" / "ouroboros"
+    assert plan.obsolete_shims == ()
+    assert plan.shadowing_commands == ()
+
+
+def test_installer_default_migrates_owned_shadowing_shim(tmp_path, monkeypatch, capsys):
+    from ouroboros.packaged_cli_install import _print_plan, install_posix, plan_posix_install
+
+    root = _make_bundle_root(tmp_path, root=tmp_path / "new-bundle")
+    old_root = _make_bundle_root(tmp_path, root=tmp_path / "old-bundle")
+    home = tmp_path / "home"
+    harness_dir = home / ".kimi-code" / "bin"
+    harness_dir.mkdir(parents=True)
+    target_dir = home / ".local" / "bin"
+    old_shim = harness_dir / "ouroboros"
+    os.chmod(root / "bin" / "ouroboros", 0o755)
+    os.chmod(old_root / "bin" / "ouroboros", 0o755)
+    os.symlink(old_root / "bin" / "ouroboros", old_shim)
+    _set_test_home(monkeypatch, home)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(harness_dir), str(target_dir)]))
+
+    plan = plan_posix_install(root)
+
+    assert plan.target == target_dir / "ouroboros"
+    assert plan.obsolete_shims == (old_shim,)
+    assert plan.shadowing_commands == ()
+
+    _print_plan(plan, dry_run=True)
+    assert f"Would remove older Ouroboros CLI shim: {old_shim}" in capsys.readouterr().out
+
+    install_posix(plan)
+
+    assert not old_shim.is_symlink()
+    assert plan.target.resolve() == (root / "bin" / "ouroboros").resolve()
+    if os.name != "nt":
+        assert shutil.which("ouroboros", path=os.environ["PATH"]) == str(plan.target)
+
+    reinstall = plan_posix_install(root)
+    assert reinstall.action == "refresh"
+    assert reinstall.obsolete_shims == ()
+    install_posix(reinstall)
+
+
+def test_installer_keeps_unowned_shadowing_command(tmp_path, monkeypatch, capsys):
+    from ouroboros.packaged_cli_install import _print_plan, install_posix, plan_posix_install
+
+    root = _make_bundle_root(tmp_path)
+    home = tmp_path / "home"
+    harness_dir = home / ".kimi-code" / "bin"
+    harness_dir.mkdir(parents=True)
+    target_dir = home / ".local" / "bin"
+    earlier_command = harness_dir / "ouroboros"
+    earlier_command.write_text("#!/bin/sh\necho foreign\n", encoding="utf-8")
+    os.chmod(earlier_command, 0o755)
+    _set_test_home(monkeypatch, home)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(harness_dir), str(target_dir)]))
+
+    plan = plan_posix_install(root)
+
+    assert plan.obsolete_shims == ()
+    assert plan.shadowing_commands == (earlier_command,)
+
+    install_posix(plan)
+    _print_plan(plan, dry_run=False)
+
+    captured = capsys.readouterr()
+    assert earlier_command.read_text(encoding="utf-8") == "#!/bin/sh\necho foreign\n"
+    assert f"earlier PATH command may shadow the installed CLI: {earlier_command}" in captured.err
+    assert f"Put {target_dir} before {harness_dir} in PATH" in captured.out
+
+
+def test_installer_explicit_target_does_not_migrate_owned_shadow(tmp_path, monkeypatch):
+    from ouroboros.packaged_cli_install import install_posix, plan_posix_install
+
+    root = _make_bundle_root(tmp_path, root=tmp_path / "new-bundle")
+    old_root = _make_bundle_root(tmp_path, root=tmp_path / "old-bundle")
+    home = tmp_path / "home"
+    harness_dir = home / ".kimi-code" / "bin"
+    harness_dir.mkdir(parents=True)
+    explicit_dir = home / "bin"
+    old_shim = harness_dir / "ouroboros"
+    os.symlink(old_root / "bin" / "ouroboros", old_shim)
+    _set_test_home(monkeypatch, home)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(harness_dir), str(explicit_dir)]))
+
+    plan = plan_posix_install(root, target_dir=explicit_dir)
+
+    assert plan.obsolete_shims == ()
+    assert plan.shadowing_commands == (old_shim,)
+
+    install_posix(plan)
+
+    assert old_shim.is_symlink()
+    assert plan.target.resolve() == (root / "bin" / "ouroboros").resolve()
+
+
+def test_installer_removes_old_shim_only_after_new_install_succeeds(tmp_path, monkeypatch):
+    from ouroboros import packaged_cli_install
+    from ouroboros.packaged_cli_install import install_posix, plan_posix_install
+
+    root = _make_bundle_root(tmp_path, root=tmp_path / "new-bundle")
+    old_root = _make_bundle_root(tmp_path, root=tmp_path / "old-bundle")
+    home = tmp_path / "home"
+    harness_dir = home / ".kimi-code" / "bin"
+    harness_dir.mkdir(parents=True)
+    target_dir = home / ".local" / "bin"
+    old_shim = harness_dir / "ouroboros"
+    os.symlink(old_root / "bin" / "ouroboros", old_shim)
+    _set_test_home(monkeypatch, home)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(harness_dir), str(target_dir)]))
+    plan = plan_posix_install(root)
+
+    def fail_install(_source, _target):
+        raise OSError("simulated install failure")
+
+    monkeypatch.setattr(packaged_cli_install.os, "symlink", fail_install)
+
+    with pytest.raises(OSError, match="simulated install failure"):
+        install_posix(plan)
+
+    assert old_shim.is_symlink()
+
+
+def test_posix_path_hint_prepends_target(tmp_path, monkeypatch):
+    from ouroboros.packaged_cli_install import _posix_path_hint
+
+    target_dir = tmp_path / "home" / ".local" / "bin"
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+
+    assert _posix_path_hint(target_dir) == (
+        f'Add this to ~/.zprofile if needed: export PATH="{target_dir}:$PATH"'
+    )
 
 
 def test_installer_plan_accepts_expected_wrapper_in_sibling_resources_dir(tmp_path, monkeypatch):

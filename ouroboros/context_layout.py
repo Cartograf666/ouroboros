@@ -69,10 +69,11 @@ def _read_doc(env: Any, rel_path: str) -> str:
 def generate_doc_nav_map(text: str, *, title: str, rel_path: str) -> str:
     """Build a compact, fence-aware navigation map of a markdown doc.
 
-    Lists every ``##`` / ``###`` heading with its line range so the agent knows
-    what exists and where, and can pull the full section on demand via
+    Lists every ``##`` through ``####`` heading with its inclusive line range
+    so the agent knows what exists and where, and can pull the full section on demand via
     ``read_file(root="system_repo", path=rel_path, start_line=A, max_lines=N)``.
-    This is a lossless index
+    A parent's range includes its complete descendant group, so parent and child
+    ranges intentionally overlap. This is a lossless index
     (P1: no silent truncation) — the single canonical file on disk is unchanged.
     """
     lines = text.splitlines()
@@ -89,20 +90,28 @@ def generate_doc_nav_map(text: str, *, title: str, rel_path: str) -> str:
             headings.append((2, line[3:].strip(), i))
         elif line.startswith("### "):
             headings.append((3, line[4:].strip(), i))
+        elif line.startswith("#### "):
+            headings.append((4, line[5:].strip(), i))
 
     out = [
         f"## {title} (navigation map)",
         "",
         f"Full text is NOT inlined to keep the working context window fit. Read any "
         f"section on demand with `read_file(root=\"system_repo\", path=\"{rel_path}\", "
-        f"start_line=A, max_lines=N)` (untruncated). Sections:",
+        f"start_line=A, max_lines=N)` (untruncated). Ranges are inclusive; a "
+        f"parent includes its complete descendant group, and `max_lines=B-A+1` "
+        f"for `lines A-B`. Sections:",
         "",
     ]
     if not headings:
-        out.append(f"- (no `##`/`###` headings; read `{rel_path}` directly)")
+        out.append(f"- (no `##`/`###`/`####` headings; read `{rel_path}` directly)")
     for idx, (level, htitle, lineno) in enumerate(headings):
-        end = headings[idx + 1][2] - 1 if idx + 1 < len(headings) else total
-        indent = "  " if level == 3 else ""
+        end = total
+        for later_level, _later_title, later_lineno in headings[idx + 1:]:
+            if later_level <= level:
+                end = later_lineno - 1
+                break
+        indent = "  " * (level - 2)
         out.append(f"{indent}- {htitle} — lines {lineno}-{end}")
     return "\n".join(out)
 

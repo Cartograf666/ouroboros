@@ -10,6 +10,11 @@ from pathlib import Path
 
 import yaml
 
+from ouroboros.tools.release_sync import (
+    RELEASE_ASSET_TEMPLATES,
+    release_asset_download_url,
+)
+
 REPO = Path(__file__).resolve().parents[1]
 SITE = REPO / "site"
 DOCS = REPO / "docs"
@@ -89,7 +94,7 @@ def test_json_ld_is_valid_and_current():
     assert "huggingface.co/razzant" not in json.dumps(homepage)
     assert "softwareVersion" not in homepage
     assert "softwareVersion" not in install
-    assert install["downloadUrl"] == "https://github.com/razzant/ouroboros/releases/latest"
+    assert install["downloadUrl"] == f"{ORIGIN}/install/"
     assert paper["@type"] == "ScholarlyArticle"
     assert paper["headline"] == "Ouroboros: A Self-Developing Frontier Coding Agent with Reviewed Core Evolution"
     assert paper["datePublished"] == "2026-08-08"
@@ -129,6 +134,8 @@ def test_llms_file_is_a_small_absolute_navigation_map():
     assert f"{ORIGIN}/install/" in linked_urls
     assert f"{ORIGIN}/benchmarks/" in linked_urls
     assert f"{ORIGIN}/paper/" in linked_urls
+    assert linked_urls[0] == f"{ORIGIN}/install/"
+    assert "Packaged downloads for normal use; clone the source only for development." in text
     for url in linked_urls:
         assert url == "https://claudexor.ai/" or url.startswith(
             (ORIGIN, "https://github.com/", "https://api.github.com/")
@@ -179,6 +186,9 @@ def test_install_manifest_discovers_releases_without_future_asset_hashes():
         for row in manifest["artifacts"]
     }
     assert artifacts == expected
+    assert {row["nameTemplate"] for row in manifest["artifacts"]} == set(
+        RELEASE_ASSET_TEMPLATES.values()
+    )
     for row in manifest["artifacts"]:
         assert "sha256" not in row
         assert "url" not in row
@@ -208,11 +218,35 @@ def test_install_page_does_not_promise_future_proof_files_for_every_release():
     assert "Each release carries" not in html
 
 
-def test_install_page_does_not_promise_native_packages_on_older_releases():
-    html = (SITE / "install" / "index.html").read_text(encoding="utf-8")
-    assert "When that release lists native packages" in html
-    assert "does not list a native package" in html
-    assert "usr/lib/ouroboros/_internal/python-standalone/bin/python3" in html
+def test_homepage_routes_downloads_to_the_platform_picker():
+    html = (SITE / "index.html").read_text(encoding="utf-8")
+
+    assert '<a class="btn btn-primary" href="/install/">Download</a>' in html
+    assert (
+        '<a class="btn btn-primary" href="/install/">Download the desktop app</a>'
+        in html
+    )
+
+
+def test_install_page_has_version_bound_direct_downloads_before_advanced_setup():
+    version = (REPO / "VERSION").read_text(encoding="utf-8").strip()
+    source = (SITE / "install" / "index.html").read_text(encoding="utf-8")
+    generated = (DOCS / "install" / "index.html").read_text(encoding="utf-8")
+
+    for html in (source, generated):
+        downloads = html.split('class="download-grid platform-downloads"', 1)[1].split(
+            "</div>", 1
+        )[0]
+        assert "/releases/latest" not in downloads
+        for proof_id in RELEASE_ASSET_TEMPLATES:
+            expected = release_asset_download_url(proof_id, version)
+            assert f'data-release-download="{proof_id}"' in html
+            assert expected in html
+        assert html.index("platform-downloads") < html.index(
+            "Advanced: headless CLI with uv"
+        ) < html.index("Develop or run from source")
+        assert "verification evidence, not additional installers" in html
+        assert "usr/lib/ouroboros/_internal/python-standalone/bin/python3" in html
 
 
 def test_benchmark_assets_expose_status_and_accessible_text():
