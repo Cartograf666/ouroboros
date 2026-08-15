@@ -1385,7 +1385,14 @@ under the child-writable snapshot's `.git`: symlinked Git metadata is a typed
 refusal, and the diff is built in a parent-owned control GIT_DIR with a fresh temp
 index seeded from the registry-recorded baseline commit (child `.git/index` and
 `.git/config` are never read or written — a child-forged index-only blob does not
-exist for the capture). At disposition the apply is a LIVE, index-free `git apply`
+exist for the capture). Both the baseline commit and the capture stage RAW bytes
+(`stage_raw_payload_inventory`: `hash-object --no-filters` + `--index-info`, so a
+`.gitattributes` eol/clean filter is inert content), regular modes are pinned to
+baseline/100644 (an executable-bit flip never rides), a non-empty patch whose
+result loader hash equals the baseline is a typed `unreviewable_metadata_change`
+refusal, and after a real apply the live loader hash must equal the recorded
+result hash or the run fails typed with its apply intent left PENDING (ambiguous
+recovery). At disposition the apply is a LIVE, index-free `git apply`
 into the non-Git payload guarded by a whole-payload content-hash CAS (drift =
 typed conflict; identical content = idempotent applied), with reserved
 lifecycle/control paths and escaping-symlink candidates refusing the WHOLE apply;

@@ -582,6 +582,51 @@ def payload_git_metadata_refusal(exec_root: Path) -> str:
     return ""
 
 
+def stage_raw_payload_inventory(
+    worktree: Path, rel_paths: Any, env: Dict[str, str],
+    baseline_modes: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """Stage exact RAW bytes into the CURRENT index — no .gitattributes, no filters.
+
+    ``git add``/worktree ``update-index`` run clean/eol filters from a child- or
+    payload-authored ``.gitattributes`` (CRLF staged as LF — reproduced by
+    review), so every regular file is hashed with ``hash-object --no-filters``
+    over raw bytes and staged via ``--index-info``; ``.gitattributes`` is just
+    content, a symlink stages as 120000 over its raw link-target bytes. Modes:
+    with ``baseline_modes`` (capture) regular files pin to the baseline mode for
+    existing paths / 100644 for new ones so an executable-bit flip can never
+    ride a patch; without it (provisioning) the real on-disk mode is recorded.
+    Returns the paths whose on-disk executable bit diverges from the staged mode.
+    """
+    root = Path(worktree)
+    lines: List[bytes] = []
+    divergent: List[str] = []
+    for rel in sorted(str(p) for p in rel_paths):
+        path = root / rel
+        if path.is_symlink():
+            blob, mode = os.readlink(os.fsencode(str(path))), "120000"
+        else:
+            blob = path.read_bytes()
+            executable = bool(path.stat().st_mode & 0o111)
+            if baseline_modes is None:
+                mode = "100755" if executable else "100644"
+            else:
+                base = baseline_modes.get(rel, "")
+                mode = base if base in ("100644", "100755") else "100644"
+                if executable != (mode == "100755"):
+                    divergent.append(rel)
+        hashed = subprocess.run(
+            ["git", "hash-object", "--no-filters", "-w", "--stdin"],
+            cwd=str(root), capture_output=True, env=env, input=blob, check=True)
+        sha = hashed.stdout.decode("ascii", errors="replace").strip()
+        lines.append(f"{mode} {sha}\t{rel}".encode("utf-8", errors="surrogateescape"))
+    subprocess.run(
+        ["git", "update-index", "-z", "--index-info"],
+        cwd=str(root), capture_output=True, env=env,
+        input=b"\0".join(lines) + b"\0" if lines else b"", check=True)
+    return divergent
+
+
 @contextlib.contextmanager
 def payload_capture_git_env(exec_root: Path):
     """A PARENT-OWNED throwaway Git control dir over the child-writable snapshot.
@@ -729,11 +774,17 @@ def provision_payload_snapshot(
         try:
             entry_count = _copy_payload_inventory(target, wt_path)
             # Fully config-isolated baseline: empty template dir (no user hooks),
-            # no global/system config, no excludes file and forced add so neither
-            # the user's global config nor a payload .gitignore can shape what
-            # the baseline commit records (Fable F1).
+            # no global/system config (Fable F1). RAW staging instead of `git
+            # add` (Sol P1 modes/filters): a payload .gitattributes (eol/clean)
+            # must not normalize the recorded baseline away from the live raw
+            # bytes, and the baseline records the REAL file modes.
             _git(wt_path, "init", "--template=", env=env)
-            _git(wt_path, "-c", "core.excludesfile=", "add", "-Af", env=env)
+            from ouroboros.skill_loader import _iter_payload_files
+
+            stage_raw_payload_inventory(
+                wt_path,
+                (p.relative_to(wt_path).as_posix() for p in _iter_payload_files(wt_path)),
+                env)
             _git(
                 wt_path,
                 "-c", "user.email=ouroboros@localhost", "-c", "user.name=Ouroboros",
