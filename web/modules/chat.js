@@ -4659,6 +4659,11 @@ export function createChatInstance({
     onWs('open', (msg) => {
         setStatus('online', 'Online');
         refreshHeaderControlState(true);
+        // A restart can happen while the selector's initial discovery calls
+        // are in flight. Re-read the model catalog once the websocket confirms
+        // that the server is alive again; the control's loader is single-flight
+        // so this is harmless on the first clean connection.
+        void disposeModelControl.refresh?.();
         // perf2 P4.1 [Gemini#3]: reconnect truth comes from the ws CLIENT
         // (previouslyConnected rides the open event) — a project instance
         // created while the socket was already open must still treat the next

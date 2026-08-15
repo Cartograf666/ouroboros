@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import threading
 import time
 from collections import defaultdict, deque
@@ -296,6 +297,19 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
         bridge = ctx.bridge_getter()
         chat_id = int(payload.get("chat_id") or 0)
         wait_for_response = bool(payload.get("wait_for_response", False))
+        raw_task_metadata = payload.get("task_metadata")
+        task_metadata: Dict[str, Any] = {}
+        # Skills cannot inject arbitrary routing metadata. The only supported
+        # direct-chat override is the owner-authenticated Telegram picker, with
+        # a bounded model identifier and no project/authority fields.
+        if isinstance(raw_task_metadata, dict) and str(raw_task_metadata.get("chat_model_source") or "") == "telegram_owner":
+            model_value = str(raw_task_metadata.get("chat_model_override") or "").strip()
+            if model_value and len(model_value) <= 200 and re.fullmatch(r"[A-Za-z0-9_.:/() -]+", model_value):
+                task_metadata = {
+                    "chat_model_override": model_value,
+                    "chat_model_source": "telegram_owner",
+                    "chat_use_local_model": bool(raw_task_metadata.get("chat_use_local_model")),
+                }
         response_event: asyncio.Event = asyncio.Event()
         response_holder: dict[str, str] = {}
         if wait_for_response:
@@ -316,6 +330,7 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
             image_mime=str(payload.get("image_mime") or ""),
             image_caption=image_caption,
             transport=payload.get("transport") if isinstance(payload.get("transport"), dict) else {},
+            task_metadata=task_metadata or None,
         )
         if not wait_for_response:
             return JSONResponse({"ok": True, "status": "queued"}, status_code=202)

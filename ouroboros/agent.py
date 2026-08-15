@@ -1014,6 +1014,15 @@ class OuroborosAgent:
                 ctx.task_model_override = model_override
             if "use_local_model" in task_metadata:
                 ctx.task_use_local_override = bool(task_metadata.get("use_local_model"))
+        # Direct Telegram turns may opt into a per-message route selected by
+        # the owner in the bot's inline model picker. Host Service validates and
+        # mints this marker; keep it separate from the subagent override path so
+        # arbitrary client metadata cannot steer root tasks.
+        if str(task_metadata.get("chat_model_source") or "") == "telegram_owner":
+            chat_model = str(task_metadata.get("chat_model_override") or "").strip()
+            if chat_model:
+                ctx.task_model_override = chat_model
+                ctx.task_use_local_override = bool(task_metadata.get("chat_use_local_model"))
         # NOTE: the ephemeral decision turn is INTENTIONALLY kept on the SAME route as the
         # main chat (no light-lane override): a busy-chat ephemeral turn can produce the
         # owner-facing answer inline (WS10), so silently lowering its model would be a P1

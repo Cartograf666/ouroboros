@@ -263,6 +263,7 @@ export function initChatModelControl({ root, showToast = () => {} } = {}) {
     let disposed = false;
     let settings = {};
     let choices = [];
+    let loadInFlight = null;
 
     function activeValue() {
         const local = ['1', 'true', 'yes', 'on'].includes(String(settings.USE_LOCAL_MAIN || '').toLowerCase());
@@ -294,43 +295,63 @@ export function initChatModelControl({ root, showToast = () => {} } = {}) {
 
     async function load() {
         if (disposed) return;
-        refresh.disabled = true;
-        status.dataset.state = 'loading';
-        status.textContent = 'Checking…';
-        try {
-            const [settingsResp, catalogResp, localResp, eventsResp] = await Promise.all([
-                timedFetch('/api/settings', { cache: 'no-store' }),
-                timedFetch('/api/model-catalog', { cache: 'no-store' }),
-                timedFetch('/api/local-model/status', { cache: 'no-store' }),
-                timedFetch('/api/logs/events?limit=2000', { cache: 'no-store' }),
-            ]);
-            settings = await responseJson(settingsResp);
-            const catalog = await responseJson(catalogResp, { items: [] });
-            const local = await responseJson(localResp);
-            const eventRows = await responseJson(eventsResp, { entries: [] });
-            choices = buildModelChoices({
-                settings,
-                catalogItems: catalog.items || [],
-                localStatus: local,
-                events: eventRows.entries || [],
-            });
-            render();
-            // Subscription discovery is informative and must never block the
-            // main-model control. Claudexor can be stale or offline while the
-            // local/Gemini choices remain perfectly usable.
-            if (harness) void timedPromise(claudexorStatus.refresh(), QUOTA_READ_TIMEOUT_MS)
-                .then(() => {
-                    if (disposed) return;
-                    const payload = claudexorStatus.snapshot || {};
-                    const lines = harnessQuotaLines(payload, claudexorStatus.facet(FACET_QUOTA));
-                    harness.textContent = lines.join('\n');
+        if (loadInFlight) return loadInFlight;
+        loadInFlight = (async () => {
+            refresh.disabled = true;
+            status.dataset.state = 'loading';
+            status.textContent = 'Checking…';
+            try {
+                // A reconnect can race the server's restart window. Retry the
+                // read-only discovery calls briefly so the selector does not
+                // stay empty just because the first request met a dead socket.
+                let responses = [];
+                for (let attempt = 0; attempt < 3; attempt += 1) {
+                    responses = await Promise.all([
+                        timedFetch('/api/settings', { cache: 'no-store' }),
+                        timedFetch('/api/model-catalog', { cache: 'no-store' }),
+                        timedFetch('/api/local-model/status', { cache: 'no-store' }),
+                        timedFetch('/api/logs/events?limit=2000', { cache: 'no-store' }),
+                    ]);
+                    if (responses.some(Boolean) || attempt === 2) break;
+                    await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
+                }
+                const [settingsResp, catalogResp, localResp, eventsResp] = responses;
+                if (!responses.some(Boolean)) {
+                    throw new Error('Ouroboros is restarting; press Refresh in a moment.');
+                }
+                settings = await responseJson(settingsResp);
+                const catalog = await responseJson(catalogResp, { items: [] });
+                const local = await responseJson(localResp);
+                const eventRows = await responseJson(eventsResp, { entries: [] });
+                choices = buildModelChoices({
+                    settings,
+                    catalogItems: catalog.items || [],
+                    localStatus: local,
+                    events: eventRows.entries || [],
                 });
-        } catch (error) {
-            status.dataset.state = 'unavailable';
-            status.textContent = 'Status unavailable';
-            detail.textContent = String(error?.message || error);
+                render();
+                // Subscription discovery is informative and must never block the
+                // main-model control. Claudexor can be stale or offline while the
+                // local/Gemini choices remain perfectly usable.
+                if (harness) void timedPromise(claudexorStatus.refresh(), QUOTA_READ_TIMEOUT_MS)
+                    .then(() => {
+                        if (disposed) return;
+                        const payload = claudexorStatus.snapshot || {};
+                        const lines = harnessQuotaLines(payload, claudexorStatus.facet(FACET_QUOTA));
+                        harness.textContent = lines.join('\n');
+                    });
+            } catch (error) {
+                status.dataset.state = 'unavailable';
+                status.textContent = 'Status unavailable';
+                detail.textContent = String(error?.message || error);
+            } finally {
+                refresh.disabled = false;
+            }
+        })();
+        try {
+            await loadInFlight;
         } finally {
-            refresh.disabled = false;
+            loadInFlight = null;
         }
     }
 
@@ -367,9 +388,13 @@ export function initChatModelControl({ root, showToast = () => {} } = {}) {
     select.addEventListener('change', onSelect);
     refresh.addEventListener('click', onRefresh);
     load();
-    return () => {
+    const dispose = () => {
         disposed = true;
         select.removeEventListener('change', onSelect);
         refresh.removeEventListener('click', onRefresh);
     };
+    // The chat controller calls this after a websocket reconnect. Keeping the
+    // same single-flight loader also makes manual Refresh safe during reloads.
+    dispose.refresh = () => load();
+    return dispose;
 }
