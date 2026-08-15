@@ -12,7 +12,7 @@
 [![Linux](https://img.shields.io/badge/Linux-x86__64-orange.svg)](https://ouroboros-agent.ai/install/#linux)
 [![Windows](https://img.shields.io/badge/Windows-x64-blue.svg)][download-windows-x64]
 [![OuroborosHub](https://img.shields.io/badge/OuroborosHub-skills%20marketplace-8A2BE2.svg)](https://github.com/razzant/OuroborosHub)
-[![Version 6.101.1](https://img.shields.io/badge/version-6.101.1-green.svg)](VERSION)
+[![Version 6.101.2](https://img.shields.io/badge/version-6.101.2-green.svg)](VERSION)
 
 Ouroboros is an open-source, general-purpose AI agent whose identity, durable memory, and history continue across tasks and restarts. It works on external projects, coordinates a live swarm of specialist agents, and can rewrite the implementation it runs on, including its code, architecture, prompts, tools, and dependencies. Reflection can also change how it understands itself without severing that continuity.
 
@@ -64,13 +64,13 @@ The desktop packages already contain an optional CLI installer. On macOS, after 
 
 </details>
 
-[download-macos-arm64]: https://github.com/razzant/ouroboros/releases/download/v6.101.1/Ouroboros-6.101.1.dmg
-[download-windows-x64]: https://github.com/razzant/ouroboros/releases/download/v6.101.1/Ouroboros-6.101.1-windows-x64.zip
-[download-linux-deb-amd64]: https://github.com/razzant/ouroboros/releases/download/v6.101.1/ouroboros_6.101.1_amd64.deb
-[download-linux-rpm-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.101.1/ouroboros-6.101.1-1.x86_64.rpm
-[download-linux-rpm-red80-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.101.1/ouroboros-6.101.1-1.red80.x86_64.rpm
-[download-linux-appimage-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.101.1/Ouroboros-6.101.1-linux-x86_64.AppImage
-[download-linux-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.101.1/Ouroboros-6.101.1-linux-x86_64.tar.gz
+[download-macos-arm64]: https://github.com/razzant/ouroboros/releases/download/v6.101.2/Ouroboros-6.101.2.dmg
+[download-windows-x64]: https://github.com/razzant/ouroboros/releases/download/v6.101.2/Ouroboros-6.101.2-windows-x64.zip
+[download-linux-deb-amd64]: https://github.com/razzant/ouroboros/releases/download/v6.101.2/ouroboros_6.101.2_amd64.deb
+[download-linux-rpm-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.101.2/ouroboros-6.101.2-1.x86_64.rpm
+[download-linux-rpm-red80-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.101.2/ouroboros-6.101.2-1.red80.x86_64.rpm
+[download-linux-appimage-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.101.2/Ouroboros-6.101.2-linux-x86_64.AppImage
+[download-linux-x86_64]: https://github.com/razzant/ouroboros/releases/download/v6.101.2/Ouroboros-6.101.2-linux-x86_64.tar.gz
 
 Ouroboros bundles [Claudexor](https://github.com/razzant/claudexor) as its local execution layer for delegated coding and hosted-agent review. Ouroboros owns the task, memory, review, and final integration, while Claudexor runs the selected connected coding harness and returns durable execution evidence. [Explore Claudexor](https://claudexor.ai/).
 
@@ -449,6 +449,7 @@ and the reason.
 
 | Version | Date | Description |
 |---------|------|-------------|
+| 6.101.2 | 2026-08-15 | **fix: initialize the main-chat model selector so configured and discovered models render instead of remaining on “Checking…”.** |
 | 6.101.1 | 2026-08-13 | **fix: Windows CI compatibility.** Packaging and delegated-run test coverage now avoids platform-specific assumptions while preserving their intended behavior. |
 | 6.101.0 | 2026-08-13 | **refactor: exact-path repository size ratchets.** Module and function exceptions now live in one checked-in manifest keyed by repository-relative path and qualified symbol, with deterministic regeneration and shrink-only validation. The same policy feeds smoke tests, hermetic preflight, health reporting, protected-path resolution, update policy, and CI while preserving the existing ceiling, runtime behavior, and public contracts. |
 | 6.100.0 | 2026-08-12 | **feat: delegated runs execute in private snapshots — capture, disposition, and GC carry one honest truth (sprint phase C).** A mutating delegated run never edits the shared tree again: at `delegate_start` the host snapshots the authority target's REAL current state (tracked + staged + eligible untracked, with the sensitive/credential veto decided BEFORE anything is hashed — a blanket `git add -A` would write `.env` blobs into the object database the execution worktree shares) into a baseline commit pinned by a `refs/ouroboros/delegated/` ref, checks out a detached private worktree, and scopes the run there; the typed binding `{execution_root, baseline_sha, target_root, authority_source}` rides the durable custody rows BEFORE the POST, an explicit retry reproduces it exactly (pre-snapshot mutating rows and GC-collected baselines are typed refusals, never re-mints), and pending-invocation orphan recovery carries the FULL binding into the recovered run's row so the startup GC — whose predicate is settled && patch_disposed — never deletes the snapshot holding the child's only work. Terminal reconciliation (orphan sweep, kill path, in-process release) captures the settled run's diff through the ONE drive-rooted capture core, eagerly ONLY where a terminal receipt proves the run over — an absent (daemon-404) or unreadable close captures nothing, because across the owned-daemon boundary the child may still be writing — and capture-at-disposition is the retry point: `integrate_delegated_patch` captures on demand BEFORE applying or rejecting, a capture that fails there is the typed `INTEGRATE_DELEGATED_CAPTURE_FAILED` refusal for BOTH decisions, and `patch_captured` MEANS "a usable artifact exists" (a manifest reporting its own failure never mints the row, pre-existing rows over failed manifests are re-captured on replay, and reject re-checks the manifest before releasing the snapshot). Nothing reaches the shared tree without the explicit owner apply/reject flow: baseline drift is proven per touched path under the git lock before the apply, touched paths are read NUL-safely from `git apply --numstat -z` in both directions, cleanup follows the DURABLE disposition row (`INTEGRATE_DISPOSITION_UNWRITTEN` / `INTEGRATE_APPLIED_UNSTAGED` are typed, never a silent double-apply), the protected-path gate applies only when the target IS the Ouroboros body, and the pending obligation stays visible on the health surface (`undisposed_patches` → "DELEGATED PATCH AWAITS DISPOSITION") until disposed. Beside it: SSOT cost projection (`accounted_upper_bound_usd` under its honest name beside deprecated `cost_usd`; $0-fabrication fixes; the web UI presents upper-bound cost honestly), `delegated_runs_failed` on the execution-evidence receipt, notification chat routing (LifecycleJob.chat_id, task-bound reviews, reaper incident chat), byte-accurate argv/env budgeting with `--prompt-file` transport, and hash-bound skill repair (immutable admission hash, per-write CAS, typed stale terminalization). |

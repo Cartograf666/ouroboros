@@ -562,7 +562,11 @@ export function createChatInstance({
     const fileInput = byId('file-input');
     const attachmentPreview = byId('attachment-preview');
     const scrollBottomBtn = byId('scroll-bottom');
-    const modelControl = byId('chat-model-control');
+    // The model control already carries the full `chat-model-control` ID in
+    // the main chat template. Passing that full ID through `byId()` would
+    // produce `chat-chat-model-control`, so the initializer would never run
+    // and the static "Checking…" placeholder would remain forever.
+    const modelControl = page.querySelector('.chat-model-control');
     let pendingAttachments = [];
     let attachmentsUploading = false;
     let nestedSubagentsExpanded = false;
