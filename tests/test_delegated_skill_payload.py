@@ -745,48 +745,80 @@ def test_reconcile_queue_failure_degrades_the_receipt_honestly(tmp_path, monkeyp
 
 
 def test_parallel_starts_on_same_payload_yield_exactly_one_winner(tmp_path, monkeypatch):
-    """Gate fix 5 (reviewer repro): two synchronized parallel starts — one
-    started, the other typed payload_delegation_busy via the atomic claim."""
+    """Gate fix 5 + Sol delta 5a: deterministic REQUESTED→STARTED window, x50.
+
+    Both starts pass the cheap early check and provision; the winner then claims
+    (durable START_REQUESTED) and is HELD inside the gateway POST — after its
+    request row, before its STARTED row. The loser runs its locked busy predicate
+    strictly inside that window: the old two-pass read could miss a holder whose
+    transition landed between the passes; the single-pass snapshot cannot. Fifty
+    fresh-drive iterations prove the interleaving is stable, not schedule-lucky."""
     import threading
 
     import ouroboros.tools.delegate as delegate
     import ouroboros.tools.delegate_integration as integration
     from ouroboros.gateways import claudexor as gw
 
-    ctx = _payload_ctx(tmp_path, monkeypatch)
-    _seed_skill(tmp_path / "data")
-    seen: dict = {}
-    monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _StartStub(seen))
-    delegate._CUSTODY.clear()
-    barrier = threading.Barrier(2, timeout=30)
     real_provision = integration._provision_payload_snapshot
+    real_replay = custody.replay
+    for iteration in range(50):
+        base = tmp_path / f"iter{iteration}"
+        base.mkdir()
+        ctx = _payload_ctx(base, monkeypatch)
+        _seed_skill(base / "data")
+        delegate._CUSTODY.clear()
+        barrier = threading.Barrier(2, timeout=30)
+        in_window = threading.Event()   # winner: REQUESTED durable, STARTED not
+        release = threading.Event()     # loser observed busy; let winner finish
 
-    def _synced(*args, **kwargs):
-        # Both threads pass the cheap early busy check and provision BEFORE
-        # either reaches the claim — the exact reproduced interleaving.
-        result = real_provision(*args, **kwargs)
-        barrier.wait()
-        return result
+        def _synced(*args, **kwargs):
+            result = real_provision(*args, **kwargs)
+            barrier.wait()
+            if threading.current_thread().name != "winner":
+                assert in_window.wait(30), "winner never reached its window"
+            return result
 
-    monkeypatch.setattr(integration, "_provision_payload_snapshot", _synced)
-    monkeypatch.setattr(delegate, "_provision_payload_snapshot", _synced)
-    results: list = []
+        class _WindowStub(_StartStub):
+            def start_run(self, request, *, idempotency_key=""):
+                in_window.set()
+                assert release.wait(30), "the loser never settled"
+                return super().start_run(request, idempotency_key=idempotency_key)
 
-    def _one(idx):
-        out = json.loads(delegate._delegate_start(
-            ctx, f"start {idx}", root="skill_payload", bucket="external",
+        def _replay_hook(drive_root, rows=None):
+            state = real_replay(drive_root, rows=rows)
+            if (threading.current_thread().name != "winner"
+                    and in_window.is_set() and not release.is_set()):
+                # Mutant-killer: the winner's STARTED row lands durably AFTER
+                # this pass returned and BEFORE the pending projection runs —
+                # the exact hole a two-pass (re-reading) predicate had. Only a
+                # single shared row snapshot still reports busy here.
+                release.set()
+                thread.join(timeout=30)
+            return state
+
+        seen: dict = {}
+        monkeypatch.setattr(custody, "replay", _replay_hook)
+        monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _WindowStub(seen))
+        monkeypatch.setattr(integration, "_provision_payload_snapshot", _synced)
+        monkeypatch.setattr(delegate, "_provision_payload_snapshot", _synced)
+        winner_out: list = []
+
+        def _winner():
+            winner_out.append(json.loads(delegate._delegate_start(
+                ctx, "start winner", root="skill_payload", bucket="external",
+                skill_name="alpha")))
+
+        thread = threading.Thread(target=_winner, name="winner")
+        thread.start()
+        loser = json.loads(delegate._delegate_start(
+            ctx, "start loser", root="skill_payload", bucket="external",
             skill_name="alpha"))
-        results.append(out)
-
-    threads = [threading.Thread(target=_one, args=(i,)) for i in range(2)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=60)
-    statuses = sorted(r["status"] for r in results)
-    assert statuses == ["refused", "started"], results
-    refused = next(r for r in results if r["status"] == "refused")
-    assert refused["reason"] == "payload_delegation_busy", refused
+        release.set()
+        thread.join(timeout=60)
+        assert not thread.is_alive(), f"iteration {iteration}: winner hung"
+        assert loser["status"] == "refused", (iteration, loser)
+        assert loser["reason"] == "payload_delegation_busy", (iteration, loser)
+        assert winner_out and winner_out[0]["status"] == "started", (iteration, winner_out)
     custody._CUSTODY.clear()
 
 

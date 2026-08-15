@@ -599,14 +599,22 @@ def _payload_delegation_busy(drive: pathlib.Path, target: pathlib.Path) -> str:
     against one payload would race the same CAS baseline, so the second is
     refused while the first has undisposed custody (unsettled run, undisposed
     patch, or a pending invocation naming the same target).
+
+    Single-pass (Sol delta, fix 5a): both projections replay ONE pre-read row
+    snapshot. Two separate log reads let the holder's REQUESTED→STARTED
+    transition land between them — invisible to the first pass as a run and to
+    the second as a pending invocation — so a second start slipped through the
+    claim lock. Against one snapshot the holder is in exactly one of the two
+    states and cannot be missed.
     """
     resolved = _resolved(target)
-    for run in custody.replay(drive).values():
+    rows = list(custody._iter_rows(custody.event_log_path(drive)))
+    for run in custody.replay(drive, rows=rows).values():
         if (run.authority_source == "skill_payload"
                 and _resolved(run.target_root) == resolved
                 and not (run.settled and run.patch_disposed)):
             return run.run_id or run.invocation_id
-    for record in custody.pending_invocations(drive):
+    for record in custody.pending_invocations(drive, rows=rows):
         if (str(record.get("authority_source") or "") == "skill_payload"
                 and _resolved(record.get("target_root")) == resolved):
             return str(record.get("invocation_id") or "")

@@ -197,9 +197,8 @@ def event_log_path(drive_root: Any) -> pathlib.Path:
 def custody_root(ctx: Any) -> pathlib.Path:
     """The drive whose event log is the custody authority for this context.
 
-    A live subagent runs on an isolated child drive that headless pruning deletes, so a
-    custody row written there cannot outlive the run it is meant to govern. The
-    canonical (budget) root is the existing SSOT for "durable, survives the child".
+    A live subagent's isolated child drive is pruned, so a custody row written
+    there cannot outlive the run; the canonical (budget) root is the durable SSOT.
     """
     from ouroboros.tool_access import canonical_data_root
 
@@ -209,11 +208,10 @@ def custody_root(ctx: Any) -> pathlib.Path:
 def emit(drive_root: Any, kind: str, payload: Dict[str, Any]) -> bool:
     """Append one custody row and REPORT whether it landed. Never raises.
 
-    ``append_jsonl`` already owns the success predicate for exactly this class of write —
-    its own contract says important events need that signal "so the caller can fall back
-    instead of pretending the write succeeded". Discarding it here is how a run could be
-    reported as started, waited on and settled while the rows that ARE its custody never
-    reached the disk. This module's authority is the row, so the row's fate is the answer.
+    ``append_jsonl`` already owns the success predicate for this class of write.
+    Discarding it is how a run could be reported as started, waited on and settled
+    while the rows that ARE its custody never reached disk; the row's fate is the
+    answer.
     """
     try:
         written = bool(append_jsonl(event_log_path(drive_root), {"ts": utc_now_iso(), "type": kind, **payload}))
@@ -408,10 +406,14 @@ def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
         custody.settled = True
 
 
-def replay(drive_root: Any) -> Dict[str, RunCustody]:
-    """Rebuild every known run's custody from the durable rows (one pass)."""
+def replay(drive_root: Any,
+           rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, RunCustody]:
+    """Rebuild every known run's custody from the durable rows (one pass).
+
+    ``rows`` replays a pre-read snapshot so several projections can share ONE
+    consistent traversal (the atomic payload busy claim, gate fix 5a)."""
     state: Dict[str, RunCustody] = {}
-    for row in _iter_rows(event_log_path(drive_root)):
+    for row in rows if rows is not None else _iter_rows(event_log_path(drive_root)):
         _apply(state, row)
     return state
 
@@ -1211,17 +1213,19 @@ def open_runs(drive_root: Any) -> List[RunCustody]:
     return [custody for custody in replay(drive_root).values() if not custody.settled]
 
 
-def pending_invocations(drive_root: Any) -> List[Dict[str, Any]]:
+def pending_invocations(drive_root: Any,
+                        rows: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     """Invocations with a durable request row, no bound run, no definite refusal.
 
     The launched-never-collected class one step EARLIER than ``open_runs``: a
     worker death between the accepted POST and ``record_started`` leaves only the
     ``START_REQUESTED`` row. Facts come from the FIRST request row (the minting,
     same rule as ``invocation_record``); a record whose canonical body never
-    landed is excluded (nothing byte-identical can be replayed)."""
+    landed is excluded (nothing byte-identical can be replayed). ``rows`` shares
+    one pre-read snapshot with ``replay`` (atomic payload busy claim)."""
     found: Dict[str, Dict[str, Any]] = {}
     state: Dict[str, str] = {}
-    for row in _iter_rows(event_log_path(drive_root)):
+    for row in rows if rows is not None else _iter_rows(event_log_path(drive_root)):
         invocation_id = str(row.get("invocation_id") or "")
         if not invocation_id:
             continue
@@ -1238,11 +1242,8 @@ def pending_invocations(drive_root: Any) -> List[Dict[str, Any]]:
                 "root_task_id": str(row.get("root_task_id") or ""),
                 "parent_task_id": str(row.get("parent_task_id") or ""),
                 # The FULL C1 isolation binding, not just the GC key: recovery
-                # re-records it on the bound run's STARTED row, so the snapshot
-                # stays custody-visible after the invocation stops being pending.
-                # snapshot_id alone was carried before, and a recovered run then
-                # replayed bindingless — the startup GC read its snapshot as
-                # closed and deleted the child's uncaptured work with it.
+                # re-records it on the bound run's STARTED row (snapshot_id alone
+                # left recovered runs bindingless and their snapshots GC-deleted).
                 "snapshot_id": str(row.get("snapshot_id") or ""),
                 "execution_root": str(row.get("execution_root") or ""),
                 "baseline_sha": str(row.get("baseline_sha") or ""),
@@ -1280,11 +1281,10 @@ def reconcile_task_runs(drive_root: Any, task_id: str, *,
     """Settle or cancel ONE task's open runs from the DURABLE rows (kill path).
 
     The supervisor-side twin of ``release_task_runs`` for a task whose worker was
-    just KILLED (cancellation custody / reap): the graceful loop-exit release runs
-    inside the worker and therefore never ran, and its in-process memo died with
-    the process, so the durable custody rows are the only complete view. Covers
-    pending invocations the same way the orphan sweep does. Cheap when the task
-    delegated nothing: the replay finds no open run and no transport is touched.
+    just KILLED (cancellation custody / reap): the graceful release never ran and
+    its memo died with the process, so the durable rows are the only complete
+    view. Covers pending invocations like the orphan sweep; cheap when the task
+    delegated nothing.
     """
     mine = str(task_id or "")
     if not mine:
