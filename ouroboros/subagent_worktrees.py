@@ -548,26 +548,74 @@ def isolated_git_env() -> Dict[str, str]:
     payload paths reset to a known-good baseline before trusting.
     """
     env = dict(os.environ)
+    # Repository-location vars inherited from the HOST process would silently
+    # redirect every command here at another repo/index (observed with a leaked
+    # GIT_DIR: `git init` "reinitialized" a foreign directory).
+    for var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+                "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_COMMON_DIR"):
+        env.pop(var, None)
     env["GIT_CONFIG_NOSYSTEM"] = "1"
     env["GIT_CONFIG_GLOBAL"] = os.devnull
     env["GIT_TERMINAL_PROMPT"] = "0"
     return env
 
 
-# The parent-authored known-good config for a standalone payload snapshot.
-# The child holds a shell inside the snapshot and may have edited .git/config
-# during its run (a snapshot-local `diff.<driver>.command` executed in the
-# PARENT process at capture — reproduced); capture overwrites the file with
-# these bytes before any parent-side git command trusts the repository.
-SNAPSHOT_GIT_CONFIG = (
-    "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n"
-    "\tlogallrefupdates = true\n"
-)
+def payload_git_metadata_refusal(exec_root: Path) -> str:
+    """lstat-trust check on a child-writable snapshot's Git metadata, or "".
+
+    The child held a shell inside the snapshot: a ``.git`` (or ``.git/config``,
+    ``.git/objects``) replaced by a symlink would make the parent's capture
+    read — or a naive fix WRITE — through a child-chosen path outside the
+    snapshot. Checked with lstat semantics BEFORE any parent git operation;
+    a refusal is a typed capture failure and touches nothing.
+    """
+    git_dir = Path(exec_root) / ".git"
+    if git_dir.is_symlink() or not git_dir.is_dir():
+        return ".git is not a real directory (symlinked or replaced by the run)"
+    config = git_dir / "config"
+    if os.path.lexists(config) and (config.is_symlink() or not config.is_file()):
+        return ".git/config is not a regular file (symlinked or replaced by the run)"
+    objects = git_dir / "objects"
+    if objects.is_symlink() or not objects.is_dir():
+        return ".git/objects is not a real directory (symlinked or replaced by the run)"
+    return ""
 
 
-def reset_snapshot_git_config(exec_root: Path) -> None:
-    """Overwrite a standalone snapshot's .git/config with the parent baseline."""
-    (Path(exec_root) / ".git" / "config").write_text(SNAPSHOT_GIT_CONFIG, encoding="utf-8")
+@contextlib.contextmanager
+def payload_capture_git_env(exec_root: Path):
+    """A PARENT-OWNED throwaway Git control dir over the child-writable snapshot.
+
+    Yields a git env whose GIT_DIR, config, hooks template and GIT_INDEX_FILE
+    all live in a host-managed temp directory (mkdtemp, 0700; the index file is
+    pre-created 0600) — never inside the snapshot the child could write. The
+    child's object database is attached READ-ONLY via the alternates mechanism
+    (objects are content-addressed, so the recorded baseline commit/tree can be
+    read but not silently substituted), while new blobs staged by the capture
+    land in the parent-owned control ODB. Child ``.git/index`` and
+    ``.git/config`` are never read and never written: an index-only blob forged
+    by the child simply does not exist for this environment, and no
+    child-controlled diff driver / filter / hook can execute in the parent.
+    """
+    import tempfile
+
+    resolved = Path(exec_root).resolve()
+    control = Path(tempfile.mkdtemp(prefix="obo-payload-capture-"))
+    try:
+        env = isolated_git_env()
+        subprocess.run(["git", "init", "--template="], cwd=str(control),
+                       capture_output=True, check=True, env=env)
+        alternates = control / ".git" / "objects" / "info" / "alternates"
+        alternates.parent.mkdir(parents=True, exist_ok=True)
+        alternates.write_text(str(resolved / ".git" / "objects") + "\n", encoding="utf-8")
+        index = control / "index"
+        os.close(os.open(index, os.O_CREAT | os.O_WRONLY, 0o600))
+        env["GIT_DIR"] = str(control / ".git")
+        env["GIT_WORK_TREE"] = str(resolved)
+        env["GIT_INDEX_FILE"] = str(index)
+        yield env
+    finally:
+        shutil.rmtree(control, ignore_errors=True)
 
 
 def _reproduce_confined_link(target_root: Path, src_link: Path, dest_link: Path) -> bool:

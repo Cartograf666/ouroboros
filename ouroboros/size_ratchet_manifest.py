@@ -168,6 +168,7 @@ BAND_PATHS = {
     "tests/test_claude_code_gateway.py": None,
     "tests/test_commit_gate.py": None,
     "tests/test_contracts.py": None,
+    "tests/test_delegated_skill_payload.py": "Sol scope-review fix batch: P1 trust probes (forged index, symlinked git metadata), P2 golden-E2E review close and schema/docs pins joined the existing R1+gate-fix payload suite.",
     "tests/test_evolution_redesign.py": None,
     "tests/test_observability_outcomes_v2.py": None,
     "tests/test_onboarding_complete_endpoint.py": None,

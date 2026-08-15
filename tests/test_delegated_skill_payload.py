@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 
 import pytest
@@ -433,7 +434,9 @@ def test_apply_from_a_foreign_cwd_writes_the_live_payload(tmp_path, monkeypatch)
     # Lifecycle state stays byte-identical; the stale review is a HASH fact.
     assert (state_dir / "grants.json").read_bytes() == grants_before
     assert "STALE" in out and "skill_review" in out
-    # The extension-reconcile marker was queued for the mutated skill.
+    # The extension-reconcile marker was queued for the mutated skill; the
+    # receipt says QUEUED and never claims the reconcile completed (Sol P2-2).
+    assert "QUEUED" in out and "reconciled off" not in out, out
     from ouroboros.extension_reconcile_queue import list_extension_reconcile_requests
 
     requests = list_extension_reconcile_requests(tmp_path / "data")
@@ -530,6 +533,14 @@ def test_registry_golden_e2e_start_wait_apply_review_stale(tmp_path, monkeypatch
     ctx = _payload_ctx(tmp_path, monkeypatch)
     data = tmp_path / "data"
     skill = _seed_skill(data)
+    # A VALID script manifest so the closing preflight+review leg (Sol P2-1)
+    # exercises the real deterministic preflight, not a manifest-parse failure.
+    (skill / "SKILL.md").write_text(
+        "---\nname: alpha\ndescription: Test skill.\nversion: 0.1.0\n"
+        "type: script\nruntime: python3\nscripts:\n  - name: run.py\n"
+        "    description: Run.\n---\n", encoding="utf-8")
+    (skill / "scripts").mkdir()
+    (skill / "scripts" / "run.py").write_text("print('ok')\n", encoding="utf-8")
     sibling = _seed_skill(data, name="beta")
     sibling_bytes = (sibling / "SKILL.md").read_bytes()
     # A PASS review bound to the CURRENT payload content.
@@ -577,6 +588,37 @@ def test_registry_golden_e2e_start_wait_apply_review_stale(tmp_path, monkeypatch
     # The old PASS review is now STALE for the new content — reachable, not faked.
     refreshed = load_skill(skill, data)
     assert refreshed.review.is_stale_for(refreshed.content_hash)
+
+    # Sol P2-1: CLOSE the loop with the REAL skill preflight + review path over
+    # the APPLIED content — reviewer LLM faked deterministically, no live model.
+    from tests.test_skill_review_persist_guard import _pass_actor
+
+    monkeypatch.setattr(
+        "ouroboros.skill_review._run_skill_advisory_pre_review",
+        lambda *_a, **_kw: {"status": "empty"})
+    monkeypatch.setattr(
+        "ouroboros.tools.review._handle_multi_model_review",
+        lambda *_a, **_kw: json.dumps(
+            {"results": [_pass_actor("fake/a"), _pass_actor("fake/b")]}))
+    preflight = json.loads(registry.execute("skill_preflight", {"skill": "alpha"}))
+    assert preflight.get("ok") is True, preflight
+    review_out = registry.execute("skill_review", {"skill": "alpha"})
+    from ouroboros.skill_loader import load_review_state
+
+    persisted = load_review_state(data, "alpha")
+    assert persisted.status == "clean", (persisted.status, review_out[:800])
+    # The fresh verdict is bound to the APPLIED content hash, so the loop ends
+    # with an executable review for exactly the delegated result.
+    assert persisted.content_hash == refreshed.content_hash
+    closed = load_skill(skill, data)
+    assert not closed.review.is_stale_for(closed.content_hash)
+    # Nothing about the delegated run fabricates grants or authorship: no grant
+    # state appears and the persisted verdict carries no run attribution.
+    assert not (state_dir / "grants.json").exists()
+    review_doc = json.loads((state_dir / "review.json").read_text(encoding="utf-8"))
+    assert not review_doc.get("auto_granted_keys")
+    assert "run-p1" not in json.dumps(review_doc)
+    assert (state_dir / "enabled.json").read_bytes() == enabled_before
     custody._CUSTODY.clear()
 
 
@@ -718,6 +760,8 @@ def test_idempotent_already_applied_branch_runs_the_finalizer(tmp_path, monkeypa
     out = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
     assert "ALREADY carries" in out, out
     assert "STALE" in out and "skill_review" in out
+    # Sol P2-2: the receipt claims a QUEUED request, never a completed reconcile.
+    assert "QUEUED" in out and "reconciled off" not in out, out
     requests = list_extension_reconcile_requests(tmp_path / "data")
     assert any(r["skill"] == "alpha" for r in requests), requests
     custody._CUSTODY.clear()
@@ -932,3 +976,124 @@ def test_unknown_root_via_registry_is_typed_unsupported_root(tmp_path, monkeypat
     parsed = json.loads(out)
     assert parsed["status"] == "refused", parsed
     assert parsed["reason"] == "unsupported_root", parsed
+
+
+# -- Sol scope-review fix batch (P1 trust defects, P2 contract gaps) ----------------
+
+
+def _capture_manifest(capture) -> dict:
+    return json.loads(pathlib.Path(capture["manifest_artifact"]).read_text(encoding="utf-8"))
+
+
+def test_child_forged_index_only_blob_is_invisible_to_capture(tmp_path, monkeypatch):
+    """Sol P1-1 (reviewer repro): a non-UTF-8 blob the child staged ONLY into the
+    snapshot's own .git/index (absent from the worktree) must not exist for the
+    capture — the parent diffs a FRESH parent-owned index seeded from the
+    RECORDED baseline commit and never reads child .git/index — while a
+    legitimate worktree edit still captures and applies."""
+    from ouroboros.tools.delegate import _capture_terminal_patch
+    from ouroboros.tools.subagent_integration import _integrate_delegated_patch
+
+    ctx, skill, handle = _provisioned(tmp_path, monkeypatch)
+    exec_root = pathlib.Path(handle.path)
+    (exec_root / "notes.txt").write_text("DONE\n", encoding="utf-8")  # legitimate edit
+    env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1"}
+    blob = subprocess.run(
+        ["git", "hash-object", "-w", "--stdin"], cwd=str(exec_root),
+        input=b"\x00\xff\xfe forged opaque bytes", capture_output=True, env=env, check=True)
+    sha = blob.stdout.decode("ascii").strip()
+    subprocess.run(
+        ["git", "update-index", "--add", "--cacheinfo", f"100644,{sha},evil.bin"],
+        cwd=str(exec_root), capture_output=True, env=env, check=True)
+    entry = _payload_entry(handle, skill)
+    capture = _capture_terminal_patch(ctx, entry)
+    assert capture["status"] == "ready_with_changes", capture
+    manifest = _capture_manifest(capture)
+    assert manifest["tracked_changed"] == ["notes.txt"], manifest
+    patch_bytes = pathlib.Path(capture["patch_artifact"]).read_bytes()
+    assert b"evil.bin" not in patch_bytes and b"\xff\xfe" not in patch_bytes
+    out = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
+    assert "✅ Integrated" in out, out
+    assert (skill / "notes.txt").read_text(encoding="utf-8") == "DONE\n"
+    assert not (skill / "evil.bin").exists()
+    custody._CUSTODY.clear()
+
+
+def test_symlinked_git_config_is_typed_capture_failure_without_writethrough(
+        tmp_path, monkeypatch):
+    """Sol P1-2 (reviewer repro): .git/config -> sentinel must fail capture typed
+    and the sentinel must stay byte-identical (nothing writes through the link)."""
+    from ouroboros.tools.delegate import _capture_terminal_patch
+
+    ctx, skill, handle = _provisioned(tmp_path, monkeypatch)
+    exec_root = pathlib.Path(handle.path)
+    sentinel = tmp_path / "sentinel.cfg"
+    sentinel.write_bytes(b"[core]\n\tsentinel = untouched\n")
+    before = sentinel.read_bytes()
+    config = exec_root / ".git" / "config"
+    config.unlink()
+    os.symlink(str(sentinel), config)
+    (exec_root / "notes.txt").write_text("DONE\n", encoding="utf-8")
+    entry = _payload_entry(handle, skill)
+    capture = _capture_terminal_patch(ctx, entry)
+    assert capture["status"] == "failed", capture
+    note = _capture_manifest(capture)["note"]
+    assert "snapshot git metadata untrusted" in note and ".git/config" in note
+    assert sentinel.read_bytes() == before
+    assert (skill / "notes.txt").read_text(encoding="utf-8") == "PENDING\n"
+    custody._CUSTODY.clear()
+
+
+def test_symlinked_git_dir_is_typed_capture_failure(tmp_path, monkeypatch):
+    """Sol P1-2: the whole .git replaced by a symlink to an outside directory is
+    refused before any parent git operation."""
+    from ouroboros.tools.delegate import _capture_terminal_patch
+
+    ctx, skill, handle = _provisioned(tmp_path, monkeypatch)
+    exec_root = pathlib.Path(handle.path)
+    outside = tmp_path / "outside_git"
+    shutil.move(str(exec_root / ".git"), str(outside))
+    os.symlink(str(outside), exec_root / ".git")
+    entry = _payload_entry(handle, skill)
+    capture = _capture_terminal_patch(ctx, entry)
+    assert capture["status"] == "failed", capture
+    note = _capture_manifest(capture)["note"]
+    assert "snapshot git metadata untrusted" in note
+    assert ".git is not a real directory" in note
+    custody._CUSTODY.clear()
+
+
+def test_schema_and_docs_split_git_staging_from_payload_live_apply():
+    """Sol P2-3 pin: integrate_delegated_patch's schema and the deep-delegation
+    docs describe the Git lane as staged-into-active-root and the payload lane
+    as a live non-Git CAS apply — no universal 'staged' claim covers both."""
+    from ouroboros.tools.subagent_integration import get_tools
+
+    entry = next(t for t in get_tools() if t.name == "integrate_delegated_patch")
+    desc = entry.schema["description"]
+    assert "LIVE apply into the non-Git payload" in desc
+    assert "nothing is staged into your active root" in desc
+    decision = entry.schema["parameters"]["properties"]["decision"]["description"]
+    assert "STAGED into your active root" in decision
+    assert "applied LIVE into the non-Git payload" in decision
+    arch = (pathlib.Path(__file__).resolve().parents[1] / "docs" /
+            "ARCHITECTURE.md").read_text(encoding="utf-8")
+    assert "differs is the staging substrate" in arch
+    assert "A SKILL-PAYLOAD target captures through the payload adapter" in arch
+    assert "QUEUES the extension reconcile request" in arch
+
+
+def test_registry_and_custody_baseline_disagreement_fails_capture_typed(
+        tmp_path, monkeypatch):
+    """Sol P1-1: the baseline identity is the HOST registry's; a custody row that
+    disagrees (or a missing registry record) is a typed failure, not a diff
+    against whichever sha happens to be replayed."""
+    from ouroboros.tools.delegate import _capture_terminal_patch
+
+    ctx, skill, handle = _provisioned(tmp_path, monkeypatch)
+    entry = _payload_entry(handle, skill)
+    entry.baseline_sha = "0" * 40  # forged/corrupt custody row
+    capture = _capture_terminal_patch(ctx, entry)
+    assert capture["status"] == "failed", capture
+    assert "disagree on the baseline" in _capture_manifest(capture)["note"]
+    custody._CUSTODY.clear()

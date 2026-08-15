@@ -877,15 +877,44 @@ def _rebind_payload_reference(
     return fresh, binding, ""
 
 
+def _snapshot_head_textual(exec_root: pathlib.Path) -> str:
+    """The snapshot's HEAD commit read TEXTUALLY (no git, no child config).
+
+    Informational input to the head_moved disclosure only. Fails soft to ""
+    on anything unusual (symlinked HEAD/ref, packed refs, unreadable files) —
+    the capture itself never depends on the child-writable HEAD.
+    """
+    git_dir = exec_root / ".git"
+    head = git_dir / "HEAD"
+    try:
+        if head.is_symlink():
+            return ""
+        text = head.read_text(encoding="utf-8", errors="replace").strip()
+        if not text.startswith("ref: "):
+            return text
+        ref = _resolved(git_dir / text[5:].strip())
+        if ref is None or git_dir.resolve() not in ref.parents or ref.is_symlink():
+            return ""
+        return ref.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
 def _write_payload_patch_artifacts(
     exec_root: pathlib.Path, cap_dir: pathlib.Path, entry: _RunCustody,
 ) -> Dict[str, Any]:
     """The payload-specific terminal capture (R1 items 5/6), same artifact contract.
 
-    Stages exactly the UNION of baseline and final loader-visible paths in the
-    snapshot's private index and emits ``workspace.patch`` (``git diff --binary``
-    so git's binary heuristic cannot veto UTF-8-with-NUL content) plus the
-    ``workspace_patch.json`` manifest against the synthetic baseline. Junk the
+    The capture trusts NOTHING under the child-writable snapshot's ``.git``
+    (Sol P1): the baseline commit/tree identity comes from the host-owned
+    snapshot registry, all git runs against a parent-owned control GIT_DIR
+    with a fresh temp index seeded from that recorded commit
+    (``payload_capture_git_env``), and exactly the final loader-visible
+    inventory plus explicit baseline deletions is staged there — a child-forged
+    index-only blob is never read, and child ``.git/config`` is never read or
+    written. ``workspace.patch`` is ``git diff --binary`` (git's binary
+    heuristic cannot veto UTF-8-with-NUL content) plus the
+    ``workspace_patch.json`` manifest against the recorded baseline. Junk the
     loader excludes never enters the candidate. A candidate add/modify of a
     genuinely non-UTF-8 file is a typed capture FAILURE (the permanent text-only
     execution contract); deletions and untouched baseline files are unaffected.
@@ -902,15 +931,14 @@ def _write_payload_patch_artifacts(
         ARTIFACT_STATUS_READY_WITH_CHANGES,
     )
     from ouroboros.skill_loader import _iter_payload_files
-    from ouroboros.subagent_worktrees import isolated_git_env, reset_snapshot_git_config
+    from ouroboros.subagent_worktrees import (
+        find_execution_snapshot,
+        payload_capture_git_env,
+        payload_git_metadata_refusal,
+    )
     from ouroboros.utils import atomic_write_json, utc_now_iso
 
-    git_env = isolated_git_env()
     diff_isolation = ("--no-ext-diff", "--no-textconv", "--no-renames")
-
-    def _git(*args: str, input_bytes: bytes = b"") -> subprocess.CompletedProcess:
-        return subprocess.run(["git", *args], cwd=str(exec_root), env=git_env,
-                              capture_output=True, input=input_bytes or None)
 
     def _manifest(status: str, **extra: Any) -> Dict[str, Any]:
         payload = {
@@ -922,18 +950,33 @@ def _write_payload_patch_artifacts(
         atomic_write_json(cap_dir / "workspace_patch.json", payload, trailing_newline=True)
         return payload
 
-    # The child held a shell inside this snapshot: neutralize the snapshot-local
-    # .git/config (a child-written `diff.<driver>.command` executed in the PARENT
-    # process — reproduced by review) and run every parent-side git command with
-    # system and global config disabled. Diff commands additionally pin
-    # --no-ext-diff / --no-textconv / --no-renames so no config or attribute can
-    # substitute content, and renames-off keeps the candidate parser total.
-    try:
-        reset_snapshot_git_config(exec_root)
-    except OSError as exc:
+    # NOTHING under the child-writable snapshot's .git is trusted (Sol P1):
+    # metadata replaced by symlinks is refused before any git operation, the
+    # baseline identity comes from the HOST-owned snapshot registry, and every
+    # parent git command runs against a parent-owned control GIT_DIR + fresh
+    # temp index (child .git/index and .git/config are never read or written —
+    # a child-forged index-only blob does not exist for this environment).
+    # Diff commands additionally pin --no-ext-diff/--no-textconv/--no-renames.
+    untrusted = payload_git_metadata_refusal(exec_root)
+    if untrusted:
         return _manifest(ARTIFACT_STATUS_FAILED,
-                         note=f"snapshot git config could not be reset: {exc}")
-    baseline = str(entry.baseline_sha or "")
+                         note=f"snapshot git metadata untrusted: {untrusted}")
+    registered = find_execution_snapshot(entry.snapshot_id or "")
+    if not registered or not registered.get("standalone"):
+        return _manifest(ARTIFACT_STATUS_FAILED,
+                         note="host snapshot registry carries no standalone record for "
+                              "this snapshot; the baseline identity cannot be trusted")
+    baseline = str(registered.get("baseline_sha") or "")
+    recorded_tree = str(registered.get("baseline_tree") or "")
+    if not baseline or not recorded_tree:
+        return _manifest(ARTIFACT_STATUS_FAILED,
+                         note="host snapshot registry record carries no baseline "
+                              "commit/tree identity")
+    if entry.baseline_sha and entry.baseline_sha != baseline:
+        return _manifest(ARTIFACT_STATUS_FAILED,
+                         note="custody row and host snapshot registry disagree on the "
+                              "baseline commit; refusing to capture over an ambiguous "
+                              "baseline")
     resolved_root = exec_root.resolve()
     # Final loader-visible inventory; raises SkillPayloadUnreadable on
     # credential-shaped files (the existing refusal — caller discloses it typed).
@@ -941,83 +984,107 @@ def _write_payload_patch_artifacts(
         path.relative_to(resolved_root).as_posix()
         for path in _iter_payload_files(resolved_root)
     )
-    listed = _git("ls-tree", "-r", "--name-only", "-z", baseline)
-    if listed.returncode != 0:
-        detail = (listed.stderr or listed.stdout or b"").decode("utf-8", errors="replace")
-        return _manifest(ARTIFACT_STATUS_FAILED, note=f"baseline unreadable: {detail.strip()[:300]}")
-    baseline_rel = [
-        chunk.decode("utf-8", errors="surrogateescape")
-        for chunk in (listed.stdout or b"").split(b"\0") if chunk
-    ]
-    def _z(paths: list) -> bytes:
-        return b"\0".join(
-            p.encode("utf-8", errors="surrogateescape") for p in paths) + b"\0"
+    with payload_capture_git_env(exec_root) as git_env:
 
-    # Only the FINAL loader-visible inventory rides as content. A baseline path
-    # absent from the final inventory is staged as a DELETION even when something
-    # still sits on disk there (e.g. a file replaced by an escaping symlink,
-    # which the inventory drops) — --add --remove over such a path would stage
-    # the on-disk escape artifact itself into the candidate (reproduced).
-    dropped = sorted(set(baseline_rel) - set(final_rel))
-    staged = _git("update-index", "-z", "--add", "--remove", "--stdin",
-                  input_bytes=_z(sorted(final_rel)))
-    if staged.returncode == 0 and dropped:
-        staged = _git("update-index", "-z", "--force-remove", "--stdin",
-                      input_bytes=_z(dropped))
-    if staged.returncode != 0:
-        detail = (staged.stderr or staged.stdout or b"").decode("utf-8", errors="replace")
-        return _manifest(ARTIFACT_STATUS_FAILED, note=f"staging failed: {detail.strip()[:300]}")
-    named = _git("diff", *diff_isolation, "--cached", "--name-only", "-z", baseline)
-    if named.returncode != 0:
-        detail = (named.stderr or named.stdout or b"").decode("utf-8", errors="replace")
-        return _manifest(ARTIFACT_STATUS_FAILED, note=f"diff failed: {detail.strip()[:300]}")
-    changed = sorted(
-        chunk.decode("utf-8", errors="surrogateescape")
-        for chunk in (named.stdout or b"").split(b"\0") if chunk
-    )
-    result_hash = payload_content_hash(resolved_root)
-    head = _git("rev-parse", "HEAD")
-    current_head = (head.stdout or b"").decode("utf-8", errors="replace").strip()
-    if not changed:
-        return _manifest(ARTIFACT_STATUS_READY_NO_CHANGES, sha256="", diffstat="",
-                         tracked_changed=[], untracked_included=[],
-                         blocked_reserved_paths=[], result_content_hash=result_hash,
-                         current_head=current_head)
-    non_utf8 = []
-    for rel in changed:
-        if rel in dropped:
-            continue  # rides as a deletion; on-disk leftovers are not content
-        candidate = resolved_root / rel
-        if candidate.is_symlink() or not candidate.is_file():
-            continue
-        try:
-            candidate.read_bytes().decode("utf-8", "strict")
-        except (OSError, UnicodeDecodeError):
-            non_utf8.append(rel)
-    if non_utf8:
+        def _git(*args: str, input_bytes: bytes = b"") -> subprocess.CompletedProcess:
+            return subprocess.run(["git", *args], cwd=str(exec_root), env=git_env,
+                                  capture_output=True, input=input_bytes or None)
+
+        # The recorded commit must be PRESENT and carry the host-recorded tree
+        # identity — a child-substituted object cannot keep the content address.
+        shown = _git("rev-parse", f"{baseline}^{{tree}}")
+        seen_tree = (shown.stdout or b"").decode("utf-8", errors="replace").strip()
+        if shown.returncode != 0 or seen_tree != recorded_tree:
+            detail = (shown.stderr or shown.stdout or b"").decode("utf-8", errors="replace")
+            return _manifest(ARTIFACT_STATUS_FAILED,
+                             note="recorded baseline commit is absent or does not match "
+                                  f"the host-recorded tree identity ({detail.strip()[:200]})")
+        # Seed the FRESH parent-owned index from the immutable recorded baseline.
+        seeded = _git("read-tree", baseline)
+        if seeded.returncode != 0:
+            detail = (seeded.stderr or seeded.stdout or b"").decode("utf-8", errors="replace")
+            return _manifest(ARTIFACT_STATUS_FAILED,
+                             note=f"baseline unreadable: {detail.strip()[:300]}")
+        listed = _git("ls-tree", "-r", "--name-only", "-z", baseline)
+        if listed.returncode != 0:
+            detail = (listed.stderr or listed.stdout or b"").decode("utf-8", errors="replace")
+            return _manifest(ARTIFACT_STATUS_FAILED,
+                             note=f"baseline unreadable: {detail.strip()[:300]}")
+        baseline_rel = [
+            chunk.decode("utf-8", errors="surrogateescape")
+            for chunk in (listed.stdout or b"").split(b"\0") if chunk
+        ]
+
+        def _z(paths: list) -> bytes:
+            return b"\0".join(
+                p.encode("utf-8", errors="surrogateescape") for p in paths) + b"\0"
+
+        # Only the FINAL loader-visible inventory rides as content. A baseline path
+        # absent from the final inventory is staged as a DELETION even when something
+        # still sits on disk there (e.g. a file replaced by an escaping symlink,
+        # which the inventory drops) — --add --remove over such a path would stage
+        # the on-disk escape artifact itself into the candidate (reproduced).
+        dropped = sorted(set(baseline_rel) - set(final_rel))
+        staged = _git("update-index", "-z", "--add", "--remove", "--stdin",
+                      input_bytes=_z(sorted(final_rel)))
+        if staged.returncode == 0 and dropped:
+            staged = _git("update-index", "-z", "--force-remove", "--stdin",
+                          input_bytes=_z(dropped))
+        if staged.returncode != 0:
+            detail = (staged.stderr or staged.stdout or b"").decode("utf-8", errors="replace")
+            return _manifest(ARTIFACT_STATUS_FAILED, note=f"staging failed: {detail.strip()[:300]}")
+        named = _git("diff", *diff_isolation, "--cached", "--name-only", "-z", baseline)
+        if named.returncode != 0:
+            detail = (named.stderr or named.stdout or b"").decode("utf-8", errors="replace")
+            return _manifest(ARTIFACT_STATUS_FAILED, note=f"diff failed: {detail.strip()[:300]}")
+        changed = sorted(
+            chunk.decode("utf-8", errors="surrogateescape")
+            for chunk in (named.stdout or b"").split(b"\0") if chunk
+        )
+        result_hash = payload_content_hash(resolved_root)
+        # Informational only (the head_moved disclosure): read TEXTUALLY — a git
+        # invocation against the child GIT_DIR would consult child config again.
+        current_head = _snapshot_head_textual(resolved_root)
+        if not changed:
+            return _manifest(ARTIFACT_STATUS_READY_NO_CHANGES, sha256="", diffstat="",
+                             tracked_changed=[], untracked_included=[],
+                             blocked_reserved_paths=[], result_content_hash=result_hash,
+                             current_head=current_head)
+        non_utf8 = []
+        for rel in changed:
+            if rel in dropped:
+                continue  # rides as a deletion; on-disk leftovers are not content
+            candidate = resolved_root / rel
+            if candidate.is_symlink() or not candidate.is_file():
+                continue
+            try:
+                candidate.read_bytes().decode("utf-8", "strict")
+            except (OSError, UnicodeDecodeError):
+                non_utf8.append(rel)
+        if non_utf8:
+            return _manifest(
+                ARTIFACT_STATUS_FAILED, non_utf8_paths=non_utf8,
+                note="the candidate adds/modifies non-UTF-8 payload content, which the "
+                     "permanent text-only skill contract refuses "
+                     f"({', '.join(non_utf8[:5])}); the snapshot is preserved")
+        diff = _git("diff", *diff_isolation, "--cached", "--binary", baseline)
+        if diff.returncode != 0:
+            detail = (diff.stderr or diff.stdout or b"").decode("utf-8", errors="replace")
+            return _manifest(ARTIFACT_STATUS_FAILED, note=f"patch emit failed: {detail.strip()[:300]}")
+        patch_bytes = diff.stdout or b""
+        (cap_dir / "workspace.patch").write_bytes(patch_bytes)
+        stat = _git("diff", *diff_isolation, "--cached", "--shortstat", baseline)
         return _manifest(
-            ARTIFACT_STATUS_FAILED, non_utf8_paths=non_utf8,
-            note="the candidate adds/modifies non-UTF-8 payload content, which the "
-                 "permanent text-only skill contract refuses "
-                 f"({', '.join(non_utf8[:5])}); the snapshot is preserved")
-    diff = _git("diff", *diff_isolation, "--cached", "--binary", baseline)
-    if diff.returncode != 0:
-        detail = (diff.stderr or diff.stdout or b"").decode("utf-8", errors="replace")
-        return _manifest(ARTIFACT_STATUS_FAILED, note=f"patch emit failed: {detail.strip()[:300]}")
-    patch_bytes = diff.stdout or b""
-    (cap_dir / "workspace.patch").write_bytes(patch_bytes)
-    stat = _git("diff", *diff_isolation, "--cached", "--shortstat", baseline)
-    return _manifest(
-        ARTIFACT_STATUS_READY_WITH_CHANGES,
-        sha256=hashlib.sha256(patch_bytes).hexdigest(),
-        patch_size=len(patch_bytes),
-        diffstat=(stat.stdout or b"").decode("utf-8", errors="replace").strip(),
-        tracked_changed=changed,
-        untracked_included=[],
-        blocked_reserved_paths=[p for p in changed if _reserved_payload_rel_path(p)],
-        result_content_hash=result_hash,
-        current_head=current_head,
-    )
+            ARTIFACT_STATUS_READY_WITH_CHANGES,
+            sha256=hashlib.sha256(patch_bytes).hexdigest(),
+            patch_size=len(patch_bytes),
+            diffstat=(stat.stdout or b"").decode("utf-8", errors="replace").strip(),
+            tracked_changed=changed,
+            untracked_included=[],
+            blocked_reserved_paths=[p for p in changed if _reserved_payload_rel_path(p)],
+            result_content_hash=result_hash,
+            current_head=current_head,
+        )
 
 
 def _payload_reserved_paths(
@@ -1160,13 +1227,16 @@ def _finalize_payload_apply(
         target=str(target))
     recorded, note = dispose("applied", True)
     if not recorded:
-        return _unwritten_disposition_text(rid, str(target), "applied", True)
+        return _unwritten_disposition_text(rid, str(target), "applied", True,
+                                           payload=True)
     staleness = (
         "The payload CONTENT CHANGED, so any prior skill review is now STALE for "
         "the new content hash: run skill_preflight and skill_review before "
         "relying on this skill. Enablement and grants were not changed by this "
         "apply; "
-        + ("a stale enabled extension is reconciled off until re-review."
+        + ("an extension reconcile was QUEUED (a marker the server processes "
+           "asynchronously — a stale enabled extension stops being live when "
+           "that reconcile runs, not at this receipt)."
            if not reconcile_err else
            f"WARNING: the extension reconcile could NOT be queued ({reconcile_err})"
            " — the review staleness above still holds, but a stale enabled "
@@ -1201,8 +1271,9 @@ def integrate_payload_patch(
     idempotently); reserved lifecycle/control destinations refuse the WHOLE
     apply with the candidate preserved; ``git apply`` runs with the live
     payload as its cwd (index-free apply writes relative to cwd — probed);
-    a successful apply queues the existing extension reconcile so a stale
-    enabled extension stops being live until re-review.
+    a successful apply QUEUES the existing extension reconcile request (a
+    durable marker the server processes asynchronously; the receipt says
+    queued, never reconciled).
     """
     import subprocess
 

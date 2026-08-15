@@ -1379,11 +1379,17 @@ model-supplied:
 A payload target gets a STANDALONE private Git snapshot
 (`subagent_worktrees.provision_payload_snapshot`): the live payload is never
 initialized as Git; the loader-visible inventory is copied out, committed as a
-synthetic baseline, and the run is scoped there. At disposition the apply is a
-LIVE, index-free `git apply` into the non-Git payload guarded by a whole-payload
-content-hash CAS (drift = typed conflict; identical content = idempotent applied),
-with reserved lifecycle/control paths and escaping-symlink candidates refusing the
-WHOLE apply; a successful apply queues the extension reconcile and the skill's
+synthetic baseline whose commit/tree identity is durably recorded in the
+host-owned snapshot registry, and the run is scoped there. Capture trusts NOTHING
+under the child-writable snapshot's `.git`: symlinked Git metadata is a typed
+refusal, and the diff is built in a parent-owned control GIT_DIR with a fresh temp
+index seeded from the registry-recorded baseline commit (child `.git/index` and
+`.git/config` are never read or written — a child-forged index-only blob does not
+exist for the capture). At disposition the apply is a LIVE, index-free `git apply`
+into the non-Git payload guarded by a whole-payload content-hash CAS (drift =
+typed conflict; identical content = idempotent applied), with reserved
+lifecycle/control paths and escaping-symlink candidates refusing the WHOLE apply;
+a successful apply QUEUES the extension reconcile request and the skill's
 existing review becomes STALE for the new content hash.
 
 **A mutating run executes in a PRIVATE EXECUTION SNAPSHOT, never in the shared
@@ -1407,16 +1413,25 @@ in place FROM THE ENGINE'S view — which is why the scoped-HOME/`delegated` mar
 below still applies unchanged.
 
 At terminal, `delegate_wait` captures the run's diff against the baseline durably
-(the same `write_workspace_patch_artifacts` primitive: sensitive veto, binary/mode
-handling, sha256 manifest) into the task's artifact store and reports it as the
-`workspace_capture` block. NOTHING reaches the shared tree automatically: the nanny
-EXPLICITLY applies or rejects through `integrate_delegated_patch`. Under the repo
-git lock it PROVES first that no touched path drifted from `baseline_sha` (a
-scratch index seeded from the baseline tree — a plain `git apply` relocates hunks
-by offset, so a moved target would otherwise be patched at a shifted position),
-then applies to the working tree and stages the paths that exist or are indexed (a
-deleted UNTRACKED file has nothing to stage), writes a verdict artifact and a
-durable disposition row. Touched paths are read NUL-safely from `git apply
+into the task's artifact store and reports it as the `workspace_capture` block, and
+NOTHING reaches the target automatically: the nanny EXPLICITLY applies or rejects
+through `integrate_delegated_patch`. That orchestration — capture, explicit
+disposition, durable rows, snapshot custody — is UNIVERSAL across both lanes. What
+differs is the staging substrate. A GIT workspace target captures through
+`write_workspace_patch_artifacts` (sensitive veto, binary/mode handling, sha256
+manifest) and applies under the repo git lock: it PROVES first that no touched path
+drifted from `baseline_sha` (a scratch index seeded from the baseline tree — a
+plain `git apply` relocates hunks by offset, so a moved target would otherwise be
+patched at a shifted position), then applies to the working tree and STAGES the
+paths that exist or are indexed (a deleted UNTRACKED file has nothing to stage),
+writes a verdict artifact and a durable disposition row — staged, never committed.
+A SKILL-PAYLOAD target captures through the payload adapter over a parent-owned
+trusted index (`_write_payload_patch_artifacts`, below) and applies LIVE into the
+non-Git payload under the whole-payload content-hash CAS — nothing is staged into
+any active root, no `.git`/index/staging is created in the payload, and a
+successful apply queues the extension reconcile while the skill's existing review
+goes stale pending a fresh `skill_preflight`/`skill_review`. Touched paths are
+read NUL-safely from `git apply
 --numstat -z` in BOTH directions (git-apply names only the paths a direction
 writes, so a rename's source appears under `-R`). The Ouroboros protected-path gate
 applies only when the target IS the Ouroboros body (no active workspace, or a
