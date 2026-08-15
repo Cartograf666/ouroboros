@@ -158,31 +158,30 @@ export function buildModelChoices({ settings = {}, catalogItems = [], localStatu
     const choices = [];
     const seen = new Set();
     const localReady = String(localStatus?.status || '') === 'ready';
-    if (localStatus?.model_name || localStatus?.model_path || localReady) {
-        choices.push({
-            value: LOCAL_VALUE,
-            label: `Local · ${basenameWithoutGguf(localStatus.model_name || localStatus.model_path)}`,
-            status: {
-                state: localReady ? 'available' : 'unavailable',
-                detail: localReady ? 'Running locally; no provider quota' : 'Local model server is not ready',
-                remaining: null, resetAt: '', limit: null, metric: '',
-            },
-        });
-        seen.add(LOCAL_VALUE);
-    }
-    if (Array.isArray(localStatus?.discovered_models)) {
+
+    if (Array.isArray(localStatus?.discovered_models) && localStatus.discovered_models.length > 0) {
         for (const dm of localStatus.discovered_models) {
             const dmName = dm.name || basenameWithoutGguf(dm.filename || dm.path);
-            const isCurrent = (localStatus?.model_name && dmName.toLowerCase().includes(localStatus.model_name.toLowerCase())) ||
-                              (localStatus?.model_path && localStatus.model_path === dm.path);
-            const val = `local_discovered::${dm.path}::${dm.source || ''}::${dm.filename || ''}`;
-            if (!isCurrent && !seen.has(val)) {
+            const val = `local_discovered::${dm.path}::${dm.source || dm.path}::${dm.filename || ''}`;
+            const isRunning = localReady && (
+                (localStatus?.model_path && (localStatus.model_path === dm.path || (dm.filename && localStatus.model_path.includes(dm.filename)))) ||
+                (localStatus?.model_name && dmName.toLowerCase().includes(localStatus.model_name.toLowerCase()))
+            );
+            const isSelected = (settings?.LOCAL_MODEL_FILENAME && dm.filename && settings.LOCAL_MODEL_FILENAME === dm.filename) ||
+                               (settings?.LOCAL_MODEL_SOURCE && (settings.LOCAL_MODEL_SOURCE === dm.path || settings.LOCAL_MODEL_SOURCE === dm.source));
+
+            if (!seen.has(val)) {
                 choices.push({
                     value: val,
+                    path: dm.path,
+                    filename: dm.filename || '',
+                    source: dm.source || dm.path,
                     label: `Local · ${dmName.replace('-Q4_K_M', '')}`,
                     status: {
-                        state: 'available',
-                        detail: `${dm.size_gb ? dm.size_gb + ' GB · ' : ''}Local GGUF model on disk; click to start`,
+                        state: isRunning ? 'available' : (String(localStatus?.status || '') === 'loading' && isSelected ? 'loading' : 'available'),
+                        detail: isRunning
+                            ? `Running locally on Metal GPU (context: ${localStatus.context_length || '128k'}); no provider quota`
+                            : `${dm.size_gb ? dm.size_gb + ' GB · ' : ''}Local GGUF model on disk; click to start`,
                         remaining: null, resetAt: '', limit: null, metric: '',
                     },
                 });
@@ -190,6 +189,34 @@ export function buildModelChoices({ settings = {}, catalogItems = [], localStatu
             }
         }
     }
+
+    if (localStatus?.model_name || localStatus?.model_path || localReady) {
+        const alreadyIncluded = choices.some((c) => c.path === localStatus.model_path);
+        if (!alreadyIncluded && !seen.has(LOCAL_VALUE)) {
+            choices.unshift({
+                value: LOCAL_VALUE,
+                label: `Local · ${basenameWithoutGguf(localStatus.model_name || localStatus.model_path)}`,
+                status: {
+                    state: localReady ? 'available' : 'unavailable',
+                    detail: localReady ? 'Running locally; no provider quota' : 'Local model server is not ready',
+                    remaining: null, resetAt: '', limit: null, metric: '',
+                },
+            });
+            seen.add(LOCAL_VALUE);
+        }
+    } else if (choices.length === 0 && ['1', 'true', 'yes', 'on'].includes(String(settings?.USE_LOCAL_MAIN || '').toLowerCase())) {
+        choices.push({
+            value: LOCAL_VALUE,
+            label: 'Local model',
+            status: {
+                state: 'unavailable',
+                detail: 'Local model server is offline',
+                remaining: null, resetAt: '', limit: null, metric: '',
+            },
+        });
+        seen.add(LOCAL_VALUE);
+    }
+
     const fallbackIsLocal = ['1', 'true', 'yes', 'on'].includes(
         String(settings?.USE_LOCAL_FALLBACK || '').toLowerCase(),
     );
@@ -220,7 +247,7 @@ export function modelSelectionPayload(value) {
     if (typeof value === 'string' && value.startsWith('local_discovered::')) {
         const parts = value.split('::');
         const path = parts[1] || '';
-        const source = parts[2] || path;
+        const source = path;
         const filename = parts[3] || '';
         return {
             USE_LOCAL_MAIN: true,
@@ -298,12 +325,46 @@ export function initChatModelControl({ root, showToast = () => {} } = {}) {
 
     let disposed = false;
     let settings = {};
+    let localStatus = {};
+    let catalogItemsCached = [];
+    let eventsCached = [];
     let choices = [];
     let loadInFlight = null;
 
     function activeValue() {
         const local = ['1', 'true', 'yes', 'on'].includes(String(settings.USE_LOCAL_MAIN || '').toLowerCase());
-        return local ? LOCAL_VALUE : String(settings.OUROBOROS_MODEL || '');
+        if (local) {
+            const targetFilename = String(settings.LOCAL_MODEL_FILENAME || '').trim().toLowerCase();
+            const targetSource = String(settings.LOCAL_MODEL_SOURCE || '').trim().toLowerCase();
+            const currentPath = String(localStatus?.model_path || '').trim().toLowerCase();
+
+            for (const choice of choices) {
+                if (!choice.value.startsWith('local_discovered::')) continue;
+                const choiceFilename = String(choice.filename || '').toLowerCase();
+                const choicePath = String(choice.path || '').toLowerCase();
+                const choiceSource = String(choice.source || '').toLowerCase();
+                if (targetFilename && choiceFilename && choiceFilename === targetFilename) {
+                    return choice.value;
+                }
+                if (targetSource && (choicePath === targetSource || choiceSource === targetSource)) {
+                    return choice.value;
+                }
+            }
+            if (currentPath) {
+                for (const choice of choices) {
+                    if (!choice.value.startsWith('local_discovered::')) continue;
+                    const choicePath = String(choice.path || '').toLowerCase();
+                    if (choicePath === currentPath || choicePath.includes(currentPath) || currentPath.includes(choicePath)) {
+                        return choice.value;
+                    }
+                }
+            }
+            if (choices.some((c) => c.value === LOCAL_VALUE)) return LOCAL_VALUE;
+            const firstLocal = choices.find((c) => c.value.startsWith('local_discovered::') || c.value === LOCAL_VALUE);
+            if (firstLocal) return firstLocal.value;
+            return LOCAL_VALUE;
+        }
+        return String(settings.OUROBOROS_MODEL || '');
     }
 
     function render() {
@@ -337,9 +398,6 @@ export function initChatModelControl({ root, showToast = () => {} } = {}) {
             status.dataset.state = 'loading';
             status.textContent = 'Checking…';
             try {
-                // A reconnect can race the server's restart window. Retry the
-                // read-only discovery calls briefly so the selector does not
-                // stay empty just because the first request met a dead socket.
                 let responses = [];
                 for (let attempt = 0; attempt < 3; attempt += 1) {
                     const requests = [
@@ -349,17 +407,12 @@ export function initChatModelControl({ root, showToast = () => {} } = {}) {
                         timedFetch('/api/logs/events?limit=2000', { cache: 'no-store' }),
                     ];
 
-                    // Settings contain the configured route, so render those
-                    // choices as soon as their response arrives. A slow remote
-                    // catalog must not hide a model the owner already selected.
                     const settingsResp = await requests[0];
                     settings = await responseJson(settingsResp);
-                    choices = buildModelChoices({ settings, events: [] });
+                    choices = buildModelChoices({ settings, localStatus, events: [] });
                     if (choices.length) render();
 
                     responses = await Promise.all(requests);
-                    // A local-status response alone is not enough evidence that
-                    // the server is ready to provide the model/settings data.
                     if (responses[0] || responses[1] || attempt === 2) break;
                     await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
                 }
@@ -367,24 +420,21 @@ export function initChatModelControl({ root, showToast = () => {} } = {}) {
                 if (!responses.some(Boolean)) {
                     throw new Error('Ouroboros is restarting; press Refresh in a moment.');
                 }
-                // `settingsResp` was consumed by the early render above. Do
-                // not read that one-shot Response body a second time: a failed
-                // second read would erase the configured models with `{}`.
                 const [catalog, local, eventRows] = await Promise.all([
                     responseJson(catalogResp, { items: [] }),
                     responseJson(localResp),
                     responseJson(eventsResp, { entries: [] }),
                 ]);
+                catalogItemsCached = catalog.items || [];
+                localStatus = local || {};
+                eventsCached = eventRows.entries || [];
                 choices = buildModelChoices({
                     settings,
-                    catalogItems: catalog.items || [],
-                    localStatus: local,
-                    events: eventRows.entries || [],
+                    catalogItems: catalogItemsCached,
+                    localStatus,
+                    events: eventsCached,
                 });
                 render();
-                // Subscription discovery is informative and must never block the
-                // main-model control. Claudexor can be stale or offline while the
-                // local/Gemini choices remain perfectly usable.
                 if (harness) void timedPromise(claudexorStatus.refresh(), QUOTA_READ_TIMEOUT_MS)
                     .then(() => {
                         if (disposed) return;
@@ -417,29 +467,18 @@ export function initChatModelControl({ root, showToast = () => {} } = {}) {
         select.disabled = true;
         try {
             const payloadBody = modelSelectionPayload(next);
-            const response = await apiFetch('/api/settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payloadBody),
-            });
-            const payload = await responseJson(response);
-            if (!response.ok) throw new Error(payload.error || 'Could not save the model');
             settings = { ...settings, ...payloadBody };
 
             if (typeof next === 'string' && next.startsWith('local_discovered::')) {
                 const parts = next.split('::');
                 const path = parts[1] || '';
-                const source = parts[2] || path;
                 const filename = parts[3] || '';
-                try {
-                    await apiFetch('/api/local-model/stop', { method: 'POST' });
-                } catch {}
                 try {
                     await apiFetch('/api/local-model/start', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            source,
+                            source: path,
                             filename,
                             n_ctx: 131072,
                             n_gpu_layers: -1,
@@ -450,8 +489,28 @@ export function initChatModelControl({ root, showToast = () => {} } = {}) {
                 }
             }
 
+            const response = await apiFetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payloadBody),
+            });
+            const payload = await responseJson(response);
+            if (!response.ok) throw new Error(payload.error || 'Could not save the model');
+            settings = { ...settings, ...payloadBody };
+
+            try {
+                const localResp = await timedFetch('/api/local-model/status', { cache: 'no-store' });
+                localStatus = await responseJson(localResp, localStatus);
+                choices = buildModelChoices({
+                    settings,
+                    catalogItems: catalogItemsCached || [],
+                    localStatus,
+                    events: eventsCached || [],
+                });
+            } catch {}
+
             render();
-            showToast('Model changed for new tasks.', 'success');
+            showToast('Model switched for new tasks.', 'success');
         } catch (error) {
             select.value = previous;
             render();
