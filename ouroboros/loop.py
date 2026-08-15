@@ -7177,8 +7177,8 @@ def run_llm_loop(
                 _merge_finalization_trace(llm_trace, forced_trace)
                 return text, accumulated_usage, llm_trace
 
-            from ouroboros.cancel_intent import cancel_pending
-            if task_id and cancel_pending(drive_root, str(task_id)):
+            from ouroboros.cancel_intents import has_active_intent
+            if task_id and has_active_intent(drive_root, str(task_id)):
                 return "⏹️ Действие остановлено пользователем.", accumulated_usage, llm_trace
 
             # Typed soft landing (v6.91): the ledger fence stays the untouched

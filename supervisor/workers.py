@@ -978,7 +978,7 @@ def cancel_active_chat_turn(chat_id: int) -> bool:
     cancelled = False
     if task_id:
         try:
-            from ouroboros.cancel_intent import request_cancel
+            from ouroboros.cancel_intents import request_cancel
             request_cancel(
                 DRIVE_ROOT,
                 task_id,

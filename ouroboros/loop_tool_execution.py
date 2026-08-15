@@ -792,8 +792,8 @@ def _execute_with_timeout(
     }, correlation, tool_call_id=tool_call_id))
 
     try:
-        from ouroboros.cancel_intent import cancel_pending
-        if task_id and cancel_pending(getattr(tools, "drive_root", None), str(task_id)):
+        from ouroboros.cancel_intents import has_active_intent
+        if task_id and has_active_intent(getattr(tools, "drive_root", None), str(task_id)):
             return {
                 "tool_call_id": tool_call_id,
                 "role": "tool",
