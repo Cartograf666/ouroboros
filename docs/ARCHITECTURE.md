@@ -111,7 +111,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── delegate_interactions.py ← Interactive-question cluster for delegated runs (extracted from tools/delegate.py for the module-size gate; delegate.py re-exports it): the process-local reported-question memo (`_REPORTED_INTERACTIONS` — a known question does not re-trigger the immediate return; popped on a delivered/already_resolved answer so the next wait re-reports promptly), the bounded inline projection `_bounded_interactions` (EVERY harness-authored DISPLAY scalar bounded — question, options, header, source, timestamps — cuts counted; the answer keys ride whole, see below), the immediate typed `waiting_on_user` payload (full set spills whole to the task drive under an interaction-addressed immutable name `<run>.<sha12>.interactions.json` with a sha256/size receipt; a compact `advances` ride-along keeps the cut-short window's journal sequence), and `_delegate_answer` (strict pre-POST row validation — string-only labels, non-empty label-or-freeText per row, no coercion; the answer keys `interaction_id`/`question_id` ride WHOLE, never truncated; engine-typed outcomes relayed verbatim; only a PAYLOAD-SEMANTIC 4xx — 400/409/413/422 — maps to the `rejected` shape, a spent subscription window is the distinct `subscription_window_exhausted` outcome carrying `reset_at`, and `delivery_unknown` is reserved for transport death/5xx plus every other non-definite status and carries a bounded detail re-read; a `timeout_at`-bearing question benign-declines at the engine timeout while `timeout_at=null` waits until answered; an internal monotonic deadline strictly below the ToolEntry timeout budgets handshake/POST/re-read and returns typed on exhaustion without further wire calls)
       ├── delegate_shared.py  ← Shared nanny-verb LEAF (phase B facade split): the single author of the typed delegate refusal (`_fail`), the custody-rooted `_emit`, and run-ownership resolution (`_owned_run` — OWNED/FOREIGN/UNKNOWN replayed from the durable rows). Extracted from tools/delegate.py to break the facade import cycle; one-way seam — the leaf never imports the facade back, and `tools.delegate` re-exports the same objects
       ├── subagents.py         ← Subagent axis vocabularies (model lane / executor), the single dispatch-time resolution (`resolve_subagent_dispatch` → `capability_delta`), and structured lineage/usage envelopes
-      ├── subagent_worktrees.py ← Acting self_worktree lifecycle: provision/remove/prune isolated git worktrees (outside repo/ and data/) + durable registry (state/subagent_worktrees.json) + cross-process ops lock; startup orphan reconciliation; also provisions durable from-scratch genesis projects (provision_genesis_project, never registry/GC); also owns the C1 delegated-exec snapshot lifecycle: `provision_execution_snapshot` builds a synthetic baseline of the target's REAL tree (temporary index, sensitive veto decided before hashing) pinned by a `refs/ouroboros/delegated/` ref and checks out a detached private worktree, registered durably with kind `delegated_exec`; removal only by explicit disposition (`remove_execution_snapshot`) or by the custody-cross-checked startup GC (`prune_execution_snapshots`, durable `delegated_snapshot_prune` event; skipped fail-closed with a `delegated_snapshot_prune_skipped` row when the custody log is unreadable)
+      ├── subagent_worktrees.py ← Acting self_worktree lifecycle: provision/remove/prune isolated git worktrees (outside repo/ and data/) + durable registry (state/subagent_worktrees.json) + cross-process ops lock; startup orphan reconciliation; also provisions durable from-scratch genesis projects (provision_genesis_project, never registry/GC); also owns the C1 delegated-exec snapshot lifecycle: `provision_execution_snapshot` builds a synthetic baseline of the target's REAL tree (temporary index, sensitive veto decided before hashing) pinned by a `refs/ouroboros/delegated/` ref and checks out a detached private worktree, registered durably with kind `delegated_exec`; `provision_payload_snapshot` is the STANDALONE sibling for one exact non-Git skill payload (the loader-visible inventory is copied — confined symlinks preserved as symlinks, absolute ones rewritten relative, escapes dropped — Git is initialized only inside the private copy, the pre-copy skill-loader content hash is the CAS baseline, and a post-copy hash mismatch aborts as a writer race; registered with `standalone=true`, cleanup touches no target-repo command); removal only by explicit disposition (`remove_execution_snapshot`) or by the custody-cross-checked startup GC (`prune_execution_snapshots`, durable `delegated_snapshot_prune` event; skipped fail-closed with a `delegated_snapshot_prune_skipped` row when the custody log is unreadable)
       ├── artifacts.py         ← Task-scoped artifact helpers shared by user-file tools, process outputs, and outcome finalization. (v6.52.0, P1) `stage_task_attachments` stages every task's INPUT attachments (CLI/API, desktop chat, and other external callers) into the agent-readable `artifact_store/attachments/` (skips secret SOURCES via the tool_access SSOT blocklist, bounded), returning a manifest of `read_file(root='artifact_store', path='attachments/<name>')` entries; `collect_task_artifact_records` EXCLUDES that subdir so staged inputs are never recorded as deliverables. (v6.52.2) `record_task_scratch`/`read_task_scratch_fingerprints` persist {abs_path: sha256} FINGERPRINTS of the run_command/run_script `scratch=[...]` ephemeral-verification files to `.scratch_manifest.json` (written to BOTH budget + live drive roots) so `headless.write_workspace_patch_artifacts` EXCLUDES a file from the workspace patch ONLY while its current content still matches (a later real file at the same path is never dropped). (v6.56.0) scratch declarations are IDEMPOTENT/ADOPTABLE: re-declaring a manifest path is ok, and an existing untracked in-cwd file may be adopted — its sha is recorded via the same SSOT writer at declaration time, so the sha-gate still excludes it only while unmodified (tracked / outside-cwd / outside-worktree declarations stay blocked); the undeclared-output guard stat-verifies candidates POST-exec (exists + mtime ≥ start−slack) for both run_command and run_script, so import strings/CLI flags/heredoc bodies no longer read as writes (v6.100.0, CR1) `delegated_capture_read_target` narrowly rebinds artifact_store READ ops for the owning task's `delegated_runs/` prefix to the canonical drive so a split-drive nanny can inspect its captured patch.
       ├── retention.py         ← Unified GC retention SSOT: clamp/age-cutoff helpers + legacy-key seed picker used by worktree/task-drive/service-log startup pruning
       ├── workspace_preflight.py ← Read-only external-workspace git/manifest/toolchain snapshot used by gateway task creation
@@ -253,8 +253,8 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── project_journal.py ← Thin per-project journal/workpad tools (v6.32.0): journal_write/read (durable milestone memory), workpad_read/write (scratch page), journal_tail_digest (context injection); over-limit writes are rejected, never silently sliced
       │   ├── task_tree.py     ← (v6.38.0) Task-tree coordination tools tree_note/tree_read (the swarm blackboard + child→parent beacons; storage/kind SSOT in ouroboros/task_tree_ledger.py)
       │   ├── join_ledger.py   ← Soft-join decision authority: validates direct lineage and exact current child-result hashes for tagged `tree_note(kind="decision")` dispositions (`integrated`, `irrelevant`, `deferred`) — single-child or batch `children` array form, each batch entry validated individually — appends the sole authoritative task-tree row, rejects stale hashes as `CHILD_RESULT_STALE`, and keeps `peek_task`, `discard_child_result`, constraint override, cancellation, and shared child-decision helpers. The hash covers status, full result, trace summary, artifact status, and stable artifact identities, not cost/timestamps/queue diagnostics/parent decisions; task-result fields are derived read projections only.
-      │   ├── delegate.py     ← Nanny verbs for DELEGATED subagent cognition on the owner's already-paid Claudexor session: `delegate_start` (host-derived authority — access profile, run mode, isolation and the `delegated` scoped-HOME marker all follow the calling task's own authority via `subagents.delegated_run_shape`; no argument can widen them), a time-bounded `delegate_wait` (progress cursor, containment verification against the run's OWN artifacts, terminal payload bounded inside `tool_result_limit` with the full result staged to the task drive and read back to EOF), `delegate_cancel` (four typed outcomes — nothing claims terminal without a receipt), and `delegate_answer` (the run's pending interactive question answered by its own nanny — custody-gated like cancel, typed outcomes; the cluster lives in `ouroboros/delegate_interactions.py`). Run LIFECYCLE, custody, settlement and reconciliation are `ouroboros/delegate_custody.py`; transport is `gateways/claudexor.py`; route policy is `ouroboros/subagents.py`. This module is nanny BEHAVIOUR only
-      │   ├── delegate_integration.py ← The C1 integration seam of the nanny verbs (extracted from tools/delegate.py for the module-size gate; delegate.py re-exports it so sibling code and tests keep one name): `_mutation_authority` derives the unified host authority record `{target_root, source, capture_mode}` for a mutating run (acting write_root vs B5 external-workspace root, typed refusals on any disagreement), `_provision_snapshot` registers + describes the private execution snapshot durably BEFORE any start intent, `_resolve_retry_invocation`/`_validated_invocation`/`_retry_binding_refusal` rebuild a retried start from its ONE durable invocation record and re-prove the C1 binding (pre-C1 mutating rows refused; moved workspace refused; GC-collected snapshot refused), and `_capture_terminal_patch` idempotently captures a terminal mutating run's diff from its snapshot for explicit `integrate_delegated_patch` disposition
+      │   ├── delegate.py     ← Nanny verbs for DELEGATED subagent cognition on the owner's already-paid Claudexor session: `delegate_start` (host-derived authority — access profile, run mode, isolation and the `delegated` scoped-HOME marker all follow the calling task's own authority via `subagents.delegated_run_shape`; no argument can widen them; the one additive selector `root="skill_payload"` + `bucket` + `skill_name` lets a TOP-LEVEL task delegate one exact installed non-Git skill payload through a fresh `ResolvedResourceBinding` for the `skill_payload.write` authority it already holds — the run then edits a private STANDALONE snapshot and the live payload receives nothing until the explicit apply), a time-bounded `delegate_wait` (progress cursor, containment verification against the run's OWN artifacts — judged against the GRANTED shape replayed from the durable custody row, never re-derived from live context — terminal payload bounded inside `tool_result_limit` with the full result staged to the task drive and read back to EOF), `delegate_cancel` (four typed outcomes — nothing claims terminal without a receipt), and `delegate_answer` (the run's pending interactive question answered by its own nanny — custody-gated like cancel, typed outcomes; the cluster lives in `ouroboros/delegate_interactions.py`). Run LIFECYCLE, custody, settlement and reconciliation are `ouroboros/delegate_custody.py`; transport is `gateways/claudexor.py`; route policy is `ouroboros/subagents.py`. This module is nanny BEHAVIOUR only
+      │   ├── delegate_integration.py ← The C1 integration seam of the nanny verbs (extracted from tools/delegate.py for the module-size gate; delegate.py re-exports it so sibling code and tests keep one name): `_mutation_authority` derives the unified host authority record `{target_root, source, capture_mode}` for a mutating run (acting write_root vs B5 external-workspace root, typed refusals on any disagreement), `_provision_snapshot` registers + describes the private execution snapshot durably BEFORE any start intent, `_resolve_retry_invocation`/`_validated_invocation`/`_retry_binding_refusal` rebuild a retried start from its ONE durable invocation record and re-prove the C1 binding (pre-C1 mutating rows refused; moved workspace refused; GC-collected snapshot refused), and `_capture_terminal_patch` idempotently captures a terminal mutating run's diff from its snapshot for explicit `integrate_delegated_patch` disposition. It also owns the exact SKILL-PAYLOAD delegation cluster (restored D10 target class, owner option A 2026-08-14): `_payload_mutation_authority` grants `authority_source="skill_payload"` only on a fresh `ResolvedResourceBinding` for a top-level principal (busy-check refuses a second delegation while the same payload has open custody), the host-minted semantic `resource_ref` {root, source, skill_name, target, baseline payload hash} rides custody durably and is re-resolved by `_rebind_payload_reference` at retry and apply, `_write_payload_patch_artifacts` captures over the skill-loader inventory (`git diff --binary` transport so UTF-8-with-NUL survives; junk the loader excludes never enters; an added/modified non-UTF-8 file is a typed capture failure; reserved lifecycle/control paths are reported as `blocked_reserved_paths`, never silently filtered), and `integrate_payload_patch` applies the candidate into the live NON-Git payload — fresh binding must equal the recorded target, whole-payload content-hash CAS (already-applied content disposes idempotently), reserved paths refuse the WHOLE apply with the candidate preserved, index-free `git apply` with the live payload as cwd, no `.git`/staging created there, and a successful apply queues `request_extension_reconcile` while enablement/grants stay untouched and the existing review goes stale by content hash
       │   └── subagent_integration.py ← integrate_subagent_patch: parent's manifest-first integration of an acting subagent's workspace.patch. For self_worktree children it applies into ctx.active_repo_dir() (sha256-verified, 3-way --index, protected-path gated, top-only lineage check, genesis refused), stages but never commits. For external_workspace children it verifies the child wrote in the same active external workspace and records an audited verdict without re-applying the patch; (v6.58.0) a NON-workspace parent integrating a COOP child (write_root = a host-minted tree under the subagent-projects root) gets a read-only verification + a SUCCESSFUL `coop_already_in_tree` no-op verdict instead of a parent-missing error — the work is already in the shared tree, which `coop_checkpoint.checkpoint_commit_coop_roots` checkpoint-commits at root finalization. Also compare_subagent_patches: read-only best-of-N helper that shows several children's candidate patches side by side for LLM-first synthesis
       ├── process_containment.py ← `ProcessContainer` for the hermetic gate: env-token membership (`OURO_PROC_CONTAINER_*`, /proc environ on Linux, `ps -E` on macOS, kill-on-close Job Object on Windows), read from LIVE kernel state at reap time; an alive or undeterminable member is an honest hard-block answer, never a kill guarantee. Policy layer over platform_layer's OS primitives
       └── platform_layer.py    ← Cross-platform process/path/locking helpers (incl. Windows Job Object ABI with explicit argtypes/restype)
@@ -1345,28 +1345,52 @@ evidence alone) rides the envelope beside `effective_executor`, a harness dispat
 
 **Read-only and mutating children share one nanny and one transport.** The only
 difference is the run shape, and the shape has ONE owner —
-`subagents.delegated_run_shape`, which answers a single question: is this an acting
-child? `tools/delegate._derive_authority` asks it of the live `ToolContext`
-(`tool_access.active_tool_profile`) and `subagents.dispatch_executor_resolution` asks it of
-the task record (`tool_access.predicted_subagent_profile`); neither reassembles the shape,
+`subagents.delegated_run_shape`. For the generic lane it answers a single question —
+is this an acting child? — asked of the live `ToolContext` by
+`tools/delegate._derive_authority` (`tool_access.active_tool_profile`) and of
+the task record by `subagents.dispatch_executor_resolution`
+(`tool_access.predicted_subagent_profile`); neither reassembles the shape,
 because a profile changed in one place and an isolation or a marker left behind in the
-other is silent and unsafe in exactly one branch.
+other is silent and unsafe in exactly one branch. The EXACT-RESOURCE lane is the
+second, explicit entry: `delegate_start(root="skill_payload", bucket, skill_name)`
+selects one installed non-native skill payload, authorized through a fresh
+`ResolvedResourceBinding` for `skill_payload.write` (top-level task profiles only)
+rather than through the acting-child question.
 
 | task authority | access | mode | isolation | `execution.delegated` |
 |---|---|---|---|---|
 | acting subagent (valid write surface) | `workspace_write` | `agent` | `live` | `true` |
 | ROOT of an external-workspace task (validated active workspace) | `workspace_write` | `agent` | `live` | `true` |
+| top-level task selecting an exact skill payload (`root="skill_payload"`) | `workspace_write` | `agent` | `live` | `true` |
 | anything else, including a fail-closed subagent | `readonly` | `ask` | envelope (default) | not sent |
 
 WHERE a mutating run's changes are destined and how they travel is the second,
 separate record — the unified host-derived **mutation authority**
-(`tools/delegate._mutation_authority`), never model-supplied:
+(`tools/delegate._mutation_authority` / `_payload_mutation_authority`), never
+model-supplied:
 
 | source | `target_root` derivation | `capture_mode` |
 |---|---|---|
 | `acting_constraint` | the child's own `task_constraint.write_root`, required to equal the genuinely ACTIVE workspace root | `delegated_snapshot` |
 | `external_workspace_root` | the root task's validated active external workspace (a root holds no acting constraint — owner 2=A: it already holds write+shell inside the project; the prior gap was per-run provenance, which the snapshot+explicit-apply below records) | `delegated_snapshot` |
+| `skill_payload` | the exact payload the fresh `skill_payload.write` binding resolved; the durable record also carries the semantic `resource_ref` (source/skill_name/CAS baseline hash) that retry and apply re-resolve | `delegated_snapshot` |
 | `readonly` | ordinary active root (nothing to write) | `none` |
+
+A payload target gets a STANDALONE private Git snapshot
+(`subagent_worktrees.provision_payload_snapshot`): the live payload is never
+initialized as Git; the loader-visible inventory is copied out, committed as a
+synthetic baseline whose commit/tree identity is durably recorded in the
+host-owned snapshot registry, and the run is scoped there. Capture trusts NOTHING
+under the child-writable snapshot's `.git`: symlinked Git metadata is a typed
+refusal, and the diff is built in a parent-owned control GIT_DIR with a fresh temp
+index seeded from the registry-recorded baseline commit (child `.git/index` and
+`.git/config` are never read or written — a child-forged index-only blob does not
+exist for the capture). At disposition the apply is a LIVE, index-free `git apply`
+into the non-Git payload guarded by a whole-payload content-hash CAS (drift =
+typed conflict; identical content = idempotent applied), with reserved
+lifecycle/control paths and escaping-symlink candidates refusing the WHOLE apply;
+a successful apply QUEUES the extension reconcile request and the skill's
+existing review becomes STALE for the new content hash.
 
 **A mutating run executes in a PRIVATE EXECUTION SNAPSHOT, never in the shared
 tree** (C1, owner 3=A — metered children keep sharing the tree; only delegated runs
@@ -1389,16 +1413,25 @@ in place FROM THE ENGINE'S view — which is why the scoped-HOME/`delegated` mar
 below still applies unchanged.
 
 At terminal, `delegate_wait` captures the run's diff against the baseline durably
-(the same `write_workspace_patch_artifacts` primitive: sensitive veto, binary/mode
-handling, sha256 manifest) into the task's artifact store and reports it as the
-`workspace_capture` block. NOTHING reaches the shared tree automatically: the nanny
-EXPLICITLY applies or rejects through `integrate_delegated_patch`. Under the repo
-git lock it PROVES first that no touched path drifted from `baseline_sha` (a
-scratch index seeded from the baseline tree — a plain `git apply` relocates hunks
-by offset, so a moved target would otherwise be patched at a shifted position),
-then applies to the working tree and stages the paths that exist or are indexed (a
-deleted UNTRACKED file has nothing to stage), writes a verdict artifact and a
-durable disposition row. Touched paths are read NUL-safely from `git apply
+into the task's artifact store and reports it as the `workspace_capture` block, and
+NOTHING reaches the target automatically: the nanny EXPLICITLY applies or rejects
+through `integrate_delegated_patch`. That orchestration — capture, explicit
+disposition, durable rows, snapshot custody — is UNIVERSAL across both lanes. What
+differs is the staging substrate. A GIT workspace target captures through
+`write_workspace_patch_artifacts` (sensitive veto, binary/mode handling, sha256
+manifest) and applies under the repo git lock: it PROVES first that no touched path
+drifted from `baseline_sha` (a scratch index seeded from the baseline tree — a
+plain `git apply` relocates hunks by offset, so a moved target would otherwise be
+patched at a shifted position), then applies to the working tree and STAGES the
+paths that exist or are indexed (a deleted UNTRACKED file has nothing to stage),
+writes a verdict artifact and a durable disposition row — staged, never committed.
+A SKILL-PAYLOAD target captures through the payload adapter over a parent-owned
+trusted index (`_write_payload_patch_artifacts`, below) and applies LIVE into the
+non-Git payload under the whole-payload content-hash CAS — nothing is staged into
+any active root, no `.git`/index/staging is created in the payload, and a
+successful apply queues the extension reconcile while the skill's existing review
+goes stale pending a fresh `skill_preflight`/`skill_review`. Touched paths are
+read NUL-safely from `git apply
 --numstat -z` in BOTH directions (git-apply names only the paths a direction
 writes, so a rename's source appears under `-R`). The Ouroboros protected-path gate
 applies only when the target IS the Ouroboros body (no active workspace, or a
@@ -1560,13 +1593,18 @@ above. Four things follow, and they are one mechanism, not four:
   success and never enforced as a breach.
 
 **The model cannot widen its own authority.** `delegate_start` exposes `prompt`,
-`max_seconds`, and recovery-only `retry_of`. The retry may replay only the same task's
+`max_seconds`, recovery-only `retry_of`, and the exact-resource selector
+(`root="skill_payload"` + `bucket` + `skill_name`). The retry may replay only the same task's
 stored canonical body under its original idempotency key; prompt or ownership mismatch
 is rejected, and it cannot change route, root, access, or permissions. There is no
-access, mode, isolation, root, or scope argument, so the child can request work but
-cannot choose its powers. Every delegated run also carries host-authored `instructions` stating
+access, mode, isolation, or scope argument, and the selector NAMES a resource rather
+than granting one — it is authorized through the same `skill_payload.write` cell as a
+direct payload write, so the child can request work but cannot choose its powers.
+Every delegated run also carries host-authored `instructions` stating
 the same prohibitions an ordinary subagent has — no commit or history move, no
-self-review, no runtime controls, skills or memory, no writes outside the root — plus
+self-review, no runtime controls, skills or memory, no writes outside the root (a
+payload run's variant instead states the truth that editing THAT skill's
+user-authored files in the private copy IS the assignment) — plus
 the hosting task's own contract objective/expected_output (host-read, host-authored:
 the model can neither widen nor forge the assignment block). Those
 are a statement; the enforcement is the access profile plus the patch capture. And

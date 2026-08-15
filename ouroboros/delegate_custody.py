@@ -1,20 +1,15 @@
 """Durable custody for delegated (Claudexor) runs.
 
 A delegated run is an OVERPOWERED, MUTATING process that Ouroboros does not own the
-process tree of: it lives inside the Claudexor daemon, it survives our worker, and the
-daemon bearer token means anything that can name it can reach it. Custody therefore
-cannot live in a module dict — a worker crash, a restart, an accepted POST whose
-response was lost, or the owning task terminalizing all leave a LIVE run that nothing
-can wait on, cancel or settle, and a process-local dict then refuses the owning task
-itself. ``maxSeconds`` is damage limitation, not custody.
+process tree of: it lives inside the Claudexor daemon and survives our worker, so
+custody cannot live in a module dict — a crash, restart, or lost POST response would
+leave a LIVE run nothing can wait on, cancel or settle. ``maxSeconds`` is damage
+limitation, not custody.
 
 **The authority is the durable record that is already written.** The task's own event
-log (``logs/events.jsonl`` under the canonical data root) already carried
-``delegate_run_started`` as a forensic trail; here it becomes the SSOT. Nothing new is
-stored beside it — the process-local dict below is a pure memoization of these rows, and
-every question (who owns this run, was its ledger row written, is its registration still
-ours, is a cancel unverified) is answered by replaying them. Rows survive a restart, so
-custody does too, and reconciliation is a scan rather than a guess.
+log (``logs/events.jsonl`` under the canonical data root) is the SSOT; the
+process-local dict below is a pure memoization of these rows, and every question is
+answered by replaying them. Rows survive a restart, so custody does too.
 
 Three lookup answers, never two: OWNED, FOREIGN (another task started it) and UNKNOWN
 (no durable record at all). Collapsing UNKNOWN into "not yours" is what made a restarted
@@ -28,7 +23,7 @@ import json
 import logging
 import pathlib
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from ouroboros.utils import append_jsonl, utc_now_iso
@@ -63,39 +58,28 @@ CONTAINMENT_RESOLVED = "delegate_run_containment_resolved"
 RECONCILED = "delegate_run_reconciled"
 OUTPUT_SPILLED = "delegate_run_output_spilled"
 # Owner doctrine D7: a delegated result is OBTAINED only after the artifact is read to
-# EOF. This row is the canonical acknowledgement — written exactly when the read windows
-# have covered the staged artifact CONTINUOUSLY from its first line to its last (a head
-# plus a tail with a skipped middle is not full reading), carrying the byte length and
-# content hash of what was staged. It is only writable at all when what was staged is
-# the verified FULL content (`full_content` on the spill row): the run detail's
-# `primaryOutput.text` is a bounded 256 KiB preview, and acknowledging a preview as the
-# result would be exactly the "received == read" conflation this row exists to end.
-# Owner directive (2026-08-03): consumption is LOAD-BEARING before settlement, so its
-# ABSENCE is now a durable typed fact (``SETTLED_UNREAD`` below) that rides the
-# settlement row, the parent's result and the health invariants until the read happens.
-# It still does not BLOCK settlement — see ``settle_run`` for why a hard gate would
-# deadlock the very flow it is meant to protect.
+# EOF. The canonical acknowledgement — written when the read windows covered the staged
+# artifact CONTINUOUSLY start-to-EOF, hash-bound, and only writable when the staging was
+# the verified FULL content (`full_content`), never the bounded 256 KiB preview.
+# Owner directive (2026-08-03): consumption is LOAD-BEARING before settlement; its
+# ABSENCE is the durable typed fact ``SETTLED_UNREAD`` below. It does not BLOCK
+# settlement — see ``settle_run`` for why a hard gate would deadlock the flow.
 OUTPUT_CONSUMED = "delegate_run_output_consumed"
 # A run whose VERIFIED FULL output was staged, paid for, and settled without ever being
 # read to EOF: the "launched and never collected" class, named at the moment it becomes
 # permanent instead of inferred later from a field nobody joined.
 SETTLED_UNREAD = "delegate_run_settled_unread"
-# C1 (delegated-run isolation): a MUTATING run executes in a private snapshot of the
-# authority target tree, and its diff is captured durably at terminal, then EXPLICITLY
-# applied or rejected into the target by the nanny. These two rows are that lifecycle:
-# capture is idempotent (the flag replays), disposition is the fact that releases the
-# snapshot for GC. A run whose snapshot was never disposed keeps its snapshot and its
-# captured patch on disk — conflict material persists until an explicit resolution.
+# C1 (delegated-run isolation): a MUTATING run executes in a private snapshot; its
+# diff is captured durably at terminal, then EXPLICITLY applied or rejected by the
+# nanny. Capture is idempotent (the flag replays); the disposition row is what
+# releases the snapshot for GC — until then conflict material persists on disk.
 PATCH_CAPTURED = "delegate_run_patch_captured"
 PATCH_DISPOSED = "delegate_run_patch_disposed"
-# CR1-3 (phase-A owed-before-sent doctrine, one row earlier than the disposition):
-# the APPLY-INTENT row lands BEFORE the target tree is mutated, and the RESOLVED
-# row lands only when the attempt is KNOWN to have left the tree unmutated (drift
-# refusal, atomic apply failure, clean revert). An intent with neither a resolution
-# nor a disposition replays as AMBIGUOUS: the tree may carry the patch (crash after
-# apply, before the disposition row), and a later reject/apply must refuse typed
-# instead of pretending "not applied" — that pretence recorded a false rejection
-# and deleted the snapshot over a modified, staged tree.
+# CR1-3 (owed-before-sent, one row earlier than the disposition): APPLY-INTENT lands
+# BEFORE the target tree is mutated; RESOLVED lands only when the attempt is KNOWN to
+# have left the tree unmutated. An intent with neither resolution nor disposition
+# replays as AMBIGUOUS — the tree may carry the patch — and a later reject/apply must
+# refuse typed instead of pretending "not applied" over a modified tree.
 PATCH_APPLY_STARTED = "delegate_run_patch_apply_started"
 PATCH_APPLY_RESOLVED = "delegate_run_patch_apply_resolved"
 
@@ -175,6 +159,18 @@ class RunCustody:
     baseline_sha: str = ""
     target_root: str = ""
     authority_source: str = ""
+    # The GRANTED run shape, replayed off the STARTED row that already carries it
+    # (the `shape` dict): delegate_wait replays this as the entitled authority —
+    # re-deriving from live context read `readonly` for a top-level payload run
+    # and cancelled it as widened (R1-2).
+    access: str = ""
+    mode: str = ""
+    isolation: str = ""
+    delegated: bool = False
+    # Host-minted semantic resource reference for an exact-resource run (logical
+    # root, source, skill name, recorded target, baseline payload hash). Consumed
+    # only by retry rebind and owned apply rebind; recovery carries it opaquely.
+    resource_ref: Dict[str, Any] = field(default_factory=dict)
     # Capture/disposition lifecycle (replayed): capture happens once at terminal;
     # ``patch_disposed`` is "" until the nanny explicitly applies ("applied") or
     # rejects ("rejected") the captured patch — only then may the snapshot be removed.
@@ -201,9 +197,8 @@ def event_log_path(drive_root: Any) -> pathlib.Path:
 def custody_root(ctx: Any) -> pathlib.Path:
     """The drive whose event log is the custody authority for this context.
 
-    A live subagent runs on an isolated child drive that headless pruning deletes, so a
-    custody row written there cannot outlive the run it is meant to govern. The
-    canonical (budget) root is the existing SSOT for "durable, survives the child".
+    A live subagent's isolated child drive is pruned, so a custody row written
+    there cannot outlive the run; the canonical (budget) root is the durable SSOT.
     """
     from ouroboros.tool_access import canonical_data_root
 
@@ -213,11 +208,10 @@ def custody_root(ctx: Any) -> pathlib.Path:
 def emit(drive_root: Any, kind: str, payload: Dict[str, Any]) -> bool:
     """Append one custody row and REPORT whether it landed. Never raises.
 
-    ``append_jsonl`` already owns the success predicate for exactly this class of write —
-    its own contract says important events need that signal "so the caller can fall back
-    instead of pretending the write succeeded". Discarding it here is how a run could be
-    reported as started, waited on and settled while the rows that ARE its custody never
-    reached the disk. This module's authority is the row, so the row's fate is the answer.
+    ``append_jsonl`` already owns the success predicate for this class of write.
+    Discarding it is how a run could be reported as started, waited on and settled
+    while the rows that ARE its custody never reached disk; the row's fate is the
+    answer.
     """
     try:
         written = bool(append_jsonl(event_log_path(drive_root), {"ts": utc_now_iso(), "type": kind, **payload}))
@@ -286,47 +280,71 @@ def _iter_rows(path: pathlib.Path, tail_bytes: Optional[int] = None) -> Iterator
         return
 
 
+# The STARTED row's string facts as ``(RunCustody attribute, row key)`` pairs —
+# one table shared by the replay and the ``record_started`` emit.
+_STARTED_STR_FIELDS: Tuple[Tuple[str, str], ...] = tuple(
+    (attr, "route" if attr == "route_id" else attr) for attr in (
+        "task_id", "route_id", "model", "project_id", "root_task_id",
+        "parent_task_id", "ledger_root", "idempotency_key", "invocation_id",
+        "snapshot_id", "execution_root", "baseline_sha", "target_root",
+        "authority_source", "access", "mode", "isolation",
+    )
+)
+# Progress carried forward from a previous row: an idempotent re-start writes a
+# SECOND started row; replacing wholesale would forget a settlement and put a
+# finished run back into the orphan sweep (which would cancel it).
+_STARTED_PROGRESS_FLAGS: Tuple[str, ...] = (
+    "ledger_recorded", "settled", "containment_disclosed", "unread_disclosed",
+    "output_artifact", "output_complete", "output_sha", "output_consumed",
+    "patch_captured", "patch_disposed", "patch_apply_pending")
+# Binding/authority facts are FIRST-WINS (R1-2): a later idempotent STARTED row
+# may be minted by a context that no longer knows the original binding; the
+# first recorded fact is authoritative and is never erased or retargeted.
+_STARTED_FIRST_WINS_FACTS: Tuple[str, ...] = (
+    "snapshot_id", "execution_root", "baseline_sha", "target_root",
+    "authority_source", "resource_ref")
+
+
+def _merge_started_into(entry: RunCustody, previous: RunCustody) -> None:
+    """Project a duplicate STARTED fact set onto an existing run — the ONE
+    merge, used by both the durable replay and the in-process memo (gate fix 8).
+
+    Progress always carries forward; binding facts are truthy-first-wins per
+    field; the SHAPE GROUP (access/mode/isolation/delegated) plus the resource
+    reference is first-wins as a UNIT, keyed on the first row that CARRIED a
+    shape — so a recorded ``delegated=False`` survives a later ``True`` and an
+    empty ``resource_ref`` is never "filled" by a later row.
+    """
+    for attr in _STARTED_PROGRESS_FLAGS:
+        setattr(entry, attr, getattr(previous, attr))
+    entry.project_owned = previous.project_owned and entry.project_owned
+    for attr in _STARTED_FIRST_WINS_FACTS:
+        prior = getattr(previous, attr)
+        if prior:
+            setattr(entry, attr, prior)
+    if previous.access:
+        entry.access, entry.mode = previous.access, previous.mode
+        entry.isolation, entry.delegated = previous.isolation, previous.delegated
+        entry.resource_ref = previous.resource_ref
+
+
 def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
     run_id = str(row.get("run_id") or "")
     if not run_id:
         return
     kind = str(row.get("type") or "")
     if kind == STARTED:
+        ref = row.get("resource_ref")
         entry = RunCustody(
             run_id=run_id,
-            task_id=str(row.get("task_id") or ""),
-            route_id=str(row.get("route") or ""),
-            model=str(row.get("model") or ""),
-            project_id=str(row.get("project_id") or ""),
             project_owned=bool(row.get("project_owned")),
-            root_task_id=str(row.get("root_task_id") or ""),
-            parent_task_id=str(row.get("parent_task_id") or ""),
-            ledger_root=str(row.get("ledger_root") or ""),
-            idempotency_key=str(row.get("idempotency_key") or ""),
-            invocation_id=str(row.get("invocation_id") or ""),
-            snapshot_id=str(row.get("snapshot_id") or ""),
-            execution_root=str(row.get("execution_root") or ""),
-            baseline_sha=str(row.get("baseline_sha") or ""),
-            target_root=str(row.get("target_root") or ""),
-            authority_source=str(row.get("authority_source") or ""),
+            delegated=row.get("delegated") is True,
+            resource_ref=dict(ref) if isinstance(ref, dict) else {},
+            **{attr: str(row.get(key) or "") for attr, key in _STARTED_STR_FIELDS},
         )
-        # An idempotent re-start writes a SECOND started row for the same run. Replacing
-        # the entry wholesale would forget that the run was already settled and put it
-        # straight back into the orphan sweep, which would then cancel a finished run.
         previous = state.get(run_id)
         if previous is not None:
-            entry.ledger_recorded = previous.ledger_recorded
-            entry.settled = previous.settled
-            entry.project_owned = previous.project_owned and entry.project_owned
-            entry.containment_disclosed = previous.containment_disclosed
-            entry.unread_disclosed = previous.unread_disclosed
-            entry.output_artifact = previous.output_artifact
-            entry.output_complete = previous.output_complete
-            entry.output_sha = previous.output_sha
-            entry.output_consumed = previous.output_consumed
-            entry.patch_captured = previous.patch_captured
-            entry.patch_disposed = previous.patch_disposed
-            entry.patch_apply_pending = previous.patch_apply_pending
+            _merge_started_into(entry, previous)
         state[run_id] = entry
         return
     custody = state.get(run_id)
@@ -388,10 +406,14 @@ def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
         custody.settled = True
 
 
-def replay(drive_root: Any) -> Dict[str, RunCustody]:
-    """Rebuild every known run's custody from the durable rows (one pass)."""
+def replay(drive_root: Any,
+           rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, RunCustody]:
+    """Rebuild every known run's custody from the durable rows (one pass).
+
+    ``rows`` replays a pre-read snapshot so several projections can share ONE
+    consistent traversal (the atomic payload busy claim, gate fix 5a)."""
     state: Dict[str, RunCustody] = {}
-    for row in _iter_rows(event_log_path(drive_root)):
+    for row in rows if rows is not None else _iter_rows(event_log_path(drive_root)):
         _apply(state, row)
     return state
 
@@ -609,6 +631,7 @@ def invocation_record(drive_root: Any, invocation_id: str) -> Optional[Dict[str,
                 "baseline_sha": str(row.get("baseline_sha") or ""),
                 "target_root": str(row.get("target_root") or ""),
                 "authority_source": str(row.get("authority_source") or ""),
+                "resource_ref": row.get("resource_ref") if isinstance(row.get("resource_ref"), dict) else {},
             }
         elif kind == STARTED:
             state, run_id = "started", str(row.get("run_id") or "")
@@ -622,11 +645,9 @@ def invocation_record(drive_root: Any, invocation_id: str) -> Optional[Dict[str,
 def record_start_requested(drive_root: Any, **payload: Any) -> bool:
     """Durably name the resources a start is about to bind, BEFORE the POST.
 
-    Returns whether the row LANDED, and the caller must not POST when it did not: a
-    start whose request row never reached the disk launches a run that nothing durable
-    names — if the worker dies before ``record_started``, the run is live, mutating,
-    and unfindable. That is the launched-never-collected class at the process level,
-    and refusing to launch is the only honest answer a broken event log leaves.
+    Returns whether the row LANDED; the caller must not POST when it did not —
+    a run whose request row never reached disk is live, mutating and unfindable
+    if the worker dies before ``record_started``.
     """
     return emit(drive_root, START_REQUESTED, payload)
 
@@ -635,37 +656,31 @@ def record_started(drive_root: Any, custody: RunCustody,
                    shape: Optional[Dict[str, Any]] = None) -> bool:
     """Memoize the run and write its authoritative row. Returns whether the row LANDED.
 
-    A start whose row did not land is custodied by this process only: the run is live and
-    overpowered, and after this worker dies nothing can name it, wait on it, cancel it or
-    settle it. The caller holds the object it passed in, so what it needs back from here
-    is the one fact it cannot otherwise know.
-
-    ``shape`` carries the facts custody itself does not need but the forensic record
-    does — the access profile, the run mode, the isolation, whether the delegated
-    marker rode along, and the root the run was scoped to. They live on the same row
-    rather than a second event, because a start whose shape is recorded separately can
-    lose one half of itself to a crash between the two writes.
+    A start whose row did not land is custodied by this process only: after this
+    worker dies nothing can name, wait on, cancel or settle the live run.
+    ``shape`` (access/mode/isolation/delegated/root) rides the SAME row — a shape
+    recorded separately can lose one half of itself to a crash between writes.
+    The memo update goes through the SAME first-wins merge the replay uses (gate
+    fix 8): a duplicate start must not diverge the in-process view from replay.
     """
+    # Fold the row-only shape onto the object first (the row spreads it last),
+    # so the memo and a replay of this same row start from identical facts.
+    for attr in ("access", "mode", "isolation"):
+        if shape and attr in shape:
+            setattr(custody, attr, str(shape.get(attr) or ""))
+    if shape and "delegated" in shape:
+        custody.delegated = shape.get("delegated") is True
+    previous = _CUSTODY.get(custody.run_id)
+    if previous is not None and previous is not custody:
+        _merge_started_into(custody, previous)
     _CUSTODY[custody.run_id] = custody
+    # The C1 binding and the resource reference ride the SAME row (a binding
+    # recorded separately can lose half of itself to a crash); shape spreads LAST.
     return emit(drive_root, STARTED, {
         "run_id": custody.run_id,
-        "task_id": custody.task_id,
-        "route": custody.route_id,
-        "model": custody.model,
-        "project_id": custody.project_id,
         "project_owned": custody.project_owned,
-        "root_task_id": custody.root_task_id,
-        "parent_task_id": custody.parent_task_id,
-        "ledger_root": custody.ledger_root,
-        "idempotency_key": custody.idempotency_key,
-        "invocation_id": custody.invocation_id,
-        # The C1 isolation binding rides the SAME row (empty for read-only runs):
-        # a binding recorded separately can lose one half of itself to a crash.
-        "snapshot_id": custody.snapshot_id,
-        "execution_root": custody.execution_root,
-        "baseline_sha": custody.baseline_sha,
-        "target_root": custody.target_root,
-        "authority_source": custody.authority_source,
+        "resource_ref": custody.resource_ref or {},
+        **{key: getattr(custody, attr) for attr, key in _STARTED_STR_FIELDS},
         **(shape or {}),
     })
 
@@ -675,16 +690,10 @@ def record_output_consumed(drive_root: Any, custody: RunCustody, *,
                            chars: int, lines: int) -> bool:
     """The canonical D7 acknowledgement: the staged artifact was read whole.
 
-    Written exactly once per STAGED CONTENT (the replayed, hash-bound
-    ``output_consumed`` flag is the guard — a re-stage of different bytes resets it and
-    a fresh acknowledgement is owed), at the moment the read windows have covered the
-    artifact continuously from start to EOF — never at delivery, which is the
-    distinction this row exists to record. Refused outright when the staging was not
-    the verified full content (acknowledging a bounded preview would launder
-    "received" into "read") and when the hash offered is not the currently staged
-    content's — an ack names bytes, never a path. Carries the byte length and content
-    hash of what was staged, so the record says WHAT was acknowledged, not merely that
-    something was.
+    Once per STAGED CONTENT (hash-bound; a re-stage of different bytes resets it),
+    written when the read windows covered the artifact start-to-EOF — never at
+    delivery. Refused when the staging was not verified full content or the hash
+    is not the currently staged content's: an ack names bytes, never a path.
     """
     if not custody.output_complete:
         return False
@@ -1204,19 +1213,19 @@ def open_runs(drive_root: Any) -> List[RunCustody]:
     return [custody for custody in replay(drive_root).values() if not custody.settled]
 
 
-def pending_invocations(drive_root: Any) -> List[Dict[str, Any]]:
+def pending_invocations(drive_root: Any,
+                        rows: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     """Invocations with a durable request row, no bound run, no definite refusal.
 
-    The launched-never-collected class one step EARLIER than ``open_runs``: a POST
-    the daemon may well have ACCEPTED, whose worker died between the wire call and
-    ``record_started``, leaves only the ``START_REQUESTED`` row — no run id anywhere,
-    so the run-keyed replay cannot see it and the retry token never reached a model.
-    Facts come from the FIRST request row (the minting), the same single-source rule
-    ``invocation_record`` follows; a record whose canonical body never landed is not
-    recoverable and is excluded (nothing byte-identical can be replayed)."""
+    The launched-never-collected class one step EARLIER than ``open_runs``: a
+    worker death between the accepted POST and ``record_started`` leaves only the
+    ``START_REQUESTED`` row. Facts come from the FIRST request row (the minting,
+    same rule as ``invocation_record``); a record whose canonical body never
+    landed is excluded (nothing byte-identical can be replayed). ``rows`` shares
+    one pre-read snapshot with ``replay`` (atomic payload busy claim)."""
     found: Dict[str, Dict[str, Any]] = {}
     state: Dict[str, str] = {}
-    for row in _iter_rows(event_log_path(drive_root)):
+    for row in rows if rows is not None else _iter_rows(event_log_path(drive_root)):
         invocation_id = str(row.get("invocation_id") or "")
         if not invocation_id:
             continue
@@ -1233,16 +1242,14 @@ def pending_invocations(drive_root: Any) -> List[Dict[str, Any]]:
                 "root_task_id": str(row.get("root_task_id") or ""),
                 "parent_task_id": str(row.get("parent_task_id") or ""),
                 # The FULL C1 isolation binding, not just the GC key: recovery
-                # re-records it on the bound run's STARTED row, so the snapshot
-                # stays custody-visible after the invocation stops being pending.
-                # snapshot_id alone was carried before, and a recovered run then
-                # replayed bindingless — the startup GC read its snapshot as
-                # closed and deleted the child's uncaptured work with it.
+                # re-records it on the bound run's STARTED row (snapshot_id alone
+                # left recovered runs bindingless and their snapshots GC-deleted).
                 "snapshot_id": str(row.get("snapshot_id") or ""),
                 "execution_root": str(row.get("execution_root") or ""),
                 "baseline_sha": str(row.get("baseline_sha") or ""),
                 "target_root": str(row.get("target_root") or ""),
                 "authority_source": str(row.get("authority_source") or ""),
+                "resource_ref": row.get("resource_ref") if isinstance(row.get("resource_ref"), dict) else {},
             }
         elif kind == STARTED:
             state[invocation_id] = "started"
@@ -1274,11 +1281,10 @@ def reconcile_task_runs(drive_root: Any, task_id: str, *,
     """Settle or cancel ONE task's open runs from the DURABLE rows (kill path).
 
     The supervisor-side twin of ``release_task_runs`` for a task whose worker was
-    just KILLED (cancellation custody / reap): the graceful loop-exit release runs
-    inside the worker and therefore never ran, and its in-process memo died with
-    the process, so the durable custody rows are the only complete view. Covers
-    pending invocations the same way the orphan sweep does. Cheap when the task
-    delegated nothing: the replay finds no open run and no transport is touched.
+    just KILLED (cancellation custody / reap): the graceful release never ran and
+    its memo died with the process, so the durable rows are the only complete
+    view. Covers pending invocations like the orphan sweep; cheap when the task
+    delegated nothing.
     """
     mine = str(task_id or "")
     if not mine:
@@ -1366,13 +1372,10 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
                                 record: Dict[str, Any]) -> Dict[str, Any]:
     """Recover the run (if any) behind an orphaned pending invocation, idempotently.
 
-    The stored canonical body is re-POSTed under the invocation's own wire key: the
-    engine's replay check returns the ORIGINAL handle when the first POST was accepted
-    (byte-identical body, same key), and only starts a fresh run when the daemon truly
-    never saw the invocation — which is the intention the owner recorded, immediately
-    collected below by the ordinary settle-or-cancel path. A definite 4xx retires the
-    invocation and the registration the original attempt owned; an unknown outcome
-    leaves it pending for the next sweep — never destroyed on missing information.
+    The stored canonical body is re-POSTed under the invocation's own wire key:
+    the engine returns the ORIGINAL handle when the first POST was accepted, and
+    starts fresh only when the daemon truly never saw it. A definite 4xx retires
+    the invocation and its registration; an unknown outcome stays pending.
     """
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
@@ -1427,7 +1430,15 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
         execution_root=str(record.get("execution_root") or ""),
         baseline_sha=str(record.get("baseline_sha") or ""),
         target_root=str(record.get("target_root") or ""),
-        authority_source=str(record.get("authority_source") or ""))
+        authority_source=str(record.get("authority_source") or ""),
+        # Carried opaquely VERBATIM — recovery never re-authorizes a target (R1-2).
+        resource_ref=record.get("resource_ref") if isinstance(record.get("resource_ref"), dict) else {},
+        # The GRANTED shape on the recovered OBJECT too, not only the row (gate
+        # fix 8c): the memo must answer the same lookups the replay does.
+        access=str(body.get("access") or ""),
+        mode=str(body.get("mode") or ""),
+        isolation=str(execution.get("isolation") or ""),
+        delegated=bool(execution.get("delegated")))
     record_started(drive_root, custody, shape={
         # The stored invocation is the single source of a replay's facts — the same
         # doctrine the explicit retry path follows.
