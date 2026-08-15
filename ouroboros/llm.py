@@ -2607,7 +2607,7 @@ class LLMClient:
             "messages": clean_messages,
             "max_tokens": local_max,
         }
-        if clean_tools:
+        if clean_tools and tool_choice != "none":
             kwargs["tools"] = clean_tools
             kwargs["tool_choice"] = tool_choice
         if timeout and timeout > 0:
