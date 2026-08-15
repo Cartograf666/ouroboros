@@ -480,7 +480,7 @@ export function initChatModelControl({ root, showToast = () => {} } = {}) {
                         body: JSON.stringify({
                             source: path,
                             filename,
-                            n_ctx: 32768,
+                            n_ctx: 131072,
                             n_gpu_layers: -1,
                         }),
                     });

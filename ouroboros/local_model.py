@@ -480,16 +480,17 @@ class LocalModelManager:
                 "--host", "127.0.0.1",
                 "--port", str(port),
                 "--n_gpu_layers", str(n_gpu_layers),
+                "--flash_attn", "True",
+                "--type_k", "2",
+                "--type_v", "2",
             ]
             if chat_format:
                 cmd.extend(["--chat_format", chat_format])
-            # Apple Silicon Metal memory safety cap:
-            # 65536 tokens (~64k) is the rock-solid safe limit on 48GB unified memory
-            # preventing Metal IOGPU driver memory exhaustion / system reboot.
-            if n_ctx > 65536:
-                log.warning("Requested n_ctx=%d exceeds safe Metal limit; clamping to 65536", n_ctx)
-                n_ctx = 65536
-            effective_ctx = n_ctx if n_ctx > 0 else 32768
+            # With Flash Attention + 4-bit KV Cache (q4_0), 131072 (128k) fits in ~24GB RAM
+            if n_ctx > 131072:
+                log.warning("Requested n_ctx=%d exceeds safe 128k Metal limit; clamping to 131072", n_ctx)
+                n_ctx = 131072
+            effective_ctx = n_ctx if n_ctx > 0 else 131072
             self._context_length = effective_ctx
             cmd.extend(["--n_ctx", str(effective_ctx)])
 
