@@ -10,6 +10,8 @@ import { quotaSummary } from './harness_accounts.js';
 const LOCAL_VALUE = '__local__';
 const SUCCESS_EVENT_TYPES = new Set(['llm_round']);
 const ERROR_EVENT_TYPES = new Set(['llm_api_error']);
+const READ_TIMEOUT_MS = 5000;
+const QUOTA_READ_TIMEOUT_MS = 1500;
 
 export function normalizeModelIdentity(value) {
     return String(value || '').trim()
@@ -237,6 +239,17 @@ async function responseJson(response, fallback = {}) {
     try { return await response.json(); } catch { return fallback; }
 }
 
+function timedFetch(path, options = {}, timeoutMs = READ_TIMEOUT_MS) {
+    const request = apiFetch(path, options).catch(() => null);
+    const timeout = new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs));
+    return Promise.race([request, timeout]);
+}
+
+function timedPromise(promise, timeoutMs = READ_TIMEOUT_MS) {
+    const timeout = new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs));
+    return Promise.race([Promise.resolve(promise).catch(() => null), timeout]);
+}
+
 export function initChatModelControl({ root, showToast = () => {} } = {}) {
     if (!root) return () => {};
     const select = root.querySelector('[data-model-select]');
@@ -286,11 +299,10 @@ export function initChatModelControl({ root, showToast = () => {} } = {}) {
         status.textContent = 'Checking…';
         try {
             const [settingsResp, catalogResp, localResp, eventsResp] = await Promise.all([
-                apiFetch('/api/settings', { cache: 'no-store' }),
-                apiFetch('/api/model-catalog', { cache: 'no-store' }),
-                apiFetch('/api/local-model/status', { cache: 'no-store' }),
-                apiFetch('/api/logs/events?limit=2000', { cache: 'no-store' }),
-                claudexorStatus.refresh(),
+                timedFetch('/api/settings', { cache: 'no-store' }),
+                timedFetch('/api/model-catalog', { cache: 'no-store' }),
+                timedFetch('/api/local-model/status', { cache: 'no-store' }),
+                timedFetch('/api/logs/events?limit=2000', { cache: 'no-store' }),
             ]);
             settings = await responseJson(settingsResp);
             const catalog = await responseJson(catalogResp, { items: [] });
@@ -303,11 +315,16 @@ export function initChatModelControl({ root, showToast = () => {} } = {}) {
                 events: eventRows.entries || [],
             });
             render();
-            if (harness) {
-                const payload = claudexorStatus.snapshot || {};
-                const lines = harnessQuotaLines(payload, claudexorStatus.facet(FACET_QUOTA));
-                harness.textContent = lines.join('\n');
-            }
+            // Subscription discovery is informative and must never block the
+            // main-model control. Claudexor can be stale or offline while the
+            // local/Gemini choices remain perfectly usable.
+            if (harness) void timedPromise(claudexorStatus.refresh(), QUOTA_READ_TIMEOUT_MS)
+                .then(() => {
+                    if (disposed) return;
+                    const payload = claudexorStatus.snapshot || {};
+                    const lines = harnessQuotaLines(payload, claudexorStatus.facet(FACET_QUOTA));
+                    harness.textContent = lines.join('\n');
+                });
         } catch (error) {
             status.dataset.state = 'unavailable';
             status.textContent = 'Status unavailable';
