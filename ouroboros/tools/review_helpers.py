@@ -1289,67 +1289,66 @@ def build_goal_section(
 
 
 def build_head_snapshot_section(
-    repo_dir: Path,
-    paths: list[str],
+    repo_dir: Path, paths: list[str], *, current_snapshots: dict[str, Path] | None = None,
 ) -> tuple[str, frozenset[str]]:
-    """Build prompt text with HEAD snapshots of touched files.
+    """Build prompt text with HEAD or explicit current snapshots of touched files.
 
-    Returns ``(section_text, included_paths)`` where ``included_paths`` holds
-    exactly the paths whose FULL snapshot text made it into the section. Every
-    other path got an omission marker (sensitive/binary/oversized/new/error),
-    and the caller must NOT report it to the atlas as ``already_included`` —
-    that claim is what the atlas trusts, so a false one bypasses the BIBLE P3
-    required-artifact refusal (XG-1R.4). Same shape as
-    ``build_touched_file_pack``'s ``(section, omitted)`` contract.
+    ``included_paths`` names only FULL snapshots; omission markers must never
+    become Atlas ``already_included`` claims (BIBLE P3 / XG-1R.4).
     """
     if not paths:
         return "(no touched files)", frozenset()
-
+    current_by_label = {str(k).strip(): Path(v) for k, v in (current_snapshots or {}).items()}
     parts: list[str] = []
     included: set[str] = set()
+    def append_bytes(rel: str, raw: bytes, source: str) -> None:
+        if len(raw) > _FILE_SIZE_LIMIT:
+            parts.append(
+                f"### {rel}\n\n*({source} omitted — {len(raw):,} bytes exceeds "
+                f"{_FILE_SIZE_LIMIT:,} byte limit)*\n"
+            )
+        elif _raw_bytes_binary(raw[:_BINARY_SNIFF_BYTES]):
+            parts.append(f"### {rel}\n\n*({source} omitted — binary content detected)*\n")
+        else:
+            lang = Path(rel).suffix.lstrip(".")
+            note = f"*{source}*\n\n" if source != "HEAD snapshot" else ""
+            content = raw.decode("utf-8", errors="replace")
+            parts.append(f"### {rel}\n\n{note}{format_prompt_code_block(content, lang)}\n")
+            included.add(rel)
+
     for rel in paths:
         fp_rel = Path(rel)
         suffix = fp_rel.suffix.lower()
-        # Omit credential-shaped files before reading HEAD snapshot.
+        current_path = current_by_label.get(str(rel).strip())
+        source = "Current skill-payload snapshot (data plane, not Git HEAD)" if current_path else "HEAD snapshot"
         fname_lower = fp_rel.name.lower()
         if suffix in _SENSITIVE_EXTENSIONS or fname_lower in _SENSITIVE_NAMES:
-            parts.append(f"### {rel}\n\n*(HEAD snapshot omitted — sensitive file)*\n")
+            parts.append(f"### {rel}\n\n*({source} omitted — sensitive file)*\n")
             continue
-        # Skip known binary extensions before invoking git.
         if suffix in BINARY_EXTENSIONS:
-            parts.append(f"### {rel}\n\n*(HEAD snapshot omitted — binary file ({suffix}))*\n")
+            parts.append(f"### {rel}\n\n*({source} omitted — binary file ({suffix}))*\n")
             continue
-        ext = Path(rel).suffix.lstrip(".")
-        lang = ext if ext else ""
         try:
-            # Force English git stderr so new-file detection is locale-stable.
-            _git_env = {**os.environ, "LC_ALL": "C", "LANG": "C", "LANGUAGE": "C"}
+            if current_path is not None:
+                if not current_path.is_file():
+                    parts.append(
+                        f"### {rel}\n\n*(Current skill-payload snapshot unavailable — "
+                        "file does not exist or is not a regular file)*\n"
+                    )
+                else:
+                    append_bytes(rel, current_path.read_bytes(), source)
+                continue
             result = subprocess.run(
                 ["git", "show", f"HEAD:{rel}"],
                 cwd=repo_dir,
                 capture_output=True,
                 timeout=10,
-                env=_git_env,
+                env={**os.environ, "LC_ALL": "C", "LANG": "C", "LANGUAGE": "C"},
             )
             if result.returncode == 0 and result.stdout:
-                raw_bytes = result.stdout
-                # Size guard uses raw bytes, not decoded characters.
-                if len(raw_bytes) > _FILE_SIZE_LIMIT:
-                    parts.append(
-                        f"### {rel}\n\n*(HEAD snapshot omitted — {len(raw_bytes):,} bytes exceeds "
-                        f"{_FILE_SIZE_LIMIT:,} byte limit)*\n"
-                    )
-                    continue
-                if _raw_bytes_binary(raw_bytes[:_BINARY_SNIFF_BYTES]):
-                    parts.append(f"### {rel}\n\n*(HEAD snapshot omitted — binary content detected)*\n")
-                    continue
-                # Decode only after binary/size checks.
-                content = raw_bytes.decode("utf-8", errors="replace")
-                parts.append(f"### {rel}\n\n```{lang}\n{content}\n```\n")
-                included.add(rel)
+                append_bytes(rel, result.stdout, source)
                 continue
             if result.returncode != 0:
-                # Distinguish a new file from a real git failure.
                 raw_stderr = result.stderr or b""
                 stderr_str = (
                     raw_stderr.decode("utf-8", errors="replace")
@@ -1366,7 +1365,6 @@ def build_head_snapshot_section(
                 if is_new_file:
                     parts.append(f"### {rel}\n\n*(File is new — no HEAD snapshot)*\n")
                 else:
-                    # Real git failure: tell the reviewer the snapshot is missing.
                     short_err = stderr_str.strip()[:200]
                     parts.append(f"### {rel}\n\n*(HEAD snapshot error — git exited {result.returncode}: {short_err})*\n")
             elif not result.stdout:

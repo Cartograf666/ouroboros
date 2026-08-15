@@ -206,26 +206,45 @@ def _plan_raw_result_from_actor(actor: dict, request_model: str) -> dict:
     }
 
 
+def resolve_plan_payload_snapshots(
+    ctx: ToolContext, files_to_touch: list,
+) -> dict[str, pathlib.Path]:
+    """Resolve exact non-native payload paths to their current data-plane files."""
+    from ouroboros.contracts.skill_payload_policy import resolve_skill_payload_target
+    from ouroboros.tool_access import canonical_data_root
+
+    try:
+        drive = canonical_data_root(ctx)
+    except Exception:
+        return {}
+    snapshots: dict[str, pathlib.Path] = {}
+    for raw in files_to_touch or []:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        try:
+            target = resolve_skill_payload_target(drive, text)
+        except ValueError:
+            continue
+        snapshots[text] = target.target_path
+    return snapshots
+
+
 def resolve_plan_roots(
     ctx: ToolContext, files_to_touch: list,
 ) -> tuple[pathlib.Path, pathlib.Path]:
     """Resolve governance and subject roots without silently mixing them."""
-    from ouroboros.contracts.skill_payload_policy import is_skill_payload_path
     from ouroboros.review_substrate import review_repo_dirs_for
-    from ouroboros.tool_access import canonical_data_root
 
     governance, subject = review_repo_dirs_for(ctx)
-    try:
-        drive = canonical_data_root(ctx)
-    except Exception:
-        drive = None
+    payload_paths = resolve_plan_payload_snapshots(ctx, files_to_touch)
     for raw in files_to_touch or []:
-        text = str(raw or "")
+        text = str(raw or "").strip()
         # Skill-payload paths live in the DATA plane and are legitimate plan
         # targets, not subject-root escapes — same frozen predicate as the
         # classification exemption in resolve_plan_class; a drive-resolution
         # failure keeps the old blanket rejection.
-        if drive is not None and is_skill_payload_path(drive, text, allow_control_plane=True):
+        if text in payload_paths:
             continue
         candidate = pathlib.Path(text)
         resolved = (candidate if candidate.is_absolute() else subject / candidate).resolve(strict=False)
@@ -240,8 +259,7 @@ def resolve_plan_roots(
 
 def resolve_plan_class(ctx: ToolContext, plan_class: str, files_to_touch: list) -> tuple[str, str]:
     """Resolve the declared class and structurally escalate system-repo work."""
-    from ouroboros.contracts.skill_payload_policy import is_skill_payload_path
-    from ouroboros.tool_access import canonical_data_root, path_is_relative_to
+    from ouroboros.tool_access import path_is_relative_to
 
     declared = str(plan_class or "").strip().lower()
     if declared not in PLAN_CLASSES:
@@ -261,17 +279,11 @@ def resolve_plan_class(ctx: ToolContext, plan_class: str, files_to_touch: list) 
     # the system repo, so they never make a plan self-modification by
     # themselves. Classification-only: write gates are unrelated code paths.
     # A drive-resolution failure skips the exemption (current behavior).
-    try:
-        drive = canonical_data_root(ctx)
-    except Exception:
-        drive = None
+    payload_paths = resolve_plan_payload_snapshots(ctx, files_to_touch)
     significant = [
         text
         for text in (str(raw or "").strip() for raw in files_to_touch or [])
-        if text and not (
-            drive is not None
-            and is_skill_payload_path(drive, text, allow_control_plane=True)
-        )
+        if text and text not in payload_paths
     ]
     touches_system = False
     if significant:

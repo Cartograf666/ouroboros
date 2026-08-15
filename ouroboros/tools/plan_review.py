@@ -42,6 +42,7 @@ from ouroboros.tools.plan_review_runtime import (
     record_raw_plan_request_attempt as _record_raw_plan_request_attempt,
     reviewed_handoff_hashes as _reviewed_handoff_hashes,
     resolve_plan_class as _resolve_plan_class,
+    resolve_plan_payload_snapshots as _resolve_plan_payload_snapshots,
     resolve_plan_roots as _resolve_plan_roots,
     run_plan_review_slots as _run_plan_review_slots,
     validate_plan_request_envelope as _validate_plan_request_envelope,
@@ -1281,6 +1282,18 @@ def _compile_plan_atlas(
     ))
 
 
+def _build_plan_touch_snapshots(
+    ctx: ToolContext, subject_repo: pathlib.Path, files_to_touch: list[str],
+) -> tuple[str, frozenset[str]]:
+    if not files_to_touch:
+        return "", frozenset()
+    return build_head_snapshot_section(
+        subject_repo,
+        files_to_touch,
+        current_snapshots=_resolve_plan_payload_snapshots(ctx, files_to_touch),
+    )
+
+
 async def _run_plan_review_async(
     ctx: ToolContext,
     request: _PlanReviewRequest,
@@ -1433,13 +1446,10 @@ async def _run_plan_review_async(
             arch_md, title="ARCHITECTURE.md", rel_path="docs/ARCHITECTURE.md"
         )
     ctx.emit_progress_fn("📐 plan_task: reading planned-touch file snapshots…")
-    head_snapshots = ""
     # Atlas inclusion claims only snapshots that survived; omission markers stay explicit.
-    snapshot_included: frozenset[str] = frozenset()
-    if files_to_touch:
-        head_snapshots, snapshot_included = build_head_snapshot_section(
-            subject_repo, files_to_touch
-        )
+    head_snapshots, snapshot_included = _build_plan_touch_snapshots(
+        ctx, subject_repo, files_to_touch
+    )
     requested_context_level = resolved_context_level
     effective_context_level = requested_context_level
     context_degradation_reason = ""

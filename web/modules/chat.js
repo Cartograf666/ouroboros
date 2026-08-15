@@ -3073,9 +3073,7 @@ export function createChatInstance({
             ${pendingHtml}
             ${timeHtml}
         `;
-        wireSkillReviewDisclosure(bubble, () => {
-            requestAnimationFrame(() => updateMessagesPadding({ preserveStickiness: true }));
-        });
+        wireSkillReviewDisclosure(bubble, () => requestAnimationFrame(() => !destroyed && updateMessagesPadding({ preserveStickiness: true })));
         stampNodeTimestamp(bubble, ts);
         insertMessageNode(bubble, { forceStick: !!opts.forceStick });
         renderRoutingAnnotation(bubble, opts.chatAnnotation);

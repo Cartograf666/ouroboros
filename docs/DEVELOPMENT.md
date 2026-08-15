@@ -472,7 +472,10 @@ ARCHITECTURE.md is CLASS-TIERED (v6.61.0, an owner-approved governance
 evolution — quiz 19): the agent declares `plan_class`
 (`self_mod | external | creative | research`), and the host STRUCTURALLY
 escalates to `self_mod` whenever `files_to_touch` resolve under the system repo
-(a path fact, never keyword matching). `self_mod` plans keep the full inline
+(a path fact, never keyword matching). The classification-only exception is an
+exact path inside a non-native installed skill payload under the canonical data
+root; it remains the declared class and does not grant or alter write authority.
+`self_mod` plans keep the full inline
 ARCHITECTURE.md — unchanged from the historical contract. Non-self_mod plans
 (an external codebase, a creative deliverable, a research question) receive
 ARCHITECTURE.md as the LOSSLESS navigation map (`context_layout.
@@ -497,10 +500,13 @@ external/creative/research scouts are steered to the plan's own domain
 internals.
 
 Planning has two distinct roots. Governance documents are always loaded from
-the system repository; planned snapshots and Atlas inventory always use
-`active_repo_dir_for(ctx)`. A workspace/subject mismatch, an unavailable root,
-or a `files_to_touch` path escaping that subject must fail loudly. Do not fall
-back to reviewing the Ouroboros repo for an external plan. Read-only scouts use
+the system repository; Git-backed planned snapshots and Atlas inventory use
+`active_repo_dir_for(ctx)`. Exact non-native installed-skill payload paths are
+the one data-plane exception: their first-class touched snapshots read the
+current bytes from the canonical data root and say explicitly that they are not
+Git HEAD snapshots. Any other `files_to_touch` path escaping the active subject,
+a workspace/subject mismatch, or an unavailable root must fail loudly. Do not
+fall back to reviewing the Ouroboros repo for an external plan. Read-only scouts use
 the existing worker pool with its generic `executor=auto` route (selected
 healthy harness first, existing loud native fallback) and persist full raw
 handoffs. Wait for every launched

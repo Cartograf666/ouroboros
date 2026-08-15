@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -237,4 +238,12 @@ test('wiring: Retry click clears the error state and refetches', async () => {
 test('wiring: non-review bubbles are left untouched', () => {
     const bubble = { querySelector: () => null };
     assert.equal(wireSkillReviewDisclosure(bubble, () => {}), false);
+});
+
+test('chat layout callback ignores late skill-review completion after destroy', () => {
+    const source = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
+    assert.match(
+        source,
+        /wireSkillReviewDisclosure\(bubble,[\s\S]*?requestAnimationFrame\(\s*\(\) => !destroyed && updateMessagesPadding/,
+    );
 });
