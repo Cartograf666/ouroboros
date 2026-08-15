@@ -33,6 +33,9 @@ CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "ocr_pdf", "youtube_transcript", "extract_video_frames",
     "send_user_message", "send_photo", "send_video", "send_file",
     "switch_model",
+    # Official Antigravity CLI consultation.  It is a read-only OAuth-backed
+    # worker, not a regular metered API model.
+    "antigravity_ask",
     "request_restart", "promote_to_stable",
     "advisory_review", "review_status", "task_acceptance_review", "verify_and_record",
     # Heal mode blocks enable_tools, so repair/review tools must be core.

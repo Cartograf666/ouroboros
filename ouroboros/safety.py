@@ -72,6 +72,9 @@ TOOL_POLICY: Dict[str, str] = {
     "wait_tasks": POLICY_SKIP,
     "list_projects": POLICY_SKIP,
     "switch_model": POLICY_SKIP,
+    # Official Antigravity CLI consultation is read-only (plan+sandbox) and its
+    # OAuth credential stays inside the CLI/keyring boundary.
+    "antigravity_ask": POLICY_SKIP,
     "service_status": POLICY_SKIP,
     "service_logs": POLICY_SKIP,
 

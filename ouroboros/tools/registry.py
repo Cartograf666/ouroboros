@@ -1482,7 +1482,7 @@ class ToolRegistry:
         self._load_modules()
 
     _FROZEN_TOOL_MODULES = [
-        "browser", "ci", "claude_advisory_review", "compact_context", "control",
+        "antigravity", "browser", "ci", "claude_advisory_review", "compact_context", "control",
         "core", "delegate", "edit_ops", "evolution_stats", "git", "git_pr", "git_rollback", "github",
         "health", "join_ledger", "knowledge", "media", "memory_tools", "plan_review", "project_journal",
         "recent_tasks",
