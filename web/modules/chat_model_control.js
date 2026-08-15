@@ -234,9 +234,12 @@ function harnessQuotaLines(payload, quotaRead) {
     });
 }
 
-async function responseJson(response, fallback = {}) {
+async function responseJson(response, fallback = {}, timeoutMs = READ_TIMEOUT_MS) {
     if (!response?.ok) return fallback;
-    try { return await response.json(); } catch { return fallback; }
+    try {
+        const payload = await timedPromise(response.json(), timeoutMs);
+        return payload == null ? fallback : payload;
+    } catch { return fallback; }
 }
 
 function timedFetch(path, options = {}, timeoutMs = READ_TIMEOUT_MS) {
@@ -306,23 +309,39 @@ export function initChatModelControl({ root, showToast = () => {} } = {}) {
                 // stay empty just because the first request met a dead socket.
                 let responses = [];
                 for (let attempt = 0; attempt < 3; attempt += 1) {
-                    responses = await Promise.all([
+                    const requests = [
                         timedFetch('/api/settings', { cache: 'no-store' }),
                         timedFetch('/api/model-catalog', { cache: 'no-store' }),
                         timedFetch('/api/local-model/status', { cache: 'no-store' }),
                         timedFetch('/api/logs/events?limit=2000', { cache: 'no-store' }),
-                    ]);
-                    if (responses.some(Boolean) || attempt === 2) break;
+                    ];
+
+                    // Settings contain the configured route, so render those
+                    // choices as soon as their response arrives. A slow remote
+                    // catalog must not hide a model the owner already selected.
+                    const settingsResp = await requests[0];
+                    settings = await responseJson(settingsResp);
+                    choices = buildModelChoices({ settings, events: [] });
+                    if (choices.length) render();
+
+                    responses = await Promise.all(requests);
+                    // A local-status response alone is not enough evidence that
+                    // the server is ready to provide the model/settings data.
+                    if (responses[0] || responses[1] || attempt === 2) break;
                     await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
                 }
-                const [settingsResp, catalogResp, localResp, eventsResp] = responses;
+                const [, catalogResp, localResp, eventsResp] = responses;
                 if (!responses.some(Boolean)) {
                     throw new Error('Ouroboros is restarting; press Refresh in a moment.');
                 }
-                settings = await responseJson(settingsResp);
-                const catalog = await responseJson(catalogResp, { items: [] });
-                const local = await responseJson(localResp);
-                const eventRows = await responseJson(eventsResp, { entries: [] });
+                // `settingsResp` was consumed by the early render above. Do
+                // not read that one-shot Response body a second time: a failed
+                // second read would erase the configured models with `{}`.
+                const [catalog, local, eventRows] = await Promise.all([
+                    responseJson(catalogResp, { items: [] }),
+                    responseJson(localResp),
+                    responseJson(eventsResp, { entries: [] }),
+                ]);
                 choices = buildModelChoices({
                     settings,
                     catalogItems: catalog.items || [],
