@@ -157,11 +157,14 @@ export async function requestStop(taskId, action) {
 // ---------------------------------------------------------------------------
 
 let openMenu = null;
+let openTrigger = null;
 
 export function closeTaskControlMenu() {
     if (!openMenu) return;
     openMenu.remove();
     openMenu = null;
+    openTrigger?.setAttribute?.('aria-expanded', 'false');
+    openTrigger = null;
     document.removeEventListener('pointerdown', onOutsidePointer, true);
     document.removeEventListener('keydown', onMenuKeydown, true);
 }
@@ -186,13 +189,18 @@ function onMenuKeydown(event) {
 export function openTaskControlMenu(anchor, { cancelPending = false, busy = false, onAction } = {}) {
     closeTaskControlMenu();
     if (!anchor || !anchor.parentElement) return null;
+    // A11y: the trigger owns a popup menu; expanded tracks the open state.
+    anchor.setAttribute('aria-haspopup', 'menu');
+    anchor.setAttribute('aria-expanded', 'true');
     const menu = document.createElement('div');
     menu.className = 'task-control-menu';
+    menu.setAttribute('role', 'menu');
     for (const action of taskControlActions({ cancelPending })) {
         const item = document.createElement('button');
         item.type = 'button';
         item.className = `task-control-item${action === ACTION_STOP_NOW ? ' danger' : ''}`;
         item.dataset.taskControl = action;
+        item.setAttribute('role', 'menuitem');
         item.textContent = TASK_CONTROL_LABELS[action];
         if (busy) item.disabled = true;
         item.addEventListener('click', (event) => {
@@ -204,6 +212,9 @@ export function openTaskControlMenu(anchor, { cancelPending = false, busy = fals
     }
     anchor.parentElement.appendChild(menu);
     openMenu = menu;
+    openTrigger = anchor;
+    // A11y: keyboard users land on the first actionable item on open.
+    menu.querySelector('button:not(:disabled)')?.focus?.();
     document.addEventListener('pointerdown', onOutsidePointer, true);
     document.addEventListener('keydown', onMenuKeydown, true);
     return menu;

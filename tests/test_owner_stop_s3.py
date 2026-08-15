@@ -205,11 +205,16 @@ def test_owner_stop_active_matrix(tmp_path):
     assert ostop.owner_stop_active(
         {**intent, "state": ci.INTENT_CLAIMED}, now=now, grace_sec=120.0,
     ) is False
-    # The immutable deadline passed: the episode no longer owns the intent.
+    # The immutable deadline passed: the episode no longer owns the intent
+    # (the SWEEP feeds custody) — but the intent stays OPEN, so the
+    # enforcement HOLD deliberately keeps covering the task (MAJOR-B).
     assert ostop.owner_stop_active(intent, now=now + 121.0, grace_sec=120.0) is False
-    # Immediate intents never form an episode.
+    assert ostop.owner_stop_open(intent) is True
+    assert ostop.owner_stop_open({**intent, "state": ci.INTENT_CLAIMED}) is False
+    # Immediate intents never form an episode and are never held.
     immediate = ci.request_cancel(tmp_path, "t-act2")
     assert ostop.owner_stop_active(immediate, now=now, grace_sec=120.0) is False
+    assert ostop.owner_stop_open(immediate) is False
 
 
 def test_running_owner_stop_tasks_reads_the_durable_projection(tmp_path):
@@ -217,13 +222,18 @@ def test_running_owner_stop_tasks_reads_the_durable_projection(tmp_path):
     ci.request_cancel(tmp_path, "t-hard")            # immediate: not held
     held = ostop.running_owner_stop_tasks(tmp_path, grace_sec=120.0)
     assert held == {"t-held"}
+    # A claimed intent releases the hold: custody owns the kill from there.
+    ci.claim_intent(tmp_path, "t-held", owner="custody-test")
+    assert ostop.running_owner_stop_tasks(tmp_path, grace_sec=120.0) == set()
     assert ostop.running_owner_stop_tasks(tmp_path, grace_sec=0.0) == set()
 
 
 def test_timeout_enforcement_bypasses_a_held_task_whole(tmp_path, monkeypatch):
-    """§12.2 item 8: a hard-over-timeout RUNNING task inside an active owner-stop
+    """§12.2 item 8: a hard-over-timeout RUNNING task inside an owner-stop
     episode is skipped by the generic enforcement loop — not withdrawn, killed,
-    reaped, or retried this tick."""
+    reaped, or retried this tick — INCLUDING past the grace deadline (MAJOR-B:
+    the hold covers the whole open-intent window; custody is the sole killer
+    at expiry)."""
     from supervisor import queue as q
 
     _graceful_intent(tmp_path, "t-timeout")
@@ -238,6 +248,142 @@ def test_timeout_enforcement_bypasses_a_held_task_whole(tmp_path, monkeypatch):
     q_isolated._enforce_task_timeouts_locked(None, time.time(), 0, {})
     assert "t-timeout" in q_isolated.RUNNING          # untouched, no kill path ran
     assert q_isolated.RUNNING["t-timeout"] is meta
+    # PAST the deadline boundary (requested_at + 120s long gone): the task is
+    # still bypassed whole — no reap, no retry clone, meta untouched.
+    q_isolated._enforce_task_timeouts_locked(None, time.time() + 100_000.0, 0, {})
+    assert q_isolated.RUNNING["t-timeout"] is meta
+    assert q_isolated.PENDING == []
+
+
+def _expiry_enforcement_queue(monkeypatch, tmp_path, task_id, meta):
+    """An isolated queue tuned so the generic rail WOULD reap/retry the task
+    if it were not held: small idle timeout, huge ceiling, captured reap jobs."""
+    from supervisor import queue as q
+    from supervisor import workers
+
+    q_isolated = _isolate_queue(monkeypatch, tmp_path, running={task_id: meta})
+    monkeypatch.setattr(q, "FINALIZATION_GRACE_SEC", 120.0, raising=False)
+    monkeypatch.setattr(q, "get_task_idle_timeout_sec", lambda: 60.0)
+    monkeypatch.setattr(q, "get_per_call_timeout_ceiling_sec", lambda: 0.0)
+    monkeypatch.setattr(q, "get_task_abs_ceiling_sec", lambda: 10_000_000.0)
+    monkeypatch.setattr(q, "_ensure_reaper_started", lambda: None)
+    jobs = []
+    monkeypatch.setattr(q, "_reap_queue", SimpleNamespace(put=jobs.append))
+    return q_isolated, workers, jobs
+
+
+def test_tool_call_spanning_expiry_keeps_the_episode_whole(tmp_path, monkeypatch):
+    """MAJOR-B trace (a): a PROGRESSING task whose tool call spans the episode
+    expiry must not have its episode withdrawn — no control revocation, no
+    false retraction toast — and the custody sweep performs the kill while the
+    undrained summary-turn control stays deliverable."""
+    from supervisor import workers
+
+    toasts = []
+    monkeypatch.setattr(
+        workers, "get_event_q", lambda: SimpleNamespace(put=toasts.append),
+    )
+    intent = _graceful_intent(tmp_path, "t-span")
+    now = time.time()
+    meta = {
+        "task": {"id": "t-span", "chat_id": 0, "type": "task"},
+        "started_at": now - 300.0,
+        "last_heartbeat_at": now,
+        "attempt": 1,
+    }
+    q_isolated, workers_mod, jobs = _expiry_enforcement_queue(
+        monkeypatch, tmp_path, "t-span", meta,
+    )
+    # Arm the real episode (control + latch) through the production sweep.
+    assert ostop.sweep_owner_stop_hold(q_isolated, "t-span", intent, now=now) is True
+    control_id = ostop.owner_stop_control_id(intent)
+    assert meta["finalization_control_msg_id"] == control_id
+    armed_toasts = len(toasts)
+    # A tool call is still producing progress as the deadline (requested+120s)
+    # passes; the enforcement tick runs 50s past expiry.
+    expiry = now + 170.0
+    meta["last_progress_at"] = expiry - 1.0
+    q_isolated._enforce_task_timeouts_locked(workers_mod, expiry, 0, {})
+    # Held whole: no withdraw (latch + control intact), no retraction toast,
+    # no reap job, the task still RUNNING.
+    assert q_isolated.RUNNING["t-span"] is meta
+    assert meta["finalization_control_msg_id"] == control_id
+    assert meta["finalization_reason"] == REASON_OWNER_REQUESTED_FINALIZATION
+    assert len(toasts) == armed_toasts
+    assert jobs == []
+    rows = _finalize_rows(tmp_path, "t-span")
+    assert len(rows) == 1 and rows[0]["msg_id"] == control_id
+    # The summary-turn control is still DELIVERABLE (never revoked): a drain
+    # yields it, so the loop's owner-stop rail can produce the final answer.
+    from ouroboros.owner_mailbox import drain_owner_entries
+
+    drained = drain_owner_entries(tmp_path, "t-span")
+    assert [e["msg_id"] for e in drained] == [control_id]
+    # Custody remains the SOLE killer at expiry: the sweep hold releases past
+    # the deadline and the generic custody feed proceeds.
+    assert ostop.sweep_owner_stop_hold(q_isolated, "t-span", intent, now=expiry) is False
+
+
+def test_non_progressing_task_at_expiry_is_not_reaped_or_cloned(tmp_path, monkeypatch):
+    """MAJOR-B trace (b): a NON-progressing task at episode expiry must not be
+    idle_timeout-reaped by the generic rail nor cloned into a new-id retry that
+    escapes the intent; the owner-requested reason stays with custody."""
+    intent = _graceful_intent(tmp_path, "t-idle")
+    now = time.time()
+    requested = ostop._requested_ts(intent)
+    meta = {
+        "task": {"id": "t-idle", "chat_id": 0, "type": "task"},
+        "started_at": now - 1000.0,
+        "last_heartbeat_at": now - 500.0,
+        "last_progress_at": now - 500.0,               # idle >> 60s idle timeout
+        "attempt": 1,
+        "finalization_requested_at": requested,        # armed episode latch
+        "finalization_reason": REASON_OWNER_REQUESTED_FINALIZATION,
+        "finalization_control_msg_id": ostop.owner_stop_control_id(intent),
+    }
+    q_isolated, workers_mod, jobs = _expiry_enforcement_queue(
+        monkeypatch, tmp_path, "t-idle", meta,
+    )
+    q_isolated._enforce_task_timeouts_locked(workers_mod, requested + 170.0, 0, {})
+    # No idle_timeout terminal, no reap job, no new-id retry clone.
+    assert q_isolated.RUNNING["t-idle"] is meta
+    assert jobs == []
+    assert q_isolated.PENDING == []
+    assert (load_task_result(tmp_path, "t-idle") or {}).get("status") != "cancelled"
+    # The owner-requested intent is still the one will custody settles.
+    live = ci.active_intent(tmp_path, "t-idle")
+    assert ci.stop_policy(live) == ci.STOP_POLICY_FINALIZE
+
+
+def test_reap_retry_is_guarded_for_intent_covered_tasks(tmp_path, monkeypatch):
+    """Grok's guard: a task whose intent is ACTIVE but not held (custody already
+    CLAIMED the finalize intent) can still reach the generic reap branch — the
+    frozen reap job must then carry will_retry=False so no new-uuid clone
+    escapes the intent and CANCELLED_ROOT_FENCES."""
+    intent = _graceful_intent(tmp_path, "t-claimed")
+    assert ci.claim_intent(tmp_path, "t-claimed", owner="custody-test")
+    now = time.time()
+    meta = {
+        "task": {"id": "t-claimed", "chat_id": 0, "type": "task"},
+        "started_at": now - 1000.0,
+        "last_heartbeat_at": now - 500.0,
+        "last_progress_at": now - 500.0,               # idle: would-be retry shape
+        "attempt": 1,
+        "finalization_requested_at": now - 300.0,      # grace long elapsed
+        "finalization_reason": "idle_timeout",
+        "finalization_control_msg_id": ostop.owner_stop_control_id(intent),
+    }
+    q_isolated, workers_mod, jobs = _expiry_enforcement_queue(
+        monkeypatch, tmp_path, "t-claimed", meta,
+    )
+    q_isolated._enforce_task_timeouts_locked(workers_mod, now, 0, {})
+    # The claimed intent released the hold, so the reap branch DID run —
+    # but the retry was refused by the active-intent guard.
+    assert len(jobs) == 1
+    assert jobs[0]["task_id"] == "t-claimed"
+    assert jobs[0]["will_retry"] is False
+    assert jobs[0]["retry_task_id"] == ""
+    assert "t-claimed" not in q_isolated.RUNNING
 
 
 def _fake_queue(tmp_path, running):
@@ -368,3 +514,58 @@ def test_owner_stop_deadline_is_immutable_from_requested_at(tmp_path):
     # Progress/heartbeats never extend it: the same intent yields the same deadline.
     assert ostop.owner_stop_deadline_ts(intent, 120.0) == deadline
     assert ostop.owner_stop_deadline_ts({}, 120.0) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Loop owner-stop rail: ZERO or ONE tool-less model turn (Q1/Q3=A, CF-02/CF-03)
+# ---------------------------------------------------------------------------
+
+
+def test_owner_stop_rail_retained_candidate_spends_zero_model_turns(tmp_path, monkeypatch):
+    """A current valid DeliveryCandidate is reused verbatim: NO model call, the
+    typed owner_requested_finalization reason stamped (never the deadline's)."""
+    from tests.test_delivery_forced_finalization import _forced_test_context
+
+    loop, registry, ctx, trace = _forced_test_context(tmp_path)
+    loop._replace_delivery_candidate(
+        registry, ctx, trace, "Retained complete final answer.", control="candidate",
+    )
+    calls = []
+    monkeypatch.setattr(
+        loop, "call_llm_with_retry",
+        lambda *a, **k: calls.append(1) or ({"role": "assistant", "content": "fresh"}, 0.0),
+    )
+    text, usage, _returned = loop._handle_forced_finalization(
+        ctx, REASON_OWNER_REQUESTED_FINALIZATION,
+    )
+    assert calls == []                                  # zero paid turns
+    assert usage["reason_code"] == REASON_OWNER_REQUESTED_FINALIZATION
+    assert "Retained complete final answer." in text
+
+
+def test_owner_stop_rail_without_candidate_spends_exactly_one_turn(tmp_path, monkeypatch):
+    """No retained candidate: exactly ONE logical tool-less finalization call
+    (single_semantic_turn — the generic second semantic refresh is disabled),
+    fed the control's bounded child projection, typed reason stamped."""
+    from tests.test_delivery_forced_finalization import _forced_test_context
+
+    loop, _registry, ctx, _trace = _forced_test_context(tmp_path)
+    calls = []
+
+    def _one_call(_llm, messages, *_args, **_kwargs):
+        calls.append(messages[-1]["content"])
+        return {"role": "assistant", "content": "Synthesized final summary."}, 0.0
+
+    monkeypatch.setattr(loop, "call_llm_with_retry", _one_call)
+    control = (
+        REASON_OWNER_REQUESTED_FINALIZATION
+        + "\n[CHILD_RESULTS] kid-1 (cancelled): partial child answer"
+    )
+    text, usage, _returned = loop._handle_forced_finalization(ctx, control)
+    assert len(calls) == 1                              # exactly one paid turn
+    assert usage["reason_code"] == REASON_OWNER_REQUESTED_FINALIZATION
+    assert "Synthesized final summary." in text
+    # The one prompt is the OWNER_STOP rail's (not the deadline's) and carries
+    # the bounded durable child projection.
+    assert "[OWNER_STOP]" in calls[0]
+    assert "[CHILD_RESULTS] kid-1 (cancelled)" in calls[0]

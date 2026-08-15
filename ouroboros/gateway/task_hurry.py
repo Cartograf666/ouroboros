@@ -146,24 +146,25 @@ async def api_task_hurry(request: Request) -> JSONResponse:
             request_id=request_id, attempt=attempt, requested_at=requested_at,
         )
         block = outcome.get("block") if isinstance(outcome.get("block"), dict) else {}
-        same_request = str(block.get("request_id") or "") == request_id
-        if not outcome.get("duplicate") or same_request:
-            # Physical mailbox root EXACTLY as steer_task: direct task ->
-            # DRIVE_ROOT; forked task -> its child drive. The non-empty text is
-            # the parser-required internal reason, never dialogue. A same-id
-            # RETRY re-appends deliberately: the drain dedupes by msg_id, so a
-            # duplicate line is invisible while a first append that failed is
-            # healed by the retry contract (same click -> same request_id).
-            drive = _task_drive_for_task(task, task_id)
-            if not write_owner_message(
-                drive, "owner_hurry", task_id,
-                msg_id=f"hurry:{request_id}", kind=KIND_HURRY,
-            ):
-                return json_error(
-                    "the durable hurry control could not be written — retry with "
-                    "the same request_id",
-                    503, task_id=task_id, reason_code="mailbox_write_failed",
-                )
+        # Physical mailbox root EXACTLY as steer_task: direct task ->
+        # DRIVE_ROOT; forked task -> its child drive. The non-empty text is
+        # the parser-required internal reason, never dialogue. EVERY request
+        # (fresh, same-id retry, or a duplicate with a DIFFERENT id, e.g.
+        # after a mailbox write failure + page reload minted a new id)
+        # appends idempotently under the effect LATCH's request_id: the drain
+        # dedupes by msg_id, so a duplicate line is invisible while a lost
+        # control is healed instead of a false «уже принято» acknowledgement.
+        latch_request_id = str(block.get("request_id") or "") or request_id
+        drive = _task_drive_for_task(task, task_id)
+        if not write_owner_message(
+            drive, "owner_hurry", task_id,
+            msg_id=f"hurry:{latch_request_id}", kind=KIND_HURRY,
+        ):
+            return json_error(
+                "the durable hurry control could not be written — retry with "
+                "the same request_id",
+                503, task_id=task_id, reason_code="mailbox_write_failed",
+            )
         if not outcome.get("duplicate"):
             emit_event(
                 None, drive_root, task_id,

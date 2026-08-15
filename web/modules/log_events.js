@@ -251,6 +251,18 @@ export function taskSoftStopPending(record) {
     return taskCancelPending(record) && String(record?.stop_policy || '') === 'finalize_then_cancel';
 }
 
+// S3 (owner decision №8/Q3): an owner-requested finalization is a SUCCESSFUL
+// soft stop, not a warning — the owner asked for the summary and received the
+// best available result. The shared terminal seam renders the card headline
+// «Остановлено с итогом» WITHOUT warn styling, and the task details carry the
+// owner-request marker (spec §17).
+export const OWNER_STOP_DONE_HEADLINE = 'Остановлено с итогом';
+export const OWNER_STOP_DETAIL_MARKER = 'итог по просьбе владельца — лучший доступный результат';
+
+export function taskStoppedWithSummary(evt) {
+    return String(evt?.reason_code || '') === 'owner_requested_finalization';
+}
+
 // S3 (HQ1): the ONE shared projection of a typed owner_hurry event for the
 // task-detail/card surfaces. Never a chat message: chat.js renders only a
 // compact task-card status from this, and the timeline summarizer hides the
@@ -293,6 +305,11 @@ export function taskOutcomeSeverity(evt) {
         || artifactStatus === 'failed'
     ) {
         return 'error';
+    }
+    // Owner-requested finalization is a best_effort SUCCESS (№8/Q3): the owner
+    // asked for the stop, so it must not read as "Finished with warnings".
+    if (taskStoppedWithSummary(evt)) {
+        return 'done';
     }
     if (
         lifecycle === 'rejected_duplicate'
@@ -337,6 +354,9 @@ function taskDoneLabel(evt) {
     }
     if (taskDoneFailure(evt)) {
         return reasonCode ? `Failed: ${reasonCode}` : `Failed ${evt.task_type || 'task'}`;
+    }
+    if (taskStoppedWithSummary(evt)) {
+        return OWNER_STOP_DONE_HEADLINE;
     }
     if (taskOutcomeSeverity(evt) === 'warn') {
         return reasonCode ? `Finished with warnings: ${reasonCode}` : `Finished with warnings`;
@@ -573,7 +593,9 @@ export function summarizeLogEvent(evt) {
             body: reviewDetails,
             meta: taskMeta(
                 ...taskOutcomeMeta(evt),
-                reasonCode,
+                // №8/Q3: the owner-requested soft stop shows the honest marker
+                // instead of the raw machine reason code.
+                taskStoppedWithSummary(evt) ? OWNER_STOP_DETAIL_MARKER : reasonCode,
                 artifactStatus ? `artifacts ${artifactStatus}` : '',
                 ownCost,
                 // v6.57.0 (P6b): show the recursive cost incl. children when it adds up to
@@ -998,15 +1020,18 @@ export function summarizeChatLiveEvent(evt) {
         const childrenCost = (accountedUpperBoundWithChildren(evt) ?? -1) > (ownValue ?? 0)
             ? `+children=${formatLogMoney(accountedUpperBoundWithChildren(evt))}${evt.cost_with_children_partial ? ' (partial)' : ''}`
             : '';
+        // №8/Q3: an owner-requested soft stop keeps 'done' severity but carries
+        // its own headline and the owner-request marker in the details meta.
+        const softStopped = taskStoppedWithSummary(evt);
         return chatView({
             phase,
-            headline: severity === 'done' ? 'Done' : taskDoneLabel(evt),
+            headline: severity === 'done' && !softStopped ? 'Done' : taskDoneLabel(evt),
             body: reviewDetails,
             visible: true,
             promote: true,
             terminal: true,
             expandByDefault: Boolean(reviewDetails),
-            meta: [ownCost, childrenCost].filter(Boolean),
+            meta: [softStopped ? OWNER_STOP_DETAIL_MARKER : '', ownCost, childrenCost].filter(Boolean),
             dedupeKey: key(
                 JSON.stringify(evt.outcome_axes || {}),
                 JSON.stringify(evt.review_projection || {}),

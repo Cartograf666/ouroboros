@@ -30,7 +30,7 @@ import logging
 import pathlib
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from ouroboros.utils import append_jsonl, utc_now_iso
 
@@ -58,13 +58,16 @@ def owner_stop_deadline_ts(intent: Dict[str, Any], grace_sec: float) -> float:
     return (requested + float(grace_sec)) if requested else 0.0
 
 
-def owner_stop_active(intent: Any, *, now: float, grace_sec: float) -> bool:
-    """Whether an UNCLAIMED graceful stop episode still owns this intent.
+def owner_stop_open(intent: Any) -> bool:
+    """Whether an UNCLAIMED finalize-policy intent is still OPEN.
 
-    Active means: the durable intent carries the explicit finalize policy, no
-    custody claim holds it (a claim means the kill already started), and the
-    shared deadline — measured from the immutable ``requested_at`` — has not
-    passed. Own/descendant progress NEVER extends this deadline (§12.2 item 8).
+    Open means: the durable intent carries the explicit finalize policy and no
+    custody claim holds it (a claim means the kill already started). This is
+    the HOLD predicate for the generic timeout rails (§12.2 item 8): a running
+    task stays held for the WHOLE open-intent window — the deadline gates only
+    the sweep's arm-vs-feed-custody decision (``sweep_owner_stop_hold``), so
+    custody remains the sole killer at expiry and the generic rail can never
+    withdraw, reap, or retry an intent-covered task in the expiry window.
     """
     if not isinstance(intent, dict):
         return False
@@ -72,7 +75,19 @@ def owner_stop_active(intent: Any, *, now: float, grace_sec: float) -> bool:
 
     if stop_policy(intent) != STOP_POLICY_FINALIZE:
         return False
-    if intent.get("state") == INTENT_CLAIMED:
+    return intent.get("state") != INTENT_CLAIMED
+
+
+def owner_stop_active(intent: Any, *, now: float, grace_sec: float) -> bool:
+    """Whether an OPEN graceful stop episode is still inside its grace window.
+
+    Active means OPEN (``owner_stop_open``) plus the shared deadline — measured
+    from the immutable ``requested_at`` — has not passed. Own/descendant
+    progress NEVER extends this deadline (§12.2 item 8). Consulted by the
+    SWEEP only (arm vs feed custody); the enforcement hold deliberately uses
+    the deadline-free ``owner_stop_open`` instead.
+    """
+    if not owner_stop_open(intent):
         return False
     deadline = owner_stop_deadline_ts(intent, grace_sec)
     return bool(deadline) and now < deadline
@@ -86,17 +101,20 @@ def queue_grace_sec(q: Any) -> float:
         return 0.0
 
 
-def running_owner_stop_tasks(
-    drive_root: Any, *, grace_sec: float, now: Optional[float] = None,
-) -> set:
-    """Task ids whose ACTIVE owner-stop episode must bypass generic timeout rails.
+def running_owner_stop_tasks(drive_root: Any, *, grace_sec: float) -> set:
+    """Task ids whose OPEN owner-stop intent must bypass generic timeout rails.
 
     Read once per enforcement pass (one small locked projection read), then
     checked per RUNNING row — the typed predicate ``supervisor/queue.py``
     consults before every spare-withdraw, spare-reset, second-grace,
-    timeout-kill, reaping, and retry branch (§12.2 item 8).
+    timeout-kill, reaping, and retry branch (§12.2 item 8). The hold covers
+    the WHOLE open-intent window, deliberately including the expiry window
+    past the grace deadline: the custody sweep (20s cadence) is the sole
+    killer there, and the faster enforcement tick must not withdraw the
+    episode, falsify the terminal reason, or clone a retry meanwhile.
+    ``grace_sec<=0`` means the graceful-stop feature is off (the sweep feeds
+    custody immediately), so no hold is needed.
     """
-    current = now if now is not None else time.time()
     if float(grace_sec or 0.0) <= 0:
         return set()
     try:
@@ -106,10 +124,7 @@ def running_owner_stop_tasks(
     except Exception:
         log.debug("owner-stop enforcement read failed", exc_info=True)
         return set()
-    return {
-        tid for tid, intent in intents.items()
-        if owner_stop_active(intent, now=current, grace_sec=float(grace_sec))
-    }
+    return {tid for tid, intent in intents.items() if owner_stop_open(intent)}
 
 
 def sweep_owner_stop_hold(q: Any, task_id: str, intent: Dict[str, Any], *, now: float) -> bool:

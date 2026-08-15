@@ -188,10 +188,15 @@ def test_same_request_id_is_idempotent_and_different_id_collapses_to_one_latch(t
     entries = drain_owner_entries(tmp_path, task_id="root-3")
     assert len([e for e in entries if e["kind"] == KIND_HURRY]) == 1
     # Different request_id while a block exists: duplicate acknowledgement, NO
-    # second mailbox control, projection still owned by the first request.
+    # second mailbox CONTROL — the healing append reuses the LATCH's msg_id
+    # (hurry:req-a), so the drain still dedupes to one control while a lost
+    # first append (mailbox write failure + reload) heals instead of a false
+    # «уже принято». Projection stays owned by the first request.
     assert other.json()["duplicate"] is True
-    assert len(_hurry_rows(tmp_path, "root-3")) == 2      # req-a twice, req-b never
+    assert len(_hurry_rows(tmp_path, "root-3")) == 3      # req-a twice + req-b's heal
     assert all(r["msg_id"] == "hurry:req-a" for r in _hurry_rows(tmp_path, "root-3"))
+    assert len([e for e in drain_owner_entries(tmp_path, task_id="root-3")
+                if e["kind"] == KIND_HURRY]) == 1
     assert load_task_result(tmp_path, "root-3")["owner_hurry"]["request_id"] == "req-a"
 
 

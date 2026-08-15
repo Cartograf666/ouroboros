@@ -14,6 +14,7 @@ import {
     hurryTaskAction,
     openTaskControlMenu,
     requestStop,
+    taskControlBusy,
 } from './task_control_menu.js';
 import { showToast } from './toast.js';
 
@@ -156,6 +157,7 @@ export function initActivity({ mount, ws } = {}) {
             const stored = await getJson(`/api/tasks/${encodeURIComponent(id)}`);
             openTaskControlMenu(btn, {
                 cancelPending: taskCancelPending(stored),
+                busy: taskControlBusy(id),
                 onAction: async (action) => {
                     busy = true;
                     try {

@@ -198,8 +198,12 @@ def request_cancel(
                 "status": settled}
     minted: Dict[str, Any] = {}
     scope_text = str(scope or "").strip()
+    # Whether THIS mutation recorded a new hardening — a duplicate immediate
+    # request over an already-hardened intent must not re-emit the forensic row.
+    newly_hardened = {"value": False}
 
     def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        newly_hardened["value"] = False
         intents = _load_intents(current, strict=True)
         existing = intents.get(tid)
         if existing is not None and not isinstance(existing, dict):
@@ -233,6 +237,7 @@ def request_cancel(
                 # forbidden softening direction and falls through unchanged.
                 updated_row["stop_policy"] = STOP_POLICY_IMMEDIATE
                 updated_row["hardened_at"] = utc_now_iso()
+                newly_hardened["value"] = True
                 changed = True
             if changed:
                 intents[tid] = updated_row
@@ -281,7 +286,7 @@ def request_cancel(
             **({"stop_policy": minted.get("stop_policy")} if minted.get("stop_policy") else {}),
             **({"settled_target_status": settled} if settled else {}),
         })
-    elif minted.get("hardened_at"):
+    elif newly_hardened["value"]:
         _forensic(drive_root, {
             "event": "stop_policy_hardened", "task_id": tid,
             "request_id": minted.get("request_id"), "stop_policy": STOP_POLICY_IMMEDIATE,

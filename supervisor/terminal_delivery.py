@@ -1210,6 +1210,15 @@ def _persist_cancel_receipt(
             merged = dict(current.get("cancel_receipt") or {}) if isinstance(
                 current.get("cancel_receipt"), dict) else {}
             for key, value in block.items():
+                if (
+                    key == "salvage"
+                    and key in merged
+                    and not (isinstance(value, dict) and value.get("preserved"))
+                ):
+                    # A replay/rebuild without a REAL salvage (the always-truthy
+                    # {"path":"","preserved":False} placeholder) must not clobber
+                    # a previously persisted preserved-copy fact.
+                    continue
                 if value or key not in merged:
                     merged[key] = value
             current = dict(current)

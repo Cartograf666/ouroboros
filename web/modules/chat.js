@@ -12,6 +12,8 @@ import { showToast } from './toast.js';
 import { downloadViaHostBridge, openViaHostBridge } from './ui_helpers.js';
 import { apiClient, apiFetch, fetchTaskDetail } from './api_client.js';
 import {
+    OWNER_STOP_DETAIL_MARKER,
+    OWNER_STOP_DONE_HEADLINE,
     formatReviewProjection,
     getLogTaskGroupId,
     isGroupedTaskEvent,
@@ -21,6 +23,7 @@ import {
     taskCancelPending,
     taskOutcomeSeverity,
     taskSoftStopPending,
+    taskStoppedWithSummary,
     taskTerminalPhase,
 } from './log_events.js';
 import {
@@ -32,6 +35,7 @@ import {
     hurryTaskAction,
     openTaskControlMenu,
     requestStop,
+    taskControlBusy,
 } from './task_control_menu.js';
 import { openConfirmDialog } from './confirm_dialog.js';
 import { renderSkillReviewDisclosure, wireSkillReviewDisclosure } from './skill_review_card.js';
@@ -341,12 +345,9 @@ export function isTerminalTaskPhase(phase = '', terminal = false) {
 function withTaskCostMeta(summary, payload, { replace = false, rawTs = '' } = {}) {
     const projection = taskCostProjection(payload, rawTs);
     // `replace` frames (task_done/task_cost_finalized) never keep the
-    // summarizer's own meta strings — even without accounting evidence a
-    // terminal frame must not render an ungated bare cost string.
-    // Cost renders from the card's STICKY record.costMeta (applyLiveCardState),
-    // never from this frame's meta list: the sticky projection is the SINGLE
-    // cost renderer. Summarizer-built `cost=` strings are dropped
-    // UNCONDITIONALLY — a frame whose payload carries no task-scope accounting
+    // summarizer's own meta strings. Cost renders ONLY from the card's sticky
+    // record.costMeta (applyLiveCardState); summarizer-built `cost=` strings
+    // are dropped UNCONDITIONALLY — a frame without task-scope accounting
     // evidence must show no money at all, not a bare per-call number.
     const base = replace ? { ...summary, meta: [] } : summary;
     const out = projection ? { ...base, costProjection: projection } : { ...base };
@@ -1533,6 +1534,7 @@ export function createChatInstance({
             event.stopPropagation();
             openTaskControlMenu(btn, {
                 cancelPending: Boolean(record.cancelPendingPolicy),
+                busy: taskControlBusy(record.groupId),
                 onAction: (action) => (action === ACTION_HURRY
                     ? hurryTaskAction(record.groupId)
                     : cancelRunFromCard(record, action)),
@@ -1681,6 +1683,7 @@ export function createChatInstance({
             // Only a fetched, live, non-pending detail restores the button.
             if (btn) btn.disabled = false;
             restoreLiveCardPhase(record, priorPhase);
+            record.cancelPendingPolicy = '';
         }
     }
 
@@ -2207,15 +2210,12 @@ export function createChatInstance({
     }
 
     // perf2 P4.4 (lazy LINEAGE bodies): a collapsed SUBAGENT timeline is
-    // display:none inside its parent's lineage container, so building its DOM
-    // (and rendering its Markdown bodies) during a bulk replay is pure waste.
-    // The data stays complete in record.items; every timeline DOM writer
-    // defers through this guard while collapsed, and the first
-    // setLiveCardExpanded(true) materializes the whole timeline. TOP-LEVEL
-    // cards render eagerly like the pre-P4 baseline: their (CSS-hidden)
+    // display:none, so building its DOM during a bulk replay is pure waste.
+    // Data stays complete in record.items; DOM writers defer through this
+    // guard while collapsed, and the first setLiveCardExpanded(true)
+    // materializes the timeline. TOP-LEVEL cards render eagerly: their
     // collapsed timeline text is part of the feed DOM contract (ui-smoke
-    // chronology asserts collapsed card textContent), and the deep-lineage
-    // fan-out — the actual replay cost — lives in subagent children.
+    // asserts it), and the deep-lineage fan-out lives in subagent children.
     function deferCollapsedTimeline(record) {
         if (!record) return true;
         if (!record.isSubagent) return false;
@@ -2628,19 +2628,25 @@ export function createChatInstance({
         const terminalPhase = taskTerminalPhase(msg || {});
         const failedResult = severity === 'error';
         // P5: a cancelled root says "Cancelled", never a generic "Done" headline.
+        // №8/Q3: an owner-requested soft stop is a SUCCESS — its own headline,
+        // never warn-styled, with the owner-request marker in the details.
+        const softStopped = taskStoppedWithSummary(msg || {});
         const doneHeadline = severity === 'cancelled'
             ? 'Cancelled'
             : (failedResult && reasonCode
                 ? `Done: ${reasonCode}`
-                : (severity === 'warn'
-                    ? (reasonCode ? `Finished with warnings: ${reasonCode}` : 'Finished with warnings')
-                    : ((record && record.lastHumanHeadline) || 'Done')));
+                : (softStopped
+                    ? OWNER_STOP_DONE_HEADLINE
+                    : (severity === 'warn'
+                        ? (reasonCode ? `Finished with warnings: ${reasonCode}` : 'Finished with warnings')
+                        : ((record && record.lastHumanHeadline) || 'Done'))));
+        const softStopDetail = softStopped ? OWNER_STOP_DETAIL_MARKER : '';
         applyLiveCardState(
             {
                 phase: terminalPhase,
                 headline: doneHeadline,
-                body: reviewDetails,
-                visible: Boolean(reviewDetails),
+                body: [softStopDetail, reviewDetails].filter(Boolean).join('\n'),
+                visible: Boolean(softStopDetail || reviewDetails),
                 human: false,
                 promote: true,
                 terminal: true,
@@ -2692,14 +2698,12 @@ export function createChatInstance({
         const rawTs = msg?.ts || new Date().toISOString();
         if (registerEphemeralDecisionFrame(msg)) return;
         if (!taskId) return;
-        // P5: host-attested cancelable marker (live WS frames AND history replay —
-        // progress rows persist it through _PROGRESS_META_FIELDS). The supervisor
-        // stamps it ONLY on lineage-resolved non-subagent ROOTS (with the RUNNING
-        // row's authoritative lineage on the same frame), so the marker itself is
-        // the truth — re-deriving rootness from frame shape here would wrongly
-        // reject a timeout-retry root, whose root_task_id names the ORIGINAL task
-        // while the endpoint can cancel its current id. A direct-chat turn never
-        // carries the marker.
+        // P5: host-attested cancelable marker (live WS frames AND history replay
+        // via _PROGRESS_META_FIELDS). The supervisor stamps it ONLY on
+        // lineage-resolved non-subagent ROOTS, so the marker is the truth —
+        // re-deriving rootness from frame shape would wrongly reject a
+        // timeout-retry root (root_task_id names the ORIGINAL task while the
+        // endpoint cancels the current id). Direct-chat turns never carry it.
         if (msg?.cancelable === true && msg?.task_id) markTaskCancelable(String(msg.task_id));
         // Subagent lifecycle pings render as child cards linked to the parent;
         // they must not update the parent card's terminal state.
@@ -3590,14 +3594,12 @@ export function createChatInstance({
                     updateMessagesPadding({ preserveStickiness: false });
                     scrollToBottomAfterLayout();
                 } else if (fromReconnect) {
-                    // Rebuild may add old rows ABOVE and new rows BELOW the viewport
-                    // simultaneously. Total scrollHeight delta cannot distinguish the
-                    // two and over-scrolls readers by the height of new bottom content.
-                    // Restore the first visible timestamped node to its prior visual
-                    // offset instead; equal-ts ordinals preserve arrival-order identity.
-                    // Live-card expansion and responsive layout settle on RAF; restore
-                    // after two frames so asynchronous card heights above the anchor
-                    // cannot move the reader immediately after this function resolves.
+                    // Rebuild may add rows both ABOVE and BELOW the viewport; a
+                    // scrollHeight delta cannot tell them apart and over-scrolls
+                    // readers. Restore the first visible timestamped node to its
+                    // prior visual offset instead (equal-ts ordinals keep
+                    // arrival-order identity), after two RAF frames so async
+                    // card heights above the anchor cannot move the reader.
                     await new Promise((resolve) => requestAnimationFrame(
                         () => requestAnimationFrame(resolve)
                     ));
