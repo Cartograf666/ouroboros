@@ -6,7 +6,6 @@ import datetime
 import json
 import logging
 import math
-import os
 import pathlib
 import queue as _stdqueue  # noqa: F401 — re-exported for the test suite's reap-queue isolation
 import threading
@@ -95,8 +94,6 @@ def init(drive_root: pathlib.Path, soft_timeout: int, hard_timeout: int) -> None
         legacy_keys.append("OUROBOROS_SOFT_TIMEOUT_SEC")
     if int(hard_timeout) != 1800:
         legacy_keys.append("OUROBOROS_HARD_TIMEOUT_SEC")
-    if str(os.environ.get("OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC", "120")) != "120":
-        legacy_keys.append("OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC")
     SOFT_TIMEOUT_SEC, HARD_TIMEOUT_SEC = 600, 1800
     FINALIZATION_GRACE_SEC = get_finalization_grace_sec()
     BUDGET_ROOT_FENCES.clear()
@@ -112,8 +109,6 @@ def refresh_timeouts_from_settings(settings: dict) -> None:
         legacy_keys.append("OUROBOROS_SOFT_TIMEOUT_SEC")
     if str(settings.get("OUROBOROS_HARD_TIMEOUT_SEC", "1800")) != "1800":
         legacy_keys.append("OUROBOROS_HARD_TIMEOUT_SEC")
-    if str(settings.get("OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC", "120")) != "120":
-        legacy_keys.append("OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC")
     _emit_timeout_deprecation_once(legacy_keys)
 
 

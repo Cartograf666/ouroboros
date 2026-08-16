@@ -1,4 +1,13 @@
-"""Reviewer execution and plan-envelope policy for ``plan_task``."""
+"""Reviewer-slot execution and envelope rails for ``plan_task``.
+
+The plan-review engine (``tools/plan_review.py``) owns state, packet and verdict;
+this module owns the thin runtime seams around it: the deadline rail, the raw
+attempt supersession, the configured reviewer rows as ``ReviewSlot`` objects
+(both delivery kinds — the D15 api_chat pin is gone), one substrate call, and the
+structural helpers (payload exemption, error text) that need a ``ToolContext``.
+Transport is NEVER chosen here: every slot carries its route and
+``review_execution._review_route_executor`` binds it (plan §8.2).
+"""
 
 from __future__ import annotations
 
@@ -6,28 +15,30 @@ import asyncio
 from hashlib import sha256
 import json
 import logging
-import os
 import pathlib
+from typing import Any, Dict, List
 
 from ouroboros.config import review_model_uses_local
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
 from ouroboros.llm import LLMClient
 from ouroboros.tools.registry import ToolContext, active_repo_dir_for
-from ouroboros.tools.review_helpers import load_checklist_section
-from ouroboros.tools.review_synthesis import build_plan_review_messages, normalize_plan_scope
 from ouroboros.utils import utc_now_iso
 
 
 PLAN_REVIEW_MAX_TOKENS = 65536
 PLAN_REVIEW_EFFORT = "high"
 PLAN_REVIEW_SLOT_TIMEOUT_SEC = 560
-PLAN_CLASSES = ("self_mod", "external", "creative", "research")
+# Per-slot provenance of what the reviewer read (BIBLE P3, retrieving reviewers):
+# an api_chat slot read exactly the host-assembled packet; an agent_session slot
+# retrieved with its own tools and the host did not observe what it opened.
+HOST_FILE_READ_ASSEMBLED = "host_assembled_packet"
+HOST_FILE_READ_UNOBSERVED = "unobserved"
 
 log = logging.getLogger(__name__)
 
 
 def plan_deadline_skip(ctx: ToolContext, *, emit: bool = False) -> str:
-    """Project the existing deadline rail without starting paid planning work."""
+    """Project the existing deadline rail without starting a paid reviewer panel."""
     from ouroboros.config import get_plan_task_deadline_min_sec
 
     metadata = getattr(ctx, "task_metadata", {})
@@ -55,10 +66,10 @@ def plan_deadline_skip(ctx: ToolContext, *, emit: bool = False) -> str:
         except Exception:
             pass
     cause = (
-        "the task deadline has expired; no new planning scout or reviewer work was started."
+        "the task deadline has expired; no reviewer work was started."
         if remaining <= 0 else
         f"insufficient time for useful planning — remaining {int(remaining)}s gives a "
-        f"swarm window of {int(scaled)}s (< {int(minimum)}s useful floor)."
+        f"review window of {int(scaled)}s (< {int(minimum)}s useful floor)."
     )
     return (
         f"PLAN_TASK_SKIPPED_DEADLINE: {cause} Proceed with your own best plan "
@@ -69,7 +80,8 @@ def plan_deadline_skip(ctx: ToolContext, *, emit: bool = False) -> str:
 def record_raw_plan_request_attempt(
     envelope: dict, state_root: pathlib.Path, task_id: str, *, reason: str,
 ) -> str:
-    """Supersede prior authority before semantic decoding can fail."""
+    """Supersede prior plan authority before semantic decoding can fail: an invalid
+    envelope must not leave an older closed wave standing as the current one."""
     payload = {"domain": "invalid_plan_task_attempt", "envelope": envelope}
     fingerprint = sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
@@ -82,120 +94,115 @@ def record_raw_plan_request_attempt(
     return fingerprint
 
 
-def reviewed_handoff_hashes(handoffs: dict) -> dict[str, str]:
-    """Hash the exact in-memory scout snapshots before reviewer dispatch."""
-    from ouroboros.tools.join_ledger import _child_result_sha256
+def plan_review_slots() -> list:
+    """The configured commit-triad rows as plan-review ``ReviewSlot`` objects.
 
-    included = [str(item) for item in handoffs.get("included_task_ids") or [] if str(item)]
-    wait = handoffs.get("wait") if isinstance(handoffs.get("wait"), dict) else {}
-    tasks = wait.get("tasks") if isinstance(wait.get("tasks"), dict) else {}
-    result: dict[str, str] = {}
-    for task_id in included:
-        snapshot = tasks.get(task_id)
-        if not isinstance(snapshot, dict):
-            raise ValueError(
-                f"PLAN_REVIEW_STATE_INVALID: included scout {task_id} has no reviewed snapshot"
-            )
-        result[task_id] = _child_result_sha256(snapshot)
-    return result
+    Both kinds ride: an ``api_chat`` row is one in-process call over the lean
+    packet; an ``agent_session`` row is a delegated retrieving reviewer
+    (``session_target``/``session_profile`` carried per row). Effort is the row's
+    own when configured, else ``PLAN_REVIEW_EFFORT``. Slot ids are the rows' own
+    (structured: owner-assigned; legacy: ``slot_N`` from the one mint).
+    """
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewSlot
+    from ouroboros.reviewer_slot_config import load_reviewer_slot_config
 
-
-def validate_plan_request_envelope(request, state_root: pathlib.Path, task_id: str) -> tuple[dict, str]:
-    """Normalize a valid envelope or durably supersede stale review authority."""
-    error = ""
-    reason = "plan_input_invalid"
-    if not str(request.plan or "").strip():
-        error = "ERROR: plan parameter is required and must not be empty."
-    elif not str(request.goal or "").strip():
-        error = "ERROR: goal parameter is required and must not be empty."
-    else:
-        try:
-            return normalize_plan_scope(request.scope), ""
-        except ValueError as exc:
-            reason = "plan_scope_invalid"
-            error = f"ERROR: PLAN_SCOPE_INVALID: {exc}"
-    envelope = {
-        "plan": request.plan,
-        "goal": request.goal,
-        "files_to_touch": request.files_to_touch,
-        "context_level": request.context_level,
-        "context_notes": request.context_notes,
-        "include_tests": request.include_tests,
-        "plan_class": request.plan_class,
-        "scope": request.scope,
-    }
-    try:
-        record_raw_plan_request_attempt(envelope, state_root, task_id, reason=reason)
-    except (OSError, TimeoutError, ValueError) as exc:
-        return {}, f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
-    return {}, error
-
-
-async def run_plan_review_slots(
-    ctx: ToolContext,
-    models: list[str],
-    system_prompt: str,
-    user_content: str,
-    user_stable_len: int = 0,
-    slot_ids: list[str] | None = None,
-) -> list[dict]:
-    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
-    from ouroboros.tools.review_synthesis import minted_plan_slot_ids
-
-    # Owner decision D15: plan review stays api_chat — no route list is consulted here.
-    row_ids = list(slot_ids) if slot_ids is not None else minted_plan_slot_ids(models)
-    slots = [
+    return [
         ReviewSlot(
-            slot_id=row_id,
-            model=str(model),
-            effort=PLAN_REVIEW_EFFORT,
+            slot_id=row.slot_id,
+            model=row.target_id,
+            effort=row.effort or PLAN_REVIEW_EFFORT,
             timeout_sec=PLAN_REVIEW_SLOT_TIMEOUT_SEC,
             max_tokens=PLAN_REVIEW_MAX_TOKENS,
             temperature=0.2,
             role_hint="plan reviewer",
-            use_local=review_model_uses_local(str(model)),
+            use_local=review_model_uses_local(row.target_id),
+            route=ReviewRouteKind.AGENT_SESSION if row.is_session else ReviewRouteKind.API_CHAT,
+            session_target=row.session_target,
+            session_profile=row.profile_id,
         )
-        for row_id, model in zip(row_ids, models, strict=True)
+        for row in load_reviewer_slot_config().triad
     ]
+
+
+def slot_is_session(slot: Any) -> bool:
+    from ouroboros.review_execution import ReviewRouteKind
+
+    return getattr(slot, "route", None) is ReviewRouteKind.AGENT_SESSION
+
+
+async def run_plan_review_slots(
+    ctx: ToolContext,
+    slots: list,
+    *,
+    system_prompt: str,
+    user_content: str,
+    session_task: str = "",
+    session_root: str = "",
+    output_contract: str = "",
+) -> list[dict]:
+    """ONE ``ReviewRequest`` fanned across the configured rows through the substrate.
+
+    api_chat rows read ``messages`` (system + user packet); agent_session rows read
+    ``session_task``/``session_root``/``policy.output_contract`` and retrieve the
+    rest themselves. Returns one raw row per slot, in slot order, carrying the id
+    the substrate RAN under, its route, text/error, refs, usage and the
+    ``host_file_read_attestation`` fact."""
+    from ouroboros.review_substrate import ReviewRequest, run_review_request
+    from ouroboros.tools.plan_packet import plan_user_stable_len
+    from ouroboros.tools.review_synthesis import build_plan_review_messages
+
     request = ReviewRequest(
         surface="plan_review",
-        goal="Review the proposed implementation plan before code is written.",
-        messages=build_plan_review_messages(system_prompt, user_content, user_stable_len),
+        goal="Review the proposed plan spec before the work starts.",
+        messages=build_plan_review_messages(
+            system_prompt, user_content, plan_user_stable_len(user_content),
+        ),
         task_id=str(getattr(ctx, "task_id", "") or "plan_review"),
         call_type="plan_review",
         max_tokens=PLAN_REVIEW_MAX_TOKENS,
         temperature=0.2,
         no_proxy=True,
+        session_task=session_task,
+        session_root=session_root,
+        policy={"output_contract": output_contract} if output_contract else {},
     )
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(
         None,
         lambda: run_review_request(
             request,
-            slots=slots,
+            slots=list(slots),
             drive_root=pathlib.Path(ctx.drive_root),
             llm=LLMClient(),
             usage_ctx=ctx,
         ),
     )
-    return [
-        _plan_raw_result_from_actor(actor, models[idx] if idx < len(models) else "")
-        for idx, actor in enumerate(result.actors)
-    ]
+    by_id = {str(slot.slot_id): slot for slot in slots}
+    rows = [_plan_row_from_actor(actor, by_id.get(str(actor.get("slot_id") or ""))) for actor in result.actors]
+    answered = {row["slot_id"] for row in rows}
+    for slot in slots:  # a slot the substrate never answered for is still a configured row
+        if str(slot.slot_id) not in answered:
+            rows.append(_plan_row_from_actor({"slot_id": slot.slot_id, "model": slot.model,
+                                              "status": "error", "error": "no actor record"}, slot))
+    return rows
 
 
-def _plan_raw_result_from_actor(actor: dict, request_model: str) -> dict:
+def _plan_row_from_actor(actor: Dict[str, Any], slot: Any) -> dict:
     usage = actor.get("usage") or {}
     text = actor.get("raw_text") or ""
     error = actor.get("error") or ""
     if actor.get("status") not in {"ok", "empty"} and not error:
         error = str(actor.get("status") or "review failed")
+    session = slot_is_session(slot) if slot is not None else False
     return {
         # Identity is CARRIED, never re-derived: the row keeps the slot_id the
         # substrate ran, so duplicate-model plan rows stay distinguishable.
-        "slot_id": str(actor.get("slot_id") or ""),
-        "model": str(usage.get("resolved_model") or actor.get("model") or request_model),
-        "request_model": request_model or actor.get("model") or "",
+        "slot_id": str(actor.get("slot_id") or getattr(slot, "slot_id", "") or ""),
+        "model": str(usage.get("resolved_model") or actor.get("model") or getattr(slot, "model", "") or ""),
+        "request_model": str(getattr(slot, "model", "") or actor.get("model") or ""),
+        "route": "agent_session" if session else "api_chat",
+        "host_file_read_attestation": HOST_FILE_READ_UNOBSERVED if session else HOST_FILE_READ_ASSEMBLED,
         "text": text,
         "error": error or None,
         "prompt_ref": actor.get("prompt_ref") or {},
@@ -206,19 +213,26 @@ def _plan_raw_result_from_actor(actor: dict, request_model: str) -> dict:
     }
 
 
-def resolve_plan_payload_snapshots(
-    ctx: ToolContext, files_to_touch: list,
-) -> dict[str, pathlib.Path]:
-    """Resolve exact non-native payload paths to their current data-plane files."""
+def plan_payload_roots(ctx: ToolContext, locators: List[str]) -> list[pathlib.Path]:
+    """Skill-payload exemption roots for ``plan_spec.resolve_constitutional``.
+
+    Skill-payload paths live in the DATA plane (``data/skills/<bucket>/…``, not the
+    system repo) and never make a plan a self-modification by themselves — the same
+    frozen predicate the deleted ``resolve_plan_class`` applied. A recognized locator
+    is exempt however it resolves: its data-plane payload root AND its literal
+    resolution against the active root are both returned. Classification-only
+    (write gates are unrelated code paths); a drive-resolution failure skips the
+    exemption, as before."""
     from ouroboros.contracts.skill_payload_policy import resolve_skill_payload_target
     from ouroboros.tool_access import canonical_data_root
 
     try:
         drive = canonical_data_root(ctx)
+        active = pathlib.Path(active_repo_dir_for(ctx)).resolve(strict=False)
     except Exception:
-        return {}
-    snapshots: dict[str, pathlib.Path] = {}
-    for raw in files_to_touch or []:
+        return []
+    roots: list[pathlib.Path] = []
+    for raw in locators or []:
         text = str(raw or "").strip()
         if not text:
             continue
@@ -226,130 +240,12 @@ def resolve_plan_payload_snapshots(
             target = resolve_skill_payload_target(drive, text)
         except ValueError:
             continue
-        snapshots[text] = target.target_path
-    return snapshots
-
-
-def resolve_plan_roots(
-    ctx: ToolContext, files_to_touch: list,
-) -> tuple[pathlib.Path, pathlib.Path]:
-    """Resolve governance and subject roots without silently mixing them."""
-    from ouroboros.review_substrate import review_repo_dirs_for
-
-    governance, subject = review_repo_dirs_for(ctx)
-    payload_paths = resolve_plan_payload_snapshots(ctx, files_to_touch)
-    for raw in files_to_touch or []:
-        text = str(raw or "").strip()
-        # Skill-payload paths live in the DATA plane and are legitimate plan
-        # targets, not subject-root escapes — same frozen predicate as the
-        # classification exemption in resolve_plan_class; a drive-resolution
-        # failure keeps the old blanket rejection.
-        if text in payload_paths:
-            continue
-        candidate = pathlib.Path(text)
-        resolved = (candidate if candidate.is_absolute() else subject / candidate).resolve(strict=False)
+        roots.append(target.payload_root)
         try:
-            resolved.relative_to(subject)
-        except ValueError as exc:
-            raise ValueError(
-                f"planned path {raw!r} escapes active subject root {subject}"
-            ) from exc
-    return governance, subject
+            candidate = pathlib.Path(text)
+            roots.append((candidate if candidate.is_absolute() else active / candidate).resolve(strict=False))
+        except (OSError, ValueError):
+            continue
+    return roots
 
 
-def resolve_plan_class(ctx: ToolContext, plan_class: str, files_to_touch: list) -> tuple[str, str]:
-    """Resolve the declared class and structurally escalate system-repo work."""
-    from ouroboros.tool_access import path_is_relative_to
-
-    declared = str(plan_class or "").strip().lower()
-    if declared not in PLAN_CLASSES:
-        declared = ""
-    system_raw = getattr(ctx, "system_repo_dir", None)
-    if system_raw is not None and system_raw.__class__.__module__.startswith("unittest.mock"):
-        system_raw = None
-    try:
-        system_repo = pathlib.Path(system_raw or ctx.repo_dir).resolve(strict=False)
-    except (TypeError, OSError, ValueError):
-        return "self_mod", ""
-    try:
-        active = pathlib.Path(active_repo_dir_for(ctx)).resolve(strict=False)
-    except Exception:
-        active = system_repo
-    # Skill-payload paths live in the DATA plane (data/skills/<bucket>/…), not
-    # the system repo, so they never make a plan self-modification by
-    # themselves. Classification-only: write gates are unrelated code paths.
-    # A drive-resolution failure skips the exemption (current behavior).
-    payload_paths = resolve_plan_payload_snapshots(ctx, files_to_touch)
-    significant = [
-        text
-        for text in (str(raw or "").strip() for raw in files_to_touch or [])
-        if text and text not in payload_paths
-    ]
-    touches_system = False
-    if significant:
-        if active == system_repo:
-            touches_system = True
-        else:
-            for raw in significant:
-                candidate = pathlib.Path(raw)
-                resolved = (
-                    candidate if candidate.is_absolute() else active / candidate
-                ).resolve(strict=False)
-                if resolved == system_repo or path_is_relative_to(resolved, system_repo):
-                    touches_system = True
-                    break
-    if touches_system:
-        note = "" if declared in ("", "self_mod") else (
-            f"plan_class escalated {declared!r} -> 'self_mod': files_to_touch resolve "
-            "under the Ouroboros system repo (structural fact)."
-        )
-        return "self_mod", note
-    if declared:
-        return declared, ""
-    return ("external" if active != system_repo else "self_mod"), ""
-
-
-def classify_reviewer_error(exc: BaseException, model: str) -> str:
-    """Return actionable reviewer failure text without swallowing details."""
-    exc_type = type(exc).__name__
-    exc_str = str(exc)
-    if isinstance(exc, json.JSONDecodeError):
-        return (
-            "API error (provider returned non-JSON response body — likely oversized prompt "
-            f"or HTTP error from {model}): {exc_str}"
-        )
-    try:
-        from openai import APIConnectionError, APIStatusError, BadRequestError, RateLimitError
-
-        if isinstance(exc, RateLimitError):
-            return f"Rate limit / quota exceeded for {model} (HTTP 429): {exc_str}"
-        if isinstance(exc, BadRequestError):
-            return (
-                f"Bad request for {model} (HTTP 400 — prompt may be too large "
-                f"for this model's context window): {exc_str}"
-            )
-        if isinstance(exc, APIConnectionError):
-            return f"API connection error for {model} (network failure): {exc_str}"
-        if isinstance(exc, APIStatusError):
-            return f"API status error {getattr(exc, 'status_code', '?')} for {model}: {exc_str}"
-    except ImportError:
-        pass
-    return f"{exc_type}: {exc_str}"
-
-
-def get_review_models() -> list[str]:
-    """Return configured reviewer slots, preserving explicit duplicates."""
-    from ouroboros import config as cfg
-
-    models = list(cfg.get_review_models() or [])
-    if not models:
-        models = [os.environ.get("OUROBOROS_MODEL", cfg.SETTINGS_DEFAULTS["OUROBOROS_MODEL"])]
-    return models
-
-
-def load_plan_checklist() -> str:
-    try:
-        return load_checklist_section("Plan Review Checklist")
-    except Exception as exc:
-        log.warning("Could not load Plan Review Checklist: %s", exc)
-        return ""

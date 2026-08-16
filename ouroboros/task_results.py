@@ -74,25 +74,11 @@ _REGRESSION_GUARD_FLOOR = _STATUS_RANK[STATUS_CANCEL_REQUESTED]
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 PLAN_REVIEW_STATE_KEY = "plan_review_state"
-_PLAN_REVIEW_STATE_VERSION = 1
-_PLAN_REVIEW_MAX_WAVES = 32
-_PLAN_REVIEW_MAX_SCOUTS = 16
+_PLAN_REVIEW_STATE_VERSION = 2
 _PLAN_REVIEW_STATE_MAX_BYTES = 1_000_000
 _PLAN_REVIEW_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _PLAN_REVIEW_REASON_MAX_CHARS = 2_000
-# Bounded per-wave copy of the plan scope's acceptance_claims (W2): the raw agent
-# text is the fingerprint identity; this copy exists because disposition-mode
-# closure cannot resend the envelope. Item bound = the contract claim-text cap
-# (600) plus the truncation marker's own length.
-_PLAN_REVIEW_MAX_CLAIMS = 24
-_PLAN_REVIEW_CLAIM_MAX_CHARS = 800
-_PLAN_REVIEW_PHASES = {
-    "scheduling",
-    "waiting",
-    "evidence_ready",
-    "evidence_pending",
-    "reviewed",
-}
+
 
 def cancellation_blocks_child_result(result: Any) -> bool:
     """Return whether canonical cancellation forbids child-drive promotion.
@@ -307,369 +293,129 @@ def write_task_result(
     return update_json_locked(path, _merge)
 
 
-def persist_plan_review_handoffs(
-    results_drive_root: Any,
-    task_id: str,
-    handoffs: Dict[str, Any],
-) -> Dict[str, str]:
-    """Atomically write the non-authoritative plan handoff audit projection."""
-    try:
-        artifact_dir = (
-            task_results_dir(results_drive_root)
-            / "artifacts"
-            / validate_task_id(task_id or "plan_review")
-        )
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        path = artifact_dir / "plan_task_handoffs.json"
-        incoming = {
-            **copy.deepcopy(handoffs),
-            "audit_only": True,
-            "authoritative": False,
-        }
 
-        def _merge(existing: Dict[str, Any]) -> Dict[str, Any]:
-            incoming_wait = incoming.get("wait")
-            prior_wait = existing.get("wait")
-            prior_tasks = prior_wait.get("tasks") if isinstance(prior_wait, dict) else None
-            incoming_task_ids = incoming.get("task_ids")
-            host_task_ids = {
-                str(item) for item in incoming_task_ids
-            } if isinstance(incoming_task_ids, list) else set()
-            preserve_prior_wait = (
-                isinstance(incoming_wait, dict)
-                and not incoming_wait
-                and incoming.get("schema_version") == existing.get("schema_version") == 1
-                and bool(incoming.get("request_fingerprint"))
-                and incoming.get("request_fingerprint") == existing.get("request_fingerprint")
-                and existing.get("audit_only") is True
-                and existing.get("authoritative") is False
-                and isinstance(prior_wait, dict)
-                and isinstance(prior_tasks, dict)
-                and set(prior_tasks) == host_task_ids
-                and all(isinstance(row, dict) for row in prior_tasks.values())
-            )
-            merged = copy.deepcopy(incoming)
-            if preserve_prior_wait:
-                merged["wait"] = copy.deepcopy(prior_wait)
-            return merged
+# --------------------------------------------------------------------------- plan review state
+#
+# ``plan_review_state`` v2 (plan-review redesign, 2026-08-15): the durable record of
+# every ``plan_task`` cycle of ONE task. Task level: ``series_id`` (fresh per first v2
+# wave), ``cycles_paid`` (paid reviewer panels — the shared cap ``review_max_cycles()``
+# binds it), ``need_evidence_seen`` (per-task memory: one locator may be requested once),
+# ``current_attempt`` (the fingerprint the gate projects + open|unavailable|rail_degraded),
+# ``waves`` (bounded: the last ``_PLAN_REVIEW_FULL_WAVES`` in full, older ones compacted,
+# ``waves_omitted`` beyond ``_PLAN_REVIEW_MAX_WAVES``). A v1 record is READ-ONLY: it
+# loads without error under ``legacy_v1``; an open v1 wave projects as
+# ``legacy_open_requires_resubmission`` (S5 — never auto-closed) until a NEW plan_task
+# call starts a fresh v2 series.
 
-        update_json_locked(path, _merge)
-        return {
-            "kind": "plan_task_handoffs",
-            "name": "plan_task_handoffs.json",
-            "path": str(path),
-        }
-    except Exception as exc:
-        log.debug("Failed to persist plan_task handoffs", exc_info=True)
-        return {
-            "kind": "plan_task_handoffs",
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-
-
-def plan_review_handoff_snapshot_path(
-    results_drive_root: Any,
-    task_id: str,
-    fingerprint: str,
-    *,
-    create: bool = False,
-) -> pathlib.Path:
-    """Canonical immutable handoff snapshot path for one reviewed fingerprint."""
-    if not _PLAN_REVIEW_HASH_RE.fullmatch(str(fingerprint or "")):
-        raise ValueError("PLAN_REVIEW_STATE_INVALID: snapshot fingerprint is invalid")
-    artifact_dir = (
-        task_results_dir(results_drive_root, create=create)
-        / "artifacts"
-        / validate_task_id(task_id or "plan_review")
-    )
-    if create:
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-    return artifact_dir / f"plan_task_handoffs.{fingerprint}.json"
-
-
-def persist_plan_review_handoff_snapshot(
-    results_drive_root: Any,
-    task_id: str,
-    handoffs: Dict[str, Any],
-) -> Dict[str, str]:
-    """Freeze the first reviewer-input snapshot for one exact plan fingerprint."""
-    try:
-        fingerprint = str(handoffs.get("request_fingerprint") or "")
-        path = plan_review_handoff_snapshot_path(
-            results_drive_root, task_id, fingerprint, create=True,
-        )
-        incoming = {
-            **copy.deepcopy(handoffs),
-            "audit_only": True,
-            "authoritative": False,
-            "immutable_reviewer_input": True,
-        }
-
-        def _freeze(existing: Dict[str, Any]) -> Dict[str, Any]:
-            if not existing:
-                return incoming
-            if (
-                existing.get("request_fingerprint") != fingerprint
-                or existing.get("audit_only") is not True
-                or existing.get("authoritative") is not False
-                or existing.get("immutable_reviewer_input") is not True
-            ):
-                raise ValueError("PLAN_REVIEW_STATE_INVALID: immutable snapshot is invalid")
-            return existing
-
-        update_json_locked(path, _freeze, strict_existing_dict=True)
-        return {
-            "kind": "plan_task_handoff_snapshot",
-            "name": path.name,
-            "path": str(path),
-        }
-    except Exception as exc:
-        log.debug("Failed to persist immutable plan_task handoff snapshot", exc_info=True)
-        return {
-            "kind": "plan_task_handoff_snapshot",
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+_PLAN_REVIEW_FULL_WAVES = 8
+_PLAN_REVIEW_MAX_WAVES = 64
+_PLAN_REVIEW_ATTEMPT_STATUSES = frozenset({"open", "unavailable", "rail_degraded", "cycles_exhausted"})
+_PLAN_REVIEW_AGGREGATES = frozenset({"GREEN", "REVIEW_REQUIRED", "REVISE_PLAN", "DEGRADED"})
+LEGACY_OPEN_STATUS = "legacy_open_requires_resubmission"
 
 
 def _empty_plan_review_state() -> Dict[str, Any]:
     return {
         "schema_version": _PLAN_REVIEW_STATE_VERSION,
+        "series_id": "",
+        "cycles_paid": 0,
+        "need_evidence_seen": [],
         "current_attempt": {},
-        "latest_review_fingerprint": "",
         "waves": [],
+        "waves_omitted": 0,
+    }
+
+
+def _legacy_v1_projection(value: Dict[str, Any]) -> Dict[str, Any]:
+    """Read-only projection of a v1 record: ``{fingerprint, status, outcome, closed,
+    acceptance_claims}`` where status ∈ closed | rail_degraded | open (every non-closed
+    v1 ATTEMPT: open review, unavailable) | pending (a wave without any attempt) | absent."""
+    attempt = value.get("current_attempt") if isinstance(value.get("current_attempt"), dict) else {}
+    fingerprint = str(attempt.get("fingerprint") or "") or str(value.get("latest_review_fingerprint") or "")
+    waves = value.get("waves") if isinstance(value.get("waves"), list) else []
+    wave = next((w for w in waves if isinstance(w, dict)
+                 and str(w.get("request_fingerprint") or "") == fingerprint), None) if fingerprint else None
+    review = wave.get("review") if isinstance((wave or {}).get("review"), dict) else {}
+    outcome = str(review.get("aggregate_signal") or "")
+    integrated = bool(review and str((wave or {}).get("phase") or "") == "reviewed"
+                      and str((wave or {}).get("review_evidence_status") or "integrated") != "pending")
+    closed = integrated and bool(review.get("closed")) and outcome in {"GREEN", "REVIEW_REQUIRED"}
+    if closed:
+        status = "closed"
+    elif str(attempt.get("status") or "") == "rail_degraded":
+        status = "rail_degraded"
+    elif fingerprint:
+        status = "open"
+    elif waves:
+        status = "pending"  # a v1 wave that never reached a panel: hold under every policy
+    else:
+        status = "absent"
+    return {
+        "fingerprint": fingerprint, "status": status, "outcome": outcome, "closed": closed,
+        "reason": str(attempt.get("reason") or ""),
+        "acceptance_claims": list((wave or {}).get("acceptance_claims") or []),
     }
 
 
 def _validated_plan_review_state(value: Any) -> Dict[str, Any]:
-    """Return a private copy of the bounded host-owned planning state."""
+    """Return a private, bounded, shape-checked copy of the host-owned planning state.
+
+    v2 records are validated; a v1 record (``schema_version: 1``) is wrapped read-only:
+    the returned v2 state carries it under ``legacy_v1`` and its projection under
+    ``legacy_v1_projection`` — nothing is migrated, nothing is auto-closed."""
     if value in (None, {}):
         return _empty_plan_review_state()
-    if not isinstance(value, dict) or value.get("schema_version") != _PLAN_REVIEW_STATE_VERSION:
+    if not isinstance(value, dict):
+        raise ValueError("PLAN_REVIEW_STATE_INVALID: unsupported or malformed schema")
+    if value.get("schema_version") == 1:
+        state = _empty_plan_review_state()
+        state["legacy_v1"] = copy.deepcopy(value)
+        state["legacy_v1_projection"] = _legacy_v1_projection(value)
+        return state
+    if value.get("schema_version") != _PLAN_REVIEW_STATE_VERSION:
         raise ValueError("PLAN_REVIEW_STATE_INVALID: unsupported or malformed schema")
     waves = value.get("waves")
     if not isinstance(waves, list) or len(waves) > _PLAN_REVIEW_MAX_WAVES:
         raise ValueError("PLAN_REVIEW_STATE_INVALID: waves must be a bounded list")
     seen: set[str] = set()
-    reviewed: set[str] = set()
     for wave in waves:
         if not isinstance(wave, dict):
             raise ValueError("PLAN_REVIEW_STATE_INVALID: wave must be an object")
         fingerprint = str(wave.get("request_fingerprint") or "")
-        plan_text_hash = str(wave.get("plan_text_hash") or "")
-        phase = str(wave.get("phase") or "")
-        attempts = wave.get("intended_scouts")
         if not _PLAN_REVIEW_HASH_RE.fullmatch(fingerprint) or fingerprint in seen:
             raise ValueError("PLAN_REVIEW_STATE_INVALID: wave fingerprints must be unique")
-        if not _PLAN_REVIEW_HASH_RE.fullmatch(plan_text_hash):
-            raise ValueError("PLAN_REVIEW_STATE_INVALID: plan_text_hash must be SHA-256")
-        if not str(wave.get("scout_cutoff_at") or "").strip():
-            raise ValueError("PLAN_REVIEW_STATE_INVALID: scout_cutoff_at is required")
-        if phase not in _PLAN_REVIEW_PHASES:
-            raise ValueError("PLAN_REVIEW_STATE_INVALID: invalid wave phase")
-        if not isinstance(attempts, list) or len(attempts) > _PLAN_REVIEW_MAX_SCOUTS:
-            raise ValueError("PLAN_REVIEW_STATE_INVALID: intended_scouts must be a bounded list")
-        roles: set[str] = set()
-        issued_ids: set[str] = set()
-        for attempt in attempts:
-            if not isinstance(attempt, dict):
-                raise ValueError("PLAN_REVIEW_STATE_INVALID: scout intent must be an object")
-            role = str(attempt.get("role") or "").strip()
-            status = str(attempt.get("schedule_status") or "")
-            task_ids = attempt.get("task_ids")
-            reason = str(attempt.get("schedule_reason") or "")
-            if not role or role in roles:
-                raise ValueError("PLAN_REVIEW_STATE_INVALID: scout roles must be non-empty and unique")
-            if status not in {"pending", "started", "failed", "unknown"}:
-                raise ValueError("PLAN_REVIEW_STATE_INVALID: invalid scout schedule status")
-            if not isinstance(task_ids, list) or len(task_ids) > 1:
-                raise ValueError("PLAN_REVIEW_STATE_INVALID: one scout intent may own at most one task id")
-            normalized_ids = [validate_task_id(item) for item in task_ids]
-            if len(normalized_ids) != len(set(normalized_ids)) or issued_ids.intersection(normalized_ids):
-                raise ValueError("PLAN_REVIEW_STATE_INVALID: scout task ids must be unique")
-            if (status == "started") != bool(normalized_ids):
-                raise ValueError("PLAN_REVIEW_STATE_INVALID: only a started scout may own task ids")
-            if len(reason) > _PLAN_REVIEW_REASON_MAX_CHARS:
-                raise ValueError("PLAN_REVIEW_STATE_INVALID: scout schedule reason is too large")
-            roles.add(role)
-            issued_ids.update(normalized_ids)
-        claims = wave.get("acceptance_claims")
-        if claims is not None:
-            if (
-                not isinstance(claims, list)
-                or not claims
-                or len(claims) > _PLAN_REVIEW_MAX_CLAIMS
-                or any(
-                    not isinstance(item, str)
-                    or not item.strip()
-                    or len(item) > _PLAN_REVIEW_CLAIM_MAX_CHARS
-                    for item in claims
-                )
-            ):
-                raise ValueError(
-                    "PLAN_REVIEW_STATE_INVALID: wave acceptance_claims must be a bounded "
-                    "list of non-empty strings"
-                )
-        claims_omitted = wave.get("acceptance_claims_omitted", 0)
-        if not isinstance(claims_omitted, int) or isinstance(claims_omitted, bool) or claims_omitted < 0:
-            raise ValueError(
-                "PLAN_REVIEW_STATE_INVALID: acceptance_claims_omitted must be a non-negative count"
-            )
-        included = wave.get("included_task_ids")
-        consumed = wave.get("consumed_task_ids")
-        omissions = wave.get("omissions")
-        disposition_warnings = wave.get("disposition_warnings", [])
-        reviewed_result_hashes = wave.get("reviewed_result_hashes", {})
-        evidence_status = str(wave.get("review_evidence_status") or "")
-        if not isinstance(included, list) or not isinstance(consumed, list):
-            raise ValueError("PLAN_REVIEW_STATE_INVALID: included/consumed ids must be lists")
-        included_ids = [validate_task_id(item) for item in included]
-        consumed_ids = [validate_task_id(item) for item in consumed]
-        if len(included_ids) != len(set(included_ids)) or not set(included_ids).issubset(issued_ids):
-            raise ValueError("PLAN_REVIEW_STATE_INVALID: included ids must be unique host-issued ids")
-        if len(consumed_ids) != len(set(consumed_ids)) or not set(consumed_ids).issubset(set(included_ids)):
-            raise ValueError("PLAN_REVIEW_STATE_INVALID: consumed ids must be unique included ids")
-        if not isinstance(reviewed_result_hashes, dict):
-            raise ValueError("PLAN_REVIEW_STATE_INVALID: reviewed result hashes must be an object")
-        normalized_result_hashes = {
-            validate_task_id(key): str(value or "")
-            for key, value in reviewed_result_hashes.items()
-        }
-        if not set(normalized_result_hashes).issubset(set(included_ids)):
-            raise ValueError(
-                "PLAN_REVIEW_STATE_INVALID: reviewed result hashes must name included evidence"
-            )
-        if any(
-            not _PLAN_REVIEW_HASH_RE.fullmatch(value)
-            for value in normalized_result_hashes.values()
-        ):
-            raise ValueError(
-                "PLAN_REVIEW_STATE_INVALID: reviewed result hashes must be SHA-256"
-            )
-        if evidence_status not in {"", "pending", "integrated"}:
-            raise ValueError("PLAN_REVIEW_STATE_INVALID: invalid review evidence status")
-        if not isinstance(omissions, list) or len(omissions) > len(attempts):
-            raise ValueError("PLAN_REVIEW_STATE_INVALID: omissions must be bounded by scout intents")
-        if any(not isinstance(item, dict) for item in omissions):
-            raise ValueError("PLAN_REVIEW_STATE_INVALID: each omission must be an object")
-        if (
-            not isinstance(disposition_warnings, list)
-            or len(disposition_warnings) > len(attempts)
-        ):
-            raise ValueError(
-                "PLAN_REVIEW_STATE_INVALID: disposition warnings must be bounded by scout intents"
-            )
-        for warning in disposition_warnings:
-            if not isinstance(warning, dict) or set(warning) != {"task_id", "code", "detail"}:
-                raise ValueError(
-                    "PLAN_REVIEW_STATE_INVALID: disposition warning shape is invalid"
-                )
-            warning_task_id = validate_task_id(warning.get("task_id"))
-            if warning_task_id not in included_ids:
-                raise ValueError(
-                    "PLAN_REVIEW_STATE_INVALID: disposition warning must name included evidence"
-                )
-            if str(warning.get("code") or "") != "CHILD_RESULT_STALE":
-                raise ValueError(
-                    "PLAN_REVIEW_STATE_INVALID: disposition warning code is invalid"
-                )
-            detail = str(warning.get("detail") or "")
-            if not detail or len(detail) > _PLAN_REVIEW_REASON_MAX_CHARS:
-                raise ValueError(
-                    "PLAN_REVIEW_STATE_INVALID: disposition warning detail is invalid"
-                )
-        if phase in {"evidence_ready", "evidence_pending", "reviewed"}:
-            if any(str(item.get("schedule_status") or "") == "pending" for item in attempts):
-                raise ValueError("PLAN_REVIEW_STATE_INVALID: collected wave has unresolved scout intent")
-            included_roles = {
-                str(attempt.get("role") or "")
-                for attempt in attempts
-                if any(task_id in included_ids for task_id in (attempt.get("task_ids") or []))
-            }
-            omission_roles = [str(item.get("role") or "") for item in omissions]
-            expected_omissions = roles - included_roles
-            if (
-                len(omission_roles) != len(set(omission_roles))
-                or set(omission_roles) != expected_omissions
-            ):
-                raise ValueError(
-                    "PLAN_REVIEW_STATE_INVALID: collection must have one omission per unfulfilled scout intent"
-                )
-        review = wave.get("review")
-        if review is not None:
-            if not isinstance(review, dict):
-                raise ValueError("PLAN_REVIEW_STATE_INVALID: review must be an object")
-            aggregate = str(review.get("aggregate_signal") or "")
-            if str(review.get("request_fingerprint") or "") != fingerprint:
-                raise ValueError("PLAN_REVIEW_STATE_INVALID: review fingerprint does not match its wave")
-            if str(review.get("plan_text_hash") or "") != plan_text_hash:
-                raise ValueError("PLAN_REVIEW_STATE_INVALID: review plan hash does not match its wave")
-            if aggregate not in {"GREEN", "REVIEW_REQUIRED", "REVISE_PLAN"}:
-                raise ValueError("PLAN_REVIEW_STATE_INVALID: invalid review aggregate")
-            if not isinstance(review.get("closed"), bool):
-                raise ValueError("PLAN_REVIEW_STATE_INVALID: review closed must be boolean")
-            if not isinstance(review.get("reviewer_slots_degraded", False), bool):
-                raise ValueError("PLAN_REVIEW_STATE_INVALID: review degradation flag must be boolean")
-            if aggregate == "GREEN" and not review["closed"]:
-                raise ValueError("PLAN_REVIEW_STATE_INVALID: GREEN review must be closed")
-            if aggregate == "REVISE_PLAN" and review["closed"]:
-                raise ValueError("PLAN_REVIEW_STATE_INVALID: REVISE_PLAN review cannot be closed")
-            if not isinstance(review.get("findings"), list):
-                raise ValueError("PLAN_REVIEW_STATE_INVALID: review findings must be a list")
-            effective_evidence_status = evidence_status or "integrated"
-            if effective_evidence_status == "pending":
-                if phase != "evidence_pending" or not included_ids or consumed_ids:
-                    raise ValueError(
-                        "PLAN_REVIEW_STATE_INVALID: pending review evidence state is inconsistent"
-                    )
-                if set(normalized_result_hashes) != set(included_ids):
-                    raise ValueError(
-                        "PLAN_REVIEW_STATE_INVALID: pending review must bind every included result"
-                    )
-            else:
-                if phase != "reviewed" or set(consumed_ids) != set(included_ids):
-                    raise ValueError(
-                        "PLAN_REVIEW_STATE_INVALID: reviewed evidence was not fully consumed"
-                    )
-                if normalized_result_hashes and set(normalized_result_hashes) != set(included_ids):
-                    raise ValueError(
-                        "PLAN_REVIEW_STATE_INVALID: integrated review hashes are incomplete"
-                    )
-                reviewed.add(fingerprint)
-        elif evidence_status or reviewed_result_hashes:
-            raise ValueError(
-                "PLAN_REVIEW_STATE_INVALID: review evidence metadata requires a paid review"
-            )
+        if str(wave.get("aggregate") or "") not in _PLAN_REVIEW_AGGREGATES:
+            raise ValueError("PLAN_REVIEW_STATE_INVALID: invalid wave aggregate")
+        if not isinstance(wave.get("closed"), bool):
+            raise ValueError("PLAN_REVIEW_STATE_INVALID: wave closed must be boolean")
+        if wave["aggregate"] == "GREEN" and not wave["closed"]:
+            raise ValueError("PLAN_REVIEW_STATE_INVALID: GREEN wave must be closed")
+        if wave["aggregate"] in {"REVISE_PLAN", "DEGRADED"} and wave["closed"]:
+            raise ValueError("PLAN_REVIEW_STATE_INVALID: REVISE_PLAN/DEGRADED wave cannot be closed")
+        if not wave.get("compact"):
+            if not isinstance(wave.get("spec"), dict) or not isinstance(wave.get("findings"), list):
+                raise ValueError("PLAN_REVIEW_STATE_INVALID: full wave needs spec and findings")
+            if not isinstance(wave.get("dispositions", []), list):
+                raise ValueError("PLAN_REVIEW_STATE_INVALID: dispositions must be a list")
         seen.add(fingerprint)
-    latest = str(value.get("latest_review_fingerprint") or "")
-    if latest and latest not in reviewed:
-        raise ValueError("PLAN_REVIEW_STATE_INVALID: latest review fingerprint is unknown")
-    copied = copy.deepcopy(value)
-    attempt = copied.get("current_attempt", {})
+    cycles_paid = value.get("cycles_paid", 0)
+    if not isinstance(cycles_paid, int) or isinstance(cycles_paid, bool) or cycles_paid < 0:
+        raise ValueError("PLAN_REVIEW_STATE_INVALID: cycles_paid must be a non-negative count")
+    if not isinstance(value.get("need_evidence_seen", []), list):
+        raise ValueError("PLAN_REVIEW_STATE_INVALID: need_evidence_seen must be a list")
+    copied = {**_empty_plan_review_state(), **copy.deepcopy(value)}
+    attempt = copied.get("current_attempt")
     if not isinstance(attempt, dict):
         raise ValueError("PLAN_REVIEW_STATE_INVALID: current_attempt must be an object")
-    if not attempt and latest:
-        # Schema v1 originally had no current_attempt pointer: its validated
-        # latest review was the current authority. Normalize it in-memory; the
-        # next locked write persists it, while any new raw attempt supersedes it.
-        attempt = {
-            "fingerprint": latest,
-            "status": "open",
-            "reason": "legacy_latest_review",
-        }
-        copied["current_attempt"] = attempt
     if attempt:
-        fingerprint = str(attempt.get("fingerprint") or "")
-        status = str(attempt.get("status") or "")
-        reason = str(attempt.get("reason") or "")
         if set(attempt) != {"fingerprint", "status", "reason"}:
             raise ValueError("PLAN_REVIEW_STATE_INVALID: current_attempt shape is invalid")
-        if not _PLAN_REVIEW_HASH_RE.fullmatch(fingerprint):
+        if not _PLAN_REVIEW_HASH_RE.fullmatch(str(attempt.get("fingerprint") or "")):
             raise ValueError("PLAN_REVIEW_STATE_INVALID: current attempt fingerprint is invalid")
-        if status not in {"open", "unavailable", "rail_degraded"}:
+        if str(attempt.get("status") or "") not in _PLAN_REVIEW_ATTEMPT_STATUSES:
             raise ValueError("PLAN_REVIEW_STATE_INVALID: current attempt status is invalid")
-        if len(reason) > _PLAN_REVIEW_REASON_MAX_CHARS:
+        if len(str(attempt.get("reason") or "")) > _PLAN_REVIEW_REASON_MAX_CHARS:
             raise ValueError("PLAN_REVIEW_STATE_INVALID: current attempt reason is too large")
-    copied.setdefault("current_attempt", {})
     if len(json.dumps(copied, ensure_ascii=False, default=str).encode("utf-8")) > _PLAN_REVIEW_STATE_MAX_BYTES:
         raise ValueError("PLAN_REVIEW_STATE_INVALID: state exceeds the bounded size limit")
     return copied
@@ -685,68 +431,94 @@ def load_plan_review_state(results_drive_root: Any, task_id: str) -> Dict[str, A
     return _validated_plan_review_state(result.get(PLAN_REVIEW_STATE_KEY))
 
 
+def plan_review_wave(state: Dict[str, Any], fingerprint: str) -> Optional[Dict[str, Any]]:
+    """The wave recorded under ``fingerprint`` (full or compact), as a private copy."""
+    for wave in (state or {}).get("waves") or []:
+        if str(wave.get("request_fingerprint") or "") == fingerprint:
+            return copy.deepcopy(wave)
+    return None
+
+
+def current_plan_review_wave(state: Any) -> Optional[Dict[str, Any]]:
+    """The wave the gate projects: the ``current_attempt`` fingerprint's wave, else the
+    latest recorded wave (private copy)."""
+    if not isinstance(state, dict):
+        return None
+    attempt = state.get("current_attempt") if isinstance(state.get("current_attempt"), dict) else {}
+    fingerprint = str(attempt.get("fingerprint") or "")
+    wave = plan_review_wave(state, fingerprint) if fingerprint else None
+    if wave is None:
+        waves = state.get("waves") if isinstance(state.get("waves"), list) else []
+        wave = copy.deepcopy(waves[-1]) if waves and not fingerprint else None
+    return wave
+
+
+def _legacy_projection_of(state: Any) -> Dict[str, Any]:
+    if not isinstance(state, dict):
+        return {}
+    if state.get("schema_version") == 1:
+        return _legacy_v1_projection(state)
+    projection = state.get("legacy_v1_projection")
+    return projection if isinstance(projection, dict) else {}
+
+
 def plan_review_gate_projection(
     state: Any,
     enforcement: str,
     *,
     hard_rail: str = "",
 ) -> Dict[str, Any]:
-    """Project one force-plan finalization decision from existing authority.
+    """Project one plan-review finalization decision from existing authority.
 
-    ``plan_review_state`` remains the durable review SSOT. Its tiny
-    ``current_attempt`` pointer prevents a newer validated fingerprint from
-    falling back to an older durable GREEN. A hard rail is supplied only by an
-    existing task-wide finalization branch.
-    """
-
+    ``plan_review_state`` is the durable SSOT; the ``current_attempt`` pointer keeps a
+    newer fingerprint from falling back to an older closed wave. Statuses: ``closed``
+    (allow) · ``rail_degraded`` (a task-wide rail released the hold — allow) ·
+    ``advisory_open`` (advisory enforcement proceeds under loud disclosure) ·
+    ``cycles_exhausted`` (the shared cap is spent on an OPEN wave: finalization is
+    released so the task can terminalize honestly as blocked — owner D27 — while
+    the wave itself stays open) · ``open`` / ``unavailable`` / ``pending`` /
+    ``legacy_open_requires_resubmission`` (blocking hold) · ``absent``. Accepts a v2
+    state, a loaded v1 wrapper, or a raw v1 record (read-only projection)."""
     policy = "blocking" if str(enforcement or "").lower() == "blocking" else "advisory"
     control: Dict[str, Any] = {}
     attempted = False
     if isinstance(state, dict):
+        legacy = _legacy_projection_of(state)
         attempt = state.get("current_attempt") if isinstance(state.get("current_attempt"), dict) else {}
-        fingerprint = str(attempt.get("fingerprint") or "")
-        attempted = bool(fingerprint)
-        if not fingerprint:
-            fingerprint = str(state.get("latest_review_fingerprint") or "")
-        wave = plan_review_wave(state, fingerprint) if fingerprint else None
-        review = wave.get("review") if isinstance((wave or {}).get("review"), dict) else {}
-        integrated = bool(
-            review
-            and str((wave or {}).get("phase") or "") == "reviewed"
-            and str((wave or {}).get("review_evidence_status") or "integrated") != "pending"
-        )
-        review_outcome = str(review.get("aggregate_signal") or "")
-        review_closed = bool(review.get("closed")) and review_outcome in {
-            "GREEN", "REVIEW_REQUIRED",
-        }
-        if integrated and review_closed:
-            control = {
-                "status": "reviewed",
-                "outcome": review_outcome,
-                "closed": True,
-                "reviewer_slots_degraded": bool(review.get("reviewer_slots_degraded")),
-                "fingerprint": fingerprint,
-            }
-        elif str(attempt.get("status") or "") == "rail_degraded":
-            control = {
-                "status": "rail_degraded",
-                "reason": str(attempt.get("reason") or ""),
-                "outcome": review_outcome,
-                "reviewer_slots_degraded": bool(review.get("reviewer_slots_degraded")),
-            }
-        elif integrated:
-            control = {
-                "status": "reviewed",
-                "outcome": review_outcome,
-                "closed": False,
-                "reviewer_slots_degraded": bool(review.get("reviewer_slots_degraded")),
-                "fingerprint": fingerprint,
-            }
-        elif attempted:
-            control = {
-                "status": str(attempt.get("status") or "open"),
-                "reason": str(attempt.get("reason") or ""),
-            }
+        wave = current_plan_review_wave(state) if state.get("schema_version") != 1 else None
+        if wave is not None or (attempt and state.get("schema_version") != 1):
+            attempted = True
+            outcome = str((wave or {}).get("aggregate") or "")
+            if wave is not None and bool(wave.get("closed")):
+                control = {"status": "closed", "outcome": outcome, "closed": True,
+                           "fingerprint": str(wave.get("request_fingerprint") or "")}
+            elif str(attempt.get("status") or "") == "rail_degraded":
+                control = {"status": "rail_degraded", "reason": str(attempt.get("reason") or ""),
+                           "outcome": outcome}
+            elif wave is not None:
+                control = {
+                    "status": "cycles_exhausted" if wave.get("cycles_exhausted") else "open",
+                    "outcome": outcome, "closed": False,
+                    "fingerprint": str(wave.get("request_fingerprint") or ""),
+                    "reviewer_slots_degraded": outcome == "DEGRADED",
+                }
+            else:
+                control = {"status": str(attempt.get("status") or "open"),
+                           "reason": str(attempt.get("reason") or "")}
+        elif legacy.get("status") not in (None, "", "absent"):
+            attempted = True
+            if legacy["status"] == "closed":
+                control = {"status": "closed", "outcome": legacy["outcome"], "closed": True,
+                           "fingerprint": legacy["fingerprint"], "legacy_v1": True}
+            elif legacy["status"] == "rail_degraded":
+                control = {"status": "rail_degraded", "reason": legacy["reason"],
+                           "outcome": legacy["outcome"], "legacy_v1": True}
+            elif legacy["status"] == "pending":
+                control = {"status": "pending", "legacy_v1": True}
+            else:
+                control = {"status": LEGACY_OPEN_STATUS, "outcome": legacy["outcome"],
+                           "closed": False, "fingerprint": legacy["fingerprint"], "legacy_v1": True,
+                           "reason": "an open v1 plan wave cannot be honored: re-call plan_task"}
         elif state.get("waves"):
             control = {"status": "pending"}
         else:
@@ -755,16 +527,17 @@ def plan_review_gate_projection(
         control = {"status": "invalid"}
 
     status = str(control.get("status") or "unavailable")
-    outcome = str(control.get("outcome") or "")
-    closed = bool(control.get("closed")) and outcome in {"GREEN", "REVIEW_REQUIRED"}
-    if status == "reviewed" and closed:
+    closed = bool(control.get("closed"))
+    if status == "closed" and closed:
         gate_status, allow = "closed", True
-    elif hard_rail:
+    elif hard_rail or status == "rail_degraded":
         gate_status, allow = "rail_degraded", True
-    elif status == "rail_degraded":
-        gate_status, allow = "rail_degraded", True
-    elif policy == "advisory" and status in {"reviewed", "open", "unavailable"}:
+    elif policy == "advisory" and status in {
+        "open", "unavailable", "cycles_exhausted", LEGACY_OPEN_STATUS,
+    }:
         gate_status, allow = "advisory_open", True
+    elif status == "cycles_exhausted":
+        gate_status, allow = "cycles_exhausted", True
     else:
         gate_status, allow = status, False
     return {
@@ -772,44 +545,34 @@ def plan_review_gate_projection(
         "status": gate_status,
         "allow": allow,
         "attempted": attempted,
-        "outcome": outcome,
+        "outcome": str(control.get("outcome") or ""),
         "closed": closed,
         "reviewer_slots_degraded": bool(control.get("reviewer_slots_degraded")),
         "reason": str(hard_rail or control.get("reason") or ""),
+        "cycles_paid": int((state or {}).get("cycles_paid") or 0) if isinstance(state, dict) else 0,
+        "legacy_v1": bool(control.get("legacy_v1")),
         "source": "durable_state",
     }
 
 
 def closed_plan_review_wave(state: Any) -> Optional[Dict[str, Any]]:
-    """The wave holding the CURRENT CLOSED plan authority, or None.
+    """The wave holding the CURRENT CLOSED plan authority, or None (pure read).
 
-    Mirrors plan_review_gate_projection's closed branch exactly: the
-    ``current_attempt`` pointer wins over ``latest_review_fingerprint`` (so a newer
-    validated fingerprint never falls back to an older durable GREEN), and closed
-    means an INTEGRATED review with closed=true and outcome GREEN or
-    disposition-closed REVIEW_REQUIRED. Pure read; the returned wave is a private
-    copy (``plan_review_wave`` deep-copies)."""
+    v2: the current wave when ``closed``. A v1 record with a closed current review
+    projects a minimal legacy wave (``{"acceptance_claims": [...], "legacy_v1": True}``)
+    so ``effective_acceptance_claims``' v1 fallback still binds those claims."""
     if not isinstance(state, dict):
         return None
-    attempt = state.get("current_attempt") if isinstance(state.get("current_attempt"), dict) else {}
-    fingerprint = str(attempt.get("fingerprint") or "") or str(
-        state.get("latest_review_fingerprint") or ""
-    )
-    if not fingerprint:
-        return None
-    wave = plan_review_wave(state, fingerprint)
-    if wave is None:
-        return None
-    review = wave.get("review") if isinstance(wave.get("review"), dict) else {}
-    integrated = bool(
-        review
-        and str(wave.get("phase") or "") == "reviewed"
-        and str(wave.get("review_evidence_status") or "integrated") != "pending"
-    )
-    closed = bool(review.get("closed")) and str(review.get("aggregate_signal") or "") in {
-        "GREEN", "REVIEW_REQUIRED",
-    }
-    return wave if (integrated and closed) else None
+    if state.get("schema_version") != 1:
+        wave = current_plan_review_wave(state)
+        if wave is not None:
+            return wave if bool(wave.get("closed")) else None
+    legacy = _legacy_projection_of(state)
+    if legacy.get("status") == "closed":
+        return {"legacy_v1": True, "request_fingerprint": legacy["fingerprint"],
+                "aggregate": legacy["outcome"], "closed": True,
+                "acceptance_claims": list(legacy.get("acceptance_claims") or [])}
+    return None
 
 
 def record_plan_review_attempt(
@@ -820,11 +583,10 @@ def record_plan_review_attempt(
     status: str = "open",
     reason: str = "",
 ) -> Dict[str, Any]:
-    """Select one already-validated canonical plan fingerprint as current."""
-
+    """Select one canonical plan fingerprint as current (open | unavailable | rail_degraded)."""
     if not _PLAN_REVIEW_HASH_RE.fullmatch(str(fingerprint or "")):
         raise ValueError("PLAN_REVIEW_STATE_INVALID: current attempt fingerprint is invalid")
-    if status not in {"open", "unavailable", "rail_degraded"}:
+    if status not in _PLAN_REVIEW_ATTEMPT_STATUSES:
         raise ValueError("PLAN_REVIEW_STATE_INVALID: current attempt status is invalid")
 
     def _record(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -844,7 +606,7 @@ def mark_current_plan_review_unavailable(
     *,
     reason: str,
 ) -> Dict[str, Any]:
-    """Mark the already-validated current fingerprint retryable-unavailable."""
+    """Mark the current fingerprint retryable-unavailable (a failed/timed-out panel)."""
 
     def _mark(state: Dict[str, Any]) -> Dict[str, Any]:
         current = state.get("current_attempt")
@@ -866,7 +628,9 @@ def _update_plan_review_state(
 
     def _merge(existing: Dict[str, Any]) -> Dict[str, Any]:
         state = _validated_plan_review_state(existing.get(PLAN_REVIEW_STATE_KEY))
+        state.pop("legacy_v1_projection", None)  # derived on load, never persisted
         updated_state = _validated_plan_review_state(mutator(state))
+        updated_state.pop("legacy_v1_projection", None)
         now = utc_now_iso()
         return {
             **existing,
@@ -888,356 +652,164 @@ def _update_plan_review_state(
     return _validated_plan_review_state(updated.get(PLAN_REVIEW_STATE_KEY))
 
 
-def plan_review_wave(state: Dict[str, Any], fingerprint: str) -> Optional[Dict[str, Any]]:
-    for wave in state.get("waves") or []:
-        if str(wave.get("request_fingerprint") or "") == fingerprint:
-            return copy.deepcopy(wave)
-    return None
-
-
-def _bounded_wave_acceptance_claims(acceptance_claims: Any) -> Dict[str, Any]:
-    """Bounded per-wave claims copy, only-when-set; an over-cap tail is DISCLOSED
-    (acceptance_claims_omitted), never silently dropped (BIBLE P1).
-
-    Claim text is frozen byte-for-byte apart from the disclosed truncation bound:
-    the review panel sees ``normalize_plan_scope`` output (per-item strip, internal
-    whitespace PRESERVED), so a lossy rewrite here — the historical
-    ``" ".join(split())`` — made acceptance bind DIFFERENT text than the panel
-    reviewed (an exact-output claim quoting code/spacing changed meaning)."""
-    from ouroboros.utils import truncate_review_artifact
-
-    cleaned = [
-        str(item).strip()
-        for item in (acceptance_claims if isinstance(acceptance_claims, list) else [])
-    ]
-    bounded = [
-        truncate_review_artifact(item, limit=600)
-        for item in cleaned if item
-    ]
-    if not bounded:
-        return {}
-    omitted = max(0, len(bounded) - _PLAN_REVIEW_MAX_CLAIMS)
-    out: Dict[str, Any] = {"acceptance_claims": bounded[:_PLAN_REVIEW_MAX_CLAIMS]}
-    if omitted:
-        out["acceptance_claims_omitted"] = omitted
-    return out
-
-
-def reserve_plan_review_wave(
-    results_drive_root: Any,
-    task_id: str,
-    *,
-    fingerprint: str,
-    plan_text_hash: str,
-    scout_roles: List[str],
-    cutoff_at: str,
-    acceptance_claims: Optional[List[str]] = None,
-) -> tuple[Dict[str, Any], bool]:
-    created = False
-
-    def _reserve(state: Dict[str, Any]) -> Dict[str, Any]:
-        nonlocal created
-        if plan_review_wave(state, fingerprint) is not None:
-            return state
-        if len(state["waves"]) >= _PLAN_REVIEW_MAX_WAVES:
-            raise ValueError("PLAN_REVIEW_STATE_CAPACITY_REACHED: fingerprint history is full")
-        created = True
-        state["waves"].append({
-            "request_fingerprint": fingerprint,
-            "plan_text_hash": plan_text_hash,
-            "created_at": utc_now_iso(),
-            "scout_cutoff_at": cutoff_at,
-            "phase": "scheduling",
-            "intended_scouts": [
-                {"role": str(role), "schedule_status": "pending", "task_ids": [], "schedule_reason": ""}
-                for role in scout_roles
-            ],
-            "included_task_ids": [],
-            "omissions": [],
-            "consumed_task_ids": [],
-            "disposition_warnings": [],
-            # W2: the wave freezes a bounded copy of the scope's acceptance_claims at
-            # reserve time — the claims are part of the fingerprinted envelope, so they
-            # cannot drift within a wave, and disposition-mode closure (which cannot
-            # resend the envelope) still has the exact reviewed claims to bind.
-            **_bounded_wave_acceptance_claims(acceptance_claims),
-        })
-        return state
-
-    state = _update_plan_review_state(results_drive_root, task_id, _reserve)
-    wave = plan_review_wave(state, fingerprint)
-    if wave is None:
-        raise ValueError("PLAN_REVIEW_STATE_INVALID: reserved wave is missing")
-    return wave, created
-
-
-def record_plan_review_scout(
-    results_drive_root: Any,
-    task_id: str,
-    *,
-    fingerprint: str,
-    role: str,
-    schedule_status: str,
-    task_ids: List[str],
-    reason: str,
-) -> Dict[str, Any]:
-    if schedule_status not in {"started", "failed", "unknown"}:
-        raise ValueError("PLAN_REVIEW_STATE_INVALID: invalid scout schedule status")
-
-    def _record(state: Dict[str, Any]) -> Dict[str, Any]:
-        wave = next((item for item in state["waves"] if item["request_fingerprint"] == fingerprint), None)
-        if wave is None:
-            raise ValueError("PLAN_REVIEW_STATE_INVALID: scout wave is missing")
-        attempt = next((item for item in wave["intended_scouts"] if item.get("role") == role), None)
-        if attempt is None or str(attempt.get("schedule_status") or "") != "pending":
-            raise ValueError("PLAN_REVIEW_STATE_INVALID: scout attempt is missing or already resolved")
-        attempt.update({
-            "schedule_status": schedule_status,
-            "task_ids": list(dict.fromkeys(str(item) for item in task_ids if str(item))),
-            "schedule_reason": str(reason or ""),
-            "scheduled_at": utc_now_iso(),
-        })
-        wave["phase"] = "waiting"
-        return state
-
-    state = _update_plan_review_state(results_drive_root, task_id, _record)
-    return plan_review_wave(state, fingerprint) or {}
-
-
-def record_plan_review_collection(
-    results_drive_root: Any,
-    task_id: str,
-    *,
-    fingerprint: str,
-    included_task_ids: List[str],
-    omissions: List[Dict[str, Any]],
-    stop_reason: str,
-) -> Dict[str, Any]:
-    def _record(state: Dict[str, Any]) -> Dict[str, Any]:
-        wave = next((item for item in state["waves"] if item["request_fingerprint"] == fingerprint), None)
-        if wave is None:
-            raise ValueError("PLAN_REVIEW_STATE_INVALID: scout wave is missing")
-        known_ids = {
-            str(task_id)
-            for attempt in wave["intended_scouts"]
-            for task_id in (attempt.get("task_ids") or [])
-            if str(task_id)
-        }
-        included = list(dict.fromkeys(str(item) for item in included_task_ids if str(item)))
-        if not set(included).issubset(known_ids):
-            raise ValueError("PLAN_REVIEW_STATE_INVALID: included scout id was not host-issued")
-        wave.update({
-            "phase": "evidence_ready",
-            "included_task_ids": included,
-            "omissions": copy.deepcopy(list(omissions)),
-            "wait_stop_reason": str(stop_reason or ""),
-            "collected_at": utc_now_iso(),
-        })
-        return state
-
-    state = _update_plan_review_state(results_drive_root, task_id, _record)
-    return plan_review_wave(state, fingerprint) or {}
-
-
-def record_plan_review_consumed(
-    results_drive_root: Any,
-    task_id: str,
-    *,
-    fingerprint: str,
-    consumed_task_ids: List[str],
-    disposition_warnings: Optional[List[Dict[str, str]]] = None,
-) -> Dict[str, Any]:
-    def _record(state: Dict[str, Any]) -> Dict[str, Any]:
-        wave = next((item for item in state["waves"] if item["request_fingerprint"] == fingerprint), None)
-        if wave is None:
-            raise ValueError("PLAN_REVIEW_STATE_INVALID: scout wave is missing")
-        included = {str(item) for item in wave.get("included_task_ids") or []}
-        consumed = list(dict.fromkeys(str(item) for item in consumed_task_ids if str(item)))
-        if set(consumed) != included:
-            raise ValueError("PLAN_REVIEW_STATE_INVALID: consumed scouts must exactly match reviewer evidence")
-        wave["consumed_task_ids"] = consumed
-        wave["disposition_warnings"] = copy.deepcopy(list(disposition_warnings or []))
-        wave["consumed_at"] = utc_now_iso()
-        if (
-            isinstance(wave.get("review"), dict)
-            and str(wave.get("review_evidence_status") or "") == "pending"
-        ):
-            wave["review_evidence_status"] = "integrated"
-            wave["phase"] = "reviewed"
-            state["latest_review_fingerprint"] = fingerprint
-        return state
-
-    state = _update_plan_review_state(results_drive_root, task_id, _record)
-    return plan_review_wave(state, fingerprint) or {}
-
-
-def record_plan_review_result(
-    results_drive_root: Any,
-    task_id: str,
-    *,
-    fingerprint: str,
-    review: Dict[str, Any],
-    require_latest: bool = False,
-    reviewed_result_hashes: Optional[Dict[str, str]] = None,
-) -> Dict[str, Any]:
-    def _record(state: Dict[str, Any]) -> Dict[str, Any]:
-        wave = next((item for item in state["waves"] if item["request_fingerprint"] == fingerprint), None)
-        if wave is None:
-            raise ValueError("PLAN_REVIEW_STATE_INVALID: reviewed wave is missing")
-        current = state.get("current_attempt")
-        if require_latest and (
-            str(state.get("latest_review_fingerprint") or "") != fingerprint
-            or not isinstance(current, dict)
-            or str(current.get("status") or "") != "open"
-            or str(current.get("fingerprint") or "") != fingerprint
-        ):
-            raise ValueError("PLAN_REVIEW_DISPOSITION_STALE: review is not latest still-current")
-        existing_review = wave.get("review") if isinstance(wave.get("review"), dict) else {}
-        if existing_review.get("closed"):
-            existing_comparable = copy.deepcopy(existing_review)
-            incoming_comparable = copy.deepcopy(review)
-            for comparable in (existing_comparable, incoming_comparable):
-                disposition = comparable.get("disposition")
-                if isinstance(disposition, dict):
-                    disposition.pop("recorded_at", None)
-            if existing_comparable != incoming_comparable:
-                raise ValueError(
-                    "PLAN_REVIEW_DISPOSITION_IMMUTABLE: a closed review cannot be changed"
-                )
-            if reviewed_result_hashes is not None and dict(
-                wave.get("reviewed_result_hashes") or {}
-            ) != dict(reviewed_result_hashes):
-                raise ValueError(
-                    "PLAN_REVIEW_DISPOSITION_IMMUTABLE: reviewed evidence hashes cannot change"
-                )
-            return state
-        wave["review"] = copy.deepcopy(review)
-        if reviewed_result_hashes is not None:
-            included = {str(item) for item in wave.get("included_task_ids") or []}
-            normalized_hashes = {
-                str(key): str(value or "")
-                for key, value in reviewed_result_hashes.items()
-            }
-            if set(normalized_hashes) != included:
-                raise ValueError(
-                    "PLAN_REVIEW_STATE_INVALID: paid review hashes must exactly match included evidence"
-                )
-            consumed = {str(item) for item in wave.get("consumed_task_ids") or []}
-            prior_hashes = dict(wave.get("reviewed_result_hashes") or {})
-            if consumed == included and included:
-                if prior_hashes and prior_hashes != normalized_hashes:
-                    raise ValueError(
-                        "PLAN_REVIEW_STATE_INVALID: reviewer retry changed consumed evidence hashes"
-                    )
-                wave["reviewed_result_hashes"] = normalized_hashes
-                wave["review_evidence_status"] = "integrated"
-                wave["phase"] = "reviewed"
-                state["latest_review_fingerprint"] = fingerprint
-                return state
-            wave["reviewed_result_hashes"] = normalized_hashes
-            if included:
-                wave["review_evidence_status"] = "pending"
-                wave["phase"] = "evidence_pending"
-            else:
-                wave["review_evidence_status"] = "integrated"
-                wave["phase"] = "reviewed"
-                state["latest_review_fingerprint"] = fingerprint
-        else:
-            wave["review_evidence_status"] = "integrated"
-            wave["phase"] = "reviewed"
-        if not require_latest and reviewed_result_hashes is None:
-            state["latest_review_fingerprint"] = fingerprint
-        return state
-
-    state = _update_plan_review_state(results_drive_root, task_id, _record)
-    return plan_review_wave(state, fingerprint) or {}
-
-
-def represent_plan_review(
-    results_drive_root: Any,
-    task_id: str,
-    *,
-    fingerprint: str,
-) -> Dict[str, Any]:
-    """Make an older open REVIEW_REQUIRED result the immediately preceding review."""
-
-    def _represent(state: Dict[str, Any]) -> Dict[str, Any]:
-        wave = next((item for item in state["waves"] if item["request_fingerprint"] == fingerprint), None)
-        review = wave.get("review") if isinstance((wave or {}).get("review"), dict) else {}
-        if (
-            not review
-            or str(review.get("aggregate_signal") or "") != "REVIEW_REQUIRED"
-            or bool(review.get("closed"))
-            or str((wave or {}).get("review_evidence_status") or "") == "pending"
-        ):
-            raise ValueError(
-                "PLAN_REVIEW_REPRESENT_INVALID: only an open REVIEW_REQUIRED review can be represented"
-            )
-        state["latest_review_fingerprint"] = fingerprint
-        return state
-
-    state = _update_plan_review_state(results_drive_root, task_id, _represent)
-    return plan_review_wave(state, fingerprint) or {}
-
-
-def plan_review_wave_task_ids(wave: Dict[str, Any]) -> List[str]:
-    return list(dict.fromkeys(
-        str(task_id)
-        for attempt in wave.get("intended_scouts") or []
-        for task_id in (attempt.get("task_ids") or [])
-        if str(task_id)
-    ))
-
-
-def plan_review_audit_only_task_ids(state: Dict[str, Any]) -> List[str]:
-    """Return scout ids that must not hold acceptance quiescence open."""
-    task_ids: List[str] = []
-    current = state.get("current_attempt") if isinstance(state.get("current_attempt"), dict) else {}
-    audit_only_fingerprint = (
-        str(current.get("fingerprint") or "")
-        if str(current.get("status") or "") in {"unavailable", "rail_degraded"} else ""
-    )
-    for wave in state.get("waves") or []:
-        if (
-            not isinstance(wave.get("review"), dict)
-            and str(wave.get("request_fingerprint") or "") != audit_only_fingerprint
-        ):
-            continue
-        for task_id in plan_review_wave_task_ids(wave):
-            if task_id not in task_ids:
-                task_ids.append(task_id)
-    return task_ids
-
-
-def plan_review_recorded_panel_task_ids(state: Dict[str, Any]) -> List[str]:
-    """Return scout ids whose wave has a durable panel-attempt record."""
-    task_ids: List[str] = []
-    for wave in state.get("waves") or []:
-        if not isinstance(wave.get("review"), dict):
-            continue
-        for task_id in plan_review_wave_task_ids(wave):
-            if task_id not in task_ids:
-                task_ids.append(task_id)
-    return task_ids
-
-
-def plan_review_wave_handoffs(wave: Dict[str, Any]) -> Dict[str, Any]:
-    """Build the public audit projection only from host-owned wave state."""
+def _compact_plan_review_wave(wave: Dict[str, Any]) -> Dict[str, Any]:
+    """Bounded summary of an older wave (S2): identity, outcome, counts, closure."""
+    findings = wave.get("findings") if isinstance(wave.get("findings"), list) else []
     return {
-        "schema_version": 1,
-        "ts": str(wave.get("collected_at") or wave.get("created_at") or utc_now_iso()),
+        "compact": True,
+        "cycle_index": wave.get("cycle_index"),
         "request_fingerprint": str(wave.get("request_fingerprint") or ""),
-        "task_ids": plan_review_wave_task_ids(wave),
-        "schedule_outputs": [str(item.get("schedule_reason") or "") for item in wave.get("intended_scouts") or []],
-        "scout_cutoff_at": str(wave.get("scout_cutoff_at") or ""),
-        "wait": {},
-        "wait_stop_reason": str(wave.get("wait_stop_reason") or ""),
-        "included_task_ids": list(wave.get("included_task_ids") or []),
-        "omissions": copy.deepcopy(list(wave.get("omissions") or [])),
-        "consumed_task_ids": list(wave.get("consumed_task_ids") or []),
-        "disposition_warnings": copy.deepcopy(list(wave.get("disposition_warnings") or [])),
-        **({"review": copy.deepcopy(wave["review"])} if isinstance(wave.get("review"), dict) else {}),
+        "aggregate": str(wave.get("aggregate") or ""),
+        "counts": {
+            "findings": len(findings),
+            "dispositions": len(wave.get("dispositions") or []),
+            "blocking": sum(1 for f in findings if isinstance(f, dict) and f.get("class") == "blocking"),
+        },
+        "closed": bool(wave.get("closed")),
+        "paid": bool(wave.get("paid")),
     }
+
+
+def record_plan_review_wave(
+    results_drive_root: Any,
+    task_id: str,
+    wave: Dict[str, Any],
+    *,
+    need_evidence_seen: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Append one reviewed v2 wave, make it current, pay its cycle, bound the history.
+
+    ``wave["paid"]`` decides whether ``cycles_paid`` advances (a DEGRADED wave never
+    pays); ``need_evidence_seen`` replaces the task-level locator memory; the first v2
+    wave of a task mints ``series_id`` (a fresh series supersedes any open v1 record).
+    Older waves compact to summaries beyond ``_PLAN_REVIEW_FULL_WAVES``; entries beyond
+    ``_PLAN_REVIEW_MAX_WAVES`` are dropped with ``waves_omitted`` counting them (S2)."""
+    fingerprint = str(wave.get("request_fingerprint") or "")
+    if not _PLAN_REVIEW_HASH_RE.fullmatch(fingerprint):
+        raise ValueError("PLAN_REVIEW_STATE_INVALID: wave fingerprint is invalid")
+
+    def _record(state: Dict[str, Any]) -> Dict[str, Any]:
+        previous = [w for w in state.get("waves") or [] if str(w.get("request_fingerprint") or "") == fingerprint]
+        # D2 (delta review): an UNPAID (DEGRADED) wave never erases a PAID predecessor with
+        # the same fingerprint — that predecessor holds the findings and rejections the
+        # promised delta cycle rides on. The degraded attempt is counted on the paid wave
+        # and the paid wave stays the durable authority; the caller still renders the
+        # degraded result it was handed.
+        if not wave.get("paid") and any(w.get("paid") for w in previous):
+            for w in state.get("waves") or []:
+                if str(w.get("request_fingerprint") or "") == fingerprint and w.get("paid"):
+                    w["degraded_retries"] = int(w.get("degraded_retries") or 0) + 1
+            state["current_attempt"] = {"fingerprint": fingerprint, "status": "open", "reason": ""}
+            if need_evidence_seen is not None:
+                state["need_evidence_seen"] = sorted({str(s) for s in need_evidence_seen if str(s)})
+            return state
+        waves = [w for w in state.get("waves") or [] if str(w.get("request_fingerprint") or "") != fingerprint]
+        waves.append(copy.deepcopy(wave))
+        if not state.get("series_id"):
+            state["series_id"] = fingerprint[:16]
+        # C-07: the cap counts PAID CYCLES, not writes. Two concurrent identical calls
+        # (agent + operator script) each dispatch a panel, but the second write replaces
+        # the first wave and must not charge a second cycle — UNLESS it is the earned
+        # delta cycle of a fully-rejected wave, which advances cycle_index and is a new
+        # paid panel by design (final-gate finding, 4e133c8a).
+        already_paid = any(
+            w.get("paid") and int(w.get("cycle_index") or 0) >= int(wave.get("cycle_index") or 0)
+            for w in previous
+        )
+        if wave.get("paid") and not already_paid:
+            state["cycles_paid"] = int(state.get("cycles_paid") or 0) + 1
+        if need_evidence_seen is not None:
+            state["need_evidence_seen"] = sorted({str(s) for s in need_evidence_seen if str(s)})
+        full_from = max(0, len(waves) - _PLAN_REVIEW_FULL_WAVES)
+        waves = [
+            (_compact_plan_review_wave(w) if idx < full_from and not w.get("compact") else w)
+            for idx, w in enumerate(waves)
+        ]
+        overflow = max(0, len(waves) - _PLAN_REVIEW_MAX_WAVES)
+        if overflow:
+            state["waves_omitted"] = int(state.get("waves_omitted") or 0) + overflow
+            waves = waves[overflow:]
+        # I-02: the per-wave bounds (findings x slots x text) can exceed the state size limit
+        # long before the wave COUNT does. A refused write would mean the panel was paid and
+        # `cycles_paid` never advanced — the shared cap could then never engage and a blocking
+        # hold would be permanent. Compact the OLDEST full waves (the existing mechanism, not a
+        # new one) until the state fits; the newest wave, the authority, is never compacted.
+        state["waves"] = waves
+        for index in range(len(waves) - 1):
+            if len(json.dumps(state, ensure_ascii=False, default=str).encode("utf-8")) <= _PLAN_REVIEW_STATE_MAX_BYTES:
+                break
+            if not waves[index].get("compact"):
+                waves[index] = _compact_plan_review_wave(waves[index])
+                state["waves"] = waves
+        # Last resort (gate advisory, 39c3a195): one maximal PAID wave can exceed the limit by
+        # itself. Bound the newest wave's finding TEXTS with a disclosed omission — identity
+        # (ids, classes, breaks, counts, hashes) is untouched, so authority is preserved.
+        if len(json.dumps(state, ensure_ascii=False, default=str).encode("utf-8")) > _PLAN_REVIEW_STATE_MAX_BYTES:
+            newest = waves[-1]
+            for cut in (600, 200, 80):
+                for finding in newest.get("findings") or []:
+                    for key in ("summary", "recommendation"):
+                        text = str(finding.get(key) or "")
+                        if len(text) > cut:
+                            finding[key] = text[:cut] + "…[truncated to fit the durable state]"
+                newest["findings_texts_truncated"] = True
+                if len(json.dumps(state, ensure_ascii=False, default=str).encode("utf-8")) <= _PLAN_REVIEW_STATE_MAX_BYTES:
+                    break
+        state["current_attempt"] = {"fingerprint": fingerprint, "status": "open", "reason": ""}
+        return state
+
+    state = _update_plan_review_state(results_drive_root, task_id, _record)
+    return plan_review_wave(state, fingerprint) or {}
+
+
+def record_plan_review_dispositions(
+    results_drive_root: Any,
+    task_id: str,
+    *,
+    fingerprint: str,
+    dispositions: List[Dict[str, Any]],
+    closed: bool,
+    closure_notes: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Store the agent's dispositions on one FULL wave and its resulting closure.
+
+    A wave that is already closed is immutable (``PLAN_REVIEW_DISPOSITION_IMMUTABLE``);
+    a GREEN/REVISE_PLAN/DEGRADED wave never becomes closed here (the closure table in
+    ``plan_spec.closure_after_disposition`` is the caller's authority)."""
+
+    def _record(state: Dict[str, Any]) -> Dict[str, Any]:
+        wave = next((w for w in state["waves"] if str(w.get("request_fingerprint") or "") == fingerprint), None)
+        if wave is None or wave.get("compact"):
+            raise ValueError("PLAN_REVIEW_DISPOSITION_UNBINDABLE: no full wave holds this fingerprint")
+        if wave.get("closed"):
+            raise ValueError("PLAN_REVIEW_DISPOSITION_IMMUTABLE: a closed wave cannot be changed")
+        wave["dispositions"] = copy.deepcopy(list(dispositions))
+        wave["disposition_recorded_at"] = utc_now_iso()
+        if closure_notes is not None:
+            wave["closure_notes"] = list(closure_notes)
+        if closed and str(wave.get("aggregate") or "") == "REVIEW_REQUIRED":
+            wave["closed"] = True
+        state["current_attempt"] = {"fingerprint": fingerprint, "status": "open", "reason": ""}
+        return state
+
+    state = _update_plan_review_state(results_drive_root, task_id, _record)
+    return plan_review_wave(state, fingerprint) or {}
+
+
+def mark_plan_review_cycles_exhausted(
+    results_drive_root: Any, task_id: str, *, fingerprint: str,
+) -> Dict[str, Any]:
+    """Stamp the current open wave ``cycles_exhausted`` (typed hold state; no panel ran)."""
+
+    def _mark(state: Dict[str, Any]) -> Dict[str, Any]:
+        wave = next((w for w in state["waves"] if str(w.get("request_fingerprint") or "") == fingerprint), None)
+        if wave is not None and not wave.get("closed"):
+            wave["cycles_exhausted"] = True
+        return state
+
+    state = _update_plan_review_state(results_drive_root, task_id, _mark)
+    return plan_review_wave(state, fingerprint) or {}
+
 
 
 def fail_tasks(results_drive_root: Any, tasks: Any, *, reason_code: str, result: str) -> int:

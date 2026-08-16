@@ -1105,6 +1105,21 @@ async def api_settings_post(request: Request) -> JSONResponse:
             raw_cadence = str(body.get(cadence_key) or "").strip()
             if raw_cadence and not _config.is_valid_post_task_evolution_cadence(raw_cadence):
                 return unsaved_error(f"{cadence_key} must be one of: off, llm, every_n:<positive int>.", 400)
+        # Shared review-cycle cap: same boundary rule as the cadence — the read-time
+        # getter fails closed to the default, the UI offers only valid segments, but a
+        # direct API client must not persist garbage. Aliases canonicalize to "unlimited".
+        from ouroboros.review_cycles import (
+            REVIEW_MAX_CYCLES_KEY, is_valid_review_max_cycles, normalize_review_max_cycles,
+        )
+        if REVIEW_MAX_CYCLES_KEY in body:
+            raw_cycles = str(body.get(REVIEW_MAX_CYCLES_KEY) or "").strip()
+            if raw_cycles and not is_valid_review_max_cycles(raw_cycles):
+                return unsaved_error(
+                    f"{REVIEW_MAX_CYCLES_KEY} must be a positive integer or 'unlimited'.", 400
+                )
+            if raw_cycles:
+                body = dict(body)
+                body[REVIEW_MAX_CYCLES_KEY] = normalize_review_max_cycles(raw_cycles)
         # Reviewer-slot SSOT (6.1): refuse a malformed structured value with 400;
         # disclose (never block, recommendation A) the all-delegated API fallback
         # (D4) from the INCOMING value. Both live in reviewer_slot_save_check.

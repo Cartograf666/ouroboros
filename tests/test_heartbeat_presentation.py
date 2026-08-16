@@ -50,23 +50,23 @@ def test_retired_timeout_defaults_are_quiet_but_custom_value_is_loud(tmp_path, m
     assert row["keys"] == ["OUROBOROS_SOFT_TIMEOUT_SEC"]
 
 
-def test_retired_planning_heartbeat_default_is_quiet_but_custom_value_is_loud(
+def test_retired_planning_heartbeat_key_is_silent_and_dropped_on_load(
     tmp_path, monkeypatch,
 ) -> None:
+    """The planning-scout heartbeat knob is RETIRED with the scout swarm (plan-review
+    redesign 2026-08-15): ``config.RETIRED_SETTING_KEYS`` drops it on settings load, so
+    there is no saved value left to be loud about, and the supervisor's timeout
+    deprecation path no longer names it (deleted consistently, not kept half-loud)."""
+    from ouroboros import config
     from supervisor import queue
 
-    monkeypatch.setattr(queue, "_timeout_deprecation_emitted", False)
-    monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC", "120")
-    queue.init(tmp_path, 600, 1800)
-    events = tmp_path / "logs" / "events.jsonl"
-    assert not events.exists()
-
+    assert "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC" in config.RETIRED_SETTING_KEYS
     monkeypatch.setattr(queue, "_timeout_deprecation_emitted", False)
     monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC", "121")
     queue.init(tmp_path, 600, 1800)
-    row = json.loads(events.read_text(encoding="utf-8"))
-    assert row["type"] == "deprecated_settings_ignored"
-    assert row["keys"] == ["OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC"]
+    assert not (tmp_path / "logs" / "events.jsonl").exists()
+    queue.refresh_timeouts_from_settings({"OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC": 121})
+    assert not (tmp_path / "logs" / "events.jsonl").exists()
 
 
 def test_owner_visible_incidents_use_canonical_message_seam() -> None:

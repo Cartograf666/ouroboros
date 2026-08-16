@@ -423,6 +423,26 @@ export function renderSettingsPage() {
                     </div>
 
                     <div class="form-section">
+                        <h3>Max Review Cycles</h3>
+                        <div class="settings-section-copy">One shared cap on paid review cycles per task for plan review, task acceptance (improvement passes = cycles &minus; 1) and the commit gate (review blocks of the same unchanged diff before it refuses another run). <code>&infin;</code> removes the cap; the task's own deadline, budget and lifecycle rails still bind.</div>
+                        <div class="settings-effort-card">
+                            <label>Max Review Cycles</label>
+                            <input id="s-review-max-cycles" type="hidden" value="2">
+                            ${renderSegmentedField({
+                                target: 's-review-max-cycles',
+                                modifier: 'data-review-cycles-group',
+                                options: [
+                                    { value: '1', label: '1' },
+                                    { value: '2', label: '2' },
+                                    { value: '3', label: '3' },
+                                    { value: '5', label: '5' },
+                                    { value: 'unlimited', label: '\u221E' },
+                                ],
+                            })}
+                        </div>
+                    </div>
+
+                    <div class="form-section">
                         <h3>Image Input</h3>
                         <div class="settings-section-copy">Auto sends images inline to vision-capable models and captions them for blind models. Caption always uses text captions; Inline refuses caption fallback; Off emits placeholders.</div>
                         <div class="settings-effort-card">

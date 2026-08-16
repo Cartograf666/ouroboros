@@ -93,16 +93,13 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_SERVER_HOST": "127.0.0.1",
     "OUROBOROS_HOST_SERVICE_PORT": 8767,
     "OUROBOROS_MODEL": "x-ai/grok-4.5",
-    # Worker lanes. Empty means "use OUROBOROS_MODEL" (same shape as consciousness),
-    # so the owner sets ONE model by default and optionally overrides a lane. HEAVY is
-    # the strong acting/coding lane (mutative first-level subagents); LIGHT is the cheap
-    # bulk lane (auto / deep subagents); real cheap default since v6.82.0.
+    # Worker lanes; empty means "use OUROBOROS_MODEL" (one model by default, per-lane
+    # override optional). HEAVY = mutative first-level subagents; LIGHT = auto/deep bulk.
     "OUROBOROS_MODEL_HEAVY": "",
     "OUROBOROS_MODEL_LIGHT": "google/gemini-3.6-flash",
     "OUROBOROS_MODEL_VISION": "",
     "OUROBOROS_IMAGE_INPUT_MODE": "auto",
-    # Background consciousness is a high-horizon cognitive loop, not a cheap
-    # helper lane. Empty means "use OUROBOROS_MODEL".
+    # Background consciousness is a high-horizon loop, not a cheap helper lane.
     "OUROBOROS_MODEL_CONSCIOUSNESS": "",
     # Cross-model resilience CHAIN (comma-separated, ordered). A single model is a
     # 1-element chain; empty disables cross-model fallback. Resilience slot — keeps a
@@ -127,11 +124,6 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # Single owner-facing knob (math SSOT in ouroboros/retention.py); deprecated
     # per-subsystem keys are migrated to this on settings load.
     "OUROBOROS_GC_RETENTION_DAYS": 7,
-    "OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC": 120,
-    "OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC": 900,
-    # One-minor deprecated no-op: the v6.65 shared terminal-or-cutoff boundary
-    # no longer stops on heartbeat staleness, but custom saved values stay loud.
-    "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC": 120,
     "TOTAL_BUDGET": 10.0,
     "OUROBOROS_PER_TASK_COST_USD": 20.0,
     # cloud.ru catalog prices are RUB per 1M while the budget is USD. No implicit
@@ -286,10 +278,10 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC": 300,
     # Acceptance-review budget layer (task_pacing SSOT). The first final review
     # reserves at least 200s; later passes use max(this floor, 1.5×timing EWMA).
-    # max passes remains the legacy default outside Required+Blocking; an explicit
-    # task-local cap is always authoritative.
     "OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC": 200,
-    "OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES": 1,
+    # Shared paid-review-cycle cap (SSOT + per-gate meaning: ouroboros/review_cycles.py):
+    # STRING "N"|"unlimited": plan review, acceptance (passes = cycles - 1), commit-gate cap.
+    "OUROBOROS_REVIEW_MAX_CYCLES": "2",
     "OUROBOROS_ACCEPTANCE_RESERVE_PCT": 5,
     # Prompt-cache TTL, one honest GLOBAL override (owner decision 2026-08-08, batch #2 Q2=A): applied to
     # EVERY cache_control breakpoint on the Anthropic-normalizing family — main loop, review lanes, safety
@@ -723,14 +715,6 @@ def get_per_call_timeout_ceiling_sec() -> int:
     return _clamped_number_setting("OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC", low=1, cast=int)
 
 
-def get_plan_task_swarm_timeout_sec() -> float:
-    return _clamped_number_setting("OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC", low=0.0)
-
-
-def get_plan_task_swarm_max_wait_sec() -> float:
-    return _clamped_number_setting("OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC", low=0.0)
-
-
 def get_restart_drain_max_sec() -> int:
     return _clamped_number_setting(
         "OUROBOROS_RESTART_DRAIN_MAX_SEC", low=0, cast=lambda v: int(float(v)))
@@ -1020,11 +1004,6 @@ def get_llm_transport_read_timeout_sec() -> float:
 def get_acceptance_review_est_sec() -> float:
     """Estimated duration of one acceptance review/improvement pass (v6.54.4)."""
     return _clamped_number_setting("OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC", low=10.0, high=3600.0)
-
-
-def get_acceptance_max_improvement_passes() -> int:
-    """Default COUNT cap for acceptance-review improvement passes (v6.54.4)."""
-    return _clamped_number_setting("OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES", low=0, high=20, cast=int)
 
 
 def get_acceptance_reserve_pct() -> int:
@@ -1331,7 +1310,25 @@ def _coerce_setting_value(key: str, value):
 RETIRED_SETTING_KEYS: tuple[str, ...] = (
     # v6.87.7: the depth cap conflated how DEEP delegation nests with how STRONG a descendant is.
     "OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT",
+    # knobs are retired (the review-cycle cap OUROBOROS_REVIEW_MAX_CYCLES bounds plan review).
+    "OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES",
+    "OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC",
+    "OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC",
+    "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC",
 )
+
+
+def _seed_review_cycles_from_legacy_passes(loaded: dict) -> None:
+    """Migrate the retired acceptance-pass key into ``OUROBOROS_REVIEW_MAX_CYCLES`` (cycles =
+    passes + 1) at LOAD: a runtime "is it customized?" test cannot tell a deliberate "2" from
+    an untouched default, and left acceptance on the legacy number."""
+    legacy = loaded.pop("OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES", None)
+    try:
+        passes = int(str(legacy).strip()) if legacy is not None else 1
+    except (TypeError, ValueError):
+        return
+    if passes != 1 and "OUROBOROS_REVIEW_MAX_CYCLES" not in loaded:  # 1 = shipped legacy default
+        loaded["OUROBOROS_REVIEW_MAX_CYCLES"] = str(max(0, passes) + 1)
 
 
 def load_settings() -> dict:
@@ -1378,6 +1375,9 @@ def load_settings_lock_held(*, _settings_lock_held: bool = True) -> dict:
             loaded["OUROBOROS_GC_RETENTION_DAYS"] = seed
     for _legacy in LEGACY_RETENTION_KEYS:
         loaded.pop(_legacy, None)
+    # Rename alias: a customized acceptance-pass count seeds the shared review-cycle knob
+    # (cycles = passes + 1) unless the owner authored one, then the legacy key is dropped.
+    _seed_review_cycles_from_legacy_passes(loaded)
     for _retired in RETIRED_SETTING_KEYS:
         loaded.pop(_retired, None)
     migrate_legacy_slot_keys(loaded)

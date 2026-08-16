@@ -677,7 +677,7 @@ def test_rails_final_pass_freeze_directive_workspace():
     assert "working tree" not in plain
 
 
-def test_rails_freeze_directive_absent_off_final_and_edge_caps():
+def test_rails_freeze_directive_absent_off_final_and_edge_caps(monkeypatch):
     # Non-final pass: no FINAL marker, but the workspace tree directive is
     # always present for workspace deliveries.
     mid = _rails(3, cap=6, workspace=True)
@@ -690,7 +690,9 @@ def test_rails_freeze_directive_absent_off_final_and_edge_caps():
     # Passes already exhausted (supersede-reset re-review): not a launch.
     spent = _rails(6, cap=6, workspace=True)
     assert "review passes: 6/6" in spent and "FINAL" not in spent
-    # No local cap (required+blocking) — no count-axis clause at all.
+    # No local cap (required+blocking with the shared review-cycle cap set to
+    # unlimited — D10/D20: otherwise the shared cap binds) — no count-axis clause.
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "unlimited")
     unbounded = _rails(4, cap=None, workspace=True, required_blocking=True)
     assert "no local count cap" in unbounded and "FINAL" not in unbounded
 

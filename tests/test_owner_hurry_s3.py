@@ -440,13 +440,15 @@ def test_unlatched_task_reaches_the_normal_acceptance_machinery(tmp_path, monkey
 # ---------------------------------------------------------------------------
 
 
-def test_required_blocking_unbounded_loop_collapses_to_zero_under_hurry(tmp_path):
+def test_required_blocking_unbounded_loop_collapses_to_zero_under_hurry(tmp_path, monkeypatch):
     from ouroboros import task_pacing
 
     ctx = _acceptance_ctx(tmp_path, latched=True)
     base_profile = task_pacing.resolve_budget_profile(ctx)
     assert base_profile.get("max_improvement_passes") is None
-    # WITHOUT hurry, Required+Blocking has NO local count cap (locally unbounded).
+    # WITHOUT hurry, Required+Blocking has NO local count cap while the shared
+    # review-cycle cap is unlimited (D10/D20: the shared cap otherwise binds).
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "unlimited")
     assert task_pacing.effective_max_improvement_passes(
         base_profile, has_deadline=False, required_blocking=True,
     ) is None

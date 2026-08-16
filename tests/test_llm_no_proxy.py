@@ -380,13 +380,15 @@ def test_plan_review_slots_use_no_proxy(tmp_path):
 
     # The slot runner (and its LLMClient construction site) moved to
     # plan_review_runtime; patch the owning module, not the re-exporting one.
+    from ouroboros.review_substrate import ReviewSlot
+
     with patch.object(plan_review_runtime, "LLMClient", return_value=FakeLLMClient()):
         result = _asyncio.run(
             plan_review._run_plan_review_slots(
                 fake_ctx,
-                ["openai/gpt-5.5"],
-                "system prompt",
-                "user content",
+                [ReviewSlot(slot_id="slot_1", model="openai/gpt-5.5", effort="high")],
+                system_prompt="system prompt",
+                user_content="user content",
             )
         )
 

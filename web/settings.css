@@ -675,6 +675,11 @@
     grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+/* Max review cycles: five short segments (1 / 2 / 3 / 5 / ∞) on one row. */
+[data-review-cycles-group].settings-effort-group {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
 /* Shared disabled segmented-button style. */
 .settings-effort-btn:disabled {
     cursor: not-allowed;
@@ -783,6 +788,10 @@
     [data-update-channel-group].settings-effort-group,
     [data-task-review-group].settings-effort-group {
         grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    [data-review-cycles-group].settings-effort-group {
+        grid-template-columns: repeat(5, minmax(0, 1fr));
     }
 }
 

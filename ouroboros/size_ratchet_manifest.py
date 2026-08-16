@@ -35,11 +35,9 @@ GIANT_PATHS = (
     "tests/test_loop_misc.py",
     "tests/test_model_slot_role_model.py",
     "tests/test_osworld_cu_bridge.py",
-    "tests/test_plan_review.py",
     "tests/test_preflight_runner.py",
     "tests/test_promote_chat_flow.py",
     "tests/test_review_agent_session_route.py",
-    "tests/test_review_prompt_caching.py",
     "tests/test_review_substrate_v2.py",
     "tests/test_runtime_mode_core.py",
     "tests/test_runtime_mode_elevation.py",
@@ -149,7 +147,6 @@ BAND_PATHS = {
     "ouroboros/skill_loader.py": None,
     "ouroboros/skill_review_runner.py": None,
     "ouroboros/subagents.py": None,
-    "ouroboros/task_results.py": None,
     "ouroboros/task_status.py": None,
     "ouroboros/tools/browser.py": None,
     "ouroboros/tools/shell_guards.py": None,
@@ -174,6 +171,7 @@ BAND_PATHS = {
     "tests/test_onboarding_complete_endpoint.py": None,
     "tests/test_onboarding_wizard.py": None,
     "tests/test_packaged_runtime_and_lifecycle.py": None,
+    "tests/test_plan_review_engine.py": "Contract tests for the redesigned plan-review engine (waves, cycles, dispositions, evidence, gate findings) grew past 1000 across the campaign's reviewed fix batches; one engine, one suite.",
     "tests/test_review_fidelity.py": None,
     "tests/test_review_verification_v6544.py": None,
     "tests/test_safety_policy.py": None,
@@ -203,8 +201,8 @@ BYTE_BASELINE_DEBT = {
 
 BYTE_DEBT = {
     "ouroboros/llm.py": 200307,
-    "ouroboros/loop.py": 321064,
+    "ouroboros/loop.py": 317393,
     "tests/test_delegated_subagent_transport.py": 320623,
-    "tests/test_devtools_benchmarks.py": 328786,
+    "tests/test_devtools_benchmarks.py": 328775,
     "web/modules/chat.js": 229423,
 }

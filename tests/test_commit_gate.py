@@ -50,11 +50,11 @@ def test_tool_registered(tool_name):
     assert tool_name in names
 
 
-def test_blocked_attempt_cap_refuses_identical_diff_resubmission(tmp_path):
-    """B4: after BLOCKED_ATTEMPT_FINGERPRINT_CAP review-blocks of the SAME
-    staged-diff fingerprint, the next attempt is refused BEFORE triad+scope;
-    a changed diff or a review_rebuttal lifts the cap; refusal records do not
-    reset the streak."""
+def test_blocked_attempt_cap_refuses_identical_diff_resubmission(tmp_path, monkeypatch):
+    """B4: after blocked_attempt_fingerprint_cap() review-blocks of the SAME
+    staged-diff fingerprint (the shared OUROBOROS_REVIEW_MAX_CYCLES, default 2),
+    the next attempt is refused BEFORE triad+scope; a changed diff or a
+    review_rebuttal lifts the cap; refusal records do not reset the streak."""
     import pathlib
 
     from ouroboros.review_state import (
@@ -64,9 +64,13 @@ def test_blocked_attempt_cap_refuses_identical_diff_resubmission(tmp_path):
         _utc_now,
     )
     from ouroboros.tools.commit_gate import (
-        BLOCKED_ATTEMPT_FINGERPRINT_CAP,
+        blocked_attempt_fingerprint_cap,
         check_blocked_attempt_cap,
     )
+
+    monkeypatch.delenv("OUROBOROS_REVIEW_MAX_CYCLES", raising=False)
+    BLOCKED_ATTEMPT_FINGERPRINT_CAP = blocked_attempt_fingerprint_cap()
+    assert BLOCKED_ATTEMPT_FINGERPRINT_CAP == 2  # shared default (was a hardcoded 3)
 
     ctx = types.SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, task_id="t-cap")
     repo_key = make_repo_key(pathlib.Path(tmp_path))
@@ -133,7 +137,7 @@ def test_tests_preflight_block_recorded_with_preflight_phase():
     assert 'phase="preflight"' in window
 
 
-def test_blocked_attempt_cap_ignores_tests_preflight_blocks(tmp_path):
+def test_blocked_attempt_cap_ignores_tests_preflight_blocks(tmp_path, monkeypatch):
     """A tests-preflight block recorded the way ouroboros/tools/git.py records
     it (block_reason=tests_preflight_blocked, phase=preflight) neither inflates
     nor resets the identical-diff streak — in BOTH directions: same-task with
@@ -147,9 +151,13 @@ def test_blocked_attempt_cap_ignores_tests_preflight_blocks(tmp_path):
         _utc_now,
     )
     from ouroboros.tools.commit_gate import (
-        BLOCKED_ATTEMPT_FINGERPRINT_CAP,
+        blocked_attempt_fingerprint_cap,
         check_blocked_attempt_cap,
     )
+
+    monkeypatch.delenv("OUROBOROS_REVIEW_MAX_CYCLES", raising=False)
+    BLOCKED_ATTEMPT_FINGERPRINT_CAP = blocked_attempt_fingerprint_cap()
+    assert BLOCKED_ATTEMPT_FINGERPRINT_CAP == 2  # shared default (was a hardcoded 3)
 
     ctx = types.SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, task_id="t-cap")
     repo_key = make_repo_key(pathlib.Path(tmp_path))

@@ -12,18 +12,30 @@ from ouroboros.review_substrate import (
     run_review_request,
 )
 from ouroboros import task_pacing
-from ouroboros.tools.plan_review import _planning_evidence_horizon, _resolve_plan_roots
-from ouroboros.tools.registry import ToolContext
 from ouroboros.usage_accounting import _claim_physical_dispatch
 from ouroboros.utils import append_jsonl
 
 
-def test_required_blocking_has_no_implicit_count_cap_but_explicit_cap_always_wins():
+def test_required_blocking_binds_shared_cycle_cap_but_explicit_cap_always_wins(monkeypatch):
+    # Owner decisions D10/D20 (2026-08-15): the shared OUROBOROS_REVIEW_MAX_CYCLES
+    # binds Required+Blocking too (passes = cycles - 1); ``unlimited`` restores
+    # the former unbounded local count. The pre-D10 pin ("999 passes allowed")
+    # asserted the replaced behavior and was removed.
+    monkeypatch.delenv("OUROBOROS_REVIEW_MAX_CYCLES", raising=False)
+    monkeypatch.delenv("OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES", raising=False)
     snapshot = task_pacing.BudgetSnapshot(has_deadline=False)
     uncapped = normalize_budget_profile({})
     assert task_pacing.improvement_pass_allowed(
+        snapshot, 0, uncapped, required_blocking=True,
+    ) == (True, "")
+    assert task_pacing.improvement_pass_allowed(
+        snapshot, 1, uncapped, required_blocking=True,
+    ) == (False, "review_cycles_exhausted")  # the SHARED cap under blocking: typed (D27)
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "unlimited")
+    assert task_pacing.improvement_pass_allowed(
         snapshot, 999, uncapped, required_blocking=True,
     ) == (True, "")
+    monkeypatch.delenv("OUROBOROS_REVIEW_MAX_CYCLES", raising=False)
 
     for policy in ("fixed", "adaptive", "until_deadline"):
         capped = normalize_budget_profile({
@@ -253,45 +265,6 @@ def test_acceptance_quiescence_requires_empty_supervisor_snapshot(tmp_path, monk
         "artifact_status": "",
         "source": "supervisor_queue",
     }
-
-
-def test_acceptance_quiescence_ignores_authoritative_plan_wave_scouts(
-    tmp_path, monkeypatch,
-):
-    from ouroboros.loop import _task_acceptance_subtree_snapshot
-    import ouroboros.task_results as task_results
-    import ouroboros.task_status as task_status
-
-    monkeypatch.setattr(task_results, "load_plan_review_state", lambda *_args: {})
-    monkeypatch.setattr(
-        task_results,
-        "plan_review_audit_only_task_ids",
-        lambda _state: ["planning-scout"],
-    )
-    monkeypatch.setattr(task_status, "find_child_tasks", lambda *_args, **_kwargs: [
-        {
-            "task_id": "planning-scout",
-            "parent_task_id": "root",
-            "status": "running",
-        },
-        {
-            "task_id": "implementation-child",
-            "parent_task_id": "root",
-            "status": "completed",
-        },
-    ])
-    ctx = SimpleNamespace(
-        drive_root=tmp_path,
-        task_metadata={"root_task_id": "root"},
-        _task_acceptance_queue_descendants=[
-            {"task_id": "planning-scout", "status": "running"},
-        ],
-    )
-
-    quiescent, rows = _task_acceptance_subtree_snapshot(ctx, tmp_path, "root")
-
-    assert quiescent is True
-    assert [row["task_id"] for row in rows] == ["implementation-child"]
 
 
 def test_acceptance_immutable_contract_is_never_silently_truncated(tmp_path):
@@ -613,50 +586,3 @@ def test_clean_acceptance_requires_per_criterion_evidence(tmp_path):
     assert clean.aggregate_signal == "PASS"
 
 
-def test_plan_subject_root_is_distinct_and_escape_fails_loudly(tmp_path):
-    system = tmp_path / "system"
-    subject = tmp_path / "subject"
-    drive = tmp_path / "drive"
-    system.mkdir()
-    subject.mkdir()
-    ctx = ToolContext(
-        repo_dir=system,
-        system_repo_dir=system,
-        workspace_root=subject,
-        workspace_mode="external",
-        drive_root=drive,
-    )
-    assert _resolve_plan_roots(ctx, ["src/app.py"]) == (
-        system.resolve(), subject.resolve(),
-    )
-    try:
-        _resolve_plan_roots(ctx, [str(system / "BIBLE.md")])
-    except ValueError as exc:
-        assert "escapes active subject root" in str(exc)
-    else:  # pragma: no cover - explicit fail-closed assertion
-        raise AssertionError("mixed-root plan was accepted")
-
-
-def test_planning_horizon_has_one_canonical_contract_and_forensic_refs(tmp_path):
-    system = tmp_path / "system"
-    drive = tmp_path / "drive"
-    system.mkdir()
-    (drive / "task_results" / "artifacts" / "root").mkdir(parents=True)
-    (drive / "task_results" / "root.json").write_text("{}", encoding="utf-8")
-    (drive / "task_results" / "artifacts" / "root" / "plan_task_handoffs.json").write_text(
-        "{}", encoding="utf-8",
-    )
-    ctx = ToolContext(
-        repo_dir=system,
-        system_repo_dir=system,
-        drive_root=drive,
-        task_id="root",
-        task_metadata={"root_task_id": "root", "parent_task_id": ""},
-        task_contract={"objective": "verbatim owner objective"},
-    )
-    horizon = _planning_evidence_horizon(
-        ctx, governance_repo=system, subject_repo=system,
-    )
-    assert horizon.count("verbatim owner objective") == 1
-    assert "plan_task_handoffs.json" in horizon
-    assert '"omissions_manifest": []' in horizon

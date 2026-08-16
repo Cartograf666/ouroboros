@@ -16,6 +16,7 @@ import logging
 from ouroboros.llm import LLMClient, normalize_reasoning_effort, add_usage
 from ouroboros import task_pacing
 from ouroboros.config import adaptive_quorum, get_context_mode, get_light_model, get_review_enforcement, get_task_review_mode, resolve_effort
+from ouroboros.review_cycles import REASON_REVIEW_CYCLES_EXHAUSTED
 from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_BYPASS_REASONS, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, REASON_DELIVERY_CONTROL_DEGRADED, REASON_OWNER_REQUESTED_FINALIZATION, RESULT_INFRA_FAILED, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
 from ouroboros.observability import new_execution_id
 from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools, swarm_router_turn
@@ -208,34 +209,9 @@ def _force_plan_decision(
 
 
 def _force_plan_reminder(decision: Dict[str, Any]) -> str:
-    outcome = str(decision.get("outcome") or "")
-    if decision.get("reviewer_slots_degraded"):
-        return (
-            "[SWARM_INITIATIVE] Blocking plan review still has an unavailable reviewer slot. "
-            "Re-call plan_task with the exact unchanged plan and no review_disposition; the "
-            "existing scout wave will be reused while the reviewer panel retries. Continue "
-            "analysis and non-mutating preparation, but do not begin implementation before "
-            "review closes or a real task-wide rail fires."
-        )
-    if outcome == "REVIEW_REQUIRED":
-        return (
-            "[SWARM_INITIATIVE] Blocking plan review remains REVIEW_REQUIRED. Re-call "
-            "plan_task with a complete review_disposition as the only field, naming the "
-            "latest fingerprint, then continue; do not resend the plan or rerun reviewers."
-        )
-    if outcome == "REVISE_PLAN":
-        return (
-            "[SWARM_INITIATIVE] Blocking plan review requires a revised plan. Change the "
-            "plan text and call plan_task for the new fingerprint. Continue analysis and "
-            "non-mutating preparation, but do not begin implementation before review closes "
-            "or a real task-wide rail fires."
-        )
-    return (
-        "[SWARM_INITIATIVE] Call plan_task with a concrete plan, goal, and appropriate "
-        "context_level. If review infrastructure is unavailable, continue analysis and "
-        "non-mutating preparation, but do not begin implementation before review closes "
-        "or a real task-wide rail fires."
-    )
+    from ouroboros.owner_hurry import plan_review_reminder
+
+    return plan_review_reminder(decision)
 
 
 def _force_plan_disclosure(
@@ -247,39 +223,15 @@ def _force_plan_disclosure(
     # Normal finalization reuses the reducer projection that already decided
     # this exact candidate. The trace copy is presentation-only and cannot grant
     # permission; forced rails recompute with their explicit rail input.
+    from ouroboros.owner_hurry import plan_review_disclosure
+
     projected = llm_trace.get("force_plan_decision")
     decision = (
         projected
         if not forced_reason and isinstance(projected, dict)
         else _force_plan_decision(ctx, llm_trace, hard_rail=forced_reason)
     )
-    if not decision.get("required") or decision.get("status") == "closed":
-        return ""
-    outcome = str(decision.get("outcome") or "")
-    if decision.get("status") == "rail_degraded":
-        rail_reason = str(forced_reason or decision.get("reason") or "task_rail")
-        detail_value = outcome
-        if decision.get("reviewer_slots_degraded"):
-            detail_value = f"{detail_value or 'open'}; reviewer availability incomplete"
-        detail = f" ({detail_value})" if detail_value else ""
-        subject = (
-            "Blocking plan review"
-            if decision.get("enforcement") == "blocking"
-            else "Plan review"
-        )
-        return (
-            f"\n\n⚠️ {subject} remained open{detail} when the task-wide "
-            f"rail `{rail_reason}` required best-effort finalization."
-        )
-    if decision.get("allow"):
-        detail = outcome or "unavailable"
-        if decision.get("reviewer_slots_degraded"):
-            detail += " with a reviewer availability gap"
-        return (
-            f"\n\n⚠️ Plan review remained {detail}; work proceeded under the "
-            "owner-selected advisory enforcement."
-        )
-    return ""
+    return plan_review_disclosure(decision, forced_reason)
 
 
 def _swarm_handoff_attempt(ctx: Any) -> Dict[str, Any]:
@@ -1088,22 +1040,6 @@ def _task_acceptance_subtree_snapshot(
             or getattr(ctx, "budget_drive_root", "")
             or drive_root
         ))
-        audit_only_task_ids: set[str] = set()
-        try:
-            from ouroboros.task_results import (
-                load_plan_review_state,
-                plan_review_audit_only_task_ids,
-            )
-
-            audit_only_task_ids = set(plan_review_audit_only_task_ids(
-                load_plan_review_state(status_root, str(task_id))
-            ))
-        except Exception:
-            # Missing/corrupt planning evidence must never hide a live child.
-            log.debug(
-                "Unable to load audit-only planning scouts for acceptance",
-                exc_info=True,
-            )
         rows = find_child_tasks(
             status_root,
             parent_task_id=str(task_id),
@@ -1116,8 +1052,6 @@ def _task_acceptance_subtree_snapshot(
             if not isinstance(row, dict):
                 continue
             row_task_id = str(row.get("task_id") or row.get("id") or "")
-            if row_task_id in audit_only_task_ids:
-                continue
             status = str(row.get("status") or "unknown")
             projected = {
                 "task_id": row_task_id,
@@ -1141,7 +1075,6 @@ def _task_acceptance_subtree_snapshot(
             }
             for row in (getattr(ctx, "_task_acceptance_queue_descendants", None) or [])
             if isinstance(row, dict)
-            and str(row.get("task_id") or "") not in audit_only_task_ids
         ]
         return (
             not queue_rows and all(row["status"] in SETTLED_STATUSES for row in compact),
@@ -1854,6 +1787,7 @@ def _apply_task_acceptance_result(
         estimated_sec=task_pacing.acceptance_review_estimate_sec(
             ctx.tools._ctx, passes_done=ctx.passes_done + 1,
         ),
+        ctx=ctx.tools._ctx,
     )
     if dialogue_terminal:
         # v6.74.0 (A5): a reviewer quorum judged the dialogue no longer
@@ -1966,7 +1900,7 @@ def _apply_task_acceptance_result(
     if capsule and open_obligations:
         _set_acceptance_decision(ctx.llm_trace, {
             "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
-            "reason": "open_obligations",
+            "reason": pass_reason if pass_reason == REASON_REVIEW_CYCLES_EXHAUSTED else "open_obligations",
             "source": "task_acceptance_review",
             "rationale": (
                 f"Improvement gates exhausted ({pass_reason or 'passes spent'}) with "
@@ -1983,6 +1917,7 @@ def _apply_task_acceptance_result(
         _set_acceptance_decision(ctx.llm_trace, {
             "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
             "reason": (
+                pass_reason if pass_reason == REASON_REVIEW_CYCLES_EXHAUSTED else
                 "improvement_window_closed"
                 if (not ctx.passes_done and pass_reason)
                 else "capsule_spent"
@@ -2585,11 +2520,11 @@ def _load_direct_child_results(
     task_id: str,
     root_task_id: str,
 ) -> list[Dict[str, Any]]:
-    """Read direct children while excluding planning scouts retained for audit only."""
+    """Read this task's direct children (plan review spawns none)."""
 
     from ouroboros.task_status import find_child_tasks
 
-    children = [
+    return [
         row for row in find_child_tasks(
             pathlib.Path(status_root),
             parent_task_id=task_id,
@@ -2598,22 +2533,6 @@ def _load_direct_child_results(
             scope="direct",
         )
         if isinstance(row, dict)
-    ]
-    try:
-        from ouroboros.task_results import (
-            load_plan_review_state,
-            plan_review_recorded_panel_task_ids,
-        )
-
-        audit_only = set(plan_review_recorded_panel_task_ids(
-            load_plan_review_state(pathlib.Path(status_root), task_id)
-        ))
-    except Exception:
-        # Corrupt/unavailable planning evidence must not hide generic children.
-        audit_only = set()
-    return [
-        row for row in children
-        if str(row.get("task_id") or row.get("id") or "") not in audit_only
     ]
 
 
@@ -4790,7 +4709,7 @@ def _enforce_swarm_actions(
     reminder = _force_plan_reminder(decision)
     _append_or_merge_user_message(messages, reminder)
     llm_trace["reasoning_notes"].append(reminder)
-    emit_progress("Swarm plan-review action required before final response.")
+    emit_progress("Plan-review action required before final response.")
     return True
 
 

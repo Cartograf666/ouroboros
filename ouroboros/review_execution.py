@@ -471,17 +471,18 @@ def review_session_output_schema(surface: str) -> Dict[str, Any]:
     """The session verdict schema, shaped to the SURFACE's own clean contract.
 
     The shared schema admits ``{"findings": []}`` — the honest clean verdict for a
-    TRIAD or ordinary ADVISORY reviewer (both canonicalize the empty array to ``[]``,
-    their sentinel clean shape). But scope's coverage contract requires all eight
-    checklist rows, PASS rows included — so for scope the one shape the schema
-    explicitly blessed was a schema-conformant answer that could only ever land as
-    ``parse_failure`` and block the commit. The floor rides the schema itself so a
-    conforming engine refuses the empty answer while the session can still
-    regenerate, instead of the gate discovering it after the run. Advisory keeps the
-    clean-capable shared schema: its checklist mode is coverage-checked downstream
-    by ``_check_expected_items``, never by starving the schema of the clean verdict
-    its ordinary mode is contractually required to produce.
+    triad or ordinary advisory reviewer. Scope's coverage contract requires all
+    eight checklist rows (PASS included), so its schema demands ``minItems: 1`` —
+    a conforming engine refuses the empty answer up front instead of the gate
+    discovering a ``parse_failure`` after the run. Advisory keeps the clean-capable
+    shared schema (coverage is checked downstream by ``_check_expected_items``).
     """
+    if surface == "plan_review":
+        # plan review's own element contract (4e133c8a): the generic item/verdict shape
+        # would conform-and-launder — an unknown class demotes to a note.
+        from ouroboros.tools.plan_spec import PLAN_REVIEW_SESSION_OUTPUT_SCHEMA
+
+        return PLAN_REVIEW_SESSION_OUTPUT_SCHEMA
     if surface != "scope_review":
         return REVIEW_SESSION_OUTPUT_SCHEMA
     shaped = json.loads(json.dumps(REVIEW_SESSION_OUTPUT_SCHEMA))

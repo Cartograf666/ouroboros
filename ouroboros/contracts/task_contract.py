@@ -313,7 +313,12 @@ def effective_acceptance_claims(
     if ingress:
         return ingress, "ingress_contract"
     wave = closed_plan_wave if isinstance(closed_plan_wave, Mapping) else {}
-    plan_claims = normalize_acceptance_claims(wave.get("acceptance_claims"))
+    # v2 waves freeze the whole reviewed SPEC (claims inside it); a v1 wave carried
+    # a bare ``acceptance_claims`` list — read as the legacy fallback.
+    spec = wave.get("spec") if isinstance(wave.get("spec"), Mapping) else {}
+    plan_claims = normalize_acceptance_claims(
+        spec.get("acceptance_claims") if spec else wave.get("acceptance_claims")
+    )
     if plan_claims:
         return plan_claims, "plan_review"
     return [], ""

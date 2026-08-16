@@ -1223,6 +1223,24 @@ def _audit_bypass(ctx: ToolContext, snapshot_hash: str, commit_message: str,
         pass
 
 
+def _identical_diff_cap_note() -> str:
+    """Schema-build-time NOTE about the identical-diff attempt cap, derived from the
+    shared OUROBOROS_REVIEW_MAX_CYCLES (never a hardcoded number)."""
+    from ouroboros.review_cycles import review_max_cycles
+
+    cap = review_max_cycles()
+    if cap is None:
+        return (
+            "NOTE: no identical-diff cap is configured (OUROBOROS_REVIEW_MAX_CYCLES=unlimited): "
+            "commit_reviewed never refuses a resubmission on cap grounds."
+        )
+    return (
+        f"NOTE: after {cap} genuine review-verdict block(s) of a byte-identical staged diff "
+        "(the shared OUROBOROS_REVIEW_MAX_CYCLES cap), commit_reviewed refuses further "
+        "attempts (attempt_cap_reached) until the diff changes or a review_rebuttal is provided."
+    )
+
+
 def _advisory_run_record(
     snapshot_hash: str,
     commit_message: str,
@@ -1930,9 +1948,7 @@ def get_tools() -> list:
                     "Run an advisory pre-commit review through the configured read-only route. "
                     "Returns structured JSON findings; any edit afterward makes the result stale. "
                     f"{ADVISORY_REVIEW_CHOICE_GUIDANCE} "
-                    "NOTE: after 3 genuine review-verdict blocks of a byte-identical staged diff, "
-                    "commit_reviewed refuses further attempts (attempt_cap_reached) until the "
-                    "diff changes or a review_rebuttal is provided."
+                    f"{_identical_diff_cap_note()}"
                 ),
                 "parameters": {
                     "type": "object",

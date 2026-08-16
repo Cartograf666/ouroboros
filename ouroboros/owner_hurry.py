@@ -372,7 +372,8 @@ def effective_budget_profile(ctx: Any, profile: Any) -> Any:
     if isinstance(profile, dict):
         # An explicit cap is authoritative under EVERY policy in
         # ``task_pacing.effective_max_improvement_passes`` — including
-        # Required+Blocking, whose implicit local loop is otherwise unbounded.
+        # Required+Blocking, whose implicit local loop is otherwise bounded only
+        # by the shared review-cycle cap (or unbounded when that is unlimited).
         return {**profile, "max_improvement_passes": 0}
     return profile
 
@@ -434,36 +435,56 @@ def acceptance_skip_applied(
     return True
 
 
+def _plan_review_engaged(state: Any) -> bool:
+    """Did this task CALL plan_task (any v2 attempt/wave, or a v1 record)? Plan §6:
+    once a task entered the plan-review gate, the gate binds under blocking."""
+    if not isinstance(state, dict):
+        return False
+    legacy = state.get("legacy_v1_projection") if isinstance(state.get("legacy_v1_projection"), dict) else {}
+    return bool(state.get("waves") or state.get("current_attempt")
+                or legacy.get("status") not in (None, "", "absent"))
+
+
 def force_plan_decision(
     ctx: Any, llm_trace: Dict[str, Any], *,
     hard_rail: str = "", enforcement: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Project the force-plan finalization gate — the ONE production consumer seam.
+    """Project the plan-review finalization gate — the ONE production consumer seam.
 
     Extracted from ``loop._force_plan_decision`` (byte-neutral extraction for the
-    pinned ``loop.py``); behavior is unchanged for unlatched tasks. While the
-    hurry latch is armed, the projection is computed under a TASK-LOCAL advisory
-    enforcement (§19.7.2 item 9): ``reviewed``/``open``/``unavailable`` states may
-    proceed locally while ``absent``/``pending`` remain hold — durable review
-    state, reviewer calls, and the configured global enforcement are untouched,
-    and the attribution rides the decision for the task detail.
+    pinned ``loop.py``). The gate is REQUIRED for a Swarm-forced task
+    (``task_metadata.force_plan``) AND for any task that itself CALLED plan_task
+    (plan-review redesign 2026-08-15, plan §6: an open plan review holds under
+    blocking enforcement whoever opened it). While the hurry latch is armed, the
+    projection is computed under a TASK-LOCAL advisory enforcement (§19.7.2 item
+    9): ``reviewed``/``open``/``unavailable`` states may proceed locally while
+    ``absent``/``pending`` remain hold — durable review state, reviewer calls, and
+    the configured global enforcement are untouched, and the attribution rides the
+    decision for the task detail.
 
     ``enforcement`` is supplied by the loop wrapper from ITS module namespace so
     the existing ``loop.get_review_enforcement`` test/monkeypatch seam holds.
     """
     metadata = getattr(ctx, "task_metadata", {})
     metadata = metadata if isinstance(metadata, dict) else {}
-    if not metadata.get("force_plan") or bool(getattr(ctx, "is_ephemeral_turn", False)):
-        return {"required": False, "allow": True, "status": "not_required"}
+    not_required = {"required": False, "allow": True, "status": "not_required"}
+    if bool(getattr(ctx, "is_ephemeral_turn", False)):
+        return not_required
     from ouroboros.task_results import load_plan_review_state, plan_review_gate_projection
 
     try:
         root = _canonical_root(ctx)
         task_id = str(getattr(ctx, "task_id", "") or "").strip()
         state = load_plan_review_state(root, task_id) if (task_id and root) else None
+        unreadable = False
     except (OSError, TimeoutError, ValueError):
         log.warning("Unable to read durable force-plan review state", exc_info=True)
-        state = None
+        state, unreadable = None, True
+    # I-17: an UNREADABLE state used to release a self-opened blocking plan (no state ->
+    # "not required") while a Swarm-forced task failed closed on the same input. A gate that
+    # cannot read its own authority is engaged, not absent.
+    if not metadata.get("force_plan") and not unreadable and not _plan_review_engaged(state):
+        return not_required
     if enforcement is None:
         from ouroboros.config import get_review_enforcement
 
@@ -472,6 +493,7 @@ def force_plan_decision(
     effective = "advisory" if hurry_armed else enforcement
     decision = {
         "required": True,
+        "self_opened": not bool(metadata.get("force_plan")),
         **plan_review_gate_projection(state, effective, hard_rail=hard_rail),
     }
     if hurry_armed and str(enforcement or "").lower() == "blocking":
@@ -480,6 +502,73 @@ def force_plan_decision(
         decision["owner_hurry_local_advisory"] = True
         decision["configured_enforcement"] = "blocking"
     return decision
+
+
+def plan_review_reminder(decision: Dict[str, Any]) -> str:
+    """The user-turn reminder appended while a blocking plan review holds finalization
+    (text moved out of the pinned ``loop.py``)."""
+    outcome = str(decision.get("outcome") or "")
+    status = str(decision.get("status") or "")
+    tag = "[PLAN_REVIEW_HOLD]"
+    if status == "legacy_open_requires_resubmission":
+        return (
+            f"{tag} An open plan review from a previous schema cannot be honored. Re-call "
+            "plan_task with your goal, plan and spec to start a fresh review before finalizing."
+        )
+    if decision.get("reviewer_slots_degraded"):
+        return (
+            f"{tag} Blocking plan review returned no parseable quorum (DEGRADED). Re-call "
+            "plan_task with the same envelope to re-run the panel (no cycle is consumed)."
+        )
+    if outcome == "REVIEW_REQUIRED":
+        return (
+            f"{tag} Blocking plan review remains REVIEW_REQUIRED. Re-call plan_task with a "
+            "complete review_disposition as the only field, naming the latest fingerprint, "
+            "then continue; do not rerun reviewers."
+        )
+    if outcome == "REVISE_PLAN":
+        return (
+            f"{tag} Blocking plan review requires a revised spec. Change the spec and call "
+            "plan_task again (or reject the blocking findings with a rationale via "
+            "review_disposition). Continue analysis and non-mutating preparation, but do not "
+            "begin the work before the review closes or a real task-wide rail fires."
+        )
+    return (
+        f"{tag} Call plan_task with a concrete goal, plan and spec. If review infrastructure "
+        "is unavailable, continue analysis and non-mutating preparation, but do not begin the "
+        "work before the review closes or a real task-wide rail fires."
+    )
+
+
+def plan_review_disclosure(decision: Dict[str, Any], forced_reason: str = "") -> str:
+    """The loud host suffix for a plan review that did not close before finalization
+    (text moved out of the pinned ``loop.py``): rail release, cap exhaustion under
+    blocking, or the owner-selected advisory enforcement."""
+    if not decision.get("required") or decision.get("status") == "closed":
+        return ""
+    outcome = str(decision.get("outcome") or "")
+    if decision.get("reviewer_slots_degraded"):
+        outcome = f"{outcome or 'open'}; no parseable reviewer quorum"
+    subject = "Blocking plan review" if decision.get("enforcement") == "blocking" else "Plan review"
+    if decision.get("status") == "rail_degraded":
+        rail_reason = str(forced_reason or decision.get("reason") or "task_rail")
+        detail = f" ({outcome})" if outcome else ""
+        return (
+            f"\n\n⚠️ {subject} remained open{detail} when the task-wide rail "
+            f"`{rail_reason}` required best-effort finalization."
+        )
+    if decision.get("status") == "cycles_exhausted" and decision.get("enforcement") == "blocking":
+        return (
+            f"\n\n⚠️ Blocking plan review stayed open ({outcome or 'open'}) with the review-cycle "
+            f"cap spent ({decision.get('cycles_paid')} paid cycle(s)); the task is finalized as "
+            "blocked_with_evidence — the planned work must not be treated as done."
+        )
+    if decision.get("allow"):
+        return (
+            f"\n\n⚠️ Plan review remained {outcome or 'unavailable'}; work proceeded under the "
+            "owner-selected advisory enforcement."
+        )
+    return ""
 
 
 # ---------------------------------------------------------------------------

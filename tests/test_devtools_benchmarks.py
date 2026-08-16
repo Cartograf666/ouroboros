@@ -3257,8 +3257,8 @@ def test_container_env_never_forwards_model_fallback(tmp_path, monkeypatch):
 
 
 def test_harbor_agent_defaults_max_workers_four_and_probes_context_timeout(tmp_path):
-    """6c: plan_task needs >=2 workers — v6.55.0 raises the template default to 4
-    decomposition slots (root takes one lane; container memory caps the pool);
+    """6c: 4 decomposition slots for the agent's own subagents (root takes one
+    lane; container memory caps the pool — plan review needs no pool);
     6d: per-task timeout adopted from the harbor AgentContext when a future
     harbor exposes it (today: metadata probe)."""
     import types as _types

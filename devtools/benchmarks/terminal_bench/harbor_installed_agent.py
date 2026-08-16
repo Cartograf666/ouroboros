@@ -200,8 +200,11 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
         server_start_timeout_sec = int(kwargs.pop("server_start_timeout_sec", 180))
         task_timeout_sec = kwargs.pop("task_timeout_sec", None)
         openrouter_min_credit_usd = float(kwargs.pop("openrouter_min_credit_usd", os.environ.get("OUROBOROS_BENCH_OPENROUTER_MIN_CREDIT_USD", 5.0)))
-        # plan_task needs >=2 workers (planning scouts run as pooled subagents);
-        # 1 worker forced the capacity-degraded inline fallback on every run.
+        # 3-4 decomposition slots for the agent's own subagents (the root takes one lane).
+        # Historic reason: `plan_task` used to run pooled planning scouts, so 1 worker forced a
+        # capacity-degraded fallback. Since the 2026-08-15 spec-gate redesign plan review runs
+        # NO scouts and needs no pool; the default stays 4 because container memory (a full
+        # python process per worker) is what bounds it.
         max_workers = int(kwargs.pop("max_workers", 4))  # v6.55.0: 3-4 subagent slots (root takes one); 10 would blow container memory (full python proc per worker)
         runtime_mode = str(kwargs.pop("runtime_mode", "pro"))
         review_enforcement = str(kwargs.pop("review_enforcement", "blocking"))
@@ -757,13 +760,11 @@ PY
         # web gate — benches measure Ouroboros as a single-model harness; the embedded
         # Claude-Code delegate is a separate future experiment.
         # Operator 2026-07-23: schedule_subagent disabled for the no-swarm submittable
-        # campaign. NB (measured on the v6.81.0 runs, correcting an earlier claim here that
-        # this means "subagents=0"): withholding the TOOL stops the agent from DELEGATING the
-        # task, but `plan_task` still runs pooled planning scouts, which surface in traces as
-        # `delegation_role=subagent`. A submission must therefore disclose "no task delegation",
-        # not "no subagents" — the traces contradict the stronger claim. `max_workers` is not
-        # moot for the same reason: the scouts need the pool (1 worker forces the degraded
-        # inline fallback).
+        # campaign. The v6.81.0 runs had to disclose "no task delegation" rather than
+        # "no subagents", because `plan_task` then ran pooled planning scouts that surfaced in
+        # traces as `delegation_role=subagent`. Since the 2026-08-15 spec-gate redesign plan
+        # review runs NO scouts: with this tool withheld a run spawns no subagents at all, and
+        # a submission may say so — check the traces of the run you are actually disclosing.
         disabled = ["claude_code_edit", "schedule_subagent"]
         if getattr(self, "disable_agent_web", True):
             disabled = list(self._WEB_TOOLS_MIRROR) + list(self._DELEGATED_VISION_TOOLS) + disabled

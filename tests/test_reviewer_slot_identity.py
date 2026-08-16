@@ -17,7 +17,6 @@ import json
 import pathlib
 import re
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
@@ -137,250 +136,42 @@ def test_triad_row_ids_come_from_the_one_mint(tmp_path, monkeypatch):
     assert durable == ran_as, durable
 
 
-def test_plan_row_ids_come_from_the_one_mint(tmp_path, monkeypatch):
-    """Plan review is the third configured-reviewer surface; it minted its own
-    ``plan_slot_{idx+1}`` beside the SSOT that owns exactly that shape."""
-    from ouroboros import review_substrate
-    from ouroboros.tools import plan_review, plan_review_runtime
+def test_plan_row_ids_come_from_the_one_mint(monkeypatch):
+    """Plan review is the third configured-reviewer surface; its rows are the
+    reviewer-slot SSOT's triad rows (legacy: minted ``slot_N`` by the ONE mint)."""
+    from ouroboros.tools import plan_review_runtime
 
-    ran_as: list = []
-    monkeypatch.setattr(review_substrate, "run_review_request", _substrate_stub(ran_as))
-    monkeypatch.setattr(plan_review_runtime, "LLMClient", lambda *a, **k: object())
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
+    monkeypatch.setenv("OUROBOROS_REVIEW_MODELS", "m/one,m/two")
     _repoint_the_mint(monkeypatch)
-
-    ctx = _fake_ctx(tmp_path)
-    asyncio.run(plan_review._run_plan_review_slots(
-        ctx, ["m/one", "m/two"], "system prompt", "user content",
-    ))
-    assert ran_as == ["plan_slot_row1", "plan_slot_row2"], ran_as
+    slots = plan_review_runtime.plan_review_slots()
+    assert [s.slot_id for s in slots] == ["slot_row1", "slot_row2"]
+    assert [s.model for s in slots] == ["m/one", "m/two"]
 
 
-def test_duplicate_model_plan_rows_stay_distinct_through_finalization(tmp_path, monkeypatch):
+def test_duplicate_model_plan_rows_stay_distinct_through_the_substrate(tmp_path, monkeypatch):
     """Two plan rows configured on the SAME model keep their own ids all the way
-    into the rows finalization stores and hands to the formatter/summarizer.
-
-    Before this fix ``_plan_raw_result_from_actor`` dropped the ``slot_id`` the
-    substrate ran under, so ``ctx._last_plan_review_raw_results`` held rows whose
-    only identity was the model string — duplicate-model rows (a supported
-    configuration; the configured list preserves duplicates on purpose) became
-    indistinguishable downstream, against the carried-not-re-derived contract.
-    """
+    into the raw rows the engine records (identity is CARRIED, never re-derived)."""
     from ouroboros import review_substrate
-    from ouroboros.tools import plan_review, plan_review_runtime
+    from ouroboros.tools import plan_review_runtime
 
     ran_as: list = []
     monkeypatch.setattr(review_substrate, "run_review_request", _substrate_stub(ran_as))
     monkeypatch.setattr(plan_review_runtime, "LLMClient", lambda *a, **k: object())
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
+    monkeypatch.setenv("OUROBOROS_REVIEW_MODELS", "m/dup,m/dup")
 
     ctx = _fake_ctx(tmp_path)
-    raw = asyncio.run(plan_review._run_plan_review_slots(
-        ctx, ["m/dup", "m/dup"], "system prompt", "user content",
+    slots = plan_review_runtime.plan_review_slots()
+    raw = asyncio.run(plan_review_runtime.run_plan_review_slots(
+        ctx, slots, system_prompt="system prompt", user_content="user content",
     ))
-    assert ran_as == ["plan_slot_1", "plan_slot_2"], ran_as
+    assert ran_as == ["slot_1", "slot_2"], ran_as
     # The converted rows carry the id each row RAN; the model cannot tell them apart.
     assert [r.get("model") for r in raw] == ["m/dup", "m/dup"], raw
-    assert [r.get("slot_id") for r in raw] == ["plan_slot_1", "plan_slot_2"], raw
-
-    out = plan_review._finalize_plan_review_output(ctx, plan_review._PlanReviewFinalization(
-        request=plan_review._PlanReviewRequest(plan="p", goal="g", files_to_touch=[]),
-        raw_results=raw,
-        models=["m/dup", "m/dup"],
-        estimated_tokens=1,
-        subject_repo=tmp_path,
-        governance_repo=tmp_path,
-        planning_handoffs={},
-        state_root=tmp_path,
-        state_task_id="t",
-        request_fingerprint="fp",
-        degraded_scout_note="",
-        reviewed_result_hashes={},
-    ))
-    assert isinstance(out, str) and out
-    stored = [r.get("slot_id") for r in (ctx._last_plan_review_raw_results or [])]
-    assert stored == ["plan_slot_1", "plan_slot_2"], stored
-
-
-def _plan_review_text(signal, findings):
-    return (
-        "## PROPOSALS\n\nConcrete review.\n\nPLAN_FINDINGS_JSON:\n"
-        + json.dumps(findings) + f"\nAGGREGATE: {signal}"
-    )
-
-
-def _per_model_substrate(recorder, texts):
-    """Substrate stub answering each slot with ITS model's review text."""
-    def _run(request, *, slots, drive_root, llm, usage_ctx=None):
-        recorder.extend(slot.slot_id for slot in slots)
-        return SimpleNamespace(actors=[{
-            "slot_id": slot.slot_id, "model": slot.model, "status": "ok",
-            "raw_text": texts[slot.model], "usage": {}, "prompt_ref": {}, "response_ref": {},
-        } for slot in slots])
-    return _run
-
-
-def _drive_plan_review_async(tmp_path, monkeypatch, *, models, limits, substrate):
-    """Run the REAL _run_plan_review_async with the world around it stubbed."""
-    from ouroboros import review_substrate
-    from ouroboros.tools import plan_review, plan_review_runtime
-
-    monkeypatch.setattr(review_substrate, "run_review_request", substrate)
-    monkeypatch.setattr(plan_review_runtime, "LLMClient", lambda *a, **k: object())
-    monkeypatch.setattr(
-        plan_review, "_start_planning_swarm",
-        lambda *a, **k: {"started": True, "handoffs": {}},
-    )
-    monkeypatch.setattr(plan_review, "_load_plan_checklist", lambda: "checklist")
-    monkeypatch.setattr(plan_review, "load_governance_doc", lambda *a, **k: "doc")
-    monkeypatch.setattr(plan_review, "build_head_snapshot_section", lambda *a, **k: "")
-    monkeypatch.setenv("OUROBOROS_REVIEW_MODELS", ",".join(models))
-    monkeypatch.setattr(plan_review, "_get_review_models", lambda: list(models))
-    monkeypatch.setattr(
-        plan_review, "_per_slot_input_token_limits", lambda _m, **_k: dict(limits),
-    )
-
-    ctx = MagicMock()
-    ctx.repo_dir = tmp_path
-    ctx.drive_root = tmp_path
-    ctx.budget_drive_root = str(tmp_path)
-    ctx.task_id = "slot-identity-fit"
-    ctx.task_metadata = {}
-    ctx.task_contract = {}
-    ctx.project_id = ""
-    ctx.drive_logs.return_value = tmp_path / "logs"
-
-    out = asyncio.run(plan_review._run_plan_review_async(
-        ctx,
-        plan_review._PlanReviewRequest(
-            plan="P", goal="G", files_to_touch=[], context_level="minimal",
-        ),
-    ))
-    return ctx, out
-
-
-def test_fit_filtered_plan_rows_keep_their_configured_ids(tmp_path, monkeypatch):
-    """Preflight fit filtration must not renumber plan_slot_N.
-
-    Before this fix ``_run_plan_review_async`` replaced the configured model
-    rows with the fit-only list from ``plan_slot_fit`` and the mint then
-    enumerated the COMPACTED list: with configured row 1 preflight-oversize,
-    configured plan_slot_2/plan_slot_3 ran (and wrote durable receipts) as
-    plan_slot_1/plan_slot_2 — the oversize row's id was silently claimed by a
-    different row — and the typed oversize record carried no id at all.
-    """
-    green = "## PROPOSALS\n\nLooks solid.\n\nPLAN_FINDINGS_JSON:\n[]\nAGGREGATE: GREEN"
-    ran_as: list = []
-    models = ["m/small", "m/big-a", "m/big-b"]
-    # Row 1's calibrated cap cannot hold any real prompt; rows 2 and 3 fit.
-    ctx, out = _drive_plan_review_async(
-        tmp_path, monkeypatch, models=models,
-        limits={"m/small": 1, "m/big-a": 900_000, "m/big-b": 900_000},
-        substrate=_per_model_substrate(ran_as, {"m/big-a": green, "m/big-b": green}),
-    )
-
-    assert "PLAN_REVIEW_OUTCOME" in out, out
-    # The surviving rows ran under the ids of their CONFIGURED positions.
-    assert ran_as == ["plan_slot_2", "plan_slot_3"], ran_as
-    stored = list(ctx._last_plan_review_raw_results or [])
-    assert [r.get("slot_id") for r in stored] == [
-        "plan_slot_1", "plan_slot_2", "plan_slot_3",
-    ], stored
-    by_id = {r["slot_id"]: r for r in stored}
-    # The dropped row answers under its ORIGINAL id, as a typed oversize record.
-    assert "preflight_oversize" in str(by_id["plan_slot_1"].get("error") or ""), stored
-    assert by_id["plan_slot_1"].get("model") == "m/small", stored
-    assert by_id["plan_slot_2"].get("model") == "m/big-a", stored
-    assert by_id["plan_slot_3"].get("model") == "m/big-b", stored
-
-
-def test_oversize_middle_row_keeps_its_id_through_the_carry(tmp_path, monkeypatch):
-    """The carry re-reads the partition ``plan_slot_fit`` made — a middle row
-    dropping out leaves plan_slot_1/plan_slot_3 untouched — and the slots
-    surface honors CARRIED ids instead of re-minting from its argument list."""
-    from ouroboros import review_substrate
-    from ouroboros.tools import plan_review, plan_review_runtime
-    from ouroboros.tools.review_synthesis import plan_slot_fit_with_identity
-
-    models = ["m/a", "m/mid-small", "m/c"]
-    limits = {"m/a": 900_000, "m/mid-small": 1, "m/c": 900_000}
-    assert plan_review._minted_plan_slot_ids(models) == [
-        "plan_slot_1", "plan_slot_2", "plan_slot_3",
-    ]
-
-    fit_models, callable_ids, stamped, error = plan_slot_fit_with_identity(
-        models, limits, 5_000,
-    )
-    assert error == ""  # two of three IS the quorum
-    assert fit_models == ["m/a", "m/c"], fit_models
-    assert callable_ids == ["plan_slot_1", "plan_slot_3"], callable_ids
-    assert [r.get("slot_id") for r in stamped] == ["plan_slot_2"], stamped
-    assert "preflight_oversize" in stamped[0]["error"], stamped
-
-    ran_as: list = []
-    monkeypatch.setattr(review_substrate, "run_review_request", _substrate_stub(ran_as))
-    monkeypatch.setattr(plan_review_runtime, "LLMClient", lambda *a, **k: object())
-    ctx = _fake_ctx(tmp_path)
-    raw = asyncio.run(plan_review._run_plan_review_slots(
-        ctx, fit_models, "system prompt", "user content", slot_ids=callable_ids,
-    ))
-    assert ran_as == ["plan_slot_1", "plan_slot_3"], ran_as
-    assert [r.get("slot_id") for r in raw] == ["plan_slot_1", "plan_slot_3"], raw
-
-
-def test_middle_slot_oversize_binds_findings_to_their_configured_rows(tmp_path, monkeypatch):
-    """XG-5R2.1 end-to-end: the carry alone was not enough — the CONSUMERS stayed
-    positional. ``oversize + answered`` concatenation put the filtered MIDDLE row's
-    record first, and summarize/addressable/format then derived identity from
-    ``enumerate``: findings and disposition ids were stitched to the WRONG
-    configured row. Every assertion here reads the final public artifacts.
-    """
-    ran_as: list = []
-    models = ["m/big-a", "m/mid-small", "m/big-b"]
-    texts = {
-        "m/big-a": _plan_review_text("REVIEW_REQUIRED", [{
-            "id": "a-risk", "level": "RISK",
-            "summary": "A-side seam is unnamed.", "recommendation": "Name it.",
-        }]),
-        "m/big-b": _plan_review_text("REVIEW_REQUIRED", [{
-            "id": "b-risk", "level": "RISK",
-            "summary": "B-side boundary is absent.", "recommendation": "Add it.",
-        }]),
-    }
-    ctx, out = _drive_plan_review_async(
-        tmp_path, monkeypatch, models=models,
-        limits={"m/big-a": 900_000, "m/mid-small": 1, "m/big-b": 900_000},
-        substrate=_per_model_substrate(ran_as, texts),
-    )
-
-    # The two callable rows ran under their CONFIGURED ids (middle row dropped).
-    assert ran_as == ["plan_slot_1", "plan_slot_3"], ran_as
-    # Stored rows are in CONFIGURED order — not oversize-first arrival order.
-    stored = list(ctx._last_plan_review_raw_results or [])
-    assert [r.get("slot_id") for r in stored] == [
-        "plan_slot_1", "plan_slot_2", "plan_slot_3",
-    ], stored
-    by_id = {r["slot_id"]: r for r in stored}
-    assert by_id["plan_slot_1"].get("model") == "m/big-a", stored
-    assert "preflight_oversize" in str(by_id["plan_slot_2"].get("error") or ""), stored
-    assert by_id["plan_slot_3"].get("model") == "m/big-b", stored
-
-    # The rendered rows are labeled by carried identity, and the header counts
-    # CONFIGURED rows, not the filtered call list.
-    assert "### Reviewer plan_slot_1: m/big-a" in out, out
-    assert "### Reviewer plan_slot_2: m/mid-small" in out, out
-    assert "### Reviewer plan_slot_3: m/big-b" in out, out
-    assert "3 configured reviewer rows — 2 called, 1 preflight-oversize" in out, out
-
-    # Finding ids and models are bound to the RIGHT configured rows.
-    findings = json.loads(out.split("## Findings Requiring Disposition")[1]
-                          .split("```json")[1].split("```")[0])
-    bound = {f["finding_id"]: (f["reviewer_slot"], f["model"]) for f in findings}
-    assert bound["plan_slot_1:a-risk"] == ("plan_slot_1", "m/big-a"), bound
-    assert bound["plan_slot_3:b-risk"] == ("plan_slot_3", "m/big-b"), bound
-    # The oversize row is preflight_excluded (swarm-plan-liveness): a slot that
-    # was never called is an availability fact, not a dispositionable finding —
-    # it must not appear in the disposition ledger under any id.
-    assert set(bound) == {"plan_slot_1:a-risk", "plan_slot_3:b-risk"}, bound
-    assert "PLAN_REVIEW_OUTCOME: REVIEW_REQUIRED" in out, out
+    assert [r.get("slot_id") for r in raw] == ["slot_1", "slot_2"], raw
+    assert {r.get("route") for r in raw} == {"api_chat"}
+    assert {r.get("host_file_read_attestation") for r in raw} == {"host_assembled_packet"}
 
 
 def test_skill_review_dispatches_through_the_slot_id_stamping_entry():

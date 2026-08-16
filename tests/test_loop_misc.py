@@ -1271,51 +1271,15 @@ def test_run_llm_loop_enforces_swarm_force_plan_before_final(tmp_path, monkeypat
         }, 0.0
 
     def fake_handle_tool_calls(tool_calls, _tools, _drive_logs, _task_id, _executor, request_messages, trace, _progress):
-        from ouroboros.task_results import (
-            STATUS_RUNNING,
-            record_plan_review_collection,
-            record_plan_review_attempt,
-            record_plan_review_result,
-            reserve_plan_review_wave,
-            write_task_result,
-        )
+        from ouroboros.task_results import STATUS_RUNNING, record_plan_review_wave, write_task_result
 
         fingerprint = "a" * 64
         write_task_result(tmp_path, "task1", STATUS_RUNNING, result="running")
-        record_plan_review_attempt(tmp_path, "task1", fingerprint=fingerprint)
-        reserve_plan_review_wave(
-            tmp_path,
-            "task1",
-            fingerprint=fingerprint,
-            plan_text_hash="b" * 64,
-            scout_roles=[],
-            cutoff_at="2026-08-03T00:00:00+00:00",
-        )
-        record_plan_review_collection(
-            tmp_path,
-            "task1",
-            fingerprint=fingerprint,
-            included_task_ids=[],
-            omissions=[],
-            stop_reason="complete",
-        )
-        record_plan_review_result(
-            tmp_path,
-            "task1",
-            fingerprint=fingerprint,
-            review={
-                "schema_version": 1,
-                "request_fingerprint": fingerprint,
-                "plan_text_hash": "b" * 64,
-                "aggregate_signal": "GREEN",
-                "findings": [],
-                "reviewed_at": "2026-08-03T00:00:00+00:00",
-                "closed": True,
-                "included_task_ids": [],
-                "omitted_task_ids": [],
-            },
-            reviewed_result_hashes={},
-        )
+        record_plan_review_wave(tmp_path, "task1", {
+            "schema_version": 2, "cycle_index": 1, "request_fingerprint": fingerprint,
+            "spec": {"goal": "g"}, "spec_hash": "b" * 64, "findings": [], "aggregate": "GREEN",
+            "closed": True, "dispositions": [], "paid": True,
+        })
         trace["tool_calls"].append({
             "tool": tool_calls[0]["function"]["name"],
             "args": {},

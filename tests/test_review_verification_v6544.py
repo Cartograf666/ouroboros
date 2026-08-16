@@ -946,7 +946,10 @@ def test_tool_capture_applies_obligation_dispositions():
 def test_until_deadline_without_deadline_falls_back_to_count_cap(monkeypatch):
     """Review round 2: until_deadline needs a deadline — without one the count cap
     applies (no near-unbounded improvement loops)."""
-    monkeypatch.setenv("OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES", "1")
+    # the legacy passes key is retired (migrated at load); the shared cycle cap is
+    # the runtime authority: 2 cycles = 1 improvement pass.
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "2")
+    monkeypatch.delenv("OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES", raising=False)
     profile = normalize_budget_profile({"improvement_policy": "until_deadline"})
     snap = task_pacing.build_budget_snapshot(SimpleNamespace(task_metadata={}, task_contract={}))
     ok, _ = task_pacing.improvement_pass_allowed(snap, 0, profile)

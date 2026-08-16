@@ -6,6 +6,7 @@ import logging
 import pathlib
 from typing import Any, Dict, List, Optional
 
+from ouroboros.review_cycles import review_max_cycles
 from ouroboros.review_state import infer_review_phase
 from ouroboros.tools.registry import ToolContext
 from ouroboros.utils import (
@@ -55,14 +56,20 @@ def _attempt_accepts_reviewing_update(existing: Any) -> bool:
 # the SAME staged diff (matching pre_review_fingerprint), further attempts are
 # refused BEFORE spending another triad+scope run. Changing the diff (fixing
 # findings) starts a fresh streak — legitimate fix-and-retry loops are never
-# capped, only verbatim resubmissions hoping for a different verdict.
-BLOCKED_ATTEMPT_FINGERPRINT_CAP = 3
+# capped, only verbatim resubmissions hoping for a different verdict. The number
+# is the shared review-cycle cap (OUROBOROS_REVIEW_MAX_CYCLES, default 2, was a
+# hardcoded 3), read at call time; ``unlimited`` disables the cap.
 _ATTEMPT_CAP_BLOCK_REASON = "attempt_cap_reached"
+
+
+def blocked_attempt_fingerprint_cap() -> Optional[int]:
+    """Live identical-diff cap from the shared setting; ``None`` = never cap."""
+    return review_max_cycles()
 
 
 def check_blocked_attempt_cap(ctx: ToolContext, fingerprint: str, *, has_rebuttal: bool = False) -> str:
     """Refusal message when the same staged diff was already review-blocked
-    ``BLOCKED_ATTEMPT_FINGERPRINT_CAP`` times in a row; "" allows the attempt.
+    ``blocked_attempt_fingerprint_cap()`` times in a row; "" allows the attempt.
 
     Counts trailing blocked attempts for this (repo, tool) whose
     ``pre_review_fingerprint`` matches the current staged diff — deliberately
@@ -75,7 +82,8 @@ def check_blocked_attempt_cap(ctx: ToolContext, fingerprint: str, *, has_rebutta
     Fail-open on ledger errors — the cap is a cost guard, not a safety gate.
     """
     fp = str(fingerprint or "").strip()
-    if not fp or has_rebuttal:
+    cap = blocked_attempt_fingerprint_cap()
+    if not fp or has_rebuttal or cap is None:
         return ""
     try:
         from ouroboros.review_state import load_state, make_repo_key
@@ -107,7 +115,7 @@ def check_blocked_attempt_cap(ctx: ToolContext, fingerprint: str, *, has_rebutta
                 streak += 1
                 continue
             break
-        if streak < BLOCKED_ATTEMPT_FINGERPRINT_CAP:
+        if streak < cap:
             return ""
         return (
             f"⚠️ REVIEW_ATTEMPT_CAP: this exact staged diff was already blocked by review "
