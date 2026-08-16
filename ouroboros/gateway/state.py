@@ -122,7 +122,19 @@ def _state_snapshot(request: Request) -> Dict[str, Any]:
         "projects": _projects_summary_safe(request),
         "project_chat_ids": _project_chat_ids_safe(request),
         "task_bindings": _task_bindings_safe(request),
+        "active_direct_turns": (
+            _direct_turns_snapshot_safe()
+        ),
     }
+
+
+def _direct_turns_snapshot_safe() -> list:
+    try:
+        from supervisor.active_activity import get_direct_activity_registry
+
+        return get_direct_activity_registry().snapshot()
+    except Exception:
+        return []
 
 
 async def api_state(request: Request) -> JSONResponse:
@@ -223,6 +235,7 @@ async def api_state(request: Request) -> JSONResponse:
             "projects": snap["projects"],
             "project_chat_ids": snap["project_chat_ids"],
             "task_bindings": snap["task_bindings"],
+            "active_direct_turns": snap.get("active_direct_turns") or [],
         })
     except Exception as exc:
         return json_exception(exc)

@@ -1484,7 +1484,10 @@ class OuroborosAgent:
             return
         try:
             self._event_queue.put({
-                "type": "typing_start", "chat_id": self._current_chat_id,
+                "type": "typing_start",
+                "chat_id": self._current_chat_id,
+                "task_id": str(self._current_task_id or ""),
+                "phase": "thinking",
                 "ts": utc_now_iso(),
             })
         except Exception:

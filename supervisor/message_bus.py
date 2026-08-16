@@ -417,14 +417,51 @@ class LocalChatBridge:
                 "transport": dict(self._chat_transports.get(int(chat_id or 0), {}) or {}),
             })
 
-    def send_chat_action(self, chat_id: int, action: str = "typing") -> bool:
-        """Send typing indicator to UI/event subscribers."""
+    def send_chat_action(
+        self,
+        chat_id: int,
+        action: str = "typing",
+        *,
+        activity_id: str = "",
+        client_message_id: str = "",
+        phase: str = "thinking",
+        kind: str = "",
+    ) -> bool:
+        """Send typing indicator to UI/event subscribers.
+
+        ``kind`` is stamped only for registry-tracked direct/ephemeral turns
+        (``direct_chat``/``ephemeral_decision``); queued managed tasks emit
+        typing without it, so the client knows the /api/state snapshot has no
+        deletion authority over their entries.
+        """
         if is_a2a_chat_id(chat_id):
             return True
+        payload: Dict[str, Any] = {
+            "type": "typing",
+            "action": action,
+            "chat_id": int(chat_id or 0),
+        }
+        if activity_id:
+            payload["activity_id"] = str(activity_id)
+        if client_message_id:
+            payload["client_message_id"] = str(client_message_id)
+        if phase:
+            payload["phase"] = str(phase)
+        if kind:
+            payload["kind"] = str(kind)
+
         if self._broadcast_fn:
-            self._broadcast_fn({"type": "typing", "action": action, "chat_id": int(chat_id or 0)})
+            self._broadcast_fn(payload)
         typing_transport = dict(self._chat_transports.get(int(chat_id or 0), {}) or {})
-        publish_event(CHAT_TYPING, {"chat_id": int(chat_id or 0), "action": str(action or ""), "transport": typing_transport})
+        publish_event(CHAT_TYPING, {
+            "chat_id": int(chat_id or 0),
+            "action": str(action or ""),
+            "activity_id": str(activity_id or ""),
+            "client_message_id": str(client_message_id or ""),
+            "phase": str(phase or "thinking"),
+            "kind": str(kind or ""),
+            "transport": typing_transport,
+        })
         return True
 
     def send_photo(
