@@ -234,9 +234,10 @@ may not weaken it.
    durably audited; it does not alter any other applicable deterministic
    or multi-model gate. An unavailable or unconfigured advisory lane is
    never represented as a clean preflight; it is a disclosed skip or failure.
-3. **Plan review**: multi-model architectural review of plans before
-   implementation starts, mandatory for non-trivial or
-   direction-changing work.
+3. **Plan review**: multi-model design review of an INTENTION before the work
+   starts — the same organ whether the work is code, research, a deliverable,
+   or an action in the world — mandatory for non-trivial or direction-changing
+   work.
 4. **Pattern Register** and **Improvement Backlog**: durable record of
    error classes and the structural fixes applied —
    `memory/knowledge/patterns.md` and
@@ -263,6 +264,10 @@ following bounds are constitutional:
   discretion. **Prompts and functional code are never excludable.**
   If a review pack would cut prompts or functional modules to fit,
   that is a signal to refactor the repo, not to reduce scope.
+  The scope floor binds reviewers of a CHANGE; a reviewer of an INTENTION
+  before the work exists carries the constitutional pack whenever the plan
+  touches Ouroboros's own body, plus the declared and requested evidence —
+  every absence named, never silent.
 
   Where the assembler cannot fit a required artifact, that is a FAILURE
   to assemble, not a smaller pack: it records a typed entry naming the

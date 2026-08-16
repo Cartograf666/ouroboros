@@ -157,7 +157,7 @@ Used by `commit_reviewed` for all changes to the Ouroboros repository.
 | # | item | what to check | severity when FAIL |
 |---|------|---------------|--------------------|
 | 1 | bible_compliance | Does the diff violate any BIBLE.md principle? | critical |
-| 2 | development_compliance | Does it follow DEVELOPMENT.md patterns? Check explicitly: (a) naming conventions (snake_case modules/vars, PascalCase classes, UPPER_SNAKE_CASE constants); (b) entity type rules — Gateway classes contain ONLY transport, no business logic; Tool functions are thin wrappers; (c) Python everywhere (including `tests/`/`devtools/`) and first-party `web/**/*.js` (including `web/tests/`) target ~1000 lines; exact repo-relative module debt above the 1600-line hard gate, exact `(path, qualname)` Python-function debt above 300 lines, the exact-current 1001-1500 band (new/re-entered paths need a nonblank rationale), and exact byte debt above 200,000 canonical UTF-8/LF bytes are checked in to `ouroboros/size_ratchet_manifest.py`, stale entries fail, methods above 150 lines are a decomposition signal, runtime-code total Python function/method count stays under `ouroboros/review.py::MAX_TOTAL_FUNCTIONS`, and more than eight parameters is a decomposition signal, not a hard gate; (d) no gratuitous abstract layers, and any SOLID/minimalism finding names an exact symbol/authority, concrete duplication or coupling, and a smaller contract-preserving alternative rather than citing diff size (P7 Minimalism) — and when the diff ADDS a surface (a new module, state file, ledger, resolver, cache, retry path, tool, endpoint, or background loop), the reviewer consults the docs/ARCHITECTURE.md map and NAMES the existing mechanism that already covers the need when one exists (the same generative duty the plan reviewer carries: "an existing function/module that already solves this, named exactly"); absence of a covering mechanism may be stated in one line; (e) new LLM calls go through the shared `LLMClient`/`llm.py` layer, not ad-hoc HTTP clients; (f) cognitive artifacts (identity.md, scratchpad, task reflections, review outputs) must NOT use hardcoded `[:N]` truncation — explicit omission notes required; (g) new `get_tools()` exports follow the ToolEntry pattern in registry.py; (h) provider independence — no change may make a core capability (agent loop, multi-model commit review, scope review, or memory/context flows) silently require a second provider or OpenRouter specifically, and every supported single direct provider (local, OpenAI, Anthropic, MiniMax, Cloud.ru, GigaChat) must keep its model AND review/scope slots self-fillable (see DEVELOPMENT.md "Provider Independence"); (i) a claimed-complete visible UI change includes vision-inspected evidence from at least one relevant real consumer flow. A screenshot file without inspection is insufficient; states/viewports/additional engines are risk-selected, mobile/WebKit are not universal, and an unavailable optional engine alone is not degradation. | critical |
+| 2 | development_compliance | Does it follow DEVELOPMENT.md patterns? Check explicitly: (a) naming conventions (snake_case modules/vars, PascalCase classes, UPPER_SNAKE_CASE constants); (b) entity type rules — Gateway classes contain ONLY transport, no business logic; Tool functions are thin wrappers; (c) Python everywhere (including `tests/`/`devtools/`) and first-party `web/**/*.js` (including `web/tests/`) target ~1000 lines; exact repo-relative module debt above the 1600-line hard gate, exact `(path, qualname)` Python-function debt above 300 lines, the exact-current 1001-1500 band (new/re-entered paths need a nonblank rationale), and exact byte debt above 200,000 canonical UTF-8/LF bytes are checked in to `ouroboros/size_ratchet_manifest.py`, stale entries fail, methods above 150 lines are a decomposition signal, runtime-code total Python function/method count stays under `ouroboros/review.py::MAX_TOTAL_FUNCTIONS`, and more than eight parameters is a decomposition signal, not a hard gate; (d) no gratuitous abstract layers, and any SOLID/minimalism finding names an exact symbol/authority, concrete duplication or coupling, and a smaller contract-preserving alternative rather than citing diff size (P7 Minimalism) — and when the diff ADDS a surface (a new module, state file, ledger, resolver, cache, retry path, tool, endpoint, or background loop), the reviewer consults the docs/ARCHITECTURE.md map and NAMES the existing mechanism that already covers the need when one exists (name it exactly — the reuse-first duty this checklist carries for a CHANGE; the plan-review checklist judges an intention and has no such generative duty); absence of a covering mechanism may be stated in one line; (e) new LLM calls go through the shared `LLMClient`/`llm.py` layer, not ad-hoc HTTP clients; (f) cognitive artifacts (identity.md, scratchpad, task reflections, review outputs) must NOT use hardcoded `[:N]` truncation — explicit omission notes required; (g) new `get_tools()` exports follow the ToolEntry pattern in registry.py; (h) provider independence — no change may make a core capability (agent loop, multi-model commit review, scope review, or memory/context flows) silently require a second provider or OpenRouter specifically, and every supported single direct provider (local, OpenAI, Anthropic, MiniMax, Cloud.ru, GigaChat) must keep its model AND review/scope slots self-fillable (see DEVELOPMENT.md "Provider Independence"); (i) a claimed-complete visible UI change includes vision-inspected evidence from at least one relevant real consumer flow. A screenshot file without inspection is insufficient; states/viewports/additional engines are risk-selected, mobile/WebKit are not universal, and an unavailable optional engine alone is not degradation. | critical |
 | 3 | secrets_check | Are secrets, API keys, .env files, credentials present in the diff? | critical |
 | 4 | code_quality | Careful code review: bugs, logic errors, crashes, regressions, race conditions, resource leaks? | critical |
 | 5 | security_issues | Security vulnerabilities: injection, path traversal, secret leakage, unsafe operations? | critical |
@@ -653,135 +653,100 @@ block repo commits and vice versa.
 
 ## Plan Review Checklist
 
-Used by `plan_task` for pre-implementation design reviews, BEFORE any code is written.
-Reviewers see the proposed plan, HEAD snapshots of files planned to be touched,
-and an agent-selected context level: `minimal`, `localized`, `broad`, or
-`constitutional`. `minimal` keeps governance docs and touched-file snapshots
-but omits the generated Atlas; `localized` adds a bounded neighborhood around
-planned files, `broad` is for shared contracts, and `constitutional` is
-reserved for self-evolution / immune-system surfaces.
-If a requested non-minimal Atlas has a typed assembly failure, or its final
-prompt leaves fewer than reviewer quorum callable, plan review rebuilds the
-same fingerprint/scout wave once at loud `minimal`. Reviewers must judge only
-the evidence actually present; the requested/effective levels, cause, Atlas
-omission, and any planned-touch snapshot omission remain explicit. A compiler
-exception, monetary budget refusal, or minimal prompt that still does not fit
-does not trigger another fallback.
+Used by `plan_task` to review an INTENTION before the work starts — the same organ whether the
+work is code, research, a deliverable, or an action in the world. Reviewers see the agent's typed
+SPEC, the task objective, the evidence the agent declared (attached bounded, with every absence
+named), and — for a self-modification plan — BIBLE.md in full; every other plan gets a
+heading-derived navigation map of BIBLE.md and may request more with `need_evidence`.
+Judge only the evidence actually present; nothing missing is ever silent.
 
-**Reviewer role is GENERATIVE, not audit.** The primary job is to contribute
-ideas the implementer may not see, using the repository evidence available for
-the selected context level. Finding defects in
-the plan is secondary; proposing concrete alternatives, surfacing existing
-surfaces that already solve the goal, and flagging subtle contract breaks the
-implementer missed is primary.
+**One question: is this SPEC sufficient to START the work safely?** Not "is everything
+specified" — details may be worked out while doing. The reviewer does not write a competing
+plan, does not propose alternatives for their own sake, and has no finding quota. The agent
+authors the plan (P0); reviewers attack it; the host counts, aggregates and enforces.
 
-### Required output structure
+### The spec you are reviewing
 
-Reviewers must structure their response in this order:
+```
+goal · in_scope[] · non_goals[] · acceptance_claims[] (checkable "done" statements)
+invariants[] (budget, deadline, safety, irreversibility, external commitments)
+decisions[] {choice, rejected[], why}  ·  deferred[] {what, why_safe_to_defer}
+affected_resources[] (what the work will CHANGE)  ·  evidence[] (what to look at)
+```
+Every element has a host-minted id (`goal`, `claim_N`, `invariant_N`, `decision_N`, `deferred_N`).
+Those ids are the only valid `breaks` targets. Ids may shift between cycles when the agent
+rewrites the spec — re-target `breaks` against the CURRENT ids using the Spec delta.
 
-1. **Your own approach.** State concisely what YOU would do if this goal
-   came to you with the available repository evidence: the concrete alternative path, the
-   existing file/function you would reuse, or the simpler route. If after real
-   effort you genuinely see no better approach, say so explicitly.
-2. **`## PROPOSALS` section.** Include only evidence-backed contributions; there
-   is no target count. Each proposal should be one of:
-   - An existing function/module that already solves this (named exactly).
-   - A subtle contract break or shared-state interaction the plan likely missed.
-   - A simpler path with less surface area that still preserves the goal.
-   - A risk pattern visible from codebase history in your context.
-   - A BIBLE.md alignment issue with a specific principle cited.
-3. **Per-item verdicts** (PASS / RISK / FAIL), each with a detailed explanation
-   and — when RISK or FAIL — a concrete fix naming the exact file/function/symbol.
-4. **Addressable findings block.** Immediately before the final line, write
-   `PLAN_FINDINGS_JSON:` followed by exactly one standalone JSON array. Include
-   every material RISK/FAIL as an object with a unique local `id`, `level`
-   (`RISK` or `FAIL`), `summary`, and `recommendation`; use `[]` when GREEN.
-5. **Final line.** End with exactly one aggregate line and no content after it:
-   - `AGGREGATE: GREEN`
-   - `AGGREGATE: REVIEW_REQUIRED`
-   - `AGGREGATE: REVISE_PLAN`
+### The rubric (five domain-free questions + one for self-modification)
 
-### Checklist items
+| # | item | what to check |
+|---|------|---------------|
+| 1 | success conditions | Are the acceptance claims checkable — could a third party tell whether each one holds? |
+| 2 | load-bearing decisions | Are the decisions that are expensive to reverse explicit, with their rejected alternatives and why? |
+| 3 | constraints and invariants | Are the real constraints named — budget, deadline, safety, irreversibility, commitments to others? |
+| 4 | deferrals | Is anything deferred that will be expensive to change once the work has started? |
+| 5 | evidence sufficiency | Is the evidence enough to judge? If not, ask for exactly what is missing (`need_evidence` with a locator) instead of inventing a gap. |
+| 6 | governance (self-modification plans only) | Does the intention contradict BIBLE.md or a frozen contract? Name the principle or contract. |
 
-| # | item | what to check | severity |
-|---|------|---------------|----------|
-| 1 | completeness | Are there files, tests, docs, prompts, configs, or sibling paths that must also change but are NOT mentioned in the plan? Name each one specifically. | FAIL if a required touchpoint is concretely missing; RISK if uncertain |
-| 2 | correctness | Given the existing code, will the proposed approach actually work? Are there hidden dependencies, wrong assumptions about how existing code works, or API mismatches? Name exact functions/constants/modules at risk. | FAIL if a concrete breakage can be identified; RISK if uncertain |
-| 3 | minimalism | Does the plan duplicate a named authority or create concrete coupling that an existing extension seam avoids? If yes, name the exact symbol/authority/coupling and the smaller existing seam, including how it preserves the required contract. When the plan ADDS a surface (a new module, state file, ledger, resolver, cache, retry path, tool, endpoint, or background loop), consult the docs/ARCHITECTURE.md map and NAME the existing mechanism that already covers the need when one exists; absence of a covering mechanism may be stated in one line. | RISK only for a concrete, evidence-backed alternative; diff size alone is not a finding |
-| 4 | bible_alignment | Does the proposed approach violate any BIBLE.md principle? Check especially P5 (LLM-First — no hardcoded behavior logic), P7 (Minimalism — no gratuitous abstraction), and P2 (Meta-over-Patch — fix the class, not the instance). | FAIL if a concrete principle violation is identifiable |
-| 5 | implicit_contracts | Does the plan touch a module that other modules depend on through implicit contracts — format assumptions, expected function signatures, shared constants, protocol invariants? Name the callers/dependents that would break. | FAIL if a concrete broken caller can be named; RISK if uncertain |
-| 6 | testability | Is the plan testable? Are there obvious edge cases not covered by the stated test approach? Are there integration boundaries that require mocking or fixtures not mentioned? | RISK (advisory) |
-| 7 | architecture_fit | Does the plan solve the class of problem or is it a narrow patch leaving the root cause unresolved? If the latter, describe what architectural change would address the root cause. | RISK (advisory) |
-| 8 | forgotten_docs | If the change affects behavior described in ARCHITECTURE.md, SYSTEM.md, README.md, DEVELOPMENT.md, or BIBLE.md, is that update included in the plan? Name the specific stale artifact. | FAIL if a concrete doc/prompt becomes stale and is not mentioned |
+### Height rule — what may block
 
-### Aggregate signal levels (adaptive quorum)
+A finding is **blocking** only if being wrong about it AFTER the work starts would invalidate work
+already done, violate a declared commitment, or make an acceptance claim unverifiable — and it
+MUST name the spec id it breaks. Everything else is a **note**. If missing evidence makes a claim
+structurally unverifiable, that is blocking against the claim, not a `need_evidence` request.
 
-The coordinator aggregates the configured reviewer slots (an arbitrary N,
-duplicates allowed) via `config.adaptive_quorum(N)` — the same reviewer-slot
-SSOT used by commit/scope/skill review: `2` for `N ≥ 3`, `N` for `N` in
-`{1, 2}` (i.e. `min(2, N)`).
+- `blocking` — requires `breaks: <spec id>`. Without a valid id the host demotes it to a note and
+  discloses the demotion.
+- `note` — the agent disposes of it (accept / reject with rationale / defer) at no cost.
+- `need_evidence` — a typed request `{locator, why}`. It never blocks by itself, never mints a new
+  fingerprint, and the same locator cannot be asked twice on one task.
 
-- **GREEN** — all responding reviewers PASS. A preflight-excluded slot was not
-  called and did not vote. Read every called reviewer's `## PROPOSALS` section
-  (they are the point of this call), then proceed with implementation.
-- **REVIEW_REQUIRED** — one or more of: (a) a `REVISE_PLAN` count BELOW the
-  adaptive quorum (minority dissent — e.g. exactly one dissent in a 2+-slot
-  setup); (b) one or more RISK items were raised; (c) non-substantive
-  degradation occurred (a reviewer errored, timed out, or returned an
-  unparseable response, so `GREEN` cannot be confirmed). Read every reviewer's
-  full response and all PROPOSALS before deciding: a single dissenting reviewer
-  often sees the structural issue the others missed. Findings are inputs to the
-  main agent, which may accept, reject, or defer each one, including all of them.
-- **REVISE_PLAN** — a `REVISE_PLAN` count **at or above `adaptive_quorum(N)`**
-  (2-of-N for 3+ slots, both in a 2-slot setup, and the lone reviewer in a
-  1-slot setup). Quorum confirms a structural problem with the plan. Blocking
-  mode requires changed plan text and a fresh panel; advisory mode may proceed
-  only under loud host disclosure and the main agent's rationale. A single
-  dissent in a multi-reviewer setup surfaces as `REVIEW_REQUIRED`, not
-  `REVISE_PLAN`.
+### Output
+
+Return ONLY a JSON array of findings (optionally one code fence); for nothing to report return the
+empty array followed by `NO_FINDINGS`. Each element:
+
+```
+{"id": "f1", "class": "blocking|note|need_evidence", "breaks": "<spec id>",
+ "locator": "<path|url|task:id>", "summary": "...", "recommendation": "..."}
+```
+
+There is no reviewer-authored aggregate line: the HOST computes the aggregate from the findings
+across all configured slots using `config.adaptive_quorum(N)`. A reviewer never emits GREEN as
+authority, and prose outside the array is not parsed.
+
+### Cycles and closure
+
+- **GREEN** — no findings. Proceed.
+- **REVIEW_REQUIRED** — notes / `need_evidence`, or a blocking finding BELOW quorum. The agent
+  closes notes and `need_evidence` with one disposition call covering every finding id
+  (accept / reject with rationale / defer) — no new panel, no cost. A below-quorum blocking
+  finding stays OPEN whatever the disposition says: it closes only through a changed spec
+  (a new fingerprint, the next paid cycle) or a reject the next paid delta cycle judges.
+- **REVISE_PLAN** — blocking findings at quorum. A disposition can never close it: the agent
+  either changes the spec (a new fingerprint, the next paid cycle) or rejects a blocking finding
+  with a rationale that rides into that next cycle, where reviewers mark it resolved or still open.
+- **DEGRADED** — no parseable quorum. Not a verdict: re-running the panel is the honest next step,
+  and it consumes no cycle.
+
+Paid cycles per task are bounded by the owner's `OUROBOROS_REVIEW_MAX_CYCLES` (default 2,
+`unlimited` available). Replaying an identical envelope is free. On cycle 2+ every reviewer sees
+all reviewers' findings from the previous cycle, the agent's dispositions and the spec delta:
+a reformulation of an earlier finding is not a new finding, and a new blocking finding must say
+why it was invisible before. When the cap is spent under blocking enforcement the host holds
+implementation and escalates with the typed `review_cycles_exhausted` reason; under advisory the
+agent may proceed with the wave open under a loud host disclosure.
 
 ### Rules for reviewers
 
-- Outside the force-plan gate, `plan_review` remains advisory: the implementer
-  decides what to do with the feedback. Force-plan follows the owner-selected
-  `OUROBOROS_REVIEW_ENFORCEMENT`: `blocking` holds normal finalization until
-  `GREEN` or a valid reference-only disposition closes `REVIEW_REQUIRED`,
-  while `advisory` permits agent judgment and preserves an explicit disclosure.
-  The disposition is a separate `plan_task` call containing only
-  `review_disposition`; it may close only the latest still-current, reviewed,
-  integrated, non-degraded `REVIEW_REQUIRED` fingerprint. It never resends the
-  plan envelope or calls a reviewer, covers every finding exactly once, and
-  exact replay is idempotent. Mixed disposition/envelope calls and vacuous
-  disposition-only calls are rejected before recording a new attempt. Ordinary
-  invalid review-mode envelopes still record a new current attempt so stale
-  review authority cannot revive.
-  Reviewer unavailability is audit evidence, not a disposition-able verdict:
-  blocking retries the same fingerprint/wave against its immutable first-panel
-  scout snapshot until review returns or a real rail fires.
-  `REVISE_PLAN` still requires changed plan text/fingerprint and a fresh review
-  in the blocking lane; advisory may proceed only with loud disclosure and the
-  main agent's rationale. Blocking permits analysis and non-mutating preparation
-  while review recovers, but implementation starts only after closure or a real
-  task-wide rail. This remains an LLM-first obligation, not a per-write/per-shell
-  gate; real deadline, budget, provider, or round rails preserve useful best-effort
-  work instead of replacing it with a terminal planning error.
-- A FAIL/RISK finding must identify a concrete defect in a named file/function/
-  symbol/authority/coupling, or a concrete smaller existing extension seam that
-  satisfies the same requirements. Generic concerns without that evidence are
-  not findings.
-- Do NOT mark RISK on `minimalism` just because you would have done it
-  differently. Flag RISK only when you can name the specific existing seam,
-  duplication, or coupling and explain the smaller alternative. Diff size,
-  file count, line count, unfamiliarity, and stylistic preference alone are not
-  findings.
-- Do NOT penalise missing tests, `VERSION` bumps, `README.md` changelog rows,
-  or `docs/ARCHITECTURE.md` updates — the plan has no code yet. Focus on design
-  correctness and elegance, not commit hygiene. Commit-gate reviewers handle
-  those at commit time.
-
-Reviewers must emit exactly one `PLAN_FINDINGS_JSON` block and end with exactly
-one of `AGGREGATE: GREEN`, `AGGREGATE: REVIEW_REQUIRED`, or
-`AGGREGATE: REVISE_PLAN`.
+- Do not name files, functions or modules as a finding unless naming them is what breaks a spec id;
+  a file-level observation without a `breaks` id is a note.
+- Do not penalise missing tests, version bumps, changelog rows or doc updates — there is no code
+  yet, and the commit gate reviews those at commit time.
+- Do not require the plan to specify what can safely be decided while doing the work. "Unspecified"
+  is only a finding when leaving it open is expensive to reverse.
+- A plan with no file paths at all (a trip, a deck, a research question) is a first-class subject:
+  the same questions apply, and repository conventions are irrelevant to it.
 
 ---
 

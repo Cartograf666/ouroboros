@@ -454,6 +454,11 @@ Any flow that requires architectural, constitutional, or procedural reasoning MU
 these artifacts as **first-class context sections** — not as optional or opportunistic
 inclusions via touched-file packs.
 
+Plan review is the one flow whose governance pack is tiered by the self-modification path fact
+(see the table below). Before any work exists, the reviewer's subject is the INTENTION, not the
+engineering handbook; what it does not receive resident it may request as typed evidence. This is
+a tiering, not an omission: every absence is a named pointer or a `need_evidence` finding.
+
 Concrete requirements:
 
 | Flow | BIBLE.md | ARCHITECTURE.md | DEVELOPMENT.md |
@@ -464,78 +469,63 @@ Concrete requirements:
 | Background consciousness (`consciousness.py`) | ✅ full | ✅ full (max) / navigation map (low) | — (not yet required) |
 | Advisory pre-review (`tools/claude_advisory_review.py`) | ✅ via `load_governance_doc` | ✅ via `load_governance_doc` | ✅ via `load_governance_doc` |
 | Scope review (`tools/scope_review.py`) | full canonical doc + Atlas accounting | full canonical doc + Atlas accounting | full canonical doc + Atlas accounting |
-| Plan review (`tools/plan_review.py`) | ✅ full (every plan class) | full for `plan_class=self_mod`; lossless **navigation map** (sections + line ranges, full sections on demand) for external/creative/research plans (v6.61.0, owner-approved governance change) | ✅ full (every plan class) |
+| Plan review (`tools/plan_review.py`) | full for a SELF-MODIFICATION plan (structural path fact: a declared target resolves under the system repo); otherwise a heading-derived navigation map of BIBLE.md generated at runtime (never a copy) | named on-demand pointer — the engine attaches no ARCHITECTURE.md; a reviewer that needs it declares it as typed evidence | named on-demand pointer; a reviewer may request it as typed evidence |
 | Deep self-review (`deep_self_review.py`) | full canonical doc + Atlas accounting | full (max) / navigation map (low) + Atlas accounting | full canonical doc + Atlas accounting |
 
-Plan review always keeps BIBLE.md, DEVELOPMENT.md, the proposed plan,
-touched-file snapshots, and reviewer-slot framing as first-class context.
-ARCHITECTURE.md is CLASS-TIERED (v6.61.0, an owner-approved governance
-evolution — quiz 19): the agent declares `plan_class`
-(`self_mod | external | creative | research`), and the host STRUCTURALLY
-escalates to `self_mod` whenever `files_to_touch` resolve under the system repo
-(a path fact, never keyword matching). The classification-only exception is an
-exact path inside a non-native installed skill payload under the canonical data
-root; it remains the declared class and does not grant or alter write authority.
-`self_mod` plans keep the full inline
-ARCHITECTURE.md — unchanged from the historical contract. Non-self_mod plans
-(an external codebase, a creative deliverable, a research question) receive
-ARCHITECTURE.md as the LOSSLESS navigation map (`context_layout.
-generate_doc_nav_map`: every H2-H4 heading + its inclusive complete-subtree
-line range, with parent rows intentionally overlapping descendants and
-`max_lines=B-A+1`; full sections remain readable on demand) — their reviewers
-judge the plan against its own domain, not ~45K
-tokens of self-body detail. Rationale: the full-pack requirement existed to
-protect SELF-modification reasoning; for non-self plans it actively hurt
-review quality (reviewers anchored on runtime internals irrelevant to the
-deliverable) while tripling cost. The agent must choose `context_level`
-explicitly for `self_mod` plans; non-self_mod plans may omit it (defaults to
-`minimal`). That field controls only the generated repository Atlas: `minimal`
-omits Atlas accounting for bounded/local plans, while `localized`, `broad`, and
-`constitutional` add progressively larger Atlas packs. A typed non-minimal
-Atlas assembly failure or final quorum-fit failure rebuilds the same requested
-fingerprint/scout wave once at loud `minimal`; compiler exceptions, monetary
-budget refusal, and a minimal prompt that still cannot fit do not. Planning
-scouts are likewise class-framed: `self_mod` scouts keep the repo-archaeology emphasis;
-external/creative/research scouts are steered to the plan's own domain
-(requirements, verification, sources, design) and never default to Ouroboros
-internals.
+Plan review keeps the reviewed SPEC, the task objective, the agent-declared evidence, and
+reviewer-slot framing as first-class context. Governance packs are tiered by ONE structural
+fact — whether the plan's declared targets (`affected_resources`, or an evidence path locator)
+resolve under the Ouroboros system repository (self-modification) — never by prose and never by
+a plan-kind taxonomy. A self-modification plan carries BIBLE.md in full; every other plan carries
+a heading-derived navigation map of BIBLE.md generated at runtime
+(`context_layout.generate_doc_nav_map`, never a copy). DEVELOPMENT.md and ARCHITECTURE.md are
+NOT resident in a plan-review packet at all — that is the deliberate deviation from the approved
+W3 wording, disclosed here: the reviewer's subject is the intention, and either document is one
+`need_evidence` request away. A reviewer
+that needs more returns a typed `need_evidence` finding naming exactly what is missing; the agent
+re-declares that locator in the next cycle's `evidence` (the host never attaches a locator the
+plan did not declare), and a request the agent chooses not to honour stays an open note it must
+dispose of. Nothing is silently omitted (P1).
+
+The skill-payload exemption is unchanged: an exact path inside an installed skill payload under
+the canonical data root is data-plane work and does not make a plan a self-modification, even
+when the active workspace is the system repository itself.
+
+Paid review cycles per task are bounded by the owner's shared `OUROBOROS_REVIEW_MAX_CYCLES`
+(default 2, `unlimited` available). Under blocking enforcement an exhausted cap holds
+implementation and escalates with the typed `review_cycles_exhausted` reason; under advisory the
+agent may proceed with the wave open under the host's loud disclosure. An idempotent replay of
+the same fingerprint and a DEGRADED wave (no parseable quorum) consume no cycle.
 
 Planning has two distinct roots. Governance documents are always loaded from
-the system repository; Git-backed planned snapshots and Atlas inventory use
-`active_repo_dir_for(ctx)`. Exact non-native installed-skill payload paths are
-the one data-plane exception: their first-class touched snapshots read the
-current bytes from the canonical data root and say explicitly that they are not
-Git HEAD snapshots. Any other `files_to_touch` path escaping the active subject,
-a workspace/subject mismatch, or an unavailable root must fail loudly. Do not
-fall back to reviewing the Ouroboros repo for an external plan. Read-only scouts use
-the existing worker pool with its generic `executor=auto` route (selected
-healthy harness first, existing loud native fallback) and persist full raw
-handoffs. Wait for every launched
-scout until it is terminal or the shared swarm ceiling is reached; give the
-panel every ready non-empty handoff and an explicit reason for every omission.
-Launch only one scout wave per exact plan fingerprint. A handoff is marked
-consumed only after it was actually included in the reviewer request; a late
-terminal handoff is audit-only and never reopens an already considered plan.
-Canonical intent, task aliases, forensic refs, and omissions belong in one
-shared evidence horizon—not copied corpora or a second planning engine.
+the system repository; declared targets and evidence locators resolve against
+`active_repo_dir_for(ctx)`. Exact non-native installed-skill payload paths are the one data-plane exception for
+CLASSIFICATION: they never make a plan a self-modification, even when the active workspace is
+the system repository. They are not attachable as evidence: the evidence resolver allows only the
+active workspace and the system repository and refuses the runtime data plane outright, so a
+payload locator comes back as a named `denied_path` omission. Any declared path escaping the active subject, a
+workspace/subject mismatch, or an unavailable root must fail loudly with a named
+omission. Do not fall back to reviewing the Ouroboros repo for an external plan.
+Evidence the host cannot attach is a typed omission row, never a silent gap, and
+a reviewer that needs more asks for it with `need_evidence`.
 
-The planning horizon must state the goal, mandatory invariants, scope
-boundaries, non-goals, chosen existing extension seam, and explicitly rejected
-expansions. Plan review publishes exactly `GREEN`, `REVIEW_REQUIRED`, or
-`REVISE_PLAN`. `REVIEW_REQUIRED` findings are inputs: the main agent may accept,
-reject, or defer any/all of them. Blocking closes the latest still-current,
-reviewed, integrated, non-degraded result without a second LLM call through a
-separate `plan_task` call containing `review_disposition` only: every finding
-appears exactly once with evidence-based rationale, and each acceptance names
-the matching plan revision. Never replay plan/goal/scope/files/context with the
-disposition. Mixed calls and vacuous disposition-only calls fail before a new
+The SPEC must state the goal, acceptance claims, invariants, in-scope and
+non-goals, the load-bearing decisions with their rejected alternatives, and what
+is consciously deferred. Plan review publishes exactly `GREEN`, `REVIEW_REQUIRED`,
+or `REVISE_PLAN`. `REVIEW_REQUIRED` findings are inputs: the main agent may
+accept, reject, or defer any/all of them. Closure happens without a second LLM
+call through a separate `plan_task` call containing `review_disposition` only —
+`{review_fingerprint, items: [{finding_id, decision, rationale}]}` — covering
+every finding exactly once with an evidence-based rationale; duplicate or
+contradictory entries for one finding are refused. Never replay the plan
+envelope with the disposition. Mixed calls and vacuous disposition-only calls fail before a new
 attempt is recorded; exact replay is idempotent. Blocking `REVISE_PLAN` requires
 changed plan text/fingerprint and another panel, while advisory may proceed only
 under loud host disclosure and the main agent's rationale. Unknown, stale,
-duplicate, contradictory, or incomplete dispositions fail closed. Reviewers
-remain generative, but a finding must name
-a concrete defect or a concrete smaller existing extension seam; never require
-a fixed number of findings.
+duplicate, contradictory, or incomplete dispositions fail closed. Reviewers are
+findings-only — they judge the intention and never author a competing plan — and
+a blocking finding must name the spec id it breaks; there is never a required
+number of findings.
 
 Force-plan is an LLM-first pre-implementation obligation on the admitted managed
 root, not a mechanical permission check around implementation tools. The existing
@@ -544,11 +534,12 @@ root, not a mechanical permission check around implementation tools. The existin
 envelope that reaches `plan_task` supersedes prior authority: invalid plan/goal/scope
 input stores a domain-separated open attempt, while a valid envelope stores its
 canonical fingerprint before repository/path validation. A newer attempt therefore
-cannot fall back to an older GREEN. Immediately before first panel dispatch, the exact planning-scout
-handoff component is frozen in a fingerprint-keyed host write-once continuity artifact;
-the remaining live reviewer context is rebuilt. An unavailable reviewer
-never becomes a disposition-able verdict; a repeat call reuses that handoff snapshot and
-retries the panel, including after A→B→A. Blocking stays in
+cannot fall back to an older GREEN. The wave records the frozen SPEC, its hash, the evidence
+manifest (attached hashes plus every omission) and the composed fingerprint before dispatch, so a
+repeat call with the identical envelope replays that recorded wave for free instead of buying a
+second panel. An unavailable reviewer never becomes a disposition-able verdict; a DEGRADED wave
+(no parseable quorum) consumes no cycle and re-running the panel is the honest next step,
+including after A→B→A. Blocking stays in
 analysis and non-mutating preparation until closure or a real task-wide rail;
 advisory may proceed by agent judgment with a host-owned disclosure, including
 an explicitly rejected `REVISE_PLAN`. A planning
@@ -708,6 +699,20 @@ hosted agent-session slot is one multistep execution; local extraction reuses
 its collected transcript rather than launching another session. Actor transport,
 parse status, semantic verdict, model and route, coverage, cost, and capability
 delta remain distinct durable facts.
+
+One shared owner knob bounds PAID review cycles across the gates:
+`OUROBOROS_REVIEW_MAX_CYCLES` (SSOT `ouroboros/review_cycles.py`; a STRING —
+a positive integer or `unlimited`; default `"2"`; Settings → Behavior → "Max
+Review Cycles" 1 / 2 / 3 / 5 / ∞). Its per-gate meaning is documented in that
+module and is literally: plan review — paid reviewer-panel cycles per task;
+task acceptance — paid panel runs per task, `improvement passes = cycles − 1`
+(the retired `OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES` is migrated into the shared key at
+settings load — cycles = passes + 1 — and never binds at runtime); commit gate — consecutive review-blocks of a
+BYTE-IDENTICAL staged diff before the identical-diff attempt cap refuses another
+triad+scope run (changing the diff starts a fresh streak; a rebuttal lifts the
+cap for that attempt only; the default moved from a hardcoded 3 to the shared 2). `unlimited` removes the
+local count everywhere; deadline, budget and lifecycle rails still bind. A
+malformed value fails closed to the bounded default and is logged once.
 
 `docs/CHECKLISTS.md` is the only reviewer-question, severity, and output SSOT.
 Architecture owns the dataflow; this section owns operator sequence. Finish all
@@ -967,16 +972,6 @@ Before every commit, verify the following:
   descendant's lane. Enabled/reviewed extension tools and enabled MCP tools may remain
   callable by owner policy, subject to inherited `task_contract.allowed_resources`
   such as no-network/no-web.
-- A NEW `plan_task` scout wave is admitted before launch, and only a NEW one: worker capacity,
-  the shared review-wave budget gate (`review_helpers.review_wave_budget_gate` — no second budget
-  authority), and a consumable window. Each scout's deadline is bound to that window (the wave's
-  shared cutoff minus the finalization grace and a margin, the reserve capped at a fraction of a
-  short window) instead of inheriting the parent deadline verbatim, and a wave whose window has
-  already closed is refused with a typed reason rather than started and then omitted. The
-  recovery/collection path is NEVER gated: those handoffs are already paid for, so declining them
-  would abandon spend. With `OUROBOROS_MAX_SUBAGENT_DEPTH=0` scouts are refused by the same
-  delegation gate as any other child, and `plan_task` then completes on its existing
-  `degraded_evidence` path — no wedge, no second wave.
 - Runtime-internal scheduling knobs do NOT become `schedule_subagent` parameters.
   `control._schedule_task` is `(ctx, internal, /, **params)`: `params` is validated against
   `control.schedule_subagent_param_names()`, which is DERIVED from
@@ -995,23 +990,12 @@ Before every commit, verify the following:
   useful, and a scout deadline was only ever runtime-internal because `plan_task` happened to be its
   first caller. The set is empty today; it stays because it is closed and an unknown key in it still
   fails loudly.
-- `plan_task` planning scouts use the same live-subagent worker pool and one
-  shared terminal-or-cutoff wait boundary. Poll in
-  `OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC` slices, but wait for every started scout
-  until it becomes terminal or the existing
-  `OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC` ceiling. At that
-  boundary, send every ready non-empty handoff to the reviewer and include every
-  omission with its precise terminal/wait reason; missing evidence must never be
-  silently presented as complete. Capacity, scheduling failure, or a normal
-  cutoff does not trigger an extra inline model call: the omissions manifest goes
-  directly to the configured reviewer panel. Repeated calls with the same plan fingerprint
-  reuse the existing durable `plan_review_state` wave and never schedule a second wave, including
-  when the first wave ended without a usable handoff. Only reviewer-included
-  handoffs become consumed. Late terminal results are retained as audit evidence
-  with `affects_review=false` and do not reopen the plan. If an included child
-  changes after its exact snapshot enters the reviewer prompt, keep the old hash
-  non-authoritative, persist the review once with a bounded stale-binding warning,
-  and treat the newer child result as audit-only rather than paying for replay.
+- `plan_task` runs no scouts and no Atlas (plan-review redesign 2026-08-15): the engine
+  in `ouroboros/tools/plan_review.py` reviews the agent's SPEC through the configured
+  reviewer rows in-process (api_chat) or as retrieving sessions (agent_session), pays at
+  most `OUROBOROS_REVIEW_MAX_CYCLES` panels per task, replays an identical envelope for
+  free, and records every wave in `plan_review_state` v2 (bounded history). The
+  planning-scout wait knobs are retired (`config.RETIRED_SETTING_KEYS`).
 - `read_file(root=runtime_data)` and `list_files(root=runtime_data)` secret/control-file denials are subagent-scoped.
 - Browser isolation for local-readonly/acting subagents (DNS fail-closed): block
   non-HTTP(S) schemes, private/link-local/reserved/unspecified and numeric-obfuscated
@@ -1318,10 +1302,6 @@ Before every commit, verify the following:
   returning on each advance woke a full-context nanny round every poll interval
   (measured: 18 rounds, 861k prompt tokens, for a run that was doing fine), so
   the observations are carried back once, at the window's expiry.
-- [ ] Planning-scout collection is deliberately different: every started scout
-  shares one terminal-or-cutoff boundary, and the reviewer receives explicit
-  omissions at that boundary without a heartbeat-based early stop or inline
-  fallback model.
 - [ ] The wait/continue/stop decision must be a **structured fact** — terminal
   status plus heartbeat freshness from `queue_snapshot.json` — not a keyword or
   regex over content (Bible P5). Use `task_status.py` terminal-status helpers and
@@ -1342,7 +1322,7 @@ Before every commit, verify the following:
 - [ ] Before root acceptance, atomically fence new descendants under the queue lock and prove recursive subtree quiescence from the existing task-status SSOT. Split-drive ACK, subtree, and acceptance-timing reads/writes use canonical `budget_drive_root`. Preserve the prior verdict until the replacement is recorded. A revision must explicitly reopen the fence; terminal/degraded outcomes seal it.
 - [ ] The host runs the authoritative acceptance panel once per unchanged candidate-hash/evidence-revision/fence binding. Task-acceptance actors receive one substantive call and at most two physical attempts total. Record transport status, parse status, and valid-response semantic verdict separately, with actor model/provider, role, coverage, panel id, quorum contribution, reason, enforcement impact, and binding hashes. Public task/event/UI records receive only the compact projection; full model payloads remain in private audit storage. `adaptive_quorum` applies; any contributing FAIL fails, DEGRADED abstains (the reviewer verdict vocabulary `PASS|FAIL|DEGRADED` is NOT narrowable — `_contract_valid_actors`, the deliberate-DEGRADED capsule rail and the host's core-overflow DEGRADED all depend on it), and no quorum is a terminal HOST decision. The host acceptance decision itself is written ONLY by `loop._set_acceptance_decision` and has exactly three owner-facing states — `accepted | revision_requested | finalized_unaccepted` — each with a typed `reason` from an existing structured fact; an unknown status fails closed to `finalized_unaccepted` keeping its raw token as the reason. When you add a writer, add its reason to the closed set AND check every value-keyed reader: `outcomes.derive_loop_outcome` keys the eligible-but-skipped degradation on the status+reason PAIR (`review_skipped_deadline_reserve` plus the closed forced-rail `ACCEPTANCE_BYPASS_REASONS`), and breaking that pairing is a silent false green. Forced exits stamp their typed bypass record in the common terminal recorder (`_record_forced_acceptance_bypass`) as a pure ledger write — never a fence, panel, extra round, or prompt text on a forced path, and never overwriting an existing host decision — with ONE exception (owner decision Q2A, 2026-08-10): the forced `children_unabsorbed` rail still runs the acceptance panel for an acceptance-eligible root when the subtree is quiescent, with the undispositioned-children debt included in the evidence packet; because that rail cannot take another round, a requested revision terminalizes as `finalized_unaccepted` with the typed `revision_unavailable_on_forced_rail` reason, while the process outcome stays best-effort `children_unabsorbed`. The agent may write only `agent_disposition`/`agent_rationale`, merged into the host decision, never replacing it. Clean requires PASS + solved + supported criterion evidence. Chat and Logs must use the same severity reducer, and degraded review or best-effort/degraded objective must never render as green solved. Do not add task scope review or reuse the commit gate.
 - [ ] The acceptance improvement loop is a reviewer-authored DIALOGUE (v6.74.0): obligation identity comes from the reviewer's typed `disposition_kind`/`obligation_id` (an unknown re-raise id fails closed to `new`, disclosed — never a silent fresh hash id); a re-raise reopens the row WITHOUT wiping the agent's argument (`previous_disposition`/`previous_reason`/`reopened_count` survive into the evidence catalog and the obligations clause); termination beyond a clean PASS/accepted rebuttal happens ONLY via the reviewers' quorum `dialogue_status` judgement reduced over ALL contract-valid actors (`aggregate_dialogue_status` — never `_contributing_actors`, which drops a DEGRADED slot's vote) or a real rail — no host counters, no answer/verdict hashes, no keyword gates (P5). Changes here must cover: malformed reviewer output, unknown/stale `obligation_id` on a re_raise, partial panel failure, multi-slot dialogue-status disagreement (the reducer's precedence), replay/restart durability of obligation rows, false completion, and the backward-compatible default when the new fields are absent.
-- [ ] An explicit `max_improvement_passes` binds under every legacy policy. Required+Blocking without one has no local count cap, but real deadline/budget/lifecycle rails remain. The first acceptance review reserves at least 200s; later passes use the canonical event-derived `max(floor, 1.5×EWMA)` (`alpha=0.5`). Only the root runs global post-task synthesis once and persists one phase checkpoint in the canonical `budget_drive_root`. Recovery is startup-only: replay `pending_once`, degrade indeterminate `running` without another paid call, and let the normal supervisor copy-back/artifact path materialize child results without overwriting a terminal canonical phase or the finalized terminal accounting (`TASK_COST_META_FIELDS` plus rounds/tokens).
+- [ ] An explicit `max_improvement_passes` binds under every legacy policy. Without one, the shared review-cycle cap binds under EVERY policy, Required+Blocking included: `OUROBOROS_REVIEW_MAX_CYCLES` (SSOT `ouroboros/review_cycles.py`; string, default `"2"`, `"unlimited"` = no local count cap) gives `improvement passes = cycles − 1`; the retired `OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES` is migrated into the shared key at settings load and never binds at runtime.
 
 #### Cognitive Artifact Integrity
 - [ ] Cognitive artifacts (identity.md, scratchpad, task reflections, review outputs, pattern register) must NOT use hardcoded `[:N]` truncation. If content must be shortened, include an explicit omission note (e.g. `⚠️ OMISSION NOTE: truncated at N chars`).

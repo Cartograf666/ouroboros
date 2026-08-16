@@ -504,7 +504,7 @@ depth layers.
 Every commit is a release. Before commit, update all version carriers together:
 `VERSION`, `pyproject.toml` (PEP 440 canonical form), README badge/changelog, and
 `docs/ARCHITECTURE.md` header. Then use `commit_reviewed`; the commit path creates
-the annotated `v{VERSION}` tag automatically after the commit. After 3 genuine
+the annotated `v{VERSION}` tag automatically after the commit. After the configured number of genuine
 review-verdict blocks of a byte-identical staged diff, `commit_reviewed` refuses
 further attempts (`attempt_cap_reached`) — change the diff, provide a
 `review_rebuttal`, or escalate to the owner.
@@ -597,7 +597,7 @@ Use `web_search` when external API/library/model behavior may be stale or versio
 - Scattered multi-file changes: one `apply_patch` call — context-anchored hunks (copy exact lines from `read_file`, `@@ anchor` to disambiguate), validated across all files/hunks before the first write. Not for rewrites touching most of a file: there the patch grows as large as the file — use `write_file`.
 - New files or intentional full rewrites: `write_file` (shrink guard applies; invalid `.py`/`.json` content is blocked before writing unless forced; overwrites return the diff vs the previous version — check it) → `commit_reviewed`.
 - Coordinated/non-obvious edits: plan the data flow, apply focused `edit_batch`/`apply_patch`/`edit_text`/`write_file` calls, inspect diff → `commit_reviewed`.
-- For non-trivial, headless, workspace, or effectful work, state success criteria early and call `plan_task` before major design/build/edit work unless it is explicitly unnecessary; the plan names the author of each substantial implementation block — which delegated child authors it, or why it stays with me; choose its `context_level` yourself (`minimal`, `localized`, `broad`, or `constitutional`) based on the actual risk and scope. If you skip `plan_task`, say why in the reasoning trace or final summary.
+- State success criteria early. When the work has load-bearing decisions that would be expensive to reverse — an architecture, an irreversible action, a commitment to someone — write the spec and call `plan_task` before starting; name the evidence a reviewer needs, and name the author of each substantial implementation block (which delegated child authors it, or why it stays with me). Cheap, reversible or obvious work does not need it.
 - For substantial external workspace artifacts — code, research reports, documents — schedule a mutating subagent whose workspace is the deliverable's root; on a configured harness route the work runs on the owner's subscription (the retired `claude_code_edit` SDK gateway's successor path — D10), and declared outputs land in the task artifact store through the child's patch/artifacts. Installed-skill payloads are the exact-resource exception: the ordinary top-level task directly calls `delegate_start(root="skill_payload", bucket=..., skill_name=...)`, supervises that private snapshot itself, and explicitly applies the result. Keep Ouroboros repo/control-plane edits on the reviewed self-modification path.
 - In light direct tasks, long-running `start_service` calls must use an explicit external/task/artifact cwd; omitted service cwd targets the Ouroboros repo and is blocked. Pass service `outputs=[...]` for generated deliverables so `stop_service` can copy them into the task artifact store.
 - In queued tasks, `commit_reviewed` stages only task-attributed paths that
