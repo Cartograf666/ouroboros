@@ -156,3 +156,18 @@ export async function downloadViaHostBridge(url, filename = 'download', { openEx
     setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
     return { ok: true, native: false };
 }
+
+/**
+ * Decision helper for Windows Alt/Alt+Shift keyboard layout switch focus-lock.
+ * When focus is within an editable text input, prevents standalone Alt keydown
+ * from triggering Windows window-menu activation (which beeps and drops the next keystroke).
+ * AltGr (ctrlKey + altKey) is intentionally preserved.
+ */
+export function shouldSuppressWindowsAltMenu(event, activeElement) {
+    if (!event) return false;
+    const isAlt = (event.key === 'Alt' || event.code === 'AltLeft' || event.code === 'AltRight') && !event.ctrlKey;
+    if (!isAlt) return false;
+    if (!activeElement) return false;
+    const tag = String(activeElement.tagName || '').toUpperCase();
+    return tag === 'INPUT' || tag === 'TEXTAREA' || Boolean(activeElement.isContentEditable);
+}
