@@ -290,7 +290,8 @@ def _write(path: pathlib.Path, text: str | bytes) -> pathlib.Path:
     if isinstance(text, bytes):
         path.write_bytes(text)
     else:
-        path.write_text(text, encoding="utf-8")
+        # bytes, not write_text: Windows newline translation would change the on-disk hash
+        path.write_bytes(text.encode("utf-8"))
     return path
 
 
@@ -394,10 +395,11 @@ def test_resolve_evidence_and_constitutional_never_raise_on_hostile_locators(tmp
         assert ok is False
     # A fifo / device is a non-regular file: refused, never opened (would block forever).
     import os
-    os.mkfifo(root / "fifo")
-    assert plan_evidence.resolve_evidence(["fifo"], active_root=root, allowed_roots=[root])["omissions"] == [
-        {"locator": "fifo", "reason": "unreadable"}
-    ]
+    if hasattr(os, "mkfifo"):  # no fifos on Windows; the regular-file guard is exercised on POSIX
+        os.mkfifo(root / "fifo")
+        assert plan_evidence.resolve_evidence(["fifo"], active_root=root, allowed_roots=[root])["omissions"] == [
+            {"locator": "fifo", "reason": "unreadable"}
+        ]
 
 
 def test_resolve_evidence_size_ceiling_latin1_and_lexical_sensitive(tmp_path):

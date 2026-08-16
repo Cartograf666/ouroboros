@@ -668,8 +668,8 @@ def test_retired_swarm_keys_are_dropped_on_settings_load(tmp_path, monkeypatch):
 
 def test_ratchet_module_sizes():
     repo = pathlib.Path(pr.__file__).resolve().parents[2]
-    assert len((repo / "ouroboros" / "tools" / "plan_review.py").read_text().splitlines()) < 1000
-    assert len((repo / "ouroboros" / "config.py").read_text().splitlines()) <= 1600
+    assert len((repo / "ouroboros" / "tools" / "plan_review.py").read_text(encoding="utf-8").splitlines()) < 1000
+    assert len((repo / "ouroboros" / "config.py").read_text(encoding="utf-8").splitlines()) <= 1600
 
 
 def test_changed_spec_at_the_cap_never_inherits_a_closed_green(harness, monkeypatch):

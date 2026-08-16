@@ -826,3 +826,72 @@ def test_health_metrics_use_the_same_inventory(tmp_path: Path) -> None:
     assert metrics["total_lines"] == sum(item.line_count for item in inventory.modules)
     assert f"**Analyzed:** {len(inventory.modules)} files" in report
     assert f"**Functions:** {len(inventory.functions)}" in report
+
+
+def test_staged_tree_is_read_without_taking_the_live_index_lock(tmp_path: Path) -> None:
+    """The validator must not die on a concurrent ``.git/index.lock``.
+
+    ``git write-tree`` holds ``index.lock`` with ``LOCK_DIE_ON_ERROR``, so a
+    parallel ``git status``/``git diff`` refresh of the same checkout (xdist
+    workers, an agent shell) used to kill ``validate_size_ratchet`` with exit
+    128 (CI run 31967137491). The staged tree is read from a private index copy.
+    """
+    from ouroboros.review import _staged_tree_without_index_lock
+
+    repo = tmp_path / "repo"
+    _bootstrap_repo(repo)
+    (repo / "staged.py").write_text("y = 2\n", encoding="utf-8")
+    _git(repo, "add", "staged.py")
+    expected = _git(repo, "write-tree")
+    assert expected != _git(repo, "rev-parse", "HEAD^{tree}")
+
+    lock = repo / ".git" / "index.lock"
+    lock.write_bytes(b"")
+    try:
+        # The fixture reaches the guarded branch: the plain command really dies here.
+        with pytest.raises(subprocess.CalledProcessError):
+            _git(repo, "write-tree")
+        assert _staged_tree_without_index_lock(repo) == expected
+        assert lock.exists()
+    finally:
+        lock.unlink(missing_ok=True)
+    assert _staged_tree_without_index_lock(repo) == expected
+
+
+def test_function_inventory_parses_each_distinct_module_text_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The first-parent history audit re-visits unchanged blobs once per commit.
+
+    Their function inventory is a pure function of (path, text): it is parsed
+    once and reused, so the audit scales with changed modules, not with
+    commits x modules (full-test windows in CI run 31968116192 hit the 300 s
+    per-test timeout at ~33 commits since the baseline). A different text or a
+    different path under the same text is a cache miss.
+    """
+    from ouroboros import review as review_module
+    from ouroboros.review import GatedModule, _iter_gated_functions_from_modules
+
+    calls: list[str] = []
+    real_parse = review_module.ast.parse
+
+    def counting_parse(source, filename="<unknown>", *args, **kwargs):
+        calls.append(filename)
+        return real_parse(source, filename, *args, **kwargs)
+
+    monkeypatch.setattr(review_module.ast, "parse", counting_parse)
+    monkeypatch.setattr(review_module, "_MODULE_FUNCTIONS_CACHE", {})
+    text_a = "def one():\n    return 1\n\n\nclass K:\n    def two(self):\n        return 2\n"
+    text_b = text_a + "\n\ndef three():\n    return 3\n"
+    module = GatedModule("ouroboros/example.py", 7, len(text_a), text_a)
+
+    first = tuple(_iter_gated_functions_from_modules([module]))
+    second = tuple(_iter_gated_functions_from_modules([module]))
+    assert first == second
+    assert [f.qualname for f in first] == ["one", "K.two"]
+    assert calls == ["ouroboros/example.py"]
+
+    tuple(_iter_gated_functions_from_modules([GatedModule("ouroboros/example.py", 11, len(text_b), text_b)]))
+    tuple(_iter_gated_functions_from_modules([GatedModule("ouroboros/other.py", 7, len(text_a), text_a)]))
+    assert calls == ["ouroboros/example.py", "ouroboros/example.py", "ouroboros/other.py"]
+
+    with pytest.raises(ValueError, match="invalid syntax"):
+        tuple(_iter_gated_functions_from_modules([GatedModule("ouroboros/bad.py", 1, 8, "def (:\n")]))

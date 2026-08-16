@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import hashlib
 import os
 import pathlib
 import subprocess
@@ -235,6 +236,31 @@ def _iter_lexical_functions(tree: ast.AST, path: str) -> Iterator[GatedFunction]
     yield from visit(tree, ())
 
 
+# (path, sha1 of the module text) -> its exact function inventory. Parsing is a
+# pure function of that key, and the first-parent history audit re-parses the
+# same unchanged blobs once per commit (~900 modules x every commit since the
+# baseline), which is what pushed the CI ratchet test past its per-test timeout
+# on the slowest runners. Bounded: cleared when it outgrows the working set.
+_MODULE_FUNCTIONS_CACHE: dict[tuple[str, str], tuple[GatedFunction, ...]] = {}
+_MODULE_FUNCTIONS_CACHE_LIMIT = 8192
+
+
+def _module_functions(module: GatedModule) -> tuple[GatedFunction, ...]:
+    key = (module.path, hashlib.sha1(module._source_text.encode("utf-8")).hexdigest())
+    cached = _MODULE_FUNCTIONS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        tree = ast.parse(module._source_text, filename=module.path)
+    except SyntaxError as exc:
+        raise ValueError(f"gated Python module has invalid syntax: {module.path}") from exc
+    functions = tuple(_iter_lexical_functions(tree, module.path))
+    if len(_MODULE_FUNCTIONS_CACHE) >= _MODULE_FUNCTIONS_CACHE_LIMIT:
+        _MODULE_FUNCTIONS_CACHE.clear()
+    _MODULE_FUNCTIONS_CACHE[key] = functions
+    return functions
+
+
 def _iter_gated_functions_from_modules(modules: Iterable[GatedModule]) -> Iterator[GatedFunction]:
     seen_keys: set[tuple[str, str]] = set()
     for module in modules:
@@ -245,11 +271,7 @@ def _iter_gated_functions_from_modules(modules: Iterable[GatedModule]) -> Iterat
             continue
         if any(part in _FUNCTION_SKIP_DIR_NAMES for part in posix.parts[:-1]):
             continue
-        try:
-            tree = ast.parse(module._source_text, filename=module.path)
-        except SyntaxError as exc:
-            raise ValueError(f"gated Python module has invalid syntax: {module.path}") from exc
-        for function in _iter_lexical_functions(tree, module.path):
+        for function in _module_functions(module):
             key = (function.path, function.qualname)
             if key in seen_keys:
                 raise ValueError(f"duplicate function ratchet key: {key!r}")
@@ -700,6 +722,40 @@ def _audit_committed_manifest_history(
     return errors, previous, latest_text
 
 
+def _staged_tree_without_index_lock(root: pathlib.Path) -> str:
+    """Return the staged tree id (``git write-tree``) without taking ``index.lock``.
+
+    ``git write-tree`` rewrites the cache-tree extension into the index and
+    therefore holds ``.git/index.lock`` with ``LOCK_DIE_ON_ERROR``: any
+    concurrent ``git status`` / ``git diff`` refresh of the same checkout
+    (parallel test workers, an agent shell, an editor) makes it die with exit
+    128 even though the staged content is perfectly readable. The validator only
+    needs the tree id, so it writes the tree from a private copy of the index
+    (``GIT_INDEX_FILE``): same staged snapshot, no lock on the live index.
+    An index without a checkout-level index file (bare/odd layouts) falls back
+    to the plain command.
+    """
+    index_path = subprocess.run(
+        ["git", "rev-parse", "--git-path", "index"],
+        cwd=root, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    index_file = pathlib.Path(index_path)
+    if not index_file.is_absolute():
+        index_file = root / index_file
+    if not index_file.is_file():
+        return subprocess.run(
+            ["git", "write-tree"], cwd=root, check=True, capture_output=True, text=True
+        ).stdout.strip()
+    with tempfile.TemporaryDirectory(prefix="ouroboros-ratchet-index-") as tmp:
+        private_index = pathlib.Path(tmp) / "index"
+        private_index.write_bytes(index_file.read_bytes())
+        env = dict(os.environ)
+        env["GIT_INDEX_FILE"] = str(private_index)
+        return subprocess.run(
+            ["git", "write-tree"], cwd=root, check=True, capture_output=True, text=True, env=env
+        ).stdout.strip()
+
+
 def validate_size_ratchet(
     repo_dir: pathlib.Path,
     *,
@@ -718,9 +774,7 @@ def validate_size_ratchet(
     head_tree = subprocess.run(
         ["git", "rev-parse", "HEAD^{tree}"], cwd=root, check=True, capture_output=True, text=True
     ).stdout.strip()
-    index_tree = subprocess.run(
-        ["git", "write-tree"], cwd=root, check=True, capture_output=True, text=True
-    ).stdout.strip()
+    index_tree = _staged_tree_without_index_lock(root)
     head_text = _git_show_manifest(root, head, manifest_path)
     if head_text is None:
         if current.baseline_source_sha != head:
