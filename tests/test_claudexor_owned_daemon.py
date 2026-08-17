@@ -578,6 +578,9 @@ def _create_login(monkeypatch, tmp_path, body: dict, *, operations, raises=False
         def ensure_running(self):
             return object()
 
+        def run_deferred_rotation(self, endpoint):
+            pass  # no spawn here ⇒ nothing was ever deferred
+
     class FakeGateway:
         def __init__(self, endpoint):
             pass
