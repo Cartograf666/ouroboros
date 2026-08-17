@@ -169,13 +169,21 @@ def executor_blocked_outcome(decision: SubagentExecutorResolution) -> Tuple[str,
         if decision.reason == "delegate_visibility_unverified":
             return text, {"execution_status": "infra_failed", "reason_code": "delegate_visibility_unverified"}
         return text, {"execution_status": "infra_failed", "reason_code": "delegate_tools_invisible"}
+    # ":delegation_" is route_health's structural refinement (Phase D3): the
+    # catalog row's manifest cannot run delegated work AT ALL, so "reschedule
+    # once the route recovers" would honestly mean "wait forever" (e.g. agy).
     text = (
         "⚠️ EXECUTOR_UNAVAILABLE: this subagent was pinned to the delegated substrate "
         f"(executor='harness') and the route cannot run: {decision.reason}."
         + (f" It resets at {decision.reset_at}." if decision.reset_at else "")
         + " The task was NOT run on metered API tokens, because that spend is exactly "
-        "what the pin exists to prevent. Reschedule once the route recovers, or "
-        "schedule it again with executor='auto' to accept metered spend."
+        "what the pin exists to prevent. "
+        + ("This harness structurally cannot run delegated work (its manifest does not "
+           "support it), so waiting will not heal it: change the delegated route, or "
+           "schedule it again with executor='auto' to accept metered spend."
+           if ":delegation_" in decision.reason else
+           "Reschedule once the route recovers, or "
+           "schedule it again with executor='auto' to accept metered spend.")
     )
     return text, {
         "execution_status": "infra_failed",

@@ -60,8 +60,13 @@ class ReviewRouteUnavailable(RuntimeError):
     """Typed refusal for a route with no executor in this build.
 
     A missing route fails loudly on its own slot; it never falls back to another
-    route, model, or profile.
+    route, model, or profile. ``code`` is the machine-readable refusal vocabulary
+    (a ``route_health`` reason or a site code); "" is an uncoded raise.
     """
+
+    def __init__(self, message: str, *, code: str = "") -> None:
+        super().__init__(message)
+        self.code = str(code or "")
 
 
 class ReviewSessionWaitingOnUser(RuntimeError):
@@ -776,8 +781,7 @@ def _owned_started_review_custody(
             "delegated review started-run recovery could not corroborate "
             f"ownership for run {run_id} (lookup={ownership}, "
             f"claimant={claimant_task_id!r}, invocation_owner={invocation_owner!r}, "
-            f"custody_owner={custody_owner!r})"
-        )
+            f"custody_owner={custody_owner!r})", code="review_recovery_ownership_unverified")
     return run_id, found
 
 
@@ -791,16 +795,14 @@ def _review_recovery_facts(
     if not isinstance(run_request, dict) or not run_request:
         raise ReviewRouteUnavailable(
             "delegated review recovery has no canonical stored request; "
-            "the existing invocation is not re-derived"
-        )
+            "the existing invocation is not re-derived", code="review_recovery_request_missing")
     stored_root = str((run_request.get("scope") or {}).get("root") or "")
     if str(run_request.get("prompt") or "") != prompt or stored_root != root:
         raise ReviewRouteUnavailable(
             "delegated review retry replays a recorded invocation whose "
             f"{'prompt' if stored_root == root else 'session root'} differs from "
             "this call's; the durable retry token remains untouched and the "
-            "recorded invocation is not replayed against a different review"
-        )
+            "recorded invocation is not replayed against a different review", code="review_recovery_request_mismatch")
     if started_custody is not None:
         route_id = str(started_custody.route_id or "")
         model = str(started_custody.model or "")
@@ -912,8 +914,8 @@ def run_delegated_review_session(
         if route is None:
             raise ReviewRouteUnavailable(
                 "delegated review session has no configured session route "
-                f"({REVIEW_SESSION_ROUTE_ENV} / OUROBOROS_SUBAGENT_HARNESS are empty or `off`)"
-            )
+                f"({REVIEW_SESSION_ROUTE_ENV} / OUROBOROS_SUBAGENT_HARNESS are empty or `off`)",
+                code="session_route_unconfigured")
         project_id, existing_project, key, schema_asked = "", "", "", False
     gateway = ensure_owned_gateway()
     try:
@@ -921,18 +923,21 @@ def run_delegated_review_session(
             # Admission health applies only while this call may POST. A durable
             # STARTED run needs gateway availability for GET/poll, but a changed
             # quota window cannot invalidate a run that already exists.
+            # The slot's manual credential pin rides into the health read: a pinned
+            # profile passes the harness-row status through — the ENGINE's typed
+            # refusal is authoritative for it (owner decision 2026-08-18, D1).
             unavailable, reset_at = route_health(
                 gateway, route.route_id, shape, route_model=route.model,
+                pinned_profile=str(getattr(route, "profile_id", "") or ""),
             )
             if unavailable:
                 raise ReviewRouteUnavailable(
-                    f"delegated review route unavailable: {unavailable}")
+                    f"delegated review route unavailable: {unavailable}", code=unavailable)
             if reset_at:
                 raise ReviewRouteUnavailable(
                     "delegated review route subscription window is exhausted "
                     f"(resets {reset_at}); this slot fails typed — never a silent "
-                    "fallback onto metered API spend"
-                )
+                    "fallback onto metered API spend", code="subscription_window_exhausted")
         if not recovering:
             existing_project = gateway.find_project_id(root)
             project_id = existing_project or gateway.register_project(root)
@@ -1003,8 +1008,7 @@ def run_delegated_review_session(
                 )
                 raise ReviewRouteUnavailable(
                     "the durable start-request row could not be written; the "
-                    "delegated review session was NOT started"
-                )
+                    "delegated review session was NOT started", code="start_request_row_unwritable")
             try:
                 handle = gateway.start_run(run_request, idempotency_key=invocation_id)
             except ClaudexorUnavailable as exc:
@@ -1039,8 +1043,7 @@ def run_delegated_review_session(
                 )
                 state["pending_invocation_id"] = invocation_id
                 raise ReviewRouteUnavailable(
-                    f"Claudexor returned a queued handle without a run id: {handle!r}"
-                )
+                    f"Claudexor returned a queued handle without a run id: {handle!r}", code="queued_without_run_id")
         state.pop("pending_invocation_id", None)
         if started_custody is not None:
             entry = started_custody
@@ -1297,8 +1300,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 raise ReviewRouteUnavailable(
                     "agent_session slot has no session task: the surface must supply "
                     "the route-owned task text (request.session_task) — the assembled "
-                    "api pack is deliberately not sendable to a session"
-                )
+                    "api pack is deliberately not sendable to a session", code="session_task_missing")
             parts = [
                 "You are an independent Ouroboros reviewer slot running as a "
                 "read-only agent session.",
@@ -1353,8 +1355,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             if route is None:
                 raise ReviewRouteUnavailable(
                     f"agent_session slot {self.assignment.slot.slot_id} has an "
-                    f"unparsable session target {spec!r}"
-                )
+                    f"unparsable session target {spec!r}", code="session_target_unparsable")
             # D1/6.3: effort has ONE source — the per-slot effort field. The
             # target_id carries route identity only; any effort a caller
             # embedded in the spec (`harness=model:effort`) is dropped so the
@@ -1368,8 +1369,8 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
         if route is None:
             raise ReviewRouteUnavailable(
                 "agent_session review slot has no configured session route "
-                f"({REVIEW_SESSION_ROUTE_ENV} / OUROBOROS_SUBAGENT_HARNESS are empty or `off`)"
-            )
+                f"({REVIEW_SESSION_ROUTE_ENV} / OUROBOROS_SUBAGENT_HARNESS are empty or `off`)",
+                code="session_route_unconfigured")
         return route
 
     def _custody_drive(self) -> Any:
@@ -1377,8 +1378,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
         if drive is None:
             raise ReviewRouteUnavailable(
                 "agent_session slot has no custody root: a delegated review run "
-                "must be durably custodied before it may start"
-            )
+                "must be durably custodied before it may start", code="custody_root_missing")
         return drive
 
     def _run_session(self) -> None:
@@ -1387,8 +1387,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
         if not root:
             raise ReviewRouteUnavailable(
                 "agent_session slot has no session root: the surface must name the "
-                "repository root the reviewer session runs in"
-            )
+                "repository root the reviewer session runs in", code="session_root_missing")
         facts = run_delegated_review_session(
             prompt=self.session_prompt,
             root=root,
@@ -1577,10 +1576,11 @@ def _review_route_executor(assignment: ReviewAssignment, *, llm: Any = None) -> 
     try:
         route = ReviewRouteKind(assignment.route)
     except ValueError:
-        raise ReviewRouteUnavailable(f"unknown review route: {assignment.slot.route!r}") from None
+        raise ReviewRouteUnavailable(f"unknown review route: {assignment.slot.route!r}", code="unknown_review_route") from None
     executor_cls = _REVIEW_ROUTE_EXECUTORS.get(route)
     if executor_cls is None:
-        raise ReviewRouteUnavailable(f"review route not implemented in this build: {route.value}")
+        raise ReviewRouteUnavailable(f"review route not implemented in this build: {route.value}",
+                                     code="review_route_not_implemented")
     return executor_cls(assignment, llm=llm)
 
 

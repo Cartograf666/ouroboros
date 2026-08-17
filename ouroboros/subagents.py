@@ -361,6 +361,7 @@ def resolve_subagent_executor(
 
 def route_health(
     gateway: Any, route_id: str, shape: DelegatedRunShape, *, route_model: str = "",
+    pinned_profile: str = "",
 ) -> tuple[str, str]:
     """Return ``(unavailable_reason, reset_at)`` for a route about to run ``shape``.
 
@@ -375,6 +376,15 @@ def route_health(
     judged against the model the run would actually use. A full-window exhaustion that
     names no reset instant still reports ``subscription_window_exhausted`` — as the
     REASON with an empty ``reset_at``, since an unknown healing time is not health.
+
+    ``pinned_profile`` is the caller's manual credential pin when it carries one
+    (reviewer-slot rows today). A pinned profile SKIPS the harness-row status
+    refusal: a row with no default credential store reads ``unavailable`` FOREVER
+    by design (agy, engine INV-135) even while a named profile works, so refusing
+    on the row here meant a verified pin could never reach the engine at all. For
+    a pinned run the ENGINE's typed refusal is authoritative (owner decision
+    2026-08-18); the catalog-absence, access-profile, version-floor and quota
+    checks below still apply unchanged.
     """
     from ouroboros.config import CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION
     from ouroboros.gateways.claudexor import engine_at_least
@@ -387,8 +397,18 @@ def route_health(
             break
     if entry is None:
         return "route_not_in_capability_catalog", ""
-    if not entry.get("enabled") or str(entry.get("status") or "") != "ok":
-        return f"route_status_{entry.get('status') or 'disabled'}", ""
+    if not pinned_profile and (
+            not entry.get("enabled") or str(entry.get("status") or "") != "ok"):
+        status = f"route_status_{entry.get('status') or 'disabled'}"
+        delegation = entry.get("delegation")
+        if (shape.delegated and isinstance(delegation, dict)
+                and delegation.get("available") is False):
+            # The SAME refusal, refined — disclosure, never a new gate: the code
+            # carries the catalog row's own structural fact so downstream wording
+            # stops telling a child to wait for a harness whose manifest cannot
+            # run delegated work at all.
+            return f"{status}:delegation_{delegation.get('reason') or 'unsupported'}", ""
+        return status, ""
     supported = [str(v) for v in entry.get("accessProfilesSupported") or []]
     # A DELEGATED run is externally confined, and the engine rewrites its access to
     # `external_sandbox_full` before admitting it (`RequestRequirementsResolver.adapterAccess`)
