@@ -294,3 +294,75 @@ def test_compiler_reads_no_settings_and_carries_no_transport(monkeypatch):
     for forbidden in ("import httpx", "import requests", "import socket",
                       "import urllib", "ClaudexorGateway", "load_settings"):
         assert forbidden not in source, f"{forbidden} has no place in a pure compiler"
+
+
+# Verbatim from the Antigravity CLI the Claudexor 3.5.0 agy adapter pins
+# (AGY_KNOWN_MODELS, verified against agy 1.1.13). Fourteen ids; effort rides
+# inside the slug, and gemini-3.1-pro exists ONLY at high/low.
+AGY_LIVE_MODELS = (
+    "gemini-3.7-flash-high", "gemini-3.7-flash-medium", "gemini-3.7-flash-low",
+    "gemini-3.6-flash-high", "gemini-3.6-flash-medium", "gemini-3.6-flash-low",
+    "gemini-3.5-flash-high", "gemini-3.5-flash-medium", "gemini-3.5-flash-low",
+    "gemini-3.1-pro-high", "gemini-3.1-pro-low",
+    "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium",
+)
+
+
+def _catalog_with_agy():
+    return {**LIVE_MODELS, "agy": AGY_LIVE_MODELS}
+
+
+@pytest.mark.parametrize("connected", [
+    ("agy",),
+    ("claude", "agy"),
+    ("codex", "agy"),
+    ("cursor", "agy"),
+    ("claude", "codex", "cursor", "agy"),
+])
+def test_agy_combination_refuses_typed_matrix_row_absent(connected):
+    preset = compile_install_preset(_discoveries(*connected, models=_catalog_with_agy()))
+    assert preset.refusal is not None
+    assert preset.refusal.code == "matrix_row_absent"
+    assert "agy" in preset.connected
+    assert preset.settings_keys() == {}
+    assert not preset.ok
+
+
+def test_matrix_row_absent_wins_over_empty_discovery():
+    # An unratified combination refuses as unratified whatever its discovery
+    # holds — the guard runs before discovery validation on purpose.
+    preset = compile_install_preset([HarnessDiscovery(harness_id="agy", model_ids=())])
+    assert preset.refusal is not None
+    assert preset.refusal.code == "matrix_row_absent"
+
+
+def test_no_recognized_combination_can_raise():
+    # The KeyError class: every non-empty subset of PRESET_HARNESSES must come
+    # back as a compiled preset or a typed refusal, never an exception.
+    import itertools
+
+    from ouroboros.subscription_install_presets import PRESET_HARNESSES
+
+    catalog = _catalog_with_agy()
+    for size in range(1, len(PRESET_HARNESSES) + 1):
+        for combo in itertools.combinations(PRESET_HARNESSES, size):
+            preset = compile_install_preset(_discoveries(*combo, models=catalog))
+            assert preset.ok or preset.refusal is not None
+
+
+def test_agy_alias_table_spells_effort_inside_the_id():
+    from ouroboros.subscription_install_presets import (
+        _EFFORT_IN_MODEL_ID,
+        _MODEL_ALIASES,
+        HARNESS_AGY,
+    )
+
+    assert HARNESS_AGY in _EFFORT_IN_MODEL_ID
+    aliases = _MODEL_ALIASES[HARNESS_AGY]
+    # Every alias candidate formats to an id the pinned vendor CLI really
+    # publishes, so a future matrix row resolves exact discovery ids.
+    assert aliases["gemini-3.7-flash"][0].format(effort="high") in AGY_LIVE_MODELS
+    assert aliases["gemini-3.1-pro"][0].format(effort="high") in AGY_LIVE_MODELS
+    assert aliases["gemini-3.1-pro"][0].format(effort="low") in AGY_LIVE_MODELS
+    # Documented trap for the future dictation: pro has no -medium slug.
+    assert aliases["gemini-3.1-pro"][0].format(effort="medium") not in AGY_LIVE_MODELS

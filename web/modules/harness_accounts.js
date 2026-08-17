@@ -54,7 +54,7 @@ import {
     readsFor,
 } from './claudexor_status_store.js';
 import { openConfirmDialog } from './confirm_dialog.js';
-import { createLoginCardController } from './harness_login_cards.js';
+import { createLoginCardController, normalizeProfileName } from './harness_login_cards.js';
 import { formatRelativeAge } from './ui_helpers.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
@@ -194,19 +194,20 @@ export function quotaSummary(snapshots, harnessId, subjectId = '',
     };
 }
 
-export function normalizeProfileName(raw) {
-    // The profile-id alphabet the login request accepts: lowercased, and every
-    // character outside it becomes '-'.
-    return String(raw || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-');
-}
+// The profile-id alphabet lives with the login card now (its own "name the
+// account" face applies the same validation the Add-account dialog does);
+// re-exported so this module keeps its established import path.
+export { normalizeProfileName };
 
 export async function promptProfileName({ dialogImpl = openConfirmDialog, family = '' } = {}) {
     // pywebview's WKWebView implements no window.prompt — it answers null
     // silently, so the old prompt()-based Add-account flow was a dead button on
     // the desktop app. The in-house input dialog asks instead, and it loops
     // until the typed name already IS its normalized form: a name that
-    // normalization would change ("Работа" → "------", "Work" → "work") is
-    // shown back, editable, BEFORE any login starts — never rewritten silently.
+    // normalization would change ("Work" → "work") is shown back, editable,
+    // BEFORE any login starts — never rewritten silently — and a name nothing
+    // slug-legal survives of ("Работа") re-asks with the engine's contract
+    // spelled out instead of offering an illegal all-separator id.
     let initialValue = '';
     let body = `Name for the additional ${family || 'agent'} account (e.g. work, backup).`
         + ' Lowercase letters, digits, "-" and "_" — anything else becomes "-".';
@@ -215,7 +216,18 @@ export async function promptProfileName({ dialogImpl = openConfirmDialog, family
         if (!answer?.confirmed) return '';
         const raw = String(answer.value || '').trim();
         const normalized = normalizeProfileName(raw);
-        if (!normalized) return '';
+        if (!raw) return '';  // a confirmed BLANK keeps meaning "never mind"
+        if (!normalized) {
+            // A typed name nothing slug-legal survives of (engine contract
+            // ^[a-z0-9][a-z0-9_-]{0,63}$ — e.g. no ASCII alphanumerics at
+            // all): re-ask with the contract spelled out instead of
+            // abandoning the add or submitting a name the engine refuses.
+            initialValue = '';
+            body = `"${raw}" cannot become an account name. `
+                + 'Enter a name that starts with a lowercase letter or digit — '
+                + 'letters, digits, "-" and "_", at most 64 characters.';
+            continue;
+        }
         if (normalized === raw) return normalized;
         initialValue = normalized;
         body = `"${raw}" will be saved as "${normalized}" — edit the name or continue.`;
@@ -397,7 +409,10 @@ export function daemonStatusLine(payload, { checking = false, reads = null } = {
 // Discovery needs a running daemon, and on first run there is none — so with
 // nothing discovered the UI still offers a Connect affordance, and the first
 // Connect is exactly what provisions the owned daemon (D30). Presentation
-// only; the login flow itself stays harness-agnostic.
+// only; the login flow itself stays harness-agnostic. agy (Antigravity) is
+// deliberately NOT bootstrapped: it has no engine-default credential store,
+// so a pre-discovery card could only refuse — its card appears from live
+// discovery the moment the engine answers.
 export const BOOTSTRAP_HARNESSES = ['codex', 'claude', 'cursor'];
 
 // The display name comes from the store, which owns the payload it reads and is
@@ -727,7 +742,7 @@ export function renderAgentAccountsSection() {
         <div class="form-section" id="harness-accounts-section">
             <h3>Accounts</h3>
             <div class="settings-section-copy">
-                Agent subscriptions (Claude Code, Codex, Cursor) used by delegated subagents and
+                Agent subscriptions used by delegated subagents and
                 review lanes. Every account of a family is equivalent — work rotates across all of
                 them. Accounts live in Ouroboros's own agent home; your personal logins are never
                 read or imported.

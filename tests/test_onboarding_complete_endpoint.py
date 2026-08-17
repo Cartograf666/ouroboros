@@ -203,7 +203,7 @@ def test_daemon_unavailable_persists_nothing_and_keeps_the_wizard_open(onboardin
     assert body["code"] == "daemon_unavailable"
     assert body["can_skip"] is True
     assert body["saved"] is False
-    assert "could not be verified" in body["error"]
+    assert "could not be applied" in body["error"]
     # NOTHING was written: no settings file, no supervisor, no env projection.
     assert not onboarding.settings_path.exists()
     assert onboarding.calls["supervisor"] == 0
@@ -1045,3 +1045,83 @@ def test_an_unreadable_settings_file_can_never_compare_equal(onboarding, monkeyp
 
     assert first.startswith("unreadable:") and second.startswith("unreadable:")
     assert first != second, "an unreadable file must refuse, never satisfy equality"
+
+
+def test_a_connected_agy_account_refuses_typed_until_the_matrix_is_dictated(onboarding):
+    # agy is RECOGNIZED by the preset compiler but has no ratified matrix rows
+    # yet (issue #232: the owner dictates its seats separately). A connected
+    # agy account at install time must therefore land on the same typed
+    # finish-without-defaults wall as any other compiler refusal — never a
+    # bare 500 (the pre-guard KeyError class).
+    # The REAL agy wire shape (Claudexor INV-135): a harness with no default
+    # credential store reports its harness ROW "unavailable" structurally and
+    # its next_up as kind="none" (the default credential is never ready), so
+    # the routable verdict comes from the CONFIGURED-profile fallback over the
+    # verified named profile. The old fixture's status:"ok" native agy account
+    # cannot occur.
+    onboarding.calls["snapshot_payload"] = {
+        "daemon": {"state": "running"},
+        "harnesses": [
+            {"id": "claude", "status": "ok", "enabled": True,
+             "models": [{"id": "claude-opus-5"}, {"id": "claude-sonnet-5"},
+                        {"id": "claude-fable-5"}, {"id": "claude-opus-4-6"}]},
+            {"id": "agy", "status": "unavailable", "enabled": True,
+             "models": [{"id": "gemini-3.7-flash-high"}, {"id": "gemini-3.1-pro-high"}]},
+        ],
+        "profiles": {
+            # next_up kind="none": the engine returns none whenever the
+            # DEFAULT credential is not ready, which is agy's permanent state —
+            # the routable verdict must come from the configured-profile
+            # fallback, not from a profile-kind next_up.
+            "harnessAccounts": [
+                _native_account("claude"),
+                {"harness_id": "agy", "native_credentials_enabled": True,
+                 "native_login_detected": False, "identity": None,
+                 "next_up": {"kind": "none", "reason": "no default credential store"}},
+            ],
+            "profiles": [_profile("agy", "work")],
+        },
+    }
+
+    response = onboarding.client.post(
+        "/api/onboarding/complete",
+        json={**WIZARD_PAYLOAD, "subscriptionsConnected": True},
+    )
+
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["code"] == "matrix_row_absent"
+    assert body["can_skip"] is True
+    assert body["saved"] is False
+    assert not onboarding.settings_path.exists()
+    assert onboarding.calls["supervisor"] == 0
+
+
+def test_an_unavailable_harness_row_with_a_verified_named_profile_is_routable():
+    # The runnability proof for a named profile is its own doctor probe, not
+    # the harness row: agy's row is STRUCTURALLY "unavailable" (no default
+    # credential store, Claudexor INV-135), and refusing on the row alone made
+    # the matrix_row_absent contract unreachable on the real wire shape. A
+    # native default seat still requires a runnable row (its only signal).
+    from ouroboros.gateway.onboarding import subscription_routable_harnesses
+
+    snapshot = {
+        "harnesses": [{"id": "agy", "status": "unavailable", "enabled": True}],
+        "profiles": {
+            "harnessAccounts": [_profile_account("agy", "work")],
+            "profiles": [_profile("agy", "work")],
+        },
+    }
+    routable, refused = subscription_routable_harnesses(snapshot)
+    assert "agy" in routable, refused
+    assert "no default credential store" in routable["agy"]
+
+    # Same row, but only a signed-in DEFAULT session: still refused — the
+    # harness row is that seat's only runnability signal.
+    snapshot = {
+        "harnesses": [{"id": "agy", "status": "unavailable", "enabled": True}],
+        "profiles": {"harnessAccounts": [_native_account("agy")], "profiles": []},
+    }
+    routable, refused = subscription_routable_harnesses(snapshot)
+    assert "agy" not in routable
+    assert refused["agy"] == "the engine reports it unavailable"

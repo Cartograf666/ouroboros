@@ -940,9 +940,12 @@ class ClaudexorLoginJobProblem(TypedDict, total=False):
     ``error`` prose, optional stable machine ``code``, optional bounded
     ``required_actions`` naming the engine's continuation (e.g. reconcile's
     409 ``setup_termination_unconfirmed`` carries
-    ``["retry_setup_reconciliation"]``). Daemon 404/410 job-absence verdicts
-    and the operation-scoped input/reconcile 409s ride this shape with their
-    original status; transport failure and daemon 5xx stay the proxy's 503.
+    ``["retry_setup_reconciliation"]``). Daemon 404/410 job-absence verdicts,
+    the operation-scoped input/reconcile 409s, and a create-time daemon 400 —
+    the engine's verdict on the requested login SHAPE (e.g. a harness with no
+    default credential store refusing a default login) — ride this shape with
+    their original status, stable code and the engine's own sentence;
+    transport failure and daemon 5xx stay the proxy's 503.
     Not an action framework: the list mirrors the daemon's own top-level
     ``ControlProblem.requiredActions`` (at most 16 strings of at most 512
     chars) and nothing else."""
