@@ -54,9 +54,9 @@ def capture_staged_diff(repo_dir: pathlib.Path, *, unified: int = 3) -> str:
         )
 
 
-def _git_bytes(repo_dir: pathlib.Path, args: list[str]) -> bytes:
+def _git_run(repo_dir: pathlib.Path, args: list[str]) -> subprocess.CompletedProcess | None:
     try:
-        result = subprocess.run(
+        return subprocess.run(
             ["git", *args],
             cwd=repo_dir,
             stdout=subprocess.PIPE,
@@ -64,16 +64,51 @@ def _git_bytes(repo_dir: pathlib.Path, args: list[str]) -> bytes:
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _git_bytes(repo_dir: pathlib.Path, args: list[str]) -> bytes:
+    result = _git_run(repo_dir, args)
+    if result is None or result.returncode != 0:
         return b""
-    return result.stdout if result.returncode == 0 else b""
+    return result.stdout
 
 
-def _tree_entry(repo_dir: pathlib.Path, ref: str, rel: str) -> tuple[str, str]:
-    record = _git_bytes(repo_dir, ["ls-tree", "-z", ref, "--", rel]).split(b"\0", 1)[0]
+def _ref_status(repo_dir: pathlib.Path, ref: str) -> bool | None:
+    """Resolve ``ref``: True when it names a real object, False when git
+    PROVES it absent (``--verify --quiet`` exits 1: no MERGE_HEAD outside a
+    merge, an unborn HEAD), None when the probe itself failed (spawn error,
+    timeout, any other exit) — a failed probe is not proof of absence.
+
+    Disclosed residual: git reports an unreadable loose ref file with the
+    same exit 1 as a missing ref, so broken ref storage still reads as
+    absence; git itself cannot tell those apart at this seam."""
+    result = _git_run(repo_dir, ["rev-parse", "--verify", "--quiet", ref])
+    if result is None:
+        return None
+    if result.returncode == 0:
+        return True
+    return False if result.returncode == 1 else None
+
+
+def _tree_entry(repo_dir: pathlib.Path, ref: str, rel: str) -> tuple[str, str, bool]:
+    """Look up ``rel`` in ``ref``'s tree. Returns ``(mode, blob, ok)``.
+
+    ``ok`` is False when the tree read failed and the ref is not PROVEN
+    absent: the ref resolves but its tree is corrupt or unreadable, or the
+    absence probe itself errored (spawn failure, timeout, unexpected exit).
+    Only a proven missing ref (no MERGE_HEAD outside a merge, an unborn
+    HEAD) or a path with no entry in a tree that read fine is a real
+    ``ok=True`` absence.
+    """
+    result = _git_run(repo_dir, ["ls-tree", "-z", ref, "--", rel])
+    if result is None or result.returncode != 0:
+        return "", "", _ref_status(repo_dir, ref) is False
+    record = (result.stdout or b"").split(b"\0", 1)[0]
     fields = record.partition(b"\t")[0].split()
     if len(fields) < 3:
-        return "", ""
-    return fields[0].decode("ascii"), fields[2].decode("ascii")
+        return "", "", True
+    return fields[0].decode("ascii"), fields[2].decode("ascii"), True
 
 
 def _object_size(repo_dir: pathlib.Path, blob_oid: str) -> str:
@@ -107,8 +142,10 @@ def render_staged_binary_metadata(repo_dir: pathlib.Path, rel: str) -> str | Non
             object_size = _object_size(repo_dir, blob_oid)
             if not object_size:
                 return None
-            _head_mode, head_blob = _tree_entry(repo_dir, "HEAD", rel)
-            _merge_mode, merge_blob = _tree_entry(repo_dir, "MERGE_HEAD", rel)
+            _head_mode, head_blob, head_ok = _tree_entry(repo_dir, "HEAD", rel)
+            _merge_mode, merge_blob, merge_ok = _tree_entry(repo_dir, "MERGE_HEAD", rel)
+            if not head_ok or not merge_ok:
+                return None
             return (
                 "*(binary bytes are represented by exact Git metadata for this review; "
                 "they are not rendered as text)*\n\n"
@@ -123,8 +160,10 @@ def render_staged_binary_metadata(repo_dir: pathlib.Path, rel: str) -> str | Non
     ).split(b"\0")
     if expected_path not in deleted:
         return None
-    head_mode, head_blob = _tree_entry(repo_dir, "HEAD", rel)
-    merge_mode, merge_blob = _tree_entry(repo_dir, "MERGE_HEAD", rel)
+    head_mode, head_blob, head_ok = _tree_entry(repo_dir, "HEAD", rel)
+    merge_mode, merge_blob, merge_ok = _tree_entry(repo_dir, "MERGE_HEAD", rel)
+    if not head_ok or not merge_ok:
+        return None
     parent_blob = head_blob or merge_blob
     object_size = _object_size(repo_dir, parent_blob) if parent_blob else ""
     if not parent_blob or not object_size:
