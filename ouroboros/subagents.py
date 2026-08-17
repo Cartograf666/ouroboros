@@ -821,7 +821,8 @@ def preflight_native_fallback_dispatch(
         lane_provenance=lane.provenance,
         effective_effort=effective_effort,
         effective_executor="native",
-        reason="; ".join(reasons),
+        reduction_reasons=tuple(reasons),
+        reason=derive_capability_reason(reasons),
         reduced=True,
     )
     return dataclasses.replace(
@@ -835,6 +836,17 @@ def preflight_native_fallback_dispatch(
             executor="native", reason=reason, reset_at="",
         ),
     )
+
+
+def derive_capability_reason(
+    reduction_reasons: Any, substrate_disclosures: Any = (),
+) -> str:
+    """THE one author of ``CapabilityDelta.reason``: every writer (dispatch
+    resolution, preflight fallback/append, completion substrate amendment)
+    derives the string from the typed lists through this join, so string and
+    lists structurally cannot diverge (B4); old durable hand-concatenated
+    records stay readable. ``str()`` keeps the join total over stored garbage."""
+    return "; ".join(str(r) for r in [*(reduction_reasons or ()), *(substrate_disclosures or ())])
 
 
 @dataclass(frozen=True)
@@ -872,6 +884,12 @@ class CapabilityDelta:
     effective_executor: str = "native"
     reason: str = ""
     reduced: bool = False
+    # The TYPED axes behind `reason` (B4, decision 7A): dispatch-time reduction
+    # axes and completion-seam substrate facts are UNRELATED — spliced into one
+    # string they read as false causality. `reason` is DERIVED from these lists
+    # (`derive_capability_reason`); additive — old string-only records stay readable.
+    reduction_reasons: tuple = ()
+    substrate_disclosures: tuple = ()
     # A field that was accepted once, is still on durable records, and is now
     # IGNORED — stated here rather than dropped, because a value that silently stops
     # meaning anything is the same class of defect as a reduction nobody announces.
@@ -890,6 +908,8 @@ class CapabilityDelta:
             "effective_executor": self.effective_executor,
             "reason": self.reason,
             "reduced": bool(self.reduced),
+            "reduction_reasons": [str(r) for r in self.reduction_reasons],
+            "substrate_disclosures": [str(s) for s in self.substrate_disclosures],
             "legacy_note": self.legacy_note,
         }
 
@@ -922,6 +942,10 @@ def capability_delta_disclosures(delta: Mapping[str, Any]) -> List[str]:
     effective_executor = str(delta.get("effective_executor") or "")
     if requested_executor != "auto" and effective_executor != requested_executor:
         parts.append(f"executor {requested_executor}->{effective_executor}")
+    # Completion-seam substrate facts (B4): SEPARATE entries after the slot
+    # axes, never spliced into an axis phrase (dispatch-time deltas carry none).
+    parts.extend(
+        str(fact) for fact in (delta.get("substrate_disclosures") or []) if str(fact))
     return parts
 
 
@@ -1165,7 +1189,8 @@ def resolve_subagent_dispatch(
         effective_effort=effective_effort,
         requested_executor=requested_executor,
         effective_executor=executor,
-        reason="; ".join(reasons),
+        reduction_reasons=tuple(reasons),
+        reason=derive_capability_reason(reasons),
         reduced=bool(reasons),
         legacy_note="; ".join(sorted(legacy_ignored.values())),
     )
@@ -1343,18 +1368,41 @@ def substrate_result_fields(envelope: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _disclose_native_only_substrate(delta: Dict[str, Any]) -> Dict[str, Any]:
+def _disclose_native_only_substrate(
+    delta: Dict[str, Any], *, nudge_ignored: bool = False,
+) -> Dict[str, Any]:
     """A harness dispatch that never started a delegated run is a REDUCED execution.
 
     Surfaced through the EXISTING capability_delta disclosure (owner decision:
     no new axis). Amends a COPY at the completion seam; the dispatch-time
-    author's dict on the live task stays untouched.
-    """
+    author's dict on the live task stays untouched. Facts land in the typed
+    ``substrate_disclosures`` list and ``reason`` re-derives from the lists (B4
+    single-author rule); a legacy dict predating the lists keeps its
+    concatenated string shape, appended exactly as before.
+
+    ``nudge_ignored`` adds the decision-3A fact
+    ``nanny_finalized_after_nudge_without_delegation``: the nudge was really
+    INJECTED (durable worker stamp — never the ctx flag, set even on
+    suppression) and the child still COMPLETED with zero delegated runs;
+    completed-only, so a cancelled nanny carries no false accusation."""
     amended = dict(delta or {})
-    reason = str(amended.get("reason") or "")
-    if "delegated_substrate_unused" not in reason:
-        amended["reason"] = "; ".join(
-            part for part in (reason, "delegated_substrate_unused") if part)
+    facts = ["delegated_substrate_unused"]
+    if nudge_ignored:
+        facts.append("nanny_finalized_after_nudge_without_delegation")
+    disclosures = [str(s) for s in (amended.get("substrate_disclosures") or [])]
+    disclosures.extend(fact for fact in facts if fact not in disclosures)
+    amended["substrate_disclosures"] = disclosures
+    reduction = amended.get("reduction_reasons")
+    if isinstance(reduction, list):
+        amended["reason"] = derive_capability_reason(reduction, disclosures)
+    else:
+        # Legacy record without the typed lists: preserve the historical
+        # concatenated string, idempotently (substring check as before).
+        reason = str(amended.get("reason") or "")
+        for fact in facts:
+            if fact not in reason:
+                reason = "; ".join(part for part in (reason, fact) if part)
+        amended["reason"] = reason
     amended["reduced"] = True
     return amended
 
@@ -1415,7 +1463,15 @@ def envelope_from_task(
     if substrate == SUBSTRATE_NATIVE_ONLY and str(task.get("effective_executor") or "") == "harness":
         # Q1A: a harness dispatch that ended native_only must not present as a
         # clean un-reduced execution — the envelope carries the amended copy.
-        capability_delta = _disclose_native_only_substrate(capability_delta)
+        # B3: the nudge-ignored fact rides only a COMPLETED finalization whose
+        # durable worker stamp proves the nudge was injected.
+        capability_delta = _disclose_native_only_substrate(
+            capability_delta,
+            nudge_ignored=(
+                str(status or "") == "completed"
+                and bool(evidence.get("nanny_nudge_recorded"))
+            ),
+        )
     return build_subagent_envelope(
         task_id=str(task.get("id") or ""),
         parent_task_id=str(task.get("parent_task_id") or ""),

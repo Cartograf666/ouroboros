@@ -404,7 +404,11 @@ def _compose_subagent_text(
             "[WRITE SURFACE]",
             f"You are a MUTATIVE (acting) child. write_surface={surface}."
             + (f" write_root={write_root}." if write_root else ""),
-            "Make all changes inside the write root only. Do NOT commit, run review / "
+            # Boundary-only wording (decision 2A): this text is frozen at
+            # schedule time, when the executor is unknown — it states WHERE
+            # changes land, never that the child executes them natively itself
+            # (the dispatch-time executor note owns execution framing).
+            "All changes land inside the write root only. Do NOT commit, run review / "
             "runtime / skills lifecycle, enable tools, or write cognitive memory. Your "
             "changes are captured as a workspace.patch and returned to the parent, who "
             "integrates and is the sole committer of the live body. Nested delegation is "

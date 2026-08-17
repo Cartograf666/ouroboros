@@ -1416,10 +1416,10 @@ def schedule_subagent_properties() -> Dict[str, Any]:
     from ouroboros.tool_access import SUBAGENT_CAPABILITIES
 
     return {
-        "objective": {"type": "string", "description": "Focused child objective. Be specific about scope."},
+        "objective": {"type": "string", "description": "Focused child objective. Be specific about scope. State the OUTCOME you need, not a step-by-step script: on a delegated (harness) dispatch the child forwards the work to its own delegated run, and a script-shaped objective reads as orders to execute natively."},
         "expected_output": {"type": "string", "description": "Concrete handoff expected from the child."},
         "role": {"type": "string", "description": "Optional freeform role label for lineage/UI, e.g. architecture-reviewer."},
-        "context": {"type": "string", "description": "Optional parent reference material. It is injected as context, not instructions."},
+        "context": {"type": "string", "description": "Optional parent reference material. It is injected as context, not instructions; for a harness-dispatched child it becomes the WORK ORDER for its delegated run's prompt, so put the recipe/details here rather than in the objective."},
         "constraints": {"type": "string", "description": "Optional constraints/non-goals for the child."},
         "memory_mode": {
             "type": "string",
@@ -1430,7 +1430,7 @@ def schedule_subagent_properties() -> Dict[str, Any]:
             "type": "string",
             "enum": ["auto", "main", "heavy", "light"],
             "default": "auto",
-            "description": "How STRONG this child should be. It says nothing about what the child may DO — authority comes from write_surface. CHOOSE CONSCIOUSLY: light for a read-only micro-check, a mini-audit, a formatting or lookup task; heavy for the strong acting/coding slot; main for the ordinary strong model. Omitting it (auto) INHERITS YOUR OWN lane — the right answer when the child's answer gets committed, or when you will act on it without re-checking. Cheap work must be NAMED light, not left unsaid. An empty Heavy/Light slot falls back to Main and the child reports the reduction in capability_delta. Depth does not change the lane; a child that finds the work harder raises itself with switch_model.",
+            "description": "How STRONG this child should be. It says nothing about what the child may DO — authority comes from write_surface. CHOOSE CONSCIOUSLY: light for a read-only micro-check, a mini-audit, a formatting or lookup task; heavy for the strong acting/coding slot; main for the ordinary strong model. Omitting it (auto) INHERITS YOUR OWN lane — the right answer when the child's answer gets committed, or when you will act on it without re-checking. Leave auto absent a specific API-strength need: an explicit lane OVERRIDES dispatch policy (a harness-dispatched nanny's own metered rounds default to the cheap light lane, and naming a lane cancels that economy). Cheap work must be NAMED light, not left unsaid. An empty Heavy/Light slot falls back to Main and the child reports the reduction in capability_delta. Depth does not change the lane; a child that finds the work harder raises itself with switch_model.",
         },
         "write_surface": {
             "type": "string",

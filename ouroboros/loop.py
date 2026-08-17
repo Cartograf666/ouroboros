@@ -5746,16 +5746,16 @@ def _nanny_finalization_message(
     """The honest nanny reminder for a harness-dispatched child at finalization —
     or '' when no reminder is deserved.
 
-    F4 (2026-08-10 saga): the old reminder accused children whose delegated runs
-    CRASHED of "choosing" not to delegate, and fired even when the delegate verbs
+    F4 (2026-08-10 saga): the old reminder accused children whose delegated
+    runs CRASHED of "choosing" not to delegate, and fired even when the verbs
     were policy-hidden. Two structural facts fix both: the task's own visible
     toolset, and durable custody evidence (delegate_custody.
     task_execution_evidence), which spans the WHOLE task — per-execution
     llm_trace resets on continuation. `trace_attempted` is the third fact: a
-    delegate_start in THIS execution's trace. It must not suppress the failure
-    message (triad finding on e84475f2: delegate, run dies, finish by hand,
-    finalize — all inside ONE execution), only the accusation when custody has
-    no rows yet (a pending/uncustodied start is an attempt, not a choice)."""
+    delegate_start in THIS execution's trace; it must not suppress the failure
+    message (triad, e84475f2: delegate, run dies, finish by hand, finalize —
+    all in ONE execution), only the accusation when custody has no rows yet (a
+    pending/uncustodied start is an attempt, not a choice)."""
     try:
         if "delegate_start" not in set(tools.available_tools()):
             return ""  # the verbs are invisible here; "you chose not to" would be false
@@ -5765,11 +5765,10 @@ def _nanny_finalization_message(
     try:
         from ouroboros.delegate_custody import custody_root, task_execution_evidence
 
-        # Split-root fix (2026-08-10 amendments): custody WRITES land on the
-        # CANONICAL (budget) root, but this read used the loop's drive_root —
-        # a split-root subagent's child drive has no custody rows, leaving
-        # the nanny blind. Resolve the SAME root the writers use; the passed
-        # drive_root stays the fallback (e.g. unit-test stubs).
+        # Split-root fix (2026-08-10): custody WRITES land on the CANONICAL
+        # (budget) root, but this read used the loop's drive_root — a split-root
+        # child drive has no custody rows, leaving the nanny blind. Resolve the
+        # SAME root the writers use; drive_root stays the unit-stub fallback.
         try:
             evidence_root = custody_root(tools._ctx)
         except Exception:
@@ -5803,19 +5802,19 @@ def _nanny_finalization_message(
         # nothing (scope finding on a5e59bdf).
         return ""
     if not started and trace_attempted:
-        # A start this execution's trace saw but custody has no row for: pending
-        # settlement or an uncustodied start. An attempt either way — neither
-        # accusation fits, and the wait/cancel path owns its own disclosure.
+        # A start this trace saw but custody has no row for: pending settlement
+        # or an uncustodied start — an attempt either way; neither accusation
+        # fits, and the wait/cancel path owns its own disclosure.
         return ""
     settled = int(evidence.get("delegated_runs_settled") or 0)
     failure_states = [str(s) for s in (evidence.get("delegated_run_failure_states") or [])]
     pending = max(0, started - settled)
     if pending:
-        # PENDING ≠ FAILED (sol review on b49f8192): a STARTED row with no
+        # PENDING ≠ FAILED (sol review, b49f8192): a STARTED row with no
         # settlement may still be executing — calling it failed invites a
         # duplicate run, and finalizing over it orphans the result. Takes
-        # precedence over the failed message: with a run in flight, "retry"
-        # is wrong even when an earlier sibling died (still a fact below).
+        # precedence over the failed message: with a run in flight, "retry" is
+        # wrong even when an earlier sibling died (still a fact below).
         failed_note = (
             f" {len(failure_states)} earlier run(s) already ended: {', '.join(failure_states)}."
             if failure_states else ""
@@ -5861,14 +5860,12 @@ def _maybe_inject_finalization_nudges(
         return False
     if (getattr(tools._ctx, "_nanny_route_dispatched", False)
             and not getattr(tools._ctx, "_nanny_finalization_injected", False)):
-        # Nanny postcondition (owner decision, 2026-08-07): a child dispatched
-        # onto the delegated substrate must not finalize as if that decision
-        # never existed. One structural fact, one re-loop; the child may still
-        # delegate OR finalize with a typed reason — never a hard gate (P5).
-        # A delegate_start in THIS trace rides into the message decision
-        # (triad, e84475f2), where custody evidence separates a failed run
-        # (NANNY_DELEGATED_RUN_FAILED) from a pending attempt (no message).
-        # Suppression cases live in _nanny_finalization_message.
+        # Nanny postcondition (owner 2026-08-07): a harness-dispatched child
+        # must not finalize as if that decision never existed. One structural
+        # fact, one re-loop; it may still delegate OR finalize with a typed
+        # reason — never a hard gate (P5). A delegate_start in THIS trace rides
+        # into the message decision (triad, e84475f2); suppression cases live
+        # in _nanny_finalization_message.
         _trace_attempted = any(
             str(c.get("tool") or "") == "delegate_start"
             for c in (llm_trace.get("tool_calls") or [])
@@ -5883,14 +5880,19 @@ def _maybe_inject_finalization_nudges(
                 messages.append({"role": "assistant", "content": content})
             _append_or_merge_user_message(messages, f"[SYSTEM REMINDER]\n{_nanny_msg}")
             # Owner decision (2026-08-15): no owner-chat progress line — the
-            # model sees the [SYSTEM REMINDER], the trace keeps the durable
-            # text, and the typed task_checkpoint carries observability.
+            # trace + typed task_checkpoint carry observability.
+            _code = _nanny_msg.split(":", 1)[0].replace("⚠️", "").strip()
             _emit_checkpoint_event(
                 getattr(tools._ctx, "event_queue", None), task_id,
                 getattr(tools._ctx, "drive_logs", None),
                 {"checkpoint_kind": "nanny_finalization_nudge",
-                 "nanny_code": _nanny_msg.split(":", 1)[0].replace("⚠️", "").strip()},
+                 "nanny_code": _code},
             )
+            # B3: durable worker stamp that the nudge was really INJECTED (the
+            # ctx flag is set even on suppression); read back at completion.
+            from ouroboros.delegate_evidence import record_nanny_nudge_stamp
+
+            record_nanny_nudge_stamp(tools._ctx, task_id, _code)
             llm_trace["reasoning_notes"].append(_nanny_msg)
             return True
     finalization_msg = _skill_finalization_message(drive_root, llm_trace)

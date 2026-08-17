@@ -11,7 +11,37 @@ with the module that owns the rows.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List
+
+log = logging.getLogger(__name__)
+
+# The nanny finalization-nudge stamp (B3, owner decision 3A): written by the
+# WORKER at the loop's injection seam through ``delegate_custody.emit`` — only
+# when the composed reminder was NON-EMPTY (the ctx `_nanny_finalization_injected`
+# flag is set even on suppression, so it can never be the signal). Task-scoped
+# (no run_id — the run-custody replay skips it by design); the type keeps the
+# ``delegate_run`` prefix so the custody scan prefilter still yields it. Defined
+# HERE, beside its one reader, because ``delegate_custody`` sits exactly at its
+# module-size ceiling.
+NANNY_NUDGE_STAMP = "delegate_run_nanny_nudge_injected"
+
+
+def record_nanny_nudge_stamp(ctx: Any, task_id: str, nanny_code: str) -> None:
+    """Durably stamp "the finalization nudge was really injected" for this task.
+
+    Synchronous same-process append on the CANONICAL (budget) root — the same
+    root ``task_execution_evidence`` reads back at the completion seam, so the
+    fact needs no supervisor round-trip and no O(history) side scan. Fail-soft:
+    a stamp that cannot land loses only the completion-seam disclosure.
+    """
+    try:
+        from ouroboros import delegate_custody as custody
+
+        custody.emit(custody.custody_root(ctx), NANNY_NUDGE_STAMP, {
+            "task_id": str(task_id or ""), "nanny_code": str(nanny_code or "")})
+    except Exception:
+        log.debug("nanny nudge stamp failed", exc_info=True)
 
 
 def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
@@ -39,6 +69,7 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
     # file IS a positively-established empty state (no row could exist);
     # existing-but-unreadable is not, and _iter_rows swallows its own OSError.
     evidence_read_failed = False
+    nudge_recorded = False
     _log_path = custody.event_log_path(drive_root)
     try:
         if _log_path.exists():
@@ -48,6 +79,11 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
         evidence_read_failed = True
     for row in custody._iter_rows(_log_path):
         if str(row.get("task_id") or "") != tid:
+            continue
+        if str(row.get("type") or "") == NANNY_NUDGE_STAMP:
+            # Task-scoped stamp, no run_id — read here so the completion seam
+            # gets the fact from the scan it already pays for (B3).
+            nudge_recorded = True
             continue
         run_id = str(row.get("run_id") or "")
         if not run_id:
@@ -105,6 +141,10 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
         # True only when the canonical log EXISTS but could not be opened —
         # zero counts are then "unknown", not "established" (additive key).
         "evidence_read_failed": evidence_read_failed,
+        # B3 (additive key): a non-empty finalization nudge was durably stamped
+        # for this task. The completion seam combines it with completed status
+        # + zero started runs into the typed substrate disclosure.
+        "nanny_nudge_recorded": nudge_recorded,
         "subscription_cost_usd": round(cost_total, 6) if (settled and cost_known) else None,
         # The settlement row's own estimated/final distinction, carried instead of
         # dropped: an estimated sum must never render as an exact receipt.
@@ -113,4 +153,4 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
     }
 
 
-__all__ = ["task_execution_evidence"]
+__all__ = ["NANNY_NUDGE_STAMP", "record_nanny_nudge_stamp", "task_execution_evidence"]
