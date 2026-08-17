@@ -37,7 +37,15 @@
 // Pure helpers up top are node-tested without a DOM.
 
 import { apiFetch } from './api_client.js';
-import { accountLoginConfirmed, claudexorStatus } from './claudexor_status_store.js';
+import {
+    FACET_ACCOUNTS,
+    READ_OK,
+    accountLoginConfirmed,
+    accountRows,
+    claudexorStatus,
+    facetReadState,
+    familyLabel,
+} from './claudexor_status_store.js';
 import { escapeHtmlAttr as escapeHtml, safeExternalHrefAttr } from './utils.js';
 
 const JOB_POLL_MS = 3000;
@@ -65,6 +73,69 @@ export function nextJobPollDelay(consecutiveFailures) {
     };
 }
 
+export function normalizeProfileName(raw) {
+    // The ENGINE's registration contract is the authority: a profile id must
+    // match ^[a-z0-9][a-z0-9_-]{0,63}$ (Claudexor profile-registration slug).
+    // Lowercase, map every other character to '-', strip separators the slug
+    // may not START with, cap at the engine's 64, and return '' for anything
+    // that still cannot satisfy the contract (e.g. a name with no ASCII
+    // alphanumerics at all) — an empty result makes the dialog/card ask again
+    // instead of submitting a name the engine would refuse. Lives with the
+    // login card; `harness_accounts.js` re-exports the established path.
+    const mapped = String(raw || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+    const slug = mapped.replace(/^[-_]+/, '').slice(0, 64);
+    return /^[a-z0-9][a-z0-9_-]{0,63}$/.test(slug) ? slug : '';
+}
+
+export function profileNameSubmission(raw) {
+    // The same loop-until-stable rule `promptProfileName` (Add account)
+    // applies: a submitted name STARTS a login only when it already IS its
+    // normalized form; otherwise the normalized spelling is handed back,
+    // editable, with a note — never rewritten silently. Pure for node tests.
+    const typed = String(raw || '').trim();
+    const normalized = normalizeProfileName(typed);
+    if (!normalized) {
+        return { profile: '', normalized: '',
+            note: 'Enter a name that starts with a lowercase letter or digit — '
+                + 'letters, digits, "-" and "_", at most 64 characters.' };
+    }
+    if (normalized !== typed) {
+        return { profile: '', normalized,
+            note: `"${typed}" will be saved as "${normalized}" — edit the name or press the button again to continue.` };
+    }
+    return { profile: normalized, normalized, note: '' };
+}
+
+export function familyHasNoAccounts(payload, harness) {
+    // Zero DETECTED accounts for this family, through the SAME projection the
+    // account rows render (`accountRows`). The daemon emits a native
+    // pseudo-row for EVERY login-capable harness — presence alone is not an
+    // account. What counts: a NAMED profile row, or a native row whose login
+    // was actually detected (the projection spells that detection as
+    // `status.verification === 'passed'` with `local_store` provenance; an
+    // undetected pseudo-row carries an empty verification). An engine without
+    // a default credential store therefore reads honestly empty until a named
+    // account exists, while a family whose default CLI login is real keeps its
+    // row — still structural, still no harness-name branch.
+    return !accountRows(payload).some((row) => {
+        if (String(row.harness) !== String(harness || '')) return false;
+        if (row.kind === 'profile') return true;
+        return String(row.status?.verification || '') === 'passed';
+    });
+}
+
+export function familyEmptinessVerified(payload, harness) {
+    // Whether the "no detected account" claim above is AUTHORITATIVE: only an
+    // accounts facet that was actually READ licenses an absence claim (the
+    // store's own rule — facetKnown/facetReadState exist so a blip is not
+    // read as emptiness). The name-the-account face is NOT withheld on an
+    // unread facet — on a fresh install the first Connect is itself what
+    // provisions the daemon, so no successful read can exist yet — but its
+    // absence claim is then disclosed as unverified instead of asserted.
+    return facetReadState(payload, FACET_ACCOUNTS) === READ_OK
+        && familyHasNoAccounts(payload, harness);
+}
+
 export function deviceCodeDisclosure(envelope) {
     // The transient read-time projection is canonical and envelope-level:
     // {job, cursor, sequence, deviceCode?}. It is never journaled by the daemon
@@ -88,6 +159,7 @@ export function deviceCodeDisclosure(envelope) {
 // owner rejected terminal-first login outright. Pure for node tests.
 export function loginCardFace(active) {
     if (!active) return 'none';
+    if (active.needsProfile) return 'name';
     if (active.error) return 'error';
     if (active.verdict?.kind === 'recovery') return 'recovery';
     if (active.verdict?.kind === 'reconciled') return 'reconciled';
@@ -399,6 +471,33 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
     if (face === 'error') {
         bits.push(`<div class="settings-inline-note" data-tone="error">${escapeHtml(active.error)}</div>`);
         bits.push('<button type="button" class="btn btn-primary" data-login-retry>Try again</button>');
+    } else if (face === 'name') {
+        // The engine refused to CREATE the default login and said why — its
+        // sentence is the honest source of the reason and is shown verbatim.
+        // The card turns that dead end into the action the refusal asks for:
+        // name an account (same validation the Add-account dialog runs) and
+        // start the NAMED login through the same standard flow.
+        bits.push(`<div class="settings-inline-note" data-tone="error" data-login-engine-said>${escapeHtml(active.needsProfile.message)}</div>`);
+        if (active.needsProfile.emptinessVerified === false) {
+            // The account list was NOT successfully read (fresh install, or a
+            // degraded accounts facet): the "no account in this family" half of
+            // the discriminator is disclosed as unverified rather than
+            // asserted — the engine's sentence above stays the primary truth.
+            bits.push('<div class="settings-inline-status" data-tone="muted" data-login-accounts-unread>'
+                + 'The account list could not be read, so "no account yet" is unverified — '
+                + 'if this family already has accounts, refresh and retry instead.</div>');
+        }
+        bits.push(`
+            <div class="harness-code-entry" data-profile-name-entry>
+                <label for="harness-profile-name-input">Name for the ${escapeHtml(active.needsProfile.familyLabel || active.harness)} account (e.g. work, backup). Lowercase letters, digits, "-" and "_" — anything else becomes "-".</label>
+                <div class="harness-code-entry-row">
+                    <input type="text" id="harness-profile-name-input" data-profile-name-input autocomplete="off" spellcheck="false"
+                        placeholder="account name" value="${escapeHtml(active.profileNameValue || '')}">
+                    <button type="button" class="btn btn-primary" data-profile-name-submit>Add account &amp; connect</button>
+                </div>
+                ${active.profileNameNote ? `<div class="settings-inline-status" data-tone="muted" data-profile-name-note>${escapeHtml(active.profileNameNote)}</div>` : ''}
+            </div>
+        `);
     } else if (face === 'device') {
         // LINK-FIRST: the prominent action is opening the disclosed sign-in
         // URL, with an explicit copy affordance (the macOS-app card pattern).
@@ -436,7 +535,7 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
     // card, a snapshot that still reads pending — a poll response captured
     // before the job settled — must not print "Waiting for the sign-in link…"
     // underneath "Connected.".
-    if (face !== 'error' && !active.verdict && !active.confirming) {
+    if (face !== 'error' && face !== 'name' && !active.verdict && !active.confirming) {
         const line = active.preparingRuntime
             ? 'Installing or checking Claudexor…'
             : loginStatusLine(active.envelope || {});
@@ -546,13 +645,17 @@ export function preserveCardFocus(host, swap, doc = typeof document === 'undefin
     // three seconds. The focused entry and its selection are captured across
     // the swap and restored onto the element that replaced it.
     const prior = doc ? doc.activeElement : null;
-    const keep = Boolean(prior && host.contains?.(prior)
-        && prior.hasAttribute?.('data-login-code-input'));
+    // The paste-code field AND the name-the-account field share the fate: a
+    // re-render (poll tick, or the name face redrawing its normalization note)
+    // replaces the input mid-typing.
+    const marker = ['data-login-code-input', 'data-profile-name-input']
+        .find((attr) => prior && host.contains?.(prior) && prior.hasAttribute?.(attr));
+    const keep = Boolean(marker);
     const start = keep ? prior.selectionStart : null;
     const end = keep ? prior.selectionEnd : null;
     swap();
     if (!keep) return;
-    const next = host.querySelector?.('[data-login-code-input]');
+    const next = host.querySelector?.(`[${marker}]`);
     if (!next || next.disabled) return;
     next.focus?.();
     if (typeof next.setSelectionRange === 'function' && start !== null) {
@@ -691,6 +794,12 @@ export function createLoginCardController({
         codeInput?.addEventListener('keydown', (event) => {
             if (event.key === 'Enter') { event.preventDefault(); submitCodeFromCard(active); }
         });
+        const nameInput = hostEl.querySelector('[data-profile-name-input]');
+        nameInput?.addEventListener('input', () => { active.profileNameValue = nameInput.value; });
+        nameInput?.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter') { event.preventDefault(); submitProfileNameFromCard(active); }
+        });
+        hostEl.querySelector('[data-profile-name-submit]')?.addEventListener('click', () => submitProfileNameFromCard(active));
         hostEl.querySelector('[data-login-code-submit]')?.addEventListener('click', () => submitCodeFromCard(active));
         hostEl.querySelector('[data-login-reconcile]')?.addEventListener('click', () => reconcile(active));
         hostEl.querySelector('[data-login-dismiss]')?.addEventListener('click', () => close(active));
@@ -832,11 +941,14 @@ export function createLoginCardController({
             return Promise.resolve(ctl.detachedStatus);
         }
         const active = ctl.active;
-        if (active?.error && !active.jobId
+        if ((active?.error || active?.needsProfile) && !active.jobId
             && (expected === undefined || expected === active)) {
             // A create that produced no usable identity has nothing this card
             // can address with DELETE. Preserve the unknown status, but keep
             // the existing Close affordance usable through honest local detach.
+            // The name-the-account face closes the same way: its create was
+            // REFUSED, so there is provably no job (it carries absent=true and
+            // detaches as released).
             const result = detach();
             onSettled();
             return Promise.resolve(result);
@@ -896,6 +1008,23 @@ export function createLoginCardController({
             render();
             return result;
         });
+    }
+
+    function submitProfileNameFromCard(active) {
+        // The "name the account" face's submit: the same validation loop the
+        // Add-account dialog runs (`promptProfileName`) — a name normalization
+        // would rewrite is shown back, editable, before any login starts. A
+        // stable name starts the NAMED login through the one standard start
+        // path (create → poll → verdict), which replaces this face.
+        if (!active?.needsProfile || ctl.active !== active || ctl.disposed) return;
+        const answer = profileNameSubmission(active.profileNameValue);
+        if (!answer.profile) {
+            if (answer.normalized) active.profileNameValue = answer.normalized;
+            active.profileNameNote = answer.note;
+            render();
+            return;
+        }
+        start(active.harness, answer.profile);
     }
 
     async function submitCodeFromCard(active) {
@@ -1018,6 +1147,7 @@ export function createLoginCardController({
             attachCommand: '', error: '',
             startedAtMs: now(), engineDegraded: false,
             inputValue: '', inputBusy: false, inputSent: false, inputError: '', inputNote: '',
+            needsProfile: null, profileNameValue: '', profileNameNote: '',
             verdict: null, confirming: false, advancedOpen: false, preparingRuntime: true,
         };
         const active = ctl.active;
@@ -1030,7 +1160,46 @@ export function createLoginCardController({
             });
             const data = await resp.json().catch(() => null);
             if (ctl.active !== active) return;
-            if (!resp.ok) throw new Error(data?.error || `HTTP ${resp.status}`);
+            if (!resp.ok) {
+                if (resp.status === 400 && !profile
+                    && familyHasNoAccounts(store?.snapshot, harness)) {
+                    // The engine refused to CREATE a DEFAULT login for a family
+                    // with ZERO accounts. That structural pair — create-time 400
+                    // plus an empty family — is the discriminator, deliberately
+                    // NOT the harness name (the set of engines without a default
+                    // credential store is the ENGINE's fact, it changes under us,
+                    // and no harness-name branch may select a capability) and NOT
+                    // the error text (prose is not a contract; this refusal
+                    // carries no machine code). A 400 at create is the daemon's
+                    // verdict on the requested login SHAPE, and with no account
+                    // in the family the only path the engine leaves open is the
+                    // named one — so the card asks for a name instead of showing
+                    // a dead end. A named create's 400, or one for a family that
+                    // HAS accounts, stays an ordinary error. The refusal also
+                    // proves no job exists (the daemon answered the create with
+                    // a refusal), so custody is honestly absent/released.
+                    active.preparingRuntime = false;
+                    active.absent = true;
+                    active.custodyStatus = LOGIN_CUSTODY_RELEASED;
+                    active.needsProfile = {
+                        message: String(data?.error || `HTTP ${resp.status}`),
+                        // An absence claim is authoritative only off a READ
+                        // accounts facet; a fresh install has none yet, so the
+                        // face still shows — with the claim disclosed as
+                        // unverified instead of asserted.
+                        emptinessVerified: familyEmptinessVerified(store?.snapshot, harness),
+                        // The engine's display name ("Antigravity"), resolved
+                        // at detection where the store is at hand — the pure
+                        // renderer must not reach for a global (raw id is the
+                        // no-payload fallback).
+                        familyLabel: familyLabel(harness, store?.snapshot || null) || String(harness || ''),
+                    };
+                    releaseStatusPolling();
+                    render();
+                    return;
+                }
+                throw new Error(data?.error || `HTTP ${resp.status}`);
+            }
             // A 2xx is not a created job. Without a job id there is nothing to
             // poll, nothing to cancel and nothing to report: the card used to
             // accept such an answer and sit "Starting the sign-in…" forever,
@@ -1259,6 +1428,10 @@ export function createLoginCardController({
         render,
         dispose,
         detach,
+        // The name-the-account face's submit seam (the card's own input/button
+        // wiring calls the same function); exposed for node tests, which have
+        // no DOM to click through.
+        submitProfileName: () => submitProfileNameFromCard(ctl.active),
         get active() { return ctl.active; },
         get disposed() { return ctl.disposed; },
         get mode() { return mode; },

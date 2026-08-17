@@ -19,7 +19,10 @@ through VERBATIM (it already has that shape; wrapping it again was issue #124's
 double ``job.job``). Daemon 404/410 job-absence verdicts pass through for
 poll/cancel/reconcile; typed 409 passes through only for input and reconcile,
 with stable ``code`` plus ``required_actions`` when the engine names the
-continuation. Transport failure, daemon 5xx, and untyped poll/cancel conflicts
+continuation. A create-time daemon 400 — the engine refusing the REQUESTED
+login shape (e.g. a harness with no default credential store refusing a
+default login) — passes through with its status, code and the engine's own
+sentence. Transport failure, daemon 5xx, and untyped poll/cancel conflicts
 collapse to this proxy's honest 503.
 
 Login shapes ("красота-сначала", D30): a structural link/device-code card
@@ -427,6 +430,7 @@ def _login_job_response(job: Dict[str, Any], **metadata: Any) -> Dict[str, Any]:
 
 def _login_create(body: Dict[str, Any]) -> Dict[str, Any]:
     from ouroboros.claudexor_daemon import attach_login_command, ensure_owned_gateway
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
     harness = str(body.get("harness") or "").strip()
     if not harness:
@@ -460,7 +464,15 @@ def _login_create(body: Dict[str, Any]) -> Dict[str, Any]:
         request_body = _build_login_request(
             harness, profile_id, transport, login_flow,
             disclosure_native=disclosure_native)
-        job = gateway.setup_job_create(request_body)
+        try:
+            job = gateway.setup_job_create(request_body)
+        except ClaudexorUnavailable as exc:
+            # Mark WHERE the daemon answered: only a 400 from the job CREATE is
+            # a verdict about the requested login shape (the pass-through the
+            # endpoint forwards). A handshake or discovery 400 earlier in this
+            # block is engine/protocol trouble and stays the honest 503.
+            exc.login_create_verdict = True
+            raise
     job_id = str(job.get("id") or job.get("jobId") or "")
     metadata: Dict[str, Any] = {"job_id": job_id, "disclosure_native": disclosure_native}
     if request_body.get("transport") == "client_pty" and job_id:
@@ -481,6 +493,23 @@ async def api_claudexor_login(request: Request) -> JSONResponse:
     except ValueError as exc:
         return json_error(str(exc), 400)
     except ClaudexorUnavailable as exc:
+        if (int(getattr(exc, "status_code", 0) or 0) == 400
+                and getattr(exc, "login_create_verdict", False)):
+            # The daemon ANSWERED and refused this create request (HTTP 400):
+            # a verdict about the requested login SHAPE — e.g. an engine whose
+            # harness has no default credential store refuses a default login
+            # and says to sign in from a named account instead. Collapsing it
+            # to 503 hid both the status and the engine's sentence, leaving
+            # the card a dead "unavailable" error for a condition the owner
+            # can fix by naming an account. Pass status, stable code and the
+            # engine's own message through in the frozen problem envelope
+            # (``ClaudexorLoginJobProblem``). Transport failure and daemon
+            # 5xx — unproven, not verdicts — stay this proxy's honest 503.
+            extra: Dict[str, Any] = {"code": exc.code}
+            actions = tuple(getattr(exc, "required_actions", ()) or ())
+            if actions:
+                extra["required_actions"] = list(actions)
+            return json_error(str(exc), 400, **extra)
         return json_error(f"{exc.code}: {exc}", 503)
     except Exception as exc:
         log.exception("api_claudexor_login failed")

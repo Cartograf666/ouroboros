@@ -329,9 +329,9 @@ test('Add account never touches window.prompt and asks through the in-house dial
 });
 
 test('a name normalization would change is shown back, editable, BEFORE any login starts', async () => {
-    // The owner types "Работа": the profile alphabet turns that into "------",
-    // and starting a login under that name silently is exactly the trap the
-    // prompt() flow had. The dialog re-opens with the normalized name visible
+    // The owner types "Работа": nothing slug-legal survives (engine contract
+    // ^[a-z0-9][a-z0-9_-]{0,63}$), and starting a login under a silently
+    // rewritten name is exactly the trap the prompt() flow had. The dialog re-opens with the normalized name visible
     // AND editable; only an explicit confirm of a stable name proceeds.
     const rounds = [];
     const answers = [
@@ -344,8 +344,11 @@ test('a name normalization would change is shown back, editable, BEFORE any logi
     } });
     assert.equal(name, 'work-2');
     assert.equal(rounds.length, 2);
-    assert.ok(rounds[1].body.includes('"Работа" will be saved as "------"'));
-    assert.equal(rounds[1].initialValue, '------');
+    // Under the engine slug contract (^[a-z0-9][a-z0-9_-]{0,63}$) nothing of
+    // "Работа" survives normalization: the dialog re-asks with the contract
+    // spelled out instead of offering an illegal all-separator name.
+    assert.ok(rounds[1].body.includes('"Работа" cannot become an account name'));
+    assert.equal(rounds[1].initialValue, '');
 
     // Accepting the shown normalized name as-is also works (one extra round).
     const folds = [];
@@ -357,9 +360,11 @@ test('a name normalization would change is shown back, editable, BEFORE any logi
     assert.equal(folds.length, 2);
     assert.equal(folds[1].initialValue, 'work');
 
-    // The normalization itself, pinned.
+    // The normalization itself, pinned to the ENGINE slug contract
+    // (^[a-z0-9][a-z0-9_-]{0,63}$): nothing slug-legal survives of "Работа",
+    // so it maps to '' and the dialog re-asks instead of offering '------'.
     assert.equal(normalizeProfileName(' Work '), 'work');
-    assert.equal(normalizeProfileName('Работа'), '------');
+    assert.equal(normalizeProfileName('Работа'), '');
     assert.equal(normalizeProfileName('a b/c'), 'a-b-c');
     assert.equal(normalizeProfileName('ok_name-1'), 'ok_name-1');
     assert.equal(normalizeProfileName(''), '');

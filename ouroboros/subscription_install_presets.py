@@ -24,8 +24,9 @@ review the owner believed was configured. Absence is reported as absence.
 
 EFFORT lives in two different places because the harnesses spell it
 differently, and the receipt records which: claude/codex model ids are
-effort-free and take the row's ``effort`` field, while cursor publishes
-COMPOUND slugs whose tail IS the effort (``cursor-grok-4.5-high``) — bracket
+effort-free and take the row's ``effort`` field, while cursor (and agy)
+publish COMPOUND slugs whose tail IS the effort (``cursor-grok-4.5-high``,
+``gemini-3.7-flash-high``) — bracket
 overrides are not supported there. A cursor seat therefore carries the effort
 in BOTH channels: the slug is what Cursor honours, and the field is what the
 review/delegation surfaces materialize anyway (an empty field does not mean
@@ -55,10 +56,16 @@ SUBAGENT_HARNESS_KEY = "OUROBOROS_SUBAGENT_HARNESS"
 HARNESS_CLAUDE = "claude"
 HARNESS_CODEX = "codex"
 HARNESS_CURSOR = "cursor"
-# The harnesses the ratified matrix covers. A connected harness outside this
-# tuple (opencode, raw-api, …) contributes no seat — the matrix is the owner's
-# decision, not an auto-derivation over whatever the engine can reach.
-PRESET_HARNESSES: Tuple[str, ...] = (HARNESS_CLAUDE, HARNESS_CODEX, HARNESS_CURSOR)
+HARNESS_AGY = "agy"
+# The harnesses the preset compiler RECOGNIZES. A connected harness outside
+# this tuple (opencode, raw-api, …) contributes no seat — the matrix is the
+# owner's decision, not an auto-derivation over whatever the engine can reach.
+# Recognized is wider than ratified since agy joined (issue #232): the matrix
+# below still covers only the claude/codex/cursor combinations, and a
+# recognized combination without a matrix row refuses typed
+# (``matrix_row_absent``) until the owner dictates its seats.
+PRESET_HARNESSES: Tuple[str, ...] = (
+    HARNESS_CLAUDE, HARNESS_CODEX, HARNESS_CURSOR, HARNESS_AGY)
 
 SURFACE_SUBAGENT = "subagent"
 SURFACE_ADVISORY = "advisory"
@@ -66,7 +73,7 @@ SURFACE_TRIAD = "triad"
 SURFACE_SCOPE = "scope"
 
 # Harnesses whose discovery ids ENCODE the reasoning effort in the id itself.
-_EFFORT_IN_MODEL_ID = frozenset({HARNESS_CURSOR})
+_EFFORT_IN_MODEL_ID = frozenset({HARNESS_CURSOR, HARNESS_AGY})
 
 # Owner shorthand -> ORDERED candidate discovery ids. ``{effort}`` is filled
 # from the seat for a harness that spells effort inside the id. The FIRST
@@ -96,6 +103,15 @@ _MODEL_ALIASES: Dict[str, Dict[str, Tuple[str, ...]]] = {
             "gpt-5.6-terra-{effort}",
             "gpt-5.6-luna-{effort}",
         ),
+    },
+    # agy (Antigravity) spells effort inside the id like cursor. Dormant until
+    # the owner dictates the agy matrix rows (issue #232): no matrix row names
+    # these preferences yet. NOTE for that dictation: agy publishes
+    # gemini-3.1-pro ONLY at high/low (no -medium slug, verified against agy
+    # 1.1.13 discovery), so a pro seat's effort must be high or low.
+    HARNESS_AGY: {
+        "gemini-3.7-flash": ("gemini-3.7-flash-{effort}",),
+        "gemini-3.1-pro": ("gemini-3.1-pro-{effort}",),
     },
 }
 
@@ -401,8 +417,9 @@ def _validate_against_parser(raw: str) -> Optional[PresetRefusal]:
 
 
 def connected_preset_harnesses(discoveries: Sequence[HarnessDiscovery]) -> Tuple[str, ...]:
-    """The matrix-covered harnesses among the ones the caller vouched for,
-    in stable matrix order."""
+    """The RECOGNIZED harnesses among the ones the caller vouched for, in
+    stable ``PRESET_HARNESSES`` order. Recognition is not ratification: a
+    combination without a matrix row compiles to a typed refusal."""
     seen = {str(d.harness_id) for d in discoveries}
     return tuple(h for h in PRESET_HARNESSES if h in seen)
 
@@ -432,6 +449,23 @@ def compile_install_preset(
                          "no preset to apply."),
             ),
         )
+    seats = _MATRIX.get(frozenset(connected))
+    if seats is None:
+        # Checked BEFORE discovery validation on purpose: a combination the
+        # owner has not ratified is refused whatever its discovery holds. This
+        # is the agy state today (issue #232): the harness is recognized, its
+        # seats are an owner decision still to be dictated, and the honest
+        # answer is a typed refusal — never a guessed row, never a KeyError.
+        return SubscriptionInstallPreset(
+            connected=connected,
+            refusal=PresetRefusal(
+                code="matrix_row_absent", seat=None, candidates=(),
+                message=("The ratified matrix has no row for the connected "
+                         f"combination: {', '.join(connected)}. Its seats are an "
+                         "owner decision that has not been dictated yet, so no "
+                         "preset is applied."),
+            ),
+        )
     discovery = {str(d.harness_id): d for d in discoveries}
     empty = [h for h in connected if not discovery[h].has_models]
     if empty:
@@ -444,7 +478,6 @@ def compile_install_preset(
                          "live discovery, never guessed."),
             ),
         )
-    seats = _MATRIX[frozenset(connected)]
     resolved: Dict[str, List[Dict[str, Any]]] = {}
     for surface in (SURFACE_SUBAGENT, SURFACE_ADVISORY, SURFACE_TRIAD, SURFACE_SCOPE):
         rows, refusal = _resolve_surface(seats[surface], discovery)
@@ -479,6 +512,7 @@ def compile_install_preset(
 
 
 __all__ = [
+    "HARNESS_AGY",
     "HARNESS_CLAUDE",
     "HARNESS_CODEX",
     "HARNESS_CURSOR",

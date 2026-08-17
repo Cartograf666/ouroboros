@@ -417,6 +417,100 @@ def test_login_endpoint_validates_before_any_daemon_work():
     assert bad_transport.status_code == 400 and b"transport" in bad_transport.body
 
 
+def test_login_create_passes_the_daemon_400_verdict_through(monkeypatch):
+    """A create-time daemon 400 is a typed VERDICT about the requested login
+    shape (e.g. a harness with no default credential store refusing a default
+    login and telling the owner to sign in from a named account), not daemon
+    unavailability. It must reach the browser with its original status, the
+    stable code and the engine's own sentence VERBATIM, in the frozen
+    ``ClaudexorLoginJobProblem`` envelope — the card keys its
+    name-the-account face on the structural pair (create-time, 400), which a
+    blanket 503 collapse made unreachable. Anything the daemon did not answer
+    with a 400 stays the proxy's honest 503."""
+    import asyncio
+
+    from starlette.requests import Request
+
+    from ouroboros.gateway.claudexor_accounts import api_claudexor_login
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    engine_said = ('harness "zephyr" has no default credential store: sign in '
+                   'from a named account (add one first, then start the login from it)')
+    refusal = {"exc": ClaudexorUnavailable("http_400", engine_said, status_code=400),
+               "stage": "create"}
+
+    class _Gateway:
+        def operations(self):
+            return {}
+
+        def create_credential_profile(self, harness, profile_id):
+            return {}
+
+        def setup_job_create(self, request_body):
+            if refusal["stage"] == "create":
+                raise refusal["exc"]
+            return {"id": "job-1", "status": "running"}
+
+    class _GatewayCtx:
+        def __enter__(self):
+            # A handshake-stage refusal raises BEFORE any gateway exists — the
+            # narrowing must keep it a 503 even at status 400, because only the
+            # job CREATE answers about the requested login shape.
+            if refusal["stage"] == "handshake":
+                raise refusal["exc"]
+            return _Gateway()
+
+        def __exit__(self, *exc_info):
+            return False
+
+    monkeypatch.setattr(
+        "ouroboros.claudexor_daemon.ensure_owned_gateway", lambda: _GatewayCtx())
+
+    async def _call():
+        payload = json.dumps({"harness": "zephyr"}).encode()
+
+        async def receive():
+            return {"type": "http.request", "body": payload, "more_body": False}
+
+        request = Request({
+            "type": "http", "method": "POST", "path": "/api/claudexor/login",
+            "headers": [(b"content-type", b"application/json")], "query_string": b"",
+        }, receive)
+        return await api_claudexor_login(request)
+
+    answer = asyncio.run(_call())
+    assert answer.status_code == 400
+    body = json.loads(answer.body)
+    assert body["error"] == engine_said, "the engine's sentence rides through verbatim"
+    assert body["code"] == "http_400"
+    assert "required_actions" not in body, "an absent continuation is absent, not []"
+
+    # A refusal that names a continuation keeps it (bounded by the transport).
+    refusal["exc"] = ClaudexorUnavailable(
+        "http_400", engine_said, status_code=400,
+        required_actions=("add_named_account",))
+    with_actions = json.loads(asyncio.run(_call()).body)
+    assert with_actions["required_actions"] == ["add_named_account"]
+
+    # No 400 verdict — an unreachable daemon (status 0) and a daemon 5xx — is
+    # never promoted to one: both stay the proxy's honest 503.
+    for exc in (ClaudexorUnavailable("daemon_unreachable", "connect refused"),
+                ClaudexorUnavailable("http_500", "boom", status_code=500)):
+        refusal["exc"] = exc
+        answer = asyncio.run(_call())
+        assert answer.status_code == 503
+        assert exc.code.encode() in answer.body
+
+    # A 400 from the HANDSHAKE stage is engine/protocol trouble, not a verdict
+    # about the requested login shape: the pass-through is scoped to the job
+    # CREATE and everything earlier stays the proxy's honest 503.
+    refusal["exc"] = ClaudexorUnavailable("http_400", "protocol mismatch", status_code=400)
+    refusal["stage"] = "handshake"
+    answer = asyncio.run(_call())
+    assert answer.status_code == 503
+    assert b"http_400" in answer.body
+
+
 # ---------------------------------------------------------------------------
 # No-terminal login UX (3.3.7 contract): disclosure-driven claude/cursor jobs
 # and the paste-code input proxy.

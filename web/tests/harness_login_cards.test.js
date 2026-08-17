@@ -10,6 +10,10 @@ import test from 'node:test';
 
 import { createClaudexorStatusStore } from '../modules/claudexor_status_store.js';
 import {
+    familyHasNoAccounts,
+    normalizeProfileName,
+    profileNameSubmission,
+    preserveCardFocus,
     JOB_POLL_GIVE_UP_FAILURES,
     LOGIN_CUSTODY_RELEASED,
     LOGIN_CUSTODY_RETAINED,
@@ -997,4 +1001,320 @@ test('compact mode drops the terminal fallback, the paste-code entry and Close, 
         999999, { mode: LOGIN_CARD_COMPACT });
     assert.ok(verified.includes('Connected.'));
     assert.ok(!verified.includes('data-login-retry'), 'nothing to retry once verified');
+});
+
+// ---------------------------------------------------------------------------
+// The "name the account" face: an engine that refuses the DEFAULT login of an
+// EMPTY family at create time (HTTP 400) asks for a named account instead of
+// leaving a dead error. The discriminator is the STRUCTURAL pair (create-time
+// 400 ∧ zero accounts in the family) — never a harness name, never the prose.
+// ---------------------------------------------------------------------------
+
+function nameFaceStatusPayload(rows) {
+    return {
+        daemon: { state: 'running', engine_version: '3.5.0', runtime: {} },
+        config_dir: '/home/agent',
+        harnesses: [{ id: 'zephyr' }],
+        profiles: { harnessAccounts: rows, profiles: [] },
+        quota: [],
+    };
+}
+
+const ENGINE_SAID = 'harness "zephyr" has no default credential store: '
+    + 'sign in from a named account (add one first, then start the login from it)';
+
+test('create-400 on an EMPTY family becomes the name-the-account face, and its submit runs the standard NAMED flow', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, nameFaceStatusPayload([])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await store.refresh();
+    const host = fakeHost();
+    const posts = [];
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                const body = JSON.parse(init.body);
+                posts.push(body);
+                if (!body.profile_id) return json(400, { error: ENGINE_SAID, code: 'http_400' });
+                return json(200, { job_id: 'job-named', job: { state: 'running', phase: 'awaiting_user' } });
+            }
+            if (init.method === 'DELETE') return json(200, { job: { state: 'cancelled' } });
+            return json(200, { job: { state: 'running' } });
+        },
+    });
+    await ctl.start('zephyr', '');
+    // The engine's own sentence, verbatim (quotes render HTML-escaped).
+    assert.ok(host.innerHTML.includes('has no default credential store: '
+        + 'sign in from a named account (add one first, then start the login from it)'),
+        `the engine's own sentence is shown: ${host.innerHTML}`);
+    assert.equal(ctl.active.needsProfile.message, ENGINE_SAID,
+        'the card holds the engine sentence untouched');
+    assert.match(host.innerHTML, /data-profile-name-input/);
+    assert.match(host.innerHTML, /data-profile-name-submit/);
+    assert.ok(!host.innerHTML.includes('data-login-retry'),
+        'not the dead-end error face — its Try again would repeat the refused default login');
+    assert.ok(!host.innerHTML.includes('data-login-state'),
+        'no live progress line: nothing is running');
+    assert.equal(store.polling, false, 'a refused create holds no status poll');
+
+    // Same validation as Add account: a name normalization would rewrite is
+    // shown back editable, and does NOT start a login.
+    ctl.active.profileNameValue = 'Work Laptop';
+    ctl.submitProfileName();
+    assert.equal(posts.length, 1, 'an unstable name must not be submitted');
+    assert.ok(host.innerHTML.includes('will be saved as &quot;work-laptop&quot;')
+        || host.innerHTML.includes('will be saved as "work-laptop"'), host.innerHTML);
+    assert.equal(ctl.active.profileNameValue, 'work-laptop');
+
+    // The stable name starts the NAMED login through the one standard flow.
+    ctl.submitProfileName();
+    await flush();
+    assert.equal(posts.length, 2);
+    assert.equal(posts[1].harness, 'zephyr');
+    assert.equal(posts[1].profile_id, 'work-laptop');
+    assert.ok(host.innerHTML.includes('(work-laptop)'), `the card now runs the named login: ${host.innerHTML}`);
+    assert.ok(!host.innerHTML.includes('data-profile-name-input'), 'the name face was replaced');
+    await ctl.dispose();
+    store.dispose();
+});
+
+test('create-400 on a family that HAS accounts stays the ordinary error face', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, nameFaceStatusPayload([
+            { harness_id: 'zephyr', native_login_detected: true },
+        ])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await store.refresh();
+    const host = fakeHost();
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                return json(400, { error: 'loginFlow is not accepted for this harness' });
+            }
+            return json(404, {});
+        },
+    });
+    await ctl.start('zephyr', '');
+    assert.ok(host.innerHTML.includes('data-login-retry'), `ordinary error face: ${host.innerHTML}`);
+    assert.ok(!host.innerHTML.includes('data-profile-name-input'),
+        'a 400 with existing accounts is not the missing-default-store shape');
+    await ctl.dispose();
+    store.dispose();
+});
+
+test('create 5xx / transport death stays the ordinary error face even for an empty family', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, nameFaceStatusPayload([])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await store.refresh();
+    const host = fakeHost();
+    let mode = '503';
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                if (mode === '503') return json(503, { error: 'daemon_unreachable: connect refused' });
+                throw new Error('network down');
+            }
+            return json(404, {});
+        },
+    });
+    await ctl.start('zephyr', '');
+    assert.ok(host.innerHTML.includes('data-login-retry'), host.innerHTML);
+    assert.ok(!host.innerHTML.includes('data-profile-name-input'),
+        'a 503 is no verdict about the login shape');
+    // Transport death: same rule.
+    mode = 'throw';
+    await ctl.start('zephyr', '');
+    assert.ok(host.innerHTML.includes('data-login-retry'), host.innerHTML);
+    assert.ok(!host.innerHTML.includes('data-profile-name-input'));
+    await ctl.dispose();
+    store.dispose();
+});
+
+test('a create-400 NAMED login never asks for a name again (only the default-login shape does)', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, nameFaceStatusPayload([])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await store.refresh();
+    const host = fakeHost();
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                return json(400, { error: 'profile id is not acceptable' });
+            }
+            return json(404, {});
+        },
+    });
+    await ctl.start('zephyr', 'work');
+    assert.ok(host.innerHTML.includes('data-login-retry'), host.innerHTML);
+    assert.ok(!host.innerHTML.includes('data-profile-name-input'));
+    await ctl.dispose();
+    store.dispose();
+});
+
+test('Close on the name-the-account face detaches as released — the refused create provably made no job', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, nameFaceStatusPayload([])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await store.refresh();
+    const host = fakeHost();
+    const calls = [];
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            calls.push(`${init.method || 'GET'} ${url}`);
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                return json(400, { error: ENGINE_SAID });
+            }
+            return json(404, {});
+        },
+    });
+    await ctl.start('zephyr', '');
+    assert.match(host.innerHTML, /data-profile-name-input/);
+    const closed = await ctl.close(ctl.active);
+    assert.equal(closed, LOGIN_CUSTODY_RELEASED, 'no job was ever created, custody is trivially released');
+    assert.equal(host.innerHTML, '', 'the card is gone');
+    assert.ok(!calls.some((c) => c.startsWith('DELETE')), 'nothing to DELETE');
+    store.dispose();
+});
+
+test('a LIVE-shaped payload — one native pseudo-row per harness — reads empty only where no login was detected', async () => {
+    // The daemon emits a native pseudo-row for EVERY login-capable harness;
+    // presence alone is not an account. Only a DETECTED native login or a
+    // named profile makes a family non-empty — so an engine without a default
+    // credential store (its pseudo-row carries native_login_detected:false)
+    // still reaches the name-the-account face on a healthy, fully-read
+    // snapshot, not only on a degraded one.
+    const liveShaped = nameFaceStatusPayload([
+        { harness_id: 'claude', native_login_detected: true },
+        { harness_id: 'codex', native_login_detected: true },
+        { harness_id: 'cursor', native_login_detected: true },
+        { harness_id: 'zephyr', native_login_detected: false },
+    ]);
+    assert.equal(familyHasNoAccounts(liveShaped, 'zephyr'), true,
+        'an undetected pseudo-row is not an account');
+    assert.equal(familyHasNoAccounts(liveShaped, 'claude'), false,
+        'a detected native login is an account');
+
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, liveShaped),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await store.refresh();
+    const host = fakeHost();
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                return json(400, { error: ENGINE_SAID, code: 'http_400' });
+            }
+            return json(404, {});
+        },
+    });
+    await ctl.start('zephyr', '');
+    assert.match(host.innerHTML, /data-profile-name-input/,
+        'the healthy live snapshot reaches the name face');
+    await ctl.dispose();
+    store.dispose();
+});
+
+test('preserveCardFocus keeps the caret in the name-the-account input across a re-render', () => {
+    let focused = null;
+    const nextInput = {
+        disabled: false,
+        focus() { focused = this; },
+        setSelectionRange(a, b) { this.sel = [a, b]; },
+    };
+    const prior = {
+        selectionStart: 2, selectionEnd: 4,
+        hasAttribute: (attr) => attr === 'data-profile-name-input',
+    };
+    const host = {
+        contains: (el) => el === prior,
+        querySelector: (sel) => (sel === '[data-profile-name-input]' ? nextInput : null),
+    };
+    preserveCardFocus(host, () => {}, { activeElement: prior });
+    assert.equal(focused, nextInput, 'focus lands on the replacement input');
+    assert.deepEqual(nextInput.sel, [2, 4], 'the selection survives the swap');
+});
+
+test('an UNREAD accounts facet still reaches the name face but discloses the unverified absence claim', async () => {
+    // Fresh install: the first Connect is what provisions the daemon, so no
+    // successful accounts read exists yet. The face must still offer the name
+    // (that is its main case) while saying the "no account yet" half of the
+    // discriminator is unverified.
+    const payload = nameFaceStatusPayload([]);
+    payload.reads = { catalog: 'ok', accounts: 'failed', quota: 'ok' };
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, payload),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await store.refresh();
+    const host = fakeHost();
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                return json(400, { error: ENGINE_SAID, code: 'http_400' });
+            }
+            return json(404, {});
+        },
+    });
+    await ctl.start('zephyr', '');
+    assert.match(host.innerHTML, /data-profile-name-input/, 'name face still offered');
+    assert.match(host.innerHTML, /data-login-accounts-unread/, 'the unverified absence claim is disclosed');
+    await ctl.dispose();
+    store.dispose();
+});
+
+test('a READ-OK empty family asserts its emptiness without the unread disclosure', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => {
+            const payload = nameFaceStatusPayload([]);
+            payload.reads = { catalog: 'ok', accounts: 'ok', quota: 'ok' };
+            return json(200, payload);
+        },
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await store.refresh();
+    const host = fakeHost();
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                return json(400, { error: ENGINE_SAID, code: 'http_400' });
+            }
+            return json(404, {});
+        },
+    });
+    await ctl.start('zephyr', '');
+    assert.match(host.innerHTML, /data-profile-name-input/);
+    assert.ok(!host.innerHTML.includes('data-login-accounts-unread'),
+        'a verified empty family carries no unverified-claim caveat');
+    await ctl.dispose();
+    store.dispose();
+});
+
+test('normalizeProfileName enforces the engine slug contract ^[a-z0-9][a-z0-9_-]{0,63}$', () => {
+    // The engine's profile registration refuses anything else; a name the
+    // normalization cannot make legal comes back '' so the dialog asks again
+    // instead of submitting a doomed create.
+    assert.equal(normalizeProfileName('Work Laptop'), 'work-laptop');
+    assert.equal(normalizeProfileName('-lead'), 'lead', 'a slug may not start with a separator');
+    assert.equal(normalizeProfileName('__x_'), 'x_');
+    assert.equal(normalizeProfileName('Работа'), '', 'no ASCII alphanumeric at all cannot become a slug');
+    assert.equal(normalizeProfileName('a'.repeat(80)).length, 64, 'capped at the engine 64');
+    assert.equal(normalizeProfileName('9start'), '9start', 'a digit is a legal first character');
+    const submitted = profileNameSubmission('Работа');
+    assert.equal(submitted.profile, '', 'an unslugifiable name never starts a login');
+    assert.ok(submitted.note.includes('starts with a lowercase letter or digit'));
 });

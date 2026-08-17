@@ -77,10 +77,15 @@ log = logging.getLogger(__name__)
 # stale, or the account was removed between the Agents step and Save. Nor does
 # it prescribe repairing the engine, because the typed `detail` beside it may
 # simply read "claude: not signed in", which no repair addresses.
+# The copy promises no action the detail cannot deliver: "finish without
+# agent defaults" is always true, while "fix the cause and try again" is
+# conditional — a matrix_row_absent refusal (a recognized-but-unratified
+# combination, e.g. agy before its seats are dictated) has no fix a retry
+# could pick up, unlike daemon_unavailable or no_verified_account.
 PRESET_UNVERIFIED_MESSAGE = (
-    "Agent defaults could not be verified right now, so nothing was saved. "
-    "The detail below says why. Fix that and try again, or finish without "
-    "agent defaults."
+    "Agent defaults could not be applied, and nothing was saved. "
+    "The detail below says why. You can finish without agent defaults, "
+    "or fix the cause — where it names one — and try again."
 )
 
 
@@ -195,8 +200,13 @@ def _next_up_verdict(
 
 def _configured_subscription_seat(
     harness: str, account: Dict[str, Any], profiles: Dict[Tuple[str, str], Dict[str, Any]],
+    *, native_allowed: bool = True,
 ) -> Tuple[bool, str]:
     """Is a subscription seat CONFIGURED here — regardless of capacity right now?
+
+    ``native_allowed=False`` is the unrunnable-harness-row case: a native
+    default seat's only runnability signal is that row, so it cannot count
+    there, while a named profile's own probe still can.
 
     Two questions the engine answers differently, and the preset must not
     collapse them into one:
@@ -222,7 +232,8 @@ def _configured_subscription_seat(
     signed in, and that IS durable — a seat billing the owner's API key is what
     D-3 forbids, spent window or not."""
     next_up = account.get("next_up") if isinstance(account.get("next_up"), dict) else {}
-    if account.get("native_login_detected") and account.get("native_credentials_enabled"):
+    if (native_allowed and account.get("native_login_detected")
+            and account.get("native_credentials_enabled")):
         effective_api_key = (str(next_up.get("kind") or "") == "native"
                              and str(next_up.get("route") or "") == _API_KEY_NATIVE_ROUTE)
         if not effective_api_key:
@@ -244,8 +255,12 @@ def subscription_routable_harnesses(
 
     An account being SIGNED IN is not the question, and neither is "would a run
     start this second". A once-only install-time decision needs the DURABLE one:
-    the harness row must be enabled and runnable, and a subscription seat must be
-    configured for it. The engine's `next_up` answers first, because when it does
+    the harness row must be enabled, and a subscription seat must be configured
+    for it — where a NATIVE default seat also needs the row RUNNABLE (the row is
+    that seat's only runnability signal), while a NAMED-profile seat is vouched
+    by its own doctor probe and counts even on a structurally unavailable row
+    (a harness with no default credential store, agy/Claudexor INV-135).
+    The engine's `next_up` answers first, because when it does
     say yes the receipt records the seat a real run would take; when it says no,
     a configured seat still counts and the refusal is recorded as a capacity
     note. Everything the verdict rests on comes from the engine."""
@@ -271,16 +286,35 @@ def subscription_routable_harnesses(
             refused[harness] = "the engine has this harness disabled"
             continue
         status = str(row.get("status") or "")
-        if status in _UNRUNNABLE_HARNESS_STATUS:
-            refused[harness] = f"the engine reports it {status}"
-            continue
+        unrunnable = status in _UNRUNNABLE_HARNESS_STATUS
+        # A harness-level "unavailable" is no longer an outright refusal: an
+        # engine whose harness has NO default credential store (agy — Claudexor
+        # INV-135) reports the harness row STRUCTURALLY unavailable while its
+        # named profiles run fine, and their per-profile doctor probes are the
+        # runnability proof the harness row cannot give. A NATIVE default seat
+        # still requires a runnable harness row — the row is that seat's only
+        # runnability signal — which keeps the deliberate
+        # signed-in-but-unavailable refusal for the classic harnesses.
+        next_up = account.get("next_up") if isinstance(account.get("next_up"), dict) else {}
+        next_kind = str(next_up.get("kind") or "")
         ok, evidence = _next_up_verdict(harness, account, profiles)
-        if ok:
-            routable[harness] = evidence
+        if ok and (not unrunnable or next_kind == "profile"):
+            routable[harness] = evidence if not unrunnable else (
+                f"{evidence} (the harness row reads {status}: it has no default "
+                "credential store, and the named-profile probe vouches the seat)")
             continue
-        seated, seat = _configured_subscription_seat(harness, account, profiles)
+        seated, seat = _configured_subscription_seat(
+            harness, account, profiles, native_allowed=not unrunnable)
         if seated:
-            routable[harness] = f"{seat}; no capacity right now ({evidence})"
+            # "No capacity" wording is reserved for genuine temporary
+            # exhaustion; a structurally unavailable row (no default
+            # credential store) discloses the structural cause instead.
+            routable[harness] = (
+                f"{seat} (the harness row reads {status}: it has no default "
+                f"credential store, and the named-profile probe vouches the seat; {evidence})"
+                if unrunnable else f"{seat}; no capacity right now ({evidence})")
+        elif unrunnable:
+            refused[harness] = f"the engine reports it {status}"
         else:
             refused[harness] = evidence
     return routable, refused
