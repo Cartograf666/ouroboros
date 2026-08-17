@@ -411,7 +411,9 @@ def test_ephemeral_decision_web_frames_never_create_task_card_or_second_receipt(
     assert "const ephemeralDecisionTaskIds = new Set();" in chat
     register = chat[
         chat.index("function registerEphemeralDecisionFrame"):
-        chat.index("function buildMessageKey")
+        # buildMessageKey moved to chat_activity.js; the next stable symbol
+        # after the register pair bounds the slice now.
+        chat.index("function readPendingReconnectBanner")
     ]
     assert "ephemeralDecisionTaskIds.add(taskId);" in register
     assert "record.root?.remove();" in register

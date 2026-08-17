@@ -88,6 +88,10 @@ class ChatOutbound(TypedDict):
     # X3: a repair receipt whose managed task id does not exist yet (the router
     # mints it at promotion). Typed truth instead of an invented id.
     task_id_pending: NotRequired[bool]
+    # "finalizing" on a root's early final answer: the answer is delivered
+    # while post-task synthesis still runs, so the frame is NOT the task's
+    # terminal conclusion — task_done settles the card/turn.
+    task_phase: NotRequired[str]
     ephemeral_decision: NotRequired[bool]
     task_incident: NotRequired[str]
     toast_once: NotRequired[str]
@@ -517,6 +521,26 @@ class ActiveDirectTurn(TypedDict):
     started_at: float
 
 
+class ActiveChatActivity(TypedDict):
+    """One in-flight chat activity in ``StateResponse.active_chat_activities``.
+
+    The combined snapshot: direct/ephemeral registry turns (same rows as
+    ``active_direct_turns``) plus ROOT managed queue tasks projected as
+    ``kind="managed_task"`` with ``phase`` ``queued`` | ``working`` |
+    ``finalizing`` (final answer stored, post-task synthesis still open).
+    Field shape mirrors ``ActiveDirectTurn`` so one client reducer hydrates
+    both; managed rows carry an empty ``client_message_id``.
+    """
+
+    activity_id: str
+    chat_id: int
+    project_id: str
+    client_message_id: str
+    kind: str
+    phase: str
+    started_at: float
+
+
 class StateResponse(TypedDict):
     """Shape of ``GET /api/state`` (happy path)."""
 
@@ -559,6 +583,10 @@ class StateResponse(TypedDict):
     # project's panel (v6.33.0 F4).
     task_bindings: dict
     active_direct_turns: NotRequired[List[ActiveDirectTurn]]
+    # Combined activity snapshot (direct/ephemeral turns + root managed queue
+    # tasks). Additive beside active_direct_turns, which stays unchanged for
+    # compatibility; new clients hydrate from this field.
+    active_chat_activities: NotRequired[List[ActiveChatActivity]]
 
 
 class SettingsNetworkMeta(TypedDict):
@@ -1271,6 +1299,7 @@ __all__ = [
     "HealthResponse",
     "StateResponse",
     "ActiveDirectTurn",
+    "ActiveChatActivity",
     "EvolutionStateSnapshot",
     "SettingsNetworkMeta",
     "SettingsMeta",

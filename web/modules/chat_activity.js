@@ -168,6 +168,8 @@ export function clearStickyCardState(record) {
     if (!record) return record;
     record.collapsedActivity = '';
     record.costMeta = null;
+    // A recycled slot must not inherit the previous cycle's finalizing hold.
+    record.finalizingHold = false;
     // The activity clock is cycle state too: a
     // recycled slot ('bg-consciousness', 'active') would otherwise open showing
     // the previous cycle's "Latest" time.
@@ -213,25 +215,33 @@ export function isTerminalTaskPhase(phase = '', terminal = false) {
 }
 
 // ---------------------------------------------------------------------------
-// In-flight direct/ephemeral turn status (owner decisions 1A-5A).
+// In-flight chat activity status (owner decisions 1A-5A; managed continuity).
 // ---------------------------------------------------------------------------
 
-// Snapshot-authoritative activity kinds: only turns the server's direct
-// registry tracks may be deleted by /api/state hydration. Typing frames from
-// queued managed tasks carry no kind — the snapshot has no authority over them
-// (they are concluded by their own final/summary frames, as before).
-const SNAPSHOT_AUTHORITATIVE_KINDS = new Set(['direct_chat', 'ephemeral_decision']);
+// Snapshot-authoritative activity kinds: only kinds the server's activity
+// snapshot actually enumerates may be deleted by /api/state hydration.
+// "managed_task" rows come from the supervisor queue (PENDING/RUNNING roots),
+// so their absence from a snapshot is authoritative conclusion. Typing frames
+// without a kind stamp (legacy frames, subagents) stay exempt — they are
+// concluded by their own final/summary frames, as before.
+const SNAPSHOT_AUTHORITATIVE_KINDS = new Set(['direct_chat', 'ephemeral_decision', 'managed_task']);
 
 /**
- * Single status reducer for the chat header (owner decisions 2A/5A). Priority:
- * disconnected > background live card (Working...) > server-confirmed in-flight
- * turns (Thinking...) > local pending submissions (Sending...) > terminal
- * attention > idle. Pure over its inputs for dependency-free node tests.
+ * Single status reducer for the chat header (owner decisions 2A/5A; managed
+ * activities added by the project-continuity contract). Priority: disconnected
+ * > background live card (Working...) > admitted managed work (Working...) >
+ * server-confirmed direct/ephemeral turns (Thinking...) > local pending
+ * submissions (Sending...) > queue-admitted but unstarted managed work
+ * (Queued...) > terminal attention > idle. A queued task ranks below
+ * Sending... because an unacknowledged local submission is the more actionable
+ * state. Pure over its inputs for dependency-free node tests.
  */
 export function computeDerivedChatStatus({
     isConnected = true,
     hasActiveLiveCard = false,
     activeDirectCount = 0,
+    activeManagedCount = 0,
+    queuedManagedCount = 0,
     pendingSubmissionsCount = 0,
     lastTerminalAttention = false,
 } = {}) {
@@ -241,11 +251,17 @@ export function computeDerivedChatStatus({
     if (hasActiveLiveCard) {
         return { kind: 'thinking', text: 'Working...', showDots: false };
     }
+    if (activeManagedCount > 0) {
+        return { kind: 'thinking', text: 'Working...', showDots: true };
+    }
     if (activeDirectCount > 0) {
         return { kind: 'thinking', text: 'Thinking...', showDots: true };
     }
     if (pendingSubmissionsCount > 0) {
         return { kind: 'thinking', text: 'Sending...', showDots: true };
+    }
+    if (queuedManagedCount > 0) {
+        return { kind: 'thinking', text: 'Queued...', showDots: true };
     }
     if (lastTerminalAttention) {
         return { kind: 'error', text: 'Attention', showDots: false };
@@ -254,12 +270,130 @@ export function computeDerivedChatStatus({
 }
 
 /**
- * Reconcile the client's active-turn map against one /api/state snapshot
- * (owner decision 1A). The snapshot is authoritative ONLY over registry-tracked
- * direct/ephemeral turns that existed before it was requested; it must never
- * delete (a) an activity registered by a WS typing frame AFTER the request
- * started (the barrier), or (b) a queued managed task's typing entry, which the
- * direct registry does not track (kind '').
+ * Local-echo continuity: split the bounded journal of locally-sent owner rows
+ * against ONE fetched history response. Entries whose client_message_id
+ * appears in the response are CONFIRMED durable (server history is the
+ * authority; the local copy retires). The rest are UNCONFIRMED and must
+ * survive a full feed rebuild: a stale history snapshot — fetched before the
+ * send was logged — has no authority to erase a message the owner just sent.
+ * Pure over its inputs for dependency-free node tests.
+ */
+export function partitionLocalEchoJournal(journal, serverClientMessageIds) {
+    const confirmed = [];
+    const unconfirmed = [];
+    const entries = journal instanceof Map ? journal.values() : (journal || []);
+    for (const entry of entries) {
+        const cmid = String(entry?.clientMessageId || '');
+        if (!cmid) continue;
+        if (serverClientMessageIds && serverClientMessageIds.has(cmid)) confirmed.push(entry);
+        else unconfirmed.push(entry);
+    }
+    return { confirmed, unconfirmed };
+}
+
+// ---------------------------------------------------------------------------
+// Pure message-presentation helpers (moved verbatim from chat.js — that
+// module sits at its byte ceiling).
+// ---------------------------------------------------------------------------
+
+/** Dedupe key for one rendered chat row; client_message_id wins when present. */
+export function buildMessageKey(role, text, timestamp, opts = {}) {
+    if (opts.clientMessageId) return `client|${opts.clientMessageId}`;
+    if (role !== 'user' && !opts.isProgress && opts.taskId) {
+        return [
+            'task',
+            role,
+            opts.systemType || '',
+            opts.source || '',
+            opts.taskId,
+            text,
+        ].join('|');
+    }
+    if (!timestamp) return '';
+    return [
+        role,
+        opts.isProgress ? '1' : '0',
+        opts.systemType || '',
+        opts.source || '',
+        opts.senderLabel || '',
+        opts.senderSessionId || '',
+        opts.taskId || '',
+        timestamp,
+        text,
+    ].join('|');
+}
+
+export function reconnectBannerText(reason = '') {
+    if (reason === 'sha-change') return '♻️ Restart complete';
+    if (reason) return '♻️ Reconnected';
+    return '';
+}
+
+/** {short, full} presentation of a message timestamp, or null when unreadable. */
+export function formatMsgTime(isoStr) {
+    if (!isoStr) return null;
+    try {
+        const d = new Date(isoStr);
+        if (isNaN(d)) return null;
+        const now = new Date();
+        const pad = n => String(n).padStart(2, '0');
+        const hhmm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+        const todayStr = now.toDateString();
+        const yesterday = new Date(now);
+        yesterday.setDate(now.getDate() - 1);
+        let short;
+        if (d.toDateString() === todayStr) short = hhmm;
+        else if (d.toDateString() === yesterday.toDateString()) short = `Yesterday, ${hhmm}`;
+        else short = `${months[d.getMonth()]} ${d.getDate()}, ${hhmm}`;
+        const full = `${months[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()} at ${hhmm}`;
+        return { short, full };
+    } catch {
+        return null;
+    }
+}
+
+/** Human text for a typed routing annotation ('' hides the line). */
+export function routingAnnotationText(annotation) {
+    if (!annotation || typeof annotation !== 'object') return '';
+    const action = String(annotation.action || '');
+    const status = String(annotation.status || '');
+    const target = String(annotation.target || '');
+    if (status === 'pending') return 'Choosing the right destination…';
+    if (status === 'needs_manual_target') {
+        const optionLabels = (Array.isArray(annotation.options) ? annotation.options : [])
+            .map(option => {
+                if (!option || typeof option !== 'object') return '';
+                if (option.label) return String(option.label);
+                if (option.action === 'new_task_in_project') {
+                    return `New task in ${String(option.project_name || 'Project')}`;
+                }
+                return String(option.title || option.task_id || option.project_name || option.project_id || '');
+            })
+            .filter(Boolean);
+        if (optionLabels.length) return `Choose a target · ${optionLabels.join(' / ')}`;
+        return target ? `Choose a target · ${target}` : 'Choose a target';
+    }
+    if (status === 'project_unavailable') return 'Project is unavailable';
+    const labels = {
+        mailbox_delivery: 'Delivered to task',
+        steer_task: 'Steered task',
+        promote_chat_to_task: 'Started task',
+        route_to_project: 'Routed to project',
+        project_route: 'Project routing',
+    };
+    const label = labels[action] || status.replaceAll('_', ' ') || action.replaceAll('_', ' ');
+    return target && label ? `${label} · ${target}` : label;
+}
+
+/**
+ * Reconcile the client's active-activity map against one /api/state snapshot
+ * (owner decision 1A). The snapshot is authoritative ONLY over kinds it
+ * enumerates (direct/ephemeral registry turns and queue-listed managed roots)
+ * that existed before it was requested; it must never delete (a) an activity
+ * registered by a WS typing frame AFTER the request started (the barrier), or
+ * (b) a kind-less typing entry (legacy frames, subagents), which no snapshot
+ * source tracks.
  *
  * `concludedIds` (Set/Map with .has) is the client-side conclusion ledger: a
  * turn already concluded by its keyed final must never be re-inserted by a
@@ -291,9 +425,9 @@ export function computeHydratedDirectActivities(existingMap, turnsList, chatId, 
     }
     for (const [aid, entry] of nextMap.entries()) {
         if (activeIdsInSnapshot.has(aid)) continue;
-        // Deletion authority is scoped to registry-tracked kinds: a queued
-        // managed task's typing entry is invisible to the direct registry and
-        // is concluded by its own final/summary frame instead.
+        // Deletion authority is scoped to snapshot-enumerated kinds: a
+        // kind-less typing entry is invisible to every snapshot source and is
+        // concluded by its own final/summary frame instead.
         if (!SNAPSHOT_AUTHORITATIVE_KINDS.has(String(entry?.kind || ''))) continue;
         const startedAt = Number(entry?.startedAt) || 0;
         if (startedAt >= snapshotBarrierMs) continue;
