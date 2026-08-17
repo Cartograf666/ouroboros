@@ -21,6 +21,7 @@ import { initDashboard } from './modules/dashboard.js';
 import { hydrateNavIcons } from './modules/page_icons.js';
 
 import { initOnboardingOverlay } from './modules/onboarding_overlay.js';
+import { installAltMenuSuppression } from './modules/ui_helpers.js';
 
 const state = {
     messages: [],
@@ -873,6 +874,10 @@ syncNavigationState();
     stableViewportHeight = viewportHeight();
     updateVvh();
 }());
+
+// Windows Alt / Layout Switch Menu-lock suppression (shared installer — the
+// onboarding wizard document installs the same guard on its own iframe window).
+installAltMenuSuppression();
 
 // Populate the project-thread isolation set BEFORE opening the socket so the live
 // fan-out never misclassifies an early project frame as main-chat traffic during

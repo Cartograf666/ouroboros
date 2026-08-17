@@ -12,8 +12,12 @@ import {
     readCompletionAnswer,
 } from './onboarding_agents_step.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
+import { installAltMenuSuppression } from './ui_helpers.js';
 
 (() => {
+        // The wizard is its own document inside the overlay iframe, so the SPA's
+        // Alt menu-lock guard cannot see its keyboard events — install our own.
+        installAltMenuSuppression();
         const bootstrap = window.__OURO_ONBOARDING_BOOTSTRAP__ || {};
         const SETUP_CONTRACT = bootstrap.contract || {};
         const HOST_MODE = bootstrap.hostMode || 'desktop';
