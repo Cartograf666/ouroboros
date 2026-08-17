@@ -74,25 +74,36 @@ def _git_bytes(repo_dir: pathlib.Path, args: list[str]) -> bytes:
     return result.stdout
 
 
-def _ref_resolves(repo_dir: pathlib.Path, ref: str) -> bool:
-    """True only if ``ref`` names a real object. MERGE_HEAD outside a merge and
-    an unborn HEAD both resolve to False here, not an error."""
+def _ref_status(repo_dir: pathlib.Path, ref: str) -> bool | None:
+    """Resolve ``ref``: True when it names a real object, False when git
+    PROVES it absent (``--verify --quiet`` exits 1: no MERGE_HEAD outside a
+    merge, an unborn HEAD), None when the probe itself failed (spawn error,
+    timeout, any other exit) — a failed probe is not proof of absence.
+
+    Disclosed residual: git reports an unreadable loose ref file with the
+    same exit 1 as a missing ref, so broken ref storage still reads as
+    absence; git itself cannot tell those apart at this seam."""
     result = _git_run(repo_dir, ["rev-parse", "--verify", "--quiet", ref])
-    return result is not None and result.returncode == 0
+    if result is None:
+        return None
+    if result.returncode == 0:
+        return True
+    return False if result.returncode == 1 else None
 
 
 def _tree_entry(repo_dir: pathlib.Path, ref: str, rel: str) -> tuple[str, str, bool]:
     """Look up ``rel`` in ``ref``'s tree. Returns ``(mode, blob, ok)``.
 
-    ``ok`` is False only when ``ref`` resolves to a real object but the tree
-    read itself failed (corrupt or unreadable object, IO error): a genuine
-    read failure, distinct from the ref simply not existing (no MERGE_HEAD
-    outside a merge, an unborn HEAD) or the path having no entry in a tree
-    that read fine, both of which are a real ``ok=True`` absence.
+    ``ok`` is False when the tree read failed and the ref is not PROVEN
+    absent: the ref resolves but its tree is corrupt or unreadable, or the
+    absence probe itself errored (spawn failure, timeout, unexpected exit).
+    Only a proven missing ref (no MERGE_HEAD outside a merge, an unborn
+    HEAD) or a path with no entry in a tree that read fine is a real
+    ``ok=True`` absence.
     """
     result = _git_run(repo_dir, ["ls-tree", "-z", ref, "--", rel])
     if result is None or result.returncode != 0:
-        return "", "", not _ref_resolves(repo_dir, ref)
+        return "", "", _ref_status(repo_dir, ref) is False
     record = (result.stdout or b"").split(b"\0", 1)[0]
     fields = record.partition(b"\t")[0].split()
     if len(fields) < 3:

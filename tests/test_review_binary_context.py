@@ -1,10 +1,12 @@
 """Hardened staged-diff capture (``capture_staged_diff``) — the one shared
-evidence source for the scope reviewer and the triad."""
+evidence source for the scope reviewer and the triad — and the fail-closed
+exact staged-binary metadata renderer (``render_staged_binary_metadata``)."""
 
 import subprocess
 
 import pytest
 
+from ouroboros.tools import review_binary_context
 from ouroboros.tools.review_binary_context import (
     StagedDiffUnavailable,
     capture_staged_diff,
@@ -140,6 +142,36 @@ def test_render_staged_binary_metadata_hard_blocks_on_head_tree_read_error(tmp_p
     (repo / "bin.dat").write_bytes(b"\x00\x01new")
     subprocess.run(["git", "add", "bin.dat"], cwd=repo, check=True, capture_output=True)
     _corrupt_root_tree(repo)
+
+    metadata = render_staged_binary_metadata(repo, "bin.dat")
+
+    assert metadata is None
+
+
+@pytest.mark.parametrize("probe_result", [None, 128])
+def test_render_staged_binary_metadata_hard_blocks_when_the_ref_probe_itself_fails(
+    tmp_path, monkeypatch, probe_result,
+):
+    """A failed ls-tree whose ref-absence probe ALSO fails (rev-parse times
+    out, cannot spawn, or exits with anything but the clean rc 1) must fail
+    closed: a broken probe is not proof the ref was absent. Only a proven
+    missing ref may render as `absent`."""
+    repo = _repo(tmp_path)
+    (repo / "bin.dat").write_bytes(b"\x00\x01new")
+    subprocess.run(["git", "add", "bin.dat"], cwd=repo, check=True, capture_output=True)
+
+    real_git_run = review_binary_context._git_run
+
+    def broken_ref_probes(repo_dir, args):
+        if args[0] == "ls-tree":
+            return subprocess.CompletedProcess(args, 128, stdout=b"")
+        if args[0] == "rev-parse":
+            if probe_result is None:
+                return None
+            return subprocess.CompletedProcess(args, probe_result, stdout=b"")
+        return real_git_run(repo_dir, args)
+
+    monkeypatch.setattr(review_binary_context, "_git_run", broken_ref_probes)
 
     metadata = render_staged_binary_metadata(repo, "bin.dat")
 
