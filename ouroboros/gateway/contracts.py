@@ -260,6 +260,13 @@ class TypingOutbound(TypedDict):
     # Multi-project: stamps the thread so the client fan-out routes a project
     # task's typing indicator to its panel instead of defaulting to main.
     chat_id: NotRequired[int]
+    activity_id: NotRequired[str]
+    client_message_id: NotRequired[str]
+    phase: NotRequired[str]
+    # Stamped only for direct-registry-tracked turns ("direct_chat" /
+    # "ephemeral_decision"); queued managed tasks emit typing without it, so the
+    # client exempts their entries from /api/state snapshot deletion authority.
+    kind: NotRequired[str]
 
 
 class LogOutbound(TypedDict):
@@ -493,6 +500,23 @@ class EvolutionStateSnapshot(TypedDict):
     campaign: NotRequired[Dict[str, Any]]
 
 
+class ActiveDirectTurn(TypedDict):
+    """An active in-process direct chat or ephemeral decision turn.
+
+    Snapshot rows in ``StateResponse.active_direct_turns``; every field is
+    always emitted by ``DirectActivityRegistry.snapshot()`` (empty-string for
+    absent optionals), so the mirror marks them all required.
+    """
+
+    activity_id: str
+    chat_id: int
+    project_id: str
+    client_message_id: str
+    kind: str
+    phase: str
+    started_at: float
+
+
 class StateResponse(TypedDict):
     """Shape of ``GET /api/state`` (happy path)."""
 
@@ -534,6 +558,7 @@ class StateResponse(TypedDict):
     # project" button (v6.33.0 P2) and render a pointer that opens the bound
     # project's panel (v6.33.0 F4).
     task_bindings: dict
+    active_direct_turns: NotRequired[List[ActiveDirectTurn]]
 
 
 class SettingsNetworkMeta(TypedDict):
@@ -1245,6 +1270,7 @@ __all__ = [
     "StatusResponse",
     "HealthResponse",
     "StateResponse",
+    "ActiveDirectTurn",
     "EvolutionStateSnapshot",
     "SettingsNetworkMeta",
     "SettingsMeta",

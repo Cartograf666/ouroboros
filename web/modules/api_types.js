@@ -30,6 +30,18 @@
  * @property {Array<Object>} projects  // active/deleting ProjectEntry sidebar projection
  * @property {Array<number>} project_chat_ids  // complete (uncapped) project chat_ids — WS fan-out isolation SSOT (v6.32.0)
  * @property {Object<string, {project_id: string, chat_id: number}>} task_bindings  // bound task -> its project: suppress the stray "turn into project" button (v6.33.0 P2) + render a pointer that opens the project panel (v6.33.0 F4)
+ * @property {ActiveDirectTurn[]=} active_direct_turns  // active direct/ephemeral chat turns snapshot
+ */
+
+/**
+ * @typedef {Object} ActiveDirectTurn
+ * @property {string} activity_id
+ * @property {number} chat_id
+ * @property {string} project_id
+ * @property {string} client_message_id
+ * @property {string} kind
+ * @property {string} phase
+ * @property {number} started_at
  */
 
 /**
@@ -237,6 +249,17 @@
  * @property {number=} telegram_chat_id
  * @property {string=} system_type
  * @property {number=} chat_id
+ */
+
+/**
+ * @typedef {Object} TypingOutbound
+ * @property {"typing"} type
+ * @property {string} action
+ * @property {number=} chat_id  // multi-project: routes the indicator to the owning panel
+ * @property {string=} activity_id
+ * @property {string=} client_message_id
+ * @property {string=} phase
+ * @property {string=} kind  // stamped only for direct-registry-tracked turns; absent for queued managed tasks (snapshot has no deletion authority over them)
  */
 
 /**
