@@ -106,6 +106,7 @@ def _state_snapshot(request: Request) -> Dict[str, Any]:
         if budget_projection is not None
         else get_evolution_status_snapshot()
     )
+    task_bindings = _task_bindings_safe(request)
     return {
         "st": st,
         "workers_alive": alive,
@@ -121,10 +122,11 @@ def _state_snapshot(request: Request) -> Dict[str, Any]:
         "github_token_configured": bool(github_token_from_env_or_settings()),
         "projects": _projects_summary_safe(request),
         "project_chat_ids": _project_chat_ids_safe(request),
-        "task_bindings": _task_bindings_safe(request),
+        "task_bindings": task_bindings,
         "active_direct_turns": (
             _direct_turns_snapshot_safe()
         ),
+        "active_chat_activities": _chat_activities_snapshot_safe(drive_root, task_bindings),
     }
 
 
@@ -135,6 +137,128 @@ def _direct_turns_snapshot_safe() -> list:
         return get_direct_activity_registry().snapshot()
     except Exception:
         return []
+
+
+def _epoch_or_zero(value: Any) -> float:
+    """Epoch seconds from a float or an ISO-8601 string (queued_at); else 0.0."""
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        pass
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# task_id -> ((mtime_ns, size), finalizing) so the poll re-reads a root's
+# durable result only when the file actually changed (projection over replay).
+_FINALIZING_MEMO: Dict[str, tuple] = {}
+_FINALIZING_MEMO_MAX = 64
+
+
+def _managed_task_finalizing(drive_root: Any, task_id: str) -> bool:
+    """True while the root's post-task synthesis checkpoint is OPEN.
+
+    An open checkpoint (``pending_once`` | ``running``) is the canonical
+    durable signal that the final answer was stored but post-task synthesis —
+    and therefore ``task_done`` — is still pending (post_task_checkpoint.py).
+    Stat-memoized; never raises.
+    """
+    try:
+        from ouroboros.task_results import task_results_dir
+
+        path = task_results_dir(pathlib.Path(drive_root), create=False) / f"{task_id}.json"
+        stat = path.stat()
+    except Exception:
+        _FINALIZING_MEMO.pop(task_id, None)
+        return False
+    key = (stat.st_mtime_ns, stat.st_size)
+    memo = _FINALIZING_MEMO.get(task_id)
+    if memo is not None and memo[0] == key:
+        return memo[1]
+    try:
+        from ouroboros.utils import read_json_dict
+
+        data = read_json_dict(path) or {}
+    except Exception:
+        return False
+    checkpoint = data.get("root_phase_checkpoint")
+    synthesis = str(checkpoint.get("post_task_synthesis") or "") if isinstance(checkpoint, dict) else ""
+    finalizing = synthesis in {"pending_once", "running"}
+    if len(_FINALIZING_MEMO) >= _FINALIZING_MEMO_MAX:
+        _FINALIZING_MEMO.clear()
+    _FINALIZING_MEMO[task_id] = (key, finalizing)
+    return finalizing
+
+
+def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None) -> list:
+    """Direct/ephemeral turns plus ROOT managed queue tasks as ONE activity list.
+
+    Additive beside ``active_direct_turns`` (kept unchanged for compatibility):
+    the client hydrates managed-task visibility from the queue authority —
+    ``queued`` (PENDING), ``working`` (RUNNING), or ``finalizing`` (RUNNING
+    with an open post-task checkpoint) — instead of relying on transient
+    typing frames. ``task_bindings`` (the same projection the snapshot already
+    serves) re-homes a mid-run "turn into project" conversion, whose queue row
+    still carries the original chat. Never raises.
+    """
+    activities = _direct_turns_snapshot_safe()
+    try:
+        from supervisor import queue as queue_mod
+        from ouroboros.task_results import resolve_task_lineage
+
+        bindings = task_bindings if isinstance(task_bindings, dict) else {}
+        with queue_mod._queue_lock:
+            pending_rows = [dict(task) for task in queue_mod.PENDING]
+            running_rows = [
+                (
+                    str(task_id),
+                    dict(meta.get("task") or {}) if isinstance(meta, dict) else {},
+                    _epoch_or_zero(meta.get("started_at")) if isinstance(meta, dict) else 0.0,
+                )
+                for task_id, meta in queue_mod.RUNNING.items()
+            ]
+
+        def _is_root(task_id: str, row: Dict[str, Any]) -> bool:
+            try:
+                return bool(resolve_task_lineage(
+                    task_id,
+                    metadata=row.get("metadata"),
+                    root_task_id=row.get("root_task_id"),
+                    parent_task_id=row.get("parent_task_id"),
+                    delegation_role=row.get("delegation_role"),
+                    original_task_id=row.get("original_task_id"),
+                    timeout_retry_from=row.get("timeout_retry_from"),
+                )["is_root_task"])
+            except Exception:
+                return False
+
+        def _activity(task_id: str, row: Dict[str, Any], phase: str, started_at: float) -> Dict[str, Any]:
+            binding = bindings.get(task_id) if isinstance(bindings.get(task_id), dict) else {}
+            return {
+                "activity_id": task_id,
+                "chat_id": int(binding.get("chat_id") or row.get("chat_id") or 0),
+                "project_id": str(binding.get("project_id") or row.get("project_id") or ""),
+                "client_message_id": "",
+                "kind": "managed_task",
+                "phase": phase,
+                "started_at": started_at,
+            }
+
+        for row in pending_rows:
+            task_id = str(row.get("id") or "")
+            if task_id and _is_root(task_id, row):
+                activities.append(_activity(task_id, row, "queued", _epoch_or_zero(row.get("queued_at"))))
+        for task_id, row, started_at in running_rows:
+            if task_id and _is_root(task_id, row):
+                phase = "finalizing" if _managed_task_finalizing(drive_root, task_id) else "working"
+                activities.append(_activity(task_id, row, phase, started_at))
+    except Exception:
+        log.debug("Managed-activity snapshot unavailable for /api/state", exc_info=True)
+    return activities
 
 
 async def api_state(request: Request) -> JSONResponse:
@@ -236,6 +360,7 @@ async def api_state(request: Request) -> JSONResponse:
             "project_chat_ids": snap["project_chat_ids"],
             "task_bindings": snap["task_bindings"],
             "active_direct_turns": snap.get("active_direct_turns") or [],
+            "active_chat_activities": snap.get("active_chat_activities") or [],
         })
     except Exception as exc:
         return json_exception(exc)

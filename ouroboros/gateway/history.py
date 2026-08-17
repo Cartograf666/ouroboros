@@ -495,10 +495,26 @@ def _annotate_terminal_task_truth(
         terminal_status_by_task: Dict[str, str] = {}
         terminal_truth_by_task: Dict[str, Dict[str, Any]] = {}
         suggested_name_by_task: Dict[str, str] = {}
+        finalizing_tasks: set = set()
         for task_id in progress_task_ids | summary_task_ids:
             result = _load_terminal_result(data_dir, task_id, cache)
             status = str(result.get("status") or "")
-            if status in FINAL_STATUSES:
+            checkpoint = result.get("root_phase_checkpoint")
+            synthesis = (
+                str(checkpoint.get("post_task_synthesis") or "")
+                if isinstance(checkpoint, dict) else ""
+            )
+            # An OPEN post-task checkpoint means the final answer is stored
+            # but synthesis (and the settled task_done) has not landed: the
+            # task is FINALIZING, not terminal. This covers the plain root
+            # (status already "completed") AND the split-drive project root,
+            # whose canonical status stays scheduled/running until copy-back.
+            # A failed/cancelled record stays terminal immediately, and a
+            # record without a checkpoint keeps the legacy terminal semantics.
+            checkpoint_open = synthesis in {"pending_once", "running"}
+            if checkpoint_open and (status == "completed" or status not in FINAL_STATUSES):
+                finalizing_tasks.add(task_id)
+            elif status in FINAL_STATUSES:
                 terminal_status_by_task[task_id] = status
                 terminal_truth: Dict[str, Any] = {
                     "outcome_axes": normalize_outcome_axes(result),
@@ -533,6 +549,11 @@ def _annotate_terminal_task_truth(
             task_id = str(message.get("task_id") or "")
             if not task_id:
                 continue
+            # Every row of a finalizing task carries the typed phase so replay
+            # (progress cards AND the early final answer row) holds the card
+            # on "Finalizing…" instead of resolving it as done.
+            if task_id in finalizing_tasks:
+                message["task_phase"] = "finalizing"
             if message.get("is_progress") and task_id in terminal_status_by_task:
                 message["task_terminal_status"] = terminal_status_by_task[task_id]
             is_summary = str(message.get("system_type") or "") == "task_summary"

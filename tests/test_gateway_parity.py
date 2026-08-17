@@ -7,6 +7,7 @@ from typing import get_args, get_type_hints
 from ouroboros.gateway.contracts import (
     HTTP_ENDPOINTS,
     WS_MESSAGE_TYPES,
+    ActiveChatActivity,
     ActiveDirectTurn,
     ChatInbound,
     ChatOutbound,
@@ -97,6 +98,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     for name in (
         "StateResponse",
         "ActiveDirectTurn",
+        "ActiveChatActivity",
         "TypingOutbound",
         "HealthResponse",
         "SettingsMeta",
@@ -146,7 +148,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     # loop above cannot see a new @property, so an ABI field added on the Python side would otherwise
     # never have to appear in the browser's typedef (ARCHITECTURE.md §11.3).
     for cls in (ChatInbound, ChatOutbound, PhotoOutbound, VideoOutbound,
-                ActiveDirectTurn, TypingOutbound,
+                ActiveDirectTurn, ActiveChatActivity, TypingOutbound,
                 StateResponse, OwnerScopeReviewFloorResponse, UpdateMergePlan,
                 UpdatePreflightRequest, UpdatePreflightResponse, UpdateApplyRequest,
                 UpdateApplySuccessResponse, UpdateApplyErrorResponse,
@@ -215,6 +217,12 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
 
     assert _notrequired_fields(ActiveDirectTurn) == set(), (
         "ActiveDirectTurn snapshot rows always emit every field: keep them all required"
+    )
+    assert _notrequired_fields(ActiveChatActivity) == set(), (
+        "ActiveChatActivity snapshot rows always emit every field: keep them all required"
+    )
+    assert ActiveChatActivity.__annotations__.keys() == ActiveDirectTurn.__annotations__.keys(), (
+        "ActiveChatActivity must mirror ActiveDirectTurn's field shape so one client reducer hydrates both"
     )
     assert _notrequired_fields(TypingOutbound) == {
         "chat_id", "activity_id", "client_message_id", "phase", "kind",

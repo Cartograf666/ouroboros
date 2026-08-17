@@ -31,6 +31,7 @@
  * @property {Array<number>} project_chat_ids  // complete (uncapped) project chat_ids — WS fan-out isolation SSOT (v6.32.0)
  * @property {Object<string, {project_id: string, chat_id: number}>} task_bindings  // bound task -> its project: suppress the stray "turn into project" button (v6.33.0 P2) + render a pointer that opens the project panel (v6.33.0 F4)
  * @property {ActiveDirectTurn[]=} active_direct_turns  // active direct/ephemeral chat turns snapshot
+ * @property {ActiveChatActivity[]=} active_chat_activities  // combined snapshot: direct/ephemeral turns + root managed queue tasks
  */
 
 /**
@@ -41,6 +42,17 @@
  * @property {string} client_message_id
  * @property {string} kind
  * @property {string} phase
+ * @property {number} started_at
+ */
+
+/**
+ * @typedef {Object} ActiveChatActivity
+ * @property {string} activity_id
+ * @property {number} chat_id
+ * @property {string} project_id
+ * @property {string} client_message_id  // empty for managed queue rows
+ * @property {string} kind  // direct_chat | ephemeral_decision | managed_task
+ * @property {string} phase  // managed rows: queued | working | finalizing
  * @property {number} started_at
  */
 
@@ -152,6 +164,9 @@
  * @property {boolean=} is_progress
  * @property {string=} task_id
  * @property {boolean=} ephemeral_decision
+ * @property {string=} task_phase
+ *   "finalizing" on a root's early final answer: post-task synthesis still
+ *   runs, so the frame is not the task's terminal conclusion.
  * @property {string=} task_incident
  * @property {string=} toast_once
  * @property {boolean=} task_id_pending

@@ -199,7 +199,10 @@ def test_chat_shows_reconnect_banner_after_reconnect_and_reload():
     source = _read("web/modules/chat.js")
     assert "wsHasConnectedOnce" in source, "Missing reconnect-once tracking flag"
     assert "Reconnected" in source, "Missing reconnect banner text"
-    assert "Restart complete" in source, "Missing restart-complete banner text"
+    # reconnectBannerText moved verbatim to chat_activity.js (chat.js byte ceiling).
+    assert "Restart complete" in _read("web/modules/chat_activity.js"), (
+        "Missing restart-complete banner text"
+    )
     assert "_ouro_reason" in source, "Missing restart reload reason handling"
     assert "history.replaceState" in source, "Reconnect params should be cleared after showing banner"
     # Ensure banner is ephemeral (not persisted to history)
