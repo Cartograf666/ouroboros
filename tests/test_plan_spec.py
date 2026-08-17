@@ -660,6 +660,9 @@ def test_system_prompt_stance_and_bible_gating():
         if "quota" in line.lower():
             assert "no findings quota" in line.lower() or "do not fill a quota" in line.lower(), line
     assert "BIBLE BODY" not in plain and "on-demand pointer" in plain and "`BIBLE.md`" in plain
+    # P1: a navigation map the host could not supply is a NAMED absence in the packet, never silence
+    assert "OMISSION NOTE: BIBLE navigation map not supplied" in plain
+    assert "OMISSION NOTE: ARCHITECTURE navigation map not supplied" in plain
     assert checklist in plain
     assert "Convergence rule" not in plain
     assert "blocking" in lowered and "`breaks`" in plain
@@ -669,9 +672,11 @@ def test_system_prompt_stance_and_bible_gating():
         assert phrase in plain
     constitutional = plan_packet.build_plan_review_system_prompt(
         checklist_section=checklist, constitutional=True, bible_text="BIBLE BODY",
-        cycle_index=2, enforcement="advisory",
+        cycle_index=2, enforcement="advisory", architecture_text="ARCH BODY",
     )
     assert "BIBLE BODY" in constitutional and "Governance" in constitutional
+    # W3: ARCHITECTURE.md rides inline, in full, in the self-modification pack
+    assert "## ARCHITECTURE.md" in constitutional and "ARCH BODY" in constitutional
     # the convergence rule is cycle-dependent and now lives in the USER prior-cycles section
     # (system prompt stays byte-stable for its cache block)
     assert "Convergence rule" not in constitutional
@@ -680,20 +685,34 @@ def test_system_prompt_stance_and_bible_gating():
     with pytest.raises(plan_packet.PlanPacketError):
         plan_packet.build_plan_review_system_prompt(
             checklist_section="c", constitutional=True, bible_text=None, cycle_index=1, enforcement="blocking",
+            architecture_text="ARCH BODY",
+        )
+    # W3: and without ARCHITECTURE.md as well — a typed failure, never a packet that silently lacks it
+    with pytest.raises(plan_packet.PlanPacketError, match="ARCHITECTURE"):
+        plan_packet.build_plan_review_system_prompt(
+            checklist_section="c", constitutional=True, bible_text="BIBLE BODY", cycle_index=1,
+            enforcement="blocking", architecture_text=None,
         )
     assert "PLAN_REVIEW_CONTROL_JSON" not in plain + constitutional
     # B-09 / D30: resolvable pointer locator and the BIBLE navigation map only when NOT constitutional.
     pointed = plan_packet.build_plan_review_system_prompt(
         checklist_section="c", constitutional=False, bible_text="BIBLE BODY", cycle_index=1, enforcement="blocking",
         bible_locator="/srv/ouro/repo/BIBLE.md", bible_nav_map="NAV-MAP-ROWS",
+        architecture_text="ARCH BODY", architecture_locator="/srv/ouro/repo/docs/ARCHITECTURE.md",
+        architecture_nav_map="ARCH-NAV-ROWS",
     )
     assert "`/srv/ouro/repo/BIBLE.md`" in pointed and "NAV-MAP-ROWS" in pointed
     assert "BIBLE navigation map (pointer, not a copy)" in pointed and "BIBLE BODY" not in pointed
+    # W3: every other plan carries the ARCHITECTURE navigation map + a resolvable pointer, never the body
+    assert "`/srv/ouro/repo/docs/ARCHITECTURE.md`" in pointed and "ARCH-NAV-ROWS" in pointed
+    assert "ARCHITECTURE navigation map (pointer, not a copy)" in pointed and "ARCH BODY" not in pointed
+    assert "OMISSION NOTE" not in pointed
+    assert "the host attaches it on the next cycle" in pointed
     with_bible = plan_packet.build_plan_review_system_prompt(
         checklist_section="c", constitutional=True, bible_text="BIBLE BODY", cycle_index=1, enforcement="blocking",
-        bible_nav_map="NAV-MAP-ROWS",
+        bible_nav_map="NAV-MAP-ROWS", architecture_text="ARCH BODY", architecture_nav_map="ARCH-NAV-ROWS",
     )
-    assert "NAV-MAP-ROWS" not in with_bible and "BIBLE BODY" in with_bible
+    assert "NAV-MAP-ROWS" not in with_bible and "BIBLE BODY" in with_bible and "ARCH BODY" in with_bible
 
 
 def _packet(spec_raw, manifest, prior_cycles=(), dispositions=(), delta=None, log=None):
@@ -796,6 +815,18 @@ def test_user_content_bounds_are_disclosed_not_silent():
     assert "(not provided by host)" in content
 
 
+def test_capped_reviewer_requests_are_rendered_even_when_the_agent_declared_nothing():
+    """W3 (delta review round 2, S-3 edge): an empty declared list must not swallow the named
+    `reviewer_request_cap` omissions — every absence stays visible to the reviewers (P1)."""
+    spec, _ = plan_spec.normalize_spec(DECK_SPEC)
+    manifest = plan_evidence.resolve_evidence([], active_root=".", allowed_roots=["."])
+    manifest["reviewer_requested"] = ["a.md"]
+    manifest["omissions"] = [{"locator": "zzz.md", "reason": "reviewer_request_cap"}]
+    content = _packet(DECK_SPEC, manifest)
+    assert "(no evidence declared by the agent)" in content
+    assert "| zzz.md | reviewer_request_cap |" in content and "OMISSIONS (every absence named)" in content
+
+
 # --------------------------------------------------------- domain independence
 
 
@@ -842,4 +873,4 @@ def test_blank_spec_items_are_disclosed_not_silently_dropped():
     )
     assert errors == []
     assert spec["in_scope"] == ["auth"]
-    assert any("blank item dropped" in note for note in spec["normalization_omissions"])
+    assert any("blank item(s) dropped" in note for note in spec["normalization_omissions"])  # one bounded note per list

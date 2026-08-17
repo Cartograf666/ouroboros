@@ -24,9 +24,10 @@ read into rows, and the global Review / Scope Review efforts are copied into
 each row. There is NO permanent double-write: once the structured key is
 saved, the comma keys become a derived runtime projection
 (``project_reviewer_slots_into_env``) that only exists for the surfaces that
-stay on the API by owner decision (D15 — plan review, task acceptance, skill
-review consume API rows only; harness delivery is commit-triad/scope/advisory
-territory).
+stay on the API by owner decision (D15 — task acceptance and skill review
+consume API rows only; harness delivery is commit-triad/scope/advisory territory,
+and plan review follows each configured triad row's own delivery kind, spec-gate
+redesign 2026-08-15).
 
 Malformed configuration RAISES: mapping a typo to ``api_chat`` would silently
 spend the API money the owner configured the row to move off of, and mapping
@@ -459,8 +460,9 @@ def row_effort(row: ConfiguredReviewerSlot, surface: str) -> str:
 
 
 def api_fallback_disclosure(config: "ReviewerSlotConfig") -> Dict[str, Any]:
-    """What the API-pinned surfaces (plan review, task acceptance, skill review)
-    will REALLY run when a group has no api_chat row left (D4/D15).
+    """What the API-pinned surfaces (task acceptance, skill review) will REALLY
+    run when a group has no api_chat row left (D4/D15). Plan review is not one of
+    them: it rides each configured triad row's own delivery kind.
 
     When every commit-triad (or scope) row is delegated, those surfaces cannot
     run on a delegated route — they stay on the API by owner decision — so they
@@ -512,9 +514,9 @@ def _fallback_warning_text(disclosure: Dict[str, Any]) -> str:
     return (
         f"Every {surfaces} row runs on an agent subscription, so those reviews "
         f"spend subscription windows instead of API budget and never fall back "
-        f"to API spend. Plan review, task acceptance and skill review are "
-        f"API-only surfaces today: they keep running on the shipped default "
-        f"models ({', '.join(models)})."
+        f"to API spend. Task acceptance and skill review are API-only surfaces "
+        f"today: they keep running on the shipped default models "
+        f"({', '.join(models)}); plan review follows each triad row's own delivery."
     )
 
 
@@ -548,9 +550,10 @@ def _record_api_fallback_substitution(disclosure: Dict[str, Any]) -> None:
 def project_reviewer_slots_into_env() -> None:
     """Project the structured config into the legacy env keys, at env-apply time.
 
-    Plan review, task acceptance and skill review stay on the API by owner
-    decision (D15) and keep reading ``get_review_models()``; when the owner's
-    triad mixes in delegated rows, those surfaces must see ONLY the API rows.
+    Task acceptance and skill review stay on the API by owner decision (D15) and
+    keep reading ``get_review_models()``; when the owner's triad mixes in
+    delegated rows, those surfaces must see ONLY the API rows (plan review reads
+    the structured rows directly, both delivery kinds).
     This is a runtime DERIVATION, not a second write: settings.json holds the
     structured key alone, and a stale comma value there is overwritten here
     rather than winning silently.

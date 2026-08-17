@@ -3,7 +3,8 @@
 Companion of ``ouroboros.tools.plan_spec`` (schema / findings / aggregate /
 evidence): the system prompt carries the findings-only stance, the domain-free
 rubric, the blocking rule, the convergence rule (cycle ≥2), the checklist
-section verbatim and BIBLE.md iff ``constitutional``; the user content carries
+section verbatim, and the governance pack (W3: BIBLE.md + ARCHITECTURE.md in full for a
+self-modification plan, their navigation maps otherwise); the user content carries
 TASK OBJECTIVE · SPEC · PLAN PROSE · EVIDENCE (+ OMISSIONS) · ROOT EXPLORATION
 LOG · PRIOR CYCLES in that order. String bounds are ``PACKET_*_CHARS`` (plan_spec) via
 ``utils.truncate_review_artifact`` — visible marker, never silent. The
@@ -41,7 +42,8 @@ _RUBRIC = (
     "irreversibility, external commitments)?",
     "4. Deferrals — is an expensive-to-reverse decision hiding inside `deferred`?",
     "5. Evidence sufficiency — is the attached evidence enough to judge 1–4? If not, ask for "
-    "exactly what is missing with a `need_evidence` finding naming its locator; do not invent a gap.",
+    "exactly what is missing with a `need_evidence` finding naming its locator (the host attaches it "
+    "on the next cycle); do not invent a gap.",
 )
 
 _BLOCKING_RULE = (
@@ -71,14 +73,26 @@ def build_plan_review_system_prompt(
     enforcement: str,
     bible_locator: str = "BIBLE.md",
     bible_nav_map: Optional[str] = None,
+    architecture_text: Optional[str] = None,
+    architecture_locator: str = "docs/ARCHITECTURE.md",
+    architecture_nav_map: Optional[str] = None,
+    governance_by_retrieval: bool = False,
 ) -> str:
     """Findings-only reviewer stance for ONE independent slot (no competing plan,
-    no issue quota, no 'your own approach'). BIBLE.md is included iff
-    ``constitutional``; otherwise it is a named on-demand pointer (W3) — the
-    caller passes a RESOLVABLE ``bible_locator`` (Phase C: the absolute
-    system-repo path) and may pass ``bible_nav_map`` (D30), included under a
-    "pointer, not a copy" heading only when not constitutional. Raises
-    ``PlanPacketError`` when ``constitutional`` and ``bible_text`` is empty."""
+    no issue quota, no 'your own approach'). Governance pack per the owner-approved
+    W3 wording: a self-modification plan (``constitutional``) carries BIBLE.md in
+    full AND ARCHITECTURE.md inline; every other plan carries the BIBLE navigation
+    map, the ARCHITECTURE navigation map and named on-demand pointers (the caller
+    passes RESOLVABLE locators — the absolute system-repo paths). Both documents
+    sit in this cache-stable system prompt. Raises ``PlanPacketError`` when
+    ``constitutional`` and ``bible_text`` or ``architecture_text`` is empty:
+    assembling a constitutional packet without its governance docs is a typed
+    failure, never a silent omission (D26, W3). ``governance_by_retrieval=True`` is the
+    RETRIEVING (agent_session) reviewer's form of the same pack: the executor's session
+    prompt is compact by contract (`review_execution` — a delegated reviewer retrieves with
+    its own tools, D12), so a constitutional pack names both documents as MANDATORY full
+    reads at their resolvable locators instead of inlining ~500k chars; the documents must
+    still exist (same typed failure)."""
     parts = [
         "You are one independent reviewer of an INTENTION — a plan spec — before the work starts. "
         "The work may be code, research, a deliverable, a computer-use flow, or an action in the "
@@ -114,17 +128,45 @@ def build_plan_review_system_prompt(
             raise PlanPacketError(
                 "constitutional plan review requires BIBLE.md in the pack (D26); none supplied"
             )
-        parts.append(
-            f"## BIBLE.md (constitution — this plan touches Ouroboros's own body)\n\n{bible_text}\n\n---\n"
-        )
+        if not architecture_text:
+            raise PlanPacketError(
+                "constitutional plan review requires ARCHITECTURE.md in the pack (W3); none supplied"
+            )
+        if governance_by_retrieval:
+            parts.append(
+                "## Governance pack (this plan touches Ouroboros's own body) — MANDATORY FULL READS\n\n"
+                "You are a retrieving reviewer: before judging, read BOTH documents in full with your "
+                f"own tools — the constitution `{str(bible_locator or 'BIBLE.md').strip()}` and the "
+                f"architecture reference `{str(architecture_locator or 'docs/ARCHITECTURE.md').strip()}`. "
+                "An api reviewer receives them inline; you receive them by retrieval (same pack, "
+                "same authority). Do not judge a self-modification plan without them.\n\n---\n"
+            )
+        else:
+            parts.append(
+                f"## BIBLE.md (constitution — this plan touches Ouroboros's own body)\n\n{bible_text}\n\n---\n"
+            )
+            parts.append(
+                "## ARCHITECTURE.md (architecture and data flow — inline, in full, for a self-modification "
+                f"plan)\n\n{architecture_text}\n\n---\n"
+            )
     else:
         parts.append(
-            "This plan does not touch the Ouroboros system repository; the constitutional pack is a "
-            "named on-demand pointer — request it as `need_evidence` with locator "
-            f"`{str(bible_locator or 'BIBLE.md').strip()}` if you need it.\n"
+            "This plan does not touch the Ouroboros system repository; the constitutional pack and "
+            "the architecture reference are named on-demand pointers — request either as "
+            f"`need_evidence` with locator `{str(bible_locator or 'BIBLE.md').strip()}` or "
+            f"`{str(architecture_locator or 'docs/ARCHITECTURE.md').strip()}` if you need it; the "
+            "host attaches it on the next cycle.\n"
         )
         if bible_nav_map:
             parts.append(f"\n## BIBLE navigation map (pointer, not a copy)\n\n{bible_nav_map}\n")
+        else:
+            parts.append("\n⚠️ OMISSION NOTE: BIBLE navigation map not supplied by the host.\n")
+        if architecture_nav_map:
+            parts.append(
+                f"\n## ARCHITECTURE navigation map (pointer, not a copy)\n\n{architecture_nav_map}\n"
+            )
+        else:
+            parts.append("\n⚠️ OMISSION NOTE: ARCHITECTURE navigation map not supplied by the host.\n")
     return "\n".join(parts)
 
 
@@ -174,13 +216,24 @@ def _render_prior_cycles(prior_cycles: list[dict], dispositions: list[dict], spe
 
 def _render_evidence(manifest: Mapping[str, Any]) -> str:
     declared = list(manifest.get("declared") or [])
-    if not declared:
+    requested = {str(x) for x in (manifest.get("reviewer_requested") or [])}
+    requested |= {str(x) for x in (manifest.get("reviewer_requested_dropped") or [])}
+    if not declared and not requested and not manifest.get("omissions"):
         return "(no evidence declared)\n"
     lines: list[str] = []
-    for item in manifest.get("attached") or []:
+    if not declared:
+        lines.append("(no evidence declared by the agent)\n")
+    if requested:
         lines.append(
-            f"### {item.get('locator')} (kind={item.get('kind')}, sha256={item.get('sha256')}, "
-            f"bytes={item.get('bytes')}, attached_bytes={item.get('attached_bytes')})\n"
+            "Locators marked `[reviewer-requested]` were asked for with `need_evidence` in an earlier "
+            "cycle and are attached by the host (W3); the rest were declared by the agent.\n"
+        )
+    for item in manifest.get("attached") or []:
+        tag = " [reviewer-requested]" if str(item.get("locator")) in requested else ""
+        redacted = ", secrets_redacted=true" if item.get("secrets_redacted") else ""
+        lines.append(
+            f"### {item.get('locator')}{tag} (kind={item.get('kind')}, sha256={item.get('sha256')}, "
+            f"bytes={item.get('bytes')}, attached_bytes={item.get('attached_bytes')}{redacted})\n"
             f"----- BEGIN {item.get('locator')} -----\n{item.get('text') or ''}\n"
             f"----- END {item.get('locator')} -----\n"
         )
@@ -188,7 +241,11 @@ def _render_evidence(manifest: Mapping[str, Any]) -> str:
     lines.append("### OMISSIONS (every absence named)\n")
     if omissions:
         lines.append("| locator | reason |\n|---|---|")
-        lines.extend(f"| {_cell(o.get('locator'))} | {_cell(o.get('reason'))} |" for o in omissions)
+        lines.extend(
+            f"| {_cell(o.get('locator'))}{' [reviewer-requested]' if str(o.get('locator')) in requested else ''} "
+            f"| {_cell(o.get('reason'))} |"
+            for o in omissions
+        )
         lines.append("")
     else:
         lines.append("none\n")

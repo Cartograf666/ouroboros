@@ -618,6 +618,58 @@ def mark_current_plan_review_unavailable(
     return _update_plan_review_state(results_drive_root, task_id, _mark)
 
 
+def _fit_plan_review_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Last resort (gate advisory, 39c3a195; W3 rounds 6-9): make the state persistable.
+
+    One maximal PAID wave can exceed the limit by itself — finding texts, locators,
+    disclosures, the normalized spec, the manifest rows, dispositions and the per-task
+    request memory are all bounded strings, and 10 slots x 32 findings x 600 four-byte
+    chars of each fill 1 MB many times over. A refused write would mean the panel was paid
+    and `cycles_paid` never advanced (the panel would be re-paid), or a closure / cap stamp
+    could not be recorded. So EVERY writer runs this: older full waves are compacted first
+    (the existing mechanism); then every free-text leaf of the newest wave is cut on shared
+    tiers with a visible marker while identity (ids, classes, breaks, hashes, fingerprints,
+    aggregate, the goal and the acceptance claims that bind task acceptance) is never
+    touched, and the wave is stamped ``spec_body_truncated`` when its frozen spec was cut
+    (its hashes then name the ORIGINAL body; the next cycle's spec delta is unavailable
+    and says so). A cut locator no longer resolves and the next packet names it as an
+    omission."""
+    def _size() -> int:
+        return len(json.dumps(state, ensure_ascii=False, default=str).encode("utf-8"))
+
+    # The fit target keeps headroom for the post-loop stamps (`spec_body_truncated`,
+    # `request_memory_truncated`) and a later one-key writer (`cycles_exhausted`), so a state
+    # that fits here still fits after them (delta review R10-2).
+    fit_limit = _PLAN_REVIEW_STATE_MAX_BYTES - 512
+
+    waves = list(state.get("waves") or [])
+    for index in range(len(waves) - 1):
+        if _size() <= fit_limit:
+            break
+        if not waves[index].get("compact"):
+            waves[index] = _compact_plan_review_wave(waves[index])
+            state["waves"] = waves
+    if waves and _size() > fit_limit:
+        newest = waves[-1]
+        wave_before = json.dumps(newest, sort_keys=True, ensure_ascii=False, default=str)
+        spec_before = json.dumps(newest.get("spec"), sort_keys=True, ensure_ascii=False, default=str)
+        for cut in _PLAN_REVIEW_TRUNCATION_TIERS:
+            _truncate_wave_texts(newest, cut)
+            memory = [str(x) for x in state.get("need_evidence_seen") or []]
+            if any(len(x) > cut for x in memory):
+                state["need_evidence_seen"] = sorted(
+                    {x[:cut] + _PLAN_REVIEW_TRUNCATION_MARKER if len(x) > cut else x for x in memory})
+                state["request_memory_truncated"] = True
+            if _size() <= fit_limit:
+                break
+        # The stamps are honest: set only for what the cut actually touched (delta review F10-2).
+        if json.dumps(newest, sort_keys=True, ensure_ascii=False, default=str) != wave_before:
+            newest["findings_texts_truncated"] = True
+        if json.dumps(newest.get("spec"), sort_keys=True, ensure_ascii=False, default=str) != spec_before:
+            newest["spec_body_truncated"] = True
+    return state
+
+
 def _update_plan_review_state(
     results_drive_root: Any,
     task_id: str,
@@ -629,7 +681,7 @@ def _update_plan_review_state(
     def _merge(existing: Dict[str, Any]) -> Dict[str, Any]:
         state = _validated_plan_review_state(existing.get(PLAN_REVIEW_STATE_KEY))
         state.pop("legacy_v1_projection", None)  # derived on load, never persisted
-        updated_state = _validated_plan_review_state(mutator(state))
+        updated_state = _validated_plan_review_state(_fit_plan_review_state(mutator(state)))
         updated_state.pop("legacy_v1_projection", None)
         now = utc_now_iso()
         return {
@@ -668,6 +720,38 @@ def _compact_plan_review_wave(wave: Dict[str, Any]) -> Dict[str, Any]:
         "closed": bool(wave.get("closed")),
         "paid": bool(wave.get("paid")),
     }
+
+
+_PLAN_REVIEW_TRUNCATION_MARKER = "…[truncated to fit the durable state]"
+_PLAN_REVIEW_TRUNCATION_TIERS = (600, 200, 80, 40)
+# Identity-bearing keys the last-resort cut never touches (authority, not prose).
+_PLAN_REVIEW_IDENTITY_KEYS = frozenset({
+    "id", "finding_id", "slot", "slot_id", "class", "breaks", "aggregate", "request_fingerprint",
+    "previous_fingerprint", "spec_hash", "evidence_manifest_hash", "plan_prose_hash", "sha256",
+    "model", "request_model", "route", "host_file_read_attestation", "reason", "decision", "kind",
+    "goal", "acceptance_claims", "cycle_index", "series_id", "schema_version",
+})
+
+
+def _truncate_wave_texts(node: Any, cut: int, *, key: str = "") -> Any:
+    """Cut every free-text string leaf under ``node`` to ``cut`` chars (marker appended), in
+    place for containers; identity keys are left whole. Returns the (possibly new) leaf."""
+    if isinstance(node, dict):
+        for k, v in list(node.items()):
+            if k in _PLAN_REVIEW_IDENTITY_KEYS:
+                continue
+            node[k] = _truncate_wave_texts(v, cut, key=k)
+        return node
+    if isinstance(node, list):
+        for i, v in enumerate(node):
+            node[i] = _truncate_wave_texts(v, cut, key=key)
+        return node
+    if isinstance(node, str) and len(node) > cut and not node.endswith(_PLAN_REVIEW_TRUNCATION_MARKER):
+        return node[:cut] + _PLAN_REVIEW_TRUNCATION_MARKER
+    if isinstance(node, str) and node.endswith(_PLAN_REVIEW_TRUNCATION_MARKER):
+        body = node[: -len(_PLAN_REVIEW_TRUNCATION_MARKER)]
+        return (body[:cut] + _PLAN_REVIEW_TRUNCATION_MARKER) if len(body) > cut else node
+    return node
 
 
 def record_plan_review_wave(
@@ -729,32 +813,9 @@ def record_plan_review_wave(
         if overflow:
             state["waves_omitted"] = int(state.get("waves_omitted") or 0) + overflow
             waves = waves[overflow:]
-        # I-02: the per-wave bounds (findings x slots x text) can exceed the state size limit
-        # long before the wave COUNT does. A refused write would mean the panel was paid and
-        # `cycles_paid` never advanced — the shared cap could then never engage and a blocking
-        # hold would be permanent. Compact the OLDEST full waves (the existing mechanism, not a
-        # new one) until the state fits; the newest wave, the authority, is never compacted.
+        # I-02: size-fitting (older-wave compaction, then the last-resort text cut) runs for
+        # EVERY writer in `_update_plan_review_state` → `_fit_plan_review_state`.
         state["waves"] = waves
-        for index in range(len(waves) - 1):
-            if len(json.dumps(state, ensure_ascii=False, default=str).encode("utf-8")) <= _PLAN_REVIEW_STATE_MAX_BYTES:
-                break
-            if not waves[index].get("compact"):
-                waves[index] = _compact_plan_review_wave(waves[index])
-                state["waves"] = waves
-        # Last resort (gate advisory, 39c3a195): one maximal PAID wave can exceed the limit by
-        # itself. Bound the newest wave's finding TEXTS with a disclosed omission — identity
-        # (ids, classes, breaks, counts, hashes) is untouched, so authority is preserved.
-        if len(json.dumps(state, ensure_ascii=False, default=str).encode("utf-8")) > _PLAN_REVIEW_STATE_MAX_BYTES:
-            newest = waves[-1]
-            for cut in (600, 200, 80):
-                for finding in newest.get("findings") or []:
-                    for key in ("summary", "recommendation"):
-                        text = str(finding.get(key) or "")
-                        if len(text) > cut:
-                            finding[key] = text[:cut] + "…[truncated to fit the durable state]"
-                newest["findings_texts_truncated"] = True
-                if len(json.dumps(state, ensure_ascii=False, default=str).encode("utf-8")) <= _PLAN_REVIEW_STATE_MAX_BYTES:
-                    break
         state["current_attempt"] = {"fingerprint": fingerprint, "status": "open", "reason": ""}
         return state
 

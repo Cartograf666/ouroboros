@@ -230,9 +230,12 @@ def resolve_evidence(
 
 def evidence_manifest_hash(manifest: Mapping[str, Any]) -> str:
     """Identity of the evidence set for the plan fingerprint (F4): declared locators,
-    attached (locator, sha256, bytes) and omission (locator, reason) — NEVER the text."""
+    attached (locator, sha256, bytes), omission (locator, reason) and the locators
+    reviewers requested (W3: a request for something already declared still changes
+    what the next wave is about) — NEVER the text."""
     return _canonical_hash({
         "declared": list(manifest.get("declared") or []),
+        "reviewer_requested": list(manifest.get("reviewer_requested") or []),
         "attached": [
             {"locator": a.get("locator"), "sha256": a.get("sha256"), "bytes": a.get("bytes")}
             for a in manifest.get("attached") or []

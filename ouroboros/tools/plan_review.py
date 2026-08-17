@@ -1,15 +1,14 @@
 """``plan_task`` — the plan-review engine: ONE review organ pointed at an INTENTION.
 
-Owner-approved redesign (2026-08-15, plan §6/§7): the agent submits a SPEC
-(goal, in_scope, non_goals, acceptance_claims, invariants, decisions, deferred,
-affected_resources, evidence) plus accompanying prose; the host normalizes it
-(``plan_spec``), resolves ONE structural fact (``constitutional``), attaches the
-declared evidence bounded with every omission named, builds the lean reviewer
-packet (``plan_packet``), fans it across the configured reviewer rows through the
-shared review substrate (api_chat in-process packet OR agent_session retrieving
-reviewer — the transport is bound by ``review_execution._review_route_executor``,
-never here), validates each slot's typed findings, computes the aggregate itself
-and records the wave in ``plan_review_state`` v2 (``task_results``).
+Owner-approved redesign (2026-08-15, plan §6/§7): the agent submits a SPEC (goal,
+in_scope, non_goals, acceptance_claims, invariants, decisions, deferred,
+affected_resources, evidence) plus prose; the host normalizes it (``plan_spec``),
+resolves ONE structural fact (``constitutional``), attaches the declared evidence
+bounded with every omission named, builds the lean packet (``plan_packet``), fans it
+across the configured reviewer rows through the shared review substrate (api_chat
+in-process packet OR agent_session retrieving reviewer — the transport is bound by
+``review_execution._review_route_executor``, never here), validates each slot's typed
+findings, computes the aggregate and records the wave in ``plan_review_state`` v2.
 
 Cycles: ``review_cycles.review_max_cycles()`` bounds PAID panels per task
 (``cycles_paid``); an identical fingerprint replays the recorded wave (no panel,
@@ -21,8 +20,7 @@ into the next delta cycle. Under blocking enforcement an open wave HOLDS
 finalization (``owner_hurry.force_plan_decision``); at the cap the typed
 ``plan_review_cycles_exhausted`` result + event leave the honest exits: owner
 unstick or a ``blocked_with_evidence`` terminal. Advisory proceeds open under the
-host's loud disclosure. Domain-neutral by construction: a spec with zero paths is
-first-class.
+host's loud disclosure. Domain-neutral: a spec with zero paths is first-class.
 """
 
 from __future__ import annotations
@@ -65,6 +63,7 @@ from ouroboros.tools.plan_review_runtime import (
     plan_deadline_skip as _plan_deadline_skip,
     plan_payload_roots as _plan_payload_roots,
     plan_review_slots as _plan_review_slots,
+    plan_slot_fit as _plan_slot_fit,
     record_raw_plan_request_attempt as _record_raw_plan_request_attempt,
     run_plan_review_slots as _run_plan_review_slots,
 )
@@ -214,7 +213,9 @@ def get_tools():
                     "REVIEW_REQUIRED closes by your review_disposition at no cost; REVISE_PLAN needs "
                     "a changed spec (next paid cycle) or a reject-with-rationale judged in the next "
                     "cycle. Cycles are bounded by the owner's Max review cycles; an unchanged "
-                    "envelope replays the recorded result for free. Under blocking enforcement an "
+                    "envelope replays the recorded result for free (a locator a reviewer asked for "
+                    "with need_evidence is attached by the host next time and makes the envelope "
+                    "new). Under blocking enforcement an "
                     "open review holds finalization; under advisory you may proceed with the "
                     "review open and the host discloses it. Declare evidence reviewers need; "
                     "declare affected_resources so a self-modification gets the constitutional pack."
@@ -418,14 +419,45 @@ def _packet_kwargs(fn: Callable, **candidates: Any) -> Dict[str, Any]:
 def _session_task_text(system_prompt: str, user_content: str, session_root: str) -> str:
     return (
         "RETRIEVING REVIEWER (agent session): you run read-only inside "
-        f"{session_root or 'the active workspace'}. The evidence below is the host's "
-        "REDACTED snapshot — the same bytes every reviewer sees; secret-bearing content "
-        "was masked before any reviewer, so do NOT re-read the raw evidence locators "
-        "(final-gate finding, 4e133c8a: a hosted session reading originals would leak "
-        "what the api route redacts). Retrieve any OTHER repository context you need "
-        "with your own tools.\n\n"
+        f"{session_root or 'the active workspace'}. The evidence below is the host's REDACTED "
+        "snapshot — the same bytes every reviewer sees — so do NOT re-read the raw evidence "
+        "locators (a session reading originals would leak what the api route redacts, 4e133c8a); "
+        "the ONE exception is the governance pack — BIBLE.md and docs/ARCHITECTURE.md are public "
+        "repository documents you MAY read raw, and MUST read in full when the pack marks them "
+        "MANDATORY FULL READS (a self-modification plan), even if the agent also declared them as "
+        "evidence. Retrieve any OTHER repository context with your own tools.\n\n"
         + system_prompt + "\n\n" + user_content
     )
+
+
+# W3 host attachment is bounded like the agent's own evidence list (MAX_LIST_ITEMS honoured
+# locators per task); what the cap drops is a NAMED `reviewer_request_cap` omission, never silent.
+_REVIEWER_REQUEST_CAP = plan_spec.MAX_LIST_ITEMS
+
+
+def _reviewer_requested_locators(ctx: ToolContext, state_root: pathlib.Path) -> tuple[list[str], list[str]]:
+    """``(honoured, dropped)`` `need_evidence` locators from this task's earlier cycles
+    (`need_evidence_seen`, kept sorted): the cap keeps the lexicographically first ones,
+    deterministically (disclosed residual: past the cap a later, earlier-sorting request can
+    displace an honoured one — then a named `reviewer_request_cap` omission, never silent).
+    Raises ``ValueError`` when the durable state cannot be read: the wave that would pay for
+    the packet must not run without the reviewers' recorded requests (fail-closed, P1)."""
+    _root, task_id = _planning_state_location(ctx)
+    try:
+        state = load_plan_review_state(state_root, task_id)
+    except (OSError, TimeoutError) as exc:
+        raise ValueError(f"PLAN_REVIEW_STATE_INVALID: {exc}") from exc
+    seen: list[str] = []
+    dropped: list[str] = []
+    for raw in state.get("need_evidence_seen") or []:
+        loc = str(raw or "").strip()
+        if not loc or loc in seen or loc in dropped:
+            continue
+        if len(loc) > plan_spec.MAX_ITEM_CHARS or len(seen) >= _REVIEWER_REQUEST_CAP:
+            dropped.append(loc)
+        else:
+            seen.append(loc)
+    return seen, dropped
 
 
 def _prepare_plan_inputs(ctx: ToolContext, request: "_PlanRequest", state_root: pathlib.Path) -> dict:
@@ -457,12 +489,26 @@ def _prepare_plan_inputs(ctx: ToolContext, request: "_PlanRequest", state_root: 
         "declare those paths so reviewers receive the constitutional pack (BIBLE)."
         if active_root == system_root and not spec["affected_resources"] else ""
     )
+    declared_evidence = list(spec["evidence"])  # W3: earlier-cycle need_evidence is HOST-attached
+    try:
+        reviewer_requested, request_dropped = _reviewer_requested_locators(ctx, state_root)
+    except ValueError as exc:
+        return {"error": f"ERROR: {exc}"}
+    host_locators = [loc for loc in reviewer_requested if loc not in declared_evidence]
     # B-08/C-06: allowed roots are the active workspace and the system repo only; the runtime
     # data plane is denied outright (the sensitive-name policy is a residual, not a boundary).
     manifest = plan_evidence.resolve_evidence(
-        spec["evidence"], active_root=active_root, allowed_roots=[active_root, system_root],
+        declared_evidence + host_locators, active_root=active_root,
+        allowed_roots=[active_root, system_root],
         resolve_task=_task_evidence_reader(state_root), deny_paths=_evidence_deny_paths(ctx),
     )
+    manifest["declared"] = declared_evidence  # the AGENT's list; requests below (tagged+hashed)
+    if reviewer_requested:
+        manifest["reviewer_requested"] = list(reviewer_requested)
+    if request_dropped:  # still reviewer requests (provenance), just not honoured by the cap
+        manifest["reviewer_requested_dropped"] = list(request_dropped)
+        manifest.setdefault("omissions", []).extend(
+            {"locator": loc, "reason": "reviewer_request_cap"} for loc in request_dropped)
     manifest_hash = plan_evidence.evidence_manifest_hash(manifest)
     fingerprint = _plan_fingerprint(spec["goal"], request.plan, spec, manifest_hash, constitutional)
     return {
@@ -506,8 +552,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
     enforcement = get_review_enforcement()
     cap = review_max_cycles()
     cycles_paid = int(state.get("cycles_paid") or 0)
-    # C-01: every envelope supersedes prior authority BEFORE any cap/rail exit —
-    # else a changed spec at the cap inherits the previous closed GREEN.
+    # C-01: every envelope supersedes prior authority BEFORE any cap/rail exit.
     try:
         record_plan_review_attempt(state_root, task_id, fingerprint=fingerprint)
     except (OSError, TimeoutError, ValueError) as exc:
@@ -518,12 +563,12 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         existing = None  # C-09: a COMPACTED row (no frozen spec) is never authority
     if existing is not None and str(existing.get("aggregate") or "") != "DEGRADED":
         # Fb3: identical request ⇒ idempotent replay — no panel, no cycle. ONE exception
-        # (final-gate finding, 4e133c8a): an open REVISE_PLAN wave whose blocking findings
-        # all carry recorded REJECT dispositions has earned the promised delta cycle —
-        # replaying forever would make "reject rides into the next paid cycle" unreachable
-        # without a cosmetic spec edit.
+        # (4e133c8a; R9-5): an open wave whose BLOCKING findings all carry recorded REJECT
+        # dispositions — REVISE_PLAN, or REVIEW_REQUIRED with a below-quorum blocking finding
+        # (C-08) — has earned the promised delta cycle; replaying forever would make "reject
+        # rides into the next paid cycle" unreachable without a cosmetic spec edit.
         earned_delta = (
-            str(existing.get("aggregate")) == "REVISE_PLAN"
+            str(existing.get("aggregate")) in {"REVISE_PLAN", "REVIEW_REQUIRED"}
             and not existing.get("closed")
             # D1: only VALID rejections earn the panel — raw items are persisted for
             # disclosure, but an invalid or contradictory one must not buy a cycle.
@@ -568,9 +613,13 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         system_root=system_root, active_root=active_root, cycle_index=cycle_index,
         enforcement=enforcement, previous=previous,
     )
-    models = [str(slot.model) for slot in slots]
-    admission = review_wave_budget_gate(
-        ctx, surface="plan_review", models=models,
+    # Per-slot input fit (P3): oversize = FREE typed row; below quorum = typed refusal.
+    callable_slots, oversize_rows, fit_error = _plan_slot_fit(
+        slots, prompt_chars=len(system_prompt) + len(user_content), quorum=adaptive_quorum(len(slots)))
+    if fit_error:
+        return _plan_unavailable(ctx, fit_error, "review_context_unavailable")
+    admission = review_wave_budget_gate(  # priced on the slots that will actually be called
+        ctx, surface="plan_review", models=[str(s.model) for s in callable_slots],
         prompt_chars=len(system_prompt) + len(user_content), max_completion_tokens=_PLAN_REVIEW_MAX_TOKENS,
     )
     if admission is not None:
@@ -586,13 +635,13 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         f"{len(slots)} reviewer slot(s) ({enforcement}; constitutional={constitutional})…"
     )
     rows = await _run_plan_review_slots(
-        ctx, slots, system_prompt=system_prompt, user_content=user_content,
+        ctx, callable_slots, system_prompt=system_prompt, user_content=user_content,
         session_task=session_task, session_root=str(active_root),
         output_contract=plan_spec.PLAN_FINDINGS_ARRAY_CONTRACT,
     )
+    rows = list(rows) + oversize_rows  # excluded slots stay configured rows: they count in the quorum denominator
     ids = plan_spec.spec_ids(spec)
-    seen = set(str(s) for s in state.get("need_evidence_seen") or [])
-    seen_after: set[str] = set(seen)
+    seen_after: set[str] = set(str(s) for s in state.get("need_evidence_seen") or [])
     slot_results: List[dict] = []
     slot_records: List[dict] = []
     for row in rows:
@@ -606,8 +655,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
                 ok, error = False, parse_error
             else:
                 findings, disclosures, slot_seen = plan_spec.validate_findings(
-                    parsed, spec_ids=ids, seen_locators=seen, slot=str(row.get("slot_id") or ""),
-                )
+                    parsed, spec_ids=ids, seen_locators=seen_after, slot=str(row.get("slot_id") or ""),
+                )  # cumulative across the wave: the per-task memory cap is exact
                 seen_after |= set(slot_seen)
         slot_results.append({"slot": row.get("slot_id"), "model": row.get("model"), "ok": ok,
                              "findings": findings, "error": error or None})
@@ -635,9 +684,12 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         "spec_hash": plan_spec.spec_hash(spec),
         "evidence_manifest": {
             "declared": list(manifest.get("declared") or []),
-            "attached": [{"locator": a.get("locator"), "sha256": a.get("sha256"), "bytes": a.get("bytes")}
+            "attached": [{"locator": a.get("locator"), "sha256": a.get("sha256"), "bytes": a.get("bytes"),
+                          **({"secrets_redacted": True} if a.get("secrets_redacted") else {})}
                          for a in manifest.get("attached") or []],
             "omissions": list(manifest.get("omissions") or []),
+            "reviewer_requested": list(manifest.get("reviewer_requested") or []),
+            "reviewer_requested_dropped": list(manifest.get("reviewer_requested_dropped") or []),
         },
         "evidence_manifest_hash": manifest_hash,
         "constitutional": bool(constitutional),
@@ -696,7 +748,8 @@ def _last_paid_wave(state: dict) -> Optional[dict]:
 
 
 def build_plan_review_packet_for_dry_run(ctx: ToolContext, request: "_PlanRequest") -> dict:
-    """Assemble exactly what cycle 1 would send, WITHOUT dispatching or recording anything.
+    """Assemble the packet SHAPE of a fresh cycle (cycle_index=1, no prior-cycle section) with the
+    task's recorded reviewer requests attached (W3), WITHOUT dispatching or recording anything.
 
     The operator entry point runs outside a task, where the shared budget gate has no usage
     scope and therefore no cost ceiling; this is how the operator sees the bill before paying
@@ -719,6 +772,14 @@ def build_plan_review_packet_for_dry_run(ctx: ToolContext, request: "_PlanReques
     }
 
 
+def _governance_text(system_root: pathlib.Path, rel_path: str) -> str:
+    """A governance document's text, or "" when it is missing: `explicit` returns a truthy
+    omission NOTE, which would ship AS the constitution/architecture; a constitutional packet
+    without the real document must be an assembly failure (D26/W3), not a note."""
+    text = load_governance_doc(system_root, rel_path, on_missing="explicit")
+    return "" if text.startswith("[⚠️ OMISSION") else text
+
+
 def _build_packet(
     ctx: ToolContext, *, spec: dict, request: _PlanRequest, manifest: dict, constitutional: bool,
     system_root: pathlib.Path, active_root: pathlib.Path, cycle_index: int, enforcement: str,
@@ -730,32 +791,44 @@ def _build_packet(
     except Exception as exc:
         log.warning("Could not load Plan Review Checklist: %s", exc)
         checklist = ""
-    bible_text = load_governance_doc(system_root, "BIBLE.md", on_missing="explicit")
-    if bible_text.startswith("[⚠️ OMISSION"):
-        # `explicit` returns a truthy omission NOTE, which would ship AS the constitution;
-        # a constitutional packet without the real BIBLE must be an assembly failure.
-        bible_text = ""
-
-    bible_nav_map = ""
-    if not constitutional and bible_text.strip():
+    bible_text = _governance_text(system_root, "BIBLE.md")
+    architecture_text = _governance_text(system_root, "docs/ARCHITECTURE.md")
+    bible_nav_map = architecture_nav_map = ""
+    if not constitutional:
         from ouroboros.context_layout import generate_doc_nav_map
 
-        bible_nav_map = generate_doc_nav_map(bible_text, title="BIBLE.md", rel_path="BIBLE.md")
-    system_prompt = build_plan_review_system_prompt(
-        checklist_section=checklist, constitutional=constitutional,
-        bible_text=bible_text if constitutional else None, cycle_index=cycle_index, enforcement=enforcement,
-        **_packet_kwargs(build_plan_review_system_prompt,
-                         bible_locator=str(system_root / "BIBLE.md"), bible_nav_map=bible_nav_map or None),
-    )
-    # plan_packet renders CYCLE records ({cycle_index, aggregate, findings}); the
-    # previous paid wave is exactly one such record (Phase B fix batch B-03).
+        if bible_text.strip():
+            bible_nav_map = generate_doc_nav_map(bible_text, title="BIBLE.md", rel_path="BIBLE.md")
+        if architecture_text.strip():
+            architecture_nav_map = generate_doc_nav_map(
+                architecture_text, title="ARCHITECTURE.md", rel_path="docs/ARCHITECTURE.md"
+            )
+    def _system(by_retrieval: bool) -> str:
+        return build_plan_review_system_prompt(
+            checklist_section=checklist, constitutional=constitutional,
+            bible_text=bible_text if constitutional else None, cycle_index=cycle_index,
+            enforcement=enforcement,
+            **_packet_kwargs(build_plan_review_system_prompt,
+                             bible_locator=str(system_root / "BIBLE.md"), bible_nav_map=bible_nav_map or None,
+                             architecture_text=architecture_text if constitutional else None,
+                             architecture_locator=str(system_root / "docs" / "ARCHITECTURE.md"),
+                             architecture_nav_map=architecture_nav_map or None,
+                             governance_by_retrieval=by_retrieval),
+        )
+
+    system_prompt = _system(False)
+    # plan_packet renders CYCLE records; the previous paid wave is exactly one (B-03).
     prior_cycles = ([{
         "cycle_index": (previous or {}).get("cycle_index"),
         "aggregate": (previous or {}).get("aggregate"),
         "findings": list((previous or {}).get("findings") or []),
     }] if previous else [])
     dispositions = list((previous or {}).get("dispositions") or [])
-    delta = plan_spec.spec_delta(previous.get("spec"), spec) if previous else None
+    delta = (  # a truncated frozen body (durable-state fit) is never diffed element-wise
+        {"unavailable": "previous frozen spec body truncated to fit the durable state; hashes name the original"}
+        if previous and previous.get("spec_body_truncated")
+        else plan_spec.spec_delta(previous.get("spec"), spec) if previous else None
+    )
     common = dict(
         objective=_task_objective(ctx), goal=spec["goal"], plan_prose=request.plan, spec=spec,
         prior_cycles=prior_cycles, dispositions=dispositions, spec_delta=delta,
@@ -763,10 +836,8 @@ def _build_packet(
         **_packet_kwargs(build_plan_review_user_content, cycle_index=cycle_index),
     )
     user_content = build_plan_review_user_content(manifest=manifest, **common)
-    session_task = _session_task_text(
-        system_prompt, build_plan_review_user_content(manifest=manifest, **common),
-        str(active_root),
-    )
+    # session task = the executor's COMPACT form: governance by mandatory retrieval, not inline
+    session_task = _session_task_text(_system(True), user_content, str(active_root))
     return system_prompt, user_content, session_task
 
 
@@ -871,9 +942,7 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
             "ERROR: PLAN_REVIEW_DISPOSITION_UNBINDABLE: no recorded plan-review wave holds "
             f"fingerprint {fingerprint} (compact history is not dispositionable). No plan attempt was recorded."
         )
-    # I-01: a disposition closes ONLY the wave the CURRENT attempt points at — else a $0
-    # disposition of a superseded wave would release a newer blocking hold and bind the
-    # older wave's acceptance claims (the base branch had this guard).
+    # I-01: a disposition closes ONLY the CURRENT attempt's wave (never a superseded one).
     attempt = state.get("current_attempt") if isinstance(state.get("current_attempt"), dict) else {}
     current_fp = str(attempt.get("fingerprint") or "")
     if current_fp and current_fp != fingerprint:
@@ -889,14 +958,16 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
     raw_items = disposition.get("items")
     if not isinstance(raw_items, list):
         return "ERROR: PLAN_REVIEW_DISPOSITION_INVALID: items must be an array"
+    if len(raw_items) > 2 * len(wave.get("findings") or []) + 8:  # bounded like the findings they answer
+        return "ERROR: PLAN_REVIEW_DISPOSITION_INVALID: more items than findings could need"
     items: List[dict] = []
     for index, item in enumerate(raw_items):
         if not isinstance(item, dict):
             return f"ERROR: PLAN_REVIEW_DISPOSITION_INVALID: items[{index}] must be an object"
         items.append({
-            "finding_id": str(item.get("finding_id") or "").strip(),
-            "decision": str(item.get("decision") or "").strip().lower(),
-            "rationale": str(item.get("rationale") or "").strip(),
+            "finding_id": str(item.get("finding_id") or "").strip()[:plan_spec.MAX_ID_CHARS * 2],
+            "decision": str(item.get("decision") or "").strip().lower()[:40],  # enum-like, bounded
+            "rationale": plan_spec.bounded_text(item.get("rationale"), plan_spec.MAX_FINDING_TEXT_CHARS),
         })
     known = {str(f.get("finding_id") or "") for f in wave.get("findings") or []}
     unknown_ids = sorted({i["finding_id"] for i in items if i["finding_id"] not in known})

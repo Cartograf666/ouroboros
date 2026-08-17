@@ -44,6 +44,10 @@ MAX_REJECTED_PER_DECISION = 8
 MAX_ITEM_CHARS = 600
 MAX_GOAL_CHARS = 2000
 MAX_FINDINGS_PER_SLOT = 32
+# Per-task `need_evidence` memory: reviewers' requests the host remembers (and, W3, attaches).
+# Bounded so the durable review state stays bounded whatever the panel asks for; a request past
+# the cap is demoted (never remembered), disclosed `need_evidence_memory_full`.
+MAX_NEED_EVIDENCE_MEMORY = 4 * MAX_LIST_ITEMS
 MAX_FINDING_TEXT_CHARS = 2000
 PACKET_OBJECTIVE_CHARS = 8_000
 PACKET_SPEC_CHARS = 120_000
@@ -74,8 +78,11 @@ def bounded_text(value: Any, limit: int) -> str:
     return truncate_review_artifact(("" if value is None else str(value)).strip(), limit=limit)
 
 
+MAX_ID_CHARS = 80
+
+
 def _sanitize_id(raw: Any, fallback: str) -> str:
-    text = "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in str(raw or "").strip())[:80]
+    text = "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in str(raw or "").strip())[:MAX_ID_CHARS]
     return text or fallback
 
 
@@ -110,6 +117,7 @@ def _string_list(raw: Any, label: str, errors: list[str], omissions: list[str]) 
         errors.append(f"{label}: must be a list of strings")
         return []
     out: list[str] = []
+    blank = 0
     for index, item in enumerate(items):
         if item is None:
             continue
@@ -120,8 +128,11 @@ def _string_list(raw: Any, label: str, errors: list[str], omissions: list[str]) 
         if text:
             out.append(text)
         else:
-            # I-20: every cut in this module is disclosed; a blank item is a cut too.
-            omissions.append(f"{label}[{index}]: blank item dropped")
+            # I-20: every cut in this module is disclosed; a blank item is a cut too — as ONE
+            # bounded disclosure per list, so the disclosure list itself cannot outgrow the state.
+            blank += 1
+    if blank:
+        omissions.append(f"{label}: {blank} blank item(s) dropped")
     return _cap_list(out, label, omissions)
 
 
@@ -624,9 +635,11 @@ def validate_findings(
     minted ``f{slot}_{n}`` when missing; the slot is capped at
     ``MAX_FINDINGS_PER_SLOT`` with an omission disclosure. ``seen_after`` is the
     updated locator memory for the caller to persist; the input is not mutated.
-    Slots of ONE wave are validated independently against the same incoming
-    memory (two reviewers asking for the same locator is agreement, not a
-    repeat); the caller unions their ``seen_after`` sets after the wave.
+    The engine validates the slots of ONE wave sequentially against the CUMULATIVE
+    memory (it passes the running ``seen_after`` back in), so the per-task memory
+    cap ``MAX_NEED_EVIDENCE_MEMORY`` is exact across slots; a second slot asking
+    for a locator the first already requested is a `need_evidence_repeat` note —
+    one request suffices, the wave stays open the same way.
     """
     ids = frozenset(str(s) for s in spec_ids)
     seen = set(str(s) for s in seen_locators)
@@ -650,7 +663,7 @@ def validate_findings(
             disclosures.append(f"missing_summary:{fid}")
             summary = "(missing summary)"
         klass = str(item.get("class") or "").strip().lower()
-        breaks = str(item.get("breaks") or "").strip()
+        breaks = str(item.get("breaks") or "").strip()[:MAX_ID_CHARS]  # an id, bounded like ids
         locator = str(item.get("locator") or "").strip()
         if klass not in FINDING_CLASSES:
             disclosures.append(f"unknown_class:{fid}:{klass or '<empty>'}")
@@ -661,6 +674,14 @@ def validate_findings(
         if klass == "need_evidence":
             if not locator:
                 disclosures.append(f"need_evidence_without_locator:{fid}")
+                klass = "note"
+            elif len(locator) > MAX_ITEM_CHARS:
+                # W3 host attachment is bounded like the agent's own evidence items: an over-long
+                # locator is never remembered (state) nor attached — demoted, disclosed.
+                disclosures.append(f"need_evidence_locator_too_long:{fid}")
+                klass = "note"
+            elif locator not in seen and len(seen) >= MAX_NEED_EVIDENCE_MEMORY:
+                disclosures.append(f"need_evidence_memory_full:{fid}")
                 klass = "note"
             elif locator in seen:
                 # I-03: a repeat is DEMOTED, never dropped. Dropping it removed the finding from
@@ -673,7 +694,9 @@ def validate_findings(
             else:
                 seen.add(locator)
         normalized.append({
-            "id": fid, "class": klass, "breaks": breaks, "locator": locator,
+            "id": fid, "class": klass, "breaks": breaks,
+            # a stored locator is bounded like every other finding string (visible marker)
+            "locator": bounded_text(locator, MAX_FINDING_TEXT_CHARS),
             "summary": summary,
             "recommendation": bounded_text(item.get("recommendation"), MAX_FINDING_TEXT_CHARS),
         })

@@ -656,8 +656,10 @@ block repo commits and vice versa.
 Used by `plan_task` to review an INTENTION before the work starts — the same organ whether the
 work is code, research, a deliverable, or an action in the world. Reviewers see the agent's typed
 SPEC, the task objective, the evidence the agent declared (attached bounded, with every absence
-named), and — for a self-modification plan — BIBLE.md in full; every other plan gets a
-heading-derived navigation map of BIBLE.md and may request more with `need_evidence`.
+named), and — for a self-modification plan — BIBLE.md and ARCHITECTURE.md in full (inline for
+an api reviewer; a retrieving reviewer reads both in full with its own tools, the pack names them
+as mandatory reads); every other plan gets the heading-derived navigation maps of BIBLE.md and
+ARCHITECTURE.md and may request more with `need_evidence` (the host attaches it on the next cycle).
 Judge only the evidence actually present; nothing missing is ever silent.
 
 **One question: is this SPEC sufficient to START the work safely?** Not "is everything
@@ -698,8 +700,10 @@ structurally unverifiable, that is blocking against the claim, not a `need_evide
 - `blocking` — requires `breaks: <spec id>`. Without a valid id the host demotes it to a note and
   discloses the demotion.
 - `note` — the agent disposes of it (accept / reject with rationale / defer) at no cost.
-- `need_evidence` — a typed request `{locator, why}`. It never blocks by itself, never mints a new
-  fingerprint, and the same locator cannot be asked twice on one task.
+- `need_evidence` — a typed request `{locator, why}`. It never blocks by itself and the same
+  locator cannot be asked twice on one task; the host attaches the locator on the next cycle
+  (through the same evidence policy), so the agent's next envelope carries it — a new
+  fingerprint, i.e. a paid cycle that actually has the evidence.
 
 ### Output
 
@@ -730,7 +734,9 @@ authority, and prose outside the array is not parsed.
   and it consumes no cycle.
 
 Paid cycles per task are bounded by the owner's `OUROBOROS_REVIEW_MAX_CYCLES` (default 2,
-`unlimited` available). Replaying an identical envelope is free. On cycle 2+ every reviewer sees
+`unlimited` available). Replaying an identical envelope is free — identical including the
+evidence the host attaches for reviewers' `need_evidence` requests, so a request received in the
+last cycle makes the next envelope a new one. On cycle 2+ every reviewer sees
 all reviewers' findings from the previous cycle, the agent's dispositions and the spec delta:
 a reformulation of an earlier finding is not a new finding, and a new blocking finding must say
 why it was invisible before. When the cap is spent under blocking enforcement the host holds

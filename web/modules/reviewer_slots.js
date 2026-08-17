@@ -403,8 +403,9 @@ export function renderReviewerSlotsSection() {
             </div>
             <div class="settings-inline-note">
                 Rows routed to a subscription never fall back to API spend: if every eligible window
-                is exhausted, the review waits for capacity. Plan review, task acceptance and skill
-                review are API-only surfaces today and keep running on the shipped default models.
+                is exhausted, the review waits for capacity. Task acceptance and skill review are
+                API-only surfaces today and keep running on the shipped default models; plan review
+                follows each triad row's own delivery.
             </div>
             <div id="reviewer-slots-error" class="ui-status" data-tone="error" hidden></div>
             <div id="reviewer-slots-pins" class="settings-inline-status" data-tone="warn" hidden></div>

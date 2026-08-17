@@ -16,8 +16,9 @@
 //     breath as the benefit, because a wizard that implies otherwise sends the
 //     owner to a first run that refuses to start.
 //   * "Rides a plan" is not "free", and NOT every reviewer moves. Commit triad,
-//     scope and the advisory pre-reviewer move; plan review, task acceptance
-//     and skill review stay API-only today (D15). The footnote carries both.
+//     scope, the advisory pre-reviewer and plan review (each triad row's own
+//     delivery) move; task acceptance and skill review stay API-only today
+//     (D15). The footnote carries both.
 //
 // The rotation artwork is a STATIC SVG — inline, no library, no animation
 // (no comparable product animates this, and motion here would be noise). It is
@@ -80,8 +81,8 @@ export const VALUE_LADDER = [
 
 export const LADDER_FOOTNOTE =
     'Riding a plan is not free — it moves that work onto a subscription you already '
-    + 'pay for instead of adding per-call API charges. Plan review, task acceptance and '
-    + 'skill review stay on the API key for now.';
+    + 'pay for instead of adding per-call API charges. Task acceptance and skill review '
+    + 'stay on the API key for now; plan review follows each triad row.';
 
 // ---------------------------------------------------------------------------
 // Pure helpers.

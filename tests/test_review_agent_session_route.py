@@ -1297,8 +1297,9 @@ def test_mixed_scope_fanout_sends_each_row_over_its_own_route(tmp_path, monkeypa
 
 
 def test_acceptance_rows_stay_api_even_when_triad_routes_delegate(monkeypatch):
-    """D15: task acceptance and plan review are pinned to the API. The triad's
-    route list must not leak into surfaces that pass no route_env_key."""
+    """D15: task acceptance is pinned to the API (plan review follows each configured
+    row's delivery since the spec-gate redesign). The triad's route list must not
+    leak into surfaces that pass no route_env_key."""
     monkeypatch.setenv(TRIAD_REVIEW_ROUTES_ENV, "agent_session,agent_session,agent_session")
     rows = reviewer_slots(["m1", "m2"], effort="high", role_hint="task acceptance")
     assert all(row.route is ReviewRouteKind.API_CHAT for row in rows)

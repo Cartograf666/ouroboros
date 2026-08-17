@@ -253,7 +253,7 @@ def test_projection_all_delegated_triad_floors_to_defaults(monkeypatch):
 
     from ouroboros.config import SETTINGS_DEFAULTS
 
-    # The API surfaces (plan review, task acceptance, skill review — D15) fall
+    # The API surfaces (task acceptance, skill review — D15) fall
     # back to the shipped defaults, never to zero reviewers or a stale comma key.
     assert os.environ["OUROBOROS_REVIEW_MODELS"] == str(SETTINGS_DEFAULTS["OUROBOROS_REVIEW_MODELS"])
 
@@ -581,7 +581,8 @@ def test_all_delegated_commit_surface_discloses_the_api_fallback(monkeypatch):
     # It names both halves of the routing fact: what moved to subscriptions,
     # and which surfaces the API still serves with which models.
     assert "agent subscription" in warning
-    assert "Plan review, task acceptance and skill review" in warning
+    assert "Task acceptance and skill review" in warning
+    assert "plan review follows each triad row" in warning  # not API-pinned (spec-gate redesign)
     assert str(SETTINGS_DEFAULTS["OUROBOROS_REVIEW_MODELS"]).split(",")[0] in warning
     # The retired advice: telling the owner to keep an API reviewer row
     # contradicts the ratified all-subscription default.

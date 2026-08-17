@@ -249,3 +249,46 @@ def plan_payload_roots(ctx: ToolContext, locators: List[str]) -> list[pathlib.Pa
     return roots
 
 
+def plan_slot_fit(slots: list, *, prompt_chars: int, quorum: int) -> tuple[list, list[dict], str]:
+    """``(callable_slots, oversize_rows, error)`` for ONE shared packet fanned across
+    mixed-window slots — the review organ's calibrated per-slot input caps
+    (`review_synthesis.per_slot_input_token_limits`, Capability Evidence windows) against
+    the packet's estimated tokens. An excluded slot is a typed `preflight_oversize` row
+    (ok=False, $0) so it is REPORTED as not participating; fewer callable slots than the
+    review quorum is a loud typed refusal, never a silent absence of review."""
+    from ouroboros.tools.review_synthesis import per_slot_input_token_limits
+
+    # Only api_chat rows are sized: a RETRIEVING (agent_session) row's model id is an opaque
+    # harness target, not a provider route (`reviewer_window.reviewer_route(session=True)`), and
+    # the review organ's convention (triad: "session rows are not constrained by this pack")
+    # is that such a row is never fit-excluded — it retrieves with its own tools.
+    api_models = [str(getattr(slot, "model", "") or "") for slot in slots if not slot_is_session(slot)]
+    limits = per_slot_input_token_limits(
+        api_models, output_reserve=PLAN_REVIEW_MAX_TOKENS, tokenizer_margin=155_000)
+    estimated = max(1, (max(0, int(prompt_chars)) + 3) // 4)  # utils.estimate_tokens on the packet
+    callable_slots, oversize = [], []
+    for slot in slots:
+        cap = int(limits.get(str(getattr(slot, "model", "") or ""), 0) or 0)
+        if slot_is_session(slot) or estimated <= cap:
+            callable_slots.append(slot)
+            continue
+        oversize.append({
+            "slot_id": str(getattr(slot, "slot_id", "") or ""), "model": str(getattr(slot, "model", "") or ""),
+            "request_model": str(getattr(slot, "model", "") or ""),
+            "route": "agent_session" if slot_is_session(slot) else "api_chat",
+            "host_file_read_attestation": None, "text": "",
+            "error": (f"preflight_oversize: assembled packet ~{estimated:,} estimated tokens exceeds "
+                      f"this slot's calibrated input cap {cap:,}"),
+            "prompt_ref": {}, "response_ref": {}, "tokens_in": 0, "tokens_out": 0, "cost": 0.0,
+        })
+    error = ""
+    if slots and len(callable_slots) < int(quorum):
+        error = (
+            "⚠️ PLAN_REVIEW_DEGRADED_PREFLIGHT_OVERSIZE: the assembled packet "
+            f"(~{estimated:,} estimated tokens) exceeds the calibrated input cap of too many reviewer "
+            "slots (" + ", ".join(f"{m}<={int(limits.get(m, 0) or 0):,}" for m in api_models)
+            + "), so fewer than the review quorum remain callable and NO reviewer was called. "
+            "A constitutional plan carries BIBLE.md and ARCHITECTURE.md in full (W3): configure "
+            "reviewer slots with a larger context window, or shrink the declared evidence."
+        )
+    return callable_slots, oversize, error

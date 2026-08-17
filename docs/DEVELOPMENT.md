@@ -469,23 +469,30 @@ Concrete requirements:
 | Background consciousness (`consciousness.py`) | ✅ full | ✅ full (max) / navigation map (low) | — (not yet required) |
 | Advisory pre-review (`tools/claude_advisory_review.py`) | ✅ via `load_governance_doc` | ✅ via `load_governance_doc` | ✅ via `load_governance_doc` |
 | Scope review (`tools/scope_review.py`) | full canonical doc + Atlas accounting | full canonical doc + Atlas accounting | full canonical doc + Atlas accounting |
-| Plan review (`tools/plan_review.py`) | full for a SELF-MODIFICATION plan (structural path fact: a declared target resolves under the system repo); otherwise a heading-derived navigation map of BIBLE.md generated at runtime (never a copy) | named on-demand pointer — the engine attaches no ARCHITECTURE.md; a reviewer that needs it declares it as typed evidence | named on-demand pointer; a reviewer may request it as typed evidence |
+| Plan review (`tools/plan_review.py`) | full for a SELF-MODIFICATION plan (structural path fact: a declared target resolves under the system repo); otherwise a heading-derived navigation map of BIBLE.md generated at runtime (never a copy) | inline, in full, for a self-modification plan; otherwise the lossless navigation map + a resolvable pointer (W3) | named on-demand pointer; a reviewer that needs it returns `need_evidence` and the host attaches it on the next cycle |
 | Deep self-review (`deep_self_review.py`) | full canonical doc + Atlas accounting | full (max) / navigation map (low) + Atlas accounting | full canonical doc + Atlas accounting |
 
 Plan review keeps the reviewed SPEC, the task objective, the agent-declared evidence, and
 reviewer-slot framing as first-class context. Governance packs are tiered by ONE structural
-fact — whether the plan's declared targets (`affected_resources`, or an evidence path locator)
-resolve under the Ouroboros system repository (self-modification) — never by prose and never by
-a plan-kind taxonomy. A self-modification plan carries BIBLE.md in full; every other plan carries
-a heading-derived navigation map of BIBLE.md generated at runtime
-(`context_layout.generate_doc_nav_map`, never a copy). DEVELOPMENT.md and ARCHITECTURE.md are
-NOT resident in a plan-review packet at all — that is the deliberate deviation from the approved
-W3 wording, disclosed here: the reviewer's subject is the intention, and either document is one
-`need_evidence` request away. A reviewer
-that needs more returns a typed `need_evidence` finding naming exactly what is missing; the agent
-re-declares that locator in the next cycle's `evidence` (the host never attaches a locator the
-plan did not declare), and a request the agent chooses not to honour stays an open note it must
-dispose of. Nothing is silently omitted (P1).
+fact — whether the plan's declared targets resolve under the Ouroboros system repository
+(self-modification) — never by prose and never by a plan-kind taxonomy. A self-modification plan
+carries BIBLE.md in full and ARCHITECTURE.md inline; every other plan carries the constitutional
+excerpt (the heading-derived navigation map of BIBLE.md, `context_layout.generate_doc_nav_map`,
+never a copy), the ARCHITECTURE navigation map, and named on-demand pointers. A reviewer that needs
+more returns a typed `need_evidence` finding naming exactly what is missing, and the host
+attaches it on the next cycle: nothing is silently omitted (P1). A host-attached locator goes
+through exactly the same allowed-root, deny-path, sensitivity and redaction policy as declared
+evidence (a refusal is a named `[reviewer-requested]` omission row), and it enters the manifest
+hash — so the agent's next envelope is a new fingerprint carrying the evidence, never an
+idempotent replay. DEVELOPMENT.md is not resident in a plan-review packet; it is one such
+request away. Delivery form: an `api_chat` row receives the constitutional pack inline; a
+retrieving (`agent_session`) row receives the executor's compact form of the same pack —
+BIBLE.md and ARCHITECTURE.md as mandatory full reads at their resolvable locators
+(`governance_by_retrieval`), the only evidence locators a session may read raw. Bounds: the
+per-task request memory (`need_evidence_seen`) holds at most `MAX_NEED_EVIDENCE_MEMORY` locators
+(a request past it is demoted, disclosed `need_evidence_memory_full`), each at most
+`MAX_ITEM_CHARS`; the host honours at most `MAX_LIST_ITEMS` of them per wave (the rest are named
+`reviewer_request_cap` omissions, still tagged as reviewer requests).
 
 The skill-payload exemption is unchanged: an exact path inside an installed skill payload under
 the canonical data root is data-plane work and does not make a plan a self-modification, even

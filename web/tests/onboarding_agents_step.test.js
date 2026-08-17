@@ -80,7 +80,9 @@ test('the footnote refuses both easy lies: "free", and "every reviewer moves"', 
     assert.match(LADDER_FOOTNOTE, /not free/i);
     assert.match(LADDER_FOOTNOTE, /already\s+pay for/i);
     // The surfaces that stay on the API key are NAMED (D15), not glossed over.
-    assert.match(LADDER_FOOTNOTE, /Plan review, task acceptance and skill review/i);
+    assert.match(LADDER_FOOTNOTE, /Task acceptance and skill review/i);
+    // plan review is NOT API-pinned any more: it rides each triad row (spec-gate redesign)
+    assert.match(LADDER_FOOTNOTE, /plan review follows each triad row/i);
     assert.match(LADDER_FOOTNOTE, /stay on the API key/i);
     assert.doesNotMatch(LADDER_FOOTNOTE, /all reviewers|every reviewer/i);
 });

@@ -393,7 +393,7 @@ def test_agents_step_ladder_states_the_startup_gate_honestly():
     assert "keeps using the API key or local model" in source
     assert "a plan cannot run it" in source
     assert "not free" in source
-    assert "Plan review, task acceptance and" in source
+    assert "Task acceptance and skill review" in source and "plan review follows each triad row" in source
     assert "stay on the API key" in source
     assert "all reviewers" not in source.lower()
     # D-10 vocabulary in the new owner-facing surface.
