@@ -144,6 +144,7 @@ def _restart_current_process(host: str, port: int) -> None:
     )
 
 from ouroboros.config import (
+    SETTINGS_DEFAULTS,
     load_settings, save_settings, apply_settings_to_env as _apply_settings_to_env,
 )
 from ouroboros.server_runtime import (
@@ -1868,14 +1869,19 @@ def _run_supervisor(settings: dict) -> None:
 
         bus_init(
             drive_root=DATA_DIR,
-            total_budget_limit=float(settings.get("TOTAL_BUDGET", 10.0)),
+            total_budget_limit=float(
+                settings.get("TOTAL_BUDGET", SETTINGS_DEFAULTS["TOTAL_BUDGET"])
+            ),
             budget_report_every=10,
             chat_bridge=bridge,
         )
 
         from supervisor.state import init as state_init, init_state, load_state, save_state, update_state
         from supervisor.state import append_jsonl, update_budget_from_usage, rotate_chat_log_if_needed, rotate_jsonl_log_if_needed
-        state_init(DATA_DIR, float(settings.get("TOTAL_BUDGET", 10.0)))
+        state_init(
+            DATA_DIR,
+            float(settings.get("TOTAL_BUDGET", SETTINGS_DEFAULTS["TOTAL_BUDGET"])),
+        )
         init_state()
 
         from supervisor.git_ops import safe_restart
@@ -1903,7 +1909,9 @@ def _run_supervisor(settings: dict) -> None:
         workers_init(
             repo_dir=REPO_DIR, drive_root=DATA_DIR, max_workers=max_workers,
             soft_timeout=soft_timeout, hard_timeout=hard_timeout,
-            total_budget_limit=float(settings.get("TOTAL_BUDGET", 10.0)),
+            total_budget_limit=float(
+                settings.get("TOTAL_BUDGET", SETTINGS_DEFAULTS["TOTAL_BUDGET"])
+            ),
             branch_dev=_workers_branch_dev, branch_stable=_workers_branch_stable,
         )
 

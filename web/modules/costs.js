@@ -71,11 +71,11 @@ export function initCosts({ state, mount }) {
                 <div class="costs-budget-fields">
                     <div class="form-field">
                         <label>Total Budget ($)</label>
-                        <input id="s-budget" type="number" value="10">
+                        <input id="s-budget" type="number" value="200">
                     </div>
                     <div class="form-field">
                         <label>Per-task Cost Cap ($)</label>
-                        <input id="s-per-task-cost" type="number" value="20">
+                        <input id="s-per-task-cost" type="number" value="50">
                         <div class="settings-inline-note">Hard dispatch cap for the whole root task tree. In-flight calls settle normally; increasing the cap does not auto-resume paused work.</div>
                     </div>
                 </div>
