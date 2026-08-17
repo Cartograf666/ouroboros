@@ -69,6 +69,14 @@ def test_projection_uses_explicit_runtime_limit_over_environment(data_root):
     assert ua.usage_projection(data_root, global_limit_usd=7.5)["limit_usd"] == 7.5
 
 
+def test_projection_fallback_uses_the_shipped_total_budget(data_root, monkeypatch):
+    from ouroboros.config import SETTINGS_DEFAULTS
+
+    monkeypatch.delenv("TOTAL_BUDGET", raising=False)
+
+    assert ua.usage_projection(data_root)["limit_usd"] == SETTINGS_DEFAULTS["TOTAL_BUDGET"]
+
+
 def test_a_bucket_whose_rows_disclosed_no_token_counts_reports_absence_not_zero(data_root):
     """`disclosed_tokens` keeps null as null at the ROW level, on the control schema's
     own instruction ("null until a harness reported it — never render null as 0"), and

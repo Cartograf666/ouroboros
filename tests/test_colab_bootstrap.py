@@ -62,6 +62,21 @@ def test_build_colab_settings_defaults_auto_grant_and_runtime():
     assert settings["OUROBOROS_UPDATE_CHANNEL"] == "stable"
     assert masked_secret_status(settings)["TELEGRAM_BOT_TOKEN"] is True
 
+
+def test_build_colab_settings_uses_shipped_budget_defaults():
+    from ouroboros.colab_bootstrap import build_colab_settings
+    from ouroboros.config import SETTINGS_DEFAULTS
+
+    settings = build_colab_settings({"OPENROUTER_API_KEY": "or-key"})
+
+    assert settings["TOTAL_BUDGET"] == SETTINGS_DEFAULTS["TOTAL_BUDGET"] == 200.0
+    assert (
+        settings["OUROBOROS_PER_TASK_COST_USD"]
+        == SETTINGS_DEFAULTS["OUROBOROS_PER_TASK_COST_USD"]
+        == 50.0
+    )
+
+
 def test_build_colab_settings_merges_existing_owner_choices():
     # A Colab re-run must preserve prior owner choices not set by the launch knobs
     # (pinned chat, tweaked model) and drop private sentinel keys.

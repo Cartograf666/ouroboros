@@ -412,9 +412,9 @@ def usage_projection(
         configured_limit = max(0.0, float(global_limit_usd))
     else:
         try:
-            configured_limit = float(os.environ.get("TOTAL_BUDGET", "10") or 0.0)
+            configured_limit = float(os.environ.get("TOTAL_BUDGET", "200") or 0.0)
         except (TypeError, ValueError):
-            configured_limit = 10.0
+            configured_limit = 200.0
     apply_limit = global_limit_usd is not None or configured_limit > 0
     cache_key = (
         "usage_projection", "", "",
@@ -629,10 +629,10 @@ def _global_limit(request: AttemptRequest) -> float:
     if request.global_limit_usd is not None:
         return max(0.0, float(request.global_limit_usd))
     try:
-        configured = float(os.environ.get("TOTAL_BUDGET", "10") or 0.0)
+        configured = float(os.environ.get("TOTAL_BUDGET", "200") or 0.0)
         return configured if configured > 0 else float("inf")
     except (TypeError, ValueError):
-        return 10.0
+        return 200.0
 
 
 def _active_root_budget_fence(root: pathlib.Path, root_task_id: str) -> Optional[Dict[str, Any]]:

@@ -15,6 +15,7 @@ import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ouroboros.provider_models import (
+    OPENROUTER_DEFAULTS,
     PROVIDER_PREFIXES,
     normalize_anthropic_model_id,
     normalize_model_identity,
@@ -38,7 +39,7 @@ from ouroboros.utils import in_worker_process
 
 log = logging.getLogger(__name__)
 
-DEFAULT_LIGHT_MODEL = "google/gemini-3.6-flash"
+DEFAULT_LIGHT_MODEL = OPENROUTER_DEFAULTS["light"]
 _FALSE_LIKE_ENV_VALUES = {"", "0", "false", "no", "off"}
 # Provider-valid Anthropic ephemeral-cache tiers.
 _VALID_CACHE_TTLS = frozenset({"5m", "1h"})
@@ -4275,11 +4276,11 @@ class LLMClient:
 
     def default_model(self) -> str:
         """Return the single default model from env. LLM switches via tool if needed."""
-        return os.environ.get("OUROBOROS_MODEL", "x-ai/grok-4.5")
+        return os.environ.get("OUROBOROS_MODEL", OPENROUTER_DEFAULTS["main"])
 
     def available_models(self) -> List[str]:
         """Return list of available models from env (for switch_model tool schema)."""
-        main = os.environ.get("OUROBOROS_MODEL", "x-ai/grok-4.5")
+        main = os.environ.get("OUROBOROS_MODEL", OPENROUTER_DEFAULTS["main"])
         heavy = os.environ.get("OUROBOROS_MODEL_HEAVY", "")
         light = os.environ.get("OUROBOROS_MODEL_LIGHT", "")
         models = [main]

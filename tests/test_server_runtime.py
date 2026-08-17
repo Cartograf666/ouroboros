@@ -52,9 +52,9 @@ def test_apply_runtime_provider_defaults_autofills_official_openai_models():
         "OUROBOROS_SCOPE_REVIEW_MODELS",
     }
     assert normalized["OUROBOROS_MODEL"] == "openai::gpt-5.6-terra"
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == "openai::gpt-5.6-sol"
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
     assert normalized["OUROBOROS_MODEL_LIGHT"] == "openai::gpt-5.6-luna"
-    assert normalized["OUROBOROS_MODEL_FALLBACKS"] == "openai::gpt-5.6-luna"
+    assert normalized["OUROBOROS_MODEL_FALLBACKS"] == "openai::gpt-5.6-sol"
 
     normalized, changed, changed_keys = apply_runtime_provider_defaults({
         "OPENAI_API_KEY": "sk-openai",
@@ -70,15 +70,12 @@ def test_apply_runtime_provider_defaults_autofills_official_openai_models():
     assert changed
     assert "OUROBOROS_MODEL" in changed_keys
     assert normalized["OUROBOROS_MODEL"] == "openai::gpt-5.6-terra"
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == "openai::gpt-5.6-sol"
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
     assert normalized["OUROBOROS_MODEL_LIGHT"] == "openai::gpt-5.6-luna"
     assert normalized["OUROBOROS_REVIEW_MODELS"] == (
-        "openai::gpt-5.6-terra,openai::gpt-5.6-luna,openai::gpt-5.6-luna"
+        "openai::gpt-5.6-terra,openai::gpt-5.6-terra,openai::gpt-5.6-terra"
     )
-    # v4.39.0: direct-provider fallback now seeds `[main, light, light]` —
-    # 3 commit-triad slots (preserving the documented 3-reviewer contract)
-    # with 2 unique models (so `plan_task`'s quorum gate passes). Replaces
-    # the old `[main] * 3` fallback that broke `plan_task` first-run.
+    # Three distinct slot identities deliberately run the same provider Main.
     assert normalized["OUROBOROS_SCOPE_REVIEW_MODEL"] == "openai::gpt-5.6-terra"
     assert normalized["OUROBOROS_SCOPE_REVIEW_MODELS"] == "openai::gpt-5.6-terra"
 
@@ -92,11 +89,11 @@ def test_apply_runtime_provider_defaults_autofills_official_openai_models():
     assert changed
     assert "OUROBOROS_MODEL" in changed_keys
     assert normalized["OUROBOROS_MODEL"] == "openai::gpt-5.6-terra"
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == "openai::gpt-5.6-sol"
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
     assert normalized["OUROBOROS_MODEL_LIGHT"] == "openai::gpt-5.6-luna"
-    assert normalized["OUROBOROS_MODEL_FALLBACKS"] == "openai::gpt-5.6-luna"
+    assert normalized["OUROBOROS_MODEL_FALLBACKS"] == "openai::gpt-5.6-sol"
     assert normalized["OUROBOROS_REVIEW_MODELS"] == (
-        "openai::gpt-5.6-terra,openai::gpt-5.6-luna,openai::gpt-5.6-luna"
+        "openai::gpt-5.6-terra,openai::gpt-5.6-terra,openai::gpt-5.6-terra"
     )
 
 
@@ -127,9 +124,9 @@ def test_apply_runtime_provider_defaults_migrates_saved_openai_values():
     # gpt-4.1 / gpt-5.4-mini light+fallback) are legacy defaults, not explicit
     # choices — they migrate to the new gpt-5.6 slot defaults.
     assert normalized["OUROBOROS_MODEL"] == "openai::gpt-5.6-terra"
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == "openai::gpt-5.6-sol"
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
     assert normalized["OUROBOROS_MODEL_LIGHT"] == "openai::gpt-5.6-luna"
-    assert normalized["OUROBOROS_MODEL_FALLBACKS"] == "openai::gpt-5.6-luna"
+    assert normalized["OUROBOROS_MODEL_FALLBACKS"] == "openai::gpt-5.6-sol"
     # v6.36.0 (D4): an explicit provider-matching review list is honored EXACTLY
     # (1 model = 1 slot — a loud single_reviewer_no_diversity degraded mode), not
     # silently expanded to [main, light, light]. Expansion fires only when the
@@ -296,19 +293,17 @@ def test_apply_runtime_provider_defaults_normalizes_anthropic_only_setup():
         "OUROBOROS_SCOPE_REVIEW_MODEL",
         "OUROBOROS_SCOPE_REVIEW_MODELS",
     }
-    assert normalized["OUROBOROS_MODEL"] == "anthropic::claude-sonnet-5"
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == "anthropic::claude-opus-5"
+    assert normalized["OUROBOROS_MODEL"] == "anthropic::claude-opus-5"
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
     assert normalized["OUROBOROS_MODEL_LIGHT"] == "anthropic::claude-sonnet-5"
-    assert normalized["OUROBOROS_MODEL_FALLBACKS"] == "anthropic::claude-opus-4-6"
-    # v6.82.0 triad-expansion contract: main == light (sonnet-5) degrades the
-    # direct-provider fallback to the loud [main] * 3 single-model triad.
+    assert normalized["OUROBOROS_MODEL_FALLBACKS"] == "anthropic::claude-sonnet-5"
     assert normalized["OUROBOROS_REVIEW_MODELS"] == (
-        "anthropic::claude-sonnet-5,"
-        "anthropic::claude-sonnet-5,"
-        "anthropic::claude-sonnet-5"
+        "anthropic::claude-opus-5,"
+        "anthropic::claude-opus-5,"
+        "anthropic::claude-opus-5"
     )
-    assert normalized["OUROBOROS_SCOPE_REVIEW_MODEL"] == "anthropic::claude-sonnet-5"
-    assert normalized["OUROBOROS_SCOPE_REVIEW_MODELS"] == "anthropic::claude-sonnet-5"
+    assert normalized["OUROBOROS_SCOPE_REVIEW_MODEL"] == "anthropic::claude-opus-5"
+    assert normalized["OUROBOROS_SCOPE_REVIEW_MODELS"] == "anthropic::claude-opus-5"
 
     normalized, changed, changed_keys = apply_runtime_provider_defaults({
         "ANTHROPIC_API_KEY": "sk-ant",
@@ -323,13 +318,13 @@ def test_apply_runtime_provider_defaults_normalizes_anthropic_only_setup():
 
     assert changed
     assert "OUROBOROS_MODEL" in changed_keys
-    assert normalized["OUROBOROS_MODEL"] == "anthropic::claude-sonnet-5"
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == "anthropic::claude-opus-5"
+    assert normalized["OUROBOROS_MODEL"] == "anthropic::claude-opus-5"
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
     assert normalized["OUROBOROS_MODEL_LIGHT"] == "anthropic::claude-sonnet-5"
     assert normalized["OUROBOROS_REVIEW_MODELS"] == (
-        "anthropic::claude-sonnet-5,"
-        "anthropic::claude-sonnet-5,"
-        "anthropic::claude-sonnet-5"
+        "anthropic::claude-opus-5,"
+        "anthropic::claude-opus-5,"
+        "anthropic::claude-opus-5"
     )
 
 
@@ -343,11 +338,11 @@ def test_apply_runtime_provider_defaults_keeps_new_triad_on_openrouter():
 
     assert not changed
     assert changed_keys == []
-    assert normalized["OUROBOROS_MODEL"] == "x-ai/grok-4.5"
-    assert normalized["OUROBOROS_MODEL_LIGHT"] == "google/gemini-3.6-flash"
+    assert normalized["OUROBOROS_MODEL"] == "google/gemini-3.7-flash"
+    assert normalized["OUROBOROS_MODEL_LIGHT"] == "openai/gpt-5.6-luna"
     assert normalized["OUROBOROS_MODEL_FALLBACKS"] == "openai/gpt-5.6-luna"
     assert normalized["OUROBOROS_REVIEW_MODELS"] == (
-        "openai/gpt-5.6-luna,google/gemini-3.6-flash,anthropic/claude-sonnet-5"
+        "google/gemini-3.7-flash,openai/gpt-5.6-terra,anthropic/claude-opus-5"
     )
     assert normalized["OUROBOROS_SCOPE_REVIEW_MODEL"] == "openai/gpt-5.6-terra"
     assert normalized["OUROBOROS_SCOPE_REVIEW_MODELS"] == "openai/gpt-5.6-terra"
@@ -516,15 +511,16 @@ def test_apply_runtime_provider_defaults_minimax_only_uses_current_models():
 
 def test_apply_runtime_provider_defaults_cloudru_migrates_populated_shipped_defaults():
     """The realistic save path: a Cloud.ru-only user whose settings already carry
-    the shipped (non-cloudru) defaults. main/code AND every review/scope reviewer
-    slot must still migrate to cloudru:: so no slot points at a provider with no key."""
+    shipped non-cloudru defaults, including the immediately outgoing v6.104 Main
+    and Light values. Every model/review slot must migrate to cloudru:: so no
+    slot points at a provider with no key."""
     from ouroboros.server_runtime import apply_runtime_provider_defaults
 
     normalized, changed, _ = apply_runtime_provider_defaults({
         "CLOUDRU_FOUNDATION_MODELS_API_KEY": "cr-key",
-        "OUROBOROS_MODEL": "google/gemini-3.5-flash",
+        "OUROBOROS_MODEL": "x-ai/grok-4.5",
         "OUROBOROS_MODEL_HEAVY": "google/gemini-3.5-flash",
-        "OUROBOROS_MODEL_LIGHT": "google/gemini-3.5-flash",
+        "OUROBOROS_MODEL_LIGHT": "google/gemini-3.6-flash",
         "OUROBOROS_MODEL_FALLBACKS": "anthropic/claude-sonnet-4.6",
         "OUROBOROS_REVIEW_MODELS": "openai/gpt-5.5,google/gemini-3.5-flash,anthropic/claude-opus-4.8",
         "OUROBOROS_SCOPE_REVIEW_MODEL": "openai/gpt-5.5",
@@ -622,12 +618,12 @@ def test_local_only_install_keeps_light_and_fallback_on_the_local_main_route():
     kept = apply_runtime_provider_defaults(remote)[0]["OUROBOROS_MODEL_LIGHT"]
     assert kept == SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"]
 
-    # UPGRADE path: a local-only settings file still holding the v6.81 shipped
-    # values is just as unreachable and must also fall back to the local Main.
+    # UPGRADE path: a local-only settings file still holding the immediately
+    # outgoing shipped values is just as unreachable and must inherit local Main.
     upgraded = {
         "OUROBOROS_MODEL": "local-main",
-        "OUROBOROS_MODEL_LIGHT": "google/gemini-3.5-flash",
-        "OUROBOROS_MODEL_FALLBACKS": "anthropic/claude-sonnet-4.6",
+        "OUROBOROS_MODEL_LIGHT": "google/gemini-3.6-flash",
+        "OUROBOROS_MODEL_FALLBACKS": "openai/gpt-5.6-luna",
         "LOCAL_MODEL_SOURCE": "repo/model.gguf",
         "USE_LOCAL_MAIN": True,
     }
