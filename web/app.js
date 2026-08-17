@@ -21,7 +21,7 @@ import { initDashboard } from './modules/dashboard.js';
 import { hydrateNavIcons } from './modules/page_icons.js';
 
 import { initOnboardingOverlay } from './modules/onboarding_overlay.js';
-import { shouldSuppressWindowsAltMenu } from './modules/ui_helpers.js';
+import { installAltMenuSuppression } from './modules/ui_helpers.js';
 
 const state = {
     messages: [],
@@ -875,14 +875,9 @@ syncNavigationState();
     updateVvh();
 }());
 
-// Windows Alt / Layout Switch Menu-lock suppression
-// When focus is in input/textarea/contenteditable, prevent standalone Alt (and Alt+Shift) from hijacking focus to window menu
-window.addEventListener('keydown', (e) => {
-    if (shouldSuppressWindowsAltMenu(e, document.activeElement)) {
-        // Suppress default Windows browser menu activation so layout switch doesn't eat next key or ring bell
-        e.preventDefault();
-    }
-}, { capture: true });
+// Windows Alt / Layout Switch Menu-lock suppression (shared installer — the
+// onboarding wizard document installs the same guard on its own iframe window).
+installAltMenuSuppression();
 
 // Populate the project-thread isolation set BEFORE opening the socket so the live
 // fan-out never misclassifies an early project frame as main-chat traffic during

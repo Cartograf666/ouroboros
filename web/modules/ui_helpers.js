@@ -161,13 +161,35 @@ export async function downloadViaHostBridge(url, filename = 'download', { openEx
  * Decision helper for Windows Alt/Alt+Shift keyboard layout switch focus-lock.
  * When focus is within an editable text input, prevents standalone Alt keydown
  * from triggering Windows window-menu activation (which beeps and drops the next keystroke).
- * AltGr (ctrlKey + altKey) is intentionally preserved.
+ * AltGr is intentionally preserved in both engine shapes: Chromium reports it as
+ * Ctrl+Alt (excluded via ctrlKey), Firefox as key='AltGraph' (excluded by name).
  */
 export function shouldSuppressWindowsAltMenu(event, activeElement) {
     if (!event) return false;
+    if (event.key === 'AltGraph') return false;
     const isAlt = (event.key === 'Alt' || event.code === 'AltLeft' || event.code === 'AltRight') && !event.ctrlKey;
     if (!isAlt) return false;
     if (!activeElement) return false;
     const tag = String(activeElement.tagName || '').toUpperCase();
     return tag === 'INPUT' || tag === 'TEXTAREA' || Boolean(activeElement.isContentEditable);
+}
+
+/**
+ * Install the standalone-Alt menu-lock guard on a document's window. Chromium
+ * hosts decide menu activation from the Alt KEYDOWN default while Firefox-style
+ * hosts decide on KEYUP, so both phases carry the same suppression test. Each
+ * top-level document installs its own guard (the onboarding wizard runs in an
+ * iframe with its own window, where the SPA listener cannot see events). The
+ * guard is an app-lifetime singleton like the other top-level app.js listeners,
+ * so it deliberately registers no disposer.
+ */
+export function installAltMenuSuppression(target = window) {
+    const doc = target.document || document;
+    const suppress = (event) => {
+        if (shouldSuppressWindowsAltMenu(event, doc.activeElement)) {
+            event.preventDefault();
+        }
+    };
+    target.addEventListener('keydown', suppress, { capture: true });
+    target.addEventListener('keyup', suppress, { capture: true });
 }
