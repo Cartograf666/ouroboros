@@ -51,7 +51,7 @@ test('the framed wizard can actually open the sign-in link the login card render
     const signInUrl = 'https://claude.ai/oauth/authorize?code=abc123';
     const card = loginCardHtml({
         harness: 'claude',
-        job: { state: 'running', phase: 'awaiting_user',
+        envelope: { job: { state: 'running', phase: 'awaiting_user' },
             deviceCode: { flow: 'oauth_url', verificationUrl: signInUrl, userCode: '' } },
     }, Date.now());
 

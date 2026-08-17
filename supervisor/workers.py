@@ -1037,6 +1037,15 @@ def _run_chat_task(
     ``ephemeral`` marks a SHORT-LIVED same-route turn (run on a separate agent
     instance while the shared chat agent is busy): it carries _ephemeral_turn so
     the task pipeline skips long-term memory / reflection / evolution writes."""
+    task: Optional[dict] = None
+    client_msg_id = ""
+    if task_metadata:
+        _cmid_ref = task_metadata.get("origin_message_ref")
+        if isinstance(_cmid_ref, dict):
+            client_msg_id = str(_cmid_ref.get("client_message_id") or "")
+        if not client_msg_id:
+            client_msg_id = str(task_metadata.get("client_message_id") or "")
+    kind = "ephemeral_decision" if ephemeral else "direct_chat"
     try:
         from ouroboros.contracts.task_contract import attach_task_contract
 
@@ -1126,9 +1135,40 @@ def _run_chat_task(
                 DRIVE_ROOT, str(task["id"]), task["text"], broadcast=_broadcast_task_named
             )
         attach_task_contract(task)
-        events = agent.handle_task(task)
-        for e in events:
-            get_event_q().put(e)
+
+        pid = str(task.get("project_id") or "")
+
+        from supervisor.active_activity import track_direct_activity
+
+        with track_direct_activity(
+            activity_id=str(task["id"]),
+            chat_id=int(chat_id or 0),
+            client_message_id=client_msg_id,
+            project_id=pid,
+            kind=kind,
+            phase="thinking",
+        ):
+            # Announce the authoritative start immediately (owner decision 2A):
+            # the client's `Sending...` retires on this frame, not on a socket
+            # echo, and the frame carries the activity<->client_message_id link
+            # so even a turn that fails before its first LLM round concludes
+            # cleanly via its keyed error final.
+            try:
+                from supervisor.message_bus import get_bridge
+
+                get_bridge().send_chat_action(
+                    int(chat_id or 0),
+                    "typing",
+                    activity_id=str(task["id"]),
+                    client_message_id=client_msg_id,
+                    phase="thinking",
+                    kind=kind,
+                )
+            except Exception:
+                log.debug("Direct-turn start typing announce failed", exc_info=True)
+            events = agent.handle_task(task)
+            for e in events:
+                get_event_q().put(e)
     except Exception as e:
         import traceback
         err_msg = f"⚠️ Error: {type(e).__name__}: {e}"
@@ -1142,7 +1182,29 @@ def _run_chat_task(
             },
         )
         try:
-            send_with_budget(chat_id, err_msg)
+            # Key the error final with the turn's activity id so the client
+            # concludes exactly this turn (active set, 4A) instead of leaving
+            # its `Sending.../Thinking...` state to an unkeyed sweep. If the
+            # failure happened before the start announce was broadcast, the
+            # client has no activity<->client_message_id link yet, so announce
+            # it first: the keyed final right after then retires both the
+            # activity and its linked `Sending...` submission.
+            failed_task_id = str(task.get("id") or "") if isinstance(task, dict) else ""
+            if failed_task_id and client_msg_id:
+                try:
+                    from supervisor.message_bus import get_bridge
+
+                    get_bridge().send_chat_action(
+                        int(chat_id or 0),
+                        "typing",
+                        activity_id=failed_task_id,
+                        client_message_id=client_msg_id,
+                        phase="thinking",
+                        kind=kind,
+                    )
+                except Exception:
+                    log.debug("Failed-turn typing announce failed", exc_info=True)
+            send_with_budget(chat_id, err_msg, task_id=failed_task_id)
         except Exception:
             log.debug("Suppressed exception", exc_info=True)
 
@@ -2801,6 +2863,20 @@ def _ensure_workers_healthy_locked(queue: Any) -> tuple[List[int], bool]:
                             )
                         except Exception:
                             log.debug("Failed to write interrupted status for %s", w.busy_task_id, exc_info=True)
+                        try:
+                            # The ONE shared same-id requeue reset (§19.7.2 item 11):
+                            # the crash-requeue used to clean nothing, so the retried
+                            # attempt inherited the dead attempt's mailbox controls
+                            # and executable owner_hurry latch. Fail-soft inside.
+                            from ouroboros.owner_hurry import retry_reset
+
+                            retry_reset(
+                                queue._task_drive_for_task(task, str(w.busy_task_id)),
+                                DRIVE_ROOT, str(w.busy_task_id),
+                                reason="worker_crash_requeue",
+                            )
+                        except Exception:
+                            log.debug("Crash-requeue retry reset failed for %s", w.busy_task_id, exc_info=True)
                         admitted = queue.enqueue_task(task, front=True)
                         admission_block = (
                             str(admitted.get("_admission_blocked") or "")

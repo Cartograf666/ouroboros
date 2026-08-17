@@ -260,6 +260,13 @@ class TypingOutbound(TypedDict):
     # Multi-project: stamps the thread so the client fan-out routes a project
     # task's typing indicator to its panel instead of defaulting to main.
     chat_id: NotRequired[int]
+    activity_id: NotRequired[str]
+    client_message_id: NotRequired[str]
+    phase: NotRequired[str]
+    # Stamped only for direct-registry-tracked turns ("direct_chat" /
+    # "ephemeral_decision"); queued managed tasks emit typing without it, so the
+    # client exempts their entries from /api/state snapshot deletion authority.
+    kind: NotRequired[str]
 
 
 class LogOutbound(TypedDict):
@@ -493,6 +500,23 @@ class EvolutionStateSnapshot(TypedDict):
     campaign: NotRequired[Dict[str, Any]]
 
 
+class ActiveDirectTurn(TypedDict):
+    """An active in-process direct chat or ephemeral decision turn.
+
+    Snapshot rows in ``StateResponse.active_direct_turns``; every field is
+    always emitted by ``DirectActivityRegistry.snapshot()`` (empty-string for
+    absent optionals), so the mirror marks them all required.
+    """
+
+    activity_id: str
+    chat_id: int
+    project_id: str
+    client_message_id: str
+    kind: str
+    phase: str
+    started_at: float
+
+
 class StateResponse(TypedDict):
     """Shape of ``GET /api/state`` (happy path)."""
 
@@ -534,6 +558,7 @@ class StateResponse(TypedDict):
     # project" button (v6.33.0 P2) and render a pointer that opens the bound
     # project's panel (v6.33.0 F4).
     task_bindings: dict
+    active_direct_turns: NotRequired[List[ActiveDirectTurn]]
 
 
 class SettingsNetworkMeta(TypedDict):
@@ -826,6 +851,15 @@ class TaskDetailResponse(TypedDict, total=False):
     # the WHY of the pending cancellation (owner text, "subtree cancellation of
     # <root>", "evolution stopped", …). Absent when no reason was recorded.
     cancel_reason: str
+    # S3 (Q1, additive-optional): rides beside a pending ``cancel_state`` when
+    # the open intent is the SOFT stop ("finalize_then_cancel") — the UI shows
+    # "Finalizing…" and offers the hard escalation. Absent on immediate intents.
+    stop_policy: str
+    # S3 (HQ1, additive-optional): the typed owner-hurry observability — the
+    # current block plus the archived history of prior same-id attempts.
+    # Absent on tasks nobody hurried. Task-detail data only, never chat.
+    owner_hurry: OwnerHurryProjection
+    owner_hurry_history: list[OwnerHurryProjection]
     error: str
 
 
@@ -872,6 +906,52 @@ class ClaudexorStatusResponse(TypedDict, total=False):
     error: str
 
 
+class ClaudexorLoginJobResponse(TypedDict, total=False):
+    """The ONE login-job success envelope (frozen browser gateway ABI,
+    issues #124/#151): every ``/api/claudexor/login`` operation — create,
+    snapshot poll, cancel, input, reconcile — answers exactly one top-level
+    bare ``job`` (the daemon's ``ControlSetupJob``), never another envelope
+    nested under it (the double ``job.job`` was issue #124).
+
+    Operation metadata rides BESIDE the job: create adds ``job_id``,
+    ``disclosure_native`` and (fallback engines only) ``attach_command``;
+    input keeps its ``ok`` bit; the snapshot poll is the daemon's own
+    ``{job, cursor, sequence, deviceCode?}`` envelope passed through
+    verbatim, so the transient sign-in disclosure lives at the ENVELOPE
+    level, not inside ``job``. ``job`` is required on every operation; all
+    other keys are operation-scoped."""
+
+    job: Required[Dict[str, Any]]
+    # snapshot-only (daemon envelope verbatim)
+    cursor: str
+    sequence: int
+    deviceCode: Dict[str, Any]
+    # create-only metadata
+    job_id: str
+    disclosure_native: bool
+    attach_command: str
+    # input-only compatibility bit
+    ok: bool
+
+
+class ClaudexorLoginJobProblem(TypedDict, total=False):
+    """The narrow login-job error envelope (frozen beside the success DTO —
+    the recovery UI consumes both sides of one operation contract): required
+    ``error`` prose, optional stable machine ``code``, optional bounded
+    ``required_actions`` naming the engine's continuation (e.g. reconcile's
+    409 ``setup_termination_unconfirmed`` carries
+    ``["retry_setup_reconciliation"]``). Daemon 404/410 job-absence verdicts
+    and the operation-scoped input/reconcile 409s ride this shape with their
+    original status; transport failure and daemon 5xx stay the proxy's 503.
+    Not an action framework: the list mirrors the daemon's own top-level
+    ``ControlProblem.requiredActions`` (at most 16 strings of at most 512
+    chars) and nothing else."""
+
+    error: Required[str]
+    code: str
+    required_actions: List[str]
+
+
 class TaskEvent(TypedDict, total=False):
     seq: int
     source: str
@@ -890,6 +970,65 @@ class TaskCancelResponse(TypedDict, total=False):
     # for the subtree cancel, which is COMPLETE by the time this answer is sent;
     # the plain envelope is unchanged.
     cascade: bool
+    # S3 (Q1/Q2, additive): present on the 202 acknowledgement of a
+    # ``{"stop_policy": "finalize_then_cancel"}`` request — the durable intent
+    # is open ("pending") while the bounded finalization attempt runs;
+    # ``stop_policy`` echoes the EFFECTIVE policy of the durable intent
+    # ("immediate" | "finalize_then_cancel"): a graceful request over an
+    # already-hard intent never softens it, and the answer says so. Absent on
+    # the legacy immediate path, which stays byte-identical.
+    cancel_state: str
+    stop_policy: str
+    error: str
+
+
+class TaskHurryRequest(TypedDict):
+    """``POST /api/tasks/{task_id}/hurry`` — the text-free owner hurry control
+    (HQ1 owner decision, paraphrased: no visible chat message ever).
+
+    The body carries ONLY a client-generated stable ``request_id`` (reused on
+    retry so the acknowledgement is idempotent); any other field is refused.
+    There is deliberately no text and no chat side effect anywhere on this
+    path — the durable facts are the typed owner-mailbox control, the
+    ``owner_hurry`` task-result projection, and one non-chat event."""
+
+    request_id: str
+
+
+class OwnerHurryProjection(TypedDict, total=False):
+    """The ``owner_hurry`` block on the task result — task-detail
+    observability, never a chat message. ``state`` is the closed vocabulary
+    requested | applied | not_applied_before_terminal; ``effects`` maps each
+    host-rail effect to its recorded status. ``owner_hurry_history`` rows
+    carry the same shape plus ``archived_at``/``archived_reason`` (rolled over
+    on every same-id requeue by the shared retry-reset)."""
+
+    attempt_key: int
+    request_id: str
+    requested_by: str
+    requested_at: str
+    reason: str
+    state: str
+    effects: Dict[str, str]
+    applied_at: str
+    reconciled_at: str
+    archived_at: str
+    archived_reason: str
+
+
+class TaskHurryResponse(TypedDict, total=False):
+    """Acknowledgement of the typed task-local acceleration control.
+
+    ``duplicate=True`` is the idempotent shape: the same ``request_id`` on the
+    live attempt (or a different id collapsing onto the one armed latch)
+    returns the existing acknowledgement without a second control."""
+
+    ok: bool
+    task_id: str
+    request_id: str
+    state: str
+    attempt_key: int
+    duplicate: bool
     error: str
 
 
@@ -992,6 +1131,7 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "GET /api/tasks/{task_id}/artifacts/{name}",
     "GET /api/tasks/{task_id}/events",
     "POST /api/tasks/{task_id}/cancel",
+    "POST /api/tasks/{task_id}/hurry",
     "POST /api/tasks/{task_id}/resume",
     "GET /api/schedules",
     "POST /api/schedules",
@@ -1033,6 +1173,7 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "GET /api/claudexor/login/{job_id}",
     "DELETE /api/claudexor/login/{job_id}",
     "POST /api/claudexor/login/{job_id}/input",
+    "POST /api/claudexor/login/{job_id}/reconcile",
     "DELETE /api/claudexor/credential-profiles/{harness}/{profile_id}",
     "GET /api/extensions",
     "GET /api/extensions/{skill}/manifest",
@@ -1044,6 +1185,7 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "POST /api/skills/{skill}/delete",
     "GET /api/skills/lifecycle-queue",
     "POST /api/skills/{skill}/review",
+    "GET /api/skills/{skill}/review-history/{job_id}",
     "POST /api/skills/{skill}/grants",
     "POST /api/skills/{skill}/reconcile",
     "GET /api/marketplace/clawhub/search",
@@ -1128,6 +1270,7 @@ __all__ = [
     "StatusResponse",
     "HealthResponse",
     "StateResponse",
+    "ActiveDirectTurn",
     "EvolutionStateSnapshot",
     "SettingsNetworkMeta",
     "SettingsMeta",
@@ -1169,8 +1312,13 @@ __all__ = [
     "ClaudexorReadState",
     "ClaudexorStatusReads",
     "ClaudexorStatusResponse",
+    "ClaudexorLoginJobResponse",
+    "ClaudexorLoginJobProblem",
     "TaskEvent",
     "TaskCancelResponse",
+    "TaskHurryRequest",
+    "TaskHurryResponse",
+    "OwnerHurryProjection",
     "LogTailResponse",
     "HTTP_ENDPOINTS",
     "WS_MESSAGE_TYPES",

@@ -1129,6 +1129,35 @@ def _maybe_auto_attach_image(
         log.debug("auto-attach image failed", exc_info=True)
 
 
+def reclaim_trace_refs(tool_ctx: Any) -> Dict[str, Any]:
+    """Per-task {tool_call_id: trace_ref} accumulated as tool results append."""
+    refs = getattr(tool_ctx, "_tool_trace_refs", None)
+    return refs if isinstance(refs, dict) else {}
+
+
+def reclaim_negative_memo(tool_ctx: Any) -> set:
+    """Per-task set of non-shrinking reclaim unit keys (created on demand)."""
+    memo = getattr(tool_ctx, "_context_reclaim_negative_memo", None)
+    if not isinstance(memo, set):
+        memo = set()
+        tool_ctx._context_reclaim_negative_memo = memo
+    return memo
+
+
+def prune_reclaim_trace_refs(tool_ctx: Any, messages: List[Dict[str, Any]]) -> None:
+    """Drop trace refs whose tool_call_id left the transcript (post-reclaim bound)."""
+    refs = getattr(tool_ctx, "_tool_trace_refs", None)
+    if not isinstance(refs, dict) or not refs:
+        return
+    live = {
+        str(msg.get("tool_call_id"))
+        for msg in messages
+        if isinstance(msg, dict) and msg.get("tool_call_id")
+    }
+    for call_id in [key for key in refs if key not in live]:
+        del refs[call_id]
+
+
 def process_tool_results(
     results: List[Dict[str, Any]],
     messages: List[Dict[str, Any]],
@@ -1158,8 +1187,20 @@ def process_tool_results(
             "content": truncated_result
         })
 
+        # Retain the pre-truncation trace ref per tool_call_id so the context
+        # reclaim materializer can bind exact tool CAS refs into its capsules.
+        trace_ref = exec_result.get("trace_ref")
+        ctx = getattr(tools, "_ctx", None) if tools is not None else None
+        if ctx is not None and isinstance(trace_ref, dict) and trace_ref:
+            refs = getattr(ctx, "_tool_trace_refs", None)
+            if not isinstance(refs, dict):
+                refs = {}
+                ctx._tool_trace_refs = refs
+            refs[str(exec_result["tool_call_id"])] = trace_ref
+
         llm_trace["tool_calls"].append({
             "tool": fn_name,
+            "tool_call_id": exec_result["tool_call_id"],
             "args": _safe_args(exec_result["args_for_log"]),
             # Evidence-parity (v6.71.1): store the SAME view the agent saw
             # (per-tool TOOL_RESULT_LIMITS, head-truncated) rather than a hidden

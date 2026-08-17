@@ -485,3 +485,20 @@ def _reconcile_delegated_runs_on_kill(q: Any, task_id: str) -> List[str]:
     except Exception:
         log.debug("Unreconciled-run disclosure append failed for %s", task_id, exc_info=True)
     return still_open
+
+
+def _cascade_delivery_row_locked(q: Any, task_id: str) -> Dict[str, Any]:
+    """A routing row for a cascade whose ROOT has already left the live maps.
+
+    Caller holds the queue lock. Returns the first live descendant's row (they
+    carry the lineage ``chat_id``), or ``{}`` when the subtree is empty too.
+    (Moved verbatim from ``task_lifecycle.py`` at its module-size boundary.)
+    """
+    for task in q.PENDING:
+        if isinstance(task, dict) and q._is_descendant_of(task, task_id) and task.get("chat_id"):
+            return dict(task)
+    for meta in q.RUNNING.values():
+        task = meta.get("task") if isinstance(meta, dict) else None
+        if isinstance(task, dict) and q._is_descendant_of(task, task_id) and task.get("chat_id"):
+            return dict(task)
+    return {}

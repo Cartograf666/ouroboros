@@ -188,9 +188,9 @@ def test_attempt_request_carries_the_payloads_applied_cache_ttl():
     del marker["ttl"]  # bare marker = provider default tier
     assert _attempt_request(target, payload).prompt_cache_ttl == "default"
     del payload["messages"][0]["content"][0]["cache_control"]
-    # Marker-free payload: nothing is written to cache at all, so the base
-    # write tier is already a safe conservative bound (never the extended 1h).
-    assert _attempt_request(target, payload).prompt_cache_ttl == "default"
+    # Marker-free physical candidates carry no invented applied TTL. Monetary
+    # admission separately retains its conservative base-tier reservation.
+    assert _attempt_request(target, payload).prompt_cache_ttl == ""
 
 
 def test_build_memory_sections_partition_modes():

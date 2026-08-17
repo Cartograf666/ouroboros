@@ -16,25 +16,28 @@ import logging
 from ouroboros.llm import LLMClient, normalize_reasoning_effort, add_usage
 from ouroboros import task_pacing
 from ouroboros.config import adaptive_quorum, get_context_mode, get_light_model, get_review_enforcement, get_task_review_mode, resolve_effort
-from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_BYPASS_REASONS, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, REASON_DELIVERY_CONTROL_DEGRADED, RESULT_INFRA_FAILED, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
-from ouroboros.observability import new_call_id, persist_call
+from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_BYPASS_REASONS, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, REASON_DELIVERY_CONTROL_DEGRADED, REASON_OWNER_REQUESTED_FINALIZATION, RESULT_INFRA_FAILED, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
+from ouroboros.observability import new_execution_id
 from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools, swarm_router_turn
 from ouroboros.tools.registry import ToolRegistry
-from ouroboros.context import build_user_content, estimate_context_prompt_tokens
-from ouroboros.context_budget import (
-    COMPACTION_HYSTERESIS_REGION_GROWTH,
-    COMPACTION_HYSTERESIS_ROUNDS,
-    EMERGENCY_COMPACTION_CHARS,
-    LOW_EMERGENCY_COMPACTION_CHARS,
-)
-from ouroboros.context_compaction import _round_has_protected_content, _tool_round_spans, compact_tool_history_llm
+from ouroboros.context import build_user_content
+from ouroboros.context_budget import ContextReclaimRequest
+from ouroboros.context_compaction import compact_tool_history_llm, context_reclaim_transcript_sha256
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
 from ouroboros.utils import estimate_tokens, truncate_review_artifact
-from ouroboros.usage_accounting import BudgetExceeded
+from ouroboros.usage_accounting import (
+    BudgetExceeded,
+    PhysicalAttemptContext,
+    PhysicalAttemptPreconditionFailed,
+    last_physical_attempt_capture,
+)
 
 from ouroboros.loop_tool_execution import (
     StatefulToolExecutor,
     handle_tool_calls,
+    prune_reclaim_trace_refs,
+    reclaim_negative_memo,
+    reclaim_trace_refs,
 )
 from ouroboros.loop_llm_call import call_llm_with_retry, emit_llm_usage_event
 from ouroboros.pricing import estimate_cost_optional
@@ -68,55 +71,7 @@ class _CompactionRoundContext:
     task_id: str
     round_idx: int
     event_queue: Optional[queue.Queue]
-    active_use_local: bool
-    active_context_mode: str
-    checkpoint_injected: bool
     emit_progress: Callable[[str], None]
-    active_model: str = ""
-    # The round's LIVE tool-schema list (the same object enable_tools appends to).
-    # Sent on the wire beside `messages`, so the necessity measure must count it;
-    # optional so existing constructions stay valid (schemas absent => 0 tokens).
-    tool_schemas: Optional[List[Dict[str, Any]]] = None
-
-
-def _estimate_messages_chars(messages: List[Dict[str, Any]]) -> int:
-    """Estimate transcript size over the FULL message list (the system block,
-    when present in ``messages``, is counted too — conservative for the
-    window-derived emergency trigger)."""
-    from ouroboros.context_budget import IMAGE_BLOCK_CHAR_EQUIVALENT
-
-    total = 0
-    for msg in messages:
-        content = msg.get("content")
-        if isinstance(content, str):
-            total += len(content)
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict):
-                    if str(block.get("type") or "") in ("image_url", "image"):
-                        # Vision tokens are billed per tile, not per base64
-                        # char: counting the raw payload made ONE image look
-                        # like ~300K tokens and permanently wedged emergency
-                        # compaction.
-                        total += IMAGE_BLOCK_CHAR_EQUIVALENT
-                        continue
-                    # Count whole multipart blocks, including cache markers.
-                    try:
-                        import json as _json2
-                        total += len(_json2.dumps(block, ensure_ascii=False))
-                    except (TypeError, ValueError):
-                        total += len(str(block))
-        tool_calls = msg.get("tool_calls")
-        if tool_calls:
-            try:
-                import json as _json
-                total += len(_json.dumps(tool_calls, ensure_ascii=False))
-            except (TypeError, ValueError):
-                total += sum(len(str(tc)) for tc in tool_calls)
-        tc_id = msg.get("tool_call_id")
-        if tc_id:
-            total += len(str(tc_id))
-    return total
 
 
 def _provider_failure_hint(accumulated_usage: Dict[str, Any]) -> str:
@@ -128,13 +83,6 @@ def _provider_failure_hint(accumulated_usage: Dict[str, Any]) -> str:
 
 def _provider_recovery_hint(accumulated_usage: Dict[str, Any]) -> str:
     """Explain whether retrying later is likely to help."""
-    if accumulated_usage.get("context_overflow_suggest_low"):
-        return (
-            " ⚠️ The context overflowed the model window. Switching to low context "
-            "mode (Settings → Behavior, or the chat toggle) fits ~200K / local "
-            "models by serving ARCHITECTURE as a navigation map and compacting "
-            "memory sooner — without changing the model or reasoning effort."
-        )
     kind = str(accumulated_usage.get("_last_llm_error_kind") or "").strip()
     if kind == "subscription_window_exhausted":
         reset_at = str(accumulated_usage.get("_last_llm_reset_at") or "").strip()
@@ -245,29 +193,18 @@ def _force_plan_decision(
     *,
     hard_rail: str = "",
 ) -> Dict[str, Any]:
-    """Project force-plan finalization from existing review + policy SSOTs."""
+    """Project force-plan finalization from existing review + policy SSOTs.
 
-    metadata = getattr(ctx, "task_metadata", {})
-    metadata = metadata if isinstance(metadata, dict) else {}
-    if not metadata.get("force_plan") or bool(getattr(ctx, "is_ephemeral_turn", False)):
-        return {"required": False, "allow": True, "status": "not_required"}
-    from ouroboros.task_results import load_plan_review_state, plan_review_gate_projection
+    Body extracted to ``owner_hurry.force_plan_decision`` (the hurry latch makes
+    the projection task-locally advisory for reviewed/open/unavailable states —
+    §19.7.2 item 9); unlatched behavior is byte-identical.
+    """
+    from ouroboros.owner_hurry import force_plan_decision
 
-    try:
-        root = pathlib.Path(str(getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
-        task_id = str(getattr(ctx, "task_id", "") or "").strip()
-        state = load_plan_review_state(root, task_id) if task_id else None
-    except (OSError, TimeoutError, ValueError):
-        log.warning("Unable to read durable force-plan review state", exc_info=True)
-        state = None
-    return {
-        "required": True,
-        **plan_review_gate_projection(
-            state,
-            get_review_enforcement(),
-            hard_rail=hard_rail,
-        ),
-    }
+    return force_plan_decision(
+        ctx, _llm_trace, hard_rail=hard_rail,
+        enforcement=get_review_enforcement(),
+    )
 
 
 def _force_plan_reminder(decision: Dict[str, Any]) -> str:
@@ -359,16 +296,14 @@ def _check_budget_limits(
 
     ``cost_ceiling`` is the typed in-task stop resolved ONCE at loop start
     (``task_pacing.resolve_cost_ceiling``). Only an ``active`` ceiling stops
-    here; ``exhausted_soft_land`` fires at the top of the round in the loop.
-    The deciding spend is the root subtree's ledger-accounted number when a
-    root cap exists (the fence counts the TREE, not own calls); own cost is
-    the DISCLOSED fallback and the diagnostic. Unknown spend never becomes $0.
-
-    The two axes are INDEPENDENT (v6.91 fix): ``budget_remaining_usd`` None
-    means only that no finite GLOBAL budget exists (TOTAL_BUDGET unset — the
-    GAIA-shaped run), which must not silence a live per-task ROOT CAP. A task
-    with neither a global budget nor a root cap resolves to a ``disabled``
-    ceiling and the whole cost axis stays silent, as before."""
+    here; ``exhausted_soft_land`` fires at the top of the round. The deciding
+    spend is the root subtree's ledger-accounted number when a root cap exists
+    (the fence counts the TREE, not own calls); own cost is the DISCLOSED
+    fallback and the diagnostic. Unknown spend never becomes $0. The two axes
+    are INDEPENDENT (v6.91 fix): ``budget_remaining_usd`` None only means no
+    finite GLOBAL budget exists (TOTAL_BUDGET unset — the GAIA-shaped run) and
+    must not silence a live per-task ROOT CAP; with neither, the ceiling
+    resolves ``disabled`` and the whole cost axis stays silent, as before."""
     accumulated_usage = ctx.accumulated_usage
     raw_task_cost = accumulated_usage.get("cost")
     task_cost = float(raw_task_cost) if raw_task_cost is not None else None
@@ -389,12 +324,11 @@ def _check_budget_limits(
                 )
                 if tool_ctx is not None else ""
             )
-            # This early rejection is a forced sink like every other: nothing was
-            # produced, but a queued/headless root still OWED a panel, and returning
-            # here without the record left `eligibility=not_eligible / run_count=0`
-            # — indistinguishable from "no panel was warranted", the exact shape the
-            # typed bypass exists to close. Pure ledger write: no panel, no model
-            # round, no fence (the common recorder is the one seam).
+            # This early rejection is a forced sink like every other: nothing
+            # was produced, but a queued/headless root still OWED a panel, and
+            # returning without the record left `not_eligible / run_count=0` —
+            # indistinguishable from "no panel was warranted". Pure ledger
+            # write: no panel, no model round, no fence.
             _record_forced_finalization(
                 ctx,
                 trace,
@@ -499,14 +433,13 @@ def _resolve_task_cost_ceiling(
     )
 
 
-# Bounded staleness for the two DECIDING cost surfaces (the ceiling check and
-# the milestone note). The free stash is refreshed by every dispatch under this
-# root, so in a fast loop it is at most one round old and this costs zero reads.
-# But ONE round can block for 900s inside wait_tasks while children spend — the
-# exact shape both dead waves had — and the pacing refresh only covers deadline-
-# less tasks, so a round that outlives this bound pays for exactly one real
-# projection read. Still never a per-round read (see the usage_accounting
-# telemetry note and the e4a87344 contention class).
+# Bounded staleness for the two DECIDING cost surfaces (ceiling check and
+# milestone note). The free stash is refreshed by every dispatch under this
+# root — at most one round old, zero reads — but ONE round can block 900s in
+# wait_tasks while children spend (the shape both dead waves had), and the
+# pacing refresh only covers deadline-less tasks, so a round outliving this
+# bound pays for exactly one real projection read. Never per-round (see the
+# usage_accounting telemetry note and the e4a87344 contention class).
 _TREE_ACCOUNTING_MAX_STALE_SEC = 120.0
 
 
@@ -515,16 +448,15 @@ def _loop_tree_accounting(
 ) -> Optional[Dict[str, Any]]:
     """The root subtree's accounted spend for the CURRENT task's tree (nullable).
 
-    Reads the reserve-time scope telemetry for free; ``refresh=True`` may
-    perform one real ledger projection read when the stash is older than
-    ``max_age_sec``. Callers: loop start / the 600s pacing note / the 15-round
-    checkpoint (already cache-breaking surfaces, small max_age), and the two
-    DECIDING surfaces (ceiling check + milestone note) with the wider
-    ``_TREE_ACCOUNTING_MAX_STALE_SEC`` bound — which costs nothing while rounds
-    are shorter than the bound, since every dispatch refreshes the stash. Never
-    an unconditional per-round read (usage_accounting telemetry notes,
-    e4a87344). Only meaningful under a root cap; returns None otherwise
-    (unknown is represented, never $0)."""
+    Reads the reserve-time scope telemetry for free; ``refresh=True`` may do one
+    real ledger projection read when the stash is older than ``max_age_sec``.
+    Callers: loop start / 600s pacing note / 15-round checkpoint (cache-breaking
+    surfaces, small max_age), plus the two DECIDING surfaces (ceiling check +
+    milestone note) with the wider ``_TREE_ACCOUNTING_MAX_STALE_SEC`` bound —
+    free while rounds are shorter than the bound, since every dispatch refreshes
+    the stash. Never an unconditional per-round read (usage_accounting notes,
+    e4a87344). Only meaningful under a root cap; returns None otherwise (unknown
+    is represented, never $0)."""
     try:
         from ouroboros.usage_accounting import (
             current_usage_scope,
@@ -619,60 +551,6 @@ def _emit_checkpoint_event(
             append_jsonl(drive_logs / "events.jsonl", {"ts": utc_now_iso(), **payload})
         except Exception:
             pass
-
-
-def _persist_compaction_checkpoint(
-    messages: List[Dict[str, Any]],
-    *,
-    drive_root: Optional[pathlib.Path],
-    drive_logs: pathlib.Path,
-    task_id: str,
-    reason: str,
-    keep_recent: int,
-    round_idx: int,
-    event_queue: Optional[queue.Queue],
-    checkpoint_kind: str = "pre_compaction_transcript",
-    call_type: str = "compaction_checkpoint",
-) -> bool:
-    """Persist the canonical transcript before a deterministic context rebuild."""
-    root = pathlib.Path(drive_root) if drive_root is not None else pathlib.Path(drive_logs).parent
-    call_id = new_call_id("compaction_checkpoint")
-    try:
-        ref = persist_call(
-            root,
-            task_id=task_id,
-            call_id=call_id,
-            call_type=call_type,
-            payload={
-                "reason": reason,
-                "keep_recent": keep_recent,
-                "round": round_idx,
-                "messages": messages,
-            },
-            manifest={
-                "round": round_idx,
-                "reason": reason,
-                "keep_recent": keep_recent,
-            },
-        )
-        _emit_checkpoint_event(event_queue, task_id, drive_logs, {
-            "checkpoint_kind": checkpoint_kind,
-            "round": round_idx,
-            "reason": reason,
-            "keep_recent": keep_recent,
-            "checkpoint_ref": ref.get("manifest_ref"),
-        })
-        return True
-    except Exception:
-        log.debug("Failed to persist pre-compaction transcript checkpoint", exc_info=True)
-        _emit_checkpoint_event(event_queue, task_id, drive_logs, {
-            "checkpoint_kind": checkpoint_kind,
-            "round": round_idx,
-            "reason": reason,
-            "keep_recent": keep_recent,
-            "checkpoint_status": "failed",
-        })
-        return False
 
 
 def _extract_plain_text_from_content(content: Any) -> str:
@@ -849,13 +727,11 @@ def _task_acceptance_eligible(
     ``auto`` and ``required`` are effect-gated: the host enforces review when the
     turn produced reviewable effects (commit / deliverable / repo / workspace /
     skill write), declared a typed deliverable/criterion, or is not a direct-chat
-    turn (queued / headless / scheduled). Read-only research and ordinary tool use
-    in direct conversation do not by themselves justify a three-reviewer panel.
-    Ephemeral routing turns are presentation/control decisions, not deliverables.
-    ``off`` never reviews.
-    This gates on typed contracts and observable runtime facts (P3 immune gate),
-    not on message content (no P5 violation).
-    """
+    turn (queued / headless / scheduled). Read-only research and ordinary tool
+    use in direct conversation do not justify a three-reviewer panel; ephemeral
+    routing turns are presentation/control decisions, not deliverables. ``off``
+    never reviews. Gates on typed contracts and observable runtime facts (P3
+    immune gate), never on message content (no P5 violation)."""
     if mode == "off":
         return False, "off"
     if not is_root_task:
@@ -1395,11 +1271,10 @@ def _set_acceptance_decision(llm_trace: Dict[str, Any], decision: Dict[str, Any]
     Every host exit funnels here and can only leave in one of the three canonical
     owner-facing states (``ACCEPTANCE_DECISION_STATUSES``) plus a typed ``reason``
     naming WHICH exit it was. A status outside the trio fails closed to
-    ``finalized_unaccepted`` and its raw token survives as the ``reason``, so a
-    future writer can neither invent a fourth state nor lose its own token. The
-    agent's stance (``agent_disposition``/``agent_rationale``) is carried forward,
-    never overwritten — after P4.1 the agent no longer writes a status at all.
-    """
+    ``finalized_unaccepted`` with its raw token surviving as the ``reason`` — no
+    fourth state, no lost token. The agent's stance (``agent_disposition``/
+    ``agent_rationale``) is carried forward, never overwritten (after P4.1 the
+    agent writes no status at all)."""
     previous = llm_trace.get("acceptance_decision") if isinstance(llm_trace.get("acceptance_decision"), dict) else {}
     merged = dict(decision)
     status = str(merged.get("status") or "")
@@ -1419,18 +1294,15 @@ def _collect_acceptance_obligations(llm_trace: Dict[str, Any], result: Any) -> N
 
     Active only on the required+blocking path. Each critical finding WITH a
     concrete recommendation becomes one open obligation in llm_trace (never the
-    durable commit review_state — that ledger stays a separate SSOT). Clean
-    finalization asks for an agent disposition per obligation via the existing
-    v6.54.0 agent_disposition mechanism; time/pass gates and every forced-
-    finalization escape hatch bound the loop, so a deadline never hangs here.
-
-    v6.60.0 widening (S1-lite, owner quiz 18b): when the AGGREGATE verdict itself
-    is failing — signal FAIL, or worst outcome tier blocked_with_evidence — the
-    contributing reviewers' HIGH-severity findings with a concrete recommendation
-    also become obligations (the PB incident: reviewers converged on a concrete
-    "the deliverable misses X" at high severity, the task finalized clean anyway).
-    On a PASS (including PASS-with-dissent) the bar stays critical-only, so the
-    blocking lane cannot creep into taxing every clean run with hygiene items."""
+    durable commit review_state — a separate SSOT). Clean finalization asks for
+    an agent disposition per obligation (the v6.54.0 mechanism); time/pass gates
+    and the forced-finalization escape hatches bound the loop, so a deadline
+    never hangs here. v6.60.0 widening (S1-lite, owner quiz 18b): when the
+    AGGREGATE verdict itself is failing — signal FAIL, or worst outcome tier
+    blocked_with_evidence — contributing reviewers' HIGH-severity findings with
+    a concrete recommendation also become obligations (the PB incident). On a
+    PASS (including PASS-with-dissent) the bar stays critical-only, so the
+    blocking lane cannot creep into taxing clean runs with hygiene items."""
     import hashlib
 
     from ouroboros.review_substrate import _contributing_actors, aggregate_outcome_tier
@@ -1794,12 +1666,10 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
     )
     # Budget admission for the whole acceptance wave (v6.69.0): a wave that
     # cannot fit the remaining root budget is declined up front as a terminal
-    # DEGRADED (no-quorum semantics) instead of dying mid-wave with paid
-    # partial slots and a wedged pending review. The estimate renders the REAL
-    # per-slot message pair (a compact evidence+checklist guess measured ~2.1x
-    # short of the dispatched prompt); the rare second physical attempt per
-    # actor is deliberately not multiplied in — this gate is a fail-open
-    # coarse filter for waves that cannot fit, not a hard reservation.
+    # DEGRADED (no-quorum semantics) instead of dying mid-wave. The estimate
+    # renders the REAL per-slot message pair; the rare second physical attempt
+    # is deliberately not multiplied in — a fail-open coarse filter, not a
+    # hard reservation.
     from ouroboros.tools.review_helpers import review_wave_budget_gate
 
     try:
@@ -1931,12 +1801,11 @@ def _apply_task_acceptance_result(
         _record_host_acceptance_run(ctx, result)
     dissent = dissent_findings(result)
     blocking_lane = ctx.mode == "required" and get_review_enforcement() == "blocking"
-    # A REUSED panel (unchanged binding) is the SAME reviewer act applied again:
-    # re-collecting would mutate reviewer-authored state with no new reviewer
-    # input — reopened_count 0→1 mislabels a first presentation as re-raised,
-    # and the changed catalog row shifts the evidence revision, buying a fresh
-    # paid panel for a byte-identical resubmit (fable review r2 #1). The rows
-    # were already collected when this exact panel first applied.
+    # A REUSED panel (unchanged binding) is the SAME reviewer act applied
+    # again: re-collecting would mutate reviewer-authored state with no new
+    # reviewer input, and the shifted evidence revision would buy a fresh paid
+    # panel for a byte-identical resubmit (fable review r2 #1). The rows were
+    # already collected when this exact panel first applied.
     if blocking_lane and not reused:
         _collect_acceptance_obligations(ctx.llm_trace, result)
     open_obligations = _open_acceptance_obligations(ctx.llm_trace) if blocking_lane else []
@@ -1989,10 +1858,10 @@ def _apply_task_acceptance_result(
     if dialogue_terminal:
         # v6.74.0 (A5): a reviewer quorum judged the dialogue no longer
         # actionable (unreachable_here / stable_disagreement). Finalize through
-        # the EXISTING honest path, recording BOTH positions — the reviewers'
-        # findings stay in the run record, the agent's dispositions stay on the
-        # obligation rows — with one owner-visible line. This is reviewer
-        # authorship, not a host timer and not a unilateral agent give-up.
+        # the EXISTING honest path, recording BOTH positions (findings in the
+        # run record, dispositions on the obligation rows) with one owner-
+        # visible line. Reviewer authorship — not a host timer or a
+        # unilateral agent give-up.
         ctx.tools._ctx._task_acceptance_reviewed = True
         _end_task_acceptance_fence(ctx.tools._ctx, outcome="terminal")
         _mark_root_acceptance_checkpoint(
@@ -2154,17 +2023,12 @@ def _apply_task_acceptance_result(
         ctx.emit_progress(f"Task acceptance review: {result.aggregate_signal} (no changes suggested).")
     else:
         _set_acceptance_decision(ctx.llm_trace, {
-            # Round-9 CRITICAL 1: this is the fall-through AFTER
-            # `task_acceptance_is_clean(result)` already refused the panel, so it
-            # cannot mint `accepted` — docs/ARCHITECTURE.md reserves that state for
-            # clean acceptance ("quorum PASS, `solved`, and supported evidence for
-            # every contributing criterion"). The reachable case is a reviewer
-            # claiming `solved` while supplying a MISSING criterion with the
-            # improvement-pass cap already spent: there is nothing actionable left
-            # to feed back, but "nothing left to ask for" is not "accepted". The
-            # typed reason is unchanged (`no_actionable_changes` still names WHY the
-            # loop stops here) and the tier honesty keeps riding `outcome_tier`;
-            # only the owner-facing state is now the honest one.
+            # Round-9 CRITICAL 1: fall-through AFTER `task_acceptance_is_clean`
+            # refused the panel, so it cannot mint `accepted` (ARCH reserves
+            # that for clean acceptance). Reachable: a reviewer claims `solved`
+            # with a MISSING criterion and the improvement-pass cap spent —
+            # nothing actionable, but not "accepted". The typed reason names
+            # WHY the loop stops; tier honesty keeps riding `outcome_tier`.
             "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
             "reason": "no_actionable_changes",
             "source": "task_acceptance_review",
@@ -2225,119 +2089,46 @@ def _record_acceptance_infra_failure(ctx: _TaskAcceptanceContext, exc: Exception
     return False
 
 
-def _build_acceptance_rails_line(
-    budget_snapshot: Any,
-    budget_profile: Dict[str, Any],
-    passes_done: int,
-    loop_rails: Optional[Dict[str, Any]],
-    *,
-    required_blocking: bool,
-    workspace: bool = False,
-) -> str:
-    try:
-        return _build_acceptance_rails_line_inner(
-            budget_snapshot, budget_profile, passes_done, loop_rails,
-            required_blocking=required_blocking, workspace=workspace,
-        )
-    except Exception:
-        # The rails line is advisory context; it must never take down the
-        # acceptance path (fable review r2 #3 — make the docstring true).
-        log.debug("acceptance rails line failed soft", exc_info=True)
-        return ""
+def _prior_acceptance_run(
+    tools_ctx: Any, llm_trace: Dict[str, Any], binding_hash: str,
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Locate the authoritative host run already recorded for this binding:
+    first the trace (survives requeue replay), then the process-local
+    ``_task_acceptance_seen_bindings`` cache. Returns (cache, prior_run)."""
+    seen_bindings = getattr(tools_ctx, "_task_acceptance_seen_bindings", None)
+    if not isinstance(seen_bindings, dict):
+        seen_bindings = {}
+        tools_ctx._task_acceptance_seen_bindings = seen_bindings
+    prior_run = next(
+        (
+            run for run in reversed(llm_trace.get("review_runs") or [])
+            if isinstance(run, dict)
+            and run.get("authority") == "host_root"
+            and not run.get("superseded_by_revision")
+            and str(run.get("binding_hash") or "") == binding_hash
+        ),
+        None,
+    )
+    cached_run = seen_bindings.get(binding_hash)
+    if (
+        prior_run is None
+        and isinstance(cached_run, dict)
+        and not cached_run.get("superseded_by_revision")
+    ):
+        prior_run = cached_run
+    return seen_bindings, prior_run
 
 
-def _build_acceptance_rails_line_inner(
-    budget_snapshot: Any,
-    budget_profile: Dict[str, Any],
-    passes_done: int,
-    loop_rails: Optional[Dict[str, Any]],
-    *,
-    required_blocking: bool,
-    workspace: bool = False,
-) -> str:
-    """One line naming every active termination source with its remaining
-    headroom (v6.74.0 A1, owner Q6): money, time, rounds, review passes. Each
-    rail comes from its real source — the usage ledger projection, the
-    BudgetSnapshot, the loop's round counter, and the pacing pass cap — and an
-    unavailable rail is omitted rather than guessed. For workspace deliveries
-    the line also carries the tree directive (v6.74.4) — a delivery-state
-    instruction, not a termination source. Fail-soft: never raises."""
-    parts: List[str] = []
-    rails = loop_rails if isinstance(loop_rails, dict) else {}
-    try:
-        money_bits: List[str] = []
-        cost = rails.get("task_cost_usd")
-        if cost is not None:
-            money_bits.append(f"${float(cost):.2f} spent this task")
-        try:
-            from ouroboros.usage_accounting import current_usage_scope, usage_projection
-
-            scope = current_usage_scope()
-            if scope is not None and scope.root_task_id:
-                projection = usage_projection(
-                    scope.drive_root, root_task_id=scope.root_task_id,
-                )
-                remaining = projection.get("remaining_known_usd")
-                if remaining is not None:
-                    money_bits.append(f"${float(remaining):.2f} budget left")
-        except Exception:
-            log.debug("rails: budget projection unavailable", exc_info=True)
-        if money_bits:
-            parts.append("money: " + ", ".join(money_bits))
-    except (TypeError, ValueError):
-        pass
-    try:
-        if getattr(budget_snapshot, "has_deadline", False):
-            parts.append(
-                f"time: {max(0.0, budget_snapshot.remaining_sec) / 60:.0f} min left "
-                f"({budget_snapshot.reserve_sec / 60:.0f} min finalization reserve)"
-            )
-    except (TypeError, ValueError):
-        pass
-    try:
-        round_idx = rails.get("round_idx")
-        max_rounds = rails.get("max_rounds")
-        if round_idx is not None and max_rounds:
-            parts.append(f"rounds: {int(round_idx)}/{int(max_rounds)}")
-    except (TypeError, ValueError):
-        pass
-    try:
-        cap = task_pacing.effective_max_improvement_passes(
-            budget_profile,
-            has_deadline=bool(getattr(budget_snapshot, "has_deadline", False)),
-            required_blocking=required_blocking,
-        )
-        if cap is None:
-            parts.append(
-                f"review passes: {int(passes_done)} done, no local count cap "
-                "(deadline/budget rails bind)"
-            )
-        else:
-            passes_part = f"review passes: {int(passes_done)}/{int(cap)}"
-            # v6.74.4 freeze directive (count axis): the pass launched at
-            # cap-1 is the last one improvement_pass_allowed will admit, so
-            # say so. cap==0 never feeds a capsule back; skip the clause, and
-            # passes_done >= cap (supersede-reset re-review) is not a launch.
-            if 0 <= int(passes_done) < int(cap) and int(passes_done) + 1 >= int(cap):
-                passes_part += " — FINAL improvement pass, no further passes will run"
-            parts.append(passes_part)
-    except (TypeError, ValueError):
-        pass
-    try:
-        # v6.74.4: EVERY workspace improvement capsule carries the tree
-        # directive, not just the provably-final one — a deadline/cost rail
-        # can end the loop between capsules (commit triad r1, sol), and the
-        # tree ships as-is on any forced end.
-        if workspace:
-            parts.append(
-                "workspace delivery: the deliverable is your working tree as "
-                "it stands when the task ends — keep it in a VERIFIED state "
-                "(rebuild, verify, and commit if the task calls for a commit) "
-                "and revert unverified edits rather than shipping them"
-            )
-    except (TypeError, ValueError):
-        pass
-    return "; ".join(parts)
+def _direct_context_fence_state(tools_ctx: Any, fence_token: Any) -> Any:
+    """Review-binding fence state: the queue-owned token when present, else the
+    direct-chat generations (no queue fence exists for a direct context)."""
+    if fence_token is not None:
+        return fence_token
+    return {
+        "state": "direct_context",
+        "owner_generation": getattr(tools_ctx, "_task_acceptance_owner_generation", None),
+        "queue_generation": getattr(tools_ctx, "_task_acceptance_fence_generation", None),
+    }
 
 
 def _run_task_acceptance_review_once(
@@ -2404,6 +2195,17 @@ def _run_task_acceptance_review_once(
     }
     if not eligible:
         return False
+    # Owner hurry (§19.7.2 item 8): AFTER structural eligibility is known and
+    # BEFORE acceptance-fence/quiescence/reviewer admission, an armed latch
+    # skips the next otherwise-eligible panel with the typed reason — zero
+    # reviewer calls (an already in-flight panel is never cancelled/relabeled).
+    from ouroboros.owner_hurry import acceptance_skip_applied, effective_budget_profile
+
+    if acceptance_skip_applied(
+        tools._ctx, llm_trace, task_id=task_id, drive_root=drive_root,
+        set_decision=_set_acceptance_decision, emit_progress=emit_progress,
+    ):
+        return False
     fence_ok, _fence_token = _begin_task_acceptance_fence(tools._ctx, task_id)
     if not fence_ok:
         llm_trace["review_decision"] = {
@@ -2438,7 +2240,12 @@ def _run_task_acceptance_review_once(
         )
         emit_progress("Task acceptance review waiting for recursive subtree quiescence.")
         return True
-    budget_profile = task_pacing.resolve_budget_profile(tools._ctx)
+    # §19.7.2 item 7: ONE effective profile (remaining improvement passes -> 0
+    # under an armed hurry latch) feeds EVERY acceptance-pacing read below —
+    # the real improvement_pass_allowed call and the rails display alike.
+    budget_profile = effective_budget_profile(
+        tools._ctx, task_pacing.resolve_budget_profile(tools._ctx),
+    )
     budget_snapshot = task_pacing.build_budget_snapshot(tools._ctx, profile=budget_profile)
     passes_done = int(getattr(tools._ctx, "_task_acceptance_improvement_passes", 0))
     launch_ok, launch_reason = task_pacing.review_launch_allowed(
@@ -2481,7 +2288,7 @@ def _run_task_acceptance_review_once(
         passes_done=passes_done,
         evidence={},
         review_binding={},
-        rails_line=_build_acceptance_rails_line(
+        rails_line=task_pacing.acceptance_rails_line(
             budget_snapshot,
             budget_profile,
             passes_done,
@@ -2498,44 +2305,15 @@ def _run_task_acceptance_review_once(
         from ouroboros.review_substrate import build_review_binding
 
         review_ctx.evidence = _build_host_acceptance_evidence(review_ctx)
-        fence_state: Any = _fence_token
-        if fence_state is None:
-            fence_state = {
-                "state": "direct_context",
-                "owner_generation": getattr(
-                    tools._ctx, "_task_acceptance_owner_generation", None,
-                ),
-                "queue_generation": getattr(
-                    tools._ctx, "_task_acceptance_fence_generation", None,
-                ),
-            }
         review_ctx.review_binding = build_review_binding(
             candidate=content,
             evidence=review_ctx.evidence,
-            fence_token_or_state=fence_state,
+            fence_token_or_state=_direct_context_fence_state(tools._ctx, _fence_token),
         )
         binding_hash = str(review_ctx.review_binding.get("binding_hash") or "")
-        seen_bindings = getattr(tools._ctx, "_task_acceptance_seen_bindings", None)
-        if not isinstance(seen_bindings, dict):
-            seen_bindings = {}
-            tools._ctx._task_acceptance_seen_bindings = seen_bindings
-        prior_run = next(
-            (
-                run for run in reversed(llm_trace.get("review_runs") or [])
-                if isinstance(run, dict)
-                and run.get("authority") == "host_root"
-                and not run.get("superseded_by_revision")
-                and str(run.get("binding_hash") or "") == binding_hash
-            ),
-            None,
+        seen_bindings, prior_run = _prior_acceptance_run(
+            tools._ctx, llm_trace, binding_hash,
         )
-        cached_run = seen_bindings.get(binding_hash)
-        if (
-            prior_run is None
-            and isinstance(cached_run, dict)
-            and not cached_run.get("superseded_by_revision")
-        ):
-            prior_run = cached_run
         reused_result = None
         if prior_run is not None:
             seen_bindings[binding_hash] = prior_run
@@ -2654,15 +2432,15 @@ def _adopt_fallback_route(
     tool_schemas: List[Dict[str, Any]],
     accumulated_usage: Dict[str, Any],
 ) -> tuple:
-    """Round-4 C1.1: adopt a SUCCESSFUL cross-family fallback as the active route for the
-    rest of the loop. Otherwise a subsequent round (esp. a tool loop) replays THIS
+    """Round-4 C1.1: adopt a SUCCESSFUL cross-family fallback as the active route for
+    the rest of the loop. Otherwise a later round (esp. a tool loop) replays THIS
     fallback's reasoning/thinking back to the original primary family with no
     model-switch sanitizer firing (active_model never changed) — the cross-family
-    signature replay, in reverse. Adopting the sanitized transcript as canonical means
-    the switched route never carries the old family's provider-private blocks (a later
-    switch_model/override re-triggers the round-start sanitizer normally). The caller
-    has already rebound the shared context-fit plan to this exact route before its
-    physical dispatch; adoption makes that tested projection canonical. Returns the new
+    signature replay, in reverse. Adopting the sanitized transcript as canonical
+    keeps the old family's provider-private blocks off the switched route (a later
+    switch_model/override re-triggers the round-start sanitizer normally); the
+    caller already rebound the context-fit plan to this exact route, so adoption
+    makes that tested projection canonical. Returns the new
     ``(active_model, active_use_local, context_fit_plan, context_mode)``."""
     ctx.active_model = fallback_model
     messages[:] = fallback_messages
@@ -2670,14 +2448,23 @@ def _adopt_fallback_route(
         tools._ctx.context_fit_plan = context_fit_plan
         tools._ctx.messages = messages
         tools._ctx.active_context_mode = active_context_mode
-        accumulated_usage["_context_route_fp"] = str(
-            getattr(context_fit_plan, "route_fp", "") or ""
-        )
-        accumulated_usage["_context_prompt_estimate"] = estimate_context_prompt_tokens(
-            messages, tool_schemas,
-        )
-        accumulated_usage["_context_fit_mode"] = active_context_mode
+        # _call_round_model already recorded the accepted candidate's complete
+        # same-basis fit facts. Do not replace them with a raw char estimate.
     return fallback_model, fallback_use_local, context_fit_plan, active_context_mode
+
+
+def _snapshot_context_fit_usage(usage: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: value for key, value in usage.items() if key.startswith("_context_")}
+
+
+def _restore_context_fit_usage(
+    usage: Dict[str, Any],
+    snapshot: Dict[str, Any],
+) -> None:
+    for key in tuple(usage):
+        if key.startswith("_context_"):
+            usage.pop(key, None)
+    usage.update(snapshot)
 
 
 def _run_cross_model_fallback_chain(
@@ -2687,14 +2474,14 @@ def _run_cross_model_fallback_chain(
     active_context_mode,
 ) -> tuple:
     """F1 (v6.39): 429-aware cross-model fallback CHAIN. Mark the failed primary on
-    cooldown if its last failure was transient (so a swarm stops stampeding it), then walk
-    the configured fallback chain, skipping cooled-down models, until one responds. Each
-    candidate gets a small per-candidate attempt cap so a multi-model chain cannot multiply
-    into a long retry storm; every call stays deadline-aware. The bench (FALLBACKS==main)
-    dedupes to an empty chain -> no cross-model fallback, by design. Returns the new
-    ``(msg, active_model, active_use_local, context_fit_plan, context_mode)``;
-    ``msg`` is None if the whole (cooled-down / empty) chain is exhausted,
-    leaving the caller to join the provider-unavailable shelf."""
+    cooldown if its last failure was transient (a swarm stops stampeding it), then
+    walk the configured chain, skipping cooled-down models, until one responds; a
+    small per-candidate attempt cap keeps a multi-model chain from a retry storm,
+    and every call stays deadline-aware. The bench (FALLBACKS==main) dedupes to an
+    empty chain -> no cross-model fallback, by design. Returns the new ``(msg,
+    active_model, active_use_local, context_fit_plan, context_mode)``; ``msg`` is
+    None when the whole (cooled-down / empty) chain is exhausted, leaving the
+    caller to join the provider-unavailable shelf."""
     from ouroboros import fallback_cooldown as _fcd
     from ouroboros.config import get_fallback_models
     from ouroboros.loop_llm_call import _COOLDOWN_ERROR_KINDS as _cooldown_kinds
@@ -2704,6 +2491,7 @@ def _run_cross_model_fallback_chain(
             _fcd.mark_cooldown(model, use_local)
 
     _cooled(active_model, active_use_local)
+    primary_context_usage = _snapshot_context_fit_usage(accumulated_usage)
     fallback_use_local = os.environ.get("USE_LOCAL_FALLBACK", "").lower() in ("true", "1")
     attempt_cap = _fcd.attempts_per_model()
     msg = None
@@ -2781,15 +2569,8 @@ def _run_cross_model_fallback_chain(
         tools._ctx.context_fit_plan = context_fit_plan
         tools._ctx.messages = messages
         tools._ctx.active_context_mode = active_context_mode
+        _restore_context_fit_usage(accumulated_usage, primary_context_usage)
         _cooled(fallback_model, fallback_use_local)
-    if msg is None and context_fit_plan is not None:
-        accumulated_usage["_context_route_fp"] = str(
-            getattr(context_fit_plan, "route_fp", "") or ""
-        )
-        accumulated_usage["_context_prompt_estimate"] = estimate_context_prompt_tokens(
-            messages, tool_schemas,
-        )
-        accumulated_usage["_context_fit_mode"] = active_context_mode
     return (
         msg,
         active_model,
@@ -2878,15 +2659,12 @@ def _compute_subagent_handoff(tools: Any, drive_root: Any, task_id: str, content
             child for child in children
             if str(child.get("status") or "").strip().lower() not in FINAL_STATUSES
         ]
-        # P5: the reminder is suppressed ONLY by structured signals — a child explicitly
-        # discarded/cancelled (already filtered out of `children` above) or absorbed (an
-        # unchanged signature — the agent has already seen this exact state). It is NOT
-        # suppressed by parsing the final PROSE for status words (a removed keyword gate
-        # that could silently orphan a child). The reminder fires once per CHANGE (a child
-        # appearing/progressing/completing re-surfaces it) rather than every round, so the
-        # agent is informed without an unbreakable loop; if the agent then finalizes with
-        # children still unhandled, the no-tool / forced finalization paths append a loud
-        # orphan note via _forced_orphan_note (P1 — never a silent loss).
+        # P5: the reminder is suppressed ONLY by structured signals — a child
+        # discarded/cancelled (filtered above) or absorbed (unchanged
+        # signature). NEVER by parsing final PROSE for status words. Fires once
+        # per CHANGE, not every round; if the agent still finalizes with
+        # unhandled children, the no-tool / forced finalization paths append a
+        # loud orphan note via _forced_orphan_note (P1).
         _ = nonterminal_children  # (kept for readability; trigger is change-based)
         if children and signature and signature != previous:
             tools._ctx._subagent_handoff_signature = signature
@@ -3094,13 +2872,11 @@ def _note_nanny_delegate_activity(
     if not verbs:
         return
     if verbs == {"delegate_wait"}:
-        # R2-5: a wait is WATCHING, not delegating — it advances only the ROUND
-        # half of the baseline. Preserving the COST half keeps the dollar axis
-        # cumulative across waits: the reviewer's probe ($0.24/round with a
-        # ritual wait every 7 rounds — incident burn rate) re-zeroed BOTH axes
-        # at every wait and never heard the reminder, while a genuinely-holding
-        # nanny (waits plus pennies per round) stays under the dollar threshold
-        # anyway.
+        # R2-5: a wait is WATCHING, not delegating — it advances only the
+        # ROUND half of the baseline. Preserving the COST half keeps the
+        # dollar axis cumulative across waits: re-zeroing BOTH axes at every
+        # wait never heard the reminder ($0.24/round probe), while a genuinely
+        # holding nanny stays under the dollar threshold anyway.
         prior = getattr(ctx, "_nanny_delegate_baseline", None)
         prior_cost = float(prior.get("cost") or 0.0) if isinstance(prior, dict) else 0.0
         ctx._nanny_delegate_baseline = {"round": mark["round"], "cost": prior_cost}
@@ -3133,20 +2909,29 @@ def _nanny_metered_since_delegate_activity(ctx: Any) -> Tuple[int, float]:
 def _nanny_reminder_due(ctx: Any, round_idx: int) -> Tuple[int, float, bool]:
     """The measured burn plus whether the proportional reminder is due THIS round.
 
-    Due when EITHER axis (rounds or dollars, ``task_pacing.NANNY_REMINDER_*``) has
+    Due when EITHER axis (rounds or dollars, ``task_pacing.NANNY_REMINDER_*``)
     crossed its threshold since the last delegate-verb call. The re-arm is
-    DUAL-AXIS too (fix F1, five reviewers converged): after a firing, the next one
-    waits until a further threshold-width has accrued on EITHER axis since that
-    firing — the old single round-spacing gate muted a fast dollar burn outright
-    (a $2+ tail at round 2 never fired, because ``round_idx - 0 < 8``). The FIRST
-    firing has no spacing gate at all, and delegate activity clears the fire
-    cursor (``_note_nanny_delegate_activity``) so a pre-activity cooldown never
-    mutes post-activity burn. Proportional and repeating, never a cap (owner
-    decision 2=B)."""
-    from ouroboros.task_pacing import NANNY_REMINDER_ROUNDS, NANNY_REMINDER_USD
+    dual-axis too (fix F1): the next firing waits for a further threshold-width
+    on EITHER axis, so a fast dollar burn is never muted by round spacing. The
+    first firing has no spacing gate; delegate activity clears the fire cursor
+    (``_note_nanny_delegate_activity``). Proportional and repeating, never a cap
+    (owner decision 2=B). With no delegate verb AND no prior firing, the first
+    reminder fires early (``NANNY_FIRST_REMINDER_ROUNDS``, owner-approved
+    2026-08-15) regardless of dollars; any delegate activity or re-arm restores
+    the ordinary dual-axis thresholds unchanged."""
+    from ouroboros.task_pacing import (
+        NANNY_FIRST_REMINDER_ROUNDS, NANNY_REMINDER_ROUNDS, NANNY_REMINDER_USD,
+    )
 
     rounds, cost = _nanny_metered_since_delegate_activity(ctx)
-    if rounds < NANNY_REMINDER_ROUNDS and cost < NANNY_REMINDER_USD:
+    round_threshold = NANNY_REMINDER_ROUNDS
+    if (
+        not isinstance(getattr(ctx, "_nanny_delegate_baseline", None), dict)
+        and not isinstance(getattr(ctx, "_nanny_reminder_mark", None), dict)
+    ):
+        # No delegate verb AND no reminder yet: first firing comes early.
+        round_threshold = NANNY_FIRST_REMINDER_ROUNDS
+    if rounds < round_threshold and cost < NANNY_REMINDER_USD:
         return rounds, cost, False
     mark = getattr(ctx, "_nanny_reminder_mark", None)
     if not isinstance(mark, dict):
@@ -3225,12 +3010,8 @@ def _maybe_inject_nanny_economics_reminder(
         "on metered tokens, continue deliberately and say why in your result."
     )
     _append_or_merge_user_message(messages, reminder)
-    emit_progress(
-        f"Nanny economics: {rounds} metered round(s)"
-        + (f" (~${cost:.2f})" if cost > 0 else "")
-        + (" since the last delegated-run activity" if _baseline_known
-           else " since task start")
-    )
+    # Owner decision (2026-08-15): no owner-chat progress line — the model sees
+    # the reminder and the typed task_checkpoint below carries observability.
     _emit_checkpoint_event(event_queue, task_id, drive_logs, {
         "checkpoint_kind": "nanny_economics_reminder",
         "round": round_idx,
@@ -3449,6 +3230,67 @@ def _setup_dynamic_tools(tools_registry, tool_schemas, messages):
     return tool_schemas, enabled_extra
 
 
+def _mark_owner_stop_control_drained(
+    owner_ctx: Any, drive_root: Optional[pathlib.Path], task_id: str,
+) -> None:
+    """Stamp the owner-stop finalize control's DELIVERY on the durable intent.
+
+    The intent lives on the CANONICAL data root (``budget_drive_root`` first;
+    a forked task's mailbox drive differs). Idempotent (first drain wins). A
+    failed stamp is retried ONCE; still unconfirmed, a typed forensic event
+    is appended and no extended budget is assumed: the sweep keeps the
+    request+outer-cap deadline, and ``_owner_stop_window_elapsed`` reads the
+    same unstamped intent, bounding the worker by that anchor."""
+    try:
+        from ouroboros.cancel_intents import active_intent, mark_finalize_control_drained
+
+        root = (
+            str(getattr(owner_ctx, "budget_drive_root", "") or "")
+            or (str(drive_root) if drive_root is not None else "")
+        )
+        if not (root and task_id):
+            return
+        root_path = pathlib.Path(root)
+        for _ in range(2):
+            if mark_finalize_control_drained(root_path, task_id):
+                return
+            row = active_intent(root_path, task_id)
+            if isinstance(row, dict) and str(row.get("control_drained_at") or ""):
+                return  # already stamped: the durable anchor is confirmed
+        from ouroboros.utils import append_jsonl, utc_now_iso
+
+        append_jsonl(root_path / "logs" / "events.jsonl", {
+            "ts": utc_now_iso(), "type": "owner_stop_stamp_failed",
+            "task_id": task_id,
+        })
+    except Exception:
+        log.debug("owner-stop drain stamp failed for %s", task_id, exc_info=True)
+
+
+def _owner_stop_window_elapsed(ctx: "_RoundLimitContext") -> bool:
+    """Whether the durable owner-stop deadline already passed at consume.
+
+    Reads the SAME durable intent the custody sweep budgets from (no drain
+    stamp -> the conservative request+outer-cap anchor). Fail-soft: an
+    unreadable intent keeps the bounded summary running."""
+    try:
+        from ouroboros.cancel_intents import STOP_POLICY_FINALIZE, active_intent, stop_policy
+        from ouroboros.config import get_finalization_grace_sec
+        from supervisor.owner_stop import owner_stop_deadline_ts
+
+        root = getattr(ctx, "status_drive_root", None) or ctx.drive_root
+        if root is None or not ctx.task_id:
+            return False
+        intent = active_intent(pathlib.Path(root), ctx.task_id)
+        if not isinstance(intent, dict) or stop_policy(intent) != STOP_POLICY_FINALIZE:
+            return False
+        deadline = owner_stop_deadline_ts(intent, float(get_finalization_grace_sec()))
+        return time.time() >= deadline if deadline else True
+    except Exception:
+        log.debug("owner-stop window check failed for %s", ctx.task_id, exc_info=True)
+        return False
+
+
 def _drain_incoming_messages(
     messages: List[Dict[str, Any]],
     incoming_messages: queue.Queue,
@@ -3491,11 +3333,27 @@ def _drain_incoming_messages(
             break
 
     if drive_root is not None and task_id:
-        from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, KIND_OWNER_TEXT, drain_owner_entries
+        from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_TEXT, drain_owner_entries
         for entry in drain_owner_entries(drive_root, task_id=task_id, seen_ids=_owner_msg_seen):
             kind = entry.get("kind") or KIND_OWNER_TEXT
             if kind == KIND_FINALIZE_NOW:
-                controls["finalize_now"] = str(entry.get("text") or "deadline")
+                text = str(entry.get("text") or "deadline")
+                controls["finalize_now"] = text
+                first_line = text.splitlines()[0].strip() if text else ""
+                if first_line == REASON_OWNER_REQUESTED_FINALIZATION:
+                    # Owner-stop budget starts at DELIVERY (1=A): stamp the drain
+                    # so the custody sweep budgets the final turn from here, not
+                    # the button press. First drain wins; fail-soft.
+                    _mark_owner_stop_control_drained(owner_ctx, drive_root, task_id)
+                continue
+            if kind == KIND_HURRY:
+                # HQ1 no-chat contract (§19.7.2 item 6): a typed hurry control is
+                # routed structurally — never through _record_owner_directive,
+                # _owner_marked_content, messages, or owner_message_injected.
+                from ouroboros.owner_hurry import apply_latch
+
+                apply_latch(owner_ctx, entry, event_queue=event_queue)
+                controls["hurry"] = str(entry.get("msg_id") or "hurry")
                 continue
             dmsg = entry.get("text") or ""
             _record_owner_directive(
@@ -3517,286 +3375,62 @@ def _drain_incoming_messages(
     return controls
 
 
-def _emergency_keep_recent(span_count: int) -> int:
-    """Tool rounds an emergency pass keeps (SSOT for the pass and its forecast).
-
-    Halve the history (floor 6), but ALWAYS clamp BELOW the span count or the
-    compactor no-ops (``len(spans) <= keep_recent`` returns the transcript
-    as-is) — a transcript over the emergency byte threshold with only ~50 huge
-    rounds used to never compact at all. With a single round there is nothing
-    older to summarize. One definition, because ``_compaction_floor_chars``
-    forecasts what this same rule will keep; two copies would let the forecast
-    drift from the pass it predicts.
-    """
-    return min(50, max(6, span_count // 2), max(1, span_count - 1))
+def _context_reclaim_passes(tool_ctx: Any) -> set[Tuple[str, str]]:
+    passes = getattr(tool_ctx, "_context_reclaim_passes", None)
+    if not isinstance(passes, set):
+        passes = set()
+        tool_ctx._context_reclaim_passes = passes
+    return passes
 
 
-def _compaction_floor_chars(messages: List[Dict[str, Any]], spans: List[Tuple[int, int]]) -> int:
-    """Smallest transcript an emergency pass could leave behind.
-
-    The pass can only replace the spans OLDER than ``_emergency_keep_recent``
-    that carry no protected content; the frozen frame (everything before the
-    first tool round), the kept spans AND the protected older spans (the
-    compactor's ``_round_has_protected_content`` skips them raw — same predicate
-    here, one SSOT) survive untouched, and the summaries it writes only ADD to
-    that. So this is a true lower bound: when the floor is already over the
-    trigger, NO pass can get under it and no amount of transcript growth changes
-    that — only a smaller FRAME (a mode change or a context rebuild) can. That
-    is what makes the hysteresis rearm criterion honest: measuring "can a pass
-    help?" on the compactable region alone rearmed on growth the pass itself
-    created (the pass collapses the region to the kept spans, so the very next
-    tool round cleared the growth bar and the pass refired every round — the
-    submarine thrash). Omitting the protected spans was the same lie one layer
-    down: a transcript dominated by an old protected round forecast a reachable
-    trigger the pass could never reach, so every 1.2x region growth bought
-    another futile summarizer pass + cache-destroying rewrite.
-    """
-    if not spans:
-        return _estimate_messages_chars(messages)
-    keep = _emergency_keep_recent(len(spans))
-    frame = messages[: spans[0][0]]
-    kept = messages[spans[-keep][0]:]
-    protected = sum(
-        _estimate_messages_chars(messages[start:end + 1])
-        for start, end in spans[:-keep]
-        if _round_has_protected_content(messages, start, end)
-    )
-    return _estimate_messages_chars(frame) + protected + _estimate_messages_chars(kept)
+def _context_reclaim_materializations(tool_ctx: Any) -> set[Tuple[str, str]]:
+    materialized = getattr(tool_ctx, "_context_reclaim_materializations", None)
+    if not isinstance(materialized, set):
+        materialized = set()
+        tool_ctx._context_reclaim_materializations = materialized
+    return materialized
 
 
-@dataclass
-class _HysteresisMeasurement:
-    """The arming round's measured pressure facts, folded into one object (the
-    <8-parameter contract). ``region_chars`` is the region the arming round
-    JUDGED (for a futile pass: the region it actually handled, not the collapsed
-    remainder), so the growth bar means "the transcript climbed back past a size
-    already proven insufficient" rather than "the pass shrank the region, so
-    anything is growth"."""
-    pressure_real_tokens: float
-    threshold_real_tokens: float
-    region_chars: int
-    schema_tokens: int
-    density: float
-    floor_real_tokens: Optional[float] = None
-
-
-def _arm_compaction_hysteresis(
-    ctx: _CompactionRoundContext,
-    usage_state: Dict[str, Any],
-    measurement: _HysteresisMeasurement,
-    *,
-    reason: str = "nothing_compactable",
-) -> None:
-    """Suppress emergency compaction until a pass can plausibly help again.
-
-    Two ways a pass fails to earn its cost, both armed here so the disclosure is
-    identical: it ran and could not bring total pressure under the trigger
-    (``emergency_pass_futile``), or the transcript holds under two tool rounds so
-    the compactor would structurally no-op (``nothing_compactable``). One loud
-    line plus a typed checkpoint event, then silence until a pass could help or
-    the round window passes — never a silent stop (BIBLE P1).
-    """
-    pressure_real_tokens = measurement.pressure_real_tokens
-    threshold_real_tokens = measurement.threshold_real_tokens
-    region_chars = measurement.region_chars
-    floor_real_tokens = measurement.floor_real_tokens
-    usage_state["_compaction_hysteresis"] = {"round": ctx.round_idx, "region_chars": region_chars}
-    frame_bound = floor_real_tokens is not None and floor_real_tokens > threshold_real_tokens
-    rearm_clause = (
-        f"{COMPACTION_HYSTERESIS_ROUNDS} rounds pass (the frame alone is over the "
-        "trigger, so transcript growth cannot make a pass able to help)"
-        if frame_bound else
-        f"the compactable transcript grows ≥{COMPACTION_HYSTERESIS_REGION_GROWTH:.1f}x or "
-        f"{COMPACTION_HYSTERESIS_ROUNDS} rounds pass"
-    )
-    ctx.emit_progress(
-        "⚠️ Emergency compaction cannot help: calibrated context "
-        f"≈{pressure_real_tokens / 1000:.0f}K real tokens exceeds the "
-        f"≈{threshold_real_tokens / 1000:.0f}K trigger, but the frozen frame (system "
-        "blocks + tool schemas) plus the protected/kept rounds carry it and cannot "
-        f"be compacted. Further passes suppressed until {rearm_clause}."
-    )
-    _emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
-        "checkpoint_kind": "compaction_hysteresis_armed",
-        "round": ctx.round_idx,
-        "reason": reason,
-        "calibrated_real_tokens": int(pressure_real_tokens),
-        "threshold_real_tokens": int(threshold_real_tokens),
-        "compactable_region_chars": int(region_chars),
-        "tool_schema_tokens": int(measurement.schema_tokens),
-        "token_density": round(float(measurement.density), 3),
-        "floor_real_tokens": None if floor_real_tokens is None else int(floor_real_tokens),
-        "frame_bound": bool(frame_bound),
-    })
+def _context_overflow_retries(tool_ctx: Any) -> set[Tuple[str, str]]:
+    retries = getattr(tool_ctx, "_context_overflow_retries", None)
+    if not isinstance(retries, set):
+        retries = set()
+        tool_ctx._context_overflow_retries = retries
+    return retries
 
 
 def _run_round_compaction(
     messages: List[Dict[str, Any]],
     ctx: _CompactionRoundContext,
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """Run at most one transcript compaction for this round.
-
-    Manual (pending) and emergency compaction always run; routine compaction
-    covers the local lane and owner low context mode (v6.33.0: mode is the SSOT —
-    the per-model small-window remote override was removed with the static window
-    table), and is skipped on self-check checkpoint rounds to avoid a duplicate
-    summarizer call. Each branch persists a forensic checkpoint before compacting
-    (P1: no silent truncation). Returns the possibly-rebound message list and any
-    compaction usage record.
-    """
-    pending_compaction = getattr(ctx.tools._ctx, "_pending_compaction", None)
-    if pending_compaction is not None:
-        if _persist_compaction_checkpoint(
-            messages, drive_root=ctx.drive_root, drive_logs=ctx.drive_logs, task_id=ctx.task_id,
-            reason="manual", keep_recent=int(pending_compaction),
-            round_idx=ctx.round_idx, event_queue=ctx.event_queue,
-        ):
-            messages, usage = compact_tool_history_llm(
-                messages,
-                keep_recent=pending_compaction,
-                drive_root=ctx.drive_root,
-                task_id=ctx.task_id,
-            )
-            ctx.tools._ctx._pending_compaction = None
-            return messages, usage
-        ctx.emit_progress("⚠️ Context compaction skipped: forensic checkpoint could not be persisted.")
+    """Run only an explicit manual reclaim; Main fit owns automatic decisions."""
+    pending = getattr(ctx.tools._ctx, "_pending_compaction", None)
+    if pending is None:
         return messages, None
-
-    # The owner low/max context MODE is the SSOT for the agent's own operating
-    # window (BIBLE P1, v6.33.0): low => 400K-char emergency trigger + routine
-    # compaction; max => 1.2M-char emergency-only (cache-friendly). No per-model
-    # window table; the reactive provider-overflow detector (context.py) drops the
-    # agent to low mode if a route's real window turns out smaller than assumed.
-    #
-    # NECESSITY vs UTILITY (the submarine thrash fix). NECESSITY — should we
-    # compact at all? — is TOTAL calibrated pressure: the frozen frame (system
-    # blocks, TOOL SCHEMAS, protected/kept rounds) counts toward the provider
-    # window even though no pass can shrink it. "Total" is literal: the schemas
-    # travel beside `messages` on the wire (~148K chars on the submarine traces),
-    # so a transcript-only measure would let the trigger fire a whole tool
-    # envelope late — they are added through the context_fit token seam
-    # (tool_schema_tokens), never re-estimated here. The char budget is compared
-    # in CALIBRATED real tokens (main_loop_token_density: neutral 1.0 cold,
-    # measured supersedes — never the review-pack cold-conservative value, which
-    # would demote fresh installs; the v6.80→v6.81 oscillation).
-    # UTILITY — can a pass help, and when should it refire? — is judged on the
-    # FLOOR a pass could reach (frozen frame + the spans it must keep,
-    # `_compaction_floor_chars`), not on the compactable region alone: a pass
-    # that could NOT get below the trigger arms a hysteresis, and one loud
-    # disclosure replaces the per-round light-model call + cache-destroying
-    # rewrite (wave3: 35/35 rounds fired because the LOW trigger sits below the
-    # irreducible low-mode frame). Early rearm (region grew ~20% past the size
-    # already proven insufficient) is admitted ONLY while the floor is under the
-    # trigger — measuring rearm on the region alone let the pass's OWN collapse
-    # of that region clear the growth bar on the very next tool round, so the
-    # thrash survived the first fix (34/35 rounds measured). Above the floor,
-    # only the N-round window refires, which keeps the transcript bounded while
-    # the frame is what carries the pressure. The reactive provider-overflow
-    # low-retry net (one-shot, loop exit path) is deliberately untouched.
-    emergency_chars = LOW_EMERGENCY_COMPACTION_CHARS if ctx.active_context_mode == "low" else EMERGENCY_COMPACTION_CHARS
-    from ouroboros.context_fit import main_loop_token_density, tool_schema_tokens
-
-    density = main_loop_token_density(ctx.drive_root, ctx.active_model)
-    threshold_real_tokens = emergency_chars / 4.0  # the token budget the char constant documents
-    schema_tokens = tool_schema_tokens(ctx.tool_schemas)
-
-    def _pressure(chars: float) -> float:
-        return (chars / 4.0 + schema_tokens) * density
-
-    def _total_pressure(msgs: List[Dict[str, Any]]) -> float:
-        return _pressure(_estimate_messages_chars(msgs))
-
-    pressure_real_tokens = _total_pressure(messages)
-    if pressure_real_tokens > threshold_real_tokens:
-        usage_state = getattr(ctx.tools._ctx, "_accumulated_usage", None)
-        usage_state = usage_state if isinstance(usage_state, dict) else {}
-        spans = _tool_round_spans(messages)
-        region_chars = _estimate_messages_chars(messages[spans[0][0]:]) if spans else 0
-        # Can a pass reach the trigger AT BEST? The floor is frame + kept spans;
-        # summaries only add to it. This is the rearm authority the compactable
-        # region cannot be: the region is exactly what a pass collapses, so
-        # region growth was satisfied by the pass's own output every round.
-        floor_real_tokens = _pressure(_compaction_floor_chars(messages, spans))
-        pass_can_reach_trigger = floor_real_tokens <= threshold_real_tokens
-        hysteresis = usage_state.get("_compaction_hysteresis")
-        if isinstance(hysteresis, dict):
-            armed_region = int(hysteresis.get("region_chars") or 0)
-            armed_round = int(hysteresis.get("round") or 0)
-            # `armed_region + 1` is the floor that makes an EMPTY armed region
-            # behave: a 20%-growth test on zero is `0 < 0`, which never
-            # suppresses, so an over-threshold frame with nothing compactable
-            # re-fired every single round — the exact thrash this arm exists to
-            # stop, just with an empty transcript instead of a full one.
-            grow_to = max(armed_region * COMPACTION_HYSTERESIS_REGION_GROWTH, armed_region + 1)
-            early_rearm = region_chars >= grow_to and pass_can_reach_trigger
-            if not early_rearm and (ctx.round_idx - armed_round) < COMPACTION_HYSTERESIS_ROUNDS:
-                return messages, None  # armed: a pass cannot help yet (disclosed once, on arming)
-            usage_state.pop("_compaction_hysteresis", None)
-        span_count = len(spans)
-        if span_count < 2:
-            # Necessity is real, but the transcript holds at most ONE tool round:
-            # the compactor's `len(spans) <= keep_recent` gate makes the pass a
-            # structural no-op (keep_recent floors at 1). Running it anyway bought
-            # nothing and wrote a forensic checkpoint every round while the frozen
-            # frame alone sat over the trigger — a low-mode task can enter its
-            # first rounds already there. Arm the hysteresis instead: same
-            # disclosure, no per-round work.
-            _arm_compaction_hysteresis(ctx, usage_state, _HysteresisMeasurement(
-                pressure_real_tokens=pressure_real_tokens,
-                threshold_real_tokens=threshold_real_tokens,
-                region_chars=region_chars,
-                schema_tokens=schema_tokens,
-                density=density,
-                floor_real_tokens=floor_real_tokens,
-            ))
-            return messages, None
-        emergency_keep_recent = _emergency_keep_recent(span_count)
-        if _persist_compaction_checkpoint(
-            messages, drive_root=ctx.drive_root, drive_logs=ctx.drive_logs, task_id=ctx.task_id,
-            reason="emergency_context_size", keep_recent=emergency_keep_recent,
-            round_idx=ctx.round_idx, event_queue=ctx.event_queue,
-        ):
-            messages, usage = compact_tool_history_llm(
-                messages,
-                keep_recent=emergency_keep_recent,
-                drive_root=ctx.drive_root,
-                task_id=ctx.task_id,
-            )
-            after_real_tokens = _total_pressure(messages)
-            if after_real_tokens > threshold_real_tokens:
-                # Arm on the region the pass ALREADY HANDLED (pre-pass), not on
-                # the remainder it just collapsed: the collapsed remainder made
-                # the next tool round clear the 1.2x bar on its own.
-                _arm_compaction_hysteresis(ctx, usage_state, _HysteresisMeasurement(
-                    pressure_real_tokens=after_real_tokens,
-                    threshold_real_tokens=threshold_real_tokens,
-                    region_chars=region_chars,
-                    schema_tokens=schema_tokens,
-                    density=density,
-                    floor_real_tokens=_pressure(
-                        _compaction_floor_chars(messages, _tool_round_spans(messages))),
-                ), reason="emergency_pass_futile")
-            return messages, usage
-        ctx.emit_progress("⚠️ Emergency compaction skipped: forensic checkpoint could not be persisted.")
-        return messages, None
-
-    # Routine compaction runs only when local or in low context mode; never on
-    # checkpoint rounds. Max mode relies on emergency compaction alone to preserve
-    # prompt-cache hits (mode is the SSOT — no per-model small-window override).
-    if not ctx.checkpoint_injected and (ctx.active_use_local or ctx.active_context_mode == "low"):
-        if ctx.round_idx > 6 and len(messages) > 40:
-            if _persist_compaction_checkpoint(
-                messages, drive_root=ctx.drive_root, drive_logs=ctx.drive_logs, task_id=ctx.task_id,
-                reason="routine", keep_recent=20,
-                round_idx=ctx.round_idx, event_queue=ctx.event_queue,
-            ):
-                return compact_tool_history_llm(
-                    messages,
-                    keep_recent=20,
-                    drive_root=ctx.drive_root,
-                    task_id=ctx.task_id,
-                )
-    return messages, None
+    ctx.tools._ctx._pending_compaction = None
+    rebuilt, receipt, usage = compact_tool_history_llm(
+        messages,
+        keep_recent=max(0, int(pending)),
+        drive_root=ctx.drive_root or pathlib.Path(ctx.drive_logs).parent,
+        task_id=ctx.task_id,
+        negative_memo=reclaim_negative_memo(ctx.tools._ctx),
+        trace_refs_by_tool_call_id=reclaim_trace_refs(ctx.tools._ctx),
+    )
+    _emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
+        "checkpoint_kind": "context_reclaim_manual",
+        "round": ctx.round_idx,
+        "status": receipt.status,
+        "reclaimed_tokens": receipt.reclaimed_tokens,
+        "goal_reached": receipt.goal_reached,
+        "checkpoint_ref": receipt.checkpoint_ref,
+    })
+    if receipt.status in {"checkpoint_failed", "summarizer_failed", "binding_mismatch"}:
+        ctx.emit_progress(
+            f"⚠️ Context compaction kept the transcript unchanged ({receipt.status})."
+        )
+    if receipt.status == "applied":
+        prune_reclaim_trace_refs(ctx.tools._ctx, rebuilt)
+    return rebuilt, usage
 
 
 @dataclass
@@ -3876,8 +3510,14 @@ def _handle_forced_finalization(ctx: _RoundLimitContext, reason: str) -> Tuple[s
     The supervisor sends a typed finalize_now control through the owner
     mailbox when the task deadline/hard-timeout is reached; this extracts one
     tool-less best final answer inside the grace window so a deadline NEVER
-    returns emptiness.
+    returns emptiness. An OWNER-STOP control (its payload's first line is the
+    typed ``owner_requested_finalization`` literal, optionally followed by the
+    bounded child projection) routes to its own rail: the owner's stop must
+    never persist the deadline's false reason (CF-02).
     """
+    reason_lines = str(reason or "").splitlines()
+    if reason_lines and reason_lines[0].strip() == REASON_OWNER_REQUESTED_FINALIZATION:
+        return _handle_owner_stop_finalization(ctx, str(reason))
     fallback = f"⚠️ Task reached {reason or 'deadline'}; finalization grace produced no answer."
     prompt = (
         f"[FINALIZE_NOW] The supervisor opened a finalization grace window (reason: {reason or 'deadline'}). "
@@ -3886,6 +3526,58 @@ def _handle_forced_finalization(ctx: _RoundLimitContext, reason: str) -> Tuple[s
         "result is the expected outcome here, not a failure."
     )
     return _forced_final_answer(ctx, prompt=prompt, fallback_text=fallback, reason_code="finalization_grace")
+
+
+def _handle_owner_stop_finalization(
+    ctx: _RoundLimitContext, control_text: str,
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """Owner-requested finalization (Q1/Q3=A): ZERO or ONE tool-less model turn.
+
+    A current valid complete DeliveryCandidate is reused with zero new model
+    turns; otherwise exactly one logical tool-less call runs (transport retries
+    keep the existing call seam; the generic second semantic refresh is
+    structurally disabled — owner steering is fenced during a pending stop, so
+    no late directive can arrive). The typed ``owner_requested_finalization``
+    reason flows through the best-effort gate, so a successful synthesis
+    terminalizes ``completed``/best-effort — never the deadline's
+    ``acceptance_bypassed_deadline`` falsehood (CF-02)."""
+    live_trace = getattr(ctx, "llm_trace", None)
+    llm_trace = live_trace if isinstance(live_trace, dict) else {}
+    candidate = _current_delivery_candidate(ctx, llm_trace)
+    if candidate is not None:
+        _finalize_forced_services(ctx, llm_trace)
+        ctx.accumulated_usage["execution_status"] = "failed"
+        ctx.accumulated_usage["reason_code"] = REASON_OWNER_REQUESTED_FINALIZATION
+        return _forced_fallback_result(
+            ctx, llm_trace, candidate.full_text, REASON_OWNER_REQUESTED_FINALIZATION,
+            retained_source="owner_stop_retained_candidate",
+        )
+    fallback = (
+        "⚠️ The owner requested finalize-then-stop; no final answer could be "
+        "produced inside the grace window."
+    )
+    if _owner_stop_window_elapsed(ctx):
+        # An expired control never buys a paid summary: the honest fallback
+        # rides the same typed rail and custody settles it.
+        _finalize_forced_services(ctx, llm_trace)
+        ctx.accumulated_usage["execution_status"] = "failed"
+        ctx.accumulated_usage["reason_code"] = REASON_OWNER_REQUESTED_FINALIZATION
+        return _forced_fallback_result(
+            ctx, llm_trace, fallback, REASON_OWNER_REQUESTED_FINALIZATION,
+            source="owner_stop_window_elapsed",
+        )
+    child_block = "\n".join(str(control_text or "").splitlines()[1:]).strip()
+    prompt = (
+        "[OWNER_STOP] The owner asked this task to summarize and stop now. "
+        "Produce your best final answer NOW from the verified work so far; "
+        "clearly mark anything unverified or incomplete. An honest best-effort "
+        "result is the expected outcome here, not a failure. Do not start new work."
+        + (f"\n\n{child_block}" if child_block else "")
+    )
+    return _forced_final_answer(
+        ctx, prompt=prompt, fallback_text=fallback,
+        reason_code="owner_requested_finalization", single_semantic_turn=True,
+    )
 
 
 def _handle_provider_unavailable(ctx: _RoundLimitContext) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
@@ -3930,12 +3622,11 @@ def _handle_provider_unavailable(ctx: _RoundLimitContext) -> Tuple[str, Dict[str
     )
     # Honesty (P1): a provider outage interrupts the task — it never "completes"
     # it. Stamp the infra-failure execution status so the outcome reducer lands
-    # on infra_failed/provider (terminal task status: failed) instead of the old
-    # best-effort promotion to "completed". The salvage text above still rides
-    # the result body; only the claimed status changes. Skipped when a swarm
-    # routing handoff already cleared the rail (the admitted task owns its own
-    # lifecycle). NOTE: "interrupted" is deliberately NOT used here — in this
-    # codebase STATUS_INTERRUPTED is a pre-requeue, non-terminal state.
+    # on infra_failed/provider (terminal: failed) instead of the old best-effort
+    # promotion to "completed"; the salvage text still rides the result body.
+    # Skipped when a swarm routing handoff already cleared the rail (the admitted
+    # task owns its lifecycle). NOTE: "interrupted" is deliberately NOT used —
+    # STATUS_INTERRUPTED is a pre-requeue, non-terminal state in this codebase.
     if str(usage.get("reason_code") or "") == "provider_unavailable":
         usage["execution_status"] = RESULT_INFRA_FAILED
     return text, usage, llm_trace
@@ -4030,13 +3721,12 @@ def _child_disposition_state(child: Dict[str, Any]) -> str:
     """Return cancellation or the current task-tree exact-hash disposition."""
 
     # Explicit cancellation is lifecycle authority and wins every completion
-    # race. Late scratch results are intentionally not projected or recovered.
-    # Only a SETTLED ``cancelled`` counts as handled (GR2-8c): the legacy
-    # ``cancel_requested`` STATUS is an unsettled latch — intent, not outcome
-    # (phase A moved intent to the durable cancel_state projection). Treating
-    # it as done suppressed the handoff reminder for a child the supervisor
-    # was still tearing down; such a child now stays visible as cancel-pending
-    # until custody settles it.
+    # race. Late scratch results are not projected or recovered. Only a
+    # SETTLED ``cancelled`` counts as handled (GR2-8c): the legacy
+    # ``cancel_requested`` STATUS is an unsettled latch — intent, not outcome.
+    # Treating it as done suppressed the handoff reminder for a child still
+    # being torn down; such a child stays visible as cancel-pending until
+    # custody settles it.
     if (
         str(child.get("parent_decision") or "").strip().lower() == "cancelled"
         and str(child.get("status") or "").strip().lower() == "cancelled"
@@ -4417,18 +4107,16 @@ def _record_forced_acceptance_bypass(
 ) -> None:
     """Typed acceptance-bypass record on a forced rail — a LEDGER write, never a gate.
 
-    The acceptance panel's only launch site is the voluntary no-tool finalization, so
-    every forced exit used to leave the review axis at {skipped, not_eligible,
-    run_count:0} — indistinguishable from "no panel warranted". This stamps the
-    terminal truth instead: the eligibility predicate is evaluated PURE against the
-    live trace (no fence begin, no subtree-quiescence wait, no panel, no model round,
-    no prompt text — forced exits are the v6.29 honesty/salvage shelf and stay
-    byte-identical in behavior), and an OWED-but-bypassed panel lands as
-    ``finalized_unaccepted`` with a closed-enum reason (`ACCEPTANCE_BYPASS_REASON_BY_RAIL`,
-    the v6.54.4 deadline-reserve precedent generalized; v6.74.4 filed follow-up).
-    Reason tokens stay ledger-only (v6.61.4 token-parroting class). Never raises —
-    the salvage lane has priority over this record.
-    """
+    The panel's only launch site is the voluntary no-tool finalization, so forced
+    exits used to leave the review axis at {skipped, not_eligible, run_count:0} —
+    indistinguishable from "no panel warranted". Stamp the terminal truth instead:
+    eligibility is evaluated PURE against the live trace (no fence begin, no
+    subtree-quiescence wait, no panel, no model round, no prompt text — forced
+    exits are the v6.29 honesty/salvage shelf, byte-identical in behavior); an
+    OWED-but-bypassed panel lands as ``finalized_unaccepted`` with a closed-enum
+    reason (`ACCEPTANCE_BYPASS_REASON_BY_RAIL`, the v6.54.4 deadline-reserve
+    precedent generalized; v6.74.4 follow-up). Reason tokens stay ledger-only
+    (v6.61.4 token-parroting class). Never raises — salvage has priority."""
     rail_reason = ACCEPTANCE_BYPASS_REASON_BY_RAIL.get(str(reason_code or ""))
     if rail_reason is None:
         return
@@ -4440,15 +4128,13 @@ def _record_forced_acceptance_bypass(
     tools_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
     if tools_ctx is None:
         return
-    # A host decision already recorded (panel ran, pacing skip, supersede) wins;
-    # the bypass record exists only for the no-host-verdict shape. "Host decision"
-    # means a canonical status (`_set_acceptance_decision` fails closed to one) —
-    # NOT the status-less agent-stance dict `process_tool_results` merges when a
-    # root task's task_acceptance_review is deferred to the host (`source` +
-    # `agent_disposition`/`agent_rationale` only): treating that as a decision
-    # left the forced bypass unrecorded exactly when the panel was still owed.
-    # The stamp below flows through `_set_acceptance_decision`, which carries the
-    # agent stance forward rather than overwriting it.
+    # A host decision already recorded (panel ran, pacing skip, supersede)
+    # wins; the bypass record exists only for the no-host-verdict shape.
+    # "Host decision" means a canonical status — NOT the status-less agent-
+    # stance dict merged when task_acceptance_review is deferred to the host:
+    # treating that as a decision left the forced bypass unrecorded exactly
+    # when the panel was still owed. The stamp flows through
+    # `_set_acceptance_decision`, which carries the agent stance forward.
     decision = llm_trace.get("acceptance_decision")
     if isinstance(decision, dict) and str(decision.get("status") or "") in ACCEPTANCE_DECISION_STATUSES:
         return
@@ -4837,16 +4523,13 @@ def _forced_orphan_note(ctx: _RoundLimitContext, *, include_terminal: bool = Tru
             tid = str(c.get("task_id") or c.get("id") or "?")
             st = str(c.get("status") or "?").strip().lower()
             lifecycle = "running" if st not in FINAL_STATUSES else st
-            # W2: a child whose LATEST blackboard decision row names a disposition
-            # that no longer binds the current result was READ and decided — say
-            # that instead of the misleading "unread". Say only what the ledger
-            # PROVES: the row EXISTS, so the write did NOT fail; what failed is the
-            # binding to the result standing now. (The pre-audit wording claimed a
-            # failed write, which the presence of the row disproves.)
-            # Scoped to children the projection genuinely left UNDECIDED: a child
-            # the projection DOES carry (deferred / integrated / irrelevant /
-            # discarded / cancelled) is not a failed-binding case, and telling its
-            # owner to "re-submit to close it" would be a false instruction.
+            # W2: a child whose LATEST blackboard decision row no longer binds
+            # the current result was READ and decided — say that, not "unread".
+            # Say only what the ledger PROVES: the row EXISTS; the binding to
+            # the standing result did not. Scoped to children the projection
+            # genuinely left UNDECIDED: a carried disposition (deferred /
+            # integrated / irrelevant / discarded / cancelled) is not a
+            # failed binding, and "re-submit to close it" would be false there.
             claim = claimed.get(tid) if not _child_disposition_state(c) else None
             if claim is not None:
                 disposition, row_sha = claim
@@ -5011,14 +4694,13 @@ def _run_forced_children_acceptance(
 ) -> None:
     """Content acceptance still runs on the forced children_unabsorbed rail (owner Q2A).
 
-    The panel goes through the ORDINARY entry point (`_run_task_acceptance_review_once`)
-    after the forced answer text exists but BEFORE the loop seals it; the evidence packet
-    carries the undispositioned children via the ctx stash. The forced rail can never take
-    another model round, so a ``True`` return terminalizes here instead of looping: a
-    requested improvement pass is downgraded to ``finalized_unaccepted``, while a WAIT
-    shape that never ran the panel keeps the typed acceptance-bypass verdict already
-    stamped by `_record_forced_finalization`. Never raises — salvage outranks review.
-    """
+    The panel uses the ORDINARY entry point (`_run_task_acceptance_review_once`)
+    after the forced answer text exists but BEFORE the loop seals it; the evidence
+    packet carries the undispositioned children via the ctx stash. The forced rail
+    can never take another model round, so a ``True`` return terminalizes here: a
+    requested improvement pass downgrades to ``finalized_unaccepted``, while a WAIT
+    shape that never ran the panel keeps the typed acceptance-bypass verdict from
+    `_record_forced_finalization`. Never raises — salvage outranks review."""
     if not str(text or "").strip():
         return
     tools_ctx = tools._ctx
@@ -5265,16 +4947,12 @@ def _no_tool_final_answer(
         messages=messages,
         emit_progress=emit_progress,
     ):
-        # v6.71.1: an acceptance improvement pass is an ORDINARY substantive answer
-        # round (like an owner revision, loop.py `_replace_delivery_candidate`
-        # "fresh" path) — do NOT arm delivery-control here. Arming layered a
-        # "return exactly one JSON object" directive on top of the OPEN OBLIGATIONS
-        # ("address them directly") and the periodic plain-text self-check, and the
-        # three conflicting finalization instructions in one message froze the model
-        # into no-tool rounds that resubmitted the same answer. The next free-form
-        # answer re-enters the acceptance panel, so blocking is not weakened. Other
-        # lanes (services/force-plan/handoff) still arm delivery-control where JSON
-        # keep/replace is genuinely needed.
+        # v6.71.1: an acceptance improvement pass is an ORDINARY substantive
+        # answer round — do NOT arm delivery-control here: layering "return
+        # exactly one JSON object" on top of OPEN OBLIGATIONS and the self-
+        # check froze the model into resubmitting the same answer. The next
+        # free-form answer re-enters the acceptance panel, so blocking is not
+        # weakened; other lanes still arm where JSON keep/replace is needed.
         return None
     candidate = getattr(tools._ctx, "_delivery_candidate", None)
     if isinstance(candidate, DeliveryCandidate):
@@ -5751,26 +5429,19 @@ def _resolve_forced_delivery_control(
 ) -> Tuple[str, str]:
     """PURE, no-retry delivery-control resolution for the forced rail.
 
-    While the delivery-control latch is armed, the model's one forced answer is
-    legitimately allowed to be the protocol object ``{"delivery_control": ...}``
-    instead of prose — shipping it raw leaked protocol JSON into the owner's
-    chat and the durable result. Resolve it here, before suffix composition and
-    publication, without ever re-looping (``_resolve_delivery_control`` can
-    inject a repair round, which a hard forced stop must never do): a valid
-    ``keep`` uses the retained candidate's full text, a valid ``replace`` uses
-    ``full_answer``, and a malformed/duplicate/invalid control falls back to the
-    retained candidate with the typed degraded reason. Protocol intent under the
-    armed latch is ANY parsed object carrying the ``delivery_control`` key
-    (regardless of verb/value) AND any JSON-LOOKING text (stripped text starting
-    with ``{``) that fails to parse — the model was explicitly instructed to
-    answer with the protocol object, so a JSON-looking non-parse is a mangled
-    protocol attempt, never the answer. JSON while NOT armed passes through
-    untouched — legitimate user-facing JSON is never eaten. Disclosed residual:
-    armed PROSE (text not starting with ``{``) is genuinely indistinguishable
-    from an intentional fresh answer and stands as-is, even if the model meant
-    it as a control acknowledgement. Clears the latch. Returns
-    ``(resolved_text, degraded_reason)``.
-    """
+    While the latch is armed, the one forced answer may legitimately be the
+    protocol object ``{"delivery_control": ...}`` — shipped raw it leaked
+    protocol JSON into the owner's chat and the durable result. Resolve it
+    before suffix composition, never re-looping (``_resolve_delivery_control``
+    can inject a repair round, which a hard forced stop must never do): valid
+    ``keep`` = the retained candidate's full text, valid ``replace`` =
+    ``full_answer``, malformed/duplicate/invalid = the retained candidate with
+    the typed degraded reason. Armed protocol intent is ANY parsed object with
+    the ``delivery_control`` key AND any JSON-looking text that fails to parse
+    (the model was told to answer with the object, so that is a mangled
+    control, never the answer). JSON while NOT armed passes through untouched.
+    Disclosed residual: armed PROSE stands as-is. Clears the latch. Returns
+    ``(resolved_text, degraded_reason)``."""
     if tools_ctx is None or not extracted:
         return extracted, ""
     candidate = getattr(tools_ctx, "_delivery_candidate", None)
@@ -5811,13 +5482,13 @@ def _resolve_forced_delivery_control(
 def _forced_delegation_note(tools_ctx: Any, llm_trace: Dict[str, Any]) -> str:
     """The nanny postcondition's forced-path half, grounded in DURABLE custody.
 
-    A forced finalization may not re-loop, so the substrate fact rides the one final
-    prompt. `delegate_custody.task_execution_evidence` on the custody root (the
-    canonical/budget root — the same split-root rule Phase A fixed in the ordinary
-    path) decides, not just the current execution's trace: succeeded → no note;
-    started-but-unsettled → pending wording (no retry pressure); settled-without-
-    success → truthful failure wording; zero started with readable evidence → the
-    no-delegation wording; unreadable evidence → no accusation."""
+    A forced finalization may not re-loop, so the substrate fact rides the one
+    final prompt. `delegate_custody.task_execution_evidence` on the custody root
+    (canonical/budget root — the split-root rule Phase A fixed) decides, not just
+    this execution's trace: succeeded → no note; started-but-unsettled → pending
+    wording (no retry pressure); settled-without-success → truthful failure
+    wording; zero started with readable evidence → the no-delegation wording;
+    unreadable evidence → no accusation."""
     if not getattr(tools_ctx, "_nanny_route_dispatched", False):
         return ""
     try:
@@ -5880,9 +5551,13 @@ def _forced_final_answer(
     prompt: str,
     fallback_text: str,
     reason_code: str,
+    single_semantic_turn: bool = False,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Force one tool-less final answer; stamp the typed forced-finalization
-    reason code (the best_effort outcome gate reads it downstream)."""
+    reason code (the best_effort outcome gate reads it downstream).
+    ``single_semantic_turn`` (owner-stop rail, CF-03): exactly ONE logical
+    model call — the late-owner-directive semantic refresh is disabled because
+    steering is fenced while the stop intent is pending."""
     live_trace = getattr(ctx, "llm_trace", None)
     llm_trace = live_trace if isinstance(live_trace, dict) else {}
     _finalize_forced_services(ctx, llm_trace)
@@ -5893,7 +5568,7 @@ def _forced_final_answer(
     prompt += _forced_delegation_note(tools_ctx, llm_trace)
     _append_or_merge_user_message(ctx.messages, prompt)
     extracted = ""
-    for attempt in range(2):
+    for attempt in range(1 if single_semantic_turn else 2):
         try:
             extracted = _call_forced_model_once(ctx)
         except BudgetExceeded:
@@ -5991,49 +5666,11 @@ def _apply_runtime_overrides(
     return active_model, active_use_local, active_effort
 
 
-def _maybe_downgrade_max_unconfirmed(mode: str, use_local: bool, model: str = "", *, allow_fetch: bool = False) -> str:
-    """Select Low only from positive exact-route evidence of a sub-1M window.
-
-    Missing/stale/failed evidence is UNKNOWN, not an invented 200K capability:
-    ordinary tasks try the owner-selected Max projection and may take the single
-    task-local Low retry only after a real provider overflow.  The P3 commit gate
-    has its own fail-closed >=1M contract and never calls this helper.
-    """
-    if mode != "max":
-        return mode
-    try:
-        from ouroboros.capability_evidence import ONE_MILLION, is_known
-        from ouroboros.context import _context_fit_route
-
-        _route, evidence = _context_fit_route(
-            {"model": model, "use_local_model": use_local},
-            allow_fetch=allow_fetch,
-        )
-        if is_known(evidence, require_fresh=True) and int(evidence.window_tokens or 0) < ONE_MILLION:
-            log.info(
-                "Exact route evidence reports a sub-1M context window "
-                "(%s tokens, use_local=%s); using the task-local Low projection.",
-                evidence.window_tokens, use_local,
-            )
-            return "low"
-    except Exception:
-        log.debug("Context-fit capability check unavailable; preserving Max", exc_info=True)
-    return mode
-
-
 def _apply_overrides_and_regate_mode(ctx, active_model, active_use_local, active_effort, active_context_mode):
-    """Apply per-round runtime overrides, then re-gate max-mode at point-of-use if the
-    active route changed (a mid-loop switch_model / local-route change — the start-of-
-    loop gate only saw the initial route). Positive small-window evidence selects Low;
-    unknown evidence remains Max until a real overflow (v6.64)."""
-    _route_before = (active_model, active_use_local)
+    """Apply per-round overrides; route rebind never predicts a mode change."""
     active_model, active_use_local, active_effort = _apply_runtime_overrides(
         ctx, active_model, active_use_local, active_effort,
     )
-    if (active_model, active_use_local) != _route_before:
-        active_context_mode = _maybe_downgrade_max_unconfirmed(
-            get_context_mode(), active_use_local, active_model,
-        )
     return active_model, active_use_local, active_effort, active_context_mode
 
 
@@ -6078,7 +5715,7 @@ def _rebind_context_fit_plan(
         log.debug("Route-switch capability probe failed; preserving unknown Max", exc_info=True)
         route, evidence = _failed_route_evidence(task)
     ratio = _route_calibration_ratio(
-        pathlib.Path(tools._ctx.drive_root),
+        None,  # canonical evidence root (one observation store)
         str(getattr(evidence, "route_fp", "") or ""),
         str(route.get("model") or model),
     )
@@ -6101,7 +5738,7 @@ def _rebind_context_fit_plan(
     max_projection = project(plan.max_projection)
     low_projection = project(plan.low_projection)
     preferred = preferred_mode if preferred_mode in {"low", "max"} else "max"
-    initial_mode = "low" if preferred == "max" and max_projection.fits_known_window is False else preferred
+    initial_mode = preferred
     rebound = replace(
         plan,
         preferred_mode=preferred,
@@ -6115,15 +5752,8 @@ def _rebind_context_fit_plan(
         max_projection=max_projection,
         low_projection=low_projection,
     )
-    mode = str(rebound.initial_mode_with_tools(tool_schemas) or initial_mode)
-    projected_prompt_tokens = rebound.projected_tokens_with_tools("max", tool_schemas)
-    if preferred == "max" and known_window:
-        max_transcript = rebound.reproject_transcript(messages, "max")
-        projected_prompt_tokens = int(
-            estimate_context_prompt_tokens(max_transcript, tool_schemas) * ratio
-        )
-        if projected_prompt_tokens + int(rebound.output_reserve_tokens or 0) > window_tokens:
-            mode = "low"
+    mode = initial_mode
+    projected_prompt_tokens = rebound.projected_tokens_with_tools(mode, tool_schemas)
     messages[:] = rebound.reproject_transcript(messages, mode)
     tools._ctx.context_fit_plan = rebound
     tools._ctx.messages = messages
@@ -6199,16 +5829,14 @@ def _nanny_finalization_message(
 
     F4 (2026-08-10 saga): the old reminder accused children whose delegated runs
     CRASHED of "choosing" not to delegate, and fired even when the delegate verbs
-    were policy-hidden from the task's toolset. Two structural facts fix both:
-    the task's own visible toolset, and the durable custody evidence
-    (delegate_custody.task_execution_evidence), which spans the WHOLE task —
-    the per-execution llm_trace resets on every continuation. `trace_attempted`
-    carries the third fact: a delegate_start in THIS execution's trace. It must
-    not suppress the failure message (triad finding on e84475f2: the saga's own
-    shape — delegate, run dies, finish by hand, finalize — happens inside ONE
-    execution), only the accusation when custody has no rows yet (a pending or
-    uncustodied start is an attempt, not a choice).
-    """
+    were policy-hidden. Two structural facts fix both: the task's own visible
+    toolset, and durable custody evidence (delegate_custody.
+    task_execution_evidence), which spans the WHOLE task — per-execution
+    llm_trace resets on continuation. `trace_attempted` is the third fact: a
+    delegate_start in THIS execution's trace. It must not suppress the failure
+    message (triad finding on e84475f2: delegate, run dies, finish by hand,
+    finalize — all inside ONE execution), only the accusation when custody has
+    no rows yet (a pending/uncustodied start is an attempt, not a choice)."""
     try:
         if "delegate_start" not in set(tools.available_tools()):
             return ""  # the verbs are invisible here; "you chose not to" would be false
@@ -6220,10 +5848,9 @@ def _nanny_finalization_message(
 
         # Split-root fix (2026-08-10 amendments): custody WRITES land on the
         # CANONICAL (budget) root, but this read used the loop's drive_root —
-        # the isolated CHILD drive for a split-root subagent, which carries no
-        # custody rows, leaving the nanny blind. Resolve the SAME root the
-        # writers use; the passed drive_root stays the fallback for contexts
-        # custody_root cannot resolve (e.g. unit-test stubs).
+        # a split-root subagent's child drive has no custody rows, leaving
+        # the nanny blind. Resolve the SAME root the writers use; the passed
+        # drive_root stays the fallback (e.g. unit-test stubs).
         try:
             evidence_root = custody_root(tools._ctx)
         except Exception:
@@ -6233,11 +5860,10 @@ def _nanny_finalization_message(
         log.debug("nanny nudge: custody evidence read failed", exc_info=True)
     if evidence.get("delegated_runs_succeeded"):
         # The route WAS used and worked — but "used once" is not a permanent
-        # license: the poltergeist children each ran ONE successful $0 run and
-        # then co-built for tens of opus rounds around it while this early
-        # return kept the nudge silent forever. The silence is now proportional
-        # to the measured burn since the last delegated-run activity; a nanny
-        # that delegated recently (or spent little since) still hears nothing.
+        # license: the poltergeist children each ran ONE successful $0 run,
+        # then co-built for tens of opus rounds while this early return kept
+        # the nudge silent. Silence is now proportional to the measured burn
+        # since the last delegated-run activity.
         rounds, cost = _nanny_metered_since_delegate_activity(tools._ctx)
         from ouroboros.task_pacing import NANNY_REMINDER_ROUNDS, NANNY_REMINDER_USD
 
@@ -6267,11 +5893,10 @@ def _nanny_finalization_message(
     pending = max(0, started - settled)
     if pending:
         # PENDING ≠ FAILED (sol review on b49f8192): a STARTED row with no
-        # settlement may simply still be executing — calling it failed invites a
-        # duplicate concurrent run, and finalizing over it orphans the result.
-        # Takes precedence over the failed message: with a run in flight,
-        # "retry" is the wrong instruction even when an earlier sibling died
-        # (those failures still ride along as a fact).
+        # settlement may still be executing — calling it failed invites a
+        # duplicate run, and finalizing over it orphans the result. Takes
+        # precedence over the failed message: with a run in flight, "retry"
+        # is wrong even when an earlier sibling died (still a fact below).
         failed_note = (
             f" {len(failure_states)} earlier run(s) already ended: {', '.join(failure_states)}."
             if failure_states else ""
@@ -6317,16 +5942,14 @@ def _maybe_inject_finalization_nudges(
         return False
     if (getattr(tools._ctx, "_nanny_route_dispatched", False)
             and not getattr(tools._ctx, "_nanny_finalization_injected", False)):
-        # Nanny postcondition (owner decision, 2026-08-07): a child dispatched onto
-        # the delegated substrate must not finalize as if that decision never
-        # existed. One structural fact, one re-loop; the child stays free to
-        # delegate now OR to finalize with a stated typed reason — never a hard
-        # gate on its judgment (P5). A delegate_start in THIS trace no longer
-        # short-circuits the whole nudge (triad finding on e84475f2): it rides
-        # into the message decision, where custody evidence distinguishes a
-        # failed run (truthful NANNY_DELEGATED_RUN_FAILED) from a pending or
-        # uncustodied attempt (no message). Suppression cases live in
-        # _nanny_finalization_message.
+        # Nanny postcondition (owner decision, 2026-08-07): a child dispatched
+        # onto the delegated substrate must not finalize as if that decision
+        # never existed. One structural fact, one re-loop; the child may still
+        # delegate OR finalize with a typed reason — never a hard gate (P5).
+        # A delegate_start in THIS trace rides into the message decision
+        # (triad, e84475f2), where custody evidence separates a failed run
+        # (NANNY_DELEGATED_RUN_FAILED) from a pending attempt (no message).
+        # Suppression cases live in _nanny_finalization_message.
         _trace_attempted = any(
             str(c.get("tool") or "") == "delegate_start"
             for c in (llm_trace.get("tool_calls") or [])
@@ -6340,7 +5963,15 @@ def _maybe_inject_finalization_nudges(
             if content and content.strip():
                 messages.append({"role": "assistant", "content": content})
             _append_or_merge_user_message(messages, f"[SYSTEM REMINDER]\n{_nanny_msg}")
-            emit_progress(_nanny_msg)
+            # Owner decision (2026-08-15): no owner-chat progress line — the
+            # model sees the [SYSTEM REMINDER], the trace keeps the durable
+            # text, and the typed task_checkpoint carries observability.
+            _emit_checkpoint_event(
+                getattr(tools._ctx, "event_queue", None), task_id,
+                getattr(tools._ctx, "drive_logs", None),
+                {"checkpoint_kind": "nanny_finalization_nudge",
+                 "nanny_code": _nanny_msg.split(":", 1)[0].replace("⚠️", "").strip()},
+            )
             llm_trace["reasoning_notes"].append(_nanny_msg)
             return True
     finalization_msg = _skill_finalization_message(drive_root, llm_trace)
@@ -6353,13 +5984,12 @@ def _maybe_inject_finalization_nudges(
         llm_trace["reasoning_notes"].append(finalization_msg)
         return True
     if not getattr(tools._ctx, "_verify_red_nudged", False):
-        # Red-verification one-shot nudge: the agent's most recent host-attested verify
-        # receipt is RED and unreconciled — finalizing over your own failing check is a
-        # self-contradiction (Bible P3/P12), distinct from the receipt_absent case below
-        # (that is "no grounding"; this is "grounding says FAIL"). Ordered BEFORE the FR3
-        # verify nudge. Binary latch; advisory (the agent may still finalize with reasoning);
-        # forced-finalization paths return earlier and bypass it. Structural — keyed on the
-        # typed receipt status, never content (Bible P5). Benchmark-neutral wording.
+        # Red-verification one-shot nudge: the latest host-attested verify receipt
+        # is RED and unreconciled — finalizing over your own failing check is a
+        # self-contradiction (Bible P3/P12), distinct from receipt_absent below
+        # ("no grounding" vs "grounding says FAIL"). Ordered BEFORE the FR3 verify
+        # nudge. Binary latch; advisory; forced-finalization paths bypass it.
+        # Keyed on the typed receipt status, never content (Bible P5).
         _failed_receipt = latest_unreconciled_failed_verification(drive_root, task_id)
         if _failed_receipt is not None:
             tools._ctx._verify_red_nudged = True
@@ -6380,13 +6010,11 @@ def _maybe_inject_finalization_nudges(
             llm_trace["reasoning_notes"].append("Red-verification nudge injected before final response.")
             return True
     if not getattr(tools._ctx, "_verify_masked_nudged", False):
-        # Exit-masking one-shot ADVISORY nudge (v6.52.2): the agent's latest PASSING verify check
-        # can LAUNDER the real exit code (a `| tail`/`grep`/`|| true` pipeline reports exit 0 even
-        # when the underlying runner failed — the false-green tutanota hit). Distinct from the red
-        # nudge (that is "grounding says FAIL"; this is "grounding says PASS but may be laundered").
-        # Ordered AFTER the red nudge. Binary latch; ADVISORY (the agent may still finalize with
-        # reasoning); forced-finalization paths return earlier and bypass it. Flag-driven on the
-        # typed receipt sensor, never content (Bible P5). Benchmark-neutral wording.
+        # Exit-masking one-shot ADVISORY nudge (v6.52.2): a PASSING verify
+        # check can LAUNDER the real exit code (`| tail`/`|| true` — the
+        # false-green tutanota hit). Distinct from the red nudge; ordered
+        # after it. Binary latch; advisory; forced paths bypass it. Flag-
+        # driven on the typed receipt sensor, never content (Bible P5).
         _masked_receipt = latest_unreconciled_masked_verification(drive_root, task_id)
         if _masked_receipt is not None:
             tools._ctx._verify_masked_nudged = True
@@ -6450,12 +6078,12 @@ def _maybe_inject_finalization_nudges(
         emit_progress("Verify-before-done nudge injected before final response.")
         llm_trace["reasoning_notes"].append("Verify-before-done nudge injected before final response.")
         return True
-    # A3 one-shot no-op nudge: a declared deliverable (non-empty expected_output) but the
-    # turn made NO tool calls, produced NO reviewable effects, and carries NO FINAL ANSWER
-    # marker — a structural about-to-finalize-without-attempting signal (same condition
-    # family as the M2 expected_output_ungrounded flag). Own latch, ordered AFTER the verify
-    # nudge; never forces acceptance review; forced-finalization paths return earlier and
-    # bypass it. Structural facts only (no refusal-text matching).
+    # A3 one-shot no-op nudge: a declared deliverable (non-empty
+    # expected_output) but the turn made NO tool calls, NO reviewable effects,
+    # NO FINAL ANSWER marker — about-to-finalize-without-attempting (same
+    # family as the M2 expected_output_ungrounded flag). Own latch, AFTER the
+    # verify nudge; never forces acceptance review; forced paths return
+    # earlier. Structural facts only (no refusal-text matching).
     if (
         not getattr(tools._ctx, "_noop_attempt_nudged", False)
         and str(_contract_expected_output(tools._ctx)).strip()
@@ -6483,21 +6111,18 @@ def _maybe_inject_finalization_nudges(
         emit_progress("No-op attempt nudge injected before final response.")
         llm_trace["reasoning_notes"].append("No-op attempt nudge injected before final response.")
         return True
-    # P2 one-shot final-answer-marker nudge: the turn produced REAL work (tool calls or
-    # reviewable effects) AND visible prose, but carries NO FINAL ANSWER marker — so the
-    # typed extractor would drop it and a forced/deadline finalization would score empty
-    # even though the answer is sitting in the prose. We strengthen the BEHAVIOR (ask the
-    # agent to mark its OWN answer) rather than mining prose into a claimed answer (Bible P5;
-    # codex-confirmed that prose-mining in core would harm ordinary users). Own latch,
-    # ordered AFTER verify/red/A3 (verification grounding outranks formatting); mutually
-    # exclusive with the A3 no-op nudge (which is the no-work case). Forced-finalization
-    # paths return earlier and bypass it. Structural facts only (no content matching).
-    # The protocol gate is sufficient: answer_protocol="final_answer_line" itself declares
-    # a machine-extracted deliverable, so the nudge must not ALSO require a declared
-    # expected_output — GAIA-shaped contracts carry the question in `objective` with
-    # expected_output empty, and the extra gate silently suppressed the one salvage
-    # surface (a v6.56.0 run finalized a last-round refusal with an empty typed answer
-    # despite 24 tool calls of real research).
+    # P2 one-shot final-answer-marker nudge: the turn produced REAL work AND
+    # visible prose but no FINAL ANSWER marker — the typed extractor would drop
+    # it and a forced/deadline finalization would score empty. Strengthen the
+    # BEHAVIOR (ask the agent to mark its OWN answer), never mine prose into a
+    # claimed answer (Bible P5). Own latch, ordered AFTER verify/red/A3
+    # (grounding outranks formatting); mutually exclusive with the A3 no-op
+    # nudge; forced paths return earlier. Structural facts only. The protocol
+    # gate alone suffices: answer_protocol="final_answer_line" itself declares
+    # a machine-extracted deliverable, so the nudge must not ALSO require a
+    # declared expected_output — GAIA-shaped contracts keep expected_output
+    # empty, and that extra gate once suppressed the only salvage surface
+    # (a v6.56.0 run finalized a last-round refusal empty despite 24 calls).
     if (
         not getattr(tools._ctx, "_final_marker_nudged", False)
         and _answer_protocol_active(tools._ctx)  # v6.60.0: marker nudge is protocol-gated
@@ -6569,16 +6194,86 @@ class _RoundModelCallContext:
     attempt_cap: Optional[int] = None
 
 
-def _call_round_model(ctx: _RoundModelCallContext) -> Tuple[Any, float, str]:
-    """Dispatch one ordinary round and its single confirmed-overflow Low retry."""
+def _context_fit_round_id(ctx: _RoundModelCallContext) -> str:
+    execution_id = str(ctx.accumulated_usage.setdefault("execution_id", new_execution_id()))
+    return f"{execution_id}:round:{ctx.round_idx}"
+
+
+def _main_context_profile(plan: Any, rendered_mode: str) -> str:
+    if rendered_mode != "low":
+        return "owner_max"
+    # Effective Low is the sizing authority even when a bare env override keeps
+    # owner intent Max for P3. A Low entered only after a real Max overflow is
+    # task-local and therefore does not inherit the economy target T.
+    return "owner_low" if str(getattr(plan, "preferred_mode", "")) == "low" else "task_local_low"
+
+
+def _remember_main_fit(ctx: _RoundModelCallContext, disposition: Any) -> None:
+    measurement = disposition.measurement
+    usage = ctx.accumulated_usage
+    usage["_context_route_fp"] = measurement.route_fp
+    usage["_context_prompt_estimate"] = measurement.estimated_input_tokens
+    usage["_context_fit_mode"] = measurement.rendered_mode
+    usage["_context_profile"] = measurement.profile
+    usage["_context_measurement_basis"] = measurement.measurement_basis
+    usage["_context_measurement_density"] = measurement.measurement_density
+    usage["_context_target_total_tokens"] = measurement.target_total_tokens
+    usage["_context_capacity_total_tokens"] = measurement.capacity_total_tokens
+    usage["_context_target_deficit_tokens"] = measurement.target_deficit_tokens
+    usage["_context_capacity_deficit_tokens"] = measurement.capacity_deficit_tokens
+    usage["_context_reclaim_goal_tokens"] = measurement.reclaim_goal_tokens
+    usage["_context_target_miss"] = disposition.action == "send_target_miss"
+    usage["_context_automatic_pass_used"] = disposition.automatic_pass_used
+    usage["_context_predicted_capacity_miss"] = disposition.predicted_capacity_miss
+
+
+def _measure_round_main_fit(
+    ctx: _RoundModelCallContext,
+    *,
+    automatic_pass_used: bool,
+) -> Any:
     plan = ctx.context_fit_plan
-    if plan is not None and str(ctx.active_model or "") == str(getattr(plan, "model", "") or ""):
-        ctx.accumulated_usage["_context_route_fp"] = str(getattr(plan, "route_fp", "") or "")
-        ctx.accumulated_usage["_context_prompt_estimate"] = estimate_context_prompt_tokens(
-            ctx.messages, ctx.tool_schemas,
-        )
-        ctx.accumulated_usage["_context_fit_mode"] = ctx.active_context_mode
-    msg, cost = call_llm_with_retry(
+    if plan is None or str(ctx.active_model or "") != str(getattr(plan, "model", "") or ""):
+        return None
+    from ouroboros.context_fit import measure_main_fit
+
+    rendered_mode = "low" if ctx.active_context_mode == "low" else "max"
+    disposition = measure_main_fit(
+        plan,
+        ctx.messages,
+        ctx.tool_schemas,
+        profile=_main_context_profile(plan, rendered_mode),
+        rendered_mode=rendered_mode,
+        round_id=_context_fit_round_id(ctx),
+        automatic_pass_used=automatic_pass_used,
+    )
+    _remember_main_fit(ctx, disposition)
+    return disposition
+
+
+def _physical_context_for_fit(disposition: Any) -> PhysicalAttemptContext:
+    measurement = disposition.measurement
+    return PhysicalAttemptContext(
+        profile=measurement.profile,
+        rendered_mode=measurement.rendered_mode,
+        measurement_basis=measurement.measurement_basis,
+        route_fp=measurement.route_fp,
+        round_id=measurement.round_id,
+        target_total_tokens=measurement.target_total_tokens,
+        capacity_total_tokens=measurement.capacity_total_tokens,
+        context_target_miss=disposition.action == "send_target_miss",
+        automatic_pass_used=disposition.automatic_pass_used,
+    )
+
+
+def _dispatch_round_model(
+    ctx: _RoundModelCallContext,
+    disposition: Any,
+    *,
+    attempt_cap: Optional[int],
+    candidate_predicate: Optional[Callable[[Any], Any]] = None,
+) -> Tuple[Any, float]:
+    return call_llm_with_retry(
         ctx.llm,
         ctx.messages,
         ctx.active_model,
@@ -6593,72 +6288,206 @@ def _call_round_model(ctx: _RoundModelCallContext) -> Tuple[Any, float, str]:
         ctx.task_type,
         use_local=ctx.active_use_local,
         deadline_ts=_task_deadline_epoch(ctx.tools),
-        attempt_cap=ctx.attempt_cap,
+        attempt_cap=attempt_cap,
         allow_server_web_search=_server_web_allowed_by_task(ctx.tools._ctx),
+        physical_context=(
+            _physical_context_for_fit(disposition) if disposition is not None else None
+        ),
+        candidate_predicate=candidate_predicate,
     )
-    should_retry_low = (
-        msg is None
-        and plan is not None
-        and str(ctx.active_model or "") == str(getattr(plan, "model", "") or "")
-        and str(getattr(plan, "preferred_mode", "")) == "max"
-        and ctx.active_context_mode != "low"
-        and str(ctx.accumulated_usage.get("_last_llm_error_kind") or "") == "context_overflow"
-        and not bool(ctx.accumulated_usage.get("_context_fit_low_retry_used"))
+
+
+def _run_main_reclaim(
+    ctx: _RoundModelCallContext,
+    disposition: Any,
+    *,
+    minimum_goal_tokens: int = 0,
+) -> Any:
+    measurement = disposition.measurement
+    key = (measurement.route_fp, measurement.round_id)
+    passes = _context_reclaim_passes(ctx.tools._ctx)
+    if key in passes:
+        return None
+    request = ContextReclaimRequest(
+        route_fp=measurement.route_fp,
+        round_id=measurement.round_id,
+        transcript_sha256=context_reclaim_transcript_sha256(ctx.messages),
+        measurement_basis=measurement.measurement_basis,
+        measurement_density=measurement.measurement_density,
+        reclaim_goal_tokens=max(
+            int(measurement.reclaim_goal_tokens),
+            max(0, int(minimum_goal_tokens)),
+        ),
+        allow_partial_shrink=True,
     )
-    if not should_retry_low:
-        return msg, cost, ctx.active_context_mode
-    checkpoint_ok = _persist_compaction_checkpoint(
+    rebuilt, receipt, usage = compact_tool_history_llm(
         ctx.messages,
-        drive_root=ctx.drive_root,
-        drive_logs=ctx.drive_logs,
+        request=request,
+        drive_root=pathlib.Path(ctx.drive_root or ctx.drive_logs.parent),
         task_id=ctx.task_id,
-        reason="confirmed_context_overflow_low_retry",
-        keep_recent=max(0, len(_tool_round_spans(ctx.messages))),
-        round_idx=ctx.round_idx,
-        event_queue=ctx.event_queue,
-        checkpoint_kind="pre_context_fit_low_retry",
-        call_type="context_fit_checkpoint",
+        negative_memo=reclaim_negative_memo(ctx.tools._ctx),
+        trace_refs_by_tool_call_id=reclaim_trace_refs(ctx.tools._ctx),
     )
-    if not checkpoint_ok:
-        return msg, cost, ctx.active_context_mode
-    ctx.accumulated_usage["_context_fit_low_retry_used"] = True
-    ctx.messages[:] = plan.reproject_transcript(ctx.messages, "low")
+    passes.add(key)
+    # The checkpoint is written only after non-empty selection and immediately
+    # before map/fold, so it also covers a post-summary binding mismatch.
+    if receipt.checkpoint_ref:
+        _context_reclaim_materializations(ctx.tools._ctx).add(key)
+    if usage:
+        _account_compaction_usage(ctx.accumulated_usage, usage, ctx.event_queue, ctx.task_id)
+    if receipt.status == "applied":
+        ctx.messages[:] = rebuilt
+        ctx.tools._ctx.messages = ctx.messages
+        seal_task_transcript(ctx.messages)
+        prune_reclaim_trace_refs(ctx.tools._ctx, ctx.messages)
+    _emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
+        "type": "context_reclaim",
+        "checkpoint_kind": "context_reclaim_automatic",
+        "round": ctx.round_idx,
+        "route_fp": measurement.route_fp,
+        "round_id": measurement.round_id,
+        "status": receipt.status,
+        "reclaim_goal_tokens": request.reclaim_goal_tokens,
+        "reclaimed_tokens": receipt.reclaimed_tokens,
+        "goal_reached": receipt.goal_reached,
+        "checkpoint_ref": receipt.checkpoint_ref,
+    })
+    return receipt
+
+
+def _measure_after_reclaim(ctx: _RoundModelCallContext) -> Any:
+    """Suppress a second pass while reporting whether a summarizer actually ran."""
+    disposition = _measure_round_main_fit(ctx, automatic_pass_used=True)
+    if disposition is None:
+        return None
+    key = (disposition.measurement.route_fp, disposition.measurement.round_id)
+    used = key in _context_reclaim_materializations(ctx.tools._ctx)
+    if disposition.automatic_pass_used != used:
+        disposition = replace(disposition, automatic_pass_used=used)
+        _remember_main_fit(ctx, disposition)
+    return disposition
+
+
+def _reproject_actual_overflow_low(ctx: _RoundModelCallContext) -> None:
+    if ctx.active_context_mode == "low" or ctx.context_fit_plan is None:
+        return
+    ctx.messages[:] = ctx.context_fit_plan.reproject_transcript(ctx.messages, "low")
+    ctx.active_context_mode = "low"
     ctx.tools._ctx.messages = ctx.messages
     ctx.tools._ctx.active_context_mode = "low"
-    ctx.accumulated_usage["_context_prompt_estimate"] = estimate_context_prompt_tokens(
-        ctx.messages, ctx.tool_schemas,
-    )
-    ctx.accumulated_usage["_context_fit_mode"] = "low"
     _emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
         "checkpoint_kind": "context_fit_low_retry",
         "round": ctx.round_idx,
-        "model": ctx.active_model,
-        "route_fp": str(getattr(plan, "route_fp", "") or ""),
-        "core_sha256": str(getattr(plan, "core_sha256", "") or ""),
-        "preferred_mode": "max",
+        "route_fp": str(getattr(ctx.context_fit_plan, "route_fp", "") or ""),
+        "preferred_mode": str(getattr(ctx.context_fit_plan, "preferred_mode", "") or ""),
         "effective_mode": "low",
-        "toast_once": f"{ctx.task_id}:context-fit-low:{ctx.round_idx}",
         "owner_visible": True,
     })
-    msg, cost = call_llm_with_retry(
-        ctx.llm,
-        ctx.messages,
-        ctx.active_model,
-        ctx.tool_schemas,
-        ctx.active_effort,
-        ctx.max_retries,
-        ctx.drive_logs,
-        ctx.task_id,
-        ctx.round_idx,
-        ctx.event_queue,
-        ctx.accumulated_usage,
-        ctx.task_type,
-        use_local=ctx.active_use_local,
-        deadline_ts=_task_deadline_epoch(ctx.tools),
-        attempt_cap=1,
-        allow_server_web_search=_server_web_allowed_by_task(ctx.tools._ctx),
+
+
+def _failed_capture_is_comparable(capture: Any) -> bool:
+    return bool(
+        capture is not None
+        and capture.state in {"dispatched", "settled", "unresolved"}
+        and capture.candidate_measurement_kind == "canonical_json_v1"
+        and capture.candidate_raw_sha256
+        and capture.candidate_context_size_bytes is not None
+        and capture.physical_context is not None
     )
-    return msg, cost, "low"
+
+
+def _strict_context_shrink_predicate(failed: Any) -> Callable[[Any], bool]:
+    def predicate(request: Any) -> bool:
+        failed_context = failed.physical_context
+        current_context = request.physical_context
+        return bool(
+            request.candidate_measurement_kind == "canonical_json_v1"
+            and request.provider == failed.provider
+            and request.model == failed.model
+            and request.max_completion_tokens == failed.max_completion_tokens
+            and current_context is not None
+            and failed_context is not None
+            and current_context.route_fp == failed_context.route_fp
+            and current_context.round_id == failed_context.round_id
+            and request.candidate_raw_sha256 != failed.candidate_raw_sha256
+            and request.candidate_context_size_bytes is not None
+            and int(request.candidate_context_size_bytes) < int(failed.candidate_context_size_bytes)
+        )
+
+    return predicate
+
+
+def _emit_overflow_retry_skipped(ctx: _RoundModelCallContext, reason: str) -> None:
+    _emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
+        "type": "context_overflow_retry_skipped",
+        "round": ctx.round_idx,
+        "route_fp": str(getattr(ctx.context_fit_plan, "route_fp", "") or ""),
+        "reason": reason,
+    })
+
+
+def _call_round_model(ctx: _RoundModelCallContext) -> Tuple[Any, float, str]:
+    """Measure, optionally reclaim, dispatch, and recover one Main round."""
+    disposition = _measure_round_main_fit(ctx, automatic_pass_used=False)
+    if disposition is not None:
+        key = (disposition.measurement.route_fp, disposition.measurement.round_id)
+        already_reclaimed = key in _context_reclaim_passes(ctx.tools._ctx)
+        if disposition.action == "reclaim_once" and not already_reclaimed:
+            _run_main_reclaim(ctx, disposition)
+            already_reclaimed = True
+        if already_reclaimed:
+            disposition = _measure_after_reclaim(ctx)
+
+    msg, cost = _dispatch_round_model(
+        ctx,
+        disposition,
+        attempt_cap=ctx.attempt_cap,
+    )
+    if msg is not None or str(ctx.accumulated_usage.get("_last_llm_error_kind") or "") != "context_overflow":
+        return msg, cost, ctx.active_context_mode
+
+    # Snapshot immediately: a reclaim summarizer is itself physically receipted
+    # and would otherwise replace the failed Main candidate in the ContextVar.
+    failed_capture = last_physical_attempt_capture()
+    if disposition is None:
+        return msg, cost, ctx.active_context_mode
+    _reproject_actual_overflow_low(ctx)
+    reclaim_key = (disposition.measurement.route_fp, disposition.measurement.round_id)
+    overflow_fit = (
+        _measure_after_reclaim(ctx)
+        if reclaim_key in _context_reclaim_passes(ctx.tools._ctx)
+        else _measure_round_main_fit(ctx, automatic_pass_used=False)
+    )
+    if overflow_fit is None:
+        return msg, cost, ctx.active_context_mode
+    key = (overflow_fit.measurement.route_fp, overflow_fit.measurement.round_id)
+    if key not in _context_reclaim_passes(ctx.tools._ctx):
+        _run_main_reclaim(ctx, overflow_fit, minimum_goal_tokens=1)
+        overflow_fit = _measure_after_reclaim(ctx)
+        if overflow_fit is None:
+            return msg, cost, ctx.active_context_mode
+
+    retries = _context_overflow_retries(ctx.tools._ctx)
+    if key in retries:
+        _emit_overflow_retry_skipped(ctx, "route_round_retry_already_used")
+        return msg, cost, ctx.active_context_mode
+    if not _failed_capture_is_comparable(failed_capture):
+        _emit_overflow_retry_skipped(ctx, "failed_candidate_not_comparable")
+        return msg, cost, ctx.active_context_mode
+    retries.add(key)
+    try:
+        retry_msg, retry_cost = _dispatch_round_model(
+            ctx,
+            overflow_fit,
+            attempt_cap=1,
+            candidate_predicate=_strict_context_shrink_predicate(
+                failed_capture,
+            ),
+        )
+    except PhysicalAttemptPreconditionFailed:
+        _emit_overflow_retry_skipped(ctx, "context_candidate_not_strictly_smaller")
+        return msg, cost, ctx.active_context_mode
+    return retry_msg, retry_cost, ctx.active_context_mode
 
 
 @dataclass
@@ -7041,12 +6870,7 @@ def run_llm_loop(
         active_use_local = bool(ctx.task_use_local_override)
     else:
         active_use_local = os.environ.get("USE_LOCAL_MAIN", "").lower() in ("true", "1")
-    # Root probes exact-route fit; unknown routes get honest Max, never invented 200K.
-    _ctx_meta = getattr(ctx, "task_metadata", {})
-    _is_subagent = (
-        isinstance(_ctx_meta, dict)
-        and str(_ctx_meta.get("delegation_role") or "").strip().lower() == "subagent"
-    )
+    # Unknown routes get one honest call; no synthetic short-window capacity.
     _preferred_context_mode = get_context_mode()
     context_fit_plan = getattr(ctx, "context_fit_plan", None)
     if (
@@ -7055,9 +6879,7 @@ def run_llm_loop(
     ):
         active_context_mode = str(getattr(context_fit_plan, "initial_mode", "") or _preferred_context_mode)
     else:
-        active_context_mode = _maybe_downgrade_max_unconfirmed(
-            _preferred_context_mode, active_use_local, active_model, allow_fetch=not _is_subagent,
-        )
+        active_context_mode = _preferred_context_mode
     llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
     accumulated_usage: Dict[str, Any] = {}
     # Published as a live reference so blocking tools (wait_task/wait_tasks/
@@ -7077,35 +6899,6 @@ def run_llm_loop(
 
     tool_schemas = initial_tool_schemas(tools)
     tool_schemas, _enabled_extra_tools = _setup_dynamic_tools(tools, tool_schemas, messages)
-    if context_fit_plan is not None and str(
-        getattr(context_fit_plan, "preferred_mode", "")
-    ) == _preferred_context_mode:
-        fit_with_tools = getattr(context_fit_plan, "initial_mode_with_tools", None)
-        if callable(fit_with_tools):
-            tool_aware_mode = str(fit_with_tools(tool_schemas) or active_context_mode)
-            if tool_aware_mode != active_context_mode:
-                messages[:] = context_fit_plan.reproject_transcript(messages, tool_aware_mode)
-                active_context_mode = tool_aware_mode
-
-    if _preferred_context_mode == "max" and active_context_mode != "max":
-        # Make the effective-vs-preferred downgrade owner-visible and durable.
-        projected_prompt = 0
-        project_with_tools = getattr(context_fit_plan, "projected_tokens_with_tools", None)
-        if callable(project_with_tools):
-            projected_prompt = int(project_with_tools("max", tool_schemas) or 0)
-        _emit_checkpoint_event(event_queue, task_id, drive_logs, {
-            "checkpoint_kind": "context_mode_downgraded",
-            "preferred_mode": _preferred_context_mode,
-            "effective_mode": active_context_mode,
-            "model": active_model,
-            "use_local": active_use_local,
-            "reason": "known_route_projection_does_not_fit",
-            "route_fp": str(getattr(context_fit_plan, "route_fp", "") or ""),
-            "window_tokens": int(getattr(context_fit_plan, "window_tokens", 0) or 0),
-            "projected_prompt_tokens": projected_prompt,
-            "core_sha256": str(getattr(context_fit_plan, "core_sha256", "") or ""),
-        })
-
     tools._ctx.event_queue = event_queue
     tools._ctx.task_id = task_id
     tools._ctx.messages = messages
@@ -7134,15 +6927,15 @@ def run_llm_loop(
                     tool_schemas=tool_schemas,
                 )
             if active_model != _prev_active_model:
-                # A cross-FAMILY switch_model / per-task override mid-conversation:
-                # proactively strip the prior family's provider-private reasoning/
-                # thinking blocks from the canonical history so the new family does
-                # not 400 on a signature it cannot validate (stripping is always
-                # safe — it loses only reasoning continuity). Same family is a no-op.
+                # A cross-FAMILY switch_model / per-task override: strip the
+                # prior family's provider-private reasoning blocks from the
+                # history so the new family does not 400 on a signature it
+                # cannot validate (safe — loses only reasoning continuity).
+                # Same family is a no-op.
                 _sanitized = LLMClient.sanitize_reasoning_on_model_switch(messages, _prev_active_model, active_model)
                 if _sanitized is not messages:
                     messages[:] = _sanitized
-            ctx.active_context_mode = active_context_mode  # CW2: switch_model reads this to refuse a sub-1M switch while max-sized
+            ctx.active_context_mode = active_context_mode  # switch_model re-binds the fit plan from this round's mode
             ctx.active_model = active_model  # publish the round's REAL model (incl. switch_model / per-task override) so tools (native screenshot vision-routing) don't read the stale global OUROBOROS_MODEL env
 
             # One forced-wrap-up context per round: consumed by the round-limit
@@ -7199,12 +6992,7 @@ def run_llm_loop(
                     task_id=task_id,
                     round_idx=round_idx,
                     event_queue=event_queue,
-                    active_use_local=active_use_local,
-                    active_context_mode=active_context_mode,
-                    checkpoint_injected=_checkpoint_injected,
                     emit_progress=emit_progress,
-                    active_model=active_model,
-                    tool_schemas=tool_schemas,
                 ),
             )
             if tools._ctx.messages is not messages:

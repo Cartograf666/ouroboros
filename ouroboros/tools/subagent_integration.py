@@ -984,11 +984,8 @@ def _manifest_capture_status(manifest_path: pathlib.Path) -> str:
 
 def _capture_failed_refusal(rid: str, cap_status: str, note: str) -> str:
     """The ONE typed refusal for disposing over a non-usable capture (C1-R3).
-
-    Shared by the capture-at-disposition seam and the reject branch's own
-    guard, so the two cannot drift in shape. No disposition is recorded by any
-    caller of this message: the obligation stays open and the snapshot persists.
-    """
+    Shared by the capture-at-disposition seam and the reject branch's own guard
+    so they cannot drift; no caller records a disposition over this message."""
     return (
         f"⚠️ INTEGRATE_DELEGATED_CAPTURE_FAILED: run {rid}'s changes were never "
         f"usably captured, and the capture-at-disposition attempt did not "
@@ -1068,23 +1065,25 @@ def _delegated_disposition_refusal(status: str, entry: Any, rid: str,
             "delegate_wait it to terminal first — its patch is captured there."
         )
     if entry.patch_apply_pending and not acknowledge_ambiguous:
-        # CR1-3: a durable apply-intent row exists with no resolution and no
-        # disposition — a previous process started the apply and died before
-        # recording the outcome. The tree MAY carry the patch, so BOTH decisions
-        # refuse: a reject here would record "not applied" over a possibly
-        # modified, staged tree, and an apply could land the same changes twice.
-        # CR2-1: the refusal names its own exit — an explicit owner
-        # acknowledgment re-enters the NORMAL flow, whose guards re-verify.
+        # CR1-3: a durable apply-intent row with no resolution/disposition — a
+        # previous process started the apply and died. The target MAY carry the
+        # patch, so BOTH decisions refuse (a reject would record "not applied"
+        # over a possibly-mutated target; an apply could land changes twice).
+        # CR2-1: the explicit owner acknowledgment re-enters the NORMAL flow.
+        inspect_hint = (
+            "compare the live payload content against the patch artifact"
+            if getattr(entry, "authority_source", "") == "skill_payload"
+            else "vcs_diff, compare against the patch artifact")
         return (
             f"⚠️ INTEGRATE_DELEGATED_APPLY_AMBIGUOUS: a durable apply-intent row "
             f"exists for run {rid} but no completed disposition — a previous "
             f"process may have applied this patch into {entry.target_root} before "
-            "dying. The tree MAY already carry the run's changes: inspect it "
-            "(vcs_diff, compare against the patch artifact), then re-run "
+            "dying. The target MAY already carry the run's changes: inspect it "
+            f"({inspect_hint}), then re-run "
             "integrate_delegated_patch with acknowledge_ambiguous=true to take "
             "the state over explicitly — that resolves the stale intent and runs "
             "the NORMAL disposition from scratch (an apply re-verifies baseline "
-            "drift and honestly refuses a tree that already moved; a reject "
+            "drift and honestly refuses a target that already moved; a reject "
             "releases the snapshot while the captured patch artifact is "
             "retained). Nothing was changed now; the execution snapshot and the "
             "captured patch are preserved."
@@ -1093,16 +1092,22 @@ def _delegated_disposition_refusal(status: str, entry: Any, rid: str,
 
 
 def _unwritten_disposition_text(rid: str, target_root: str, disposition: str,
-                                applied: bool) -> str:
-    """The typed refusal for a completed operation whose row did not land."""
+                                applied: bool, *, payload: bool = False) -> str:
+    """The typed refusal for a completed operation whose row did not land.
+    ``payload`` selects accurate apply wording (Sol P2-3): a payload apply lands
+    LIVE in the non-Git payload — nothing staged, no index for vcs_diff."""
     if applied:
+        landed, verify = (
+            (f"applied LIVE into the non-Git payload {target_root}",
+             "compare the live payload against the patch artifact") if payload
+            else (f"applied and staged in {target_root}", "verify with vcs_diff"))
         return (
-            f"⚠️ INTEGRATE_DISPOSITION_UNWRITTEN: run {rid}'s patch IS APPLIED and "
-            f"staged in {target_root}, but the durable disposition row could not be "
+            f"⚠️ INTEGRATE_DISPOSITION_UNWRITTEN: run {rid}'s patch IS {landed}, "
+            "but the durable disposition row could not be "
             "written, so nothing on disk records that this patch was handled. Do "
             "NOT call integrate_delegated_patch again for this run — a second "
             "apply would land the same changes twice. Fix the drive/event log, "
-            "then verify with vcs_diff and record the outcome; the execution "
+            f"then {verify} and record the outcome; the execution "
             "snapshot is deliberately preserved."
         )
     return (
@@ -1115,15 +1120,35 @@ def _unwritten_disposition_text(rid: str, target_root: str, disposition: str,
     )
 
 
+def _dispose_delegated(drive: Any, entry: Any, snapshot_key: str, reason: str,
+                       disposition: str, cleanup: bool) -> tuple[bool, str]:
+    """Record a delegated disposition durably; clean up ONLY if the row landed.
+    Releasing snapshot/patch on an UNWRITTEN row loses the record that the patch
+    was handled (a restart could apply it twice). Shared by the Git and payload
+    branches (``delegate_integration``). Returns ``(recorded, note)``."""
+    from ouroboros import delegate_custody as custody
+    from ouroboros.subagent_worktrees import remove_execution_snapshot
+
+    recorded = custody.record_patch_disposed(
+        drive, entry, disposition=disposition, reason=str(reason or ""))
+    if not recorded:
+        return False, ""
+    note = ""
+    if cleanup:
+        try:
+            removed = remove_execution_snapshot(snapshot_key)
+        except Exception:
+            removed = False
+        note = "" if removed else " (snapshot cleanup deferred to the startup GC.)"
+    return True, note
+
+
 def _resolve_acknowledged_intent(drive: Any, entry: Any) -> None:
     """CR2-1: the owner explicitly took over the AMBIGUOUS crash state.
-
     Resolves the stale apply intent durably as owner-acknowledged; the caller
-    then runs the NORMAL disposition flow from scratch — apply re-proves
-    baseline drift, reject re-runs the ready-manifest guard. A failed row
-    write only means a post-restart replay is ambiguous again, which is the
-    fail-closed direction (see ``record_patch_apply_resolved``).
-    """
+    re-runs the NORMAL disposition from scratch (apply re-proves drift, reject
+    re-runs the ready-manifest guard). A failed row write only makes a
+    post-restart replay ambiguous again — the fail-closed direction."""
     from ouroboros import delegate_custody as custody
 
     custody.record_patch_apply_resolved(drive, entry, reason="owner_acknowledged")
@@ -1153,7 +1178,6 @@ def _integrate_delegated_patch(
     flow, whose own guards re-verify the tree. A no-op when nothing is pending.
     """
     from ouroboros import delegate_custody as custody
-    from ouroboros.subagent_worktrees import remove_execution_snapshot
 
     rid = str(run_id or "").strip()
     if not rid:
@@ -1182,31 +1206,20 @@ def _integrate_delegated_patch(
             manifest = loaded if isinstance(loaded, dict) else {}
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             return f"⚠️ INTEGRATE_MANIFEST_UNREADABLE: {manifest_path}: {type(exc).__name__}: {exc}."
+    if entry.authority_source == "skill_payload" or str(manifest.get("capture_kind") or "") == "skill_payload":
+        # The exact-payload branch (R1 item 3) lives in delegate_integration:
+        # fresh semantic rebinding, whole-payload CAS, reserved-path whole-apply
+        # refusal, index-free apply into the live NON-Git payload — no staging.
+        from ouroboros.tools.delegate_integration import integrate_payload_patch
+
+        return integrate_payload_patch(
+            ctx, drive=drive, entry=entry, rid=rid, decision=decision,
+            reason=reason, cap_dir=cap_dir, manifest=manifest, patch_path=patch_path)
     touched = [str(p) for p in (manifest.get("tracked_changed") or [])]
     touched += [str(p) for p in (manifest.get("untracked_included") or [])]
 
     def _dispose(disposition: str, cleanup: bool) -> tuple[bool, str]:
-        """Record the disposition durably, and clean up ONLY if it landed.
-
-        The snapshot and the captured patch are the run's whole custody trail:
-        releasing them on an UNWRITTEN disposition loses the record that this
-        patch was already handled, and after a restart (where the in-process
-        flag is gone) the same patch could be applied a second time over an
-        already-patched tree. Returns ``(recorded, note)``.
-        """
-        recorded = custody.record_patch_disposed(
-            drive, entry, disposition=disposition, reason=str(reason or ""))
-        if not recorded:
-            return False, ""
-        note = ""
-        if cleanup:
-            removed = False
-            try:
-                removed = remove_execution_snapshot(snapshot_key)
-            except Exception:
-                removed = False
-            note = "" if removed else " (snapshot cleanup deferred to the startup GC.)"
-        return True, note
+        return _dispose_delegated(drive, entry, snapshot_key, reason, disposition, cleanup)
 
     def _unwritten_disposition(disposition: str, applied: bool) -> str:
         return _unwritten_disposition_text(rid, str(entry.target_root), disposition, applied)
@@ -1560,14 +1573,19 @@ def get_tools() -> List[ToolEntry]:
                     "record a rejection and discard. Either DURABLY RECORDED disposition "
                     "releases the run's execution snapshot; a CONFLICT (a path drifted since "
                     "the snapshot) keeps snapshot and patch as resolution material you own. "
-                    "Read the captured diff (see delegate_wait's workspace_capture block) "
-                    "before applying — the run's output is a claim, not a verified result."
+                    "For a skill-payload run (delegate_start root='skill_payload') apply is "
+                    "instead a LIVE apply into the non-Git payload, guarded by a whole-payload "
+                    "content-hash CAS — nothing is staged into your active root — and the "
+                    "skill's existing review goes STALE: it must be re-run before the skill "
+                    "is relied on. Read the captured diff (see delegate_wait's "
+                    "workspace_capture block) before applying — the run's output is a claim, "
+                    "not a verified result."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "run_id": {"type": "string", "description": "The delegated run whose captured patch to integrate (from delegate_start)."},
-                        "decision": {"type": "string", "enum": ["apply", "reject"], "default": "apply", "description": "apply = stage the run's captured diff; reject = record a rejection and release the snapshot."},
+                        "decision": {"type": "string", "enum": ["apply", "reject"], "default": "apply", "description": "apply = integrate the run's captured diff (Git targets: applied and STAGED into your active root; skill-payload runs: applied LIVE into the non-Git payload under the content-hash CAS, nothing staged anywhere); reject = record a rejection and release the snapshot."},
                         "reason": {"type": "string", "description": "Optional rationale recorded in the verdict and the durable disposition row."},
                         "acknowledge_ambiguous": {"type": "boolean", "default": False, "description": "Set true ONLY after inspecting an INTEGRATE_DELEGATED_APPLY_AMBIGUOUS state (a crashed apply left a durable unresolved intent): resolves that stale intent and re-runs the normal disposition guards, which re-verify the tree. A no-op when no ambiguity is pending."},
                     },

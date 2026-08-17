@@ -14,7 +14,7 @@ import pathlib
 import queue
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import logging
 
@@ -23,9 +23,12 @@ from ouroboros.deadline_utils import seconds_until
 from ouroboros.llm import LLMClient, LocalContextTooLargeError, add_usage
 from ouroboros.observability import new_call_id, new_execution_id, persist_call
 from ouroboros.pricing import emit_llm_usage_event, estimate_cost_optional, infer_model_category
-from ouroboros.usage_accounting import UsageAccountingError
+from ouroboros.usage_accounting import (
+    PhysicalAttemptContext,
+    UsageAccountingError,
+    bind_physical_attempt_context,
+)
 from ouroboros.utils import append_jsonl, emit_log_event, sanitize_tool_result_for_log, truncate_review_artifact, utc_now_iso
-from ouroboros.config import get_context_mode
 
 log = logging.getLogger(__name__)
 
@@ -182,8 +185,15 @@ def _classify_empty_response(usage: Dict[str, Any], msg: Dict[str, Any]) -> Tupl
     transient budget. Only rate_limit / provider_transient body errors and a bare
     ``finish_reason=null`` glitch are retryable."""
     finish_reason = msg.get("finish_reason") or msg.get("stop_reason")
-    is_provider_glitch = finish_reason is None
+    if str(finish_reason or "").strip().lower() in _STRUCTURED_CONTEXT_OVERFLOW_CODES:
+        return "remote_context_overflow", False, True
     body_err = usage.get("provider_error") if isinstance(usage, dict) else None
+    if isinstance(body_err, dict) and any(
+        str(body_err.get(key) or "").strip().lower() in _STRUCTURED_CONTEXT_OVERFLOW_CODES
+        for key in ("code", "type")
+    ):
+        return "remote_context_overflow", False, True
+    is_provider_glitch = finish_reason is None
     body_kind = str((body_err or {}).get("kind") or "") if isinstance(body_err, dict) else ""
     permanent_body_error = bool(body_err) and body_kind not in ("rate_limit", "provider_transient")
     if permanent_body_error:
@@ -209,7 +219,7 @@ def _attempt_loop_budget(max_retries: int, attempt_cap: Optional[int]) -> int:
 def _record_and_emit_empty_response(
     *, usage, msg, accumulated_usage, event_queue, drive_logs, task_id, execution_id,
     round_id, llm_call_id, round_idx, attempt, model, task_type, content, tool_calls,
-    request_ref, response_ref, transient_budget,
+    request_ref, response_ref, transient_budget, context_fit_event_fields,
 ) -> tuple:
     """Classify an empty / no-tool-call response, log + emit its events, and stamp
     accumulated_usage (last error / execution_status / reason_code / F1 cooldown kind).
@@ -223,18 +233,26 @@ def _record_and_emit_empty_response(
         event_type, event_queue=event_queue, drive_logs=drive_logs,
         base={"task_id": task_id, "execution_id": execution_id, "round_id": round_id,
               "llm_call_id": llm_call_id, "round": round_idx, "attempt": attempt + 1,
-              "model": model, "finish_reason": finish_reason},
+              "model": model, "finish_reason": finish_reason,
+              **context_fit_event_fields},
         task_type=task_type,
         details={"content": content, "tool_calls": tool_calls,
                  "request_ref": request_ref, "response_ref": response_ref},
     )
     accumulated_usage["_last_llm_error"] = _short_error_text(log_msg)
-    accumulated_usage["execution_status"] = (
-        "infra_failed" if (is_provider_glitch and not permanent_body_error) else "failed"
-    )
-    accumulated_usage["reason_code"] = event_type
-    # Cooldown signal for the F1 fallback gate (see helper; not a retry change).
-    accumulated_usage["_last_llm_error_kind"] = _cooldown_kind_for_empty_response(usage, event_type)
+    if event_type == "remote_context_overflow":
+        accumulated_usage["execution_status"] = "infra_failed"
+        accumulated_usage["reason_code"] = "llm_api_error"
+        accumulated_usage["_last_llm_error_kind"] = "context_overflow"
+    else:
+        accumulated_usage["execution_status"] = (
+            "infra_failed" if (is_provider_glitch and not permanent_body_error) else "failed"
+        )
+        accumulated_usage["reason_code"] = event_type
+        # Cooldown signal for the F1 fallback gate (see helper; not a retry change).
+        accumulated_usage["_last_llm_error_kind"] = _cooldown_kind_for_empty_response(
+            usage, event_type,
+        )
     return event_type, is_provider_glitch, permanent_body_error
 
 
@@ -249,6 +267,11 @@ def _cooldown_kind_for_empty_response(usage: Dict[str, Any], event_type: str) ->
     cooldown is the second layer once that budget is exhausted)."""
     body_err = usage.get("provider_error") if isinstance(usage, dict) else None
     body_kind = str((body_err or {}).get("kind") or "") if isinstance(body_err, dict) else ""
+    if isinstance(body_err, dict):
+        body_code = str(body_err.get("code") or "").strip()
+        body_message = str(body_err.get("message") or "")
+        if body_code == "413" or _is_output_or_body_size_error(body_message):
+            return "request_too_large"
     return body_kind if body_kind in _COOLDOWN_ERROR_KINDS else event_type
 
 
@@ -318,6 +341,7 @@ class _LlmErrorContext:
     drive_logs: pathlib.Path
     event_queue: Optional[queue.Queue]
     accumulated_usage: Dict[str, Any]
+    context_fit_event_fields: Optional[Dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -352,16 +376,10 @@ def _short_error_text(value: Any, limit: int = 220) -> str:
     return text[: limit - 3] + "..."
 
 
-_CONTEXT_OVERFLOW_MARKERS = (
-    "context_length_exceeded",
-    "context length",
-    "maximum context",
-    "too many tokens",
-    "prompt is too long",
-    "reduce the length",
-    "exceeds the context",
-    "context window",
-    "input is too long",
+from ouroboros.context_budget import (  # one overflow vocabulary for every seam
+    CONTEXT_OVERFLOW_CODES as _STRUCTURED_CONTEXT_OVERFLOW_CODES,
+    context_overflow_message as _context_overflow_message,
+    output_or_body_size_message as _output_or_body_size_message,
 )
 _NON_RETRYABLE_PROVIDER_MARKERS = {
     "quota_exhausted": (
@@ -386,11 +404,8 @@ _NON_RETRYABLE_PROVIDER_MARKERS = {
         "output tokens",
         "maximum output",
         "too many tokens",
-        "context_length_exceeded",
-        "context length",
-        "maximum context",
-        "prompt is too long",
-        "exceeds the context",
+        "request body too large",
+        "body too large",
     ),
     "bad_request": (
         "badrequest",
@@ -432,13 +447,19 @@ def _is_rate_limit_text(text: str) -> bool:
 
 
 def _is_context_overflow_error(exc: Exception, safe_error: str) -> bool:
-    """Classify local/remote context-window overflow (drives the low-mode hint)."""
+    """Classify untyped local/remote context-window overflow.
+
+    The output-size precedence lives inside the SHARED helper, not here, so
+    Main, the local transport, and the summarizer classify identically."""
     if isinstance(exc, LocalContextTooLargeError):
         return True
-    low = str(safe_error or "").lower()
-    if _is_rate_limit_text(low):
+    if _is_rate_limit_text(safe_error):
         return False
-    return any(marker in low for marker in _CONTEXT_OVERFLOW_MARKERS)
+    return _context_overflow_message(safe_error)
+
+
+def _is_output_or_body_size_error(safe_error: str) -> bool:
+    return _output_or_body_size_message(safe_error)
 
 
 def _exception_status_code(exc: Exception) -> Optional[int]:
@@ -456,24 +477,38 @@ def _exception_status_code(exc: Exception) -> Optional[int]:
     return value if isinstance(value, int) else None
 
 
-def _exception_provider_code(exc: Exception, safe_error: str) -> str:
+def _exception_provider_values(exc: Exception) -> List[str]:
+    values: List[str] = []
+
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if text and text not in values:
+            values.append(text)
+
     for attr in ("code", "type"):
-        value = getattr(exc, attr, None)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
+        add(getattr(exc, attr, None))
     body = getattr(exc, "body", None)
     if isinstance(body, dict):
         for key in ("code", "type"):
-            value = body.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
+            add(body.get(key))
         nested = body.get("error")
         if isinstance(nested, dict):
             for key in ("code", "type"):
-                value = nested.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
-    return ""
+                add(nested.get(key))
+    capture = getattr(exc, "physical_attempt_capture", None)
+    if capture is not None:
+        add(getattr(capture, "provider_code", None))
+        add(getattr(capture, "provider_error_type", None))
+    return values
+
+
+def _exception_provider_code(exc: Exception, safe_error: str) -> str:
+    del safe_error
+    values = _exception_provider_values(exc)
+    for value in values:
+        if value.lower() in _STRUCTURED_CONTEXT_OVERFLOW_CODES:
+            return value
+    return values[0] if values else ""
 
 
 def _exception_provider_message(exc: Exception, safe_error: str = "") -> str:
@@ -527,6 +562,8 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
     status_code = _exception_status_code(exc)
     provider_code = _exception_provider_code(exc, safe)
     low = str(safe or "").lower()
+    if provider_code.lower() in _STRUCTURED_CONTEXT_OVERFLOW_CODES:
+        return LlmErrorClassification("context_overflow", False, status_code, provider_code)
     provider_kind = _provider_code_kind(provider_code)
     if provider_kind:
         return LlmErrorClassification(provider_kind, False, status_code, provider_code)
@@ -534,6 +571,8 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
         return LlmErrorClassification("provider_transient", True, status_code, provider_code)
     if _is_rate_limit_text(low):
         return LlmErrorClassification("provider_transient", True, status_code, provider_code)
+    if _is_output_or_body_size_error(low):
+        return LlmErrorClassification("request_too_large", False, status_code, provider_code)
     if _is_context_overflow_error(exc, safe):
         return LlmErrorClassification("context_overflow", False, status_code, provider_code)
     for kind, markers in _NON_RETRYABLE_PROVIDER_MARKERS.items():
@@ -627,11 +666,8 @@ def _record_llm_call_error(
 ) -> bool:
     """Record and classify an LLM-round exception.
 
-    Emits the live ``llm_round_error`` log and the durable ``llm_api_error``
-    event, marks the usage as infra-failed, and writes context-overflow
-    diagnostics. A remote-context overflow outside low context mode sets the
-    one-time owner hint (``context_overflow_suggest_low``). Returns True for a
-    local context overflow, signalling the caller to stop retrying.
+    Emits live/durable error evidence, marks usage as infra-failed, and returns
+    whether the caller must stop retrying the unchanged request.
     """
     safe_error = sanitize_tool_result_for_log(repr(error))
     classification = classify_llm_exception(error, safe_error)
@@ -663,6 +699,7 @@ def _record_llm_call_error(
         "status_code": classification.status_code,
         "provider_code": classification.provider_code,
         "provider_message": provider_message,
+        **(ctx.context_fit_event_fields or {}),
         "request_ref": ctx.request_ref.get("manifest_ref") if ctx.request_ref else None,
     })
     ctx.accumulated_usage["_last_llm_error"] = _short_error_text(safe_error)
@@ -680,22 +717,7 @@ def _record_llm_call_error(
         ctx.accumulated_usage["_last_llm_status_code"] = classification.status_code
     if classification.provider_code:
         ctx.accumulated_usage["_last_llm_provider_code"] = classification.provider_code
-    ctx.accumulated_usage["execution_status"] = "infra_failed"
-    ctx.accumulated_usage["reason_code"] = "llm_api_error"
-    # Context-window overflow while NOT already in low: surface a one-time owner
-    # hint to switch to low context mode (rendered by the recovery-hint helper).
-    if get_context_mode() != "low" and classification.kind == "context_overflow":
-        ctx.accumulated_usage["context_overflow_suggest_low"] = True
-        append_jsonl(ctx.drive_logs / "events.jsonl", {
-            "ts": utc_now_iso(),
-            "type": "context_overflow_suggest_low",
-            "task_id": ctx.task_id,
-            "execution_id": ctx.execution_id,
-            "round": ctx.round_idx,
-            "attempt": ctx.attempt + 1,
-            "model": ctx.model,
-            "error": safe_error,
-        })
+    ctx.accumulated_usage.update(execution_status="infra_failed", reason_code="llm_api_error")
     if classification.kind == "context_overflow":
         overflow_event_type = "local_context_overflow" if isinstance(error, LocalContextTooLargeError) else "remote_context_overflow"
         append_jsonl(ctx.drive_logs / "events.jsonl", {
@@ -709,6 +731,7 @@ def _record_llm_call_error(
             "attempt": ctx.attempt + 1,
             "model": ctx.model,
             "error": safe_error,
+            **(ctx.context_fit_event_fields or {}),
         })
         return True
     if not classification.retry_same_request:
@@ -765,6 +788,19 @@ def _context_fit_event_fields(usage: Dict[str, Any]) -> Dict[str, Any]:
         "context_route_fp": str(usage.get("_context_route_fp") or ""),
         "estimated_prompt_tokens": int(usage.get("_context_prompt_estimate") or 0),
         "context_fit_mode": str(usage.get("_context_fit_mode") or ""),
+        "context_profile": str(usage.get("_context_profile") or ""),
+        "context_measurement_basis": str(usage.get("_context_measurement_basis") or ""),
+        "context_measurement_density": float(usage.get("_context_measurement_density") or 0.0),
+        "context_target_total_tokens": usage.get("_context_target_total_tokens"),
+        "context_capacity_total_tokens": usage.get("_context_capacity_total_tokens"),
+        "context_target_deficit_tokens": usage.get("_context_target_deficit_tokens"),
+        "context_capacity_deficit_tokens": usage.get("_context_capacity_deficit_tokens"),
+        "context_reclaim_goal_tokens": int(usage.get("_context_reclaim_goal_tokens") or 0),
+        "context_target_miss": bool(usage.get("_context_target_miss")),
+        "context_automatic_pass_used": bool(usage.get("_context_automatic_pass_used")),
+        "context_predicted_capacity_miss": bool(
+            usage.get("_context_predicted_capacity_miss")
+        ),
     }
 
 
@@ -805,6 +841,52 @@ def _record_round_cache_facts(
     return prompt_cache_ttl, cache_hit_rate, cache_cold_restart, gap_since_prev_round_sec
 
 
+def _prepare_main_messages(
+    messages: List[Dict[str, Any]],
+    *,
+    model: str,
+    llm: LLMClient,
+    accumulated_usage: Dict[str, Any],
+    drive_root: pathlib.Path,
+    task_id: str,
+    event_queue: Optional[queue.Queue],
+    use_local: bool,
+) -> List[Dict[str, Any]]:
+    try:
+        from ouroboros.vision_routing import VisionRoutingContext, prepare_messages_for_send
+
+        return prepare_messages_for_send(
+            messages,
+            routing=VisionRoutingContext(
+                model=model, llm=llm, accumulated_usage=accumulated_usage,
+                drive_root=drive_root, task_id=task_id, event_queue=event_queue,
+                use_local=use_local,
+            ),
+        )
+    except Exception:
+        log.debug("vision routing preparation failed; falling back to canonical messages", exc_info=True)
+        return messages
+
+
+def _send_main_candidate(
+    llm: LLMClient,
+    kwargs: Dict[str, Any],
+    *,
+    model: str,
+    use_local: bool,
+    deadline_ts: Optional[float],
+    physical_context: Optional[PhysicalAttemptContext],
+    candidate_predicate: Optional[Callable[[Any], Any]],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    with model_concurrency.model_call_slot(model, use_local, deadline_ts):
+        if physical_context is None:
+            return llm.chat(**kwargs)
+        with bind_physical_attempt_context(
+            physical_context, candidate_predicate=candidate_predicate,
+        ):
+            return llm.chat(**kwargs)
+
+
 def call_llm_with_retry(
     llm: LLMClient,
     messages: List[Dict[str, Any]],
@@ -822,6 +904,8 @@ def call_llm_with_retry(
     deadline_ts: Optional[float] = None,
     attempt_cap: Optional[int] = None,
     allow_server_web_search: bool = False,
+    physical_context: Optional[PhysicalAttemptContext] = None,
+    candidate_predicate: Optional[Callable[[Any], Any]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
     """Call one model with failure-class retry budgets and usage events.
 
@@ -832,6 +916,11 @@ def call_llm_with_retry(
     drive_root = pathlib.Path(drive_logs).parent
     execution_id = str(accumulated_usage.setdefault("execution_id", new_execution_id()))
     round_id = f"{execution_id}:round:{round_idx}"
+    context_fit_event_fields = (
+        _context_fit_event_fields(accumulated_usage)
+        if physical_context is not None
+        else {}
+    )
     transient_budget = _attempt_loop_budget(max_retries, attempt_cap)
     response_cache_bypass_requested = False
     for attempt in range(transient_budget):
@@ -839,24 +928,11 @@ def call_llm_with_retry(
         llm_call_id = new_call_id("llm")
         request_ref: Dict[str, Any] = {}
         try:
-            send_messages = messages
-            try:
-                from ouroboros.vision_routing import VisionRoutingContext, prepare_messages_for_send
-
-                send_messages = prepare_messages_for_send(
-                    messages,
-                    routing=VisionRoutingContext(
-                        model=model,
-                        llm=llm,
-                        accumulated_usage=accumulated_usage,
-                        drive_root=drive_root,
-                        task_id=task_id,
-                        event_queue=event_queue,
-                        use_local=use_local,
-                    ),
-                )
-            except Exception:
-                log.debug("vision routing preparation failed; falling back to canonical messages", exc_info=True)
+            send_messages = _prepare_main_messages(
+                messages, model=model, llm=llm, accumulated_usage=accumulated_usage,
+                drive_root=drive_root, task_id=task_id, event_queue=event_queue,
+                use_local=use_local,
+            )
             _emit_live_log(event_queue, {
                 "type": "llm_round_started",
                 "task_id": task_id,
@@ -907,21 +983,22 @@ def call_llm_with_retry(
                         "model": model,
                         "reasoning_effort": effort,
                         "response_cache_bypass_requested": response_cache_bypass_requested,
-                        **_context_fit_event_fields(accumulated_usage),
+                        **context_fit_event_fields,
                     },
                 )
             except Exception:
                 log.debug("Failed to persist LLM request observability payload", exc_info=True)
-            # Cap only the provider call, not retries/backoff; fail-soft and deadline-bounded.
-            with model_concurrency.model_call_slot(model, use_local, deadline_ts):
-                resp_msg, usage = llm.chat(**kwargs)
+            # Vision preparation is outside the Main-only physical binding.
+            resp_msg, usage = _send_main_candidate(
+                llm, kwargs, model=model, use_local=use_local, deadline_ts=deadline_ts,
+                physical_context=physical_context, candidate_predicate=candidate_predicate,
+            )
             msg = resp_msg
             accumulated_usage.pop("_last_llm_error", None)
             accumulated_usage.pop("_last_llm_error_kind", None)
             accumulated_usage.pop("_last_llm_retry_same_request", None)
             accumulated_usage.pop("_last_llm_status_code", None)
             accumulated_usage.pop("_last_llm_provider_code", None)
-            accumulated_usage.pop("context_overflow_suggest_low", None)
 
             cost, display_model, provider, cost_estimated = _normalize_usage_cost(
                 usage,
@@ -990,6 +1067,7 @@ def call_llm_with_retry(
                     llm_call_id=llm_call_id, round_idx=round_idx, attempt=attempt, model=model,
                     task_type=task_type, content=content, tool_calls=tool_calls,
                     request_ref=request_ref, response_ref=response_ref, transient_budget=transient_budget,
+                    context_fit_event_fields=context_fit_event_fields,
                 )
                 if event_type == "provider_incomplete_response" and not usage.get("provider_error"):
                     response_cache_bypass_requested = True
@@ -1037,7 +1115,7 @@ def call_llm_with_retry(
                 "cache_cold_restart": cache_cold_restart,
                 "gap_since_prev_round_sec": gap_since_prev_round_sec,
                 "cost_usd": cost,
-                **_context_fit_event_fields(accumulated_usage),
+                **context_fit_event_fields,
                 "request_ref": request_ref.get("manifest_ref") if request_ref else None,
                 "response_ref": response_ref.get("manifest_ref") if response_ref else None,
             }
@@ -1083,6 +1161,7 @@ def call_llm_with_retry(
                     drive_logs=drive_logs,
                     event_queue=event_queue,
                     accumulated_usage=accumulated_usage,
+                    context_fit_event_fields=context_fit_event_fields,
                 ),
             ):
                 break

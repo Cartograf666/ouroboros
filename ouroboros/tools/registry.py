@@ -934,6 +934,16 @@ def _target_binding_operation(name: str, args: dict[str, Any]) -> str | None:
         return "service" if name == "start_service" else "shell"
     if name == "verify_and_record" and str(args.get("contract_kind") or "") in _VERIFY_RUN_KINDS:
         return "shell"
+    # CONDITIONAL, never a static map entry (R1 item 1): delegate_start becomes
+    # target-bound only when it explicitly selects an exact skill payload; a
+    # plain or retry call keeps its current active-workspace behavior untouched.
+    # ONLY the known selector value binds here — any other root value falls
+    # through to the handler's TYPED unsupported_root refusal instead of an
+    # untyped ValueError from binding construction (gate fix 9).
+    if (name == "delegate_start"
+            and str(args.get("root") or "").strip() == "skill_payload"
+            and not str(args.get("retry_of") or "").strip()):
+        return "write"
     return None
 
 
@@ -1044,6 +1054,15 @@ def _build_builtin_target_binding(ctx: Any, name: str, args: dict[str, Any]) -> 
             ctx,
             operation=operation,
             process_cwd=str(args.get("cwd") or ""),
+            bucket=str(args.get("bucket") or ""),
+            skill_name=str(args.get("skill_name") or ""),
+        )
+    if name == "delegate_start":
+        return build_resolved_resource_binding(
+            ctx,
+            root=str(args.get("root") or ""),
+            operation="write",
+            path=".",
             bucket=str(args.get("bucket") or ""),
             skill_name=str(args.get("skill_name") or ""),
         )

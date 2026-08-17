@@ -1388,35 +1388,25 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
     async function saveWizardPayload(payload) {
         const result = await completeOnboardingAtomically(payload);
-        // Setup is over: release the Agents step's status subscription and its
-        // login-job timer before the shell takes the page away. AWAIT it — the
-        // step answers whether the login was genuinely let go, and announcing
-        // completion first would navigate away while a create POST was still in
-        // flight, stranding a live login job with nobody left to cancel it.
-        // The disposer is retryable by contract, and this is the LAST moment it
-        // can run: announceCompletion takes the page away, and with the page
-        // goes the only client that knows the job id. So a refused release is
-        // retried a bounded number of times before giving up — which is what
-        // turns the realistic cause (a daemon blip during the DELETE) into a
-        // proven cancel instead of an orphan.
-        let released = await agentsStep?.dispose();
-        for (let attempt = 0; released === false && attempt < LOGIN_RELEASE_RETRIES; attempt += 1) {
+        // Ask once for the exact custody result. A known retained job cannot be
+        // improved by repeating cancel; only an unknown transport result gets
+        // the existing bounded retry window. Completion still leaves honestly:
+        // detach is local-only and never claims the process stopped.
+        let custody = agentsStep ? await agentsStep.dispose() : 'released';
+        for (let attempt = 0; custody === 'unknown' && attempt < LOGIN_RELEASE_RETRIES; attempt += 1) {
             await new Promise((resolve) => setTimeout(resolve, LOGIN_RELEASE_RETRY_MS));
-            released = await agentsStep?.dispose();
+            custody = await agentsStep.dispose();
         }
-        if (released === false) {
-            // Still unproven. The controller kept the job id, but nothing here
-            // can act on it once the page is gone, so this is a DISCLOSED
-            // residual rather than a handled one: the engine owns that job and
-            // settles it on its own. Completion is still announced, because the
-            // save LANDED — withholding it would be the larger lie and would
-            // send the owner back through an onboarding that is already done.
-            console.warn('onboarding: a sign-in could not be confirmed cancelled after '
+        if (custody === 'retained') {
+            console.warn('onboarding: the agent engine could not confirm that the sign-in process stopped; '
+                + 'the next Connect will return to that attempt.');
+        } else if (custody === 'unknown') {
+            console.warn('onboarding: sign-in cleanup remained unknown after '
                 + `${LOGIN_RELEASE_RETRIES + 1} attempts; the agent engine still owns that job `
-                + 'and will settle it.');
-        } else {
-            agentsStep = null;
+                + 'and the next Connect will recover its current state.');
         }
+        agentsStep?.detach();
+        agentsStep = null;
         announceCompletion(result);
         return 'ok';
     }

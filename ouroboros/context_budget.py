@@ -1,8 +1,8 @@
 """Single source of truth for AGENT-context size budgets.
 
 These govern the size of Ouroboros's OWN working context: the main-loop
-assembled prompt, tool-history compaction triggers, and the background
-consciousness context guards.
+assembled prompt, the typed context-reclaim request/receipt contract, and
+the background consciousness context guards.
 
 They are deliberately SEPARATE from the REVIEW-prompt budget family
 (``ouroboros.tools.review_helpers.REVIEW_PROMPT_TOKEN_BUDGET`` and the
@@ -10,10 +10,10 @@ They are deliberately SEPARATE from the REVIEW-prompt budget family
 prompts, not the agent's own context. Merging the two would couple unrelated
 concerns and is explicitly avoided.
 
-Constants only (no functions) so this module stays free against the codebase
-function-count gate (``ouroboros.review.MAX_TOTAL_FUNCTIONS``). Profile-keyed
-resolution (the low/max context modes) is layered on later without renaming
-these constants.
+Constants, frozen context-reclaim records, and pure classification helpers
+only. This module must stay import-pure: no imports from ``ouroboros.llm``,
+``ouroboros.loop*``, or any other runtime module, so every seam can import
+the shared vocabulary without cycles.
 
 Char-based guards assume the ~chars/4 estimate (``ouroboros.utils.estimate_tokens``);
 the comments give the approximate token equivalents.
@@ -21,44 +21,150 @@ the comments give the approximate token equivalents.
 
 from __future__ import annotations
 
-# Main-loop emergency tool-history compaction trigger (~300K tokens at chars/4).
-# Remote routine compaction stays off by design; this is the overflow backstop.
-# NECESSITY is judged on this budget in CALIBRATED real tokens (chars/4 × the
-# main-loop measured density, neutral 1.0 cold): on a ~1.7×-dense Claude route
-# the raw-char form silently meant ~500K real tokens, engaging only deep into
-# the task and then thrashing (see the hysteresis constants below).
-#
-# THE NUMBER IS A REAL-TOKEN BUDGET, NOT A CHAR COUNT — say the consequence out
-# loud, because it is the opposite of what the name reads like. The comparison is
-# (chars/4 + tool_schema_tokens) × density > CONST/4, so the transcript the agent
-# may hold shrinks with BOTH density and the tool envelope. Measured fire points
-# (tests/test_loop_compaction.py::test_emergency_trigger_fire_points_are_pinned
-# drives the real decision and pins these):
-#   max, density 1.0, no schemas ......... ~1.20M chars  (the constant, verbatim)
-#   max, density 1.0, 37K schema tokens ... ~1.06M chars  (1.14x earlier)
-#   max, density 1.7, no schemas .......... ~708K chars   (1.70x earlier)
-#   max, density 1.7, 37K schema tokens ... ~559K chars   (2.14x earlier)
-#   low, density 1.7, 37K schema tokens ... ~91K chars    (4.40x earlier)
-# The dense Claude lane (the production main loop) is therefore ~2.1x more eager
-# in max mode than the raw constant suggests — deliberate under the v6.91 owner
-# decision "necessity = total calibrated pressure" (an immutable core otherwise
-# overflows the window with no trigger at all), and affordable only because the
-# UTILITY hysteresis below stops a futile pass from refiring every round. If that
-# eagerness ever has to come down, move the CONSTANT with these numbers in hand;
-# do not density-scale the threshold, which would cancel the calibration out.
-EMERGENCY_COMPACTION_CHARS = 1_200_000
+from dataclasses import dataclass
+from typing import Any, Dict, Literal, Optional, Tuple
 
-# Emergency-compaction hysteresis (the necessity-vs-utility split). NECESSITY
-# (compact at all?) is total calibrated pressure — the frozen frame (system
-# blocks + tools + protected/kept rounds) counts toward the provider window.
-# UTILITY (can a pass help?) is the COMPACTABLE region only: after a pass that
-# could NOT get the context below the trigger (the frame alone exceeds it —
-# the submarine wave3 shape: 35/35 rounds fired, each pass a light-model call
-# plus a transcript rewrite that collapsed the prompt cache to the static
-# floor), further passes are suppressed until the compactable transcript grows
-# by this factor or this many rounds pass, whichever is first.
-COMPACTION_HYSTERESIS_REGION_GROWTH = 1.2
-COMPACTION_HYSTERESIS_ROUNDS = 10
+# Owner-selected Low's total-context economy/short-window target. This is an
+# elastic target, not a provider admission ceiling: Phase 2 measures the sealed
+# Main input plus its unchanged response reserve against T and the selected
+# route capacity W, requests at most one useful reclaim pass, then sends best
+# effort. Crossing T never creates a task failure.
+OWNER_LOW_TARGET_TOKENS = 200_000
+
+# One overflow vocabulary for every seam that must recognize a CONTEXT-WINDOW
+# overflow (Main provider-code precedence, the local transport, and the
+# summarizer split path). A provider code or message shape added here reaches
+# all three seams at once; per-module copies drifted independently before.
+CONTEXT_OVERFLOW_CODES = frozenset({
+    "context_length_exceeded",
+    "context_window_exceeded",
+    "model_context_window_exceeded",
+    "prompt_too_long",
+    "input_too_long",
+})
+CONTEXT_OVERFLOW_MESSAGE_MARKERS = (
+    "context_length_exceeded",
+    "context length",
+    "maximum context",
+    "prompt is too long",
+    "exceeds the context",
+    "context window",
+    "input is too long",
+)
+# OUTPUT/body-size limits take precedence over overflow markers: a message like
+# "max_tokens 65536 exceeds maximum context length 32768" is an output-limit
+# rejection, not a window overflow — shrinking the prompt cannot fix it.
+OUTPUT_OR_BODY_SIZE_MARKERS = (
+    "max_tokens",
+    "maximum tokens",
+    "output tokens",
+    "maximum output",
+    "request body too large",
+    "body too large",
+)
+
+
+def output_or_body_size_message(text: Any) -> bool:
+    """True when a provider error message names an output/body-size limit."""
+    low = str(text or "").lower()
+    return any(marker in low for marker in OUTPUT_OR_BODY_SIZE_MARKERS)
+
+
+def context_overflow_message(text: Any) -> bool:
+    """True when a provider error message matches the shared overflow markers.
+
+    Applies the output-size precedence itself so every seam (Main classifier,
+    local transport, summarizer split) classifies identically: a message that
+    matches an output/body-size marker is NOT a context overflow. Callers check
+    structured overflow codes first; a structured code still wins over this
+    message-level verdict.
+    """
+    low = str(text or "").lower()
+    if any(marker in low for marker in OUTPUT_OR_BODY_SIZE_MARKERS):
+        return False
+    return any(marker in low for marker in CONTEXT_OVERFLOW_MESSAGE_MARKERS)
+
+MeasurementBasis = Literal["fresh_route_usage", "fresh_model_usage", "cold_estimate"]
+ReclaimStatus = Literal[
+    "applied", "no_eligible", "no_positive_reclaim", "checkpoint_failed",
+    "summarizer_failed", "no_measurable_shrink", "binding_mismatch",
+]
+
+
+@dataclass(frozen=True)
+class ContextReclaimRequest:
+    route_fp: str
+    round_id: str
+    transcript_sha256: str
+    measurement_basis: MeasurementBasis
+    measurement_density: float
+    reclaim_goal_tokens: int
+    allow_partial_shrink: bool = True
+
+
+@dataclass(frozen=True)
+class ContextReclaimReceipt:
+    status: ReclaimStatus
+    before_transcript_sha256: str
+    after_transcript_sha256: str
+    selection_fingerprint: str
+    selected_unit_ids: Tuple[str, ...]
+    reclaimed_tokens: int
+    goal_reached: bool
+    checkpoint_ref: Optional[Dict[str, Any]]
+    capsule_refs: Tuple[Dict[str, Any], ...]
+
+
+class SummarizerContextOverflow(RuntimeError):
+    """Typed permission to split one summarizer batch or source."""
+
+
+class _UnsafeVisual(ValueError):
+    pass
+
+
+class _UnitSummaryFailure(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class _AtomicUnit:
+    unit_id: str
+    start: int
+    end: int
+    raw_sha256: str
+    raw_size_bytes: int
+    context_size_tokens: int
+    source_text: str
+    source_sha256: str
+    predicted_reclaim_tokens: int
+    generation: int
+    lineage_hashes: Tuple[str, ...]
+    source_refs: Tuple[Dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class _SelectedUnit:
+    unit: _AtomicUnit
+    summary_budget_tokens: int
+    negative_memo_key: str
+
+
+@dataclass(frozen=True)
+class _Selection:
+    units: Tuple[_SelectedUnit, ...]
+    fingerprint: str
+    predicted_reclaim_tokens: int
+
+
+@dataclass(frozen=True)
+class _Part:
+    root_id: str
+    source_id: str
+    start_char: int
+    end_char: int
+    text: str
+    sha256: str
 
 # Background-consciousness assembled-context guards. P1: fail fast, never
 # silently truncate cognitive artifacts.
@@ -71,28 +177,10 @@ BG_STATE_JSON_WARN_CHARS = 200_000
 # WARN threshold for a single oversized governance/knowledge context section.
 LARGE_CONTEXT_SECTION_CHARS = 200_000
 
-# Main-loop assembled-context soft cap (tokens). A no-op recorder
-# (P1 no-silent-truncation); the live transcript is bounded by compaction below.
-CONTEXT_SOFT_CAP_TOKENS = 200_000
-
-# --- Low-profile (≈200K window / local models) overrides -------------------
-# These tighten the live working set in low context mode. They never shorten the
-# memory HORIZON: recent dialogue is only coarsened when older dialogue is
-# already represented by valid consolidation, and tool-history transcript
-# compaction persists a forensic checkpoint before summarizing.
-
 # Raw recent-dialogue tail shown when no valid consolidation can represent older
-# dialogue. Low mode keeps this horizon rather than silently shortening it.
+# dialogue. The universal temporal renderer remains issue #220; this PR neither
+# shortens nor reinterprets that horizon.
 MAX_RECENT_CHAT_TAIL = 1000
-
-# Low fires emergency tool-history compaction earlier (~100K tokens at chars/4)
-# to fit a ~200K window, and (unlike max) also enables remote routine compaction.
-# The owner low/max context MODE is the SSOT for the agent's own operating
-# window (v6.33.0 BIBLE P1): low => this 400K trigger + routine compaction; max
-# => the 1.2M emergency-only trigger. There is no per-model window table; the
-# reactive provider-overflow detector (context.py) is the safety net if a route's
-# real window is smaller than the mode assumes.
-LOW_EMERGENCY_COMPACTION_CHARS = 400_000
 
 # --- Native image blocks (v6.26.0 multimodal chat) ---------------------------
 # Char-equivalent for ONE image block in chars/4 token estimates (~1.1K tokens):

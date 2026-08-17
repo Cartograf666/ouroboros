@@ -43,13 +43,14 @@ from starlette.responses import JSONResponse
 
 from ouroboros.config import DATA_DIR
 from ouroboros.config import SETTINGS_DEFAULTS as _SETTINGS_DEFAULTS
+from ouroboros.context_mode_compat import normalize_context_mode_compat
 from ouroboros.gateway._helpers import json_error, request_drive_root
 from ouroboros.utils import append_jsonl, atomic_write_json, utc_now_iso
 
 log = logging.getLogger(__name__)
 
-# The context mode and its derived authority bit are authored together, by the owner endpoint
-# or by the system auto-downgrade — never by a generic save (see prepare_settings_for_persist).
+# The context mode and its one-window false provenance tombstone are authored together by
+# the owner endpoint, never by a generic save (see prepare_settings_for_persist).
 _CONTEXT_MODE_KEYS = ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW")
 
 
@@ -169,6 +170,9 @@ def _owner_read_settings_raw() -> Dict[str, Any]:
         if _config.SETTINGS_PATH.exists():
             raw = json.loads(_config.SETTINGS_PATH.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
+                raw = normalize_context_mode_compat(
+                    raw, settings_path=_config.SETTINGS_PATH, warn_ambiguous=True,
+                )
                 merged.update(raw)
     except Exception:
         log.debug("Failed to read raw owner settings; using defaults", exc_info=True)
@@ -188,8 +192,8 @@ def _owner_write_settings(
 
     Skipping that ONE ratchet is the whole reason this writer exists; everything else comes from
     ``config.prepare_settings_for_persist``, the single point both persisting writers pass through.
-    An endpoint that genuinely authors a disk-authored key (context mode, safety mode, the derived
-    auto-low flag) must name it in ``authored_keys`` — otherwise a POST about an unrelated key would
+    An endpoint that genuinely authors a disk-authored key (context mode, safety mode, the false
+    compatibility tombstone) must name it in ``authored_keys`` — otherwise a POST about an unrelated key would
     author a mode decision out of the defaults merge that ``_owner_read_settings_raw`` performs.
 
     The settings lock is REQUIRED, not attempted: a timed-out acquisition raises

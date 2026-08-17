@@ -33,6 +33,7 @@ if __package__ in {None, ""}:
 
 from devtools.benchmarks.common.manifests import runtime_attestation
 from devtools.benchmarks.common.secrets import isolated_credential_grants  # noqa: F401 (re-export)
+from ouroboros.context_mode_compat import normalize_context_mode_compat
 from ouroboros.provider_models import ALL_PROVIDER_CREDENTIAL_KEYS, provider_credential_plan
 from ouroboros.platform_layer import (
     kill_pid_tree,
@@ -81,9 +82,8 @@ _ISO_SETTINGS_ALLOW_EXACT = frozenset({
     # falls back to the "auto" default and the end-of-task review never runs).
     "OUROBOROS_TASK_REVIEW_MODE", "OUROBOROS_REVIEW_ENFORCEMENT",
     "CLAUDE_CODE_MODEL", "CLAUDE_AGENT_SDK_MODEL",
-    # The DERIVED auto-low flag travels with the context mode: without it a host
-    # sitting in an auto-downgraded `low` would hand the isolated server a bare
-    # `low`, and get_owner_context_mode resolves an absent flag fail-closed.
+    # One-window false provenance tombstone: it travels with an explicit Low so
+    # the isolated run keeps owner-Low/P3 semantics. Legacy true is normalized.
     "TOTAL_BUDGET", "OUROBOROS_PER_TASK_COST_USD", "OUROBOROS_CONTEXT_MODE",
     "OUROBOROS_CONTEXT_MODE_AUTO_LOW",
 })
@@ -137,6 +137,10 @@ def build_isolated_settings(live_cfg: dict, **overrides) -> dict:
         if ks in _ISO_SETTINGS_ALLOW_EXACT or ks.startswith(_ISO_SETTINGS_ALLOW_PREFIX):
             out[ks] = value
     out.update(overrides)
+    if "OUROBOROS_CONTEXT_MODE" in overrides and "OUROBOROS_CONTEXT_MODE_AUTO_LOW" not in overrides:
+        # A benchmark override is an explicit operator choice, not ambiguous legacy disk state.
+        out["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
+    out = normalize_context_mode_compat(out)
     for key in provider_credential_plan(out)["planned_keys"]:
         if key in (overrides or {}):
             continue

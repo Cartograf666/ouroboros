@@ -1,52 +1,78 @@
 import {
-    accountedUpperBound,
-    accountedUpperBoundWithChildren,
     escapeHtmlAttr,
     escapeHtmlText as escapeHtml,
-    formatUsdWhole,
     renderMarkdown,
 } from './utils.js';
 import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
 import { downloadViaHostBridge, openViaHostBridge } from './ui_helpers.js';
-import { apiClient, apiFetch, cancelTask } from './api_client.js';
+import { apiClient, apiFetch, fetchTaskDetail } from './api_client.js';
 import {
+    OWNER_STOP_DETAIL_MARKER,
+    OWNER_STOP_DONE_HEADLINE,
     formatReviewProjection,
     getLogTaskGroupId,
     isGroupedTaskEvent,
     normalizeLogTs,
+    ownerHurryProjection,
     summarizeChatLiveEvent,
     taskCancelPending,
     taskOutcomeSeverity,
+    taskSoftStopPending,
+    taskStoppedWithSummary,
     taskTerminalPhase,
 } from './log_events.js';
+import {
+    ACTION_FINALIZE,
+    ACTION_HURRY,
+    REUSABLE_TASK_IDS,
+    TASK_CONTROL_TRIGGER_LABEL,
+    cancelRunEligibility,
+    hurryTaskAction,
+    openTaskControlMenu,
+    requestStop,
+    taskControlBusy,
+} from './task_control_menu.js';
 import { openConfirmDialog } from './confirm_dialog.js';
+import { renderSkillReviewDisclosure, wireSkillReviewDisclosure } from './skill_review_card.js';
 import {
     createHistoryResyncScheduler,
     createRebuildBatch,
     loadOlderControlState,
     nextQuotaEscalation,
 } from './chat_render_batch.js';
+import {
+    COLLAPSED_ACTIVITY_MAX,
+    boundActivityPreview,
+    clearStickyCardState,
+    computeDerivedChatStatus,
+    computeHydratedDirectActivities,
+    headerBudgetPresentation,
+    isTerminalTaskPhase,
+    liveLineRowToggleKey,
+    mergeStickyCostMeta,
+    projectCollapsedActivity,
+    rawTimestampEpoch,
+    taskCostMeta,
+    taskCostProjection,
+} from './chat_activity.js';
 
-// Row-surface disclosure guard (v6.71.0), pure for node tests: returns the
-// lineKey to toggle for a click landing on `target`, or '' when the click must
-// NOT toggle (nested interactive element, or an active text selection inside
-// the line).
-export function liveLineRowToggleKey(target, selection = null) {
-    const line = target?.closest?.('.chat-live-line.expandable');
-    if (!line) return '';
-    if (target.closest('button, a, input, textarea, select, label, summary, [contenteditable="true"]')) return '';
-    if (selection && !selection.isCollapsed && line.contains(selection.anchorNode)) return '';
-    return (line.dataset && line.dataset.liveLineKey) || '';
-}
-
-/** Convert a raw source timestamp to sortable epoch milliseconds. */
-export function rawTimestampEpoch(raw) {
-    if (raw == null || raw === '') return NaN;
-    const epoch = typeof raw === 'number' ? raw : Date.parse(String(raw));
-    return Number.isFinite(epoch) ? epoch : NaN;
-}
+export {
+    COLLAPSED_ACTIVITY_MAX,
+    boundActivityPreview,
+    clearStickyCardState,
+    computeDerivedChatStatus,
+    computeHydratedDirectActivities,
+    headerBudgetPresentation,
+    isTerminalTaskPhase,
+    liveLineRowToggleKey,
+    mergeStickyCostMeta,
+    projectCollapsedActivity,
+    rawTimestampEpoch,
+    taskCostMeta,
+    taskCostProjection,
+};
 
 /**
  * Insert a top-level timeline node chronologically while keeping typing last.
@@ -102,190 +128,6 @@ const MAX_PENDING_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 // mirrored into Main, but must still produce exactly one toast.
 const shownIncidentToastKeys = new Set();
 
-function optionalFiniteNumber(value) {
-    if (value === null || value === undefined || value === '') return null;
-    const number = Number(value);
-    return Number.isFinite(number) ? number : null;
-}
-
-/** Pure presentation projection used by the header and dependency-free tests. */
-export function headerBudgetPresentation(data) {
-    if (!data || data.accounting_loading === true) {
-        return { state: 'loading', label: 'Loading…', fillPct: 0 };
-    }
-    if (data?.accounting?.available === false) {
-        return { state: 'unavailable', label: 'Unavailable', fillPct: 0 };
-    }
-    // Older state shapes did not carry accounting.available.  Keep accepting
-    // them when they contain a real numeric projection, but never coerce null
-    // (ledger failure in the new shape) into a convincing $0.
-    const spent = optionalFiniteNumber(data.spent_usd);
-    if (spent === null) {
-        return { state: 'unavailable', label: 'Unavailable', fillPct: 0 };
-    }
-    const rawLimit = optionalFiniteNumber(data.budget_limit);
-    const limit = rawLimit !== null && rawLimit > 0 ? rawLimit : 0;
-    const label = typeof data.budget_text === 'string' && data.budget_text.trim()
-        ? data.budget_text
-        : `${formatUsdWhole(spent)} / ${limit > 0 ? formatUsdWhole(limit) : '∞'}`;
-    return {
-        state: 'available',
-        label,
-        fillPct: limit > 0 ? Math.min(100, Math.max(0, (spent / limit) * 100)) : 0,
-    };
-}
-
-/**
- * Render task money without conflating unknown/non-final values with a final
- * zero.  The returned strings are card metadata, not another cost authority.
- */
-export function taskCostMeta(payload = {}) {
-    const has = (key) => Object.prototype.hasOwnProperty.call(payload, key);
-    // Task-scope accounting evidence only (v6.82 P1): a bare `cost_usd` is NOT
-    // enough — llm_round_finished carries a per-round delta under that key, and
-    // rendering it as task cost lied on the card. Subagent progress_meta and
-    // task_done/task_cost_finalized frames carry cost_accounting_status /
-    // cost_final alongside cost_usd, so honest task-scope frames still qualify.
-    const hasAccountingEvidence = [
-        'cost_accounting_status', 'cost_final',
-        'cost_usd_with_children', 'cost_with_children_partial',
-        'accounted_upper_bound_usd', 'accounted_upper_bound_usd_with_children',
-        'reserved_usd', 'unresolved_upper_bound_usd', 'unknown_unmetered',
-    ].some(has);
-    if (!hasAccountingEvidence) return [];
-    if (payload.cost_accounting_status === 'unavailable') return ['cost unavailable'];
-
-    // C2/F12: ONE precedence resolver, shared with the Python seams and with
-    // log_events — the deprecated alias wins a diverged pair, so the read side
-    // and the write side never pick opposite winners for the same record.
-    const own = accountedUpperBound(payload);
-    const finalKnown = payload.cost_final === true;
-    const pendingKnown = payload.cost_final === false
-        || payload.cost_with_children_partial === true
-        || payload.cost_accounting_status === 'available' && !has('cost_final');
-    const meta = [];
-    if (own === null) {
-        meta.push('cost pending');
-    } else if (finalKnown || pendingKnown || own !== 0) {
-        meta.push(`cost=$${own.toFixed(2)}${pendingKnown && !finalKnown ? ' (pending)' : ''}`);
-    }
-
-    const subtree = accountedUpperBoundWithChildren(payload);
-    if (subtree !== null && (
-        own === null || subtree !== own || payload.cost_with_children_partial === true
-    )) {
-        const partial = payload.cost_with_children_partial === true || !finalKnown;
-        meta.push(`subtree=$${subtree.toFixed(2)}${partial ? ' (pending)' : ''}`);
-    }
-    const reserved = optionalFiniteNumber(payload.reserved_usd);
-    if (reserved !== null && reserved > 0) meta.push(`reserved=$${reserved.toFixed(2)}`);
-    const unresolved = optionalFiniteNumber(payload.unresolved_upper_bound_usd);
-    if (unresolved !== null && unresolved > 0) meta.push(`unresolved≤$${unresolved.toFixed(2)}`);
-    const unknown = optionalFiniteNumber(payload.unknown_unmetered);
-    if (unknown !== null && unknown > 0) meta.push(`unmetered=${Math.trunc(unknown)}`);
-    return meta;
-}
-
-/**
- * Project one frame's task-scope cost evidence into the sticky structured form
- * `{meta, ts, final}` (v6.82 P1). Returns null when the frame carries NO
- * task-scope accounting evidence (e.g. an llm_round_finished per-round delta)
- * — such frames must never touch a card's cost.
- */
-export function taskCostProjection(payload = {}, rawTs = '') {
-    const meta = taskCostMeta(payload);
-    if (!meta.length) return null;
-    const unavailable = payload.cost_accounting_status === 'unavailable';
-    return {
-        meta,
-        ts: rawTimestampEpoch(rawTs),
-        // Only a SETTLED ledger value is final. "unavailable" is an honest
-        // unknown, not a settled truth: marking it final let one transient
-        // ledger-read failure outrank every later real reading.
-        final: payload.cost_final === true,
-        unavailable,
-    };
-}
-
-/**
- * Sticky per-card cost precedence (v6.82 P1). Rank unavailable < pending < final:
- * an honest reading always outranks an unknown (one transient ledger-read failure
- * must not pin the card for the whole run) and a settled value outranks both.
- * Among equal rank the newer raw source timestamp wins, so an older history replay
- * can never overwrite newer evidence; frames without evidence (null `next`) keep
- * the previous projection, so an unavailable snapshot is still sticky.
- */
-export function mergeStickyCostMeta(previous, next) {
-    if (!next || !Array.isArray(next.meta) || !next.meta.length) return previous || null;
-    if (!previous || !Array.isArray(previous.meta) || !previous.meta.length) return next;
-    // Rank: unavailable < pending < final. An `unavailable` snapshot is sticky (a
-    // costless frame must not erase it) but must NOT outrank a later HONEST reading:
-    // one transient ledger-read failure would otherwise pin the card to "cost
-    // unavailable" for the rest of the run.
-    const rank = (p) => (p.final ? 2 : (p.unavailable ? 0 : 1));
-    const prevRank = rank(previous);
-    const nextRank = rank(next);
-    if (prevRank !== nextRank) return nextRank > prevRank ? next : previous;
-    const prevTs = Number(previous.ts);
-    const nextTs = Number(next.ts);
-    if (Number.isFinite(prevTs) && Number.isFinite(nextTs) && nextTs < prevTs) return previous;
-    // A frame whose source timestamp is unreadable must not defeat a
-    // timestamped previous value of equal finality.
-    if (Number.isFinite(prevTs) && !Number.isFinite(nextTs)) return previous;
-    return next;
-}
-
-/**
- * Reset the sticky presentation state (collapsed activity + cost projection)
- * introduced in v6.82 P1. Used by resetLiveCardRecord; pure over the record
- * shape so dependency-free node tests can exercise the recycle path.
- */
-export function clearStickyCardState(record) {
-    if (!record) return record;
-    record.collapsedActivity = '';
-    record.costMeta = null;
-    // The activity clock is cycle state too: a
-    // recycled slot ('bg-consciousness', 'active') would otherwise open showing
-    // the previous cycle's "Latest" time.
-    record.latestActivityTs = '';
-    if (record.activityEl) {
-        record.activityEl.textContent = '';
-        record.activityEl.removeAttribute('title');
-    }
-    return record;
-}
-
-/**
- * Decide the collapsed activity line text (v6.82 P1), shared by root and
- * subagent cards. Root cards show the latest activity headline ONLY when a
- * coined name occupies the title — an unnamed card's title already shows the
- * activity, so the line is suppressed to avoid duplication. Subagent titles
- * keep the role·model·id identity, so their routed progress body always feeds
- * the line. A frame without new activity keeps `previous`, so finishing a card
- * never blanks its last activity. Geometry is owned by the two-line CSS clamp;
- * this character ceiling is only a defensive DOM/accessibility bound.
- */
-export const COLLAPSED_ACTIVITY_MAX = 240;
-
-export function boundActivityPreview(value = '') {
-    const candidate = String(value || '').replace(/\s+/g, ' ').trim();
-    if (candidate.length <= COLLAPSED_ACTIVITY_MAX) return candidate;
-    return candidate.slice(0, COLLAPSED_ACTIVITY_MAX - 1).trimEnd() + '…';
-}
-
-export function projectCollapsedActivity({
-    isSubagent = false, suggestedName = '', headline = '', body = '', previous = '',
-} = {}) {
-    const current = boundActivityPreview(isSubagent ? body : headline);
-    const candidate = current || boundActivityPreview(previous);
-    if (!isSubagent && !String(suggestedName || '').trim()) return '';
-    return candidate;
-}
-
-// Logical slots that may host multiple independent cycles (v6.82: hoisted to
-// module scope so cancelRunEligibility shares the same truth as the card layer).
-export const REUSABLE_TASK_IDS = new Set(['bg-consciousness', 'active']);
-
 /**
  * /panic gate (v6.90.3, CRITICAL CONTROL): pure decision helper between the
  * confirm dialog's resolution and sending the panic command. Panic fires on an
@@ -323,41 +165,12 @@ export async function confirmAndSendPanic(deps) {
     return false;
 }
 
-// v6.82 (P5): terminal card phases. 'cancelled' is a first-class terminal phase
-// so a force-cancelled root resolves its card instead of re-inflating.
-export function isTerminalTaskPhase(phase = '', terminal = false) {
-    return Boolean(terminal) || ['done', 'lifecycle_error', 'cancelled'].includes(phase);
-}
-
-/**
- * v6.82 (P5): may this live card offer the "Cancel run" action?
- * Card shape alone cannot answer it — an in-process direct-chat turn mints an
- * ordinary non-reusable, non-subagent card (supervisor/workers.py builds it a
- * real uuid task id) yet has no queue entry to cancel. So eligibility requires
- * the supervisor's host-attested `cancelable` progress-meta marker on top of
- * the structural gates: a ROOT (non-subagent) pooled card, not a reusable slot,
- * not finished, not converted into a project chip.
- */
-export function cancelRunEligibility({
-    groupId = '', isSubagent = false, finished = false, cancelable = false, converted = false,
-} = {}) {
-    return Boolean(cancelable)
-        && !isSubagent
-        && !finished
-        && !converted
-        && Boolean(String(groupId || '').trim())
-        && !REUSABLE_TASK_IDS.has(String(groupId || ''));
-}
-
 function withTaskCostMeta(summary, payload, { replace = false, rawTs = '' } = {}) {
     const projection = taskCostProjection(payload, rawTs);
     // `replace` frames (task_done/task_cost_finalized) never keep the
-    // summarizer's own meta strings — even without accounting evidence a
-    // terminal frame must not render an ungated bare cost string.
-    // Cost renders from the card's STICKY record.costMeta (applyLiveCardState),
-    // never from this frame's meta list: the sticky projection is the SINGLE
-    // cost renderer. Summarizer-built `cost=` strings are dropped
-    // UNCONDITIONALLY — a frame whose payload carries no task-scope accounting
+    // summarizer's own meta strings. Cost renders ONLY from the card's sticky
+    // record.costMeta (applyLiveCardState); summarizer-built `cost=` strings
+    // are dropped UNCONDITIONALLY — a frame without task-scope accounting
     // evidence must show no money at all, not a bare per-call number.
     const base = replace ? { ...summary, meta: [] } : summary;
     const out = projection ? { ...base, costProjection: projection } : { ...base };
@@ -792,6 +605,29 @@ export function createChatInstance({
     // suppresses the transient card while preserving the typed routing annotation
     // and any non-empty final conversational answer as separate UI roles.
     const ephemeralDecisionTaskIds = new Set();
+    // Server-confirmed in-flight direct/ephemeral turns
+    // (activityId -> { activityId, kind, phase, clientMessageId, startedAt }).
+    const activeDirectActivities = new Map();
+    // Local user submissions awaiting server confirmation (clientMessageId
+    // -> { clientMessageId, timestamp }).
+    const pendingSubmissions = new Map();
+    // Conclusion ledger: ids concluded by a keyed final. Task ids never
+    // restart, so late typing frames / stale snapshots must not resurrect a
+    // concluded turn (project panels hydrate one-shot, no poll). Bounded FIFO.
+    const concludedDirectActivities = new Map();
+    const CONCLUDED_ACTIVITY_LEDGER_MAX = 200;
+
+    function recordConcludedActivity(activityId) {
+        const aid = String(activityId || '').trim();
+        if (!aid) return;
+        concludedDirectActivities.delete(aid);
+        concludedDirectActivities.set(aid, Date.now());
+        while (concludedDirectActivities.size > CONCLUDED_ACTIVITY_LEDGER_MAX) {
+            const oldest = concludedDirectActivities.keys().next().value;
+            concludedDirectActivities.delete(oldest);
+        }
+    }
+    let lastTerminalAttention = false;
     // Finished task ids hidden from routine syncs until reload/reconnect rebuilds history.
     const retiredTaskIds = new Set();
     // The owner's last main-chat request, handed to the next live card it spawns so a
@@ -940,39 +776,6 @@ export function createChatInstance({
         return 'Ouroboros';
     }
 
-    function summarizeSkillReviewMessage(text) {
-        const raw = String(text || '');
-        const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-        const headline = lines[0] || 'Skill review';
-        const hashLine = lines.find((line) => line.startsWith('content_hash=')) || '';
-        const reviewersLine = lines.find((line) => line.startsWith('Reviewers:')) || '';
-        const findingsLine = lines.find((line) => /^##\s+Findings/.test(line)) || '';
-        const meta = [hashLine, reviewersLine.replace(/^Reviewers:\s*/, ''), findingsLine.replace(/^##\s*/, '')]
-            .filter(Boolean)
-            .map((line) => escapeHtml(line.length > 140 ? `${line.slice(0, 137)}...` : line))
-            .join(' · ');
-        return {
-            headline: escapeHtml(headline.replace(/^#+\s*/, '')),
-            meta,
-        };
-    }
-
-    function renderSkillReviewDisclosure(text) {
-        const summary = summarizeSkillReviewMessage(text);
-        return `
-            <div class="skill-review-disclosure" data-skill-review-disclosure data-expanded="0">
-                <button type="button" class="skill-review-summary-button" data-skill-review-toggle aria-expanded="false">
-                    <span class="skill-review-summary-main">${summary.headline}</span>
-                    <span class="skill-review-summary-side">
-                        <span class="skill-review-meta">${summary.meta}</span>
-                        <span class="skill-review-toggle-label">Show review</span>
-                    </span>
-                </button>
-                <div class="skill-review-full" data-skill-review-full hidden>${renderMarkdown(text)}</div>
-            </div>
-        `;
-    }
-
     function setStatus(kind, text) {
         // perf2 P4.3: replay frames write the composer status once per batch
         // (last write wins), not once per historical frame.
@@ -1006,7 +809,6 @@ export function createChatInstance({
         const ctxBtn = byId('context-mode');
         if (ctxBtn && typeof data?.context_mode === 'string') {
             ctxBtn.dataset.contextMode = data.context_mode === 'low' ? 'low' : 'max';
-            ctxBtn.dataset.contextModeAutoLow = data.context_mode_auto_low ? 'true' : 'false';
         }
         const budget = headerBudgetPresentation(data);
         const budgetText = byId('budget-text');
@@ -1017,13 +819,20 @@ export function createChatInstance({
 
     async function refreshHeaderControlState(force = false) {
         if (!force && state.activePage !== 'chat') return;
+        // Snapshot authority barrier: the reply only knows activities that
+        // existed before this instant; later registrations survive hydration.
+        const snapshotRequestedAt = Date.now();
         try {
             const resp = await apiFetch('/api/state', { cache: 'no-store' });
             if (!resp.ok) {
                 syncHeaderControlState({ accounting: { available: false } });
                 return;
             }
-            syncHeaderControlState(await resp.json());
+            const data = await resp.json();
+            syncHeaderControlState(data);
+            if (Array.isArray(data?.active_direct_turns)) {
+                hydrateDirectActivities(data.active_direct_turns, snapshotRequestedAt);
+            }
         } catch {
             syncHeaderControlState({ accounting: { available: false } });
         }
@@ -1570,10 +1379,19 @@ export function createChatInstance({
         btn.type = 'button';
         btn.className = 'btn btn-xs btn-danger';
         btn.dataset.cancelRun = '1';
-        btn.textContent = 'Cancel run';
+        btn.textContent = TASK_CONTROL_TRIGGER_LABEL;
+        // S3 (Q2/HQ1): the trigger opens the three-action dropdown; dismissing
+        // it continues the run. While a cancel intent is pending the menu
+        // offers ONLY the hard escalation ("Stop now").
         btn.addEventListener('click', (event) => {
             event.stopPropagation();
-            cancelRunFromCard(record);
+            openTaskControlMenu(btn, {
+                cancelPending: Boolean(record.cancelPendingPolicy),
+                busy: taskControlBusy(record.groupId),
+                onAction: (action) => (action === ACTION_HURRY
+                    ? hurryTaskAction(record.groupId)
+                    : cancelRunFromCard(record, action)),
+            });
         });
         actions.appendChild(btn);
         record.cancelRunBtn = btn;
@@ -1583,12 +1401,14 @@ export function createChatInstance({
     // intent is recorded and the supervisor is confirming the teardown — the
     // card stays honestly LIVE (never an instant "Cancelled" lie) and resolves
     // on the settled task_done: Cancelled, or Completed when the run finished
-    // first (completion wins).
-    function markLiveCardCancelPending(taskId = '') {
+    // first (completion wins). S3 (Q1): a pending SOFT stop shows "Finalizing…"
+    // instead — a bounded final turn is running before the same intent settles.
+    function markLiveCardCancelPending(taskId = '', soft = false) {
         const record = liveCardRecords.get(String(taskId || '').trim());
         if (!record || record.finished || !record.phaseEl) return;
+        record.cancelPendingPolicy = soft ? 'finalize' : 'immediate';
         record.phaseEl.dataset.phase = 'working';
-        record.phaseEl.textContent = 'Cancelling…';
+        record.phaseEl.textContent = soft ? 'Finalizing…' : 'Cancelling…';
         record.phaseEl.className = 'chat-live-phase working cancelling';
     }
 
@@ -1621,7 +1441,7 @@ export function createChatInstance({
     function reconcileCancelCardFromDetail(record, taskId, stored) {
         if (!stored || record.finished) return;
         if (taskCancelPending(stored)) {
-            markLiveCardCancelPending(taskId);
+            markLiveCardCancelPending(taskId, taskSoftStopPending(stored));
             return;
         }
         const status = String(stored?.status || '');
@@ -1630,42 +1450,38 @@ export function createChatInstance({
         }
     }
 
-    async function cancelRunFromCard(record) {
+    async function cancelRunFromCard(record, action = '') {
         const taskId = String(record?.groupId || '').trim();
         if (!taskId || record.finished) return;
-        const confirmed = await openConfirmDialog({
-            title: 'Cancel this run?',
-            body: 'Cancel this run and all its subagents? A run that already finished keeps its result; unfinished work is salvaged best-effort.',
-            confirmLabel: 'Cancel run',
-            cancelLabel: 'Keep running',
-            danger: true,
-        });
-        if (!confirmed) return;
-        // Completion-wins race: the task may have finished while the dialog was
-        // open — its task_done already resolved the card, nothing to cancel.
-        if (record.finished) return;
+        // Q2: the dropdown itself is the confirmation surface — dismissing it
+        // continued the run, so a selected action executes immediately.
+        const soft = action === ACTION_FINALIZE;
         const btn = record.cancelRunBtn;
         if (btn) btn.disabled = true;
         const priorPhase = captureLiveCardPhase(record);
-        markLiveCardCancelPending(taskId);
+        markLiveCardCancelPending(taskId, soft);
         try {
-            // Answered only after the teardown finished, so a resolved promise
-            // means the run is really down; a refusal throws and is toasted below.
-            await cancelTask(taskId, { cascade: true });
+            // Immediate: answered only after the teardown finished, so a resolved
+            // promise means the run is really down. Soft (Q1): a 202 arrives with
+            // the durable intent open while the bounded finalization runs — the
+            // card stays "Finalizing…". A refusal throws and is toasted below.
+            await requestStop(taskId, action);
             // Backend publication is fail-soft past the durable boundary, so a 200
             // can arrive with the task_done event lost. Reconcile from the durable
             // record through the same terminal seam replay uses — idempotent with
             // a later event, so double resolution is harmless.
             try {
-                const stored = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`).then(
-                    (resp) => (resp && typeof resp.json === 'function' && resp.ok !== false) ? resp.json() : null,
-                );
-                reconcileCancelCardFromDetail(record, taskId, stored);
+                reconcileCancelCardFromDetail(record, taskId, await fetchTaskDetail(taskId));
             } catch {
                 // The card still resolves on its own frame if one arrives.
             }
-            // The card resolves via the existing task_done{status:"cancelled"}
-            // frames; keep the button disabled until that (or removal) happens.
+            // Immediate: the card resolves via the existing task_done frames and
+            // the button stays disabled until then. Soft: the hard escalation
+            // must stay REACHABLE during the wait (Q1), so re-enable the trigger
+            // (the pending menu offers only "Stop now").
+            if (btn && !record.finished && record.cancelPendingPolicy === 'finalize') {
+                btn.disabled = false;
+            }
         } catch (exc) {
             // 404 = nothing live anymore (natural completion beat the cancel):
             // graceful no-op, the card resolves on its own terminal frame.
@@ -1684,10 +1500,7 @@ export function createChatInstance({
                 // sit "Working" forever. Ask the durable record and resolve the
                 // card through the same terminal seam replay uses.
                 try {
-                    const stored = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`).then(
-                        (resp) => (resp && typeof resp.json === 'function' && resp.ok !== false) ? resp.json() : null,
-                    );
-                    reconcileCancelCardFromDetail(record, taskId, stored);
+                    reconcileCancelCardFromDetail(record, taskId, await fetchTaskDetail(taskId));
                 } catch {
                     // The card still resolves on its own frame if one arrives;
                     // nothing worse than the pre-resync behavior.
@@ -1703,9 +1516,7 @@ export function createChatInstance({
             // task gets its prior phase restored and the button re-enabled.
             let stored = null;
             try {
-                stored = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`).then(
-                    (resp) => (resp && typeof resp.json === 'function' && resp.ok !== false) ? resp.json() : null,
-                );
+                stored = await fetchTaskDetail(taskId);
             } catch {
                 // Typed state unreachable — handled by the null guard below.
             }
@@ -1725,6 +1536,7 @@ export function createChatInstance({
             // Only a fetched, live, non-pending detail restores the button.
             if (btn) btn.disabled = false;
             restoreLiveCardPhase(record, priorPhase);
+            record.cancelPendingPolicy = '';
         }
     }
 
@@ -2251,15 +2063,12 @@ export function createChatInstance({
     }
 
     // perf2 P4.4 (lazy LINEAGE bodies): a collapsed SUBAGENT timeline is
-    // display:none inside its parent's lineage container, so building its DOM
-    // (and rendering its Markdown bodies) during a bulk replay is pure waste.
-    // The data stays complete in record.items; every timeline DOM writer
-    // defers through this guard while collapsed, and the first
-    // setLiveCardExpanded(true) materializes the whole timeline. TOP-LEVEL
-    // cards render eagerly like the pre-P4 baseline: their (CSS-hidden)
+    // display:none, so building its DOM during a bulk replay is pure waste.
+    // Data stays complete in record.items; DOM writers defer through this
+    // guard while collapsed, and the first setLiveCardExpanded(true)
+    // materializes the timeline. TOP-LEVEL cards render eagerly: their
     // collapsed timeline text is part of the feed DOM contract (ui-smoke
-    // chronology asserts collapsed card textContent), and the deep-lineage
-    // fan-out — the actual replay cost — lives in subagent children.
+    // asserts it), and the deep-lineage fan-out lives in subagent children.
     function deferCollapsedTimeline(record) {
         if (!record) return true;
         if (!record.isSubagent) return false;
@@ -2588,14 +2397,16 @@ export function createChatInstance({
             }
             syncLiveCardToggle(record);
             if (drivesComposerStatus) {
-                setStatus(summary.phase === 'error' || summary.phase === 'timeout' ? 'error' : 'online', summary.phase === 'error' || summary.phase === 'timeout' ? 'Attention' : 'Online');
+                lastTerminalAttention = (summary.phase === 'error' || summary.phase === 'timeout');
+                syncChatStatus();
             }
         } else {
             setLiveCardTypingVisible(record, true);
             if (drivesComposerStatus) {
-                setStatus('thinking', 'Working...');
-            } else if (!hasActiveLiveCard() && statusBadge && ['Thinking...', 'Working...'].includes(statusBadge.textContent)) {
-                setStatus('online', 'Online');
+                lastTerminalAttention = false;
+                syncChatStatus();
+            } else if (!hasActiveLiveCard()) {
+                syncChatStatus();
             }
         }
         if (summary.expandByDefault) {
@@ -2636,10 +2447,8 @@ export function createChatInstance({
         }
         syncLiveCardToggle(record);
         if (activeLiveGroupId === record.groupId) activeLiveGroupId = '';
-        if (!hasActiveLiveCard()) {
-            setStatus(activePhase === 'error' || activePhase === 'timeout' ? 'error' : 'online',
-                      activePhase === 'error' || activePhase === 'timeout' ? 'Attention' : 'Online');
-        }
+        lastTerminalAttention = (activePhase === 'error' || activePhase === 'timeout');
+        syncChatStatus();
     }
 
     function appendTaskSummaryToLiveCard(msg, { suppressDomInsert = false } = {}) {
@@ -2672,19 +2481,25 @@ export function createChatInstance({
         const terminalPhase = taskTerminalPhase(msg || {});
         const failedResult = severity === 'error';
         // P5: a cancelled root says "Cancelled", never a generic "Done" headline.
+        // №8/Q3: an owner-requested soft stop is a SUCCESS — its own headline,
+        // never warn-styled, with the owner-request marker in the details.
+        const softStopped = taskStoppedWithSummary(msg || {});
         const doneHeadline = severity === 'cancelled'
             ? 'Cancelled'
             : (failedResult && reasonCode
                 ? `Done: ${reasonCode}`
-                : (severity === 'warn'
-                    ? (reasonCode ? `Finished with warnings: ${reasonCode}` : 'Finished with warnings')
-                    : ((record && record.lastHumanHeadline) || 'Done')));
+                : (softStopped
+                    ? OWNER_STOP_DONE_HEADLINE
+                    : (severity === 'warn'
+                        ? (reasonCode ? `Finished with warnings: ${reasonCode}` : 'Finished with warnings')
+                        : ((record && record.lastHumanHeadline) || 'Done'))));
+        const softStopDetail = softStopped ? OWNER_STOP_DETAIL_MARKER : '';
         applyLiveCardState(
             {
                 phase: terminalPhase,
                 headline: doneHeadline,
-                body: reviewDetails,
-                visible: Boolean(reviewDetails),
+                body: [softStopDetail, reviewDetails].filter(Boolean).join('\n'),
+                visible: Boolean(softStopDetail || reviewDetails),
                 human: false,
                 promote: true,
                 terminal: true,
@@ -2736,14 +2551,12 @@ export function createChatInstance({
         const rawTs = msg?.ts || new Date().toISOString();
         if (registerEphemeralDecisionFrame(msg)) return;
         if (!taskId) return;
-        // P5: host-attested cancelable marker (live WS frames AND history replay —
-        // progress rows persist it through _PROGRESS_META_FIELDS). The supervisor
-        // stamps it ONLY on lineage-resolved non-subagent ROOTS (with the RUNNING
-        // row's authoritative lineage on the same frame), so the marker itself is
-        // the truth — re-deriving rootness from frame shape here would wrongly
-        // reject a timeout-retry root, whose root_task_id names the ORIGINAL task
-        // while the endpoint can cancel its current id. A direct-chat turn never
-        // carries the marker.
+        // P5: host-attested cancelable marker (live WS frames AND history replay
+        // via _PROGRESS_META_FIELDS). The supervisor stamps it ONLY on
+        // lineage-resolved non-subagent ROOTS, so the marker is the truth —
+        // re-deriving rootness from frame shape would wrongly reject a
+        // timeout-retry root (root_task_id names the ORIGINAL task while the
+        // endpoint cancels the current id). Direct-chat turns never carry it.
         if (msg?.cancelable === true && msg?.task_id) markTaskCancelable(String(msg.task_id));
         // Subagent lifecycle pings render as child cards linked to the parent;
         // they must not update the parent card's terminal state.
@@ -2976,6 +2789,14 @@ export function createChatInstance({
         if (!taskId) return;
         const eventType = evt.type || evt.event || '';
         const rawTs = evt.ts || evt.timestamp || new Date().toISOString();
+        if (eventType === 'owner_hurry') {
+            // HQ1: compact task-card status ONLY — never a timeline row or any
+            // chat bubble (the summarizer also hides this family, visible=false).
+            if (ownerHurryProjection(evt).applied) {
+                liveCardRecords.get(taskId)?.root?.setAttribute('data-owner-hurry', '1');
+            }
+            return;
+        }
         // A known subagent child's log events update its linked child card.
         if (subagentChildParents.has(taskId)) {
             if (eventType === 'task_done') {
@@ -3070,6 +2891,7 @@ export function createChatInstance({
                 senderSessionId,
                 clientMessageId,
                 taskId,
+                skillReview: opts.skillReview || null,
             });
             // Mirror the sessionStorage slice(-200): the in-memory copy exists
             // only to feed that snapshot, so it obeys the same cap (P3).
@@ -3094,7 +2916,7 @@ export function createChatInstance({
         const rendered = role === 'user'
             ? escapeHtml(text)
             : (role === 'system' && systemType === 'skill_review'
-                ? renderSkillReviewDisclosure(text)
+                ? renderSkillReviewDisclosure(text, opts.skillReview || null)
                 : renderMarkdown(text));
         const timeFmt = formatMsgTime(ts);
         const timeHtml = timeFmt ? `<div class="msg-time" title="${escapeHtmlAttr(timeFmt.full)}">${escapeHtml(timeFmt.short)}</div>` : '';
@@ -3105,21 +2927,7 @@ export function createChatInstance({
             ${pendingHtml}
             ${timeHtml}
         `;
-        const skillReviewToggle = bubble.querySelector('[data-skill-review-toggle]');
-        if (skillReviewToggle) {
-            skillReviewToggle.addEventListener('click', () => {
-                const disclosure = bubble.querySelector('[data-skill-review-disclosure]');
-                const full = bubble.querySelector('[data-skill-review-full]');
-                const label = bubble.querySelector('.skill-review-toggle-label');
-                const expanded = disclosure?.dataset.expanded === '1';
-                if (!disclosure || !full) return;
-                disclosure.dataset.expanded = expanded ? '0' : '1';
-                full.hidden = expanded;
-                skillReviewToggle.setAttribute('aria-expanded', expanded ? 'false' : 'true');
-                if (label) label.textContent = expanded ? 'Show review' : 'Hide review';
-                requestAnimationFrame(() => updateMessagesPadding({ preserveStickiness: true }));
-            });
-        }
+        wireSkillReviewDisclosure(bubble, () => requestAnimationFrame(() => !destroyed && updateMessagesPadding({ preserveStickiness: true })));
         stampNodeTimestamp(bubble, ts);
         insertMessageNode(bubble, { forceStick: !!opts.forceStick });
         renderRoutingAnnotation(bubble, opts.chatAnnotation);
@@ -3206,6 +3014,14 @@ export function createChatInstance({
         if (!bubble) return;
         bubble.classList.remove('pending');
         bubble.querySelector('.msg-pending')?.remove();
+        pendingUserBubbles.delete(clientMessageId);
+    }
+
+    function markPendingDropped(clientMessageId) {
+        const bubble = pendingUserBubbles.get(clientMessageId || '');
+        if (!bubble) return;
+        const note = bubble.querySelector('.msg-pending');
+        if (note) note.textContent = 'Not delivered — send again';
         pendingUserBubbles.delete(clientMessageId);
     }
 
@@ -3457,6 +3273,12 @@ export function createChatInstance({
                 }
                 for (const msg of messages) {
                     const taskId = msg.task_id || '';
+                    // Reconnect: a durably recorded submission must not stay
+                    // `Sending...` — history + snapshot are the authorities
+                    // (a live turn re-links via hydration / next typing frame).
+                    if (fromReconnect && msg.role === 'user' && msg.client_message_id) {
+                        pendingSubmissions.delete(String(msg.client_message_id));
+                    }
                     if (!renderUser && msg.role === 'user') continue;
                     if (msg.is_progress) {
                         // Progress-only/failed tasks still anchor at their first event.
@@ -3488,6 +3310,12 @@ export function createChatInstance({
                         const preservedPhase = taskState?.completedPhase || record?.phaseEl?.dataset?.phase || 'done';
                         finishLiveCard(taskId, preservedPhase);
                     }
+                    // A replayed durable routing receipt carries the same
+                    // authority as its live WS frame: a receipt that landed
+                    // while the socket was down still retires `Sending...`.
+                    if (msg.chat_annotation && msg.client_message_id) {
+                        pendingSubmissions.delete(String(msg.client_message_id));
+                    }
                     addMessage(msg.text, msg.role, !!msg.markdown, msg.ts || null, false, {
                         systemType: msg.system_type || '',
                         source: msg.source || '',
@@ -3496,6 +3324,9 @@ export function createChatInstance({
                         clientMessageId: msg.client_message_id || '',
                         taskId,
                         chatAnnotation: msg.chat_annotation || null,
+                        skillReview: msg.system_type === 'skill_review' && msg.skill && msg.job_id
+                            ? { skill: msg.skill, jobId: msg.job_id }
+                            : null,
                     });
                 }
                 // Resolve cards whose task is already terminal on the server
@@ -3582,11 +3413,8 @@ export function createChatInstance({
                     _historyReplayActive = false;
                 }
 
-                // After first load, unfinished foreground cards still show typing.
-                if (!historyLoaded) {
-                    const hasOngoingTask = Array.from(liveCardRecords.values()).some(isForegroundLiveCard);
-                    if (hasOngoingTask) showTyping();
-                }
+                // After first load, sync status from live cards/active turns.
+                syncChatStatus();
 
                 // One-shot server recall seed includes other clients without resetting
                 // ArrowUp during reconnect. Merge [server..., local...], newest wins.
@@ -3636,14 +3464,12 @@ export function createChatInstance({
                     updateMessagesPadding({ preserveStickiness: false });
                     scrollToBottomAfterLayout();
                 } else if (fromReconnect) {
-                    // Rebuild may add old rows ABOVE and new rows BELOW the viewport
-                    // simultaneously. Total scrollHeight delta cannot distinguish the
-                    // two and over-scrolls readers by the height of new bottom content.
-                    // Restore the first visible timestamped node to its prior visual
-                    // offset instead; equal-ts ordinals preserve arrival-order identity.
-                    // Live-card expansion and responsive layout settle on RAF; restore
-                    // after two frames so asynchronous card heights above the anchor
-                    // cannot move the reader immediately after this function resolves.
+                    // Rebuild may add rows both ABOVE and BELOW the viewport; a
+                    // scrollHeight delta cannot tell them apart and over-scrolls
+                    // readers. Restore the first visible timestamped node to its
+                    // prior visual offset instead (equal-ts ordinals keep
+                    // arrival-order identity), after two RAF frames so async
+                    // card heights above the anchor cannot move the reader.
                     await new Promise((resolve) => requestAnimationFrame(
                         () => requestAnimationFrame(resolve)
                     ));
@@ -3724,6 +3550,7 @@ export function createChatInstance({
                     senderSessionId: msg.senderSessionId || '',
                     clientMessageId: msg.clientMessageId || '',
                     taskId: msg.taskId || '',
+                    skillReview: msg.skillReview || null,
                 });
             }
         } catch {}
@@ -3866,6 +3693,16 @@ export function createChatInstance({
             clientMessageId: result?.clientMessageId || '',
             forceStick: true,
         });
+        // ws.send always coins a client_message_id for chat frames; guard
+        // only against a non-chat result shape.
+        const pendingId = result?.clientMessageId || '';
+        if (pendingId) {
+            pendingSubmissions.set(pendingId, {
+                clientMessageId: pendingId,
+                timestamp: Date.now(),
+            });
+        }
+        syncChatStatus();
         resizeChatInput({ preserveStickiness: false });
         scrollToBottomAfterLayout();
     }
@@ -3905,12 +3742,7 @@ export function createChatInstance({
         if (!seg || contextModeBtn.dataset.disabled === 'true') return;
         const next = seg.dataset.mode === 'low' ? 'low' : 'max';
         const current = contextModeBtn.dataset.contextMode === 'low' ? 'low' : 'max';
-        // A displayed `low` that is a system AUTO-DOWNGRADE is not an owner selection:
-        // re-picking Low must still POST (the endpoint is idempotent and clears the
-        // derived flag), or an unconfirmable-window install stays wedged with scope
-        // review blocking every commit and no reachable way to declare Low.
-        const derivedLow = contextModeBtn.dataset.contextModeAutoLow === 'true';
-        if (next === current && !(next === 'low' && derivedLow)) return;
+        if (next === current) return;
         contextModeBtn.dataset.disabled = 'true';
         const postMode = (mode) => apiFetch('/api/owner/context-mode', {
             method: 'POST',
@@ -3918,41 +3750,7 @@ export function createChatInstance({
             body: JSON.stringify({ mode }),
         });
         try {
-            let resp = await postMode(next);
-            if (!resp.ok) {
-                let payload = {};
-                try { payload = await resp.json(); } catch {}
-                // Max context mode needs the active model's 1M-token window confirmed.
-                // Offer a plain, model-scoped confirmation (kept until the model changes).
-                const ack = payload?.needs_ack;
-                if (next === 'max' && ack && ack.model) {
-                    const ok = await openConfirmDialog({
-                        title: 'Confirm 1M-token context window',
-                        body: `${payload.error || 'Max context mode needs a confirmed 1M-token window.'}\n\n` +
-                            `Confirm that this model supports a 1,000,000-token context window?\n` +
-                            `provider: ${ack.provider || '(default)'}\nmodel: ${ack.model}\n` +
-                            `base_url: ${ack.base_url || '(default)'}\n\n` +
-                            `This applies only to this exact model/provider and is removed if you change it.`,
-                        confirmLabel: 'Confirm window',
-                    });
-                    if (ok) {
-                        const ackResp = await apiFetch('/api/owner/capability-ack', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                provider: ack.provider, model: ack.model,
-                                base_url: ack.base_url, window_tokens: 1000000,
-                                note: 'owner-confirmed via context-mode toggle',
-                            }),
-                        });
-                        if (ackResp.ok) {
-                            resp = await postMode(next);  // retry with the confirmation in place
-                        } else {
-                            showToast('Could not save the confirmation.', 'error');
-                        }
-                    }
-                }
-            }
+            const resp = await postMode(next);
             if (resp.ok) {
                 contextModeBtn.dataset.contextMode = next;
             } else {
@@ -4193,6 +3991,10 @@ export function createChatInstance({
         // "Connecting…" (the one-shot WS `open` already fired before it existed;
         // future reconnects still update it via the shared `open` handler).
         if (ws.isConnected?.()) setStatus('online', 'Online');
+        // 1A: a panel created AFTER the socket opened missed the typing frame
+        // and the `open`-driven refresh — hydrate in-flight turns once from
+        // the snapshot (per-instance closure filters to this panel's chat_id).
+        refreshHeaderControlState(true);
     } else {
         refreshHeaderControlState(true);
         headerControlInterval = setInterval(refreshHeaderControlState, 3000);
@@ -4290,12 +4092,52 @@ export function createChatInstance({
         return Array.from(liveCardRecords.values()).some(isForegroundLiveCard);
     }
 
-    function showTyping() {
-        if (!hasActiveLiveCard()) {
+    function deriveChatStatus() {
+        return computeDerivedChatStatus({
+            isConnected: ws.isConnected ? ws.isConnected() : true,
+            hasActiveLiveCard: hasActiveLiveCard(),
+            activeDirectCount: activeDirectActivities.size,
+            pendingSubmissionsCount: pendingSubmissions.size,
+            lastTerminalAttention,
+        });
+    }
+
+    function syncChatStatus() {
+        const derived = deriveChatStatus();
+        setStatus(derived.kind, derived.text);
+        if (derived.showDots && !hasActiveLiveCard()) {
             typingEl.style.display = '';
             if (isNearBottom()) messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        } else {
+            typingEl.style.display = 'none';
         }
-        setStatus('thinking', 'Thinking...');
+    }
+
+    function showTyping(activityId = '', meta = {}) {
+        const actId = String(activityId || '').trim() || ('direct-' + chatId);
+        // A typing frame after its turn's keyed final must not resurrect the
+        // concluded turn — but it still carries the activity<->cmid link, so
+        // it settles the linked submission (broadcasts are not ordered).
+        if (concludedDirectActivities.has(actId)) {
+            if (meta.clientMessageId && pendingSubmissions.delete(meta.clientMessageId)) {
+                syncChatStatus();
+            }
+            return;
+        }
+        activeDirectActivities.set(actId, {
+            activityId: actId,
+            // '' = not registry-tracked (queued managed task): visible in the
+            // active set but exempt from /api/state snapshot deletion.
+            kind: meta.kind || '',
+            phase: meta.phase || 'thinking',
+            clientMessageId: meta.clientMessageId || '',
+            startedAt: Date.now(),
+        });
+        if (meta.clientMessageId) {
+            pendingSubmissions.delete(meta.clientMessageId);
+        }
+        lastTerminalAttention = false;
+        syncChatStatus();
     }
 
     function hideTypingIndicatorOnly() {
@@ -4307,11 +4149,18 @@ export function createChatInstance({
         typingEl.style.display = 'none';
     }
 
-    function hideTyping() {
-        hideTypingIndicatorOnly();
-        if (statusBadge && ['Thinking...', 'Working...'].includes(statusBadge.textContent)) {
-            setStatus('online', 'Online');
+    function hydrateDirectActivities(turnsList, snapshotBarrierMs = Infinity) {
+        if (!Array.isArray(turnsList)) return;
+        const nextMap = computeHydratedDirectActivities(
+            activeDirectActivities, turnsList, chatId, snapshotBarrierMs, concludedDirectActivities);
+        activeDirectActivities.clear();
+        for (const [k, v] of nextMap.entries()) {
+            activeDirectActivities.set(k, v);
+            if (v.clientMessageId) {
+                pendingSubmissions.delete(v.clientMessageId);
+            }
         }
+        syncChatStatus();
     }
 
     const isKnownProjectFrame = (msg) => {
@@ -4332,7 +4181,15 @@ export function createChatInstance({
 
     onWs('typing', (msg) => {
         if (!isMyThread(msg)) return;  // each column shows typing only for its own thread
-        showTyping();
+        const actId = msg.activity_id || msg.task_id || ('direct-' + (msg.chat_id || chatId));
+        const clientMsgId = msg.client_message_id || '';
+        showTyping(actId, {
+            clientMessageId: clientMsgId,
+            phase: msg.phase || 'thinking',
+            // Server-stamped for registry-tracked turns; empty for queued
+            // managed tasks (the snapshot has no authority over them).
+            kind: msg.kind || '',
+        });
     });
 
     // One socket, client-side fan-out: project instances take only their own
@@ -4363,8 +4220,13 @@ export function createChatInstance({
         if (msg.role === 'user') {
             const clientMessageId = msg.client_message_id || '';
             const senderSessionId = msg.sender_session_id || '';
+            // 2A: the user echo is receipt of the user ROW, not turn start —
+            // it settles the bubble but must NOT retire the `Sending...`
+            // submission; that takes a linked typing frame / snapshot turn /
+            // routing receipt or the turn's conclusion.
             if (senderSessionId === chatSessionId && clientMessageId) {
                 markPendingDelivered(clientMessageId);
+                syncChatStatus();
                 return;
             }
             addMessage(msg.content, 'user', false, msg.ts || null, false, {
@@ -4375,29 +4237,66 @@ export function createChatInstance({
                 taskId: msg.task_id || '',
             });
             incrementUnreadIfNeeded(msg);
+            syncChatStatus();
             return;
         }
 
         if (msg.role === 'assistant' || msg.role === 'system') {
-            hideTyping();
             const explicitTaskId = msg.task_id || '';
             const ephemeralDecision = registerEphemeralDecisionFrame(msg);
+            // 3A: Main mirrors Project frames as штаб presentation only — a
+            // mirrored ephemeral turn never enters THIS instance's active set.
+            const isMirror = isMain && isKnownProjectFrame(msg);
+            if (ephemeralDecision && explicitTaskId && !isMirror) {
+                const existing = activeDirectActivities.get(explicitTaskId) || {};
+                activeDirectActivities.set(explicitTaskId, {
+                    activityId: explicitTaskId,
+                    kind: 'ephemeral_decision',
+                    phase: 'thinking',
+                    startedAt: existing.startedAt || Date.now(),
+                    clientMessageId: existing.clientMessageId || '',
+                });
+            }
             if (msg.is_progress) {
                 showTaskIncidentToast(msg);
                 if (ephemeralDecision) return;
                 updateLiveCardFromProgressMessage(msg);
+                syncChatStatus();
                 return;
             }
+
+            if (!isMirror) {
+                if (explicitTaskId) {
+                    // 4A (active set): a keyed final concludes ITS OWN turn —
+                    // the finished activity + its linked pending — never a
+                    // concurrent turn's state (2A keeps later `Sending...`).
+                    const finished = activeDirectActivities.get(explicitTaskId);
+                    activeDirectActivities.delete(explicitTaskId);
+                    recordConcludedActivity(explicitTaskId);
+                    if (finished?.clientMessageId) {
+                        pendingSubmissions.delete(finished.clientMessageId);
+                    }
+                } else {
+                    // A bare (unkeyed) final cannot be scoped: clear the set
+                    // but NEVER ledger — no proof any specific turn ended; a
+                    // live turn stays restorable by typing frame or snapshot.
+                    activeDirectActivities.clear();
+                    pendingSubmissions.clear();
+                }
+            }
+
             if (msg.system_type === 'task_summary') {
                 appendTaskSummaryToLiveCard(msg);
                 markAssistantReply(explicitTaskId);
                 incrementUnreadIfNeeded(msg);
+                syncChatStatus();
                 return;
             }
             if (explicitTaskId && subagentChildParents.has(explicitTaskId)) {
                 routeSubagentFinalMessageToCard(explicitTaskId, msg);
                 markAssistantReply(explicitTaskId);
                 incrementUnreadIfNeeded(msg);
+                syncChatStatus();
                 return;
             }
             if (explicitTaskId) finishLiveCard(explicitTaskId);
@@ -4409,6 +4308,7 @@ export function createChatInstance({
                 taskId: explicitTaskId,
             });
             incrementUnreadIfNeeded(msg);
+            syncChatStatus();
         }
     });
 
@@ -4416,6 +4316,22 @@ export function createChatInstance({
         if (!isMyThread(msg)) return;
         if (msg.annotation_type !== 'routing_ack') return;
         updateMessageAnnotation(msg.client_message_id || '', msg);
+        // Any routing receipt is the durable disposition of the submission and
+        // ends its `Sending...` phase; further activity announces itself via
+        // its own typing frame or task card.
+        const receiptCid = String(msg.client_message_id || '');
+        if (receiptCid && pendingSubmissions.delete(receiptCid)) {
+            syncChatStatus();
+        }
+    });
+
+    onWs('outbound_dropped', (msg) => {
+        // Evicted from the offline queue: the submission will never reach
+        // the server, so it can never earn a receipt or a turn.
+        const cid = String(msg?.clientMessageId || '');
+        if (!cid) return;
+        markPendingDropped(cid);
+        if (pendingSubmissions.delete(cid)) syncChatStatus();
     });
 
     onWs('log', (msg) => {
@@ -4438,12 +4354,22 @@ export function createChatInstance({
     });
 
     onWs('outbound_sent', (evt) => {
-        markPendingDelivered(evt?.clientMessageId || '');
+        const cid = evt?.clientMessageId || '';
+        if (cid) {
+            // A socket write is not durable acceptance (2A): settle the
+            // bubble only; `Sending...` retires on authoritative evidence.
+            markPendingDelivered(cid);
+            syncChatStatus();
+        }
     });
 
     onWs('photo', (msg) => {
         if (!isMyThread(msg)) return;
-        hideTyping();
+        // Media frames carry no activity identity: hide the dots row for the
+        // incoming bubble but leave the authoritative active set intact (4A) —
+        // syncChatStatus re-derives the header from live state.
+        hideTypingIndicatorOnly();
+        syncChatStatus();
         const role = msg.role === 'user' ? 'user' : 'assistant';
         const sender = role === 'user'
             ? getSenderLabel('user', false, '', {
@@ -4480,7 +4406,8 @@ export function createChatInstance({
 
     onWs('video', (msg) => {
         if (!isMyThread(msg)) return;
-        hideTyping();
+        hideTypingIndicatorOnly();
+        syncChatStatus();
         const role = msg.role === 'user' ? 'user' : 'assistant';
         const sender = role === 'user'
             ? getSenderLabel('user', false, '', {
@@ -4623,15 +4550,22 @@ export function createChatInstance({
 
     onWs('document', (msg) => {
         if (!isMyThread(msg)) return;
-        hideTyping();
+        hideTypingIndicatorOnly();
+        syncChatStatus();
         if (appendDocumentBubble(msg)) incrementUnreadIfNeeded(msg);
     });
 
     let wsHasConnectedOnce = false;
 
     onWs('open', (msg) => {
-        setStatus('online', 'Online');
+        // Reconnect drops kind-less (managed) entries: the snapshot has no
+        // authority over them, so a final lost offline would pin them forever.
+        // A live managed task re-asserts with its next typing frame.
+        for (const [aid, entry] of activeDirectActivities) {
+            if (!entry.kind) activeDirectActivities.delete(aid);
+        }
         refreshHeaderControlState(true);
+        syncChatStatus();
         // perf2 P4.1 [Gemini#3]: reconnect truth comes from the ws CLIENT
         // (previouslyConnected rides the open event) — a project instance
         // created while the socket was already open must still treat the next
@@ -4672,8 +4606,8 @@ export function createChatInstance({
     });
 
     onWs('close', () => {
-        hideTyping();
-        setStatus('offline', 'Reconnecting...');
+        hideTypingIndicatorOnly();
+        syncChatStatus();
         syncHeaderControlState({ accounting: { available: false } });
     });
 

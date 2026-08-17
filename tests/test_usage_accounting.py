@@ -513,6 +513,18 @@ def test_request_carried_applied_ttl_wins_over_the_global_setting(data_root, mon
             prompt_cache_ttl=ttl,
         ))
 
+    marker_free_candidate = _request(
+        data_root,
+        model="anthropic/claude-test",
+        provider="openrouter",
+        reservation_usd=None,
+        prompt_tokens_estimate=1_000,
+        max_completion_tokens=1_000,
+        prompt_cache_ttl="",
+        candidate_measurement_kind="canonical_json_v1",
+    )
+    assert ua._reservation_cost(marker_free_candidate) == 0.01875
+
     assert _priced("5m") == 0.01875
     assert _priced("default") == 0.01875
     assert _priced("1h") == 0.021

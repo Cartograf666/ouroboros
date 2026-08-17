@@ -1155,8 +1155,24 @@ def _has_pending_descendant(task_id: str) -> bool:
 def _enforce_task_timeouts_locked(
     workers: Any, now: float, owner_chat_id: int, st: Dict[str, Any]
 ) -> None:
+    # ONE typed owner-stop predicate before every generic timeout-grace consumer
+    # (S3 §12.2 item 8): a task whose owner-requested finalization intent is
+    # still OPEN is bypassed whole — no spare-withdraw, no spare-clock reset,
+    # no second grace episode, no expiry kill, no RUNNING.pop, no reaper
+    # enqueue, no retry scheduling. The hold deliberately outlives the grace
+    # deadline (the expiry window): the deadline gates only the sweep's
+    # arm-vs-feed-custody decision in supervisor/owner_stop.py +
+    # sweep_cancel_intents; the intent stays the one owner will and custody
+    # stays the only killer.
+    from supervisor.owner_stop import running_owner_stop_tasks
+
+    owner_stop_held = running_owner_stop_tasks(
+        DRIVE_ROOT, grace_sec=FINALIZATION_GRACE_SEC,
+    )
     for task_id, meta in list(RUNNING.items()):
         if not isinstance(meta, dict):
+            continue
+        if str(task_id) in owner_stop_held:
             continue
         task = meta.get("task") if isinstance(meta.get("task"), dict) else {}
         started_at = float(meta.get("started_at") or 0.0)
@@ -1286,6 +1302,15 @@ def _enforce_task_timeouts_locked(
         # loaded this tick, so this reflects the current owner decision.
         if will_retry and task_type == "evolution" and not bool(st.get("evolution_mode_enabled")):
             will_retry = False
+        # An ACTIVE cancel intent (immediate policy, or a finalize intent already
+        # CLAIMED by custody — open finalize intents never reach here, the hold
+        # above skips them) must never spawn a retry clone: a new-uuid retry
+        # escapes the intent (keyed by the old id) and CANCELLED_ROOT_FENCES,
+        # restarting work the owner stopped.
+        if will_retry:
+            from ouroboros.cancel_intents import has_active_intent
+
+            will_retry = not has_active_intent(DRIVE_ROOT, str(task_id))
         retry_task_id = ""
         if will_retry:
             same_id = task_type == "evolution" or str(task.get("delegation_role") or "") == "subagent"

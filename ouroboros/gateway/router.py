@@ -37,6 +37,7 @@ def collect_routes(
         api_skill_lifecycle_queue,
         api_skill_reconcile,
         api_skill_review,
+        api_skill_review_history_detail,
         api_skill_toggle,
     )
     from ouroboros.gateway.files import (
@@ -65,6 +66,7 @@ def collect_routes(
         api_claudexor_credential_profile,
         api_claudexor_login,
         api_claudexor_login_job,
+        api_claudexor_login_job_reconcile,
         api_claudexor_status,
         api_claudexor_wake,
     )
@@ -109,6 +111,7 @@ def collect_routes(
     from ouroboros.gateway.tasks import (
         api_task_artifact,
         api_task_cancel,
+        api_task_hurry,
         api_task_resume,
         api_task_events,
         api_task_get,
@@ -163,6 +166,11 @@ def collect_routes(
         Route("/api/skills/daemons", endpoint=api_skill_daemons, methods=["GET"]),
         Route("/api/skills/lifecycle-queue", endpoint=api_skill_lifecycle_queue, methods=["GET"]),
         Route("/api/skills/{skill}/review", endpoint=api_skill_review, methods=["POST"]),
+        Route(
+            "/api/skills/{skill}/review-history/{job_id}",
+            endpoint=api_skill_review_history_detail,
+            methods=["GET"],
+        ),
         Route("/api/owner/skills/{skill}/attest-review", endpoint=api_owner_skill_attest_review, methods=["POST"]),
         Route("/api/skills/{skill}/grants", endpoint=api_skill_grants, methods=["POST"]),
         Route("/api/skills/{skill}/reconcile", endpoint=api_skill_reconcile, methods=["POST"]),
@@ -228,6 +236,7 @@ def collect_routes(
         Route("/api/tasks/{task_id}", endpoint=api_task_get, methods=["GET"]),
         Route("/api/tasks/{task_id}/events", endpoint=api_task_events, methods=["GET"]),
         Route("/api/tasks/{task_id}/cancel", endpoint=api_task_cancel, methods=["POST"]),
+        Route("/api/tasks/{task_id}/hurry", endpoint=api_task_hurry, methods=["POST"]),
         Route("/api/tasks/{task_id}/resume", endpoint=api_task_resume, methods=["POST"]),
         Route("/api/schedules", endpoint=api_schedules_list, methods=["GET"]),
         Route("/api/schedules", endpoint=api_schedules_upsert, methods=["POST"]),
@@ -274,6 +283,11 @@ def collect_routes(
         Route(
             "/api/claudexor/login/{job_id}/input",
             endpoint=api_claudexor_login_job,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/claudexor/login/{job_id}/reconcile",
+            endpoint=api_claudexor_login_job_reconcile,
             methods=["POST"],
         ),
         Route(

@@ -86,6 +86,28 @@ def test_isolated_settings_grant_only_the_declared_providers_credentials():
         assert owner_secret not in out
 
 
+def test_isolated_settings_forward_explicit_context_intent_and_normalize_legacy_state():
+    default = build_isolated_settings(_LIVE)
+    assert "OUROBOROS_CONTEXT_MODE" not in default
+    assert "OUROBOROS_CONTEXT_MODE_AUTO_LOW" not in default
+
+    explicit_low = build_isolated_settings(_LIVE, OUROBOROS_CONTEXT_MODE="low")
+    assert explicit_low["OUROBOROS_CONTEXT_MODE"] == "low"
+    assert explicit_low["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
+
+    explicit_max = build_isolated_settings(_LIVE, OUROBOROS_CONTEXT_MODE="max")
+    assert explicit_max["OUROBOROS_CONTEXT_MODE"] == "max"
+    assert explicit_max["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
+
+    legacy = build_isolated_settings({
+        **_LIVE,
+        "OUROBOROS_CONTEXT_MODE": "low",
+        "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "true",
+    })
+    assert legacy["OUROBOROS_CONTEXT_MODE"] == "max"
+    assert legacy["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
+
+
 def test_declaring_a_direct_provider_slot_grants_exactly_that_provider():
     """The mirror: a run that DOES declare a direct lane must still be able to authenticate.
 
@@ -259,6 +281,10 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     "provider_unavailable": (True, "loop.py:3185 reroute + fallback exhausted"),
     "children_unabsorbed": (True, "loop.py:4071 forced terminal, child results unabsorbed"),
     "llm_api_error": (True, "loop_llm_call.py:630 transport death; never a fair shot"),
+    # S3 owner graceful stop ("Wrap up"): the owner ended the attempt, so
+    # reward 0 is an owner decision, never a fair-shot capability fact (CF-02:
+    # reusing finalization_grace would persist the deadline's false reason).
+    "owner_requested_finalization": (True, "loop.py _handle_owner_stop_finalization; owner-requested stop"),
 
     # -- not truncating: a real terminal the agent reached, or a rejected tool call --------
     # An explicit `executor=harness` request that could not be honored ends the CHILD
@@ -292,6 +318,13 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     # GR4-8: the corrupt-projection flavor of the same ingress refusal — still a
     # refusal about a CANCEL request (503), never a task terminal.
     "cancel_intent_projection_corrupt": (False, "gateway/tasks.py fail-closed cancel ingress refusal (corrupt projection); never a task terminal"),
+    # S3 hurry ingress (POST /api/tasks/<id>/hurry): all four are refusals about
+    # a HURRY request — the task itself keeps running untouched, so no trial
+    # ever terminalizes with any of them.
+    "request_id_required": (False, "gateway/task_hurry.py hurry ingress refusal (400); never a task terminal"),
+    "unexpected_fields": (False, "gateway/task_hurry.py hurry ingress refusal (400, text-free contract); never a task terminal"),
+    "task_not_live": (False, "gateway/task_hurry.py hurry ingress refusal (404); never a task terminal"),
+    "mailbox_write_failed": (False, "gateway/task_hurry.py fail-closed hurry ingress refusal (503); never a task terminal"),
 }
 
 _REASON_CODE_LITERAL = re.compile(

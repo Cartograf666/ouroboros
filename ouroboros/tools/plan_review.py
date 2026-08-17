@@ -13,7 +13,6 @@ from datetime import timedelta
 
 from ouroboros.config import SETTINGS_DEFAULTS
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now as _planning_now
-from ouroboros.review_substrate import review_repo_dirs_for
 from ouroboros.task_results import (
     load_plan_review_state,
     mark_current_plan_review_unavailable,
@@ -43,6 +42,8 @@ from ouroboros.tools.plan_review_runtime import (
     record_raw_plan_request_attempt as _record_raw_plan_request_attempt,
     reviewed_handoff_hashes as _reviewed_handoff_hashes,
     resolve_plan_class as _resolve_plan_class,
+    resolve_plan_payload_snapshots as _resolve_plan_payload_snapshots,
+    resolve_plan_roots as _resolve_plan_roots,
     run_plan_review_slots as _run_plan_review_slots,
     validate_plan_request_envelope as _validate_plan_request_envelope,
 )
@@ -279,8 +280,7 @@ def get_tools():
                             "description": "Whether generated Atlas context may include related tests.",
                         },
                     },
-                    # The handler enforces two mutually exclusive modes: plan+goal for a
-                    # fresh review, or review_disposition alone for a stored result.
+                    # Handler enforces two exclusive modes: plan+goal (fresh review) or review_disposition alone (stored result).
                     "required": [],
                 },
             },
@@ -528,9 +528,8 @@ def _schedule_planning_scouts(
         before_side = set(_scheduled_side_channel_ids(ctx))
         before_durable = set(_planning_direct_children(ctx))
         try:
-            # `deadline_at` became a public schedule_subagent parameter in v6.87.7, so the
-            # scout deadline now rides the same channel any parent would use. Narrowing is
-            # enforced downstream: the earlier of this and the parent's deadline wins.
+            # `deadline_at` is a public schedule_subagent parameter (v6.87.7): the scout deadline
+            # rides the normal channel; downstream narrowing takes the earlier of this and the parent's.
             output = _schedule_task(
                 ctx, objective=objective, deadline_at=deadline_at,
                 expected_output=("A concise planning handoff with sections: summary, missed_touchpoints, "
@@ -741,9 +740,8 @@ def _start_planning_swarm(
                     context_level=context_level, context_notes=request.context_notes,
                     scope=request.scope,
                 )
-                # Admission for a NEW wave ONLY. The recovery/collection path below gathers
-                # handoffs that are already PAID — gating those would abandon spend, not save it.
-                # The worker-capacity refusal lives inside the wave plan (max_workers < 2).
+                # Admission gates a NEW wave ONLY — recovery/collection below gathers already-PAID
+                # handoffs (gating those abandons spend); the capacity refusal lives in the wave plan.
                 scout_deadline, refusal = _planning_scout_wave_plan(
                     str(wave.get("scout_cutoff_at") or ""), max_workers=get_max_workers(),
                     grace_sec=get_finalization_grace_sec(), now=_planning_now(),
@@ -788,6 +786,15 @@ def _start_planning_swarm(
     if not (handoffs.get("artifact") or {}).get("path"):
         return {"started": False, "error": "ERROR: raw planning handoff audit could not be saved.",
                 "task_ids": task_ids, "handoffs": handoffs, "resumed": resumed}
+    if not completed and any(isinstance(row, dict) and str(row.get("status") or "").strip().lower() == "cancelled"
+                             for row in (tasks or {}).values()):
+        # Scouts settle terminal-cancelled only via a cancel intent — an owner/parent stop cascade
+        # racing this plan (incident 39e0f183/20c37ed3). Treat the wave as scout-unavailable (the same
+        # retryable outcome as a failed schedule) instead of spending the paid reviewer panel and the owner's finalize episode.
+        return {"started": False,
+                "error": ("ERROR: plan_task planning scout(s) were cancelled before producing a "
+                          "handoff; plan review is unavailable for this attempt."),
+                "task_ids": task_ids, "handoffs": handoffs, "resumed": resumed}
     return {"started": True, "task_ids": task_ids, "handoffs": handoffs, "resumed": resumed,
             "degraded_evidence": not bool(completed)}
 
@@ -802,8 +809,8 @@ def _mark_planning_handoffs_consumed(ctx: ToolContext, handoffs: dict) -> dict:
 
     reviewed_hashes = handoffs.get("reviewed_result_hashes")
     if not isinstance(reviewed_hashes, dict) or set(reviewed_hashes) != set(included):
-        # Compatibility for callers/tests that consume before the paid review is
-        # stored. Production resume always uses the durable exact hash mapping.
+        # Compatibility for callers/tests consuming before the paid review is stored;
+        # production resume always uses the durable exact hash mapping.
         reviewed_hashes = _reviewed_handoff_hashes(handoffs)
 
     disposition_warnings: list[dict] = []
@@ -873,23 +880,6 @@ def _capture_late_planning_audit(ctx: ToolContext, handoffs: dict) -> None:
         "tasks": late_tasks,
     }
     handoffs["artifact"] = _persist_planning_handoffs(ctx, handoffs)
-
-
-def _resolve_plan_roots(
-    ctx: ToolContext, files_to_touch: list,
-) -> tuple[pathlib.Path, pathlib.Path]:
-    """Resolve governance and subject roots without silently mixing them."""
-    governance, subject = review_repo_dirs_for(ctx)
-    for raw in files_to_touch or []:
-        candidate = pathlib.Path(str(raw or ""))
-        resolved = (candidate if candidate.is_absolute() else subject / candidate).resolve(strict=False)
-        try:
-            resolved.relative_to(subject)
-        except ValueError as exc:
-            raise ValueError(
-                f"planned path {raw!r} escapes active subject root {subject}"
-            ) from exc
-    return governance, subject
 
 
 def _planning_evidence_horizon(
@@ -1298,6 +1288,18 @@ def _compile_plan_atlas(
     ))
 
 
+def _build_plan_touch_snapshots(
+    ctx: ToolContext, subject_repo: pathlib.Path, files_to_touch: list[str],
+) -> tuple[str, frozenset[str]]:
+    if not files_to_touch:
+        return "", frozenset()
+    return build_head_snapshot_section(
+        subject_repo,
+        files_to_touch,
+        current_snapshots=_resolve_plan_payload_snapshots(ctx, files_to_touch),
+    )
+
+
 async def _run_plan_review_async(
     ctx: ToolContext,
     request: _PlanReviewRequest,
@@ -1450,13 +1452,10 @@ async def _run_plan_review_async(
             arch_md, title="ARCHITECTURE.md", rel_path="docs/ARCHITECTURE.md"
         )
     ctx.emit_progress_fn("📐 plan_task: reading planned-touch file snapshots…")
-    head_snapshots = ""
     # Atlas inclusion claims only snapshots that survived; omission markers stay explicit.
-    snapshot_included: frozenset[str] = frozenset()
-    if files_to_touch:
-        head_snapshots, snapshot_included = build_head_snapshot_section(
-            subject_repo, files_to_touch
-        )
+    head_snapshots, snapshot_included = _build_plan_touch_snapshots(
+        ctx, subject_repo, files_to_touch
+    )
     requested_context_level = resolved_context_level
     effective_context_level = requested_context_level
     context_degradation_reason = ""

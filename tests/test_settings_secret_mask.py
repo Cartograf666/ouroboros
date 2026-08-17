@@ -65,7 +65,6 @@ def settings_client(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway, "save_settings", fake_save_settings, raising=False)
     monkeypatch.setattr(gateway, "_apply_settings_to_env", lambda *a, **k: None)
     monkeypatch.setattr(gateway, "apply_runtime_provider_defaults", provider_defaults)
-    monkeypatch.setattr(gateway, "_apply_max_context_auto_downgrade", lambda *a, **k: ("", ""))
     monkeypatch.setattr(gateway, "_owner_read_settings_raw", fake_load_settings)
     monkeypatch.setattr(gateway, "_owner_write_settings", fake_save_settings)
 

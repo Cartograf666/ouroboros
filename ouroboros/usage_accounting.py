@@ -22,16 +22,12 @@ import pathlib
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple
+from dataclasses import asdict, dataclass, field, replace
+from typing import Any, Callable, Dict, Iterator, Literal, Optional, Sequence, Tuple
 
 from ouroboros.pricing import estimate_cost_optional
-# One-way seam: the durable ledger substrate (locking, atomic append + fsync, row
-# and transition validation, torn-tail quarantine) lives in ouroboros/usage_ledger.py
-# and knows nothing about reservations, budgets, pricing, or projections. This module
-# is the ACCOUNTING POLICY on top of it and imports FROM it; usage_ledger must never
-# import back. The private names are re-bound here so existing call sites — and the
-# tests that monkeypatch `usage_accounting._locked` — keep working unchanged.
+from ouroboros._usage_response import usage_from_response
+# One-way seam: usage_ledger owns bytes/validation; this module owns policy.
 from ouroboros.usage_ledger import (  # noqa: F401 — re-exported substrate
     LEDGER_REL,
     QUARANTINE_REL,
@@ -48,10 +44,6 @@ from ouroboros.usage_ledger import (  # noqa: F401 — re-exported substrate
     _number,
     _read_new_records_locked,
     _read_records_locked,
-    # Re-exported although THIS module no longer reads it: the terminal-state set is
-    # part of the substrate's vocabulary, and a policy function that terminalizes an
-    # attempt needs to name those states. Dropping it from the re-export would make the
-    # split look clean here and break a caller that arrives from another branch.
     _TERMINAL,
     _validate_records,
     _write_bytes_atomic_fsync,
@@ -66,15 +58,16 @@ from ouroboros._usage_rows import (  # noqa: F401  (re-exported substrate vocabu
 )
 
 log = logging.getLogger(__name__)
-
 IMPORT_REL = pathlib.Path("state/usage_import_watermark.json")
-
 __all__ = (
-    "AttemptRequest", "AttemptReservation", "BudgetExceeded", "PhysicalAttemptLimitExceeded",
+    "AttemptRequest", "AttemptReservation", "BudgetExceeded", "PhysicalAttemptCapture",
+    "PhysicalAttemptContext", "PhysicalAttemptLimitExceeded", "PhysicalAttemptPreconditionFailed",
+    "PhysicalAttemptPreparationFailed",
     "UsageAccountingError", "UsageLedgerCorrupt", "UsageScope", "capture_attempt_ids",
-    "current_usage_scope",
+    "bind_physical_attempt_context", "current_physical_attempt_context",
+    "current_physical_attempt_predicate", "current_usage_scope",
     "ensure_legacy_imported", "execute_physical_attempt", "execute_physical_attempt_async",
-    "last_root_accounting",
+    "last_physical_attempt_capture", "last_root_accounting", "physical_attempt_capture_from_exception",
     "mark_dispatched", "mark_unresolved", "physical_attempt_limit",
     "record_subscription_session",
     "record_unmetered_external_dispatch", "refresh_root_accounting",
@@ -91,18 +84,16 @@ _ATTEMPT_COLLECTOR: contextvars.ContextVar[Optional[list[str]]] = contextvars.Co
 _PHYSICAL_LIMIT: contextvars.ContextVar[Optional["_AttemptLimit"]] = contextvars.ContextVar(
     "ouroboros_physical_attempt_limit", default=None
 )
+_PHYSICAL_CONTEXT: contextvars.ContextVar[Optional["PhysicalAttemptContext"]] = contextvars.ContextVar(
+    "ouroboros_physical_attempt_context", default=None
+)
+_PHYSICAL_PREDICATE: contextvars.ContextVar[Optional[Callable[["AttemptRequest"], Any]]] = contextvars.ContextVar(
+    "ouroboros_physical_attempt_predicate", default=None
+)
+_LAST_PHYSICAL_ATTEMPT: contextvars.ContextVar[Optional["PhysicalAttemptCapture"]] = contextvars.ContextVar(
+    "ouroboros_last_physical_attempt", default=None
+)
 
-# --- Root-subtree accounted telemetry (v6.91) -------------------------------
-# The loop's in-task cost stop must compare its ceiling against the TREE's
-# accounted spend (the number the fence enforces), but a per-round
-# ``usage_projection`` read would re-create the O(ledger)-under-lock contention
-# that burned 137 concurrent tasks (e4a87344). ``reserve_attempt`` already
-# computes the root subtree sum inside the lock, so it is stashed here
-# (process-local, newest-wins) and read for free; the rare read points (loop
-# start / 600s pacing / 15-round checkpoint) may force one real projection read
-# via ``refresh_root_accounting`` when the stash is stale — e.g. after a 900s
-# ``wait_tasks`` block while children spent. Unknown stays None end-to-end;
-# nothing here is a second monetary authority.
 _ROOT_ACCOUNTING_TELEMETRY: Dict[str, Dict[str, Any]] = {}
 _ROOT_ACCOUNTING_TELEMETRY_LOCK = threading.Lock()
 _ROOT_ACCOUNTING_TELEMETRY_CAP = 64
@@ -134,15 +125,7 @@ def _stash_root_accounting(
 
 
 def last_root_accounting(root_task_id: str) -> Optional[Dict[str, Any]]:
-    """The most recent root-subtree accounted snapshot seen by THIS process.
-
-    Zero I/O: refreshed as a byproduct of every ``reserve_attempt`` (with the
-    fresh reservation's in-flight hold included) and every terminal transition
-    (settle/release/unresolve) under this root, so within one process it tracks
-    the ledger fence exactly; only spend from OTHER processes (delegated
-    children) can make it stale. Returns ``{"accounted_usd", "root_limit_usd",
-    "age_sec"}`` or None when no dispatch under the root has been reserved here
-    yet."""
+    """Newest process-local root snapshot, including in-flight holds."""
     with _ROOT_ACCOUNTING_TELEMETRY_LOCK:
         entry = _ROOT_ACCOUNTING_TELEMETRY.get(str(root_task_id or "").strip())
         if entry is None:
@@ -158,12 +141,7 @@ def refresh_root_accounting(
     *,
     max_age_sec: float = 0.0,
 ) -> Optional[Dict[str, Any]]:
-    """Return the root-subtree accounted snapshot, re-reading the ledger only
-    when the stash is missing or older than ``max_age_sec``.
-
-    This is the RARE read path (loop start / pacing / checkpoint — never per
-    round; see the telemetry comment above). Fail-soft: a failed read returns
-    the stale stash (with its honest ``age_sec``) or None — never a fake $0."""
+    """Refresh a stale root snapshot; on failure return stale/None, never fake $0."""
     root_task_id = str(root_task_id or "").strip()
     if not root_task_id:
         return None
@@ -196,6 +174,16 @@ class PhysicalAttemptLimitExceeded(UsageAccountingError):
     """Raised before a provider send would exceed the caller's actor-local rail."""
 
 
+class PhysicalAttemptPreparationFailed(UsageAccountingError):
+    """An inspectable candidate could not be persisted before dispatch."""
+
+    def __init__(self, message: str, *, attempt_id: str = "") -> None:
+        super().__init__(message)
+        self.attempt_id = str(attempt_id or "")
+
+
+class PhysicalAttemptPreconditionFailed(PhysicalAttemptPreparationFailed):
+    """The host rejected an immutable final-candidate fact before dispatch."""
 @dataclass
 class _AttemptLimit:
     maximum: int
@@ -216,6 +204,19 @@ class UsageScope:
 
 
 @dataclass(frozen=True)
+class PhysicalAttemptContext:
+    profile: Literal["owner_max", "owner_low", "task_local_low"]
+    rendered_mode: Literal["max", "low"]
+    measurement_basis: Literal["fresh_route_usage", "fresh_model_usage", "cold_estimate"]
+    route_fp: str
+    round_id: str
+    target_total_tokens: Optional[int]
+    capacity_total_tokens: Optional[int]
+    context_target_miss: bool
+    automatic_pass_used: bool
+
+
+@dataclass(frozen=True)
 class AttemptRequest:
     model: str
     provider: str
@@ -232,13 +233,14 @@ class AttemptRequest:
     source: str = ""
     root_limit_usd: Optional[float] = None
     force_unknown_reservation: bool = False
-    # The send-time finalizer's APPLIED prompt-cache TTL for THIS payload
-    # ("1h" / "5m" / "default"), carried by llm._attempt_request so reservation
-    # pricing bills the tier that actually ships. Empty = unknown (a
-    # construction site that never sees a payload); pricing then falls back to
-    # the owner's one TTL authority (config.resolve_prompt_cache_ttl) — never
-    # to a hardcoded second one.
+    # Applied payload TTL; empty construction sites fall back to the owner SSOT.
     prompt_cache_ttl: str = ""
+    candidate_raw_sha256: Optional[str] = None
+    candidate_raw_size_bytes: Optional[int] = None
+    candidate_context_sha256: Optional[str] = None
+    candidate_context_size_bytes: Optional[int] = None
+    candidate_measurement_kind: Literal["canonical_json_v1", "opaque"] = "opaque"
+    physical_context: Optional[PhysicalAttemptContext] = None
 
 
 @dataclass(frozen=True)
@@ -248,6 +250,26 @@ class AttemptReservation:
     model: str
     provider: str
     reservation_upper_bound_usd: Optional[float]
+
+
+@dataclass(frozen=True)
+class PhysicalAttemptCapture:
+    attempt_id: str
+    model: str
+    provider: str
+    state: Literal["reserved", "released", "dispatched", "settled", "unresolved"]
+    candidate_measurement_kind: Literal["canonical_json_v1", "opaque"]
+    max_completion_tokens: int = 0
+    candidate_raw_sha256: Optional[str] = None
+    candidate_raw_size_bytes: Optional[int] = None
+    candidate_context_sha256: Optional[str] = None
+    candidate_context_size_bytes: Optional[int] = None
+    candidate_manifest_ref: Optional[Dict[str, Any]] = None
+    physical_context: Optional[PhysicalAttemptContext] = None
+    provider_status_code: Optional[int] = None
+    provider_code: str = ""
+    provider_error_type: str = ""
+    provider_error: str = ""
 
 
 @contextlib.contextmanager
@@ -263,6 +285,40 @@ def usage_scope(scope: UsageScope) -> Iterator[UsageScope]:
 def current_usage_scope() -> Optional[UsageScope]:
     """Return the immutable scope bound to this execution context, if any."""
     return _CURRENT_SCOPE.get()
+
+
+@contextlib.contextmanager
+def bind_physical_attempt_context(
+    context: PhysicalAttemptContext,
+    candidate_predicate: Optional[Callable[[AttemptRequest], Any]] = None,
+) -> Iterator[PhysicalAttemptContext]:
+    """Bind frozen Main metadata and an optional final-fact predicate."""
+    if not isinstance(context, PhysicalAttemptContext):
+        raise TypeError("physical attempt context must be PhysicalAttemptContext")
+    context_token = _PHYSICAL_CONTEXT.set(context)
+    predicate_token = _PHYSICAL_PREDICATE.set(candidate_predicate)
+    try:
+        yield context
+    finally:
+        _PHYSICAL_PREDICATE.reset(predicate_token)
+        _PHYSICAL_CONTEXT.reset(context_token)
+
+
+def current_physical_attempt_context() -> Optional[PhysicalAttemptContext]:
+    return _PHYSICAL_CONTEXT.get()
+
+
+def current_physical_attempt_predicate() -> Optional[Callable[[AttemptRequest], Any]]:
+    return _PHYSICAL_PREDICATE.get()
+
+
+def last_physical_attempt_capture() -> Optional[PhysicalAttemptCapture]:
+    return _LAST_PHYSICAL_ATTEMPT.get()
+
+
+def physical_attempt_capture_from_exception(exc: BaseException) -> Optional[PhysicalAttemptCapture]:
+    capture = getattr(exc, "physical_attempt_capture", None)
+    return capture if isinstance(capture, PhysicalAttemptCapture) else last_physical_attempt_capture()
 
 
 @contextlib.contextmanager
@@ -318,12 +374,6 @@ def _merge_scope(request: AttemptRequest) -> Tuple[AttemptRequest, UsageScope]:
     return request, scope
 
 
-# The read-side rows memo and the fingerprint-keyed render cache live in
-# ouroboros/_usage_rows_memo.py (extracted for the module-size gate, same
-# precedent as _usage_rows.py). The implementation resolves `_locked` /
-# `_read_records_locked` back through THIS namespace at call time, so the
-# historical monkeypatch sites keep governing display reads unchanged; the
-# names are re-bound here so tests keep addressing `ua._ROWS_MEMO` etc.
 from ouroboros._usage_rows_memo import (  # noqa: F401,E402  (re-exported seam)
     _LedgerRowsMemo,
     _ROWS_MEMO,
@@ -347,11 +397,6 @@ def usage_projection(
     still carries ``limit_usd``/``remaining_known_usd`` — the two fields
     ``budget_remaining`` consumes. The default keeps the full contract."""
     root = _drive_root(drive_root)
-    # Every configuration input is resolved BEFORE the key is built: the
-    # TOTAL_BUDGET env read happens per call (hot-reload and tests change it
-    # without touching the ledger), so a cached render can never outlive it.
-    # The integrity bit is stat'ed and appended to the key by _render_cached,
-    # after the row read that may itself quarantine a torn tail.
     if root_task_id:
         cache_key = ("usage_projection", root_task_id, "", None, True)
 
@@ -487,11 +532,7 @@ def _reservation_cost(request: AttemptRequest) -> Optional[float]:
     if str(request.provider or "").lower() == "local":
         return 0.0
     prompt_tokens = max(0, int(request.prompt_tokens_estimate or 0))
-    # chars/4 is a planning estimate, not a safe monetary hold.  OpenAI-family
-    # tokenization on the live v6.64 smoke measured 1.0382x that estimate; keep
-    # a provider-specific 1.10 linear envelope so the reservation also selects
-    # the correct long-context price tier.  Explicit/opaque caps and settlement
-    # remain untouched above/below this estimator.
+    # OpenAI-family chars/4 estimates keep the measured 1.10 reservation envelope.
     from ouroboros.provider_models import normalize_model_identity
 
     normalized_model = normalize_model_identity(str(request.model or "").lstrip("~"))
@@ -505,20 +546,20 @@ def _reservation_cost(request: AttemptRequest) -> Optional[float]:
     )
     prompt_cache_ttl: Optional[str] = None
     if cache_write_tokens:
-        # Price the cache-write tier that will actually ship, never a hardcoded
-        # worst case: the dispatch path carries the finalizer's APPLIED TTL
-        # (llm._attempt_request reads it off the exact candidate payload), and a
-        # construction site that never sees a payload falls back to the owner's
-        # single TTL authority — the same setting the send-time finalizer stamps
-        # onto every breakpoint of this family. The previous hardcoded "1h" was
-        # a second TTL authority that over-priced admission by 2.0/1.25 on the
-        # write component whenever the owner selected the cheaper 5m/default
-        # tier, rejecting calls the budget actually affords.
+        # Price the applied candidate TTL; unknown construction sites use the owner SSOT.
         from ouroboros.config import PROMPT_CACHE_TTL_SCALE, resolve_prompt_cache_ttl
 
         prompt_cache_ttl = str(request.prompt_cache_ttl or "").strip().lower()
         if prompt_cache_ttl not in PROMPT_CACHE_TTL_SCALE:
-            prompt_cache_ttl = resolve_prompt_cache_ttl()
+            # An inspectable marker-free candidate writes no cache at all. Keep
+            # the historical conservative base-tier reservation without
+            # misreporting a TTL on the eventual physical settlement. Opaque
+            # construction sites still fall back to the owner setting.
+            prompt_cache_ttl = (
+                "default"
+                if request.candidate_measurement_kind == "canonical_json_v1"
+                else resolve_prompt_cache_ttl()
+            )
     return estimate_cost_optional(
         request.model,
         prompt_tokens,
@@ -538,20 +579,7 @@ def review_wave_admission(
     prompt_chars: int,
     max_completion_tokens: int = 65536,
 ) -> Dict[str, Any]:
-    """Read-only pre-flight: does a full review wave fit the remaining root budget?
-
-    A review wave (one reviewer call per slot) that cannot possibly fit dies
-    mid-wave today: the first N slots spend real money, a later slot hits the
-    root-budget gate, the review hangs ``pending``, and the task dies
-    ``budget_exhausted`` with paid-but-useless partial review work. This helper
-    lets a review surface decline the WHOLE wave up front and finalize honestly
-    instead. It reuses the exact per-attempt reservation math
-    (``_reservation_cost``) and the ledger projection — no second budget
-    authority. Fail-open by design: no root scope, no known limit, or unknown
-    pricing for a slot contributes zero to the estimate and is counted in
-    ``unpriced_slots`` rather than short-circuiting the whole wave to ``fits=True``
-    (identical to the admission stance in ``reserve_attempt``, where unknown price
-    never blocks dispatch — but there the unknown is per attempt, not per wave)."""
+    """Read-only all-slot admission using the normal reservation math; fail open."""
     result: Dict[str, Any] = {
         "fits": True,
         "estimated_wave_usd": None,
@@ -585,13 +613,7 @@ def review_wave_admission(
                 )
             )
             if bound is None:
-                # An unpriceable slot contributes an unknown, not a veto and not a
-                # pass for the whole wave. Returning here made ONE such model disable
-                # admission for every priced sibling too — the gate stopped binding
-                # exactly when a wave mixed a known-cost reviewer with an unknown one.
-                # Count it as zero, keep summing the rest, and disclose the unknown so
-                # a reader can tell "fits, all known" from "fits, partly unknown"
-                # (BIBLE P1: a gap is represented, never filled in).
+                # Unknown contributes no invented price and remains explicitly counted.
                 result["unpriced_slots"] = int(result.get("unpriced_slots") or 0) + 1
                 continue
             total += float(bound)
@@ -641,6 +663,24 @@ def _active_root_budget_fence(root: pathlib.Path, root_task_id: str) -> Optional
     return None
 
 
+_CANDIDATE_ROW_FIELDS = (
+    "candidate_raw_sha256", "candidate_raw_size_bytes", "candidate_context_sha256",
+    "candidate_context_size_bytes", "candidate_measurement_kind", "physical_context",
+    "candidate_manifest_ref",
+)
+
+
+def _candidate_request_fields(request: AttemptRequest) -> Dict[str, Any]:
+    return {
+        "candidate_raw_sha256": request.candidate_raw_sha256,
+        "candidate_raw_size_bytes": request.candidate_raw_size_bytes,
+        "candidate_context_sha256": request.candidate_context_sha256,
+        "candidate_context_size_bytes": request.candidate_context_size_bytes,
+        "candidate_measurement_kind": request.candidate_measurement_kind,
+        "physical_context": asdict(request.physical_context) if request.physical_context else None,
+    }
+
+
 def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
     """Atomically check global/root limits and append a ``reserved`` record."""
     request, scope = _merge_scope(request)
@@ -679,16 +719,7 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
             root_rows = [row for row in finals if str(row.get("root_task_id") or "") == scope.root_task_id]
             root_accounted = float(_summary(root_rows)["accounted_usd"])
             root_limit = max(0.0, float(scope.root_limit_usd))
-            # Scope telemetry piggyback (v6.91): the subtree sum is already in
-            # hand — stash the MEASURED pre-this-attempt value (never a
-            # speculative one: on the refusal path below no row is appended) so
-            # the loop's pacing and ceiling checks read the tree number with
-            # zero new ledger reads. After the append succeeds below, the stash
-            # is refreshed again WITH this reservation's hold: the loop trusts
-            # the stash for up to 120s, so a pre-append-only value advertised
-            # "ledger-accounted incl. in-flight holds" while omitting the one
-            # call currently in flight — near the cap that let the hard ledger
-            # fence fire before the graceful wrap-up ever saw the true number.
+            # Piggyback the measured pre-append subtree sum on this locked read.
             _stash_root_accounting(scope.root_task_id, root_accounted, root_limit)
             if root_limit <= 0 or root_accounted >= root_limit - 1e-9 or (
                 bound is not None and root_accounted + bound > root_limit + 1e-9
@@ -725,12 +756,11 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
                     "source": scope.source,
                     "global_limit_usd": request.global_limit_usd,
                     "root_limit_usd": scope.root_limit_usd,
+                    **_candidate_request_fields(request),
                 }
             ],
         )
         if root_rows is not None:
-            # Post-append refresh: the same in-lock rows plus the row just
-            # written — zero additional ledger reads (the e4a87344 constraint).
             _stash_root_accounting(
                 scope.root_task_id,
                 float(_summary([*root_rows, *appended])["accounted_usd"]),
@@ -827,27 +857,7 @@ def record_subscription_session(
     credential_profile_id: str = "",
     access_profile: str = "",
 ) -> str:
-    """Idempotently record one subscription session on the sessions/quota axis.
-
-    The row has THREE cash states, and only the first is final (rule in
-    docs/DEVELOPMENT.md, LLM Call Rules):
-
-    * DISCLOSED ZERO (``spend_usd=0.0``) — a genuinely free session, the case this row
-      kind was created for: ``cost_usd: 0.0, cost_final: True``, projection stays final.
-    * ESTIMATED (``spend_estimated=True``) — the engine disclosed an amount it has not
-      settled: the number rides as money, the finality does not.
-    * UNDISCLOSED (``spend_usd=None``) — the harness reported nothing: ``cost_usd: None``,
-      counted as unknown/unmetered, never written as a confident ``0.0``.
-
-    Reusing ``record_unmetered_external_dispatch`` for any of them would also drop the
-    separate sessions/quota axis (``subscription_sessions`` / ``subscription_windows``).
-
-    An AMOUNT and its EXACTNESS are two facts, so both are parameters: ``spend_usd``
-    alone cannot say whether the engine settled that cash or estimated it, and a caller
-    that passes only the amount would have the row assert a finality nobody proved.
-    Token counts are ``int | None`` for the same reason on the usage axis — ``None`` is
-    "no harness reported this", which is not the same run as one that used zero.
-    """
+    """Record one idempotent subscription session; None remains undisclosed."""
     stable_id, route_id = str(session_id or "").strip(), str(route or "").strip()
     if not stable_id or not route_id:
         raise UsageAccountingError("subscription session requires a stable session_id and route")
@@ -862,38 +872,14 @@ def record_subscription_session(
         "state": "settled",
         "model": str(model or ""),
         "provider": route_id,
-        # A subscription session is free ONLY when the harness says it was. `spend_usd`
-        # is the engine's settled cash: a real charge (expired session, a route that
-        # bills, an auth fallback) must ride the ledger as money, and an UNDISCLOSED
-        # spend must not be written as a confident zero — that is the one shape that
-        # would hide delegated cost from every budget fence while claiming finality.
-        # UNKNOWN is None, not 0.0. A `cost_final=False` row whose cost is 0.0 adds zero
-        # to the projection's `estimated` total, and `not 0.0` is True — so the honest
-        # per-row disclosure was invisible in `usage_projection`, which kept reporting
-        # `cost_final: True`. None routes the row through the `unknown` counter instead,
-        # where it correctly drops finality. The DISCLOSED-zero case (a genuinely free
-        # subscription session) still settles at 0.0/final and leaves the projection
-        # final — which is the property this row kind was created for.
-        #
-        # ESTIMATED is the third state, and it is neither of the other two: the engine
-        # discloses an amount it has NOT settled (`spendEstimated` on the wire). It rides
-        # as money — the number is the best fact anyone has — but it may not claim
-        # finality, so it lands in the projection's `estimated` bucket, which is exactly
-        # what that bucket is for. `pricing_known` stays on the amount: a price IS known
-        # here, just not exact; EXACTNESS is `cost_final`'s axis, not this one.
+        # None is undisclosed; zero is genuinely free; estimated amounts are non-final.
         "cost_usd": None if spend_usd is None else round(float(spend_usd), 6),
         "cost_final": spend_usd is not None and not spend_estimated,
         "reservation_upper_bound_usd": None if spend_usd is None else round(float(spend_usd), 6),
         "pricing_known": spend_usd is not None,
         "prompt_tokens": None if prompt_tokens is None else max(0, int(prompt_tokens)),
         "completion_tokens": None if completion_tokens is None else max(0, int(completion_tokens)),
-        # The schema sentence that governs the two above governs a THIRD field, and the
-        # engine really fills it: 28 of 60 rows on a live `/v2/runs` page carry a non-null
-        # `cachedInputTokens`, 27 of them non-zero. Dropping it left the delegated row with
-        # no `cached_tokens` key at all, which `_breakdown_bucket` renders as 0 beside a
-        # six-figure prompt count — the render-unknown-as-zero shape its two siblings just
-        # stopped doing. It is its own bucket and is never summed into `total_tokens`,
-        # which is required: cached is ⊆ input for some harnesses and disjoint for others.
+        # Cached tokens are a separate axis because harness semantics differ.
         "cached_tokens": None if cached_tokens is None else max(0, int(cached_tokens)),
         "task_id": str(task_id or bound.task_id or ""),
         "root_task_id": str(root_task_id or bound.root_task_id or task_id or bound.task_id or ""),
@@ -902,11 +888,7 @@ def record_subscription_session(
         "source": str(source or bound.source or "delegated_subagent"),
         "subscription_route": route_id,
         "subscription_reset_at": str(reset_at or ""),
-        # D29: the APPLIED credential-profile id and access profile ride the
-        # durable row BY DEFAULT — the engine discloses which account and which
-        # access the deciding attempt actually ran under, and a subscription
-        # session that hides that cannot answer "which of my accounts paid".
-        # Empty means the engine reported none (default/native credentials).
+        # Empty profile/access means the engine reported none.
         "credential_profile_id": str(credential_profile_id or ""),
         "access_profile": str(access_profile or ""),
         "session_id_sha256": identity,
@@ -939,18 +921,14 @@ def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> D
             "source": str(current.get("source") or "llm"),
             "global_limit_usd": current.get("global_limit_usd"),
             "root_limit_usd": current.get("root_limit_usd"),
+            **{key: current.get(key) for key in _CANDIDATE_ROW_FIELDS if key in current},
             **fields,
         }
         appended = _append_rows_locked(reservation.drive_root, records, [row])
         root_task_id = str(current.get("root_task_id") or "")
         root_limit = _number(current.get("root_limit_usd"))
         if root_task_id and root_limit is not None:
-            # Telemetry refresh from the post-transition finals: settle/release/
-            # unresolve change the subtree's accounted sum (a settled cost
-            # replaces its own hold, a release drops it), and leaving the stash
-            # at the reserve-time pre-append value made the loop's 120s-trusted
-            # snapshot lag one full call behind the ledger fence. Same lock,
-            # same rows already in memory — no new ledger read.
+            # Refresh from post-transition finals without another ledger read.
             subtree = [
                 r for r in _final_rows([*records, *appended]).values()
                 if str(r.get("root_task_id") or "") == root_task_id
@@ -961,17 +939,29 @@ def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> D
         return appended[0]
 
 
-def mark_dispatched(reservation: AttemptReservation) -> None:
+def mark_dispatched(
+    reservation: AttemptReservation,
+    *,
+    candidate_manifest_ref: Optional[Dict[str, Any]] = None,
+) -> None:
     try:
         _claim_physical_dispatch()
     except PhysicalAttemptLimitExceeded:
-        release_attempt(reservation, "physical_attempt_limit")
+        release_attempt(
+            reservation,
+            "physical_attempt_limit",
+            candidate_manifest_ref=candidate_manifest_ref,
+        )
         raise
-    _transition(reservation, "dispatched")
+    fields = {"candidate_manifest_ref": candidate_manifest_ref} if candidate_manifest_ref else {}
+    _transition(reservation, "dispatched", **fields)
 
 
-def release_attempt(reservation: AttemptReservation, reason: str = "not_dispatched") -> None:
-    _transition(reservation, "released", reason=str(reason or "not_dispatched"))
+def release_attempt(
+    reservation: AttemptReservation, reason: str = "not_dispatched", *, candidate_manifest_ref=None,
+) -> None:
+    _transition(reservation, "released", reason=str(reason or "not_dispatched"), **(
+        {"candidate_manifest_ref": candidate_manifest_ref} if candidate_manifest_ref else {}))
 
 
 def mark_unresolved(reservation: AttemptReservation, reason: str) -> None:
@@ -984,18 +974,7 @@ def terminalize_abandoned_attempt(
     reason: str,
     usage: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Close an attempt whose owning process died before it could settle.
-
-    A non-terminal attempt keeps its full reservation upper bound counted
-    against the global/root limit forever, so a killed out-of-process dispatch
-    (timeout, native abort) permanently burns whatever it reserved — for the
-    advisory gateway that reservation IS the remaining budget. The supervising
-    process settles it with whatever usage the dead child managed to report
-    (measured tokens, estimated cost, never a fabricated final number) and falls
-    back to the honest ``unresolved`` state when nothing was reported.
-
-    Already-terminal attempts are returned untouched: appending after a terminal
-    state would corrupt the ledger for every later reader."""
+    """Close a dead owner attempt from measured usage, else unresolved/released."""
     with _locked(reservation.drive_root):
         current = _final_rows(_read_records_locked(reservation.drive_root)).get(
             reservation.attempt_id
@@ -1021,77 +1000,6 @@ def terminalize_abandoned_attempt(
     return "unresolved"
 
 
-def _plain(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool, dict, list)):
-        return value
-    if hasattr(value, "model_dump"):
-        try:
-            return value.model_dump()
-        except Exception:
-            pass
-    if hasattr(value, "dict"):
-        try:
-            return value.dict()
-        except Exception:
-            pass
-    return value
-
-
-def usage_from_response(response: Any) -> Tuple[Dict[str, Any], Optional[float], bool]:
-    """Extract common provider usage/cost fields without persisting response text."""
-    payload: Any = _plain(response)
-    if not isinstance(payload, dict) and hasattr(response, "json"):
-        try:
-            payload = response.json()
-        except Exception:
-            payload = None
-    usage: Any = payload.get("usage") if isinstance(payload, dict) else getattr(response, "usage", None)
-    usage = _plain(usage)
-    if not isinstance(usage, dict):
-        usage = {}
-    prompt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
-    completion = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
-    details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
-    cached = int(details.get("cached_tokens") or usage.get("cached_tokens") or 0) if isinstance(details, dict) else 0
-    normalized = {
-        **usage,
-        "prompt_tokens": prompt,
-        "completion_tokens": completion,
-        "cached_tokens": cached,
-    }
-    # An OpenAI-compatible HTTP-200 whose body is a top-level provider error
-    # (OpenRouter passes 429/5xx/4xx through the body) that billed zero tokens is
-    # a request rejected BEFORE generation — nothing was charged. Settle a
-    # confirmed $0 so the attempt's conservative reservation upper bound is
-    # RELEASED instead of held as an unresolved "phantom" that accumulates across
-    # a provider storm and exhausts the task/global budget while real spend stays
-    # small (v6.64.0 physical-attempt ledger blind spot; SWE-Pro tasks died
-    # budget_exhausted at ~$7.5 of a $25 cap). The reservation stays held for the
-    # cases that must not under-count: any billed tokens (prompt/completion > 0 —
-    # a partial stream or an unknown-price success) fall through to the normal
-    # cost path and keep their bound; the SDK/opaque-session path settles via
-    # mark_unresolved and is untouched.
-    if (
-        isinstance(payload, dict)
-        and isinstance(payload.get("error"), dict)
-        and prompt == 0
-        and completion == 0
-    ):
-        return normalized, 0.0, True
-    cost_value = None
-    for candidate in (
-        usage.get("cost"),
-        usage.get("total_cost"),
-        payload.get("total_cost_usd") if isinstance(payload, dict) else None,
-        getattr(response, "total_cost_usd", None),
-    ):
-        if candidate is not None:
-            cost_value = candidate
-            break
-    cost = _number(cost_value)
-    return normalized, cost, cost is not None
-
-
 def settle_attempt(
     reservation: AttemptReservation,
     usage: Optional[Dict[str, Any]] = None,
@@ -1114,6 +1022,7 @@ def settle_attempt(
             int(normalized.get("completion_tokens") or normalized.get("output_tokens") or 0),
             cache_usage={"cached_tokens": int(normalized.get("cached_tokens") or 0),
                          "cache_write_tokens": int(normalized.get("cache_write_tokens") or 0),
+                         "cache_write_tokens_by_ttl": normalized.get("cache_write_tokens_by_ttl"),
                          "prompt_cache_ttl": str(normalized.get("prompt_cache_ttl") or "")},
             allow_live_fetch=False,
             provider=reservation.provider,
@@ -1132,40 +1041,14 @@ def settle_attempt(
     )
 
 
-# Providers whose reported ``prompt_tokens`` INCLUDES cache reads and cache writes —
-# the assumption `pricing.py` already encodes when it derives
-# `regular_input = prompt_tokens - cached - cache_write`. On these routes a cached call
-# still measures density correctly, so cache markers must NOT suppress the observation:
-# the main loop and every review surface mark a stable prefix, so a
-# skip-on-any-cache-token rule would silently make the measurement path VACUOUS and
-# freeze every pack at the conservative cold-start density forever.
-# `anthropic` belongs here as of v6.81.0: the direct-Anthropic path now reports
-# `prompt_tokens = input_tokens + cache_read_input_tokens + cache_creation_input_tokens`
-# (`llm.py`, v6.77.0), i.e. the same OpenAI-semantics total the rest of this set has.
-# It was correctly ABSENT while that path still reported bare `input_tokens`; leaving it
-# out afterwards made the measurement vacuous on the main and heavy slots, which are the
-# direct-Anthropic routes. GigaChat stays out: its `precached_prompt_tokens` semantics
-# are still undocumented.
+# Cache-inclusive prompt totals are measurable; GigaChat's semantics remain unknown.
 _CACHE_INCLUSIVE_PROMPT_TOKEN_PROVIDERS = frozenset({
     "openrouter", "openai", "openai-compatible", "cloudru", "local", "anthropic",
 })
 
 
 def _observe_token_density(request: AttemptRequest, usage: Optional[Dict[str, Any]]) -> None:
-    """Learn the model's real tokenizer density from one settled physical send.
-
-    Called AFTER settlement and therefore OUTSIDE the ledger lock, so a
-    capability-evidence write can never delay or starve monetary accounting; every
-    failure is swallowed (fail-soft — an unlearned observation only means review
-    packs keep using the conservative cold-start density).
-
-    A cache-bearing send is skipped ONLY on a route whose ``prompt_tokens`` semantics
-    are not known to be cache-inclusive — today GigaChat, whose `precached_prompt_tokens`
-    semantics are undocumented. There a partially cached call would report a falsely LOW
-    density, and an under-measured density LOOSENS the review-pack cap — the one direction
-    that reintroduces provider 400s. No arithmetic reconstruction is attempted here on
-    purpose; the direct-Anthropic path needs none, because as of v6.77.0 it already folds
-    cache reads and writes into ``prompt_tokens`` itself."""
+    """Learn density after settlement; unknown cache semantics produce no witness."""
     try:
         normalized = dict(usage or {})
         cache_bearing = bool(
@@ -1188,23 +1071,14 @@ def _observe_token_density(request: AttemptRequest, usage: Optional[Dict[str, An
             prompt_chars=estimate * 4,
             prompt_tokens=real,
             source="dispatch_usage",
+            route_fp=str(request.physical_context.route_fp if request.physical_context else ""),
         )
     except Exception:
         log.debug("token-density observation skipped", exc_info=True)
 
 
 def _is_pre_routing_rejection(exc: BaseException) -> bool:
-    """True for an OpenRouter router-side 404 that never reached an upstream.
-
-    OpenRouter answers "No endpoints found ..." (e.g. unsupported request
-    parameters under require_parameters) with HTTP 404 from its ROUTER — no
-    provider generation happened and nothing was billed. Settling such an
-    attempt at a confirmed $0 releases its conservative reservation instead of
-    holding a phantom upper bound against the root budget forever (the same
-    blind-spot class as the v6.65.4 zero-usage body-error fix). Deliberately
-    narrow: BOTH the 404 status and the router signature are required (and the
-    caller additionally gates on provider == "openrouter"), so ordinary
-    provider 404/5xx/timeout failures stay honestly unresolved."""
+    """True for the exact free OpenRouter router-side 404 signature."""
     text = str(exc or "").lower()
     if "no endpoints found" not in text:
         return False
@@ -1217,21 +1091,7 @@ def _is_pre_routing_rejection(exc: BaseException) -> bool:
 
 
 def _is_tos_rejection(exc: BaseException) -> bool:
-    """True for an OpenRouter ToS-policy 403 that never reached generation.
-
-    OpenRouter rejects the request with HTTP 403 and the body signature
-    "prohibited due to a violation of provider Terms Of Service" (the OpenAI SDK
-    raises it as PermissionDeniedError with status_code=403; the match here is
-    structural-or-textual so a transport wrapper that stringifies the error
-    still settles) BEFORE any upstream generation — the audited CLB incident showed 0 llm_usage events
-    and 0 billed tokens across 240 such rejections while the ledger accumulated
-    a ~$479 phantom unresolved bound. Settling the attempt at a confirmed $0
-    releases the conservative reservation instead of holding that phantom bound
-    against the budget fence. Deliberately narrow, mirroring
-    _is_pre_routing_rejection: BOTH the 403 status and the exact ToS body
-    signature are required (and the caller additionally gates on
-    provider == "openrouter"), so generic 401/403/quota failures — where the
-    outcome is genuinely unknown — stay honestly unresolved."""
+    """True for the exact free OpenRouter ToS-policy 403 signature."""
     text = str(exc or "").lower()
     if "prohibited due to a violation of provider terms of service" not in text:
         return False
@@ -1243,7 +1103,7 @@ def _is_tos_rejection(exc: BaseException) -> bool:
     return status == 403 or "error code: 403" in text or '"code": 403' in text or "'code': 403" in text
 
 
-def _terminalize_failed_attempt(reservation: AttemptReservation, exc: BaseException) -> None:
+def _terminalize_failed_attempt(reservation: AttemptReservation, exc: BaseException) -> str:
     """Route a raised provider send to its honest terminal ledger state."""
     provider = str(reservation.provider or "").strip().lower()
     if provider == "openrouter" and _is_pre_routing_rejection(exc):
@@ -1254,6 +1114,7 @@ def _terminalize_failed_attempt(reservation: AttemptReservation, exc: BaseExcept
             cost_final=True,
             settle_reason="pre_routing_rejection",
         )
+        return "settled"
     elif provider == "openrouter" and _is_tos_rejection(exc):
         _transition(
             reservation,
@@ -1262,8 +1123,98 @@ def _terminalize_failed_attempt(reservation: AttemptReservation, exc: BaseExcept
             cost_final=True,
             settle_reason="tos_rejection",
         )
+        return "settled"
     else:
         mark_unresolved(reservation, f"{type(exc).__name__}: {exc}")
+        return "unresolved"
+
+
+def _provider_exception_facts(exc: BaseException) -> Tuple[Optional[int], str, str, str]:
+    response = getattr(exc, "response", None)
+    status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
+    try:
+        status = int(status) if status is not None else None
+    except (TypeError, ValueError, OverflowError):
+        status = None
+    payload = getattr(exc, "body", None)
+    if payload is None and response is not None and callable(getattr(response, "json", None)):
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+    error = payload.get("error") if isinstance(payload, dict) and isinstance(payload.get("error"), dict) else payload
+    code = getattr(exc, "code", None)
+    error_type = getattr(exc, "type", None)
+    message = str(exc or "")
+    if isinstance(error, dict):
+        code = error.get("code", code)
+        error_type = error.get("type", error_type)
+        details = json.dumps(error, ensure_ascii=False, sort_keys=True, default=str)
+        message = f"{message}; provider_error={details}" if message else details
+    try:
+        from ouroboros.observability import redact_projection
+        message = str(redact_projection(message).value)
+    except Exception:
+        pass
+    return status, str(code or ""), str(error_type or type(exc).__name__), message
+
+
+def _record_attempt_capture(
+    reservation: AttemptReservation,
+    request: AttemptRequest,
+    state: str,
+    *,
+    candidate_manifest_ref: Optional[Dict[str, Any]] = None,
+    exc: Optional[BaseException] = None,
+) -> PhysicalAttemptCapture:
+    status, code, error_type, error = _provider_exception_facts(exc) if exc is not None else (None, "", "", "")
+    capture = PhysicalAttemptCapture(
+        attempt_id=reservation.attempt_id,
+        model=reservation.model,
+        provider=reservation.provider,
+        state=state,  # type: ignore[arg-type]
+        candidate_measurement_kind=request.candidate_measurement_kind,
+        max_completion_tokens=max(0, int(request.max_completion_tokens or 0)),
+        candidate_raw_sha256=request.candidate_raw_sha256,
+        candidate_raw_size_bytes=request.candidate_raw_size_bytes,
+        candidate_context_sha256=request.candidate_context_sha256,
+        candidate_context_size_bytes=request.candidate_context_size_bytes,
+        candidate_manifest_ref=dict(candidate_manifest_ref) if candidate_manifest_ref else None,
+        physical_context=request.physical_context,
+        provider_status_code=status,
+        provider_code=code,
+        provider_error_type=error_type,
+        provider_error=error,
+    )
+    _LAST_PHYSICAL_ATTEMPT.set(capture)
+    if exc is not None:
+        try:
+            setattr(exc, "physical_attempt_capture", capture)
+        except Exception:
+            pass
+    return capture
+
+
+def _pre_dispatch_failure(
+    reservation: AttemptReservation,
+    request: AttemptRequest,
+    exc: BaseException,
+    *,
+    candidate_manifest_ref: Optional[Dict[str, Any]] = None,
+) -> BaseException:
+    manifest_ref = getattr(exc, "candidate_manifest_ref", None) or candidate_manifest_ref
+    capture_state = "reserved"
+    try:
+        release_attempt(reservation, f"before_dispatch_failed:{type(exc).__name__}", candidate_manifest_ref=manifest_ref)
+        capture_state = "released"
+    except Exception:
+        log.exception("Failed to release pre-dispatch attempt: %s", reservation.attempt_id)
+    failure = exc if isinstance(exc, PhysicalAttemptPreparationFailed) else PhysicalAttemptPreparationFailed(
+        f"physical candidate preparation failed: {type(exc).__name__}: {exc}",
+        attempt_id=reservation.attempt_id,
+    )
+    _record_attempt_capture(reservation, request, capture_state, candidate_manifest_ref=manifest_ref, exc=failure)
+    return failure
 
 
 def execute_physical_attempt(
@@ -1271,30 +1222,67 @@ def execute_physical_attempt(
     send: Callable[[], Any],
     *,
     extractor: Callable[[Any], Tuple[Dict[str, Any], Optional[float], bool]] = usage_from_response,
+    before_dispatch: Optional[Callable[[AttemptReservation], Optional[Dict[str, Any]]]] = None,
 ) -> Any:
     """Execute one synchronous provider send with durable lifecycle accounting."""
+    _LAST_PHYSICAL_ATTEMPT.set(None)
     reservation = reserve_attempt(request)
-    mark_dispatched(reservation)
+    manifest_ref = None
+    try:
+        manifest_ref = before_dispatch(reservation) if before_dispatch is not None else None
+        if manifest_ref is not None and not isinstance(manifest_ref, dict):
+            raise TypeError("before_dispatch must return a manifest ref object or None")
+        mark_dispatched(reservation, candidate_manifest_ref=manifest_ref)
+        _record_attempt_capture(reservation, request, "dispatched", candidate_manifest_ref=manifest_ref)
+    except BaseException as exc:
+        if isinstance(exc, PhysicalAttemptLimitExceeded):
+            _record_attempt_capture(
+                reservation,
+                request,
+                "released",
+                candidate_manifest_ref=manifest_ref,
+                exc=exc,
+            )
+            raise
+        failure = _pre_dispatch_failure(
+            reservation,
+            request,
+            exc,
+            candidate_manifest_ref=manifest_ref,
+        )
+        if failure is exc:
+            raise
+        raise failure from exc
     try:
         response = send()
     except BaseException as exc:
+        terminal_state = "dispatched"
         try:
-            _terminalize_failed_attempt(reservation, exc)
+            terminal_state = _terminalize_failed_attempt(reservation, exc)
         except Exception:
             log.exception("Failed to mark provider attempt unresolved: %s", reservation.attempt_id)
+        _record_attempt_capture(
+            reservation, request, terminal_state, candidate_manifest_ref=manifest_ref, exc=exc,
+        )
         raise
+    terminal_state = "settled"
     try:
         usage, cost, final = extractor(response)
+        usage = dict(usage or {})
+        if request.prompt_cache_ttl and not usage.get("prompt_cache_ttl"):
+            usage["prompt_cache_ttl"] = request.prompt_cache_ttl
         settle_attempt(reservation, usage, cost_usd=cost, cost_final=final)
         _observe_token_density(request, usage)
     except Exception as exc:
-        # The provider response may already be paid and useful.  Preserve it;
-        # extractor and persistence failures both leave an unresolved upper bound.
+        # Preserve a paid/useful response; accounting failure leaves an open bound.
         log.exception("Failed to account paid provider response: %s", reservation.attempt_id)
+        terminal_state = "dispatched"
         try:
             mark_unresolved(reservation, f"post_response_accounting_failed:{type(exc).__name__}")
+            terminal_state = "unresolved"
         except Exception:
             log.exception("Failed to mark post-response accounting failure unresolved")
+    _record_attempt_capture(reservation, request, terminal_state, candidate_manifest_ref=manifest_ref)
     return response
 
 
@@ -1303,27 +1291,68 @@ async def execute_physical_attempt_async(
     send: Callable[[], Any],
     *,
     extractor: Callable[[Any], Tuple[Dict[str, Any], Optional[float], bool]] = usage_from_response,
+    before_dispatch: Optional[Callable[[AttemptReservation], Any]] = None,
 ) -> Any:
+    _LAST_PHYSICAL_ATTEMPT.set(None)
     reservation = reserve_attempt(request)
-    mark_dispatched(reservation)
+    manifest_ref = None
+    try:
+        if before_dispatch is not None:
+            manifest_ref = before_dispatch(reservation)
+            if hasattr(manifest_ref, "__await__"):
+                manifest_ref = await manifest_ref
+        if manifest_ref is not None and not isinstance(manifest_ref, dict):
+            raise TypeError("before_dispatch must return a manifest ref object or None")
+        mark_dispatched(reservation, candidate_manifest_ref=manifest_ref)
+        _record_attempt_capture(reservation, request, "dispatched", candidate_manifest_ref=manifest_ref)
+    except BaseException as exc:
+        if isinstance(exc, PhysicalAttemptLimitExceeded):
+            _record_attempt_capture(
+                reservation,
+                request,
+                "released",
+                candidate_manifest_ref=manifest_ref,
+                exc=exc,
+            )
+            raise
+        failure = _pre_dispatch_failure(
+            reservation,
+            request,
+            exc,
+            candidate_manifest_ref=manifest_ref,
+        )
+        if failure is exc:
+            raise
+        raise failure from exc
     try:
         response = await send()
     except BaseException as exc:
+        terminal_state = "dispatched"
         try:
-            _terminalize_failed_attempt(reservation, exc)
+            terminal_state = _terminalize_failed_attempt(reservation, exc)
         except Exception:
             log.exception("Failed to mark provider attempt unresolved: %s", reservation.attempt_id)
+        _record_attempt_capture(
+            reservation, request, terminal_state, candidate_manifest_ref=manifest_ref, exc=exc,
+        )
         raise
+    terminal_state = "settled"
     try:
         usage, cost, final = extractor(response)
+        usage = dict(usage or {})
+        if request.prompt_cache_ttl and not usage.get("prompt_cache_ttl"):
+            usage["prompt_cache_ttl"] = request.prompt_cache_ttl
         settle_attempt(reservation, usage, cost_usd=cost, cost_final=final)
         _observe_token_density(request, usage)
     except Exception as exc:
         log.exception("Failed to account paid provider response: %s", reservation.attempt_id)
+        terminal_state = "dispatched"
         try:
             mark_unresolved(reservation, f"post_response_accounting_failed:{type(exc).__name__}")
+            terminal_state = "unresolved"
         except Exception:
             log.exception("Failed to mark post-response accounting failure unresolved")
+    _record_attempt_capture(reservation, request, terminal_state, candidate_manifest_ref=manifest_ref)
     return response
 
 

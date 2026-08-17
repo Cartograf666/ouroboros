@@ -66,6 +66,69 @@ def test_settings_template_contract():
             assert value == "", f"secret-shaped template key {key} must be blank"
 
 
+def test_context_mode_template_and_child_env_carry_false_tombstone(tmp_path):
+    import argparse
+
+    base = tmp_path / "context-settings.json"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    for marker in (False, "false", "off", 0):
+        base.write_text(json.dumps({
+            "OUROBOROS_CONTEXT_MODE": "low",
+            "OUROBOROS_CONTEXT_MODE_AUTO_LOW": marker,
+        }), encoding="utf-8")
+        rendered = run_clb.render_run_settings(
+            base, run_dir, solve_model="openai/gpt-5.5",
+            evolution=False, total_budget=1.0,
+        )
+        assert rendered["OUROBOROS_CONTEXT_MODE"] == "low"
+        assert rendered["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
+
+    # A template mode is an explicit benchmark choice even when the tombstone was
+    # omitted; the renderer adds it before the compatibility normalizer.
+    base.write_text(json.dumps({"OUROBOROS_CONTEXT_MODE": "low"}), encoding="utf-8")
+    rendered = run_clb.render_run_settings(
+        base, run_dir, solve_model="openai/gpt-5.5",
+        evolution=False, total_budget=1.0,
+    )
+    assert rendered["OUROBOROS_CONTEXT_MODE"] == "low"
+    assert rendered["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
+
+    # A legacy true marker is never forwarded as true.
+    base.write_text(json.dumps({
+        "OUROBOROS_CONTEXT_MODE": "low",
+        "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "true",
+    }), encoding="utf-8")
+    legacy = run_clb.render_run_settings(
+        base, run_dir, solve_model="openai/gpt-5.5",
+        evolution=False, total_budget=1.0,
+    )
+    assert legacy["OUROBOROS_CONTEXT_MODE"] == "max"
+    assert legacy["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
+
+    args = argparse.Namespace(
+        ouroboros_clone=str(tmp_path / "clone"),
+        effort="low",
+        or_provider="",
+    )
+    child_env = run_clb._sanitized_child_env(run_dir, {
+        "TOTAL_BUDGET": 1.0,
+        "OUROBOROS_CONTEXT_MODE": "low",
+        "OUROBOROS_CONTEXT_MODE_AUTO_LOW": False,
+    }, args)
+    assert child_env["OUROBOROS_CONTEXT_MODE"] == "low"
+    assert child_env["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
+
+    legacy_child_env = run_clb._sanitized_child_env(run_dir, {
+        "TOTAL_BUDGET": 1.0,
+        "OUROBOROS_CONTEXT_MODE": "low",
+        "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "true",
+    }, args)
+    assert legacy_child_env["OUROBOROS_CONTEXT_MODE"] == "max"
+    assert legacy_child_env["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
+
+
 def test_help_exits_zero():
     buf = io.StringIO()
     with pytest.raises(SystemExit) as exc, contextlib.redirect_stdout(buf):

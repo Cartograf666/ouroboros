@@ -11,15 +11,19 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import pathlib
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from ouroboros.context_layout import reference_doc_sections
-from ouroboros.utils import estimate_tokens, iter_jsonl_objects
+from ouroboros.utils import estimate_tokens
 
 log = logging.getLogger(__name__)
+
+ContextProfile = Literal["owner_max", "owner_low", "task_local_low"]
+MeasurementBasis = Literal["fresh_route_usage", "fresh_model_usage", "cold_estimate"]
 
 
 @dataclass(frozen=True)
@@ -35,6 +39,31 @@ class ContextFitProjection:
 
     def system_message(self) -> Dict[str, Any]:
         return {"role": "system", "content": json.loads(self.system_content_json)}
+
+
+@dataclass(frozen=True)
+class MainFitMeasurement:
+    route_fp: str
+    round_id: str
+    profile: ContextProfile
+    rendered_mode: Literal["max", "low"]
+    estimated_input_tokens: int
+    response_reserve_tokens: int
+    target_total_tokens: Optional[int]
+    capacity_total_tokens: Optional[int]
+    measurement_basis: MeasurementBasis
+    measurement_density: float
+    target_deficit_tokens: Optional[int]
+    capacity_deficit_tokens: Optional[int]
+    reclaim_goal_tokens: int
+
+
+@dataclass(frozen=True)
+class MainFitDisposition:
+    measurement: MainFitMeasurement
+    action: Literal["send", "reclaim_once", "send_target_miss"]
+    automatic_pass_used: bool
+    predicted_capacity_miss: bool
 
 
 @dataclass(frozen=True)
@@ -100,19 +129,6 @@ class ContextFitPlan:
             (projection.estimated_tokens + tool_schema_tokens(tools))
             * projection.calibration_ratio
         )
-
-    def initial_mode_with_tools(self, tools: Optional[List[Dict[str, Any]]]) -> str:
-        from ouroboros.capability_evidence import is_known
-
-        if self.preferred_mode != "max" or not is_known(self, require_fresh=True):
-            return self.initial_mode
-        projected = self.projected_tokens_with_tools("max", tools)
-        return (
-            "low"
-            if projected + self.output_reserve_tokens > self.window_tokens
-            else self.initial_mode
-        )
-
 
 @dataclass(frozen=True)
 class ContextCore:
@@ -183,104 +199,119 @@ def estimate_context_prompt_tokens(
     messages: List[Dict[str, Any]],
     tools: Optional[List[Dict[str, Any]]] = None,
 ) -> int:
-    """Existing chars/4 estimate, including tools and a bounded image proxy."""
+    """Estimate the complete inspectable context shape with bounded images."""
     from ouroboros.context_budget import IMAGE_BLOCK_CHAR_EQUIVALENT
 
-    total = 0
-    for msg in messages:
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            for block in content:
-                if not isinstance(block, dict):
-                    total += estimate_tokens(str(block))
-                elif str(block.get("type") or "") in {"image", "image_url"}:
-                    total += max(1, IMAGE_BLOCK_CHAR_EQUIVALENT // 4)
-                else:
-                    total += estimate_tokens(str(block.get("text", "")))
-            total += 6
-        else:
-            total += estimate_tokens(str(content)) + 6
-        if msg.get("tool_calls"):
-            total += estimate_tokens(
-                json.dumps(msg["tool_calls"], ensure_ascii=False, default=str)
-            )
-    total += tool_schema_tokens(tools)
-    return max(0, int(total))
+    def project(value: Any) -> Any:
+        if isinstance(value, dict):
+            if str(value.get("type") or "") in {"image", "image_url"}:
+                return {
+                    "type": str(value.get("type") or "image"),
+                    "image_token_proxy": "#" * IMAGE_BLOCK_CHAR_EQUIVALENT,
+                }
+            return {
+                str(key): project(item)
+                for key, item in value.items()
+                if str(key) != "_context_capsule"
+            }
+        if isinstance(value, list):
+            return [project(item) for item in value]
+        return value
 
-
-def main_loop_token_density(drive_root: Any, model: str) -> float:
-    """MAIN-LOOP calibrated token density: neutral 1.0 cold, measured supersedes.
-
-    The baseline `_route_calibration_ratio` starts from, exposed as its own SSOT so
-    the emergency-compaction necessity trigger and the fit projections share ONE
-    policy. DELIBERATELY NOT ``capability_evidence.resolve_token_density`` — that is
-    the review-pack COLD-CONSERVATIVE value, which on an empty observation store
-    (every fresh install and isolated benchmark server) would silently narrow the
-    main loop's horizon on a guess (the v6.80.0 → v6.81.0 oscillation; BIBLE P1).
-    Only a MEASURED density for this exact model identity may raise it above 1.0.
-    """
-    baseline = 1.0
-    try:
-        from ouroboros.capability_evidence import get_token_density
-        from ouroboros.provider_models import normalize_model_identity
-
-        measured = get_token_density(drive_root, normalize_model_identity(str(model or "")))
-        if measured > 0:
-            baseline = measured
-    except Exception:
-        log.debug("Measured token density unavailable", exc_info=True)
-    return baseline
+    serialized = json.dumps(
+        {"messages": project(messages), "tools": tools or []},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return max(0, int(estimate_tokens(serialized)))
 
 
 def _route_calibration_ratio(
-    drive_root: pathlib.Path,
+    drive_root: Optional[pathlib.Path],
     route_fp: str,
     model: str,
 ) -> float:
-    """Measured model baseline plus successful exact-route observations.
+    """Fresh exact-route/model witness, never an event-tail or orphan maximum.
 
-    DELIBERATELY NOT the cold-conservative review-pack density (v6.80.0): with an
-    empty observation store — every fresh install and EVERY isolated benchmark server
-    — a cold cross-model density would silently demote ``initial_mode`` from Max to
-    Low for the main loop. Unknown routes deliberately try Max (BIBLE P1: the horizon
-    is not narrowed by a guess). Only MEASURED knowledge about this exact model, plus
-    exact-route observations, may raise the baseline above 1.0.
-
-    What actually happens on a genuine overflow (verified, not assumed): the round
-    FAILS. ``loop_llm_call`` classifies it as ``context_overflow`` with
-    ``retry_same_request=False``, marks the usage ``execution_status="infra_failed" /
-    reason_code="llm_api_error"``, and emits the one-time
-    ``context_overflow_suggest_low`` owner hint — it does NOT rebuild anything. The
-    ONE-SHOT recovery lives one level up in ``loop.py``: after that failed round, a
-    confirmed ``context_overflow`` on a ``preferred_mode="max"`` plan for the same
-    model persists a forensic pre-retry checkpoint and reprojects the transcript into
-    task-local Low exactly once (guarded by ``_context_fit_low_retry_used``), then
-    retries. So the residual cost of the neutral cold baseline is bounded to ONE failed
-    round per task, and only when the very first prompt already exceeds the window on a
-    fresh evidence store; the first successful send records this model's density, after
-    which the projection is measured rather than guessed.
+    ``None`` reads the canonical host evidence root (one observation store).
     """
-    ratios = [float(main_loop_token_density(drive_root, model))]
     try:
-        events_path = pathlib.Path(drive_root) / "logs" / "events.jsonl"
-        for event in iter_jsonl_objects(
-            events_path,
-            max_entries=200,
-            tail_bytes=2_000_000,
-        ):
-            if event.get("type") != "llm_round":
-                continue
-            if str(event.get("context_route_fp") or "") != str(route_fp or ""):
-                continue
-            estimated = int(event.get("estimated_prompt_tokens") or 0)
-            actual = int(event.get("prompt_tokens") or 0)
-            if estimated > 0 and actual > 0:
-                ratio = actual / estimated
-                if 0.5 <= ratio <= 4.0:
-                    ratios.append(ratio)
+        from ouroboros.capability_evidence import (
+            canonical_evidence_root, resolve_main_token_density,
+        )
+
+        root = drive_root if drive_root is not None else canonical_evidence_root()
+        return float(resolve_main_token_density(root, route_fp, model)[0])
     except Exception:
-        log.debug("Failed to read route token calibration", exc_info=True)
-    return max(ratios)
+        log.debug("Fresh route token calibration unavailable", exc_info=True)
+        return 1.0
+
+
+def measure_main_fit(
+    plan: ContextFitPlan,
+    messages: List[Dict[str, Any]],
+    tools: Optional[List[Dict[str, Any]]],
+    *,
+    drive_root: Optional[pathlib.Path] = None,
+    profile: ContextProfile,
+    rendered_mode: Literal["max", "low"],
+    round_id: str,
+    automatic_pass_used: bool = False,
+) -> MainFitDisposition:
+    """Measure one sealed Main candidate against owner target T and route W.
+
+    ``drive_root=None`` reads density from the canonical host evidence root
+    (one observation store) — a child task's own drive must not be consulted.
+    """
+    from ouroboros.capability_evidence import (
+        canonical_evidence_root, is_known, resolve_main_token_density,
+    )
+    from ouroboros.context_budget import OWNER_LOW_TARGET_TOKENS
+
+    if drive_root is None:
+        drive_root = canonical_evidence_root()
+    density, basis = resolve_main_token_density(drive_root, plan.route_fp, plan.model)
+    density = float(density)
+    estimated_input = int(math.ceil(estimate_context_prompt_tokens(messages, tools) * density))
+    reserve = int(plan.output_reserve_tokens or 0)
+    total = estimated_input + reserve
+    target = OWNER_LOW_TARGET_TOKENS if profile == "owner_low" else None
+    capacity = int(plan.window_tokens or 0) if is_known(plan, require_fresh=True) else None
+    target_deficit = max(0, total - target) if target is not None else None
+    capacity_deficit = max(0, total - capacity) if capacity is not None else None
+    goal = max(
+        [value for value in (target_deficit, capacity_deficit) if value is not None]
+        or [0]
+    )
+    measurement = MainFitMeasurement(
+        route_fp=str(plan.route_fp or ""),
+        round_id=str(round_id or ""),
+        profile=profile,
+        rendered_mode=rendered_mode,
+        estimated_input_tokens=estimated_input,
+        response_reserve_tokens=reserve,
+        target_total_tokens=target,
+        capacity_total_tokens=capacity,
+        measurement_basis=basis,
+        measurement_density=density,
+        target_deficit_tokens=target_deficit,
+        capacity_deficit_tokens=capacity_deficit,
+        reclaim_goal_tokens=goal,
+    )
+    if goal > 0 and not automatic_pass_used:
+        action: Literal["send", "reclaim_once", "send_target_miss"] = "reclaim_once"
+    elif target_deficit and target_deficit > 0:
+        action = "send_target_miss"
+    else:
+        action = "send"
+    return MainFitDisposition(
+        measurement=measurement,
+        action=action,
+        automatic_pass_used=bool(automatic_pass_used),
+        predicted_capacity_miss=bool(capacity_deficit and capacity_deficit > 0),
+    )
 
 
 def resolve_context_fit_route(
@@ -371,8 +402,10 @@ def build_context_fit_plan(
     from ouroboros.loop_llm_call import MAIN_LOOP_MAX_TOKENS
 
     output_reserve = MAIN_LOOP_MAX_TOKENS
+    # One observation store: witnesses are written at settlement into the
+    # canonical host root, so a child task's own drive must not be consulted.
     ratio = _route_calibration_ratio(
-        pathlib.Path(env.drive_root),
+        None,
         str(evidence.route_fp or ""),
         str(route["model"] or ""),
     )
@@ -406,11 +439,10 @@ def build_context_fit_plan(
 
     max_projection = _projection("max")
     low_projection = _projection("low")
-    # Unknown routes deliberately try Max.  Only positive exact-route evidence
-    # that the captured Max projection cannot fit selects Low before dispatch.
+    # Prediction may request mutable-history reclaim, but it never changes the
+    # owner's document projection. Task-local Low is authorized only after a
+    # real provider overflow on this route.
     initial_mode = preferred
-    if preferred == "max" and max_projection.fits_known_window is False:
-        initial_mode = "low"
 
     core_payload = json.dumps(
         {

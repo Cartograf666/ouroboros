@@ -386,13 +386,18 @@ def test_gr6_2_mid_tree_cascade_digest_lists_grandchildren(tmp_path, monkeypatch
 
     assert owed is True
     (event,) = [e for e in queue.events if e.get("type") == "send_message"]
-    assert "- kid6: cancelled" in event["text"], (
+    assert "2 descendant task(s) were settled with it" in event["text"]
+    outcomes = {
+        row["task_id"]: row["outcome"]
+        for row in load_task_result(tmp_path, "mid6")["cancel_receipt"]["children"]
+    }
+    assert outcomes.get("kid6") == "cancelled", (
         "GR6-2: a non-subagent direct child is in the digest"
     )
-    assert "- gkid6: completed" in event["text"], (
+    assert outcomes.get("gkid6") == "completed", (
         "GR6-2: the mid-tree grandchild is enumerated by ancestry"
     )
-    assert "- orig-root" not in event["text"], (
+    assert "orig-root" not in outcomes, (
         "the target's own ANCESTOR is not a descendant"
     )
 

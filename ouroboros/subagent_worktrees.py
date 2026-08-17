@@ -164,13 +164,15 @@ def _force_rmtree(path: Path) -> None:
         pass
 
 
-def _git(repo_dir: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+def _git(repo_dir: Path, *args: str, check: bool = True,
+         env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", *args],
         cwd=str(repo_dir),
         capture_output=True,
         text=True,
         check=check,
+        env=env,
     )
 
 
@@ -371,6 +373,12 @@ class ExecutionSnapshotHandle:
     created_at: float
     entry_count: int = 0
     excluded_untracked: tuple = ()
+    # Standalone payload snapshots (R1): the snapshot owns its OWN .git (the
+    # target is a non-Git skill payload), so cleanup touches no target-repo
+    # worktree/ref command. ``payload_hash`` is the pre-copy skill-loader
+    # content hash — the whole-payload CAS baseline for the explicit apply.
+    standalone: bool = False
+    payload_hash: str = ""
 
 
 def _git_env_index(index_path: Path) -> Dict[str, str]:
@@ -530,6 +538,300 @@ def provision_execution_snapshot(
         return handle
 
 
+def isolated_git_env() -> Dict[str, str]:
+    """A git environment no host or child configuration can shape.
+
+    Parent-side git over a payload snapshot must never consult the system or
+    the user's global config (external diff drivers, textconv, excludes,
+    hooks templates): `GIT_CONFIG_NOSYSTEM` plus a `/dev/null` global leave
+    only command-line `-c` overrides and the repo-local config — which the
+    payload paths reset to a known-good baseline before trusting.
+    """
+    env = dict(os.environ)
+    # Repository-location vars inherited from the HOST process would silently
+    # redirect every command here at another repo/index (observed with a leaked
+    # GIT_DIR: `git init` "reinitialized" a foreign directory).
+    for var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+                "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_COMMON_DIR"):
+        env.pop(var, None)
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+def payload_git_metadata_refusal(exec_root: Path) -> str:
+    """lstat-trust check on a child-writable snapshot's Git metadata, or "".
+
+    The child held a shell inside the snapshot: a ``.git`` (or ``.git/config``,
+    ``.git/objects``) replaced by a symlink would make the parent's capture
+    read — or a naive fix WRITE — through a child-chosen path outside the
+    snapshot. Checked with lstat semantics BEFORE any parent git operation;
+    a refusal is a typed capture failure and touches nothing.
+    """
+    git_dir = Path(exec_root) / ".git"
+    if git_dir.is_symlink() or not git_dir.is_dir():
+        return ".git is not a real directory (symlinked or replaced by the run)"
+    config = git_dir / "config"
+    if os.path.lexists(config) and (config.is_symlink() or not config.is_file()):
+        return ".git/config is not a regular file (symlinked or replaced by the run)"
+    objects = git_dir / "objects"
+    if objects.is_symlink() or not objects.is_dir():
+        return ".git/objects is not a real directory (symlinked or replaced by the run)"
+    return ""
+
+
+def stage_raw_payload_inventory(
+    worktree: Path, rel_paths: Any, env: Dict[str, str],
+    baseline_modes: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """Stage exact RAW bytes into the CURRENT index — no .gitattributes, no filters.
+
+    ``git add``/worktree ``update-index`` run clean/eol filters from a child- or
+    payload-authored ``.gitattributes`` (CRLF staged as LF — reproduced by
+    review), so every regular file is hashed with ``hash-object --no-filters``
+    over raw bytes and staged via ``--index-info``; ``.gitattributes`` is just
+    content, a symlink stages as 120000 over its raw link-target bytes. Modes:
+    with ``baseline_modes`` (capture) regular files pin to the baseline mode for
+    existing paths / 100644 for new ones so an executable-bit flip can never
+    ride a patch; without it (provisioning) the real on-disk mode is recorded.
+    Returns the paths whose on-disk executable bit diverges from the staged mode.
+    """
+    root = Path(worktree)
+    lines: List[bytes] = []
+    divergent: List[str] = []
+    for rel in sorted(str(p) for p in rel_paths):
+        path = root / rel
+        if path.is_symlink():
+            blob, mode = os.readlink(os.fsencode(str(path))), "120000"
+        else:
+            blob = path.read_bytes()
+            executable = bool(path.stat().st_mode & 0o111)
+            if baseline_modes is None:
+                mode = "100755" if executable else "100644"
+            else:
+                base = baseline_modes.get(rel, "")
+                mode = base if base in ("100644", "100755") else "100644"
+                if executable != (mode == "100755"):
+                    divergent.append(rel)
+        hashed = subprocess.run(
+            ["git", "hash-object", "--no-filters", "-w", "--stdin"],
+            cwd=str(root), capture_output=True, env=env, input=blob, check=True)
+        sha = hashed.stdout.decode("ascii", errors="replace").strip()
+        lines.append(f"{mode} {sha}\t{rel}".encode("utf-8", errors="surrogateescape"))
+    subprocess.run(
+        ["git", "update-index", "-z", "--index-info"],
+        cwd=str(root), capture_output=True, env=env,
+        input=b"\0".join(lines) + b"\0" if lines else b"", check=True)
+    return divergent
+
+
+@contextlib.contextmanager
+def payload_capture_git_env(exec_root: Path):
+    """A PARENT-OWNED throwaway Git control dir over the child-writable snapshot.
+
+    Yields a git env whose GIT_DIR, config, hooks template and GIT_INDEX_FILE
+    all live in a host-managed temp directory (mkdtemp, 0700; the index file is
+    pre-created 0600) — never inside the snapshot the child could write. The
+    child's object database is attached READ-ONLY via the alternates mechanism
+    (objects are content-addressed, so the recorded baseline commit/tree can be
+    read but not silently substituted), while new blobs staged by the capture
+    land in the parent-owned control ODB. Child ``.git/index`` and
+    ``.git/config`` are never read and never written: an index-only blob forged
+    by the child simply does not exist for this environment, and no
+    child-controlled diff driver / filter / hook can execute in the parent.
+    """
+    import tempfile
+
+    resolved = Path(exec_root).resolve()
+    control = Path(tempfile.mkdtemp(prefix="obo-payload-capture-"))
+    try:
+        env = isolated_git_env()
+        subprocess.run(["git", "init", "--template="], cwd=str(control),
+                       capture_output=True, check=True, env=env)
+        alternates = control / ".git" / "objects" / "info" / "alternates"
+        alternates.parent.mkdir(parents=True, exist_ok=True)
+        # Byte-exact: text mode would emit CRLF on Windows -> git seeks "objects\r".
+        alternates.write_bytes((str(resolved / ".git" / "objects") + "\n").encode("utf-8"))
+        index = control / "index"
+        os.close(os.open(index, os.O_CREAT | os.O_WRONLY, 0o600))
+        env["GIT_DIR"] = str(control / ".git")
+        env["GIT_WORK_TREE"] = str(resolved)
+        env["GIT_INDEX_FILE"] = str(index)
+        yield env
+    finally:
+        shutil.rmtree(control, ignore_errors=True)
+
+
+def _reproduce_confined_link(target_root: Path, src_link: Path, dest_link: Path) -> bool:
+    """Reproduce one payload symlink in the snapshot, or refuse an escape (R1 item 4).
+
+    A confined RELATIVE link is copied verbatim (``copytree(symlinks=True)``
+    semantics); a confined ABSOLUTE link is rewritten to the equivalent relative
+    link so the snapshot stays self-contained; a link resolving outside the
+    payload is NOT copied (it is already outside the loader inventory).
+    """
+    try:
+        raw = os.readlink(src_link)
+        resolved = src_link.resolve(strict=False)
+        rel_target = resolved.relative_to(target_root)
+    except (OSError, ValueError):
+        return False
+    if os.path.isabs(raw):
+        raw = os.path.relpath(target_root / rel_target, src_link.parent)
+    dest_link.parent.mkdir(parents=True, exist_ok=True)
+    if not os.path.lexists(dest_link):
+        os.symlink(raw, dest_link)
+    return True
+
+
+def _copy_payload_inventory(target: Path, dest: Path) -> int:
+    """Copy the exact skill-loader-visible inventory of ``target`` into ``dest``.
+
+    The loader inventory is the SSOT walk (cache/control-dir exclusions, symlink
+    escape exclusion, credential-shape refusal) — no second filesystem walk is
+    invented. A file reached through a symlinked ancestor directory reproduces
+    the ancestor LINK once instead of materializing a second copy under it.
+    """
+    from ouroboros.skill_loader import _iter_payload_files
+
+    resolved_target = target.resolve()
+    dest.mkdir(parents=True, exist_ok=False)
+    copied = 0
+    for path in _iter_payload_files(resolved_target):
+        rel = path.relative_to(resolved_target)
+        # A symlinked ANCESTOR directory is reproduced as the link itself; the
+        # linked content is copied at its real (confined) location by its own
+        # inventory entry, exactly like copytree(symlinks=True).
+        ancestor = resolved_target
+        via_link = False
+        for part in rel.parts[:-1]:
+            ancestor = ancestor / part
+            if ancestor.is_symlink():
+                link_rel = ancestor.relative_to(resolved_target)
+                if _reproduce_confined_link(resolved_target, ancestor, dest / link_rel):
+                    copied += 1
+                via_link = True
+                break
+        if via_link:
+            continue
+        out = dest / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_symlink():
+            if _reproduce_confined_link(resolved_target, path, out):
+                copied += 1
+            continue
+        shutil.copy2(path, out)
+        copied += 1
+    return copied
+
+
+def provision_payload_snapshot(
+    *,
+    target_root: Any,
+    task_id: Any,
+    snapshot_id: str,
+    worktree_root: Optional[Any] = None,
+    data_dir: Optional[Any] = None,
+) -> ExecutionSnapshotHandle:
+    """Snapshot ONE non-Git skill payload into a private STANDALONE Git repo (R1 §9.2).
+
+    The live payload is NEVER initialized as Git and never touched: the
+    loader-visible inventory is copied into a private directory under the
+    delegated snapshot root (outside repo/data), Git is initialized only THERE,
+    and the copied payload becomes the synthetic baseline commit. The pre-copy
+    skill-loader content hash is recomputed after the copy — a changed hash
+    means the snapshot raced another writer, so it is removed and the run must
+    not start. Registered durably (``standalone=true``) BEFORE any start intent.
+    """
+    from ouroboros.tools.delegate_integration import payload_content_hash
+
+    target = Path(target_root).resolve()
+    if not target.is_dir():
+        raise ValueError(f"skill payload {target} does not exist")
+    if (target / ".git").exists():
+        raise ValueError(
+            f"skill payload {target} unexpectedly contains .git; refusing to snapshot")
+    root = _resolve_root(worktree_root)
+    if _is_within(root, target) or _is_within(target, root):
+        raise ValueError(f"subagent worktree root {root} overlaps the snapshot target {target}")
+    # The TARGET legitimately lives inside runtime data (data/skills/...), but
+    # the snapshot ROOT itself must stay outside BOTH the system repo and the
+    # runtime data root — a snapshot under data/ would put a child-writable
+    # Git repo inside live state (reproduced by review).
+    _assert_root_isolated(root, Path(__file__).resolve().parents[1], _data_dir(data_dir))
+    snap = str(snapshot_id or "").strip()
+    if not snap:
+        raise ValueError("snapshot_id is required for a delegated payload snapshot")
+    safe_snap = _safe_name(snap)
+    safe_task = _safe_name(task_id)
+    with _ops_lock(root):
+        wt_path = (root / f"dlgp_{safe_task}_{safe_snap[:16]}").resolve()
+        if wt_path.exists():
+            _force_rmtree(wt_path)  # idempotent re-provision of the SAME snapshot id
+        source_hash = payload_content_hash(target)
+        env = isolated_git_env()
+        try:
+            entry_count = _copy_payload_inventory(target, wt_path)
+            # Fully config-isolated baseline: empty template dir (no user hooks),
+            # no global/system config (Fable F1). RAW staging instead of `git
+            # add` (Sol P1 modes/filters): a payload .gitattributes (eol/clean)
+            # must not normalize the recorded baseline away from the live raw
+            # bytes, and the baseline records the REAL file modes.
+            _git(wt_path, "init", "--template=", env=env)
+            from ouroboros.skill_loader import _iter_payload_files
+
+            stage_raw_payload_inventory(
+                wt_path,
+                (p.relative_to(wt_path).as_posix() for p in _iter_payload_files(wt_path)),
+                env)
+            _git(
+                wt_path,
+                "-c", "user.email=ouroboros@localhost", "-c", "user.name=Ouroboros",
+                "commit", "--allow-empty", "-m",
+                f"ouroboros: delegated payload baseline {snap}", env=env,
+            )
+            baseline_sha = _git(wt_path, "rev-parse", "HEAD", env=env).stdout.strip()
+            baseline_tree = _git(wt_path, "rev-parse", "HEAD^{tree}", env=env).stdout.strip()
+            manifest_raw = _git(wt_path, "ls-tree", "-r", "-z", baseline_tree, env=env).stdout
+            import hashlib
+
+            manifest_digest = hashlib.sha256(
+                manifest_raw.encode("utf-8", errors="surrogateescape")).hexdigest()
+            if payload_content_hash(target) != source_hash:
+                raise RuntimeError(
+                    "the live payload changed while it was being snapshotted "
+                    "(another writer raced the copy); retry the delegation")
+            handle = ExecutionSnapshotHandle(
+                snapshot_id=snap,
+                task_id=str(task_id or ""),
+                path=str(wt_path),
+                target_root=str(target),
+                baseline_ref="",
+                baseline_sha=baseline_sha,
+                baseline_tree=baseline_tree,
+                manifest_digest=manifest_digest,
+                target_head="",
+                created_at=time.time(),
+                entry_count=entry_count,
+                standalone=True,
+                payload_hash=source_hash,
+            )
+            # Registry write INSIDE the cleanup scope: an unregistered snapshot
+            # directory would be invisible to disposal/retention (orphan leak).
+            entries = [e for e in _load_registry(data_dir) if e.get("path") != str(wt_path)]
+            record = asdict(handle)
+            record["kind"] = _KIND_DELEGATED_EXEC
+            record["excluded_untracked"] = []
+            entries.append(record)
+            _save_registry(entries, data_dir)
+        except Exception:
+            _force_rmtree(wt_path)
+            raise
+        return handle
+
+
 def find_execution_snapshot(snapshot_id: str, data_dir: Optional[Any] = None) -> Optional[Dict[str, Any]]:
     """The registry record for a delegated execution snapshot, or None."""
     snap = str(snapshot_id or "").strip()
@@ -558,14 +860,23 @@ def remove_execution_snapshot(
         return False
     root = _resolve_root(worktree_root)
     with _ops_lock(root):
-        target = Path(str(entry.get("target_root") or "."))
-        _remove_paths(target, Path(str(entry.get("path") or "")), "", allowed_root=root)
-        ref = str(entry.get("baseline_ref") or "")
-        if ref.startswith(_BASELINE_REF_PREFIX):
-            try:
-                _git(target, "update-ref", "-d", ref, check=False)
-            except Exception:
-                pass
+        if entry.get("standalone"):
+            # Standalone payload snapshot (R1 §10.4): its .git lives INSIDE the
+            # snapshot directory and the target is a non-Git payload — remove
+            # only the private directory and the registry row; no target-repo
+            # worktree/ref command exists to run.
+            wt_path = Path(str(entry.get("path") or ""))
+            if str(wt_path).strip() and _is_within(wt_path, root) and wt_path.exists():
+                _force_rmtree(wt_path)
+        else:
+            target = Path(str(entry.get("target_root") or "."))
+            _remove_paths(target, Path(str(entry.get("path") or "")), "", allowed_root=root)
+            ref = str(entry.get("baseline_ref") or "")
+            if ref.startswith(_BASELINE_REF_PREFIX):
+                try:
+                    _git(target, "update-ref", "-d", ref, check=False)
+                except Exception:
+                    pass
         survivors = [e for e in _load_registry(data_dir) if not (
             e.get("kind") == _KIND_DELEGATED_EXEC and e.get("snapshot_id") == entry.get("snapshot_id")
         )]
