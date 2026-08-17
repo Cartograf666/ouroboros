@@ -988,10 +988,10 @@ def test_retry_replays_the_stored_route_and_registers_nothing_new(tmp_path, fake
     health_calls = []
     real_route_health = subagents.route_health
 
-    def _track_route_health(gateway, route_id, shape, *, route_model=""):
+    def _track_route_health(gateway, route_id, shape, *, route_model="", pinned_profile=""):
         health_calls.append((route_id, route_model))
         return real_route_health(
-            gateway, route_id, shape, route_model=route_model,
+            gateway, route_id, shape, route_model=route_model, pinned_profile=pinned_profile,
         )
 
     monkeypatch.setattr(subagents, "route_health", _track_route_health)
@@ -1135,6 +1135,67 @@ def test_unhealthy_route_refuses_typed_never_falls_back(tmp_path, fake_route):
     assert actor["status"] == "error"
     assert "route_status_degraded" in actor["error"]
     assert llm.calls == []
+    assert not any(inst.start_requests for inst in fake_route.instances)
+
+
+def test_pinned_profile_passes_row_status_through_to_the_engine(tmp_path, fake_route):
+    """Phase D1 (owner batch-2 1A/2): a slot carrying a manual credential pin must
+    not be refused on the harness-row catalog status — a row with no default
+    credential store reads "unavailable" FOREVER by design (agy, engine INV-135)
+    while its named profiles work. The request REACHES the engine with the pinned
+    credentialProfileId on the wire, and the ENGINE's typed refusal propagates
+    typed on this slot: never a silent degrade, never a fallback onto the api route."""
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    fake_route.catalog_entry["status"] = "unavailable"
+    fake_route.catalog_entry["enabled"] = False
+    fake_route.start_error = ClaudexorUnavailable(
+        "engine_refuses_profile", "engine typed refusal for this profile", status_code=422)
+    llm = FakeLLM()
+    result = run_review_request(
+        _agent_request(),
+        slots=[_agent_slot(session_target="fake-review=fake-small",
+                           session_profile="acct-pinned")],
+        drive_root=tmp_path, llm=llm)
+    starts = [r for inst in fake_route.instances for r in inst.start_requests]
+    assert len(starts) == 1  # the start attempt was actually posted
+    assert starts[0]["credentialProfileId"] == "acct-pinned"
+    actor = result.actors[0]
+    assert actor["status"] == "error"
+    assert "engine typed refusal for this profile" in actor["error"]
+    assert llm.calls == []  # never a silent fallback onto the api route
+
+
+def test_route_status_refusal_carries_its_typed_code(tmp_path, fake_route):
+    """Phase D2: the route_health refusal rides ReviewRouteUnavailable with a
+    machine-readable `.code` (the rotation sprint's quorum classification keys
+    on failure codes; a bare RuntimeError is invisible to it)."""
+    from ouroboros.review_execution import ReviewRouteUnavailable
+
+    fake_route.catalog_entry["status"] = "unavailable"
+    fake_route.catalog_entry["enabled"] = False
+    with pytest.raises(ReviewRouteUnavailable) as excinfo:
+        _run_session_directly(tmp_path)
+    assert excinfo.value.code == "route_status_unavailable"
+    assert not any(inst.start_requests for inst in fake_route.instances)
+
+
+def test_absent_catalog_row_refuses_typed_even_with_a_pinned_profile(tmp_path, fake_route):
+    """Phase D1 keeps `route_not_in_capability_catalog`: a pin skips only the row
+    STATUS refusal — a route the catalog does not carry at all has no engine row
+    to be authoritative about, so it still refuses typed before any POST."""
+    import dataclasses
+
+    from ouroboros.review_execution import ReviewRouteUnavailable
+    from ouroboros.subagents import parse_subagent_harness
+
+    fake_route.catalog_entry = {"id": "some-other-route", "enabled": True, "status": "ok",
+                                "accessProfilesSupported": ["readonly"]}
+    route = dataclasses.replace(parse_subagent_harness("fake-review=fake-small"),
+                                profile_id="acct-pinned")
+    with pytest.raises(ReviewRouteUnavailable) as excinfo:
+        _run_session_directly(tmp_path, session_route=route)
+    assert excinfo.value.code == "route_not_in_capability_catalog"
     assert not any(inst.start_requests for inst in fake_route.instances)
 
 
