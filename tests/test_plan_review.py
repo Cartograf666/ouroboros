@@ -26,7 +26,8 @@ def _wave(fingerprint: str, *, aggregate: str = "REVIEW_REQUIRED", closed: bool 
             for i, c in enumerate(claims or [], start=1)
         ]},
         "spec_hash": "b" * 64, "findings": [], "aggregate": aggregate, "closed": closed,
-        "dispositions": [], "paid": aggregate != "DEGRADED",
+        # B2: paid = dispatched — a recorded DEGRADED wave normally paid its panel.
+        "dispositions": [], "paid": True,
         **({"cycles_exhausted": True} if cycles_exhausted else {}),
     }
 
@@ -51,13 +52,14 @@ def _force_plan_gate_state(kind: str) -> dict:
             ""
         ),
     }
-    if kind in {"open", "closed", "cycles_exhausted", "degraded"}:
+    if kind in {"open", "closed", "cycles_exhausted", "degraded", "degraded_exhausted"}:
         state["waves"] = [_wave(
             fingerprint,
-            aggregate="GREEN" if kind == "closed" else "DEGRADED" if kind == "degraded" else "REVIEW_REQUIRED",
-            closed=kind == "closed", cycles_exhausted=kind == "cycles_exhausted",
+            aggregate="GREEN" if kind == "closed"
+            else "DEGRADED" if kind.startswith("degraded") else "REVIEW_REQUIRED",
+            closed=kind == "closed", cycles_exhausted=kind.endswith("exhausted"),
         )]
-        state["cycles_paid"] = 0 if kind == "degraded" else 1
+        state["cycles_paid"] = 1
     return state
 
 
@@ -77,6 +79,9 @@ def _force_plan_gate_state(kind: str) -> dict:
         ("cycles_exhausted", "advisory", True, "advisory_open"),
         # D27: the spent cap releases finalization for the honest BLOCKED terminal.
         ("cycles_exhausted", "blocking", True, "cycles_exhausted"),
+        # B2: DEGRADED waves pay, so a DEGRADED current wave can spend the cap too.
+        ("degraded_exhausted", "advisory", True, "advisory_open"),
+        ("degraded_exhausted", "blocking", True, "cycles_exhausted"),
         ("closed", "advisory", True, "closed"),
         ("closed", "blocking", True, "closed"),
     ],
@@ -88,7 +93,28 @@ def test_force_plan_gate_projection_matrix(kind, enforcement, allowed, status):
 
     assert decision["allow"] is allowed
     assert decision["status"] == status
-    assert decision["reviewer_slots_degraded"] is (kind == "degraded")
+    assert decision["reviewer_slots_degraded"] is (kind in {"degraded", "degraded_exhausted"})
+
+
+def test_force_plan_gate_quorum_unreachable_releases_only_with_the_typed_fact():
+    """B2b: an OPEN wave carrying `quorum_unreachable` releases finalization under
+    blocking (status stays open, agent-chosen blocked terminal); without the typed
+    fact the same open DEGRADED wave still holds. Advisory is untouched."""
+    from ouroboros.task_results import plan_review_gate_projection
+
+    state = _force_plan_gate_state("degraded")
+    state["waves"][0]["quorum_unreachable"] = True
+    state["waves"][0]["earliest_reset"] = "2030-01-01T00:00:00+00:00"
+    blocking = plan_review_gate_projection(state, "blocking")
+    assert blocking["allow"] is True and blocking["status"] == "open"
+    assert blocking["closed"] is False
+    assert blocking["quorum_unreachable"] is True
+    assert blocking["earliest_reset"] == "2030-01-01T00:00:00+00:00"
+    advisory = plan_review_gate_projection(state, "advisory")
+    assert advisory["allow"] is True and advisory["status"] == "advisory_open"
+    plain = plan_review_gate_projection(_force_plan_gate_state("degraded"), "blocking")
+    assert plain["allow"] is False and plain["status"] == "open"
+    assert plain["quorum_unreachable"] is False and plain["earliest_reset"] == ""
 
 
 @pytest.mark.parametrize("state", [
@@ -676,7 +702,8 @@ class TestPlanReviewDispositionEnvelope(unittest.TestCase):
             ("REVIEW_REQUIRED", False, ("REVIEW_REQUIRED", False)),
             ("REVIEW_REQUIRED", True, ("REVIEW_REQUIRED", True)),
             ("REVISE_PLAN", False, ("REVISE_PLAN", False)),
-            ("DEGRADED", False, ("REVIEW_REQUIRED", False)),
+            # B2 honest DEGRADED: the control line carries the real aggregate, open.
+            ("DEGRADED", False, ("DEGRADED", False)),
         ):
             rendered = pr._render_wave(
                 {**_wave("f" * 64, aggregate=aggregate, closed=closed), "constitutional_note": "n",
@@ -711,6 +738,107 @@ class TestPlanBudgetFollowsQuorum(unittest.TestCase):
         # adaptive_quorum: 1 slot -> 1, 2 slots -> both, 3+ -> 2 of N.
         self.assertEqual(self.limit(["a", "b"], {"a": 545_000, "b": 745_000}), 545_000)
         self.assertEqual(self.limit(["a"], {"a": 545_000}), 545_000)
+
+
+class TestPlanRowTypedFacts(unittest.TestCase):
+    """B1: typed lane-failure facts survive the substrate boundary into the plan row
+    and its wave-record projection — never re-derived from the error prose."""
+
+    def test_plan_row_carries_typed_failure_facts(self):
+        from ouroboros.tools.plan_review_runtime import _plan_row_from_actor, plan_row_typed_facts
+
+        actor = {"slot_id": "s1", "model": "m", "status": "error",
+                 "error": "delegated review session run-1 ended failed",
+                 "failure_code": "subscription_window_exhausted",
+                 "reset_at": "2030-01-01T00:00:00Z", "http_status": 429,
+                 "transport_status": "provider_transport_error",
+                 "usage": {"capability_delta": [{"reason": "reduced"}]}}
+        row = _plan_row_from_actor(actor, None)
+        self.assertEqual(row["failure_code"], "subscription_window_exhausted")
+        self.assertEqual(row["reset_at"], "2030-01-01T00:00:00Z")
+        self.assertEqual(row["http_status"], 429)
+        self.assertEqual(row["transport_status"], "provider_transport_error")
+        self.assertEqual(row["capability_delta"], [{"reason": "reduced"}])
+        self.assertEqual(plan_row_typed_facts(row), {
+            "failure_code": "subscription_window_exhausted",
+            "reset_at": "2030-01-01T00:00:00Z", "http_status": 429,
+            "transport_status": "provider_transport_error",
+            "capability_delta": [{"reason": "reduced"}],
+        })
+
+    def test_a_pre_typed_row_defaults_to_honest_absence(self):
+        """Fail-open: an actor from an engine that carries no typed facts (code:null
+        world) produces the exact empty defaults — nothing invented, nothing broken."""
+        from ouroboros.tools.plan_review_runtime import _plan_row_from_actor, plan_row_typed_facts
+
+        row = _plan_row_from_actor({"slot_id": "s2", "status": "error", "error": "boom"}, None)
+        self.assertEqual((row["failure_code"], row["reset_at"], row["http_status"]),
+                         ("", "", None))
+        self.assertEqual((row["transport_status"], row["capability_delta"]), ("", []))
+        facts = plan_row_typed_facts({"slot_id": "s2"})  # e.g. a preflight_oversize row
+        self.assertEqual(facts["failure_code"], "")
+        self.assertEqual(facts["capability_delta"], [])
+
+
+class TestRenderTypedFailure(unittest.TestCase):
+    """B1: the wave render leads a failed actor with the typed code and reset when the
+    record carries them; without them the prose renders exactly as before."""
+
+    def _wave_with_actors(self, actors):
+        return {"cycle_index": 1, "request_fingerprint": "f" * 64, "constitutional": False,
+                "constitutional_note": "", "evidence_manifest": {}, "findings": [],
+                "aggregate": "DEGRADED", "closed": False, "reasons": [], "counts": {},
+                "actors": actors}
+
+    def test_failed_actor_line_shows_code_and_reset(self):
+        from ouroboros.tools.plan_render import _render_wave
+
+        typed = {"slot_id": "s2", "model": "m/b", "route": "agent_session",
+                 "host_file_read_attestation": "unobserved", "ok": False,
+                 "error": "delegated review session run-9 ended failed",
+                 "failure_code": "subscription_window_exhausted",
+                 "reset_at": "2030-01-01T00:00:00Z"}
+        prose = {"slot_id": "s3", "model": "m/c", "route": "api_chat",
+                 "host_file_read_attestation": "assembled", "ok": False,
+                 "error": "transport died"}
+        undated = {"slot_id": "s4", "model": "m/d", "route": "agent_session",
+                   "host_file_read_attestation": "unobserved", "ok": False,
+                   "error": "pool spent", "failure_code": "credential_pool_exhausted"}
+        text = _render_wave(self._wave_with_actors([typed, prose, undated]),
+                            cap=3, cycles_paid=1, enforcement="advisory")
+        self.assertIn(
+            "FAILED[subscription_window_exhausted] (resets 2030-01-01T00:00:00Z)", text)
+        self.assertIn("FAILED: transport died", text)          # prose path unchanged
+        self.assertIn("FAILED[credential_pool_exhausted]: pool spent", text)
+
+
+def test_advisory_open_event_carries_health_skip_typed_facts():
+    """B2b: the moment-of-record advisory event carries every actor's typed failure
+    facts — pre-fan-out $0 health-skip rows included — so the owner sees who was
+    skipped, with what code, until when."""
+    import queue as _queue
+    from types import SimpleNamespace
+
+    from ouroboros.tools.plan_review_runtime import emit_plan_review_advisory_open
+
+    events: _queue.Queue = _queue.Queue()
+    ctx = SimpleNamespace(event_queue=events)
+    wave = {
+        "request_fingerprint": "a" * 64, "aggregate": "DEGRADED", "cycle_index": 1,
+        "paid": True,
+        "actors": [
+            {"slot_id": "s1", "ok": True, "failure_code": "", "reset_at": ""},
+            {"slot_id": "s2", "ok": False,
+             "failure_code": "subscription_window_exhausted",
+             "reset_at": "2030-01-02T00:00:00+00:00"},
+        ],
+    }
+    emit_plan_review_advisory_open(ctx, None, task_id="t1", wave=wave, cycles_paid=1, cap=2)
+    event = events.get_nowait()
+    slots = {s["slot_id"]: s for s in event["data"]["slots"]}
+    assert slots["s2"]["failure_code"] == "subscription_window_exhausted"
+    assert slots["s2"]["reset_at"] == "2030-01-02T00:00:00+00:00"
+    assert slots["s1"]["failure_code"] == "" and slots["s1"]["ok"] is True
 
 
 if __name__ == "__main__":

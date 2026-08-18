@@ -263,9 +263,8 @@ def _task_uses_external_context(task: Dict[str, Any]) -> bool:
 
 
 def _scheduled_tasks_digest(env: Any, *, limit: int = 8) -> Optional[Dict[str, Any]]:
-    """Compact digest of active cron schedules for task/consciousness context.
-
-    Keeps the agent aware of standing cron schedules without inlining the full
+    """Compact digest of active schedules (cron + one-shot) for task/consciousness
+    context. Keeps the agent aware of standing schedules without inlining the full
     schedule table; notes how many active schedules were omitted past ``limit``.
     """
     try:
@@ -282,13 +281,19 @@ def _scheduled_tasks_digest(env: Any, *, limit: int = 8) -> Optional[Dict[str, A
     digest: List[Dict[str, Any]] = []
     for record in tasks[:limit]:
         trigger = record.get("trigger") if isinstance(record.get("trigger"), dict) else {}
-        digest.append({
+        entry = {
             "id": str(record.get("id") or ""),
             "name": str(record.get("name") or ""),
-            "cron": str(trigger.get("expr") or record.get("cron") or ""),
             "timezone": str(record.get("timezone") or "") or "local",
             "next_run_at": str(record.get("next_run_at") or ""),
-        })
+        }
+        if str(trigger.get("type") or "cron") == "once":
+            # One-shot records (schedule_followup) have no cron cadence: project
+            # the fire instant instead of an empty-string cron.
+            entry["run_at"] = str(trigger.get("run_at") or "")
+        else:
+            entry["cron"] = str(trigger.get("expr") or record.get("cron") or "")
+        digest.append(entry)
     out: Dict[str, Any] = {"active": digest}
     if len(tasks) > limit:
         out["omitted_count"] = len(tasks) - limit
@@ -457,6 +462,81 @@ def _promoted_task_toolset(env: Any) -> Dict[str, Any]:
     }
 
 
+def _delegation_capability_fact() -> Optional[Dict[str, Any]]:
+    """B4-lite: the CONFIGURED delegation route plus honestly-labeled HISTORICAL
+    observations (last recorded execution per reviewer slot and the last
+    delegated run).
+
+    Deliberately NOT live health — receipts prove what the last execution did,
+    not what a lane can do now; live lane facts arrive from plan-review wave
+    rows and typed delegate refusals. Pure bounded file reads over the existing
+    receipt projections: no daemon probes, no new health authority. Absent
+    receipt files mean absent observations, never "healthy". Fail-soft on its
+    own (None on any failure) so a problem here never drops the surrounding
+    capabilities digest.
+    """
+    try:
+        from ouroboros.reviewer_slot_config import reviewer_slot_last_executions
+        from ouroboros.subagents import get_subagent_harness, subagent_last_delegation
+
+        def _observed_label(ts: Any) -> str:
+            # Timestamp only: the verbatim "historical, not live health" disclaimer
+            # lives ONCE in the note below, never repeated per row.
+            return f"last observed at {str(ts or '').strip() or 'unknown time'}"
+
+        route = get_subagent_harness()
+        delegation: Dict[str, Any] = {
+            "configured_route": (
+                {
+                    "harness": route.route_id,
+                    "model": route.model,
+                    "effort": route.effort,
+                }
+                if route is not None
+                else "not configured"
+            ),
+            "note": (
+                "Every row here is historical, not live health (the last "
+                "recorded execution per reviewer slot / delegated run): "
+                "live lane facts arrive from plan-review wave rows and typed "
+                "delegate refusals. A missing row means no observation on "
+                "record — never healthy."
+            ),
+        }
+        slot_rows: List[Dict[str, Any]] = []
+        for slot_id, row in sorted(reviewer_slot_last_executions().items()):
+            if not isinstance(row, dict):
+                continue
+            status = str(row.get("status") or "").strip()
+            fact: Dict[str, Any] = {
+                "slot": str(slot_id),
+                "outcome": (("ok" if status == "ok" else "failed") if status
+                            else "unknown"),
+                "observed": _observed_label(row.get("ts")),
+            }
+            # B1's typed failure facts, forwarded only when recorded (a dated
+            # window carries reset_at without a code and an undated one the
+            # code without a reset — read both independently).
+            for key in ("failure_code", "reset_at"):
+                if row.get(key):
+                    fact[key] = row[key]
+            slot_rows.append(fact)
+        if slot_rows:
+            delegation["reviewer_slots_last"] = slot_rows
+        last = subagent_last_delegation()
+        if isinstance(last, dict) and last:
+            delegation["subagent_last_delegation"] = {
+                "route": str(last.get("route") or ""),
+                "requested_model": str(last.get("requested_model") or ""),
+                "applied_model": str(last.get("applied_model") or ""),
+                "observed": _observed_label(last.get("ts")),
+            }
+        return delegation
+    except Exception:
+        log.debug("Failed to build delegation capability fact", exc_info=True)
+        return None
+
+
 def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) -> str:
     try:
         git_branch, git_sha = get_git_info(env.repo_dir)
@@ -548,6 +628,12 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
                 "spawn acting subagents."
             ),
         }
+        # B4-lite: configured route + honestly-labeled HISTORY, never live
+        # health. Own nested fail-soft inside the helper: a failure there must
+        # never drop the whole capabilities digest above.
+        _delegation_fact = _delegation_capability_fact()
+        if _delegation_fact is not None:
+            runtime_data["capabilities"]["delegation"] = _delegation_fact
         if ctx is not None:
             from ouroboros.tool_access import filesystem_affordance_map
 

@@ -470,7 +470,9 @@ def force_plan_decision(
     not_required = {"required": False, "allow": True, "status": "not_required"}
     if bool(getattr(ctx, "is_ephemeral_turn", False)):
         return not_required
-    from ouroboros.task_results import load_plan_review_state, plan_review_gate_projection
+    from ouroboros.task_results import (
+        current_plan_review_wave, load_plan_review_state, plan_review_gate_projection,
+    )
 
     try:
         root = _canonical_root(ctx)
@@ -496,6 +498,12 @@ def force_plan_decision(
         "self_opened": not bool(metadata.get("force_plan")),
         **plan_review_gate_projection(state, effective, hard_rail=hard_rail),
     }
+    if decision.get("reviewer_slots_degraded"):
+        # The reminder's replay promise is conditional on the recorded wave's
+        # structural health epoch (empty epoch = a re-dispatch is PAID), so the
+        # epoch fact rides the decision for plan_review_reminder.
+        decision["degraded_health_epoch"] = (
+            (current_plan_review_wave(state) or {}).get("health_epoch") or "")
     if hurry_armed and str(enforcement or "").lower() == "blocking":
         # Attribution only (task detail); the durable state and the configured
         # global enforcement are byte-identical before/after.
@@ -516,9 +524,19 @@ def plan_review_reminder(decision: Dict[str, Any]) -> str:
             "plan_task with your goal, plan and spec to start a fresh review before finalizing."
         )
     if decision.get("reviewer_slots_degraded"):
+        # B2: facts, never a retry coach (P5). The replay promise is CONDITIONAL —
+        # wording SSOT: plan_render._degraded_replay_note (a free replay exists only
+        # while a non-empty recorded epoch and the reviewer roster stand; an
+        # empty-epoch wave re-dispatches a paid panel). Lazy import; plan_render
+        # never imports owner_hurry, so no cycle.
+        from ouroboros.tools.plan_render import _degraded_replay_note
+
+        note = _degraded_replay_note({"health_epoch": decision.get("degraded_health_epoch")})
         return (
-            f"{tag} Blocking plan review returned no parseable quorum (DEGRADED). Re-call "
-            "plan_task with the same envelope to re-run the panel (no cycle is consumed)."
+            f"{tag} Blocking plan review is OPEN with no parseable reviewer quorum (DEGRADED). "
+            f"The recorded wave lists each reviewer slot's typed state and reset time; {note}; "
+            "a changed spec starts the next paid cycle. Implementation stays held while the "
+            "review is open."
         )
     if outcome == "REVIEW_REQUIRED":
         return (
@@ -562,6 +580,17 @@ def plan_review_disclosure(decision: Dict[str, Any], forced_reason: str = "") ->
             f"\n\n⚠️ Blocking plan review stayed open ({outcome or 'open'}) with the review-cycle "
             f"cap spent ({decision.get('cycles_paid')} paid cycle(s)); the task is finalized as "
             "blocked_with_evidence — the planned work must not be treated as done."
+        )
+    if decision.get("quorum_unreachable") and decision.get("enforcement") == "blocking":
+        # B2b: the agent chose the honest blocked terminal while the reviewer quorum
+        # was structurally unreachable; the review stays open and nothing was built.
+        reset = str(decision.get("earliest_reset") or "")
+        return (
+            f"\n\n⚠️ Blocking plan review stayed open ({outcome or 'open'}) with its reviewer "
+            "quorum structurally unreachable (typed window-exhausted reviewer lanes"
+            + (f"; earliest recorded reset {reset}" if reset else "")
+            + "); the task is finalized as blocked_with_evidence — the planned work must "
+            "not be treated as done."
         )
     if decision.get("allow"):
         return (

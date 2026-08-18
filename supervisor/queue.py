@@ -146,9 +146,8 @@ from supervisor.task_admission import (  # noqa: E402,F401 - public queue API
     reserve_task_admission,
 )
 
-# Variant A off-loop worker reaper lives in supervisor/task_reaper.py (extracted for
-# module size). Re-export the thin names the enforce path and tests use; monkeypatching
-# these queue-module names still works because the enforce path references them here.
+# Variant A off-loop worker reaper lives in supervisor/task_reaper.py (module size); re-export
+# the thin names the enforce path and tests use — monkeypatching these queue names still works.
 from supervisor.task_reaper import (  # noqa: E402,F401 — re-exported for enforce path + tests
     ensure_reaper_started as _ensure_reaper_started,
     reap_queue as _reap_queue,
@@ -212,9 +211,8 @@ def enqueue_task(
         task_id = str(t.get("id") or "").strip()
         reserved_token = str(ADMISSION_RESERVATIONS.get(task_id) or "")
         if reserved_token and admission_token != reserved_token:
-            # A reservation owns this id until its request either enqueues or
-            # releases it.  Tokenless internal callers and competing ingress
-            # requests must not be able to consume/collide with that id.
+            # A reservation owns this id until its request either enqueues or releases it.
+            # Tokenless internal callers and competing ingress must not consume/collide with it.
             t["_admission_blocked"] = "admission_reservation_owned"
             return t
         if require_worker_pool:
@@ -482,7 +480,9 @@ def resync_skill_schedules(drive_root: pathlib.Path | None = None) -> Dict[str, 
 # module-size relief); imported under their historical private names.
 from supervisor.schedule_time import (  # noqa: E402
     next_cron_time as _next_cron_time,
+    once_due as _once_due,
     parse_schedule_time as _parse_schedule_time,
+    prune_consumed_once_records as _prune_consumed_once, record_last_error as _record_last_error,
     schedule_next_run as _schedule_next_run,
     timezone_for_schedule as _timezone_for_schedule,
 )
@@ -577,27 +577,38 @@ def check_scheduled_tasks() -> None:
                 continue
             tz = _timezone_for_schedule(record)
             now = now_utc.astimezone(tz)
-            if trigger_type != "cron":
-                record["last_error"] = f"unsupported trigger type: {trigger_type}"
-                changed = True
-                continue
-            expr = str(trigger.get("expr") or record.get("cron") or "").strip()
-            if not expr:
-                record["last_error"] = "missing cron expression"
-                changed = True
-                continue
-            next_run = _parse_schedule_time(record.get("next_run_at"), tz)
-            if next_run is None:
-                try:
-                    next_run = _next_cron_time(expr, now - datetime.timedelta(minutes=1))
-                    record["next_run_at"] = next_run.isoformat()
-                    changed = True
-                except Exception as exc:
-                    record["last_error"] = f"{type(exc).__name__}: {exc}"
-                    changed = True
+            expr = ""
+            if trigger_type == "once":
+                # One-shot (B2b W=A): fires once at/after run_at via the same admission path
+                # as cron, then is marked done below. A consumed receipt (non-empty completed_at)
+                # NEVER re-fires even re-enabled from UI; re-arm = gateway upsert, fresh run_at.
+                if record.get("completed_at"):
                     continue
-            if next_run > now:
+                due, once_error = _once_due(trigger, tz, now)
+                if once_error:
+                    changed = _record_last_error(record, once_error) or changed
+                    continue
+                if not due:
+                    continue
+            elif trigger_type != "cron":
+                changed = _record_last_error(record, f"unsupported trigger type: {trigger_type}") or changed
                 continue
+            else:
+                expr = str(trigger.get("expr") or record.get("cron") or "").strip()
+                if not expr:
+                    changed = _record_last_error(record, "missing cron expression") or changed
+                    continue
+                next_run = _parse_schedule_time(record.get("next_run_at"), tz)
+                if next_run is None:
+                    try:
+                        next_run = _next_cron_time(expr, now - datetime.timedelta(minutes=1))
+                        record["next_run_at"] = next_run.isoformat()
+                        changed = True
+                    except Exception as exc:
+                        changed = _record_last_error(record, f"{type(exc).__name__}: {exc}") or changed
+                        continue
+                if next_run > now:
+                    continue
             if str(record.get("source") or "") == "skill_manifest":
                 if collision_names is None:
                     collision_names = skill_identity_collision_names(DRIVE_ROOT)
@@ -632,11 +643,27 @@ def check_scheduled_tasks() -> None:
             record["last_run_at"] = now.isoformat()
             record["last_task_id"] = task["id"]
             record_scheduled_admission(task, admitted, record)
-            try:
-                record["next_run_at"] = _next_cron_time(expr, now).isoformat()
-            except Exception as exc:
-                record["last_error"] = f"{type(exc).__name__}: {exc}"
+            if trigger_type == "once":
+                if not (isinstance(admitted, dict) and admitted.get("_admission_blocked")):
+                    # Consumed ONLY when admission succeeded (durable receipt, never re-fired); a
+                    # refused admission left the record enabled with last_error → next tick retries.
+                    record["enabled"] = False
+                    record["completed_at"] = now.isoformat()
+                    record["next_run_at"] = ""
+            else:
+                try:
+                    record["next_run_at"] = _next_cron_time(expr, now).isoformat()
+                except Exception as exc:
+                    record["last_error"] = f"{type(exc).__name__}: {exc}"
             changed = True
+        # Consumed one-shot receipts age out past the unified GC retention (DEVELOPMENT
+        # Runtime Cleanup SSOT; enabled records are never pruned — see the helper).
+        from ouroboros.retention import age_cutoff, get_gc_retention_days
+
+        kept, pruned = _prune_consumed_once(list(data.get("tasks") or []),
+                                            age_cutoff(get_gc_retention_days()))
+        if pruned:
+            data["tasks"], changed = kept, True
         if changed:
             _write_scheduled_tasks(data)
             persist_queue_snapshot(reason="scheduled_tasks")
@@ -908,12 +935,10 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                     log.warning("Failed to terminalize fenced snapshot task %s", task_id, exc_info=True)
                 continue
             # Never resurrect a terminal/cancelled task as a ghost pending entry.
-            # AR2-10 (§8-A1): the intent projection is consulted UNDER the queue
-            # lock at restore — the "no active intent" read and the enqueue form
-            # one serialized step against assignment/drop, the same invariant the
-            # pre-assignment consult keeps. Boot-time and contention-free;
-            # _queue_lock is an RLock, so enqueue_task's own acquisition stays
-            # re-entrant.
+            # AR2-10 (§8-A1): the intent projection is consulted UNDER the queue lock at
+            # restore — the "no active intent" read and the enqueue form one serialized step
+            # against assignment/drop (same invariant as the pre-assignment consult). Boot-time
+            # and contention-free; _queue_lock is an RLock, so enqueue_task stays re-entrant.
             with _queue_lock:
                 skip_revival = False
                 try:
@@ -1150,15 +1175,13 @@ def _has_pending_descendant(task_id: str) -> bool:
 def _enforce_task_timeouts_locked(
     workers: Any, now: float, owner_chat_id: int, st: Dict[str, Any]
 ) -> None:
-    # ONE typed owner-stop predicate before every generic timeout-grace consumer
-    # (S3 §12.2 item 8): a task whose owner-requested finalization intent is
-    # still OPEN is bypassed whole — no spare-withdraw, no spare-clock reset,
-    # no second grace episode, no expiry kill, no RUNNING.pop, no reaper
-    # enqueue, no retry scheduling. The hold deliberately outlives the grace
-    # deadline (the expiry window): the deadline gates only the sweep's
-    # arm-vs-feed-custody decision in supervisor/owner_stop.py +
-    # sweep_cancel_intents; the intent stays the one owner will and custody
-    # stays the only killer.
+    # ONE typed owner-stop predicate before every generic timeout-grace consumer (S3
+    # §12.2 item 8): a task whose owner-requested finalization intent is still OPEN is
+    # bypassed whole — no spare-withdraw, no spare-clock reset, no second grace episode,
+    # no expiry kill, no RUNNING.pop, no reaper enqueue, no retry scheduling. The hold
+    # deliberately outlives the grace deadline (the expiry window): the deadline gates only
+    # the sweep's arm-vs-feed-custody decision in supervisor/owner_stop.py +
+    # sweep_cancel_intents; the intent stays the one owner will and custody stays the only killer.
     from supervisor.owner_stop import running_owner_stop_tasks
 
     owner_stop_held = running_owner_stop_tasks(
@@ -1206,24 +1229,22 @@ def _enforce_task_timeouts_locked(
         # is legitimate silence (hard-bounded by events._handle_external_wait_lease);
         # it spares ONLY this idle rail — ceiling/deadline/budget/cancel never consult it.
         lease_ts = meta.get("external_wait_lease_until")
-        # Keep an orchestrator alive on own progress, a freshly progressing RUNNING
-        # descendant, a QUEUED descendant (a kill would orphan the queued subtree), or a
-        # live external-wait lease; only abs ceiling / explicit deadline / budget are
-        # unconditional.
+        # Keep an orchestrator alive on own progress, a freshly progressing RUNNING descendant,
+        # a QUEUED descendant (a kill would orphan the queued subtree), or a live external-wait
+        # lease; only abs ceiling / explicit deadline / budget are unconditional.
         progressing = (own_progress or subtree_progressing or _has_pending_descendant(task_id)
                        or (isinstance(lease_ts, (int, float)) and float(lease_ts) > now))
         ceiling_reached = runtime_sec >= abs_ceiling
 
         # Hard axes (deadline_at, abs ceiling) stop the task regardless of activity; the
-        # idle/subtree gate only spares a still-progressing task with NO explicit deadline
-        # — an explicit/caller deadline is honored promptly, while no blanket wall-clock
-        # kills a productively-waiting orchestrator.
+        # idle/subtree gate only spares a still-progressing task with NO explicit deadline —
+        # an explicit/caller deadline is honored promptly, while no blanket wall-clock kills
+        # a productively-waiting orchestrator.
         if not ceiling_reached and not deadline_reached and progressing:
-            # An outstanding episode outlives this reprieve or is withdrawn by it; the
-            # rule (own progress answers the request, sparing only suspends its clock)
-            # lives with the rest of the episode mechanics in task_reaper. The latch is
-            # checked here so the drive resolution (which may read the result record)
-            # stays off the no-episode path.
+            # An outstanding episode outlives this reprieve or is withdrawn by it; the rule
+            # (own progress answers the request, sparing only suspends its clock) lives with
+            # the rest of the episode mechanics in task_reaper. The latch is checked here so
+            # the drive resolution (which may read the result record) stays off the no-episode path.
             if meta.get("finalization_requested_at") and _resolve_grace_episode_for_spared_task(
                 _task_drive_for_task(task, str(task_id)), str(task_id), meta,
                 chat_id=int(task.get("chat_id") or owner_chat_id or 0),
@@ -1515,13 +1536,13 @@ def enqueue_evolution_task_if_needed() -> None:
         )
         return
 
-    # BUG3: pause if the SAME objective has been re-proposed and no-op'd
-    # OBJECTIVE_REPEAT_CAP times without ever absorbing. This is a SEPARATE breaker from
-    # consecutive_failures above: that counter is reset to 0 by ANY non-failing cycle
-    # (events.py), so it cannot catch a self-maintenance loop where a blocked objective is
-    # re-proposed NON-consecutively (interleaved with other no_op work). The per-objective
-    # count is keyed on the same canonical fingerprint the transaction stamps, accumulates
-    # across non-consecutive recurrence, and is cleared only on a genuine absorb.
+    # BUG3: pause if the SAME objective has been re-proposed and no-op'd OBJECTIVE_REPEAT_CAP
+    # times without ever absorbing. This is a SEPARATE breaker from consecutive_failures
+    # above: that counter is reset to 0 by ANY non-failing cycle (events.py), so it cannot
+    # catch a self-maintenance loop where a blocked objective is re-proposed NON-consecutively
+    # (interleaved with other no_op work). The per-objective count is keyed on the same
+    # canonical fingerprint the transaction stamps, accumulates across non-consecutive
+    # recurrence, and is cleared only on a genuine absorb.
     from ouroboros.evolution_fingerprint import canonical_objective_fingerprint
 
     _objective_repeat_counts = campaign.get("objective_repeat_counts") or {}

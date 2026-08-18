@@ -20,9 +20,9 @@ const SETTINGS_TABS = [
 // Guard markers: renderTabStrip emits behavior/advanced tabs at runtime.
 
 const MODEL_CARDS = [
-    ['Main', 'Primary reasoning model.', 's-model', 's-local-main', 'x-ai/grok-4.5'],
+    ['Main', 'Primary reasoning model.', 's-model', 's-local-main', 'google/gemini-3.7-flash'],
     ['Heavy', 'Strong acting/coding lane for mutative first-level subagents. Empty uses Main.', 's-model-heavy', 's-local-heavy', ''],
-    ['Light', 'Fast summaries, lightweight tasks, and all deep subagents. Empty uses Main.', 's-model-light', 's-local-light', 'google/gemini-3.6-flash'],
+    ['Light', 'Fast summaries, lightweight tasks, and all deep subagents. Empty uses Main.', 's-model-light', 's-local-light', 'openai/gpt-5.6-luna'],
     ['Vision', 'Caption and VLM lane. Empty uses Main.', 's-model-vision', '', ''],
     ['Consciousness', 'High-horizon background consciousness. Empty uses Main.', 's-model-consciousness', 's-local-consciousness', ''],
     ['Fallback', 'Resilience and degraded path (comma-separated chain).', 's-model-fallback', 's-local-fallback', 'openai/gpt-5.6-luna'],
@@ -800,11 +800,11 @@ export function renderSettingsPage() {
                             </div>
                             <div class="form-field">
                                 <label>Total Budget (USD)</label>
-                                <input id="s-total-budget" type="number" min="0.01" step="any" value="10.0">
+                                <input id="s-total-budget" type="number" min="0.01" step="any" value="200.0">
                             </div>
                             <div class="form-field">
                                 <label>Per-Task Cost Cap (USD)</label>
-                                <input id="s-settings-per-task-cost" type="number" min="0.01" step="any" value="20.0">
+                                <input id="s-settings-per-task-cost" type="number" min="0.01" step="any" value="50.0">
                             </div>
                         </div>
                     </div>

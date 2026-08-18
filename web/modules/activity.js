@@ -90,11 +90,16 @@ export function initActivity({ mount, ws } = {}) {
         if (!tasks.length) return '<div class="activity-empty">No scheduled tasks.</div>';
         return tasks.map((s) => {
             const managed = isSkillManaged(s);
-            const cron = esc((s.trigger && s.trigger.expr) || s.cron || '');
+            const trigger = s.trigger || {};
+            const once = String(trigger.type || 'cron') === 'once';
+            // One-shot rows have no cron: show the fire instant + a "one-shot" tag.
+            const timing = once
+                ? `one-shot · at/after ${esc(trigger.run_at || '')}`
+                : esc(trigger.expr || s.cron || '');
             const next = esc(s.next_run_at || '');
             const enabled = s.enabled !== false;
             const id = esc(s.id || '');
-            const sub = `${cron}${next ? ` · next ${next}` : ''}${managed && s.skill ? ` · ${esc(s.skill)}` : ''}`;
+            const sub = `${timing}${next ? ` · next ${next}` : ''}${managed && s.skill ? ` · ${esc(s.skill)}` : ''}`;
             const actions = managed
                 ? '<span class="activity-tag">managed by skill</span>'
                 : `<button type="button" class="btn btn-xs btn-default" data-act="schedule-toggle" data-id="${id}">${enabled ? 'Disable' : 'Enable'}</button>
@@ -129,7 +134,7 @@ export function initActivity({ mount, ws } = {}) {
                     ${renderBg(st)}
                 </div>
                 <div class="activity-section">
-                    <h3 class="activity-h">Scheduled (cron)</h3>
+                    <h3 class="activity-h">Scheduled</h3>
                     ${renderSchedules(sched)}
                 </div>
             </div>

@@ -229,7 +229,7 @@ subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", "."], check=
 secrets = collect_colab_secrets()
 settings = build_colab_settings(
     secrets,
-    total_budget=float(os.environ.get("TOTAL_BUDGET", "10")),
+    total_budget=float(os.environ.get("TOTAL_BUDGET", "200")),
     runtime_mode=os.environ.get("OUROBOROS_RUNTIME_MODE", "advanced"),
     max_workers=int(os.environ.get("OUROBOROS_MAX_WORKERS", "1")),
     existing=_settings_seed,

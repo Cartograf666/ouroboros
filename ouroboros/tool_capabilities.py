@@ -10,6 +10,11 @@ CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "start_service", "service_status", "service_logs", "stop_service",
     "vcs_status", "vcs_diff", "vcs_commit_reviewed", "commit_reviewed",
     "vcs_restore", "vcs_revert", "vcs_pull_ff", "vcs_rollback",
+    # One-shot deferred follow-up (W=A): core so a root task facing a typed wait
+    # instant (e.g. a structurally unreachable review quorum with a known reset)
+    # can register it without an enable_tools detour. Deliberately absent from
+    # the subagent profiles below — a child may not mint future root tasks.
+    "schedule_followup",
     "schedule_subagent", "integrate_subagent_patch", "compare_subagent_patches",
     "integrate_delegated_patch",
     "wait_task", "wait_tasks", "get_task_result",

@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping
 
 from ouroboros.config import (
@@ -444,14 +445,33 @@ def _model_scope_matches(route_model: str, applies_to_models: Any) -> bool:
     return any(a == model or a in model or model in a for a in aliases)
 
 
+def _cooldown_active(cooldown_until: Any) -> bool:
+    """A cooldown blocks only while its instant is still AHEAD: an expired
+    ``cooldown_until`` is history the harness has not refreshed yet, not positive
+    evidence of a spent window. An illegible instant keeps the conservative old
+    reading (spent) — the harness positively said "cooling down" and an unreadable
+    clock is no proof it healed."""
+    text = str(cooldown_until or "").strip()
+    if not text:
+        return False
+    try:
+        instant = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=timezone.utc)
+    return instant > datetime.now(timezone.utc)
+
+
 def _exhausted_window(gateway: Any, route_id: str, route_model: str = "") -> tuple[bool, str]:
     """``(exhausted, reset_at)`` for a route judged against its OWN model.
 
-    A window counts as spent when the harness reports it fully used or explicitly
-    cooling down AND its model scope covers the route's model — a window scoped to a
-    model this route never uses (the live incident: a Fable-only weekly window taking
-    an opus-pinned route offline for days) is someone else's exhaustion, not this
-    route's. Stale snapshots are ignored — an old reading must not block a lane.
+    A window counts as spent when the harness reports it fully used or still cooling
+    down (a FUTURE ``cooldown_until``) AND its model scope covers the route's model —
+    a window scoped to a model this route never uses (the live incident: a Fable-only
+    weekly window taking an opus-pinned route offline for days) is someone else's
+    exhaustion, not this route's. Stale snapshots are ignored — an old reading must
+    not block a lane.
 
     ANY LIVE SNAPSHOT MEANS THE LANE IS USABLE (D28). And exhaustion needs POSITIVE
     evidence for the WHOLE route: a profile whose quota could not be read at all
@@ -480,7 +500,7 @@ def _exhausted_window(gateway: Any, route_id: str, route_model: str = "") -> tup
             (str(c.get("cooldown_until") or "") or str(c.get("resets_at") or ""))
             for c in (snapshot.get("constraints") or [])
             if isinstance(c, dict)
-            and (bool(c.get("cooldown_until"))
+            and (_cooldown_active(c.get("cooldown_until"))
                  or (isinstance(c.get("used_ratio"), (int, float))
                      and float(c.get("used_ratio")) >= 1.0))
             and _model_scope_matches(route_model, c.get("applies_to_models"))

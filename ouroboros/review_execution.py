@@ -865,7 +865,7 @@ def run_delegated_review_session(
     from ouroboros import delegate_custody as custody
     from ouroboros.claudexor_daemon import ensure_owned_gateway
     from ouroboros.gateways.claudexor import (
-        ClaudexorSubscriptionWindowExhausted, ClaudexorUnavailable,
+        WINDOW_EXHAUSTED_CODES, ClaudexorSubscriptionWindowExhausted, ClaudexorUnavailable,
     )
     from ouroboros.subagents import delegated_run_shape, route_health
     from ouroboros.usage_accounting import current_usage_scope
@@ -918,21 +918,21 @@ def run_delegated_review_session(
     gateway = ensure_owned_gateway()
     try:
         if not run_id:
-            # Admission health applies only while this call may POST. A durable
-            # STARTED run needs gateway availability for GET/poll, but a changed
-            # quota window cannot invalidate a run that already exists.
+            # Admission health applies only while this call may POST: a changed
+            # quota window cannot invalidate a STARTED run that already exists.
             unavailable, reset_at = route_health(
                 gateway, route.route_id, shape, route_model=route.model,
             )
+            if unavailable in WINDOW_EXHAUSTED_CODES or reset_at:
+                raise ClaudexorSubscriptionWindowExhausted(
+                    "delegated review route subscription window is exhausted"
+                    + (f" (resets {reset_at})" if reset_at else "")
+                    + "; this slot fails typed — never a silent fallback onto "
+                    "metered API spend", reset_at=reset_at,
+                    code=(unavailable or "subscription_window_exhausted"))
             if unavailable:
                 raise ReviewRouteUnavailable(
                     f"delegated review route unavailable: {unavailable}")
-            if reset_at:
-                raise ReviewRouteUnavailable(
-                    "delegated review route subscription window is exhausted "
-                    f"(resets {reset_at}); this slot fails typed — never a silent "
-                    "fallback onto metered API spend"
-                )
         if not recovering:
             existing_project = gateway.find_project_id(root)
             project_id = existing_project or gateway.register_project(root)
@@ -1079,9 +1079,9 @@ def run_delegated_review_session(
             message = (f"delegated review session {run_id} ended {run_state or 'unknown'}"
                        + (f": {json.dumps(failure, ensure_ascii=False)}" if failure else ""))
             code = str(failure.get("code") or "")
-            if code == "subscription_window_exhausted":
+            if code in WINDOW_EXHAUSTED_CODES:
                 raise ClaudexorSubscriptionWindowExhausted(
-                    message, reset_at=str(failure.get("resetsAt") or ""))
+                    message, reset_at=str(failure.get("resetsAt") or ""), code=code)
             raise ClaudexorUnavailable(code or f"run_{run_state or 'unknown'}", message)
         text = _full_session_text(gateway, run_id, detail)
         spend, estimated = custody.disclosed_spend(summary)
