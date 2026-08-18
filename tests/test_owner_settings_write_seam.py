@@ -361,6 +361,15 @@ def test_settings_save_body_runs_off_the_event_loop():
             endpoint_text = ast.unparse(node)
     assert "asyncio.to_thread(_api_settings_post_sync" in endpoint_text
 
+    # Worker threads do not inherit the event loop's free serialization: two
+    # concurrent saves interleaving read-merge-write would silently drop each
+    # other's keys. The sync body must hold the save lock.
+    sync_text = ""
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.FunctionDef) and node.name == "_api_settings_post_sync":
+            sync_text = ast.unparse(node)
+    assert "_SETTINGS_SAVE_LOCK" in sync_text
+
 
 def test_reviewer_slots_reload_does_not_await_the_status_probe():
     """The shared Claudexor status read can wake a cold daemon and walk model
@@ -375,3 +384,11 @@ def test_reviewer_slots_reload_does_not_await_the_status_probe():
     ).read_text(encoding="utf-8")
     assert "Promise.resolve(state.store.refresh({ includeModels: true })).catch(() => {});" in source
     assert "await state.store.refresh" not in source
+    # loadSettings awaits BOTH sections via Promise.all: one awaiting sibling
+    # would keep the Save button hostage to the same probe.
+    subagents = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "web" / "modules" / "subagents_settings.js"
+    ).read_text(encoding="utf-8")
+    assert "Promise.resolve(state.store.refresh({ includeModels: true })).catch(() => {});" in subagents
+    assert "await state.store.refresh" not in subagents

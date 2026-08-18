@@ -504,7 +504,12 @@ function adoptStoreSnapshot() {
 }
 
 export async function reloadSubagentsSection() {
-    await state.store.refresh({ includeModels: true });
+    // Deliberately NOT awaited — the same rule as reloadReviewerSlots, or the
+    // fix there is defeated: loadSettings awaits BOTH via Promise.all, so one
+    // awaiting sibling keeps the Save button hostage to the cold-daemon probe.
+    // The rows render from the current snapshot; the status surface binding in
+    // initSubagentsSection repaints them when the fresh snapshot lands.
+    Promise.resolve(state.store.refresh({ includeModels: true })).catch(() => {});
     adoptStoreSnapshot();
     renderRows();
 }

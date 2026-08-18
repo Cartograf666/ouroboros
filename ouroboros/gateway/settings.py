@@ -8,6 +8,7 @@ import os
 import pathlib
 import socket
 import sys
+import threading
 from typing import Any, Dict, Optional
 
 from starlette.requests import Request
@@ -1085,14 +1086,26 @@ async def api_settings_post(request: Request) -> JSONResponse:
     # save, which read as the entire app hanging on the Save button.
     try:
         body = await request.json()
-    except Exception:
-        return unsaved_error("JSON body must be an object.", 400)
-    import asyncio
-
+    except Exception as exc:
+        # Same answer the broad in-body handler used to give a parse failure.
+        return unsaved_error(str(exc), 400)
     return await asyncio.to_thread(_api_settings_post_sync, request, body)
 
 
+# The event loop used to serialize saves for free (the old async body had no
+# await between parse and return); worker threads do not. This lock restores
+# that in-process serialization so two concurrent saves cannot interleave
+# their read-merge-write and silently drop each other's keys, while the loop
+# itself stays free to serve everything else.
+_SETTINGS_SAVE_LOCK = threading.Lock()
+
+
 def _api_settings_post_sync(request: Request, body: Any) -> JSONResponse:
+    with _SETTINGS_SAVE_LOCK:
+        return _api_settings_post_locked(request, body)
+
+
+def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
     # Everything below the write is a POST-commit step. The broad handler at the
     # bottom used to answer a failure there with "400, nothing saved" while the
     # bytes were already on disk; `boundary` is what lets it tell the two apart.
