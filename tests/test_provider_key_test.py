@@ -308,3 +308,80 @@ def test_provider_test_constants_stay_in_sync_with_provider_specs():
         assert f'"{key}"' in source, f"allowlisted key {key} is not read by _provider_specs"
     assert model_catalog_api._PROVIDER_TEST_SECRET_KEYS <= model_catalog_api._PROVIDER_TEST_OVERRIDE_KEYS
     assert set(model_catalog_api._PROVIDER_TEST_ENDPOINT_GUARDS) <= model_catalog_api._PROVIDER_TEST_OVERRIDE_KEYS
+
+
+def test_endpoint_guard_requires_every_configured_credential_re_entered(monkeypatch):
+    # Satisfying the guard with one re-entered secret while another saved one
+    # rides along (password submitted, OAuth credentials kept) is the same
+    # exfiltration through a side door.
+    monkeypatch.setattr(
+        model_catalog_api,
+        "load_settings",
+        lambda: {
+            "GIGACHAT_CREDENTIALS": "unit-test-credential",
+            "GIGACHAT_PASSWORD": "unit-test-password",
+            "GIGACHAT_USER": "unit-test-user",
+        },
+    )
+    status, body = _post({
+        "provider_id": "gigachat",
+        "overrides": {
+            "GIGACHAT_BASE_URL": "https://unit-test-attacker.example/v1",
+            "GIGACHAT_PASSWORD": "unit-test-password",
+        },
+    })
+    assert status == 400
+    assert "re-entering the credential" in body.get("error", "")
+
+    async def fake_gigachat(_credentials, _scope, _base_url, _verify, _user="", _password=""):
+        return [{"value": "gigachat::unit-test-model"}]
+
+    monkeypatch.setattr(model_catalog_api, "_fetch_gigachat_model_catalog", fake_gigachat)
+    status, body = _post({
+        "provider_id": "gigachat",
+        "overrides": {
+            "GIGACHAT_BASE_URL": "https://unit-test-other.example/v1",
+            "GIGACHAT_CREDENTIALS": "unit-test-other-credential",
+            "GIGACHAT_PASSWORD": "unit-test-other-password",
+        },
+    })
+    assert status == 200 and body["ok"] is True
+
+
+def test_tls_verification_toggle_is_endpoint_guarded(monkeypatch):
+    # Turning off certificate verification changes the connection's trust
+    # boundary exactly like a URL change: saved credentials must not ride.
+    monkeypatch.setattr(
+        model_catalog_api,
+        "load_settings",
+        lambda: {"GIGACHAT_CREDENTIALS": "unit-test-credential"},
+    )
+    status, body = _post({
+        "provider_id": "gigachat",
+        "overrides": {"GIGACHAT_VERIFY_SSL_CERTS": "false"},
+    })
+    assert status == 400
+    assert "re-entering the credential" in body.get("error", "")
+
+
+def test_short_credentials_are_redacted_as_standalone_tokens(monkeypatch):
+    monkeypatch.setattr(
+        model_catalog_api,
+        "load_settings",
+        lambda: {
+            "OPENAI_COMPATIBLE_API_KEY": "abc",
+            "OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-base-url.example/v1",
+        },
+    )
+
+    async def exploding(client, provider_id, provider_label, api_key, base_url):
+        raise httpx.ConnectError("bad token abc rejected; abcdef is a different word")
+
+    monkeypatch.setattr(
+        model_catalog_api, "_fetch_openai_compatible_model_catalog", exploding
+    )
+    status, body = _post({"provider_id": "openai-compatible"})
+    assert status == 200 and body["ok"] is False
+    assert " abc " not in f' {body["error"]} '.replace("***", " *** ")
+    # An innocent longer word sharing the prefix stays legible.
+    assert "abcdef" in body["error"]

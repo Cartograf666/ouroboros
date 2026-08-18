@@ -132,7 +132,14 @@ function wireSecretRow(row) {
     const clear = row.querySelector('[data-row-secret-clear]');
     if (input) input.addEventListener('input', () => { if (input.value.trim()) delete input.dataset.forceClear; });
     if (toggle && input) toggle.addEventListener('click', () => { input.type = input.type === 'password' ? 'text' : 'password'; toggle.textContent = input.type === 'password' ? 'Show' : 'Hide'; });
-    if (clear && input) clear.addEventListener('click', () => { input.value = ''; input.type = 'password'; input.dataset.forceClear = '1'; if (toggle) toggle.textContent = 'Show'; markSettingsDirty(); });
+    if (clear && input) clear.addEventListener('click', () => {
+        input.value = ''; input.type = 'password'; input.dataset.forceClear = '1';
+        if (toggle) toggle.textContent = 'Show';
+        markSettingsDirty();
+        // Programmatic value changes fire no 'input' event, but a Clear is an
+        // edit like any other: the provider-test verdict listener must see it.
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
 }
 
 function customSecretRow(key = '', value = '') {
@@ -1159,6 +1166,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         // request was in flight would wear a verdict it never earned. Applies to
         // BOTH outcomes — 4xx contract answers reject through the client and
         // land in the catch branch, and they are just as draft-dependent.
+        // (Edits AFTER the verdict landed are handled by the input listener
+        // below, which clears a stale verdict the moment a field changes.)
         const withDraftNote = (verdict) => (
             JSON.stringify(collectOverrides()) !== JSON.stringify(overrides)
                 ? `${verdict} — for the previous draft; the fields changed while testing, test again`
@@ -1175,6 +1184,21 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             if (status) status.textContent = withDraftNote(`Failed: ${String(error?.message || error || 'unknown error')}`);
         } finally {
             button.disabled = false;
+        }
+    });
+
+    // A displayed verdict is only good for the draft it tested: the moment any
+    // field of that card changes, the old OK/Failed would sit beside values it
+    // never saw — clear it instead of letting it vouch for the new draft.
+    page.querySelector('[data-settings-panel="providers"]')?.addEventListener('input', (event) => {
+        const target = event.target;
+        if (!(target instanceof Element) || !target.id) return;
+        for (const [provider, inputs] of Object.entries(PROVIDER_TEST_INPUTS)) {
+            if (target.id in inputs) {
+                const status = page.querySelector(`[data-provider-test-status="${provider}"]`);
+                if (status) status.textContent = '';
+                break;
+            }
         }
     });
 
