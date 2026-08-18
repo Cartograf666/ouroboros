@@ -896,4 +896,4 @@
  * @property {?boolean} check_ok
  */
 
-export const GATEWAY_CONTRACT_VERSION = '6.105.0';
+export const GATEWAY_CONTRACT_VERSION = '6.105.1';
