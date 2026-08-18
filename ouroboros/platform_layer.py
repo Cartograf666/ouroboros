@@ -674,7 +674,11 @@ def process_command(pid: int) -> str:
     if IS_WINDOWS:
         return ""
     try:
-        result = subprocess.run(["ps", "-p", str(int(pid)), "-o", "command="],
+        # -ww: unlimited width. BSD ps truncates to the terminal/128 cols
+        # otherwise, and consumers match exact argv tokens — a packaged
+        # interpreter path is long enough to push the script argument off the
+        # end of a truncated line.
+        result = subprocess.run(["ps", "-ww", "-p", str(int(pid)), "-o", "command="],
                                 capture_output=True, text=True, timeout=3)
         return result.stdout.strip()
     except Exception:

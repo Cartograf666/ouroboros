@@ -63,18 +63,21 @@ def _path_forms(base, leaf: str = "") -> Set[str]:
     return forms
 
 
-def _candidate_pids() -> List[int]:
-    """This user's pids whose command line mentions ouroboros. ``-U``: other accounts run their own
-    legitimate installs and are unsignallable anyway. ``-i``: a packaged install runs
-    ``EMBEDDED_PYTHON .../Ouroboros/repo/server.py`` with a capital O."""
+def _candidate_pids() -> "Optional[List[int]]":
+    """This user's pids whose command line mentions ouroboros, or ``None`` when enumeration itself
+    failed. ``-U``: other accounts run their own legitimate installs and are unsignallable anyway.
+    ``-i``: a packaged install runs ``EMBEDDED_PYTHON .../Ouroboros/repo/server.py`` with a capital
+    O. ``None`` (no pgrep, or pgrep errored — rc>1; rc 1 is the documented no-matches answer) must
+    never read as a clean sweep: nothing was checked."""
     try:
         out = subprocess.run(
             ["pgrep", "-U", str(os.getuid()), "-fi", "ouroboros"],
             capture_output=True, text=True, timeout=5,
         )
     except Exception:
-        # No usable `pgrep`: nothing is enumerated, so nothing is killed.
-        return []
+        return None
+    if out.returncode not in (0, 1):
+        return None
     pids: List[int] = []
     for line in (out.stdout or "").splitlines():
         try:
@@ -86,20 +89,28 @@ def _candidate_pids() -> List[int]:
     return pids
 
 
-def _runs_our_server(pid: int, server_paths: Set[str]) -> bool:
-    """Whether ``pid``'s live command line IS this install's server: an exact argv token equal to
+def install_server_path_forms(repo_dir) -> Set[str]:
+    """The spellings of THIS install's server.py a live command line may carry."""
+    return _path_forms(repo_dir, "server.py")
+
+
+def command_names_our_server(command: str, server_paths: Set[str]) -> bool:
+    """Whether a live command line IS this install's server: an exact argv token equal to
     ``<REPO_DIR>/server.py`` directly after a python-named interpreter token — the launcher's only
     spawn shape. A bare substring test would also match editors, pagers or log tools whose
     arguments merely mention the path; those are not server generations and must not even appear
     as spared candidates. A sibling install, a bench clone and a dev checkout carry different
-    paths and never match. A path containing whitespace defeats the token split and is spared by
-    construction (never a licence to kill)."""
-    command = _pl.process_command(pid) or ""
-    tokens = command.split()
+    paths and never match. Shared with the startup stray check so its ``scope`` labels agree with
+    what this sweep would actually treat as a server."""
+    tokens = (command or "").split()
     for i in range(1, len(tokens)):
         if tokens[i] in server_paths and pathlib.PurePath(tokens[i - 1]).name.lower().startswith("python"):
             return True
     return False
+
+
+def _runs_our_server(pid: int, server_paths: Set[str]) -> bool:
+    return command_names_our_server(_pl.process_command(pid) or "", server_paths)
 
 
 def _is_launcher_managed(pid: int, data_dir_values: Set[str]) -> bool:
@@ -127,6 +138,18 @@ def find_same_install_server_pids(
         return [], []
     server_paths = _path_forms(repo_dir, "server.py")
     data_dir_values = _path_forms(data_dir)
+    if any(" " in path for path in server_paths):
+        # The exact-token proof cannot represent a whitespace path, so nothing
+        # could ever be proven; the caller (reap) names this once per sweep.
+        return [], []
+    candidates = _candidate_pids()
+    if candidates is None:
+        # Enumeration itself failed: nothing was CHECKED, which is different from
+        # nothing found. Raising (instead of returning empty) routes a MID-sweep
+        # failure into reap's aborted-mid-work path, so pids already proven in
+        # this sweep are still reported as survivors; the systemic no-pgrep case
+        # is answered by reap's pre-check with its own named warning.
+        raise RuntimeError("process enumeration unavailable")
     known = {os.getpid(), os.getppid()}
     known.update(int(pid) for pid in (exclude_pids or ()) if int(pid) > 0)
     known_groups: Set[int] = set()
@@ -139,7 +162,7 @@ def find_same_install_server_pids(
     known_groups.discard(0)
     proven: List[int] = []
     unproven: List[int] = []
-    for pid in _candidate_pids():
+    for pid in candidates:
         if pid in known or not _runs_our_server(pid, server_paths):
             continue
         try:
@@ -182,6 +205,18 @@ def reap_same_install_strays(
         return []
     server_paths = _path_forms(repo_dir, "server.py")
     data_dir_values = _path_forms(data_dir)
+    if any(" " in path for path in server_paths):
+        log.warning(
+            "Same-install stray sweep disabled (%s): the repo path contains whitespace, which the "
+            "exact-token identity proof cannot represent — no process was checked.", reason,
+        )
+        return []
+    if _candidate_pids() is None:
+        log.warning(
+            "Same-install stray sweep could not enumerate processes (%s) — nothing was checked, "
+            "which is not a clean sweep.", reason,
+        )
+        return []
     killed: Set[int] = set()
     proven_seen: Set[int] = set()
     survivors: List[int] = []

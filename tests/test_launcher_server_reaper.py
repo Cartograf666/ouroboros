@@ -45,11 +45,10 @@ def _install_fakes(monkeypatch, pids, commands, env_states, groups=None):
         ),
     )
     monkeypatch.setattr("ouroboros.platform_layer.IS_WINDOWS", False)
-    # Pin self/parent identity: the finder folds the REAL getpid/getppid into
-    # its exclusion set, and a fake pid colliding with the test runner's own
-    # pid would silently vanish from the candidate list.
-    monkeypatch.setattr(reaper.os, "getpid", lambda: 999900001)
-    monkeypatch.setattr(reaper.os, "getppid", lambda: 999900002)
+    # No getpid/getppid stubbing: `reaper.os` IS the interpreter-wide os module,
+    # so patching it would leak into every other caller in-process. Fake pids
+    # instead sit far above any OS pid range (Linux pid_max 4194304), so they
+    # can never collide with the runner's real identity.
 
 
 def _proof(data_dir=DATA):
@@ -70,12 +69,12 @@ def test_both_env_assignments_are_required_before_a_pid_is_proven(monkeypatch):
     direct run of this checkout that exported our data dir is still not managed."""
     _install_fakes(
         monkeypatch,
-        pids=[101, 102, 103],
-        commands={101: OURS, 102: OURS, 103: OURS},
+        pids=[9990101, 9990102, 9990103],
+        commands={9990101: OURS, 9990102: OURS, 9990103: OURS},
         env_states={
-            101: _proof(),
-            102: {(reaper.DATA_DIR_ENV, DATA): containment.ENV_ASSIGNMENT_PRESENT},
-            103: {
+            9990101: _proof(),
+            9990102: {(reaper.DATA_DIR_ENV, DATA): containment.ENV_ASSIGNMENT_PRESENT},
+            9990103: {
                 (reaper.MANAGED_MARKER_ENV, reaper.MANAGED_MARKER_VALUE): (
                     containment.ENV_ASSIGNMENT_PRESENT
                 )
@@ -83,8 +82,8 @@ def test_both_env_assignments_are_required_before_a_pid_is_proven(monkeypatch):
         },
     )
     proven, unproven = reaper.find_same_install_server_pids(REPO, DATA)
-    assert proven == [101]
-    assert sorted(unproven) == [102, 103]
+    assert proven == [9990101]
+    assert sorted(unproven) == [9990102, 9990103]
 
 
 def test_an_unreadable_environment_is_spared_not_killed(monkeypatch):
@@ -92,10 +91,10 @@ def test_an_unreadable_environment_is_spared_not_killed(monkeypatch):
     EACCES for a nondumpable process. Unanswered is never answered-yes."""
     _install_fakes(
         monkeypatch,
-        pids=[201],
-        commands={201: OURS},
+        pids=[9990201],
+        commands={9990201: OURS},
         env_states={
-            201: {
+            9990201: {
                 (reaper.MANAGED_MARKER_ENV, reaper.MANAGED_MARKER_VALUE): (
                     containment.ENV_ASSIGNMENT_UNREADABLE
                 ),
@@ -104,18 +103,18 @@ def test_an_unreadable_environment_is_spared_not_killed(monkeypatch):
         },
     )
     proven, unproven = reaper.find_same_install_server_pids(REPO, DATA)
-    assert proven == [] and unproven == [201]
+    assert proven == [] and unproven == [9990201]
 
 
 def test_a_different_data_directory_is_not_our_generation(monkeypatch):
     _install_fakes(
         monkeypatch,
-        pids=[301],
-        commands={301: OURS},
-        env_states={301: _proof(data_dir="/opt/Ouroboros/other-data")},
+        pids=[9990301],
+        commands={9990301: OURS},
+        env_states={9990301: _proof(data_dir="/opt/Ouroboros/other-data")},
     )
     proven, unproven = reaper.find_same_install_server_pids(REPO, DATA)
-    assert proven == [] and unproven == [301]
+    assert proven == [] and unproven == [9990301]
 
 
 def test_sibling_installs_and_dev_clones_are_never_enumerated(monkeypatch):
@@ -125,9 +124,9 @@ def test_sibling_installs_and_dev_clones_are_never_enumerated(monkeypatch):
     dev = "/usr/bin/python3 /home/dev/src/ouroboros/server.py"
     _install_fakes(
         monkeypatch,
-        pids=[401, 402],
-        commands={401: sibling, 402: dev},
-        env_states={401: _proof(), 402: _proof()},
+        pids=[9990401, 9990402],
+        commands={9990401: sibling, 9990402: dev},
+        env_states={9990401: _proof(), 9990402: _proof()},
     )
     proven, unproven = reaper.find_same_install_server_pids(REPO, DATA)
     assert proven == [] and unproven == []
@@ -136,20 +135,19 @@ def test_sibling_installs_and_dev_clones_are_never_enumerated(monkeypatch):
 def test_self_parent_caller_exclusions_and_known_groups_are_skipped(monkeypatch):
     """The launcher, its parent, an explicitly excluded pid and anything sharing
     a known process group are part of a tree we already account for."""
-    # The stubbed identities _install_fakes pins (not this test runner's own).
-    me, parent = 999900001, 999900002
+    me, parent = os.getpid(), os.getppid()
     _install_fakes(
         monkeypatch,
-        pids=[me, parent, 501, 502, 503],
-        commands={pid: OURS for pid in (me, parent, 501, 502, 503)},
-        env_states={pid: _proof() for pid in (me, parent, 501, 502, 503)},
-        # 502 shares the caller-excluded pid's group; 503 stands alone.
-        groups={me: me, parent: parent, 501: 501, 502: 501, 503: 503},
+        pids=[me, parent, 9990501, 9990502, 9990503],
+        commands={pid: OURS for pid in (me, parent, 9990501, 9990502, 9990503)},
+        env_states={pid: _proof() for pid in (me, parent, 9990501, 9990502, 9990503)},
+        # 9990502 shares the caller-excluded pid's group; 9990503 stands alone.
+        groups={me: me, parent: parent, 9990501: 9990501, 9990502: 9990501, 9990503: 9990503},
     )
     proven, unproven = reaper.find_same_install_server_pids(
-        REPO, DATA, exclude_pids=[501],
+        REPO, DATA, exclude_pids=[9990501],
     )
-    assert proven == [503] and unproven == []
+    assert proven == [9990503] and unproven == []
 
 
 def test_candidate_enumeration_scopes_pgrep_to_the_current_user(monkeypatch):
@@ -166,12 +164,62 @@ def test_candidate_enumeration_scopes_pgrep_to_the_current_user(monkeypatch):
     assert seen["cmd"] == ["pgrep", "-U", str(os.getuid()), "-fi", "ouroboros"]
 
 
-def test_a_missing_pgrep_enumerates_nothing(monkeypatch):
-    def fake_run(cmd, **kwargs):
+def test_a_missing_pgrep_is_enumeration_failure_not_a_clean_answer(monkeypatch):
+    """No pgrep, or a pgrep ERROR (rc>1 — rc 1 is the documented no-matches
+    answer), must be distinguishable from an empty result: nothing was checked."""
+    def missing_run(cmd, **kwargs):
         raise FileNotFoundError("pgrep")
 
-    monkeypatch.setattr(reaper.subprocess, "run", fake_run)
+    monkeypatch.setattr(reaper.subprocess, "run", missing_run)
+    assert reaper._candidate_pids() is None
+
+    def erroring_run(cmd, **kwargs):
+        return types.SimpleNamespace(stdout="", returncode=2)
+
+    monkeypatch.setattr(reaper.subprocess, "run", erroring_run)
+    assert reaper._candidate_pids() is None
+
+    def no_matches_run(cmd, **kwargs):
+        return types.SimpleNamespace(stdout="", returncode=1)
+
+    monkeypatch.setattr(reaper.subprocess, "run", no_matches_run)
     assert reaper._candidate_pids() == []
+
+
+def test_reap_names_an_enumeration_failure_instead_of_reading_clean(monkeypatch, caplog):
+    monkeypatch.setattr("ouroboros.platform_layer.IS_WINDOWS", False)
+    monkeypatch.setattr(reaper, "_candidate_pids", lambda: None)
+    with caplog.at_level(logging.WARNING, logger=reaper.log.name):
+        assert reaper.reap_same_install_strays(REPO, DATA) == []
+    assert any("could not enumerate" in r.getMessage() for r in caplog.records)
+
+
+def test_a_whitespace_repo_path_disables_the_sweep_with_one_named_warning(monkeypatch, caplog):
+    """The exact-token proof cannot represent a whitespace path; silence would
+    hide that such an install is never swept."""
+    monkeypatch.setattr("ouroboros.platform_layer.IS_WINDOWS", False)
+    with caplog.at_level(logging.WARNING, logger=reaper.log.name):
+        assert reaper.reap_same_install_strays("/opt/Our Oboros/repo", DATA) == []
+    assert any("whitespace" in r.getMessage() for r in caplog.records)
+    assert reaper.find_same_install_server_pids("/opt/Our Oboros/repo", DATA) == ([], [])
+
+
+def test_process_command_requests_unlimited_width(monkeypatch):
+    """BSD ps truncates without -ww, and the identity rule matches exact argv
+    tokens — a packaged interpreter path is long enough to push the server.py
+    argument off a truncated line."""
+    from ouroboros import platform_layer
+
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        return types.SimpleNamespace(stdout="python3 /x/server.py\n", returncode=0)
+
+    monkeypatch.setattr(platform_layer, "IS_WINDOWS", False)
+    monkeypatch.setattr(platform_layer.subprocess, "run", fake_run)
+    assert platform_layer.process_command(1234).endswith("server.py")
+    assert "-ww" in seen["cmd"]
 
 
 def test_the_finder_never_reads_the_custody_ledger():
@@ -205,27 +253,27 @@ def test_proven_strays_are_tree_killed_and_unproven_ones_are_spared(monkeypatch,
     killed = _spy_kill(monkeypatch)
     _install_fakes(
         monkeypatch,
-        pids=[601, 602],
-        commands={601: OURS, 602: OURS},
-        env_states={601: _proof()},
+        pids=[9990601, 9990602],
+        commands={9990601: OURS, 9990602: OURS},
+        env_states={9990601: _proof()},
     )
     with caplog.at_level(logging.WARNING, logger=reaper.log.name):
         survivors = reaper.reap_same_install_strays(REPO, DATA, "startup")
     # Three bounded passes, each re-proving the pid that never dies in this fake.
-    assert set(killed) == {601}
-    assert killed.count(601) == reaper.REAP_PASSES
-    assert survivors == [601]
-    assert 602 not in killed
-    assert any("602" in record.getMessage() for record in caplog.records)
+    assert set(killed) == {9990601}
+    assert killed.count(9990601) == reaper.REAP_PASSES
+    assert survivors == [9990601]
+    assert 9990602 not in killed
+    assert any("9990602" in record.getMessage() for record in caplog.records)
 
 
 def test_a_pid_that_dies_between_proof_and_signal_is_not_killed(monkeypatch):
     """Revalidation happens immediately before the signal; a pid whose command
     line no longer matches may have been recycled onto a stranger."""
     killed = _spy_kill(monkeypatch)
-    commands = {701: OURS}
+    commands = {9990701: OURS}
     _install_fakes(
-        monkeypatch, pids=[701], commands=commands, env_states={701: _proof()},
+        monkeypatch, pids=[9990701], commands=commands, env_states={9990701: _proof()},
     )
 
     real_revalidate = reaper._revalidate_and_kill
@@ -243,7 +291,7 @@ def test_a_fork_between_passes_is_caught_by_the_rescan(monkeypatch):
     """A stray forking mid-sweep hands its child the same cmdline and the same
     inherited environment, so the child is proven on the next pass."""
     killed = _spy_kill(monkeypatch)
-    live = {801: OURS}
+    live = {9990801: OURS}
     monkeypatch.setattr(reaper, "_candidate_pids", lambda: sorted(live))
     monkeypatch.setattr(
         "ouroboros.platform_layer.process_command", lambda pid: live.get(pid, ""),
@@ -263,12 +311,12 @@ def test_a_fork_between_passes_is_caught_by_the_rescan(monkeypatch):
     def forking_kill(pid, **kwargs):
         real_kill(pid)
         live.pop(pid, None)
-        if pid == 801:
-            live[802] = OURS  # the fork inherits everything
+        if pid == 9990801:
+            live[9990802] = OURS  # the fork inherits everything
 
     monkeypatch.setattr("ouroboros.platform_layer.kill_pid_tree", forking_kill)
     survivors = reaper.reap_same_install_strays(REPO, DATA)
-    assert killed == [801, 802]
+    assert killed == [9990801, 9990802]
     assert survivors == []
 
 
@@ -276,9 +324,9 @@ def test_the_sweep_is_bounded_and_reports_survivors(monkeypatch):
     """A pid that refuses to die must not become an unbounded kill loop."""
     killed = _spy_kill(monkeypatch)
     _install_fakes(
-        monkeypatch, pids=[901], commands={901: OURS}, env_states={901: _proof()},
+        monkeypatch, pids=[9990901], commands={9990901: OURS}, env_states={9990901: _proof()},
     )
-    assert reaper.reap_same_install_strays(REPO, DATA) == [901]
+    assert reaper.reap_same_install_strays(REPO, DATA) == [9990901]
     assert len(killed) == reaper.REAP_PASSES
 
 
@@ -408,13 +456,13 @@ def test_a_command_merely_mentioning_the_server_path_is_not_a_candidate(monkeypa
     install's server."""
     _install_fakes(
         monkeypatch,
-        pids=[621, 622, 623],
+        pids=[9990621, 9990622, 9990623],
         commands={
-            621: f"vim {REPO}/server.py",
-            622: f"/opt/Ouroboros/python/bin/python3 {REPO}/server.py.bak",
-            623: f"tail -f {REPO}/server.py.log",
+            9990621: f"vim {REPO}/server.py",
+            9990622: f"/opt/Ouroboros/python/bin/python3 {REPO}/server.py.bak",
+            9990623: f"tail -f {REPO}/server.py.log",
         },
-        env_states={pid: _proof() for pid in (621, 622, 623)},
+        env_states={pid: _proof() for pid in (9990621, 9990622, 9990623)},
     )
     assert reaper.find_same_install_server_pids(REPO, DATA) == ([], [])
 
@@ -425,7 +473,7 @@ def test_a_sweep_aborted_mid_work_reports_survivors_not_clean(monkeypatch, caplo
     prevent."""
     killed = _spy_kill(monkeypatch)
     _install_fakes(
-        monkeypatch, pids=[631], commands={631: OURS}, env_states={631: _proof()},
+        monkeypatch, pids=[9990631], commands={9990631: OURS}, env_states={9990631: _proof()},
     )
 
     def exploding(pid, server_paths, data_dir_values):
@@ -433,7 +481,7 @@ def test_a_sweep_aborted_mid_work_reports_survivors_not_clean(monkeypatch, caplo
 
     monkeypatch.setattr(reaper, "_revalidate_and_kill", exploding)
     with caplog.at_level(logging.WARNING, logger=reaper.log.name):
-        assert reaper.reap_same_install_strays(REPO, DATA) == [631]
+        assert reaper.reap_same_install_strays(REPO, DATA) == [9990631]
     assert killed == []
     assert any("aborted mid-work" in r.getMessage() for r in caplog.records)
 
@@ -450,9 +498,9 @@ def test_a_signalled_pid_still_alive_is_a_survivor_not_a_kill(monkeypatch, caplo
     monkeypatch.setattr(reaper, "_SETTLE_SEC", 0)
     monkeypatch.setattr(reaper, "_CONFIRM_DEADLINE_SEC", 0)
     _install_fakes(
-        monkeypatch, pids=[641], commands={641: OURS}, env_states={641: _proof()},
+        monkeypatch, pids=[9990641], commands={9990641: OURS}, env_states={9990641: _proof()},
     )
     with caplog.at_level(logging.INFO, logger=reaper.log.name):
-        assert reaper.reap_same_install_strays(REPO, DATA) == [641]
-    assert signalled and all(pid == 641 for pid in signalled)
+        assert reaper.reap_same_install_strays(REPO, DATA) == [9990641]
+    assert signalled and all(pid == 9990641 for pid in signalled)
     assert not any("Reaped" in r.getMessage() for r in caplog.records)

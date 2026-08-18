@@ -347,15 +347,21 @@ def check_stray_server_processes(env: Any) -> Tuple[Dict[str, Any], int]:
             r"(ouroboros(\.cli)?\s+server|ouroboros/(repo/)?server\.py|-m\s+ouroboros\.cli\s+server)",
             _re.IGNORECASE,
         )
-        # Literal and resolved spellings: a command line carries whatever path was
-        # passed, which resolve() may not reproduce (/var vs /private/var).
+        # The reaper's own identity rule (exact argv token after a python
+        # interpreter, literal + resolved spellings): the scope label must agree
+        # with what the launcher sweep would actually treat as a server, or an
+        # editor merely opening server.py would read as a same_install stray.
         try:
             from ouroboros.config import REPO_DIR as _repo_dir
+            from ouroboros.launcher_server_reaper import (
+                command_names_our_server as _names_our_server,
+                install_server_path_forms as _server_path_forms,
+            )
 
-            same_install_paths = {str(_pathlib.Path(_repo_dir) / "server.py")}
-            same_install_paths.add(str(_pathlib.Path(_repo_dir).resolve() / "server.py"))
+            same_install_paths = _server_path_forms(_repo_dir)
         except Exception:
             same_install_paths = set()
+            _names_our_server = lambda command, paths: False  # noqa: E731
         stray: list[dict[str, Any]] = []
         for line in (out.stdout or "").splitlines():
             try:
@@ -385,7 +391,7 @@ def check_stray_server_processes(env: Any) -> Tuple[Dict[str, Any], int]:
             except Exception:
                 pass
             scope = ("same_install"
-                     if any(path in command for path in same_install_paths)
+                     if _names_our_server(command or "", same_install_paths)
                      else "foreign")
             stray.append({"pid": pid, "command": command[:160], "scope": scope})
         if stray:
