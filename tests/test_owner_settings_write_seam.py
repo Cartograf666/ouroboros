@@ -361,14 +361,19 @@ def test_settings_save_body_runs_off_the_event_loop():
             endpoint_text = ast.unparse(node)
     assert "asyncio.to_thread(_api_settings_post_sync" in endpoint_text
 
-    # Worker threads do not inherit the event loop's free serialization: two
-    # concurrent saves interleaving read-merge-write would silently drop each
-    # other's keys. The sync body must hold the save lock.
+    # Worker threads do not inherit the event loop's free serialization: a
+    # writer interleaving read-merge-write with another would silently drop
+    # keys. EVERY settings.py writer holds the seam-wide document lock — the
+    # generic save's threaded body and all five single-decision endpoints.
     sync_text = ""
     for node in ast.walk(ast.parse(src)):
         if isinstance(node, ast.FunctionDef) and node.name == "_api_settings_post_sync":
             sync_text = ast.unparse(node)
-    assert "_SETTINGS_SAVE_LOCK" in sync_text
+    assert "settings_document_mutation" in sync_text
+    assert src.count("with settings_document_mutation():") >= 6, (
+        "the generic save plus the five single-decision writers must all hold "
+        "the document lock across their read-merge-write"
+    )
 
 
 def test_reviewer_slots_reload_does_not_await_the_status_probe():

@@ -8,7 +8,6 @@ import os
 import pathlib
 import socket
 import sys
-import threading
 from typing import Any, Dict, Optional
 
 from starlette.requests import Request
@@ -29,6 +28,7 @@ from ouroboros.gateway.owner_settings import (
     _owner_audit,
     _owner_read_settings_raw,
     _owner_write_settings,
+    settings_document_mutation,
     owner_write_guard,
     post_commit_failure_response,
     unsaved_error,
@@ -372,9 +372,13 @@ async def api_owner_runtime_mode(request: Request) -> JSONResponse:
         # A no-change POST must not rewrite settings.json: the rewrite raced a
         # concurrent generic save (last-writer-wins over a stale read) for zero
         # information gain. The audit and the response stay identical either way.
-        current = dict(old_settings)
-        current["OUROBOROS_RUNTIME_MODE"] = next_mode
-        _owner_write_settings(current)
+        # Re-read under the document lock: the pre-lock read above only decided
+        # whether to write at all, and a threaded generic save may be mid
+        # read-merge-write on the same document.
+        with settings_document_mutation():
+            current = dict(_owner_read_settings_raw())
+            current["OUROBOROS_RUNTIME_MODE"] = next_mode
+            _owner_write_settings(current)
     _owner_audit(
         request,
         "runtime_mode",
@@ -399,9 +403,10 @@ async def api_owner_auto_grant(request: Request) -> JSONResponse:
     if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
         return unsaved_error("'enabled' must be a boolean", 400)
     enabled = bool(body.get("enabled"))
-    current = _owner_read_settings_raw()
-    current["OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS"] = "true" if enabled else "false"
-    _owner_write_settings(current)
+    with settings_document_mutation():
+        current = _owner_read_settings_raw()
+        current["OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS"] = "true" if enabled else "false"
+        _owner_write_settings(current)
     os.environ["OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS"] = current["OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS"]
     _owner_audit(request, "auto_grant", {"enabled": enabled})
     return JSONResponse({"ok": True, "enabled": enabled})
@@ -670,14 +675,15 @@ async def api_owner_context_mode(request: Request) -> JSONResponse:
             "Wait until no queued or running work remains, then switch Low/Max.",
             409,
         )
-    current = _owner_read_settings_raw()
-    current["OUROBOROS_CONTEXT_MODE"] = next_mode
-    # The retired marker survives one compatibility window only as explicit false
-    # provenance, so owner Low still means "scope review not performed" while a bare
-    # forwarded env Low remains owner Max.
-    current["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
-    # This endpoint IS the author of both keys, so they persist even at the shipped default.
-    _owner_write_settings(current, authored_keys=_CONTEXT_MODE_KEYS, allow_context_lowering=True)
+    with settings_document_mutation():
+        current = _owner_read_settings_raw()
+        current["OUROBOROS_CONTEXT_MODE"] = next_mode
+        # The retired marker survives one compatibility window only as explicit false
+        # provenance, so owner Low still means "scope review not performed" while a bare
+        # forwarded env Low remains owner Max.
+        current["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
+        # This endpoint IS the author of both keys, so they persist even at the shipped default.
+        _owner_write_settings(current, authored_keys=_CONTEXT_MODE_KEYS, allow_context_lowering=True)
     os.environ["OUROBOROS_CONTEXT_MODE"] = next_mode
     os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
     _owner_audit(
@@ -714,10 +720,11 @@ async def api_owner_scope_review_floor(request: Request) -> JSONResponse:
     raw = str((body or {}).get("floor") or "").strip().lower()
     if raw not in {"blocking_1m", "advisory"}:
         return unsaved_error("'floor' must be one of: blocking_1m, advisory", 400)
-    current = _owner_read_settings_raw()
-    previous = str(current.get("OUROBOROS_SCOPE_REVIEW_FLOOR") or "blocking_1m").strip().lower()
-    current["OUROBOROS_SCOPE_REVIEW_FLOOR"] = raw
-    _owner_write_settings(current)
+    with settings_document_mutation():
+        current = _owner_read_settings_raw()
+        previous = str(current.get("OUROBOROS_SCOPE_REVIEW_FLOOR") or "blocking_1m").strip().lower()
+        current["OUROBOROS_SCOPE_REVIEW_FLOOR"] = raw
+        _owner_write_settings(current)
     os.environ["OUROBOROS_SCOPE_REVIEW_FLOOR"] = raw
     _owner_audit(
         request,
@@ -750,11 +757,12 @@ async def api_owner_safety_mode(request: Request) -> JSONResponse:
     raw_mode = str((body or {}).get("mode") or "").strip().lower()
     if raw_mode not in set(_config.VALID_SAFETY_MODES):
         return unsaved_error("'mode' must be one of: full, light, off", 400)
-    current = _owner_read_settings_raw()
-    previous = _config.normalize_safety_mode(current.get("OUROBOROS_SAFETY_MODE"))
-    current["OUROBOROS_SAFETY_MODE"] = raw_mode
-    _owner_write_settings(
-        current, authored_keys=("OUROBOROS_SAFETY_MODE",), allow_safety_lowering=True)
+    with settings_document_mutation():
+        current = _owner_read_settings_raw()
+        previous = _config.normalize_safety_mode(current.get("OUROBOROS_SAFETY_MODE"))
+        current["OUROBOROS_SAFETY_MODE"] = raw_mode
+        _owner_write_settings(
+            current, authored_keys=("OUROBOROS_SAFETY_MODE",), allow_safety_lowering=True)
     os.environ["OUROBOROS_SAFETY_MODE"] = raw_mode
     _owner_audit(
         request,
@@ -1092,16 +1100,13 @@ async def api_settings_post(request: Request) -> JSONResponse:
     return await asyncio.to_thread(_api_settings_post_sync, request, body)
 
 
-# The event loop used to serialize saves for free (the old async body had no
-# await between parse and return); worker threads do not. This lock restores
-# that in-process serialization so two concurrent saves cannot interleave
-# their read-merge-write and silently drop each other's keys, while the loop
-# itself stays free to serve everything else.
-_SETTINGS_SAVE_LOCK = threading.Lock()
-
-
 def _api_settings_post_sync(request: Request, body: Any) -> JSONResponse:
-    with _SETTINGS_SAVE_LOCK:
+    # The event loop used to serialize every settings writer for free (no
+    # writer awaited mid read-merge-write); a worker thread does not inherit
+    # that, so the whole body holds the seam-wide document lock — the
+    # single-decision endpoints hold the same lock, and the loop itself stays
+    # free to serve everything else.
+    with settings_document_mutation():
         return _api_settings_post_locked(request, body)
 
 

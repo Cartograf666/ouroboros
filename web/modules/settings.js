@@ -15,6 +15,7 @@ import { PROVIDER_TEST_INPUTS, SECRET_KEYS, bindSecretInputs, bindSettingsTabs, 
 import { showToast } from './toast.js';
 import { escapeHtmlAttr as escapeHtml, formatDualVersion } from './utils.js';
 import { apiClient, apiFetch, cleanExtensionRoute, extensionRoutePath } from './api_client.js';
+import { bindStatusSurface, claudexorStatus } from './claudexor_status_store.js';
 import { collectSafeFieldValues, renderSafeField, setInlineStatus } from './ui_helpers.js';
 
 let markSettingsDirty = () => {};
@@ -466,6 +467,29 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         if (indicator) indicator.classList.toggle('is-visible', settingsDirty);
     }
 
+    let baselineSettleDisposer = null;
+    function armCleanBaselineOnStatusSettle() {
+        // The sections' Claudexor status probe is fire-and-forget, so the
+        // baseline above can be taken BEFORE the store ever settled — and the
+        // store-gated collectors change their output when it does. Absent
+        // owner edits, that settlement must not read as an unsaved change:
+        // re-take the baseline once, and only while the draft is still clean.
+        baselineSettleDisposer?.();
+        baselineSettleDisposer = null;
+        if (claudexorStatus.everSettled) return;
+        const disposer = bindStatusSurface(claudexorStatus, {
+            elementId: 'btn-save-settings',
+            includeModels: true,
+            listener: () => {
+                if (!claudexorStatus.everSettled) return;
+                baselineSettleDisposer = null;
+                disposer();
+                if (!settingsDirty) setSettingsCleanBaseline();
+            },
+        });
+        baselineSettleDisposer = disposer;
+    }
+
     function discardUnsavedSettingsDraft() {
         closeSettingsModelPickers();
         applySettings(currentSettings || {});
@@ -670,8 +694,12 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         renderCustomSecrets(page, data);
         // Await the reviewer rows and the Subagents accounts BEFORE the clean
         // baseline: their async arrival must not read as an unsaved owner edit.
+        // (The Claudexor status probe inside them is fire-and-forget — a cold
+        // daemon must not hold the Save button — so its LATER settlement is
+        // re-baselined below.)
         await Promise.all([reloadReviewerSlots(), reloadSubagentsSection()]);
         setSettingsCleanBaseline();
+        armCleanBaselineOnStatusSettle();
         closeSettingsModelPickers();
         _renderNetworkHint(data._meta);
         renderClaudeCodeUi();
