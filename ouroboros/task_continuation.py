@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from ouroboros.utils import atomic_write_json, replace_atomic, utc_now_iso
+from ouroboros.utils import atomic_write_json, utc_now_iso
 
 _CONTINUATION_DIR_RELPATH = "state/review_continuations"
 _CORRUPT_DIR_NAME = "corrupt"
@@ -357,7 +358,7 @@ def _quarantine_corrupt_continuation(drive_root: Any, task_id: str, *, reason: s
     corrupt_dir = corrupt_continuation_dir(drive_root)
     archived = corrupt_dir / f"{task_id}.{stamp}.json"
     note = archived.with_suffix(".txt")
-    replace_atomic(src, archived)
+    os.replace(src, archived)
     note.write_text(reason.strip() or "corrupt continuation quarantined", encoding="utf-8")
 
 

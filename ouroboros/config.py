@@ -1459,10 +1459,9 @@ def save_settings(
                 f"{baseline_mode!r} -> {new_mode!r}.{hint}"
             )
         try:
-            from ouroboros.utils import replace_atomic
             tmp = SETTINGS_PATH.with_suffix(".tmp")
             tmp.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-            replace_atomic(str(tmp), str(SETTINGS_PATH))
+            os.replace(str(tmp), str(SETTINGS_PATH))
         except OSError:
             SETTINGS_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
     finally:

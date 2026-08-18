@@ -5,7 +5,7 @@ import pathlib
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
-from ouroboros.utils import atomic_write_json, read_json_dict, replace_atomic, utc_now_iso, read_text, write_text
+from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso, read_text, write_text
 
 from ouroboros.platform_layer import (
     file_lock_exclusive as _lock_ex,
@@ -469,7 +469,7 @@ def _load_blocks(path: pathlib.Path) -> List[Dict[str, Any]]:
         # for forensic recovery instead of overwriting it on the next write.
         quarantine = path.with_name(f"{path.name}.corrupt-{utc_now_iso().replace(':', '')}.bak")
         try:
-            replace_atomic(path, quarantine)
+            os.replace(path, quarantine)
             log.error("Corrupt blocks file %s — quarantined to %s, starting fresh", path, quarantine)
         except OSError:
             log.error("Corrupt blocks file %s — quarantine failed, starting fresh", path, exc_info=True)

@@ -31,8 +31,6 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 from urllib.parse import urlparse
 
-from ouroboros.utils import replace_atomic
-
 log = logging.getLogger(__name__)
 
 _PIN_SCHEMA_VERSION = 1
@@ -368,7 +366,7 @@ def _fetch_exact_file(
                     sink.flush()
                     os.fsync(sink.fileno())
         verify(temporary)
-        replace_atomic(temporary, target)
+        os.replace(temporary, target)
         return verify(target)
     except ClaudexorRuntimeError:
         raise
@@ -983,7 +981,7 @@ class ClaudexorRuntimeManager:
             try:
                 shutil.copyfile(seed, temporary)
                 verify_runtime_archive(temporary, pin)
-                replace_atomic(temporary, cache)
+                os.replace(temporary, cache)
                 return verify_runtime_archive(cache, pin), "bundle_seed"
             finally:
                 try:

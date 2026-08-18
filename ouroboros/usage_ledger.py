@@ -25,7 +25,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, Optional, Sequence, Tuple
 
-from ouroboros.utils import append_jsonl, replace_atomic, utc_now_iso
+from ouroboros.utils import append_jsonl, utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -186,7 +186,7 @@ def _write_bytes_atomic_fsync(path: pathlib.Path, payload: bytes) -> None:
         os.fsync(fd)
         os.close(fd)
         fd = None
-        replace_atomic(tmp, path)
+        os.replace(tmp, path)
     except Exception:
         if fd is not None:
             os.close(fd)

@@ -209,12 +209,10 @@ def _hidden_run(command: Sequence[str], **kwargs: object) -> subprocess.Complete
 
 
 def _save_settings(path: pathlib.Path, settings: dict) -> None:
-    from ouroboros.utils import replace_atomic
-
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-    replace_atomic(tmp, path)
+    os.replace(tmp, path)
 
 
 def _run_inner_cli(runtime: PackagedRuntime, args: Sequence[str]) -> int:
