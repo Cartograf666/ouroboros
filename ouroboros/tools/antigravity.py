@@ -31,7 +31,6 @@ from ouroboros.utils import truncate_within_limit
 
 _CLI_CANDIDATES = (
     "agy",
-    "/Users/alex/.local/bin/agy",
     "~/.local/bin/agy",
 )
 _DEFAULT_TIMEOUT_SEC = 300
