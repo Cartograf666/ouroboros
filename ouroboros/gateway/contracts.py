@@ -38,6 +38,12 @@ class ChatInbound(TypedDict):
     # stays user_id 1; chat_id selects the thread, project_id scopes memory.
     chat_id: NotRequired[int]
     project_id: NotRequired[str]
+    # Per-message sending-surface observables (additive-optional): raw facts the
+    # SPA measures at send time (pywebview bridge presence, ua, viewport,
+    # matchMedia booleans, captured_at). The gateway normalizes through the
+    # closed-key bounded `client_surface.normalize_client_surface`; absence is an
+    # honest gap, never defaulted.
+    client_surface: NotRequired[dict]
 
 
 class TaskConstraintInbound(TypedDict, total=False):

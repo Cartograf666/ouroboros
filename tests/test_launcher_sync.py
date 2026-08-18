@@ -315,6 +315,49 @@ def test_agent_lifecycle_preflight_cleans_host_service_port(monkeypatch):
     assert killed[:2] == [8765, 9876]
 
 
+def test_start_agent_exports_presentation_posture(monkeypatch, tmp_path):
+    """Producer contract (Owner Surface Fact): the launcher's OWN env assembly
+    must export OUROBOROS_PRESENTATION — a monkeypatched reader test cannot
+    catch a dead wire (the retired is_desktop lesson)."""
+    import launcher
+
+    data_dir = tmp_path / "data"
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / "server.py").write_text("print('server')\n", encoding="utf-8")
+    captured = {}
+
+    class FakeStdout:
+        def readline(self):
+            return b""
+
+    class FakeProcess:
+        pid = 4242
+        stdout = FakeStdout()
+
+    def fake_popen(cmd, **kwargs):
+        captured["env"] = kwargs.get("env") or {}
+        return FakeProcess()
+
+    monkeypatch.setattr(launcher, "IS_WINDOWS", False)
+    monkeypatch.setattr(launcher, "DATA_DIR", data_dir)
+    monkeypatch.setattr(launcher, "REPO_DIR", repo_dir)
+    monkeypatch.setattr(launcher, "EMBEDDED_PYTHON", sys.executable)
+    monkeypatch.setattr(launcher, "_load_settings", lambda: {})
+    monkeypatch.setattr(launcher, "_apply_settings_to_env", lambda _settings: None)
+    monkeypatch.setattr(launcher, "subprocess_new_group_kwargs", lambda: {"start_new_session": True})
+    monkeypatch.setattr(launcher, "_hidden_popen", fake_popen)
+    monkeypatch.setattr(launcher, "process_group_id", lambda _pid: 4242)
+
+    monkeypatch.setattr(launcher, "_headless", False)
+    launcher.start_agent(port=9871)
+    assert captured["env"]["OUROBOROS_PRESENTATION"] == "desktop_window"
+
+    monkeypatch.setattr(launcher, "_headless", True)
+    launcher.start_agent(port=9872)
+    assert captured["env"]["OUROBOROS_PRESENTATION"] == "browser_fallback"
+
+
 def test_start_agent_unix_uses_process_group_and_writes_server_record(monkeypatch, tmp_path):
     import launcher
 

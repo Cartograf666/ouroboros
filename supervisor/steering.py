@@ -241,6 +241,11 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
                 target,
                 msg_id=msg_id,
                 kind=KIND_OWNER_TEXT,
+                client_surface=(
+                    dict(evt["client_surface"])
+                    if isinstance(evt.get("client_surface"), dict) and evt.get("client_surface")
+                    else None
+                ),
             ):
                 raise OSError("owner mailbox append was not durable")
             if direct_active:

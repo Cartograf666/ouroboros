@@ -829,7 +829,8 @@ def test_runtime_section_includes_improvement_backlog_digest(tmp_path):
 
 
 class TestRuntimeEnvSection:
-    """build_runtime_section includes runtime_env with platform and is_desktop."""
+    """build_runtime_section: runtime_env carries presentation + platform, and
+    the per-message owner_client fact renders beside it (is_desktop retired)."""
 
     def _make_env(self, tmp_path):
         class FakeEnv:
@@ -845,26 +846,83 @@ class TestRuntimeEnvSection:
         )
         return FakeEnv()
 
-    def test_runtime_env_present(self, tmp_path, monkeypatch):
+    def test_runtime_env_presentation_absent_means_web(self, tmp_path, monkeypatch):
         from ouroboros.context import build_runtime_section
 
-        monkeypatch.delenv("OUROBOROS_DESKTOP_MODE", raising=False)
+        monkeypatch.delenv("OUROBOROS_PRESENTATION", raising=False)
         env = self._make_env(tmp_path)
         section = build_runtime_section(env, {"id": "t1", "type": "task"})
         data = json.loads(section.split("## Runtime context\n\n", 1)[1])
         assert "runtime_env" in data
         assert "platform" in data["runtime_env"]
         assert isinstance(data["runtime_env"]["platform"], str)
-        assert data["runtime_env"]["is_desktop"] is False
+        assert data["runtime_env"]["presentation"] == "web"
+        # The dead is_desktop flag is retired; presentation replaced it.
+        assert "is_desktop" not in data["runtime_env"]
 
-    def test_runtime_env_desktop_flag(self, tmp_path, monkeypatch):
+    def test_runtime_env_presentation_from_launcher_export(self, tmp_path, monkeypatch):
         from ouroboros.context import build_runtime_section
 
-        monkeypatch.setenv("OUROBOROS_DESKTOP_MODE", "1")
+        for value in ("desktop_window", "browser_fallback"):
+            monkeypatch.setenv("OUROBOROS_PRESENTATION", value)
+            env = self._make_env(tmp_path)
+            section = build_runtime_section(env, {"id": "t2", "type": "task"})
+            data = json.loads(section.split("## Runtime context\n\n", 1)[1])
+            assert data["runtime_env"]["presentation"] == value
+
+    def test_owner_client_rendered_from_metadata(self, tmp_path, monkeypatch):
+        from ouroboros.context import build_runtime_section
+
+        monkeypatch.delenv("OUROBOROS_PRESENTATION", raising=False)
         env = self._make_env(tmp_path)
-        section = build_runtime_section(env, {"id": "t2", "type": "task"})
+        fact = {"pywebview": True, "ua": "TestShell/1.0", "viewport": {"w": 1200, "h": 800}}
+        section = build_runtime_section(
+            env, {"id": "t3", "type": "task", "metadata": {"client_surface": fact}}
+        )
         data = json.loads(section.split("## Runtime context\n\n", 1)[1])
-        assert data["runtime_env"]["is_desktop"] is True
+        assert data["owner_client"] == fact
+        assert "SENT" in data["owner_client_note"]
+
+    def test_owner_client_absent_is_a_gap_not_a_default(self, tmp_path, monkeypatch):
+        from ouroboros.context import build_runtime_section
+
+        env = self._make_env(tmp_path)
+        section = build_runtime_section(env, {"id": "t4", "type": "task"})
+        data = json.loads(section.split("## Runtime context\n\n", 1)[1])
+        assert "owner_client" not in data
+        assert "owner_client_note" not in data
+
+    def test_owner_client_channel_fact_stamped_by_external_admission(self, tmp_path):
+        from ouroboros.context import build_runtime_section
+
+        env = self._make_env(tmp_path)
+        # /api/tasks and CLI STAMP the channel fact at admission; the renderer
+        # reads only the producer-assembled fact.
+        section = build_runtime_section(
+            env, {"id": "t5", "type": "task", "metadata": {"client_surface": {"channel": "cli"}}}
+        )
+        data = json.loads(section.split("## Runtime context\n\n", 1)[1])
+        assert data["owner_client"] == {"channel": "cli"}
+
+    def test_owner_client_never_inferred_from_metadata_source(self, tmp_path):
+        from ouroboros.context import build_runtime_section
+
+        env = self._make_env(tmp_path)
+        # metadata.source is OVERLOADED (scheduler writes scheduled_task /
+        # skill_scheduled_task): the renderer must never dress it up as an
+        # owner surface — no producer stamp, no fact (codex scope round 2 N1).
+        for source in ("cli", "scheduled_task", "skill_scheduled_task", "web"):
+            section = build_runtime_section(
+                env, {"id": "t6", "type": "task", "metadata": {"source": source}}
+            )
+            data = json.loads(section.split("## Runtime context\n\n", 1)[1])
+            assert "owner_client" not in data, f"source={source!r} must not render"
+        # Internal producers use top-level task["source"], never rendered.
+        section = build_runtime_section(
+            env, {"id": "t7", "type": "task", "source": "promote_chat_to_task"}
+        )
+        data = json.loads(section.split("## Runtime context\n\n", 1)[1])
+        assert "owner_client" not in data
 
 
 # ===========================================================================
