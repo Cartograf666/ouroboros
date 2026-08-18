@@ -766,7 +766,16 @@ class LocalModelManager:
                 health = self.health_check()
                 if health.get("ok"):
                     self._status = "ready"
-                    self._context_length = health.get("context_length", 0)
+                    # The LAUNCH value is authoritative: we passed --n_ctx ourselves.
+                    # health_check reads n_ctx_train (the model's TRAINING window), which
+                    # llama-cpp-python does not always expose, so it returns 0 — and
+                    # overwriting with that 0 left get_context_length() permanently
+                    # unable to cache, so callers fell back to a hardcoded 131072 while
+                    # the server actually served 65536. A probe that learned nothing must
+                    # not erase what we already know.
+                    reported = int(health.get("context_length") or 0)
+                    if reported > 0:
+                        self._context_length = reported
                     self._model_name = health.get("model_name", "")
                     log.info(
                         "Local model server ready (ctx=%d, model=%s)",

@@ -268,3 +268,49 @@ def test_prefill_target_never_refuses_a_prompt_the_window_can_hold():
     with pytest.raises(LocalContextTooLargeError) as excinfo:
         client._prepare_messages_for_local_context(messages, ctx_len=100, max_tokens=50)
     assert "window" in str(excinfo.value)
+
+
+def test_health_probe_does_not_erase_the_launched_context_length(monkeypatch):
+    """The launch value is authoritative; a probe that learned nothing must not erase it.
+
+    Live symptom: the server ran with `--n_ctx 65536`, but /api/local-model/status
+    reported context_length 0, so llm.py fell back to a hardcoded 131072 and
+    reserved 131072//4 = 32768 tokens for output — half the REAL window — while
+    sizing the input budget against a window twice the true size.
+
+    Cause: health_check reads `n_ctx_train` (the model's TRAINING window), which
+    llama-cpp-python does not always expose. It returned 0, and the readiness path
+    assigned that 0 over the value start() had just recorded. get_context_length()
+    then never cached, because it only caches a positive value.
+
+    This drives the REAL readiness path with a stubbed probe, not a copy of its logic.
+    """
+    from ouroboros.local_model import LocalModelManager
+
+    manager = LocalModelManager.__new__(LocalModelManager)
+    manager._context_length = 65536          # what start() recorded from --n_ctx
+    manager._model_name = ""
+    manager._status = "starting"
+    manager._error = None
+    manager._stderr_buf = b""
+    manager._proc = type("P", (), {"poll": staticmethod(lambda: None)})()
+
+    monkeypatch.setattr(
+        manager, "health_check",
+        lambda: {"ok": True, "context_length": 0, "model_name": "local.gguf"},
+        raising=False,
+    )
+    manager._wait_for_healthy(timeout=5.0)
+    assert manager._status == "ready"
+    assert manager._context_length == 65536, "a silent probe erased the launched n_ctx"
+    assert manager.get_context_length() == 65536
+
+    # A probe that DID determine the window still wins.
+    manager._status = "starting"
+    monkeypatch.setattr(
+        manager, "health_check",
+        lambda: {"ok": True, "context_length": 32768, "model_name": "local.gguf"},
+        raising=False,
+    )
+    manager._wait_for_healthy(timeout=5.0)
+    assert manager._context_length == 32768
