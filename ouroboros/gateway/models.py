@@ -540,7 +540,10 @@ _PROVIDER_TEST_SECRET_KEYS: frozenset[str] = frozenset({
 # credential riding along is the exfiltration this guard exists to stop.
 _PROVIDER_TEST_ENDPOINT_GUARDS: dict[str, tuple[str, ...]] = {
     "OPENAI_BASE_URL": ("OPENAI_API_KEY",),
-    "OPENAI_COMPATIBLE_BASE_URL": ("OPENAI_COMPATIBLE_API_KEY",),
+    # The legacy OpenAI key rides in the tuple because CLEARING the compatible
+    # base URL activates _provider_specs' legacy-pair fallback — the probe's
+    # destination changes and the saved legacy key would ride along.
+    "OPENAI_COMPATIBLE_BASE_URL": ("OPENAI_COMPATIBLE_API_KEY", "OPENAI_API_KEY"),
     "CLOUDRU_FOUNDATION_MODELS_BASE_URL": ("CLOUDRU_FOUNDATION_MODELS_API_KEY",),
     "GIGACHAT_BASE_URL": ("GIGACHAT_CREDENTIALS", "GIGACHAT_PASSWORD"),
     "GIGACHAT_VERIFY_SSL_CERTS": ("GIGACHAT_CREDENTIALS", "GIGACHAT_PASSWORD"),
@@ -639,13 +642,16 @@ async def api_provider_test(request: Request) -> JSONResponse:
         import re as _re
         import urllib.parse as _urlparse
 
+        import base64 as _base64
+
         secret_forms: set[str] = set()
         short_forms: set[str] = set()
         for key in _PROVIDER_TEST_SECRET_KEYS:
             value = str(merged.get(key, "") or "").strip()
             if not value:
                 continue
-            for form in (value, _urlparse.quote(value, safe=""), _urlparse.quote_plus(value)):
+            b64 = _base64.b64encode(value.encode("utf-8")).decode("ascii")
+            for form in (value, _urlparse.quote(value, safe=""), _urlparse.quote_plus(value), b64):
                 # A 1-3 char credential is degenerate but still a credential:
                 # plain replacement would mangle innocent words around it, so
                 # short forms are scrubbed only as standalone tokens.

@@ -540,6 +540,10 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
 
     function applySettings(s) {
         setupContract = s?._meta?.setup_contract || setupContract || {};
+        // A settings (re)load replaces the values every provider verdict was
+        // earned against — programmatic assignment fires no 'input' events, so
+        // the expiry listener cannot see it; expire the verdicts here.
+        page.querySelectorAll('[data-provider-test-status]').forEach((el) => { el.textContent = ''; });
         applySecretInputs(page, s);
         INPUT_FIELDS.forEach(([id, key, fallback = '']) => applyInputValue(id, fallback && !s[key] ? fallback : s[key]));
         VALUE_FIELDS.forEach(([id, key, fallback]) => { byId(id).value = s[key] || fallback; });

@@ -13,8 +13,11 @@ every launcher-started generation carries them, while a direct or dev run of the
 not and is spared with a warning. An environment that cannot be READ is never a licence to kill.
 
 The custody ledger is deliberately never consulted: missing ledger entries are the defect this
-sweep repairs, so a ledger lookup would spare exactly the strays that matter. POSIX only — on
-Windows the launcher's kill-on-close Job Object already reaps orphans.
+sweep repairs, so a ledger lookup would spare exactly the strays that matter. Enforcement requires a
+byte-exact environment source, so kills happen only on /proc hosts (the field-incident platform);
+elsewhere the sweep says so and does nothing — Windows orphans already die with the launcher's
+kill-on-close Job Object, and the ps -E fallback mixes argv into the environment column, which
+must never authorize a kill.
 
 CONTRACT (disclosed residual): the lock-implies-orphan inference assumes PID_FILE and DATA_DIR
 derive from one APP_ROOT, which every packaged install satisfies. An owner who deliberately
@@ -30,7 +33,6 @@ import os
 import pathlib
 import signal
 import subprocess
-import sys
 import time
 from typing import Iterable, List, Optional, Set, Tuple
 
@@ -187,6 +189,39 @@ def find_same_install_server_pids(
     return proven, unproven
 
 
+def _env_proof_available() -> bool:
+    """Whether this host offers a byte-exact environment source (/proc). The ps -E fallback
+    appends the environment to the SAME column as the argv, so an argv token spelled
+    ``KEY=value`` is indistinguishable from a real assignment — that is not a kill-grade
+    proof. Capability probe, not platform sniffing: a /proc-less POSIX host answers no."""
+    return os.path.isdir("/proc/self")
+
+
+def _descendants(pid: int) -> List[int]:
+    """Live descendant pids of ``pid``, captured BEFORE any signal: SIGKILLing the root
+    reparents its children to init, after which no parent-walk can find them."""
+    found: List[int] = []
+    frontier = [pid]
+    while frontier:
+        parent = frontier.pop()
+        try:
+            out = subprocess.run(
+                ["pgrep", "-P", str(parent)],
+                capture_output=True, text=True, timeout=3,
+            )
+        except Exception:
+            break
+        for line in (out.stdout or "").splitlines():
+            try:
+                child = int(line.strip())
+            except ValueError:
+                continue
+            if child > 0 and child not in found:
+                found.append(child)
+                frontier.append(child)
+    return found
+
+
 def _signal_pid(pid: int) -> None:
     """SIGKILL one pid; every failure mode is answered by the liveness read that follows."""
     try:
@@ -219,10 +254,16 @@ def _revalidate_and_kill(pid: int, server_paths: Set[str], data_dir_values: Set[
     True means CONFIRMED DEAD, not merely signalled: the kill primitives swallow per-pid errors,
     so only a liveness read after the signal can say what it achieved — a pid logged as reaped
     while it survived would contradict the survivor report from the same generation."""
+    # Descendants are captured BEFORE the root signal: SIGKILLing the root
+    # reparents its children to init, after which no parent-walk finds them. A
+    # fork landing after this capture is the next pass's job — that is what the
+    # bounded rescans exist for.
+    descendants = _descendants(pid)
     if not _runs_our_server(pid, server_paths) or not _is_launcher_managed(pid, data_dir_values):
         return False
     _signal_pid(pid)
-    _pl.kill_pid_tree(pid)
+    for child in descendants:
+        _signal_pid(child)
     deadline = time.time() + _CONFIRM_DEADLINE_SEC
     while True:
         if _pid_gone(pid):
@@ -241,23 +282,23 @@ def reap_same_install_strays(
     A non-empty return is the caller's signal that starting another generation would collide."""
     if _pl.IS_WINDOWS:
         return []
+    if not _env_proof_available():
+        # ps -E mixes argv and environment into one column, so a KEY=value argv
+        # token reads as an assignment — argv must never authorize a kill. The
+        # field incident is a /proc platform; elsewhere the sweep is honest
+        # about doing nothing rather than killing on a spoofable proof.
+        log.warning(
+            "Same-install stray sweep is report-only on this host (%s): no byte-exact "
+            "environment source (/proc), and the ps fallback cannot distinguish an argv "
+            "token from a real assignment — no process was killed.", reason,
+        )
+        return []
     server_paths = _path_forms(repo_dir, "server.py")
     data_dir_values = _path_forms(data_dir)
     if any(" " in path for path in server_paths):
         log.warning(
             "Same-install stray sweep disabled (%s): the repo path contains whitespace, which the "
             "exact-token identity proof cannot represent — no process was checked.", reason,
-        )
-        return []
-    if not sys.platform.startswith("linux") and any(" " in value for value in data_dir_values):
-        # /proc environ matching is byte-exact, but the ps -E token scan cannot
-        # represent a whitespace assignment value — symmetric with the
-        # whitespace-repo disclosure above, or such installs are silently
-        # unswept forever on this platform.
-        log.warning(
-            "Same-install stray sweep disabled (%s): the data directory path contains whitespace, "
-            "which this platform's environment proof cannot represent — no process was checked.",
-            reason,
         )
         return []
     if _candidate_commands() is None:

@@ -186,6 +186,7 @@ def test_a_missing_ps_is_enumeration_failure_not_a_clean_answer(monkeypatch):
 
 def test_reap_names_an_enumeration_failure_instead_of_reading_clean(monkeypatch, caplog):
     monkeypatch.setattr("ouroboros.platform_layer.IS_WINDOWS", False)
+    monkeypatch.setattr(reaper, "_env_proof_available", lambda: True)
     monkeypatch.setattr(reaper, "_candidate_commands", lambda: None)
     with caplog.at_level(logging.WARNING, logger=reaper.log.name):
         assert reaper.reap_same_install_strays(REPO, DATA) == []
@@ -196,6 +197,7 @@ def test_a_whitespace_repo_path_disables_the_sweep_with_one_named_warning(monkey
     """The exact-token proof cannot represent a whitespace path; silence would
     hide that such an install is never swept."""
     monkeypatch.setattr("ouroboros.platform_layer.IS_WINDOWS", False)
+    monkeypatch.setattr(reaper, "_env_proof_available", lambda: True)
     with caplog.at_level(logging.WARNING, logger=reaper.log.name):
         assert reaper.reap_same_install_strays("/opt/Our Oboros/repo", DATA) == []
     assert any("whitespace" in r.getMessage() for r in caplog.records)
@@ -234,6 +236,10 @@ def test_the_finder_never_reads_the_custody_ledger():
 
 def _spy_kill(monkeypatch):
     killed = []
+    # The enforcement gate needs a byte-exact env source; the test host may
+    # not have /proc, and no test reads real kernel state anyway.
+    monkeypatch.setattr(reaper, "_env_proof_available", lambda: True)
+    monkeypatch.setattr(reaper, "_descendants", lambda pid: [])
     # The proven root is signalled directly; the tree kill is follow-up cleanup.
     monkeypatch.setattr(reaper, "_signal_pid", lambda pid: killed.append(pid))
     monkeypatch.setattr(
@@ -303,7 +309,8 @@ def test_a_fork_between_passes_is_caught_by_the_rescan(monkeypatch):
         ),
     )
     monkeypatch.setattr("ouroboros.platform_layer.IS_WINDOWS", False)
-    monkeypatch.setattr("ouroboros.platform_layer.kill_pid_tree", lambda pid, **kw: None)
+    monkeypatch.setattr(reaper, "_env_proof_available", lambda: True)
+    monkeypatch.setattr(reaper, "_descendants", lambda pid: [])
     monkeypatch.setattr(reaper, "_pid_gone", lambda pid: pid not in live)
     monkeypatch.setattr(reaper, "_SETTLE_SEC", 0)
     monkeypatch.setattr(reaper, "_CONFIRM_DEADLINE_SEC", 0)
@@ -491,8 +498,9 @@ def test_a_signalled_pid_still_alive_is_a_survivor_not_a_kill(monkeypatch, caplo
     what the signal achieved; a pid logged as reaped while it survived would
     contradict the survivor report from the same generation."""
     signalled = []
+    monkeypatch.setattr(reaper, "_env_proof_available", lambda: True)
+    monkeypatch.setattr(reaper, "_descendants", lambda pid: [])
     monkeypatch.setattr(reaper, "_signal_pid", lambda pid: signalled.append(pid))
-    monkeypatch.setattr("ouroboros.platform_layer.kill_pid_tree", lambda pid, **kw: None)
     monkeypatch.setattr(reaper, "_pid_gone", lambda pid: False)
     monkeypatch.setattr(reaper, "_SETTLE_SEC", 0)
     monkeypatch.setattr(reaper, "_CONFIRM_DEADLINE_SEC", 0)
@@ -503,3 +511,37 @@ def test_a_signalled_pid_still_alive_is_a_survivor_not_a_kill(monkeypatch, caplo
         assert reaper.reap_same_install_strays(REPO, DATA) == [9990641]
     assert signalled and all(pid == 9990641 for pid in signalled)
     assert not any("Reaped" in r.getMessage() for r in caplog.records)
+
+
+def test_without_proc_the_sweep_is_report_only_with_a_named_warning(monkeypatch, caplog):
+    """ps -E mixes argv into the environment column, so a KEY=value argv token
+    reads as an assignment — argv must never authorize a kill."""
+    monkeypatch.setattr("ouroboros.platform_layer.IS_WINDOWS", False)
+    monkeypatch.setattr(reaper, "_env_proof_available", lambda: False)
+    with caplog.at_level(logging.WARNING, logger=reaper.log.name):
+        assert reaper.reap_same_install_strays(REPO, DATA) == []
+    assert any("report-only" in r.getMessage() for r in caplog.records)
+
+
+def test_descendants_are_captured_before_the_root_signal(monkeypatch):
+    """SIGKILLing the root reparents its children to init, after which no
+    parent-walk can find them: capture must precede the signal, and the
+    captured children must be signalled too."""
+    order = []
+    monkeypatch.setattr(reaper, "_descendants", lambda pid: order.append(("enum", pid)) or [9990902])
+    monkeypatch.setattr(reaper, "_signal_pid", lambda pid: order.append(("kill", pid)))
+    monkeypatch.setattr(reaper, "_pid_gone", lambda pid: True)
+    monkeypatch.setattr(reaper, "_SETTLE_SEC", 0)
+    monkeypatch.setattr(reaper, "_CONFIRM_DEADLINE_SEC", 0)
+    monkeypatch.setattr(
+        "ouroboros.platform_layer.process_command", lambda pid: OURS,
+    )
+    monkeypatch.setattr(
+        reaper, "pid_environment_assignment_state",
+        lambda pid, key, value: containment.ENV_ASSIGNMENT_PRESENT,
+    )
+
+    server_paths = reaper.install_server_path_forms(REPO)
+    data_dir_values = reaper._path_forms(DATA)
+    assert reaper._revalidate_and_kill(9990901, server_paths, data_dir_values) is True
+    assert order == [("enum", 9990901), ("kill", 9990901), ("kill", 9990902)]

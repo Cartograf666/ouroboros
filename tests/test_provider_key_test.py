@@ -433,3 +433,59 @@ def test_provider_card_clear_buttons_dispatch_input_for_verdict_expiry():
     settings = (WEB / "settings.js").read_text(encoding="utf-8")
     assert settings_ui.count("dispatchEvent(new Event('input', { bubbles: true }))") == 1
     assert settings.count("dispatchEvent(new Event('input', { bubbles: true }))") == 1
+
+
+def test_clearing_the_compat_endpoint_guards_the_legacy_fallback_key(monkeypatch):
+    # An empty compatible base URL activates the legacy OPENAI pair at runtime:
+    # the destination changes and the saved legacy key must not ride along.
+    monkeypatch.setattr(
+        model_catalog_api,
+        "load_settings",
+        lambda: {
+            "OPENAI_COMPATIBLE_API_KEY": "unit-test-credential",
+            "OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-base-url.example/v1",
+            "OPENAI_API_KEY": "unit-test-legacy-credential",
+            "OPENAI_BASE_URL": "https://unit-test-legacy.example/v1",
+        },
+    )
+    status, body = _post({
+        "provider_id": "openai-compatible",
+        "overrides": {
+            "OPENAI_COMPATIBLE_BASE_URL": "",
+            "OPENAI_COMPATIBLE_API_KEY": "",
+        },
+    })
+    assert status == 400
+    assert "re-entering the credential" in body.get("error", "")
+
+
+def test_provider_test_redacts_base64_credential_forms(monkeypatch):
+    import base64
+
+    monkeypatch.setattr(
+        model_catalog_api,
+        "load_settings",
+        lambda: {"GIGACHAT_CREDENTIALS": "unit-test-credential"},
+    )
+    encoded = base64.b64encode(b"unit-test-credential").decode("ascii")
+
+    async def exploding(_credentials, _scope, _base_url, _verify, _user="", _password=""):
+        raise RuntimeError(f"authorization header Basic {encoded} rejected")
+
+    monkeypatch.setattr(model_catalog_api, "_fetch_gigachat_model_catalog", exploding)
+    status, body = _post({"provider_id": "gigachat"})
+    assert status == 200 and body["ok"] is False
+    assert encoded not in json.dumps(body)
+
+
+def test_settings_reload_expires_provider_verdicts():
+    settings = (WEB / "settings.js").read_text(encoding="utf-8")
+    apply_at = settings.index("function applySettings(s)")
+    secret_at = settings.index("applySecretInputs(page, s);", apply_at)
+    expiry = settings.index(
+        "querySelectorAll('[data-provider-test-status]')", apply_at
+    )
+    assert apply_at < expiry < secret_at, (
+        "a settings (re)load replaces the tested values programmatically — no "
+        "input events fire, so applySettings itself must expire the verdicts"
+    )
