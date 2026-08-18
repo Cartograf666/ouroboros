@@ -31,7 +31,6 @@ from __future__ import annotations
 import logging
 import os
 import pathlib
-import signal
 import subprocess
 import time
 from typing import Iterable, List, Optional, Set, Tuple
@@ -223,25 +222,16 @@ def _descendants(pid: int) -> List[int]:
 
 
 def _signal_pid(pid: int) -> None:
-    """SIGKILL one pid; every failure mode is answered by the liveness read that follows."""
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except OSError:
-        pass
+    """Force-kill one pid via the platform layer; every failure mode is answered by the
+    liveness read that follows (the primitive swallows per-pid errors)."""
+    _pl.force_kill_pid(pid)
 
 
 def _pid_gone(pid: int) -> bool:
-    """ESRCH means gone; EPERM means ALIVE — the process exists, we just cannot signal it.
-    The platform's pid_is_alive folds every OSError into 'dead', which here would let a
-    colliding generation start next to a live one. Anything undeterminable reads as alive
-    (a survivor blocks the boot; a false 'gone' collides it)."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except OSError:
-        return False
-    return False
+    """Positive nonexistence via the platform layer: EPERM means the process EXISTS and a
+    survivor must block the boot — plain ``not pid_is_alive`` would read it as dead and
+    let a colliding generation start next to a live one."""
+    return _pl.pid_provably_gone(pid)
 
 
 def _revalidate_and_kill(pid: int, server_paths: Set[str], data_dir_values: Set[str]) -> bool:

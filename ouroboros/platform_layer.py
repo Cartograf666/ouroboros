@@ -437,6 +437,26 @@ def pid_is_alive(pid: int) -> bool:
         return False
 
 
+def pid_provably_gone(pid: int) -> bool:
+    """True only when the OS positively answers that ``pid`` does not exist.
+
+    Stricter than ``not pid_is_alive``: the POSIX branch there folds EVERY
+    OSError into 'dead', but EPERM means the process EXISTS and merely refuses
+    our signal — a caller deciding whether a killed process is really gone
+    must treat that (and anything else undeterminable) as still present."""
+    if pid <= 0:
+        return True
+    if IS_WINDOWS:
+        return not pid_is_alive(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 # Windows file locking via LockFileEx/UnlockFileEx; unlike msvcrt.locking(),
 # this works on empty files by locking a range beyond current size.
 
