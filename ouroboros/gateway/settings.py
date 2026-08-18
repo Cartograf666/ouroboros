@@ -703,6 +703,10 @@ def _api_owner_context_mode_sync(request: Request, body: Any) -> JSONResponse:
         # The idle guard is re-proved UNDER the lock: this thread can block on
         # it behind a long generic save, and a task started in that window
         # would otherwise be demoted to low mid-flight on a stale idle answer.
+        # BOTH halves of the predicate re-proved under the lock: the pre-lock
+        # answer above is only a fast path, and a writer that committed while
+        # this thread waited can have changed the very mode being lowered FROM.
+        previous_mode = _config.get_owner_context_mode()
         if previous_mode == "max" and next_mode == "low" and _has_running_agent_tasks():
             return unsaved_error(
                 "Context mode can only be lowered while Ouroboros is idle. "
