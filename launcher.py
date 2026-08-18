@@ -1149,7 +1149,9 @@ def main():
             # pre-start) or stale from an older run on another port. Poll
             # briefly for a healthy server, re-reading the file between
             # probes, so Open during bootstrap lands on the live UI; on
-            # timeout fall back to the last-read port (best-effort notice).
+            # timeout fall back to the last-read port (best-effort notice;
+            # the bound is soft — a probe straddling the deadline may run
+            # its own urlopen timeout, a couple of seconds of overshoot).
             port = _read_port_file()
             deadline = time.time() + 10.0
             while time.time() < deadline and not _wait_for_server(port, timeout=1.0):
