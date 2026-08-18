@@ -3,7 +3,7 @@ import json
 import logging
 import pathlib
 import uuid
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from ouroboros.task_results import validate_task_id
 from ouroboros.utils import append_jsonl, utc_now_iso
@@ -40,6 +40,7 @@ def write_owner_message(
     task_id: str,
     msg_id: Optional[str] = None,
     kind: str = KIND_OWNER_TEXT,
+    client_surface: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Write an owner message or typed control entry to a task's mailbox."""
     path = _mailbox_path(drive_root, task_id)
@@ -50,6 +51,10 @@ def write_owner_message(
         "text": text,
         "kind": str(kind or KIND_OWNER_TEXT),
     }
+    if isinstance(client_surface, dict) and client_surface:
+        # Owner Surface Fact (additive, like ``ts``): which client surface sent
+        # this follow-up, so the loop can note a mid-task device change.
+        entry["client_surface"] = dict(client_surface)
     try:
         if not append_jsonl(path, entry):
             log.warning("Failed to durably append owner message for task %s", task_id)
@@ -130,10 +135,16 @@ def drain_owner_entries(
                 # ``ts`` is ADDITIVE (2026-08-15 Fable pin): typed controls such
                 # as ``hurry`` carry their request time into the drained entry so
                 # the attempt latch can preserve when the owner actually asked.
-                entries.append({
+                drained = {
                     "msg_id": mid, "text": text, "kind": kind,
                     "ts": str(entry.get("ts") or ""),
-                })
+                }
+                # Owner Surface Fact: the drain projection must carry the field
+                # explicitly or a written fact is never delivered (the exact
+                # dead-wire class this sprint closes).
+                if isinstance(entry.get("client_surface"), dict) and entry.get("client_surface"):
+                    drained["client_surface"] = dict(entry["client_surface"])
+                entries.append(drained)
         return entries
     except Exception:
         log.debug("Failed to read mailbox for task %s", task_id, exc_info=True)

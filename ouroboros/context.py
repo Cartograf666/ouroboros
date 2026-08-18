@@ -263,9 +263,8 @@ def _task_uses_external_context(task: Dict[str, Any]) -> bool:
 
 
 def _scheduled_tasks_digest(env: Any, *, limit: int = 8) -> Optional[Dict[str, Any]]:
-    """Compact digest of active cron schedules for task/consciousness context.
-
-    Keeps the agent aware of standing cron schedules without inlining the full
+    """Compact digest of active schedules (cron + one-shot) for task/consciousness
+    context. Keeps the agent aware of standing schedules without inlining the full
     schedule table; notes how many active schedules were omitted past ``limit``.
     """
     try:
@@ -282,13 +281,19 @@ def _scheduled_tasks_digest(env: Any, *, limit: int = 8) -> Optional[Dict[str, A
     digest: List[Dict[str, Any]] = []
     for record in tasks[:limit]:
         trigger = record.get("trigger") if isinstance(record.get("trigger"), dict) else {}
-        digest.append({
+        entry = {
             "id": str(record.get("id") or ""),
             "name": str(record.get("name") or ""),
-            "cron": str(trigger.get("expr") or record.get("cron") or ""),
             "timezone": str(record.get("timezone") or "") or "local",
             "next_run_at": str(record.get("next_run_at") or ""),
-        })
+        }
+        if str(trigger.get("type") or "cron") == "once":
+            # One-shot records (schedule_followup) have no cron cadence: project
+            # the fire instant instead of an empty-string cron.
+            entry["run_at"] = str(trigger.get("run_at") or "")
+        else:
+            entry["cron"] = str(trigger.get("expr") or record.get("cron") or "")
+        digest.append(entry)
     out: Dict[str, Any] = {"active": digest}
     if len(tasks) > limit:
         out["omitted_count"] = len(tasks) - limit
@@ -310,6 +315,20 @@ _DECISION_TURN_OUTCOME_RULE = (
     "After any routing tool call, the final no-tool response MUST be self-contained: "
     "state what was attempted and the outcome known to you, because prose from the "
     "tool-call round is transient progress and is not durable conversation history."
+)
+
+# Hoisted verbatim from ``build_runtime_section`` (same pattern as
+# ``_DECISION_TURN_OUTCOME_RULE``) to keep that builder under the hard method gate.
+_OWNER_CLIENT_NOTE = (
+    "owner_client is the client surface that SENT the message that started/steered "
+    "this work. Provenance: browser observables are CLIENT-REPORTED (the owner's own "
+    "SPA measured them; not host-attested); received_at is a HOST stamp; {channel: ...} "
+    "is a host stamp for bridge/command ingress but CALLER-DECLARED for external "
+    "/api/tasks admissions (default api_task); captured_at is the client clock at "
+    "SEND time (delivery can lag it — received_at is the honest arrival mark). "
+    "runtime_env.presentation is the server process's own shell, NOT the sender. "
+    "When owner_client is absent, the surface is unknown: ask or hedge rather than "
+    "assuming a browser."
 )
 
 
@@ -457,6 +476,81 @@ def _promoted_task_toolset(env: Any) -> Dict[str, Any]:
     }
 
 
+def _delegation_capability_fact() -> Optional[Dict[str, Any]]:
+    """B4-lite: the CONFIGURED delegation route plus honestly-labeled HISTORICAL
+    observations (last recorded execution per reviewer slot and the last
+    delegated run).
+
+    Deliberately NOT live health — receipts prove what the last execution did,
+    not what a lane can do now; live lane facts arrive from plan-review wave
+    rows and typed delegate refusals. Pure bounded file reads over the existing
+    receipt projections: no daemon probes, no new health authority. Absent
+    receipt files mean absent observations, never "healthy". Fail-soft on its
+    own (None on any failure) so a problem here never drops the surrounding
+    capabilities digest.
+    """
+    try:
+        from ouroboros.reviewer_slot_config import reviewer_slot_last_executions
+        from ouroboros.subagents import get_subagent_harness, subagent_last_delegation
+
+        def _observed_label(ts: Any) -> str:
+            # Timestamp only: the verbatim "historical, not live health" disclaimer
+            # lives ONCE in the note below, never repeated per row.
+            return f"last observed at {str(ts or '').strip() or 'unknown time'}"
+
+        route = get_subagent_harness()
+        delegation: Dict[str, Any] = {
+            "configured_route": (
+                {
+                    "harness": route.route_id,
+                    "model": route.model,
+                    "effort": route.effort,
+                }
+                if route is not None
+                else "not configured"
+            ),
+            "note": (
+                "Every row here is historical, not live health (the last "
+                "recorded execution per reviewer slot / delegated run): "
+                "live lane facts arrive from plan-review wave rows and typed "
+                "delegate refusals. A missing row means no observation on "
+                "record — never healthy."
+            ),
+        }
+        slot_rows: List[Dict[str, Any]] = []
+        for slot_id, row in sorted(reviewer_slot_last_executions().items()):
+            if not isinstance(row, dict):
+                continue
+            status = str(row.get("status") or "").strip()
+            fact: Dict[str, Any] = {
+                "slot": str(slot_id),
+                "outcome": (("ok" if status == "ok" else "failed") if status
+                            else "unknown"),
+                "observed": _observed_label(row.get("ts")),
+            }
+            # B1's typed failure facts, forwarded only when recorded (a dated
+            # window carries reset_at without a code and an undated one the
+            # code without a reset — read both independently).
+            for key in ("failure_code", "reset_at"):
+                if row.get(key):
+                    fact[key] = row[key]
+            slot_rows.append(fact)
+        if slot_rows:
+            delegation["reviewer_slots_last"] = slot_rows
+        last = subagent_last_delegation()
+        if isinstance(last, dict) and last:
+            delegation["subagent_last_delegation"] = {
+                "route": str(last.get("route") or ""),
+                "requested_model": str(last.get("requested_model") or ""),
+                "applied_model": str(last.get("applied_model") or ""),
+                "observed": _observed_label(last.get("ts")),
+            }
+        return delegation
+    except Exception:
+        log.debug("Failed to build delegation capability fact", exc_info=True)
+        return None
+
+
 def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) -> str:
     try:
         git_branch, git_sha = get_git_info(env.repo_dir)
@@ -493,7 +587,15 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
             "deadline_at": task.get("deadline_at"),
             "allowed_resources": task.get("allowed_resources"),
         },
-        "runtime_env": {"is_desktop": bool(os.environ.get("OUROBOROS_DESKTOP_MODE", "")), "platform": sys.platform},
+        # Server-process presentation posture (launcher-exported; absent = a
+        # web/headless serving process). This is the PROCESS's shell, NOT the
+        # surface the owner's current message came from — that per-message fact
+        # is `owner_client` below. (The former `is_desktop` flag read
+        # OUROBOROS_DESKTOP_MODE, which no producer ever set — retired.)
+        "runtime_env": {
+            "presentation": os.environ.get("OUROBOROS_PRESENTATION", "").strip() or "web",
+            "platform": sys.platform,
+        },
     }
     if isinstance(task.get("task_contract"), dict):
         runtime_data["task_contract"] = task.get("task_contract")
@@ -548,6 +650,12 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
                 "spawn acting subagents."
             ),
         }
+        # B4-lite: configured route + honestly-labeled HISTORY, never live
+        # health. Own nested fail-soft inside the helper: a failure there must
+        # never drop the whole capabilities digest above.
+        _delegation_fact = _delegation_capability_fact()
+        if _delegation_fact is not None:
+            runtime_data["capabilities"]["delegation"] = _delegation_fact
         if ctx is not None:
             from ouroboros.tool_access import filesystem_affordance_map
 
@@ -617,6 +725,21 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
     # duplicating it. This is a structural fact; the model still chooses (BIBLE P5).
     # It also gives project-room messages their default project scene.
     _meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    # Owner Surface Fact: the surface that SENT the message this task/turn came
+    # from. A web message carries raw observables (pywebview/ua/viewport/...);
+    # a non-web ingress carries {"channel": <source>} STAMPED AT ITS PRODUCER
+    # (bridge routing, /api/command, /api/tasks admission).
+    # Absence is an honest gap — no key, never a guessed default (BIBLE P1).
+    # ONE shared projection of the producer-assembled fact — the mailbox
+    # surface-note baseline reads the same function, so the two can't disagree.
+    # The renderer never infers a surface from metadata.source (overloaded by
+    # internal producers: scheduler, skill schedules); absence stays honest.
+    from ouroboros.client_surface import owner_client_fact
+
+    _owner_client = owner_client_fact(_meta)
+    if _owner_client:
+        runtime_data["owner_client"] = dict(_owner_client)
+        runtime_data["owner_client_note"] = _OWNER_CLIENT_NOTE
     _current_chat = _meta.get("current_chat") if isinstance(_meta.get("current_chat"), dict) else None
     _swarm_router = bool(_meta.get("force_plan")) and bool(task.get("_ephemeral_turn"))
     if _current_chat and (_current_chat.get("running_tasks") or _current_chat.get("addressable_root_tasks")):

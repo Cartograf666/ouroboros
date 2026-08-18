@@ -340,6 +340,31 @@ def test_legacy_acceptance_key_migrates_into_the_shared_knob(tmp_path, monkeypat
     assert review_max_cycles() == 2 and get_acceptance_max_improvement_passes() == 1
 
 
+def test_exhausted_event_is_durable_even_with_a_live_queue(tmp_path):
+    """Review fix 4: the typed D27 escalation must ALWAYS land in events.jsonl —
+    the live queue path persists only task_checkpoint rows, so queue-only emission
+    silently lost the durable record; the queue additionally gets the UI push."""
+    import queue as _queue
+
+    events: _queue.Queue = _queue.Queue()
+    rc.emit_review_cycles_exhausted(
+        events, tmp_path, surface="plan_review", task_id="t1",
+        cycles_paid=2, cap=2, enforcement="blocking", fingerprint="f" * 64)
+    rows = [json.loads(line) for line in
+            (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1 and rows[0]["type"] == "review_cycles_exhausted"
+    assert rows[0]["task_id"] == "t1" and rows[0]["cap"] == 2
+    pushed = events.get_nowait()
+    assert pushed["type"] == "log_event"
+    assert pushed["data"]["type"] == "review_cycles_exhausted"
+    # No queue: the durable append still lands alone (unchanged path).
+    rc.emit_review_cycles_exhausted(
+        None, tmp_path, surface="plan_review", task_id="t2",
+        cycles_paid=1, cap=1, enforcement="advisory")
+    lines = (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2 and events.empty()
+
+
 def test_docs_describe_shared_key_and_new_module_size():
     dev = (REPO / "docs" / "DEVELOPMENT.md").read_text(encoding="utf-8")
     arch = (REPO / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8")

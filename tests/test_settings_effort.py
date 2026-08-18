@@ -87,9 +87,9 @@ def test_review_models_default_in_config():
     assert val  # non-empty
     models = [m.strip() for m in val.split(",") if m.strip()]
     assert models == [
-        "openai/gpt-5.6-luna",
-        "google/gemini-3.6-flash",
-        "anthropic/claude-sonnet-5",
+        "google/gemini-3.7-flash",
+        "openai/gpt-5.6-terra",
+        "anthropic/claude-opus-5",
     ]
 
 
@@ -185,12 +185,8 @@ def test_get_review_models_empty_env_falls_back_to_default(monkeypatch):
     assert models == [m.strip() for m in SETTINGS_DEFAULTS["OUROBOROS_REVIEW_MODELS"].split(",") if m.strip()]
 
 
-def test_get_review_models_falls_back_to_main_light_light_in_openai_only_mode(monkeypatch):
-    """v4.39.0: direct-provider fallback returns [main, light, light] (3 slots,
-    2 unique) instead of the legacy [main]*N so both commit triad and
-    plan_task have a quorum-safe reviewer list out of the box. The light slot
-    picks up the provider default (OPENAI_DIRECT_DEFAULTS['light'] =
-    openai::gpt-5.6-luna) when OUROBOROS_MODEL_LIGHT is not explicitly set."""
+def test_get_review_models_repeats_main_in_openai_only_mode(monkeypatch):
+    """The OpenAI-only profile runs its Main reviewer three independent times."""
     monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -208,8 +204,8 @@ def test_get_review_models_falls_back_to_main_light_light_in_openai_only_mode(mo
 
     assert models == [
         "openai::gpt-5.6-terra",
-        "openai::gpt-5.6-luna",
-        "openai::gpt-5.6-luna",
+        "openai::gpt-5.6-terra",
+        "openai::gpt-5.6-terra",
     ]
 
 
@@ -250,10 +246,8 @@ def test_get_review_models_preserves_explicit_official_openai_list(monkeypatch):
     assert models == ["openai::gpt-5.5", "openai::gpt-4.1"]
 
 
-def test_get_review_models_falls_back_to_main_light_light_in_anthropic_only_mode(monkeypatch):
-    """v4.39.0: same direct-provider fallback as OpenAI — [main, light, light]
-    with light = ANTHROPIC_DIRECT_DEFAULTS['light'] = anthropic::claude-sonnet-5
-    when OUROBOROS_MODEL_LIGHT is not explicitly set."""
+def test_get_review_models_repeats_main_in_anthropic_only_mode(monkeypatch):
+    """The Anthropic-only profile repeats even an explicit provider Main."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -271,8 +265,8 @@ def test_get_review_models_falls_back_to_main_light_light_in_anthropic_only_mode
 
     assert models == [
         "anthropic::claude-opus-4-6",
-        "anthropic::claude-sonnet-5",
-        "anthropic::claude-sonnet-5",
+        "anthropic::claude-opus-4-6",
+        "anthropic::claude-opus-4-6",
     ]
 
 

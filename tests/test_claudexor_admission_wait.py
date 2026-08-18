@@ -190,17 +190,19 @@ def _rotation_recorder(monkeypatch, manager, states: list):
 
     The incident's exact failure was rotation fired INTO the recovery window
     (503'd, silently lost), so the fact worth pinning is the timing, not the
-    call count alone.
+    call count alone. Post-merge the rotation surface is the mainline's
+    ``reconcile_rotation`` riding every ensure — the timing pin holds: it must
+    run only after the admission loop admitted, never into the window.
     """
     rotations = []
 
-    def _rotate(_endpoint):
+    def _rotate(_gateway):
         state = states[-1] if states else None
         admitted = bool(state and state["normal_after"] is not None
                         and state["handshakes"] >= state["normal_after"])
         rotations.append(admitted)
 
-    monkeypatch.setattr(manager, "_enable_rotation", _rotate)
+    monkeypatch.setattr(manager, "reconcile_rotation", _rotate)
     return rotations
 
 
@@ -319,9 +321,11 @@ def test_attach_to_recovering_daemon_waits_then_succeeds(monkeypatch, tmp_path):
         finally:
             gateway.close()
         assert state["handshakes"] >= 3
-        # Attached, not spawned — and attach never owed a provisioning patch.
+        # Attached, not spawned. Post-merge the mainline reconcile rides EVERY
+        # ensure — attach included (that is its point) — and the timing pin
+        # holds: it ran only after admission, never into the window.
         assert manager._proc is None
-        assert rotations == []
+        assert rotations == [True]
     finally:
         server.shutdown()
 
@@ -360,17 +364,17 @@ def test_handshake_without_serving_mode_keeps_todays_path(monkeypatch, tmp_path)
     _spawning_recovery_daemon(monkeypatch, servers, states, normal_after=0,
                               with_mode_field=False)
     rotation_at = []
-    monkeypatch.setattr(manager, "_enable_rotation",
-                        lambda _endpoint: rotation_at.append(states[0]["handshakes"]))
+    monkeypatch.setattr(manager, "reconcile_rotation",
+                        lambda _gateway: rotation_at.append(states[0]["handshakes"]))
 
     try:
         gateway = owned.ensure_owned_gateway()
         gateway.close()
-        # Rotation fired inside the spawn path, right after the FIRST (and only)
-        # reachability handshake — exactly today's behavior.
-        assert rotation_at == [1]
-        # ensure_owned_gateway added its single handshake and never polled.
+        # ensure_owned_gateway added its single handshake and never polled
+        # (no servingMode field ⇒ normal admission, byte-identical pre-3.4
+        # path), and the mainline reconcile ran once after that handshake.
         assert states[0]["handshakes"] == 2
+        assert rotation_at == [2]
     finally:
         manager.stop()
         for server in servers:
@@ -453,7 +457,7 @@ def test_initial_handshake_is_read_bounded_by_the_admission_window(monkeypatch):
             pass
 
     stub = SimpleNamespace(ensure_running=lambda: object(),
-                           run_deferred_rotation=lambda endpoint: None)
+                           reconcile_rotation=lambda gateway: None)
     monkeypatch.setattr(daemon_mod, "get_owned_daemon", lambda: stub)
     monkeypatch.setattr(gw_mod, "ClaudexorGateway", _Gateway)
     owned.ensure_owned_gateway(admission_wait_sec=0)

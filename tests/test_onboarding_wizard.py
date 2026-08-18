@@ -579,11 +579,16 @@ def test_setup_contract_has_no_secret_values():
     assert "OPENROUTER_API_KEY" in text
     assert "sk-or-v1-super-secret" not in text
     assert "sk-ant-super-secret" not in text
-    suggestions = build_setup_bootstrap({}, "web")["modelSuggestions"]
+    empty_bootstrap = build_setup_bootstrap({}, "web")
+    suggestions = empty_bootstrap["modelSuggestions"]
     assert "anthropic/claude-sonnet-5" in suggestions
     assert "anthropic::claude-sonnet-5" in suggestions
     assert "minimax::MiniMax-M3" in suggestions
     assert "minimax::MiniMax-M2.7" in suggestions
+    assert empty_bootstrap["initialState"]["totalBudget"] == 200.0
+    assert empty_bootstrap["initialState"]["perTaskCostUsd"] == 50.0
+    assert budget_fields["TOTAL_BUDGET"]["default"] == 200.0
+    assert budget_fields["OUROBOROS_PER_TASK_COST_USD"]["default"] == 50.0
 
     configured_value = "minimax-hidden-value"
     bootstrap = build_setup_bootstrap({"MINIMAX_API_KEY": configured_value}, "web")

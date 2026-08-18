@@ -652,6 +652,7 @@ def record_reviewer_slot_executions(surface: str, actors: Any, slots_by_id: Dict
     state beside the saved settings, not per-task forensics — those live in
     the durable actor records already.
     """
+    from ouroboros.review_substrate import TYPED_FAILURE_FACT_KEYS
     from ouroboros.utils import utc_now_iso, write_text_atomic
 
     path = _last_execution_path()
@@ -693,7 +694,7 @@ def record_reviewer_slot_executions(surface: str, actors: Any, slots_by_id: Dict
                 effective["profile_id"] = str(usage["applied_profile"])
             if usage.get("applied_access"):
                 effective["access"] = str(usage["applied_access"])
-            data[str(actor.slot_id)] = {
+            row: Dict[str, Any] = {
                 "ts": utc_now_iso(),
                 "surface": str(surface or ""),
                 "requested": {
@@ -707,6 +708,14 @@ def record_reviewer_slot_executions(surface: str, actors: Any, slots_by_id: Dict
                 "capability_delta": usage.get("capability_delta") or [],
                 "status": str(getattr(actor, "status", "") or ""),
             }
+            # B1: typed failure facts, present only when the substrate carried them
+            # (a later health surface reads them; absence stays honest absence).
+            # ONE shared key list with the plan-row/wave projections (sources differ).
+            for key in TYPED_FAILURE_FACT_KEYS:
+                value = getattr(actor, key, None)
+                if value:
+                    row[key] = value
+            data[str(actor.slot_id)] = row
         if len(data) > _LAST_EXECUTION_CAP:
             ordered = sorted(data.items(), key=lambda kv: str(kv[1].get("ts") or ""))
             data = dict(ordered[-_LAST_EXECUTION_CAP:])

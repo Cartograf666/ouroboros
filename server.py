@@ -144,6 +144,7 @@ def _restart_current_process(host: str, port: int) -> None:
     )
 
 from ouroboros.config import (
+    SETTINGS_DEFAULTS,
     load_settings, save_settings, apply_settings_to_env as _apply_settings_to_env,
 )
 from ouroboros.server_runtime import (
@@ -505,7 +506,12 @@ def _route_project_chat_to_running_task(
                 if isinstance(active_fence, dict) and str(active_fence.get("status") or "") == "sealed":
                     return ""
             if not write_owner_message(
-                task_drive, f"{message}{attachment_note}", tid, msg_id=msg_id
+                task_drive, f"{message}{attachment_note}", tid, msg_id=msg_id,
+                client_surface=(
+                    dict(task_metadata["client_surface"])
+                    if isinstance(task_metadata, dict) and isinstance(task_metadata.get("client_surface"), dict)
+                    else None
+                ),
             ):
                 return ""
             if direct_lock_held:
@@ -1294,6 +1300,9 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         # through the conversation decision lane would combine skill_repair with
         # _ephemeral_turn: ephemeral hides the repair mutators while heal mode
         # blocks promotion. Promote it directly without weakening either policy.
+        # DELIBERATE: task_metadata (incl. any client_surface fact) is dropped on
+        # this branch — a repair task's objective is a fixed UI action and the
+        # sending surface adds nothing to it (same treatment as force_plan here).
         from supervisor.events import _handle_promote_chat_to_task
 
         ctx.consciousness.inject_observation(
@@ -1382,6 +1391,21 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         # A suppressed (never-logged) message has a DESIGNED absence of origin;
         # downstream binders must not classify it as a producer bug.
         task_metadata = {**(task_metadata or {}), "origin_suppressed": True}
+    # Owner Surface Fact channel fallback: a non-web ingress (telegram/skill
+    # transports) carries no browser observables, but its channel IS the
+    # surface fact. Host-stamped here, never overwriting a real descriptor;
+    # source=="web" stays an honest absence (an old SPA sends no fact), and a
+    # synthetic A2A chat (negative id) is machine traffic — no owner sent it,
+    # so it must never wear an owner_client fact.
+    from ouroboros.contracts.chat_id_policy import is_a2a_chat_id as _is_a2a
+
+    _ingress_source = str(incoming.get("source") or "web")
+    if (
+        _ingress_source != "web"
+        and not _is_a2a(chat_id)
+        and not isinstance(task_metadata.get("client_surface"), dict)
+    ):
+        task_metadata = {**task_metadata, "client_surface": {"channel": _ingress_source}}
     if project_id and not swarm_intent:
         routed_to_task = _route_project_chat_to_running_task(
             ctx,
@@ -1519,6 +1543,11 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
                 sender_session_id=sender_session_id,
                 client_message_id=client_message_id,
                 transport=transport,
+                client_surface=(
+                    task_metadata.get("client_surface")
+                    if isinstance(task_metadata, dict) and isinstance(task_metadata.get("client_surface"), dict)
+                    else None
+                ),
             )
             from ouroboros.project_dialogue import build_owner_message_ref
 
@@ -1727,6 +1756,7 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
                     "task_metadata": task_metadata,
                     "log_text": log_text,
                     "origin_message_ref": origin_message_ref,
+                    "source": source,
                 },
             )
     return offset
@@ -1841,6 +1871,54 @@ def _resume_interrupted_project_deletions() -> None:
         log.debug("Project deletion recovery failed", exc_info=True)
 
 
+def _startup_worktree_prune() -> None:
+    """Startup hygiene: prune orphaned subagent worktrees (after the custody sweep)."""
+    from supervisor.state import append_jsonl
+
+    try:
+        from ouroboros import subagent_worktrees
+
+        worktree_report = subagent_worktrees.prune_orphans()
+        if worktree_report.get("removed"):
+            append_jsonl(DATA_DIR / "logs" / "events.jsonl", {
+                "ts": utc_now_iso(),
+                "type": "subagent_worktree_prune",
+                "report": worktree_report,
+            })
+    except Exception:
+        log.debug("Subagent worktree prune failed", exc_info=True)
+
+
+def _startup_prune_sweeps() -> None:
+    """Startup hygiene: prune stale task drives/trees and orphaned temp files."""
+    from supervisor.state import append_jsonl
+
+    try:
+        from ouroboros.headless import prune_headless_task_drives, prune_task_drives, prune_task_trees
+        from ouroboros.utils import sweep_stale_temp_files
+
+        prune_report = prune_headless_task_drives(DATA_DIR)
+        task_drive_report = prune_task_drives(DATA_DIR)
+        # Ephemeral task-tree coordination ledgers age out with their terminal root.
+        prune_task_trees(DATA_DIR)
+        # Reap orphaned atomic-write temp files (.*.tmp.*) left by a hard kill.
+        sweep_stale_temp_files(DATA_DIR)
+        if (
+            prune_report.get("pruned")
+            or prune_report.get("errors")
+            or task_drive_report.get("pruned")
+            or task_drive_report.get("errors")
+        ):
+            append_jsonl(DATA_DIR / "logs" / "events.jsonl", {
+                "ts": utc_now_iso(),
+                "type": "headless_task_drive_prune",
+                "report": prune_report,
+                "task_drives": task_drive_report,
+            })
+    except Exception:
+        log.debug("Headless task drive prune failed", exc_info=True)
+
+
 def _run_supervisor(settings: dict) -> None:
     """Initialize and run the supervisor loop. Called in a background thread."""
     global _supervisor_error, _supervisor_thread, _consciousness
@@ -1875,14 +1953,14 @@ def _run_supervisor(settings: dict) -> None:
 
         bus_init(
             drive_root=DATA_DIR,
-            total_budget_limit=float(settings.get("TOTAL_BUDGET", 10.0)),
+            total_budget_limit=float(settings.get("TOTAL_BUDGET", SETTINGS_DEFAULTS["TOTAL_BUDGET"])),
             budget_report_every=10,
             chat_bridge=bridge,
         )
 
         from supervisor.state import init as state_init, init_state, load_state, save_state, update_state
         from supervisor.state import append_jsonl, update_budget_from_usage, rotate_chat_log_if_needed, rotate_jsonl_log_if_needed
-        state_init(DATA_DIR, float(settings.get("TOTAL_BUDGET", 10.0)))
+        state_init(DATA_DIR, float(settings.get("TOTAL_BUDGET", SETTINGS_DEFAULTS["TOTAL_BUDGET"])))
         init_state()
 
         from supervisor.git_ops import safe_restart
@@ -1910,7 +1988,7 @@ def _run_supervisor(settings: dict) -> None:
         workers_init(
             repo_dir=REPO_DIR, drive_root=DATA_DIR, max_workers=max_workers,
             soft_timeout=soft_timeout, hard_timeout=hard_timeout,
-            total_budget_limit=float(settings.get("TOTAL_BUDGET", 10.0)),
+            total_budget_limit=float(settings.get("TOTAL_BUDGET", SETTINGS_DEFAULTS["TOTAL_BUDGET"])),
             branch_dev=_workers_branch_dev, branch_stable=_workers_branch_stable,
         )
 
@@ -1925,44 +2003,11 @@ def _run_supervisor(settings: dict) -> None:
         spawn_workers(max_workers)
         persist_queue_snapshot(reason="startup")
         _resume_interrupted_project_deletions()
-        try:
-            from ouroboros.headless import prune_headless_task_drives, prune_task_drives, prune_task_trees
-            from ouroboros.utils import sweep_stale_temp_files
-
-            prune_report = prune_headless_task_drives(DATA_DIR)
-            task_drive_report = prune_task_drives(DATA_DIR)
-            # Ephemeral task-tree coordination ledgers age out with their terminal root.
-            prune_task_trees(DATA_DIR)
-            # Reap orphaned atomic-write temp files (.*.tmp.*) left by a hard kill.
-            sweep_stale_temp_files(DATA_DIR)
-            if (
-                prune_report.get("pruned")
-                or prune_report.get("errors")
-                or task_drive_report.get("pruned")
-                or task_drive_report.get("errors")
-            ):
-                append_jsonl(DATA_DIR / "logs" / "events.jsonl", {
-                    "ts": utc_now_iso(),
-                    "type": "headless_task_drive_prune",
-                    "report": prune_report,
-                    "task_drives": task_drive_report,
-                })
-        except Exception:
-            log.debug("Headless task drive prune failed", exc_info=True)
+        # Original startup order preserved: drive prunes, custody sweep (reap
+        # orphaned processes), THEN worktree prune.
+        _startup_prune_sweeps()
         _startup_custody_sweep()
-
-        try:
-            from ouroboros import subagent_worktrees
-
-            worktree_report = subagent_worktrees.prune_orphans()
-            if worktree_report.get("removed"):
-                append_jsonl(DATA_DIR / "logs" / "events.jsonl", {
-                    "ts": utc_now_iso(),
-                    "type": "subagent_worktree_prune",
-                    "report": worktree_report,
-                })
-        except Exception:
-            log.debug("Subagent worktree prune failed", exc_info=True)
+        _startup_worktree_prune()
 
         _prune_delegated_snapshots()
 

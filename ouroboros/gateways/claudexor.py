@@ -78,11 +78,20 @@ class ClaudexorUnavailable(RuntimeError):
         self.required_actions = tuple(required_actions or ())
 
 
+# Cross-repo contract (B1): the engine's window-exhausted RunFailure codes. A
+# newer engine (rotation PR-A) reports a spent credential POOL under its own
+# code; both heal on a timer, so both map onto the exhausted class below — with
+# the ORIGINAL code preserved. Any other code stays a generic
+# ClaudexorUnavailable: fail-open, old engines emitting code:null included.
+WINDOW_EXHAUSTED_CODES = ("subscription_window_exhausted", "credential_pool_exhausted")
+
+
 class ClaudexorSubscriptionWindowExhausted(ClaudexorUnavailable):
     """The subscription window is spent and heals on a timer, not on payment."""
 
-    def __init__(self, message: str, *, reset_at: str = "", status_code: int = 0) -> None:
-        super().__init__("subscription_window_exhausted", message, status_code=status_code)
+    def __init__(self, message: str, *, reset_at: str = "", status_code: int = 0,
+                 code: str = "subscription_window_exhausted") -> None:
+        super().__init__(code, message, status_code=status_code)
         self.reset_at = str(reset_at or "")
 
 
@@ -347,10 +356,10 @@ class ClaudexorGateway:
         # quota snapshot), so the transient class was unreachable — while any unrelated
         # refusal that happened to carry one, an `idempotency_conflict` say, would have
         # been announced as a spent subscription window and retried on a timer.
-        if code == "subscription_window_exhausted":
+        if code in WINDOW_EXHAUSTED_CODES:
             return ClaudexorSubscriptionWindowExhausted(
                 message, reset_at=str(context.get("resetsAt") or ""),
-                status_code=response.status_code,
+                status_code=response.status_code, code=code,
             )
         return ClaudexorUnavailable(code, message, status_code=response.status_code,
                                     required_actions=required_actions)
@@ -655,9 +664,22 @@ class ClaudexorGateway:
         ops = body.get("operations") if isinstance(body, dict) else None
         return [row for row in (ops or []) if isinstance(row, dict)]
 
+    def get_settings(self) -> Dict[str, Any]:
+        """GET /v2/settings — the daemon's effective settings snapshot.
+
+        The read half of the rotation reconcile (B3): the snapshot's
+        ``harnesses`` map carries each configured harness's
+        ``profileLimitAction``, so provisioning patches only what is actually
+        missing instead of blind-writing every discovered harness. The route
+        has served since the v2 boundary existed, so every engine past
+        ``CLAUDEXOR_MIN_VERSION`` answers it.
+        """
+        body = self._request("GET", "/v2/settings")
+        return body if isinstance(body, dict) else {}
+
     def patch_settings(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /v2/settings — the daemon's own live settings patch (used once
-        at provisioning to turn on profile rotation, D28)."""
+        """POST /v2/settings — the daemon's own live settings patch (the
+        write half of the rotation reconcile, D28/B3)."""
         body = self._request("POST", "/v2/settings", json_body=dict(request))
         return body if isinstance(body, dict) else {}
 
@@ -814,6 +836,7 @@ __all__ = [
     "ClaudexorSubscriptionWindowExhausted",
     "ClaudexorUnavailable",
     "DaemonEndpoint",
+    "WINDOW_EXHAUSTED_CODES",
     "attempt_containment",
     "discover_daemon",
     "discover_daemon_at",

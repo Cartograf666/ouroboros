@@ -151,6 +151,11 @@ async def api_command(request: Request) -> JSONResponse:
             send_kwargs: dict[str, Any] = {"broadcast": False, "suppress_chat_log": bool(visible_text)}
             if task_constraint:
                 send_kwargs["task_constraint"] = task_constraint
+            # Owner Surface Fact: messages through this endpoint (CLI `chat send`,
+            # SPA heal/repair posts) would otherwise masquerade as ordinary web
+            # frames. The honest stamp names the ENDPOINT — the host cannot know
+            # the true caller here (disclosed non-goal).
+            send_kwargs["task_metadata"] = {"client_surface": {"channel": "api_command"}}
             bridge.ui_send(cmd, **send_kwargs)
             if visible_task_id:
                 _RECENT_VISIBLE_COMMANDS[visible_task_id] = time.monotonic()

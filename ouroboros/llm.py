@@ -14,12 +14,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from ouroboros.provider_models import (
-    PROVIDER_PREFIXES,
-    normalize_anthropic_model_id,
-    normalize_model_identity,
-    resolve_minimax_base_url,
-)
+from ouroboros.provider_models import OPENROUTER_DEFAULTS, PROVIDER_PREFIXES, normalize_anthropic_model_id, normalize_model_identity, resolve_minimax_base_url
 from ouroboros.usage_accounting import (
     AttemptRequest,
     PhysicalAttemptPreconditionFailed,
@@ -38,7 +33,7 @@ from ouroboros.utils import in_worker_process
 
 log = logging.getLogger(__name__)
 
-DEFAULT_LIGHT_MODEL = "google/gemini-3.6-flash"
+DEFAULT_LIGHT_MODEL = OPENROUTER_DEFAULTS["light"]
 _FALSE_LIKE_ENV_VALUES = {"", "0", "false", "no", "off"}
 # Provider-valid Anthropic ephemeral-cache tiers.
 _VALID_CACHE_TTLS = frozenset({"5m", "1h"})
@@ -549,9 +544,7 @@ def fetch_openrouter_pricing(*, timeout_sec: float = 5.0) -> Dict[str, Tuple[Opt
                         tier_row = (tier_prompt, tier_cached, tier_write, tier_completion)
                         tiers.append((min_prompt_tokens, tier_row))
                     except (TypeError, ValueError):
-                        log.warning(
-                            "Skipping malformed pricing override for %s", model_id,
-                        )
+                        log.warning("Skipping malformed pricing override for %s", model_id)
             if tiers:
                 row = PricingSchedule(row, tuple(tiers))
             pricing_dict[model_id] = row
@@ -869,9 +862,7 @@ class LLMClient:
                 # and every reactive in-process rejection is also recorded
                 # durably, so replacing (not unioning) lets expired entries
                 # actually evict from a long-running process.
-                cls._REJECTED_PARAMS_CACHE[durable_key] = set(
-                    get_rejected_params(DATA_DIR, durable_key)
-                )
+                cls._REJECTED_PARAMS_CACHE[durable_key] = set(get_rejected_params(DATA_DIR, durable_key))
             except Exception:
                 pass
         for key in {model_id, normalize_model_identity(model_id)}:
@@ -4275,11 +4266,11 @@ class LLMClient:
 
     def default_model(self) -> str:
         """Return the single default model from env. LLM switches via tool if needed."""
-        return os.environ.get("OUROBOROS_MODEL", "x-ai/grok-4.5")
+        return os.environ.get("OUROBOROS_MODEL", OPENROUTER_DEFAULTS["main"])
 
     def available_models(self) -> List[str]:
         """Return list of available models from env (for switch_model tool schema)."""
-        main = os.environ.get("OUROBOROS_MODEL", "x-ai/grok-4.5")
+        main = self.default_model()
         heavy = os.environ.get("OUROBOROS_MODEL_HEAVY", "")
         light = os.environ.get("OUROBOROS_MODEL_LIGHT", "")
         models = [main]

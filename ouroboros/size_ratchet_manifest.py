@@ -131,7 +131,6 @@ BAND_PATHS = {
     "ouroboros/agent.py": "Shrank into the band from 1589 lines: the dispatch-time executor note pair (dispatch_executor_note/executor_blocked_outcome) moved whole to subagent_dispatch_notes.py with same-name re-exports kept (delegation-substrate sprint, B1/F7).",
     "ouroboros/agent_startup_checks.py": None,
     "ouroboros/claudexor_runtime.py": None,
-    "ouroboros/context.py": None,
     "ouroboros/extension_process_runner.py": None,
     "ouroboros/gateway/contracts.py": None,
     "ouroboros/gateway/extensions.py": None,
@@ -201,9 +200,9 @@ BYTE_BASELINE_DEBT = {
 }
 
 BYTE_DEBT = {
-    "ouroboros/llm.py": 200307,
-    "ouroboros/loop.py": 317371,
+    "ouroboros/llm.py": 200199,
+    "ouroboros/loop.py": 317359,
     "tests/test_delegated_subagent_transport.py": 320623,
     "tests/test_devtools_benchmarks.py": 328775,
-    "web/modules/chat.js": 229395,
+    "web/modules/chat.js": 229361,
 }

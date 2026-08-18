@@ -226,3 +226,10 @@ TOOLS_LOG_WARN_BYTES = 100_000_000
 # this warning fires only if rotation is broken or missing — a deliberate
 # regression tripwire, not a size preference.
 PROGRESS_LOG_WARN_BYTES = 8_000_000
+# state/scheduled_tasks.json is a whole-document store the scheduler READS AND
+# REWRITES on every tick under the queue lock (supervisor/queue.py::
+# check_scheduled_tasks), and consumed one-shot follow-ups are RETAINED as
+# durable receipts (enabled=False + completed_at) — so it now grows with every
+# fired follow-up. 2MB ≈ thousands of ~1KB records: the point where a
+# per-tick full parse + atomic rewrite under the lock stops being free.
+SCHEDULED_TASKS_WARN_BYTES = 2_000_000

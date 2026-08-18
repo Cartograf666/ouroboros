@@ -465,6 +465,16 @@ def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
     env["OUROBOROS_REPO_DIR"] = str(REPO_DIR)
     env["OUROBOROS_APP_VERSION"] = str(APP_VERSION)
     env["OUROBOROS_MANAGED_BY_LAUNCHER"] = "1"
+    # Owner Surface Fact: the launcher is the only actor that knows HOW this
+    # server will be presented. `_headless` is decided in main() before the
+    # lifecycle loop ever calls start_agent(), and every managed restart funnels
+    # back through here, so the export is re-stamped fresh each time. Absence of
+    # the var (source mode, Docker, Colab, CLI server) truthfully means "web".
+    # Env-only by design — never a SETTINGS_DEFAULTS key (pop-on-absent would
+    # erase an injected value). Known bounded lie: a SIGKILLed launcher can
+    # orphan the server with a stale "desktop_window" until the next launcher
+    # start reaps it — the same envelope OUROBOROS_MANAGED_BY_LAUNCHER accepts.
+    env["OUROBOROS_PRESENTATION"] = "browser_fallback" if _headless else "desktop_window"
     # The server runs out of the managed repo, not the bundle: without this the
     # bundled payloads (node, ripgrep) are invisible to it (platform_layer.
     # bundled_resource_bases).

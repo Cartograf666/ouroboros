@@ -122,12 +122,22 @@ def test_plan_review_control_requires_exact_closed_typed_marker():
     assert open_review["plan_review_outcome"] == "REVIEW_REQUIRED"
     assert open_review["plan_review_closed"] is False
 
+    # B2 honest DEGRADED: a legal, always-open control outcome.
+    degraded = _extract_result_metadata(
+        "plan_task",
+        'PLAN_REVIEW_CONTROL_JSON: {"outcome":"DEGRADED","closed":false}',
+        False,
+    )
+    assert degraded["plan_review_outcome"] == "DEGRADED"
+    assert degraded["plan_review_closed"] is False
+
     for text in (
         "## Plan Review Results\nAGGREGATE: GREEN",
         'PLAN_REVIEW_CONTROL_JSON: {"outcome":"UNKNOWN","closed":true}',
         'PLAN_REVIEW_CONTROL_JSON: {"outcome":"GREEN","closed":"true"}',
         'PLAN_REVIEW_CONTROL_JSON: {"outcome":"GREEN","closed":false}',
         'PLAN_REVIEW_CONTROL_JSON: {"outcome":"REVISE_PLAN","closed":true}',
+        'PLAN_REVIEW_CONTROL_JSON: {"outcome":"DEGRADED","closed":true}',
         'PLAN_REVIEW_CONTROL_JSON: {"outcome":"GREEN","outcome":"REVIEW_REQUIRED","closed":true}',
         'PLAN_REVIEW_CONTROL_JSON: {"outcome":"GREEN","closed":true,"extra":1}',
         'PLAN_REVIEW_CONTROL_JSON: {"outcome":"GREEN","closed":true}\n'

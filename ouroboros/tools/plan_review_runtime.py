@@ -16,7 +16,7 @@ from hashlib import sha256
 import json
 import logging
 import pathlib
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from ouroboros.config import review_model_uses_local
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
@@ -188,6 +188,17 @@ async def run_plan_review_slots(
     return rows
 
 
+def _typed_facts_from(source: Any, get: Any) -> Dict[str, Any]:
+    """The B1 typed failure facts off one source via ``get(source, key)`` — the
+    ONE key list is ``review_substrate.TYPED_FAILURE_FACT_KEYS`` (shared with the
+    last-execution recorder; sources differ, keys must not). ``http_status`` stays
+    raw (int-or-None); the rest coerce to honest-empty strings."""
+    from ouroboros.review_substrate import TYPED_FAILURE_FACT_KEYS
+
+    return {key: (get(source, key) if key == "http_status" else str(get(source, key) or ""))
+            for key in TYPED_FAILURE_FACT_KEYS}
+
+
 def _plan_row_from_actor(actor: Dict[str, Any], slot: Any) -> dict:
     usage = actor.get("usage") or {}
     text = actor.get("raw_text") or ""
@@ -210,7 +221,140 @@ def _plan_row_from_actor(actor: Dict[str, Any], slot: Any) -> dict:
         "tokens_in": usage.get("prompt_tokens", 0),
         "tokens_out": usage.get("completion_tokens", 0),
         "cost": float(usage["cost"]) if usage.get("cost") is not None else None,
+        # B1 typed failure facts, forwarded VERBATIM from the actor record (empty on
+        # success and on pre-typed engines) so downstream never regresses to matching
+        # the error prose for the code or the reset instant.
+        **_typed_facts_from(actor, lambda source, key: source.get(key)),
+        "capability_delta": usage.get("capability_delta") or [],
     }
+
+
+def plan_row_typed_facts(row: Dict[str, Any]) -> Dict[str, Any]:
+    """The typed failure facts a wave actor record carries forward from a plan row.
+
+    One projection for the engine's wave records (``plan_review.py`` sits at its
+    size pin, so the logic lives here). Every fact defaults to honest absence —
+    rows from pre-B1 engines and typed-fact-free rows (``plan_slot_fit``'s
+    preflight_oversize rows) behave exactly as before."""
+    return {
+        **_typed_facts_from(row, lambda source, key: source.get(key)),
+        "capability_delta": row.get("capability_delta") or [],
+    }
+
+
+# Root exploration log (plan F3/S8): the task's OWN tool calls before this call,
+# read from the task-local conversation — never a scan of tools.jsonl.
+_EXPLORATION_TAIL_CALLS = 40
+_EXPLORATION_ARGS_CHARS = 240
+_EXPLORATION_RESULT_CHARS = 320
+
+
+def root_exploration_log(ctx: ToolContext) -> Optional[str]:
+    """Bounded tail of THIS task's tool calls before this plan_task, from the task-local
+    conversation (S8): exact omitted count, never a scan of the shared tools.jsonl.
+    ``None`` when the host holds no conversation for this context (named omission)."""
+    from ouroboros.review_evidence import _accept_redact_cap
+
+    messages = getattr(ctx, "messages", None)
+    if not isinstance(messages, list):
+        return None
+    results: Dict[str, str] = {}
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "tool":
+            results[str(message.get("tool_call_id") or "")] = str(message.get("content") or "")
+    calls: List[str] = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            fn = call.get("function") if isinstance(call, dict) else None
+            name = str((fn or {}).get("name") or "")
+            if not name or name == "plan_task":
+                continue
+            # I-04: raw tool args/results must be redacted before reviewers see them;
+            # reuse acceptance's projection (`_accept_redact_cap`), not a second path (P7).
+            args = _accept_redact_cap(str((fn or {}).get("arguments") or ""), _EXPLORATION_ARGS_CHARS)
+            result = _accept_redact_cap(
+                results.get(str(call.get("id") or ""), ""), _EXPLORATION_RESULT_CHARS,
+            ).replace("\n", " ")
+            calls.append(f"- {name}({args}) → {result or '(no result recorded)'}")
+    tail = calls[-_EXPLORATION_TAIL_CALLS:]
+    header = (
+        f"{len(calls)} tool call(s) by this task before this plan_task; showing the last "
+        f"{len(tail)}; omitted {len(calls) - len(tail)} (bounded tail)."
+    )
+    return "\n".join([header, *tail])
+
+
+# Dedup memo for the advisory-open event: one event per recorded-open
+# (data root, task, fingerprint, health-epoch) STATE, not per call — empty-epoch
+# DEGRADED re-dispatches and unpaid $0 re-discoveries re-enter the emitter with
+# an unchanged state and must not spam the owner. Process-local by design: a
+# restart may re-announce an already-announced state once (disclosed residual —
+# this is an event rail, never authority).
+_ADVISORY_OPEN_SEEN: Dict[tuple, bool] = {}
+_ADVISORY_OPEN_SEEN_MAX = 512
+
+
+def emit_plan_review_advisory_open(
+    ctx: ToolContext, drive_root: Any, *, task_id: str, wave: Dict[str, Any],
+    cycles_paid: int, cap: Any,
+) -> None:
+    """ONE typed owner-visible event when a wave RECORDS open under advisory
+    enforcement (B2): loud at the moment it happens, not only when finalization
+    later appends ``owner_hurry.plan_review_disclosure``. Deduplicated per
+    (fingerprint, health-epoch) recorded-open state (see ``_ADVISORY_OPEN_SEEN``);
+    replays, dispositions and re-renders never reach this emitter at all.
+    Durability is UNCONDITIONAL: the ``events.jsonl`` append always lands — the
+    live queue path persists only task_checkpoint rows — and a live queue
+    additionally gets the UI push. The dedup memo is inserted ONLY AFTER the
+    durable append succeeded (review fix 6): a failed append is logged loudly and
+    NOT memoized, so the next call for the same state retries the whole emission
+    instead of the memo silently swallowing an event that never landed. Never
+    raises."""
+    from ouroboros.utils import append_jsonl, emit_log_event
+
+    key = (str(drive_root or ""), str(task_id or ""),
+           str(wave.get("request_fingerprint") or ""),
+           json.dumps(wave.get("health_epoch") or [], sort_keys=True, default=str))
+    if key in _ADVISORY_OPEN_SEEN:
+        return
+    row = {
+        "type": "plan_review_advisory_open",
+        "surface": "plan_review",
+        "task_id": str(task_id or ""),
+        "fingerprint": str(wave.get("request_fingerprint") or ""),
+        "aggregate": str(wave.get("aggregate") or ""),
+        "cycle_index": wave.get("cycle_index"),
+        "paid": bool(wave.get("paid")),
+        "cycles_paid": int(cycles_paid),
+        "cap": cap,
+        "enforcement": "advisory",
+        # Bounded per-slot typed facts: who failed, with what code, until when.
+        "slots": [
+            {"slot_id": a.get("slot_id"), "ok": bool(a.get("ok")),
+             "failure_code": str(a.get("failure_code") or ""),
+             "reset_at": str(a.get("reset_at") or "")}
+            for a in (wave.get("actors") or []) if isinstance(a, dict)
+        ],
+    }
+    stamped = {"ts": utc_now_iso(), **row}
+    try:
+        if drive_root:
+            append_jsonl(pathlib.Path(str(drive_root)) / "logs" / "events.jsonl", stamped)
+    except Exception:
+        log.warning("plan_review_advisory_open durable append failed for %s; "
+                    "not memoized — the next call retries", task_id, exc_info=True)
+        return
+    _ADVISORY_OPEN_SEEN[key] = True
+    while len(_ADVISORY_OPEN_SEEN) > _ADVISORY_OPEN_SEEN_MAX:
+        _ADVISORY_OPEN_SEEN.pop(next(iter(_ADVISORY_OPEN_SEEN)))
+    try:
+        event_queue = getattr(ctx, "event_queue", None)
+        if event_queue is not None:
+            emit_log_event(event_queue, stamped, log_label="plan review")
+    except Exception:
+        log.debug("plan_review_advisory_open emission failed for %s", task_id, exc_info=True)
 
 
 def plan_payload_roots(ctx: ToolContext, locators: List[str]) -> list[pathlib.Path]:
@@ -247,6 +391,251 @@ def plan_payload_roots(ctx: ToolContext, locators: List[str]) -> list[pathlib.Pa
         except (OSError, ValueError):
             continue
     return roots
+
+
+# ------------------------------------------------------------ panel health (B2b)
+#
+# ONE health snapshot before fan-out turns slots with POSITIVE structural evidence
+# of a spent lane into $0 typed skip rows that stay in the quorum denominator
+# (BIBLE P3: the quorum never silently narrows). Unknown health DISPATCHES
+# (fail-open); transient daemon states (`daemon_recovery_only`, a dead socket)
+# are never skip evidence and never enter the epoch (roast pt 9). Side effect,
+# disclosed: `ensure_owned_gateway` may lazily SPAWN the owned daemon and runs
+# its per-ensure rotation reconcile — both bounded and fail-open (a spawn/probe
+# failure returns None here, never an exception).
+#
+# DISCLOSED LIMITATION: `subagents.route_health` — the ONE manifest reader — judges
+# a whole ROUTE (harness id + pinned model), never a slot's pinned credential
+# profile. A live sibling profile can therefore mask a pinned slot's exhaustion:
+# such a slot dispatches (fail-open) and fails typed downstream (B1). No second
+# health oracle is built here. api_chat rows have no route health source at all
+# and always dispatch. Cursor lanes without quota snapshots simply dispatch too.
+
+
+def _slot_session_route(slot: Any) -> Any:
+    """The route an agent_session slot would dispatch on (None when unresolvable —
+    the dispatch path owns that refusal; health has nothing to say about it)."""
+    from ouroboros.review_execution import review_session_route
+    from ouroboros.subagents import parse_subagent_harness
+
+    spec = str(getattr(slot, "session_target", "") or "")
+    if spec:
+        return parse_subagent_harness(spec)
+    return review_session_route()
+
+
+def _structural_skip_code(reason: str, reset_at: str) -> str:
+    """POSITIVE structural evidence only: a dated window exhaustion whose reset is
+    still ahead, or a typed dead-pool code. An UNDATED exhaustion, a stale reset and
+    every other reason (route_status_*, transient daemon states, unknown) dispatch —
+    the pre-dispatch admission and the run itself refuse typed downstream at ~$0."""
+    from ouroboros.gateways.claudexor import WINDOW_EXHAUSTED_CODES
+
+    if reset_at:
+        instant = parse_deadline_ts(reset_at)
+        if instant is not None and instant > utc_now():
+            return reason or "subscription_window_exhausted"
+        return ""
+    if reason in WINDOW_EXHAUSTED_CODES and reason != "subscription_window_exhausted":
+        # e.g. credential_pool_exhausted: the pool itself is dead. Honest note: NO
+        # producer routes this code through `route_health` today — the branch is
+        # the contract point for PR-A A5's route_health sync (the typed pool
+        # terminal), kept on purpose so the sync lands without an engine change.
+        return reason
+    return ""
+
+
+def plan_panel_health_snapshot(slots: list) -> Optional[Dict[str, Dict[str, str]]]:
+    """``{slot_id: {failure_code, reset_at}}`` for the slots a pre-fan-out snapshot
+    proves structurally dead; ``{}`` when the snapshot ran and found none; ``None``
+    when no snapshot could be captured (daemon unprovisioned/unreachable) — unknown
+    health dispatches, and a FAILED snapshot must never read as "everything healed"
+    at the replay seam."""
+    session_slots = [slot for slot in slots if slot_is_session(slot)]
+    if not session_slots:
+        return {}
+    from ouroboros.claudexor_daemon import ensure_owned_gateway, owned_daemon_provisioned
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+    from ouroboros.subagents import delegated_run_shape, route_health
+
+    if not owned_daemon_provisioned():
+        return None
+    shape = delegated_run_shape(False)  # a reviewer reads and answers
+    evidence: Dict[str, Dict[str, str]] = {}
+    by_route: Dict[tuple, tuple[str, str]] = {}
+    gateway = None
+    try:
+        gateway = ensure_owned_gateway()
+        for slot in session_slots:
+            route = _slot_session_route(slot)
+            if route is None:
+                continue
+            key = (route.route_id, route.model)
+            if key not in by_route:
+                by_route[key] = route_health(gateway, route.route_id, shape,
+                                             route_model=route.model)
+            code = _structural_skip_code(*by_route[key])
+            if code:
+                evidence[str(getattr(slot, "slot_id", "") or "")] = {
+                    "failure_code": code, "reset_at": by_route[key][1]}
+    except ClaudexorUnavailable:
+        return None  # transient (incl. daemon_recovery_only): never a skip row
+    except Exception:
+        log.debug("plan panel health snapshot failed (fail-open)", exc_info=True)
+        return None
+    finally:
+        if gateway is not None:
+            gateway.close()
+    return evidence
+
+
+def plan_health_skip_rows(slots: list, evidence: Optional[Dict[str, Dict[str, str]]]) -> tuple[list, list[dict]]:
+    """``(live_slots, skip_rows)`` — a structurally dead slot becomes a $0 typed row
+    shaped like ``plan_slot_fit``'s preflight_oversize rows plus B1's typed facts; it
+    stays a configured row in the quorum denominator. Live slots keep dispatching
+    even when the dead ones make the quorum unreachable (never `plan_slot_fit`'s
+    below-quorum refusal — that would silence the whole panel)."""
+    live, rows = [], []
+    for slot in slots:
+        ev = (evidence or {}).get(str(getattr(slot, "slot_id", "") or ""))
+        if not ev:
+            live.append(slot)
+            continue
+        code, reset = str(ev.get("failure_code") or ""), str(ev.get("reset_at") or "")
+        rows.append({
+            "slot_id": str(getattr(slot, "slot_id", "") or ""),
+            "model": str(getattr(slot, "model", "") or ""),
+            "request_model": str(getattr(slot, "model", "") or ""),
+            "route": "agent_session", "host_file_read_attestation": None, "text": "",
+            "error": (
+                f"health_skip[{code}]: the pre-fan-out panel health snapshot shows this "
+                f"slot's delegated route window spent{f' (resets {reset})' if reset else ''}; "
+                "skipped before dispatch at $0. Route-level evidence only: the snapshot "
+                "judges the whole route, not a pinned credential profile."
+            ),
+            "failure_code": code, "reset_at": reset,
+            "prompt_ref": {}, "response_ref": {}, "tokens_in": 0, "tokens_out": 0, "cost": 0.0,
+        })
+    return live, rows
+
+
+def plan_health_epoch(evidence: Optional[Dict[str, Dict[str, str]]]) -> list[dict]:
+    """Material health epoch (roast pt 8): sorted ``{slot, code, reset_at}`` rows, NO
+    observed_at. Only snapshot-derived structural evidence enters — transient,
+    timeout and parse failures never do (pt 9), so they can never pin a replay."""
+    rows = [
+        {"slot": str(sid), "code": str(ev.get("failure_code") or ""),
+         "reset_at": str(ev.get("reset_at") or "")}
+        for sid, ev in (evidence or {}).items()
+    ]
+    return sorted(rows, key=lambda r: (r["slot"], r["code"], r["reset_at"]))
+
+
+# Sentinel for "the replay seam captured no fresh snapshot" — distinct from a
+# snapshot that RAN and failed (None), which is a meaningful transient-unknown.
+PLAN_NO_SNAPSHOT = object()
+
+
+def plan_reviewer_config_fingerprint(slots: list) -> str:
+    """Identity of the configured reviewer roster (roast pt 1): slot ids, targets,
+    routes, pinned session targets/profiles AND efforts — a changed roster must not
+    inherit an open wave's recorded replay authority. Effort is identity (it changes
+    what the reviewer actually does); timeouts are tuning, not identity; roster
+    ORDER is identity (it is the configured row order)."""
+    rows = [
+        [str(getattr(s, "slot_id", "") or ""), str(getattr(s, "model", "") or ""),
+         str(getattr(getattr(s, "route", None), "value", "") or ""),
+         str(getattr(s, "session_target", "") or ""),
+         str(getattr(s, "session_profile", "") or ""),
+         str(getattr(s, "effort", "") or "")]
+        for s in slots or []
+    ]
+    return sha256(json.dumps(rows, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def plan_wave_replay_decision(slots_fn: Any, existing: Dict[str, Any]) -> tuple:
+    """``(stale, fresh_snapshot)`` for one recorded OPEN wave and an identical
+    envelope: ``stale=True`` means the recorded replay authority lapsed and the
+    envelope must RE-DISPATCH a fresh panel; ``fresh_snapshot`` is the health
+    snapshot captured while deciding (``PLAN_NO_SNAPSHOT`` when none was), so the
+    dispatch path reuses it instead of probing the daemon twice.
+
+    Replay authority rules:
+
+    * a changed reviewer roster re-dispatches (roast pt 1) — a non-empty recorded
+      ``reviewer_config_fingerprint`` differing from the current roster's; an
+      absent fingerprint (pre-fingerprint wave) is unknown, never change evidence;
+    * only a DEGRADED wave consults lane health — every other open aggregate
+      replays exactly as before B2b;
+    * a DEGRADED wave with an EMPTY recorded epoch carries no structural snapshot
+      evidence (its slots died at dispatch time, invisible to the pre-fan-out
+      snapshot): a transient death is never cached as structural (roast pt 9), so
+      the identical envelope re-dispatches;
+    * a DEGRADED wave with a non-empty epoch replays free while a fresh snapshot
+      matches it; a FAILED snapshot (``None``) is transient-unknown and keeps the
+      replay; a healed or newly dead lane re-dispatches.
+    """
+    try:
+        slots = list(slots_fn() or [])
+        stored_fp = str(existing.get("reviewer_config_fingerprint") or "")
+        if stored_fp and stored_fp != plan_reviewer_config_fingerprint(slots):
+            return True, PLAN_NO_SNAPSHOT
+        if str(existing.get("aggregate") or "") != "DEGRADED":
+            return False, PLAN_NO_SNAPSHOT
+        stored = existing.get("health_epoch") if isinstance(existing.get("health_epoch"), list) else []
+        if not stored:
+            return True, PLAN_NO_SNAPSHOT
+        fresh = plan_panel_health_snapshot(slots)
+    except Exception:
+        # Accepted-partial (review fix 4): a configuration-resolution failure keeps
+        # the recorded free replay (fail-open, never a paid re-dispatch bought by a
+        # transient config error) — but LOUDLY, never a silent except.
+        log.warning(
+            "plan-review replay decision could not resolve the current reviewer "
+            "configuration; keeping the recorded wave's free replay", exc_info=True)
+        return False, PLAN_NO_SNAPSHOT
+    if fresh is None:
+        return False, PLAN_NO_SNAPSHOT
+    normalized = sorted((
+        {"slot": str(r.get("slot") or ""), "code": str(r.get("code") or ""),
+         "reset_at": str(r.get("reset_at") or "")}
+        for r in stored if isinstance(r, dict)
+    ), key=lambda r: (r["slot"], r["code"], r["reset_at"]))
+    return plan_health_epoch(fresh) != normalized, fresh
+
+
+def plan_quorum_unreachable_facts(slot_records: List[dict], *, quorum: int) -> Dict[str, Any]:
+    """``{}`` or the typed structural-unreachability facts for one recorded wave,
+    computed from the wave's OWN typed rows (never from live state): when configured
+    minus structurally-dead slots cannot reach the quorum, no re-dispatch of this
+    envelope can close it. Dead means a typed window code that is UNDATED, or dated
+    with a reset still in the FUTURE (mirror of ``_structural_skip_code``): a row
+    whose recorded reset already passed may have healed and never counts.
+    ``earliest_reset`` is the earliest parseable reset among the dead rows (empty
+    when none names one)."""
+    from ouroboros.gateways.claudexor import WINDOW_EXHAUSTED_CODES
+
+    def _is_dead(r: dict) -> bool:
+        if str(r.get("failure_code") or "") not in WINDOW_EXHAUSTED_CODES:
+            return False
+        reset = str(r.get("reset_at") or "")
+        if not reset:
+            return True  # undated typed window code still counts
+        instant = parse_deadline_ts(reset)
+        return instant is not None and instant > utc_now()
+
+    dead = [r for r in slot_records if _is_dead(r)]
+    if not dead or len(slot_records) - len(dead) >= max(1, int(quorum)):
+        return {}
+    resets = sorted(
+        (instant, str(r.get("reset_at") or "")) for r in dead
+        if (instant := parse_deadline_ts(str(r.get("reset_at") or ""))) is not None
+    )
+    return {
+        "quorum_unreachable": True,
+        "structurally_dead_slots": [str(r.get("slot_id") or "") for r in dead],
+        "earliest_reset": resets[0][1] if resets else "",
+    }
 
 
 def plan_slot_fit(slots: list, *, prompt_chars: int, quorum: int) -> tuple[list, list[dict], str]:

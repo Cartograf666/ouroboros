@@ -716,6 +716,18 @@ def _attach_origin_from_metadata(ctx: ToolContext, evt: Dict[str, Any]) -> None:
         evt["origin_suppressed"] = True
 
 
+def _attach_client_surface(ctx: ToolContext, evt: Dict[str, Any]) -> None:
+    """Copy the routing turn's per-message client-surface fact onto a
+    promote/route/steer event BY VALUE (the origin_message_ref rail's sibling:
+    the fact was captured at ingress; producers never re-derive it)."""
+    metadata = getattr(ctx, "task_metadata", None)
+    if not isinstance(metadata, dict):
+        return
+    fact = metadata.get("client_surface")
+    if isinstance(fact, dict) and fact:
+        evt["client_surface"] = dict(fact)
+
+
 def _attach_swarm_intent(ctx: ToolContext, evt: Dict[str, Any]) -> None:
     """Carry host-attested Swarm intent into the admitted managed root."""
 
@@ -888,6 +900,7 @@ def _promote_chat_to_task(
     }
     _attach_origin_from_metadata(ctx, evt)
     _attach_swarm_intent(ctx, evt)
+    _attach_client_surface(ctx, evt)
     mode, confirmation = _emit_and_wait_for_routing(ctx, evt)
     if display_name:
         scope_note = f" in new project '{display_name}'"
@@ -1069,6 +1082,7 @@ def _route_to_project(
     }
     _attach_origin_from_metadata(ctx, evt)
     _attach_swarm_intent(ctx, evt)
+    _attach_client_surface(ctx, evt)
     mode, receipt = _emit_and_wait_for_routing(ctx, evt)
     name = str(proj.get("name") or pid)
     status = str(receipt.get("status") or "unconfirmed")
@@ -1152,6 +1166,7 @@ def _steer_task(ctx: ToolContext, task_id: str, message: str) -> str:
         if isinstance(_md, dict) else [],
         "ts": utc_now_iso(),
     }
+    _attach_client_surface(ctx, evt)
     mode, receipt = _emit_and_wait_for_routing(ctx, evt)
     status = str(receipt.get("status") or "unconfirmed")
     if status == "delivered":

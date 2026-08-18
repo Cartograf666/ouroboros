@@ -271,9 +271,7 @@ def _check_budget_limits(
                 return router_result
             tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
             suffix = (
-                _force_plan_disclosure(
-                    tool_ctx, trace, forced_reason="budget_exhausted",
-                )
+                _force_plan_disclosure(tool_ctx, trace, forced_reason="budget_exhausted")
                 if tool_ctx is not None else ""
             )
             # This early rejection is a forced sink like every other: nothing
@@ -306,9 +304,7 @@ def _check_budget_limits(
 
     if cost_ceiling is None or cost_ceiling.state != task_pacing.COST_CEILING_ACTIVE:
         return None
-    tree_info = _loop_tree_accounting(
-        refresh=True, max_age_sec=_TREE_ACCOUNTING_MAX_STALE_SEC,
-    )
+    tree_info = _loop_tree_accounting(refresh=True, max_age_sec=_TREE_ACCOUNTING_MAX_STALE_SEC)
     tree_cost = tree_info.get("accounted_usd") if isinstance(tree_info, dict) else None
     deciding, spend_basis = task_pacing.resolve_deciding_spend(
         tree_cost_usd=tree_cost,
@@ -420,9 +416,7 @@ def _loop_tree_accounting(
         if scope is None or not scope.root_task_id or scope.root_limit_usd is None:
             return None
         if refresh:
-            return refresh_root_accounting(
-                scope.drive_root, scope.root_task_id, max_age_sec=max_age_sec,
-            )
+            return refresh_root_accounting(scope.drive_root, scope.root_task_id, max_age_sec=max_age_sec)
         return last_root_accounting(scope.root_task_id)
     except Exception:
         log.debug("Tree accounting telemetry unavailable", exc_info=True)
@@ -714,9 +708,7 @@ def _begin_task_acceptance_fence(ctx: Any, task_id: str) -> tuple[bool, Any]:
     admission_agent = getattr(ctx, "owner_message_admission_agent", None)
     if admission_lock is not None and admission_agent is not None:
         with admission_lock:
-            ctx._task_acceptance_owner_generation = int(
-                getattr(admission_agent, "_owner_message_generation", 0) or 0
-            )
+            ctx._task_acceptance_owner_generation = int(getattr(admission_agent, "_owner_message_generation", 0) or 0)
     existing = getattr(ctx, "_task_acceptance_fence_token", None)
     if existing is not None:
         inspect = getattr(ctx, "inspect_acceptance_fence", None)
@@ -3281,7 +3273,9 @@ def _drain_incoming_messages(
                 content=dmsg,
                 msg_id=str(entry.get("msg_id") or ""),
             )
-            _append_or_merge_user_message(messages, _owner_marked_content(dmsg))
+            from ouroboros.client_surface import noted_owner_text
+
+            _append_or_merge_user_message(messages, _owner_marked_content(noted_owner_text(owner_ctx, entry, dmsg)))
             if event_queue is not None:
                 try:
                     event_queue.put_nowait({
