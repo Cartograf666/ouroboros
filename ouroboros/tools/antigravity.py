@@ -17,10 +17,14 @@ from __future__ import annotations
 import os
 import pathlib
 import shutil
-import signal
 import subprocess
 from typing import Any, List, Optional
 
+from ouroboros.platform_layer import (
+    kill_process_tree,
+    subprocess_new_group_kwargs,
+    terminate_process_tree,
+)
 from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for
 from ouroboros.utils import truncate_within_limit
 
@@ -70,16 +74,6 @@ def _clean_output(stdout: str, stderr: str) -> str:
     return "(Antigravity не вернул текстовый ответ.)"
 
 
-def _kill_process_tree(proc: subprocess.Popen[str]) -> None:
-    """Best-effort cleanup for the CLI and its language-server child."""
-
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except (OSError, ProcessLookupError):
-        try:
-            proc.terminate()
-        except (OSError, ProcessLookupError):
-            pass
 
 
 def _ask_antigravity(
@@ -149,14 +143,20 @@ def _ask_antigravity(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
+            **subprocess_new_group_kwargs(),
             env=None,  # inherit OAuth/keyring environment; never serialize it
         )
         try:
             stdout, stderr = proc.communicate(timeout=timeout + 15)
         except subprocess.TimeoutExpired:
-            _kill_process_tree(proc)
-            stdout, stderr = proc.communicate(timeout=5)
+            terminate_process_tree(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                # The CLI ignored SIGTERM. Escalate rather than leave the tree behind:
+                # this call site is allowlisted precisely because it reaps its own child.
+                kill_process_tree(proc)
+                stdout, stderr = proc.communicate(timeout=5)
             return (
                 f"⚠️ ANTIGRAVITY_TIMEOUT: CLI exceeded {timeout} seconds.\n"
                 + _clean_output(stdout, stderr)

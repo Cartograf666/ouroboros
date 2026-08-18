@@ -101,6 +101,8 @@ EXPECTED_TOOLS = [
     "browse_page", "browser_action",
     "run_ci_tests",
     "advisory_review", "review_status",
+    # v6.102 read-only second-opinion CLI consultation (ouroboros/tools/antigravity.py).
+    "antigravity_ask",
     "compact_context", "set_tool_timeout", "request_restart",
     "promote_to_stable", "schedule_subagent", "integrate_subagent_patch", "compare_subagent_patches",
     # C1: the explicit acceptance seam for a delegated run's captured patch —
