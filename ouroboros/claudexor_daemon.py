@@ -187,9 +187,6 @@ class OwnedClaudexorDaemon:
         self._last_error = ""
         self._engine_version = ""
         self._engine_build_sha = ""
-        # The last authenticated handshake's explicit servingMode ('' = the
-        # engine said nothing = normal).
-        self._serving_mode = ""
         # Rotation reconcile (B3): a non-blocking lock dedups CONCURRENT
         # ensures so they never double-POST settings; nothing else is gated.
         self._rotation_lock = threading.Lock()
@@ -216,7 +213,6 @@ class OwnedClaudexorDaemon:
         if not owned_daemon_provisioned():
             self._engine_version = ""
             self._engine_build_sha = ""
-            self._serving_mode = ""
             return None, "not_provisioned", ""
         try:
             endpoint = discover_daemon_at(owned_config_dir())
@@ -228,19 +224,13 @@ class OwnedClaudexorDaemon:
                 self._engine_version = gateway.engine_version
                 engine = handshake.get("engine") if isinstance(handshake.get("engine"), dict) else {}
                 self._engine_build_sha = str(engine.get("sha") or "")
-                # RECORDED, never waited on here: reachable-recovering is still
-                # "running" (the handshake proves identity and liveness), and
-                # admission is a separate, later question (`ensure_owned_gateway`).
-                self._serving_mode = _handshake_serving_mode(handshake)
+                # Reachable-recovering is still "running" (the handshake proves
+                # identity and liveness); admission is a separate, later
+                # question answered by `ensure_owned_gateway`'s own handshakes.
             return endpoint, "running", ""
         except ClaudexorUnavailable as exc:
             self._engine_version = ""
             self._engine_build_sha = ""
-            # ``_serving_mode`` is deliberately NOT cleared here: this method
-            # also runs unlocked (status polls), so a transient handshake
-            # failure must not clobber a just-recorded mode for concurrent
-            # readers. Failure paths never write the mode; it always holds
-            # the LAST SUCCESSFUL handshake's answer.
             status = int(getattr(exc, "status_code", 0) or 0)
             if status in (401, 403):
                 return None, "foreign_daemon", (
