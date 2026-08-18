@@ -62,3 +62,61 @@ def test_atomic_write_json_still_works(tmp_path):
     atomic_write_json(target, {"a": 1, "b": [2, 3]})
     import json
     assert json.loads(target.read_text(encoding="utf-8")) == {"a": 1, "b": [2, 3]}
+
+
+def test_replace_retries_windows_sharing_violation_then_succeeds(tmp_path, monkeypatch):
+    """Transient PermissionError (Windows winerror 5/32 sharing violation: a
+    reader holds the destination open without FILE_SHARE_DELETE) must be
+    absorbed by a bounded retry — the write lands and the file is intact."""
+    target = tmp_path / "job.json"
+    target.write_text("OLD", encoding="utf-8")
+    real_replace = utils.os.replace
+    calls = {"n": 0}
+
+    def _flaky_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            raise PermissionError(13, "The process cannot access the file")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(utils.os, "replace", _flaky_replace)
+    monkeypatch.setattr(utils.time, "sleep", lambda _s: None)
+    write_text_atomic(target, "NEW")
+    assert calls["n"] == 4
+    assert target.read_text(encoding="utf-8") == "NEW"
+    assert not list(tmp_path.glob(".job.json.tmp.*"))
+
+
+def test_replace_raises_permission_error_after_bounded_retries(tmp_path, monkeypatch):
+    """A persistent PermissionError (a genuinely locked file) must surface
+    honestly after the retry bound — never swallowed, never unbounded."""
+    target = tmp_path / "job.json"
+    target.write_text("OLD", encoding="utf-8")
+    calls = {"n": 0}
+
+    def _always_denied(src, dst):
+        calls["n"] += 1
+        raise PermissionError(13, "The process cannot access the file")
+
+    monkeypatch.setattr(utils.os, "replace", _always_denied)
+    monkeypatch.setattr(utils.time, "sleep", lambda _s: None)
+    with pytest.raises(PermissionError):
+        write_text_atomic(target, "NEW CONTENT THAT NEVER LANDS")
+    assert calls["n"] == utils._REPLACE_RETRY_ATTEMPTS
+    assert target.read_text(encoding="utf-8") == "OLD"
+    assert not list(tmp_path.glob(".job.json.tmp.*"))
+
+
+def test_replace_atomic_does_not_retry_other_oserrors(tmp_path, monkeypatch):
+    """Only the Windows sharing-violation class retries; any other OSError
+    (POSIX-visible failures included) propagates on the first attempt."""
+    calls = {"n": 0}
+
+    def _boom(src, dst):
+        calls["n"] += 1
+        raise OSError("disk detached")
+
+    monkeypatch.setattr(utils.os, "replace", _boom)
+    with pytest.raises(OSError):
+        utils.replace_atomic(tmp_path / "a", tmp_path / "b")
+    assert calls["n"] == 1
