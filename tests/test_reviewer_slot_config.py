@@ -717,3 +717,36 @@ def test_malformed_advisory_route_raises_typed_not_attributeerror(monkeypatch):
     monkeypatch.setenv(rsc.REVIEWER_SLOTS_ENV, good)
     assert rsc.reviewer_slot_config_error() == ""
     assert rsc.parse_reviewer_slots(good).advisory.target_id == "codex"
+
+
+def test_last_execution_carries_typed_failure_facts():
+    """B1: the last-execution projection keeps the typed failure facts a failed slot
+    carried (failure_code / reset_at / transport_status / http_status) so a later
+    health surface (B4-lite) can read them; a healthy row grows no placeholder keys."""
+    from types import SimpleNamespace
+
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewSlot
+    from ouroboros.reviewer_slot_config import (
+        record_reviewer_slot_executions,
+        reviewer_slot_last_executions,
+    )
+
+    dead_slot = ReviewSlot(slot_id="t_dead", model="cursor=grok", effort="high",
+                           route=ReviewRouteKind.AGENT_SESSION, session_target="cursor=grok")
+    dead = SimpleNamespace(slot_id="t_dead", status="error", usage={},
+                           failure_code="subscription_window_exhausted",
+                           reset_at="2030-01-01T00:00:00Z", http_status=429,
+                           transport_status="provider_transport_error")
+    ok_slot = ReviewSlot(slot_id="t_alive", model="m/a", effort="high",
+                         route=ReviewRouteKind.API_CHAT)
+    alive = SimpleNamespace(slot_id="t_alive", status="ok", usage={})
+    record_reviewer_slot_executions(
+        "multi_model_review", [dead, alive], {"t_dead": dead_slot, "t_alive": ok_slot})
+    rows = reviewer_slot_last_executions()
+    assert rows["t_dead"]["failure_code"] == "subscription_window_exhausted"
+    assert rows["t_dead"]["reset_at"] == "2030-01-01T00:00:00Z"
+    assert rows["t_dead"]["transport_status"] == "provider_transport_error"
+    assert rows["t_dead"]["http_status"] == 429
+    for key in ("failure_code", "reset_at", "transport_status", "http_status"):
+        assert key not in rows["t_alive"]

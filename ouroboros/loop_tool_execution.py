@@ -74,7 +74,9 @@ _FAILURE_PREFIXES = (
     "⚠️ INTEGRATE_",
 )
 
-_PLAN_REVIEW_OUTCOMES = frozenset({"GREEN", "REVIEW_REQUIRED", "REVISE_PLAN"})
+# B2 (honest DEGRADED): the no-quorum aggregate is a legal, always-OPEN control
+# outcome — the render layer no longer launders it into REVIEW_REQUIRED.
+_PLAN_REVIEW_OUTCOMES = frozenset({"GREEN", "REVIEW_REQUIRED", "REVISE_PLAN", "DEGRADED"})
 
 
 def _parse_plan_review_control(text: str) -> tuple[str, bool] | None:
@@ -105,7 +107,7 @@ def _parse_plan_review_control(text: str) -> tuple[str, bool] | None:
     closed = payload.get("closed")
     if outcome not in _PLAN_REVIEW_OUTCOMES or type(closed) is not bool:
         return None
-    if (outcome == "GREEN" and not closed) or (outcome == "REVISE_PLAN" and closed):
+    if (outcome == "GREEN" and not closed) or (outcome in {"REVISE_PLAN", "DEGRADED"} and closed):
         return None
     return outcome, closed
 _FAILURE_MARKERS = (

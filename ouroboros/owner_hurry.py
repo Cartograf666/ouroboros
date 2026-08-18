@@ -516,9 +516,13 @@ def plan_review_reminder(decision: Dict[str, Any]) -> str:
             "plan_task with your goal, plan and spec to start a fresh review before finalizing."
         )
     if decision.get("reviewer_slots_degraded"):
+        # B2: facts, never a retry coach (P5). The recorded wave carries each slot's typed
+        # state; an identical envelope replays it free; a changed spec buys the next cycle.
         return (
-            f"{tag} Blocking plan review returned no parseable quorum (DEGRADED). Re-call "
-            "plan_task with the same envelope to re-run the panel (no cycle is consumed)."
+            f"{tag} Blocking plan review is OPEN with no parseable reviewer quorum (DEGRADED). "
+            "The recorded wave lists each reviewer slot's typed state and reset time; an "
+            "identical envelope replays that recorded result at no cost, and a changed spec "
+            "starts the next paid cycle. Implementation stays held while the review is open."
         )
     if outcome == "REVIEW_REQUIRED":
         return (
@@ -562,6 +566,17 @@ def plan_review_disclosure(decision: Dict[str, Any], forced_reason: str = "") ->
             f"\n\n⚠️ Blocking plan review stayed open ({outcome or 'open'}) with the review-cycle "
             f"cap spent ({decision.get('cycles_paid')} paid cycle(s)); the task is finalized as "
             "blocked_with_evidence — the planned work must not be treated as done."
+        )
+    if decision.get("quorum_unreachable") and decision.get("enforcement") == "blocking":
+        # B2b: the agent chose the honest blocked terminal while the reviewer quorum
+        # was structurally unreachable; the review stays open and nothing was built.
+        reset = str(decision.get("earliest_reset") or "")
+        return (
+            f"\n\n⚠️ Blocking plan review stayed open ({outcome or 'open'}) with its reviewer "
+            "quorum structurally unreachable (typed window-exhausted reviewer lanes"
+            + (f"; earliest recorded reset {reset}" if reset else "")
+            + "); the task is finalized as blocked_with_evidence — the planned work must "
+            "not be treated as done."
         )
     if decision.get("allow"):
         return (

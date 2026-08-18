@@ -152,6 +152,13 @@ REASON_ACCEPTANCE_SKIPPED_OWNER_HURRY = "owner_hurry"
 # ``best_effort`` — with the reviewer findings preserved in the review axis.
 REASON_REVIEW_CYCLES_EXHAUSTED = "review_cycles_exhausted"
 
+# B2b: a BLOCKING plan review whose recorded wave proves its reviewer quorum is
+# STRUCTURALLY unreachable (typed window-exhausted rows leave fewer live slots
+# than the quorum). The gate releases finalization for an agent-CHOSEN honest
+# blocked terminal — the review stays open, implementation stays held, and the
+# objective terminalizes BLOCKED exactly like the spent-cap case above.
+REASON_REVIEW_QUORUM_UNREACHABLE = "plan_review_quorum_unreachable"
+
 # CLOSED mapping: forced-finalization rail (the loop's typed reason_code) -> typed
 # acceptance-bypass reason, stamped by the loop's common forced-finalization recorder
 # when the panel was OWED (eligible) but a rail ended the task first. Both deadline
@@ -1001,17 +1008,23 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
     review = _review_axis(llm_trace)
     objective = _objective_axis(review)
     plan_gate = _trace_mapping(llm_trace, "force_plan_decision")
-    if (
-        str(plan_gate.get("status") or "") == "cycles_exhausted"
-        and str(plan_gate.get("enforcement") or "") == "blocking"
+    _plan_gate_status = str(plan_gate.get("status") or "")
+    if str(plan_gate.get("enforcement") or "") == "blocking" and (
+        _plan_gate_status == "cycles_exhausted"
+        or (_plan_gate_status == "open" and plan_gate.get("quorum_unreachable"))
     ):
-        # D27: a blocking plan review whose cycle cap is spent never closed —
-        # the task terminalizes BLOCKED, never best_effort.
+        # D27: a blocking plan review whose cycle cap is spent never closed — the
+        # task terminalizes BLOCKED, never best_effort. B2b extends the same honest
+        # terminal to a structurally unreachable reviewer quorum (the agent CHOSE to
+        # finalize; the review itself stays open and implementation stayed held).
+        _quorum_case = _plan_gate_status != "cycles_exhausted"
         objective.update({
             "status": OBJECTIVE_FAIL,
-            "source": "plan_review_cycles_exhausted",
+            "source": ("plan_review_quorum_unreachable" if _quorum_case
+                       else "plan_review_cycles_exhausted"),
             "outcome_tier": OUTCOME_TIER_BLOCKED,
-            "reason": REASON_REVIEW_CYCLES_EXHAUSTED,
+            "reason": (REASON_REVIEW_QUORUM_UNREACHABLE if _quorum_case
+                       else REASON_REVIEW_CYCLES_EXHAUSTED),
         })
     if deferred_child_count and objective.get("status") != OBJECTIVE_FAIL:
         objective.update({
