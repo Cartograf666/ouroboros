@@ -1,0 +1,357 @@
+schema_version: 3
+contract_id: COST-AWARE-MODEL-ROUTING-V1
+status: draft
+implementation_authorized: false
+document_depth: COMPACT_PRD
+discovery_mode: direct
+
+source_documents:
+  decision_brief: null
+  prd: .ai/specs/cost-aware-model-routing/PRD.md
+  technical_brief: .ai/specs/cost-aware-model-routing/TECHNICAL-BRIEF.md
+  technical_brief_omission_reason: null
+  architecture_manifest: .ai/architecture.yaml
+  architecture_baseline: null
+  design_system_manifest: null
+  design_brief: null
+
+run_spec:
+  objective: >-
+    Record a deterministic, reasoned placement recommendation on every eligible subagent dispatch
+    and enrolled internal call, and surface it per task and in aggregate, without changing any
+    route, model, locality, executor or tool profile.
+  non_goals:
+    - Granting the router authority over any route; that is a separate later contract.
+    - Review lanes (triad, scope, plan, skill review, deep self-review).
+    - Any change to a threshold, gate constant, grandfather set, or the OUROBOROS_CONTEXT_MODE default.
+    - Any change to the default model of any slot.
+    - Any new UI page, design token, primitive, or component API.
+  acceptance_criteria:
+    - id: AC-1
+      statement: >-
+        For a dispatch with model_lane="auto", the dispatch record carries a metering
+        recommendation with a typed reason, and the resolved lane, model, locality, executor and
+        tool profile are identical to the values resolved without the router.
+      source_requirement_ids: [FR-1, NFR-1]
+      verification_gate_ids: [GATE-UNIT, GATE-SUITE]
+    - id: AC-2
+      statement: >-
+        For a dispatch with an explicitly declared lane, the recorded recommendation is
+        explicit_declaration and no placement recommendation is produced.
+      source_requirement_ids: [FR-5]
+      verification_gate_ids: [GATE-UNIT]
+    - id: AC-3
+      statement: >-
+        An enrolled internal call site records a lane and locality recommendation keyed on its
+        source label, and the call's actual model, locality and parameters are unchanged.
+      source_requirement_ids: [FR-2, NFR-1]
+      verification_gate_ids: [GATE-UNIT, GATE-SUITE]
+    - id: AC-4
+      statement: >-
+        With the evidence projection absent, unreadable, or truncated, the surrounding operation
+        completes normally and records recommendation_unavailable with the reason.
+      source_requirement_ids: [FR-9]
+      verification_gate_ids: [GATE-UNIT]
+    - id: AC-5
+      statement: >-
+        The router makes no model call and no network call on any path, proven by a test that
+        fails if the provider seam or an HTTP client is reached during recommendation.
+      source_requirement_ids: [FR-3]
+      verification_gate_ids: [GATE-UNIT]
+    - id: AC-6
+      statement: >-
+        The router performs no full read of usage_attempts.jsonl or any other append-only store
+        on the decision path.
+      source_requirement_ids: [FR-4, NFR-2]
+      verification_gate_ids: [GATE-UNIT]
+    - id: AC-7
+      statement: >-
+        Identical inputs produce an identical recommendation and reason across repeated calls and
+        across a fresh process.
+      source_requirement_ids: [NFR-3]
+      verification_gate_ids: [GATE-UNIT]
+    - id: AC-8
+      statement: >-
+        The chat card for a task carrying a recommendation displays it and its reason, and the
+        additive-optional outbound field is pinned by the frozen-contract tests.
+      source_requirement_ids: [FR-6]
+      verification_gate_ids: [GATE-CONTRACTS, GATE-UNIT]
+    - id: AC-9
+      statement: >-
+        The savings summary reports, for a bounded window, recommendation counts by kind, the
+        estimated spend difference, and the observed mismatch count, labelled as counterfactual.
+      source_requirement_ids: [FR-7]
+      verification_gate_ids: [GATE-UNIT]
+    - id: AC-10
+      statement: >-
+        The evidence projection appears in the context_budget.py threshold table with a justified
+        constant and is reported by the hot-store growth probe.
+      source_requirement_ids: [FR-8, NFR-5]
+      verification_gate_ids: [GATE-UNIT, GATE-SMOKE]
+    - id: AC-11
+      statement: >-
+        MAX_TOTAL_FUNCTIONS, MAX_MODULE_LINES, MAX_FUNCTION_LINES, every GRANDFATHERED_* set and
+        the OUROBOROS_CONTEXT_MODE default are unchanged, and the size gates pass with no new
+        grandfather entry.
+      source_requirement_ids: [NFR-4]
+      verification_gate_ids: [GATE-SMOKE, GATE-LINT]
+    - id: AC-12
+      statement: >-
+        The routing leaf imports no routing owner (one-way seam), no dispatch resolver reads its
+        output, and the change introduces no platform-layer or process-custody violation.
+      source_requirement_ids: [NFR-1, FR-3]
+      verification_gate_ids: [GATE-PLATFORM, GATE-CUSTODY, GATE-UNIT]
+  constraints:
+    - The router must not perform a model call or a network call.
+    - The router must not read a growing append-only store on the decision path (projection over replay).
+    - A new durable store must be enrolled in ouroboros/context_budget.py in the same commit.
+    - An explicitly declared lane always suppresses the recommendation.
+    - The recommendation must not be an input to dispatch resolution.
+    - Implementation may not begin while the reviewed commit gate is red.
+  compatibility_requirements:
+    - Existing dispatch resolution behavior is unchanged for every task.
+    - Any outbound contract change is additive-optional and pinned in tests/test_contracts.py.
+  risk_level: medium
+  human_approval_required_for:
+    - Granting the router authority over any route.
+    - Any change to a gate constant, threshold, or grandfather set.
+    - Any frozen-ABI extension beyond one additive-optional outbound field.
+    - Any change to a default model slot.
+    - Hooking the task-settle path (ouroboros/outcomes.py, ouroboros/task_finalization.py) to
+      write the evidence projection. Permitted only with no new authority, lifecycle branch, or
+      terminal state. Expressed here rather than as a conditional component because the schema
+      forbids one component being both allowed and conditional.
+
+change_envelope:
+  primary_component: routing-evidence
+  allowed_components:
+    routing-evidence:
+      reason: New pure recommendation leaf plus its bounded evidence projection.
+      depth: full
+      paths:
+        - ouroboros/routing_recommendation.py
+        - ouroboros/routing_evidence.py
+    agent-core:
+      reason: >-
+        Attach the recommendation after dispatch resolution (subagents.py), record it at the
+        enrolled internal call sites, and enrol the new store in the threshold table.
+      depth: methods-only
+      paths:
+        - ouroboros/subagents.py
+        - ouroboros/consolidator.py
+        - ouroboros/project_naming.py
+        - ouroboros/semantic_dedup.py
+        - ouroboros/review_execution.py
+        - ouroboros/context_budget.py
+        - ouroboros/outcomes.py
+        - ouroboros/task_finalization.py
+    contracts:
+      reason: One additive-optional outbound field carrying the recommendation to the chat card.
+      depth: methods-only
+      paths:
+        - ouroboros/contracts/api_v1.py
+    web-ui:
+      reason: Render the recommendation on the existing chat card.
+      depth: methods-only
+      paths:
+        - web/modules/chat.js
+    governance-docs:
+      reason: Document the router, its deliberate non-authority, and the new durable store.
+      depth: methods-only
+      paths:
+        - docs/ARCHITECTURE.md
+    tests:
+      reason: Verify the approved acceptance behavior.
+      depth: full
+      paths:
+        - tests/**
+  conditional_components: {}
+  forbidden_components:
+    - usage-ledger
+    - launcher
+    - supervisor
+    - marketplace
+    - harness-gateways
+    - skills
+    - devtools
+    - platform-layer
+  protected_interfaces:
+    - ouroboros/contracts/** (frozen ABI; additive-optional only, pinned in tests/test_contracts.py)
+    - ouroboros/review.py gate constants (MAX_MODULE_LINES, MAX_FUNCTION_LINES, MAX_TOTAL_FUNCTIONS, GRANDFATHERED_*)
+    - ouroboros/size_ratchet_manifest.py and the checked-in size-ratchet manifest
+    - ouroboros/config.py SETTINGS_DEFAULTS model slots and OUROBOROS_CONTEXT_MODE
+    - ouroboros/tools/review.py, tools/scope_review.py, tools/plan_review.py (review lanes are out of scope)
+    - ouroboros/review_execution.py reviewer slot and route selection (only verdict extraction is in scope)
+    - ouroboros/llm.py (provider transport)
+    - BIBLE.md
+  architecture_acceptance:
+    - ARCH-ROUTING_LEAF_IS_ONE_WAY holds; the leaf imports no routing owner.
+    - ARCH-ROUTING_LEAF_HAS_NO_AUTHORITY holds; no dispatch resolver reads the recommendation.
+    - ARCH-NO_LEDGER_REPLAY_ON_HOT_PATH holds; the decision path reads only a bounded projection.
+    - ARCH-NO_PLATFORM_OUTSIDE_LAYER and the process-custody rule remain satisfied by the change.
+    - No module crosses MAX_MODULE_LINES and no new grandfather entry is added.
+
+quality_gates:
+  - id: GATE-LINT
+    command: uv run --locked python -m ruff check . --select F
+    source: existing-repository
+    trust: reviewed
+    requires_approval: false
+    sandbox: required
+    network: deny
+    secrets: none
+    timeout_seconds: 300
+    resolved_input_paths:
+      - pyproject.toml
+      - uv.lock
+  - id: GATE-UNIT
+    command: uv run --locked python -m pytest tests/ -q -k routing
+    source: existing-repository
+    trust: reviewed
+    requires_approval: false
+    sandbox: required
+    network: deny
+    secrets: none
+    timeout_seconds: 900
+    resolved_input_paths:
+      - pyproject.toml
+      - tests/conftest.py
+  - id: GATE-SMOKE
+    command: uv run --locked python -m pytest tests/test_smoke.py -q
+    source: existing-repository
+    trust: reviewed
+    requires_approval: false
+    sandbox: required
+    network: deny
+    secrets: none
+    timeout_seconds: 900
+    resolved_input_paths:
+      - pyproject.toml
+      - tests/conftest.py
+      - tests/test_smoke.py
+      - ouroboros/review.py
+  - id: GATE-CONTRACTS
+    command: uv run --locked python -m pytest tests/test_contracts.py -q
+    source: existing-repository
+    trust: reviewed
+    requires_approval: false
+    sandbox: required
+    network: deny
+    secrets: none
+    timeout_seconds: 600
+    resolved_input_paths:
+      - pyproject.toml
+      - tests/conftest.py
+      - tests/test_contracts.py
+  - id: GATE-PLATFORM
+    command: uv run --locked python -m pytest tests/test_platform_guard.py -q
+    source: existing-repository
+    trust: reviewed
+    requires_approval: false
+    sandbox: required
+    network: deny
+    secrets: none
+    timeout_seconds: 300
+    resolved_input_paths:
+      - pyproject.toml
+      - tests/test_platform_guard.py
+      - ouroboros/platform_layer.py
+  - id: GATE-CUSTODY
+    command: uv run --locked python -m pytest tests/test_process_custody.py -q
+    source: existing-repository
+    trust: reviewed
+    requires_approval: false
+    sandbox: required
+    network: deny
+    secrets: none
+    timeout_seconds: 900
+    resolved_input_paths:
+      - pyproject.toml
+      - tests/test_process_custody.py
+      - ouroboros/process_custody.py
+  - id: GATE-SUITE
+    command: uv run --locked python -m pytest tests/ -q
+    source: existing-repository
+    trust: reviewed
+    requires_approval: false
+    sandbox: required
+    network: deny
+    secrets: none
+    timeout_seconds: 1800
+    resolved_input_paths:
+      - pyproject.toml
+      - tests/conftest.py
+
+test_policy:
+  acceptance_test_owner: tester
+  writer_may_modify_acceptance_tests: false
+  freeze_after_state: TEST_DESIGN
+  acceptance_tests_required: true
+
+design_policy:
+  applies: false
+  reason: >-
+    No UI design work. The recommendation rides the existing ChatOutbound projection already used
+    by review_projection and is rendered with existing typography and status conventions; no new
+    page, token, primitive, or component API is introduced.
+  system_status: not-applicable
+  required_gate_ids: []
+  acceptance: []
+
+automation:
+  requested_mode: bounded-auto
+  # Most-restrictive wins: .ai/architecture.yaml sets the PROJECT mode to manual, so the
+  # effective mode is manual regardless of what this task requested.
+  effective_mode: manual
+  policy_sources:
+    - source: project
+      mode: manual
+    - source: task
+      mode: bounded-auto
+  max_implementation_attempts: 3
+  max_review_rounds: 2
+  max_parallel_writers: 1
+  max_tool_calls: 400
+  max_elapsed_minutes: 180
+  max_budget_usd: 25
+
+interaction_policy:
+  intake_mode: guided
+  progress_updates: state-transitions
+  interrupt_for:
+    - protected-decision
+    - contract-change
+    - change-envelope-expansion
+    - budget-exhaustion
+    - required-gate-unavailable
+    - provider-substitution
+    - terminal-failure
+  continue_until: accepted-or-terminal
+  resume_from_run_record: true
+
+provider_policy:
+  allowed_providers: [host]
+  sensitive_path_policy: deny
+  allow_external_code_transfer: false
+  role_assignments:
+    manager: {preferred: "host:best-available", fallbacks: []}
+    scout: {preferred: "host:best-available", fallbacks: []}
+    tester: {preferred: "host:best-available", fallbacks: []}
+    writer: {preferred: "host:best-available", fallbacks: []}
+    verifier: {preferred: "host:best-available", fallbacks: []}
+    reviewer: {preferred: "host:best-available", fallbacks: []}
+  substitution_policy: ask
+  reviewer_independence: different-context
+
+approval:
+  status: pending
+  approved_by: null
+  approved_at: null
+  method: null
+  key_id: null
+  authority_event_id: null
+  attestation_hmac_sha256: null
+  source_revision: null
+  artifact_hashes: {}
+  gate_input_hashes: {}
+  contract_payload_sha256: null

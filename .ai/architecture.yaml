@@ -1,0 +1,284 @@
+schema_version: 1
+status: provisional
+architecture_style: >-
+  Self-modifying agent runtime. A release-reviewed outer launcher supervises a self-editable
+  inner server; a single gateway fronts every browser and CLI client; a supervisor owns the
+  durable queue and a multiprocess worker pool; the agent core runs inside workers behind a
+  frozen ABI. Documented in docs/ARCHITECTURE.md, which remains the SSOT — this manifest is a
+  machine-checkable projection of it and MUST NOT restate its content.
+
+# SSOT POINTERS. BIBLE.md Principle 7 forbids a second canonical location for any fact, so this
+# manifest carries rules and pointers only. Where a rule already has a canonical home, the home
+# wins and this file names it.
+#   BIBLE.md              -> constitutional values (13 principles)
+#   docs/ARCHITECTURE.md  -> structural/operational map, protected boundaries, rationale
+#   docs/DEVELOPMENT.md   -> naming, module patterns, size budgets, invariants
+#   docs/CHECKLISTS.md    -> review checklists
+#   ouroboros/config.py   -> runtime defaults
+#   ouroboros/review.py   -> size/count gate constants and grandfather sets
+
+automation:
+  mode: manual
+  auto_allow: [tests, internal_dto, generated_types]
+  ask:
+    - public_api
+    - external_api_contract
+    - new_dependency
+    - cross_component_dependency
+    - authentication
+    - authorization
+  deny:
+    - production_deployment
+    - destructive_migration
+    - credential_change
+
+components:
+  launcher:
+    paths: [launcher.py, ouroboros/launcher_bootstrap.py, ouroboros/launcher_onboarding.py]
+    responsibilities:
+      - "OBSERVED+APPROVED: single-instance PID lock, packaged bundle bootstrap, server process supervision, desktop/browser presentation, restart signal, final cleanup (docs/ARCHITECTURE.md Runtime topology)."
+      - "The running packaged launcher is deliberately OUTSIDE managed hot-swap; it is the continuity role that can finish, retry or roll back an inner-body transition."
+    public_interfaces: ["exit code 42 = managed restart request", "data/state/server_process.json"]
+    internal_interfaces: []
+    required_gate_ids: [GATE-SMOKE, GATE-SUITE]
+    change_approval_class: human
+  server-runtime:
+    paths:
+      - server.py
+      - ouroboros/server_auth.py
+      - ouroboros/server_control.py
+      - ouroboros/server_entrypoint.py
+      - ouroboros/server_runtime.py
+      - ouroboros/server_web.py
+    responsibilities:
+      - "OBSERVED+APPROVED: the self-editable inner body. Hosts HTTP/WebSocket, the gateway, message bus, supervisor and worker pool."
+    public_interfaces: ["HTTP/WS on the configured host:port"]
+    internal_interfaces: []
+    required_gate_ids: [GATE-SUITE]
+    change_approval_class: manager
+  gateway:
+    paths: [ouroboros/gateway/**]
+    responsibilities:
+      - "APPROVED (docs/ARCHITECTURE.md 'Gateway Boundary v1'): the single inbound HTTP/WebSocket boundary for browser and CLI clients."
+      - "Domain handlers translate transport into calls on existing runtime owners and MUST NOT acquire a second copy of queue, review, settings or lifecycle policy."
+    public_interfaces: ["/api/** routes", "WebSocket frames declared in ouroboros/contracts/api_v1.py"]
+    internal_interfaces: [ouroboros/gateway/_helpers.py]
+    required_gate_ids: [GATE-CONTRACTS, GATE-SUITE]
+    change_approval_class: manager
+  supervisor:
+    paths: [supervisor/**]
+    responsibilities:
+      - "OBSERVED+APPROVED: durable queue authority (PENDING/RUNNING), worker pool, task lifecycle and cancellation custody, managed update and git recovery."
+    public_interfaces: [supervisor/message_bus.py, supervisor/queue.py]
+    internal_interfaces: []
+    required_gate_ids: [GATE-SUITE]
+    change_approval_class: manager
+  agent-core:
+    # Principal owners named explicitly. The manifest names OWNERS, not every file; the
+    # complete module map is docs/ARCHITECTURE.md Section 1 and is not duplicated here.
+    # Globs are avoided at this depth because the validator treats any two same-depth globs as
+    # overlapping.
+    paths:
+      - ouroboros/agent.py
+      - ouroboros/agent_task_pipeline.py
+      - ouroboros/agent_startup_checks.py
+      - ouroboros/loop.py
+      - ouroboros/loop_llm_call.py
+      - ouroboros/loop_tool_execution.py
+      - ouroboros/context.py
+      - ouroboros/context_fit.py
+      - ouroboros/context_budget.py
+      - ouroboros/context_layout.py
+      - ouroboros/memory.py
+      - ouroboros/consciousness.py
+      - ouroboros/outcomes.py
+      - ouroboros/task_finalization.py
+      - ouroboros/consolidator.py
+      - ouroboros/project_naming.py
+      - ouroboros/semantic_dedup.py
+      - ouroboros/subagents.py
+      - ouroboros/llm.py
+      - ouroboros/usage_accounting.py
+      - ouroboros/review.py
+      - ouroboros/review_substrate.py
+      - ouroboros/review_execution.py
+      - ouroboros/config.py
+    responsibilities:
+      - "OBSERVED+APPROVED: task orchestration, LLM loop, context assembly, memory, outcomes, usage accounting, review substrate."
+    public_interfaces: [ouroboros/agent.py, ouroboros/loop.py]
+    internal_interfaces: []
+    required_gate_ids: [GATE-SMOKE, GATE-SUITE]
+    change_approval_class: manager
+  tools:
+    paths: [ouroboros/tools/**]
+    responsibilities:
+      - "OBSERVED+APPROVED: the agent-callable tool surface and its deterministic guards. ToolRegistry is the single registration and gating point."
+    public_interfaces: ["Tool API v2 canonical names (docs/ARCHITECTURE.md 'Tool capability and execution')"]
+    internal_interfaces: []
+    required_gate_ids: [GATE-SMOKE, GATE-SUITE]
+    change_approval_class: manager
+  contracts:
+    paths: [ouroboros/contracts/**]
+    responsibilities:
+      - "APPROVED (docs/ARCHITECTURE.md Section 11): FROZEN ABI. Extension is additive and must update Section 11.1 and tests/test_contracts.py in the same change."
+    public_interfaces: [ouroboros/contracts/api_v1.py, ouroboros/contracts/plugin_api.py, ouroboros/contracts/tool_abi.py]
+    internal_interfaces: []
+    required_gate_ids: [GATE-CONTRACTS]
+    change_approval_class: human
+  platform-layer:
+    paths: [ouroboros/platform_layer.py]
+    responsibilities:
+      - "APPROVED (docs/DEVELOPMENT.md 'Platform Abstraction Rule'): the only home for platform-specific APIs."
+    public_interfaces: [ouroboros/platform_layer.py]
+    internal_interfaces: []
+    required_gate_ids: [GATE-PLATFORM]
+    change_approval_class: manager
+  routing-evidence:
+    paths: [ouroboros/routing_recommendation.py, ouroboros/routing_evidence.py]
+    responsibilities:
+      - "PROVISIONAL (this manifest, pending approval): a PURE placement-recommendation function and a bounded evidence projection."
+      - "It is an advisory LEAF. No routing owner may read its output to make a decision; granting it authority is a separate approved change."
+    public_interfaces: [recommend_placement, evidence_projection_path]
+    internal_interfaces: []
+    required_gate_ids: [GATE-UNIT, GATE-SMOKE]
+    change_approval_class: manager
+  usage-ledger:
+    paths: [ouroboros/usage_ledger.py]
+    responsibilities:
+      - "APPROVED (docs/ARCHITECTURE.md 'Usage ledger substrate vs. accounting policy'): the durable append-only physical-attempt substrate. ONE-WAY SEAM — accounting imports it, it never imports accounting."
+    public_interfaces: [append, replay]
+    internal_interfaces: []
+    required_gate_ids: [GATE-SUITE]
+    change_approval_class: human
+  harness-gateways:
+    paths: [ouroboros/gateways/**]
+    responsibilities:
+      - "OBSERVED: read-only advisory boundary to external coding harnesses (Claude Agent SDK, Claudexor)."
+    public_interfaces: [run_readonly]
+    internal_interfaces: []
+    required_gate_ids: [GATE-SUITE]
+    change_approval_class: manager
+  marketplace:
+    paths: [ouroboros/marketplace/**]
+    responsibilities: ["OBSERVED: skill catalog fetch, provenance, isolated dependency install."]
+    public_interfaces: []
+    internal_interfaces: []
+    required_gate_ids: [GATE-SUITE]
+    change_approval_class: manager
+  web-ui:
+    paths: [web/**]
+    responsibilities:
+      - "OBSERVED+APPROVED: build-free ES-module SPA. Requests go through web/modules/api_client.js; every long-lived acquisition carries a disposer (docs/DEVELOPMENT.md 'UI resources carry a disposer')."
+    public_interfaces: [web/modules/api_client.js]
+    internal_interfaces: []
+    required_gate_ids: [GATE-SMOKE]
+    change_approval_class: manager
+  skills:
+    paths: [skills/**]
+    responsibilities: ["OBSERVED+APPROVED: reviewed external capability bound by contracts/plugin_api.py."]
+    public_interfaces: [plugin.py::register]
+    internal_interfaces: []
+    required_gate_ids: [GATE-SUITE]
+    change_approval_class: manager
+  devtools:
+    paths: [devtools/**]
+    responsibilities:
+      - "APPROVED (docs/ARCHITECTURE.md 'Devtools boundary'): tracked operator tooling OUTSIDE runtime and package discovery."
+    public_interfaces: []
+    internal_interfaces: []
+    required_gate_ids: []
+    change_approval_class: auto-low-risk
+  governance-docs:
+    paths: [docs/**]
+    responsibilities:
+      - "APPROVED: the architectural, procedural and review SSOT. docs/ARCHITECTURE.md must be updated with the code it describes (Key Invariant 7)."
+    public_interfaces: [docs/ARCHITECTURE.md, docs/DEVELOPMENT.md, docs/CHECKLISTS.md]
+    internal_interfaces: []
+    required_gate_ids: []
+    change_approval_class: manager
+  tests:
+    paths: [tests/**]
+    responsibilities: ["OBSERVED: the deterministic immune system; owns every gate listed here."]
+    public_interfaces: []
+    internal_interfaces: []
+    required_gate_ids: []
+    change_approval_class: auto-low-risk
+
+dependency_rules:
+  # APPROVED + GATED by tests/test_no_core_a2a_telegram_imports.py: core must not import the
+  # a2a/telegram transport surfaces.
+  - id: ARCH-NO_CORE_TO_TRANSPORT_SKILLS
+    from: agent-core
+    to: skills
+    decision: deny
+  # APPROVED by docs/ARCHITECTURE.md "Devtools boundary" and OBSERVED (zero violations in tree),
+  # but NOT gated deterministically. A proposed GATE-DEVTOOLS would close it; not added here
+  # because adding a gate is itself a change requiring approval.
+  - id: ARCH-NO_RUNTIME_TO_DEVTOOLS
+    from: agent-core
+    to: devtools
+    decision: deny
+  # APPROVED + GATED by tests/test_platform_guard.py: platform-specific APIs are reachable only
+  # through ouroboros/platform_layer.py.
+  - id: ARCH-NO_PLATFORM_OUTSIDE_LAYER
+    from: agent-core
+    to: platform-layer
+    decision: allow-via-port
+  # APPROVED (Gateway Boundary v1): the browser reaches the runtime only through the gateway via
+  # web/modules/api_client.js; it never imports the agent body.
+  - id: ARCH-GATEWAY_IS_SOLE_INGRESS
+    from: web-ui
+    to: gateway
+    decision: allow-via-port
+  # APPROVED: consumers depend on the frozen ABI; the ABI depends on nothing above it. Extension
+  # is additive only and gated by tests/test_contracts.py.
+  - id: ARCH-CONTRACTS_ARE_FROZEN
+    from: gateway
+    to: contracts
+    decision: allow
+  # PROVISIONAL: owners may call the recommendation leaf; the leaf must never import a routing
+  # owner. One-way seam, mirroring the established usage_accounting -> usage_ledger direction.
+  - id: ARCH-ROUTING_LEAF_IS_ONE_WAY
+    from: agent-core
+    to: routing-evidence
+    decision: allow
+  # PROVISIONAL and the whole point of the component: the leaf produces ADVICE only. A dispatch
+  # resolver that read this advice would recreate the invisible-inference class deleted in
+  # v6.87.7 and v6.87.26. Granting authority is a separate approved change.
+  - id: ARCH-ROUTING_LEAF_HAS_NO_AUTHORITY
+    from: routing-evidence
+    to: agent-core
+    decision: deny
+  # APPROVED invariant "projection over replay" (docs/DEVELOPMENT.md): a per-interaction reader
+  # reaches durable history only through a bounded maintained projection, never by scanning
+  # usage_attempts.jsonl or any other append-only store.
+  - id: ARCH-NO_LEDGER_REPLAY_ON_HOT_PATH
+    from: routing-evidence
+    to: usage-ledger
+    decision: allow-via-port
+
+# NO .ai/architecture-baseline.yaml EXISTS, DELIBERATELY. Accepted structural debt already has
+# canonical homes in this repository, and BIBLE.md P7 forbids a second one:
+#   ouroboros/review.py::GRANDFATHERED_OVERSIZED_MODULES / _FUNCTIONS  -> accepted size debt
+#   ouroboros/size_ratchet_manifest.py (+ scripts/regenerate_size_ratchet.py) -> byte/function ratchet
+#   docs/ARCHITECTURE.md "disclosed residual" paragraphs -> accepted runtime residuals
+# Known legacy structure NOT baselined here because it is measured, not accepted: 202/271 modules
+# in one strongly-connected component via 1979 function-local imports, and 69 single-importer
+# modules. These are tracked as campaign metrics, not as authorized exceptions.
+
+architecture_checks:
+  enforcement: block-new-violations
+  gate_ids:
+    - GATE-LINT
+    - GATE-SMOKE
+    - GATE-CONTRACTS
+    - GATE-PLATFORM
+    - GATE-CUSTODY
+    - GATE-UNIT
+    - GATE-SUITE
+
+approval:
+  status: pending
+  approved_by: null
+  approved_at: null
+  manifest_sha256: null
