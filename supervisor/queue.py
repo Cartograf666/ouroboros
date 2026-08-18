@@ -146,9 +146,8 @@ from supervisor.task_admission import (  # noqa: E402,F401 - public queue API
     reserve_task_admission,
 )
 
-# Variant A off-loop worker reaper lives in supervisor/task_reaper.py (extracted for
-# module size). Re-export the thin names the enforce path and tests use; monkeypatching
-# these queue-module names still works because the enforce path references them here.
+# Variant A off-loop worker reaper lives in supervisor/task_reaper.py (module size); re-export
+# the thin names the enforce path and tests use — monkeypatching these queue names still works.
 from supervisor.task_reaper import (  # noqa: E402,F401 — re-exported for enforce path + tests
     ensure_reaper_started as _ensure_reaper_started,
     reap_queue as _reap_queue,
@@ -212,9 +211,8 @@ def enqueue_task(
         task_id = str(t.get("id") or "").strip()
         reserved_token = str(ADMISSION_RESERVATIONS.get(task_id) or "")
         if reserved_token and admission_token != reserved_token:
-            # A reservation owns this id until its request either enqueues or
-            # releases it.  Tokenless internal callers and competing ingress
-            # requests must not be able to consume/collide with that id.
+            # A reservation owns this id until its request either enqueues or releases it.
+            # Tokenless internal callers and competing ingress must not consume/collide with it.
             t["_admission_blocked"] = "admission_reservation_owned"
             return t
         if require_worker_pool:
@@ -581,8 +579,11 @@ def check_scheduled_tasks() -> None:
             now = now_utc.astimezone(tz)
             expr = ""
             if trigger_type == "once":
-                # One-shot entry (B2b W=A): fires once at/after run_at, then is
-                # marked done below — the same admission path as cron schedules.
+                # One-shot (B2b W=A): fires once at/after run_at via the same admission path
+                # as cron, then is marked done below. A consumed receipt (non-empty completed_at)
+                # NEVER re-fires even re-enabled from UI; re-arm = gateway upsert, fresh run_at.
+                if record.get("completed_at"):
+                    continue
                 due, once_error = _once_due(trigger, tz, now)
                 if once_error:
                     changed = _record_last_error(record, once_error) or changed
@@ -936,9 +937,8 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
             # Never resurrect a terminal/cancelled task as a ghost pending entry.
             # AR2-10 (§8-A1): the intent projection is consulted UNDER the queue lock at
             # restore — the "no active intent" read and the enqueue form one serialized step
-            # against assignment/drop, the same invariant the pre-assignment consult keeps.
-            # Boot-time and contention-free; _queue_lock is an RLock, so enqueue_task's own
-            # acquisition stays re-entrant.
+            # against assignment/drop (same invariant as the pre-assignment consult). Boot-time
+            # and contention-free; _queue_lock is an RLock, so enqueue_task stays re-entrant.
             with _queue_lock:
                 skip_revival = False
                 try:

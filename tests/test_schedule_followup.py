@@ -106,6 +106,26 @@ def test_once_schedule_survives_a_refused_admission_and_retries(tmp_path, monkey
     assert record.get("last_error") == ""
 
 
+def test_re_enabled_completed_once_never_refires(tmp_path):
+    """Round-3 exactly-once: a consumed one-shot (non-empty completed_at) must not
+    fire again even when the owner flips enabled back on from the UI — re-arming
+    goes through the gateway upsert with a fresh run_at, never a bare toggle."""
+    queue, pending = _queue(tmp_path)
+    fired = datetime.datetime(2020, 1, 1, tzinfo=UTC).isoformat()
+    queue.upsert_scheduled_task({
+        "id": "fu-rearmed", "name": "Follow-up", "enabled": True,  # UI re-enable
+        "completed_at": fired, "last_task_id": "t-already-ran",
+        "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},  # long due
+        "task": {"type": "task", "text": "must not run twice"},
+    })
+    queue.check_scheduled_tasks()
+    queue.check_scheduled_tasks()
+    assert pending == []
+    record = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
+    assert record["completed_at"] == fired  # receipt untouched
+    assert record["last_task_id"] == "t-already-ran"
+
+
 def test_once_schedule_with_invalid_run_at_records_a_typed_error(tmp_path):
     queue, pending = _queue(tmp_path)
     queue.upsert_scheduled_task({
@@ -270,6 +290,61 @@ def test_schedules_gateway_accepts_and_validates_once_triggers(tmp_path):
     assert unknown.status_code == 400
 
 
+def test_gateway_rearm_of_completed_once_requires_a_fresh_run_at(tmp_path):
+    """Round-3 exactly-once vs re-enable: re-enabling a CONSUMED one-shot through
+    the Schedules upsert without a NEW run_at is a 400; supplying a fresh run_at
+    re-arms it (completed_at cleared) and it fires exactly once; a disable that
+    keeps the same run_at carries the receipt forward for GC."""
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from ouroboros.gateway.schedules import api_schedules_upsert
+    from supervisor import queue
+
+    queue.init(tmp_path, 600, 1800)
+    pending: list = []
+    queue.init_queue_refs(pending, {}, {"value": 0})
+    fired = datetime.datetime(2020, 1, 1, tzinfo=UTC).isoformat()
+    queue.upsert_scheduled_task({
+        "id": "fu-done", "name": "Follow-up", "enabled": False, "completed_at": fired,
+        "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
+        "task": {"type": "task", "text": "resume"},
+    })
+    app = Starlette(routes=[Route("/api/schedules", endpoint=api_schedules_upsert, methods=["POST"])])
+    app.state.drive_root = tmp_path
+    client = TestClient(app)
+
+    # Bare re-enable with the SAME run_at: refused with a clear re-arm message.
+    refused = client.post("/api/schedules", json={
+        "id": "fu-done", "enabled": True,
+        "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
+        "task": {"type": "task", "text": "resume"},
+    })
+    assert refused.status_code == 400 and "run_at" in refused.json()["error"]
+    # Disable/edit keeping the same run_at: allowed, receipt carried forward.
+    kept = client.post("/api/schedules", json={
+        "id": "fu-done", "enabled": False,
+        "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
+        "task": {"type": "task", "text": "resume"},
+    })
+    assert kept.status_code == 200
+    assert kept.json()["schedule"]["completed_at"] == fired
+    # A fresh run_at re-arms: completed_at cleared, and the record fires ONCE.
+    rearmed = client.post("/api/schedules", json={
+        "id": "fu-done", "enabled": True,
+        "trigger": {"type": "once", "run_at": "2000-02-01T00:00:00+00:00"},
+        "task": {"type": "task", "text": "resume"},
+    })
+    assert rearmed.status_code == 200
+    assert "completed_at" not in rearmed.json()["schedule"]
+    queue.check_scheduled_tasks()
+    queue.check_scheduled_tasks()
+    assert len(pending) == 1
+    record = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
+    assert record["enabled"] is False and record["completed_at"]
+
+
 def test_scheduled_tasks_digest_projects_run_at_for_once_records(tmp_path):
     """Review fix 9: the context digest shows a one-shot's fire instant (run_at)
     instead of an empty-string cron; cron records keep their cron field."""
@@ -325,9 +400,16 @@ def test_consumed_once_records_are_pruned_past_gc_retention(tmp_path):
         "trigger": {"type": "cron", "expr": "0 3 * * *"},
         "task": {"type": "task", "text": "paused"},
     })
+    queue.upsert_scheduled_task({  # round-3: disabled CRON with a stray old completed_at
+        "id": "disabled-cron-stamped", "enabled": False, "completed_at": old,
+        "trigger": {"type": "cron", "expr": "0 4 * * *"},
+        "task": {"type": "task", "text": "paused, once ran"},
+    })
     queue.check_scheduled_tasks()
     ids = {r["id"] for r in queue.list_scheduled_tasks(tmp_path)["tasks"]}
-    assert ids == {"consumed-fresh", "enabled-future", "disabled-cron"}
+    # Only the aged-out CONSUMED ONE-SHOT is pruned; a disabled cron row is a
+    # standing schedule the owner may re-enable, even when it carries completed_at.
+    assert ids == {"consumed-fresh", "enabled-future", "disabled-cron", "disabled-cron-stamped"}
     assert pending == []
 
 

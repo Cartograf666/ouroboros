@@ -77,6 +77,28 @@ async def api_schedules_upsert(request: Request) -> JSONResponse:
         enabled = _enabled_value(body)
         if isinstance(enabled, str):
             return json_error(enabled, 400)
+        completed_at = ""
+        if trigger.get("type") == "once":
+            # Exactly-once vs re-enable: a one-shot that already fired (non-empty
+            # completed_at) cannot be re-armed by flipping enabled back on — that
+            # would silently re-run the consumed task. Re-arming requires a NEW
+            # trigger.run_at, which clears the consumed receipt; a disable/edit that
+            # keeps the same run_at carries the receipt forward so GC still sees it.
+            from supervisor.queue import list_scheduled_tasks
+
+            wanted = str(body.get("id") or "").strip()
+            existing = next(
+                (item for item in list_scheduled_tasks(request_drive_root(request)).get("tasks") or []
+                 if isinstance(item, dict) and str(item.get("id") or "") == wanted), None)
+            prev = (existing or {}).get("trigger")
+            prev = prev if isinstance(prev, dict) else {}
+            if (existing is not None and str(existing.get("completed_at") or "")
+                    and str(prev.get("run_at") or "") == trigger["run_at"]):
+                if enabled:
+                    return json_error(
+                        "this one-shot schedule already fired; re-arming it requires a new "
+                        "trigger.run_at (a fresh run_at clears completed_at)", 400)
+                completed_at = str(existing.get("completed_at"))
         record = {
             "id": str(body.get("id") or "").strip(),
             "name": str(body.get("name") or body.get("id") or "scheduled-task").strip(),
@@ -86,6 +108,8 @@ async def api_schedules_upsert(request: Request) -> JSONResponse:
             "trigger": trigger,
             "task": task,
         }
+        if completed_at:
+            record["completed_at"] = completed_at
         from supervisor.queue import upsert_scheduled_task
 
         return JSONResponse({"ok": True, "schedule": upsert_scheduled_task(record, drive_root=request_drive_root(request))})

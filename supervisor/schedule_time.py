@@ -68,21 +68,24 @@ def record_last_error(record: Dict[str, Any], message: str) -> bool:
 
 
 def prune_consumed_once_records(tasks: list, cutoff_epoch: float) -> tuple[list, int]:
-    """``(kept, pruned_count)`` — drop CONSUMED one-shot records (``enabled=False``
-    + ``completed_at``) whose completion is older than the unified GC retention
-    cutoff (epoch seconds; ``retention.age_cutoff``). The consumed record is a
-    durable receipt, not a standing schedule, so it ages out like every other
-    disposable runtime artifact. ENABLED records are never pruned here (an
-    owner-disabled cron row has no ``completed_at`` and is kept too); an
-    unparseable ``completed_at`` is kept, conservatively."""
+    """``(kept, pruned_count)`` — drop CONSUMED one-shot records (``trigger.type ==
+    "once"`` + ``enabled=False`` + ``completed_at``) whose completion is older than
+    the unified GC retention cutoff (epoch seconds; ``retention.age_cutoff``). The
+    consumed one-shot is a durable receipt, not a standing schedule, so it ages out
+    like every other disposable runtime artifact. ONLY one-shots are pruned: a
+    disabled CRON row is a standing schedule the owner may re-enable, and is kept
+    even if it carries a stray ``completed_at``. ENABLED records are never pruned;
+    an unparseable ``completed_at`` is kept, conservatively."""
     kept, pruned = [], 0
     for record in tasks:
         if (isinstance(record, dict) and not record.get("enabled", True)
                 and record.get("completed_at")):
-            done = parse_schedule_time(record.get("completed_at"), datetime.timezone.utc)
-            if done is not None and done.timestamp() < float(cutoff_epoch):
-                pruned += 1
-                continue
+            trigger = record.get("trigger") if isinstance(record.get("trigger"), dict) else {}
+            if str(trigger.get("type") or "") == "once":
+                done = parse_schedule_time(record.get("completed_at"), datetime.timezone.utc)
+                if done is not None and done.timestamp() < float(cutoff_epoch):
+                    pruned += 1
+                    continue
         kept.append(record)
     return kept, pruned
 
