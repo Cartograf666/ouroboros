@@ -22,7 +22,9 @@ from __future__ import annotations
 import logging
 import os
 import pathlib
+import signal
 import subprocess
+import sys
 import time
 from typing import Iterable, List, Optional, Set, Tuple
 
@@ -63,30 +65,35 @@ def _path_forms(base, leaf: str = "") -> Set[str]:
     return forms
 
 
-def _candidate_pids() -> "Optional[List[int]]":
-    """This user's pids whose command line mentions ouroboros, or ``None`` when enumeration itself
-    failed. ``-U``: other accounts run their own legitimate installs and are unsignallable anyway.
-    ``-i``: a packaged install runs ``EMBEDDED_PYTHON .../Ouroboros/repo/server.py`` with a capital
-    O. ``None`` (no pgrep, or pgrep errored — rc>1; rc 1 is the documented no-matches answer) must
-    never read as a clean sweep: nothing was checked."""
+def _candidate_commands() -> "Optional[dict]":
+    """``pid -> full command line`` for THIS user's processes from ONE ``ps`` read, or ``None``
+    when enumeration itself failed — which must never read as a clean sweep: nothing was checked.
+
+    ``ps`` (not a pattern-scoped ``pgrep``): candidate selection must not depend on the install
+    path containing any particular word — REPO_DIR is configurable, and the exact-token matcher is
+    the real filter. ``-u <uid>``: other accounts run their own legitimate installs and are
+    unsignallable anyway. ``-ww``: BSD ps truncates otherwise and the matcher needs exact argv."""
     try:
         out = subprocess.run(
-            ["pgrep", "-U", str(os.getuid()), "-fi", "ouroboros"],
+            ["ps", "-ww", "-u", str(os.getuid()), "-o", "pid=,command="],
             capture_output=True, text=True, timeout=5,
         )
     except Exception:
         return None
-    if out.returncode not in (0, 1):
+    if out.returncode != 0:
         return None
-    pids: List[int] = []
+    commands: dict = {}
     for line in (out.stdout or "").splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
         try:
-            pid = int(line.strip())
+            pid = int(parts[0])
         except ValueError:
             continue
         if pid > 0:
-            pids.append(pid)
-    return pids
+            commands[pid] = parts[1]
+    return commands
 
 
 def install_server_path_forms(repo_dir) -> Set[str]:
@@ -142,12 +149,12 @@ def find_same_install_server_pids(
         # The exact-token proof cannot represent a whitespace path, so nothing
         # could ever be proven; the caller (reap) names this once per sweep.
         return [], []
-    candidates = _candidate_pids()
+    candidates = _candidate_commands()
     if candidates is None:
         # Enumeration itself failed: nothing was CHECKED, which is different from
         # nothing found. Raising (instead of returning empty) routes a MID-sweep
         # failure into reap's aborted-mid-work path, so pids already proven in
-        # this sweep are still reported as survivors; the systemic no-pgrep case
+        # this sweep are still reported as survivors; the systemic no-ps case
         # is answered by reap's pre-check with its own named warning.
         raise RuntimeError("process enumeration unavailable")
     known = {os.getpid(), os.getppid()}
@@ -162,8 +169,8 @@ def find_same_install_server_pids(
     known_groups.discard(0)
     proven: List[int] = []
     unproven: List[int] = []
-    for pid in candidates:
-        if pid in known or not _runs_our_server(pid, server_paths):
+    for pid, command in sorted(candidates.items()):
+        if pid in known or not command_names_our_server(command, server_paths):
             continue
         try:
             if _pl.process_group_id(pid) in known_groups:
@@ -174,20 +181,45 @@ def find_same_install_server_pids(
     return proven, unproven
 
 
-def _revalidate_and_kill(pid: int, server_paths: Set[str], data_dir_values: Set[str]) -> bool:
-    """Re-prove ``pid`` from live state and signal it with NOTHING in between: any lookup in that
-    gap is a window for the pid to exit and be recycled onto a stranger. Kills the pid TREE, never
-    the group — server workers hold their own sessions and a reused pgid reaches bystanders.
+def _signal_pid(pid: int) -> None:
+    """SIGKILL one pid; every failure mode is answered by the liveness read that follows."""
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
 
-    True means CONFIRMED DEAD, not merely signalled: ``kill_pid_tree`` swallows per-pid errors, so
-    only a liveness read after the signal can say what it achieved — a pid logged as reaped while
-    it survived would contradict the survivor report from the same generation."""
+
+def _pid_gone(pid: int) -> bool:
+    """ESRCH means gone; EPERM means ALIVE — the process exists, we just cannot signal it.
+    The platform's pid_is_alive folds every OSError into 'dead', which here would let a
+    colliding generation start next to a live one. Anything undeterminable reads as alive
+    (a survivor blocks the boot; a false 'gone' collides it)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _revalidate_and_kill(pid: int, server_paths: Set[str], data_dir_values: Set[str]) -> bool:
+    """Re-prove ``pid`` from live state and signal the PROVEN ROOT with NOTHING in between: any
+    lookup in that gap is a window for the pid to exit and be recycled onto a stranger —
+    ``kill_pid_tree`` runs its own child enumeration, so it follows the direct root signal rather
+    than replacing it. Trees, never process groups: server workers hold their own sessions and a
+    reused pgid reaches bystanders.
+
+    True means CONFIRMED DEAD, not merely signalled: the kill primitives swallow per-pid errors,
+    so only a liveness read after the signal can say what it achieved — a pid logged as reaped
+    while it survived would contradict the survivor report from the same generation."""
     if not _runs_our_server(pid, server_paths) or not _is_launcher_managed(pid, data_dir_values):
         return False
+    _signal_pid(pid)
     _pl.kill_pid_tree(pid)
     deadline = time.time() + _CONFIRM_DEADLINE_SEC
     while True:
-        if not _pl.pid_is_alive(pid):
+        if _pid_gone(pid):
             return True
         if time.time() >= deadline:
             return False
@@ -211,7 +243,18 @@ def reap_same_install_strays(
             "exact-token identity proof cannot represent — no process was checked.", reason,
         )
         return []
-    if _candidate_pids() is None:
+    if not sys.platform.startswith("linux") and any(" " in value for value in data_dir_values):
+        # /proc environ matching is byte-exact, but the ps -E token scan cannot
+        # represent a whitespace assignment value — symmetric with the
+        # whitespace-repo disclosure above, or such installs are silently
+        # unswept forever on this platform.
+        log.warning(
+            "Same-install stray sweep disabled (%s): the data directory path contains whitespace, "
+            "which this platform's environment proof cannot represent — no process was checked.",
+            reason,
+        )
+        return []
+    if _candidate_commands() is None:
         log.warning(
             "Same-install stray sweep could not enumerate processes (%s) — nothing was checked, "
             "which is not a clean sweep.", reason,

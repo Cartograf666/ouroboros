@@ -28,8 +28,9 @@ def _install_fakes(monkeypatch, pids, commands, env_states, groups=None):
     ABSENT, which (like UNREADABLE) is not a proof.
     """
     monkeypatch.setattr(
-        reaper, "_candidate_pids", lambda: list(pids),
+        reaper, "_candidate_commands", lambda: {pid: commands.get(pid, "") for pid in pids},
     )
+    # Revalidation re-reads the live command through the platform layer.
     monkeypatch.setattr(
         "ouroboros.platform_layer.process_command",
         lambda pid: commands.get(pid, ""),
@@ -150,45 +151,42 @@ def test_self_parent_caller_exclusions_and_known_groups_are_skipped(monkeypatch)
     assert proven == [9990503] and unproven == []
 
 
-def test_candidate_enumeration_scopes_pgrep_to_the_current_user(monkeypatch):
-    """-U keeps another account's legitimate install out of the sweep; -fi keeps
-    the capital-O packaged path in it."""
+def test_candidate_enumeration_uses_one_unbranded_full_width_ps_read(monkeypatch):
+    """ps, not a pattern-scoped pgrep: candidate selection must not depend on
+    the install path containing any particular word (REPO_DIR is configurable);
+    -u scopes to this user, -ww defeats BSD truncation."""
     seen = {}
 
     def fake_run(cmd, **kwargs):
         seen["cmd"] = cmd
-        return types.SimpleNamespace(stdout="777\nnot-a-pid\n-1\n", returncode=0)
+        return types.SimpleNamespace(
+            stdout="  777 python3 /x/server.py\nnot-a-pid oops\n", returncode=0,
+        )
 
     monkeypatch.setattr(reaper.subprocess, "run", fake_run)
-    assert reaper._candidate_pids() == [777]
-    assert seen["cmd"] == ["pgrep", "-U", str(os.getuid()), "-fi", "ouroboros"]
+    assert reaper._candidate_commands() == {777: "python3 /x/server.py"}
+    assert seen["cmd"] == ["ps", "-ww", "-u", str(os.getuid()), "-o", "pid=,command="]
 
 
-def test_a_missing_pgrep_is_enumeration_failure_not_a_clean_answer(monkeypatch):
-    """No pgrep, or a pgrep ERROR (rc>1 — rc 1 is the documented no-matches
-    answer), must be distinguishable from an empty result: nothing was checked."""
+def test_a_missing_ps_is_enumeration_failure_not_a_clean_answer(monkeypatch):
+    """No ps, or a ps error (nonzero rc), must be distinguishable from an empty
+    result: nothing was checked."""
     def missing_run(cmd, **kwargs):
-        raise FileNotFoundError("pgrep")
+        raise FileNotFoundError("ps")
 
     monkeypatch.setattr(reaper.subprocess, "run", missing_run)
-    assert reaper._candidate_pids() is None
+    assert reaper._candidate_commands() is None
 
     def erroring_run(cmd, **kwargs):
-        return types.SimpleNamespace(stdout="", returncode=2)
-
-    monkeypatch.setattr(reaper.subprocess, "run", erroring_run)
-    assert reaper._candidate_pids() is None
-
-    def no_matches_run(cmd, **kwargs):
         return types.SimpleNamespace(stdout="", returncode=1)
 
-    monkeypatch.setattr(reaper.subprocess, "run", no_matches_run)
-    assert reaper._candidate_pids() == []
+    monkeypatch.setattr(reaper.subprocess, "run", erroring_run)
+    assert reaper._candidate_commands() is None
 
 
 def test_reap_names_an_enumeration_failure_instead_of_reading_clean(monkeypatch, caplog):
     monkeypatch.setattr("ouroboros.platform_layer.IS_WINDOWS", False)
-    monkeypatch.setattr(reaper, "_candidate_pids", lambda: None)
+    monkeypatch.setattr(reaper, "_candidate_commands", lambda: None)
     with caplog.at_level(logging.WARNING, logger=reaper.log.name):
         assert reaper.reap_same_install_strays(REPO, DATA) == []
     assert any("could not enumerate" in r.getMessage() for r in caplog.records)
@@ -236,14 +234,14 @@ def test_the_finder_never_reads_the_custody_ledger():
 
 def _spy_kill(monkeypatch):
     killed = []
+    # The proven root is signalled directly; the tree kill is follow-up cleanup.
+    monkeypatch.setattr(reaper, "_signal_pid", lambda pid: killed.append(pid))
     monkeypatch.setattr(
-        "ouroboros.platform_layer.kill_pid_tree", lambda pid, **kw: killed.append(pid),
+        "ouroboros.platform_layer.kill_pid_tree", lambda pid, **kw: None,
     )
     # Confirmed-dead follows the signal: liveness is answered from the spy so
     # no test outcome depends on which real pids exist on this machine.
-    monkeypatch.setattr(
-        "ouroboros.platform_layer.pid_is_alive", lambda pid: pid not in killed,
-    )
+    monkeypatch.setattr(reaper, "_pid_gone", lambda pid: pid in killed)
     monkeypatch.setattr(reaper, "_SETTLE_SEC", 0)
     monkeypatch.setattr(reaper, "_CONFIRM_DEADLINE_SEC", 0)
     return killed
@@ -290,9 +288,9 @@ def test_a_pid_that_dies_between_proof_and_signal_is_not_killed(monkeypatch):
 def test_a_fork_between_passes_is_caught_by_the_rescan(monkeypatch):
     """A stray forking mid-sweep hands its child the same cmdline and the same
     inherited environment, so the child is proven on the next pass."""
-    killed = _spy_kill(monkeypatch)
+    killed = []
     live = {9990801: OURS}
-    monkeypatch.setattr(reaper, "_candidate_pids", lambda: sorted(live))
+    monkeypatch.setattr(reaper, "_candidate_commands", lambda: dict(live))
     monkeypatch.setattr(
         "ouroboros.platform_layer.process_command", lambda pid: live.get(pid, ""),
     )
@@ -305,16 +303,18 @@ def test_a_fork_between_passes_is_caught_by_the_rescan(monkeypatch):
         ),
     )
     monkeypatch.setattr("ouroboros.platform_layer.IS_WINDOWS", False)
+    monkeypatch.setattr("ouroboros.platform_layer.kill_pid_tree", lambda pid, **kw: None)
+    monkeypatch.setattr(reaper, "_pid_gone", lambda pid: pid not in live)
+    monkeypatch.setattr(reaper, "_SETTLE_SEC", 0)
+    monkeypatch.setattr(reaper, "_CONFIRM_DEADLINE_SEC", 0)
 
-    real_kill = reaper._pl.kill_pid_tree
-
-    def forking_kill(pid, **kwargs):
-        real_kill(pid)
+    def forking_signal(pid):
+        killed.append(pid)
         live.pop(pid, None)
         if pid == 9990801:
             live[9990802] = OURS  # the fork inherits everything
 
-    monkeypatch.setattr("ouroboros.platform_layer.kill_pid_tree", forking_kill)
+    monkeypatch.setattr(reaper, "_signal_pid", forking_signal)
     survivors = reaper.reap_same_install_strays(REPO, DATA)
     assert killed == [9990801, 9990802]
     assert survivors == []
@@ -491,10 +491,9 @@ def test_a_signalled_pid_still_alive_is_a_survivor_not_a_kill(monkeypatch, caplo
     what the signal achieved; a pid logged as reaped while it survived would
     contradict the survivor report from the same generation."""
     signalled = []
-    monkeypatch.setattr(
-        "ouroboros.platform_layer.kill_pid_tree", lambda pid, **kw: signalled.append(pid),
-    )
-    monkeypatch.setattr("ouroboros.platform_layer.pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(reaper, "_signal_pid", lambda pid: signalled.append(pid))
+    monkeypatch.setattr("ouroboros.platform_layer.kill_pid_tree", lambda pid, **kw: None)
+    monkeypatch.setattr(reaper, "_pid_gone", lambda pid: False)
     monkeypatch.setattr(reaper, "_SETTLE_SEC", 0)
     monkeypatch.setattr(reaper, "_CONFIRM_DEADLINE_SEC", 0)
     _install_fakes(

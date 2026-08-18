@@ -805,7 +805,8 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
             # restart. No dependency sync — nothing about the checkout changed.
             _agent_restart_requested.clear()
             log.info("Restarting the agent to adopt the saved first-run configuration.")
-            _kill_stale_runtime_ports(port)
+            # No port sweep here: _pre_generation_cleanup at the top of the
+            # next iteration runs it as its third phase.
             continue
 
         if exit_code == RESTART_EXIT_CODE:
@@ -829,7 +830,7 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
                         "import them — see the pip output above for the cause.",
                         MAX_CRASH_RESTARTS, CRASH_WINDOW_SEC,
                     )
-            _kill_stale_runtime_ports(port)
+            # No port sweep here: _pre_generation_cleanup owns it next iteration.
             continue
 
         now = time.time()
@@ -840,7 +841,7 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
             break
 
         log.info("Agent crashed. Restarting in 3s...")
-        _kill_stale_runtime_ports(port)
+        # No port sweep here: _pre_generation_cleanup owns it next iteration.
         time.sleep(3)
 
 def _request_agent_restart() -> None:
