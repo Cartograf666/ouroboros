@@ -15,9 +15,7 @@ import time
 from typing import Any, Optional, Sequence
 
 from ouroboros.context_mode_compat import (
-    normalize_and_persist_context_mode_compat,
-    normalize_context_mode,
-    owner_declared_low,
+    normalize_and_persist_context_mode_compat, normalize_context_mode, owner_declared_low,
 )
 from ouroboros.platform_layer import pid_lock_acquire as _compat_pid_lock_acquire, pid_lock_release as _compat_pid_lock_release
 from ouroboros.provider_models import OPENROUTER_DEFAULTS, OPENROUTER_REVIEW_DEFAULTS, compute_direct_review_models_fallback, local_only_review_route_env, migrate_model_value, review_model_uses_local as review_model_uses_local
@@ -1024,9 +1022,7 @@ def get_context_mode() -> str:
     No boot-pin: hot-applies on the next task. The key is dropped from the
     agent-reachable /api/settings POST (P1)."""
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_CONTEXT_MODE"])
-    return normalize_context_mode(
-        os.environ.get("OUROBOROS_CONTEXT_MODE", default_val) or default_val
-    )
+    return normalize_context_mode(os.environ.get("OUROBOROS_CONTEXT_MODE", default_val) or default_val)
 
 
 def get_owner_context_mode() -> str:

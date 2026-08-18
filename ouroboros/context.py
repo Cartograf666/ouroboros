@@ -317,6 +317,20 @@ _DECISION_TURN_OUTCOME_RULE = (
     "tool-call round is transient progress and is not durable conversation history."
 )
 
+# Hoisted verbatim from ``build_runtime_section`` (same pattern as
+# ``_DECISION_TURN_OUTCOME_RULE``) to keep that builder under the hard method gate.
+_OWNER_CLIENT_NOTE = (
+    "owner_client is the client surface that SENT the message that started/steered "
+    "this work. Provenance: browser observables are CLIENT-REPORTED (the owner's own "
+    "SPA measured them; not host-attested); received_at is a HOST stamp; {channel: ...} "
+    "is a host stamp for bridge/command ingress but CALLER-DECLARED for external "
+    "/api/tasks admissions (default api_task); captured_at is the client clock at "
+    "SEND time (delivery can lag it — received_at is the honest arrival mark). "
+    "runtime_env.presentation is the server process's own shell, NOT the sender. "
+    "When owner_client is absent, the surface is unknown: ask or hedge rather than "
+    "assuming a browser."
+)
+
 
 def _project_room_fact(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """The project-room working-folder FACT for a room turn, or None.
@@ -573,7 +587,15 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
             "deadline_at": task.get("deadline_at"),
             "allowed_resources": task.get("allowed_resources"),
         },
-        "runtime_env": {"is_desktop": bool(os.environ.get("OUROBOROS_DESKTOP_MODE", "")), "platform": sys.platform},
+        # Server-process presentation posture (launcher-exported; absent = a
+        # web/headless serving process). This is the PROCESS's shell, NOT the
+        # surface the owner's current message came from — that per-message fact
+        # is `owner_client` below. (The former `is_desktop` flag read
+        # OUROBOROS_DESKTOP_MODE, which no producer ever set — retired.)
+        "runtime_env": {
+            "presentation": os.environ.get("OUROBOROS_PRESENTATION", "").strip() or "web",
+            "platform": sys.platform,
+        },
     }
     if isinstance(task.get("task_contract"), dict):
         runtime_data["task_contract"] = task.get("task_contract")
@@ -703,6 +725,21 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
     # duplicating it. This is a structural fact; the model still chooses (BIBLE P5).
     # It also gives project-room messages their default project scene.
     _meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    # Owner Surface Fact: the surface that SENT the message this task/turn came
+    # from. A web message carries raw observables (pywebview/ua/viewport/...);
+    # a non-web ingress carries {"channel": <source>} STAMPED AT ITS PRODUCER
+    # (bridge routing, /api/command, /api/tasks admission).
+    # Absence is an honest gap — no key, never a guessed default (BIBLE P1).
+    # ONE shared projection of the producer-assembled fact — the mailbox
+    # surface-note baseline reads the same function, so the two can't disagree.
+    # The renderer never infers a surface from metadata.source (overloaded by
+    # internal producers: scheduler, skill schedules); absence stays honest.
+    from ouroboros.client_surface import owner_client_fact
+
+    _owner_client = owner_client_fact(_meta)
+    if _owner_client:
+        runtime_data["owner_client"] = dict(_owner_client)
+        runtime_data["owner_client_note"] = _OWNER_CLIENT_NOTE
     _current_chat = _meta.get("current_chat") if isinstance(_meta.get("current_chat"), dict) else None
     _swarm_router = bool(_meta.get("force_plan")) and bool(task.get("_ephemeral_turn"))
     if _current_chat and (_current_chat.get("running_tasks") or _current_chat.get("addressable_root_tasks")):

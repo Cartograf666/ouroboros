@@ -544,9 +544,7 @@ def fetch_openrouter_pricing(*, timeout_sec: float = 5.0) -> Dict[str, Tuple[Opt
                         tier_row = (tier_prompt, tier_cached, tier_write, tier_completion)
                         tiers.append((min_prompt_tokens, tier_row))
                     except (TypeError, ValueError):
-                        log.warning(
-                            "Skipping malformed pricing override for %s", model_id,
-                        )
+                        log.warning("Skipping malformed pricing override for %s", model_id)
             if tiers:
                 row = PricingSchedule(row, tuple(tiers))
             pricing_dict[model_id] = row
@@ -864,9 +862,7 @@ class LLMClient:
                 # and every reactive in-process rejection is also recorded
                 # durably, so replacing (not unioning) lets expired entries
                 # actually evict from a long-running process.
-                cls._REJECTED_PARAMS_CACHE[durable_key] = set(
-                    get_rejected_params(DATA_DIR, durable_key)
-                )
+                cls._REJECTED_PARAMS_CACHE[durable_key] = set(get_rejected_params(DATA_DIR, durable_key))
             except Exception:
                 pass
         for key in {model_id, normalize_model_identity(model_id)}:

@@ -831,6 +831,7 @@ def log_chat(
     mime: str = "",
     download_url: str = "",
     caption: str = "",
+    client_surface: Optional[Dict[str, Any]] = None,
 ) -> None:
     if DATA_DIR:
         record = {
@@ -855,6 +856,10 @@ def log_chat(
         # persisted row as a DocumentOutbound WS envelope.
         if record_type:
             record["type"] = record_type
+        if client_surface:
+            # Per-message sending-surface provenance (Owner Surface Fact);
+            # optional column, never a "type":"chat" literal (AST-scan hygiene).
+            record["client_surface"] = dict(client_surface)
         if filename:
             record["filename"] = filename
         if mime:

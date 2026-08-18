@@ -52,6 +52,10 @@ STALE_INHERITED_ENV_KEYS = (
     "OUROBOROS_SERVER_HOST", "OUROBOROS_SERVER_PORT", "OUROBOROS_HOST_SERVICE_PORT",
     "OUROBOROS_APP_ROOT", "OUROBOROS_REPO_DIR", "OUROBOROS_DATA_DIR", "OUROBOROS_SETTINGS_PATH",
     "OUROBOROS_URL", "OUROBOROS_MANAGED_BY_LAUNCHER",
+    # The launcher-exported presentation posture describes the OPERATOR's desktop
+    # process; an isolated benchmark server is a headless web process and must
+    # not inherit "desktop_window".
+    "OUROBOROS_PRESENTATION",
     # The parent-pinned runtime-mode baseline is exported to subprocesses and is PREFERRED
     # over settings.json (config.initialize_runtime_mode_baseline / get_runtime_mode), so an
     # inherited value would boot the isolated server in the LIVE mode instead of its own
