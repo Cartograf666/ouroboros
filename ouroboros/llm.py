@@ -369,6 +369,44 @@ def _split_markdown_sections(text: str) -> Tuple[str, List[Tuple[str, str]]]:
     return "\n".join(preamble).strip(), sections
 
 
+def _trim_local_sections(text: str, excess_chars: int) -> tuple:
+    """Shrink section BODIES largest-first; never drop a section. -> (text, removed).
+
+    The tail trim this replaces cut from the END of a block, deleting exactly the
+    sections ``_compact_markdown_sections`` had just PRESERVED — Memory Registry,
+    Drive state and Runtime context all sit after Dialogue History.
+    """
+    if excess_chars <= 0:
+        return text, 0
+    preamble, sections = _split_markdown_sections(text)
+    if not sections:
+        return text, 0
+    bodies = []
+    for index, (title, section) in enumerate(sections):
+        head, sep, body = section.partition("\n\n")
+        bodies.append([index, title, head, sep, body])
+    removed = 0
+    marker = len(_LOCAL_TRUNCATION_MARKER)
+    # Largest body first, so a small section is never spent on a deficit a large one
+    # can absorb.
+    for entry in sorted(bodies, key=lambda item: -len(item[4])):
+        if removed >= excess_chars:
+            break
+        body = entry[4]
+        # The marker is re-added, so it counts against the cut; ignoring it overstated
+        # the removal per section and left the payload over budget by that much.
+        keep = max(_LOCAL_SECTION_BODY_FLOOR, len(body) - (excess_chars - removed) - marker)
+        net = len(body) - keep - marker
+        if net <= 0:
+            continue
+        entry[4] = body[:keep] + _LOCAL_TRUNCATION_MARKER
+        removed += net
+    rebuilt = [preamble] if preamble else []
+    for _index, _title, head, sep, body in bodies:
+        rebuilt.append(head + sep + body if sep else head)
+    return "\n\n".join(part for part in rebuilt if part).strip(), removed
+
+
 def _compact_markdown_sections(
     text: str,
     preserve_titles: Set[str],
@@ -394,6 +432,19 @@ def _compact_markdown_sections(
 
     return "\n\n".join(p for p in parts if p).strip()
 
+
+# A trimmed section keeps at least this much body, so a preserved section is always
+# still legible rather than reduced to a bare header.
+_LOCAL_SECTION_BODY_FLOOR = 160
+_LOCAL_TRUNCATION_MARKER = "\n...[truncated for local context]..."
+
+# Appended unconditionally, so its size is RESERVED before trimming: trimming against
+# a budget this text then exceeds is how the payload ended up over by its own length.
+_LOCAL_LANGUAGE_RULE = (
+    "\n\nCRITICAL: Always respond in the same language as the user's message "
+    "(e.g. if the user writes in Russian, you MUST reply in Russian)."
+)
+_LOCAL_LANGUAGE_RULE_MARKER = "CRITICAL: Always respond in the same language"
 
 _LOCAL_COMPACTION_MODES = {
     "static": (
@@ -2340,17 +2391,9 @@ class LLMClient:
         optional-parameter retry — callers must keep a text-parse fallback."""
         messages = self._normalize_system_message_placement(messages)
         is_local = use_local or str(model or "").startswith("local_discovered::") or str(model or "") in ("local-model", "__local__") or str(model or "").endswith(" (local)")
-        # THE per-route concurrency seam: one guard on the method every production
-        # provider call goes through, instead of one per call site — only four of the
-        # call sites opened a slot, so the review lanes, deep self-review, dialogue
-        # consolidation, semantic dedup and skill publish ran uncapped against a
-        # documented cap of 3. Re-entrant by route, so the callers that still open
-        # their own slot keep their deadline-bounded outer wait and this passes
-        # through. Wraps only the dispatch: one attempt, never the retry chain.
-        #
-        # Keyed on is_local, NOT use_local: locality is also derived from the model
-        # NAME above, and the semaphore key carries that flag — keying on the raw
-        # argument would give one physical local runtime two separate semaphores.
+        # THE per-route concurrency seam (rationale: model_concurrency module docstring).
+        # Keyed on is_local, not the raw argument: locality is also derived from the
+        # model NAME above and the semaphore key carries that flag.
         with model_concurrency.model_call_slot(model, is_local), capture_attempt_ids() as attempt_ids:
             if is_local:
                 message, usage = self._chat_local(
@@ -2507,25 +2550,30 @@ class LLMClient:
             return compacted
 
         # Adaptive secondary trimming: trim system message text blocks from the end to fit target_chars
-        excess_chars = compacted_chars - target_chars
+        # Reserve the language rule appended below; it is part of the payload.
+        excess_chars = compacted_chars - target_chars + len(_LOCAL_LANGUAGE_RULE)
         for msg in compacted:
             if msg.get("role") != "system":
                 continue
             content = msg.get("content")
             if isinstance(content, list):
-                for block in reversed(content):
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        btext = str(block.get("text", ""))
-                        if len(btext) > 300:
-                            trim = min(len(btext) - 150, excess_chars + 100)
-                            block["text"] = btext[:-trim] + "\n...[truncated for local context]..."
-                            excess_chars -= trim
-                            if excess_chars <= 0:
-                                break
+                # Largest block first: the deficit is paid by the biggest text, not by
+                # whichever block happens to sit last.
+                blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "text"]
+                for block in sorted(blocks, key=lambda b: -len(str(b.get("text", "")))):
+                    if excess_chars <= 0:
+                        break
+                    trimmed, removed = _trim_local_sections(str(block.get("text", "")), excess_chars)
+                    if removed:
+                        block["text"] = trimmed
+                        excess_chars -= removed
             elif isinstance(content, str):
-                if len(content) > excess_chars + 300:
-                    msg["content"] = content[:-(excess_chars + 100)] + "\n...[truncated for local context]..."
-                    excess_chars = 0
+                trimmed, removed = _trim_local_sections(content, excess_chars)
+                if removed:
+                    msg["content"] = trimmed
+                    excess_chars -= removed
+                    if excess_chars <= 0:
+                        excess_chars = 0
             break
 
         # Prune older conversation history if message count is high
@@ -2545,17 +2593,28 @@ class LLMClient:
         for msg in compacted:
             if msg.get("role") == "system":
                 content = msg.get("content")
-                lang_rule = "\n\nCRITICAL: Always respond in the same language as the user's message (e.g. if the user writes in Russian, you MUST reply in Russian)."
                 if isinstance(content, list):
                     for block in content:
                         if isinstance(block, dict) and block.get("type") == "text":
-                            if "CRITICAL: Always respond in the same language" not in str(block.get("text", "")):
-                                block["text"] = str(block.get("text", "")) + lang_rule
+                            if _LOCAL_LANGUAGE_RULE_MARKER not in str(block.get("text", "")):
+                                block["text"] = str(block.get("text", "")) + _LOCAL_LANGUAGE_RULE
                             break
                 elif isinstance(content, str):
-                    if "CRITICAL: Always respond in the same language" not in content:
-                        msg["content"] = content + lang_rule
+                    if _LOCAL_LANGUAGE_RULE_MARKER not in content:
+                        msg["content"] = content + _LOCAL_LANGUAGE_RULE
                 break
+
+        # Fail TYPED rather than ship an over-window payload. Bodies stop at
+        # _LOCAL_SECTION_BODY_FLOOR, so "still too large" means the PRESERVED CORE does
+        # not fit. Recovery belongs to the callers (context_compaction,
+        # loop_llm_call.classify_llm_exception), so the signal must reach them typed.
+        final_chars = _estimate_message_chars(compacted)
+        if final_chars > target_chars:
+            raise LocalContextTooLargeError(
+                "local context window cannot hold the preserved core: "
+                f"{final_chars} chars > {target_chars} budget "
+                f"(ctx_len={ctx_len}, max_tokens={max_tokens})"
+            )
 
         return compacted
 
@@ -2646,13 +2705,17 @@ class LLMClient:
                 last_exc = exc
                 err = str(exc)
                 if "context_length_exceeded" in err or "400" in err or _is_structured_context_overflow_exception(exc) or context_overflow_message(err):
-                    # Adaptive emergency recovery: drastically reduce system message and retry
-                    for m in clean_messages:
-                        if m.get("role") == "system":
-                            m["content"] = str(m.get("content", ""))[:4000] + "\n[truncated for local context]"
-                            break
-                    candidate["messages"] = clean_messages
-                    candidate["max_tokens"] = min(local_max, 1024)
+                    # Typed, on the FIRST attempt: resending an over-window payload only
+                    # spends the window again. Callers classify this into
+                    # `context_overflow` and own recovery.
+                    #
+                    # The "adaptive recovery" this replaces rewrote the system message in
+                    # place: content is a LIST of blocks here, so str() shipped 4000 chars
+                    # of a Python repr as the prompt. Fitting belongs to
+                    # _prepare_messages_for_local_context; failing typed belongs here.
+                    raise LocalContextTooLargeError(
+                        f"local context window exceeded and the payload cannot be resent unchanged: {err}"
+                    ) from exc
                 if "APIConnectionError" in err or "Connection refused" in err or "ConnectError" in err:
                     log.warning("Local model server unreachable (attempt %d/3); checking autostart...", attempt + 1)
                     try:
