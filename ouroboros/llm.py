@@ -14,6 +14,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from ouroboros import model_concurrency
 from ouroboros.provider_models import (
     PROVIDER_PREFIXES,
     normalize_anthropic_model_id,
@@ -2339,7 +2340,18 @@ class LLMClient:
         optional-parameter retry — callers must keep a text-parse fallback."""
         messages = self._normalize_system_message_placement(messages)
         is_local = use_local or str(model or "").startswith("local_discovered::") or str(model or "") in ("local-model", "__local__") or str(model or "").endswith(" (local)")
-        with capture_attempt_ids() as attempt_ids:
+        # THE per-route concurrency seam: one guard on the method every production
+        # provider call goes through, instead of one per call site — only four of the
+        # call sites opened a slot, so the review lanes, deep self-review, dialogue
+        # consolidation, semantic dedup and skill publish ran uncapped against a
+        # documented cap of 3. Re-entrant by route, so the callers that still open
+        # their own slot keep their deadline-bounded outer wait and this passes
+        # through. Wraps only the dispatch: one attempt, never the retry chain.
+        #
+        # Keyed on is_local, NOT use_local: locality is also derived from the model
+        # NAME above, and the semaphore key carries that flag — keying on the raw
+        # argument would give one physical local runtime two separate semaphores.
+        with model_concurrency.model_call_slot(model, is_local), capture_attempt_ids() as attempt_ids:
             if is_local:
                 message, usage = self._chat_local(
                     messages, tools, max_tokens, tool_choice, timeout=timeout,
