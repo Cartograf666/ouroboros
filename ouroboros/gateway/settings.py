@@ -700,6 +700,15 @@ def _api_owner_context_mode_sync(request: Request, body: Any) -> JSONResponse:
             409,
         )
     with settings_document_mutation():
+        # The idle guard is re-proved UNDER the lock: this thread can block on
+        # it behind a long generic save, and a task started in that window
+        # would otherwise be demoted to low mid-flight on a stale idle answer.
+        if previous_mode == "max" and next_mode == "low" and _has_running_agent_tasks():
+            return unsaved_error(
+                "Context mode can only be lowered while Ouroboros is idle. "
+                "Wait until no queued or running work remains, then switch Low/Max.",
+                409,
+            )
         current = _owner_read_settings_raw()
         current["OUROBOROS_CONTEXT_MODE"] = next_mode
         # The retired marker survives one compatibility window only as explicit false
