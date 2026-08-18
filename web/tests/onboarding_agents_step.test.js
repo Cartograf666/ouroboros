@@ -189,6 +189,33 @@ test('several accounts are named in family order and the rows say they rotate', 
     assert.deepEqual(familyStatusText(twoInOne, 'claude'), { tone: 'muted', text: 'Not connected' });
 });
 
+test('an all-disabled family is not connected — the aggregate reads the enabled fact', () => {
+    // The owner switched every codex account OFF: rotation never takes them,
+    // so the wizard must not declare the family connected under a header that
+    // says the opposite (the same rule the Subagents section applies).
+    const allOff = snapshotWith([]);
+    allOff.profiles.profiles = [
+        { profile: { harness_id: 'codex', profile_id: 'a', enabled: false }, status: { verification: 'passed' } },
+        { profile: { harness_id: 'codex', profile_id: 'b', enabled: false }, status: { verification: 'passed' } },
+    ];
+    assert.deepEqual(connectedHarnesses(allOff), []);
+    assert.deepEqual(familyStatusText(allOff, 'codex'), { tone: 'muted', text: 'Not connected' });
+
+    // One row re-enabled: enabled+passed still connects and counts — and the
+    // count excludes the disabled sibling instead of over-promising the pool.
+    const oneOn = snapshotWith([]);
+    oneOn.profiles.profiles = [
+        { profile: { harness_id: 'codex', profile_id: 'a', enabled: false }, status: { verification: 'passed' } },
+        { profile: { harness_id: 'codex', profile_id: 'b', enabled: true }, status: { verification: 'passed' } },
+    ];
+    assert.deepEqual(connectedHarnesses(oneOn), ['codex']);
+    assert.deepEqual(familyStatusText(oneOn, 'codex'), { tone: 'ok', text: 'Connected' });
+
+    // Absent stays connected: the fail-open default, exactly like the panel.
+    const legacy = snapshotWith(['claude']);
+    assert.deepEqual(connectedHarnesses(legacy), ['claude']);
+});
+
 test('a family the engine renames is spoken in the engine words, never as a raw id', () => {
     // The step used to keep its OWN map of three families and fall through to
     // the harness id, while the Agents tab preferred the engine's display_name.

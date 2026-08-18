@@ -95,9 +95,14 @@ export function connectedHarnesses(snapshot) {
     // stable family order. `accountRows` is the SSOT projection of the status
     // payload (native CLI session + verified credential profiles alike), so
     // this step and the accounts panel can never disagree about "connected".
+    // An account the owner switched OFF is skipped however healthy its login:
+    // rotation never takes it, so counting it here would declare a family
+    // connected on a pool the engine will not use. Absent stays connected —
+    // the same fail-open `enabled` projection the accounts panel applies.
     const passed = new Set(
         accountRows(snapshot)
-            .filter((row) => String(row?.status?.verification || '') === 'passed')
+            .filter((row) => row?.enabled !== false
+                && String(row?.status?.verification || '') === 'passed')
             .map((row) => String(row.harness || '')),
     );
     return AGENT_FAMILIES.map((f) => f.harness).filter((harness) => passed.has(harness));
@@ -106,6 +111,7 @@ export function connectedHarnesses(snapshot) {
 export function harnessAccountCount(snapshot, harness) {
     return accountRows(snapshot).filter(
         (row) => row.harness === harness
+            && row?.enabled !== false
             && String(row?.status?.verification || '') === 'passed',
     ).length;
 }

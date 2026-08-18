@@ -7,7 +7,8 @@ control plane is loopback-Origin-guarded and bearer-token'd; the token must
 never reach a page), so these handlers translate: status aggregation, the
 owner-initiated daemon wake behind the panel's Refresh button, login job
 create, login job read/cancel/input, login job termination reconcile, and
-credential-profile removal. Nothing here interprets a credential and nothing
+the credential-profile row actions — removal and the Enabled toggle,
+DELETE/PATCH on one route. Nothing here interprets a credential and nothing
 here stores one.
 
 Login-job wire contract (frozen, ``ClaudexorLoginJobResponse`` /
@@ -93,6 +94,37 @@ def _login_disclosure_native(operations: List[Dict[str, Any]]) -> bool:
     return False
 
 
+# The UNIFIED ACCOUNT MODEL's feature marker (frozen contract, sprint plan §L.2):
+# `GET /v2/account-pools` ships in the same engine change that migrates every
+# default CLI login into a named registry row, empties `harnessAccounts` and
+# carries the pool routing verdict in the additive `accountPools` key. One
+# structural marker for the one feature, and it is the catalog ID — the
+# engine's own stable identifier for the operation, not the path spelling.
+# Absent on every 3.5.0 engine.
+_ACCOUNT_POOLS_OPERATION_ID = "get:account-pools"
+
+
+def _unified_accounts_native(operations: List[Dict[str, Any]]) -> bool:
+    """Does this engine serve the UNIFIED account model (every account a named
+    registry row, routing facts in ``accountPools``)?
+
+    True iff the ``/v2/operations`` catalog advertises the account-pools read
+    under its EXACT catalog id (the ``_login_disclosure_native`` pattern). The
+    expensive direction is a false POSITIVE: it would make the client treat a
+    legacy engine's native pseudo-rows as named profiles (Remove buttons on
+    rows the engine cannot delete, a verify-race that never resolves). A false
+    negative only costs the old rendering, which is correct on every engine
+    that lacks the route. Pure for unit tests; a caller that could not READ
+    the catalog must pass [] and get False — fail closed to the old behavior.
+    """
+    for op in operations:
+        if not isinstance(op, dict):
+            continue
+        if str(op.get("id") or "") == _ACCOUNT_POOLS_OPERATION_ID:
+            return True
+    return False
+
+
 def _login_capable_harness_ids(rows: List[Dict[str, Any]]) -> "set | None":
     """Harnesses whose manifest declares a ``native_session`` auth source.
 
@@ -170,6 +202,15 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
             "accounts": READ_NOT_READ,
             "quota": READ_NOT_READ,
         },
+        # UNIFIED ACCOUNT MODEL feature fact (sprint plan §L.2): True only when
+        # the engine's own /v2/operations catalog was READ and advertises
+        # `GET /v2/account-pools`. Anything else — old engine, unreadable
+        # catalog, no daemon — is False: the client falls closed to the legacy
+        # native-pseudo-row rendering, which is correct on every engine that
+        # lacks the route. Deliberately NOT a facet: like the login-capability
+        # manifest read it is a rendering input whose failure is absorbed, not
+        # reported.
+        "unified_accounts": False,
         # The Subagents section's «last delegated run» receipt — Ouroboros's
         # own projection, not daemon truth, so it is served even with the
         # daemon down. {} = no delegated run recorded (absence, not a default).
@@ -191,11 +232,15 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
             # on its own (see `_facet_outcome`), a refusal surfaces as the typed
             # unreachable state below WITHOUT downgrading the siblings that
             # landed, and a manifest refusal still fails OPEN.
-            with ThreadPoolExecutor(max_workers=4) as pool:
+            with ThreadPoolExecutor(max_workers=5) as pool:
                 catalog_call = pool.submit(gateway.agent_capabilities)
                 manifests_call = pool.submit(gateway.harnesses)
                 profiles_call = pool.submit(gateway.credential_profiles)
                 quota_call = pool.submit(gateway.quota_snapshots)
+                # Deferred lookup on purpose: the failure of THIS read (or a
+                # transport double that lacks the method) must land inside the
+                # future, where the absorbed fail-closed handling below owns it.
+                operations_call = pool.submit(lambda: gateway.operations())
             # Classify every submitted future INDEPENDENTLY, before consuming
             # any of them. Reading `.result()` in sequence would make a facet's
             # verdict depend on which sibling raised first — a catalog failure
@@ -226,6 +271,17 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
                 capable = _login_capable_harness_ids(manifests_call.result())
             except ClaudexorUnavailable:
                 capable = None
+            # The unified-accounts feature fact, from the engine's own route
+            # catalog. An unreadable catalog fails CLOSED to the old behavior
+            # (False) — the legacy rendering is correct on every engine, while
+            # a guessed True would draw named-row affordances over pseudo-rows
+            # the engine cannot honor. Absorbed like the manifest read: a
+            # rendering input, never a reported facet.
+            try:
+                payload["unified_accounts"] = _unified_accounts_native(operations_call.result())
+            except Exception:
+                log.debug("operations catalog read failed; assuming legacy account model",
+                          exc_info=True)
             rows: List[Dict[str, Any]] = []
             for row in catalog.get("harnesses") or []:
                 if not isinstance(row, dict):
@@ -672,14 +728,29 @@ def _remove_credential_profile(harness: str, profile_id: str) -> Dict[str, Any]:
     return {"ok": True, "harness": harness, "profile_id": profile_id}
 
 
-async def api_claudexor_credential_profile(request: Request) -> JSONResponse:
-    """DELETE /api/claudexor/credential-profiles/{harness}/{profile_id}.
+def _update_credential_profile(harness: str, profile_id: str, enabled: bool) -> Dict[str, Any]:
+    from ouroboros.claudexor_daemon import owned_config_dir
+    from ouroboros.gateways.claudexor import ClaudexorGateway, discover_daemon_at
 
-    Another thin proxy, same rule as its siblings: the daemon owns the
-    account record, so removing one is its own contract
-    (``DELETE /v2/credential-profiles/:harness/:profileId``) and its refusal is
-    the answer. Nothing here touches a vendor credential file — a native CLI
+    endpoint = discover_daemon_at(owned_config_dir())
+    with ClaudexorGateway(endpoint) as gateway:
+        gateway.handshake()
+        gateway.update_credential_profile(harness, profile_id, enabled=enabled)
+    return {"ok": True, "harness": harness, "profile_id": profile_id, "enabled": bool(enabled)}
+
+
+async def api_claudexor_credential_profile(request: Request) -> JSONResponse:
+    """DELETE|PATCH /api/claudexor/credential-profiles/{harness}/{profile_id}.
+
+    Two thin proxies on one route, same rule as their siblings: the daemon
+    owns the account record. DELETE asks the engine to forget one named
+    account (``DELETE /v2/credential-profiles/:harness/:profileId``) — nothing
+    here touches a vendor credential file, and a legacy engine's native CLI
     login has no route because this process cannot honestly sign it out.
+    PATCH is the Enabled toggle
+    (``PATCH /v2/credential-profiles/:harness/:profileId`` with the engine's
+    own strict ``{enabled}`` body): whether this account participates in the
+    engine's rotation pool. The refusal, in both cases, is the answer.
     """
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
@@ -687,14 +758,29 @@ async def api_claudexor_credential_profile(request: Request) -> JSONResponse:
     profile_id = str(request.path_params.get("profile_id") or "").strip()
     if not harness or not profile_id:
         return json_error("harness and profile_id are required", 400)
+    is_update = request.method == "PATCH"
+    if is_update:
+        # STRICT in the proxy sense, mirroring the engine's own
+        # ControlCredentialProfileUpdateRequest: one JSON object with one
+        # BOOLEAN `enabled`. Nothing is coerced — a "true" string is a caller
+        # bug the engine would refuse anyway, and rewriting it here would
+        # decide for the engine what the caller meant.
+        body: Any = await request_json_or(request, {})
+        enabled = body.get("enabled") if isinstance(body, dict) else None
+        if not isinstance(enabled, bool):
+            return json_error("enabled is required (a JSON boolean)", 400)
     try:
+        if is_update:
+            return JSONResponse(
+                await asyncio.to_thread(_update_credential_profile, harness, profile_id, enabled))
         return JSONResponse(
             await asyncio.to_thread(_remove_credential_profile, harness, profile_id))
     except ClaudexorUnavailable as exc:
         return json_error(f"{exc.code}: {exc}", 503)
     except Exception as exc:
-        log.exception("api_claudexor_credential_profile failed")
-        return json_error(f"{type(exc).__name__}: Claudexor account removal failed")
+        log.exception("api_claudexor_credential_profile failed (%s)", request.method)
+        return json_error(f"{type(exc).__name__}: Claudexor account "
+                          f"{'update' if is_update else 'removal'} failed")
 
 
 __all__ = [

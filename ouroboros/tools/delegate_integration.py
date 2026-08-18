@@ -251,7 +251,11 @@ def _resolve_retry_invocation(ctx: ToolContext, drive: pathlib.Path, retry_token
     scope = request_body.get("scope") if isinstance(request_body.get("scope"), dict) else {}
     route = DelegationRoute(route_id=str(request_body.get("primaryHarness") or ""),
                             model=str(request_body.get("model") or ""),
-                            effort=str(request_body.get("effort") or ""))
+                            effort=str(request_body.get("effort") or ""),
+                            # The STORED pin, so a retry's health check judges the
+                            # account the replayed body actually names — never the
+                            # setting as it reads today (D-U5).
+                            profile_id=str(request_body.get("credentialProfileId") or ""))
     authority = DelegatedRunShape(access=str(request_body.get("access") or ""),
                                   mode=str(request_body.get("mode") or ""),
                                   isolation=str(execution.get("isolation") or ""),

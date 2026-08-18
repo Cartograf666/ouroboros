@@ -150,9 +150,22 @@ export function indexProfilesByHarness(payload) {
         const harness = String(profile.harness_id || '');
         const id = String(profile.profile_id || '');
         if (!harness || !id) continue;
-        (byHarness[harness] = byHarness[harness] || []).push(id);
+        // The entry carries the ENABLED fact beside the id (same fail-open
+        // rule as accountRows: absent reads enabled), so the pin selects can
+        // say a disabled account is disabled instead of offering it bare.
+        (byHarness[harness] = byHarness[harness] || []).push({
+            id, enabled: profile.enabled !== false,
+        });
     }
     return byHarness;
+}
+
+// One index entry, whichever spelling it arrived in: the index emits
+// `{id, enabled}` objects; older call sites and tests still hand plain id
+// strings, which read as enabled (the same fail-open rule as the index).
+function profileEntry(entry) {
+    if (typeof entry === 'string') return { id: entry, enabled: true };
+    return { id: String(entry?.id || ''), enabled: entry?.enabled !== false };
 }
 
 export function buildReviewerSlotsSetting(state) {
@@ -271,8 +284,15 @@ export function profileOptionsFor(profiles, savedPin, { accountsKnown = true } =
     // select fell back to its first entry and redrew the row as "automatic rotation".
     // The pin only LOOKED gone — until the owner saved the panel, which then really
     // did delete it, silently widening which account the reviewer may spend.
+    // A DISABLED account stays selectable, labeled "(disabled)": the engine's
+    // typed refusal is the authority on whether a pinned run may use it
+    // (D-U6), so the label is honesty, not a gate — hiding or greying the
+    // option would be a second, client-side gate the design rejected.
     const options = [{ value: '', label: 'Account: automatic rotation' },
-        ...(profiles || []).map((p) => ({ value: p, label: `Account: ${p} (pinned)` }))];
+        ...(profiles || []).map(profileEntry).filter((p) => p.id).map((p) => ({
+            value: p.id,
+            label: `Account: ${p.id} (pinned)${p.enabled ? '' : ' (disabled)'}`,
+        }))];
     if (savedPin && !options.some((o) => o.value === savedPin)) {
         options.push({
             value: savedPin,
@@ -305,7 +325,7 @@ export function pinnedAccountWarning({ triad = [], scope = [], advisory = null,
         const pin = String(route.profile_id || '');
         if (!pin) continue;
         const harness = splitSessionTarget(route.target_id).harness;
-        if ((profilesByHarness[harness] || []).includes(pin)) continue;
+        if ((profilesByHarness[harness] || []).some((entry) => profileEntry(entry).id === pin)) continue;
         const label = `${harness} · ${pin}`;
         if (!missing.includes(label)) missing.push(label);
     }

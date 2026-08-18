@@ -171,19 +171,33 @@ def _profile_seat_verdict(
 
 
 def _next_up_verdict(
-    harness: str, account: Dict[str, Any], profiles: Dict[Tuple[str, str], Dict[str, Any]],
+    harness: str, next_up: Dict[str, Any], account: Dict[str, Any],
+    profiles: Dict[Tuple[str, str], Dict[str, Any]],
 ) -> Tuple[bool, str]:
     """Would an UNPINNED run of this harness route through a subscription seat
     RIGHT NOW? The daemon's own server-computed answer; Ouroboros does not
     re-derive the rotation (D28), it only judges whether the seat the engine
     names is a SUBSCRIPTION or an API key.
 
+    ``next_up`` is the verdict the caller already resolved off the wire —
+    the unified ``accountPools`` row first, the legacy per-harness
+    ``harnessAccounts[].next_up`` second (dual-read, sprint plan §K.7) — and
+    the two unions are judged side by side here: ``profile``/``none`` are
+    shared spellings, ``native`` exists only on the legacy wire (it reads the
+    legacy ``account`` row's own facts), ``api_key_route`` only in the pool
+    union (frozen contract §L.1). An UNKNOWN kind — either wire growing a
+    spelling this reader predates — is fail-safe: not a subscription verdict,
+    and the caller's configured-seat scan still gets its say.
+
     This answers a MOMENT-IN-TIME question — see ``_configured_subscription_seat``
     for why the install-time preset cannot be decided by it alone."""
-    next_up = account.get("next_up") if isinstance(account.get("next_up"), dict) else {}
     kind = str(next_up.get("kind") or "")
     if kind == "none":
         return False, str(next_up.get("reason") or "the engine has nothing routable for it")
+    if kind == "api_key_route":
+        # The pool union's explicit API-key verdict (Q2=A: allowed under
+        # auth_preference=auto, disclosed) — a maintained route, never a seat.
+        return False, "an unpinned run would route through an API key, not a subscription"
     if kind == "native":
         if not account.get("native_login_detected"):
             return False, "no signed-in session is detected for the default account"
@@ -199,7 +213,8 @@ def _next_up_verdict(
 
 
 def _configured_subscription_seat(
-    harness: str, account: Dict[str, Any], profiles: Dict[Tuple[str, str], Dict[str, Any]],
+    harness: str, next_up: Dict[str, Any], account: Dict[str, Any],
+    profiles: Dict[Tuple[str, str], Dict[str, Any]],
     *, native_allowed: bool = True,
 ) -> Tuple[bool, str]:
     """Is a subscription seat CONFIGURED here — regardless of capacity right now?
@@ -226,16 +241,22 @@ def _configured_subscription_seat(
     falls back to API spend and it must not silently vanish from the
     configuration either. Out of capacity is not evidence of not-a-subscription.
 
-    ``next_up`` is still consulted here for the ONE thing only it can answer:
-    whether the default login's EFFECTIVE route is the vendor session or an API
-    key. A harness's ``auth_preference`` can put a key ahead of a session that is
-    signed in, and that IS durable — a seat billing the owner's API key is what
-    D-3 forbids, spent window or not."""
-    next_up = account.get("next_up") if isinstance(account.get("next_up"), dict) else {}
+    ``next_up`` — the caller's ALREADY-RESOLVED routing verdict (pool first,
+    legacy second, same dual-read as the caller) — is still consulted here for
+    the ONE thing only it can answer: whether the default login's EFFECTIVE
+    route is the vendor session or an API key. A harness's ``auth_preference``
+    can put a key ahead of a session that is signed in, and that IS durable —
+    a seat billing the owner's API key is what D-3 forbids, spent window or
+    not. Both unions spell it: the legacy ``native`` verdict's ``api_key``
+    route, and the pool union's ``api_key_route`` kind (§L.1). On a purely
+    unified payload ``account`` is empty, so the native short-circuit never
+    fires and the named-profile scan below is the whole answer."""
     if (native_allowed and account.get("native_login_detected")
             and account.get("native_credentials_enabled")):
-        effective_api_key = (str(next_up.get("kind") or "") == "native"
-                             and str(next_up.get("route") or "") == _API_KEY_NATIVE_ROUTE)
+        kind = str(next_up.get("kind") or "")
+        effective_api_key = (
+            (kind == "native" and str(next_up.get("route") or "") == _API_KEY_NATIVE_ROUTE)
+            or kind == "api_key_route")
         if not effective_api_key:
             return True, "signed-in default session"
     for (row_harness, profile_id) in sorted(profiles):
@@ -263,7 +284,20 @@ def subscription_routable_harnesses(
     The engine's `next_up` answers first, because when it does
     say yes the receipt records the seat a real run would take; when it says no,
     a configured seat still counts and the refusal is recorded as a capacity
-    note. Everything the verdict rests on comes from the engine."""
+    note. Everything the verdict rests on comes from the engine.
+
+    DUAL-READ (unified account model, sprint plan §K.7 + frozen contract §L):
+    a unified engine emits ``harnessAccounts: []`` — every account a named
+    registry row — and carries the routing verdict in the ADDITIVE top-level
+    ``accountPools: [{harness_id, next_up}]`` key instead. That pool row is
+    the accounts authority there (skipping the harness because its legacy row
+    is absent would silently drop every unified harness from the preset); on a
+    legacy engine the per-harness account row keeps answering exactly as
+    before. When both carry a verdict, the pool wins — profiles own account
+    facts, the pool owns routing facts. Routing is NEVER re-derived from the
+    profile list client-side; a unified harness with an unknown or refusing
+    pool verdict falls to the configured-seat scan, which on that wire is the
+    named-profile scan alone (there is no native fact to read)."""
     routable: Dict[str, str] = {}
     refused: Dict[str, str] = {}
     rows = _discovery_rows(snapshot.get("harnesses"))
@@ -274,10 +308,17 @@ def subscription_routable_harnesses(
         for row in (payload.get("harnessAccounts") or [])
         if isinstance(row, dict)
     }
+    pools = {
+        str(row.get("harness_id") or ""): row.get("next_up")
+        for row in (payload.get("accountPools") or [])
+        if isinstance(row, dict) and isinstance(row.get("next_up"), dict)
+    }
     for harness in PRESET_HARNESSES:
         account = accounts.get(harness)
-        if account is None:
+        pool_next_up = pools.get(harness)
+        if account is None and pool_next_up is None:
             continue  # the engine publishes no accounts authority for it: silent absence
+        account = account if isinstance(account, dict) else {}
         row = rows.get(harness)
         if row is None:
             refused[harness] = "the engine does not list this harness"
@@ -295,16 +336,18 @@ def subscription_routable_harnesses(
         # still requires a runnable harness row — the row is that seat's only
         # runnability signal — which keeps the deliberate
         # signed-in-but-unavailable refusal for the classic harnesses.
-        next_up = account.get("next_up") if isinstance(account.get("next_up"), dict) else {}
+        legacy_next_up = (account.get("next_up")
+                          if isinstance(account.get("next_up"), dict) else {})
+        next_up = pool_next_up if pool_next_up is not None else legacy_next_up
         next_kind = str(next_up.get("kind") or "")
-        ok, evidence = _next_up_verdict(harness, account, profiles)
+        ok, evidence = _next_up_verdict(harness, next_up, account, profiles)
         if ok and (not unrunnable or next_kind == "profile"):
             routable[harness] = evidence if not unrunnable else (
                 f"{evidence} (the harness row reads {status}: it has no default "
                 "credential store, and the named-profile probe vouches the seat)")
             continue
         seated, seat = _configured_subscription_seat(
-            harness, account, profiles, native_allowed=not unrunnable)
+            harness, next_up, account, profiles, native_allowed=not unrunnable)
         if seated:
             # "No capacity" wording is reserved for genuine temporary
             # exhaustion; a structurally unavailable row (no default

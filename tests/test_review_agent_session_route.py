@@ -988,10 +988,10 @@ def test_retry_replays_the_stored_route_and_registers_nothing_new(tmp_path, fake
     health_calls = []
     real_route_health = subagents.route_health
 
-    def _track_route_health(gateway, route_id, shape, *, route_model=""):
-        health_calls.append((route_id, route_model))
+    def _track_route_health(gateway, route_id, shape, *, route_model="", route_profile=""):
+        health_calls.append((route_id, route_model, route_profile))
         return real_route_health(
-            gateway, route_id, shape, route_model=route_model,
+            gateway, route_id, shape, route_model=route_model, route_profile=route_profile,
         )
 
     monkeypatch.setattr(subagents, "route_health", _track_route_health)
@@ -1006,7 +1006,7 @@ def test_retry_replays_the_stored_route_and_registers_nothing_new(tmp_path, fake
     assert retry_gateway.start_requests[0]["harnesses"] == ["fake-review"]
     # Pending recovery can still POST, so it remains admission-health gated —
     # against the STORED route/model, never the drifted current configuration.
-    assert health_calls == [("fake-review", "fake-small")]
+    assert health_calls == [("fake-review", "fake-small", "")]
     # No project lookup or registration happened on the retry: the original
     # attempt's project rides the record.
     assert retry_gateway.project_lookups == []
@@ -1014,6 +1014,50 @@ def test_retry_replays_the_stored_route_and_registers_nothing_new(tmp_path, fake
     assert sum(before) == sum(len(i.registrations) for i in fake_route.instances)
     # Same wire key, byte-identical body.
     assert retry_gateway.start_keys == [pending]
+
+
+def test_retry_of_a_pinned_session_health_checks_the_stored_account(tmp_path, fake_route,
+                                                                    monkeypatch):
+    """§K.7 on the review lane's OWN recovery: the stored canonical request
+    carries the account pin (`credentialProfileId`), so a retry's pre-flight
+    health must judge that exact subject — never the harness-wide pool, and
+    never whatever pin the settings drifted to after the original attempt."""
+    from ouroboros import subagents
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+    from ouroboros.subagents import DelegationRoute
+
+    pinned = DelegationRoute(route_id="fake-review", model="fake-small",
+                             effort="low", profile_id="pinned-account")
+    state: dict = {}
+    fake_route.start_error = ClaudexorUnavailable("daemon_unreachable", "boom", status_code=0)
+    with pytest.raises(ClaudexorUnavailable):
+        _run_session_directly(tmp_path, retry_state=state, session_route=pinned)
+    assert state["pending_invocation_id"]
+
+    # The setting drifts to another route between the attempts.
+    monkeypatch.setenv(REVIEW_SESSION_ROUTE_ENV, "other-route=other-model:high")
+    health_calls = []
+    real_route_health = subagents.route_health
+
+    def _track_route_health(gateway, route_id, shape, *, route_model="", route_profile=""):
+        health_calls.append((route_id, route_model, route_profile))
+        return real_route_health(
+            gateway, route_id, shape, route_model=route_model, route_profile=route_profile,
+        )
+
+    monkeypatch.setattr(subagents, "route_health", _track_route_health)
+
+    facts = _run_session_directly(tmp_path, retry_state=state)
+
+    # The health check received the STORED pin — not '' and not the drift.
+    assert health_calls == [("fake-review", "fake-small", "pinned-account")]
+    retry_gateway = fake_route.instances[-1]
+    assert retry_gateway.start_requests[0]["credentialProfileId"] == "pinned-account"
+    # And the fresh STARTED custody row carries the pin, symmetric with the
+    # delegate lane, so the receipt line can disclose a requested-vs-ran drift.
+    started = [r for r in _custody_rows(tmp_path) if r["type"] == custody.STARTED]
+    assert started and started[-1]["profile_id"] == "pinned-account"
+    assert facts["run_id"]
 
 
 def test_retry_refuses_typed_when_the_stored_prompt_diverges(tmp_path, fake_route):

@@ -816,6 +816,7 @@ def _review_recovery_facts(
     route = DelegationRoute(
         route_id=route_id, model=model,
         effort=str(run_request.get("effort") or ""),
+        profile_id=str(run_request.get("credentialProfileId") or ""),
     )
     existing_project = "" if project_owned else project_id
     return route, project_id, existing_project, key, "outputSchema" in run_request
@@ -883,12 +884,11 @@ def run_delegated_review_session(
     state = retry_state if retry_state is not None else {}
     run_id, run_request, invocation_id = "", None, ""
     started_custody = None
-    # THE RETRY IS READ FIRST, before any daemon call. A retry replays the STORED
-    # invocation, so every fact about it — the route whose health is checked, the
-    # project, the lookup key, whether the schema was asked — comes from the record,
-    # not from the environment as it stands now. Computing them up front POSTed the
-    # recorded body while checking a route the run never used and writing a durable
-    # record that contradicted the bytes on the wire.
+    # THE RETRY IS READ FIRST, before any daemon call. A retry replays the STORED invocation,
+    # so every fact about it — the route whose health is checked, the project, the lookup key,
+    # whether the schema was asked — comes from the record, not from the environment as it
+    # stands now. Computing them up front POSTed the recorded body while checking a route the
+    # run never used and writing a durable record that contradicted the bytes on the wire.
     retry_token = str(state.get("pending_invocation_id") or "")
     record = custody.invocation_record(custody_drive, retry_token) if retry_token else None
     if record is not None and record["state"] == "started" and record["run_id"]:
@@ -899,8 +899,7 @@ def run_delegated_review_session(
     elif (record is not None and record["state"] == "pending"
           and isinstance(record.get("request"), dict) and record["request"]):
         run_request, invocation_id = record["request"], retry_token
-    # A dead (definitely refused) or unrecorded token falls through and mints
-    # fresh — its id must never ride the wire again.
+    # A dead (definitely refused) or unrecorded token falls through and mints fresh; its id never rides the wire again.
     recovering = bool(run_id) or run_request is not None
     if recovering:
         route, project_id, existing_project, key, schema_asked = (
@@ -918,12 +917,13 @@ def run_delegated_review_session(
     gateway = ensure_owned_gateway()
     try:
         if not run_id:
-            # Admission health applies only while this call may POST. A durable
-            # STARTED run needs gateway availability for GET/poll, but a changed
-            # quota window cannot invalidate a run that already exists.
+            # Admission health applies only while this call may POST. A durable STARTED run needs gateway
+            # availability for GET/poll, but a changed quota window cannot invalidate a run that already exists.
             unavailable, reset_at = route_health(
                 gateway, route.route_id, shape, route_model=route.model,
-            )
+                # A PINNED row is judged against its own subject exactly (unified-accounts §K.7): a healthy
+                # sibling account must not vouch a spent pin into a dispatch the engine will refuse.
+                route_profile=getattr(route, "profile_id", ""))
             if unavailable:
                 raise ReviewRouteUnavailable(
                     f"delegated review route unavailable: {unavailable}")
@@ -989,12 +989,11 @@ def run_delegated_review_session(
                 root_task_id=root_task_id, parent_task_id=parent_task_id,
             )
             if not requested:
-                # The POST is CONDITIONAL on the durable request row: a run
-                # launched without its custody trail would be unfindable if
-                # this worker died mid-review. Nothing was sent on THIS attempt,
-                # so a FRESH start's registration is definitively retirable —
-                # but a RETRY's project belongs to the original attempt, whose
-                # POST may have bound a live run.
+                # The POST is CONDITIONAL on the durable request row: a run launched
+                # without its custody trail would be unfindable if this worker died
+                # mid-review. Nothing was sent on THIS attempt, so a FRESH start's
+                # registration is definitively retirable — but a RETRY's project
+                # belongs to the original attempt, whose POST may have bound a live run.
                 _retire_orphaned_review_registration(
                     custody, gateway, custody_drive, project_id,
                     definite_refusal=not recovering,
@@ -1049,6 +1048,7 @@ def run_delegated_review_session(
             entry = custody.RunCustody(
                 run_id=run_id, task_id=task_id,
                 route_id=route.route_id, model=str(route.model or ""),
+                profile_id=str(getattr(route, "profile_id", "") or ""),
                 project_id=project_id, project_owned=not existing_project,
                 root_task_id=root_task_id, parent_task_id=parent_task_id,
                 ledger_root=str(custody_drive), idempotency_key=key,

@@ -671,6 +671,7 @@
  * @property {Object=} profiles
  * @property {Array<Object>=} quota
  * @property {ClaudexorStatusReads=} reads
+ * @property {boolean=} unified_accounts
  * @property {Object=} subagent_last_delegation
  * @property {string=} error
  */
