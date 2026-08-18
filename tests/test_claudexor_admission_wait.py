@@ -64,8 +64,8 @@ def _recovery_server(token: str, *, normal_after, with_mode_field: bool = True):
     many handshakes (None = it recovers forever — blocked journal partitions).
     Product routes 503 typed while recovering, exactly the 3.4.2 wire shape.
     Threading server on purpose: the admission poll loop keeps ITS gateway's
-    keep-alive connection open while the deferred rotation patch opens a second
-    one, which would deadlock a single-threaded handler.
+    keep-alive connection open while the rotation reconcile's settings reads
+    use a second one, which would deadlock a single-threaded handler.
     """
     state = {"handshakes": 0, "normal_after": normal_after,
              "mode_field": with_mode_field}
@@ -354,7 +354,7 @@ def test_zero_admission_wait_refuses_immediately_when_recovering(monkeypatch, tm
 
 # ---------------------------------------------------------------------------
 # A6 (v): an engine that never says servingMode (pre-3.4) keeps today's exact
-# path — rotation at spawn time, no admission polls.
+# path — no admission polls; the reconcile rides the ensure as everywhere.
 # ---------------------------------------------------------------------------
 
 
