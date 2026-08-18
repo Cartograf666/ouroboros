@@ -579,10 +579,26 @@ async def api_provider_test(request: Request) -> JSONResponse:
 
         merged = dict(load_settings())
         for endpoint_key, credential_keys in _PROVIDER_TEST_ENDPOINT_GUARDS.items():
+            if endpoint_key not in overrides:
+                continue
             submitted = str(overrides.get(endpoint_key, "") or "").strip()
             saved = str(merged.get(endpoint_key, "") or "").strip()
-            if endpoint_key not in overrides or not submitted or submitted == saved:
+            if endpoint_key == "GIGACHAT_VERIFY_SSL_CERTS":
+                # Boolean semantics, not spelling: unset means verify (the
+                # loader's own default), so submitting 'true' over an empty
+                # saved value confirms the existing trust boundary rather than
+                # changing it — raw string comparison would refuse a no-op.
+                as_bool = lambda text, default: (  # noqa: E731
+                    default if not text else text.lower() not in ("0", "false", "no", "off")
+                )
+                if as_bool(submitted, True) == as_bool(saved, True):
+                    continue
+            elif submitted == saved:
                 continue
+            # An EXPLICIT empty endpoint override still changes the probe's
+            # destination (the loader falls back to a default or legacy
+            # endpoint), so it takes the same credential re-entry as any
+            # other endpoint change.
             # EVERY credential that would still be non-empty after the merge
             # must itself come from this request: satisfying the guard with one
             # re-entered secret while another saved one rides along (e.g. a

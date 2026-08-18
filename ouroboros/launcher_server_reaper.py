@@ -15,6 +15,12 @@ not and is spared with a warning. An environment that cannot be READ is never a 
 The custody ledger is deliberately never consulted: missing ledger entries are the defect this
 sweep repairs, so a ledger lookup would spare exactly the strays that matter. POSIX only — on
 Windows the launcher's kill-on-close Job Object already reaps orphans.
+
+CONTRACT (disclosed residual): the lock-implies-orphan inference assumes PID_FILE and DATA_DIR
+derive from one APP_ROOT, which every packaged install satisfies. An owner who deliberately
+decouples them via environment overrides — two launchers holding DIFFERENT lock files over the
+SAME data directory — is outside this contract: such a topology already corrupts the shared
+state files that the single-instance lock exists to protect, with or without this sweep.
 """
 
 from __future__ import annotations
@@ -262,17 +268,16 @@ def reap_same_install_strays(
         return []
     killed: Set[int] = set()
     proven_seen: Set[int] = set()
+    unproven_seen: Set[int] = set()
     survivors: List[int] = []
     try:
         for attempt in range(REAP_PASSES):
             proven, unproven = find_same_install_server_pids(repo_dir, data_dir, exclude_pids)
             proven_seen.update(proven)
-            if unproven and attempt == 0:
-                log.warning(
-                    "Sparing same-install server process(es) with no launcher proof (%s): %s — a "
-                    "direct run of this checkout, or an environment that could not be read.",
-                    reason, sorted(unproven),
-                )
+            # Accumulated across passes: a spared process that first appears on
+            # pass 2 or 3 (a fork of an unproven direct run mid-sweep) must be
+            # just as visible as one seen up front.
+            unproven_seen.update(unproven)
             if not proven:
                 break
             for pid in sorted(proven):
@@ -289,6 +294,12 @@ def reap_same_install_strays(
         # colliding generation on the strength of an exception.
         log.warning("Same-install stray sweep aborted mid-work (%s)", reason, exc_info=True)
         survivors = sorted(proven_seen - killed)
+    if unproven_seen:
+        log.warning(
+            "Sparing same-install server process(es) with no launcher proof (%s): %s — a "
+            "direct run of this checkout, or an environment that could not be read.",
+            reason, sorted(unproven_seen),
+        )
     if killed:
         log.info("Reaped same-install stray server process(es) (%s): %s", reason, sorted(killed))
     return sorted(survivors)

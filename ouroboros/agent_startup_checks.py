@@ -360,8 +360,10 @@ def check_stray_server_processes(env: Any) -> Tuple[Dict[str, Any], int]:
 
             same_install_paths = _server_path_forms(_repo_dir)
         except Exception:
+            # The identity rule could not load: an unlabelled answer is honest,
+            # a hard 'foreign' would deny a genuine same-install stray.
             same_install_paths = set()
-            _names_our_server = lambda command, paths: False  # noqa: E731
+            _names_our_server = None
         stray: list[dict[str, Any]] = []
         for line in (out.stdout or "").splitlines():
             try:
@@ -390,9 +392,12 @@ def check_stray_server_processes(env: Any) -> Tuple[Dict[str, Any], int]:
                     continue
             except Exception:
                 pass
-            scope = ("same_install"
-                     if _names_our_server(command or "", same_install_paths)
-                     else "foreign")
+            if _names_our_server is None:
+                scope = "unknown"
+            else:
+                scope = ("same_install"
+                         if _names_our_server(command or "", same_install_paths)
+                         else "foreign")
             stray.append({"pid": pid, "command": command[:160], "scope": scope})
         if stray:
             log.warning("Stray ouroboros server process(es) outside this install: %s", stray)

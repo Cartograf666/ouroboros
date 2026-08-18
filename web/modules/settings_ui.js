@@ -986,6 +986,10 @@ export function bindSecretInputs(root) {
             target.dataset.forceClear = '1';
             const toggle = root.querySelector(`.secret-toggle[data-target="${button.dataset.target}"]`);
             if (toggle) toggle.textContent = 'Show';
+            // Programmatic value changes fire no 'input' event, but a Clear is
+            // an edit like any other: the provider-test verdict-expiry listener
+            // must see it, or a stale OK keeps vouching for a cleared key.
+            target.dispatchEvent(new Event('input', { bubbles: true }));
         });
     });
 }

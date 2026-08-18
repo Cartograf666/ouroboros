@@ -385,3 +385,51 @@ def test_short_credentials_are_redacted_as_standalone_tokens(monkeypatch):
     assert " abc " not in f' {body["error"]} '.replace("***", " *** ")
     # An innocent longer word sharing the prefix stays legible.
     assert "abcdef" in body["error"]
+
+
+def test_an_explicit_empty_endpoint_override_is_still_an_endpoint_change(monkeypatch):
+    # Unsetting the saved endpoint reroutes the probe to a default or legacy
+    # destination — a destination change like any other while a saved key rides.
+    monkeypatch.setattr(
+        model_catalog_api,
+        "load_settings",
+        lambda: {
+            "CLOUDRU_FOUNDATION_MODELS_API_KEY": "unit-test-credential",
+            "CLOUDRU_FOUNDATION_MODELS_BASE_URL": "https://unit-test-base-url.example/v1",
+        },
+    )
+    status, body = _post({
+        "provider_id": "cloudru",
+        "overrides": {"CLOUDRU_FOUNDATION_MODELS_BASE_URL": ""},
+    })
+    assert status == 400
+    assert "re-entering the credential" in body.get("error", "")
+
+
+def test_verify_ssl_guard_ignores_semantic_noops(monkeypatch):
+    # Unset means verify (the loader default), so an explicit 'true' confirms
+    # the existing trust boundary; only an actual flip demands re-entry.
+    monkeypatch.setattr(
+        model_catalog_api,
+        "load_settings",
+        lambda: {"GIGACHAT_CREDENTIALS": "unit-test-credential"},
+    )
+
+    async def fake_gigachat(_credentials, _scope, _base_url, _verify, _user="", _password=""):
+        return [{"value": "gigachat::unit-test-model"}]
+
+    monkeypatch.setattr(model_catalog_api, "_fetch_gigachat_model_catalog", fake_gigachat)
+    status, body = _post({
+        "provider_id": "gigachat",
+        "overrides": {"GIGACHAT_VERIFY_SSL_CERTS": "true"},
+    })
+    assert status == 200 and body["ok"] is True
+
+
+def test_provider_card_clear_buttons_dispatch_input_for_verdict_expiry():
+    # BOTH clear handlers (provider cards' .secret-clear and custom secret
+    # rows') must fire 'input': verdict expiry listens for it exclusively.
+    settings_ui = (WEB / "settings_ui.js").read_text(encoding="utf-8")
+    settings = (WEB / "settings.js").read_text(encoding="utf-8")
+    assert settings_ui.count("dispatchEvent(new Event('input', { bubbles: true }))") == 1
+    assert settings.count("dispatchEvent(new Event('input', { bubbles: true }))") == 1
