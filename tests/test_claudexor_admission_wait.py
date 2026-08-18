@@ -160,10 +160,11 @@ def _spawning_recovery_daemon(monkeypatch, servers: list, states: list, *,
         _provision_home(home, server.server_address[1], token)
         if child_factory is not None:
             return child_factory()
+        from ouroboros.platform_layer import subprocess_new_group_kwargs
         return subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(120)"],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, start_new_session=True)
+            stderr=subprocess.DEVNULL, **subprocess_new_group_kwargs())
 
     monkeypatch.setattr(custody_mod, "spawn_supervised", fake_spawn)
 
