@@ -489,6 +489,52 @@ def test_unified_accounts_capability_reads_the_operations_catalog():
     assert _unified_accounts_native([None, "get:account-pools"]) is False
 
 
+def test_pinned_engine_serves_the_account_pools_marker_id():
+    """Cross-repo byte-assertion (unified-accounts sprint obligation): from
+    Claudexor 3.6.0 the engine's /v2/operations catalog serves the pool-
+    authority read under the EXACT id `get:account-pools`. The engine derives
+    ids from routes (`method.toLowerCase() + ':' + path minus its '/v2/'
+    prefix, [:/<>]+ folded to '.'), and claudexor pins the same literal from
+    its side (control-api.test.ts asserts the catalog row for
+    /v2/account-pools carries this id verbatim). If either repo respells it,
+    the feature detect quietly answers False and every install degrades to
+    the legacy accounts rendering — the deliberate cheap direction of
+    `_unified_accounts_native`, which is exactly why no behavioral test would
+    notice. The assertion is gated on the tracked runtime pin so a deliberate
+    pre-3.6 pin rollback leaves it dormant instead of red."""
+    from ouroboros.claudexor_runtime import load_runtime_pin
+    from ouroboros.gateway.claudexor_accounts import (
+        _ACCOUNT_POOLS_OPERATION_ID,
+        _unified_accounts_native,
+    )
+
+    pin = load_runtime_pin()
+    assert pin is not None, "the tracked runtime pin must select a release"
+    major, minor, _patch = (int(part) for part in pin.version.split("."))
+    if (major, minor) < (3, 6):
+        pytest.skip(
+            f"pinned engine {pin.version} predates the unified account model"
+        )
+    assert _ACCOUNT_POOLS_OPERATION_ID == "get:account-pools"
+    # A 3.6-shaped catalog slice — the accounts-surface rows exactly as the
+    # pinned engine generates them — satisfies the feature detect...
+    catalog_3_6 = [
+        {"id": "get:quota", "method": "GET", "path": "/v2/quota"},
+        {"id": "get:account-pools", "method": "GET", "path": "/v2/account-pools"},
+        {"id": "get:credential-profiles", "method": "GET",
+         "path": "/v2/credential-profiles"},
+        {"id": "post:accounts-migration.rollback", "method": "POST",
+         "path": "/v2/accounts-migration/rollback"},
+    ]
+    assert _unified_accounts_native(catalog_3_6) is True
+    # ...and the same catalog without the one marker row is the legacy model:
+    # no neighbouring accounts route may stand in for the marker.
+    without_marker = [
+        op for op in catalog_3_6 if op["id"] != _ACCOUNT_POOLS_OPERATION_ID
+    ]
+    assert _unified_accounts_native(without_marker) is False
+
+
 def test_status_payload_stamps_the_unified_accounts_fact(monkeypatch, tmp_path):
     """`unified_accounts` rides every status answer: True only when the
     operations catalog was READ and carries the account-pools marker; an old

@@ -55,8 +55,10 @@ _ADMISSION_POLL_SEC = 0.15
 # (kind-aware "auto" semantics, Clawdexor A6): subscription profiles rotate,
 # metered API keys fail, and the OWNER's explicit choices always win. Blanket
 # "rotate" writes from this side would overwrite that judgment, so reconcile
-# skips those engines entirely. A6 is planned for the 3.6.0 release wave; this
-# is deliberately not CLAUDEXOR_MIN_VERSION (owner decision 5=A: no floor bump).
+# skips those engines entirely. Confirmed shipped in the actual 3.6.0 release
+# (claudexor 31aa51c9, schema limit_action enum carries kind-aware "auto"), so
+# this floor names the real release wave (issue #246); it is deliberately not
+# CLAUDEXOR_MIN_VERSION (owner decision 5=A: no floor bump).
 _ROTATION_AUTO_SEMANTICS_MIN_VERSION = "3.6.0"
 _ROTATION_RECEIPT_NAME = "claudexor_rotation_provisioning.json"
 
