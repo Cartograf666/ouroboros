@@ -10,9 +10,11 @@ from typing import List, Optional
 from ouroboros.loop_tool_execution import PLAN_REVIEW_CONTROL_PREFIX
 
 
+# B2 (honest DEGRADED): every aggregate reaches the control line as itself — the
+# old DEGRADED→REVIEW_REQUIRED laundering hid the no-quorum fact from the agent.
 _CONTROL_OUTCOME = {
     "GREEN": "GREEN", "REVIEW_REQUIRED": "REVIEW_REQUIRED",
-    "REVISE_PLAN": "REVISE_PLAN", "DEGRADED": "REVIEW_REQUIRED",
+    "REVISE_PLAN": "REVISE_PLAN", "DEGRADED": "DEGRADED",
 }
 
 
@@ -25,6 +27,39 @@ def _quote_control_lines(text: str) -> str:
 
 
 
+def _actor_outcome(actor: dict) -> str:
+    """``ok``, or a FAILED tail led by the typed facts when the record carries them
+    (B1: ``FAILED[code] (resets …): prose``). Without a typed code the prose renders
+    exactly as before — rows from pre-typed engines lose nothing."""
+    if actor.get("ok"):
+        return "ok"
+    code = str(actor.get("failure_code") or "")
+    if not code:
+        return "FAILED: " + str(actor.get("error"))
+    reset = str(actor.get("reset_at") or "")
+    return (f"FAILED[{code}]" + (f" (resets {reset})" if reset else "")
+            + ": " + str(actor.get("error")))
+
+
+def _degraded_replay_note(wave: dict) -> str:
+    """The honest replay mechanics of one recorded DEGRADED wave (aligned with the
+    engine's `plan_wave_replay_decision`): a wave with structural snapshot evidence
+    replays while its epoch and the reviewer roster stand; one without (its slots
+    died at dispatch time, invisible to the pre-fan-out snapshot) never replays —
+    a transient death is never cached as structural."""
+    if wave.get("health_epoch"):
+        return (
+            "an identical envelope replays this recorded result at no further cost while "
+            "the recorded lane-health epoch and the reviewer roster stand (a healed or "
+            "newly dead lane, or a changed roster, re-dispatches)"
+        )
+    return (
+        "no structural lane evidence was recorded for this wave (its slots failed at "
+        "dispatch time, invisible to the pre-fan-out health snapshot), so an identical "
+        "envelope re-dispatches a fresh panel — a transient death is never cached as structural"
+    )
+
+
 def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid: int) -> str:
     aggregate = str(wave.get("aggregate") or "")
     fp = str(wave.get("request_fingerprint") or "")
@@ -32,11 +67,32 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
     if bool(wave.get("closed")):
         return "Closed: proceed with the reviewed spec."
     if aggregate == "DEGRADED":
-        return (
-            "DEGRADED: no parseable quorum — re-call plan_task with the same envelope to re-run "
-            "the panel; a degraded wave consumes NO cycle."
+        # B2: facts, not a retry coach (BIBLE P5 — the host never dictates the next tool
+        # call). Quorum arithmetic, per-slot typed states above, and the replay mechanics;
+        # the decision (revise the spec, wait, escalate, proceed if permitted) is the LLM's.
+        counts = wave.get("counts") if isinstance(wave.get("counts"), dict) else {}
+        text = (
+            f"DEGRADED: parseable reviewer verdicts {counts.get('parseable', 0)} of "
+            f"{counts.get('configured', 0)} configured slot(s) — below the review quorum "
+            f"({counts.get('quorum', '?')}). Per-slot typed states (code and reset time, when "
+            "known) are listed under Reviewer slots above. This wave is recorded and OPEN; "
+            f"{_degraded_replay_note(wave)}; a changed spec starts the next paid cycle. "
         )
-    if aggregate == "REVIEW_REQUIRED":
+        if wave.get("quorum_unreachable"):
+            # Naming asymmetry, on purpose: the wave fact is the bare
+            # `quorum_unreachable` (scoped by the record it sits on); the task-level
+            # typed reason is outcomes.REASON_REVIEW_QUORUM_UNREACHABLE
+            # ("plan_review_quorum_unreachable") — surface-prefixed because it
+            # travels task-wide. Do not "align" one to the other.
+            dead = ", ".join(str(s) for s in wave.get("structurally_dead_slots") or [])
+            reset = str(wave.get("earliest_reset") or "")
+            text += (
+                f"Quorum is STRUCTURALLY unreachable for this wave: slot(s) {dead} are "
+                "window-spent, leaving fewer live slots than the quorum"
+                + (f"; earliest recorded reset {reset}" if reset else "")
+                + ". "
+            )
+    elif aggregate == "REVIEW_REQUIRED":
         blocking = [f for f in wave.get("findings") or [] if f.get("class") == "blocking"]
         text = (
             "Disposition every finding id (accept | reject | defer, each with a rationale) in ONE "
@@ -64,6 +120,16 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
             + (" — the cycle cap is reached: exits are owner unstick (Swarm/hurry) or finalizing "
                "with outcome_tier=blocked_with_evidence." if at_cap else ".")
         )
+        if wave.get("quorum_unreachable") and not bool(wave.get("closed")):
+            # B2b facts, never imperatives: the honest exits that exist alongside
+            # each other while the quorum stays structurally unreachable.
+            text += (
+                " With the quorum structurally unreachable, finalization is RELEASED: "
+                "finalizing now records outcome_tier=blocked_with_evidence with the review "
+                "left OPEN and implementation still held. Waiting is also open — a one-shot "
+                "deferred follow-up can be registered through schedule_followup for the "
+                "earliest reset — as is asking the owner."
+            )
     else:
         text += (
             "Advisory enforcement: you may proceed with the review OPEN; the host discloses "
@@ -96,10 +162,13 @@ def _render_wave(
     if reminder:
         lines += ["", "⚠️ " + reminder]
     if aggregate == "DEGRADED":
-        lines += ["", "⚠️ DEGRADED: no parseable quorum — re-call to re-run the panel; a degraded wave consumes NO cycle."]
+        # Banner aligned with _next_step: the replay promise depends on whether the
+        # wave carries structural snapshot evidence (see _degraded_replay_note).
+        lines += ["", "⚠️ DEGRADED: no parseable reviewer quorum — recorded as an OPEN wave; "
+                  + _degraded_replay_note(wave) + "."]
     actor_lines = [
         f"- {a.get('slot_id')} · {a.get('model')} · {a.get('route')} · host_file_read: "
-        f"{a.get('host_file_read_attestation')} · {'ok' if a.get('ok') else 'FAILED: ' + str(a.get('error'))}"
+        f"{a.get('host_file_read_attestation')} · {_actor_outcome(a)}"
         + (f" · disclosures: {', '.join(a['disclosures'])}" if a.get("disclosures") else "")
         for a in wave.get("actors") or []
     ] or ["(no actor records)"]

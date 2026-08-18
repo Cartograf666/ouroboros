@@ -502,7 +502,9 @@ Paid review cycles per task are bounded by the owner's shared `OUROBOROS_REVIEW_
 (default 2, `unlimited` available). Under blocking enforcement an exhausted cap holds
 implementation and escalates with the typed `review_cycles_exhausted` reason; under advisory the
 agent may proceed with the wave open under the host's loud disclosure. An idempotent replay of
-the same fingerprint and a DEGRADED wave (no parseable quorum) consume no cycle.
+the same fingerprint — a recorded DEGRADED wave included — consumes no cycle; a wave pays iff
+at least one reviewer slot was physically dispatched, so a dispatched DEGRADED panel pays its
+cycle while a nothing-dispatched wave of typed $0 skip rows stays unpaid.
 
 Planning has two distinct roots. Governance documents are always loaded from
 the system repository; declared targets and evidence locators resolve against
@@ -544,9 +546,25 @@ canonical fingerprint before repository/path validation. A newer attempt therefo
 cannot fall back to an older GREEN. The wave records the frozen SPEC, its hash, the evidence
 manifest (attached hashes plus every omission) and the composed fingerprint before dispatch, so a
 repeat call with the identical envelope replays that recorded wave for free instead of buying a
-second panel. An unavailable reviewer never becomes a disposition-able verdict; a DEGRADED wave
-(no parseable quorum) consumes no cycle and re-running the panel is the honest next step,
-including after A→B→A. Blocking stays in
+second panel, including after A→B→A. An unavailable reviewer never becomes a disposition-able
+verdict; a DEGRADED wave (no parseable quorum) records OPEN with per-slot typed failure facts,
+pays the cycle its dispatch cost, reaches the agent as an honest DEGRADED control outcome, and
+replays free ONLY under all three conditions: an identical envelope, a NON-EMPTY recorded
+structural lane-health epoch that a fresh pre-fan-out snapshot still matches, and an unchanged
+reviewer roster (slot ids, targets, routes, pinned profiles and efforts — an effort change is a
+roster change). An empty-epoch DEGRADED wave re-dispatches a PAID panel on the identical
+envelope; so does a lane the snapshot proves healed or newly dead, or a changed roster; a
+failed snapshot keeps the free replay — the next step (change the spec, wait, escalate, or
+proceed where enforcement permits) is the agent's judgment, never a host-authored re-call
+imperative. Structurally dead slots (dated window exhaustion with a future reset, or a typed
+dead-pool code) are skipped before dispatch as $0 typed rows that stay in the quorum
+denominator; unknown health dispatches. A wave whose typed rows prove the quorum structurally
+unreachable carries `quorum_unreachable` + the earliest reset; under blocking the finalization
+gate releases for an agent-chosen honest `blocked_with_evidence` terminal (review open,
+implementation held), and a one-shot deferred follow-up can be registered through
+`schedule_followup` on the existing supervisor scheduler. An open wave recorded under advisory
+enforcement emits one typed owner-visible
+`plan_review_advisory_open` event at record time. Blocking stays in
 analysis and non-mutating preparation until closure or a real task-wide rail;
 advisory may proceed by agent judgment with a host-owned disclosure, including
 an explicitly rejected `REVISE_PLAN`. A planning

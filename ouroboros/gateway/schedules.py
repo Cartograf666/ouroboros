@@ -35,13 +35,23 @@ async def api_schedules_upsert(request: Request) -> JSONResponse:
         if err := schedule_id_error(str(body.get("id") or "")):
             return json_error(err, 400)
         trigger = body.get("trigger") if isinstance(body.get("trigger"), dict) else {}
-        if str(trigger.get("type") or "cron") == "cron":
+        trigger_type = str(trigger.get("type") or "cron")
+        if trigger_type == "cron":
             expr = str(trigger.get("expr") or body.get("cron") or "").strip()
             if err := cron_error(expr):
                 return json_error(err, 400)
             trigger = {"type": "cron", "expr": expr}
+        elif trigger_type == "once":
+            # One-shot records (schedule_followup) round-trip through this upsert
+            # when the owner toggles/edits them from the Schedules surface.
+            from ouroboros.deadline_utils import parse_deadline_ts
+
+            instant = parse_deadline_ts(str(trigger.get("run_at") or "").strip())
+            if instant is None:
+                return json_error("trigger.run_at must be a parseable ISO 8601 instant", 400)
+            trigger = {"type": "once", "run_at": instant.isoformat()}
         else:
-            return json_error("trigger.type must be cron", 400)
+            return json_error("trigger.type must be cron or once", 400)
         task = body.get("task") if isinstance(body.get("task"), dict) else {}
         if RESERVED_TEMPLATE_FIELDS & set(task):
             return json_error("scheduled task templates cannot include workspace/drive fields; use /api/tasks for workspace preflight", 400)
@@ -67,6 +77,28 @@ async def api_schedules_upsert(request: Request) -> JSONResponse:
         enabled = _enabled_value(body)
         if isinstance(enabled, str):
             return json_error(enabled, 400)
+        completed_at = ""
+        if trigger.get("type") == "once":
+            # Exactly-once vs re-enable: a one-shot that already fired (non-empty
+            # completed_at) cannot be re-armed by flipping enabled back on — that
+            # would silently re-run the consumed task. Re-arming requires a NEW
+            # trigger.run_at, which clears the consumed receipt; a disable/edit that
+            # keeps the same run_at carries the receipt forward so GC still sees it.
+            from supervisor.queue import list_scheduled_tasks
+
+            wanted = str(body.get("id") or "").strip()
+            existing = next(
+                (item for item in list_scheduled_tasks(request_drive_root(request)).get("tasks") or []
+                 if isinstance(item, dict) and str(item.get("id") or "") == wanted), None)
+            prev = (existing or {}).get("trigger")
+            prev = prev if isinstance(prev, dict) else {}
+            if (existing is not None and str(existing.get("completed_at") or "")
+                    and str(prev.get("run_at") or "") == trigger["run_at"]):
+                if enabled:
+                    return json_error(
+                        "this one-shot schedule already fired; re-arming it requires a new "
+                        "trigger.run_at (a fresh run_at clears completed_at)", 400)
+                completed_at = str(existing.get("completed_at"))
         record = {
             "id": str(body.get("id") or "").strip(),
             "name": str(body.get("name") or body.get("id") or "scheduled-task").strip(),
@@ -76,6 +108,8 @@ async def api_schedules_upsert(request: Request) -> JSONResponse:
             "trigger": trigger,
             "task": task,
         }
+        if completed_at:
+            record["completed_at"] = completed_at
         from supervisor.queue import upsert_scheduled_task
 
         return JSONResponse({"ok": True, "schedule": upsert_scheduled_task(record, drive_root=request_drive_root(request))})

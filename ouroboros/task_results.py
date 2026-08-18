@@ -477,7 +477,9 @@ def plan_review_gate_projection(
     ``cycles_exhausted`` (the shared cap is spent on an OPEN wave: finalization is
     released so the task can terminalize honestly as blocked — owner D27 — while
     the wave itself stays open) · ``open`` / ``unavailable`` / ``pending`` /
-    ``legacy_open_requires_resubmission`` (blocking hold) · ``absent``. Accepts a v2
+    ``legacy_open_requires_resubmission`` (blocking hold; EXCEPT an ``open`` wave
+    whose ``quorum_unreachable`` typed fact holds — B2b — which releases
+    finalization the same honest-blocked way while staying open) · ``absent``. Accepts a v2
     state, a loaded v1 wrapper, or a raw v1 record (read-only projection)."""
     policy = "blocking" if str(enforcement or "").lower() == "blocking" else "advisory"
     control: Dict[str, Any] = {}
@@ -502,6 +504,12 @@ def plan_review_gate_projection(
                     "fingerprint": str(wave.get("request_fingerprint") or ""),
                     "reviewer_slots_degraded": outcome == "DEGRADED",
                 }
+                if wave.get("quorum_unreachable"):
+                    # B2b typed fact: the wave's own rows prove the quorum cannot be
+                    # met by any re-dispatch (structurally dead lanes), with the
+                    # earliest recorded reset when one was named.
+                    control["quorum_unreachable"] = True
+                    control["earliest_reset"] = str(wave.get("earliest_reset") or "")
             else:
                 control = {"status": str(attempt.get("status") or "open"),
                            "reason": str(attempt.get("reason") or "")}
@@ -538,6 +546,15 @@ def plan_review_gate_projection(
         gate_status, allow = "advisory_open", True
     elif status == "cycles_exhausted":
         gate_status, allow = "cycles_exhausted", True
+    elif status == "open" and control.get("quorum_unreachable"):
+        # B2b: quorum structurally unreachable under blocking — finalization is
+        # RELEASED so the agent MAY choose an honest blocked terminal (outcomes maps
+        # it to blocked_with_evidence). The review stays open, implementation stays
+        # held, and nothing here auto-finalizes: the gate merely stops refusing.
+        # Staleness residual (disclosed): the stamped facts are as old as the wave
+        # record — earliest_reset may already have passed by finalization time; the
+        # agent SEES the reset instant below and can re-call plan_task to re-probe.
+        gate_status, allow = "open", True
     else:
         gate_status, allow = status, False
     return {
@@ -548,6 +565,8 @@ def plan_review_gate_projection(
         "outcome": str(control.get("outcome") or ""),
         "closed": closed,
         "reviewer_slots_degraded": bool(control.get("reviewer_slots_degraded")),
+        "quorum_unreachable": bool(control.get("quorum_unreachable")),
+        "earliest_reset": str(control.get("earliest_reset") or ""),
         "reason": str(hard_rail or control.get("reason") or ""),
         "cycles_paid": int((state or {}).get("cycles_paid") or 0) if isinstance(state, dict) else 0,
         "legacy_v1": bool(control.get("legacy_v1")),
@@ -763,8 +782,10 @@ def record_plan_review_wave(
 ) -> Dict[str, Any]:
     """Append one reviewed v2 wave, make it current, pay its cycle, bound the history.
 
-    ``wave["paid"]`` decides whether ``cycles_paid`` advances (a DEGRADED wave never
-    pays); ``need_evidence_seen`` replaces the task-level locator memory; the first v2
+    ``wave["paid"]`` decides whether ``cycles_paid`` advances — the engine sets it iff
+    at least one reviewer slot was physically dispatched (B2: a dispatched DEGRADED
+    panel pays; only a nothing-dispatched wave of typed $0 skip rows stays unpaid);
+    ``need_evidence_seen`` replaces the task-level locator memory; the first v2
     wave of a task mints ``series_id`` (a fresh series supersedes any open v1 record).
     Older waves compact to summaries beyond ``_PLAN_REVIEW_FULL_WAVES``; entries beyond
     ``_PLAN_REVIEW_MAX_WAVES`` are dropped with ``waves_omitted`` counting them (S2)."""
@@ -774,15 +795,27 @@ def record_plan_review_wave(
 
     def _record(state: Dict[str, Any]) -> Dict[str, Any]:
         previous = [w for w in state.get("waves") or [] if str(w.get("request_fingerprint") or "") == fingerprint]
-        # D2 (delta review): an UNPAID (DEGRADED) wave never erases a PAID predecessor with
-        # the same fingerprint — that predecessor holds the findings and rejections the
-        # promised delta cycle rides on. The degraded attempt is counted on the paid wave
-        # and the paid wave stays the durable authority; the caller still renders the
-        # degraded result it was handed.
+        # D2, deliberately NARROWED by B2 (explicit wave-record authority change): only an
+        # UNPAID wave — one in which NOTHING was physically dispatched (typed $0 skip rows
+        # only) — preserves a PAID predecessor with the same fingerprint as the durable
+        # authority (that predecessor holds the findings and rejections the promised delta
+        # cycle rides on; a free attempt must not erase them). A PAID DEGRADED wave — the
+        # panel WAS dispatched but returned no parseable quorum — is recordable as current
+        # like any other paid wave: it replaces the predecessor and charges its cycle.
+        # The degraded_retries counter therefore now counts only nothing-dispatched
+        # attempts; the caller still renders the attempt it was handed.
         if not wave.get("paid") and any(w.get("paid") for w in previous):
             for w in state.get("waves") or []:
                 if str(w.get("request_fingerprint") or "") == fingerprint and w.get("paid"):
                     w["degraded_retries"] = int(w.get("degraded_retries") or 0) + 1
+                    # An unpaid all-skip attempt can DISCOVER structural quorum
+                    # unreachability the paid predecessor never saw. The typed fact
+                    # must land on the DURABLE record the gate projects, or the tool
+                    # answer (finalization released) and the gate (hold) contradict.
+                    if wave.get("quorum_unreachable") and not w.get("closed"):
+                        w["quorum_unreachable"] = True
+                        w["structurally_dead_slots"] = list(wave.get("structurally_dead_slots") or [])
+                        w["earliest_reset"] = str(wave.get("earliest_reset") or "")
             state["current_attempt"] = {"fingerprint": fingerprint, "status": "open", "reason": ""}
             if need_evidence_seen is not None:
                 state["need_evidence_seen"] = sorted({str(s) for s in need_evidence_seen if str(s)})

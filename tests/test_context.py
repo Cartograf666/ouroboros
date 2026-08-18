@@ -482,6 +482,20 @@ class TestHotStoreGrowthInvariant:
         result = build_health_invariants(env)
         assert "HOT STORE GROWTH" not in result
 
+    def test_scheduled_tasks_store_growth_warns_with_receipt_remediation(self, tmp_path):
+        """The one-shot follow-up receipts (B2b W=A) made this whole-document
+        store grow with every fired follow-up; the scheduler re-parses and
+        rewrites it on every tick under the queue lock."""
+        from ouroboros.context_budget import SCHEDULED_TASKS_WARN_BYTES
+
+        env = _make_health_env(tmp_path)
+        _grow_file(tmp_path / "state" / "scheduled_tasks.json", SCHEDULED_TASKS_WARN_BYTES + 1)
+
+        result = build_health_invariants(env)
+        assert "HOT STORE GROWTH" in result
+        assert "state/scheduled_tasks.json" in result
+        assert "receipts" in result  # remediation pointer
+
     def test_absent_stores_stay_silent(self, tmp_path):
         env = _make_health_env(tmp_path)
 
@@ -1623,3 +1637,130 @@ def test_settled_continuation_with_open_obligations_survives_age_retirement(tmp_
     assert not continuation_path(tmp_path, "closedtask").exists()
     assert (archived_continuation_dir(tmp_path) / "closedtask.json").exists()
     assert "closedtask" in dynamic_text  # transient archive disclosure line
+
+
+# ---------------------------------------------------------------------------
+# B4-lite: capabilities["delegation"] — configured route + honestly-labeled
+# HISTORICAL observations (never live health).
+# ---------------------------------------------------------------------------
+
+
+def _delegation_data_root(tmp_path, monkeypatch):
+    root = tmp_path / "delegation_data_root"
+    (root / "state").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", root)
+    return root
+
+
+def _delegation_fact(tmp_path, monkeypatch):
+    env = _make_health_env(tmp_path)
+    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "advanced")
+    section = build_runtime_section(env, {"id": "task-1", "type": "task"})
+    payload = json.loads(section.split("\n\n", 1)[1])
+    return payload["capabilities"]
+
+
+def test_delegation_fact_carries_configured_route_and_historical_rows(tmp_path, monkeypatch):
+    root = _delegation_data_root(tmp_path, monkeypatch)
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "claudexor=opus-5:high")
+    (root / "state" / "reviewer_slot_last_execution.json").write_text(json.dumps({
+        "triad_1": {
+            "ts": "2026-08-18T01:02:03+00:00",
+            "surface": "triad",
+            "status": "ok",
+            "effective": {"route": "agent_session:claudexor", "model": "opus-5"},
+        },
+        "triad_2": {
+            "ts": "2026-08-18T01:02:04+00:00",
+            "surface": "triad",
+            "status": "error",
+            # B1 typed facts: a dated window carries reset_at, an undated one
+            # only the code — both must surface independently.
+            "failure_code": "subscription_window_exhausted",
+            "reset_at": "2026-08-18T09:20:00+00:00",
+        },
+    }), encoding="utf-8")
+    (root / "state" / "subagent_last_delegation.json").write_text(json.dumps({
+        "ts": "2026-08-18T02:00:00+00:00",
+        "route": "claudexor",
+        "requested_model": "opus-5",
+        "applied_model": "claude-opus-5",
+        "run_id": "run-1",
+    }), encoding="utf-8")
+
+    capabilities = _delegation_fact(tmp_path, monkeypatch)
+    delegation = capabilities["delegation"]
+
+    assert delegation["configured_route"] == {
+        "harness": "claudexor", "model": "opus-5", "effort": "high",
+    }
+    rows = {row["slot"]: row for row in delegation["reviewer_slots_last"]}
+    assert rows["triad_1"]["outcome"] == "ok"
+    assert "failure_code" not in rows["triad_1"]
+    assert rows["triad_2"]["outcome"] == "failed"
+    assert rows["triad_2"]["failure_code"] == "subscription_window_exhausted"
+    assert rows["triad_2"]["reset_at"] == "2026-08-18T09:20:00+00:00"
+    # Per-row label is the timestamp only; the verbatim historical disclaimer
+    # lives ONCE in the note (review fix 12), never repeated per row.
+    assert rows["triad_1"]["observed"] == "last observed at 2026-08-18T01:02:03+00:00"
+    last = delegation["subagent_last_delegation"]
+    assert last["route"] == "claudexor"
+    assert last["applied_model"] == "claude-opus-5"
+    assert last["observed"] == "last observed at 2026-08-18T02:00:00+00:00"
+    assert "historical" not in rows["triad_1"]["observed"]
+    # The prompt-visible note teaches the semantics ONCE: rows are history, live
+    # facts come from plan-review waves and typed delegate refusals.
+    assert "historical, not live health" in delegation["note"]
+    assert "plan-review wave rows" in delegation["note"]
+    assert "typed" in delegation["note"] and "refusal" in delegation["note"]
+    assert "never healthy" in delegation["note"]
+
+
+def test_delegation_fact_undated_window_code_surfaces_without_reset(tmp_path, monkeypatch):
+    root = _delegation_data_root(tmp_path, monkeypatch)
+    monkeypatch.delenv("OUROBOROS_SUBAGENT_HARNESS", raising=False)
+    (root / "state" / "reviewer_slot_last_execution.json").write_text(json.dumps({
+        "scope": {
+            "ts": "2026-08-18T03:00:00+00:00",
+            "status": "error",
+            "failure_code": "credential_pool_exhausted",
+        },
+    }), encoding="utf-8")
+
+    delegation = _delegation_fact(tmp_path, monkeypatch)["delegation"]
+
+    (row,) = delegation["reviewer_slots_last"]
+    assert row["failure_code"] == "credential_pool_exhausted"
+    assert "reset_at" not in row
+    assert row["outcome"] == "failed"
+
+
+def test_delegation_fact_absent_files_mean_absent_observations_not_health(tmp_path, monkeypatch):
+    _delegation_data_root(tmp_path, monkeypatch)
+    monkeypatch.delenv("OUROBOROS_SUBAGENT_HARNESS", raising=False)
+
+    delegation = _delegation_fact(tmp_path, monkeypatch)["delegation"]
+
+    assert delegation["configured_route"] == "not configured"
+    assert "reviewer_slots_last" not in delegation
+    assert "subagent_last_delegation" not in delegation
+    # Nothing in the fact may read as a live-health claim.
+    assert "healthy" not in json.dumps(
+        {k: v for k, v in delegation.items() if k != "note"})
+
+
+def test_delegation_fact_failure_never_drops_capability_digest(tmp_path, monkeypatch):
+    _delegation_data_root(tmp_path, monkeypatch)
+
+    def _boom():
+        raise RuntimeError("reader exploded")
+
+    monkeypatch.setattr(
+        "ouroboros.reviewer_slot_config.reviewer_slot_last_executions", _boom)
+
+    capabilities = _delegation_fact(tmp_path, monkeypatch)
+
+    assert "delegation" not in capabilities
+    # The surrounding digest survives intact.
+    assert "allow_mutative_subagents" in capabilities
+    assert "write_surfaces" in capabilities

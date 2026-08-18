@@ -18,7 +18,7 @@ import queue
 import threading
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 log = logging.getLogger("review_substrate")
 
@@ -144,6 +144,13 @@ class ReviewActorRecord:
     # consumers from conflating a transport failure, malformed JSON, and a
     # valid semantic DEGRADED verdict.
     transport_status: str = ""
+    # B1 typed failure facts, allowlist-carried off the exception's ATTRIBUTES
+    # (generic across every ClaudexorUnavailable subclass; never exc.__dict__):
+    # the machine code, the healing instant and the HTTP status survive the
+    # substrate as fields instead of flattening into `error` prose.
+    failure_code: str = ""
+    reset_at: str = ""
+    http_status: Optional[int] = None
     parse_status: str = ""
     semantic_verdict: str = ""
     provider: str = ""
@@ -155,6 +162,10 @@ class ReviewActorRecord:
     quorum_contribution: bool = False
     reason: str = ""
     enforcement_impact: str = ""
+
+
+# B1 typed failure facts, ONE shared key tuple (row/wave/last-execution projections).
+TYPED_FAILURE_FACT_KEYS = ("failure_code", "reset_at", "http_status", "transport_status")
 
 
 @dataclass
@@ -1527,12 +1538,16 @@ class ReviewCoordinator:
                 )
             except Exception:
                 response_ref = {}
+            http_status = getattr(exc, "status_code", None)
             return ReviewActorRecord(
                 slot_id=slot.slot_id,
                 model=slot.model,
                 status="error",
                 error=sanitize_tool_result_for_log(error_msg),
                 transport_status=_transport_error_status(exc),
+                failure_code=str(getattr(exc, "code", "") or ""),
+                reset_at=str(getattr(exc, "reset_at", "") or ""),
+                http_status=http_status if isinstance(http_status, int) and http_status else None,
                 prompt_ref=prompt_ref,
                 response_ref=response_ref,
                 duration_sec=round(time.time() - start, 3),

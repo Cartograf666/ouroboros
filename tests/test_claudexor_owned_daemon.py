@@ -578,6 +578,9 @@ def _create_login(monkeypatch, tmp_path, body: dict, *, operations, raises=False
         def ensure_running(self):
             return object()
 
+        def reconcile_rotation(self, gateway):
+            pass  # B3 reconcile is not this test's subject
+
     class FakeGateway:
         def __init__(self, endpoint):
             pass
@@ -1274,11 +1277,8 @@ def test_first_spawn_loser_attaches_to_the_winners_endpoint(monkeypatch, tmp_pat
     manager = owned.OwnedClaudexorDaemon()
     monkeypatch.setattr(manager, "_classify_liveness", lambda: (None, "not_provisioned", ""))
     monkeypatch.setattr(manager, "_alive_endpoint", lambda: endpoint)
-    rotations = []
-    monkeypatch.setattr(manager, "_enable_rotation", rotations.append)
 
     assert manager.ensure_running() is endpoint
-    assert rotations == [endpoint]
     assert manager._proc is None
     assert manager.stop() is False
 
@@ -1568,7 +1568,6 @@ def test_staged_update_activates_only_at_the_next_natural_start(monkeypatch, tmp
         lambda command, **_kwargs: spawns.append(list(command)) or _LiveChild(),
     )
     monkeypatch.setattr(daemon, "_alive_endpoint", lambda: new_endpoint)
-    monkeypatch.setattr(daemon, "_enable_rotation", lambda _endpoint: None)
 
     # Phase 1: the OLD endpoint keeps serving; the new target is only staged.
     assert daemon.ensure_running() is old_endpoint
@@ -2202,3 +2201,291 @@ def test_the_proxy_count_in_the_docs_matches_the_handlers_that_exist(tmp_path):
         # two-segment removal route; compare on the stable prefix.
         prefix = re.split(r"\{", path)[0].rstrip("/")
         assert prefix in line, f"{path} is registered but the gateway map never names it"
+
+
+# ---------------------------------------------------------------------------
+# Rotation reconcile (B3, owner decision 5=A literal): GET -> conditional POST
+# on EVERY ensure — no read-path TTL; the non-blocking lock only dedups
+# concurrent ensures. Persisted policies are never overwritten; A6+ engines
+# that own kind-aware "auto" defaults are skipped; ANY failure (the daemon's
+# startup "recovery only" refusal included) simply retries on the next ensure;
+# an actual patch leaves a durable receipt under state/.
+# ---------------------------------------------------------------------------
+
+
+class _ReconcileGateway:
+    """Offline gateway double for reconcile_rotation: records reads/patches."""
+
+    def __init__(self, *, engine_version="3.5.0", snapshot=None,
+                 harnesses=("codex", "claude"), get_error=None):
+        self.engine_version = engine_version
+        self._snapshot = {"harnesses": dict(snapshot or {})}
+        self._harnesses = list(harnesses)
+        self._get_error = get_error
+        self.get_calls = 0
+        self.patches = []
+
+    def get_settings(self):
+        self.get_calls += 1
+        if self._get_error is not None:
+            raise self._get_error
+        return self._snapshot
+
+    def agent_capabilities(self):
+        return {"harnesses": [{"id": hid} for hid in self._harnesses]}
+
+    def patch_settings(self, request):
+        self.patches.append(request)
+        return {}
+
+
+def _rotation_receipt_path(data_dir: pathlib.Path) -> pathlib.Path:
+    return data_dir / "state" / "claudexor_rotation_provisioning.json"
+
+
+def test_reconcile_patches_only_harnesses_without_a_persisted_limit_action(
+        monkeypatch, tmp_path):
+    """Owner decision 3=A: an explicitly persisted fail/ask/rotate is the
+    owner's (or engine's) word — reconcile defaults ONLY the absent ones."""
+    data_dir = tmp_path / "data"
+    _point_owned_home(monkeypatch, data_dir / "claudexor", data_dir)
+
+    gateway = _ReconcileGateway(
+        snapshot={
+            "codex": {"profileLimitAction": "fail"},     # explicit: untouched
+            "claude": {"profileLimitAction": "rotate"},  # already on: untouched
+        },
+        harnesses=("codex", "claude", "cursor"),         # cursor: no policy row
+    )
+    manager = owned.OwnedClaudexorDaemon()
+    manager.reconcile_rotation(gateway)
+
+    assert gateway.patches == [
+        {"harnesses": {"cursor": {"profileLimitAction": "rotate"}}}
+    ]
+    # The durable receipt names the daemon identity and exactly what changed.
+    receipt = json.loads(_rotation_receipt_path(data_dir).read_text(encoding="utf-8"))
+    assert receipt["patched_harnesses"] == ["cursor"]
+    assert receipt["limit_action"] == "rotate"
+    assert receipt["daemon_config_dir"] == str(data_dir / "claudexor")
+    assert receipt["engine_version"] == "3.5.0"
+    assert receipt["ts"]
+
+
+def test_reconcile_skips_the_post_when_nothing_is_missing(monkeypatch, tmp_path):
+    """Idempotence: a fully policied daemon gets a GET and NOTHING else —
+    no settings POST, no receipt claiming a change that never happened."""
+    data_dir = tmp_path / "data"
+    _point_owned_home(monkeypatch, data_dir / "claudexor", data_dir)
+
+    gateway = _ReconcileGateway(snapshot={
+        "codex": {"profileLimitAction": "rotate"},
+        "claude": {"profileLimitAction": "fail"},
+    })
+    manager = owned.OwnedClaudexorDaemon()
+    manager.reconcile_rotation(gateway)
+
+    assert gateway.get_calls == 1
+    assert gateway.patches == []
+    assert not _rotation_receipt_path(data_dir).exists()
+
+
+def test_reconcile_never_blanket_posts_on_settings_shape_drift(monkeypatch, tmp_path):
+    """Review fix 10: a snapshot whose `harnesses` is missing or not a dict is
+    UNKNOWN state, not "nothing persisted" — reconcile must return early instead
+    of blanket-POSTing rotate over judgments it simply failed to read."""
+    data_dir = tmp_path / "data"
+    _point_owned_home(monkeypatch, data_dir / "claudexor", data_dir)
+
+    for drifted in ({}, {"harnesses": None}, {"harnesses": []}, {"harnesses": "x"}, "not-a-dict"):
+        gateway = _ReconcileGateway(harnesses=("codex", "claude"))
+        gateway._snapshot = drifted
+        manager = owned.OwnedClaudexorDaemon()
+        manager.reconcile_rotation(gateway)
+        assert gateway.get_calls == 1, drifted
+        assert gateway.patches == [], drifted
+    assert not _rotation_receipt_path(data_dir).exists()
+
+
+def test_every_ensure_reads_and_posts_only_when_something_is_missing(monkeypatch, tmp_path):
+    """Owner decision 5=A, literal: EVERY ensure does the GET and computes the
+    missing set — the second ensure reads again and still POSTs nothing when
+    nothing is missing; a harness discovered later is patched on the very next
+    ensure (no TTL window to wait out, no process-lifetime boolean)."""
+    data_dir = tmp_path / "data"
+    _point_owned_home(monkeypatch, data_dir / "claudexor", data_dir)
+
+    manager = owned.OwnedClaudexorDaemon()
+    first = _ReconcileGateway(harnesses=("codex",))
+    manager.reconcile_rotation(first)
+    assert first.patches == [
+        {"harnesses": {"codex": {"profileLimitAction": "rotate"}}}
+    ]
+
+    # The very next ensure DOES read — and POSTs nothing when nothing is missing.
+    second = _ReconcileGateway(
+        snapshot={"codex": {"profileLimitAction": "rotate"}}, harnesses=("codex",))
+    manager.reconcile_rotation(second)
+    assert second.get_calls == 1
+    assert second.patches == []
+
+    # A harness discovered later is patched IMMEDIATELY (and only it — codex
+    # now shows a persisted rotate); the receipt reflects the real POST.
+    third = _ReconcileGateway(
+        snapshot={"codex": {"profileLimitAction": "rotate"}},
+        harnesses=("codex", "grok"),
+    )
+    manager.reconcile_rotation(third)
+    assert third.get_calls == 1
+    assert third.patches == [
+        {"harnesses": {"grok": {"profileLimitAction": "rotate"}}}
+    ]
+
+
+def test_concurrent_ensures_are_single_flighted(monkeypatch, tmp_path):
+    """The non-blocking lock's ONLY job: a reconcile already in flight covers a
+    concurrent ensure — the overlapping caller neither reads nor patches. The
+    lock never gates a later, non-overlapping ensure."""
+    data_dir = tmp_path / "data"
+    _point_owned_home(monkeypatch, data_dir / "claudexor", data_dir)
+
+    manager = owned.OwnedClaudexorDaemon()
+    overlapped = _ReconcileGateway(harnesses=("codex",))
+    assert manager._rotation_lock.acquire(blocking=False)  # a reconcile is "in flight"
+    try:
+        manager.reconcile_rotation(overlapped)
+        assert overlapped.get_calls == 0 and overlapped.patches == []
+    finally:
+        manager._rotation_lock.release()
+    after = _ReconcileGateway(harnesses=("codex",))
+    manager.reconcile_rotation(after)  # lock free again: the ensure reconciles
+    assert after.get_calls == 1
+
+
+def test_any_reconcile_failure_retries_on_the_very_next_ensure(monkeypatch, tmp_path):
+    """The exact race that silenced the old spawn-only patch: the daemon's
+    startup window answers 'serving recovery only'. With no read-path TTL the
+    special case collapses — that refusal, and every ORDINARY failure too,
+    simply retries on the next ensure."""
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    data_dir = tmp_path / "data"
+    _point_owned_home(monkeypatch, data_dir / "claudexor", data_dir)
+
+    manager = owned.OwnedClaudexorDaemon()
+    refusing = _ReconcileGateway(get_error=ClaudexorUnavailable(
+        "daemon_recovery_only",
+        "daemon is serving recovery only; product routes are closed",
+        status_code=503,
+    ))
+    manager.reconcile_rotation(refusing)
+    assert refusing.get_calls == 1
+
+    healed = _ReconcileGateway(harnesses=("codex",))
+    manager.reconcile_rotation(healed)   # immediately after: retried, no wait
+    assert healed.get_calls == 1
+    assert healed.patches == [
+        {"harnesses": {"codex": {"profileLimitAction": "rotate"}}}
+    ]
+
+    # An ORDINARY failure retries on the next ensure exactly the same way.
+    fresh = owned.OwnedClaudexorDaemon()
+    broken = _ReconcileGateway(get_error=ClaudexorUnavailable(
+        "http_500", "settings route exploded", status_code=500))
+    fresh.reconcile_rotation(broken)
+    after = _ReconcileGateway(harnesses=("codex",))
+    fresh.reconcile_rotation(after)
+    assert after.get_calls == 1
+    assert after.patches == [
+        {"harnesses": {"codex": {"profileLimitAction": "rotate"}}}
+    ]
+
+
+def test_reconcile_never_patches_a_home_ownership_rejects(monkeypatch, tmp_path):
+    """Never-adopt extends to settings writes: a home whose marker names a
+    different data plane is not ours to reconfigure."""
+    data_dir = tmp_path / "data"
+    _point_owned_home(monkeypatch, data_dir / "claudexor", data_dir)
+    monkeypatch.setattr(owned, "verify_owned_home",
+                        lambda: "ownership marker names a different data plane")
+
+    gateway = _ReconcileGateway()
+    owned.OwnedClaudexorDaemon().reconcile_rotation(gateway)
+
+    assert gateway.get_calls == 0
+    assert gateway.patches == []
+    assert not _rotation_receipt_path(data_dir).exists()
+
+
+def test_reconcile_skips_engines_that_own_auto_semantics(monkeypatch, tmp_path):
+    """An A6+ engine defaults limit actions itself, kind-aware (subscription ->
+    rotate, metered API key -> fail). A blanket 'rotate' from this side would
+    overwrite that judgment, so the reconcile stands down entirely."""
+    data_dir = tmp_path / "data"
+    _point_owned_home(monkeypatch, data_dir / "claudexor", data_dir)
+
+    gateway = _ReconcileGateway(engine_version="3.6.0")
+    owned.OwnedClaudexorDaemon().reconcile_rotation(gateway)
+
+    assert gateway.get_calls == 0
+    assert gateway.patches == []
+
+
+def test_ensure_owned_gateway_reconciles_rotation_on_every_ensure(monkeypatch):
+    """The ONE funnel: spawn AND attach consumers all pass through
+    ensure_owned_gateway, so the reconcile riding it covers both — including
+    the attach paths the old spawn-only patch never reached."""
+    from ouroboros.gateways import claudexor as gateway_mod
+
+    endpoint = gateway_mod.DaemonEndpoint(host="127.0.0.1", port=45699, token="tok")
+
+    class _Manager:
+        def __init__(self):
+            self.reconciled = []
+
+        def ensure_running(self):
+            return endpoint
+
+        def reconcile_rotation(self, gateway):
+            self.reconciled.append(gateway)
+
+    manager = _Manager()
+    monkeypatch.setattr(owned, "get_owned_daemon", lambda: manager)
+
+    class _Gateway:
+        def __init__(self, ep):
+            assert ep is endpoint
+            self.handshakes = 0
+
+        def handshake(self):
+            self.handshakes += 1
+            return {"compatible": True}
+
+        def close(self):
+            raise AssertionError("a healthy ensure must hand the gateway to the caller open")
+
+    monkeypatch.setattr(gateway_mod, "ClaudexorGateway", _Gateway)
+
+    gateway = owned.ensure_owned_gateway()
+    assert gateway.handshakes == 1
+    # Reconcile ran, ONCE, against the very gateway the caller receives —
+    # and only AFTER the authenticated handshake (identity before writes).
+    assert manager.reconciled == [gateway]
+
+
+def test_reconcile_is_best_effort_and_never_breaks_the_ensure(monkeypatch, tmp_path):
+    """A reconcile hiccup must never eat the delegation/login that ensured the
+    daemon: patch failures are logged and swallowed, not raised."""
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    data_dir = tmp_path / "data"
+    _point_owned_home(monkeypatch, data_dir / "claudexor", data_dir)
+
+    class _PatchExplodes(_ReconcileGateway):
+        def patch_settings(self, request):
+            raise ClaudexorUnavailable("http_500", "patch exploded", status_code=500)
+
+    gateway = _PatchExplodes(harnesses=("codex",))
+    owned.OwnedClaudexorDaemon().reconcile_rotation(gateway)  # must not raise
+    assert not _rotation_receipt_path(data_dir).exists(), \
+        "no receipt may claim a patch that never landed"
