@@ -120,6 +120,37 @@ def write_text(path: pathlib.Path, content: str) -> None:
     write_text_atomic(pathlib.Path(path), content)
 
 
+# Windows sharing-violation retry bound: os.replace over a file that another
+# thread/process holds open (CPython opens files WITHOUT FILE_SHARE_DELETE)
+# raises PermissionError (winerror 5/32) even though the reader is transient —
+# e.g. the skill-review heartbeat replacing review_job.json while a poller
+# reads it. ~10 attempts with doubling backoff ≈ 0.5s total, then the original
+# PermissionError is raised honestly.
+_REPLACE_RETRY_ATTEMPTS = 10
+_REPLACE_RETRY_INITIAL_DELAY_SEC = 0.002
+_REPLACE_RETRY_MAX_DELAY_SEC = 0.1
+
+
+def replace_atomic(src: pathlib.Path | str, dst: pathlib.Path | str) -> None:
+    """``os.replace`` with a bounded retry on Windows sharing violations.
+
+    Retries ONLY on PermissionError, which POSIX rename(2) never raises for an
+    open destination — so POSIX behavior is byte-identical (one syscall, no
+    sleeps). After the bound is exhausted the last PermissionError propagates
+    unchanged; every other exception propagates immediately.
+    """
+    delay = _REPLACE_RETRY_INITIAL_DELAY_SEC
+    for attempt in range(_REPLACE_RETRY_ATTEMPTS):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, _REPLACE_RETRY_MAX_DELAY_SEC)
+
+
 def write_text_atomic(
     path: pathlib.Path,
     content: str,
@@ -168,7 +199,7 @@ def write_text_atomic(
                 os.chmod(tmp, existing_mode)
             except OSError:
                 pass
-        os.replace(tmp, path)
+        replace_atomic(tmp, path)
     except Exception:
         try:
             tmp.unlink()

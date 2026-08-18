@@ -18,7 +18,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from ouroboros.utils import atomic_write_json, utc_now_iso
+from ouroboros.utils import atomic_write_json, replace_atomic, utc_now_iso
 
 
 OBSERVABILITY_DIR = "observability"
@@ -279,7 +279,7 @@ def write_blob(drive_root: pathlib.Path, payload: Any, *, kind: str = "json") ->
             with gzip.open(tmp, "wb") as fh:
                 fh.write(raw)
             _chmod_private(tmp)
-            os.replace(tmp, path)
+            replace_atomic(tmp, path)
             _chmod_private(path)
         except Exception:
             if path.exists():
@@ -629,7 +629,7 @@ def preserve_salvaged_output(preserve_root: pathlib.Path, task_id: str, text: st
     try:
         tmp.write_text(str(text), encoding="utf-8")
         _chmod_private(tmp)
-        os.replace(tmp, path)
+        replace_atomic(tmp, path)
         _chmod_private(path)
     except Exception:
         try:

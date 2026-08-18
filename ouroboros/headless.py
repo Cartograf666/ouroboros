@@ -23,7 +23,7 @@ from ouroboros.task_results import (
     TASK_COST_META_FIELDS,
     cancellation_blocks_child_result, load_task_result, validate_task_id, write_task_result,
 )
-from ouroboros.utils import atomic_write_json, utc_now_iso
+from ouroboros.utils import atomic_write_json, replace_atomic, utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -488,7 +488,7 @@ def _publish_child_verification_receipts(
             return  # shared-drive shape: already the canonical file
         tmp = dest.with_name(f"{dest.name}.tmp.{os.getpid()}")
         shutil.copy2(src, tmp)
-        os.replace(tmp, dest)
+        replace_atomic(tmp, dest)
     except Exception:
         log.warning("Failed to publish child receipts for task %s", task_id, exc_info=True)
 
