@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ouroboros.llm import fetch_cloudru_pricing, fetch_openrouter_pricing
+from ouroboros.pricing import fetch_cloudru_pricing, fetch_openrouter_pricing
 from ouroboros.pricing import (
     PricingSchedule,
     emit_llm_usage_event,
@@ -34,7 +34,7 @@ def _reset_pricing_cache():
 
 
 def test_unknown_direct_model_cost_is_none_and_does_not_query_openrouter():
-    with patch("ouroboros.llm.fetch_openrouter_pricing") as fetch:
+    with patch("ouroboros.pricing.fetch_openrouter_pricing") as fetch:
         assert estimate_cost_optional(
             "openai::future-model", 1_000, 500, provider="openai",
         ) is None
@@ -42,7 +42,7 @@ def test_unknown_direct_model_cost_is_none_and_does_not_query_openrouter():
 
 
 def test_provider_is_inferred_without_openrouter_fallback():
-    with patch("ouroboros.llm.fetch_openrouter_pricing") as fetch:
+    with patch("ouroboros.pricing.fetch_openrouter_pricing") as fetch:
         assert estimate_cost_optional(
             "openai::future-model", 1_000, 500, provider=None,
         ) is None
@@ -51,7 +51,7 @@ def test_provider_is_inferred_without_openrouter_fallback():
 
 def test_live_catalog_prices_exact_new_openrouter_model():
     with patch(
-        "ouroboros.llm.fetch_openrouter_pricing",
+        "ouroboros.pricing.fetch_openrouter_pricing",
         return_value={"openai/gpt-new": (2.0, 0.2, None, 8.0)},
     ) as fetch:
         cost = estimate_cost_optional(
@@ -63,7 +63,7 @@ def test_live_catalog_prices_exact_new_openrouter_model():
 
 def test_similar_model_name_does_not_inherit_prefix_price():
     with patch(
-        "ouroboros.llm.fetch_openrouter_pricing",
+        "ouroboros.pricing.fetch_openrouter_pricing",
         return_value={"openai/gpt-new": (2.0, 0.2, None, 8.0)},
     ):
         assert estimate_cost_optional(
@@ -72,7 +72,7 @@ def test_similar_model_name_does_not_inherit_prefix_price():
 
 
 def test_failed_catalog_fetch_has_short_process_local_cooldown():
-    with patch("ouroboros.llm.fetch_openrouter_pricing", return_value={}) as fetch:
+    with patch("ouroboros.pricing.fetch_openrouter_pricing", return_value={}) as fetch:
         assert get_pricing(provider="openrouter") == {}
         assert get_pricing(provider="openrouter") == {}
     fetch.assert_called_once_with(timeout_sec=5.0)
@@ -80,7 +80,7 @@ def test_failed_catalog_fetch_has_short_process_local_cooldown():
 
 def test_missing_cache_prices_are_not_invented():
     with patch(
-        "ouroboros.llm.fetch_openrouter_pricing",
+        "ouroboros.pricing.fetch_openrouter_pricing",
         return_value={"provider/model": (1.0, None, None, 3.0)},
     ):
         assert estimate_cost_optional(
@@ -102,7 +102,7 @@ def test_cache_heavy_anthropic_usage_keeps_a_nonzero_fresh_input_component():
     Direct Anthropic used to report `input_tokens` alone (cache reads/writes excluded), so
     the subtraction clamped fresh input to 0 and the row understated the prompt."""
     with patch(
-        "ouroboros.llm.fetch_openrouter_pricing",
+        "ouroboros.pricing.fetch_openrouter_pricing",
         return_value={"anthropic/claude-x": (3.0, 0.3, 3.75, 15.0)},
     ):
         # Provider row: input_tokens=500, cache_read=9_000, cache_creation=500.
@@ -129,7 +129,7 @@ def test_exact_prompt_tier_is_applied_without_prefix_matching():
         (1.0, 0.1, None, 3.0),
         ((100_000, (2.0, 0.2, None, 5.0)),),
     )
-    with patch("ouroboros.llm.fetch_openrouter_pricing", return_value={"x/model": row}):
+    with patch("ouroboros.pricing.fetch_openrouter_pricing", return_value={"x/model": row}):
         assert estimate_cost_optional(
             "x/model", 100_000, 1_000, provider="openrouter",
         ) == 0.205

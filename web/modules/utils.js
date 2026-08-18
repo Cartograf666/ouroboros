@@ -278,7 +278,20 @@ export function accountedUpperBoundWithChildren(payload) {
 }
 
 export function renderMarkdown(text) {
-    let html = escapeHtmlText(text);
+    let raw = String(text ?? '');
+    const thinkingBlocks = [];
+    raw = raw.replace(/<(think|reasoning)>([\s\S]*?)(?:<\/\1>|$)/gi, function(_, tag, inner) {
+        const trimmed = inner.trim();
+        if (!trimmed) return '';
+        const id = thinkingBlocks.length;
+        thinkingBlocks.push(trimmed);
+        return `__THINKING_BLOCK_${id}__`;
+    });
+
+    // Strip excessive consecutive newlines to avoid large empty gaps
+    raw = raw.replace(/\n{3,}/g, '\n\n').trim();
+
+    let html = escapeHtmlText(raw);
     html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
     html = html.replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>');
     html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
@@ -308,7 +321,15 @@ export function renderMarkdown(text) {
         t += '</tbody></table>';
         return '<div class="md-table-wrap">' + t + '</div>';
     });
-    return html;
+
+    html = html.replace(/(?:^|\n*)__THINKING_BLOCK_(\d+)__(?:\n*|$)/g, function(_, idStr) {
+        const id = parseInt(idStr, 10);
+        const inner = thinkingBlocks[id] || '';
+        const innerFormatted = escapeHtmlText(inner).replace(/\n/g, '<br>');
+        return `<details class="chat-thinking-block"><summary class="chat-thinking-summary"><span class="chat-thinking-label">Рассуждения</span></summary><div class="chat-thinking-body">${innerFormatted}</div></details>`;
+    });
+
+    return html.trim();
 }
 
 export function extractVersions(data) {
@@ -370,4 +391,12 @@ export function initMatrixRain() {
     }
 
     setInterval(draw, 66);
+}
+
+// Shared by the chat timeline and the cost projection; a generic timestamp parser
+// belongs in neither of them. Moved out of chat.js when cost presentation left it.
+export function rawTimestampEpoch(raw) {
+    if (raw == null || raw === '') return NaN;
+    const epoch = typeof raw === 'number' ? raw : Date.parse(String(raw));
+    return Number.isFinite(epoch) ? epoch : NaN;
 }

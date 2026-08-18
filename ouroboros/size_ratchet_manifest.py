@@ -152,6 +152,7 @@ BAND_PATHS = {
     "ouroboros/task_results.py": None,
     "ouroboros/task_status.py": None,
     "ouroboros/tools/browser.py": None,
+    "ouroboros/tools/review_context_atlas.py": "atlas_budget_pair moved the target/hard derivation to the module owning the budget constants and removed a duplicated literal from two callers",
     "ouroboros/tools/shell_guards.py": None,
     "ouroboros/tools/skill_exec.py": None,
     "ouroboros/utils.py": None,
@@ -202,9 +203,8 @@ BYTE_BASELINE_DEBT = {
 }
 
 BYTE_DEBT = {
-    "ouroboros/llm.py": 200307,
-    "ouroboros/loop.py": 321064,
+    "ouroboros/loop.py": 321046,
     "tests/test_delegated_subagent_transport.py": 320623,
     "tests/test_devtools_benchmarks.py": 328786,
-    "web/modules/chat.js": 229431,
+    "web/modules/chat.js": 225961,
 }

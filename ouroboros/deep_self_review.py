@@ -14,6 +14,7 @@ from ouroboros.tools.review_context_atlas import (  # noqa: E402
     ReviewContextAtlasRequest,
     atlas_assembly_failed,
     atlas_assembly_failure_reason,
+    atlas_budget_pair,
     compile_review_context_atlas,
 )
 from ouroboros.tools.review_helpers import (  # noqa: E402
@@ -287,7 +288,8 @@ def build_review_pack(
                 tracked_paths=tuple(tracked),
                 already_included=already_included,
                 fixed_prompt_tokens=atlas_fixed_tokens,
-                target_total_tokens=min(850_000, hard_budget),
+                # Same required-only reserve as the scope lane; see atlas_budget_pair.
+                target_total_tokens=atlas_budget_pair(hard_budget)[0],
                 hard_total_tokens=hard_budget,
                 include_tests=False,
                 title="Generated Deep Self-Review Atlas",

@@ -38,6 +38,18 @@ import {
     taskControlBusy,
 } from './task_control_menu.js';
 import { openConfirmDialog } from './confirm_dialog.js';
+// Cost presentation moved to costs.js (its subject); re-exported here because
+// web/tests/cost_presentation.test.js imports these names from this module.
+import { rawTimestampEpoch } from './utils.js';
+export { rawTimestampEpoch };
+import {
+    headerBudgetPresentation, taskCostMeta, taskCostProjection,
+    mergeStickyCostMeta, clearStickyCardState, withTaskCostMeta,
+} from './costs.js';
+export {
+    headerBudgetPresentation, taskCostMeta, taskCostProjection,
+    mergeStickyCostMeta, clearStickyCardState, withTaskCostMeta,
+};
 import { renderSkillReviewDisclosure, wireSkillReviewDisclosure } from './skill_review_card.js';
 import {
     createHistoryResyncScheduler,
@@ -45,6 +57,7 @@ import {
     loadOlderControlState,
     nextQuotaEscalation,
 } from './chat_render_batch.js';
+import { initChatModelControl } from './chat_model_control.js';
 
 // Row-surface disclosure guard (v6.71.0), pure for node tests: returns the
 // lineKey to toggle for a click landing on `target`, or '' when the click must
@@ -59,12 +72,6 @@ export function liveLineRowToggleKey(target, selection = null) {
 }
 
 /** Convert a raw source timestamp to sortable epoch milliseconds. */
-export function rawTimestampEpoch(raw) {
-    if (raw == null || raw === '') return NaN;
-    const epoch = typeof raw === 'number' ? raw : Date.parse(String(raw));
-    return Number.isFinite(epoch) ? epoch : NaN;
-}
-
 /**
  * Insert a top-level timeline node chronologically while keeping typing last.
  * Equal timestamps preserve arrival order; timestamp-free nodes append.
@@ -119,158 +126,6 @@ const MAX_PENDING_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 // mirrored into Main, but must still produce exactly one toast.
 const shownIncidentToastKeys = new Set();
 
-function optionalFiniteNumber(value) {
-    if (value === null || value === undefined || value === '') return null;
-    const number = Number(value);
-    return Number.isFinite(number) ? number : null;
-}
-
-/** Pure presentation projection used by the header and dependency-free tests. */
-export function headerBudgetPresentation(data) {
-    if (!data || data.accounting_loading === true) {
-        return { state: 'loading', label: 'Loading…', fillPct: 0 };
-    }
-    if (data?.accounting?.available === false) {
-        return { state: 'unavailable', label: 'Unavailable', fillPct: 0 };
-    }
-    // Older state shapes did not carry accounting.available.  Keep accepting
-    // them when they contain a real numeric projection, but never coerce null
-    // (ledger failure in the new shape) into a convincing $0.
-    const spent = optionalFiniteNumber(data.spent_usd);
-    if (spent === null) {
-        return { state: 'unavailable', label: 'Unavailable', fillPct: 0 };
-    }
-    const rawLimit = optionalFiniteNumber(data.budget_limit);
-    const limit = rawLimit !== null && rawLimit > 0 ? rawLimit : 0;
-    const label = typeof data.budget_text === 'string' && data.budget_text.trim()
-        ? data.budget_text
-        : `${formatUsdWhole(spent)} / ${limit > 0 ? formatUsdWhole(limit) : '∞'}`;
-    return {
-        state: 'available',
-        label,
-        fillPct: limit > 0 ? Math.min(100, Math.max(0, (spent / limit) * 100)) : 0,
-    };
-}
-
-/**
- * Render task money without conflating unknown/non-final values with a final
- * zero.  The returned strings are card metadata, not another cost authority.
- */
-export function taskCostMeta(payload = {}) {
-    const has = (key) => Object.prototype.hasOwnProperty.call(payload, key);
-    // Task-scope accounting evidence only (v6.82 P1): a bare `cost_usd` is NOT
-    // enough — llm_round_finished carries a per-round delta under that key, and
-    // rendering it as task cost lied on the card. Subagent progress_meta and
-    // task_done/task_cost_finalized frames carry cost_accounting_status /
-    // cost_final alongside cost_usd, so honest task-scope frames still qualify.
-    const hasAccountingEvidence = [
-        'cost_accounting_status', 'cost_final',
-        'cost_usd_with_children', 'cost_with_children_partial',
-        'accounted_upper_bound_usd', 'accounted_upper_bound_usd_with_children',
-        'reserved_usd', 'unresolved_upper_bound_usd', 'unknown_unmetered',
-    ].some(has);
-    if (!hasAccountingEvidence) return [];
-    if (payload.cost_accounting_status === 'unavailable') return ['cost unavailable'];
-
-    // C2/F12: ONE precedence resolver, shared with the Python seams and with
-    // log_events — the deprecated alias wins a diverged pair, so the read side
-    // and the write side never pick opposite winners for the same record.
-    const own = accountedUpperBound(payload);
-    const finalKnown = payload.cost_final === true;
-    const pendingKnown = payload.cost_final === false
-        || payload.cost_with_children_partial === true
-        || payload.cost_accounting_status === 'available' && !has('cost_final');
-    const meta = [];
-    if (own === null) {
-        meta.push('cost pending');
-    } else if (finalKnown || pendingKnown || own !== 0) {
-        meta.push(`cost=$${own.toFixed(2)}${pendingKnown && !finalKnown ? ' (pending)' : ''}`);
-    }
-
-    const subtree = accountedUpperBoundWithChildren(payload);
-    if (subtree !== null && (
-        own === null || subtree !== own || payload.cost_with_children_partial === true
-    )) {
-        const partial = payload.cost_with_children_partial === true || !finalKnown;
-        meta.push(`subtree=$${subtree.toFixed(2)}${partial ? ' (pending)' : ''}`);
-    }
-    const reserved = optionalFiniteNumber(payload.reserved_usd);
-    if (reserved !== null && reserved > 0) meta.push(`reserved=$${reserved.toFixed(2)}`);
-    const unresolved = optionalFiniteNumber(payload.unresolved_upper_bound_usd);
-    if (unresolved !== null && unresolved > 0) meta.push(`unresolved≤$${unresolved.toFixed(2)}`);
-    const unknown = optionalFiniteNumber(payload.unknown_unmetered);
-    if (unknown !== null && unknown > 0) meta.push(`unmetered=${Math.trunc(unknown)}`);
-    return meta;
-}
-
-/**
- * Project one frame's task-scope cost evidence into the sticky structured form
- * `{meta, ts, final}` (v6.82 P1). Returns null when the frame carries NO
- * task-scope accounting evidence (e.g. an llm_round_finished per-round delta)
- * — such frames must never touch a card's cost.
- */
-export function taskCostProjection(payload = {}, rawTs = '') {
-    const meta = taskCostMeta(payload);
-    if (!meta.length) return null;
-    const unavailable = payload.cost_accounting_status === 'unavailable';
-    return {
-        meta,
-        ts: rawTimestampEpoch(rawTs),
-        // Only a SETTLED ledger value is final. "unavailable" is an honest
-        // unknown, not a settled truth: marking it final let one transient
-        // ledger-read failure outrank every later real reading.
-        final: payload.cost_final === true,
-        unavailable,
-    };
-}
-
-/**
- * Sticky per-card cost precedence (v6.82 P1). Rank unavailable < pending < final:
- * an honest reading always outranks an unknown (one transient ledger-read failure
- * must not pin the card for the whole run) and a settled value outranks both.
- * Among equal rank the newer raw source timestamp wins, so an older history replay
- * can never overwrite newer evidence; frames without evidence (null `next`) keep
- * the previous projection, so an unavailable snapshot is still sticky.
- */
-export function mergeStickyCostMeta(previous, next) {
-    if (!next || !Array.isArray(next.meta) || !next.meta.length) return previous || null;
-    if (!previous || !Array.isArray(previous.meta) || !previous.meta.length) return next;
-    // Rank: unavailable < pending < final. An `unavailable` snapshot is sticky (a
-    // costless frame must not erase it) but must NOT outrank a later HONEST reading:
-    // one transient ledger-read failure would otherwise pin the card to "cost
-    // unavailable" for the rest of the run.
-    const rank = (p) => (p.final ? 2 : (p.unavailable ? 0 : 1));
-    const prevRank = rank(previous);
-    const nextRank = rank(next);
-    if (prevRank !== nextRank) return nextRank > prevRank ? next : previous;
-    const prevTs = Number(previous.ts);
-    const nextTs = Number(next.ts);
-    if (Number.isFinite(prevTs) && Number.isFinite(nextTs) && nextTs < prevTs) return previous;
-    // A frame whose source timestamp is unreadable must not defeat a
-    // timestamped previous value of equal finality.
-    if (Number.isFinite(prevTs) && !Number.isFinite(nextTs)) return previous;
-    return next;
-}
-
-/**
- * Reset the sticky presentation state (collapsed activity + cost projection)
- * introduced in v6.82 P1. Used by resetLiveCardRecord; pure over the record
- * shape so dependency-free node tests can exercise the recycle path.
- */
-export function clearStickyCardState(record) {
-    if (!record) return record;
-    record.collapsedActivity = '';
-    record.costMeta = null;
-    // The activity clock is cycle state too: a
-    // recycled slot ('bg-consciousness', 'active') would otherwise open showing
-    // the previous cycle's "Latest" time.
-    record.latestActivityTs = '';
-    if (record.activityEl) {
-        record.activityEl.textContent = '';
-        record.activityEl.removeAttribute('title');
-    }
-    return record;
-}
 
 /**
  * Decide the collapsed activity line text (v6.82 P1), shared by root and
@@ -342,20 +197,6 @@ export function isTerminalTaskPhase(phase = '', terminal = false) {
     return Boolean(terminal) || ['done', 'lifecycle_error', 'cancelled'].includes(phase);
 }
 
-function withTaskCostMeta(summary, payload, { replace = false, rawTs = '' } = {}) {
-    const projection = taskCostProjection(payload, rawTs);
-    // `replace` frames (task_done/task_cost_finalized) never keep the
-    // summarizer's own meta strings. Cost renders ONLY from the card's sticky
-    // record.costMeta (applyLiveCardState); summarizer-built `cost=` strings
-    // are dropped UNCONDITIONALLY — a frame without task-scope accounting
-    // evidence must show no money at all, not a bare per-call number.
-    const base = replace ? { ...summary, meta: [] } : summary;
-    const out = projection ? { ...base, costProjection: projection } : { ...base };
-    if (Array.isArray(out.meta) && out.meta.length) {
-        out.meta = out.meta.filter((entry) => !String(entry || '').startsWith('cost='));
-    }
-    return out;
-}
 
 function showTaskIncidentToast(msg) {
     const incident = String(msg?.task_incident || '').trim();
@@ -484,6 +325,26 @@ export function createChatInstance({
                 <div class="chat-toolbar-row">
                     <div class="chat-composer-pills" id="chat-composer-pills">
                         <button class="chat-swarm" id="chat-swarm" type="button" data-armed="false" title="Swarm: route your next message into a new managed task, run a deep plan review with plan_task, then delegate when parallel work helps. Auto-disarms after sending.">Swarm</button>
+                        ${isMain ? `
+                        <details class="chat-model-control" id="chat-model-control">
+                            <summary title="Choose the main model for new tasks and inspect observed limits">
+                                <span class="chat-model-dot" aria-hidden="true"></span>
+                                <span data-model-summary>Model · Loading…</span>
+                            </summary>
+                            <div class="chat-model-menu">
+                                <label class="chat-model-field">
+                                    <span>Main model for new tasks</span>
+                                    <select data-model-select aria-label="Main model for new tasks"></select>
+                                </label>
+                                <div class="chat-model-state-row">
+                                    <span class="chat-model-state" data-model-status data-state="loading">Checking…</span>
+                                    <button type="button" class="chat-model-refresh" data-model-refresh>Refresh</button>
+                                </div>
+                                <p class="chat-model-detail" data-model-detail>Reading recent provider results…</p>
+                                <div class="chat-harness-quota" data-harness-quota>Claude Code / Codex · checking subscription limits…</div>
+                                <p class="chat-model-note">Claude Code and Codex are delegated agents, not main-chat models.</p>
+                            </div>
+                        </details>` : ''}
                         <div class="chat-context-mode" id="chat-context-mode" data-context-mode="max" role="group" aria-label="Context size mode" title="Context mode (owner setting). Low fits ~200K / local models; Max is full. Saves immediately; lowering to Low requires Ouroboros to be idle.">
                             <button class="chat-seg" type="button" data-mode="low">Low</button>
                             <button class="chat-seg" type="button" data-mode="max">Max</button>
@@ -499,6 +360,9 @@ export function createChatInstance({
                     <div class="chat-send-group">
                         <button class="chat-scroll-bottom-btn" id="chat-scroll-bottom" type="button" aria-label="Scroll to latest message" title="Scroll to latest message">
                             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M19 12l-7 7-7-7"/></svg>
+                        </button>
+                        <button class="chat-stop-inline" id="chat-stop" type="button" title="Stop execution" style="display: none;">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
                         </button>
                         <button class="chat-send-inline" id="chat-send" title="Send message">Send</button>
                     </div>
@@ -531,9 +395,15 @@ export function createChatInstance({
     const fileInput = byId('file-input');
     const attachmentPreview = byId('attachment-preview');
     const scrollBottomBtn = byId('scroll-bottom');
+    // The model control already carries the full `chat-model-control` ID in
+    // the main chat template. Passing that full ID through `byId()` would
+    // produce `chat-chat-model-control`, so the initializer would never run
+    // and the static "Checking…" placeholder would remain forever.
+    const modelControl = page.querySelector('.chat-model-control');
     let pendingAttachments = [];
     let attachmentsUploading = false;
     let nestedSubagentsExpanded = false;
+    let disposeModelControl = () => {};
 
     // Instance lifecycle (P3): destroy() flips this so rAF loops and late async
     // continuations become no-ops instead of touching a removed DOM subtree.
@@ -541,6 +411,16 @@ export function createChatInstance({
     // Every ws.on subscription's disposer, released together in destroy().
     const wsDisposers = [];
     const onWs = (event, fn) => wsDisposers.push(ws.on(event, fn));
+
+    if (modelControl) {
+        disposeModelControl = initChatModelControl({
+            root: modelControl,
+            showToast,
+            onModelChanged: (modelLabel) => {
+                addMessage(`🔄 Модель переключена на: **${modelLabel}**`, 'system', true);
+            },
+        });
+    }
 
     async function loadUiPreferences() {
         try {
@@ -3840,6 +3720,35 @@ export function createChatInstance({
         if (swarmBtn) swarmBtn.dataset.armed = armed ? 'true' : 'false';
     }
 
+    const stopBtn = byId('stop');
+
+    function syncChatStopButton() {
+        if (!stopBtn) return;
+        const isBusy = sendGroup.dataset.busy === '1' || hasActiveLiveCard() || (typingEl && typingEl.style.display !== 'none');
+        stopBtn.style.display = isBusy ? 'inline-flex' : 'none';
+    }
+
+    async function stopActiveChatAction() {
+        if (stopBtn) stopBtn.disabled = true;
+        try {
+            await apiFetch('/api/chat/stop', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ chat_id: chatId }),
+            });
+            showToast('Stopping active chat action…', 'info');
+            hideTyping();
+            setSendBusy(false);
+        } catch (e) {
+            showToast(`Could not stop action: ${e?.message || e}`, 'error');
+        } finally {
+            if (stopBtn) stopBtn.disabled = false;
+            syncChatStopButton();
+        }
+    }
+
+    stopBtn?.addEventListener('click', stopActiveChatAction);
+
     function setSendBusy(busy, label = '') {
         sendGroup.dataset.busy = busy ? '1' : '0';
         sendBtn.disabled = busy;
@@ -3850,6 +3759,7 @@ export function createChatInstance({
             sendBtn.textContent = 'Send';
             sendBtn.title = 'Send message';
         }
+        syncChatStopButton();
     }
 
     swarmBtn?.addEventListener('click', () => setSwarm(!swarmArmed()));
@@ -4214,6 +4124,7 @@ export function createChatInstance({
             if (isNearBottom()) messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
         setStatus('thinking', 'Thinking...');
+        syncChatStopButton();
     }
 
     function hideTypingIndicatorOnly() {
@@ -4223,6 +4134,7 @@ export function createChatInstance({
             return;
         }
         typingEl.style.display = 'none';
+        syncChatStopButton();
     }
 
     function hideTyping() {
@@ -4230,6 +4142,7 @@ export function createChatInstance({
         if (statusBadge && ['Thinking...', 'Working...'].includes(statusBadge.textContent)) {
             setStatus('online', 'Online');
         }
+        syncChatStopButton();
     }
 
     const isKnownProjectFrame = (msg) => {
@@ -4357,6 +4270,14 @@ export function createChatInstance({
 
     onWs('outbound_sent', (evt) => {
         markPendingDelivered(evt?.clientMessageId || '');
+    });
+
+    onWs('chat_stopped', (evt) => {
+        if (Number(evt?.chat_id ?? 1) === chatId || isMain) {
+            hideTyping();
+            setSendBusy(false);
+            syncChatStopButton();
+        }
     });
 
     onWs('photo', (msg) => {
@@ -4550,6 +4471,11 @@ export function createChatInstance({
     onWs('open', (msg) => {
         setStatus('online', 'Online');
         refreshHeaderControlState(true);
+        // A restart can happen while the selector's initial discovery calls
+        // are in flight. Re-read the model catalog once the websocket confirms
+        // that the server is alive again; the control's loader is single-flight
+        // so this is harmless on the first clean connection.
+        void disposeModelControl.refresh?.();
         // perf2 P4.1 [Gemini#3]: reconnect truth comes from the ws CLIENT
         // (previouslyConnected rides the open event) — a project instance
         // created while the socket was already open must still treat the next
@@ -4636,6 +4562,7 @@ export function createChatInstance({
                 if (taskState?.cleanupTimer) clearTimeout(taskState.cleanupTimer);
             }
             if (headerControlInterval) { clearInterval(headerControlInterval); headerControlInterval = null; }
+            try { disposeModelControl(); } catch {}
             liveCardRecords.clear();
             taskUiStates.clear();
             pendingSuggestedNames.clear();

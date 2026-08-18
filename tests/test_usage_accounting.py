@@ -413,7 +413,7 @@ def test_live_openrouter_catalog_produces_known_reservation(data_root, monkeypat
     monkeypatch.setattr(pricing, "_pricing_retry_after", {})
     monkeypatch.setattr(pricing, "_pricing_fetch_in_progress", set())
     monkeypatch.setattr(
-        "ouroboros.llm.fetch_openrouter_pricing",
+        "ouroboros.pricing.fetch_openrouter_pricing",
         lambda **kwargs: {"openai/gpt-new": (2.0, None, None, 8.0)},
     )
     reservation = ua.reserve_attempt(_request(
@@ -464,7 +464,7 @@ def _isolated_anthropic_catalog(monkeypatch):
     monkeypatch.setattr(pricing, "_pricing_retry_after", {})
     monkeypatch.setattr(pricing, "_pricing_fetch_in_progress", set())
     monkeypatch.setattr(
-        "ouroboros.llm.fetch_openrouter_pricing",
+        "ouroboros.pricing.fetch_openrouter_pricing",
         # (input, cached_read, cache_write(5m), output) per 1M tokens.
         lambda **kwargs: {"anthropic/claude-test": (3.0, 0.3, 3.75, 15.0)},
     )
@@ -694,7 +694,7 @@ def test_opaque_operation_without_max_budget_reserves_unknown(data_root, monkeyp
 
 
 def test_unknown_pricing_is_fail_open_under_finite_global_and_root_limits(data_root, monkeypatch):
-    monkeypatch.setattr("ouroboros.llm.fetch_openrouter_pricing", lambda **kwargs: {})
+    monkeypatch.setattr("ouroboros.pricing.fetch_openrouter_pricing", lambda **kwargs: {})
     first = ua.reserve_attempt(_request(
         data_root, model="unknown/vendor-model", reservation_usd=None,
     ))
@@ -760,7 +760,7 @@ def test_live_pricing_lookup_finishes_before_ledger_lock(data_root, monkeypatch)
 def test_unknown_new_model_dispatches_when_catalog_is_unavailable(
     data_root, monkeypatch, provider, model,
 ):
-    monkeypatch.setattr("ouroboros.llm.fetch_openrouter_pricing", lambda **kwargs: {})
+    monkeypatch.setattr("ouroboros.pricing.fetch_openrouter_pricing", lambda **kwargs: {})
     sends = 0
 
     def send():

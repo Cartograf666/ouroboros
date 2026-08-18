@@ -14,6 +14,16 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from ouroboros import model_concurrency
+# Prompt fitting for the local context window lives with the local model manager;
+# llm.py keeps only the transport and the typed LocalContextTooLargeError.
+from ouroboros.local_model import (
+    _LOCAL_LANGUAGE_RULE,
+    _LOCAL_LANGUAGE_RULE_MARKER,
+    _compact_local_text,
+    _estimate_message_chars,
+    _trim_local_sections,
+)
 from ouroboros.provider_models import (
     PROVIDER_PREFIXES,
     normalize_anthropic_model_id,
@@ -152,25 +162,6 @@ _MANDATORY_VALUE_MARKERS = ("mandatory", "cannot be disabled", "must be enabled"
 
 class LocalContextTooLargeError(RuntimeError):
     """Raised when a local model cannot fit context without silent truncation."""
-
-
-def _estimate_message_chars(messages: List[Dict[str, Any]]) -> int:
-    from ouroboros.context_budget import IMAGE_BLOCK_CHAR_EQUIVALENT
-
-    total = 0
-    for msg in messages:
-        content = msg.get("content")
-        if isinstance(content, list):
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                if str(block.get("type") or "") in ("image_url", "image"):
-                    total += IMAGE_BLOCK_CHAR_EQUIVALENT
-                    continue
-                total += len(str(block.get("text", "")))
-        else:
-            total += len(str(content or ""))
-    return total
 
 
 def _applied_payload_cache_ttl(payload: Dict[str, Any]) -> Optional[str]:
@@ -343,99 +334,6 @@ async def _execute_candidate_async(request: AttemptRequest, send: Any, before_di
     return await execute_physical_attempt_async(request, send, before_dispatch=before_dispatch)
 
 
-def _split_markdown_sections(text: str) -> Tuple[str, List[Tuple[str, str]]]:
-    lines = str(text or "").splitlines()
-    preamble: List[str] = []
-    sections: List[Tuple[str, str]] = []
-    current_title: Optional[str] = None
-    current_lines: List[str] = []
-
-    for line in lines:
-        if line.startswith("## "):
-            if current_title is None:
-                preamble = current_lines[:]
-            else:
-                sections.append((current_title, "\n".join(current_lines).strip()))
-            current_title = line[3:].strip()
-            current_lines = [line]
-        else:
-            current_lines.append(line)
-
-    if current_title is None:
-        return "\n".join(lines).strip(), []
-
-    sections.append((current_title, "\n".join(current_lines).strip()))
-    return "\n".join(preamble).strip(), sections
-
-
-def _compact_markdown_sections(
-    text: str,
-    preserve_titles: Set[str],
-    reason: str,
-) -> str:
-    preamble, sections = _split_markdown_sections(text)
-    if not sections:
-        return text
-
-    parts: List[str] = []
-    if preamble:
-        parts.append(preamble)
-
-    for title, section in sections:
-        if title in preserve_titles:
-            parts.append(section)
-            continue
-        omitted_chars = max(0, len(section))
-        parts.append(
-            f"## {title}\n\n"
-            f"[Compacted for local-model context: omitted {omitted_chars} chars. {reason}]"
-        )
-
-    return "\n\n".join(p for p in parts if p).strip()
-
-
-_LOCAL_COMPACTION_MODES = {
-    "static": (
-        {"BIBLE.md"},
-        "Use a larger-context model or read the source file directly if this section becomes necessary.",
-    ),
-    "semi_stable": (
-        {"Identity"},
-        "Identity was preserved; non-core stable memory sections were compacted for local execution.",
-    ),
-    "dynamic": (
-        {
-            "Scratchpad",
-            "Dialogue History",
-            "Dialogue Summary",
-            "Memory Registry (what I know / don't know)",
-            "Drive state",
-            "Runtime context",
-            "Health Invariants",
-        },
-        "Working-memory and runtime sections were preserved; non-core recent/history sections were compacted for local execution.",
-    ),
-    "system": (
-        {
-            "BIBLE.md",
-            "Scratchpad",
-            "Identity",
-            "Drive state",
-            "Runtime context",
-            "Health Invariants",
-            "Recent observations",
-            "Background consciousness info",
-        },
-        "Non-core sections were compacted for local execution.",
-    ),
-}
-
-
-def _compact_local_text(text: str, mode: str) -> str:
-    preserve_titles, reason = _LOCAL_COMPACTION_MODES[mode]
-    return _compact_markdown_sections(text, preserve_titles=preserve_titles, reason=reason)
-
-
 def normalize_reasoning_effort(value: str, default: str = "medium") -> str:
     # v6.57.0: the accepted set is the EFFORT_SCALE SSOT (config.py), so adding a
     # tier (e.g. `max`) happens in one place. Imported lazily to avoid a config
@@ -459,192 +357,6 @@ def add_usage(total: Dict[str, Any], usage: Dict[str, Any]) -> None:
             total["cost_final"] = False
     else:
         total["cost_final"] = False
-
-
-def fetch_openrouter_pricing(*, timeout_sec: float = 5.0) -> Dict[str, Tuple[Optional[float], ...]]:
-    """Fetch OpenRouter pricing as model_id -> per-1M prices.
-
-    Tuples are ``(input, cached_read, cache_write, output)``. Missing cache
-    prices remain ``None`` instead of inheriting a synthetic coefficient.
-    """
-    import logging
-    from ouroboros.pricing import PricingSchedule
-    log = logging.getLogger("ouroboros.llm")
-
-    try:
-        import requests
-    except ImportError:
-        log.warning("requests not installed, cannot fetch pricing")
-        return {}
-
-    try:
-        url = "https://openrouter.ai/api/v1/models"
-        resp = requests.get(url, timeout=max(0.1, min(5.0, float(timeout_sec))))
-        resp.raise_for_status()
-
-        data = resp.json()
-        models = data.get("data", [])
-
-        pricing_dict = {}
-        for model in models:
-            model_id = str(model.get("id") or "").strip()
-
-            pricing = model.get("pricing", {})
-            if not pricing or pricing.get("prompt") is None or pricing.get("completion") is None:
-                continue
-
-            raw_prompt = float(pricing.get("prompt", 0))
-            raw_completion = float(pricing.get("completion", 0))
-            raw_cached_str = pricing.get("input_cache_read")
-            raw_cached = float(raw_cached_str) if raw_cached_str is not None else None
-            raw_cache_write_str = pricing.get("input_cache_write")
-            raw_cache_write = float(raw_cache_write_str) if raw_cache_write_str is not None else None
-            if raw_prompt < 0 or raw_completion < 0:
-                continue
-            if raw_cached is not None and raw_cached < 0:
-                raw_cached = None
-            if raw_cache_write is not None and raw_cache_write < 0:
-                raw_cache_write = None
-
-            prompt_price = round(raw_prompt * 1_000_000, 4)
-            completion_price = round(raw_completion * 1_000_000, 4)
-            cached_price = round(raw_cached * 1_000_000, 4) if raw_cached is not None else None
-            cache_write_price = (
-                round(raw_cache_write * 1_000_000, 4)
-                if raw_cache_write is not None else None
-            )
-
-            if prompt_price > 1000 or completion_price > 1000:
-                log.warning(f"Skipping {model_id}: prices seem wrong (prompt={prompt_price}, completion={completion_price})")
-                continue
-
-            row = (prompt_price, cached_price, cache_write_price, completion_price)
-
-            tiers = []
-            raw_overrides = pricing.get("overrides") or []
-            if isinstance(raw_overrides, list):
-                for override in raw_overrides:
-                    if not isinstance(override, dict):
-                        continue
-                    try:
-                        min_prompt_tokens = int(override.get("min_prompt_tokens") or 0)
-                        if min_prompt_tokens <= 0:
-                            continue
-                        tier_raw_prompt = float(override.get("prompt", raw_prompt))
-                        tier_raw_completion = float(override.get("completion", raw_completion))
-                        tier_prompt = round(tier_raw_prompt * 1_000_000, 4)
-                        tier_completion = round(tier_raw_completion * 1_000_000, 4)
-                        override_cached = override.get("input_cache_read")
-                        tier_cached = (
-                            round(float(override_cached) * 1_000_000, 4)
-                            if override_cached is not None else None
-                        )
-                        override_write = override.get("input_cache_write")
-                        if override_write is not None:
-                            tier_write = round(float(override_write) * 1_000_000, 4)
-                        else:
-                            tier_write = None
-                        if tier_prompt > 1000 or tier_completion > 1000:
-                            continue
-                        tier_row = (tier_prompt, tier_cached, tier_write, tier_completion)
-                        tiers.append((min_prompt_tokens, tier_row))
-                    except (TypeError, ValueError):
-                        log.warning(
-                            "Skipping malformed pricing override for %s", model_id,
-                        )
-            if tiers:
-                row = PricingSchedule(row, tuple(tiers))
-            pricing_dict[model_id] = row
-            normalized_model_id = normalize_model_identity(model_id)
-            if normalized_model_id != model_id:
-                pricing_dict[normalized_model_id] = row
-
-        log.info(f"Fetched pricing for {len(pricing_dict)} models from OpenRouter")
-        return pricing_dict
-
-    except (requests.RequestException, ValueError, KeyError) as e:
-        log.warning(f"Failed to fetch OpenRouter pricing: {e}")
-        return {}
-
-
-def fetch_cloudru_pricing(*, timeout_sec: float = 5.0) -> Dict[str, Tuple[Optional[float], ...]]:
-    """Fetch cloud.ru Foundation Models pricing as ``cloudru/<id>`` -> per-1M USD.
-
-    cloud.ru's ``GET /v1/models`` returns per-model ``metadata`` with token costs
-    (``prompt_tokens_cost``, ``generated_tokens_cost``, ``cache_read_tokens_cost``,
-    ``cache_write_tokens_cost``) in RUB per 1M tokens — i.e. the real resale price
-    the owner pays. We convert to USD via ``OUROBOROS_RUB_USD_RATE`` so the catalog
-    is the SSOT for ALL cloud.ru models (no hardcoded per-model table). Models with
-    ``is_billable=false`` is an exact free row; missing billability or an absent
-    explicit ``OUROBOROS_RUB_USD_RATE`` stays unknown. Returns {} when the catalog
-    cannot be queried. Tuples are ``(input, cached_read, cache_write, output)``."""
-    import logging
-    log = logging.getLogger("ouroboros.llm")
-
-    api_key = (os.environ.get("CLOUDRU_FOUNDATION_MODELS_API_KEY", "") or "").strip()
-    if not api_key:
-        return {}
-    try:
-        import requests
-    except ImportError:
-        return {}
-
-    base_url = (
-        os.environ.get("CLOUDRU_FOUNDATION_MODELS_BASE_URL", "") or ""
-    ).strip() or "https://foundation-models.api.cloud.ru/v1"
-    try:
-        rate = float(os.environ.get("OUROBOROS_RUB_USD_RATE", ""))
-    except (TypeError, ValueError):
-        return {}
-    if rate <= 0:
-        return {}
-
-    try:
-        resp = requests.get(
-            f"{base_url.rstrip('/')}/models",
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=max(0.1, min(5.0, float(timeout_sec))),
-        )
-        resp.raise_for_status()
-        models = resp.json().get("data", []) or []
-
-        def _rub_per_1m_to_usd(value: Any) -> Optional[float]:
-            try:
-                num = float(value)
-            except (TypeError, ValueError):
-                return None
-            if num < 0:  # cloud.ru uses -1 for "n/a" (e.g. embedding output)
-                return None
-            return round(num / rate, 6)
-
-        pricing_dict: Dict[str, Tuple[Optional[float], ...]] = {}
-        for model in models:
-            model_id = str(model.get("id") or "").strip()
-            meta = model.get("metadata") if isinstance(model.get("metadata"), dict) else {}
-            if not model_id or not meta or meta.get("is_billable") is None:
-                continue
-            if meta.get("is_billable") is False:
-                pricing_dict[normalize_model_identity(f"cloudru::{model_id}")] = (0.0, 0.0, 0.0, 0.0)
-                continue
-            prompt_price = _rub_per_1m_to_usd(meta.get("prompt_tokens_cost"))
-            output_price = _rub_per_1m_to_usd(meta.get("generated_tokens_cost"))
-            if prompt_price is None or output_price is None:
-                continue
-            cached_price = _rub_per_1m_to_usd(meta.get("cache_read_tokens_cost"))
-            cache_write_price = _rub_per_1m_to_usd(meta.get("cache_write_tokens_cost"))
-            row = (
-                prompt_price,
-                cached_price,
-                cache_write_price,
-                output_price,
-            )
-            pricing_dict[normalize_model_identity(f"cloudru::{model_id}")] = row
-
-        log.info(f"Fetched pricing for {len(pricing_dict)} models from cloud.ru")
-        return pricing_dict
-    except (requests.RequestException, ValueError, KeyError) as e:
-        log.warning(f"Failed to fetch cloud.ru pricing: {e}")
-        return {}
 
 
 class LLMClient:
@@ -1308,6 +1020,8 @@ class LLMClient:
     @staticmethod
     def _parse_provider_model(model: str) -> Tuple[str, str]:
         model_name = str(model or "").strip()
+        if model_name.startswith("local_discovered::") or model_name in ("local-model", "__local__") or model_name.endswith(" (local)"):
+            return "local", "local-model"
         for prefix, provider in PROVIDER_PREFIXES:
             if model_name.startswith(prefix):
                 return provider, model_name[len(prefix):].strip()
@@ -1327,11 +1041,26 @@ class LLMClient:
             return f"gigachat/{resolved_model}"
         if provider == "minimax":
             return f"minimax/{resolved_model}"
+        if provider == "local":
+            return "local/local-model"
         return f"openai-compatible/{resolved_model}"
 
     def _resolve_remote_target(self, model: str) -> Dict[str, Any]:
         provider, resolved_model = self._parse_provider_model(model)
         usage_model = self._qualified_model_name(provider, resolved_model)
+
+        if provider == "local":
+            port = int(os.environ.get("LOCAL_MODEL_PORT", "8766"))
+            return {
+                "provider": provider,
+                "resolved_model": "local-model",
+                "usage_model": usage_model,
+                "api_key": "local",
+                "base_url": f"http://127.0.0.1:{port}/v1",
+                "default_headers": {},
+                "supports_openrouter_extensions": False,
+                "supports_generation_cost": False,
+            }
 
         if provider == "openai":
             return {
@@ -2321,8 +2050,12 @@ class LLMClient:
         and GigaChat routes ignore it, and a provider rejection strips it via the
         optional-parameter retry — callers must keep a text-parse fallback."""
         messages = self._normalize_system_message_placement(messages)
-        with capture_attempt_ids() as attempt_ids:
-            if use_local:
+        is_local = use_local or str(model or "").startswith("local_discovered::") or str(model or "") in ("local-model", "__local__") or str(model or "").endswith(" (local)")
+        # THE per-route concurrency seam (rationale: model_concurrency module docstring).
+        # Keyed on is_local, not the raw argument: locality is also derived from the
+        # model NAME above and the semaphore key carries that flag.
+        with model_concurrency.model_call_slot(model, is_local), capture_attempt_ids() as attempt_ids:
+            if is_local:
                 message, usage = self._chat_local(
                     messages, tools, max_tokens, tool_choice, timeout=timeout,
                 )
@@ -2362,6 +2095,14 @@ class LLMClient:
         no_proxy = no_proxy or in_worker_process()
         if tools:
             raise ValueError("chat_async does not support tool calls")
+        is_local = str(model or "").startswith("local_discovered::") or str(model or "") in ("local-model", "__local__") or str(model or "").endswith(" (local)")
+        if is_local:
+            with capture_attempt_ids() as attempt_ids:
+                result = await asyncio.to_thread(
+                    self._chat_local, messages, tools, max_tokens, tool_choice, timeout,
+                )
+            result[1]["ledger_attempt_ids"] = list(attempt_ids)
+            return result
         target = self._resolve_remote_target(model)
         if target.get("provider") == "anthropic":
             with capture_attempt_ids() as attempt_ids:
@@ -2437,8 +2178,9 @@ class LLMClient:
         ctx_len: int,
         max_tokens: int,
     ) -> List[Dict[str, Any]]:
-        available_tokens = max(256, ctx_len - max_tokens - 64)
-        target_chars = available_tokens * 3
+        available_tokens = max(256, ctx_len - max_tokens - 128)
+        # Safe character ratio for local model: max 12k chars (~3k tokens) for instant sub-second prefill
+        target_chars = min(12000, int(available_tokens * 1.5))
         total_chars = _estimate_message_chars(messages)
         if total_chars <= target_chars:
             return messages
@@ -2467,10 +2209,74 @@ class LLMClient:
         if compacted_chars <= target_chars:
             return compacted
 
-        raise LocalContextTooLargeError(
-            f"Local model context too large after safe compaction "
-            f"({compacted_chars} chars > target {target_chars})."
-        )
+        # Adaptive secondary trimming: trim system message text blocks from the end to fit target_chars
+        # Reserve the language rule appended below; it is part of the payload.
+        excess_chars = compacted_chars - target_chars + len(_LOCAL_LANGUAGE_RULE)
+        for msg in compacted:
+            if msg.get("role") != "system":
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                # Largest block first: the deficit is paid by the biggest text, not by
+                # whichever block happens to sit last.
+                blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "text"]
+                for block in sorted(blocks, key=lambda b: -len(str(b.get("text", "")))):
+                    if excess_chars <= 0:
+                        break
+                    trimmed, removed = _trim_local_sections(str(block.get("text", "")), excess_chars)
+                    if removed:
+                        block["text"] = trimmed
+                        excess_chars -= removed
+            elif isinstance(content, str):
+                trimmed, removed = _trim_local_sections(content, excess_chars)
+                if removed:
+                    msg["content"] = trimmed
+                    excess_chars -= removed
+                    if excess_chars <= 0:
+                        excess_chars = 0
+            break
+
+        # Prune older conversation history if message count is high
+        if len(compacted) > 6:
+            sys_msgs = [m for m in compacted if m.get("role") == "system"]
+            non_sys = [m for m in compacted if m.get("role") != "system"]
+            compacted = sys_msgs + non_sys[-6:]
+
+        # Truncate giant individual non-system messages (e.g. huge file reads) for instant local prefill
+        for msg in compacted:
+            if msg.get("role") != "system":
+                c = msg.get("content")
+                if isinstance(c, str) and len(c) > 4000:
+                    msg["content"] = c[:2000] + "\n...[truncated for local context]...\n" + c[-2000:]
+
+        # Ensure strict language consistency rule for local models
+        for msg in compacted:
+            if msg.get("role") == "system":
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            if _LOCAL_LANGUAGE_RULE_MARKER not in str(block.get("text", "")):
+                                block["text"] = str(block.get("text", "")) + _LOCAL_LANGUAGE_RULE
+                            break
+                elif isinstance(content, str):
+                    if _LOCAL_LANGUAGE_RULE_MARKER not in content:
+                        msg["content"] = content + _LOCAL_LANGUAGE_RULE
+                break
+
+        # Fail TYPED rather than ship an over-window payload. Bodies stop at
+        # _LOCAL_SECTION_BODY_FLOOR, so "still too large" means the PRESERVED CORE does
+        # not fit. Recovery belongs to the callers (context_compaction,
+        # loop_llm_call.classify_llm_exception), so the signal must reach them typed.
+        final_chars = _estimate_message_chars(compacted)
+        if final_chars > target_chars:
+            raise LocalContextTooLargeError(
+                "local context window cannot hold the preserved core: "
+                f"{final_chars} chars > {target_chars} budget "
+                f"(ctx_len={ctx_len}, max_tokens={max_tokens})"
+            )
+
+        return compacted
 
     def _chat_local(
         self,
@@ -2500,17 +2306,17 @@ class LLMClient:
                 if isinstance(block, dict) and str(block.get("type") or "") in ("image_url", "image"):
                     content[idx] = {"type": "text", "text": "[image omitted: model has no vision]"}
         local_max = min(max_tokens, 2048)
-        ctx_len = 0
+        ctx_len = 131072
         try:
             from ouroboros.local_model import get_manager
-            ctx_len = get_manager().get_context_length()
-            if ctx_len > 0:
-                local_max = min(max_tokens, max(256, ctx_len // 4))
+            mgr_ctx = get_manager().get_context_length()
+            if mgr_ctx > 0:
+                ctx_len = mgr_ctx
+            local_max = min(max_tokens, max(256, ctx_len // 4))
         except Exception:
             pass
 
-        if ctx_len > 0:
-            clean_messages = self._prepare_messages_for_local_context(clean_messages, ctx_len, local_max)
+        clean_messages = self._prepare_messages_for_local_context(clean_messages, ctx_len, local_max)
 
         for msg in clean_messages:
             content = msg.get("content")
@@ -2532,11 +2338,13 @@ class LLMClient:
             "messages": clean_messages,
             "max_tokens": local_max,
         }
-        if clean_tools:
+        if clean_tools and tool_choice != "none":
             kwargs["tools"] = clean_tools
             kwargs["tool_choice"] = tool_choice
         if timeout and timeout > 0:
-            kwargs["timeout"] = float(timeout)
+            kwargs["timeout"] = max(float(timeout), 180.0)
+        else:
+            kwargs["timeout"] = 180.0
 
         candidate = _physical_candidate(kwargs)
         local_target = {"provider": "local", "usage_model": "local-model"}
@@ -2556,9 +2364,27 @@ class LLMClient:
             except Exception as exc:
                 last_exc = exc
                 err = str(exc)
-                if (_is_structured_context_overflow_exception(exc)
-                        or context_overflow_message(err)):
-                    raise LocalContextTooLargeError(err) from exc
+                if "context_length_exceeded" in err or "400" in err or _is_structured_context_overflow_exception(exc) or context_overflow_message(err):
+                    # Typed, on the FIRST attempt: resending an over-window payload only
+                    # spends the window again. Callers classify this into
+                    # `context_overflow` and own recovery.
+                    #
+                    # The "adaptive recovery" this replaces rewrote the system message in
+                    # place: content is a LIST of blocks here, so str() shipped 4000 chars
+                    # of a Python repr as the prompt. Fitting belongs to
+                    # _prepare_messages_for_local_context; failing typed belongs here.
+                    raise LocalContextTooLargeError(
+                        f"local context window exceeded and the payload cannot be resent unchanged: {err}"
+                    ) from exc
+                if "APIConnectionError" in err or "Connection refused" in err or "ConnectError" in err:
+                    log.warning("Local model server unreachable (attempt %d/3); checking autostart...", attempt + 1)
+                    try:
+                        from ouroboros.config import load_settings
+                        from ouroboros.local_model_autostart import auto_start_local_model
+                        auto_start_local_model(load_settings())
+                        time.sleep(2.5)
+                    except Exception as start_err:
+                        log.debug("Auto-start recovery failed: %s", start_err)
                 if attempt == 2:
                     log.warning("Local model request failed: %s", exc)
                     raise

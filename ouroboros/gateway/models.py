@@ -408,8 +408,14 @@ async def api_local_model_start(request: Request) -> JSONResponse:
         from ouroboros.local_model import get_manager, _get_runtime_hint
         mgr = get_manager()
 
-        if mgr.is_running:
-            return JSONResponse({"error": "Local model server is already running"}, status_code=409)
+        # Download/resolve can be slow, run in thread to not block the async event loop
+        model_path = await asyncio.to_thread(mgr.download_model, source, filename)
+
+        if mgr.is_running and mgr._model_path == model_path and mgr.port == port:
+            return JSONResponse({"status": "ready", "model_path": model_path})
+
+        if mgr.is_running or mgr.get_status() in ("ready", "loading"):
+            mgr.stop_server()
 
         # Preflight: check llama-cpp-python is installed BEFORE downloading the model.
         # This prevents users from waiting through a large download only to hit an
@@ -428,9 +434,6 @@ async def api_local_model_start(request: Request) -> JSONResponse:
                 },
                 status_code=412,
             )
-
-        # Download can be slow, run in thread to not block the async event loop
-        model_path = await asyncio.to_thread(mgr.download_model, source, filename)
 
         mgr.start_server(model_path, port=port, n_gpu_layers=n_gpu_layers, n_ctx=n_ctx, chat_format=chat_format)
         return JSONResponse({"status": "starting", "model_path": model_path})
@@ -469,6 +472,14 @@ async def api_local_model_test(request: Request) -> JSONResponse:
             return json_error("Local model server is not running", 400)
         result = mgr.test_tool_calling()
         return JSONResponse(result)
+    except Exception as e:
+        return json_exception(e)
+
+
+async def api_local_model_discovered(_request: Request) -> JSONResponse:
+    try:
+        from ouroboros.local_model import discover_local_models
+        return JSONResponse({"models": discover_local_models()})
     except Exception as e:
         return json_exception(e)
 

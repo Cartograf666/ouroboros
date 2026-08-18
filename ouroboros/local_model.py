@@ -9,7 +9,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from ouroboros.platform_layer import (
     IS_MACOS, terminate_process_tree, kill_process_tree,
@@ -57,12 +57,231 @@ _manager: Optional[LocalModelManager] = None
 _manager_lock = threading.Lock()
 
 
+def discover_local_models() -> list[dict[str, Any]]:
+    """Scan HuggingFace cache and local directories for available .gguf model files."""
+    discovered: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+
+    search_roots = [
+        pathlib.Path.home() / ".cache" / "huggingface" / "hub",
+        pathlib.Path.home() / "models",
+        pathlib.Path.home() / "Downloads",
+        pathlib.Path.home() / ".ollama" / "models",
+    ]
+
+    for root in search_roots:
+        if not root.exists():
+            continue
+        try:
+            for p in root.rglob("*.gguf"):
+                if not p.is_file():
+                    continue
+                resolved_path = str(p.resolve())
+                if resolved_path in seen_paths:
+                    continue
+                seen_paths.add(resolved_path)
+
+                size_gb = round(p.stat().st_size / (1024 ** 3), 2)
+                name = p.stem
+                source = resolved_path
+
+                for parent in p.parents:
+                    if parent.name.startswith("models--"):
+                        hf_name = parent.name[len("models--"):].replace("--", "/")
+                        name = hf_name.split("/")[-1]
+                        source = hf_name
+                        break
+
+                discovered.append({
+                    "name": name,
+                    "filename": p.name,
+                    "path": resolved_path,
+                    "source": source,
+                    "size_gb": size_gb,
+                })
+        except Exception:
+            continue
+
+    return sorted(discovered, key=lambda m: m["name"])
+
+
 def get_manager() -> LocalModelManager:
     global _manager
     with _manager_lock:
         if _manager is None:
             _manager = LocalModelManager()
         return _manager
+
+
+# --- Prompt fitting for the local context window ---------------------------------
+# Moved here from ouroboros/llm.py (v6.102.x). This code exists solely to fit a prompt
+# into the local llama-server window, which is this module's subject; in llm.py it sat
+# beside provider transport it has nothing to do with. Every function here is pure —
+# no client state, no network — and `_estimate_message_chars` had no consumer outside
+# the local path. `LocalContextTooLargeError` deliberately stays in llm.py: it is part
+# of that module's public surface (loop_llm_call and context_compaction import it).
+
+def _estimate_message_chars(messages: List[Dict[str, Any]]) -> int:
+    from ouroboros.context_budget import IMAGE_BLOCK_CHAR_EQUIVALENT
+
+    total = 0
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if str(block.get("type") or "") in ("image_url", "image"):
+                    total += IMAGE_BLOCK_CHAR_EQUIVALENT
+                    continue
+                total += len(str(block.get("text", "")))
+        else:
+            total += len(str(content or ""))
+    return total
+
+
+def _split_markdown_sections(text: str) -> Tuple[str, List[Tuple[str, str]]]:
+    lines = str(text or "").splitlines()
+    preamble: List[str] = []
+    sections: List[Tuple[str, str]] = []
+    current_title: Optional[str] = None
+    current_lines: List[str] = []
+
+    for line in lines:
+        if line.startswith("## "):
+            if current_title is None:
+                preamble = current_lines[:]
+            else:
+                sections.append((current_title, "\n".join(current_lines).strip()))
+            current_title = line[3:].strip()
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+
+    if current_title is None:
+        return "\n".join(lines).strip(), []
+
+    sections.append((current_title, "\n".join(current_lines).strip()))
+    return "\n".join(preamble).strip(), sections
+
+
+def _trim_local_sections(text: str, excess_chars: int) -> tuple:
+    """Shrink section BODIES largest-first; never drop a section. -> (text, removed).
+
+    The tail trim this replaces cut from the END of a block, deleting exactly the
+    sections ``_compact_markdown_sections`` had just PRESERVED — Memory Registry,
+    Drive state and Runtime context all sit after Dialogue History.
+    """
+    if excess_chars <= 0:
+        return text, 0
+    preamble, sections = _split_markdown_sections(text)
+    if not sections:
+        return text, 0
+    bodies = []
+    for index, (title, section) in enumerate(sections):
+        head, sep, body = section.partition("\n\n")
+        bodies.append([index, title, head, sep, body])
+    removed = 0
+    marker = len(_LOCAL_TRUNCATION_MARKER)
+    # Largest body first, so a small section is never spent on a deficit a large one
+    # can absorb.
+    for entry in sorted(bodies, key=lambda item: -len(item[4])):
+        if removed >= excess_chars:
+            break
+        body = entry[4]
+        # The marker is re-added, so it counts against the cut; ignoring it overstated
+        # the removal per section and left the payload over budget by that much.
+        keep = max(_LOCAL_SECTION_BODY_FLOOR, len(body) - (excess_chars - removed) - marker)
+        net = len(body) - keep - marker
+        if net <= 0:
+            continue
+        entry[4] = body[:keep] + _LOCAL_TRUNCATION_MARKER
+        removed += net
+    rebuilt = [preamble] if preamble else []
+    for _index, _title, head, sep, body in bodies:
+        rebuilt.append(head + sep + body if sep else head)
+    return "\n\n".join(part for part in rebuilt if part).strip(), removed
+
+
+def _compact_markdown_sections(
+    text: str,
+    preserve_titles: Set[str],
+    reason: str,
+) -> str:
+    preamble, sections = _split_markdown_sections(text)
+    if not sections:
+        return text
+
+    parts: List[str] = []
+    if preamble:
+        parts.append(preamble)
+
+    for title, section in sections:
+        if title in preserve_titles:
+            parts.append(section)
+            continue
+        omitted_chars = max(0, len(section))
+        parts.append(
+            f"## {title}\n\n"
+            f"[Compacted for local-model context: omitted {omitted_chars} chars. {reason}]"
+        )
+
+    return "\n\n".join(p for p in parts if p).strip()
+
+
+# A trimmed section keeps at least this much body, so a preserved section is always
+# still legible rather than reduced to a bare header.
+_LOCAL_SECTION_BODY_FLOOR = 160
+_LOCAL_TRUNCATION_MARKER = "\n...[truncated for local context]..."
+
+# Appended unconditionally, so its size is RESERVED before trimming: trimming against
+# a budget this text then exceeds is how the payload ended up over by its own length.
+_LOCAL_LANGUAGE_RULE = (
+    "\n\nCRITICAL: Always respond in the same language as the user's message "
+    "(e.g. if the user writes in Russian, you MUST reply in Russian)."
+)
+_LOCAL_LANGUAGE_RULE_MARKER = "CRITICAL: Always respond in the same language"
+
+_LOCAL_COMPACTION_MODES = {
+    "static": (
+        {"BIBLE.md"},
+        "Use a larger-context model or read the source file directly if this section becomes necessary.",
+    ),
+    "semi_stable": (
+        {"Identity"},
+        "Identity was preserved; non-core stable memory sections were compacted for local execution.",
+    ),
+    "dynamic": (
+        {
+            "Scratchpad",
+            "Dialogue History",
+            "Dialogue Summary",
+            "Memory Registry (what I know / don't know)",
+            "Drive state",
+            "Runtime context",
+            "Health Invariants",
+        },
+        "Working-memory and runtime sections were preserved; non-core recent/history sections were compacted for local execution.",
+    ),
+    "system": (
+        {
+            "BIBLE.md",
+            "Scratchpad",
+            "Identity",
+            "Drive state",
+            "Runtime context",
+            "Health Invariants",
+            "Recent observations",
+            "Background consciousness info",
+        },
+        "Non-core sections were compacted for local execution.",
+    ),
+}
+
+
+def _compact_local_text(text: str, mode: str) -> str:
+    preserve_titles, reason = _LOCAL_COMPACTION_MODES[mode]
+    return _compact_markdown_sections(text, preserve_titles=preserve_titles, reason=reason)
 
 
 class LocalModelManager:
@@ -113,6 +332,7 @@ class LocalModelManager:
             "download_progress": self._download_progress,
             "runtime_status": self._runtime_status,
             "runtime_install_log": self._runtime_install_log[-500:] if self._runtime_install_log else "",
+            "discovered_models": discover_local_models(),
         }
 
     def check_runtime(self) -> bool:
@@ -294,7 +514,24 @@ class LocalModelManager:
             expanded = os.path.expanduser(source)
             if os.path.isfile(expanded):
                 return expanded
-            raise FileNotFoundError(f"Local model file not found: {expanded}")
+
+        # Resilient local lookup: check if filename or source basename matches an already discovered GGUF file
+        target_name = (filename or os.path.basename(source)).lower()
+        if target_name:
+            for dm in discover_local_models():
+                dm_path = dm.get("path", "")
+                if dm_path and os.path.isfile(dm_path):
+                    dm_fn = str(dm.get("filename") or "").lower()
+                    dm_name = str(dm.get("name") or "").lower()
+                    if dm_fn and dm_fn == target_name:
+                        log.info("Resolved model from disk by filename: %s", dm_path)
+                        return dm_path
+                    if os.path.basename(dm_path).lower() == target_name:
+                        log.info("Resolved model from disk by basename: %s", dm_path)
+                        return dm_path
+                    if dm_name and (dm_name in target_name or target_name in dm_name):
+                        log.info("Resolved model from disk by model name: %s", dm_path)
+                        return dm_path
 
         try:
             from huggingface_hub import hf_hub_download
@@ -411,12 +648,20 @@ class LocalModelManager:
             cmd = [
                 python, "-m", "llama_cpp.server",
                 "--model", model_path,
+                "--host", "127.0.0.1",
                 "--port", str(port),
                 "--n_gpu_layers", str(n_gpu_layers),
+                "--flash_attn", "True",
+                "--type_k", "2",
+                "--type_v", "2",
             ]
             if chat_format:
                 cmd.extend(["--chat_format", chat_format])
-            effective_ctx = n_ctx if n_ctx > 0 else 16384
+            # With Flash Attention + 4-bit KV Cache (q4_0), 131072 (128k) fits in ~24GB RAM
+            if n_ctx > 131072:
+                log.warning("Requested n_ctx=%d exceeds safe 128k Metal limit; clamping to 131072", n_ctx)
+                n_ctx = 131072
+            effective_ctx = n_ctx if n_ctx > 0 else 131072
             self._context_length = effective_ctx
             cmd.extend(["--n_ctx", str(effective_ctx)])
 
@@ -560,21 +805,24 @@ class LocalModelManager:
                 except Exception:
                     pass
 
-        if proc is None:
-            return
+        if proc is not None:
+            log.info("Stopping local model server (pid=%s)...", proc.pid)
+            terminate_process_tree(proc)
 
-        log.info("Stopping local model server (pid=%s)...", proc.pid)
-        terminate_process_tree(proc)
-
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            log.warning("Local model server did not exit, force-killing")
-            kill_process_tree(proc)
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                pass
+                log.warning("Local model server did not exit, force-killing")
+                kill_process_tree(proc)
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
+
+        try:
+            subprocess.run(["pkill", "-9", "-f", f"llama_cpp.server.*--port {self._port}"], capture_output=True)
+        except Exception:
+            pass
 
     def health_check(self) -> Dict[str, Any]:
         """Query local server health and loaded-model info."""
@@ -583,26 +831,29 @@ class LocalModelManager:
         from ouroboros.utils import in_worker_process
 
         url = f"http://127.0.0.1:{self._port}/v1/models"
-        with requests.Session() as session:
-            if in_worker_process():
-                session.trust_env = False  # fork-safe + localhost never needs a proxy
-            resp = session.get(url, timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
-        models = data.get("data", [])
-        if not models:
-            return {"ok": False, "error": "No models loaded"}
+        try:
+            with requests.Session() as session:
+                if in_worker_process():
+                    session.trust_env = False  # fork-safe + localhost never needs a proxy
+                resp = session.get(url, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            models = data.get("data", [])
+            if not models:
+                return {"ok": False, "error": "No models loaded"}
 
-        model_info = models[0]
-        ctx = model_info.get("meta", {}).get("n_ctx_train", 0)
-        if not ctx:
-            ctx = model_info.get("context_window", 0)
+            model_info = models[0]
+            ctx = model_info.get("meta", {}).get("n_ctx_train", 0)
+            if not ctx:
+                ctx = model_info.get("context_window", 0)
 
-        return {
-            "ok": True,
-            "model_name": model_info.get("id", "unknown"),
-            "context_length": ctx,
-        }
+            return {
+                "ok": True,
+                "model_name": model_info.get("id", "unknown"),
+                "context_length": ctx,
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     def get_context_length(self) -> int:
         """Return cached context length, querying the server if needed."""

@@ -36,6 +36,40 @@ DEFAULT_ATLAS_HARD_TOTAL_TOKENS = 920_000
 _ATLAS_MANIFEST_RESERVE_TOKENS = 30_000
 _ATLAS_HARD_HEADROOM_TOKENS = 5_000
 
+def atlas_budget_pair(hard_total_tokens: int) -> tuple:
+    """``(target, hard)`` for a route whose real input ceiling is ``hard_total_tokens``.
+
+    ``target`` is a SOFT ceiling below ``hard``: the fill caps discretionary candidates at
+    ``target_context_tokens`` while required ones may reach ``hard_context_tokens``, and the
+    second shrink wave trims non-required content back toward the target. The band between
+    them is therefore margin — room the assembled pack is not supposed to spend.
+
+    Callers used to pass ``target=min(850_000, limit), hard=limit``, which COLLAPSES the two
+    whenever the calibrated limit is under 850K — the ordinary cold-start case, where
+    ``COLD_START_TOKEN_DENSITY`` puts a 1M reviewer near 545K. Collapsed, the pack is free to
+    ride its own hard ceiling with only ``_ATLAS_HARD_HEADROOM_TOKENS`` (5K) to spare, and
+    the sizing is an ESTIMATE: ``estimate_tokens`` is chars/4 while the calibrated density
+    for an unmeasured route is 1.65, so an estimate that lands just under the ceiling can be
+    over it in real tokens.
+
+    Measured effect, honestly bounded: at small limits the manifest reserve already dominates
+    and the derived pair changes nothing; where it does bite it buys margin by dropping the
+    last discretionary file (at a 90K ceiling: 74,246 estimated tokens with ~14.7K of headroom
+    instead of 79,940 with ~9.1K). It does NOT rescue required artifacts — those are selected
+    first and against ``hard_context_tokens``, so the collapse never threatened them.
+
+    Scaling by the shipped ratio rather than subtracting a fixed reserve keeps a small window
+    from having its whole target eaten, and reproduces the shipped pair exactly at the
+    documented ceiling (920K -> 850K), so behavior at or above it is unchanged.
+    """
+    hard = max(0, int(hard_total_tokens))
+    target = min(
+        DEFAULT_ATLAS_TARGET_TOTAL_TOKENS,
+        (hard * DEFAULT_ATLAS_TARGET_TOTAL_TOKENS) // max(1, DEFAULT_ATLAS_HARD_TOTAL_TOKENS),
+    )
+    return target, hard
+
+
 _CANONICAL_CONTEXT_DOCS = frozenset({
     "BIBLE.md",
     "docs/DEVELOPMENT.md",

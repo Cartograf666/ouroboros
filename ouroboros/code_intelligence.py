@@ -176,7 +176,20 @@ def _file_from_json(raw: Any) -> FileFact | None:
 
 
 def load_cached_inventory(repo_root: pathlib.Path, drive_root: pathlib.Path) -> CodeInventory | None:
-    """Load a v2 derived inventory cache, returning None for v1/malformed data."""
+    """Load a v2 derived inventory cache; None only when the WHOLE file is unusable.
+
+    Two failure scopes, deliberately not collapsed into one. An unreadable file, a
+    non-dict payload, or a schema older than v2 invalidates the whole cache (the rows
+    cannot be trusted to mean what this version reads). A single malformed ROW is
+    quarantined instead: it is dropped and the surviving rows are kept, because one
+    corrupt entry is not evidence about the other ~1000. Same shape as the usage-ledger
+    torn-tail quarantine in ``usage_ledger.py`` — a validated prefix stays readable.
+
+    Quarantine needs no signal to the caller: a dropped path is simply absent from the
+    cache map, so ``build_code_inventory`` re-derives that one file through ``_file_fact``
+    and the resulting mismatch against the cached rows rewrites the healed cache. The
+    bad row costs one re-parse, not the ~7 s full rebuild that ``return None`` forced.
+    """
     path = inventory_cache_path(repo_root, drive_root)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -188,7 +201,7 @@ def load_cached_inventory(repo_root: pathlib.Path, drive_root: pathlib.Path) -> 
     for item in raw.get("files") or []:
         fact = _file_from_json(item)
         if fact is None:
-            return None
+            continue
         files.append(fact)
     coverage: Dict[str, int] = {}
     raw_cov = raw.get("coverage")
@@ -622,15 +635,44 @@ def build_code_inventory(
     coverage: Dict[str, int] = {}
     for file in files:
         coverage[file.disposition] = coverage.get(file.disposition, 0) + 1
+    head = _git_head(root)
+    # The rewrite is the expensive half, not the scan. Measured on this repo (1051
+    # files, 88.7 MB cache): sha256 over every tracked file is 0.05 s, loading and
+    # reconstructing the cached rows is 0.76 s, and `to_json` + `json.dumps` + the
+    # atomic write is ~2.6 s — 76% of a warm call spent re-emitting bytes that already
+    # say the same thing. `query_code` (definition/references/callers/callees/impact/
+    # digest), the review-context atlas, and deep self-review all land here, so that
+    # cost repeats per interactive call.
+    #
+    # `git_head` was recorded from the first version and never read; this is what it is
+    # for. It CANNOT gate the scan — the working tree changes constantly at a fixed HEAD
+    # and a HEAD-only fast path would serve stale symbols for every uncommitted edit,
+    # which is exactly the review-correctness failure this inventory must not have. It
+    # gates only the WRITE, alongside full row equality, so disk and memory never
+    # disagree: identical rows plus identical HEAD means the file on disk is already the
+    # answer. `created_at` is carried over rather than refreshed, because bumping it
+    # would be the one field forcing a write on an otherwise unchanged inventory.
+    #
+    # Row equality is the test rather than an all-rows-reused flag: `sensitive`,
+    # `oversized`, `path_escape` and `read_error` rows carry an empty sha256, so they
+    # never match the digest and are re-derived on every call. That re-derivation is a
+    # cheap early return in `_file_fact` and lands on an EQUAL FileFact, so comparing
+    # values keeps the skip working for repositories that contain them; a reused-flag
+    # would be defeated by a single `.env`.
+    unchanged = (
+        cached is not None
+        and cached.git_head == head
+        and files == cached.files
+    )
     inventory = CodeInventory(
         schema_version=CODE_INTELLIGENCE_SCHEMA_VERSION,
         repo_root=str(root),
-        git_head=_git_head(root),
-        created_at=utc_now_iso(),
+        git_head=head,
+        created_at=cached.created_at if unchanged else utc_now_iso(),
         files=files,
         coverage=coverage,
     )
-    if persist and drive_root is not None:
+    if persist and drive_root is not None and not unchanged:
         path = inventory_cache_path(root, pathlib.Path(drive_root))
         atomic_write_json(path, inventory.to_json(), trailing_newline=True)
     return inventory

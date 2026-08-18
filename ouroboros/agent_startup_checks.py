@@ -105,8 +105,18 @@ def check_version_sync(env: Any) -> Tuple[dict, int]:
             log.debug("Failed to check README.md version", exc_info=True)
 
         try:
-            arch_content = read_text(env.repo_path("docs/ARCHITECTURE.md"))
-            arch_version = extract_architecture_header_version(arch_content)
+            # Bounded head first: this reads a version out of the document TITLE, and
+            # ARCHITECTURE.md is ~455 KB. Every worker process runs this check at boot
+            # (see _log_worker_boot_once's per-process guard), so the full read was
+            # megabytes of identical I/O per launch. The regex is MULTILINE, so a header
+            # further down would still be legal — fall back to the whole file when the
+            # head does not carry one, which keeps the result identical in every case.
+            arch_path = env.repo_path("docs/ARCHITECTURE.md")
+            with open(arch_path, "r", encoding="utf-8") as handle:
+                arch_head = handle.read(8192)
+            arch_version = extract_architecture_header_version(arch_head)
+            if not arch_version:
+                arch_version = extract_architecture_header_version(read_text(arch_path))
             if arch_version:
                 result_data["architecture_version"] = arch_version
                 if version_file != arch_version:

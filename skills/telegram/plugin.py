@@ -116,6 +116,7 @@ def _build_menu_keyboard(command_mode: str, lang: str = "en") -> tuple[str, list
     return header, keyboard
 
 
+
 def _build_menu_status(command_mode: str, lang: str = "en", info_text: str = "") -> tuple[str, list[list[dict]]]:
     """Return status header and keyboard with Refresh and Back button."""
     t = _LOCALIZED_TEXTS[lang]
@@ -259,7 +260,7 @@ def _make_settings_save(api):
                 {"ok": False, "message": "Invalid Telegram settings payload."},
                 status_code=400,
             )
-        allowed = {"TELEGRAM_CHAT_ID", "TELEGRAM_MAX_UPDATES_PER_POLL", "TELEGRAM_MIRROR_MODE", "TELEGRAM_COMMAND_MODE", "TELEGRAM_LANGUAGE", "TELEGRAM_SILENT_MODE", "TELEGRAM_SUBAGENT_CARDS", "TELEGRAM_MIRROR_PROGRESS", "TELEGRAM_NOTIFY_TASKS", "TELEGRAM_NOTIFY_BUDGET", "TELEGRAM_MINIAPP_ENABLED"}
+        allowed = {"TELEGRAM_CHAT_ID", "TELEGRAM_MAX_UPDATES_PER_POLL", "TELEGRAM_MIRROR_MODE", "TELEGRAM_COMMAND_MODE", "TELEGRAM_LANGUAGE", "TELEGRAM_MODEL", "TELEGRAM_USE_LOCAL_MODEL", "TELEGRAM_SILENT_MODE", "TELEGRAM_SUBAGENT_CARDS", "TELEGRAM_MIRROR_PROGRESS", "TELEGRAM_NOTIFY_TASKS", "TELEGRAM_NOTIFY_BUDGET", "TELEGRAM_MINIAPP_ENABLED"}
         payload = {key: data.get(key) for key in allowed if key in data}
         owner_ignored = False
         if "TELEGRAM_CHAT_ID" in payload and not request_may_change_owner(request):
@@ -394,6 +395,20 @@ async def _inject(api, payload: Dict[str, Any]) -> None:
         raise RuntimeError("Host Service port is invalid.") from None
     if not 1 <= port <= 65535:
         raise RuntimeError("Host Service port is invalid.")
+    # Keep the Telegram picker per-chat and per-message: an empty selection
+    # means "use Ouroboros' global main route", while a chosen route is carried
+    # as a narrowly scoped owner marker to the canonical task metadata.
+    selected_model = str(settings.get("TELEGRAM_MODEL") or "").strip()
+    if selected_model and str(payload.get("source") or "") == "telegram":
+        bounded_model = selected_model[:200]
+        existing_metadata = payload.get("task_metadata") if isinstance(payload.get("task_metadata"), dict) else {}
+        payload = dict(payload)
+        payload["task_metadata"] = {
+            **existing_metadata,
+            "chat_model_override": bounded_model,
+            "chat_model_source": "telegram_owner",
+            "chat_use_local_model": bounded_model == "local-model",
+        }
     async with httpx.AsyncClient(
         timeout=60,
         trust_env=False,
@@ -592,6 +607,156 @@ async def _start_poller(api):
         raise
 
 
+async def _handle_callback_query(
+    api, client, callback_query, pinned_chat: str, command_mode: str, lang: str,
+) -> str:
+    """Handle one inline-button press; returns the (possibly switched) language.
+
+    Extracted from ``_poller`` at the 300-line function gate. The branch was half
+    that function and is a separate concern: button presses carry their own
+    authorization, their own keyboards, and never fall through to message
+    handling — every path in it ended the update. Those twelve ``continue``
+    statements are ``return lang`` here, and the caller continues on its own,
+    which is the identical control flow: the branch owns no loop of its own
+    (verified: zero nested loops), so all twelve targeted the update loop.
+
+    ``lang`` is the one value that escapes: the language keyboard switches it,
+    and the message path below the call reads it on every later update.
+    """
+    cb_id = str(callback_query.get("id") or "")
+    cb_data = str(callback_query.get("data") or "").strip()
+    cb_message = callback_query.get("message") or {}
+    cb_message_id = int(cb_message.get("message_id") or 0)
+    cb_chat = cb_message.get("chat") or {}
+    cb_chat_id = int(cb_chat.get("id") or 0)
+    cb_sender = callback_query.get("from") or {}
+    if (
+        not pinned_chat
+        or str(cb_chat_id) != pinned_chat
+        or str(cb_sender.get("id") or "") != pinned_chat
+    ):
+        await client.answer_callback_query(cb_id, text=_LOCALIZED_TEXTS[lang]["not_authorized"])
+        return lang
+
+    # --- Dynamic Tab Navigation (Category 1) ---
+    if cb_data.startswith("nav:"):
+        target = cb_data.split(":", 1)[1]
+        await client.answer_callback_query(cb_id)
+        if target == "menu":
+            header, keyboard = _build_menu_keyboard(command_mode, lang)
+            await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
+        elif target == "status":
+            info_text = await _compile_status_text(api, lang)
+            header, keyboard = _build_menu_status(command_mode, lang, info_text)
+            await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
+        elif target == "mind":
+            bg_enabled = _is_bg_consciousness_active(api)
+            header, keyboard = _build_menu_mind(command_mode, lang, bg_enabled)
+            await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
+        elif target == "language":
+            header, keyboard = _build_language_keyboard(lang)
+            await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
+        elif target == "tasks":
+            header, keyboard = await asyncio.to_thread(
+                _build_menu_tasks, api, command_mode, lang
+            )
+            await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
+        elif target == "settings":
+            header, keyboard = _build_menu_settings(api, command_mode, lang)
+            await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
+        return lang
+
+    # --- Command Actions / Control (Category 2) ---
+    if cb_data.startswith("cmd_act:"):
+        action = cb_data.split(":", 1)[1]
+
+        if action == "update_status":
+            await client.answer_callback_query(cb_id, text=_LOCALIZED_TEXTS[lang]["updating_status"])
+            info_text = await _compile_status_text(api, lang)
+            header, keyboard = _build_menu_status(command_mode, lang, info_text)
+            await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
+            return lang
+
+        elif action == "toggle_silent":
+            # Toggle TELEGRAM_SILENT_MODE and refresh the Settings panel.
+            # This is a display preference (no LLM injection), so it is
+            # allowed in every command_mode including strict.
+            local_settings = _load_settings(api)
+            currently_on = _is_silent_mode_enabled(local_settings)
+            new_value = "off" if currently_on else "on"
+            merge_settings(pathlib.Path(api.get_state_dir()), {"TELEGRAM_SILENT_MODE": new_value})
+            # Clear any stale tracked message id for this chat so the
+            # next outbound starts a fresh bubble in either direction.
+            _clear_silent_msg(api, cb_chat_id)
+            toast_key = "silent_toggled_on" if new_value == "on" else "silent_toggled_off"
+            await client.answer_callback_query(cb_id, text=_LOCALIZED_TEXTS[lang][toast_key])
+            header, keyboard = _build_menu_settings(api, command_mode, lang)
+            await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
+            return lang
+
+        elif action == "bg_thoughts":
+            await client.answer_callback_query(cb_id, text=_LOCALIZED_TEXTS[lang]["extracting_thoughts"])
+            bg_enabled = _is_bg_consciousness_active(api)
+            thoughts = await asyncio.to_thread(_load_recent_thoughts, api)
+            header, keyboard = _build_menu_mind(command_mode, lang, bg_enabled, thoughts)
+            await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
+            return lang
+
+        elif action in ("bg_start", "bg_stop"):
+            if command_mode != _COMMAND_MODE_FULL:
+                await client.answer_callback_query(cb_id, text=_LOCALIZED_TEXTS[lang]["restricted_safe"])
+                return lang
+            await client.answer_callback_query(cb_id, text=_LOCALIZED_TEXTS[lang]["injecting_consciousness"])
+            translated = "/bg start" if action == "bg_start" else "/bg stop"
+            sender_name = _extract_sender_label(cb_sender, cb_chat_id)
+            sender_label = f"Telegram ({sender_name})"
+            await _inject(api, {
+                "text": translated,
+                "chat_id": cb_chat_id,
+                "user_id": int(cb_sender.get("id") or cb_chat_id or 1),
+                "source": "telegram",
+                "sender_label": sender_label,
+                "transport": {
+                    "kind": "telegram",
+                    "conversation_id": str(cb_chat_id),
+                    "sender_label": sender_label,
+                },
+                "image_base64": "",
+                "image_mime": "",
+                "image_caption": "",
+            })
+            # Give it a tiny moment to commit setting then refresh mind panel
+            await asyncio.sleep(0.8)
+            bg_enabled = _is_bg_consciousness_active(api)
+            header, keyboard = _build_menu_mind(command_mode, lang, bg_enabled)
+            await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
+            return lang
+
+    # --- Handle language selection buttons ---
+    if cb_data.startswith("set_lang:"):
+        new_lang = cb_data.split(":", 1)[1]
+        if new_lang in ("en", "ru"):
+            merge_settings(pathlib.Path(api.get_state_dir()), {"TELEGRAM_LANGUAGE": new_lang})
+
+            lang = new_lang
+            await client.answer_callback_query(cb_id, text=_LOCALIZED_TEXTS[lang]["lang_changed"])
+
+            # Smoothly return to menu panel in updated language
+            header, keyboard = _build_menu_keyboard(command_mode, lang)
+            await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
+            return lang
+
+    if cb_data.startswith("set_budget:"):
+        await client.answer_callback_query(
+            cb_id,
+            text=("Бюджет меняется в Mini App." if lang == "ru" else "Budget is changed in the Mini App."),
+        )
+        return lang
+
+    await client.answer_callback_query(cb_id, text=_LOCALIZED_TEXTS[lang]["unknown_command"])
+    return lang
+
+
 async def _poller(api) -> None:
     client, offset, pinned_chat, max_updates, command_mode, lang = await _start_poller(api)
 
@@ -616,137 +781,9 @@ async def _poller(api) -> None:
                     # --- Handle callback queries (inline button presses) ---
                     callback_query = update.get("callback_query")
                     if callback_query:
-                        cb_id = str(callback_query.get("id") or "")
-                        cb_data = str(callback_query.get("data") or "").strip()
-                        cb_message = callback_query.get("message") or {}
-                        cb_message_id = int(cb_message.get("message_id") or 0)
-                        cb_chat = cb_message.get("chat") or {}
-                        cb_chat_id = int(cb_chat.get("id") or 0)
-                        cb_sender = callback_query.get("from") or {}
-                        if (
-                            not pinned_chat
-                            or str(cb_chat_id) != pinned_chat
-                            or str(cb_sender.get("id") or "") != pinned_chat
-                        ):
-                            await client.answer_callback_query(cb_id, text=_LOCALIZED_TEXTS[lang]["not_authorized"])
-                            continue
-
-                        # --- Dynamic Tab Navigation (Category 1) ---
-                        if cb_data.startswith("nav:"):
-                            target = cb_data.split(":", 1)[1]
-                            await client.answer_callback_query(cb_id)
-                            if target == "menu":
-                                header, keyboard = _build_menu_keyboard(command_mode, lang)
-                                await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
-                            elif target == "status":
-                                info_text = await _compile_status_text(api, lang)
-                                header, keyboard = _build_menu_status(command_mode, lang, info_text)
-                                await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
-                            elif target == "mind":
-                                bg_enabled = _is_bg_consciousness_active(api)
-                                header, keyboard = _build_menu_mind(command_mode, lang, bg_enabled)
-                                await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
-                            elif target == "language":
-                                header, keyboard = _build_language_keyboard(lang)
-                                await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
-                            elif target == "tasks":
-                                header, keyboard = await asyncio.to_thread(
-                                    _build_menu_tasks, api, command_mode, lang
-                                )
-                                await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
-                            elif target == "settings":
-                                header, keyboard = _build_menu_settings(api, command_mode, lang)
-                                await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
-                            continue
-
-                        # --- Command Actions / Control (Category 2) ---
-                        if cb_data.startswith("cmd_act:"):
-                            action = cb_data.split(":", 1)[1]
-
-                            if action == "update_status":
-                                await client.answer_callback_query(cb_id, text=_LOCALIZED_TEXTS[lang]["updating_status"])
-                                info_text = await _compile_status_text(api, lang)
-                                header, keyboard = _build_menu_status(command_mode, lang, info_text)
-                                await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
-                                continue
-
-                            elif action == "toggle_silent":
-                                # Toggle TELEGRAM_SILENT_MODE and refresh the Settings panel.
-                                # This is a display preference (no LLM injection), so it is
-                                # allowed in every command_mode including strict.
-                                local_settings = _load_settings(api)
-                                currently_on = _is_silent_mode_enabled(local_settings)
-                                new_value = "off" if currently_on else "on"
-                                merge_settings(pathlib.Path(api.get_state_dir()), {"TELEGRAM_SILENT_MODE": new_value})
-                                # Clear any stale tracked message id for this chat so the
-                                # next outbound starts a fresh bubble in either direction.
-                                _clear_silent_msg(api, cb_chat_id)
-                                toast_key = "silent_toggled_on" if new_value == "on" else "silent_toggled_off"
-                                await client.answer_callback_query(cb_id, text=_LOCALIZED_TEXTS[lang][toast_key])
-                                header, keyboard = _build_menu_settings(api, command_mode, lang)
-                                await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
-                                continue
-
-                            elif action == "bg_thoughts":
-                                await client.answer_callback_query(cb_id, text=_LOCALIZED_TEXTS[lang]["extracting_thoughts"])
-                                bg_enabled = _is_bg_consciousness_active(api)
-                                thoughts = await asyncio.to_thread(_load_recent_thoughts, api)
-                                header, keyboard = _build_menu_mind(command_mode, lang, bg_enabled, thoughts)
-                                await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
-                                continue
-
-                            elif action in ("bg_start", "bg_stop"):
-                                if command_mode != _COMMAND_MODE_FULL:
-                                    await client.answer_callback_query(cb_id, text=_LOCALIZED_TEXTS[lang]["restricted_safe"])
-                                    continue
-                                await client.answer_callback_query(cb_id, text=_LOCALIZED_TEXTS[lang]["injecting_consciousness"])
-                                translated = "/bg start" if action == "bg_start" else "/bg stop"
-                                sender_name = _extract_sender_label(cb_sender, cb_chat_id)
-                                sender_label = f"Telegram ({sender_name})"
-                                await _inject(api, {
-                                    "text": translated,
-                                    "chat_id": cb_chat_id,
-                                    "user_id": int(cb_sender.get("id") or cb_chat_id or 1),
-                                    "source": "telegram",
-                                    "sender_label": sender_label,
-                                    "transport": {
-                                        "kind": "telegram",
-                                        "conversation_id": str(cb_chat_id),
-                                        "sender_label": sender_label,
-                                    },
-                                    "image_base64": "",
-                                    "image_mime": "",
-                                    "image_caption": "",
-                                })
-                                # Give it a tiny moment to commit setting then refresh mind panel
-                                await asyncio.sleep(0.8)
-                                bg_enabled = _is_bg_consciousness_active(api)
-                                header, keyboard = _build_menu_mind(command_mode, lang, bg_enabled)
-                                await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
-                                continue
-
-                        # --- Handle language selection buttons ---
-                        if cb_data.startswith("set_lang:"):
-                            new_lang = cb_data.split(":", 1)[1]
-                            if new_lang in ("en", "ru"):
-                                merge_settings(pathlib.Path(api.get_state_dir()), {"TELEGRAM_LANGUAGE": new_lang})
-
-                                lang = new_lang
-                                await client.answer_callback_query(cb_id, text=_LOCALIZED_TEXTS[lang]["lang_changed"])
-
-                                # Smoothly return to menu panel in updated language
-                                header, keyboard = _build_menu_keyboard(command_mode, lang)
-                                await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
-                                continue
-
-                        if cb_data.startswith(("set_model:", "set_budget:")):
-                            await client.answer_callback_query(
-                                cb_id,
-                                text=("Используйте Mini App." if lang == "ru" else "Use the Mini App."),
-                            )
-                            continue
-
-                        await client.answer_callback_query(cb_id, text=_LOCALIZED_TEXTS[lang]["unknown_command"])
+                        lang = await _handle_callback_query(
+                            api, client, callback_query, pinned_chat, command_mode, lang,
+                        )
                         continue
 
                     # --- Handle regular messages ---
@@ -770,6 +807,10 @@ async def _poller(api) -> None:
                         else:
                             await client.send_message(chat_id, header)
                         continue
+
+                    # Handle /model locally — it only changes the Telegram
+                    # reply route and never forwards a slash command to the
+                    # agent.
 
                     # Handle /language command locally — always allowed
                     is_lang_cmd = _is_exact_bot_command(cleaned_text, "/language")

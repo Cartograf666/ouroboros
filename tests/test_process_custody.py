@@ -53,6 +53,7 @@ _POPEN_ALLOWLIST = {
     "ouroboros/tools/skill_preflight.py", # waited preflight child
     "ouroboros/marketplace/isolated_deps.py",  # waited installer child
     "ouroboros/gateways/claude_code.py",  # waited readonly child (timeout-bound)
+    "ouroboros/tools/antigravity.py",      # waited read-only CLI child (timeout-bound, reaps its own tree)
     "ouroboros/extension_process_runner.py",  # waited extension child
     "ouroboros/workspace_executor.py",    # custody write-through added at spawn
     "ouroboros/local_model.py",           # custody record added at spawn

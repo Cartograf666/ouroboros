@@ -791,6 +791,18 @@ def _execute_with_timeout(
         "args": args_for_log,
     }, correlation, tool_call_id=tool_call_id))
 
+    try:
+        from ouroboros.cancel_intents import has_active_intent
+        if task_id and has_active_intent(getattr(tools, "drive_root", None), str(task_id)):
+            return {
+                "tool_call_id": tool_call_id,
+                "role": "tool",
+                "name": fn_name,
+                "content": json.dumps({"error": "Action cancelled by user."}),
+            }
+    except Exception:
+        pass
+
     if use_stateful:
         future = stateful_executor.submit(_execute_single_tool, tools, tc, drive_logs, task_id)
         try:
