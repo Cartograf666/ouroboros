@@ -7,6 +7,7 @@ import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
 import { downloadViaHostBridge, openViaHostBridge } from './ui_helpers.js';
+import { clientSurfaceField } from './client_surface.js';
 import { apiClient, apiFetch, fetchTaskDetail } from './api_client.js';
 import {
     OWNER_STOP_DETAIL_MARKER,
@@ -918,9 +919,7 @@ export function createChatInstance({
             ) || null;
         }
         if (!node && anchor.ts) {
-            const matches = Array.from(messagesDiv.children).filter(
-                (item) => item.dataset?.ts === anchor.ts
-            );
+            const matches = Array.from(messagesDiv.children).filter((item) => item.dataset?.ts === anchor.ts);
             node = matches[anchor.ordinal] || matches[0] || null;
         }
         return restoreNode(node, anchor.topOffset ?? anchor.offset);
@@ -1047,9 +1046,7 @@ export function createChatInstance({
         const movedEarlier = stampNodeTimestamp(record.root, rawTs, { anchor: true });
         if (record.isSubagent) {
             const parent = liveCardRecords.get(record.parentGroupId);
-            const parentMoved = reanchorTaskCard(
-                parent, rawTs, { suppressDomInsert }, seen
-            );
+            const parentMoved = reanchorTaskCard(parent, rawTs, { suppressDomInsert }, seen);
             return movedEarlier || parentMoved;
         }
         if (!movedEarlier) return false;
@@ -1759,9 +1756,7 @@ export function createChatInstance({
     }
 
     function getSubagentCardRecord(childId = '', parentId = '', role = '') {
-        return withStableViewport(() => getSubagentCardRecordMutation(
-            childId, parentId, role,
-        ));
+        return withStableViewport(() => getSubagentCardRecordMutation(childId, parentId, role));
     }
 
     function getSubagentCardRecordMutation(childId = '', parentId = '', role = '') {
@@ -3428,9 +3423,7 @@ export function createChatInstance({
                     // prior visual offset instead (equal-ts ordinals keep
                     // arrival-order identity), after two RAF frames so async
                     // card heights above the anchor cannot move the reader.
-                    await new Promise((resolve) => requestAnimationFrame(
-                        () => requestAnimationFrame(resolve)
-                    ));
+                    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
                     const restoredFromAnchor = restoreVisibleTimelineAnchor(scrollBeforeSync.anchor);
                     if (!restoredFromAnchor) messagesDiv.scrollTop = scrollBeforeSync.top;
                     updateScrollButton();
@@ -3627,6 +3620,7 @@ export function createChatInstance({
             ...(isMain ? {} : { chat_id: chatId }),
             ...(projectId ? { project_id: projectId } : {}),
             ...(attachmentMeta.length ? { attachments: attachmentMeta } : {}),
+            ...clientSurfaceField(),
         }, hasAttachments ? { queue: false } : undefined);
         if (hasAttachments && result?.status !== 'sent') {
             await cleanupUploadedAttachments(uploadedAttachments);

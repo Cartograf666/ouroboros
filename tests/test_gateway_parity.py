@@ -250,6 +250,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "OwnerScopeReviewFloorResponse.deprecation_notice must be declared for the browser"
     )
     assert re.search(r"@property \{boolean=\} force_plan\b", text), "ChatInbound missing force_plan"
+    assert re.search(r"@property \{Object=\} client_surface\b", text), "ChatInbound missing client_surface"
     for field in ("model_lane", "requested_model_lane", "effective_model_lane", "model", "task_group_id"):
         assert re.search(rf"@property \{{string=\}} {field}\b", text), f"ChatOutbound missing {field}"
     for field in ("source", "line", "root"):

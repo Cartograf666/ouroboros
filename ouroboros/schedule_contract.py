@@ -14,6 +14,12 @@ RESERVED_TEMPLATE_FIELDS = frozenset({
     "child_drive_root", "budget_drive_root", "parent_task_id",
     "root_task_id", "delegation_role", "task_constraint",
     "task_id", "session_id", "actor_id", "headless_child_drive_root",
+    # Owner Surface Fact: a scheduled task is machine-fired — no owner message
+    # stands behind it, so a template must never smuggle a sending-surface
+    # descriptor (incl. a forged received_at) into owner_client. Admission
+    # rejects the key loudly; _task_from_schedule filters it from records
+    # persisted before this rule.
+    "client_surface",
 })
 
 
