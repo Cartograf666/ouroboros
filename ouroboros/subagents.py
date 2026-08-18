@@ -378,9 +378,11 @@ def route_health(
     REASON with an empty ``reset_at``, since an unknown healing time is not health.
 
     ``pinned_profile`` (reviewer-slot rows today) SKIPS the harness-row status
-    refusal: a no-default-credential row reads ``unavailable`` FOREVER by design
-    (agy, INV-135) even while a named profile works — for a pinned run the
-    ENGINE's typed refusal is authoritative (owner 2026-08-18); every other check applies.
+    refusal AND the ``enabled`` flag beside it: a no-default-credential row reads
+    ``unavailable`` FOREVER by design (agy, INV-135) and commonly ships disabled
+    too — the ENGINE's typed refusal is authoritative for a pinned run (owner
+    2026-08-18; one wasted round trip on a really-disabled harness). Catalog
+    absence, access-profile fit, version floor and quota still apply.
     """
     from ouroboros.config import CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION
     from ouroboros.gateways.claudexor import engine_at_least
@@ -1456,20 +1458,21 @@ def envelope_from_task(
     """
     usage = usage or {}
     evidence = _execution_evidence_for_task(task, status)
-    # Unreadable custody log: the zero counts are UNKNOWN, not established
-    # facts — no substrate claim and no reduction amendment (the docs/JSDoc
-    # contract; omission keeps the enum vocabulary closed).
+    # Unreadable custody log: zero counts are UNKNOWN — no substrate claim, no
+    # reduction amendment (docs/JSDoc contract; omission keeps the enum closed).
     claimable = evidence is not None and not evidence.get("evidence_read_failed")
     substrate = actual_substrate(evidence) if claimable else ""
     capability_delta = task.get("capability_delta") if isinstance(task.get("capability_delta"), dict) else {}
     if substrate == SUBSTRATE_NATIVE_ONLY and str(task.get("effective_executor") or "") == "harness":
-        # Q1A: a harness dispatch that ended native_only must not present as a
-        # clean un-reduced execution — the envelope carries the amended copy.
-        # B3: only a COMPLETED finalization with the durable injection stamp.
+        # Q1A: a harness dispatch that ended native_only carries the amended
+        # copy. B3: only COMPLETED + the durable stamp + ZERO durable attempts
+        # (a nanny refused typed after TRYING delegate_start did not ignore
+        # the nudge — this stays an obedience fact, never an accusation).
         capability_delta = _disclose_native_only_substrate(
             capability_delta,
             nudge_ignored=(str(status or "") == "completed"
-                           and bool(evidence.get("nanny_nudge_recorded"))),
+                           and bool(evidence.get("nanny_nudge_recorded"))
+                           and not evidence.get("delegate_start_attempted")),
         )
     return build_subagent_envelope(
         task_id=str(task.get("id") or ""),

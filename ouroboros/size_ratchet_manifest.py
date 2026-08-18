@@ -147,7 +147,6 @@ BAND_PATHS = {
     "ouroboros/protected_artifacts.py": None,
     "ouroboros/skill_loader.py": None,
     "ouroboros/skill_review_runner.py": None,
-    "ouroboros/subagents.py": None,
     "ouroboros/task_status.py": None,
     "ouroboros/tools/browser.py": None,
     "ouroboros/tools/shell_guards.py": None,

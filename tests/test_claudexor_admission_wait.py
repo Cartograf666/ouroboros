@@ -429,21 +429,37 @@ def test_probe_refuses_typed_when_recovery_outlives_the_window(monkeypatch, tmp_
             server.shutdown()
 
 
-def test_supervisor_sweep_wiring_passes_a_zero_wait_factory():
+def test_supervisor_sweep_wiring_passes_a_zero_wait_factory(monkeypatch):
     """The server tick opts OUT of the admission wait at its own call site.
 
-    The call rides inside a broad try/except on the supervisor path, so a
-    signature drift would silently disable orphan reconciliation on every
-    tick instead of failing loudly — pin both halves of the wiring: the
-    reconciler accepts ``gateway_factory`` and server.py passes the
-    zero-admission-wait lambda (triad finding, final gate 2026-08-18).
+    EXECUTED, not text-matched (proton0 review, both panels): the call rides
+    inside a broad try/except on the supervisor path, so dead wiring would
+    silently disable orphan reconciliation on every tick. Run the real
+    ``_reconcile_delegated_runs``, capture the factory it passes, invoke it,
+    and require the zero-wait call to reach ``ensure_owned_gateway`` — the
+    property at stake is "the sweep never stalls the supervisor thread".
     """
-    import inspect
+    import server as server_mod
+    from ouroboros import claudexor_daemon as daemon_mod
+    from ouroboros import delegate_custody as custody_mod
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
-    from ouroboros.delegate_custody import reconcile_orphaned_runs
+    captured: dict = {}
 
-    assert "gateway_factory" in inspect.signature(reconcile_orphaned_runs).parameters
-    assert "admission_wait_sec" in inspect.signature(owned.ensure_owned_gateway).parameters
-    server_src = (pathlib.Path(__file__).resolve().parents[1] / "server.py").read_text(
-        encoding="utf-8")
-    assert "gateway_factory=lambda: ensure_owned_gateway(admission_wait_sec=0)" in server_src
+    def fake_reconcile(drive_root, *, running_task_ids, gateway_factory):
+        captured["factory"] = gateway_factory
+        return []
+
+    ensure_calls: list = []
+
+    def fake_ensure(*, admission_wait_sec=None):
+        ensure_calls.append(admission_wait_sec)
+        raise ClaudexorUnavailable("daemon_recovery_only", "still recovering")
+
+    monkeypatch.setattr(custody_mod, "reconcile_orphaned_runs", fake_reconcile)
+    monkeypatch.setattr(daemon_mod, "ensure_owned_gateway", fake_ensure)
+    server_mod._reconcile_delegated_runs(set())
+    assert "factory" in captured, "the sweep never reached the reconciler"
+    with pytest.raises(ClaudexorUnavailable):
+        captured["factory"]()
+    assert ensure_calls == [0]  # the sweep's posture: skip until the next tick

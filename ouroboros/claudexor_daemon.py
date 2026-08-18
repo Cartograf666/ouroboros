@@ -224,7 +224,13 @@ class OwnedClaudexorDaemon:
         except ClaudexorUnavailable as exc:
             self._engine_version = ""
             self._engine_build_sha = ""
-            self._serving_mode = ""
+            # ``_serving_mode`` is deliberately NOT cleared here: this method
+            # also runs unlocked (status polls), and a transient handshake
+            # failure racing the locked spawn loop would otherwise flip a
+            # just-recorded "recovery_only" to "" between `_alive_endpoint`
+            # and `_admit_spawned` — re-enabling the early rotation patch the
+            # deferral exists to prevent. Failure paths never write the mode;
+            # it always holds the LAST SUCCESSFUL handshake's answer.
             status = int(getattr(exc, "status_code", 0) or 0)
             if status in (401, 403):
                 return None, "foreign_daemon", (
@@ -546,22 +552,34 @@ def ensure_owned_gateway(*, admission_wait_sec: Optional[float] = None) -> Any:
     try:
         body = gateway.handshake()
         deadline = time.monotonic() + wait
+
+        def _expired() -> ClaudexorUnavailable:
+            return ClaudexorUnavailable(
+                "daemon_recovery_only",
+                "the owned daemon is reachable but still admitting only "
+                f"recovery work after {wait:.1f}s; its product routes "
+                "answer 503 (retryable) until journal recovery completes",
+            )
+
         while _handshake_serving_mode(body) == "recovery_only":
             remaining = deadline - time.monotonic()
-            if remaining > 0:
-                time.sleep(min(_ADMISSION_POLL_SEC, remaining))
-                remaining = deadline - time.monotonic()
-            # A residue thinner than one poll cannot buy a real handshake read:
-            # it would raise a transport-class error and mislabel an expired
-            # admission window, so it counts as expiry (typed, not transport).
-            if remaining < _ADMISSION_POLL_SEC:
-                raise ClaudexorUnavailable(
-                    "daemon_recovery_only",
-                    "the owned daemon is reachable but still admitting only "
-                    f"recovery work after {wait:.1f}s; its product routes "
-                    "answer 503 (retryable) until journal recovery completes",
-                )
-            body = gateway.handshake(timeout_sec=remaining)
+            if remaining <= 0:
+                raise _expired()
+            time.sleep(min(_ADMISSION_POLL_SEC, remaining))
+            # The WHOLE declared window is usable (proton0 review): the last
+            # read gets the thin residue, floored so a loopback handshake can
+            # still complete — a daemon that admitted normal work at the
+            # window's edge is observed, not discarded. A transport failure
+            # inside that final residue counts as expiry (typed, never a
+            # transport mislabel); a mid-window one propagates unchanged.
+            remaining = deadline - time.monotonic()
+            try:
+                body = gateway.handshake(
+                    timeout_sec=max(remaining, _ADMISSION_POLL_SEC / 3.0))
+            except ClaudexorUnavailable:
+                if deadline - time.monotonic() <= 0:
+                    raise _expired() from None
+                raise
         daemon.run_deferred_rotation(endpoint)
     except Exception:
         gateway.close()

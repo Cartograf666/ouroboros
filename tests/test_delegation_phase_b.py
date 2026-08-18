@@ -341,6 +341,45 @@ def test_nudge_fact_rides_only_completed_native_only_envelopes(tmp_path):
     assert "nanny_finalized_after_nudge_without_delegation" not in cdelta["substrate_disclosures"]
 
 
+def test_a_refused_attempt_after_the_nudge_is_never_an_accusation(tmp_path):
+    """Final-review finding (codex proton0): a nanny that OBEYED the nudge —
+    called delegate_start and was refused typed before any run existed — must
+    not be disclosed as having finalized "without delegation". Both durable
+    attempt shapes count: the pre-mint typed blocker row and a request row
+    whose POST then died."""
+    from ouroboros import delegate_custody as custody
+    from ouroboros.delegate_evidence import record_nanny_nudge_stamp, record_start_blocked
+
+    # Shape 1: typed route_health blocker before any invocation was minted.
+    drive = _drive(tmp_path / "blocked")
+    record_nanny_nudge_stamp(_stamp_ctx(drive), "child-1", "NANNY_DID_NOT_DELEGATE")
+    record_start_blocked(_stamp_ctx(drive), "child-1", "route_status_unavailable")
+    evidence = custody.task_execution_evidence(drive, "child-1")
+    assert evidence["delegate_start_attempted"] is True
+    assert evidence["delegated_runs_started"] == 0
+    envelope = envelope_from_task(_harness_task(drive), status="completed")
+    delta = envelope["capability_delta"]
+    assert "delegated_substrate_unused" in delta["substrate_disclosures"]
+    assert "nanny_finalized_after_nudge_without_delegation" not in delta["substrate_disclosures"]
+
+    # Shape 2: the durable request row landed, the POST failed, nothing started.
+    drive2 = _drive(tmp_path / "requested")
+    record_nanny_nudge_stamp(_stamp_ctx(drive2), "child-1", "NANNY_DID_NOT_DELEGATE")
+    assert custody.emit(drive2, custody.START_REQUESTED, {
+        "task_id": "child-1", "invocation_id": "inv-1", "route": "claude",
+        "request": {"prompt": "x"}})
+    envelope2 = envelope_from_task(_harness_task(drive2), status="completed")
+    assert ("nanny_finalized_after_nudge_without_delegation"
+            not in envelope2["capability_delta"]["substrate_disclosures"])
+
+    # A truly idle nanny (stamp, zero attempts) is still disclosed.
+    idle = _drive(tmp_path / "idle")
+    record_nanny_nudge_stamp(_stamp_ctx(idle), "child-1", "NANNY_DID_NOT_DELEGATE")
+    envelope3 = envelope_from_task(_harness_task(idle), status="completed")
+    assert ("nanny_finalized_after_nudge_without_delegation"
+            in envelope3["capability_delta"]["substrate_disclosures"])
+
+
 def test_nudge_fact_absent_when_delegation_happened_or_nudge_never_fired(tmp_path):
     from ouroboros import delegate_custody as custody
     from ouroboros.delegate_evidence import record_nanny_nudge_stamp

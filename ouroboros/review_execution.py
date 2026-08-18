@@ -816,9 +816,9 @@ def _review_recovery_facts(
         project_owned = bool(record.get("project_owned"))
         key = str(record.get("idempotency_key") or "")
     route = DelegationRoute(
-        route_id=route_id, model=model,
-        effort=str(run_request.get("effort") or ""),
-    )
+        route_id=route_id, model=model, effort=str(run_request.get("effort") or ""),
+        # The stored request carries the pin: a pinned retry replays PINNED (D1).
+        profile_id=str(run_request.get("credentialProfileId") or ""))
     existing_project = "" if project_owned else project_id
     return route, project_id, existing_project, key, "outputSchema" in run_request
 

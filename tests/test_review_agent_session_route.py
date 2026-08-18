@@ -1016,6 +1016,50 @@ def test_retry_replays_the_stored_route_and_registers_nothing_new(tmp_path, fake
     assert retry_gateway.start_keys == [pending]
 
 
+def test_pending_retry_replays_the_stored_credential_pin(tmp_path, fake_route):
+    """Phase D1 on the RECOVERY path: the stored request is the durable pin
+    carrier. A pinned slot whose first attempt died mid-flight must replay as
+    PINNED — both past route_health (the row status the pin exists to skip)
+    and on the wire — or the retry re-refuses on the exact class D1 removed."""
+    import dataclasses
+
+    from ouroboros import subagents
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+    from ouroboros.subagents import parse_subagent_harness
+
+    pinned = dataclasses.replace(parse_subagent_harness("fake-review=fake-small"),
+                                 profile_id="acct-pinned")
+
+    # Attempt 1: pinned start dies indefinite; the invocation stays PENDING.
+    state: dict = {}
+    fake_route.start_error = ClaudexorUnavailable("daemon_unreachable", "boom", status_code=0)
+    with pytest.raises(ClaudexorUnavailable):
+        _run_session_directly(tmp_path, retry_state=state, session_route=pinned)
+    assert state["pending_invocation_id"]
+
+    # Attempt 2: the row now reads permanently unavailable (the agy shape).
+    fake_route.start_error = None
+    fake_route.catalog_entry["status"] = "unavailable"
+    fake_route.catalog_entry["enabled"] = False
+    pins_seen = []
+    real_route_health = subagents.route_health
+
+    def _track(gateway, route_id, shape, *, route_model="", pinned_profile=""):
+        pins_seen.append(pinned_profile)
+        return real_route_health(
+            gateway, route_id, shape, route_model=route_model, pinned_profile=pinned_profile,
+        )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(subagents, "route_health", _track)
+        facts = _run_session_directly(tmp_path, retry_state=state, session_route=pinned)
+
+    assert facts["idempotent_recovery"] is True
+    assert pins_seen == ["acct-pinned"]  # the rebuilt route carries the pin
+    retry_starts = [r for inst in fake_route.instances for r in inst.start_requests]
+    assert retry_starts[-1]["credentialProfileId"] == "acct-pinned"
+
+
 def test_retry_refuses_typed_when_the_stored_prompt_diverges(tmp_path, fake_route):
     """The replay sends the RECORDED bytes. If this call describes a different review,
     that is a typed refusal — never a silent review of something else."""
