@@ -421,7 +421,10 @@ def _api_owner_auto_grant_sync(request: Request, body: Any) -> JSONResponse:
         current = _owner_read_settings_raw()
         current["OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS"] = "true" if enabled else "false"
         _owner_write_settings(current)
-    os.environ["OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS"] = current["OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS"]
+        # Projected under the SAME lock as the commit: released first, two
+        # writers can commit A->B and project B->A, stranding the live
+        # environment on the loser's value.
+        os.environ["OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS"] = current["OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS"]
     _owner_audit(request, "auto_grant", {"enabled": enabled})
     return JSONResponse({"ok": True, "enabled": enabled})
 
@@ -705,8 +708,9 @@ def _api_owner_context_mode_sync(request: Request, body: Any) -> JSONResponse:
         current["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
         # This endpoint IS the author of both keys, so they persist even at the shipped default.
         _owner_write_settings(current, authored_keys=_CONTEXT_MODE_KEYS, allow_context_lowering=True)
-    os.environ["OUROBOROS_CONTEXT_MODE"] = next_mode
-    os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
+        # Same-lock projection: see api_owner_auto_grant.
+        os.environ["OUROBOROS_CONTEXT_MODE"] = next_mode
+        os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
     _owner_audit(
         request,
         "context_mode",
@@ -753,7 +757,8 @@ def _api_owner_scope_review_floor_sync(request: Request, body: Any) -> JSONRespo
         previous = str(current.get("OUROBOROS_SCOPE_REVIEW_FLOOR") or "blocking_1m").strip().lower()
         current["OUROBOROS_SCOPE_REVIEW_FLOOR"] = raw
         _owner_write_settings(current)
-    os.environ["OUROBOROS_SCOPE_REVIEW_FLOOR"] = raw
+        # Same-lock projection: see api_owner_auto_grant.
+        os.environ["OUROBOROS_SCOPE_REVIEW_FLOOR"] = raw
     _owner_audit(
         request,
         "scope_review_floor",
@@ -798,7 +803,8 @@ def _api_owner_safety_mode_sync(request: Request, body: Any) -> JSONResponse:
         current["OUROBOROS_SAFETY_MODE"] = raw_mode
         _owner_write_settings(
             current, authored_keys=("OUROBOROS_SAFETY_MODE",), allow_safety_lowering=True)
-    os.environ["OUROBOROS_SAFETY_MODE"] = raw_mode
+        # Same-lock projection: see api_owner_auto_grant.
+        os.environ["OUROBOROS_SAFETY_MODE"] = raw_mode
     _owner_audit(
         request,
         "safety_mode",

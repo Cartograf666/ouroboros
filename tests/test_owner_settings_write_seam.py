@@ -463,6 +463,7 @@ def test_reviewer_slots_reload_does_not_await_the_status_probe():
         pathlib.Path(__file__).resolve().parents[1]
         / "web" / "modules" / "claudexor_status_store.js"
     ).read_text(encoding="utf-8")
-    assert "Promise.race([refresh, new Promise((resolve) => setTimeout(resolve, beatMs))])" in store, (
-        "the bounded beat must race the refresh, never cancel it"
+    assert "Promise.race([refresh, beat]).finally(() => { if (timer) clearTimeout(timer); });" in store, (
+        "the bounded beat must race the refresh (never cancel it) and clear "
+        "the losing timer"
     )

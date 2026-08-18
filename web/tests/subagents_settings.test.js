@@ -568,11 +568,11 @@ test('a model swapped at EQUAL count really reaches the pixels', async () => {
     try {
         initSubagentsSection({ store });
         applySubagentsSettings({ OUROBOROS_SUBAGENT_HARNESS: '' });
-        // The reload fires the shared probe without awaiting it (the Save
-        // button must not wait on a cold daemon); the store's own refresh is
-        // the settlement boundary.
-        reloadSubagentsSection();
-        await store.refresh({ includeModels: true });
+        // The reload awaits the probe for a bounded beat; a fake store settles
+        // inside it, so this await IS the settlement boundary here — and it
+        // retires the reload's own render, keeping later caret-guard phases
+        // free of floating repaints.
+        await reloadSubagentsSection();
         assert.ok(host.innerHTML.includes('old-model'), host.innerHTML);
         // The section's own binding is what keeps the shared read alive: a
         // subscriber with no visibility predicate could never arm the poll.
@@ -630,14 +630,13 @@ test('the settings collector itself refuses to author from an unknown read', asy
     try {
         initSubagentsSection({ store });
         applySubagentsSettings({ OUROBOROS_SUBAGENT_HARNESS: '' });
-        // The reload no longer awaits the shared status probe (awaiting it
-        // held the Save button hostage to a cold-daemon wake); the store's own
-        // refresh is the settlement boundary now, and the surface binding
-        // repaints the section when it lands.
-        reloadSubagentsSection();
+        // The reload awaits the probe only for a bounded beat; the synchronous
+        // window before any settle is asserted first, then the reload is
+        // retired INSIDE the test so its render never outlives the fake DOM.
+        const reloading = reloadSubagentsSection();
         assert.deepEqual(collectSubagentsSettings(), {},
             'before any read settles the collector must stay silent');
-        await store.refresh({ includeModels: true });
+        await reloading;
         assert.deepEqual(collectSubagentsSettings(), {},
             'an unread account store must never author the delegation route');
 

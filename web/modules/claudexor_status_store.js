@@ -804,19 +804,6 @@ export const SURFACE_ACTIVATION_EVENTS = ['ouro:page-shown', 'ouro:settings-subt
  * @param {boolean} [options.includeModels] the activation read needs discovery
  * @returns {Function} one disposer releasing the subscription and the listeners
  */
-/**
- * Refresh with a bounded wait: resolve when the read settles OR after
- * `beatMs`, whichever comes first — the refresh itself always runs to
- * completion and notifies subscribers/surfaces when it lands. For callers on
- * a user-facing critical path (the Settings Save flow) that want the settled
- * snapshot when it is cheap (warm daemon) but must not wait out a cold
- * daemon's wake-and-discover walk.
- */
-export function boundedStatusRefresh(store, { includeModels = true, beatMs = 2000 } = {}) {
-    const refresh = Promise.resolve(store.refresh({ includeModels })).catch(() => {});
-    return Promise.race([refresh, new Promise((resolve) => setTimeout(resolve, beatMs))]);
-}
-
 export function bindStatusSurface(store, {
     listener = () => {},
     elementId = '',
@@ -848,4 +835,20 @@ export function bindStatusSurface(store, {
             try { dispose(); } catch (err) { /* a broken disposer must not block the rest */ }
         }
     };
+}
+
+/**
+ * Refresh with a bounded wait: resolve when the read settles OR after
+ * `beatMs`, whichever comes first — the refresh itself always runs to
+ * completion and notifies subscribers/surfaces when it lands. For callers on
+ * a user-facing critical path (the Settings Save flow) that want the settled
+ * snapshot when it is cheap (warm daemon) but must not wait out a cold
+ * daemon's wake-and-discover walk. The losing timer is cleared so a settled
+ * refresh leaves nothing holding a node test-runner's loop open.
+ */
+export function boundedStatusRefresh(store, { includeModels = true, beatMs = 2000 } = {}) {
+    const refresh = Promise.resolve(store.refresh({ includeModels })).catch(() => {});
+    let timer = null;
+    const beat = new Promise((resolve) => { timer = setTimeout(resolve, beatMs); });
+    return Promise.race([refresh, beat]).finally(() => { if (timer) clearTimeout(timer); });
 }
