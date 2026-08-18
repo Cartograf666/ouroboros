@@ -647,3 +647,74 @@ def test_required_beyond_diff_is_one_public_definition_for_every_consumer():
     # a merely-touched ordinary file may legally degrade to diff-only
     assert not atlas_required_beyond_diff("module.py")
     assert not atlas_required_beyond_diff("tests/test_thing.py")
+
+
+def test_atlas_budget_pair_never_collapses_target_into_hard():
+    """`target` is the soft ceiling that keeps a pack off its own hard limit.
+
+    Callers derived it as `min(850_000, limit)`, which makes target == hard for every
+    limit under 850K — the ordinary cold-start case, where COLD_START_TOKEN_DENSITY
+    puts a 1M route near 545K. The pack then rides its own ceiling on a chars/4
+    ESTIMATE with only _ATLAS_HARD_HEADROOM_TOKENS to spare.
+    """
+    from ouroboros.tools.review_context_atlas import (
+        DEFAULT_ATLAS_HARD_TOTAL_TOKENS,
+        DEFAULT_ATLAS_TARGET_TOTAL_TOKENS,
+        atlas_budget_pair,
+    )
+
+    # Behavior at and above the documented ceiling is exactly what shipped.
+    assert atlas_budget_pair(DEFAULT_ATLAS_HARD_TOTAL_TOKENS) == (
+        DEFAULT_ATLAS_TARGET_TOTAL_TOKENS,
+        DEFAULT_ATLAS_HARD_TOTAL_TOKENS,
+    )
+    assert atlas_budget_pair(1_000_000) == (DEFAULT_ATLAS_TARGET_TOTAL_TOKENS, 1_000_000)
+
+    # Below it, the two must stay apart — the old expression collapsed them.
+    for limit in (745_000, 545_454, 200_000, 40_000):
+        target, hard = atlas_budget_pair(limit)
+        assert hard == limit
+        assert target < hard, f"target collapsed into hard at limit={limit}"
+        assert target == min(limit, target)
+
+
+def test_atlas_soft_ceiling_keeps_headroom_below_the_hard_limit(tmp_path):
+    """Under budget pressure the derived pair must leave more room below `hard`.
+
+    The trade is explicit: margin is bought with the last discretionary file. Required
+    artifacts are NOT involved — they are selected first and against
+    `hard_context_tokens`, so neither pair threatens them.
+    """
+    from ouroboros.tools.review_context_atlas import atlas_budget_pair
+
+    _write(tmp_path / "BIBLE.md", "constitution\n" * 400)
+    for index in range(30):
+        _write(tmp_path / f"mod{index}.py", f"def f{index}():\n    return {index}\n" * 900)
+    tracked = ("BIBLE.md",) + tuple(f"mod{index}.py" for index in range(30))
+
+    limit = 90_000
+    fixed = 1_000
+
+    def _pack(target: int):
+        return compile_review_context_atlas(
+            ReviewContextAtlasRequest(
+                repo_dir=tmp_path,
+                tracked_paths=tracked,
+                fixed_prompt_tokens=fixed,
+                target_total_tokens=target,
+                hard_total_tokens=limit,
+            )
+        )
+
+    collapsed = _pack(min(850_000, limit))  # the old expression
+    derived = _pack(atlas_budget_pair(limit)[0])
+
+    collapsed_tokens = collapsed.manifest["estimated_total_tokens"]
+    derived_tokens = derived.manifest["estimated_total_tokens"]
+    assert derived_tokens < collapsed_tokens, "the soft ceiling bought no margin"
+    assert (limit - fixed - derived_tokens) > (limit - fixed - collapsed_tokens)
+
+    # Neither pack sacrifices the required artifact.
+    for pack in (collapsed, derived):
+        assert _coverage(pack)["BIBLE.md"]["disposition"] == "full"
+        assert not atlas_unassembled_required(pack.manifest)
