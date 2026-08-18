@@ -47,6 +47,7 @@ from ouroboros.gateway.owner_settings import (
     _owner_audit,
     _owner_write_settings,
     post_commit_failure_response,
+    settings_document_mutation,
     unsaved_error,
 )
 from ouroboros.server_runtime import (
@@ -580,13 +581,21 @@ def _persist(request: Request, old_settings: Dict[str, Any], current: Dict[str, 
     to_save = dict(current)
     to_save["OUROBOROS_RUNTIME_MODE"] = pending_mode
     authored = ("OUROBOROS_SAFETY_MODE",) if safety_light else ()
-    _owner_write_settings(
-        to_save,
-        authored_keys=authored,
-        allow_safety_lowering=safety_light,
-        precondition=_write_precondition(preset_applied, safety_light, read_fingerprint),
-        boundary=boundary,
-    )
+    # Under the seam-wide document lock: the fingerprint precondition protects
+    # THIS write from a stale merge, but not a generic save whose (locked)
+    # read happened before this write — without the lock that save would land
+    # after us and silently erase the whole onboarding transaction. Holding it
+    # orders the two: either the save finishes first and the precondition
+    # refuses honestly, or this write finishes first and the save's read sees
+    # the onboarded document.
+    with settings_document_mutation():
+        _owner_write_settings(
+            to_save,
+            authored_keys=authored,
+            allow_safety_lowering=safety_light,
+            precondition=_write_precondition(preset_applied, safety_light, read_fingerprint),
+            boundary=boundary,
+        )
     # The RUNNING process keeps its boot runtime mode; the owner's next-boot
     # choice lives on disk only (identical to the endpoint this replaces).
     boundary.at("environment projection")

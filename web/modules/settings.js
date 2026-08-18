@@ -470,24 +470,23 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     let baselineSettleDisposer = null;
     function armCleanBaselineOnStatusSettle() {
         // The sections' Claudexor status probe is fire-and-forget, so the
-        // baseline above can be taken BEFORE the store ever settled — and the
-        // store-gated collectors change their output when it does. Absent
-        // owner edits, that settlement must not read as an unsaved change:
-        // re-take the baseline once, and only while the draft is still clean.
+        // baseline can be taken before the store-gated collectors have their
+        // facts — and their output changes when a snapshot lands (the accounts
+        // facet, the later include-models upgrade). Absent owner edits, no
+        // store arrival may read as an unsaved change; and every owner edit
+        // flips settingsDirty through its own input handler BEFORE any store
+        // notify, so re-baselining while the draft is clean can never mask
+        // one. Deliberately NOT a one-shot on everSettled: an earlier
+        // model-less read may have settled the store long before the upgrade
+        // this page's collectors actually feed on.
         baselineSettleDisposer?.();
-        baselineSettleDisposer = null;
-        if (claudexorStatus.everSettled) return;
-        const disposer = bindStatusSurface(claudexorStatus, {
+        baselineSettleDisposer = bindStatusSurface(claudexorStatus, {
             elementId: 'btn-save-settings',
             includeModels: true,
             listener: () => {
-                if (!claudexorStatus.everSettled) return;
-                baselineSettleDisposer = null;
-                disposer();
-                if (!settingsDirty) setSettingsCleanBaseline();
+                if (!settingsDirty && settingsLoaded) setSettingsCleanBaseline();
             },
         });
-        baselineSettleDisposer = disposer;
     }
 
     function discardUnsavedSettingsDraft() {
