@@ -56,6 +56,9 @@ from ouroboros.launcher_onboarding import (
     prepare_first_run_settings as _prepare_first_run_settings,
     present_first_run_onboarding as _present_first_run_onboarding,
 )
+from ouroboros.launcher_server_reaper import (
+    reap_same_install_strays as _reap_same_install_strays_impl,
+)
 from ouroboros.platform_layer import (
     BUNDLE_DIR_ENV,
     IS_LINUX,
@@ -636,6 +639,35 @@ def _kill_stale_runtime_ports(port: int) -> None:
     _kill_stale_on_port(_host_service_port())
 
 
+def _reap_same_install_strays(reason: str) -> list[int]:
+    """Kill leftover generations of THIS install's server; return proven survivors.
+
+    Only ever called while this process holds the single-instance pid lock, which is what makes the
+    identity rule sound: with the lock held, another process running this install's server.py under
+    this launcher's stamped environment cannot be a live peer's generation. Never called from a
+    panic or window-close path — Emergency Stop tears down what it owns and adds no new killing.
+    """
+    try:
+        return _reap_same_install_strays_impl(REPO_DIR, DATA_DIR, reason)
+    except Exception:
+        # A sweep that cannot run must not stop the launcher booting.
+        log.warning("Same-install stray sweep failed (%s)", reason, exc_info=True)
+        return []
+
+
+def _pre_generation_cleanup(port: int) -> list[int]:
+    """Clear the previous generation before starting a new one; returns proven stray survivors.
+
+    Per GENERATION, not once per launcher: exit-42 and crash restarts are where the observed
+    double-boot collisions began. Ordered recorded-cleanup -> stray sweep -> port sweep: the
+    recorded pid keeps its record-driven path with the record unlinked first, the tree kill runs
+    while PPID links are still live, and the port sweep stays the residual net."""
+    _cleanup_recorded_server_process("startup")
+    survivors = _reap_same_install_strays("startup")
+    _kill_stale_runtime_ports(port)
+    return survivors
+
+
 def _wait_for_server(port: int, timeout: float = 30.0, abort_event=None) -> bool:
     """Wait for the agent HTTP server to respond.
 
@@ -714,10 +746,19 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
     global _agent_proc, _agent_job
     crash_times: list[float] = []
 
-    _cleanup_recorded_server_process("startup")
-    _kill_stale_runtime_ports(port)
-
     while not _shutdown_event.is_set():
+        survivors = _pre_generation_cleanup(port)
+        if survivors:
+            # Starting now would put a second generation on the same data directory — the exact
+            # collision this sweep exists to prevent. The next iteration re-sweeps.
+            log.error(
+                "Not starting the agent: same-install server process(es) %s are proven "
+                "launcher-managed strays but survived every kill pass. Retrying in 3s.",
+                survivors,
+            )
+            time.sleep(3)
+            continue
+
         try:
             PORT_FILE.unlink(missing_ok=True)
         except OSError:
@@ -1284,6 +1325,7 @@ def main():
 
     # Clear any stale server process or ports before starting the new agent
     _cleanup_recorded_server_process("preflight")
+    _reap_same_install_strays("preflight")
     _kill_stale_runtime_ports(port)
     try:
         PORT_FILE.unlink(missing_ok=True)

@@ -296,7 +296,14 @@ def check_stray_server_processes(env: Any) -> Tuple[Dict[str, Any], int]:
     neither this process tree, the recorded server process, nor any pid ever
     recorded in the custody ledger (conservative under-reporting: a reused
     ledger pid masks a stray rather than false-flagging a legitimate one). Scans
-    only THIS user's processes; non-POSIX platforms skip (pgrep-based)."""
+    only THIS user's processes; non-POSIX platforms skip (pgrep-based).
+
+    Each report carries a ``scope``: ``same_install`` when the command line names
+    THIS install's ``<REPO_DIR>/server.py``, else ``foreign``. The launcher reaps
+    proven same-install strays before every generation
+    (``ouroboros.launcher_server_reaper``), so a same_install WARN that persists
+    means one of: a direct (unmanaged) run of this checkout, a process spared for
+    lack of readable env proof, or a pid that survived the kill passes."""
     import os as _os
     import pathlib as _pathlib
     import re as _re
@@ -340,6 +347,15 @@ def check_stray_server_processes(env: Any) -> Tuple[Dict[str, Any], int]:
             r"(ouroboros(\.cli)?\s+server|ouroboros/(repo/)?server\.py|-m\s+ouroboros\.cli\s+server)",
             _re.IGNORECASE,
         )
+        # Literal and resolved spellings: a command line carries whatever path was
+        # passed, which resolve() may not reproduce (/var vs /private/var).
+        try:
+            from ouroboros.config import REPO_DIR as _repo_dir
+
+            same_install_paths = {str(_pathlib.Path(_repo_dir) / "server.py")}
+            same_install_paths.add(str(_pathlib.Path(_repo_dir).resolve() / "server.py"))
+        except Exception:
+            same_install_paths = set()
         stray: list[dict[str, Any]] = []
         for line in (out.stdout or "").splitlines():
             try:
@@ -368,7 +384,10 @@ def check_stray_server_processes(env: Any) -> Tuple[Dict[str, Any], int]:
                     continue
             except Exception:
                 pass
-            stray.append({"pid": pid, "command": command[:160]})
+            scope = ("same_install"
+                     if any(path in command for path in same_install_paths)
+                     else "foreign")
+            stray.append({"pid": pid, "command": command[:160], "scope": scope})
         if stray:
             log.warning("Stray ouroboros server process(es) outside this install: %s", stray)
             return {"status": "stray_processes", "processes": stray}, 1
