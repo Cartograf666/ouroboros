@@ -22,6 +22,7 @@ import {
     accountGroups,
     accountMetaLine,
     accountName,
+    confirmRemoveAccount,
     familyActionLabel,
     familyLabel,
     familyStatus,
@@ -626,6 +627,46 @@ test('a partial gap obeys the SAME fault precedence as a total one', () => {
 // ---------------------------------------------------------------------------
 // Removal.
 // ---------------------------------------------------------------------------
+
+test('Remove consumes the non-input confirm boolean and performs the mutation once', async () => {
+    const calls = [];
+    const store = {
+        snapshot: { harnesses: [{ id: 'claude', display_name: 'Claude Code' }] },
+        refresh: async () => calls.push(['refresh']),
+    };
+
+    await confirmRemoveAccount('claude', 'work', {
+        dialogImpl: async (options) => {
+            assert.notEqual(options.input, true);
+            assert.equal(options.danger, true);
+            assert.equal(options.confirmLabel, 'Remove');
+            calls.push(['dialog']);
+            return true;
+        },
+        removeImpl: async (harness, profileId) => calls.push(['remove', harness, profileId]),
+        store,
+        renderImpl: () => calls.push(['render']),
+    });
+
+    assert.deepEqual(calls, [
+        ['dialog'],
+        ['remove', 'claude', 'work'],
+        ['refresh'],
+        ['render'],
+    ]);
+
+    for (const resolution of [false, undefined, null, { confirmed: true }]) {
+        const skipped = [];
+        await confirmRemoveAccount('claude', 'work', {
+            dialogImpl: async () => { skipped.push(['dialog']); return resolution; },
+            removeImpl: async () => skipped.push(['remove']),
+            store: { snapshot: store.snapshot, refresh: async () => skipped.push(['refresh']) },
+            renderImpl: () => skipped.push(['render']),
+        });
+        assert.deepEqual(skipped, [['dialog']],
+            `resolution ${JSON.stringify(resolution)} must stop after the dialog`);
+    }
+});
 
 test('removing a named account goes through the engine contract, and says so', () => {
     const calls = [];
