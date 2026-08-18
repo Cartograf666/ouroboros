@@ -37,7 +37,12 @@ import {
     statusUnavailableNote,
 } from './claudexor_status_store.js';
 import { renderSegmentedField } from './page_header.js';
-import { modelsGapNote, sessionModelOptions } from './reviewer_slots.js';
+import {
+    indexProfilesByHarness,
+    modelsGapNote,
+    profileOptionsFor,
+    sessionModelOptions,
+} from './reviewer_slots.js';
 import { formatRelativeAge } from './ui_helpers.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
@@ -94,7 +99,11 @@ export function lastDelegationLine(entry) {
     // REALLY ran as. Absence is shown as absence — no record, no line; an
     // undisclosed applied model says so instead of echoing the request; a
     // requested≠applied pair is disclosed loudly (owner decision: the run
-    // completes on what the engine gave, the mismatch is advisory).
+    // completes on what the engine gave, the mismatch is advisory). The
+    // ACCOUNT follows the same rule (D-U5): the applied account is the
+    // engine's own settlement receipt; a pin the run did not land on is a
+    // disclosed mismatch, never rewritten; an unpinned run with no receipt
+    // says nothing rather than inventing an account.
     if (!entry || typeof entry !== 'object' || !entry.run_id) return '';
     const requested = String(entry.requested_model || '');
     const applied = String(entry.applied_model || '');
@@ -103,6 +112,15 @@ export function lastDelegationLine(entry) {
         parts.push(`requested ${requested} → ran ${applied}`);
     } else {
         parts.push(applied || 'model not disclosed');
+    }
+    const requestedAccount = String(entry.requested_profile || '');
+    const appliedAccount = String(entry.applied_profile || '');
+    if (requestedAccount && appliedAccount && requestedAccount !== appliedAccount) {
+        parts.push(`account requested ${requestedAccount} → ran ${appliedAccount}`);
+    } else if (appliedAccount) {
+        parts.push(`account ${appliedAccount}`);
+    } else if (requestedAccount) {
+        parts.push(`account ${requestedAccount} requested — applied not disclosed`);
     }
     const when = formatRelativeAge(Date.parse(entry.ts || ''), 'just now');
     if (when) parts.push(when);
@@ -147,14 +165,21 @@ export function connectedHarnesses(payload) {
     const out = [];
     for (const row of accountRows(payload)) {
         if (String(row?.status?.verification || '') !== 'passed') continue;
+        // An account the owner switched OFF is excluded from rotation however
+        // healthy its login is — the Accounts header counts signed-in AND
+        // enabled, with all-disabled its own state. Reading only the
+        // verification here let an all-disabled family render "connected" in
+        // this section under a header saying the opposite. Absent stays
+        // connected: the same fail-open `enabled` projection the rows apply.
+        if (row?.enabled === false) continue;
         if (out.some((item) => item.id === row.harness)) continue;
         out.push({ id: row.harness, label: names[row.harness] || row.harness });
     }
     return out;
 }
 
-export function delegationView({ saved = '', payload = null, statusError = '', accountsRead = '',
-    catalogRead = READ_OK, edit = null, loaded = true } = {}) {
+export function delegationView({ saved = '', savedProfile = '', payload = null, statusError = '',
+    accountsRead = '', catalogRead = READ_OK, edit = null, loaded = true } = {}) {
     // The whole section as ONE value: which state to render, what the harness
     // select offers, and the muted sentence under it. `edit` is the owner's
     // unsaved choice laid over the saved value — it goes through the same
@@ -180,7 +205,8 @@ export function delegationView({ saved = '', payload = null, statusError = '', a
         // Not read YET is not "nothing connected": until the accounts arrive the
         // section states only that it is reading (collect() already guards on the
         // same fact, so this renders nothing it would then author).
-        return view({ state: 'loading', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
+        return view({ state: 'loading', enabled: false, harness: '', model: '', modelOptions: [], suffix: '',
+            profile: '', profileOptions: [], options: [],
             note: statusUnavailableNote(READ_UNREAD, { facet: FACET_ACCOUNTS }).text });
     }
     // This section renders the ACCOUNTS facet, so that facet alone decides the
@@ -195,7 +221,8 @@ export function delegationView({ saved = '', payload = null, statusError = '', a
         ? statusUnavailableNote(accountsState, { error: statusError, facet: FACET_ACCOUNTS })
         : null;
     if (unavailable) {
-        return view({ state: 'unknown', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
+        return view({ state: 'unknown', enabled: false, harness: '', model: '', modelOptions: [], suffix: '',
+            profile: '', profileOptions: [], options: [],
             note: unavailable.text });
     }
     const connected = connectedHarnesses(payload);
@@ -207,9 +234,11 @@ export function delegationView({ saved = '', payload = null, statusError = '', a
         // "turns on by itself" over it would announce an override that will not
         // happen.
         return view(route.decided
-            ? { state: 'no_subscription', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
+            ? { state: 'no_subscription', enabled: false, harness: '', model: '', modelOptions: [], suffix: '',
+                profile: '', profileOptions: [], options: [],
                 note: 'Delegation is off because you turned it off, and it stays off until you turn it back on. No agent subscription is connected right now; connect one under Accounts above to make delegation available again.' }
-            : { state: 'no_subscription', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
+            : { state: 'no_subscription', enabled: false, harness: '', model: '', modelOptions: [], suffix: '',
+                profile: '', profileOptions: [], options: [],
                 note: 'No agent subscription is connected, so there is nothing to delegate to. Connect one under Accounts above and delegation turns on by itself.' });
     }
 
@@ -242,6 +271,23 @@ export function delegationView({ saved = '', payload = null, statusError = '', a
         : [];
     const modelsGap = enabled && harness
         ? modelsGapNote(row, catalogRead === READ_OK) : '';
+    // The OPTIONAL account pin (D-U5), same rules as the model tail: a saved
+    // pin belongs to the harness it was written for (a harness switch drops it
+    // visibly), and the SAME options fragment the reviewer rows use keeps an
+    // undiscovered saved pin selectable — a Save while the daemon cannot list
+    // accounts must not silently erase it. '' = automatic rotation (D28), the
+    // first option and the default. A disabled account is offered with a
+    // "(disabled)" label, still selectable: the engine's typed refusal is the
+    // authority on a pin it will not serve (D-U6) — the label is honesty, not
+    // a gate. The fact rides indexProfilesByHarness's `{id, enabled}` entries
+    // and the shared builder renders it, so reviewer rows say the same thing.
+    const savedPin = harness && harness === savedHarness ? String(savedProfile || '') : '';
+    const profile = edit && edit.profile !== null && edit.profile !== undefined
+        ? String(edit.profile) : savedPin;
+    const profileOptions = enabled && harness
+        ? profileOptionsFor((indexProfilesByHarness(payload)[harness]) || [], profile,
+            { accountsKnown: accountsState === READ_OK })
+        : [];
 
     const options = [...connected];
     if (savedHarness && !options.some((item) => item.id === savedHarness)) {
@@ -273,7 +319,7 @@ export function delegationView({ saved = '', payload = null, statusError = '', a
         // select below is short for a reason nothing else on the page states.
         note = `${note} The model list for ${harness} could not be read, so the choices below may be incomplete; your saved model is kept.`;
     }
-    return view({ state, enabled, harness, model, modelOptions, suffix, options, note });
+    return view({ state, enabled, harness, model, modelOptions, suffix, profile, profileOptions, options, note });
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +329,7 @@ export function delegationView({ saved = '', payload = null, statusError = '', a
 const state = {
     loaded: false,
     saved: '',
+    savedProfile: '',
     payload: null,
     statusError: '',
     // The ACCOUNTS facet's own read state, so this section can tell "we could
@@ -296,9 +343,11 @@ const state = {
     // The owner's unsaved answer only; everything derived from it (which route,
     // which options, which sentence) stays in delegationView. `model: null`
     // means "no unsaved model edit" — '' is a real answer (Engine default).
+    // Same for `profile: null` — '' is a real answer (automatic rotation).
     enabled: null,
     harness: '',
     model: null,
+    profile: null,
     onChange: () => {},
 };
 
@@ -385,13 +434,15 @@ function currentView() {
     // non-null model edit never rides a null enabled.
     return delegationView({
         saved: state.saved,
+        savedProfile: state.savedProfile,
         payload: state.payload,
         statusError: state.statusError,
         accountsRead: state.accountsRead,
         catalogRead: state.catalogRead,
         edit: state.enabled === null
             ? null
-            : { enabled: state.enabled, harness: state.harness, model: state.model },
+            : { enabled: state.enabled, harness: state.harness, model: state.model,
+                profile: state.profile },
         loaded: state.loaded,
     });
 }
@@ -409,6 +460,10 @@ function renderRows() {
         const selected = opt.value === view.model ? ' selected' : '';
         return `<option value="${escapeHtml(opt.value)}"${selected}>${escapeHtml(opt.label)}</option>`;
     }).join('');
+    const profileOptions = view.profileOptions.map((opt) => {
+        const selected = opt.value === view.profile ? ' selected' : '';
+        return `<option value="${escapeHtml(opt.value)}"${selected}>${escapeHtml(opt.label)}</option>`;
+    }).join('');
     const lastLine = lastDelegationLine(state.payload?.subagent_last_delegation);
     host.innerHTML = `
         <div class="reviewer-slot-row" data-subagent-row>
@@ -420,6 +475,7 @@ function renderRows() {
                 </select>
                 ${view.enabled ? `<select data-subagent-harness aria-label="Agent">${options}</select>` : ''}
                 ${view.enabled ? `<select data-subagent-model aria-label="Agent model">${modelOptions}</select>` : ''}
+                ${view.enabled ? `<select data-subagent-profile aria-label="Agent account">${profileOptions}</select>` : ''}
             </div>` : ''}
             <div class="reviewer-slot-meta muted">${escapeHtml(view.note)}</div>
             ${lastLine ? `<div class="reviewer-slot-meta muted">${escapeHtml(lastLine)}</div>` : ''}
@@ -441,10 +497,12 @@ function bindRowEvents() {
     host.querySelector('[data-subagent-harness]')?.addEventListener('change', (event) => {
         state.enabled = true;
         state.harness = String(event.target.value || '');
-        // The model belongs to the harness it was picked for: switching resets
-        // the unsaved pick, and delegationView drops the saved tail, so the
-        // select visibly shows "Engine default model" (accepted residual).
+        // The model AND the account pin belong to the harness they were picked
+        // for: switching resets the unsaved picks, and delegationView drops the
+        // saved tail/pin, so the selects visibly show "Engine default model" /
+        // "automatic rotation" (accepted residual).
         state.model = null;
+        state.profile = null;
         renderRows();
         state.onChange();
     });
@@ -454,13 +512,21 @@ function bindRowEvents() {
         renderRows();
         state.onChange();
     });
+    host.querySelector('[data-subagent-profile]')?.addEventListener('change', (event) => {
+        state.enabled = true;
+        state.profile = String(event.target.value || '');
+        renderRows();
+        state.onChange();
+    });
 }
 
 export function applySubagentsSettings(settings) {
     state.saved = String(settings?.OUROBOROS_SUBAGENT_HARNESS ?? '').trim();
+    state.savedProfile = String(settings?.OUROBOROS_SUBAGENT_PROFILE ?? '').trim();
     state.enabled = null;
     state.harness = '';
     state.model = null;
+    state.profile = null;
     renderRows();
 }
 
@@ -484,6 +550,9 @@ export function renderSignature(store) {
             // that succeeds must repaint even when the list stays the same.
             String(harness?.models_error || ''),
         ]),
+        // The account-pin select is built from the named profiles, so a new,
+        // renamed or removed account must repaint (same id rule as the models).
+        indexProfilesByHarness(snapshot),
         snapshot.subagent_last_delegation || null,
     ];
 }
@@ -552,5 +621,12 @@ export function collectSubagentsSettings() {
     if (!state.loaded || state.statusError) return {};
     const view = currentView();
     if (view.state === 'no_subscription' || view.state === 'unknown' || view.state === 'loading') return {};
-    return { OUROBOROS_SUBAGENT_HARNESS: composeSubagentRoute(view.harness, view.suffix) };
+    return {
+        OUROBOROS_SUBAGENT_HARNESS: composeSubagentRoute(view.harness, view.suffix),
+        // The account pin rides its own key beside the route (D-U5). Delegation
+        // off means no harness for a pin to belong to, so off authors '' — same
+        // rule as the view dropping a pin on a harness switch. The undiscovered
+        // saved-pin option above keeps a daemon-down save from erasing a pin.
+        OUROBOROS_SUBAGENT_PROFILE: view.enabled ? String(view.profile || '') : '',
+    };
 }

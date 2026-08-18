@@ -587,6 +587,27 @@ class ClaudexorGateway:
         )
         return body if isinstance(body, dict) else {}
 
+    def update_credential_profile(self, harness_id: str, profile_id: str,
+                                  *, enabled: bool) -> Dict[str, Any]:
+        """PATCH /v2/credential-profiles/:harness/:profileId — the engine's own
+        Enabled toggle for a NAMED account (``{enabled}`` is the one
+        user-settable routing control the profile row carries).
+
+        Translate-only, like every account surface here: the daemon owns the
+        registry row and rotation policy, and its refusal is the answer. The
+        route exists on 3.5.0 engines already; unified-model engines serve the
+        migrated default logins through it too, because those are ordinary
+        registry rows there."""
+        from urllib.parse import quote
+
+        body = self._request(
+            "PATCH",
+            f"/v2/credential-profiles/{quote(str(harness_id), safe='')}"
+            f"/{quote(str(profile_id), safe='')}",
+            json_body={"enabled": bool(enabled)},
+        )
+        return body if isinstance(body, dict) else {}
+
     def delete_credential_profile(self, harness_id: str, profile_id: str) -> Dict[str, Any]:
         """DELETE /v2/credential-profiles/:harness/:profileId — the engine's own
         removal contract for a NAMED account.

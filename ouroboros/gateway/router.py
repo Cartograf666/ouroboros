@@ -293,7 +293,10 @@ def collect_routes(
         Route(
             "/api/claudexor/credential-profiles/{harness}/{profile_id}",
             endpoint=api_claudexor_credential_profile,
-            methods=["DELETE"],
+            # DELETE = forget the named account; PATCH = the Enabled toggle
+            # (both thin proxies of the engine's own credential-profile
+            # contract; the handler dispatches on the method).
+            methods=["DELETE", "PATCH"],
         ),
         WebSocketRoute("/ws", endpoint=ws_endpoint),
     ]

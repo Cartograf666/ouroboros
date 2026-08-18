@@ -392,6 +392,215 @@ def test_account_removal_is_the_engine_contract_and_refuses_out_loud(monkeypatch
     assert b"profile_id" in bare.body
 
 
+def test_account_enabled_toggle_is_the_engine_contract(monkeypatch, tmp_path):
+    """The Enabled toggle shares the credential-profile route (PATCH beside
+    DELETE) and is the same thin-proxy rule: one forwarded call carrying the
+    engine's own strict ``{enabled}`` body, a refusal answered AS a refusal,
+    and a body that is not one JSON boolean refused at this edge before any
+    daemon work — nothing is coerced for the engine."""
+    import asyncio
+    import json
+
+    from starlette.requests import Request
+
+    from ouroboros.gateway import claudexor_accounts as accounts
+    from ouroboros.gateways import claudexor as gw
+    import ouroboros.claudexor_daemon as owned
+
+    patched: list = []
+
+    class FakeGateway:
+        def __init__(self, endpoint):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def handshake(self, **_kw):
+            return {}
+
+        def update_credential_profile(self, harness_id, profile_id, *, enabled):
+            if refuse:
+                raise gw.ClaudexorUnavailable("profile_unknown", "no such registry row")
+            patched.append((harness_id, profile_id, enabled))
+            return {"profile": {}, "status": {}}
+
+    monkeypatch.setattr(owned, "owned_config_dir", lambda: tmp_path / "cfg")
+    monkeypatch.setattr(gw, "ClaudexorGateway", FakeGateway)
+    monkeypatch.setattr(gw, "discover_daemon_at", lambda _cfg: object())
+
+    def _call(harness, profile_id, body):
+        raw = json.dumps(body).encode("utf-8") if body is not None else b""
+
+        async def receive():
+            return {"type": "http.request", "body": raw, "more_body": False}
+
+        request = Request({
+            "type": "http", "method": "PATCH",
+            "path": f"/api/claudexor/credential-profiles/{harness}/{profile_id}",
+            "headers": [(b"content-type", b"application/json")], "query_string": b"",
+            "path_params": {"harness": harness, "profile_id": profile_id},
+        }, receive)
+        return asyncio.run(accounts.api_claudexor_credential_profile(request))
+
+    refuse = False
+    ok = _call("codex", "work", {"enabled": False})
+    assert ok.status_code == 200
+    assert patched == [("codex", "work", False)], "the handler forwards and does nothing else"
+    body = json.loads(ok.body)
+    assert body == {"ok": True, "harness": "codex", "profile_id": "work", "enabled": False}
+
+    refuse = True
+    denied = _call("codex", "work", {"enabled": True})
+    assert denied.status_code == 503
+    assert b"profile_unknown" in denied.body
+    assert patched == [("codex", "work", False)], "a refusal toggled nothing"
+
+    refuse = False
+    for bad in ({"enabled": "true"}, {"enabled": 1}, {}, None):
+        answer = _call("codex", "work", bad)
+        assert answer.status_code == 400, f"non-boolean body {bad!r} must refuse at the edge"
+        assert b"enabled" in answer.body
+    assert patched == [("codex", "work", False)], "no invalid body reached the daemon"
+
+    bare = _call("codex", "", {"enabled": True})
+    assert bare.status_code == 400
+    assert b"profile_id" in bare.body
+
+
+def test_unified_accounts_capability_reads_the_operations_catalog():
+    """The unified-account-model marker is the EXACT catalog id of the engine's
+    new `GET /v2/account-pools` operation (frozen contract §L.2) — never the
+    path spelling, and an unreadable catalog (spelled `[]` by the caller) is
+    the old model. Same discipline as `_login_disclosure_native`."""
+    from ouroboros.gateway.claudexor_accounts import _unified_accounts_native
+
+    by_id = [{"id": "get:quota"}, {"id": "get:account-pools", "path": "/v2/account-pools"}]
+    assert _unified_accounts_native(by_id) is True
+    # The id alone is sufficient; the path alone is NOT the marker.
+    assert _unified_accounts_native([{"id": "get:account-pools"}]) is True
+    assert _unified_accounts_native(
+        [{"id": "get:something-else", "path": "/v2/account-pools"}]) is False
+    assert _unified_accounts_native([{"id": "get:quota"}]) is False
+    assert _unified_accounts_native([]) is False
+    assert _unified_accounts_native([None, "get:account-pools"]) is False
+
+
+def test_status_payload_stamps_the_unified_accounts_fact(monkeypatch, tmp_path):
+    """`unified_accounts` rides every status answer: True only when the
+    operations catalog was READ and carries the account-pools marker; an old
+    engine reads False, and a catalog read failure fails CLOSED to False (the
+    legacy rendering is correct on every engine; a guessed True is not)."""
+    from ouroboros.gateway.claudexor_accounts import _status_payload
+    from ouroboros.gateways import claudexor as gw
+    import ouroboros.claudexor_daemon as owned
+
+    class FakeDaemon:
+        def status_dict(self):
+            return {"state": "running"}
+
+    class FakeGateway:
+        engine_version = "9.9.9"
+        operations_answer: list = [{"id": "get:account-pools"}]
+
+        def __init__(self, endpoint):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def handshake(self, **_kw):
+            return {}
+
+        def agent_capabilities(self):
+            return {"harnesses": []}
+
+        def harnesses(self):
+            return []
+
+        def credential_profiles(self):
+            return {"profiles": [], "harnessAccounts": [], "accountPools": []}
+
+        def quota_snapshots(self):
+            return []
+
+        def operations(self):
+            return type(self).operations_answer
+
+    monkeypatch.setattr(owned, "get_owned_daemon", lambda: FakeDaemon())
+    monkeypatch.setattr(owned, "owned_config_dir", lambda: tmp_path / "cfg")
+    monkeypatch.setattr(gw, "discover_daemon_at", lambda _path: object())
+    monkeypatch.setattr(gw, "ClaudexorGateway", FakeGateway)
+
+    assert _status_payload(include_models=False)["unified_accounts"] is True
+
+    FakeGateway.operations_answer = [{"id": "get:quota"}]
+    assert _status_payload(include_models=False)["unified_accounts"] is False
+
+    class BrokenCatalog(FakeGateway):
+        def operations(self):
+            raise gw.ClaudexorUnavailable("daemon_unreachable", "catalog read died")
+
+    monkeypatch.setattr(gw, "ClaudexorGateway", BrokenCatalog)
+    payload = _status_payload(include_models=False)
+    assert payload["unified_accounts"] is False, "an unreadable catalog fails closed to the old model"
+    # …and the absorbed catalog read never downgrades the real facets.
+    assert payload["reads"] == {"catalog": "ok", "accounts": "ok", "quota": "ok"}
+
+    class NoCatalogMethod(FakeGateway):
+        operations = None
+
+    monkeypatch.setattr(gw, "ClaudexorGateway", NoCatalogMethod)
+    assert _status_payload(include_models=False)["unified_accounts"] is False
+
+    class UnifiedWire(FakeGateway):
+        # The unified engine's full accounts body (frozen contract §L.1):
+        # every account a named registry row, the legacy key an empty
+        # compatibility list, the routing verdict in the ADDITIVE pool key.
+        operations_answer = [{"id": "get:account-pools"}]
+
+        def harnesses(self):
+            # A populated manifest read turns the visibility filters ON —
+            # exactly the path that rewrites the profiles body's other keys.
+            return [{"id": "codex", "manifest": {"capability_profile": {
+                "auth": {"supported_sources": ["native_session"]}}}}]
+
+        def credential_profiles(self):
+            return {
+                "profiles": [{"profile": {"harness_id": "codex",
+                                          "profile_id": "codex-default"}}],
+                "harnessAccounts": [],
+                "accountPools": [{"harness_id": "codex",
+                                  "next_up": {"kind": "profile",
+                                              "profileId": "codex-default"}}],
+            }
+
+    monkeypatch.setattr(gw, "ClaudexorGateway", UnifiedWire)
+    served = _status_payload(include_models=False)
+    # The ADDITIVE pool key rides the accounts facet through the visibility
+    # filters untouched: the store's dual-wire nextUpAccount reader and the
+    # onboarding dual-read both consume it from this one served payload.
+    assert served["unified_accounts"] is True
+    assert served["profiles"]["accountPools"] == [
+        {"harness_id": "codex",
+         "next_up": {"kind": "profile", "profileId": "codex-default"}}]
+    assert served["profiles"]["harnessAccounts"] == []
+    assert [w["profile"]["profile_id"] for w in served["profiles"]["profiles"]] == ["codex-default"]
+
+    class StoppedDaemon:
+        def status_dict(self):
+            return {"state": "stale"}
+
+    monkeypatch.setattr(owned, "get_owned_daemon", lambda: StoppedDaemon())
+    assert _status_payload(include_models=False)["unified_accounts"] is False
+
+
 def test_login_endpoint_validates_before_any_daemon_work():
     import asyncio
 

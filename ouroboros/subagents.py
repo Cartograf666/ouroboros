@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dataclass_replace
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping
 
@@ -152,11 +152,13 @@ class DelegationRoute:
     ``route_id`` is passed through to Claudexor verbatim as the primary harness.
     Ouroboros never interprets it — no ``if codex/claude/cursor`` anywhere (AGENTS.md).
 
-    ``profile_id`` is the OPTIONAL manual credential pin (Q2-в, applied as the
-    reversible default pending owner confirmation): empty means the daemon's
-    own rotation policy picks the account (D28 — the default); a value rides
-    the run request verbatim as ``credentialProfileId``. Reviewer-slot rows
-    are the only author today.
+    ``profile_id`` is the OPTIONAL manual credential pin: empty means the
+    daemon's own rotation policy picks the account (D28 — the default); a
+    value rides the run request verbatim as ``credentialProfileId``. Two
+    authors: reviewer-slot rows (Q2-в) and the Delegation account pin
+    (``OUROBOROS_SUBAGENT_PROFILE``, unified-accounts sprint D-U5). A pin is
+    STRICT (D-U6): an exhausted pinned window is a typed refusal, never a
+    silent rotation onto a sibling account.
     """
 
     route_id: str
@@ -213,6 +215,18 @@ def get_subagent_harness() -> DelegationRoute | None:
             "OUROBOROS_SUBAGENT_HARNESS is set but unparseable (%r) — "
             "delegation is OFF until it reads harness[=model][:effort]", raw,
         )
+    if route is None:
+        return None
+    # The OPTIONAL account pin (D-U5), a SIBLING key rather than a fourth
+    # grammar position: the route grammar stays Claudexor's own reviewer-panel
+    # spelling, and this is the ONLY reader of the pin key. Empty = the
+    # engine's quota-aware rotation pool (D28).
+    profile = str(
+        os.environ.get("OUROBOROS_SUBAGENT_PROFILE", "")
+        or SETTINGS_DEFAULTS.get("OUROBOROS_SUBAGENT_PROFILE", "")
+    ).strip()
+    if profile:
+        route = dataclass_replace(route, profile_id=profile)
     return route
 
 
@@ -237,14 +251,21 @@ def _last_delegation_path():
 
 
 def record_last_delegation(*, route: str, requested_model: str,
-                           applied_model: str, run_id: str) -> None:
-    """Record the last delegated run's route + requested/applied model.
+                           applied_model: str, run_id: str,
+                           requested_profile: str = "",
+                           applied_profile: str = "") -> None:
+    """Record the last delegated run's route + requested/applied model + account.
 
     Best-effort and atomic, in the CANONICAL data plane beside the saved
     settings (the reviewer-slot projection's own rule): this is UI state, not
     per-task forensics — those live in the custody event log and the ledger.
     ``applied_model`` is the engine summary's own value, '' when the run never
     disclosed one — the requested model is never dressed up as the applied one.
+    The same rule for the account (D-U5): ``applied_profile`` is the engine's
+    ``authRoute.profileId`` settlement receipt, '' when telemetry predates it;
+    ``requested_profile`` is the pin the request carried ('' = rotation) — the
+    two stay separate so a requested-vs-ran mismatch is disclosable, never
+    rewritten.
     """
     import json
 
@@ -262,6 +283,8 @@ def record_last_delegation(*, route: str, requested_model: str,
             "route": str(route or ""),
             "requested_model": str(requested_model or ""),
             "applied_model": str(applied_model or ""),
+            "requested_profile": str(requested_profile or ""),
+            "applied_profile": str(applied_profile or ""),
             "run_id": str(run_id or ""),
         }, ensure_ascii=False, indent=1))
     except Exception:
@@ -378,12 +401,18 @@ def route_health(
     names no reset instant still reports ``subscription_window_exhausted`` — as the
     REASON with an empty ``reset_at``, since an unknown healing time is not health.
 
-    ``pinned_profile`` (reviewer-slot rows today) SKIPS the harness-row status
-    refusal AND the ``enabled`` flag beside it: a no-default-credential row reads
-    ``unavailable`` FOREVER by design (agy, INV-135) and commonly ships disabled
-    too — the ENGINE's typed refusal is authoritative for a pinned run (owner
-    2026-08-18; one wasted round trip on a really-disabled harness). Catalog
-    absence, access-profile fit, version floor and quota still apply.
+    ``pinned_profile`` is the route's pinned ACCOUNT (``DelegationRoute.profile_id``;
+    authors: reviewer-slot rows and the Delegation account pin, unified-accounts
+    D-U5). It does two things at once. It SKIPS the harness-row status refusal AND
+    the ``enabled`` flag beside it: a no-default-credential row reads ``unavailable``
+    FOREVER by design (agy, INV-135) and commonly ships disabled too — the ENGINE's
+    typed refusal is authoritative for a pinned run (owner 2026-08-18; one wasted
+    round trip on a really-disabled harness). Catalog absence, access-profile fit,
+    version floor and quota still apply — and the quota judgement narrows to THAT
+    subject exactly (§K.7): a pin is strict (D-U6), so a healthy sibling account
+    must not mask a spent pinned one into a dispatch the engine is certain to
+    refuse. Empty (automatic rotation) keeps the harness-wide judgement: WHICH
+    profile an unpinned run lands on stays Claudexor's business.
     """
     from ouroboros.config import CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION
     from ouroboros.gateways.claudexor import engine_at_least
@@ -433,7 +462,7 @@ def route_health(
         CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION,
     ):
         return "engine_rejects_delegated_marker", ""
-    exhausted, reset_at = _exhausted_window(gateway, route_id, route_model)
+    exhausted, reset_at = _exhausted_window(gateway, route_id, route_model, pinned_profile)
     if exhausted and not reset_at:
         # Spent with no named healing instant: still spent. The old shape carried
         # exhaustion ONLY in a non-empty reset, so a window the harness reports as
@@ -479,7 +508,8 @@ def _cooldown_active(cooldown_until: Any) -> bool:
     return instant > datetime.now(timezone.utc)
 
 
-def _exhausted_window(gateway: Any, route_id: str, route_model: str = "") -> tuple[bool, str]:
+def _exhausted_window(gateway: Any, route_id: str, route_model: str = "",
+                      pinned_profile: str = "") -> tuple[bool, str]:
     """``(exhausted, reset_at)`` for a route judged against its OWN model.
 
     A window counts as spent when the harness reports it fully used or still cooling
@@ -500,15 +530,28 @@ def _exhausted_window(gateway: Any, route_id: str, route_model: str = "") -> tup
 
     A snapshot with an applicable spent constraint counts as spent even if another of
     ITS OWN constraints has room: a 5-hour window at 100% blocks that profile now,
-    whatever its weekly window says. WHICH profile a run lands on is Claudexor's
-    business — rotation stays there and no profile identity is interpreted here.
+    whatever its weekly window says. WHICH profile an UNPINNED run lands on is
+    Claudexor's business — rotation stays there and no profile identity is
+    interpreted here. A PINNED route (``pinned_profile`` non-empty, D-U6 strict pin)
+    is the one exception: the run can only ever land on that subject, so only ITS
+    snapshots and absences are consulted — exact ``subject_id`` match, the same
+    rule the accounts panel's quotaSummary applies — and a healthy sibling cannot
+    vouch for it. All the fail-open rules above still hold per subject: a pinned
+    account with no readable quota at all is UNKNOWN, not spent.
     """
+    pinned = str(pinned_profile or "")
+
+    def _subject_matches(subject: Dict[str, Any]) -> bool:
+        if str(subject.get("harness") or "") != route_id:
+            return False
+        return not pinned or str(subject.get("subject_id") or "") == pinned
+
     resets: List[str] = []
     any_live = False
     any_spent = False
     for snapshot in gateway.quota_snapshots():
         subject = snapshot.get("subject") if isinstance(snapshot.get("subject"), dict) else {}
-        if str(subject.get("harness") or "") != route_id:
+        if not _subject_matches(subject):
             continue
         if str(snapshot.get("freshness") or "") != "fresh":
             continue
@@ -532,7 +575,7 @@ def _exhausted_window(gateway: Any, route_id: str, route_model: str = "") -> tup
     if callable(absences):
         for row in absences() or []:
             subject = row.get("subject") if isinstance(row, dict) else None
-            if isinstance(subject, dict) and str(subject.get("harness") or "") == route_id:
+            if isinstance(subject, dict) and _subject_matches(subject):
                 return False, ""
     return True, min(resets) if resets else ""
 
@@ -559,6 +602,7 @@ def probe_subagent_executor(
         gateway = ensure_owned_gateway()
         unavailable, reset_at = route_health(
             gateway, route.route_id, run_shape, route_model=route.model,
+            pinned_profile=route.profile_id,
         )
     except ClaudexorUnavailable as exc:
         return resolve_subagent_executor(

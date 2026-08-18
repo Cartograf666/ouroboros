@@ -1199,7 +1199,8 @@ Before every commit, verify the following:
   was binary per mode; the v6.91 surface-aware light default obsoleted it.
 - One capability, one section. The whole subagent story lives in Agents →
   Delegation (`web/modules/subagents_settings.js`), beside Review lanes: the
-  route (`OUROBOROS_SUBAGENT_HARNESS`), the write permission
+  route (`OUROBOROS_SUBAGENT_HARNESS`), the optional account pin
+  (`OUROBOROS_SUBAGENT_PROFILE`), the write permission
   (`OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS`), and the two counts that bound it
   (`OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT`, `OUROBOROS_MAX_SUBAGENT_DEPTH`),
   with the two path roots behind a collapsed Advanced disclosure. They all answer
@@ -1213,6 +1214,11 @@ Before every commit, verify the following:
   tail of the same key from engine discovery ("Engine default model" = empty
   tail); reasoning effort stays derived per call, and a hand-written `:effort`
   remainder rides through verbatim with no control over it.
+  The ACCOUNT pin is a sibling settings key, never a fourth grammar position:
+  its selector reuses the reviewer rows' `profileOptionsFor` ('' = automatic
+  rotation first; an undiscovered saved pin keeps its option so a daemon-down
+  save cannot erase it), a harness switch visibly drops the pin, and turning
+  delegation off authors the pin away with the route.
 - Onboarding completes in ONE transaction, and install-time defaults belong in
   it. `POST /api/onboarding/complete` persists settings, the next-boot runtime
   mode, the fresh-install safety default and the agent-subscription preset in a
@@ -1242,7 +1248,12 @@ Before every commit, verify the following:
   once-only decision is never taken on a moment-in-time reading: the daemon's
   `next_up` is quota-derived, so a subscription whose window is spent during
   onboarding must stay in the preset (D-3), and the seat is resolved from the
-  durable facts — credential kind, enabled, present, verified.
+  durable facts — credential kind, enabled, present, verified. The verdict is
+  read DUAL-WIRE: a unified engine carries it in the additive `accountPools`
+  key beside an empty `harnessAccounts` compatibility list, a legacy engine on
+  the per-harness accounts row — pool first, legacy second, never re-derived
+  from the profile list, and an unknown `next_up.kind` on either wire is a
+  fail-safe refusal that still lets the configured-seat scan answer.
 - Owner settings writes go through `gateway/owner_settings.py`. The settings
   lock is a PRECONDITION of the write, not a hint: `_acquire_settings_lock`
   answers `None` on timeout and a writer that proceeds anyway is unlocked while
@@ -1265,7 +1276,12 @@ Before every commit, verify the following:
   instead of rendering a delegation toggle whose every dispatch would silently
   fall back to an API child. Harness lists come from the accounts panel's own
   source (`accountRows` over `/api/claudexor/status`) — one catalog path, one
-  login-capable discriminator.
+  login-capable discriminator — and `accountRows` is dual-shape: a unified
+  payload (server-stamped `unified_accounts`) serves every account as a named
+  profile wrapper and synthesizes no native pseudo-row, while a legacy payload
+  keeps the pseudo-row behavior-identical, plus the additive fail-open
+  `enabled` projection every row now carries; the account-pin options ride the
+  same payload's named profiles through `indexProfilesByHarness`.
 - Owner-facing copy says "agent", never "coding agent" (D-10, owner verbatim:
   the same subscriptions build presentations and run arbitrary tasks). Product
   names — Claude Code, Codex, Cursor — are trademarks and stay as they are.

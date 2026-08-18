@@ -24,6 +24,7 @@ import {
     loginCardHtml,
     loginReleaseProven,
     reconcileLoginJob,
+    resolvedJobProfileId,
 } from '../modules/harness_login_cards.js';
 
 const json = (status, body) => ({ ok: status >= 200 && status < 300, status, json: async () => body });
@@ -1185,6 +1186,21 @@ test('Close on the name-the-account face detaches as released — the refused cr
     assert.equal(host.innerHTML, '', 'the card is gone');
     assert.ok(!calls.some((c) => c.startsWith('DELETE')), 'nothing to DELETE');
     store.dispose();
+});
+
+test('the verify-race adopts the job\'s OWN resolved profile id, and only a string one', () => {
+    // Unified engines resolve a default login onto their bootstrap registry
+    // row and the job record names it (plan §K.4) — the row the verify-race
+    // must ask about, because no row with the empty id exists there. A legacy
+    // engine's default job carries null, which reads as the empty-string
+    // address, byte-identical to the old behavior.
+    assert.equal(resolvedJobProfileId({ job: { profileId: 'codex-default' } }), 'codex-default');
+    assert.equal(resolvedJobProfileId({ job: { profileId: null } }), '');
+    assert.equal(resolvedJobProfileId({ job: {} }), '');
+    assert.equal(resolvedJobProfileId({}), '');
+    assert.equal(resolvedJobProfileId(null), '');
+    // Fail-safe against a future non-string spelling: never a coerced name.
+    assert.equal(resolvedJobProfileId({ job: { profileId: 42 } }), '');
 });
 
 test('a LIVE-shaped payload — one native pseudo-row per harness — reads empty only where no login was detected', async () => {
