@@ -111,17 +111,18 @@ class RunCustody:
     task_id: str = ""
     route_id: str = ""
     model: str = ""
+    # Requested pin (`credentialProfileId`) from the start body; '' = automatic; applied half = settlement authRoute.
+    profile_id: str = ""
     project_id: str = ""
     project_owned: bool = False
     root_task_id: str = ""
     parent_task_id: str = ""
     ledger_root: str = ""
     idempotency_key: str = ""
-    # The LOGICAL INVOCATION ID: minted once per intended invocation, reused verbatim as
-    # the wire Idempotency-Key on a transport retry of the SAME invocation (so the engine
-    # returns the run it already accepted), and fresh for every deliberately new
-    # ``delegate_start``. ``idempotency_key`` above is the content-derived identity used
-    # to FIND a pending invocation; this id is what actually rides the wire.
+    # The LOGICAL INVOCATION ID: minted once per intended invocation, reused verbatim as the wire Idempotency-Key
+    # on a transport retry of the SAME invocation (so the engine returns the run it already accepted), and fresh
+    # for every deliberately new ``delegate_start``. ``idempotency_key`` above is the content-derived identity
+    # used to FIND a pending invocation; this id is what actually rides the wire.
     invocation_id: str = ""
     ledger_recorded: bool = False
     settled: bool = False
@@ -132,18 +133,15 @@ class RunCustody:
     containment_disclosed: bool = False
     # Whether the settled-but-never-read omission has already been named durably.
     unread_disclosed: bool = False
-    # The staged-output half of the terminal story (D7). ``output_artifact`` is the
-    # task-drive-relative path the terminal payload was staged to (empty when it fit
-    # inline); ``output_complete`` is whether what was staged is the full content as
-    # far as the run's OWN report can establish it — its served size, or the preview
-    # carried as a prefix (`_resolve_full_primary_output`); the engine publishes no
-    # content hash for the primary output, so equal length binds the body to the run's
-    # CLAIM about it, not to a digest of it. An artifact that matches neither stages as
-    # incomplete and can never be acknowledged. ``output_sha`` is
-    # the content hash of what is CURRENTLY staged; ``output_consumed`` is whether the
-    # canonical acknowledgement exists FOR THAT HASH — a re-stage of different content
-    # at the same path resets it, because an ack names bytes, not a path. All replayed,
-    # so a restarted worker keeps the facts.
+    # The staged-output half of the terminal story (D7). ``output_artifact`` is the task-drive-relative path the
+    # terminal payload was staged to (empty when it fit inline); ``output_complete`` is whether what was staged is
+    # the full content as far as the run's OWN report can establish it — its served size, or the preview carried
+    # as a prefix (`_resolve_full_primary_output`); the engine publishes no content hash for the primary output,
+    # so equal length binds the body to the run's CLAIM about it, not to a digest of it. An artifact that matches
+    # neither stages as incomplete and can never be acknowledged. ``output_sha`` is the content hash of what is
+    # CURRENTLY staged; ``output_consumed`` is whether the canonical acknowledgement exists FOR THAT HASH — a
+    # re-stage of different content at the same path resets it, because an ack names bytes, not a path. All
+    # replayed, so a restarted worker keeps the facts.
     output_artifact: str = ""
     output_complete: bool = False
     output_sha: str = ""
@@ -284,7 +282,7 @@ def _iter_rows(path: pathlib.Path, tail_bytes: Optional[int] = None) -> Iterator
 # one table shared by the replay and the ``record_started`` emit.
 _STARTED_STR_FIELDS: Tuple[Tuple[str, str], ...] = tuple(
     (attr, "route" if attr == "route_id" else attr) for attr in (
-        "task_id", "route_id", "model", "project_id", "root_task_id",
+        "task_id", "route_id", "model", "profile_id", "project_id", "root_task_id",
         "parent_task_id", "ledger_root", "idempotency_key", "invocation_id",
         "snapshot_id", "execution_root", "baseline_sha", "target_root",
         "authority_source", "access", "mode", "isolation",
@@ -1414,6 +1412,7 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
         run_id=run_id, task_id=task_id,
         route_id=str(record["route"] or body.get("primaryHarness") or ""),
         model=str(body.get("model") or ""),
+        profile_id=str(body.get("credentialProfileId") or ""),
         project_id=record["project_id"], project_owned=bool(record["project_owned"]),
         root_task_id=str(record.get("root_task_id") or ""),
         parent_task_id=str(record.get("parent_task_id") or ""),

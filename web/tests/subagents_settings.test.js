@@ -85,6 +85,36 @@ test('a FAILED verification is not connected — the same red the accounts panel
     assert.equal(view.enabled, false);
 });
 
+test('a disabled account is not connected — the same aggregate the Accounts header shows', () => {
+    // The Accounts card header counts the accounts rotation can actually use:
+    // signed-in AND enabled, with all-disabled its own state. connectedHarnesses
+    // read only the verification and never learned the `enabled` fact, so a
+    // family whose every account the owner switched OFF still rendered the
+    // Delegation section as "connected" under a header saying "all disabled".
+    const allDisabled = statusPayload({
+        harnesses: [{ id: 'claude', display_name: 'Claude Code' }],
+        profiles: [{ profile: { harness_id: 'claude', profile_id: 'valentine', enabled: false },
+                     status: { verification: 'passed', verification_source: 'vendor' } }],
+    });
+    assert.deepEqual(connectedHarnesses(allDisabled), []);
+    const view = delegationView({ saved: '', payload: allDisabled });
+    assert.equal(view.state, 'no_subscription');
+    assert.equal(view.enabled, false);
+
+    // One disabled beside one enabled+passed account: the family IS connected —
+    // rotation still has someone to land on.
+    const mixed = statusPayload({
+        harnesses: [{ id: 'claude', display_name: 'Claude Code' }],
+        profiles: [
+            { profile: { harness_id: 'claude', profile_id: 'valentine', enabled: false },
+              status: { verification: 'passed', verification_source: 'vendor' } },
+            { profile: { harness_id: 'claude', profile_id: 'mironov' },
+              status: { verification: 'passed', verification_source: 'vendor' } },
+        ],
+    });
+    assert.deepEqual(connectedHarnesses(mixed).map((h) => h.id), ['claude']);
+});
+
 test('subscription-first: a local session is enough to turn delegation on by default', () => {
     // OWNER DECISION 2026-08-09 (guard, not a characterization). A review lens
     // recommended requiring vendor-level verification before the default-on
@@ -420,6 +450,90 @@ test('the last-delegated-run line discloses mismatch and shows absence as absenc
     assert.ok(!bare.includes('sonnet'));
 });
 
+test('the last-delegated-run line shows the APPLIED account, and a pin mismatch loudly', () => {
+    // Unified-accounts sprint (D-U5/§K.7): the applied account is the engine's
+    // own settlement receipt (authRoute.profileId). Shown when known…
+    const applied = lastDelegationLine({ ts: new Date().toISOString(), route: 'codex',
+        requested_model: 'o3', applied_model: 'o3', run_id: 'r1',
+        requested_profile: '', applied_profile: 'codex-default' });
+    assert.ok(applied.includes('account codex-default'));
+    // …a requested-vs-ran pin mismatch is disclosed, never rewritten…
+    const mismatch = lastDelegationLine({ ts: new Date().toISOString(), route: 'codex',
+        requested_model: 'o3', applied_model: 'o3', run_id: 'r2',
+        requested_profile: 'koshak', applied_profile: 'codex-default' });
+    assert.ok(mismatch.includes('account requested koshak → ran codex-default'));
+    // …a pinned run whose engine telemetry predates the receipt says so
+    // instead of dressing the request up as the applied account…
+    const undisclosed = lastDelegationLine({ ts: new Date().toISOString(), route: 'codex',
+        requested_model: 'o3', applied_model: 'o3', run_id: 'r3',
+        requested_profile: 'koshak', applied_profile: '' });
+    assert.ok(undisclosed.includes('account koshak requested — applied not disclosed'));
+    // …and an unpinned run with no receipt claims nothing about accounts —
+    // records that predate the field included.
+    const silent = lastDelegationLine({ ts: new Date().toISOString(), route: 'codex',
+        requested_model: 'o3', applied_model: 'o3', run_id: 'r4' });
+    assert.ok(!silent.includes('account'));
+});
+
+test('the Delegation account pin: automatic first, saved pin kept, harness switch drops it', () => {
+    // The selector reuses the reviewer rows' own options fragment: '' =
+    // automatic rotation is always the first option (D28), a saved pin selects
+    // its named profile, and a pin missing from discovery keeps an option
+    // instead of silently redrawing as automatic (which the next Save would
+    // then really write).
+    const payload = statusPayload({
+        harnesses: [{ id: 'codex', display_name: 'Codex' }, { id: 'claude', display_name: 'Claude' }],
+        profiles: [
+            { profile: { harness_id: 'codex', profile_id: 'codex-default', enabled: true },
+                status: { verification: 'passed', verification_source: 'local_store' } },
+            { profile: { harness_id: 'codex', profile_id: 'koshak', enabled: true },
+                status: { verification: 'passed', verification_source: 'vendor' } },
+            { profile: { harness_id: 'claude', profile_id: 'claude-default', enabled: true },
+                status: { verification: 'passed', verification_source: 'local_store' } },
+        ],
+    });
+    const view = delegationView({ saved: 'codex', savedProfile: 'koshak', payload, accountsRead: 'ok' });
+    assert.equal(view.profile, 'koshak');
+    assert.deepEqual(view.profileOptions.map((o) => o.value), ['', 'codex-default', 'koshak']);
+    assert.equal(view.profileOptions[0].label, 'Account: automatic rotation');
+    // An ENABLED account carries no disabled marker.
+    assert.equal(view.profileOptions[2].label, 'Account: koshak (pinned)');
+    // A pin discovery no longer lists keeps its option, labeled by the
+    // accounts facet's own verdict.
+    const gone = delegationView({ saved: 'codex', savedProfile: 'retired', payload, accountsRead: 'ok' });
+    assert.ok(gone.profileOptions.some((o) => o.value === 'retired' && /not in discovery/.test(o.label)));
+    const unread = delegationView({ saved: 'codex', savedProfile: 'retired', payload });
+    assert.ok(unread.profileOptions.some((o) => o.value === 'retired' && /not checked/.test(o.label)));
+    // The pin belongs to the harness it was written for: an unsaved harness
+    // switch drops it to a VISIBLE automatic rotation before Save.
+    const switched = delegationView({ saved: 'codex', savedProfile: 'koshak', payload,
+        accountsRead: 'ok', edit: { enabled: true, harness: 'claude', model: null, profile: null } });
+    assert.equal(switched.profile, '');
+    assert.deepEqual(switched.profileOptions.map((o) => o.value), ['', 'claude-default']);
+});
+
+test('the Delegation pin selector labels a disabled account "(disabled)", still selectable', () => {
+    // The wire carries the enabled fact; dropping it offered a disabled
+    // account as a pin with no marker. The option stays SELECTABLE — the
+    // engine's typed refusal is the authority on a pin it will not serve
+    // (D-U6); the label is honesty, not a gate.
+    const payload = statusPayload({
+        harnesses: [{ id: 'codex', display_name: 'Codex' }],
+        profiles: [
+            { profile: { harness_id: 'codex', profile_id: 'codex-default', enabled: true },
+                status: { verification: 'passed', verification_source: 'local_store' } },
+            { profile: { harness_id: 'codex', profile_id: 'benched', enabled: false },
+                status: { verification: 'passed', verification_source: 'vendor' } },
+        ],
+    });
+    const view = delegationView({ saved: 'codex', payload, accountsRead: 'ok' });
+    const benched = view.profileOptions.find((o) => o.value === 'benched');
+    assert.equal(benched.label, 'Account: benched (pinned) (disabled)');
+    assert.ok(!benched.disabled, 'the disabled account stays selectable');
+    const kept = view.profileOptions.find((o) => o.value === 'codex-default');
+    assert.equal(kept.label, 'Account: codex-default (pinned)');
+});
+
 // ---------------------------------------------------------------------------
 // Phase 2: "we could not ask" and "we asked and the daemon is down" are two
 // different sentences, and NEITHER earns a row-level claim about the owner's
@@ -647,6 +761,15 @@ test('the settings collector itself refuses to author from an unknown read', asy
         await store.refresh({ includeModels: true });
         assert.ok('OUROBOROS_SUBAGENT_HARNESS' in collectSubagentsSettings(),
             'a genuinely read store authors normally');
+        // The account pin rides its own key beside the route (D-U5): a saved
+        // pin round-trips verbatim through an untouched Save, and delegation
+        // OFF authors the pin away with the route (no harness to belong to).
+        applySubagentsSettings({ OUROBOROS_SUBAGENT_HARNESS: 'codex', OUROBOROS_SUBAGENT_PROFILE: 'koshak' });
+        assert.deepEqual(collectSubagentsSettings(), {
+            OUROBOROS_SUBAGENT_HARNESS: 'codex', OUROBOROS_SUBAGENT_PROFILE: 'koshak' });
+        applySubagentsSettings({ OUROBOROS_SUBAGENT_HARNESS: DELEGATION_OFF, OUROBOROS_SUBAGENT_PROFILE: 'koshak' });
+        assert.deepEqual(collectSubagentsSettings(), {
+            OUROBOROS_SUBAGENT_HARNESS: DELEGATION_OFF, OUROBOROS_SUBAGENT_PROFILE: '' });
     } finally {
         destroySubagentsSection();
         store.dispose();

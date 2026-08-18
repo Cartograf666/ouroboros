@@ -688,6 +688,7 @@
  * @property {Object=} profiles
  * @property {Array<Object>=} quota
  * @property {ClaudexorStatusReads=} reads
+ * @property {boolean=} unified_accounts
  * @property {Object=} subagent_last_delegation
  * @property {string=} error
  */
@@ -895,4 +896,4 @@
  * @property {?boolean} check_ok
  */
 
-export const GATEWAY_CONTRACT_VERSION = '6.104.0';
+export const GATEWAY_CONTRACT_VERSION = '6.105.1';

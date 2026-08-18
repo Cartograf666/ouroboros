@@ -16,7 +16,7 @@ import uuid
 from typing import Any, Dict, Iterable, List
 
 from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
-from ouroboros.utils import iter_jsonl_objects, jsonl_append_lock_path, utc_now_iso
+from ouroboros.utils import iter_jsonl_objects, jsonl_append_lock_path, replace_atomic, utc_now_iso
 
 _ANNOTATIONS_NAME = "chat_annotations.jsonl"
 _COMPACT_AT_BYTES = 800_000
@@ -186,7 +186,7 @@ def _compact_annotations_locked(drive_root: Any, path: pathlib.Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
-    os.replace(tmp, path)
+    replace_atomic(tmp, path)
 
 
 def append_chat_annotation(

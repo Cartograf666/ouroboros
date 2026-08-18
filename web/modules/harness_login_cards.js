@@ -342,6 +342,20 @@ export async function confirmLoginLive(harness, profileId, {
     return { confirmed: false, stale: false, payload };
 }
 
+export function resolvedJobProfileId(envelope) {
+    // The profile a login job REALLY targets, read off the job's own record.
+    // On a legacy engine a default login carries `profileId: null` — the
+    // empty-string address the native pseudo-row answers to. On a unified
+    // engine (plan §K.4) the engine resolves a default login onto its
+    // bootstrap registry row and the job record names it, so the verify-race
+    // must ask about THAT row: no row with the empty id exists there, and an
+    // unresolved '' address would report every successful default login as
+    // unconfirmed. A named login's job names the same profile the card
+    // started with, so adopting the job's answer is safe on both engines.
+    const raw = envelope?.job?.profileId;
+    return typeof raw === 'string' ? raw : '';
+}
+
 export function pollResponseApplies(captured, current) {
     // Whether a poll answer may still be written onto the card. It belongs to
     // the job it was captured for (`captured === current`: the card may have
@@ -1365,7 +1379,15 @@ export function createLoginCardController({
         // — briefly re-polled, is the judge.
         active.confirming = true;
         render();
-        const check = await confirmLoginLive(active.harness, active.profile || '', {
+        // The row address: the profile the card started with, upgraded to the
+        // job's OWN resolved profile when the engine names one — a unified
+        // engine resolves a default login onto its bootstrap registry row, and
+        // only that row can confirm it (resolvedJobProfileId). On a legacy
+        // engine the job carries null for a default login and the address
+        // stays the empty string, byte-identical to today.
+        const rowAddress = active.profile
+            || resolvedJobProfileId(active.envelope || {}) || '';
+        const check = await confirmLoginLive(active.harness, rowAddress, {
             store,
             isStale: () => ctl.active !== active,
         });
@@ -1378,7 +1400,7 @@ export function createLoginCardController({
         // the newest committed snapshot is judged with the same predicate
         // before "unconfirmed" may be said.
         const confirmed = check.confirmed
-            || accountLoginConfirmed(store?.snapshot, active.harness, active.profile || '');
+            || accountLoginConfirmed(store?.snapshot, active.harness, rowAddress);
         // An exhausted window is not a failure verdict: the job's own read was
         // already judged unproven, and the account row often appears a tick after
         // the bounded re-poll gives up. Say that, and say where to look.

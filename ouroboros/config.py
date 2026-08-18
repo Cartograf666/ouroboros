@@ -317,12 +317,14 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_FALLBACK_COOLDOWN_ENABLED": True,
     "OUROBOROS_FALLBACK_COOLDOWN_SEC": 120,
     "OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL": 1,
-    # Delegated subagents. NARROW key, read ONLY by the subagent scheduler; deliberately
-    # absent from provider_models.MODEL_SETTING_KEYS (see ARCHITECTURE "Delegated
-    # subagents"). Empty = delegation off AND undecided (Settings' Subagents section
-    # offers the connected-subscription default); the literal `off` = delegation off
-    # because the owner said so. Wait keys bound the nanny's QUIET wait only.
+    # Delegated subagents. NARROW key, read ONLY by the subagent scheduler; deliberately absent from
+    # provider_models.MODEL_SETTING_KEYS (see ARCHITECTURE "Delegated subagents"). Empty = delegation off AND
+    # undecided (Settings' Subagents section offers the connected-subscription default); the literal `off` =
+    # delegation off because the owner said so. Wait keys bound the nanny's QUIET wait only.
     "OUROBOROS_SUBAGENT_HARNESS": "",
+    # Optional Delegation account pin (D-U5): a credential-profile id sent as `credentialProfileId`; empty = engine
+    # rotation pool (D28; presets never author it). Read ONLY by get_subagent_harness -> DelegationRoute.profile_id.
+    "OUROBOROS_SUBAGENT_PROFILE": "",
     "OUROBOROS_DELEGATE_WAIT_SEC": 120,
     "OUROBOROS_DELEGATE_WAIT_MAX_SEC": 1800,
 }
@@ -330,14 +332,12 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
 # Claudexor control-plane contract, checked at handshake so an old daemon is a typed
 # lane refusal rather than a mid-run schema surprise.
 CLAUDEXOR_PROTOCOL_MAJOR: int = 3
-# The TRANSPORT floor: the lowest engine that serves the READ-ONLY lane, which sends no
-# `execution` block at all. 3.2.0 schema-accepts every field that lane does send (verified
-# live: the body comes back with only the fake-root error, never a field error), and a
-# read-only run is already scoped by Claudexor's ordinary envelope. Keeping the floor AT the
-# oldest serving engine is the owner's explicit decision — it lets an older daemon keep
-# read-only delegation instead of losing the lane; a floor set to the newest daemon anyone
-# happens to run is not conservative, it is an outage (3.2.1 here refused the operator's own
-# 3.2.0 engine and took read-only delegation down with it).
+# The TRANSPORT floor: the lowest engine that serves the READ-ONLY lane, which sends no `execution` block at all.
+# 3.2.0 schema-accepts every field that lane does send (verified live: the body comes back with only the fake-root
+# error, never a field error), and a read-only run is already scoped by Claudexor's ordinary envelope. Keeping the
+# floor AT the oldest serving engine is the owner's explicit decision — it lets an older daemon keep read-only
+# delegation instead of losing the lane; a floor set to the newest daemon anyone happens to run is not conservative,
+# it is an outage (3.2.1 here refused the operator's own 3.2.0 engine and took read-only delegation down with it).
 CLAUDEXOR_MIN_VERSION: str = "3.2.0"
 # The MARKER floor: the oldest engine whose SCHEMA ACCEPTS `execution.delegated`, which is
 # the only delegated-lane question a version can answer honestly. Measured: `RunExecution`
@@ -1459,9 +1459,10 @@ def save_settings(
                 f"{baseline_mode!r} -> {new_mode!r}.{hint}"
             )
         try:
+            from ouroboros.utils import replace_atomic
             tmp = SETTINGS_PATH.with_suffix(".tmp")
             tmp.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-            os.replace(str(tmp), str(SETTINGS_PATH))
+            replace_atomic(str(tmp), str(SETTINGS_PATH))
         except OSError:
             SETTINGS_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
     finally:

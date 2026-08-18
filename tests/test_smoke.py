@@ -102,7 +102,8 @@ EXPECTED_TOOLS = [
     "run_ci_tests",
     "advisory_review", "review_status",
     "compact_context", "set_tool_timeout", "request_restart",
-    "promote_to_stable", "schedule_subagent", "integrate_subagent_patch", "compare_subagent_patches",
+    "promote_to_stable", "schedule_subagent", "schedule_followup",
+    "integrate_subagent_patch", "compare_subagent_patches",
     # C1: the explicit acceptance seam for a delegated run's captured patch —
     # a first-class tool, so the registry contract must name it.
     "integrate_delegated_patch", "cancel_task",
@@ -126,7 +127,7 @@ EXPECTED_TOOLS = [
     "codebase_health", "knowledge_read", "knowledge_write", "knowledge_list",
     "journal_read", "journal_write", "workpad_read", "workpad_write",
     "promote_chat_to_task", "route_to_project", "list_projects", "steer_task",
-    "ensure_project_scope",
+    "ensure_project_scope", "schedule_followup",
     "memory_map", "memory_update_registry",
     "plan_task", "recent_tasks", "task_acceptance_review", "verify_and_record", "web_search",
     "start_service", "service_status", "service_logs", "stop_service",

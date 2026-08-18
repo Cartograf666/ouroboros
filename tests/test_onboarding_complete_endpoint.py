@@ -865,6 +865,96 @@ def test_a_seat_with_no_capacity_still_reaches_the_compiled_preset_with_its_mode
     assert "claude-opus-5" in dict((d.harness_id, d.model_ids) for d in discoveries)["claude"]
 
 
+# ---------------------------------------------------------------------------
+# The UNIFIED account model's wire (sprint plan §K.7 + frozen contract §L):
+# `harnessAccounts` arrives EMPTY (every account a named registry row) and the
+# routing verdict rides the additive `accountPools: [{harness_id, next_up}]`.
+# ---------------------------------------------------------------------------
+
+
+def _unified_snapshot(pools, profiles=(), harnesses=None, legacy_accounts=()):
+    snapshot = _routable_snapshot(list(legacy_accounts), profiles, harnesses)
+    snapshot["profiles"]["accountPools"] = list(pools)
+    return snapshot
+
+
+def _pool(harness, next_up):
+    return {"harness_id": harness, "next_up": next_up}
+
+
+def test_a_unified_engine_routes_through_account_pools_not_the_empty_legacy_key():
+    """The dual-read's load-bearing half: on a unified engine the legacy
+    `harnessAccounts` is `[]`, so the old accounts.get(harness) authority is
+    absent — skipping there would silently drop EVERY unified harness from the
+    preset. The pool row is the accounts authority on that wire."""
+    from ouroboros.gateway.onboarding import subscription_routable_harnesses
+
+    routable, refused = subscription_routable_harnesses(_unified_snapshot(
+        [_pool("claude", {"kind": "profile", "profileId": "claude-default"}),
+         _pool("codex", {"kind": "api_key_route"})],
+        [_profile("claude", "claude-default")],
+    ))
+
+    assert routable == {"claude": "account 'claude-default' (config_dir_login)"}
+    # The pool union's explicit API-key verdict is a refusal, same wording
+    # class as the legacy native api_key route.
+    assert "API key" in refused["codex"]
+    # No pool row and no legacy row: silent absence, exactly as before.
+    assert "cursor" not in routable and "cursor" not in refused
+
+
+def test_a_unified_refusal_still_keeps_a_configured_named_seat_in_the_preset():
+    """D-3 through the new wire: a spent window at onboarding time must not
+    delete a configured subscription from the once-only preset. On the unified
+    wire the configured-seat fallback is the named-profile scan ALONE — there
+    is no native fact to read."""
+    from ouroboros.gateway.onboarding import subscription_routable_harnesses
+
+    routable, refused = subscription_routable_harnesses(_unified_snapshot(
+        [_pool("claude", {"kind": "none", "reason": "every window is spent"}),
+         _pool("cursor", {"kind": "none", "reason": "nothing routable"})],
+        [_profile("claude", "claude-default")],
+    ))
+
+    assert routable == {
+        "claude": "account 'claude-default' (config_dir_login); "
+                  "no capacity right now (every window is spent)"}
+    assert refused == {"cursor": "nothing routable"}
+
+
+def test_an_unknown_pool_kind_is_fail_safe_and_the_seat_scan_still_answers():
+    """Either wire may grow a spelling this reader predates (plan §E: degrade
+    honestly). An unknown kind is never a subscription verdict; a configured
+    named profile still counts through the seat scan, and a harness with none
+    is refused with the unknown state named."""
+    from ouroboros.gateway.onboarding import subscription_routable_harnesses
+
+    routable, refused = subscription_routable_harnesses(_unified_snapshot(
+        [_pool("claude", {"kind": "quantum_pool"}),
+         _pool("codex", {"kind": "quantum_pool"})],
+        [_profile("claude", "claude-default")],
+    ))
+
+    assert set(routable) == {"claude"}
+    assert "unknown routing state 'quantum_pool'" in routable["claude"]
+    assert "unknown routing state 'quantum_pool'" in refused["codex"]
+
+
+def test_when_both_wires_carry_a_verdict_the_pool_wins():
+    """A transitional payload may carry both. Profiles own account facts, the
+    pool owns routing facts — one authority, or the two could disagree about
+    the same harness."""
+    from ouroboros.gateway.onboarding import subscription_routable_harnesses
+
+    routable, refused = subscription_routable_harnesses(_unified_snapshot(
+        [_pool("codex", {"kind": "api_key_route"})],
+        legacy_accounts=[_native_account("codex")],  # legacy says: healthy session
+    ))
+
+    assert routable == {}
+    assert "API key" in refused["codex"]
+
+
 def test_out_of_capacity_never_launders_an_api_key_or_an_unusable_seat():
     """The round-one finding must not regress through the new fallback: being out
     of capacity is not evidence of being a subscription. A harness whose only

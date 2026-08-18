@@ -55,8 +55,10 @@ _ADMISSION_POLL_SEC = 0.15
 # (kind-aware "auto" semantics, Clawdexor A6): subscription profiles rotate,
 # metered API keys fail, and the OWNER's explicit choices always win. Blanket
 # "rotate" writes from this side would overwrite that judgment, so reconcile
-# skips those engines entirely. A6 is planned for the 3.6.0 release wave; this
-# is deliberately not CLAUDEXOR_MIN_VERSION (owner decision 5=A: no floor bump).
+# skips those engines entirely. Confirmed shipped in the actual 3.6.0 release
+# (claudexor 31aa51c9, schema limit_action enum carries kind-aware "auto"), so
+# this floor names the real release wave (issue #246); it is deliberately not
+# CLAUDEXOR_MIN_VERSION (owner decision 5=A: no floor bump).
 _ROTATION_AUTO_SEMANTICS_MIN_VERSION = "3.6.0"
 _ROTATION_RECEIPT_NAME = "claudexor_rotation_provisioning.json"
 
@@ -185,9 +187,6 @@ class OwnedClaudexorDaemon:
         self._last_error = ""
         self._engine_version = ""
         self._engine_build_sha = ""
-        # The last authenticated handshake's explicit servingMode ('' = the
-        # engine said nothing = normal).
-        self._serving_mode = ""
         # Rotation reconcile (B3): a non-blocking lock dedups CONCURRENT
         # ensures so they never double-POST settings; nothing else is gated.
         self._rotation_lock = threading.Lock()
@@ -214,7 +213,6 @@ class OwnedClaudexorDaemon:
         if not owned_daemon_provisioned():
             self._engine_version = ""
             self._engine_build_sha = ""
-            self._serving_mode = ""
             return None, "not_provisioned", ""
         try:
             endpoint = discover_daemon_at(owned_config_dir())
@@ -226,19 +224,13 @@ class OwnedClaudexorDaemon:
                 self._engine_version = gateway.engine_version
                 engine = handshake.get("engine") if isinstance(handshake.get("engine"), dict) else {}
                 self._engine_build_sha = str(engine.get("sha") or "")
-                # RECORDED, never waited on here: reachable-recovering is still
-                # "running" (the handshake proves identity and liveness), and
-                # admission is a separate, later question (`ensure_owned_gateway`).
-                self._serving_mode = _handshake_serving_mode(handshake)
+                # Reachable-recovering is still "running" (the handshake proves
+                # identity and liveness); admission is a separate, later
+                # question answered by `ensure_owned_gateway`'s own handshakes.
             return endpoint, "running", ""
         except ClaudexorUnavailable as exc:
             self._engine_version = ""
             self._engine_build_sha = ""
-            # ``_serving_mode`` is deliberately NOT cleared here: this method
-            # also runs unlocked (status polls), so a transient handshake
-            # failure must not clobber a just-recorded mode for concurrent
-            # readers. Failure paths never write the mode; it always holds
-            # the LAST SUCCESSFUL handshake's answer.
             status = int(getattr(exc, "status_code", 0) or 0)
             if status in (401, 403):
                 return None, "foreign_daemon", (

@@ -404,23 +404,39 @@ def plan_payload_roots(ctx: ToolContext, locators: List[str]) -> list[pathlib.Pa
 # its per-ensure rotation reconcile — both bounded and fail-open (a spawn/probe
 # failure returns None here, never an exception).
 #
-# DISCLOSED LIMITATION: `subagents.route_health` — the ONE manifest reader — judges
-# a whole ROUTE (harness id + pinned model), never a slot's pinned credential
-# profile. A live sibling profile can therefore mask a pinned slot's exhaustion:
-# such a slot dispatches (fail-open) and fails typed downstream (B1). No second
-# health oracle is built here. api_chat rows have no route health source at all
-# and always dispatch. Cursor lanes without quota snapshots simply dispatch too.
+# SCOPE OF THE ANSWER: `subagents.route_health` — the ONE manifest reader — judges
+# a ROUTE (harness id + pinned model) NARROWED to the slot's pinned credential
+# profile whenever the row pins one, exactly as the dispatcher asks it
+# (`review_execution`: a pin is strict, so a healthy sibling account must not vouch
+# a spent pin). A row that pins NO profile keeps the route-wide answer: which
+# account an unpinned run lands on is Claudexor's rotation business, so a route
+# whose pool still holds a live account reads healthy — such a slot dispatches
+# (fail-open) and fails typed downstream (B1) if rotation lands it badly. No second
+# health oracle is built here. api_chat rows have no route health source at all and
+# always dispatch. Cursor lanes without quota snapshots simply dispatch too.
 
 
 def _slot_session_route(slot: Any) -> Any:
     """The route an agent_session slot would dispatch on (None when unresolvable —
-    the dispatch path owns that refusal; health has nothing to say about it)."""
+    the dispatch path owns that refusal; health has nothing to say about it).
+
+    Mirrors the dispatcher's own resolution (`review_execution` `_session_route`)
+    including the row's optional credential pin, so health judges the SAME account
+    the run would actually ride. Effort is deliberately NOT mirrored: health reads
+    route identity, model and profile only.
+    """
+    import dataclasses
+
     from ouroboros.review_execution import review_session_route
     from ouroboros.subagents import parse_subagent_harness
 
     spec = str(getattr(slot, "session_target", "") or "")
     if spec:
-        return parse_subagent_harness(spec)
+        route = parse_subagent_harness(spec)
+        pin = str(getattr(slot, "session_profile", "") or "")
+        if route is not None and pin:
+            route = dataclasses.replace(route, profile_id=pin)
+        return route
     return review_session_route()
 
 
@@ -470,10 +486,16 @@ def plan_panel_health_snapshot(slots: list) -> Optional[Dict[str, Dict[str, str]
             route = _slot_session_route(slot)
             if route is None:
                 continue
-            key = (route.route_id, route.model)
+            # The PIN is part of the subject, so it is part of the memo key: two
+            # rows on the same harness+model but different accounts must never
+            # share one verdict (a spent pin would otherwise be vouched for by a
+            # sibling's health, or vice versa).
+            pin = str(getattr(route, "profile_id", "") or "")
+            key = (route.route_id, route.model, pin)
             if key not in by_route:
                 by_route[key] = route_health(gateway, route.route_id, shape,
-                                             route_model=route.model)
+                                             route_model=route.model,
+                                             pinned_profile=pin)
             code = _structural_skip_code(*by_route[key])
             if code:
                 evidence[str(getattr(slot, "slot_id", "") or "")] = {
@@ -502,6 +524,13 @@ def plan_health_skip_rows(slots: list, evidence: Optional[Dict[str, Dict[str, st
             live.append(slot)
             continue
         code, reset = str(ev.get("failure_code") or ""), str(ev.get("reset_at") or "")
+        pin = str(getattr(slot, "session_profile", "") or "")
+        scope = (
+            f"Evidence is scoped to this slot's pinned credential profile {pin!r}."
+            if pin else
+            "Evidence is route-wide: this slot pins no credential profile, so the "
+            "answer covers the route's rotation pool rather than one account."
+        )
         rows.append({
             "slot_id": str(getattr(slot, "slot_id", "") or ""),
             "model": str(getattr(slot, "model", "") or ""),
@@ -510,8 +539,7 @@ def plan_health_skip_rows(slots: list, evidence: Optional[Dict[str, Dict[str, st
             "error": (
                 f"health_skip[{code}]: the pre-fan-out panel health snapshot shows this "
                 f"slot's delegated route window spent{f' (resets {reset})' if reset else ''}; "
-                "skipped before dispatch at $0. Route-level evidence only: the snapshot "
-                "judges the whole route, not a pinned credential profile."
+                f"skipped before dispatch at $0. {scope}"
             ),
             "failure_code": code, "reset_at": reset,
             "prompt_ref": {}, "response_ref": {}, "tokens_in": 0, "tokens_out": 0, "cost": 0.0,

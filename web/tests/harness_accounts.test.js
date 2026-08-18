@@ -1307,7 +1307,10 @@ test('each row projection is gated by ITS OWN facet, and a stale value says it i
     const fresh = accountRowFacts(row, payload, { accountsRead: 'ok', quotaRead: 'ok' });
     assert.equal(fresh.badge.tone, 'ok');
     assert.equal(fresh.badge.label, 'Verified live');
-    assert.equal(fresh.name, 'Default CLI login');
+    // Honest naming (unified-accounts sprint): the retired "Default CLI
+    // login" claimed a separate account TYPE; an identity-less legacy
+    // pseudo-row is simply the default account.
+    assert.equal(fresh.name, 'Default account');
     assert.equal(fresh.quota.exhausted, true);
     assert.match(fresh.quota.label, /^Limit reached/);
     assert.match(fresh.meta, /Limit reached/);
