@@ -33,6 +33,11 @@ import time
 
 import pytest
 
+# Real loopback ports (ThreadingHTTPServer) and a real spawned child process:
+# not parallel-safe under the xdist lane (DEVELOPMENT.md "Parallel CI and the
+# serial marker") — the whole module runs in the serial pass.
+pytestmark = pytest.mark.serial
+
 from ouroboros import claudexor_daemon as owned
 from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
@@ -421,3 +426,23 @@ def test_probe_refuses_typed_when_recovery_outlives_the_window(monkeypatch, tmp_
         manager.stop()
         for server in servers:
             server.shutdown()
+
+
+def test_supervisor_sweep_wiring_passes_a_zero_wait_factory():
+    """The server tick opts OUT of the admission wait at its own call site.
+
+    The call rides inside a broad try/except on the supervisor path, so a
+    signature drift would silently disable orphan reconciliation on every
+    tick instead of failing loudly — pin both halves of the wiring: the
+    reconciler accepts ``gateway_factory`` and server.py passes the
+    zero-admission-wait lambda (triad finding, final gate 2026-08-18).
+    """
+    import inspect
+
+    from ouroboros.delegate_custody import reconcile_orphaned_runs
+
+    assert "gateway_factory" in inspect.signature(reconcile_orphaned_runs).parameters
+    assert "admission_wait_sec" in inspect.signature(owned.ensure_owned_gateway).parameters
+    server_src = (pathlib.Path(__file__).resolve().parents[1] / "server.py").read_text(
+        encoding="utf-8")
+    assert "gateway_factory=lambda: ensure_owned_gateway(admission_wait_sec=0)" in server_src

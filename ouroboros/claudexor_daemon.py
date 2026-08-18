@@ -551,7 +551,10 @@ def ensure_owned_gateway(*, admission_wait_sec: Optional[float] = None) -> Any:
             if remaining > 0:
                 time.sleep(min(_ADMISSION_POLL_SEC, remaining))
                 remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            # A residue thinner than one poll cannot buy a real handshake read:
+            # it would raise a transport-class error and mislabel an expired
+            # admission window, so it counts as expiry (typed, not transport).
+            if remaining < _ADMISSION_POLL_SEC:
                 raise ClaudexorUnavailable(
                     "daemon_recovery_only",
                     "the owned daemon is reachable but still admitting only "
