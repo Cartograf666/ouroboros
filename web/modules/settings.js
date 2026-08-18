@@ -11,7 +11,7 @@ import {
 } from './subagents_settings.js';
 import { initHarnessAccounts } from './harness_accounts.js';
 import { openConfirmDialog } from './confirm_dialog.js';
-import { SECRET_KEYS, bindSecretInputs, bindSettingsTabs, renderSettingsPage } from './settings_ui.js';
+import { PROVIDER_TEST_INPUTS, SECRET_KEYS, bindSecretInputs, bindSettingsTabs, renderSettingsPage } from './settings_ui.js';
 import { showToast } from './toast.js';
 import { escapeHtmlAttr as escapeHtml, formatDualVersion } from './utils.js';
 import { apiClient, apiFetch, cleanExtensionRoute, extensionRoutePath } from './api_client.js';
@@ -70,7 +70,12 @@ function byId(id) {
 }
 
 function applyInputValue(id, value) {
-    byId(id).value = value === undefined || value === null ? '' : value;
+    const el = byId(id);
+    el.value = value === undefined || value === null ? '' : value;
+    // Server-applied snapshot (secrets arrive MASKED): lets the provider-test
+    // handler tell an owner edit apart from the mask, which must never be sent
+    // back as a credential.
+    el.dataset.appliedValue = el.value;
 }
 
 function applyCheckboxValue(id, value) {
@@ -1119,6 +1124,42 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 renderClaudeCodeUi();
                 refreshClaudeCodeStatus();
             });
+        }
+    });
+
+    // Provider credential probe: runs the catalog fetcher against what is typed
+    // in the card right now, so a bad key surfaces here instead of on the first
+    // real task. Values leave the browser only inside this one POST body.
+    page.querySelector('[data-settings-panel="providers"]')?.addEventListener('click', async (event) => {
+        const button = event.target instanceof Element ? event.target.closest('[data-provider-test]') : null;
+        if (!button) return;
+        const provider = button.dataset.providerTest;
+        const status = page.querySelector(`[data-provider-test-status="${provider}"]`);
+        const overrides = {};
+        for (const [inputId, settingKey] of Object.entries(PROVIDER_TEST_INPUTS[provider] || {})) {
+            const input = byId(inputId);
+            const value = (input?.value || '').trim();
+            // Only owner-edited values become overrides: saved secrets render
+            // as MASKED placeholders (gateway mask_settings_secret), and echoing
+            // a mask back as the credential would fail every already-saved key.
+            // An untouched field means "test the saved value server-side".
+            if (value && value !== (input?.dataset.appliedValue ?? '').trim()) {
+                overrides[settingKey] = value;
+            }
+        }
+        button.disabled = true;
+        if (status) status.textContent = 'Testing…';
+        try {
+            const data = await apiClient.providerTest({ provider_id: provider, overrides });
+            if (status) {
+                status.textContent = data.ok
+                    ? `OK — ${data.model_count} model(s)`
+                    : `Failed: ${data.error} (${data.stage})`;
+            }
+        } catch (error) {
+            if (status) status.textContent = `Failed: ${String(error?.message || error || 'unknown error')}`;
+        } finally {
+            button.disabled = false;
         }
     });
 

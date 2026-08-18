@@ -1,0 +1,126 @@
+"""Settings-page provider credential probe (POST /api/providers/test).
+
+The endpoint exercises the ordinary catalog fetcher with entered-but-unsaved
+values so a bad key is caught at paste time rather than on the first real task.
+All literals here are placeholders that cannot be mistaken for real credentials.
+"""
+
+import asyncio
+import json
+import pathlib
+
+import httpx
+import ouroboros.gateway.models as model_catalog_api
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+WEB = REPO_ROOT / "web" / "modules"
+
+
+class _Request:
+    def __init__(self, payload):
+        self._payload = payload
+
+    async def json(self):
+        return self._payload
+
+
+def _post(payload):
+    response = asyncio.run(model_catalog_api.api_provider_test(_Request(payload)))
+    return response.status_code, json.loads(response.body.decode("utf-8"))
+
+
+def test_provider_test_uses_unsaved_overrides(monkeypatch):
+    monkeypatch.setattr(model_catalog_api, "load_settings", lambda: {})
+    captured = {}
+
+    async def fake_compatible(_client, provider_id, provider_label, api_key, base_url):
+        captured.update({"api_key": api_key, "base_url": base_url})
+        return [
+            model_catalog_api._build_model_catalog_entry(provider_id, provider_label, "model-a", "model-a"),
+            model_catalog_api._build_model_catalog_entry(provider_id, provider_label, "model-b", "model-b"),
+        ]
+
+    monkeypatch.setattr(model_catalog_api, "_fetch_openai_compatible_model_catalog", fake_compatible)
+
+    status, payload = _post({
+        "provider_id": "openai-compatible",
+        "overrides": {
+            "OPENAI_COMPATIBLE_API_KEY": "unit-test-credential",
+            "OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-base-url.example/v1",
+        },
+    })
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["model_count"] == 2
+    assert isinstance(payload["duration_ms"], int)
+    assert captured == {
+        "api_key": "unit-test-credential",
+        "base_url": "https://unit-test-base-url.example/v1",
+    }
+
+
+def test_provider_test_rejects_unknown_override_without_echoing_value(monkeypatch):
+    monkeypatch.setattr(model_catalog_api, "load_settings", lambda: {})
+
+    status, payload = _post({
+        "provider_id": "openai-compatible",
+        "overrides": {"OUROBOROS_NOT_A_PROVIDER_KEY": "unit-test-credential"},
+    })
+
+    assert status == 400
+    assert "OUROBOROS_NOT_A_PROVIDER_KEY" in payload["error"]
+    # The rejection names key names only — never the submitted value.
+    assert "unit-test-credential" not in json.dumps(payload)
+
+
+def test_provider_test_requires_a_configured_provider(monkeypatch):
+    monkeypatch.setattr(model_catalog_api, "load_settings", lambda: {})
+
+    status, payload = _post({"provider_id": "openrouter"})
+
+    assert status == 400
+    assert payload["error"] == "provider is not configured (missing key or base URL)"
+
+
+def test_provider_test_reports_fetch_failure_as_ok_false(monkeypatch):
+    monkeypatch.setattr(model_catalog_api, "load_settings", lambda: {})
+
+    async def fake_compatible(_client, _provider_id, _provider_label, _api_key, _base_url):
+        raise httpx.ConnectError("boom")
+
+    monkeypatch.setattr(model_catalog_api, "_fetch_openai_compatible_model_catalog", fake_compatible)
+
+    status, payload = _post({
+        "provider_id": "openai-compatible",
+        "overrides": {"OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-base-url.example/v1"},
+    })
+
+    # The endpoint worked; the provider did not. That is a 200 with ok:false.
+    assert status == 200
+    assert payload["ok"] is False
+    assert payload["stage"] == "connect"
+    assert payload["error"] == "boom"
+
+
+def test_provider_test_route_is_registered():
+    source = (REPO_ROOT / "ouroboros" / "gateway" / "router.py").read_text(encoding="utf-8")
+    assert "api_provider_test," in source
+    assert 'Route("/api/providers/test", endpoint=api_provider_test, methods=["POST"])' in source
+
+
+def test_provider_test_ui_surface_is_wired():
+    settings_ui = (WEB / "settings_ui.js").read_text(encoding="utf-8")
+    settings = (WEB / "settings.js").read_text(encoding="utf-8")
+    api_client = (WEB / "api_client.js").read_text(encoding="utf-8")
+
+    assert 'data-provider-test="${spec.testProvider}">Test</button>' in settings_ui
+    assert 'data-provider-test-status="${spec.testProvider}"' in settings_ui
+    assert "export const PROVIDER_TEST_INPUTS" in settings_ui
+    assert "providerTest: (payload) => jsonPost('/api/providers/test', payload)," in api_client
+    assert "closest('[data-provider-test]')" in settings
+    assert "apiClient.providerTest({ provider_id: provider, overrides })" in settings
+    # Mask-echo guard: saved secrets render masked; only owner-edited values may
+    # become overrides, or every already-saved key would fail its own test.
+    assert "el.dataset.appliedValue = el.value;" in settings
+    assert "value !== (input?.dataset.appliedValue ?? '').trim()" in settings

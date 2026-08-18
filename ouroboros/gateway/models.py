@@ -493,6 +493,72 @@ async def api_openai_compatible_models(request: Request) -> JSONResponse:
         return json_exception(e)
 
 
+# Only provider credential/endpoint keys may be overridden by the Settings Test
+# button; anything else must go through the ordinary settings save path.
+_PROVIDER_TEST_OVERRIDE_KEYS: frozenset[str] = frozenset({
+    "OPENROUTER_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "MINIMAX_API_KEY",
+    "MINIMAX_REGION",
+    "OPENAI_COMPATIBLE_API_KEY",
+    "OPENAI_COMPATIBLE_BASE_URL",
+    "OPENAI_BASE_URL",
+    "CLOUDRU_FOUNDATION_MODELS_API_KEY",
+    "CLOUDRU_FOUNDATION_MODELS_BASE_URL",
+    "GIGACHAT_CREDENTIALS",
+    "GIGACHAT_USER",
+    "GIGACHAT_PASSWORD",
+    "GIGACHAT_SCOPE",
+    "GIGACHAT_BASE_URL",
+    "GIGACHAT_VERIFY_SSL_CERTS",
+})
+
+
+async def api_provider_test(request: Request) -> JSONResponse:
+    """Probe one provider's catalog with entered-but-unsaved credentials.
+
+    A failed fetch is a 200 with ``ok: false`` — the endpoint itself worked and
+    the failure is the answer the owner asked for. Only contract misuse is 4xx.
+    Credential VALUES never appear in the response or in the log line.
+    """
+    try:
+        body = await request.json()
+        provider_id = str(body.get("provider_id", "") or "").strip()
+        if not provider_id:
+            return json_error("provider_id is required", 400)
+
+        overrides = body.get("overrides") or {}
+        if not isinstance(overrides, dict):
+            return json_error("overrides must be an object", 400)
+        unknown = sorted(str(key) for key in overrides if str(key) not in _PROVIDER_TEST_OVERRIDE_KEYS)
+        if unknown:
+            return json_error(f"unsupported override keys: {', '.join(unknown)}", 400)
+
+        merged = dict(load_settings())
+        for key, value in overrides.items():
+            # An empty override means "keep whatever is saved" — masked secret
+            # inputs render blank until the owner retypes them.
+            text = str(value or "").strip()
+            if text:
+                merged[str(key)] = text
+
+        specs = dict(_provider_specs(merged))
+        loader = specs.get(provider_id)
+        if loader is None:
+            return json_error("provider is not configured (missing key or base URL)", 400)
+
+        timeout = httpx.Timeout(_CATALOG_HTTP_TIMEOUT_SEC)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            _, items, error, stage, duration_ms = await _load_provider(client, provider_id, loader)
+
+        if error:
+            return JSONResponse({"ok": False, "error": error, "stage": stage, "duration_ms": duration_ms})
+        return JSONResponse({"ok": True, "model_count": len(items), "duration_ms": duration_ms})
+    except Exception as e:
+        return json_exception(e)
+
+
 async def api_local_model_install_runtime(request: Request) -> JSONResponse:
     """Start an async install of llama-cpp-python into the app-managed interpreter.
 

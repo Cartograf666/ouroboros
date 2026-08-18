@@ -81,6 +81,7 @@ def collect_routes(
         api_local_model_test,
         api_model_catalog,
         api_openai_compatible_models,
+        api_provider_test,
     )
     from ouroboros.gateway.schedules import (
         api_schedules_delete,
@@ -257,6 +258,7 @@ def collect_routes(
         Route("/api/chat/upload", endpoint=api_chat_upload, methods=["POST"]),
         Route("/api/chat/upload", endpoint=api_chat_upload_delete, methods=["DELETE"]),
         Route("/api/openai-compatible/models", endpoint=api_openai_compatible_models, methods=["POST"]),
+        Route("/api/providers/test", endpoint=api_provider_test, methods=["POST"]),
         Route("/api/local-model/start", endpoint=api_local_model_start, methods=["POST"]),
         Route("/api/local-model/stop", endpoint=api_local_model_stop, methods=["POST"]),
         Route("/api/local-model/status", endpoint=api_local_model_status),
