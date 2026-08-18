@@ -1155,21 +1155,24 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         const overrides = collectOverrides();
         button.disabled = true;
         if (status) status.textContent = 'Testing…';
+        // The probe answers for the draft it was given; a draft edited while the
+        // request was in flight would wear a verdict it never earned. Applies to
+        // BOTH outcomes — 4xx contract answers reject through the client and
+        // land in the catch branch, and they are just as draft-dependent.
+        const withDraftNote = (verdict) => (
+            JSON.stringify(collectOverrides()) !== JSON.stringify(overrides)
+                ? `${verdict} — for the previous draft; the fields changed while testing, test again`
+                : verdict
+        );
         try {
             const data = await apiClient.providerTest({ provider_id: provider, overrides });
-            // The probe answered for the draft it was given; a draft edited while
-            // the request was in flight would wear a verdict it never earned.
-            const draftChanged = JSON.stringify(collectOverrides()) !== JSON.stringify(overrides);
             if (status) {
-                const verdict = data.ok
+                status.textContent = withDraftNote(data.ok
                     ? `OK — ${data.model_count} model(s)`
-                    : `Failed: ${data.error} (${data.stage})`;
-                status.textContent = draftChanged
-                    ? `${verdict} — for the previous draft; the fields changed while testing, test again`
-                    : verdict;
+                    : `Failed: ${data.error} (${data.stage})`);
             }
         } catch (error) {
-            if (status) status.textContent = `Failed: ${String(error?.message || error || 'unknown error')}`;
+            if (status) status.textContent = withDraftNote(`Failed: ${String(error?.message || error || 'unknown error')}`);
         } finally {
             button.disabled = false;
         }

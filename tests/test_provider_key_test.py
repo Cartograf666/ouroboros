@@ -93,7 +93,12 @@ def test_provider_test_reports_fetch_failure_as_ok_false(monkeypatch):
 
     status, payload = _post({
         "provider_id": "openai-compatible",
-        "overrides": {"OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-base-url.example/v1"},
+        "overrides": {
+            # The credential rides along: an endpoint override alone is refused
+            # by the exfiltration guard.
+            "OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-base-url.example/v1",
+            "OPENAI_COMPATIBLE_API_KEY": "unit-test-credential",
+        },
     })
 
     # The endpoint worked; the provider did not. That is a 200 with ok:false.
@@ -174,7 +179,12 @@ def test_provider_test_rejects_an_unknown_minimax_region(monkeypatch):
     )
     status, body = _post({
         "provider_id": "minimax",
-        "overrides": {"MINIMAX_REGION": "definitely-not-a-region"},
+        "overrides": {
+            # The credential rides along: a region override alone is refused by
+            # the exfiltration guard (a region change IS an endpoint change).
+            "MINIMAX_REGION": "definitely-not-a-region",
+            "MINIMAX_API_KEY": "unit-test-credential",
+        },
     })
     assert status == 400
     assert "region" in body.get("error", "")
@@ -202,3 +212,99 @@ def test_provider_test_redacts_credentials_from_error_answers(monkeypatch):
     assert status == 200
     assert body["ok"] is False and body["stage"] == "connect"
     assert "unit-test-credential" not in json.dumps(body)
+
+
+def test_provider_test_never_pairs_a_saved_key_with_an_unsaved_endpoint(monkeypatch):
+    # Accepting a caller-supplied base URL alone would send the STORED key to a
+    # server the owner never configured — an exfiltration primitive, not a probe.
+    monkeypatch.setattr(
+        model_catalog_api,
+        "load_settings",
+        lambda: {
+            "OPENAI_COMPATIBLE_API_KEY": "unit-test-credential",
+            "OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-base-url.example/v1",
+        },
+    )
+    status, body = _post({
+        "provider_id": "openai-compatible",
+        "overrides": {"OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-attacker.example/v1"},
+    })
+    assert status == 400
+    assert "re-entering the credential" in body.get("error", "")
+
+    # Same endpoint value as saved: nothing new is being paired — allowed.
+    async def fake_fetch(client, provider_id, provider_label, api_key, base_url):
+        return [{"value": "openai-compatible::unit-test-model"}]
+
+    monkeypatch.setattr(
+        model_catalog_api, "_fetch_openai_compatible_model_catalog", fake_fetch
+    )
+    status, body = _post({
+        "provider_id": "openai-compatible",
+        "overrides": {"OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-base-url.example/v1"},
+    })
+    assert status == 200 and body["ok"] is True
+
+    # New endpoint WITH a re-entered credential: the owner typed both — allowed.
+    status, body = _post({
+        "provider_id": "openai-compatible",
+        "overrides": {
+            "OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-other.example/v1",
+            "OPENAI_COMPATIBLE_API_KEY": "unit-test-other-credential",
+        },
+    })
+    assert status == 200 and body["ok"] is True
+
+
+def test_provider_test_redacts_percent_encoded_credential_forms(monkeypatch):
+    monkeypatch.setattr(
+        model_catalog_api,
+        "load_settings",
+        lambda: {
+            "OPENAI_COMPATIBLE_API_KEY": "unit test credential@x",
+            "OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-base-url.example/v1",
+        },
+    )
+
+    async def exploding(client, provider_id, provider_label, api_key, base_url):
+        import urllib.parse
+
+        raise httpx.ConnectError(
+            "connect to https://"
+            + urllib.parse.quote("unit test credential@x", safe="")
+            + "@host failed"
+        )
+
+    monkeypatch.setattr(
+        model_catalog_api, "_fetch_openai_compatible_model_catalog", exploding
+    )
+    status, body = _post({"provider_id": "openai-compatible"})
+    assert status == 200 and body["ok"] is False
+    joined = json.dumps(body)
+    assert "unit%20test%20credential%40x" not in joined
+    assert "unit test credential@x" not in joined
+
+
+def test_provider_test_constants_stay_in_sync_with_provider_specs():
+    # Both constants are hand-maintained mirrors of _provider_specs; this pin
+    # fails the moment a provider is added there without updating them.
+    import inspect
+
+    settings = {
+        "OPENROUTER_API_KEY": "unit-test-credential",
+        "OPENAI_API_KEY": "unit-test-credential",
+        "ANTHROPIC_API_KEY": "unit-test-credential",
+        "MINIMAX_API_KEY": "unit-test-credential",
+        "OPENAI_COMPATIBLE_API_KEY": "unit-test-credential",
+        "OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-base-url.example/v1",
+        "CLOUDRU_FOUNDATION_MODELS_API_KEY": "unit-test-credential",
+        "GIGACHAT_CREDENTIALS": "unit-test-credential",
+    }
+    emitted = {pid for pid, _loader in model_catalog_api._provider_specs(settings)}
+    assert emitted == set(model_catalog_api._PROVIDER_TEST_KNOWN_IDS)
+
+    source = inspect.getsource(model_catalog_api._provider_specs)
+    for key in model_catalog_api._PROVIDER_TEST_OVERRIDE_KEYS:
+        assert f'"{key}"' in source, f"allowlisted key {key} is not read by _provider_specs"
+    assert model_catalog_api._PROVIDER_TEST_SECRET_KEYS <= model_catalog_api._PROVIDER_TEST_OVERRIDE_KEYS
+    assert set(model_catalog_api._PROVIDER_TEST_ENDPOINT_GUARDS) <= model_catalog_api._PROVIDER_TEST_OVERRIDE_KEYS

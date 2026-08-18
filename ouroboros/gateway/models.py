@@ -521,6 +521,29 @@ _PROVIDER_TEST_KNOWN_IDS: frozenset[str] = frozenset({
     "openai-compatible", "cloudru", "gigachat",
 })
 
+# The credential-class subset of the allowlist: what error redaction scrubs.
+# Redacting every override value would also scrub innocents like 'true' or
+# 'global_en' out of unrelated words in provider error messages.
+_PROVIDER_TEST_SECRET_KEYS: frozenset[str] = frozenset({
+    "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+    "MINIMAX_API_KEY", "OPENAI_COMPATIBLE_API_KEY",
+    "CLOUDRU_FOUNDATION_MODELS_API_KEY", "GIGACHAT_CREDENTIALS",
+    "GIGACHAT_PASSWORD",
+})
+
+# An endpoint-shaping override may never be paired with a SAVED credential:
+# the probe authenticates against whatever endpoint it is given, so accepting
+# a caller-supplied URL/region alone would send the stored key to a server
+# the owner never configured. Changing the endpoint requires re-entering the
+# credential in the same request.
+_PROVIDER_TEST_ENDPOINT_GUARDS: dict[str, tuple[str, ...]] = {
+    "OPENAI_BASE_URL": ("OPENAI_API_KEY",),
+    "OPENAI_COMPATIBLE_BASE_URL": ("OPENAI_COMPATIBLE_API_KEY",),
+    "CLOUDRU_FOUNDATION_MODELS_BASE_URL": ("CLOUDRU_FOUNDATION_MODELS_API_KEY",),
+    "GIGACHAT_BASE_URL": ("GIGACHAT_CREDENTIALS", "GIGACHAT_PASSWORD"),
+    "MINIMAX_REGION": ("MINIMAX_API_KEY",),
+}
+
 
 async def api_provider_test(request: Request) -> JSONResponse:
     """Probe one provider's catalog with entered-but-unsaved credentials.
@@ -552,6 +575,20 @@ async def api_provider_test(request: Request) -> JSONResponse:
             return json_error(f"unsupported override keys: {', '.join(unknown)}", 400)
 
         merged = dict(load_settings())
+        for endpoint_key, credential_keys in _PROVIDER_TEST_ENDPOINT_GUARDS.items():
+            submitted = str(overrides.get(endpoint_key, "") or "").strip()
+            saved = str(merged.get(endpoint_key, "") or "").strip()
+            if (
+                endpoint_key in overrides
+                and submitted
+                and submitted != saved
+                and not any(str(overrides.get(ck, "") or "").strip() for ck in credential_keys)
+            ):
+                return json_error(
+                    "changing the endpoint requires re-entering the credential in the same "
+                    "request: saved keys are never sent to an unsaved endpoint",
+                    400,
+                )
         for key, value in overrides.items():
             # Every submitted override is an explicit owner edit: a non-empty
             # value replaces the saved one, an EMPTY value unsets it (the owner
@@ -573,15 +610,19 @@ async def api_provider_test(request: Request) -> JSONResponse:
         # Not routed through _load_provider: its log line carries the raw
         # exception, and this endpoint promises credential values never reach
         # the response OR the log — provider errors can embed the base URL with
-        # inlined credentials. Redact every secret this probe knows about.
-        secrets = sorted(
-            {
-                str(merged.get(key, "") or "").strip()
-                for key in _PROVIDER_TEST_OVERRIDE_KEYS
-                if len(str(merged.get(key, "") or "").strip()) > 3
-            },
-            key=len, reverse=True,
-        )
+        # inlined credentials. Redaction covers the raw value AND its
+        # percent-encoded spellings, because HTTP clients normalize userinfo
+        # and query values before they ever appear in an error message.
+        import urllib.parse as _urlparse
+
+        secret_forms: set[str] = set()
+        for key in _PROVIDER_TEST_SECRET_KEYS:
+            value = str(merged.get(key, "") or "").strip()
+            if len(value) > 3:
+                secret_forms.add(value)
+                secret_forms.add(_urlparse.quote(value, safe=""))
+                secret_forms.add(_urlparse.quote_plus(value))
+        secrets = sorted(secret_forms, key=len, reverse=True)
 
         def _redacted(text: str) -> str:
             for secret in secrets:
