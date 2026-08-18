@@ -1077,12 +1077,27 @@ def _apply_settings_save_side_effects(
 
 
 async def api_settings_post(request: Request) -> JSONResponse:
+    # Body parse stays on the loop (it is the only await); everything else runs
+    # in a worker thread. The save body is synchronous work — validation, the
+    # disk write, env projection, hot-reload side effects, and (when review
+    # keys changed) NETWORK evidence fetches for the warning surface — and on
+    # the event loop it froze every other request and WebSocket for the whole
+    # save, which read as the entire app hanging on the Save button.
+    try:
+        body = await request.json()
+    except Exception:
+        return unsaved_error("JSON body must be an object.", 400)
+    import asyncio
+
+    return await asyncio.to_thread(_api_settings_post_sync, request, body)
+
+
+def _api_settings_post_sync(request: Request, body: Any) -> JSONResponse:
     # Everything below the write is a POST-commit step. The broad handler at the
     # bottom used to answer a failure there with "400, nothing saved" while the
     # bytes were already on disk; `boundary` is what lets it tell the two apart.
     boundary = CommitBoundary()
     try:
-        body = await request.json()
         if not isinstance(body, dict):
             return unsaved_error("JSON body must be an object.", 400)
         channel_key = "OUROBOROS_UPDATE_CHANNEL"

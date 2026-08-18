@@ -341,3 +341,37 @@ def test_a_lock_held_read_does_not_wait_for_the_lock_it_holds(isolated_settings)
 
     assert settings["TOTAL_BUDGET"] == 42.0
     assert elapsed < 0.5, f"the lock-held read waited {elapsed:.2f}s for a lock it holds"
+
+
+def test_settings_save_body_runs_off_the_event_loop():
+    """The save body is synchronous work — validation, the disk write, env
+    projection, hot-reload side effects, and (when review keys changed)
+    NETWORK evidence fetches for the warning surface. On the event loop it
+    froze every other request and WebSocket for the whole save."""
+    import ast
+    import pathlib
+
+    src = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "ouroboros" / "gateway" / "settings.py"
+    ).read_text(encoding="utf-8")
+    endpoint_text = ""
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "api_settings_post":
+            endpoint_text = ast.unparse(node)
+    assert "asyncio.to_thread(_api_settings_post_sync" in endpoint_text
+
+
+def test_reviewer_slots_reload_does_not_await_the_status_probe():
+    """The shared Claudexor status read can wake a cold daemon and walk model
+    discovery; awaiting it inside reloadReviewerSlots held the Save button
+    (loadSettings awaits that function) hostage for the whole probe. The
+    status surface binding repaints the rows when the snapshot lands."""
+    import pathlib
+
+    source = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "web" / "modules" / "reviewer_slots.js"
+    ).read_text(encoding="utf-8")
+    assert "Promise.resolve(state.store.refresh({ includeModels: true })).catch(() => {});" in source
+    assert "await state.store.refresh" not in source

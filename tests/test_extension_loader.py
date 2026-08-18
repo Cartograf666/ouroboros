@@ -1313,14 +1313,22 @@ def test_reload_all_called_on_settings_save():
     # The reload lives in the extracted post-save side-effects helper; the pin
     # follows the seam so the regression teeth survive the extraction: the
     # endpoint must reach the helper, and the helper must reach the reload.
-    endpoint_text = helper_text = ""
+    endpoint_text = sync_body_text = helper_text = ""
     for node in ast.walk(tree):
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "api_settings_post":
             endpoint_text = ast.unparse(node)
+        if isinstance(node, ast.FunctionDef) and node.name == "_api_settings_post_sync":
+            sync_body_text = ast.unparse(node)
         if isinstance(node, ast.FunctionDef) and node.name == "_apply_settings_save_side_effects":
             helper_text = ast.unparse(node)
-    assert "_apply_settings_save_side_effects" in endpoint_text, (
-        "api_settings_post must invoke the post-save side-effects helper."
+    # The endpoint hands the whole save body to a worker thread (the loop must
+    # not freeze for the save); the chain the pin protects is endpoint -> sync
+    # body -> side-effects helper -> reload.
+    assert "_api_settings_post_sync" in endpoint_text, (
+        "api_settings_post must delegate the save body off the event loop."
+    )
+    assert "_apply_settings_save_side_effects" in sync_body_text, (
+        "the settings save body must invoke the post-save side-effects helper."
     )
     assert "reload_all" in helper_text or "_reload_extensions" in helper_text, (
         "the post-save side-effects helper must call extension_loader.reload_all "

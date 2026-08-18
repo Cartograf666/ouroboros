@@ -732,8 +732,13 @@ export async function reloadReviewerSlots() {
     }
     // ONE status read for the whole app (the accounts panel and the Subagents
     // section share this request; `includeModels` is sticky, so no later read
-    // downgrades the snapshot these selects depend on).
-    await state.store.refresh({ includeModels: true });
+    // downgrades the snapshot these selects depend on). Deliberately NOT
+    // awaited: this read can wake a cold Claudexor daemon and walk per-harness
+    // model discovery, and awaiting it held the Save button (loadSettings
+    // awaits this function) hostage for that whole probe. The rows render now
+    // from the current snapshot; the status surface binding in
+    // initReviewerSlots repaints them when the fresh snapshot lands.
+    Promise.resolve(state.store.refresh({ includeModels: true })).catch(() => {});
     adoptStatusSnapshot();
     renderRows();
 }
