@@ -1835,6 +1835,54 @@ def _resume_interrupted_project_deletions() -> None:
         log.debug("Project deletion recovery failed", exc_info=True)
 
 
+def _startup_worktree_prune() -> None:
+    """Startup hygiene: prune orphaned subagent worktrees (after the custody sweep)."""
+    from supervisor.state import append_jsonl
+
+    try:
+        from ouroboros import subagent_worktrees
+
+        worktree_report = subagent_worktrees.prune_orphans()
+        if worktree_report.get("removed"):
+            append_jsonl(DATA_DIR / "logs" / "events.jsonl", {
+                "ts": utc_now_iso(),
+                "type": "subagent_worktree_prune",
+                "report": worktree_report,
+            })
+    except Exception:
+        log.debug("Subagent worktree prune failed", exc_info=True)
+
+
+def _startup_prune_sweeps() -> None:
+    """Startup hygiene: prune stale task drives/trees and orphaned temp files."""
+    from supervisor.state import append_jsonl
+
+    try:
+        from ouroboros.headless import prune_headless_task_drives, prune_task_drives, prune_task_trees
+        from ouroboros.utils import sweep_stale_temp_files
+
+        prune_report = prune_headless_task_drives(DATA_DIR)
+        task_drive_report = prune_task_drives(DATA_DIR)
+        # Ephemeral task-tree coordination ledgers age out with their terminal root.
+        prune_task_trees(DATA_DIR)
+        # Reap orphaned atomic-write temp files (.*.tmp.*) left by a hard kill.
+        sweep_stale_temp_files(DATA_DIR)
+        if (
+            prune_report.get("pruned")
+            or prune_report.get("errors")
+            or task_drive_report.get("pruned")
+            or task_drive_report.get("errors")
+        ):
+            append_jsonl(DATA_DIR / "logs" / "events.jsonl", {
+                "ts": utc_now_iso(),
+                "type": "headless_task_drive_prune",
+                "report": prune_report,
+                "task_drives": task_drive_report,
+            })
+    except Exception:
+        log.debug("Headless task drive prune failed", exc_info=True)
+
+
 def _run_supervisor(settings: dict) -> None:
     """Initialize and run the supervisor loop. Called in a background thread."""
     global _supervisor_error, _supervisor_thread, _consciousness
@@ -1926,44 +1974,11 @@ def _run_supervisor(settings: dict) -> None:
         spawn_workers(max_workers)
         persist_queue_snapshot(reason="startup")
         _resume_interrupted_project_deletions()
-        try:
-            from ouroboros.headless import prune_headless_task_drives, prune_task_drives, prune_task_trees
-            from ouroboros.utils import sweep_stale_temp_files
-
-            prune_report = prune_headless_task_drives(DATA_DIR)
-            task_drive_report = prune_task_drives(DATA_DIR)
-            # Ephemeral task-tree coordination ledgers age out with their terminal root.
-            prune_task_trees(DATA_DIR)
-            # Reap orphaned atomic-write temp files (.*.tmp.*) left by a hard kill.
-            sweep_stale_temp_files(DATA_DIR)
-            if (
-                prune_report.get("pruned")
-                or prune_report.get("errors")
-                or task_drive_report.get("pruned")
-                or task_drive_report.get("errors")
-            ):
-                append_jsonl(DATA_DIR / "logs" / "events.jsonl", {
-                    "ts": utc_now_iso(),
-                    "type": "headless_task_drive_prune",
-                    "report": prune_report,
-                    "task_drives": task_drive_report,
-                })
-        except Exception:
-            log.debug("Headless task drive prune failed", exc_info=True)
+        # Original startup order preserved: drive prunes, custody sweep (reap
+        # orphaned processes), THEN worktree prune.
+        _startup_prune_sweeps()
         _startup_custody_sweep()
-
-        try:
-            from ouroboros import subagent_worktrees
-
-            worktree_report = subagent_worktrees.prune_orphans()
-            if worktree_report.get("removed"):
-                append_jsonl(DATA_DIR / "logs" / "events.jsonl", {
-                    "ts": utc_now_iso(),
-                    "type": "subagent_worktree_prune",
-                    "report": worktree_report,
-                })
-        except Exception:
-            log.debug("Subagent worktree prune failed", exc_info=True)
+        _startup_worktree_prune()
 
         _prune_delegated_snapshots()
 
