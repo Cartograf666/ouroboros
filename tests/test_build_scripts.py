@@ -1028,7 +1028,7 @@ def test_launcher_preserves_macos_git_setup_path():
     assert 'subprocess.Popen(["xcode-select", "--install"])' in launcher_source
     assert "Install Git (Xcode CLI Tools)" in launcher_source
     assert "Installing... A system dialog may appear." in launcher_source
-    assert '["lsof", "-ti", f"tcp:{port}"]' in launcher_source
+    assert '["lsof", "-nP", "-ti", f"tcp:{port}", "-sTCP:LISTEN"]' in launcher_source
 
 
 def test_cross_platform_build_scripts_are_present():

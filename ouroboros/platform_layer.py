@@ -815,8 +815,14 @@ def kill_process_on_port(port: int) -> None:
                         except (ValueError, ProcessLookupError, PermissionError):
                             pass
         else:
+            # -sTCP:LISTEN scopes the sweep to the listener, mirroring the
+            # Windows branch's LISTENING filter: a bare tcp:PORT selector also
+            # matches ESTABLISHED client sockets, so on browser-mode installs
+            # the sweep would SIGKILL the owner's own browser mid-session.
+            # -nP skips host/port name resolution so a slow resolver cannot
+            # eat the 5s timeout.
             res = subprocess.run(
-                ["lsof", "-ti", f"tcp:{port}"],
+                ["lsof", "-nP", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
                 capture_output=True, text=True, timeout=5,
             )
             for pid_str in res.stdout.strip().split():

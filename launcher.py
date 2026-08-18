@@ -596,8 +596,13 @@ def _kill_stale_on_port(port: int) -> None:
         kill_process_on_port(port)
         return
     try:
+        # -sTCP:LISTEN keeps this a listener sweep: a bare tcp:PORT selector
+        # also matches ESTABLISHED client sockets, and in browser mode the
+        # owner's own browser holds one — sweeping it violates the invariant
+        # documented on _open_browser_detached (the browser is the owner's
+        # application, outside custody). -nP avoids resolver stalls.
         result = subprocess.run(
-            ["lsof", "-ti", f"tcp:{port}"],
+            ["lsof", "-nP", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -1050,13 +1055,15 @@ def _headless_signal_handler(signum, frame) -> None:
     _shutdown_event.set()
 
 
-def _open_browser_detached(url: str) -> None:
+def _open_browser_detached(url: str) -> threading.Thread:
     """Open the default browser without ever blocking the caller.
 
     `webbrowser.open` waits for the child on a stdlib-resolved console
     browser (w3m/lynx or an unrecognized $BROWSER), which would stall the
     keep-alive loop for that browser's lifetime; the URL is already printed,
-    so the open is best-effort and rides a daemon thread.
+    so the open is best-effort and rides a daemon thread. Returns the thread
+    so a short-lived caller (the already-running notice) can bound-join it
+    before process exit would kill the daemon thread under the opener.
 
     DELIBERATE (owner-approved): the opened browser is the USER'S own
     application, intentionally outside process custody and launcher teardown —
@@ -1070,7 +1077,9 @@ def _open_browser_detached(url: str) -> None:
         except Exception:
             log.info("Could not open the default browser for %s", url, exc_info=True)
 
-    threading.Thread(target=_open, name="ouroboros-open-browser", daemon=True).start()
+    thread = threading.Thread(target=_open, name="ouroboros-open-browser", daemon=True)
+    thread.start()
+    return thread
 
 
 def _run_headless_main(url: str, port: int, lifecycle_thread: threading.Thread) -> None:
@@ -1135,10 +1144,18 @@ def main():
     if not acquire_pid_lock():
         log.error("Another instance already running.")
         if _headless:
+            existing_url = f"http://127.0.0.1:{_read_port_file()}"
             print(
-                f"Ouroboros is already running at http://127.0.0.1:{_read_port_file()}",
+                f"Ouroboros is already running at {existing_url}",
                 file=sys.stderr,
             )
+            # Desktop-icon launches have no visible stderr, so the notice
+            # alone reads as "Open does nothing". Surface the running
+            # instance the same way a fresh headless boot would — open the
+            # default browser at it. Bounded join: the open rides a daemon
+            # thread (see _open_browser_detached), and returning immediately
+            # would end the process under the opener before it fires.
+            _open_browser_detached(existing_url).join(timeout=5.0)
             return
         webview.create_window(
             "Ouroboros",
