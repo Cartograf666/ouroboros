@@ -196,31 +196,6 @@ def _env_proof_available() -> bool:
     return os.path.isdir("/proc/self")
 
 
-def _descendants(pid: int) -> List[int]:
-    """Live descendant pids of ``pid``, captured BEFORE any signal: SIGKILLing the root
-    reparents its children to init, after which no parent-walk can find them."""
-    found: List[int] = []
-    frontier = [pid]
-    while frontier:
-        parent = frontier.pop()
-        try:
-            out = subprocess.run(
-                ["pgrep", "-P", str(parent)],
-                capture_output=True, text=True, timeout=3,
-            )
-        except Exception:
-            break
-        for line in (out.stdout or "").splitlines():
-            try:
-                child = int(line.strip())
-            except ValueError:
-                continue
-            if child > 0 and child not in found:
-                found.append(child)
-                frontier.append(child)
-    return found
-
-
 def _signal_pid(pid: int) -> None:
     """Force-kill one pid via the platform layer; every failure mode is answered by the
     liveness read that follows (the primitive swallows per-pid errors)."""
@@ -237,9 +212,9 @@ def _pid_gone(pid: int) -> bool:
 def _revalidate_and_kill(pid: int, server_paths: Set[str], data_dir_values: Set[str]) -> bool:
     """Re-prove ``pid`` from live state and signal the PROVEN ROOT with NOTHING in between: any
     lookup in that gap is a window for the pid to exit and be recycled onto a stranger —
-    ``kill_pid_tree`` runs its own child enumeration, so it follows the direct root signal rather
-    than replacing it. Trees, never process groups: server workers hold their own sessions and a
-    reused pgid reaches bystanders.
+    descendants are therefore captured before revalidation, then the root is signalled directly
+    before those captured children. Trees, never process groups: server workers hold their own
+    sessions and a reused pgid reaches bystanders.
 
     True means CONFIRMED DEAD, not merely signalled: the kill primitives swallow per-pid errors,
     so only a liveness read after the signal can say what it achieved — a pid logged as reaped
@@ -248,7 +223,7 @@ def _revalidate_and_kill(pid: int, server_paths: Set[str], data_dir_values: Set[
     # reparents its children to init, after which no parent-walk finds them. A
     # fork landing after this capture is the next pass's job — that is what the
     # bounded rescans exist for.
-    descendants = _descendants(pid)
+    descendants = _pl.collect_descendant_pids(pid)
     if not _runs_our_server(pid, server_paths) or not _is_launcher_managed(pid, data_dir_values):
         return False
     _signal_pid(pid)

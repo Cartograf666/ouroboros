@@ -15,7 +15,6 @@ import pytest
 from ouroboros import launcher_server_reaper as reaper
 from ouroboros import process_containment as containment
 
-
 REPO = "/opt/Ouroboros/repo"
 DATA = "/opt/Ouroboros/data"
 OURS = f"/opt/Ouroboros/python/bin/python3 {REPO}/server.py"
@@ -239,12 +238,11 @@ def _spy_kill(monkeypatch):
     # The enforcement gate needs a byte-exact env source; the test host may
     # not have /proc, and no test reads real kernel state anyway.
     monkeypatch.setattr(reaper, "_env_proof_available", lambda: True)
-    monkeypatch.setattr(reaper, "_descendants", lambda pid: [])
-    # The proven root is signalled directly; the tree kill is follow-up cleanup.
-    monkeypatch.setattr(reaper, "_signal_pid", lambda pid: killed.append(pid))
     monkeypatch.setattr(
-        "ouroboros.platform_layer.kill_pid_tree", lambda pid, **kw: None,
+        "ouroboros.platform_layer.collect_descendant_pids", lambda pid: [],
     )
+    # The proven root and the descendants captured before it are signalled directly.
+    monkeypatch.setattr(reaper, "_signal_pid", lambda pid: killed.append(pid))
     # Confirmed-dead follows the signal: liveness is answered from the spy so
     # no test outcome depends on which real pids exist on this machine.
     monkeypatch.setattr(reaper, "_pid_gone", lambda pid: pid in killed)
@@ -310,7 +308,9 @@ def test_a_fork_between_passes_is_caught_by_the_rescan(monkeypatch):
     )
     monkeypatch.setattr("ouroboros.platform_layer.IS_WINDOWS", False)
     monkeypatch.setattr(reaper, "_env_proof_available", lambda: True)
-    monkeypatch.setattr(reaper, "_descendants", lambda pid: [])
+    monkeypatch.setattr(
+        "ouroboros.platform_layer.collect_descendant_pids", lambda pid: [],
+    )
     monkeypatch.setattr(reaper, "_pid_gone", lambda pid: pid not in live)
     monkeypatch.setattr(reaper, "_SETTLE_SEC", 0)
     monkeypatch.setattr(reaper, "_CONFIRM_DEADLINE_SEC", 0)
@@ -499,7 +499,9 @@ def test_a_signalled_pid_still_alive_is_a_survivor_not_a_kill(monkeypatch, caplo
     contradict the survivor report from the same generation."""
     signalled = []
     monkeypatch.setattr(reaper, "_env_proof_available", lambda: True)
-    monkeypatch.setattr(reaper, "_descendants", lambda pid: [])
+    monkeypatch.setattr(
+        "ouroboros.platform_layer.collect_descendant_pids", lambda pid: [],
+    )
     monkeypatch.setattr(reaper, "_signal_pid", lambda pid: signalled.append(pid))
     monkeypatch.setattr(reaper, "_pid_gone", lambda pid: False)
     monkeypatch.setattr(reaper, "_SETTLE_SEC", 0)
@@ -528,7 +530,10 @@ def test_descendants_are_captured_before_the_root_signal(monkeypatch):
     parent-walk can find them: capture must precede the signal, and the
     captured children must be signalled too."""
     order = []
-    monkeypatch.setattr(reaper, "_descendants", lambda pid: order.append(("enum", pid)) or [9990902])
+    monkeypatch.setattr(
+        "ouroboros.platform_layer.collect_descendant_pids",
+        lambda pid: order.append(("enum", pid)) or [9990902],
+    )
     monkeypatch.setattr(reaper, "_signal_pid", lambda pid: order.append(("kill", pid)))
     monkeypatch.setattr(reaper, "_pid_gone", lambda pid: True)
     monkeypatch.setattr(reaper, "_SETTLE_SEC", 0)
@@ -545,3 +550,11 @@ def test_descendants_are_captured_before_the_root_signal(monkeypatch):
     data_dir_values = reaper._path_forms(DATA)
     assert reaper._revalidate_and_kill(9990901, server_paths, data_dir_values) is True
     assert order == [("enum", 9990901), ("kill", 9990901), ("kill", 9990902)]
+
+
+def test_descendant_discovery_uses_the_shared_platform_seam():
+    """The reaper owns identity policy, while generic tree discovery stays in
+    platform_layer so its OS behavior cannot drift into a second copy."""
+    source = inspect.getsource(reaper)
+    assert "_pl.collect_descendant_pids(pid)" in source
+    assert "def _descendants(" not in source
