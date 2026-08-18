@@ -1049,9 +1049,16 @@ def _periodic_supervisor_maintenance(last_custody_reap: list, last_review_reconc
 def _reconcile_delegated_runs(running_task_ids: set) -> None:
     """Settle or cancel delegated runs whose owning task is gone (startup + tick)."""
     try:
+        from ouroboros.claudexor_daemon import ensure_owned_gateway
         from ouroboros.delegate_custody import reconcile_orphaned_runs
 
-        outcomes = reconcile_orphaned_runs(DATA_DIR, running_task_ids=running_task_ids)
+        # The tick runs on the supervisor loop thread: a daemon sitting in its
+        # recovery-only admission window must not hold that thread for the default
+        # admission wait — skip-until-next-sweep is this caller's normal posture.
+        outcomes = reconcile_orphaned_runs(
+            DATA_DIR, running_task_ids=running_task_ids,
+            gateway_factory=lambda: ensure_owned_gateway(admission_wait_sec=0),
+        )
         if outcomes:
             log.info("Delegated-run reconciliation handled %d orphan(s): %s", len(outcomes), outcomes)
     except Exception:

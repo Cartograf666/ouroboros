@@ -2457,7 +2457,7 @@ def test_ensure_owned_gateway_reconciles_rotation_on_every_ensure(monkeypatch):
             assert ep is endpoint
             self.handshakes = 0
 
-        def handshake(self):
+        def handshake(self, **_kw):
             self.handshakes += 1
             return {"compatible": True}
 

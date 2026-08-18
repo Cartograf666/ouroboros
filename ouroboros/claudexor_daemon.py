@@ -41,6 +41,16 @@ log = logging.getLogger(__name__)
 _OWNED_DIR_NAME = "claudexor"
 _SPAWN_WAIT_SEC = 20.0
 _SPAWN_POLL_SEC = 0.25
+# Admission, distinct from reachability: a 3.4+ daemon serves the authenticated
+# handshake BEFORE its admission gate (the body says `servingMode`), while every
+# product route answers 503 `daemon_recovery_only` (retryable) until journal
+# recovery completes. Recovery can persist indefinitely (blocked journal
+# partitions), so the wait is bounded and ends in the typed refusal the 503
+# already produces (D28) — never a silent indefinite wait, never a kill of a
+# recovering daemon. The 150 ms cadence is the engine CLI's own.
+_ADMISSION_WAIT_SEC = 5.0
+_ADMISSION_POLL_SEC = 0.15
+
 # Engines at/above this version own the limit-action default themselves
 # (kind-aware "auto" semantics, Clawdexor A6): subscription profiles rotate,
 # metered API keys fail, and the OWNER's explicit choices always win. Blanket
@@ -49,6 +59,19 @@ _SPAWN_POLL_SEC = 0.25
 # is deliberately not CLAUDEXOR_MIN_VERSION (owner decision 5=A: no floor bump).
 _ROTATION_AUTO_SEMANTICS_MIN_VERSION = "3.6.0"
 _ROTATION_RECEIPT_NAME = "claudexor_rotation_provisioning.json"
+
+
+def _handshake_serving_mode(body: Any) -> str:
+    """The handshake's explicit admission mode, '' when the engine says nothing.
+
+    Only an EXPLICIT ``recovery_only`` ever counts as recovering: pre-3.4
+    engines carry no ``servingMode`` at all, and an absent or unknown value must
+    read as normal admission — byte-identical behavior for every engine that
+    predates the field.
+    """
+    if not isinstance(body, dict):
+        return ""
+    return str(body.get("servingMode") or "").strip().lower()
 
 
 def owned_config_dir() -> pathlib.Path:
@@ -162,6 +185,9 @@ class OwnedClaudexorDaemon:
         self._last_error = ""
         self._engine_version = ""
         self._engine_build_sha = ""
+        # The last authenticated handshake's explicit servingMode ('' = the
+        # engine said nothing = normal).
+        self._serving_mode = ""
         # Rotation reconcile (B3): a non-blocking lock dedups CONCURRENT
         # ensures so they never double-POST settings; nothing else is gated.
         self._rotation_lock = threading.Lock()
@@ -188,6 +214,7 @@ class OwnedClaudexorDaemon:
         if not owned_daemon_provisioned():
             self._engine_version = ""
             self._engine_build_sha = ""
+            self._serving_mode = ""
             return None, "not_provisioned", ""
         try:
             endpoint = discover_daemon_at(owned_config_dir())
@@ -199,10 +226,19 @@ class OwnedClaudexorDaemon:
                 self._engine_version = gateway.engine_version
                 engine = handshake.get("engine") if isinstance(handshake.get("engine"), dict) else {}
                 self._engine_build_sha = str(engine.get("sha") or "")
+                # RECORDED, never waited on here: reachable-recovering is still
+                # "running" (the handshake proves identity and liveness), and
+                # admission is a separate, later question (`ensure_owned_gateway`).
+                self._serving_mode = _handshake_serving_mode(handshake)
             return endpoint, "running", ""
         except ClaudexorUnavailable as exc:
             self._engine_version = ""
             self._engine_build_sha = ""
+            # ``_serving_mode`` is deliberately NOT cleared here: this method
+            # also runs unlocked (status polls), so a transient handshake
+            # failure must not clobber a just-recorded mode for concurrent
+            # readers. Failure paths never write the mode; it always holds
+            # the LAST SUCCESSFUL handshake's answer.
             status = int(getattr(exc, "status_code", 0) or 0)
             if status in (401, 403):
                 return None, "foreign_daemon", (
@@ -401,6 +437,14 @@ class OwnedClaudexorDaemon:
                 + (f"; log tail: {tail}" if tail else ""),
             )
 
+    # Spawn-path rotation deferral (the sprint's `_admit_spawned` /
+    # `run_deferred_rotation` pair) was SUPERSEDED at merge by the mainline's
+    # `reconcile_rotation`, which rides EVERY `ensure_owned_gateway` (spawn and
+    # attach), is conditional and idempotent, and treats the recovery-window
+    # 503 as an ordinary retry-next-ensure failure — the same incident class
+    # closed without spawn-time state. REACHABLE stays the whole spawn exit
+    # predicate; the bounded admission wait stays in `ensure_owned_gateway`.
+
     def _terminate_child(self) -> None:
         """Stop and forget the child this manager spawned. Caller holds the lock."""
         proc, self._proc = self._proc, None
@@ -541,7 +585,7 @@ def get_owned_daemon() -> OwnedClaudexorDaemon:
         return _MANAGER
 
 
-def ensure_owned_gateway() -> Any:
+def ensure_owned_gateway(*, admission_wait_sec: Optional[float] = None) -> Any:
     """Return an authenticated gateway to the lazily ensured owned daemon.
 
     This is the explicit start/probe seam — the ONE funnel every consumer
@@ -552,14 +596,70 @@ def ensure_owned_gateway() -> Any:
     use it as a context manager). Daemon stop semantics are unchanged: only
     ``get_owned_daemon().stop()`` may stop a process this manager spawned,
     and it never kills an attached process.
-    """
-    from ouroboros.gateways.claudexor import ClaudexorGateway
 
+    ADMISSION is waited for here — outside the daemon manager's lock, the same
+    way for a fresh spawn and an attach. A daemon whose handshake explicitly
+    says ``servingMode=recovery_only`` answers every product route 503
+    (``daemon_recovery_only``, retryable), so the handshake is re-polled about
+    every 150 ms under a wall-clock deadline of ``admission_wait_sec`` seconds
+    (default ``_ADMISSION_WAIT_SEC``, resolved at call time so tests can shrink
+    it), each poll's read phase bounded by what is left of the window. Expiry
+    raises the SAME typed refusal the 503 produces — the dispatch table already
+    classifies it (auto → native with a loud marker, pin → blocked) — and the
+    recovering daemon is left alive (D28: bounded wait, then typed refusal;
+    never a silent indefinite wait, never a kill). ``admission_wait_sec=0`` is
+    the zero-wait variant for callers that must not stall on ADMISSION: a
+    recovering daemon is an immediate typed refusal there, and the initial
+    handshake below is read-bounded by the same small window. The wait bounds
+    admission only — ``ensure_running``'s own liveness/spawn probes keep their
+    pre-existing finite transport ceilings (connect 5s; they are one identity
+    handshake, not a poll loop), unchanged for every caller of this seam.
+    An expired/failed admission also skips the reconcile: the recovering
+    daemon 503s settings reads anyway, and the next ensure retries it.
+    """
+    from ouroboros.gateways.claudexor import (
+        SHORT_POLL_TIMEOUT_SEC, ClaudexorGateway, ClaudexorUnavailable,
+    )
+
+    wait = _ADMISSION_WAIT_SEC if admission_wait_sec is None else max(
+        0.0, float(admission_wait_sec))
     daemon = get_owned_daemon()
     endpoint = daemon.ensure_running()
     gateway = ClaudexorGateway(endpoint)
     try:
-        gateway.handshake()
+        # Read-bounded: a daemon that accepts the socket but withholds the
+        # handshake must not hold a zero/small-wait caller for the transport's
+        # 60s default read — the sweep's whole posture is "skip, next tick".
+        body = gateway.handshake(timeout_sec=max(wait, SHORT_POLL_TIMEOUT_SEC))
+        deadline = time.monotonic() + wait
+
+        def _expired() -> ClaudexorUnavailable:
+            return ClaudexorUnavailable(
+                "daemon_recovery_only",
+                "the owned daemon is reachable but still admitting only "
+                f"recovery work after {wait:.1f}s; its product routes "
+                "answer 503 (retryable) until journal recovery completes",
+            )
+
+        while _handshake_serving_mode(body) == "recovery_only":
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _expired()
+            time.sleep(min(_ADMISSION_POLL_SEC, remaining))
+            # The WHOLE declared window is usable (proton0 review): the last
+            # read gets the thin residue, floored so a loopback handshake can
+            # still complete — a daemon that admitted normal work at the
+            # window's edge is observed, not discarded. A transport failure
+            # inside that final residue counts as expiry (typed, never a
+            # transport mislabel); a mid-window one propagates unchanged.
+            remaining = deadline - time.monotonic()
+            try:
+                body = gateway.handshake(
+                    timeout_sec=max(remaining, _ADMISSION_POLL_SEC / 3.0))
+            except ClaudexorUnavailable:
+                if deadline - time.monotonic() <= 0:
+                    raise _expired() from None
+                raise
     except Exception:
         gateway.close()
         raise

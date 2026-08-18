@@ -11,7 +11,60 @@ with the module that owns the rows.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List
+
+log = logging.getLogger(__name__)
+
+# The nanny finalization-nudge stamp (B3, owner decision 3A): written by the
+# WORKER at the loop's injection seam through ``delegate_custody.emit`` — only
+# when the composed reminder was NON-EMPTY (the ctx `_nanny_finalization_injected`
+# flag is set even on suppression, so it can never be the signal). Task-scoped
+# (no run_id — the run-custody replay skips it by design); the type keeps the
+# ``delegate_run`` prefix so the custody scan prefilter still yields it. Defined
+# HERE, beside its one reader, because ``delegate_custody`` sits exactly at its
+# module-size ceiling.
+NANNY_NUDGE_STAMP = "delegate_run_nanny_nudge_injected"
+
+# A delegate_start attempt the substrate REFUSED before any invocation was
+# minted (typed route_health blocker). Task-scoped like the stamp above (no
+# run_id/invocation_id — pending-invocation recovery must never sweep it);
+# the ``delegate_run`` prefix keeps the custody scan prefilter yielding it.
+# Post-preflight attempts already leave durable START_REQUESTED rows, so the
+# two together answer "did the nanny TRY?" without a new scan.
+START_BLOCKED = "delegate_run_start_blocked"
+
+
+def record_start_blocked(ctx: Any, task_id: str, reason: str) -> None:
+    """Durably record "delegate_start was attempted and refused typed".
+
+    Fail-soft, same shape as the nudge stamp: a row that cannot land loses only
+    the completion-seam nuance (an attempted nanny might read as nudge-ignoring).
+    """
+    try:
+        from ouroboros import delegate_custody as custody
+
+        custody.emit(custody.custody_root(ctx), START_BLOCKED, {
+            "task_id": str(task_id or ""), "reason": str(reason or "")})
+    except Exception:
+        log.debug("start-blocked row failed", exc_info=True)
+
+
+def record_nanny_nudge_stamp(ctx: Any, task_id: str, nanny_code: str) -> None:
+    """Durably stamp "the finalization nudge was really injected" for this task.
+
+    Synchronous same-process append on the CANONICAL (budget) root — the same
+    root ``task_execution_evidence`` reads back at the completion seam, so the
+    fact needs no supervisor round-trip and no O(history) side scan. Fail-soft:
+    a stamp that cannot land loses only the completion-seam disclosure.
+    """
+    try:
+        from ouroboros import delegate_custody as custody
+
+        custody.emit(custody.custody_root(ctx), NANNY_NUDGE_STAMP, {
+            "task_id": str(task_id or ""), "nanny_code": str(nanny_code or "")})
+    except Exception:
+        log.debug("nanny nudge stamp failed", exc_info=True)
 
 
 def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
@@ -39,6 +92,8 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
     # file IS a positively-established empty state (no row could exist);
     # existing-but-unreadable is not, and _iter_rows swallows its own OSError.
     evidence_read_failed = False
+    nudge_recorded = False
+    start_attempted = False
     _log_path = custody.event_log_path(drive_root)
     try:
         if _log_path.exists():
@@ -49,6 +104,16 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
     for row in custody._iter_rows(_log_path):
         if str(row.get("task_id") or "") != tid:
             continue
+        if str(row.get("type") or "") == NANNY_NUDGE_STAMP:
+            # Task-scoped stamp, no run_id — read here so the completion seam
+            # gets the fact from the scan it already pays for (B3).
+            nudge_recorded = True
+            continue
+        if str(row.get("type") or "") in (START_BLOCKED, custody.START_REQUESTED):
+            # An ATTEMPT is evidence of obedience even when nothing started:
+            # a typed pre-mint refusal (START_BLOCKED) or a durable request
+            # whose POST then failed (START_REQUESTED with no STARTED row).
+            start_attempted = True
         run_id = str(row.get("run_id") or "")
         if not run_id:
             continue
@@ -105,6 +170,14 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
         # True only when the canonical log EXISTS but could not be opened —
         # zero counts are then "unknown", not "established" (additive key).
         "evidence_read_failed": evidence_read_failed,
+        # B3 (additive key): a non-empty finalization nudge was durably stamped
+        # for this task. The completion seam combines it with completed status
+        # + zero started runs into the typed substrate disclosure.
+        "nanny_nudge_recorded": nudge_recorded,
+        # Additive: ANY durable delegate_start attempt (blocked-typed or
+        # requested), started or not. The seam reads it so a nanny the
+        # substrate refused is never disclosed as having ignored the nudge.
+        "delegate_start_attempted": start_attempted or bool(started | settled),
         "subscription_cost_usd": round(cost_total, 6) if (settled and cost_known) else None,
         # The settlement row's own estimated/final distinction, carried instead of
         # dropped: an estimated sum must never render as an exact receipt.
@@ -113,4 +186,5 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
     }
 
 
-__all__ = ["task_execution_evidence"]
+__all__ = ["NANNY_NUDGE_STAMP", "START_BLOCKED", "record_nanny_nudge_stamp",
+           "record_start_blocked", "task_execution_evidence"]

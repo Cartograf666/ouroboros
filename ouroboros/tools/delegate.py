@@ -669,6 +669,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                     bucket: Optional[str] = None, skill_name: Optional[str] = None,
                     _resolved_binding: Any = None) -> str:
     from ouroboros.claudexor_daemon import ensure_owned_gateway
+    from ouroboros.delegate_evidence import record_start_blocked
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
     from ouroboros.subagents import (
         get_subagent_harness, resolve_subagent_executor, route_health,
@@ -763,6 +764,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             "harness", route=route, unavailable_reason=unavailable, reset_at=reset_at,
         )
         if resolution.blocked:
+            record_start_blocked(ctx, str(getattr(ctx, "task_id", "") or ""), resolution.reason)
             return _fail(
                 "delegate_start", resolution.reason,
                 "The delegated route cannot run now. This is a typed blocker: do NOT "

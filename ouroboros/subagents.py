@@ -362,6 +362,7 @@ def resolve_subagent_executor(
 
 def route_health(
     gateway: Any, route_id: str, shape: DelegatedRunShape, *, route_model: str = "",
+    pinned_profile: str = "",
 ) -> tuple[str, str]:
     """Return ``(unavailable_reason, reset_at)`` for a route about to run ``shape``.
 
@@ -376,6 +377,13 @@ def route_health(
     judged against the model the run would actually use. A full-window exhaustion that
     names no reset instant still reports ``subscription_window_exhausted`` — as the
     REASON with an empty ``reset_at``, since an unknown healing time is not health.
+
+    ``pinned_profile`` (reviewer-slot rows today) SKIPS the harness-row status
+    refusal AND the ``enabled`` flag beside it: a no-default-credential row reads
+    ``unavailable`` FOREVER by design (agy, INV-135) and commonly ships disabled
+    too — the ENGINE's typed refusal is authoritative for a pinned run (owner
+    2026-08-18; one wasted round trip on a really-disabled harness). Catalog
+    absence, access-profile fit, version floor and quota still apply.
     """
     from ouroboros.config import CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION
     from ouroboros.gateways.claudexor import engine_at_least
@@ -388,8 +396,16 @@ def route_health(
             break
     if entry is None:
         return "route_not_in_capability_catalog", ""
-    if not entry.get("enabled") or str(entry.get("status") or "") != "ok":
-        return f"route_status_{entry.get('status') or 'disabled'}", ""
+    if not pinned_profile and (
+            not entry.get("enabled") or str(entry.get("status") or "") != "ok"):
+        status = f"route_status_{entry.get('status') or 'disabled'}"
+        delegation = entry.get("delegation")
+        if (shape.delegated and isinstance(delegation, dict)
+                and delegation.get("available") is False):
+            # SAME refusal, refined (disclosure, never a new gate): the code carries
+            # the row's structural cannot-delegate fact for downstream wording.
+            return f"{status}:delegation_{delegation.get('reason') or 'unsupported'}", ""
+        return status, ""
     supported = [str(v) for v in entry.get("accessProfilesSupported") or []]
     # A DELEGATED run is externally confined, and the engine rewrites its access to
     # `external_sandbox_full` before admitting it (`RequestRequirementsResolver.adapterAccess`)
@@ -841,7 +857,8 @@ def preflight_native_fallback_dispatch(
         lane_provenance=lane.provenance,
         effective_effort=effective_effort,
         effective_executor="native",
-        reason="; ".join(reasons),
+        reduction_reasons=tuple(reasons),
+        reason=derive_capability_reason(reasons),
         reduced=True,
     )
     return dataclasses.replace(
@@ -855,6 +872,14 @@ def preflight_native_fallback_dispatch(
             executor="native", reason=reason, reset_at="",
         ),
     )
+
+
+def derive_capability_reason(reduction_reasons: Any, substrate_disclosures: Any = ()) -> str:
+    """THE one author of ``CapabilityDelta.reason``: every writer derives the
+    string from the typed lists through this join, so string and lists cannot
+    diverge (B4); old hand-concatenated durable records stay readable, and
+    ``str()`` keeps the join total over stored garbage."""
+    return "; ".join(str(r) for r in [*(reduction_reasons or ()), *(substrate_disclosures or ())])
 
 
 @dataclass(frozen=True)
@@ -892,6 +917,10 @@ class CapabilityDelta:
     effective_executor: str = "native"
     reason: str = ""
     reduced: bool = False
+    # Typed axes behind `reason` (B4, 7A): dispatch vs completion-seam facts are
+    # UNRELATED; `reason` derives from these additive lists.
+    reduction_reasons: tuple = ()
+    substrate_disclosures: tuple = ()
     # A field that was accepted once, is still on durable records, and is now
     # IGNORED — stated here rather than dropped, because a value that silently stops
     # meaning anything is the same class of defect as a reduction nobody announces.
@@ -910,6 +939,8 @@ class CapabilityDelta:
             "effective_executor": self.effective_executor,
             "reason": self.reason,
             "reduced": bool(self.reduced),
+            "reduction_reasons": [str(r) for r in self.reduction_reasons],
+            "substrate_disclosures": [str(s) for s in self.substrate_disclosures],
             "legacy_note": self.legacy_note,
         }
 
@@ -942,6 +973,9 @@ def capability_delta_disclosures(delta: Mapping[str, Any]) -> List[str]:
     effective_executor = str(delta.get("effective_executor") or "")
     if requested_executor != "auto" and effective_executor != requested_executor:
         parts.append(f"executor {requested_executor}->{effective_executor}")
+    # Substrate facts (B4): SEPARATE entries after the slot axes, never spliced.
+    parts.extend(
+        str(fact) for fact in (delta.get("substrate_disclosures") or []) if str(fact))
     return parts
 
 
@@ -1185,7 +1219,8 @@ def resolve_subagent_dispatch(
         effective_effort=effective_effort,
         requested_executor=requested_executor,
         effective_executor=executor,
-        reason="; ".join(reasons),
+        reduction_reasons=tuple(reasons),
+        reason=derive_capability_reason(reasons),
         reduced=bool(reasons),
         legacy_note="; ".join(sorted(legacy_ignored.values())),
     )
@@ -1363,18 +1398,35 @@ def substrate_result_fields(envelope: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _disclose_native_only_substrate(delta: Dict[str, Any]) -> Dict[str, Any]:
+def _disclose_native_only_substrate(
+    delta: Dict[str, Any], *, nudge_ignored: bool = False,
+) -> Dict[str, Any]:
     """A harness dispatch that never started a delegated run is a REDUCED execution.
 
     Surfaced through the EXISTING capability_delta disclosure (owner decision:
-    no new axis). Amends a COPY at the completion seam; the dispatch-time
-    author's dict on the live task stays untouched.
-    """
+    no new axis). Amends a COPY at the completion seam (the live task's dict
+    stays untouched); facts land in ``substrate_disclosures`` and ``reason``
+    re-derives (B4); a pre-lists legacy dict keeps its concatenated shape.
+    ``nudge_ignored`` adds ``nanny_finalized_after_nudge_without_delegation``
+    (3A): the nudge was really INJECTED (durable worker stamp, never the
+    suppression-blind ctx flag) and the child COMPLETED with zero runs."""
     amended = dict(delta or {})
-    reason = str(amended.get("reason") or "")
-    if "delegated_substrate_unused" not in reason:
-        amended["reason"] = "; ".join(
-            part for part in (reason, "delegated_substrate_unused") if part)
+    facts = ["delegated_substrate_unused"]
+    if nudge_ignored:
+        facts.append("nanny_finalized_after_nudge_without_delegation")
+    disclosures = [str(s) for s in (amended.get("substrate_disclosures") or [])]
+    disclosures.extend(fact for fact in facts if fact not in disclosures)
+    amended["substrate_disclosures"] = disclosures
+    reduction = amended.get("reduction_reasons")
+    if isinstance(reduction, list):
+        amended["reason"] = derive_capability_reason(reduction, disclosures)
+    else:
+        # Legacy string-only record: preserve the historical concatenation idempotently.
+        reason = str(amended.get("reason") or "")
+        for fact in facts:
+            if fact not in reason:
+                reason = "; ".join(part for part in (reason, fact) if part)
+        amended["reason"] = reason
     amended["reduced"] = True
     return amended
 
@@ -1426,16 +1478,22 @@ def envelope_from_task(
     """
     usage = usage or {}
     evidence = _execution_evidence_for_task(task, status)
-    # Unreadable custody log: the zero counts are UNKNOWN, not established
-    # facts — no substrate claim and no reduction amendment (the docs/JSDoc
-    # contract; omission keeps the enum vocabulary closed).
+    # Unreadable custody log: zero counts are UNKNOWN — no substrate claim, no
+    # reduction amendment (docs/JSDoc contract; omission keeps the enum closed).
     claimable = evidence is not None and not evidence.get("evidence_read_failed")
     substrate = actual_substrate(evidence) if claimable else ""
     capability_delta = task.get("capability_delta") if isinstance(task.get("capability_delta"), dict) else {}
     if substrate == SUBSTRATE_NATIVE_ONLY and str(task.get("effective_executor") or "") == "harness":
-        # Q1A: a harness dispatch that ended native_only must not present as a
-        # clean un-reduced execution — the envelope carries the amended copy.
-        capability_delta = _disclose_native_only_substrate(capability_delta)
+        # Q1A: a harness dispatch that ended native_only carries the amended
+        # copy. B3: only COMPLETED + the durable stamp + ZERO durable attempts
+        # (a nanny refused typed after TRYING delegate_start did not ignore
+        # the nudge — this stays an obedience fact, never an accusation).
+        capability_delta = _disclose_native_only_substrate(
+            capability_delta,
+            nudge_ignored=(str(status or "") == "completed"
+                           and bool(evidence.get("nanny_nudge_recorded"))
+                           and not evidence.get("delegate_start_attempted")),
+        )
     return build_subagent_envelope(
         task_id=str(task.get("id") or ""),
         parent_task_id=str(task.get("parent_task_id") or ""),
