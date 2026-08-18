@@ -13,8 +13,6 @@ on every CI platform; ``subprocess.run`` and the kill primitives are faked, so
 no real process is touched.
 """
 
-import types
-
 import ouroboros.platform_layer as platform_layer
 
 
@@ -78,7 +76,7 @@ def test_launcher_stale_sweep_scopes_lsof_to_listeners(monkeypatch):
     monkeypatch.setattr(launcher, "IS_WINDOWS", False)
     monkeypatch.setattr(launcher.subprocess, "run", fake_run)
     monkeypatch.setattr(launcher, "force_kill_pid", lambda pid: seen["killed"].append(pid))
-    # The unscoped-fallback path must not fire when lsof succeeds.
+    # The except-branch fallback must not fire when lsof succeeds.
     monkeypatch.setattr(
         launcher,
         "kill_process_on_port",

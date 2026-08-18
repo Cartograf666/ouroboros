@@ -1144,7 +1144,18 @@ def main():
     if not acquire_pid_lock():
         log.error("Another instance already running.")
         if _headless:
-            existing_url = f"http://127.0.0.1:{_read_port_file()}"
+            # The lock loss usually races the FIRST launcher's bootstrap
+            # (repeated Open clicks): the port file may be absent (unlinked
+            # pre-start) or stale from an older run on another port. Poll
+            # briefly for a healthy server, re-reading the file between
+            # probes, so Open during bootstrap lands on the live UI; on
+            # timeout fall back to the last-read port (best-effort notice).
+            port = _read_port_file()
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not _wait_for_server(port, timeout=1.0):
+                time.sleep(0.5)
+                port = _read_port_file()
+            existing_url = f"http://127.0.0.1:{port}"
             print(
                 f"Ouroboros is already running at {existing_url}",
                 file=sys.stderr,

@@ -489,6 +489,7 @@ def test_headless_already_running_opens_browser_at_existing_url(monkeypatch, cap
     monkeypatch.setattr(launcher, "_headless", True)
     monkeypatch.setattr(launcher, "acquire_pid_lock", lambda: False)
     monkeypatch.setattr(launcher, "_read_port_file", lambda: 8123)
+    monkeypatch.setattr(launcher, "_wait_for_server", lambda port, timeout=1.0: True)
     monkeypatch.setattr(
         launcher,
         "_open_browser_detached",
@@ -503,6 +504,43 @@ def test_headless_already_running_opens_browser_at_existing_url(monkeypatch, cap
         "browser (GenericBrowser) would hang the notice process forever"
     )
     assert "already running at http://127.0.0.1:8123" in capsys.readouterr().err
+
+
+def test_headless_already_running_rereads_stale_port_file(monkeypatch):
+    """Open during the first launcher's bootstrap must land on the live port.
+
+    The lock loss usually races bootstrap: the port file can be absent or
+    stale (an older run's port) at first read. The branch polls server
+    health and re-reads the file between probes, so a mid-bootstrap Open
+    opens the port the server actually bound instead of a dead one."""
+    import launcher
+
+    opened: list = []
+    ports = iter([9999, 9999, 8123])  # stale, stale, freshly written
+    health: dict = {9999: False, 8123: True}
+
+    class _FakeThread:
+        def join(self, timeout=None):
+            pass
+
+    monkeypatch.setattr(launcher, "IS_WINDOWS", False)
+    monkeypatch.setattr(launcher, "_detect_headless", lambda: None)
+    monkeypatch.setattr(launcher, "_headless", True)
+    monkeypatch.setattr(launcher, "acquire_pid_lock", lambda: False)
+    monkeypatch.setattr(launcher, "_read_port_file", lambda: next(ports))
+    monkeypatch.setattr(
+        launcher, "_wait_for_server", lambda port, timeout=1.0: health[port]
+    )
+    monkeypatch.setattr(launcher.time, "sleep", lambda s: None)
+    monkeypatch.setattr(
+        launcher,
+        "_open_browser_detached",
+        lambda url: opened.append(url) or _FakeThread(),
+    )
+
+    launcher.main()
+
+    assert opened == ["http://127.0.0.1:8123"]
 
 
 def test_open_browser_detached_returns_joinable_thread(monkeypatch):
