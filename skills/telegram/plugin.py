@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import os
 import pathlib
@@ -109,7 +108,6 @@ def _build_menu_keyboard(command_mode: str, lang: str = "en") -> tuple[str, list
         ],
         [
             {"text": "📋 Задачи" if lang == "ru" else "📋 Tasks", "callback_data": "nav:tasks"},
-            {"text": "🤖 Модель" if lang == "ru" else "🤖 Model", "callback_data": "nav:model"},
         ],
         [
             {"text": t["btn_settings"], "callback_data": "nav:settings"},
@@ -117,115 +115,6 @@ def _build_menu_keyboard(command_mode: str, lang: str = "en") -> tuple[str, list
     ]
     return header, keyboard
 
-
-def _telegram_model_token(value: str) -> str:
-    """Compact callback token (Telegram limits callback_data to 64 bytes)."""
-    raw = str(value or "").encode("utf-8")
-    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=") or "main"
-
-
-def _telegram_model_from_token(token: str) -> str | None:
-    token = str(token or "").strip()
-    if token == "main":
-        return ""
-    if not token or len(token) > 128 or not re.fullmatch(r"[A-Za-z0-9_-]+", token):
-        return None
-    try:
-        decoded = base64.urlsafe_b64decode(token + ("=" * (-len(token) % 4))).decode("utf-8")
-    except Exception:
-        return None
-    return decoded if len(decoded) <= 200 else None
-
-
-def _telegram_model_label(value: str, settings: Dict[str, Any], local_status: Dict[str, Any]) -> str:
-    value = str(value or "").strip()
-    if value == "local-model":
-        local_name = str(local_status.get("model_name") or local_status.get("model_path") or "Local model")
-        local_name = pathlib.Path(local_name).name.removesuffix(".gguf")
-        return f"🖥 Local · {local_name}"
-    if not value:
-        value = str(settings.get("OUROBOROS_MODEL") or "")
-        prefix = "🌐 Main · "
-    else:
-        prefix = "☁️ "
-    display = value.replace("::", "/").split("/")[-1].removeprefix("models/")
-    if not display:
-        display = "configured route"
-    display = display.replace("-", " ")
-    return prefix + " ".join(part.upper() if part.replace(".", "", 1).isdigit() else part.capitalize()
-                              for part in display.split())
-
-
-async def _load_telegram_model_choices(api) -> list[Dict[str, str]]:
-    """Build a small, actionable picker from current core routes + local health."""
-    telegram_settings = _load_settings(api)
-    core_settings: Dict[str, Any] = {}
-    local_status: Dict[str, Any] = {}
-    try:
-        info = api.get_runtime_info()
-        port = int(info.get("server_port") or 0) if isinstance(info, dict) else 0
-    except Exception:
-        port = 0
-    if 1 <= port <= 65_535:
-        try:
-            async with httpx.AsyncClient(timeout=2.5, trust_env=False, follow_redirects=False) as client:
-                settings_response, local_response = await asyncio.gather(
-                    client.get(f"http://127.0.0.1:{port}/api/settings", headers={"Cache-Control": "no-store"}),
-                    client.get(f"http://127.0.0.1:{port}/api/local-model/status", headers={"Cache-Control": "no-store"}),
-                    return_exceptions=True,
-                )
-            if not isinstance(settings_response, Exception) and settings_response.status_code == 200:
-                payload = settings_response.json()
-                if isinstance(payload, dict):
-                    core_settings = payload
-            if not isinstance(local_response, Exception) and local_response.status_code == 200:
-                payload = local_response.json()
-                if isinstance(payload, dict):
-                    local_status = payload
-        except Exception:
-            pass
-
-    values: list[str] = [""]
-    for key in ("OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY", "OUROBOROS_MODEL_LIGHT"):
-        value = str(core_settings.get(key) or "").strip()
-        if value and value not in values:
-            values.append(value)
-    for value in str(core_settings.get("OUROBOROS_MODEL_FALLBACKS") or "").split():
-        value = value.strip()
-        if value and value not in values:
-            values.append(value)
-    selected = str(telegram_settings.get("TELEGRAM_MODEL") or "").strip()
-    if selected and selected not in values:
-        values.append(selected)
-    local_ready = str(local_status.get("status") or "").lower() == "ready"
-    local_fallback = "local-model" in values or str(core_settings.get("USE_LOCAL_FALLBACK") or "").lower() in {"1", "true", "yes", "on"}
-    if local_ready or local_fallback:
-        values.append("local-model")
-
-    choices: list[Dict[str, str]] = []
-    seen: set[str] = set()
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        choices.append({"value": value, "label": _telegram_model_label(value, core_settings, local_status)})
-    return choices
-
-
-def _build_model_keyboard(settings: Dict[str, Any], choices: list[Dict[str, str]], lang: str = "en") -> tuple[str, list[list[dict]]]:
-    selected = str(settings.get("TELEGRAM_MODEL") or "").strip()
-    current = next((item["label"] for item in choices if item.get("value") == selected), "🌐 Main")
-    header = (f"🤖 Модель Telegram: {current}\nВыбор действует для следующих сообщений."
-              if lang == "ru" else
-              f"🤖 Telegram model: {current}\nThis applies to the next messages.")
-    rows = []
-    for item in choices:
-        value = str(item.get("value") or "")
-        marker = "✅ " if value == selected else ""
-        rows.append([{"text": marker + str(item.get("label") or value),
-                      "callback_data": f"model_set:{_telegram_model_token(value)}"}])
-    rows.append([{ "text": _LOCALIZED_TEXTS[lang]["btn_back"], "callback_data": "nav:menu" }])
-    return header, rows
 
 
 def _build_menu_status(command_mode: str, lang: str = "en", info_text: str = "") -> tuple[str, list[list[dict]]]:
@@ -310,7 +199,6 @@ def _bot_commands(command_mode: str) -> list:
     here just makes them discoverable/tappable (no new authority)."""
     cmds = [
         {"command": "menu", "description": "Interactive panel / Меню"},
-        {"command": "model", "description": "Choose reply model / Выбрать модель"},
         {"command": "language", "description": "Select language / Выбор языка"},
         {"command": "status", "description": "Request status / Статус"},
         {"command": "help", "description": "Usage guide / Справка"},
@@ -773,10 +661,6 @@ async def _handle_callback_query(
                 _build_menu_tasks, api, command_mode, lang
             )
             await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
-        elif target == "model":
-            choices = await _load_telegram_model_choices(api)
-            header, keyboard = _build_model_keyboard(_load_settings(api), choices, lang)
-            await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
         elif target == "settings":
             header, keyboard = _build_menu_settings(api, command_mode, lang)
             await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
@@ -862,28 +746,6 @@ async def _handle_callback_query(
             await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
             return lang
 
-    if cb_data.startswith("model_set:"):
-        selected_model = _telegram_model_from_token(cb_data.split(":", 1)[1])
-        choices = await _load_telegram_model_choices(api)
-        allowed_models = {str(item.get("value") or "") for item in choices}
-        if selected_model is None or selected_model not in allowed_models:
-            await client.answer_callback_query(
-                cb_id,
-                text=("Модель больше недоступна; обновите меню." if lang == "ru" else "That model is no longer available; reopen the menu."),
-            )
-            return lang
-        merge_settings(pathlib.Path(api.get_state_dir()), {
-            "TELEGRAM_MODEL": selected_model,
-            "TELEGRAM_USE_LOCAL_MODEL": "on" if selected_model == "local-model" else "off",
-        })
-        await client.answer_callback_query(
-            cb_id,
-            text=("Модель сохранена." if lang == "ru" else "Model saved."),
-        )
-        header, keyboard = _build_model_keyboard(_load_settings(api), choices, lang)
-        await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
-        return lang
-
     if cb_data.startswith("set_budget:"):
         await client.answer_callback_query(
             cb_id,
@@ -949,12 +811,6 @@ async def _poller(api) -> None:
                     # Handle /model locally — it only changes the Telegram
                     # reply route and never forwards a slash command to the
                     # agent.
-                    is_model_cmd = _is_exact_bot_command(cleaned_text, "/model")
-                    if is_model_cmd:
-                        choices = await _load_telegram_model_choices(api)
-                        header, keyboard = _build_model_keyboard(_load_settings(api), choices, lang)
-                        await client.send_message_with_inline_keyboard(chat_id, header, keyboard)
-                        continue
 
                     # Handle /language command locally — always allowed
                     is_lang_cmd = _is_exact_bot_command(cleaned_text, "/language")
