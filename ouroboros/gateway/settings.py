@@ -322,6 +322,10 @@ async def _json_body_or_empty(request: Request) -> Any:
 
 
 def _has_running_agent_tasks() -> bool:
+    # Known pre-existing residual: PENDING/RUNNING are read without the queue
+    # lock, so a task mid-handoff (removed from PENDING, not yet in RUNNING)
+    # can be invisible to one snapshot. The context-mode guard tolerates it —
+    # the read races the supervisor thread with or without any settings lock.
     try:
         from supervisor.workers import PENDING, RUNNING, _get_chat_agent
         if PENDING or RUNNING:
