@@ -306,7 +306,11 @@ def preflight_delegate_visibility(
     def _append_reason(delta: CapabilityDelta, note: str, **changes: Any) -> CapabilityDelta:
         from ouroboros.subagents import derive_capability_reason
 
-        reasons = (*delta.reduction_reasons, note)
+        # Seed from the legacy string when the typed list is empty but a reason
+        # exists (a stored pre-lists delta): rebuilding purely from the list
+        # would silently DISCARD that disclosure text (P1).
+        base = delta.reduction_reasons or ((delta.reason,) if delta.reason else ())
+        reasons = (*base, note)
         return dataclasses.replace(
             delta, reduction_reasons=reasons,
             reason=derive_capability_reason(reasons, delta.substrate_disclosures),
