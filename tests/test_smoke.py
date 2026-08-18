@@ -102,7 +102,8 @@ EXPECTED_TOOLS = [
     "run_ci_tests",
     "advisory_review", "review_status",
     "compact_context", "set_tool_timeout", "request_restart",
-    "promote_to_stable", "schedule_subagent", "integrate_subagent_patch", "compare_subagent_patches",
+    "promote_to_stable", "schedule_subagent", "schedule_followup",
+    "integrate_subagent_patch", "compare_subagent_patches",
     # C1: the explicit acceptance seam for a delegated run's captured patch —
     # a first-class tool, so the registry contract must name it.
     "integrate_delegated_patch", "cancel_task",
