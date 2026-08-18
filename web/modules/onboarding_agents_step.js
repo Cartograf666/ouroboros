@@ -39,12 +39,12 @@ import { claudexorStatus, accountRows, familyLabel } from './claudexor_status_st
 import { LOGIN_CARD_FULL, createLoginCardController } from './harness_login_cards.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
-// The families the RATIFIED install matrix covers. Since agy (Antigravity)
+// The families the declarative install policy currently assigns. Since agy (Antigravity)
 // joined the compiler's PRESET_HARNESSES this list is deliberately NARROWER
-// than that tuple: agy is recognized but has no matrix rows yet (its seats are
+// than that tuple: agy is recognized but has no assigned seats yet (its seats are
 // an owner decision still to be dictated — issue #232), and offering a family
 // here whose every combination the compiler refuses would promise something
-// the install cannot deliver. Extend this list together with the matrix rows.
+// the install cannot deliver. Extend this list together with the policy seats.
 export const AGENT_FAMILIES = [
     { harness: 'claude', label: 'Claude Code' },
     { harness: 'codex', label: 'Codex' },

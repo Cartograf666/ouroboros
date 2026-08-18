@@ -317,11 +317,13 @@ async def ws_endpoint(websocket: WebSocket) -> None:
             payload = msg.get("content", "") if msg_type == "chat" else msg.get("cmd", "")
             if msg_type in ("chat", "command") and payload:
                 try:
+                    from ouroboros.client_surface import normalize_client_surface
                     from supervisor.message_bus import get_bridge
 
                     bridge = get_bridge()
                     if msg_type == "chat":
                         force_plan = bool(msg.get("force_plan"))
+                        client_surface = normalize_client_surface(msg.get("client_surface"))
                         image_b64, image_mime, image_caption = _first_image_attachment(
                             msg.get("attachments")
                         )
@@ -340,6 +342,13 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                         uploads = _chat_attachment_uploads(msg.get("attachments"))
                         if uploads:
                             task_metadata["chat_attachment_uploads"] = uploads
+                        if client_surface is not None:
+                            # Sending-surface observables ride task_metadata
+                            # (the force_plan rail): they pass the bus whitelist
+                            # nested, reach direct/ephemeral/queued turns, and
+                            # land in chat.jsonl at the canonical-row writer.
+                            client_surface["received_at"] = utc_now_iso()
+                            task_metadata["client_surface"] = client_surface
                         bridge.ui_send(
                             payload,
                             sender_session_id=str(msg.get("sender_session_id", "") or ""),

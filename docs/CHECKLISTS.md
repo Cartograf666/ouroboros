@@ -730,8 +730,20 @@ authority, and prose outside the array is not parsed.
 - **REVISE_PLAN** — blocking findings at quorum. A disposition can never close it: the agent
   either changes the spec (a new fingerprint, the next paid cycle) or rejects a blocking finding
   with a rationale that rides into that next cycle, where reviewers mark it resolved or still open.
-- **DEGRADED** — no parseable quorum. Not a verdict: re-running the panel is the honest next step,
-  and it consumes no cycle.
+- **DEGRADED** — no parseable quorum. Not a verdict, but the dispatched panel PAID its cycle:
+  the wave records OPEN with each slot's typed failure state (code and reset time when known),
+  the control line reports DEGRADED honestly, and the recorded result replays for free ONLY
+  under all three conditions — an identical envelope, a NON-EMPTY recorded structural
+  lane-health epoch that a fresh snapshot still matches, and an unchanged reviewer roster
+  (slot ids, targets, routes, pinned profiles and EFFORTS). An empty-epoch DEGRADED wave
+  (slots died at dispatch time, no structural snapshot evidence) re-dispatches a PAID panel
+  on the identical envelope; so does a healed or newly dead lane or a changed roster. Only a
+  wave in which no reviewer slot was physically dispatched (typed $0 skip rows only —
+  pre-fan-out health skips included) stays unpaid.
+  When the wave's typed rows prove the quorum STRUCTURALLY unreachable, the wave carries
+  `quorum_unreachable` + the earliest reset: under blocking the finalization gate releases for
+  an agent-chosen honest `blocked_with_evidence` terminal (review stays open, implementation
+  stays held), waiting via a one-shot `schedule_followup` and asking the owner stay open too.
 
 Paid cycles per task are bounded by the owner's `OUROBOROS_REVIEW_MAX_CYCLES` (default 2,
 `unlimited` available). Replaying an identical envelope is free — identical including the

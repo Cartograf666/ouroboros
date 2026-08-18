@@ -144,15 +144,16 @@ def emit_review_cycles_exhausted(
     event_queue: Any, drive_root: Any, *, surface: str, task_id: str,
     cycles_paid: int, cap: int, enforcement: str, **extra: Any,
 ) -> None:
-    """The typed escalation event (D27): queue when live, else durable append.
-
-    Reuses the existing ``log_event`` emitter / ``events.jsonl`` — no new ledger."""
+    """The typed escalation event (D27): the durable ``events.jsonl`` append ALWAYS
+    lands (the live queue path persists only task_checkpoint rows), and a live
+    queue additionally gets the UI push. No new ledger."""
     row = {"type": REASON_REVIEW_CYCLES_EXHAUSTED, "surface": str(surface), "task_id": str(task_id or ""),
            "cycles_paid": int(cycles_paid), "cap": int(cap), "enforcement": str(enforcement or ""), **extra}
     try:
+        stamped = {"ts": utc_now_iso(), **row}
+        if drive_root:
+            append_jsonl(pathlib.Path(str(drive_root)) / "logs" / "events.jsonl", stamped)
         if event_queue is not None:
-            emit_log_event(event_queue, {"ts": utc_now_iso(), **row}, log_label="review cycles")
-        elif drive_root:
-            append_jsonl(pathlib.Path(str(drive_root)) / "logs" / "events.jsonl", {"ts": utc_now_iso(), **row})
+            emit_log_event(event_queue, stamped, log_label="review cycles")
     except Exception:
         log.debug("review_cycles_exhausted emission failed for %s", task_id, exc_info=True)

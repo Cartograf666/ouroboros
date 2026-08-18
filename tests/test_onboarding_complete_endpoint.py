@@ -171,11 +171,11 @@ def test_fresh_install_applies_the_preset_in_one_write(onboarding):
     assert onboarding.calls["snapshot"] == 1  # exactly ONE daemon read
 
     saved = onboarding.saved()
-    assert saved[PRESET_MARKER_KEY] == "1"
+    assert saved[PRESET_MARKER_KEY] == "2"
     assert saved["OUROBOROS_SUBAGENT_HARNESS"] == "claude=claude-opus-5:medium"
     slots = json.loads(saved["OUROBOROS_REVIEWER_SLOTS"])
     assert [row["route"]["target_id"] for row in slots["triad"]] == [
-        "claude=claude-opus-5", "codex=gpt-5.6-sol", "claude=claude-sonnet-5"]
+        "claude=claude-opus-5", "codex=gpt-5.6-sol"]
     assert slots["scope"][0]["route"]["target_id"] == "codex=gpt-5.6-sol"
     assert slots["advisory"]["route"]["target_id"] == "claude=claude-sonnet-5"
     # Everything else of the transaction landed in the SAME file.
@@ -185,6 +185,33 @@ def test_fresh_install_applies_the_preset_in_one_write(onboarding):
     # D-2: the API model slots are untouched by the preset.
     assert saved["OUROBOROS_MODEL"] == "openai/gpt-5.6-luna"
     assert onboarding.calls["supervisor"] == 1
+
+
+def test_antigravity_install_refuses_until_owner_dictates_its_seats(onboarding):
+    onboarding.calls["snapshot_payload"] = {
+        "daemon": {"state": "running"},
+        "harnesses": [{
+            "id": "agy", "status": "ok", "enabled": True,
+            "models": [
+                {"id": "gemini-3.7-flash-low"},
+                {"id": "gemini-3.7-flash-medium"},
+                {"id": "gemini-3.7-flash-high"},
+            ],
+        }],
+        "profiles": {
+            "harnessAccounts": [_profile_account("agy", "google-owner")],
+            "profiles": [_profile("agy", "google-owner", kind="oauth_token")],
+        },
+    }
+
+    response = onboarding.client.post(
+        "/api/onboarding/complete",
+        json={**WIZARD_PAYLOAD, "subscriptionsConnected": True},
+    )
+
+    assert response.status_code == 503, response.text
+    assert response.json()["code"] == "matrix_row_absent"
+    assert not onboarding.settings_path.exists()
 
 
 def test_daemon_unavailable_persists_nothing_and_keeps_the_wizard_open(onboarding):
@@ -214,8 +241,7 @@ def test_unresolvable_model_refuses_before_any_write(onboarding):
     onboarding.calls["snapshot_payload"] = {
         "daemon": {"state": "running"},
         "harnesses": [{"id": "claude", "status": "ok", "enabled": True,
-                       "models": [{"id": "claude-opus-5"}, {"id": "claude-sonnet-5"},
-                                  {"id": "claude-fable-5"}]}],
+                       "models": [{"id": "claude-sonnet-5"}]}],
         "profiles": {"harnessAccounts": [_native_account("claude")]},
     }
 
@@ -351,7 +377,7 @@ def test_an_environment_completion_fact_cannot_close_the_install_window(monkeypa
     assert body["preset"]["applied"] is True
     assert onboarding.calls["snapshot"] == 1, "the daemon was never consulted"
     saved = onboarding.saved()
-    assert saved[PRESET_MARKER_KEY] == "1"
+    assert saved[PRESET_MARKER_KEY] == "2"
     # The endpoint's own timestamp, not the environment's.
     assert saved[ONBOARDING_COMPLETED_KEY] != "2020-01-01T00:00:00Z"
 
@@ -483,7 +509,7 @@ def test_a_post_commit_failure_reports_the_save_that_landed(monkeypatch, onboard
     assert "supervisor refused to start" in body["error"]
     # And the transaction really IS on disk, preset marker included.
     saved = onboarding.saved()
-    assert saved[PRESET_MARKER_KEY] == "1"
+    assert saved[PRESET_MARKER_KEY] == "2"
     assert saved[ONBOARDING_COMPLETED_KEY]
     assert saved["OPENROUTER_API_KEY"] == WIZARD_PAYLOAD["OPENROUTER_API_KEY"]
 
@@ -672,7 +698,7 @@ def _routable_snapshot(accounts, profiles=(), harnesses=None):
             {"id": "claude", "status": "ok", "enabled": True, "models": [{"id": "claude-opus-5"}]},
             {"id": "codex", "status": "ok", "enabled": True, "models": [{"id": "gpt-5.6-sol"}]},
             {"id": "cursor", "status": "ok", "enabled": True,
-             "models": [{"id": "cursor-grok-4.5-high"}]},
+             "models": [{"id": "cursor-grok-4.6-high"}]},
         ],
         "profiles": {"harnessAccounts": list(accounts), "profiles": list(profiles)},
     }
@@ -1137,8 +1163,8 @@ def test_an_unreadable_settings_file_can_never_compare_equal(onboarding, monkeyp
     assert first != second, "an unreadable file must refuse, never satisfy equality"
 
 
-def test_a_connected_agy_account_refuses_typed_until_the_matrix_is_dictated(onboarding):
-    # agy is RECOGNIZED by the preset compiler but has no ratified matrix rows
+def test_a_connected_agy_account_refuses_typed_until_its_policy_is_dictated(onboarding):
+    # agy is RECOGNIZED by the preset compiler but has no assigned policy seats
     # yet (issue #232: the owner dictates its seats separately). A connected
     # agy account at install time must therefore land on the same typed
     # finish-without-defaults wall as any other compiler refusal — never a

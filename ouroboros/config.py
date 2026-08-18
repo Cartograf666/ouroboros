@@ -15,12 +15,10 @@ import time
 from typing import Any, Optional, Sequence
 
 from ouroboros.context_mode_compat import (
-    normalize_and_persist_context_mode_compat,
-    normalize_context_mode,
-    owner_declared_low,
+    normalize_and_persist_context_mode_compat, normalize_context_mode, owner_declared_low,
 )
 from ouroboros.platform_layer import pid_lock_acquire as _compat_pid_lock_acquire, pid_lock_release as _compat_pid_lock_release
-from ouroboros.provider_models import compute_direct_review_models_fallback, local_only_review_route_env, migrate_model_value, review_model_uses_local as review_model_uses_local
+from ouroboros.provider_models import OPENROUTER_DEFAULTS, OPENROUTER_REVIEW_DEFAULTS, compute_direct_review_models_fallback, local_only_review_route_env, migrate_model_value, review_model_uses_local as review_model_uses_local
 from ouroboros.secret_masking import strip_masked_secrets
 from ouroboros.update_channels import UPDATE_SETTINGS_DEFAULTS, normalize_update_channel
 
@@ -92,21 +90,21 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_NETWORK_PASSWORD": "",
     "OUROBOROS_SERVER_HOST": "127.0.0.1",
     "OUROBOROS_HOST_SERVICE_PORT": 8767,
-    "OUROBOROS_MODEL": "x-ai/grok-4.5",
+    "OUROBOROS_MODEL": OPENROUTER_DEFAULTS["main"],
     # Worker lanes; empty means "use OUROBOROS_MODEL" (one model by default, per-lane
     # override optional). HEAVY = mutative first-level subagents; LIGHT = auto/deep bulk.
-    "OUROBOROS_MODEL_HEAVY": "",
-    "OUROBOROS_MODEL_LIGHT": "google/gemini-3.6-flash",
-    "OUROBOROS_MODEL_VISION": "",
+    "OUROBOROS_MODEL_HEAVY": OPENROUTER_DEFAULTS["heavy"],
+    "OUROBOROS_MODEL_LIGHT": OPENROUTER_DEFAULTS["light"],
+    "OUROBOROS_MODEL_VISION": OPENROUTER_DEFAULTS["vision"],
     "OUROBOROS_IMAGE_INPUT_MODE": "auto",
     # Background consciousness is a high-horizon loop, not a cheap helper lane.
-    "OUROBOROS_MODEL_CONSCIOUSNESS": "",
+    "OUROBOROS_MODEL_CONSCIOUSNESS": OPENROUTER_DEFAULTS["consciousness"],
     # Cross-model resilience CHAIN (comma-separated, ordered). A single model is a
     # 1-element chain; empty disables cross-model fallback. Resilience slot — keeps a
     # real default, unlike the worker lanes. (Renamed from the singular MODEL_FALLBACK.)
-    "OUROBOROS_MODEL_FALLBACKS": "openai/gpt-5.6-luna",
-    "OUROBOROS_MODEL_DEEP_SELF_REVIEW": "openai/gpt-5.6-sol-pro",
-    "CLAUDE_CODE_MODEL": "opus[1m]",
+    "OUROBOROS_MODEL_FALLBACKS": OPENROUTER_DEFAULTS["fallback"],
+    "OUROBOROS_MODEL_DEEP_SELF_REVIEW": OPENROUTER_DEFAULTS["deep_self_review"],
+    "CLAUDE_CODE_MODEL": OPENROUTER_REVIEW_DEFAULTS["advisory"],
     "OUROBOROS_MAX_WORKERS": 10,
     "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT": 6,
     "OUROBOROS_MAX_SUBAGENT_DEPTH": 2,
@@ -124,8 +122,8 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # Single owner-facing knob (math SSOT in ouroboros/retention.py); deprecated
     # per-subsystem keys are migrated to this on settings load.
     "OUROBOROS_GC_RETENTION_DAYS": 7,
-    "TOTAL_BUDGET": 10.0,
-    "OUROBOROS_PER_TASK_COST_USD": 20.0,
+    "TOTAL_BUDGET": 200.0,
+    "OUROBOROS_PER_TASK_COST_USD": 50.0,
     # cloud.ru catalog prices are RUB per 1M while the budget is USD. No implicit
     # exchange rate: the owner must explicitly configure the divisor.
     "OUROBOROS_RUB_USD_RATE": "",
@@ -206,7 +204,7 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_GENERATIVE_PROBE": "1",
     "OUROBOROS_GENERATIVE_PROBE_CHARS": "5000000",
     # Pre-commit review: comma-separated provider-tagged model list
-    "OUROBOROS_REVIEW_MODELS": "openai/gpt-5.6-luna,google/gemini-3.6-flash,anthropic/claude-sonnet-5",
+    "OUROBOROS_REVIEW_MODELS": ",".join(OPENROUTER_REVIEW_DEFAULTS["triad"]),
     "OUROBOROS_REVIEWER_SLOTS": "",  # structured slot SSOT (reviewer_slot_config.py); "" = legacy comma keys
     # INSTALL-TIME facts: the agent-preset generation this install received, and WHEN onboarding last completed
     # (recorded on EVERY completion). Endpoint-authored and disk-only — see ENDPOINT_AUTHORED_SETTINGS.
@@ -245,8 +243,8 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "MCP_SERVERS": [],
     "MCP_TOOL_TIMEOUT_SEC": 60,
     # Scope review: one or more reviewer slots; enforcement follows OUROBOROS_REVIEW_ENFORCEMENT.
-    "OUROBOROS_SCOPE_REVIEW_MODELS": "openai/gpt-5.6-terra",
-    "OUROBOROS_SCOPE_REVIEW_MODEL": "openai/gpt-5.6-terra",
+    "OUROBOROS_SCOPE_REVIEW_MODELS": ",".join(OPENROUTER_REVIEW_DEFAULTS["scope"]),
+    "OUROBOROS_SCOPE_REVIEW_MODEL": OPENROUTER_REVIEW_DEFAULTS["scope"][0],
     # DEPRECATED, enforcement-inert (v6.80.0): stored, owner-only (dedicated audited endpoint), but
     # NOTHING consults it — whether the BIBLE P3 blocking scope review applies follows owner-only
     # OUROBOROS_CONTEXT_MODE. Degraded opt-in key: removed.
@@ -1024,9 +1022,7 @@ def get_context_mode() -> str:
     No boot-pin: hot-applies on the next task. The key is dropped from the
     agent-reachable /api/settings POST (P1)."""
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_CONTEXT_MODE"])
-    return normalize_context_mode(
-        os.environ.get("OUROBOROS_CONTEXT_MODE", default_val) or default_val
-    )
+    return normalize_context_mode(os.environ.get("OUROBOROS_CONTEXT_MODE", default_val) or default_val)
 
 
 def get_owner_context_mode() -> str:

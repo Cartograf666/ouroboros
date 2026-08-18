@@ -41,6 +41,39 @@ log = logging.getLogger(__name__)
 _OWNED_DIR_NAME = "claudexor"
 _SPAWN_WAIT_SEC = 20.0
 _SPAWN_POLL_SEC = 0.25
+# Admission, distinct from reachability: a 3.4+ daemon serves the authenticated
+# handshake BEFORE its admission gate (the body says `servingMode`), while every
+# product route answers 503 `daemon_recovery_only` (retryable) until journal
+# recovery completes. Recovery can persist indefinitely (blocked journal
+# partitions), so the wait is bounded and ends in the typed refusal the 503
+# already produces (D28) — never a silent indefinite wait, never a kill of a
+# recovering daemon. The 150 ms cadence is the engine CLI's own.
+_ADMISSION_WAIT_SEC = 5.0
+_ADMISSION_POLL_SEC = 0.15
+
+# Engines at/above this version own the limit-action default themselves
+# (kind-aware "auto" semantics, Clawdexor A6): subscription profiles rotate,
+# metered API keys fail, and the OWNER's explicit choices always win. Blanket
+# "rotate" writes from this side would overwrite that judgment, so reconcile
+# skips those engines entirely. A6 is planned for the 3.6.0 release wave; this
+# is deliberately not CLAUDEXOR_MIN_VERSION (owner decision 5=A: no floor bump).
+_ROTATION_AUTO_SEMANTICS_MIN_VERSION = "3.6.0"
+_ROTATION_RECEIPT_NAME = "claudexor_rotation_provisioning.json"
+
+
+def _handshake_serving_mode(body: Any) -> str:
+    """The handshake's explicit admission mode, '' when the engine says nothing.
+
+    Only an EXPLICIT ``recovery_only`` ever counts as recovering: pre-3.4
+    engines carry no ``servingMode`` at all, and an absent or unknown value must
+    read as normal admission — byte-identical behavior for every engine that
+    predates the field.
+    """
+    if not isinstance(body, dict):
+        return ""
+    return str(body.get("servingMode") or "").strip().lower()
+
+
 def owned_config_dir() -> pathlib.Path:
     """The data-plane root the owned daemon lives under."""
     from ouroboros.config import DATA_DIR
@@ -152,6 +185,12 @@ class OwnedClaudexorDaemon:
         self._last_error = ""
         self._engine_version = ""
         self._engine_build_sha = ""
+        # The last authenticated handshake's explicit servingMode ('' = the
+        # engine said nothing = normal).
+        self._serving_mode = ""
+        # Rotation reconcile (B3): a non-blocking lock dedups CONCURRENT
+        # ensures so they never double-POST settings; nothing else is gated.
+        self._rotation_lock = threading.Lock()
 
     # -- state ------------------------------------------------------------
 
@@ -175,6 +214,7 @@ class OwnedClaudexorDaemon:
         if not owned_daemon_provisioned():
             self._engine_version = ""
             self._engine_build_sha = ""
+            self._serving_mode = ""
             return None, "not_provisioned", ""
         try:
             endpoint = discover_daemon_at(owned_config_dir())
@@ -186,10 +226,19 @@ class OwnedClaudexorDaemon:
                 self._engine_version = gateway.engine_version
                 engine = handshake.get("engine") if isinstance(handshake.get("engine"), dict) else {}
                 self._engine_build_sha = str(engine.get("sha") or "")
+                # RECORDED, never waited on here: reachable-recovering is still
+                # "running" (the handshake proves identity and liveness), and
+                # admission is a separate, later question (`ensure_owned_gateway`).
+                self._serving_mode = _handshake_serving_mode(handshake)
             return endpoint, "running", ""
         except ClaudexorUnavailable as exc:
             self._engine_version = ""
             self._engine_build_sha = ""
+            # ``_serving_mode`` is deliberately NOT cleared here: this method
+            # also runs unlocked (status polls), so a transient handshake
+            # failure must not clobber a just-recorded mode for concurrent
+            # readers. Failure paths never write the mode; it always holds
+            # the LAST SUCCESSFUL handshake's answer.
             status = int(getattr(exc, "status_code", 0) or 0)
             if status in (401, 403):
                 return None, "foreign_daemon", (
@@ -357,7 +406,6 @@ class OwnedClaudexorDaemon:
                 endpoint = self._alive_endpoint()
                 if endpoint is not None:
                     self._last_error = ""
-                    self._enable_rotation(endpoint)
                     return endpoint
                 time.sleep(_SPAWN_POLL_SEC)
             # Two Ouroboros processes can race only on first provisioning: the
@@ -370,7 +418,6 @@ class OwnedClaudexorDaemon:
                 if self._proc.poll() is not None:
                     self._proc = None
                 self._last_error = ""
-                self._enable_rotation(endpoint)
                 return endpoint
             tail = ""
             try:
@@ -390,6 +437,14 @@ class OwnedClaudexorDaemon:
                 + (f"; log tail: {tail}" if tail else ""),
             )
 
+    # Spawn-path rotation deferral (the sprint's `_admit_spawned` /
+    # `run_deferred_rotation` pair) was SUPERSEDED at merge by the mainline's
+    # `reconcile_rotation`, which rides EVERY `ensure_owned_gateway` (spawn and
+    # attach), is conditional and idempotent, and treats the recovery-window
+    # 503 as an ordinary retry-next-ensure failure — the same incident class
+    # closed without spawn-time state. REACHABLE stays the whole spawn exit
+    # predicate; the bounded admission wait stays in `ensure_owned_gateway`.
+
     def _terminate_child(self) -> None:
         """Stop and forget the child this manager spawned. Caller holds the lock."""
         proc, self._proc = self._proc, None
@@ -406,28 +461,109 @@ class OwnedClaudexorDaemon:
         except Exception:
             proc.terminate()
 
-    def _enable_rotation(self, endpoint: Any) -> None:
-        """D28 at provisioning: ONE settings patch turns profile auto-rotation
-        on for every discovered harness (the engine default is fail). Config,
-        not code — the daemon owns the rotation engine; best-effort because a
-        patch failure must not eat the login that provisioned the daemon."""
-        try:
-            from ouroboros.gateways.claudexor import ClaudexorGateway
+    def reconcile_rotation(self, gateway: Any) -> None:
+        """D28 as reconciliation (B3): default the MISSING limit-action
+        policies to "rotate", never touching a persisted one.
 
-            with ClaudexorGateway(endpoint) as gateway:
-                gateway.handshake()
-                harness_ids = [
-                    str(row.get("id") or "")
-                    for row in gateway.agent_capabilities().get("harnesses") or []
-                    if isinstance(row, dict) and row.get("id")
-                ]
-                if harness_ids:
+        The predecessor was a spawn-only best-effort patch: one attempt at
+        provisioning, a bare except, and no read-back — so a race with the
+        daemon's startup "serving recovery only" window failed it forever,
+        attach paths never patched at all, and a harness discovered later was
+        never covered. This runs on EVERY ``ensure_owned_gateway`` instead
+        (owner decision 5=A, literal: no read-path TTL — each ensure does the
+        GET, computes the missing set and POSTs conditionally), against the
+        gateway that ensure just handshook:
+
+        * GET the effective settings snapshot, then POST only when a
+          discovered harness carries NO ``profileLimitAction`` at all — an
+          explicitly persisted ``fail``/``ask``/``rotate`` is the owner's (or
+          the engine's) word and is never overwritten (owner decision 3=A);
+        * skip engines whose version owns kind-aware "auto" defaults (A6+):
+          their judgment is strictly better than a blanket "rotate";
+        * the non-blocking lock exists purely to dedup CONCURRENT ensures —
+          the overlapping caller is covered by the reconcile in flight;
+        * ANY failure — the daemon's typed startup "recovery only" refusal
+          included — simply retries on the next ensure; no special case;
+        * a POST that actually changed policy leaves a durable receipt under
+          ``state/`` naming the daemon and the patched harnesses;
+        * never patches a home ``verify_owned_home`` rejects (never-adopt).
+
+        Best-effort by contract: raises nothing, so a reconcile hiccup can
+        never eat the delegation or login that ensured the daemon.
+        """
+        if not self._rotation_lock.acquire(blocking=False):
+            return  # a concurrent ensure is reconciling right now; it covers us
+        try:
+            try:
+                from ouroboros.gateways.claudexor import engine_at_least
+
+                if engine_at_least(str(getattr(gateway, "engine_version", "") or ""),
+                                   _ROTATION_AUTO_SEMANTICS_MIN_VERSION):
+                    return
+                ownership_problem = verify_owned_home()
+                if ownership_problem:
+                    log.warning("rotation reconcile refused (never-adopt): %s",
+                                ownership_problem)
+                    return
+                snapshot = gateway.get_settings()
+                raw_configured = snapshot.get("harnesses") if isinstance(snapshot, dict) else None
+                if not isinstance(raw_configured, dict):
+                    # Shape drift (no harnesses table, or not a dict): unknown state
+                    # must never read as "nothing persisted" — a blanket POST here
+                    # would overwrite judgments this side simply failed to read.
+                    log.warning(
+                        "rotation reconcile skipped: settings snapshot carries no "
+                        "harnesses dict (engine %s)",
+                        str(getattr(gateway, "engine_version", "") or "unknown"))
+                    return
+                configured = raw_configured
+                missing = []
+                for row in gateway.agent_capabilities().get("harnesses") or []:
+                    hid = str(row.get("id") or "") if isinstance(row, dict) else ""
+                    if not hid:
+                        continue
+                    stored = configured.get(hid)
+                    action = stored.get("profileLimitAction") if isinstance(stored, dict) else None
+                    if not str(action or ""):
+                        missing.append(hid)
+                if missing:
                     gateway.patch_settings({
-                        "harnesses": {hid: {"profileLimitAction": "rotate"} for hid in harness_ids},
+                        "harnesses": {hid: {"profileLimitAction": "rotate"} for hid in missing},
                     })
-        except Exception:
-            log.warning("rotation enablement patch failed (D28); the daemon keeps "
-                        "its own default until the next provisioning", exc_info=True)
+                    self._record_rotation_receipt(
+                        str(getattr(gateway, "engine_version", "") or ""), missing)
+            except Exception:
+                log.warning("rotation reconcile failed; the next ensure retries",
+                            exc_info=True)
+        finally:
+            self._rotation_lock.release()
+
+    def _record_rotation_receipt(self, engine_version: str, patched: list) -> None:
+        """Durable half of the reconcile: a settings POST that changed the
+        daemon's policy leaves a record naming the daemon identity, the
+        patched harnesses and the moment — not just a log line (the
+        ``_record_api_fallback_substitution`` pattern)."""
+        import json
+
+        from ouroboros.config import DATA_DIR
+        from ouroboros.utils import utc_now_iso, write_text_atomic
+
+        path = pathlib.Path(DATA_DIR) / "state" / _ROTATION_RECEIPT_NAME
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_text_atomic(path, json.dumps({
+                "ts": utc_now_iso(),
+                "daemon_config_dir": str(owned_config_dir()),
+                "engine_version": str(engine_version or ""),
+                "patched_harnesses": sorted(str(h) for h in patched),
+                "limit_action": "rotate",
+                "reason": "limit_action_absent_defaulted_to_rotate",
+            }, ensure_ascii=False, indent=1))
+        except OSError as exc:
+            # Residual: the POST itself landed — the next ensure's GET sees the values
+            # present and correctly skips — so the only gap is this missing receipt.
+            log.warning("rotation provisioning receipt write failed at %s: %s",
+                        path, exc, exc_info=True)
 
     def stop(self) -> bool:
         """Terminate ONLY a self-started daemon; attached daemons are left alone."""
@@ -449,23 +585,85 @@ def get_owned_daemon() -> OwnedClaudexorDaemon:
         return _MANAGER
 
 
-def ensure_owned_gateway() -> Any:
+def ensure_owned_gateway(*, admission_wait_sec: Optional[float] = None) -> Any:
     """Return an authenticated gateway to the lazily ensured owned daemon.
 
-    This is the explicit start/probe seam. The gateway transport itself stays
-    pure I/O; callers own ``close()`` (or use it as a context manager). Daemon
-    stop semantics are unchanged: only ``get_owned_daemon().stop()`` may stop a
-    process this manager spawned, and it never kills an attached process.
-    """
-    from ouroboros.gateways.claudexor import ClaudexorGateway
+    This is the explicit start/probe seam — the ONE funnel every consumer
+    (delegation, review sessions, account surfaces, login) passes through,
+    which is why the rotation reconcile rides it: spawn AND attach paths are
+    both covered, on every ensure, best-effort (see ``reconcile_rotation``).
+    The gateway transport itself stays pure I/O; callers own ``close()`` (or
+    use it as a context manager). Daemon stop semantics are unchanged: only
+    ``get_owned_daemon().stop()`` may stop a process this manager spawned,
+    and it never kills an attached process.
 
-    endpoint = get_owned_daemon().ensure_running()
+    ADMISSION is waited for here — outside the daemon manager's lock, the same
+    way for a fresh spawn and an attach. A daemon whose handshake explicitly
+    says ``servingMode=recovery_only`` answers every product route 503
+    (``daemon_recovery_only``, retryable), so the handshake is re-polled about
+    every 150 ms under a wall-clock deadline of ``admission_wait_sec`` seconds
+    (default ``_ADMISSION_WAIT_SEC``, resolved at call time so tests can shrink
+    it), each poll's read phase bounded by what is left of the window. Expiry
+    raises the SAME typed refusal the 503 produces — the dispatch table already
+    classifies it (auto → native with a loud marker, pin → blocked) — and the
+    recovering daemon is left alive (D28: bounded wait, then typed refusal;
+    never a silent indefinite wait, never a kill). ``admission_wait_sec=0`` is
+    the zero-wait variant for callers that must not stall on ADMISSION: a
+    recovering daemon is an immediate typed refusal there, and the initial
+    handshake below is read-bounded by the same small window. The wait bounds
+    admission only — ``ensure_running``'s own liveness/spawn probes keep their
+    pre-existing finite transport ceilings (connect 5s; they are one identity
+    handshake, not a poll loop), unchanged for every caller of this seam.
+    An expired/failed admission also skips the reconcile: the recovering
+    daemon 503s settings reads anyway, and the next ensure retries it.
+    """
+    from ouroboros.gateways.claudexor import (
+        SHORT_POLL_TIMEOUT_SEC, ClaudexorGateway, ClaudexorUnavailable,
+    )
+
+    wait = _ADMISSION_WAIT_SEC if admission_wait_sec is None else max(
+        0.0, float(admission_wait_sec))
+    daemon = get_owned_daemon()
+    endpoint = daemon.ensure_running()
     gateway = ClaudexorGateway(endpoint)
     try:
-        gateway.handshake()
+        # Read-bounded: a daemon that accepts the socket but withholds the
+        # handshake must not hold a zero/small-wait caller for the transport's
+        # 60s default read — the sweep's whole posture is "skip, next tick".
+        body = gateway.handshake(timeout_sec=max(wait, SHORT_POLL_TIMEOUT_SEC))
+        deadline = time.monotonic() + wait
+
+        def _expired() -> ClaudexorUnavailable:
+            return ClaudexorUnavailable(
+                "daemon_recovery_only",
+                "the owned daemon is reachable but still admitting only "
+                f"recovery work after {wait:.1f}s; its product routes "
+                "answer 503 (retryable) until journal recovery completes",
+            )
+
+        while _handshake_serving_mode(body) == "recovery_only":
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _expired()
+            time.sleep(min(_ADMISSION_POLL_SEC, remaining))
+            # The WHOLE declared window is usable (proton0 review): the last
+            # read gets the thin residue, floored so a loopback handshake can
+            # still complete — a daemon that admitted normal work at the
+            # window's edge is observed, not discarded. A transport failure
+            # inside that final residue counts as expiry (typed, never a
+            # transport mislabel); a mid-window one propagates unchanged.
+            remaining = deadline - time.monotonic()
+            try:
+                body = gateway.handshake(
+                    timeout_sec=max(remaining, _ADMISSION_POLL_SEC / 3.0))
+            except ClaudexorUnavailable:
+                if deadline - time.monotonic() <= 0:
+                    raise _expired() from None
+                raise
     except Exception:
         gateway.close()
         raise
+    daemon.reconcile_rotation(gateway)
     return gateway
 
 

@@ -38,6 +38,12 @@ class ChatInbound(TypedDict):
     # stays user_id 1; chat_id selects the thread, project_id scopes memory.
     chat_id: NotRequired[int]
     project_id: NotRequired[str]
+    # Per-message sending-surface observables (additive-optional): raw facts the
+    # SPA measures at send time (pywebview bridge presence, ua, viewport,
+    # matchMedia booleans, captured_at). The gateway normalizes through the
+    # closed-key bounded `client_surface.normalize_client_surface`; absence is an
+    # honest gap, never defaulted.
+    client_surface: NotRequired[dict]
 
 
 class TaskConstraintInbound(TypedDict, total=False):
@@ -88,6 +94,10 @@ class ChatOutbound(TypedDict):
     # X3: a repair receipt whose managed task id does not exist yet (the router
     # mints it at promotion). Typed truth instead of an invented id.
     task_id_pending: NotRequired[bool]
+    # "finalizing" on a root's early final answer: the answer is delivered
+    # while post-task synthesis still runs, so the frame is NOT the task's
+    # terminal conclusion — task_done settles the card/turn.
+    task_phase: NotRequired[str]
     ephemeral_decision: NotRequired[bool]
     task_incident: NotRequired[str]
     toast_once: NotRequired[str]
@@ -121,7 +131,10 @@ class ChatOutbound(TypedDict):
     # The completion-seam EVIDENCE the route decision is reconciled against
     # (subagents.envelope_from_task): delegated runs started/settled/succeeded,
     # terminal failure states, disclosed subscription spend (+estimated flag),
-    # engine-reported models. Terminal frames only; its absence means "no
+    # engine-reported models, the additive `nanny_nudge_recorded` flag (a
+    # non-empty finalization nudge was durably stamped), and the additive
+    # `delegate_start_attempted` flag (any durable delegate_start attempt,
+    # refused or started). Terminal frames only; its absence means "no
     # evidence yet", never "ran natively".
     execution_evidence: NotRequired[Dict[str, Any]]
     # The FACT beside the executor_route plan, from the same custody evidence:
@@ -517,6 +530,26 @@ class ActiveDirectTurn(TypedDict):
     started_at: float
 
 
+class ActiveChatActivity(TypedDict):
+    """One in-flight chat activity in ``StateResponse.active_chat_activities``.
+
+    The combined snapshot: direct/ephemeral registry turns (same rows as
+    ``active_direct_turns``) plus ROOT managed queue tasks projected as
+    ``kind="managed_task"`` with ``phase`` ``queued`` | ``working`` |
+    ``finalizing`` (final answer stored, post-task synthesis still open).
+    Field shape mirrors ``ActiveDirectTurn`` so one client reducer hydrates
+    both; managed rows carry an empty ``client_message_id``.
+    """
+
+    activity_id: str
+    chat_id: int
+    project_id: str
+    client_message_id: str
+    kind: str
+    phase: str
+    started_at: float
+
+
 class StateResponse(TypedDict):
     """Shape of ``GET /api/state`` (happy path)."""
 
@@ -559,6 +592,10 @@ class StateResponse(TypedDict):
     # project's panel (v6.33.0 F4).
     task_bindings: dict
     active_direct_turns: NotRequired[List[ActiveDirectTurn]]
+    # Combined activity snapshot (direct/ephemeral turns + root managed queue
+    # tasks). Additive beside active_direct_turns, which stays unchanged for
+    # compatibility; new clients hydrate from this field.
+    active_chat_activities: NotRequired[List[ActiveChatActivity]]
 
 
 class SettingsNetworkMeta(TypedDict):
@@ -1283,6 +1320,7 @@ __all__ = [
     "HealthResponse",
     "StateResponse",
     "ActiveDirectTurn",
+    "ActiveChatActivity",
     "EvolutionStateSnapshot",
     "SettingsNetworkMeta",
     "SettingsMeta",

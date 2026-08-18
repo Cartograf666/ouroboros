@@ -1156,12 +1156,6 @@ def _prepare_review_configuration(args) -> tuple[dict | None, str, dict]:
                 probe_models=openrouter_models,
             )
     else:
-        if not os.environ.get("TOTAL_BUDGET", "").strip():
-            print(
-                "WARN: TOTAL_BUDGET is not configured; the $10 default can "
-                "starve a full production review.",
-                file=sys.stderr,
-            )
         _select_healthy_openrouter_key()
     return contributor_snapshot, review_base_commit, resolved_config
 

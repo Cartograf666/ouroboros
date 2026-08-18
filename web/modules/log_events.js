@@ -1046,11 +1046,15 @@ export function summarizeChatLiveEvent(evt) {
         const unavailable = evt.cost_accounting_status === 'unavailable';
         const ownCost = unavailable ? 'cost unavailable' : formatLogMoney(accountedUpperBound(evt));
         const subtreeCost = unavailable ? '' : formatLogMoney(accountedUpperBoundWithChildren(evt));
+        // A cost checkpoint is bookkeeping, never the task's conclusion: only
+        // the settled task_done resolves the card. On the blocking lane this
+        // frame precedes task_done; treating it as terminal closed the card
+        // early, and a live card mid-"Finalizing…" must absorb it quietly.
         return chatView({
-            phase: unavailable ? 'warn' : 'done',
-            headline: unavailable ? 'Cost accounting unavailable' : 'Done',
+            phase: unavailable ? 'warn' : 'usage',
+            headline: unavailable ? 'Cost accounting unavailable' : 'Cost finalized',
             visible: false,
-            terminal: true,
+            terminal: false,
             meta: [ownCost, subtreeCost ? `subtree=${subtreeCost}` : ''].filter(Boolean),
             dedupeKey: key('task-cost-finalized', evt.post_task_status || ''),
         });

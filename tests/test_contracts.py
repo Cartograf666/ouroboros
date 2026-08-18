@@ -776,6 +776,9 @@ def test_command_inbound_matches_ws_endpoint_dispatch():
     assert "type" in read_keys, "ws_endpoint no longer reads 'type'"
     assert "cmd" in read_keys, "ws_endpoint no longer reads 'cmd'"
     assert "content" in read_keys, "ws_endpoint no longer reads 'content'"
+    # Owner Surface Fact: the sending-surface observables must keep being read
+    # off the frame (a dropped read silently kills the whole provenance chain).
+    assert "client_surface" in read_keys, "ws_endpoint no longer reads 'client_surface'"
 
 
 # ---------------------------------------------------------------------------

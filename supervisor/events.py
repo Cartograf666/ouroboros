@@ -404,7 +404,11 @@ def _compose_subagent_text(
             "[WRITE SURFACE]",
             f"You are a MUTATIVE (acting) child. write_surface={surface}."
             + (f" write_root={write_root}." if write_root else ""),
-            "Make all changes inside the write root only. Do NOT commit, run review / "
+            # Boundary-only wording (decision 2A): this text is frozen at
+            # schedule time, when the executor is unknown — it states WHERE
+            # changes land, never that the child executes them natively itself
+            # (the dispatch-time executor note owns execution framing).
+            "All changes land inside the write root only. Do NOT commit, run review / "
             "runtime / skills lifecycle, enable tools, or write cognitive memory. Your "
             "changes are captured as a workspace.patch and returned to the parent, who "
             "integrates and is the sole committer of the live body. Nested delegation is "
@@ -954,6 +958,31 @@ def _handle_typing_start(evt: Dict[str, Any], ctx: Any) -> None:
                     kind = entry.kind
             except Exception:
                 pass
+        if not kind and task_id:
+            # A RUNNING queue ROOT is stamped "managed_task" so the client can
+            # reconcile its entry against the /api/state activity snapshot
+            # (which lists queue roots). Subagent typing keeps the legacy
+            # no-kind exemption: no snapshot source enumerates children.
+            try:
+                running = getattr(ctx, "RUNNING", None)
+                meta = running.get(task_id) if isinstance(running, dict) else None
+                task_row = meta.get("task") if isinstance(meta, dict) else None
+                if isinstance(task_row, dict):
+                    from ouroboros.task_results import resolve_task_lineage
+
+                    lineage = resolve_task_lineage(
+                        task_id,
+                        metadata=task_row.get("metadata"),
+                        root_task_id=task_row.get("root_task_id"),
+                        parent_task_id=task_row.get("parent_task_id"),
+                        delegation_role=task_row.get("delegation_role"),
+                        original_task_id=task_row.get("original_task_id"),
+                        timeout_retry_from=task_row.get("timeout_retry_from"),
+                    )
+                    if lineage["is_root_task"]:
+                        kind = "managed_task"
+            except Exception:
+                log.debug("managed typing kind resolution failed for %s", task_id, exc_info=True)
         if chat_id:
             ctx.bridge.send_chat_action(
                 chat_id,

@@ -660,8 +660,7 @@ def _start_request(ctx: ToolContext, route: Any, authority: "DelegatedRunShape",
     if route.effort:
         request["effort"] = route.effort
     if route.profile_id:
-        # Delegation account pin (D-U5), same wire contract as reviewer slots; a pin is strict (D-U6).
-        # Enters the stored canonical body, so a retry_of replay stays byte-identical with the pin included.
+        # Account pin (D-U5), reviewer-slot wire contract; strict (D-U6). In the stored canonical body, so a retry_of replay stays byte-identical, pin included.
         request["credentialProfileId"] = route.profile_id
     if seconds:
         request["maxSeconds"] = seconds
@@ -673,6 +672,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                     bucket: Optional[str] = None, skill_name: Optional[str] = None,
                     _resolved_binding: Any = None) -> str:
     from ouroboros.claudexor_daemon import ensure_owned_gateway
+    from ouroboros.delegate_evidence import record_start_blocked
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
     from ouroboros.subagents import (
         get_subagent_harness, resolve_subagent_executor, route_health,
@@ -761,11 +761,12 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         # STORED invocation's, so the answer is about the run actually being replayed —
         # not about whatever the environment names today.
         unavailable, reset_at = route_health(
-            gateway, route.route_id, authority, route_model=route.model, route_profile=route.profile_id)
+            gateway, route.route_id, authority, route_model=route.model, pinned_profile=route.profile_id)
         resolution = resolve_subagent_executor(
             "harness", route=route, unavailable_reason=unavailable, reset_at=reset_at,
         )
         if resolution.blocked:
+            record_start_blocked(ctx, str(getattr(ctx, "task_id", "") or ""), resolution.reason)
             return _fail(
                 "delegate_start", resolution.reason,
                 "The delegated route cannot run now. This is a typed blocker: do NOT "
@@ -1302,8 +1303,7 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                     record_last_delegation(
                         route=entry.route_id, requested_model=entry.model,
                         applied_model=str(payload.get("model") or ""), run_id=rid,
-                        # Applied = the settlement receipt's authRoute fact
-                        # (never invented); requested replays off STARTED.
+                        # Applied = the settlement receipt's authRoute fact (never invented); requested replays off STARTED.
                         requested_profile=entry.profile_id,
                         applied_profile=str((summary.get("authRoute") or {}).get("profileId") or ""))
                 # D7 made load-bearing: settlement is where "paid for and never read"

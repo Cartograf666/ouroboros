@@ -564,6 +564,11 @@ async def api_tasks_create(request: Request) -> JSONResponse:
     metadata.setdefault("session_id", str(body.get("session_id") or uuid.uuid4().hex))
     metadata.setdefault("actor_id", str(body.get("actor_id") or "cli"))
     metadata.setdefault("source", str(body.get("source") or "api_task"))
+    # Owner Surface Fact: assembled at its PRODUCER. An external admission
+    # carries no browser observables, and a caller-built descriptor must not
+    # smuggle past the closed-key web normalizer (a fake received_at would
+    # impersonate a host stamp) — the caller-declared channel IS the fact.
+    metadata["client_surface"] = {"channel": str(metadata.get("source") or "api_task")}
     metadata.setdefault("delegation_role", "root")
     parent_task_id = None
     root_task_id = task_id

@@ -114,7 +114,7 @@ def build_colab_settings(
     secrets: Dict[str, str],
     *,
     github_repo: str = "",
-    total_budget: float = 10.0,
+    total_budget: float = float(SETTINGS_DEFAULTS["TOTAL_BUDGET"]),
     runtime_mode: str = "advanced",
     max_workers: int = 1,
     models: Dict[str, str] | None = None,

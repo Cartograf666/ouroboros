@@ -1,4 +1,4 @@
-"""Install-time subscription preset compiler (owner matrix D-3/D-9).
+"""Install-time subscription preset compiler (declarative policy D-3/D-9).
 
 When the owner connects at least one agent SUBSCRIPTION during
 onboarding, every surface that CAN run on a subscription moves onto it:
@@ -24,14 +24,15 @@ review the owner believed was configured. Absence is reported as absence.
 
 EFFORT lives in two different places because the harnesses spell it
 differently, and the receipt records which: claude/codex model ids are
-effort-free and take the row's ``effort`` field, while cursor (and agy)
-publish COMPOUND slugs whose tail IS the effort (``cursor-grok-4.5-high``,
-``gemini-3.7-flash-high``) — bracket
-overrides are not supported there. A cursor seat therefore carries the effort
-in BOTH channels: the slug is what Cursor honours, and the field is what the
-review/delegation surfaces materialize anyway (an empty field does not mean
-"no effort" downstream — it means "the surface's global default", which would
-silently disagree with the slug).
+effort-free and take the row's ``effort`` field, while cursor and agy publish
+COMPOUND slugs whose tail IS the effort (``cursor-grok-4.6-high`` /
+``gemini-3.7-flash-high``) — bracket overrides are not supported there. An
+active cursor seat therefore carries the effort in BOTH channels: the slug is
+what Cursor honours, and the field is what the review/delegation surfaces
+materialize anyway (an empty field does not mean "no effort" downstream — it
+means "the surface's global default", which would silently disagree with the
+slug). Agy aliases are recognized for typed install-time refusal but receive no
+seat until the owner dictates that policy.
 
 ``profile_id`` is deliberately never pinned: the daemon rotates credential
 profiles (D28), and pinning one row to one account at install time would
@@ -47,7 +48,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 # The marker written beside the applied preset. Its ABSENCE is not authority to
 # apply anything (every pre-preset install lacks it too); the server-side
 # fresh-install latch is. Bumping this string marks a NEW preset generation.
-SUBSCRIPTION_PRESET_VERSION = "1"
+SUBSCRIPTION_PRESET_VERSION = "2"
 PRESET_MARKER_KEY = "OUROBOROS_SUBSCRIPTION_PRESET_VERSION"
 
 REVIEWER_SLOTS_KEY = "OUROBOROS_REVIEWER_SLOTS"
@@ -58,14 +59,12 @@ HARNESS_CODEX = "codex"
 HARNESS_CURSOR = "cursor"
 HARNESS_AGY = "agy"
 # The harnesses the preset compiler RECOGNIZES. A connected harness outside
-# this tuple (opencode, raw-api, …) contributes no seat — the matrix is the
-# owner's decision, not an auto-derivation over whatever the engine can reach.
-# Recognized is wider than ratified since agy joined (issue #232): the matrix
-# below still covers only the claude/codex/cursor combinations, and a
-# recognized combination without a matrix row refuses typed
-# (``matrix_row_absent``) until the owner dictates its seats.
+# this tuple (opencode, raw-api, …) contributes no seat. Recognition is wider
+# than the current declarative policy since agy joined (issue #232): its
+# connected combinations refuse typed until the owner dictates their seats.
 PRESET_HARNESSES: Tuple[str, ...] = (
-    HARNESS_CLAUDE, HARNESS_CODEX, HARNESS_CURSOR, HARNESS_AGY)
+    HARNESS_CLAUDE, HARNESS_CODEX, HARNESS_CURSOR, HARNESS_AGY,
+)
 
 SURFACE_SUBAGENT = "subagent"
 SURFACE_ADVISORY = "advisory"
@@ -84,29 +83,17 @@ _MODEL_ALIASES: Dict[str, Dict[str, Tuple[str, ...]]] = {
     HARNESS_CLAUDE: {
         "opus-5": ("claude-opus-5",),
         "sonnet-5": ("claude-sonnet-5",),
-        "opus-4.6": ("claude-opus-4-6",),
-        "fable-5": ("claude-fable-5",),
     },
     HARNESS_CODEX: {
         "gpt-5.6-sol": ("gpt-5.6-sol",),
         "gpt-5.6-terra": ("gpt-5.6-terra",),
-        "gpt-5.5": ("gpt-5.5",),
     },
     HARNESS_CURSOR: {
-        "grok-4.5": ("cursor-grok-4.5-{effort}", "grok-4.5-{effort}"),
-        "gemini-3.6-flash": ("gemini-3.6-flash-{effort}",),
-        # Cursor publishes no bare gpt-5.6 slug; the owner's "gpt-5.6" seat is
-        # the 5.6 FAMILY, resolved in flagship order.
-        "gpt-5.6": (
-            "gpt-5.6-{effort}",
-            "gpt-5.6-sol-{effort}",
-            "gpt-5.6-terra-{effort}",
-            "gpt-5.6-luna-{effort}",
-        ),
+        "grok-4.6": ("cursor-grok-4.6-{effort}", "grok-4.6-{effort}"),
     },
     # agy (Antigravity) spells effort inside the id like cursor. Dormant until
-    # the owner dictates the agy matrix rows (issue #232): no matrix row names
-    # these preferences yet. NOTE for that dictation: agy publishes
+    # the owner dictates the agy policy (issue #232): no seat names these
+    # preferences yet. NOTE for that dictation: agy publishes
     # gemini-3.1-pro ONLY at high/low (no -medium slug, verified against agy
     # 1.1.13 discovery), so a pro seat's effort must be high or low.
     HARNESS_AGY: {
@@ -130,7 +117,7 @@ class HarnessDiscovery:
 
 @dataclass(frozen=True)
 class PresetSeat:
-    """One seat of the matrix: which harness, which model preference, how hard."""
+    """One compiled policy seat: harness, model preference, and effort."""
 
     surface: str
     position: int  # 1-based within its surface
@@ -193,93 +180,83 @@ def _seat(surface: str, position: int, harness: str, preference: str, effort: st
                       preference=preference, effort=effort)
 
 
-def _combo(subagent: Tuple[str, str, str], advisory: Tuple[str, str, str],
-           triad: Sequence[Tuple[str, str, str]],
-           scope: Sequence[Tuple[str, str, str]]) -> Dict[str, Tuple[PresetSeat, ...]]:
-    """One matrix row, written as (harness, preference, effort) triples."""
-    return {
-        SURFACE_SUBAGENT: (_seat(SURFACE_SUBAGENT, 1, *subagent),),
-        SURFACE_ADVISORY: (_seat(SURFACE_ADVISORY, 1, *advisory),),
-        SURFACE_TRIAD: tuple(
-            _seat(SURFACE_TRIAD, idx, *spec) for idx, spec in enumerate(triad, start=1)),
-        SURFACE_SCOPE: tuple(
-            _seat(SURFACE_SCOPE, idx, *spec) for idx, spec in enumerate(scope, start=1)),
-    }
+@dataclass(frozen=True)
+class SurfacePolicy:
+    preference: str
+    effort: str
 
 
-_CLAUDE = HARNESS_CLAUDE
-_CODEX = HARNESS_CODEX
-_CURSOR = HARNESS_CURSOR
+@dataclass(frozen=True)
+class HarnessPolicy:
+    """Per-harness model choices; combination behavior lives in ordered rules."""
 
-# ---------------------------------------------------------------------------
-# THE RATIFIED MATRIX (plan §D.1 = owner batch-1 answer 2.1 + D-9 completions).
-#
-# Written as a TABLE, not as an algorithm: the four single/double rows the owner
-# dictated verbatim and the three D-9 completions are one ratified artifact, and
-# a reviewer must be able to diff this against §D.1 line by line. The priority
-# policy that PRODUCED the completions is documented, not re-derived here:
-#   delegated subagent  Opus-5 -> Sol -> Grok
-#   advisory            Sonnet-5(low) -> Terra(medium) -> Grok(medium)
-#   scope               Sol -> Fable -> Grok(high)
-#   triad               the strongest model of every connected harness, the
-#                       remaining seats filled from the preferred harness.
-# ---------------------------------------------------------------------------
-_MATRIX: Dict[frozenset, Dict[str, Tuple[PresetSeat, ...]]] = {
-    frozenset({_CLAUDE}): _combo(
-        subagent=(_CLAUDE, "opus-5", "medium"),
-        advisory=(_CLAUDE, "sonnet-5", "low"),
-        triad=[(_CLAUDE, "sonnet-5", "medium"), (_CLAUDE, "opus-5", "medium"),
-               (_CLAUDE, "opus-4.6", "medium")],
-        scope=[(_CLAUDE, "fable-5", "medium")],
+    subagent: SurfacePolicy
+    advisory: SurfacePolicy
+    triad: SurfacePolicy
+    scope: SurfacePolicy
+
+
+def _surface(preference: str, effort: str) -> SurfacePolicy:
+    return SurfacePolicy(preference=preference, effort=effort)
+
+
+_HARNESS_POLICIES: Dict[str, HarnessPolicy] = {
+    HARNESS_CLAUDE: HarnessPolicy(
+        subagent=_surface("opus-5", "medium"),
+        advisory=_surface("sonnet-5", "low"),
+        triad=_surface("opus-5", "medium"),
+        scope=_surface("opus-5", "medium"),
     ),
-    frozenset({_CODEX}): _combo(
-        subagent=(_CODEX, "gpt-5.6-sol", "medium"),
-        advisory=(_CODEX, "gpt-5.6-terra", "medium"),
-        triad=[(_CODEX, "gpt-5.6-sol", "medium"), (_CODEX, "gpt-5.6-terra", "medium"),
-               (_CODEX, "gpt-5.5", "medium")],
-        scope=[(_CODEX, "gpt-5.6-sol", "medium")],
+    HARNESS_CODEX: HarnessPolicy(
+        subagent=_surface("gpt-5.6-sol", "medium"),
+        advisory=_surface("gpt-5.6-terra", "medium"),
+        triad=_surface("gpt-5.6-sol", "medium"),
+        scope=_surface("gpt-5.6-sol", "medium"),
     ),
-    frozenset({_CURSOR}): _combo(
-        subagent=(_CURSOR, "grok-4.5", "high"),
-        advisory=(_CURSOR, "grok-4.5", "medium"),
-        triad=[(_CURSOR, "grok-4.5", "medium"), (_CURSOR, "gemini-3.6-flash", "medium"),
-               (_CURSOR, "gpt-5.6", "medium")],
-        scope=[(_CURSOR, "grok-4.5", "high")],
-    ),
-    frozenset({_CLAUDE, _CODEX}): _combo(
-        subagent=(_CLAUDE, "opus-5", "medium"),
-        advisory=(_CLAUDE, "sonnet-5", "low"),
-        triad=[(_CLAUDE, "opus-5", "medium"), (_CODEX, "gpt-5.6-sol", "medium"),
-               (_CLAUDE, "sonnet-5", "medium")],
-        scope=[(_CODEX, "gpt-5.6-sol", "medium")],
-    ),
-    frozenset({_CLAUDE, _CURSOR}): _combo(
-        subagent=(_CLAUDE, "opus-5", "medium"),
-        advisory=(_CLAUDE, "sonnet-5", "low"),
-        triad=[(_CLAUDE, "opus-5", "medium"), (_CURSOR, "grok-4.5", "medium"),
-               (_CLAUDE, "sonnet-5", "medium")],
-        scope=[(_CLAUDE, "fable-5", "medium")],
-    ),
-    frozenset({_CODEX, _CURSOR}): _combo(
-        subagent=(_CODEX, "gpt-5.6-sol", "medium"),
-        advisory=(_CODEX, "gpt-5.6-terra", "medium"),
-        triad=[(_CODEX, "gpt-5.6-sol", "medium"), (_CURSOR, "grok-4.5", "medium"),
-               (_CODEX, "gpt-5.6-terra", "medium")],
-        scope=[(_CODEX, "gpt-5.6-sol", "medium")],
-    ),
-    frozenset({_CLAUDE, _CODEX, _CURSOR}): _combo(
-        subagent=(_CLAUDE, "opus-5", "medium"),
-        advisory=(_CLAUDE, "sonnet-5", "low"),
-        triad=[(_CLAUDE, "opus-5", "medium"), (_CODEX, "gpt-5.6-sol", "medium"),
-               (_CURSOR, "grok-4.5", "medium")],
-        scope=[(_CODEX, "gpt-5.6-sol", "medium")],
+    HARNESS_CURSOR: HarnessPolicy(
+        subagent=_surface("grok-4.6", "high"),
+        advisory=_surface("grok-4.6", "medium"),
+        triad=_surface("grok-4.6", "medium"),
+        scope=_surface("grok-4.6", "high"),
     ),
 }
 
+_POLICY_HARNESSES = (HARNESS_CLAUDE, HARNESS_CODEX, HARNESS_CURSOR)
+_DELEGATION_ORDER = _POLICY_HARNESSES
+_ADVISORY_ORDER = _POLICY_HARNESSES
+_TRIAD_ORDER = (HARNESS_CLAUDE, HARNESS_CODEX, HARNESS_CURSOR)
+_SCOPE_ORDER = (HARNESS_CODEX, HARNESS_CLAUDE, HARNESS_CURSOR)
 
-def matrix_combinations() -> Tuple[frozenset, ...]:
-    """Every connected-harness combination the ratified matrix covers (7)."""
-    return tuple(_MATRIX)
+
+def _first_connected(order: Sequence[str], connected: set[str]) -> str:
+    return next(harness for harness in order if harness in connected)
+
+
+def _policy_seat(surface: str, position: int, harness: str) -> PresetSeat:
+    spec = getattr(_HARNESS_POLICIES[harness], surface)
+    return _seat(surface, position, harness, spec.preference, spec.effort)
+
+
+def _compile_policy_seats(connected: Sequence[str]) -> Dict[str, Tuple[PresetSeat, ...]]:
+    """Apply linear priority rules; no powerset row grows when a harness is added."""
+    present = set(connected)
+    primary = _first_connected(_DELEGATION_ORDER, present)
+    advisory = _first_connected(_ADVISORY_ORDER, present)
+    scope = _first_connected(_SCOPE_ORDER, present)
+
+    triad_harnesses = [harness for harness in _TRIAD_ORDER if harness in present]
+    if len(triad_harnesses) == 1:
+        triad_harnesses *= 3
+
+    return {
+        SURFACE_SUBAGENT: (_policy_seat(SURFACE_SUBAGENT, 1, primary),),
+        SURFACE_ADVISORY: (_policy_seat(SURFACE_ADVISORY, 1, advisory),),
+        SURFACE_TRIAD: tuple(
+            _policy_seat(SURFACE_TRIAD, position, harness)
+            for position, harness in enumerate(triad_harnesses, start=1)
+        ),
+        SURFACE_SCOPE: (_policy_seat(SURFACE_SCOPE, 1, scope),),
+    }
 
 
 def _candidate_ids(seat: PresetSeat) -> Tuple[str, ...]:
@@ -419,7 +396,7 @@ def _validate_against_parser(raw: str) -> Optional[PresetRefusal]:
 def connected_preset_harnesses(discoveries: Sequence[HarnessDiscovery]) -> Tuple[str, ...]:
     """The RECOGNIZED harnesses among the ones the caller vouched for, in
     stable ``PRESET_HARNESSES`` order. Recognition is not ratification: a
-    combination without a matrix row compiles to a typed refusal."""
+    combination outside the declarative policy compiles to a typed refusal."""
     seen = {str(d.harness_id) for d in discoveries}
     return tuple(h for h in PRESET_HARNESSES if h in seen)
 
@@ -449,21 +426,19 @@ def compile_install_preset(
                          "no preset to apply."),
             ),
         )
-    seats = _MATRIX.get(frozenset(connected))
-    if seats is None:
+    if HARNESS_AGY in connected:
         # Checked BEFORE discovery validation on purpose: a combination the
-        # owner has not ratified is refused whatever its discovery holds. This
-        # is the agy state today (issue #232): the harness is recognized, its
-        # seats are an owner decision still to be dictated, and the honest
-        # answer is a typed refusal — never a guessed row, never a KeyError.
+        # owner has not ratified is refused whatever its discovery holds. Agy
+        # is recognized, but no seat is guessed merely because the harness is
+        # live. Keep the v6.104.0 refusal code stable across the matrix removal.
         return SubscriptionInstallPreset(
             connected=connected,
             refusal=PresetRefusal(
                 code="matrix_row_absent", seat=None, candidates=(),
-                message=("The ratified matrix has no row for the connected "
-                         f"combination: {', '.join(connected)}. Its seats are an "
-                         "owner decision that has not been dictated yet, so no "
-                         "preset is applied."),
+                message=("The ratified preset policy has no seats for the connected "
+                         f"combination: {', '.join(connected)}. Its Antigravity "
+                         "seats are an owner decision that has not been dictated "
+                         "yet, so no preset is applied."),
             ),
         )
     discovery = {str(d.harness_id): d for d in discoveries}
@@ -478,6 +453,7 @@ def compile_install_preset(
                          "live discovery, never guessed."),
             ),
         )
+    seats = _compile_policy_seats(connected)
     resolved: Dict[str, List[Dict[str, Any]]] = {}
     for surface in (SURFACE_SUBAGENT, SURFACE_ADVISORY, SURFACE_TRIAD, SURFACE_SCOPE):
         rows, refusal = _resolve_surface(seats[surface], discovery)
@@ -531,5 +507,4 @@ __all__ = [
     "SubscriptionInstallPreset",
     "compile_install_preset",
     "connected_preset_harnesses",
-    "matrix_combinations",
 ]
