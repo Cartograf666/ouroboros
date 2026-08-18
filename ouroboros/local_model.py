@@ -9,7 +9,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from ouroboros.platform_layer import (
     IS_MACOS, terminate_process_tree, kill_process_tree,
@@ -111,6 +111,177 @@ def get_manager() -> LocalModelManager:
         if _manager is None:
             _manager = LocalModelManager()
         return _manager
+
+
+# --- Prompt fitting for the local context window ---------------------------------
+# Moved here from ouroboros/llm.py (v6.102.x). This code exists solely to fit a prompt
+# into the local llama-server window, which is this module's subject; in llm.py it sat
+# beside provider transport it has nothing to do with. Every function here is pure —
+# no client state, no network — and `_estimate_message_chars` had no consumer outside
+# the local path. `LocalContextTooLargeError` deliberately stays in llm.py: it is part
+# of that module's public surface (loop_llm_call and context_compaction import it).
+
+def _estimate_message_chars(messages: List[Dict[str, Any]]) -> int:
+    from ouroboros.context_budget import IMAGE_BLOCK_CHAR_EQUIVALENT
+
+    total = 0
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if str(block.get("type") or "") in ("image_url", "image"):
+                    total += IMAGE_BLOCK_CHAR_EQUIVALENT
+                    continue
+                total += len(str(block.get("text", "")))
+        else:
+            total += len(str(content or ""))
+    return total
+
+
+def _split_markdown_sections(text: str) -> Tuple[str, List[Tuple[str, str]]]:
+    lines = str(text or "").splitlines()
+    preamble: List[str] = []
+    sections: List[Tuple[str, str]] = []
+    current_title: Optional[str] = None
+    current_lines: List[str] = []
+
+    for line in lines:
+        if line.startswith("## "):
+            if current_title is None:
+                preamble = current_lines[:]
+            else:
+                sections.append((current_title, "\n".join(current_lines).strip()))
+            current_title = line[3:].strip()
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+
+    if current_title is None:
+        return "\n".join(lines).strip(), []
+
+    sections.append((current_title, "\n".join(current_lines).strip()))
+    return "\n".join(preamble).strip(), sections
+
+
+def _trim_local_sections(text: str, excess_chars: int) -> tuple:
+    """Shrink section BODIES largest-first; never drop a section. -> (text, removed).
+
+    The tail trim this replaces cut from the END of a block, deleting exactly the
+    sections ``_compact_markdown_sections`` had just PRESERVED — Memory Registry,
+    Drive state and Runtime context all sit after Dialogue History.
+    """
+    if excess_chars <= 0:
+        return text, 0
+    preamble, sections = _split_markdown_sections(text)
+    if not sections:
+        return text, 0
+    bodies = []
+    for index, (title, section) in enumerate(sections):
+        head, sep, body = section.partition("\n\n")
+        bodies.append([index, title, head, sep, body])
+    removed = 0
+    marker = len(_LOCAL_TRUNCATION_MARKER)
+    # Largest body first, so a small section is never spent on a deficit a large one
+    # can absorb.
+    for entry in sorted(bodies, key=lambda item: -len(item[4])):
+        if removed >= excess_chars:
+            break
+        body = entry[4]
+        # The marker is re-added, so it counts against the cut; ignoring it overstated
+        # the removal per section and left the payload over budget by that much.
+        keep = max(_LOCAL_SECTION_BODY_FLOOR, len(body) - (excess_chars - removed) - marker)
+        net = len(body) - keep - marker
+        if net <= 0:
+            continue
+        entry[4] = body[:keep] + _LOCAL_TRUNCATION_MARKER
+        removed += net
+    rebuilt = [preamble] if preamble else []
+    for _index, _title, head, sep, body in bodies:
+        rebuilt.append(head + sep + body if sep else head)
+    return "\n\n".join(part for part in rebuilt if part).strip(), removed
+
+
+def _compact_markdown_sections(
+    text: str,
+    preserve_titles: Set[str],
+    reason: str,
+) -> str:
+    preamble, sections = _split_markdown_sections(text)
+    if not sections:
+        return text
+
+    parts: List[str] = []
+    if preamble:
+        parts.append(preamble)
+
+    for title, section in sections:
+        if title in preserve_titles:
+            parts.append(section)
+            continue
+        omitted_chars = max(0, len(section))
+        parts.append(
+            f"## {title}\n\n"
+            f"[Compacted for local-model context: omitted {omitted_chars} chars. {reason}]"
+        )
+
+    return "\n\n".join(p for p in parts if p).strip()
+
+
+# A trimmed section keeps at least this much body, so a preserved section is always
+# still legible rather than reduced to a bare header.
+_LOCAL_SECTION_BODY_FLOOR = 160
+_LOCAL_TRUNCATION_MARKER = "\n...[truncated for local context]..."
+
+# Appended unconditionally, so its size is RESERVED before trimming: trimming against
+# a budget this text then exceeds is how the payload ended up over by its own length.
+_LOCAL_LANGUAGE_RULE = (
+    "\n\nCRITICAL: Always respond in the same language as the user's message "
+    "(e.g. if the user writes in Russian, you MUST reply in Russian)."
+)
+_LOCAL_LANGUAGE_RULE_MARKER = "CRITICAL: Always respond in the same language"
+
+_LOCAL_COMPACTION_MODES = {
+    "static": (
+        {"BIBLE.md"},
+        "Use a larger-context model or read the source file directly if this section becomes necessary.",
+    ),
+    "semi_stable": (
+        {"Identity"},
+        "Identity was preserved; non-core stable memory sections were compacted for local execution.",
+    ),
+    "dynamic": (
+        {
+            "Scratchpad",
+            "Dialogue History",
+            "Dialogue Summary",
+            "Memory Registry (what I know / don't know)",
+            "Drive state",
+            "Runtime context",
+            "Health Invariants",
+        },
+        "Working-memory and runtime sections were preserved; non-core recent/history sections were compacted for local execution.",
+    ),
+    "system": (
+        {
+            "BIBLE.md",
+            "Scratchpad",
+            "Identity",
+            "Drive state",
+            "Runtime context",
+            "Health Invariants",
+            "Recent observations",
+            "Background consciousness info",
+        },
+        "Non-core sections were compacted for local execution.",
+    ),
+}
+
+
+def _compact_local_text(text: str, mode: str) -> str:
+    preserve_titles, reason = _LOCAL_COMPACTION_MODES[mode]
+    return _compact_markdown_sections(text, preserve_titles=preserve_titles, reason=reason)
 
 
 class LocalModelManager:

@@ -1781,6 +1781,17 @@ def _set_applied_host_acceptance_impact(
     )
 
 
+def _seal_terminal_acceptance(ctx: Any, result: Any) -> None:
+    ctx.tools._ctx._task_acceptance_reviewed = True
+    _end_task_acceptance_fence(ctx.tools._ctx, outcome="terminal")
+    _mark_root_acceptance_checkpoint(
+        ctx.tools._ctx,
+        ctx.llm_trace,
+        status=str(result.aggregate_signal or "DEGRADED").lower(),
+        pass_index=ctx.passes_done,
+    )
+
+
 def _apply_task_acceptance_result(
     ctx: _TaskAcceptanceContext,
     result: Any,
@@ -1862,14 +1873,7 @@ def _apply_task_acceptance_result(
         # run record, dispositions on the obligation rows) with one owner-
         # visible line. Reviewer authorship — not a host timer or a
         # unilateral agent give-up.
-        ctx.tools._ctx._task_acceptance_reviewed = True
-        _end_task_acceptance_fence(ctx.tools._ctx, outcome="terminal")
-        _mark_root_acceptance_checkpoint(
-            ctx.tools._ctx,
-            ctx.llm_trace,
-            status=str(result.aggregate_signal or "DEGRADED").lower(),
-            pass_index=ctx.passes_done,
-        )
+        _seal_terminal_acceptance(ctx, result)
         _set_acceptance_decision(ctx.llm_trace, {
             # The with/without-obligations distinction moves from the status token to
             # the `open_obligations` id list this branch already records.
@@ -1920,14 +1924,7 @@ def _apply_task_acceptance_result(
         )
         return True
 
-    ctx.tools._ctx._task_acceptance_reviewed = True
-    _end_task_acceptance_fence(ctx.tools._ctx, outcome="terminal")
-    _mark_root_acceptance_checkpoint(
-        ctx.tools._ctx,
-        ctx.llm_trace,
-        status=str(result.aggregate_signal or "DEGRADED").lower(),
-        pass_index=ctx.passes_done,
-    )
+    _seal_terminal_acceptance(ctx, result)
     if _dispose_obligations_on_clean_pass(
         ctx.llm_trace, result, open_obligations, bool(dissent),
     ):
@@ -3242,7 +3239,6 @@ def _mark_owner_stop_control_drained(
     request+outer-cap deadline, and ``_owner_stop_window_elapsed`` reads the
     same unstamped intent, bounding the worker by that anchor."""
     try:
-        from ouroboros.cancel_intents import active_intent, mark_finalize_control_drained
 
         root = (
             str(getattr(owner_ctx, "budget_drive_root", "") or "")
@@ -3250,6 +3246,7 @@ def _mark_owner_stop_control_drained(
         )
         if not (root and task_id):
             return
+        from ouroboros.cancel_intents import active_intent, mark_finalize_control_drained
         root_path = pathlib.Path(root)
         for _ in range(2):
             if mark_finalize_control_drained(root_path, task_id):
@@ -3274,13 +3271,13 @@ def _owner_stop_window_elapsed(ctx: "_RoundLimitContext") -> bool:
     stamp -> the conservative request+outer-cap anchor). Fail-soft: an
     unreadable intent keeps the bounded summary running."""
     try:
-        from ouroboros.cancel_intents import STOP_POLICY_FINALIZE, active_intent, stop_policy
         from ouroboros.config import get_finalization_grace_sec
         from supervisor.owner_stop import owner_stop_deadline_ts
 
         root = getattr(ctx, "status_drive_root", None) or ctx.drive_root
         if root is None or not ctx.task_id:
             return False
+        from ouroboros.cancel_intents import STOP_POLICY_FINALIZE, active_intent, stop_policy
         intent = active_intent(pathlib.Path(root), ctx.task_id)
         if not isinstance(intent, dict) or stop_policy(intent) != STOP_POLICY_FINALIZE:
             return False
@@ -4794,6 +4791,13 @@ def _enforce_swarm_actions(
     return True
 
 
+def _candidate_is_stale(candidate: Any, revision: Any, fingerprint: Any) -> bool:
+    return isinstance(candidate, DeliveryCandidate) and (
+        candidate.evidence_revision != revision
+        or candidate.evidence_fingerprint != fingerprint
+    )
+
+
 def _no_tool_final_answer(
     content: Any,
     limit_ctx: _RoundLimitContext,
@@ -4882,13 +4886,7 @@ def _no_tool_final_answer(
             tools, limit_ctx, llm_trace,
         )
         candidate = getattr(tools._ctx, "_delivery_candidate", None)
-        if (
-            isinstance(candidate, DeliveryCandidate)
-            and (
-                candidate.evidence_revision != evidence_revision
-                or candidate.evidence_fingerprint != evidence_fingerprint
-            )
-        ):
+        if _candidate_is_stale(candidate, evidence_revision, evidence_fingerprint):
             if content and str(content).strip():
                 messages.append({"role": "assistant", "content": str(content)})
             llm_trace["reasoning_notes"].append(
@@ -5016,13 +5014,7 @@ def _no_tool_final_answer(
         tools, limit_ctx, llm_trace,
     )
     candidate = getattr(tools._ctx, "_delivery_candidate", None)
-    if (
-        isinstance(candidate, DeliveryCandidate)
-        and (
-            candidate.evidence_revision != evidence_revision
-            or candidate.evidence_fingerprint != evidence_fingerprint
-        )
-    ):
+    if _candidate_is_stale(candidate, evidence_revision, evidence_fingerprint):
         acceptance_was_terminal = bool(
             getattr(tools._ctx, "_task_acceptance_reviewed", False)
             or getattr(tools._ctx, "_task_acceptance_sealed_fence_token", None)
@@ -6972,7 +6964,7 @@ def run_llm_loop(
 
             from ouroboros.cancel_intents import has_active_intent
             if task_id and has_active_intent(drive_root, str(task_id)):
-                return "⏹️ Действие остановлено пользователем.", accumulated_usage, llm_trace
+                return "⏹️ Stopped by the owner.", accumulated_usage, llm_trace
 
             # Typed soft landing (v6.91): the ledger fence stays the untouched
             # backstop; an exhausted ceiling wraps up BEFORE spending a round.

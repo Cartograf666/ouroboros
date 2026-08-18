@@ -392,3 +392,11 @@ export function initMatrixRain() {
 
     setInterval(draw, 66);
 }
+
+// Shared by the chat timeline and the cost projection; a generic timestamp parser
+// belongs in neither of them. Moved out of chat.js when cost presentation left it.
+export function rawTimestampEpoch(raw) {
+    if (raw == null || raw === '') return NaN;
+    const epoch = typeof raw === 'number' ? raw : Date.parse(String(raw));
+    return Number.isFinite(epoch) ? epoch : NaN;
+}
