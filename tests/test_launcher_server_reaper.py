@@ -1,7 +1,7 @@
 """Launcher-owned reaping of same-install stray server processes.
 
-No test in this file signals a real process: `kill_pid_tree` is always spied and
-process enumeration is always faked.
+No test in this file signals a real process: the signal and descendant-discovery
+seams are always spied, and process enumeration is always faked.
 """
 
 import inspect
@@ -494,9 +494,9 @@ def test_a_sweep_aborted_mid_work_reports_survivors_not_clean(monkeypatch, caplo
 
 
 def test_a_signalled_pid_still_alive_is_a_survivor_not_a_kill(monkeypatch, caplog):
-    """kill_pid_tree swallows per-pid errors, so only a liveness read can say
-    what the signal achieved; a pid logged as reaped while it survived would
-    contradict the survivor report from the same generation."""
+    """The platform signal primitive swallows per-pid errors, so only a
+    liveness read can say what the signal achieved; a pid logged as reaped
+    while it survived would contradict the survivor report from the same generation."""
     signalled = []
     monkeypatch.setattr(reaper, "_env_proof_available", lambda: True)
     monkeypatch.setattr(
