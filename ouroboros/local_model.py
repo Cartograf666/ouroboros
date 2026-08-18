@@ -232,6 +232,9 @@ def _compact_markdown_sections(
 # A trimmed section keeps at least this much body, so a preserved section is always
 # still legible rather than reduced to a bare header.
 _LOCAL_SECTION_BODY_FLOOR = 160
+# Preferred prompt size for a sub-second local prefill. A PREFERENCE, not a
+# capacity limit — see _prepare_messages_for_local_context.
+_LOCAL_PREFILL_TARGET_CHARS = 12000
 _LOCAL_TRUNCATION_MARKER = "\n...[truncated for local context]..."
 
 # Appended unconditionally, so its size is RESERVED before trimming: trimming against

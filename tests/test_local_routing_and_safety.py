@@ -213,3 +213,58 @@ def test_python_named_wrapper_has_no_safe_shell_subject():
     assert _normalize_safe_shell_subject(
         "/tmp/python-malicious -m pytest tests/test_scope_review.py -q"
     ) == ""
+
+
+def test_prefill_target_never_refuses_a_prompt_the_window_can_hold():
+    """The 12k prefill target is a SPEED preference, not a capacity limit.
+
+    Live failure on a 128k-window local model, for the message "ты работаешь?":
+    "local context window cannot hold the preserved core: 16980 chars > 12000
+    budget (ctx_len=131072, max_tokens=32768)". That window holds ~147k chars, so
+    12k is 8% of it.
+
+    16,980 is not one huge section — it is the SUM OF FLOORS. Each preserved
+    section stops shrinking at _LOCAL_SECTION_BODY_FLOOR, so once a prompt carries
+    enough of them their floors alone exceed a 12k target while remaining far
+    inside the real window. Compaction may still aim at the small target; only the
+    window may refuse.
+    """
+    from ouroboros.llm import LLMClient, LocalContextTooLargeError
+
+    client = LLMClient()
+    # Enough preserved sections that their floors alone clear 12k.
+    dynamic = "\n\n".join(
+        f"## Runtime context {index}\n\n" + "Z" * 900 for index in range(100)
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "SYSTEM\n\n## BIBLE.md\n\n" + "B" * 5000},
+                {"type": "text", "text": "## Identity\n\n" + "I" * 5000},
+                {"type": "text", "text": dynamic},
+            ],
+        },
+        {"role": "user", "content": "ты работаешь?"},
+    ]
+
+    # The exact configuration that failed in production.
+    compacted = client._prepare_messages_for_local_context(
+        messages, ctx_len=131072, max_tokens=32768
+    )
+    sent = sum(
+        len(block["text"])
+        for message in compacted
+        if message["role"] == "system"
+        for block in message["content"]
+    )
+    assert sent > 12000, (
+        "the fixture no longer reproduces the failure: it compacts under the prefill "
+        f"target ({sent} chars), so it cannot prove the target stopped refusing"
+    )
+
+    # A window that genuinely cannot hold the floor-trimmed core still refuses, so
+    # the typed signal the recovery path depends on is not weakened.
+    with pytest.raises(LocalContextTooLargeError) as excinfo:
+        client._prepare_messages_for_local_context(messages, ctx_len=100, max_tokens=50)
+    assert "window" in str(excinfo.value)

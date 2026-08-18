@@ -19,6 +19,7 @@ from ouroboros import model_concurrency
 # llm.py keeps only the transport and the typed LocalContextTooLargeError.
 from ouroboros.local_model import (
     _LOCAL_LANGUAGE_RULE,
+    _LOCAL_PREFILL_TARGET_CHARS,
     _LOCAL_LANGUAGE_RULE_MARKER,
     _compact_local_text,
     _estimate_message_chars,
@@ -2179,8 +2180,14 @@ class LLMClient:
         max_tokens: int,
     ) -> List[Dict[str, Any]]:
         available_tokens = max(256, ctx_len - max_tokens - 128)
-        # Safe character ratio for local model: max 12k chars (~3k tokens) for instant sub-second prefill
-        target_chars = min(12000, int(available_tokens * 1.5))
+        # What the window can ACTUALLY hold. This is the correctness bound.
+        window_chars = int(available_tokens * 1.5)
+        # 12k chars (~3k tokens) keeps local prefill sub-second. That is a SPEED
+        # PREFERENCE, not a capacity limit: on a 128k-window model it is 8% of what
+        # fits, so treating it as a hard ceiling refused prompts the model could read
+        # (16,980-char core on ctx_len=131072 -> "cannot hold the preserved core").
+        # Compaction still aims at the preference; only `window_chars` may refuse.
+        target_chars = min(_LOCAL_PREFILL_TARGET_CHARS, window_chars)
         total_chars = _estimate_message_chars(messages)
         if total_chars <= target_chars:
             return messages
@@ -2270,9 +2277,18 @@ class LLMClient:
         # loop_llm_call.classify_llm_exception), so the signal must reach them typed.
         final_chars = _estimate_message_chars(compacted)
         if final_chars > target_chars:
+            if final_chars <= window_chars:
+                # Over the prefill preference but inside the real window: send it.
+                # A slower prefill is a cost; refusing a promptable request is a fault.
+                log.info(
+                    "Local prompt exceeds the %d-char prefill target but fits the window "
+                    "(%d <= %d chars); sending with a slower prefill.",
+                    target_chars, final_chars, window_chars,
+                )
+                return compacted
             raise LocalContextTooLargeError(
                 "local context window cannot hold the preserved core: "
-                f"{final_chars} chars > {target_chars} budget "
+                f"{final_chars} chars > {window_chars} window "
                 f"(ctx_len={ctx_len}, max_tokens={max_tokens})"
             )
 
