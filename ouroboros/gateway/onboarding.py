@@ -596,20 +596,25 @@ def _persist(request: Request, old_settings: Dict[str, Any], current: Dict[str, 
             precondition=_write_precondition(preset_applied, safety_light, read_fingerprint),
             boundary=boundary,
         )
-    # The RUNNING process keeps its boot runtime mode; the owner's next-boot
-    # choice lives on disk only (identical to the endpoint this replaces).
-    boundary.at("environment projection")
-    env_view = dict(current)
-    env_view["OUROBOROS_RUNTIME_MODE"] = get_runtime_mode()
-    apply_settings_to_env(env_view)
-    boundary.at("supervisor start")
-    _start_supervisor_if_needed_for_request(request, current)
-    boundary.at("hot-reload")
-    changed = [
-        key for key in current
-        if str(current.get(key, "") or "") != str(old_settings.get(key, "") or "")
-    ]
-    _apply_settings_save_side_effects(request, current, old_settings, changed)
+        # STILL under the lock, symmetric with the generic save's locked body:
+        # released after the write alone, a concurrent writer could persist AND
+        # project a newer document before this transaction projects its
+        # pre-prepared snapshot — stamping stale values back over the
+        # environment the newer write just projected.
+        # The RUNNING process keeps its boot runtime mode; the owner's next-boot
+        # choice lives on disk only (identical to the endpoint this replaces).
+        boundary.at("environment projection")
+        env_view = dict(current)
+        env_view["OUROBOROS_RUNTIME_MODE"] = get_runtime_mode()
+        apply_settings_to_env(env_view)
+        boundary.at("supervisor start")
+        _start_supervisor_if_needed_for_request(request, current)
+        boundary.at("hot-reload")
+        changed = [
+            key for key in current
+            if str(current.get(key, "") or "") != str(old_settings.get(key, "") or "")
+        ]
+        _apply_settings_save_side_effects(request, current, old_settings, changed)
 
 
 async def api_onboarding_complete(request: Request) -> JSONResponse:

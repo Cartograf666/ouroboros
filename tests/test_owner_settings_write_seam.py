@@ -370,10 +370,38 @@ def test_settings_save_body_runs_off_the_event_loop():
         if isinstance(node, ast.FunctionDef) and node.name == "_api_settings_post_sync":
             sync_text = ast.unparse(node)
     assert "settings_document_mutation" in sync_text
-    assert src.count("with settings_document_mutation():") >= 6, (
-        "the generic save plus the five single-decision writers must all hold "
-        "the document lock across their read-merge-write"
-    )
+    # Named per writer, not a substring count: a seventh writer added without
+    # the lock must FAIL this pin, and a refactor must not satisfy it by
+    # accident.
+    writers = {
+        "_api_settings_post_sync",
+        "api_owner_runtime_mode",
+        "api_owner_auto_grant",
+        "api_owner_context_mode",
+        "api_owner_scope_review_floor",
+        "api_owner_safety_mode",
+    }
+    seen = {}
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in writers:
+            seen[node.name] = ast.unparse(node)
+    assert set(seen) == writers, f"missing writer functions: {writers - set(seen)}"
+    for name, text in seen.items():
+        assert "settings_document_mutation" in text, (
+            f"{name} must hold the document lock across its read-merge-write"
+        )
+    # And any FUTURE writer: every _owner_write_settings call site in this
+    # module must live inside one of the locked writers above. The locked body
+    # itself is the one exemption — its caller _api_settings_post_sync holds
+    # the lock for it.
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in writers or node.name == "_api_settings_post_locked":
+                continue
+            if "_owner_write_settings(" in ast.unparse(node):
+                assert "settings_document_mutation" in ast.unparse(node), (
+                    f"new settings writer {node.name} does not hold the document lock"
+                )
 
 
 def test_reviewer_slots_reload_does_not_await_the_status_probe():

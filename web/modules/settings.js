@@ -15,7 +15,7 @@ import { PROVIDER_TEST_INPUTS, SECRET_KEYS, bindSecretInputs, bindSettingsTabs, 
 import { showToast } from './toast.js';
 import { escapeHtmlAttr as escapeHtml, formatDualVersion } from './utils.js';
 import { apiClient, apiFetch, cleanExtensionRoute, extensionRoutePath } from './api_client.js';
-import { bindStatusSurface, claudexorStatus } from './claudexor_status_store.js';
+import { claudexorStatus } from './claudexor_status_store.js';
 import { collectSafeFieldValues, renderSafeField, setInlineStatus } from './ui_helpers.js';
 
 let markSettingsDirty = () => {};
@@ -478,14 +478,12 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         // notify, so re-baselining while the draft is clean can never mask
         // one. Deliberately NOT a one-shot on everSettled: an earlier
         // model-less read may have settled the store long before the upgrade
-        // this page's collectors actually feed on.
+        // this page's collectors actually feed on. A BARE subscription, not a
+        // status surface: this observer must react to snapshots the sections'
+        // own surfaces fetch, never arm the polling chain itself.
         baselineSettleDisposer?.();
-        baselineSettleDisposer = bindStatusSurface(claudexorStatus, {
-            elementId: 'btn-save-settings',
-            includeModels: true,
-            listener: () => {
-                if (!settingsDirty && settingsLoaded) setSettingsCleanBaseline();
-            },
+        baselineSettleDisposer = claudexorStatus.subscribe(() => {
+            if (!settingsDirty && settingsLoaded) setSettingsCleanBaseline();
         });
     }
 
