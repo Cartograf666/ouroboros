@@ -358,6 +358,13 @@ def _has_started_agent_tasks() -> bool:
 async def api_owner_runtime_mode(request: Request) -> JSONResponse:
     """Persist the owner-selected runtime mode for the next boot."""
     body = await _json_body_or_empty(request)
+    # Off the event loop, under the document lock (held inside): a slow
+    # generic save must not be able to freeze the loop THROUGH this
+    # endpoint's synchronous lock acquisition.
+    return await asyncio.to_thread(_api_owner_runtime_mode_sync, request, body)
+
+
+def _api_owner_runtime_mode_sync(request: Request, body: Any) -> JSONResponse:
     from ouroboros import config as _config
 
     raw_mode = str((body or {}).get("mode") or "").strip().lower()
@@ -400,6 +407,13 @@ async def api_owner_runtime_mode(request: Request) -> JSONResponse:
 async def api_owner_auto_grant(request: Request) -> JSONResponse:
     """Persist the owner auto-grant toggle outside generic settings writes."""
     body = await _json_body_or_empty(request)
+    # Off the event loop, under the document lock (held inside): a slow
+    # generic save must not be able to freeze the loop THROUGH this
+    # endpoint's synchronous lock acquisition.
+    return await asyncio.to_thread(_api_owner_auto_grant_sync, request, body)
+
+
+def _api_owner_auto_grant_sync(request: Request, body: Any) -> JSONResponse:
     if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
         return unsaved_error("'enabled' must be a boolean", 400)
     enabled = bool(body.get("enabled"))
@@ -660,6 +674,13 @@ async def api_owner_context_mode(request: Request) -> JSONResponse:
     task (mirrors the auto-grant toggle), so no restart is required.
     """
     body = await _json_body_or_empty(request)
+    # Off the event loop, under the document lock (held inside): a slow
+    # generic save must not be able to freeze the loop THROUGH this
+    # endpoint's synchronous lock acquisition.
+    return await asyncio.to_thread(_api_owner_context_mode_sync, request, body)
+
+
+def _api_owner_context_mode_sync(request: Request, body: Any) -> JSONResponse:
     from ouroboros import config as _config
 
     raw_mode = str((body or {}).get("mode") or "").strip().lower()
@@ -717,6 +738,13 @@ async def api_owner_scope_review_floor(request: Request) -> JSONResponse:
     accepted, stored, audited, and answered with an explicit deprecation notice naming the
     control that actually decides."""
     body = await _json_body_or_empty(request)
+    # Off the event loop, under the document lock (held inside): a slow
+    # generic save must not be able to freeze the loop THROUGH this
+    # endpoint's synchronous lock acquisition.
+    return await asyncio.to_thread(_api_owner_scope_review_floor_sync, request, body)
+
+
+def _api_owner_scope_review_floor_sync(request: Request, body: Any) -> JSONResponse:
     raw = str((body or {}).get("floor") or "").strip().lower()
     if raw not in {"blocking_1m", "advisory"}:
         return unsaved_error("'floor' must be one of: blocking_1m, advisory", 400)
@@ -752,6 +780,13 @@ async def api_owner_safety_mode(request: Request) -> JSONResponse:
     The deterministic registry sandbox, protected paths, and light-mode guards run
     in every mode (BIBLE P3: the LLM supervisor is a layer, not the floor)."""
     body = await _json_body_or_empty(request)
+    # Off the event loop, under the document lock (held inside): a slow
+    # generic save must not be able to freeze the loop THROUGH this
+    # endpoint's synchronous lock acquisition.
+    return await asyncio.to_thread(_api_owner_safety_mode_sync, request, body)
+
+
+def _api_owner_safety_mode_sync(request: Request, body: Any) -> JSONResponse:
     from ouroboros import config as _config
 
     raw_mode = str((body or {}).get("mode") or "").strip().lower()

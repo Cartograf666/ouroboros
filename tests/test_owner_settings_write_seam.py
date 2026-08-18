@@ -375,12 +375,22 @@ def test_settings_save_body_runs_off_the_event_loop():
     # accident.
     writers = {
         "_api_settings_post_sync",
-        "api_owner_runtime_mode",
-        "api_owner_auto_grant",
-        "api_owner_context_mode",
-        "api_owner_scope_review_floor",
-        "api_owner_safety_mode",
+        "_api_owner_runtime_mode_sync",
+        "_api_owner_auto_grant_sync",
+        "_api_owner_context_mode_sync",
+        "_api_owner_scope_review_floor_sync",
+        "_api_owner_safety_mode_sync",
     }
+    # The loop must NEVER hold the document lock: every async settings writer
+    # delegates its locked body to a worker thread.
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name in {
+            "api_owner_runtime_mode", "api_owner_auto_grant", "api_owner_context_mode",
+            "api_owner_scope_review_floor", "api_owner_safety_mode",
+        }:
+            assert "asyncio.to_thread" in ast.unparse(node), (
+                f"{node.name} must run its locked body off the event loop"
+            )
     seen = {}
     for node in ast.walk(ast.parse(src)):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in writers:
@@ -439,13 +449,20 @@ def test_reviewer_slots_reload_does_not_await_the_status_probe():
         pathlib.Path(__file__).resolve().parents[1]
         / "web" / "modules" / "reviewer_slots.js"
     ).read_text(encoding="utf-8")
-    assert "Promise.resolve(state.store.refresh({ includeModels: true })).catch(() => {});" in source
+    assert "await boundedStatusRefresh(state.store);" in source
     assert "await state.store.refresh" not in source
-    # loadSettings awaits BOTH sections via Promise.all: one awaiting sibling
+    # loadSettings awaits BOTH sections via Promise.all: one unbounded sibling
     # would keep the Save button hostage to the same probe.
     subagents = (
         pathlib.Path(__file__).resolve().parents[1]
         / "web" / "modules" / "subagents_settings.js"
     ).read_text(encoding="utf-8")
-    assert "Promise.resolve(state.store.refresh({ includeModels: true })).catch(() => {});" in subagents
+    assert "await boundedStatusRefresh(state.store);" in subagents
     assert "await state.store.refresh" not in subagents
+    store = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "web" / "modules" / "claudexor_status_store.js"
+    ).read_text(encoding="utf-8")
+    assert "Promise.race([refresh, new Promise((resolve) => setTimeout(resolve, beatMs))])" in store, (
+        "the bounded beat must race the refresh, never cancel it"
+    )

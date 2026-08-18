@@ -493,24 +493,15 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         // own surfaces fetch, never arm the polling chain itself.
         baselineSettleDisposer?.();
         baselineSettleDisposer = claudexorStatus.subscribe(() => {
-            if (!settingsLoaded || !settingsBaseline) return;
-            if (!settingsDirty) {
-                setSettingsCleanBaseline();
-                return;
-            }
-            // The owner edited something while the probe was in flight: a full
-            // re-baseline would mask that edit, but ignoring the arrival leaves
-            // the store's contribution inside the "unsaved changes" diff FOREVER
-            // (reverting the edit could never read clean again). Fold ONLY the
-            // store-gated keys into the existing baseline: the late arrival
-            // stops counting as an owner change, the edit keeps counting.
-            try {
-                settingsBaseline = stableSerializeDraft({
-                    ...JSON.parse(settingsBaseline),
-                    ...collectSubagentsSettings(),
-                });
-                updateSettingsDirtyState();
-            } catch (error) { /* a malformed baseline must never block the page */ }
+            // CLEAN drafts only. Folding store-gated keys into a DIRTY baseline
+            // was tried and reverted: collectSubagentsSettings overlays the
+            // owner's unsaved Delegation edits onto the store facts, so the
+            // fold silently erased exactly those edits from the diff.
+            // Disclosed residual: a cold-daemon settle landing AFTER an owner
+            // edit stays inside the unsaved-changes diff until the next save —
+            // rare (the reloads wait a bounded beat for the probe first) and
+            // fail-safe (an over-eager indicator, never a lost edit).
+            if (!settingsDirty && settingsLoaded) setSettingsCleanBaseline();
         });
     }
 
