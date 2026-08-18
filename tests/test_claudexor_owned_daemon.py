@@ -2489,3 +2489,36 @@ def test_reconcile_is_best_effort_and_never_breaks_the_ensure(monkeypatch, tmp_p
     owned.OwnedClaudexorDaemon().reconcile_rotation(gateway)  # must not raise
     assert not _rotation_receipt_path(data_dir).exists(), \
         "no receipt may claim a patch that never landed"
+
+
+def test_receipt_write_failure_warns_loudly_and_never_breaks_the_reconcile(
+        monkeypatch, tmp_path, caplog):
+    """Post-merge follow-up (sol finding 4): a failed receipt write is no longer a
+    bare swallowed warning — it names the path and the error. Best-effort stands:
+    the reconcile (and thus the ensure) still succeeds, and the patch is NOT
+    treated as receipted — the next ensure's GET sees the values present and
+    correctly skips, so the only residual is the missing receipt itself."""
+    import logging
+
+    import ouroboros.utils as utils
+
+    data_dir = tmp_path / "data"
+    _point_owned_home(monkeypatch, data_dir / "claudexor", data_dir)
+
+    def _no_space(path, text, *args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(utils, "write_text_atomic", _no_space)
+    gateway = _ReconcileGateway(harnesses=("codex",))
+    with caplog.at_level(logging.WARNING, logger="ouroboros.claudexor_daemon"):
+        owned.OwnedClaudexorDaemon().reconcile_rotation(gateway)  # must not raise
+    assert gateway.patches == [
+        {"harnesses": {"codex": {"profileLimitAction": "rotate"}}}
+    ], "the policy POST itself landed; only the receipt is missing"
+    assert not _rotation_receipt_path(data_dir).exists()
+    warned = [r for r in caplog.records if r.levelno == logging.WARNING
+              and "receipt write failed" in r.getMessage()]
+    assert warned, "the failed receipt write must warn loudly"
+    message = warned[0].getMessage()
+    assert "claudexor_rotation_provisioning.json" in message, "the warning names the path"
+    assert "No space left on device" in message, "the warning names the error"

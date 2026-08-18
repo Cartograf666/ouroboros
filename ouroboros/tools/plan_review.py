@@ -550,6 +550,11 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         else:  # stale ⇒ replay authority lapsed: the identical envelope re-dispatches fresh
             stale, replay_snapshot = _plan_wave_replay_decision(_plan_review_slots, existing)
             if not stale:
+                if enforcement == "advisory":
+                    # Still-OPEN wave: re-invoke the emitter so a durable append that FAILED
+                    # at record time retries on replay (memo only on success ⇒ landed dedups).
+                    _emit_plan_review_advisory_open(ctx, state_root, task_id=task_id,
+                                                    wave=existing, cycles_paid=cycles_paid, cap=cap)
                 return _render_wave(existing, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement, cached=True, reminder=reminder)
     deadline_skip = _plan_deadline_skip(ctx)
     if deadline_skip:

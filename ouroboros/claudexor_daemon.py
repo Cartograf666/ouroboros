@@ -515,8 +515,11 @@ class OwnedClaudexorDaemon:
                 "limit_action": "rotate",
                 "reason": "limit_action_absent_defaulted_to_rotate",
             }, ensure_ascii=False, indent=1))
-        except OSError:
-            log.warning("rotation provisioning receipt write failed", exc_info=True)
+        except OSError as exc:
+            # Residual: the POST itself landed — the next ensure's GET sees the values
+            # present and correctly skips — so the only gap is this missing receipt.
+            log.warning("rotation provisioning receipt write failed at %s: %s",
+                        path, exc, exc_info=True)
 
     def stop(self) -> bool:
         """Terminate ONLY a self-started daemon; attached daemons are left alone."""

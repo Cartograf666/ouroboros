@@ -287,3 +287,46 @@ def test_failed_durable_append_is_not_memoized_and_retries(harness, monkeypatch)
     rows = [json.loads(line) for line in
             events_path.read_text(encoding="utf-8").splitlines()]
     assert len([r for r in rows if r.get("fingerprint") == "f" * 64]) == 1
+
+
+def test_cached_replay_of_an_open_wave_retries_a_failed_advisory_open_append(harness, monkeypatch):
+    """Post-merge follow-up (sol finding 3): the durable advisory-open append that
+    FAILED at record time was unreachable forever — the identical envelope's cached
+    replay returned before the emitter. The replay path now re-invokes the emitter
+    for the still-open wave: zero substrate calls, and the row lands exactly once."""
+    import ouroboros.utils as utils
+
+    harness.state["enforcement"] = "advisory"
+    _patch_health(monkeypatch, lambda slots: {})
+    note = json.dumps([_finding("n1", "note")])
+    sub = harness.install({"s1": note, "s2": CLEAN, "s3": CLEAN})
+    real_append = utils.append_jsonl
+
+    def _fail_advisory(path, row, *args, **kwargs):
+        if isinstance(row, dict) and row.get("type") == "plan_review_advisory_open":
+            raise OSError("disk full")
+        return real_append(path, row, *args, **kwargs)
+
+    monkeypatch.setattr(utils, "append_jsonl", _fail_advisory)
+    ctx = harness.make_ctx()
+    first = _call(ctx)
+    assert _control(first) == {"outcome": "REVIEW_REQUIRED", "closed": False}
+    assert len(sub.calls) == 1
+    events_path = harness.drive / "logs" / "events.jsonl"
+    durable = events_path.read_text(encoding="utf-8") if events_path.exists() else ""
+    assert "plan_review_advisory_open" not in durable, "the append failed: no durable row yet"
+    # The disk heals: the IDENTICAL envelope replays from cache — zero further
+    # substrate calls — and the replay path retries the durable append.
+    monkeypatch.setattr(utils, "append_jsonl", real_append)
+    second = _call(ctx)
+    assert "cached exact review" in second and len(sub.calls) == 1
+    rows = [json.loads(line) for line in
+            events_path.read_text(encoding="utf-8").splitlines()]
+    mine = [r for r in rows if r.get("type") == "plan_review_advisory_open"]
+    assert len(mine) == 1 and mine[0]["aggregate"] == "REVIEW_REQUIRED"
+    # A third identical call dedups via the memo: still exactly one durable row.
+    third = _call(ctx)
+    assert "cached exact review" in third and len(sub.calls) == 1
+    rows = [json.loads(line) for line in
+            events_path.read_text(encoding="utf-8").splitlines()]
+    assert len([r for r in rows if r.get("type") == "plan_review_advisory_open"]) == 1
