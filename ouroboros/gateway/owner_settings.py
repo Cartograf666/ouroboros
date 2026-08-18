@@ -62,9 +62,11 @@ _CONTEXT_MODE_KEYS = ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW
 # event loop), then writes, would silently revert a single-decision endpoint
 # that landed in between. Every event-loop writer used to inherit this
 # serialization for free from the loop itself; a threaded writer does not.
-# Endpoints whose write carries a read-fingerprint ``precondition`` (the
-# onboarding transaction) already refuse stale merges at the seam and do not
-# need this lock.
+# A read-fingerprint ``precondition`` (the onboarding transaction) refuses
+# THIS writer's own stale merge, but cannot stop a lock-holding writer whose
+# read predated this write from landing afterwards — so the onboarding
+# transaction holds this lock TOO, from its write through its environment
+# projection and hot-reload effects, symmetric with the generic save.
 _settings_document_lock = threading.Lock()
 
 

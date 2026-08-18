@@ -390,6 +390,30 @@ def test_settings_save_body_runs_off_the_event_loop():
         assert "settings_document_mutation" in text, (
             f"{name} must hold the document lock across its read-merge-write"
         )
+    # The onboarding transaction lives in its own module and holds the lock
+    # from its write through env projection and hot-reload (a fingerprint
+    # precondition refuses ITS stale merge, not a later writer's).
+    onboarding_src = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "ouroboros" / "gateway" / "onboarding.py"
+    ).read_text(encoding="utf-8")
+    for node in ast.walk(ast.parse(onboarding_src)):
+        if not isinstance(node, ast.With):
+            continue
+        header = "".join(ast.unparse(item.context_expr) for item in node.items)
+        if "settings_document_mutation" not in header:
+            continue
+        locked_body = "".join(ast.unparse(stmt) for stmt in node.body)
+        assert "_owner_write_settings(" in locked_body, (
+            "the onboarding write must sit inside the document lock"
+        )
+        assert "apply_settings_to_env(" in locked_body, (
+            "the lock must cover the environment projection, not just the write"
+        )
+        break
+    else:
+        raise AssertionError("onboarding.py holds no settings_document_mutation block")
+
     # And any FUTURE writer: every _owner_write_settings call site in this
     # module must live inside one of the locked writers above. The locked body
     # itself is the one exemption — its caller _api_settings_post_sync holds

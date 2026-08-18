@@ -443,8 +443,18 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         });
     }
 
+    // Top-level keys in sorted order: the dirty check compares these strings,
+    // and the status-settle baseline fold below inserts keys AFTER the fact —
+    // equality must not depend on object insertion order. Nested values keep
+    // native stringify (both sides build them through the same code path).
+    function stableSerializeDraft(draft) {
+        return JSON.stringify(Object.fromEntries(
+            Object.entries(draft).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+        ));
+    }
+
     function snapshotSettingsDraft() {
-        return JSON.stringify({
+        return stableSerializeDraft({
             ...collectBody(),
             OUROBOROS_RUNTIME_MODE_DRAFT: byId('s-runtime-mode')?.value || 'advanced',
             OUROBOROS_CONTEXT_MODE_DRAFT: byId('s-context-mode')?.value || 'max',
@@ -483,7 +493,24 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         // own surfaces fetch, never arm the polling chain itself.
         baselineSettleDisposer?.();
         baselineSettleDisposer = claudexorStatus.subscribe(() => {
-            if (!settingsDirty && settingsLoaded) setSettingsCleanBaseline();
+            if (!settingsLoaded || !settingsBaseline) return;
+            if (!settingsDirty) {
+                setSettingsCleanBaseline();
+                return;
+            }
+            // The owner edited something while the probe was in flight: a full
+            // re-baseline would mask that edit, but ignoring the arrival leaves
+            // the store's contribution inside the "unsaved changes" diff FOREVER
+            // (reverting the edit could never read clean again). Fold ONLY the
+            // store-gated keys into the existing baseline: the late arrival
+            // stops counting as an owner change, the edit keeps counting.
+            try {
+                settingsBaseline = stableSerializeDraft({
+                    ...JSON.parse(settingsBaseline),
+                    ...collectSubagentsSettings(),
+                });
+                updateSettingsDirtyState();
+            } catch (error) { /* a malformed baseline must never block the page */ }
         });
     }
 
