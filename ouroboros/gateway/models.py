@@ -13,7 +13,7 @@ from starlette.responses import JSONResponse
 
 from ouroboros.config import load_settings
 from ouroboros.gateway._helpers import json_error, json_exception
-from ouroboros.provider_models import resolve_minimax_base_url
+from ouroboros.provider_models import MINIMAX_REGION_ENDPOINTS, resolve_minimax_base_url
 
 log = logging.getLogger(__name__)
 
@@ -559,17 +559,55 @@ async def api_provider_test(request: Request) -> JSONResponse:
             # "Use saved" is expressed by omitting the key entirely.
             merged[str(key)] = str(value or "").strip()
 
+        # A typo'd region would silently resolve to the default endpoint and
+        # answer OK for a deployment the owner never selected.
+        minimax_region = str(merged.get("MINIMAX_REGION", "") or "").strip().lower()
+        if provider_id == "minimax" and minimax_region and minimax_region not in MINIMAX_REGION_ENDPOINTS:
+            return json_error("unknown MiniMax region", 400)
+
         specs = dict(_provider_specs(merged))
         loader = specs.get(provider_id)
         if loader is None:
             return json_error("provider is not configured (missing key or base URL)", 400)
 
-        timeout = httpx.Timeout(_CATALOG_HTTP_TIMEOUT_SEC)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            _, items, error, stage, duration_ms = await _load_provider(client, provider_id, loader)
+        # Not routed through _load_provider: its log line carries the raw
+        # exception, and this endpoint promises credential values never reach
+        # the response OR the log — provider errors can embed the base URL with
+        # inlined credentials. Redact every secret this probe knows about.
+        secrets = sorted(
+            {
+                str(merged.get(key, "") or "").strip()
+                for key in _PROVIDER_TEST_OVERRIDE_KEYS
+                if len(str(merged.get(key, "") or "").strip()) > 3
+            },
+            key=len, reverse=True,
+        )
 
-        if error:
-            return JSONResponse({"ok": False, "error": error, "stage": stage, "duration_ms": duration_ms})
+        def _redacted(text: str) -> str:
+            for secret in secrets:
+                text = text.replace(secret, "***")
+            return text[:500]
+
+        started = time.perf_counter()
+        timeout = httpx.Timeout(_CATALOG_HTTP_TIMEOUT_SEC)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                items = await loader(client)
+        except Exception as exc:
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            stage = _catalog_error_stage(exc)
+            log.warning(
+                "provider_test provider=%s stage=%s duration_ms=%s error=%s",
+                provider_id, stage, duration_ms, _redacted(str(exc)),
+            )
+            return JSONResponse({
+                "ok": False, "error": _redacted(str(exc)), "stage": stage, "duration_ms": duration_ms,
+            })
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        log.info(
+            "provider_test provider=%s stage=success duration_ms=%s item_count=%s",
+            provider_id, duration_ms, len(items),
+        )
         return JSONResponse({"ok": True, "model_count": len(items), "duration_ms": duration_ms})
     except Exception as e:
         return json_exception(e)

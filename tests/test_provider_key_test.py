@@ -161,3 +161,44 @@ def test_provider_test_empty_override_unsets_the_saved_value(monkeypatch):
     })
     assert status == 400
     assert "not configured" in body.get("error", "")
+
+
+def test_provider_test_rejects_an_unknown_minimax_region(monkeypatch):
+    # resolve_minimax_base_url silently maps unknown regions to the default
+    # endpoint; a typo'd region must not come back as an OK for a deployment
+    # the owner never selected.
+    monkeypatch.setattr(
+        model_catalog_api,
+        "load_settings",
+        lambda: {"MINIMAX_API_KEY": "unit-test-credential"},
+    )
+    status, body = _post({
+        "provider_id": "minimax",
+        "overrides": {"MINIMAX_REGION": "definitely-not-a-region"},
+    })
+    assert status == 400
+    assert "region" in body.get("error", "")
+
+
+def test_provider_test_redacts_credentials_from_error_answers(monkeypatch):
+    # Provider exceptions can embed the base URL with inlined credentials; the
+    # endpoint promises credential values never reach the response or the log.
+    monkeypatch.setattr(
+        model_catalog_api,
+        "load_settings",
+        lambda: {
+            "OPENAI_COMPATIBLE_API_KEY": "unit-test-credential",
+            "OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-base-url.example/v1",
+        },
+    )
+
+    async def exploding(client, provider_id, provider_label, api_key, base_url):
+        raise httpx.ConnectError(f"connect to {base_url}?key=unit-test-credential failed")
+
+    monkeypatch.setattr(
+        model_catalog_api, "_fetch_openai_compatible_model_catalog", exploding
+    )
+    status, body = _post({"provider_id": "openai-compatible"})
+    assert status == 200
+    assert body["ok"] is False and body["stage"] == "connect"
+    assert "unit-test-credential" not in json.dumps(body)

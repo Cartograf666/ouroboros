@@ -1135,28 +1135,38 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         if (!button) return;
         const provider = button.dataset.providerTest;
         const status = page.querySelector(`[data-provider-test-status="${provider}"]`);
-        const overrides = {};
-        for (const [inputId, settingKey] of Object.entries(PROVIDER_TEST_INPUTS[provider] || {})) {
-            const input = byId(inputId);
-            const value = (input?.value || '').trim();
-            // Only owner-edited fields become overrides: saved secrets render
-            // as MASKED placeholders (gateway mask_settings_secret), and echoing
-            // a mask back as the credential would fail every already-saved key.
-            // An untouched field means "test the saved value server-side"; an
-            // edited-to-empty field (Clear included) sends an explicit empty
-            // override so the probe tests the visible draft, not the old key.
-            if (value !== (input?.dataset.appliedValue ?? '').trim()) {
-                overrides[settingKey] = value;
+        const collectOverrides = () => {
+            const overrides = {};
+            for (const [inputId, settingKey] of Object.entries(PROVIDER_TEST_INPUTS[provider] || {})) {
+                const input = byId(inputId);
+                const value = (input?.value || '').trim();
+                // Only owner-edited fields become overrides: saved secrets render
+                // as MASKED placeholders (gateway mask_settings_secret), and echoing
+                // a mask back as the credential would fail every already-saved key.
+                // An untouched field means "test the saved value server-side"; an
+                // edited-to-empty field (Clear included) sends an explicit empty
+                // override so the probe tests the visible draft, not the old key.
+                if (value !== (input?.dataset.appliedValue ?? '').trim()) {
+                    overrides[settingKey] = value;
+                }
             }
-        }
+            return overrides;
+        };
+        const overrides = collectOverrides();
         button.disabled = true;
         if (status) status.textContent = 'Testing…';
         try {
             const data = await apiClient.providerTest({ provider_id: provider, overrides });
+            // The probe answered for the draft it was given; a draft edited while
+            // the request was in flight would wear a verdict it never earned.
+            const draftChanged = JSON.stringify(collectOverrides()) !== JSON.stringify(overrides);
             if (status) {
-                status.textContent = data.ok
+                const verdict = data.ok
                     ? `OK — ${data.model_count} model(s)`
                     : `Failed: ${data.error} (${data.stage})`;
+                status.textContent = draftChanged
+                    ? `${verdict} — for the previous draft; the fields changed while testing, test again`
+                    : verdict;
             }
         } catch (error) {
             if (status) status.textContent = `Failed: ${String(error?.message || error || 'unknown error')}`;
