@@ -1026,25 +1026,35 @@ async function toggleAccountEnabled(harness, profileId, enabled) {
     renderRows();
 }
 
-async function confirmRemoveAccount(harness, profileId) {
+/**
+ * Complete destructive flow behind a row's Remove button. Injectable deps let
+ * the node suite drive the production handler; confirm mode authorizes only on
+ * its documented strict boolean `true`, never the input mode's object shape.
+ */
+export async function confirmRemoveAccount(harness, profileId, {
+    dialogImpl = openConfirmDialog,
+    removeImpl = removeAccount,
+    store = state.store,
+    renderImpl = renderRows,
+} = {}) {
     if (!harness || !profileId) return;
-    const family = familyLabel(harness, state.store.snapshot || {});
-    const answer = await openConfirmDialog({
+    const family = familyLabel(harness, store.snapshot || {});
+    const answer = await dialogImpl({
         title: 'Remove account',
         body: removeAccountConfirmBody(profileId, family),
         confirmLabel: 'Remove',
         danger: true,
     });
-    if (!answer?.confirmed) return;
+    if (answer !== true) return;
     state.removeError = '';
     try {
-        await removeAccount(harness, profileId);
+        await removeImpl(harness, profileId);
     } catch (error) {
         state.removeError = `Could not remove "${profileId}": ${error.message || error}. `
             + 'The account is unchanged.';
     }
-    await state.store.refresh();
-    renderRows();
+    await store.refresh();
+    renderImpl();
 }
 
 /**
