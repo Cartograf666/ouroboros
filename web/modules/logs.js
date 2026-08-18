@@ -49,6 +49,18 @@ export function initLogs({ ws, state, mount }) {
         });
     }
 
+    // Live entries must not yank the view away from history the reader
+    // scrolled up to: per-entry autoscroll sticks only while the reader is
+    // already at the bottom. Callers capture this BEFORE appending — the
+    // append itself grows scrollHeight, which would misread a pinned reader
+    // as scrolled-up. Deliberate jumps (filter toggle, tab switch, backfill)
+    // stay unconditional. A hidden panel measures 0/0/0 → pinned, matching
+    // the tab-switch jump the reader gets on return.
+    const PINNED_SLACK_PX = 48;
+    function isPinnedToLatest() {
+        return logEntries.scrollHeight - logEntries.scrollTop - logEntries.clientHeight <= PINNED_SLACK_PX;
+    }
+
     function updateVisibility(entry) {
         entry.hidden = !state.activeFilters[entry.dataset.category];
     }
@@ -174,6 +186,7 @@ export function initLogs({ ws, state, mount }) {
         `;
         bindRawToggle(entry);
         updateVisibility(entry);
+        const pinned = isPinnedToLatest();
         logEntries.appendChild(entry);
 
         if (dedupeKey) {
@@ -181,7 +194,7 @@ export function initLogs({ ws, state, mount }) {
         }
 
         trimEntries();
-        if (state.activeFilters[cat]) scrollToLatest();
+        if (state.activeFilters[cat] && pinned) scrollToLatest();
     }
 
     function createTaskGroupCard(groupId, category) {
@@ -307,9 +320,10 @@ export function initLogs({ ws, state, mount }) {
 
         renderTaskTimeline(record);
         updateVisibility(record.entry);
+        const pinned = isPinnedToLatest();
         logEntries.appendChild(record.entry);
         trimEntries();
-        if (state.activeFilters[category]) scrollToLatest();
+        if (state.activeFilters[category] && pinned) scrollToLatest();
     }
 
     function addLogEntry(evt) {
