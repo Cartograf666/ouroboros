@@ -429,6 +429,37 @@ def test_probe_refuses_typed_when_recovery_outlives_the_window(monkeypatch, tmp_
             server.shutdown()
 
 
+def test_initial_handshake_is_read_bounded_by_the_admission_window(monkeypatch):
+    """A daemon that accepts the socket but WITHHOLDS the handshake reply must
+    not hold a zero/small-wait caller for the transport's 60s default read
+    (final-gate finding on 01466781): the first handshake is read-bounded by
+    the admission window, floored at the short-poll ceiling."""
+    from types import SimpleNamespace
+
+    from ouroboros import claudexor_daemon as daemon_mod
+    from ouroboros.gateways import claudexor as gw_mod
+
+    seen: list = []
+
+    class _Gateway:
+        def __init__(self, endpoint):
+            pass
+
+        def handshake(self, *, timeout_sec=None):
+            seen.append(timeout_sec)
+            return {"servingMode": "normal"}
+
+        def close(self):
+            pass
+
+    stub = SimpleNamespace(ensure_running=lambda: object(),
+                           run_deferred_rotation=lambda endpoint: None)
+    monkeypatch.setattr(daemon_mod, "get_owned_daemon", lambda: stub)
+    monkeypatch.setattr(gw_mod, "ClaudexorGateway", _Gateway)
+    owned.ensure_owned_gateway(admission_wait_sec=0)
+    assert seen == [gw_mod.SHORT_POLL_TIMEOUT_SEC]  # bounded, never the 60s default
+
+
 def test_supervisor_sweep_wiring_passes_a_zero_wait_factory(monkeypatch):
     """The server tick opts OUT of the admission wait at its own call site.
 

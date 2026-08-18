@@ -539,10 +539,16 @@ def ensure_owned_gateway(*, admission_wait_sec: Optional[float] = None) -> Any:
     classifies it (auto → native with a loud marker, pin → blocked) — and the
     recovering daemon is left alive (D28: bounded wait, then typed refusal;
     never a silent indefinite wait, never a kill). ``admission_wait_sec=0`` is
-    the zero-wait variant for callers that must not stall: a recovering daemon
-    is an immediate typed refusal there.
+    the zero-wait variant for callers that must not stall on ADMISSION: a
+    recovering daemon is an immediate typed refusal there, and the initial
+    handshake below is read-bounded by the same small window. The wait bounds
+    admission only — ``ensure_running``'s own liveness/spawn probes keep their
+    pre-existing finite transport ceilings (connect 5s; they are one identity
+    handshake, not a poll loop), unchanged for every caller of this seam.
     """
-    from ouroboros.gateways.claudexor import ClaudexorGateway, ClaudexorUnavailable
+    from ouroboros.gateways.claudexor import (
+        SHORT_POLL_TIMEOUT_SEC, ClaudexorGateway, ClaudexorUnavailable,
+    )
 
     wait = _ADMISSION_WAIT_SEC if admission_wait_sec is None else max(
         0.0, float(admission_wait_sec))
@@ -550,7 +556,10 @@ def ensure_owned_gateway(*, admission_wait_sec: Optional[float] = None) -> Any:
     endpoint = daemon.ensure_running()
     gateway = ClaudexorGateway(endpoint)
     try:
-        body = gateway.handshake()
+        # Read-bounded: a daemon that accepts the socket but withholds the
+        # handshake must not hold a zero/small-wait caller for the transport's
+        # 60s default read — the sweep's whole posture is "skip, next tick".
+        body = gateway.handshake(timeout_sec=max(wait, SHORT_POLL_TIMEOUT_SEC))
         deadline = time.monotonic() + wait
 
         def _expired() -> ClaudexorUnavailable:
