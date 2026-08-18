@@ -124,3 +124,40 @@ def test_provider_test_ui_surface_is_wired():
     # become overrides, or every already-saved key would fail its own test.
     assert "el.dataset.appliedValue = el.value;" in settings
     assert "value !== (input?.dataset.appliedValue ?? '').trim()" in settings
+
+
+def test_provider_test_unknown_provider_id_is_distinct(monkeypatch):
+    monkeypatch.setattr(model_catalog_api, "load_settings", lambda: {})
+    status, body = _post({"provider_id": "openrouterr"})
+    assert status == 400
+    assert "unknown provider id" in body.get("error", "")
+
+
+def test_provider_test_rejects_non_object_bodies():
+    class _BrokenRequest:
+        async def json(self):
+            raise ValueError("not json")
+
+    response = asyncio.run(model_catalog_api.api_provider_test(_BrokenRequest()))
+    assert response.status_code == 400
+
+    status, body = _post(["provider_id", "openrouter"])
+    assert status == 400
+    assert "JSON object" in body.get("error", "")
+
+
+def test_provider_test_empty_override_unsets_the_saved_value(monkeypatch):
+    # The owner cleared the field: the probe must test the visible draft, not
+    # the saved key — with the only credential unset, the provider is reported
+    # not configured instead of a misleading OK against the old value.
+    monkeypatch.setattr(
+        model_catalog_api,
+        "load_settings",
+        lambda: {"OPENROUTER_API_KEY": "unit-test-credential"},
+    )
+    status, body = _post({
+        "provider_id": "openrouter",
+        "overrides": {"OPENROUTER_API_KEY": ""},
+    })
+    assert status == 400
+    assert "not configured" in body.get("error", "")

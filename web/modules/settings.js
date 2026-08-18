@@ -1139,11 +1139,13 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         for (const [inputId, settingKey] of Object.entries(PROVIDER_TEST_INPUTS[provider] || {})) {
             const input = byId(inputId);
             const value = (input?.value || '').trim();
-            // Only owner-edited values become overrides: saved secrets render
+            // Only owner-edited fields become overrides: saved secrets render
             // as MASKED placeholders (gateway mask_settings_secret), and echoing
             // a mask back as the credential would fail every already-saved key.
-            // An untouched field means "test the saved value server-side".
-            if (value && value !== (input?.dataset.appliedValue ?? '').trim()) {
+            // An untouched field means "test the saved value server-side"; an
+            // edited-to-empty field (Clear included) sends an explicit empty
+            // override so the probe tests the visible draft, not the old key.
+            if (value !== (input?.dataset.appliedValue ?? '').trim()) {
                 overrides[settingKey] = value;
             }
         }

@@ -514,6 +514,13 @@ _PROVIDER_TEST_OVERRIDE_KEYS: frozenset[str] = frozenset({
     "GIGACHAT_VERIFY_SSL_CERTS",
 })
 
+# Every provider id _provider_specs can ever emit: a typo'd id must read as
+# "unknown provider id", not as the not-configured answer a real provider gives.
+_PROVIDER_TEST_KNOWN_IDS: frozenset[str] = frozenset({
+    "openrouter", "openai", "anthropic", "minimax",
+    "openai-compatible", "cloudru", "gigachat",
+})
+
 
 async def api_provider_test(request: Request) -> JSONResponse:
     """Probe one provider's catalog with entered-but-unsaved credentials.
@@ -523,12 +530,21 @@ async def api_provider_test(request: Request) -> JSONResponse:
     Credential VALUES never appear in the response or in the log line.
     """
     try:
-        body = await request.json()
+        try:
+            body = await request.json()
+        except Exception:
+            return json_error("request body must be a JSON object", 400)
+        if not isinstance(body, dict):
+            return json_error("request body must be a JSON object", 400)
         provider_id = str(body.get("provider_id", "") or "").strip()
         if not provider_id:
             return json_error("provider_id is required", 400)
+        if provider_id not in _PROVIDER_TEST_KNOWN_IDS:
+            return json_error("unknown provider id", 400)
 
-        overrides = body.get("overrides") or {}
+        overrides = body.get("overrides")
+        if overrides is None:
+            overrides = {}
         if not isinstance(overrides, dict):
             return json_error("overrides must be an object", 400)
         unknown = sorted(str(key) for key in overrides if str(key) not in _PROVIDER_TEST_OVERRIDE_KEYS)
@@ -537,11 +553,11 @@ async def api_provider_test(request: Request) -> JSONResponse:
 
         merged = dict(load_settings())
         for key, value in overrides.items():
-            # An empty override means "keep whatever is saved" — masked secret
-            # inputs render blank until the owner retypes them.
-            text = str(value or "").strip()
-            if text:
-                merged[str(key)] = text
+            # Every submitted override is an explicit owner edit: a non-empty
+            # value replaces the saved one, an EMPTY value unsets it (the owner
+            # cleared the field and wants the draft tested, not the saved key).
+            # "Use saved" is expressed by omitting the key entirely.
+            merged[str(key)] = str(value or "").strip()
 
         specs = dict(_provider_specs(merged))
         loader = specs.get(provider_id)
