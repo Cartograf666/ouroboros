@@ -649,7 +649,6 @@ class LocalModelManager:
                     pass
 
         try:
-            import subprocess
             subprocess.run(["pkill", "-9", "-f", f"llama_cpp.server.*--port {self._port}"], capture_output=True)
         except Exception:
             pass
