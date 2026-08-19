@@ -16,9 +16,9 @@ from ouroboros.gateway._helpers import json_error, json_exception
 from ouroboros.observability import redact_projection
 from ouroboros.provider_models import (
     ALL_PROVIDER_CREDENTIAL_KEYS,
+    ACTIVE_MODEL_SETTING_KEYS,
     DIRECT_PROVIDER_DEFAULTS,
     MINIMAX_REGION_ENDPOINTS,
-    MODEL_SETTING_KEYS,
     OPENROUTER_DEFAULTS,
     provider_for_model,
     resolve_minimax_base_url,
@@ -510,7 +510,7 @@ _PROVIDER_TEST_KNOWN_IDS: frozenset[str] = frozenset({
 
 def _provider_test_model(provider_id: str, settings: dict) -> str:
     """Resolve one deterministic runtime/default model without catalog I/O."""
-    for setting_key in MODEL_SETTING_KEYS:
+    for setting_key in ACTIVE_MODEL_SETTING_KEYS:
         for raw_model in str(settings.get(setting_key, "") or "").split(","):
             model = raw_model.strip()
             if model and provider_for_model(model) == provider_id:

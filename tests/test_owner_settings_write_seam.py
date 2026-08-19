@@ -188,6 +188,79 @@ def test_every_generic_validation_refusal_says_saved_false(monkeypatch, isolated
     assert not isolated_settings.exists()
 
 
+def test_generic_settings_save_validates_and_canonicalizes_available_subagents(
+    monkeypatch, isolated_settings,
+):
+    from ouroboros.configured_subagents import SUBAGENTS_SETTING, parse_configured_subagents
+
+    app = _settings_app(monkeypatch, isolated_settings)
+    payload = {
+        "enabled": True,
+        "items": [{
+            "subagent_id": "owner-row",
+            "name": "",
+            "recommended_use": "Use for owner-selected work.",
+            "route": {"kind": "api_model", "target_id": "openai/gpt-5.6-sol"},
+        }],
+    }
+    response = TestClient(app).post("/api/settings", json={SUBAGENTS_SETTING: payload})
+
+    assert response.status_code == 200, response.text
+    saved = json.loads(isolated_settings.read_text(encoding="utf-8"))
+    canonical = saved[SUBAGENTS_SETTING]
+    assert isinstance(canonical, str)
+    parsed = parse_configured_subagents(canonical)
+    assert parsed.items[0].name == "Owner Row"
+
+
+def test_generic_settings_save_rejects_malformed_available_subagents_without_write(
+    monkeypatch, isolated_settings,
+):
+    from ouroboros.configured_subagents import SUBAGENTS_SETTING
+
+    app = _settings_app(monkeypatch, isolated_settings)
+    response = TestClient(app).post("/api/settings", json={SUBAGENTS_SETTING: {
+        "enabled": True,
+        "items": [{
+            "subagent_id": "bad",
+            "name": "Bad",
+            "recommended_use": "Bad",
+            "route": {"kind": "api_model", "target_id": "x", "extra": True},
+        }],
+    }})
+
+    assert response.status_code == 400, response.text
+    assert response.json()["saved"] is False
+    assert not isolated_settings.exists()
+
+
+def test_settings_get_reports_legacy_actor_source_without_materializing_it(
+    monkeypatch, isolated_settings,
+):
+    from ouroboros.gateway import settings as settings_mod
+
+    original = {
+        "OUROBOROS_SUBAGENT_HARNESS": "codex=gpt-5.6-sol:high",
+        "OUROBOROS_SUBAGENT_PROFILE": "owner-profile",
+    }
+    isolated_settings.write_text(json.dumps(original), encoding="utf-8")
+    monkeypatch.setattr(settings_mod, "apply_runtime_provider_defaults", lambda s: (s, False, []))
+    app = Starlette(routes=[
+        Route("/api/settings", endpoint=settings_mod.api_settings_get, methods=["GET"]),
+    ])
+    app.state.drive_root = isolated_settings.parent
+    app.state.repo_dir = isolated_settings.parent
+    response = TestClient(app).get("/api/settings")
+
+    assert response.status_code == 200, response.text
+    projection = response.json()["_meta"]["available_subagents"]
+    assert projection["source"] == "legacy_migrated"
+    assert projection["candidate"]["items"][0]["route"]["credential_profile_id"] == (
+        "owner-profile"
+    )
+    assert json.loads(isolated_settings.read_text(encoding="utf-8")) == original
+
+
 def test_a_malformed_body_says_saved_false(monkeypatch, isolated_settings):
     app = _settings_app(monkeypatch, isolated_settings)
     resp = TestClient(app).post("/api/settings", json=["not", "an", "object"])

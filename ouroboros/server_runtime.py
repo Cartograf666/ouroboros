@@ -17,7 +17,6 @@ from ouroboros.utils import utc_now_iso
 
 _MODEL_ROLE_SETTING_KEYS = {
     "main": "OUROBOROS_MODEL",
-    "heavy": "OUROBOROS_MODEL_HEAVY",
     "light": "OUROBOROS_MODEL_LIGHT",
     "fallback": "OUROBOROS_MODEL_FALLBACKS",
     "deep_self_review": "OUROBOROS_MODEL_DEEP_SELF_REVIEW",
@@ -373,7 +372,7 @@ def has_local_routing(settings: dict) -> bool:
     """Return True when a task-capable model slot is routed to local."""
     return any(
         _truthy_setting(settings.get(k))
-        for k in ("USE_LOCAL_MAIN", "USE_LOCAL_HEAVY", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK")
+        for k in ("USE_LOCAL_MAIN", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK")
     )
 
 
@@ -382,7 +381,7 @@ def needs_local_model_autostart(settings: dict) -> bool:
     return any(
         _truthy_setting(settings.get(k))
         for k in (
-            "USE_LOCAL_MAIN", "USE_LOCAL_HEAVY", "USE_LOCAL_LIGHT",
+            "USE_LOCAL_MAIN", "USE_LOCAL_LIGHT",
             "USE_LOCAL_CONSCIOUSNESS", "USE_LOCAL_FALLBACK",
         )
     )
@@ -477,12 +476,12 @@ def apply_runtime_provider_defaults(settings: dict) -> tuple[dict, bool, list[st
             _DIRECT_PROVIDER_LEGACY_DEFAULTS.get(provider, {}).get(key, set())
             | _PRIOR_SHIPPED_SLOT_DEFAULTS.get(key, set())
         )
-        # Heavy/Light default EMPTY -> Main (role-model, v6.39). Their pre-role-model
+        # Light default EMPTY -> Main (role-model, v6.39). Its pre-role-model
         # default was the shared Main default, so a stored value equal to it is the old
         # "follow Main" default and migrates to the provider slot exactly like "".
         extra_default = (
             main_shipped_default
-            if key in ("OUROBOROS_MODEL_HEAVY", "OUROBOROS_MODEL_LIGHT")
+            if key == "OUROBOROS_MODEL_LIGHT"
             else ""
         )
         migrated_extra_default = migrate_model_value(provider, extra_default)

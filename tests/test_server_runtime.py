@@ -41,7 +41,6 @@ def test_apply_runtime_provider_defaults_autofills_official_openai_models():
     assert changed
     assert set(changed_keys) == {
         "OUROBOROS_MODEL",
-        "OUROBOROS_MODEL_HEAVY",
         "OUROBOROS_MODEL_LIGHT",
         "OUROBOROS_MODEL_FALLBACKS",
         # v6.82.0: deep self-review is a per-provider slot too, so a direct-only
@@ -52,7 +51,7 @@ def test_apply_runtime_provider_defaults_autofills_official_openai_models():
         "OUROBOROS_SCOPE_REVIEW_MODELS",
     }
     assert normalized["OUROBOROS_MODEL"] == "openai::gpt-5.6-terra"
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == "anthropic/claude-opus-4.6"
     assert normalized["OUROBOROS_MODEL_LIGHT"] == "openai::gpt-5.6-luna"
     assert normalized["OUROBOROS_MODEL_FALLBACKS"] == "openai::gpt-5.6-sol"
 
@@ -70,7 +69,7 @@ def test_apply_runtime_provider_defaults_autofills_official_openai_models():
     assert changed
     assert "OUROBOROS_MODEL" in changed_keys
     assert normalized["OUROBOROS_MODEL"] == "openai::gpt-5.6-terra"
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == "google/gemini-3.5-flash"
     assert normalized["OUROBOROS_MODEL_LIGHT"] == "openai::gpt-5.6-luna"
     assert normalized["OUROBOROS_REVIEW_MODELS"] == (
         "openai::gpt-5.6-terra,openai::gpt-5.6-terra,openai::gpt-5.6-terra"
@@ -110,7 +109,6 @@ def test_apply_runtime_provider_defaults_migrates_saved_openai_values():
     assert changed
     assert set(changed_keys) == {
         "OUROBOROS_MODEL",
-        "OUROBOROS_MODEL_HEAVY",
         "OUROBOROS_MODEL_LIGHT",
         "OUROBOROS_MODEL_FALLBACKS",
         # v6.82.0: deep self-review is a per-provider slot too, so a direct-only
@@ -120,11 +118,10 @@ def test_apply_runtime_provider_defaults_migrates_saved_openai_values():
         "OUROBOROS_SCOPE_REVIEW_MODEL",
         "OUROBOROS_SCOPE_REVIEW_MODELS",
     }
-    # v6.82.0: stored copies of the OLD shipped OpenAI defaults (gpt-5.5 main/heavy,
-    # gpt-4.1 / gpt-5.4-mini light+fallback) are legacy defaults, not explicit
-    # choices — they migrate to the new gpt-5.6 slot defaults.
+    # Active Main/Light/Fallback defaults migrate. Heavy remains bounded legacy
+    # input so ConfiguredSubagent migration can preserve its exact old route.
     assert normalized["OUROBOROS_MODEL"] == "openai::gpt-5.6-terra"
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == "openai/gpt-5.5"
     assert normalized["OUROBOROS_MODEL_LIGHT"] == "openai::gpt-5.6-luna"
     assert normalized["OUROBOROS_MODEL_FALLBACKS"] == "openai::gpt-5.6-sol"
     # v6.36.0 (D4): an explicit provider-matching review list is honored EXACTLY
@@ -283,7 +280,6 @@ def test_apply_runtime_provider_defaults_normalizes_anthropic_only_setup():
     assert changed
     assert set(changed_keys) == {
         "OUROBOROS_MODEL",
-        "OUROBOROS_MODEL_HEAVY",
         "OUROBOROS_MODEL_LIGHT",
         "OUROBOROS_MODEL_FALLBACKS",
         # v6.82.0: deep self-review is a per-provider slot too, so a direct-only
@@ -294,7 +290,7 @@ def test_apply_runtime_provider_defaults_normalizes_anthropic_only_setup():
         "OUROBOROS_SCOPE_REVIEW_MODELS",
     }
     assert normalized["OUROBOROS_MODEL"] == "anthropic::claude-opus-5"
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == "anthropic/claude-opus-4.6"
     assert normalized["OUROBOROS_MODEL_LIGHT"] == "anthropic::claude-sonnet-5"
     assert normalized["OUROBOROS_MODEL_FALLBACKS"] == "anthropic::claude-sonnet-5"
     assert normalized["OUROBOROS_REVIEW_MODELS"] == (
@@ -319,7 +315,7 @@ def test_apply_runtime_provider_defaults_normalizes_anthropic_only_setup():
     assert changed
     assert "OUROBOROS_MODEL" in changed_keys
     assert normalized["OUROBOROS_MODEL"] == "anthropic::claude-opus-5"
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == "google/gemini-3.5-flash"
     assert normalized["OUROBOROS_MODEL_LIGHT"] == "anthropic::claude-sonnet-5"
     assert normalized["OUROBOROS_REVIEW_MODELS"] == (
         "anthropic::claude-opus-5,"
@@ -483,7 +479,7 @@ def test_apply_runtime_provider_defaults_cloudru_only_elevates_to_direct():
     assert changed
     assert "OUROBOROS_MODEL" in changed_keys
     assert normalized["OUROBOROS_MODEL"].startswith("cloudru::")
-    assert normalized["OUROBOROS_MODEL_HEAVY"].startswith("cloudru::")
+    assert "OUROBOROS_MODEL_HEAVY" not in normalized
     assert all(m.startswith("cloudru::") for m in normalized["OUROBOROS_REVIEW_MODELS"].split(","))
     assert normalized["OUROBOROS_SCOPE_REVIEW_MODEL"].startswith("cloudru::")
 
@@ -496,7 +492,7 @@ def test_apply_runtime_provider_defaults_minimax_only_uses_current_models():
     assert changed
     assert "OUROBOROS_MODEL" in changed_keys
     assert normalized["OUROBOROS_MODEL"] == "minimax::MiniMax-M3"
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == "minimax::MiniMax-M3"
+    assert "OUROBOROS_MODEL_HEAVY" not in normalized
     assert normalized["OUROBOROS_MODEL_LIGHT"] == "minimax::MiniMax-M2.7"
     assert normalized["OUROBOROS_MODEL_FALLBACKS"] == "minimax::MiniMax-M2.7"
     # Deep self-review stays empty: MiniMax guarantees only a 512K window floor,
@@ -512,8 +508,8 @@ def test_apply_runtime_provider_defaults_minimax_only_uses_current_models():
 def test_apply_runtime_provider_defaults_cloudru_migrates_populated_shipped_defaults():
     """The realistic save path: a Cloud.ru-only user whose settings already carry
     shipped non-cloudru defaults, including the immediately outgoing v6.104 Main
-    and Light values. Every model/review slot must migrate to cloudru:: so no
-    slot points at a provider with no key."""
+    and Light values. Every active model/review slot migrates to cloudru::;
+    legacy Heavy remains bounded migration input."""
     from ouroboros.server_runtime import apply_runtime_provider_defaults
 
     normalized, changed, _ = apply_runtime_provider_defaults({
@@ -528,7 +524,7 @@ def test_apply_runtime_provider_defaults_cloudru_migrates_populated_shipped_defa
     })
     assert changed
     assert normalized["OUROBOROS_MODEL"].startswith("cloudru::")
-    assert normalized["OUROBOROS_MODEL_HEAVY"].startswith("cloudru::")
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == "google/gemini-3.5-flash"
     assert all(m.startswith("cloudru::") for m in normalized["OUROBOROS_REVIEW_MODELS"].split(","))
     assert normalized["OUROBOROS_SCOPE_REVIEW_MODEL"].startswith("cloudru::")
     assert normalized["OUROBOROS_SCOPE_REVIEW_MODELS"].startswith("cloudru::")
@@ -549,15 +545,15 @@ def test_apply_runtime_provider_defaults_gigachat_only_elevates_to_direct():
     assert "OUROBOROS_MODEL" in changed_keys
     assert normalized["OUROBOROS_MODEL"].startswith("gigachat::")
     assert normalized["OUROBOROS_MODEL"] == "gigachat::GigaChat-2-Max"
-    assert normalized["OUROBOROS_MODEL_HEAVY"].startswith("gigachat::")
+    assert "OUROBOROS_MODEL_HEAVY" not in normalized
     assert all(m.startswith("gigachat::") for m in normalized["OUROBOROS_REVIEW_MODELS"].split(","))
     assert normalized["OUROBOROS_SCOPE_REVIEW_MODEL"].startswith("gigachat::")
 
 
 def test_apply_runtime_provider_defaults_gigachat_credentials_migrates_shipped_defaults():
     """A GigaChat-only user (authorization key) whose settings still carry the
-    shipped (non-gigachat) defaults: main/code AND every review/scope reviewer slot
-    must migrate to gigachat:: so no slot points at a provider with no key."""
+    shipped (non-gigachat) defaults: active Main/Light and every review/scope
+    reviewer slot migrate; legacy Heavy stays available to the actor migrator."""
     from ouroboros.server_runtime import apply_runtime_provider_defaults
 
     normalized, changed, _ = apply_runtime_provider_defaults({
@@ -573,7 +569,7 @@ def test_apply_runtime_provider_defaults_gigachat_credentials_migrates_shipped_d
     assert changed
     assert normalized["OUROBOROS_MODEL"].startswith("gigachat::")
     assert normalized["OUROBOROS_MODEL"] == "gigachat::GigaChat-2-Max"
-    assert normalized["OUROBOROS_MODEL_HEAVY"].startswith("gigachat::")
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == "google/gemini-3.5-flash"
     assert all(m.startswith("gigachat::") for m in normalized["OUROBOROS_REVIEW_MODELS"].split(","))
     assert normalized["OUROBOROS_SCOPE_REVIEW_MODEL"].startswith("gigachat::")
     assert normalized["OUROBOROS_SCOPE_REVIEW_MODELS"].startswith("gigachat::")

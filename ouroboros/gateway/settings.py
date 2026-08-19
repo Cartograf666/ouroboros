@@ -993,6 +993,18 @@ async def api_settings_get(request: Request) -> JSONResponse:
         and settings.get(key)
     )
     meta["setup_contract"] = build_setup_contract("web")
+    from ouroboros.configured_subagents import (
+        configured_subagents_dict,
+        resolve_configured_subagents,
+    )
+    subagents = resolve_configured_subagents(settings)
+    meta["available_subagents"] = {
+        "source": subagents.source,
+        "diagnostic": subagents.diagnostic,
+        "candidate": (
+            configured_subagents_dict(subagents.config) if subagents.config is not None else None
+        ),
+    }
     safe["_meta"] = meta
     return JSONResponse(safe)
 
@@ -1221,6 +1233,17 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
                 _reviewer_fallback_warning = reviewer_slot_save_check(str(body["OUROBOROS_REVIEWER_SLOTS"]))
             except ValueError as exc:
                 return unsaved_error(str(exc), 400)
+        subagents_key = "OUROBOROS_SUBAGENTS"
+        if subagents_key in body and body.get(subagents_key) not in (None, ""):
+            from ouroboros.configured_subagents import normalize_configured_subagents
+            try:
+                _subagents, canonical_subagents = normalize_configured_subagents(
+                    body.get(subagents_key)
+                )
+            except ValueError as exc:
+                return unsaved_error(str(exc), 400)
+            body = dict(body)
+            body[subagents_key] = canonical_subagents
         parsed_budget: dict[str, float] = {}
         for budget_key in BUDGET_SETTING_KEYS:
             if budget_key not in body:

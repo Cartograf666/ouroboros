@@ -1265,6 +1265,7 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     # overlay frame, plain browser). /api/onboarding stays the readiness probe.
     "GET /onboarding",
     "GET /api/onboarding",
+    "POST /api/onboarding/subagents/preview",
     "POST /api/onboarding/complete",
     "GET /api/claude-code/status",
     "POST /api/claude-code/install",

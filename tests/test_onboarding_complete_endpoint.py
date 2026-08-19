@@ -16,6 +16,7 @@ from starlette.testclient import TestClient
 
 from ouroboros.settings_setup_contract import ONBOARDING_COMPLETED_KEY
 from ouroboros.subscription_install_presets import PRESET_MARKER_KEY
+from ouroboros.configured_subagents import SUBAGENTS_RECEIPT_KEY, SUBAGENTS_SETTING
 
 _PROVIDER_ENV = (
     "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MINIMAX_API_KEY",
@@ -23,7 +24,8 @@ _PROVIDER_ENV = (
     "GIGACHAT_PASSWORD", "OPENAI_COMPATIBLE_BASE_URL", "OPENAI_BASE_URL",
     "USE_LOCAL_MAIN", "USE_LOCAL_HEAVY", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK",
     "USE_LOCAL_CONSCIOUSNESS", "LOCAL_MODEL_SOURCE", PRESET_MARKER_KEY,
-    "OUROBOROS_REVIEWER_SLOTS", "OUROBOROS_SUBAGENT_HARNESS", "OUROBOROS_SAFETY_MODE",
+    "OUROBOROS_REVIEWER_SLOTS", SUBAGENTS_SETTING, "OUROBOROS_SUBAGENT_HARNESS",
+    "OUROBOROS_SAFETY_MODE",
     ONBOARDING_COMPLETED_KEY,
 )
 
@@ -147,6 +149,8 @@ def onboarding(monkeypatch, tmp_path):
     monkeypatch.setattr(gw_settings, "_apply_settings_save_side_effects", _side_effects)
 
     app = Starlette(routes=[
+        Route("/api/onboarding/subagents/preview",
+              endpoint=gw_onboarding.api_onboarding_subagents_preview, methods=["POST"]),
         Route("/api/onboarding/complete",
               endpoint=gw_onboarding.api_onboarding_complete, methods=["POST"]),
     ])
@@ -171,8 +175,13 @@ def test_fresh_install_applies_the_preset_in_one_write(onboarding):
     assert onboarding.calls["snapshot"] == 1  # exactly ONE daemon read
 
     saved = onboarding.saved()
-    assert saved[PRESET_MARKER_KEY] == "2"
-    assert saved["OUROBOROS_SUBAGENT_HARNESS"] == "claude=claude-opus-5:medium"
+    assert saved[PRESET_MARKER_KEY] == "3"
+    assert saved["OUROBOROS_SUBAGENT_HARNESS"] == ""
+    available = json.loads(saved[SUBAGENTS_SETTING])
+    assert [row["route"]["target_id"] for row in available["items"]] == [
+        "claude=claude-opus-5", "codex=gpt-5.6-sol", "openai/gpt-5.6-luna",
+    ]
+    assert json.loads(saved[SUBAGENTS_RECEIPT_KEY])["available_subagents_fingerprint"]
     slots = json.loads(saved["OUROBOROS_REVIEWER_SLOTS"])
     assert [row["route"]["target_id"] for row in slots["triad"]] == [
         "claude=claude-opus-5", "codex=gpt-5.6-sol"]
@@ -187,7 +196,7 @@ def test_fresh_install_applies_the_preset_in_one_write(onboarding):
     assert onboarding.calls["supervisor"] == 1
 
 
-def test_antigravity_install_refuses_until_owner_dictates_its_seats(onboarding):
+def test_antigravity_install_succeeds_without_inventing_reviewer_seats(onboarding):
     onboarding.calls["snapshot_payload"] = {
         "daemon": {"state": "running"},
         "harnesses": [{
@@ -209,9 +218,15 @@ def test_antigravity_install_refuses_until_owner_dictates_its_seats(onboarding):
         json={**WIZARD_PAYLOAD, "subscriptionsConnected": True},
     )
 
-    assert response.status_code == 503, response.text
-    assert response.json()["code"] == "matrix_row_absent"
-    assert not onboarding.settings_path.exists()
+    assert response.status_code == 200, response.text
+    saved = onboarding.saved()
+    items = json.loads(saved[SUBAGENTS_SETTING])["items"]
+    assert items[0]["route"] == {
+        "kind": "agent_session",
+        "target_id": "agy=gemini-3.7-flash-high",
+        "credential_profile_id": "",
+    }
+    assert saved["OUROBOROS_REVIEWER_SLOTS"] == ""
 
 
 def test_daemon_unavailable_persists_nothing_and_keeps_the_wizard_open(onboarding):
@@ -297,7 +312,135 @@ def test_no_subscription_declared_never_reads_the_daemon(onboarding):
     response = onboarding.client.post("/api/onboarding/complete", json=dict(WIZARD_PAYLOAD))
 
     assert response.status_code == 200, response.text
-    assert response.json()["preset"]["reason"] == "not_requested"
+    assert response.json()["preset"]["reason"] == "applied"
+    assert onboarding.calls["snapshot"] == 0
+    assert json.loads(onboarding.saved()[SUBAGENTS_SETTING])["items"]
+
+
+def test_api_only_preview_is_read_only_and_never_reads_claudexor(onboarding):
+    response = onboarding.client.post(
+        "/api/onboarding/subagents/preview", json=dict(WIZARD_PAYLOAD),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["source"] == "onboarding_default"
+    assert body["available_subagents"]["enabled"] is True
+    assert [row["code"] for row in body["diagnostics"]] == [
+        "duplicate_api_routes_omitted",
+    ]
+    assert onboarding.calls["snapshot"] == 0
+    assert not onboarding.settings_path.exists()
+    assert onboarding.calls["env"] == []
+    assert onboarding.calls["supervisor"] == 0
+
+
+def test_local_only_preview_materializes_only_local_routes_without_daemon_read(onboarding):
+    response = onboarding.client.post(
+        "/api/onboarding/subagents/preview",
+        json={
+            **WIZARD_PAYLOAD,
+            "OPENROUTER_API_KEY": "",
+            "LOCAL_MODEL_SOURCE": "/models/owner.gguf",
+            "LOCAL_ROUTING_MODE": "all",
+            "OUROBOROS_MODEL": "owner-main",
+            "OUROBOROS_MODEL_LIGHT": "owner-light",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    targets = [
+        row["route"]["target_id"]
+        for row in response.json()["available_subagents"]["items"]
+    ]
+    assert targets == ["owner-main (local)", "owner-light (local)"]
+    assert onboarding.calls["snapshot"] == 0
+    assert not onboarding.settings_path.exists()
+
+
+def test_subscription_preview_reads_one_snapshot_and_still_persists_nothing(onboarding):
+    response = onboarding.client.post(
+        "/api/onboarding/subagents/preview",
+        json={**WIZARD_PAYLOAD, "subscriptionsConnected": True},
+    )
+
+    assert response.status_code == 200, response.text
+    assert onboarding.calls["snapshot"] == 1
+    assert not onboarding.settings_path.exists()
+    assert onboarding.calls["supervisor"] == 0
+
+
+def test_completion_validates_but_never_replaces_owner_edited_actor_rows(onboarding):
+    owner = {
+        "enabled": True,
+        "items": [{
+            "subagent_id": "owner-route",
+            "name": "Owner route",
+            "recommended_use": "Use exactly when the owner chooses this saved route.",
+            "route": {"kind": "api_model", "target_id": "x-ai/grok-owner"},
+            "effort": "high",
+        }],
+    }
+    preview = onboarding.client.post(
+        "/api/onboarding/subagents/preview",
+        json={**WIZARD_PAYLOAD, "subscriptionsConnected": True,
+              SUBAGENTS_SETTING: owner},
+    )
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["source"] == "configured"
+    assert preview.json()["available_subagents"] == owner
+    assert not onboarding.settings_path.exists()
+
+    response = onboarding.client.post(
+        "/api/onboarding/complete",
+        json={**WIZARD_PAYLOAD, "subscriptionsConnected": True,
+              SUBAGENTS_SETTING: owner},
+    )
+    assert response.status_code == 200, response.text
+    assert json.loads(onboarding.saved()[SUBAGENTS_SETTING]) == owner
+    assert response.json()["preset"]["receipt"]["source"] == "configured"
+    assert onboarding.calls["snapshot"] == 2  # one independently verified snapshot per request
+
+
+def test_malformed_owner_actor_draft_refuses_before_snapshot_or_write(onboarding):
+    malformed = {
+        "enabled": True,
+        "items": [{
+            "subagent_id": "dup",
+            "name": "Bad",
+            "recommended_use": "Bad",
+            "route": {"kind": "api_model", "target_id": "x", "extra": True},
+        }],
+    }
+    for path in ("/api/onboarding/subagents/preview", "/api/onboarding/complete"):
+        response = onboarding.client.post(
+            path,
+            json={**WIZARD_PAYLOAD, "subscriptionsConnected": True,
+                  SUBAGENTS_SETTING: malformed},
+        )
+        assert response.status_code == 400, response.text
+        assert response.json()["code"] == "invalid_available_subagents"
+    assert onboarding.calls["snapshot"] == 0
+    assert not onboarding.settings_path.exists()
+
+
+def test_skip_subscription_defaults_still_saves_an_explicit_owner_actor_draft(onboarding):
+    owner = {
+        "enabled": False,
+        "items": [],
+    }
+    response = onboarding.client.post(
+        "/api/onboarding/complete",
+        json={**WIZARD_PAYLOAD, "subscriptionsConnected": True,
+              "skipSubscriptionPresets": True, SUBAGENTS_SETTING: owner},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["preset"]["reason"] == "configured_by_owner"
+    saved = onboarding.saved()
+    assert json.loads(saved[SUBAGENTS_SETTING]) == owner
+    assert not saved.get(PRESET_MARKER_KEY)
+    assert not saved.get("OUROBOROS_REVIEWER_SLOTS")
     assert onboarding.calls["snapshot"] == 0
 
 
@@ -338,7 +481,7 @@ def test_every_completion_records_the_durable_onboarding_fact(onboarding):
     response = onboarding.client.post("/api/onboarding/complete", json=dict(WIZARD_PAYLOAD))
 
     assert response.status_code == 200, response.text
-    assert response.json()["preset"]["reason"] == "not_requested"
+    assert response.json()["preset"]["reason"] == "applied"
     assert onboarding.saved()[ONBOARDING_COMPLETED_KEY]
 
 
@@ -377,7 +520,7 @@ def test_an_environment_completion_fact_cannot_close_the_install_window(monkeypa
     assert body["preset"]["applied"] is True
     assert onboarding.calls["snapshot"] == 1, "the daemon was never consulted"
     saved = onboarding.saved()
-    assert saved[PRESET_MARKER_KEY] == "2"
+    assert saved[PRESET_MARKER_KEY] == "3"
     # The endpoint's own timestamp, not the environment's.
     assert saved[ONBOARDING_COMPLETED_KEY] != "2020-01-01T00:00:00Z"
 
@@ -397,32 +540,15 @@ def test_onboarding_validation_refusals_say_saved_false(onboarding):
     assert not onboarding.settings_path.exists()
 
 
-def test_the_wire_contract_does_not_promise_a_marker_every_success_lacks(onboarding):
-    """FINDING 4. A subscription-free completion is an ORDINARY success that
-    persists no preset and no marker (D-4), but both wire contracts said the
-    marker always lands with a successful completion. Behaviour first, then the
-    copy that describes it — a contract a client reads is part of the API."""
-    import pathlib
-
-    from ouroboros.gateway.contracts import OnboardingCompleteResponse
-
+def test_subscription_free_completion_still_materializes_actor_default(onboarding):
+    """API/local-only first installs compile actors without reading Claudexor."""
     response = onboarding.client.post("/api/onboarding/complete", json=dict(WIZARD_PAYLOAD))
     assert response.status_code == 200, response.text
-    assert response.json()["preset"]["applied"] is False
+    assert response.json()["preset"]["applied"] is True
     saved = onboarding.saved()
     assert saved[ONBOARDING_COMPLETED_KEY], "the completion fact IS unconditional"
-    # The key rides the defaults merge; what must be absent is a RECORDED generation.
-    assert not saved.get(PRESET_MARKER_KEY), "no preset ran, so no marker may be recorded"
-
-    web = pathlib.Path(__file__).resolve().parent.parent / "web" / "modules"
-    for name, text in (
-        ("contracts.py", OnboardingCompleteResponse.__doc__ or ""),
-        ("api_client.js", (web / "api_client.js").read_text(encoding="utf-8")),
-        ("api_types.js", (web / "api_types.js").read_text(encoding="utf-8")),
-    ):
-        assert "preset.applied" in text or "`preset.applied`" in text, (
-            f"{name} describes the completion envelope without conditioning the preset "
-            "on preset.applied — the marker does not land on every success")
+    assert saved.get(PRESET_MARKER_KEY) == "3"
+    assert json.loads(saved[SUBAGENTS_SETTING])["items"]
 
 
 def test_generic_settings_save_cannot_author_or_clear_the_completion_fact():
@@ -509,7 +635,7 @@ def test_a_post_commit_failure_reports_the_save_that_landed(monkeypatch, onboard
     assert "supervisor refused to start" in body["error"]
     # And the transaction really IS on disk, preset marker included.
     saved = onboarding.saved()
-    assert saved[PRESET_MARKER_KEY] == "2"
+    assert saved[PRESET_MARKER_KEY] == "3"
     assert saved[ONBOARDING_COMPLETED_KEY]
     assert saved["OPENROUTER_API_KEY"] == WIZARD_PAYLOAD["OPENROUTER_API_KEY"]
 
@@ -998,18 +1124,25 @@ def test_an_engine_with_no_accounts_authority_vouches_nothing():
     assert failure is not None and failure.code == "no_verified_account"
 
 
-def test_generic_settings_save_cannot_author_or_clear_the_marker():
-    """The marker is owner-only: a Settings POST neither writes nor wipes it."""
+def test_generic_settings_save_cannot_author_or_clear_preset_facts():
+    """Marker and receipt are endpoint-authored: Settings neither writes nor wipes."""
     from ouroboros.gateway.settings import _merge_settings_payload
 
-    merged = _merge_settings_payload({PRESET_MARKER_KEY: "1", "TOTAL_BUDGET": 10.0},
-                                     {PRESET_MARKER_KEY: "99", "TOTAL_BUDGET": 20.0})
+    merged = _merge_settings_payload(
+        {PRESET_MARKER_KEY: "1", SUBAGENTS_RECEIPT_KEY: "old", "TOTAL_BUDGET": 10.0},
+        {PRESET_MARKER_KEY: "99", SUBAGENTS_RECEIPT_KEY: "new", "TOTAL_BUDGET": 20.0},
+    )
 
     assert merged[PRESET_MARKER_KEY] == "1"
+    assert merged[SUBAGENTS_RECEIPT_KEY] == "old"
     assert merged["TOTAL_BUDGET"] == 20.0
 
-    fresh = _merge_settings_payload({"TOTAL_BUDGET": 10.0}, {PRESET_MARKER_KEY: "1"})
+    fresh = _merge_settings_payload(
+        {"TOTAL_BUDGET": 10.0},
+        {PRESET_MARKER_KEY: "1", SUBAGENTS_RECEIPT_KEY: "new"},
+    )
     assert not fresh.get(PRESET_MARKER_KEY)
+    assert not fresh.get(SUBAGENTS_RECEIPT_KEY)
 
 
 def test_get_onboarding_read_writes_nothing(monkeypatch, tmp_path):
@@ -1163,12 +1296,7 @@ def test_an_unreadable_settings_file_can_never_compare_equal(onboarding, monkeyp
     assert first != second, "an unreadable file must refuse, never satisfy equality"
 
 
-def test_a_connected_agy_account_refuses_typed_until_its_policy_is_dictated(onboarding):
-    # agy is RECOGNIZED by the preset compiler but has no assigned policy seats
-    # yet (issue #232: the owner dictates its seats separately). A connected
-    # agy account at install time must therefore land on the same typed
-    # finish-without-defaults wall as any other compiler refusal — never a
-    # bare 500 (the pre-guard KeyError class).
+def test_a_connected_agy_account_composes_with_core_reviewers(onboarding):
     # The REAL agy wire shape (Claudexor INV-135): a harness with no default
     # credential store reports its harness ROW "unavailable" structurally and
     # its next_up as kind="none" (the default credential is never ready), so
@@ -1204,20 +1332,23 @@ def test_a_connected_agy_account_refuses_typed_until_its_policy_is_dictated(onbo
         json={**WIZARD_PAYLOAD, "subscriptionsConnected": True},
     )
 
-    assert response.status_code == 503, response.text
-    body = response.json()
-    assert body["code"] == "matrix_row_absent"
-    assert body["can_skip"] is True
-    assert body["saved"] is False
-    assert not onboarding.settings_path.exists()
-    assert onboarding.calls["supervisor"] == 0
+    assert response.status_code == 200, response.text
+    saved = onboarding.saved()
+    actor_targets = [
+        row["route"]["target_id"]
+        for row in json.loads(saved[SUBAGENTS_SETTING])["items"]
+    ]
+    assert "agy=gemini-3.7-flash-high" in actor_targets
+    reviewer = json.loads(saved["OUROBOROS_REVIEWER_SLOTS"])
+    assert all("agy=" not in row["route"]["target_id"] for row in reviewer["triad"])
+    assert onboarding.calls["supervisor"] == 1
 
 
 def test_an_unavailable_harness_row_with_a_verified_named_profile_is_routable():
     # The runnability proof for a named profile is its own doctor probe, not
     # the harness row: agy's row is STRUCTURALLY "unavailable" (no default
     # credential store, Claudexor INV-135), and refusing on the row alone made
-    # the matrix_row_absent contract unreachable on the real wire shape. A
+    # the Agy task-actor policy unreachable on the real wire shape. A
     # native default seat still requires a runnable row (its only signal).
     from ouroboros.gateway.onboarding import subscription_routable_harnesses
 

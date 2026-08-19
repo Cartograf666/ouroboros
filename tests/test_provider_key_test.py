@@ -350,7 +350,7 @@ def test_explicit_settings_mapping_is_authoritative(monkeypatch, model, settings
             "OUROBOROS_MODEL_HEAVY": "anthropic::heavy",
             "OUROBOROS_MODEL_LIGHT": "anthropic::light",
             "CLAUDE_CODE_MODEL": "claude-name-only",
-        }, "anthropic::heavy"),
+        }, "anthropic::light"),
         ("cloudru", {}, "cloudru::zai-org/GLM-4.7"),
         ("openrouter", {"CLAUDE_AGENT_SDK_MODEL": "opus"}, "google/gemini-3.7-flash"),
         ("openai-compatible", {
@@ -675,3 +675,13 @@ def test_provider_test_registry_is_derived_from_provider_defaults():
         "openai-compatible",
     }
     assert provider_api._PROVIDER_TEST_OVERRIDE_KEYS == provider_api.ALL_PROVIDER_CREDENTIAL_KEYS
+
+
+def test_provider_test_and_active_model_enumeration_never_select_legacy_heavy():
+    from ouroboros.provider_models import ACTIVE_MODEL_SETTING_KEYS, LEGACY_MODEL_SETTING_KEYS
+
+    assert "OUROBOROS_MODEL_HEAVY" not in ACTIVE_MODEL_SETTING_KEYS
+    assert LEGACY_MODEL_SETTING_KEYS == ("OUROBOROS_MODEL_HEAVY",)
+    assert provider_api._provider_test_model("anthropic", {
+        "OUROBOROS_MODEL_HEAVY": "anthropic::owner-legacy-heavy",
+    }) == "anthropic::claude-opus-5"

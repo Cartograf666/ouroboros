@@ -12,16 +12,15 @@ transaction:
    never an authority;
 2. validate the wizard payload through the SHARED setup validator and the
    startup gate (a subscription alone never satisfies it, D-1);
-3. read ONE fresh Claudexor snapshot when the payload declares subscriptions
-   were connected, and compile the preset from LIVE discovery;
-4. apply the ordinary provider normalization FIRST, then add the structured
-   preset keys on top (R8: normalization is continuous re-derivation, the
-   preset is an install-time transaction — they must not be taught about each
-   other);
-5. persist settings + runtime mode + safety default + the one-shot preset
-   marker in a single write whose eligibility is re-proved under the settings
+3. apply the ordinary provider normalization before compiling task routes;
+4. compile truthful API/local task actors with zero daemon reads, or read ONE
+   fresh Claudexor snapshot when subscriptions were declared;
+5. validate an owner-edited ``OUROBOROS_SUBAGENTS`` object without replacing
+   its rows, while compiling reviewer rows as an independent sibling;
+6. persist settings + runtime mode + safety default + actor fingerprint/source
+   receipt in a single write whose eligibility is re-proved under the settings
    lock;
-6. only then start the supervisor.
+7. only then start the supervisor.
 
 A daemon that cannot answer at save time is a TYPED failure that persists
 NOTHING and keeps the wizard open, with an explicit "finish without agent
@@ -35,10 +34,19 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+
+from ouroboros.configured_subagents import (
+    SOURCE_CONFIGURED,
+    SOURCE_ONBOARDING_DEFAULT,
+    SUBAGENTS_SETTING,
+    ConfiguredSubagents,
+    configured_subagents_dict,
+    normalize_configured_subagents,
+)
 
 from ouroboros.gateway.owner_settings import (
     CommitBoundary,
@@ -61,6 +69,7 @@ from ouroboros.settings_setup_contract import (
 from ouroboros.subscription_install_presets import (
     PRESET_HARNESSES,
     PRESET_MARKER_KEY,
+    REVIEWER_PRESET_HARNESSES,
     HarnessDiscovery,
     SubscriptionInstallPreset,
     compile_install_preset,
@@ -80,9 +89,8 @@ log = logging.getLogger(__name__)
 # simply read "claude: not signed in", which no repair addresses.
 # The copy promises no action the detail cannot deliver: "finish without
 # agent defaults" is always true, while "fix the cause and try again" is
-# conditional — a matrix_row_absent refusal (a recognized-but-unratified
-# combination, e.g. agy before its seats are dictated) has no fix a retry
-# could pick up, unlike daemon_unavailable or no_verified_account.
+# conditional — an exact required model missing from discovery may need an
+# owner edit rather than a retry, unlike daemon_unavailable.
 PRESET_UNVERIFIED_MESSAGE = (
     "Agent defaults could not be applied, and nothing was saved. "
     "The detail below says why. You can finish without agent defaults, "
@@ -366,6 +374,8 @@ def subscription_routable_harnesses(
 
 def verified_harness_discoveries(
     snapshot: Dict[str, Any],
+    *,
+    required_models_for: Optional[set[str]] = None,
 ) -> Tuple[Tuple[HarnessDiscovery, ...], Optional[PresetFailure]]:
     """Turn one ``/api/claudexor/status?include=models`` snapshot into the
     compiler's input, or a typed failure. PURE — unit-testable with no daemon."""
@@ -388,9 +398,10 @@ def verified_harness_discoveries(
             f"{', '.join(PRESET_HARNESSES)}." + (f" {detail}" if detail else ""),
         )
     discoveries: List[HarnessDiscovery] = []
+    required = set(wanted) if required_models_for is None else set(required_models_for)
     for harness in wanted:
         row = rows.get(harness) or {}
-        if row.get("models_error"):
+        if row.get("models_error") and harness in required:
             return (), PresetFailure(
                 "models_unavailable",
                 f"Model discovery for {harness} failed: {row.get('models_error')}",
@@ -400,7 +411,7 @@ def verified_harness_discoveries(
             for model in (row.get("models") or [])
             if isinstance(model, dict) and str(model.get("id") or "")
         )
-        if not model_ids:
+        if not model_ids and harness in required:
             return (), PresetFailure(
                 "models_unavailable",
                 f"The engine listed no models for {harness}.",
@@ -435,19 +446,37 @@ def _read_harness_snapshot() -> Dict[str, Any]:
 
 
 async def resolve_install_preset(
+    settings: Optional[Dict[str, Any]] = None,
+    *,
+    subscriptions_connected: bool = True,
+    owner_draft: Optional[ConfiguredSubagents] = None,
 ) -> Tuple[Optional[SubscriptionInstallPreset], Optional[PresetFailure]]:
-    """One fresh snapshot -> one compiled preset, or a typed failure."""
-    try:
-        snapshot = await asyncio.to_thread(_read_harness_snapshot)
-    except Exception as exc:  # a dead/broken engine is a failure, not a crash
-        log.warning("Claudexor snapshot for onboarding presets failed", exc_info=True)
-        return None, PresetFailure("daemon_unavailable", f"{type(exc).__name__}: {exc}")
-    discoveries, failure = verified_harness_discoveries(snapshot)
-    if failure is not None:
-        return None, failure
+    """Zero daemon reads for API/local-only, exactly one when subscriptions exist."""
+    snapshot: Dict[str, Any] = {}
+    discoveries: Sequence[HarnessDiscovery] = ()
+    capability: Mapping[str, Any] = {}
+    if subscriptions_connected:
+        try:
+            snapshot = await asyncio.to_thread(_read_harness_snapshot)
+        except Exception as exc:  # a dead/broken engine is a failure, not a crash
+            log.warning("Claudexor snapshot for onboarding presets failed", exc_info=True)
+            return None, PresetFailure("daemon_unavailable", f"{type(exc).__name__}: {exc}")
+        required_models = (
+            set(REVIEWER_PRESET_HARNESSES)
+            if owner_draft is not None else None
+        )
+        discoveries, failure = verified_harness_discoveries(
+            snapshot, required_models_for=required_models,
+        )
+        if failure is not None:
+            return None, failure
+        capability = _harness_capability(snapshot, [d.harness_id for d in discoveries])
     preset = compile_install_preset(
         discoveries,
-        capability=_harness_capability(snapshot, [d.harness_id for d in discoveries]),
+        settings=settings or {},
+        configured_subagents=owner_draft,
+        source=SOURCE_CONFIGURED if owner_draft is not None else SOURCE_ONBOARDING_DEFAULT,
+        capability=capability,
     )
     if not preset.ok:
         refusal = preset.refusal.as_dict() if preset.refusal else {}
@@ -606,6 +635,77 @@ def _prepared_settings(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, 
     return old_settings, normalized, ""
 
 
+def _configured_owner_draft(
+    body: Mapping[str, Any],
+) -> Tuple[Optional[ConfiguredSubagents], str]:
+    """Validate an owner-edited canonical object without reading live status."""
+    if SUBAGENTS_SETTING not in body:
+        return None, ""
+    try:
+        config, _canonical = normalize_configured_subagents(body.get(SUBAGENTS_SETTING))
+    except ValueError as exc:
+        return None, str(exc)
+    return config, ""
+
+
+async def _compile_onboarding_preset(
+    current: Dict[str, Any],
+    *,
+    subscriptions_connected: bool,
+    owner_draft: Optional[ConfiguredSubagents],
+) -> Tuple[Optional[SubscriptionInstallPreset], Optional[PresetFailure]]:
+    preset, failure = await resolve_install_preset(
+        current,
+        subscriptions_connected=subscriptions_connected,
+        owner_draft=owner_draft,
+    )
+    return preset, failure
+
+
+async def api_onboarding_subagents_preview(request: Request) -> JSONResponse:
+    """Read-only canonical preview for the wizard; never persists or projects env."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        return unsaved_error("JSON body must be an object.", 400)
+
+    owner_draft, draft_error = _configured_owner_draft(body)
+    if draft_error:
+        return unsaved_error(
+            draft_error, 400, code="invalid_available_subagents",
+            diagnostics=[{"code": "invalid_available_subagents", "message": draft_error}],
+        )
+    _old_settings, current, error = _prepared_settings(body)
+    if error:
+        return unsaved_error(
+            error, 400, code="invalid_onboarding_settings",
+            diagnostics=[{"code": "invalid_onboarding_settings", "message": error}],
+        )
+    subscriptions_connected, skip_presets = parse_subscription_intent(body)
+    preset, failure = await _compile_onboarding_preset(
+        current,
+        subscriptions_connected=subscriptions_connected and not skip_presets,
+        owner_draft=owner_draft,
+    )
+    if failure is not None:
+        return unsaved_error(
+            PRESET_UNVERIFIED_MESSAGE, 503, code=failure.code, detail=failure.detail,
+            can_skip=True,
+            diagnostics=[{"code": failure.code, "message": failure.detail}],
+        )
+    assert preset is not None
+    return JSONResponse({
+        "ok": True,
+        "available_subagents": configured_subagents_dict(
+            normalize_configured_subagents(preset.available_subagents)[0]
+        ),
+        "source": preset.source,
+        "diagnostics": list(preset.diagnostics),
+    })
+
+
 def _persist(request: Request, old_settings: Dict[str, Any], current: Dict[str, Any],
              pending_mode: str, safety_light: bool, preset_applied: bool,
              boundary: CommitBoundary, read_fingerprint: str) -> None:
@@ -672,6 +772,12 @@ async def api_onboarding_complete(request: Request) -> JSONResponse:
     if not isinstance(body, dict):
         return unsaved_error("JSON body must be an object.", 400)
 
+    owner_draft, draft_error = _configured_owner_draft(body)
+    if draft_error:
+        return unsaved_error(
+            draft_error, 400, code="invalid_available_subagents",
+        )
+
     # BEFORE the read, not after: if a write lands between the two, the document
     # this request goes on to derive is NEWER than the fingerprint, the locked
     # precondition sees the mismatch and refuses. Taken the other way round the
@@ -698,8 +804,22 @@ async def api_onboarding_complete(request: Request) -> JSONResponse:
         preset_reason = "not_install_time"
     elif skip_presets:
         preset_reason = "skipped_by_owner"
-    elif subscriptions_connected:
-        preset, failure = await resolve_install_preset()
+        if owner_draft is not None:
+            preset, failure = await _compile_onboarding_preset(
+                current, subscriptions_connected=False, owner_draft=owner_draft,
+            )
+            if failure is not None:
+                return failure.as_response()
+            preset_reason = "configured_by_owner"
+            current.update(preset.settings_keys(
+                include_reviewer=False, include_marker=False,
+            ))
+    else:
+        preset, failure = await _compile_onboarding_preset(
+            current,
+            subscriptions_connected=subscriptions_connected,
+            owner_draft=owner_draft,
+        )
         if failure is not None:
             return failure.as_response()
         preset_reason = "applied"
@@ -764,6 +884,7 @@ __all__ = [
     "PRESET_UNVERIFIED_MESSAGE",
     "PresetFailure",
     "api_onboarding_complete",
+    "api_onboarding_subagents_preview",
     "install_is_unconfigured",
     "preset_eligible",
     "resolve_install_preset",
