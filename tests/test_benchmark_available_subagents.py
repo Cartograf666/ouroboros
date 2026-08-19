@@ -19,6 +19,7 @@ from devtools.benchmarks.common.model_slots import (
     single_model_subagents_setting,
 )
 from devtools.benchmarks.common.server_runner import build_isolated_settings
+from ouroboros.config import SETTINGS_DEFAULTS
 from ouroboros.configured_subagents import (
     parse_configured_subagents,
     serialize_configured_subagents,
@@ -105,11 +106,34 @@ def test_disabled_encoder_can_retain_one_exact_measured_actor():
 def test_runtime_actor_snapshot_compares_main_and_canonical_actor():
     actor = single_model_subagents_setting("openai/gpt-5.5")
     exact = runtime_actor_snapshot(
-        {"OUROBOROS_MODEL": "openai/gpt-5.5", "OUROBOROS_SUBAGENTS": actor},
+        {
+            "OUROBOROS_MODEL": "openai/gpt-5.5",
+            "OUROBOROS_MODEL_LIGHT": "openai/gpt-5.5",
+            "OUROBOROS_MODEL_FALLBACKS": "openai/gpt-5.5, openai/gpt-5.5",
+            "OUROBOROS_MODEL_VISION": "",
+            "OUROBOROS_SUBAGENTS": actor,
+        },
         expected_model="openai/gpt-5.5",
     )
     assert exact["mismatches"] == []
+    assert exact["model_slots"] == {
+        "OUROBOROS_MODEL": "openai/gpt-5.5",
+        "OUROBOROS_MODEL_LIGHT": "openai/gpt-5.5",
+        "OUROBOROS_MODEL_FALLBACKS": "openai/gpt-5.5, openai/gpt-5.5",
+    }
     assert _only_target(json.dumps(exact["available_subagents"])) == "openai/gpt-5.5"
+
+    contaminated = runtime_actor_snapshot(
+        {
+            "OUROBOROS_MODEL": "openai/gpt-5.5",
+            "OUROBOROS_MODEL_LIGHT": "anthropic/foreign-light",
+            "OUROBOROS_MODEL_FALLBACKS": "openai/gpt-5.5,anthropic/foreign-fallback",
+            "OUROBOROS_SUBAGENTS": actor,
+        },
+        expected_model="openai/gpt-5.5",
+    )
+    assert any("OUROBOROS_MODEL_LIGHT" in item for item in contaminated["mismatches"])
+    assert any("OUROBOROS_MODEL_FALLBACKS" in item for item in contaminated["mismatches"])
 
     drifted = runtime_actor_snapshot(
         {
@@ -143,6 +167,27 @@ def test_committed_single_model_profiles_use_one_canonical_actor(relative: str, 
     assert serialize_configured_subagents(parse_configured_subagents(raw)) == raw
     assert "OUROBOROS_MODEL_HEAVY" not in payload
     assert "USE_LOCAL_HEAVY" not in payload
+
+
+@pytest.mark.parametrize(
+    "relative,expected",
+    (
+        ("devtools/benchmarks/programbench/settings_base.json", "openai/gpt-5.5"),
+        ("devtools/benchmarks/osworld/settings_base.json", "anthropic/claude-sonnet-4.6"),
+    ),
+)
+def test_target_attached_profiles_override_foreign_runtime_defaults(relative, expected):
+    payload = json.loads((REPO / relative).read_text(encoding="utf-8"))
+    effective = dict(SETTINGS_DEFAULTS)
+    effective.update(payload)
+    actor = runtime_actor_snapshot(effective, expected_model=expected)
+    assert actor["mismatches"] == []
+    assert all(
+        item.strip() == expected
+        for raw in actor["model_slots"].values()
+        for item in raw.split(",")
+        if item.strip()
+    )
 
 
 def test_benchmark_snapshot_records_canonical_actor_and_refuses_malformed(tmp_path):
@@ -284,6 +329,75 @@ def test_programbench_binds_manifest_to_target_actor_and_refuses_before_discover
     assert manifest["extra"]["refusal"]["reason"] == "target_actor_mismatch"
 
 
+def test_programbench_target_actor_is_durable_before_discovery_and_first_task_crash(
+    tmp_path, monkeypatch
+):
+    from devtools.benchmarks.programbench import run_programbench_e2e as e2e
+
+    measured = "openai/gpt-5.5"
+    target_settings = single_model_slot_snapshot(measured)
+    target_settings["OUROBOROS_SUBAGENTS"] = single_model_subagents_setting(measured)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps(target_settings), encoding="utf-8")
+    out = tmp_path / "run"
+
+    def fake_admit(path, **_kwargs):
+        manifest = {"harness": {}, "extra": {}, "output_paths": {}}
+        e2e.write_json(path, manifest)
+        return manifest
+
+    def assert_durable_actor():
+        durable = json.loads((out / "run_manifest.json").read_text(encoding="utf-8"))
+        actor = durable["harness"]["target_runtime_actor"]
+        assert actor["mismatches"] == []
+        assert actor["model"] == measured
+        assert actor["model_slots"]["OUROBOROS_MODEL"] == measured
+        assert durable["available_subagents"] == actor["available_subagents"]
+
+    observed = {"discovery": False, "first_task": False}
+
+    def load_instances(**_kwargs):
+        assert_durable_actor()
+        observed["discovery"] = True
+        return [{"instance_id": "inst-a", "image_name": "img-a"}]
+
+    def crash_first_task(_instance, _config):
+        assert_durable_actor()
+        observed["first_task"] = True
+        raise RuntimeError("synthetic first-task crash")
+
+    monkeypatch.setattr(e2e, "_ensure_docker_host", lambda: None)
+    monkeypatch.setattr(e2e, "run_root", lambda *_a, **_k: out)
+    monkeypatch.setattr(e2e, "assert_outside_repo", lambda path, _repo: path)
+    monkeypatch.setattr(e2e, "admit_benchmark_run", fake_admit)
+    monkeypatch.setattr(e2e, "preflight_model_slots", lambda *_a, **_k: target_settings)
+    monkeypatch.setattr(e2e, "ouroboros_api_request", lambda *_a, **_k: target_settings)
+    monkeypatch.setattr(e2e, "runtime_attestation", lambda *_a, **_k: {"ok": True})
+    monkeypatch.setattr(e2e, "_load_instances", load_instances)
+    monkeypatch.setattr(e2e, "_process_instance", crash_first_task)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_programbench_e2e.py",
+            "--repo-dir",
+            str(tmp_path / "repo"),
+            "--settings-path",
+            str(settings),
+            "--solve-model",
+            measured,
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic first-task crash"):
+        e2e.main()
+    assert observed == {"discovery": True, "first_task": True}
+    assert_durable_actor()
+    final = json.loads((out / "run_manifest.json").read_text(encoding="utf-8"))
+    assert final["extra"]["outcome"] == "crashed"
+    assert final["extra"]["error"]["type"] == "RuntimeError"
+
+
 def test_osworld_allowed_target_mismatch_records_the_actual_actor():
     from devtools.benchmarks.osworld import run_step_agent as rsa
 
@@ -329,6 +443,21 @@ def test_osworld_cu_bridge_validates_declared_and_target_actor(tmp_path, monkeyp
         },
     )
     assert cu._cu_actor_preflight(settings, "http://target")["ok"] is True
+
+    monkeypatch.setattr(
+        cu,
+        "_api",
+        lambda *_a, **_k: {
+            "OUROBOROS_MODEL": model,
+            "OUROBOROS_MODEL_LIGHT": "anthropic/foreign-light",
+            "OUROBOROS_MODEL_FALLBACKS": "anthropic/foreign-fallback",
+            "OUROBOROS_SUBAGENTS": single_model_subagents_setting(model),
+        },
+    )
+    contaminated = cu._cu_actor_preflight(settings, "http://target")
+    assert contaminated["ok"] is False
+    assert any("OUROBOROS_MODEL_LIGHT" in item for item in contaminated["failures"])
+    assert any("OUROBOROS_MODEL_FALLBACKS" in item for item in contaminated["failures"])
 
     other = "anthropic/claude-fable-5"
     monkeypatch.setattr(

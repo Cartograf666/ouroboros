@@ -524,58 +524,70 @@ def main() -> int:
         },
     )
 
-    with finalize_run_manifest(manifest_path, manifest, outcome="completed") as final:
-        # PREFLIGHT + DISCOVERY, now inside the admitted run: every refusal below is recorded by
-        # the finalization seam instead of vanishing with the process.
+    # TARGET PREFLIGHT, after durable admission but before the long-lived finalization seam. A
+    # successful bind is checkpointed below before discovery or the first paid task. Keeping the
+    # checkpoint OUTSIDE an active finalizer preserves invariant C: no pre-merge terminal record
+    # can be published while that seam owns the manifest path.
+    try:
         model_slots = preflight_model_slots(settings_path, solve_model=str(args.solve_model or ""))
-        manifest["harness"]["model_slots_normalized"] = model_slots
-        measured_model = str(args.solve_model or model_slots.get("OUROBOROS_MODEL") or "").strip()
-        # The local settings declaration is not proof of what an already-running target
-        # server will execute. Fetch its effective settings, bind the top-level manifest
-        # projection to THAT actor, and refuse any mismatch before dataset work/tasks.
-        try:
-            target_settings = ouroboros_api_request(
-                str(args.ouroboros_url), "GET", "/api/settings", timeout=30
-            )
-            target_actor = runtime_actor_snapshot(
-                target_settings,
-                expected_model=measured_model,
-            )
-        except Exception as exc:
-            manifest["available_subagents"] = {}
-            manifest["harness"]["target_runtime_actor"] = {
-                "error": f"{type(exc).__name__}: {exc}"
+    except BaseException:
+        with finalize_run_manifest(manifest_path, manifest, outcome="completed"):
+            raise
+    manifest["harness"]["model_slots_normalized"] = model_slots
+    measured_model = str(args.solve_model or model_slots.get("OUROBOROS_MODEL") or "").strip()
+    # The local settings declaration is not proof of what an already-running target
+    # server will execute. Fetch its effective settings, bind the top-level manifest
+    # projection to THAT actor, and refuse any mismatch before dataset work/tasks.
+    try:
+        target_settings = ouroboros_api_request(
+            str(args.ouroboros_url), "GET", "/api/settings", timeout=30
+        )
+        target_actor = runtime_actor_snapshot(
+            target_settings,
+            expected_model=measured_model,
+        )
+    except Exception as exc:
+        manifest["available_subagents"] = {}
+        manifest["harness"]["target_runtime_actor"] = {
+            "error": f"{type(exc).__name__}: {exc}"
+        }
+        with finalize_run_manifest(
+            manifest_path, manifest, outcome="refused", exit_code=2
+        ) as final:
+            final["refusal"] = {
+                "stage": "target_actor_preflight",
+                "reason": "target_settings_unavailable",
+                "exit_code": 2,
             }
-            final.update({
-                "outcome": "refused",
+        print(f"[pb-e2e] FATAL: target actor preflight failed: {exc}", file=sys.stderr)
+        return 2
+    except BaseException:
+        with finalize_run_manifest(manifest_path, manifest, outcome="completed"):
+            raise
+    manifest["available_subagents"] = target_actor["available_subagents"]
+    manifest["harness"]["target_runtime_actor"] = target_actor
+    if target_actor["mismatches"]:
+        with finalize_run_manifest(
+            manifest_path, manifest, outcome="refused", exit_code=2
+        ) as final:
+            final["refusal"] = {
+                "stage": "target_actor_preflight",
+                "reason": "target_actor_mismatch",
                 "exit_code": 2,
-                "refusal": {
-                    "stage": "target_actor_preflight",
-                    "reason": "target_settings_unavailable",
-                    "exit_code": 2,
-                },
-            })
-            print(f"[pb-e2e] FATAL: target actor preflight failed: {exc}", file=sys.stderr)
-            return 2
-        manifest["available_subagents"] = target_actor["available_subagents"]
-        manifest["harness"]["target_runtime_actor"] = target_actor
-        if target_actor["mismatches"]:
-            final.update({
-                "outcome": "refused",
-                "exit_code": 2,
-                "refusal": {
-                    "stage": "target_actor_preflight",
-                    "reason": "target_actor_mismatch",
-                    "exit_code": 2,
-                    "mismatches": list(target_actor["mismatches"]),
-                },
-            })
-            print(
-                "[pb-e2e] FATAL: target runtime does not match the declared measured actor: "
-                + "; ".join(target_actor["mismatches"]),
-                file=sys.stderr,
-            )
-            return 2
+                "mismatches": list(target_actor["mismatches"]),
+            }
+        print(
+            "[pb-e2e] FATAL: target runtime does not match the declared measured actor: "
+            + "; ".join(target_actor["mismatches"]),
+            file=sys.stderr,
+        )
+        return 2
+
+    # Atomic target-binding checkpoint: after successful comparison, before dataset discovery,
+    # runtime attestation or paid tasks. A failed/partial bind never reaches this write.
+    write_json(manifest_path, manifest)
+
+    with finalize_run_manifest(manifest_path, manifest, outcome="completed") as final:
         instances = _load_instances(**selector)
         if not instances:
             final.update({"outcome": "refused", "exit_code": 1,

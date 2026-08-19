@@ -2037,31 +2037,6 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
     example_id = run.example_id
     domain = run.domain
 
-    # The CU bridge submits to an already-running server. Its local settings file
-    # declares methodology, but only the target /api/settings says which actor will
-    # execute. Bind the top-level manifest to that actual actor and refuse drift
-    # before taking a claim or booting the VM.
-    actor_preflight = _cu_actor_preflight(settings_path, args.ouroboros_url)
-    _bind_cu_actor(run.base_manifest, actor_preflight)
-    if not actor_preflight["ok"]:
-        final.update({
-            "outcome": "blocked",
-            "exit_code": 2,
-            "refusal": {
-                "stage": "target_actor_preflight",
-                "reason": "target_actor_mismatch",
-                "exit_code": 2,
-            },
-        })
-        _write_outcome(
-            None,
-            "blocked",
-            "target_actor_mismatch",
-            "; ".join(actor_preflight["failures"]),
-            extra={"actor_preflight": actor_preflight},
-        )
-        return 2
-
     # Owner Q9=A+B / Q10: attest the RUNNING server (its HTTP `runtime_version`) against the
     # checkout it was started from (local HEAD + VERSION) before any paid work. The shared
     # helper fails CLOSED by raising, so a typed `blocked` row keeps the denominator honest
@@ -2095,6 +2070,32 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
                       "refusal": {"stage": "runtime_attestation",
                                   "reason": "runtime_attestation_failed", "exit_code": 2}})
         _write_outcome(None, "blocked", "runtime_attestation_failed", f"{type(exc).__name__}: {exc}")
+        return 2
+
+    # The CU bridge submits to the runtime just attested above. Its local settings file declares
+    # methodology, but only the target /api/settings says which actor will execute. Bind the
+    # manifest to that actual actor and refuse drift before taking a claim or booting the VM.
+    # Attestation deliberately stays first so unreachable/skewed runtimes retain their existing
+    # typed causes instead of being flattened into a generic target-actor mismatch.
+    actor_preflight = _cu_actor_preflight(settings_path, args.ouroboros_url)
+    _bind_cu_actor(run.base_manifest, actor_preflight)
+    if not actor_preflight["ok"]:
+        final.update({
+            "outcome": "blocked",
+            "exit_code": 2,
+            "refusal": {
+                "stage": "target_actor_preflight",
+                "reason": "target_actor_mismatch",
+                "exit_code": 2,
+            },
+        })
+        _write_outcome(
+            None,
+            "blocked",
+            "target_actor_mismatch",
+            "; ".join(actor_preflight["failures"]),
+            extra={"actor_preflight": actor_preflight},
+        )
         return 2
 
     # Multi-lane claim: take the task exclusively or step aside. Deliberately BEFORE

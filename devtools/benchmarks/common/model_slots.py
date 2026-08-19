@@ -36,6 +36,8 @@ from ouroboros.configured_subagents import (
 )
 from ouroboros.route_spec import ROUTE_KIND_API_MODEL, RouteSpec
 
+from devtools.benchmarks.common.manifests import ACTIVE_MODEL_SLOT_KEYS
+
 # Every model slot a single-model run pins. Superset that is correct for both the
 # settings.json-profile path (SWE-bench Pro) and the forwarded-env path
 # (Terminal-Bench); pinning a slot a given adapter ignores is a harmless no-op.
@@ -54,6 +56,7 @@ SINGLE_MODEL_SLOT_KEYS = (
 
 BENCHMARK_SUBAGENT_ID = "benchmark-model"
 BENCHMARK_SUBAGENT_NAME = "Benchmark model"
+_ACTIVE_FIXED_MODEL_KEYS = tuple(key for key in ACTIVE_MODEL_SLOT_KEYS if "MODEL" in key)
 
 
 def _benchmark_actor(model: str) -> ConfiguredSubagent:
@@ -123,12 +126,31 @@ def runtime_actor_snapshot(
     if not isinstance(settings, Mapping):
         raise ValueError("runtime settings must be an object")
 
-    actual_model = str(settings.get("OUROBOROS_MODEL") or "").strip()
+    active_model_slots = {
+        key: str(settings.get(key) or "").strip()
+        for key in _ACTIVE_FIXED_MODEL_KEYS
+        if str(settings.get(key) or "").strip()
+    }
+    actual_model = active_model_slots.get("OUROBOROS_MODEL", "")
     mismatches: list[str] = []
     if actual_model != model:
         mismatches.append(
             f"OUROBOROS_MODEL: runtime={actual_model!r} expected={model!r}"
         )
+    # Empty optional slots mean "no alternate actor" and are therefore safe. Every non-empty
+    # active slot must resolve only to the measured model: Light, fallback, reviewer, vision or
+    # another live role can all execute work and would otherwise contaminate a fixed-model run.
+    # ACTIVE_MODEL_SLOT_KEYS deliberately excludes legacy Heavy, so historical settings remain
+    # readable without resurrecting it as an execution authority.
+    for key, raw in active_model_slots.items():
+        if key == "OUROBOROS_MODEL":
+            continue
+        configured = [item.strip() for item in raw.split(",") if item.strip()]
+        foreign = [item for item in configured if item != model]
+        if foreign:
+            mismatches.append(
+                f"{key}: runtime={raw!r} expected empty or only {model!r}"
+            )
 
     projection: dict[str, Any] = {}
     parse_error = ""
@@ -146,6 +168,7 @@ def runtime_actor_snapshot(
             )
     return {
         "model": actual_model,
+        "model_slots": active_model_slots,
         "available_subagents": projection,
         "mismatches": mismatches,
         **({"parse_error": parse_error} if parse_error else {}),

@@ -14,8 +14,19 @@ from pathlib import Path
 
 import pytest
 
+from devtools.benchmarks.common.model_slots import single_model_subagents_setting
 from devtools.benchmarks.osworld import run_cu_bridge_agent as rcb
 from ouroboros.extension_loader import extension_surface_name
+
+
+_CU_ACTOR_MODEL = "openai/gpt-5.5"
+
+
+def _cu_actor_settings():
+    return {
+        "OUROBOROS_MODEL": _CU_ACTOR_MODEL,
+        "OUROBOROS_SUBAGENTS": single_model_subagents_setting(_CU_ACTOR_MODEL),
+    }
 
 
 def test_infeasible_checks_final_answer_fields_only():
@@ -364,9 +375,12 @@ def test_cu_bridge_claim_is_acquired_inside_the_try_that_releases_it():
     # of the RUN FLOW. Anchored on `body` (the flow, from the claim declaration on), not the
     # whole file: module-level helpers defined above the flow (`_gate_round`) legitimately
     # contain the same POST literal but are only ever CALLED from inside the flow.
-    assert src.index("runtime_attestation(args.ouroboros_url, repo_dir)") < src.index("acquire_task_claim(\n")
+    attestation = src.index("runtime_attestation(args.ouroboros_url, repo_dir)")
+    actor_match = src.index("actor_preflight = _cu_actor_preflight(settings_path, args.ouroboros_url)")
+    claim = src.index("acquire_task_claim(\n")
+    assert attestation < actor_match < claim
     first_paid_post_in_flow = src.index("claim_fd: int | None = None") + body.index('"POST", "/api/tasks"')
-    assert src.index("runtime_attestation(args.ouroboros_url, repo_dir)") < first_paid_post_in_flow
+    assert attestation < actor_match < first_paid_post_in_flow
 
 
 def test_cu_bridge_refuses_before_the_claim_when_attestation_fails(tmp_path, monkeypatch, capsys):
@@ -950,13 +964,14 @@ def _cu_bridge_stubs(monkeypatch, tmp_path, *, reward=1.0):
     monkeypatch.setattr(rcb, "_enable_skill", lambda repo, data: {"skill": "seeded"})
     monkeypatch.setattr(rcb, "_publish_target", lambda data, target: tmp_path / "state_target.txt")
     monkeypatch.setattr(rcb, "_collect_budget_counters", lambda *a, **k: {})
-    monkeypatch.setattr(
-        rcb, "_api",
-        lambda url, method, path, body=None, timeout=60: (
-            {"task_id": "t1"} if method == "POST" and path == "/api/tasks"
-            else {"status": "completed", "final_answer": "done"}
-        ),
-    )
+    def _api(url, method, path, body=None, timeout=60):
+        if method == "GET" and path == "/api/settings":
+            return _cu_actor_settings()
+        if method == "POST" and path == "/api/tasks":
+            return {"task_id": "t1"}
+        return {"status": "completed", "final_answer": "done"}
+
+    monkeypatch.setattr(rcb, "_api", _api)
     return rcb, env
 
 
@@ -970,7 +985,7 @@ def _cu_bridge_argv(tmp_path, claims):
     (repo_dir / "VERSION").write_text("6.76.0\n", encoding="utf-8")
     results = tmp_path / "results"
     settings = tmp_path / "settings.json"
-    settings.write_text("{}", encoding="utf-8")
+    settings.write_text(json.dumps(_cu_actor_settings()), encoding="utf-8")
     return [
         "run_cu_bridge_agent.py", "--osworld-root", str(osworld), "--provider_name", "docker",
         "--path_to_vm", "/vm/Ubuntu.qcow2", "--task", str(task), "--result_dir", str(results),
