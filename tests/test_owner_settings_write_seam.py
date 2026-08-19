@@ -571,8 +571,8 @@ def test_reviewer_slots_reload_does_not_await_the_status_probe():
         pathlib.Path(__file__).resolve().parents[1]
         / "web" / "modules" / "subagents_settings.js"
     ).read_text(encoding="utf-8")
-    assert "await boundedStatusRefresh(state.store);" in subagents
-    assert "await state.store.refresh" not in subagents
+    assert "await boundedStatusRefresh(store);" in subagents
+    assert "await store.refresh" not in subagents
     store = (
         pathlib.Path(__file__).resolve().parents[1]
         / "web" / "modules" / "claudexor_status_store.js"

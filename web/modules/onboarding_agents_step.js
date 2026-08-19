@@ -35,8 +35,13 @@
 //
 // Pure helpers up top are node-tested without a DOM.
 
+import { apiClient } from './api_client.js';
 import { claudexorStatus, accountRows, familyLabel } from './claudexor_status_store.js';
 import { LOGIN_CARD_FULL, createLoginCardController } from './harness_login_cards.js';
+import {
+    availableSubagentsEditorHost,
+    createAvailableSubagentsEditor,
+} from './subagents_settings.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
 // The families the declarative install policy currently assigns. Since agy (Antigravity)
@@ -142,6 +147,35 @@ export function subscriptionDeclaration({ connected = [], skipPresets = false } 
     return {
         subscriptionsConnected: (connected || []).length > 0,
         skipSubscriptionPresets: Boolean(skipPresets),
+    };
+}
+
+/** Open provider/local/model draft shared by preview and final completion. */
+export function onboardingSettingsDraft({
+    state = {}, providerFields = [], budgetFields = [], modelSlots = [],
+    trim = (value) => String(value || '').trim(),
+} = {}) {
+    const clean = (value) => trim(value);
+    return {
+        ...Object.fromEntries(providerFields.map(
+            (field) => [field.settingKey, clean(state[field.stateKey])],
+        )),
+        ...Object.fromEntries(budgetFields.map(
+            (field) => [field.settingKey, Number(state[field.stateKey] || 0)],
+        )),
+        OUROBOROS_REVIEW_ENFORCEMENT: clean(state.reviewEnforcement) || 'advisory',
+        OUROBOROS_SKILLS_REPO_PATH: clean(state.skillsRepoPath),
+        LOCAL_MODEL_SOURCE: clean(state.localSource),
+        LOCAL_MODEL_FILENAME: clean(state.localFilename),
+        LOCAL_MODEL_CONTEXT_LENGTH: Number(state.localContextLength || 0),
+        LOCAL_MODEL_N_GPU_LAYERS: Number(state.localGpuLayers || 0),
+        LOCAL_MODEL_CHAT_FORMAT: clean(state.localChatFormat),
+        LOCAL_ROUTING_MODE: clean(state.localSource)
+            ? (clean(state.localRoutingMode) || 'cloud') : 'cloud',
+        ...Object.fromEntries(modelSlots.map(
+            (slot) => [slot.settingKey, clean(state[slot.stateKey])],
+        )),
+        OUROBOROS_RUNTIME_MODE: clean(state.runtimeMode) || 'advanced',
     };
 }
 
@@ -259,14 +293,14 @@ export function agentsOutcomeText(connected = [],
     const labels = joinLabels(familyLabels(connected, snapshot));
     if (skipPresets) {
         return `${labels} ${connected.length === 1 ? 'is' : 'are'} connected, but you chose to `
-            + 'finish without agent defaults: reviewers and subagents stay on your API '
-            + 'access. Everything stays editable in Settings → Agents.';
+            + 'skip the automatic subscription preset. The Available subagents draft below '
+            + 'is still saved exactly as you edit it; other agent defaults stay unchanged.';
     }
     return `${labels} ${connected.length === 1 ? 'is' : 'are'} connected. When you finish, `
         + 'Ouroboros will try to move commit review, the scope pass, the advisory '
-        + 'pre-review and delegated subagents onto '
+        + 'pre-review and add subscription-backed choices to Available subagents through '
         + `${connected.length === 1 ? 'it' : 'them'}. If those models cannot be read at `
-        + 'that moment nothing is changed, and you can finish without agent defaults.';
+        + 'that moment nothing is changed, and you can finish without subscription presets.';
 }
 
 export function familyStatusText(snapshot, harness, { accountsKnown = true } = {}) {
@@ -277,6 +311,24 @@ export function familyStatusText(snapshot, harness, { accountsKnown = true } = {
         tone: 'ok',
         text: count === 1 ? 'Connected' : `${count} accounts connected · they rotate`,
     };
+}
+
+export function subagentPreviewStatusSignature(view, snapshot) {
+    return JSON.stringify([
+        view?.reads?.catalog || '',
+        view?.reads?.accounts || '',
+        (snapshot?.harnesses || []).map((harness) => [
+            String(harness?.id || ''),
+            String(harness?.models_error || ''),
+            (harness?.models || []).map((model) => String(model?.id || model?.value || model || '')),
+        ]),
+        accountRows(snapshot).map((row) => [
+            String(row?.harness || ''),
+            String(row?.profileId || row?.profile_id || row?.id || ''),
+            row?.enabled !== false,
+            String(row?.status?.verification || ''),
+        ]),
+    ]);
 }
 
 // ---------------------------------------------------------------------------
@@ -404,6 +456,14 @@ export function agentsStepHtml() {
             <div id="agents-login-host"></div>
             <div id="agents-outcome" class="agent-outcome"></div>
         </div>
+        <div class="panel-card" id="agents-available-subagents-card">
+            <h3>Available subagents</h3>
+            <div class="agent-ladder-note">
+                This generated draft is what Ouroboros will see. Edit names, recommended uses,
+                routes, models, effort, or account pins before finishing setup.
+            </div>
+            ${availableSubagentsEditorHost('onboarding-available-subagents')}
+        </div>
     `;
 }
 
@@ -418,6 +478,9 @@ export function agentsStepHtml() {
  * @param {Function} [options.fetchImpl]  transport for the login card
  * @param {Function} [options.isVisible]  is the Agents step on screen right now
  * @param {Function} [options.onChange]   called with the connected harness list
+ * @param {Function} [options.previewPayload] current open provider/local draft
+ * @param {Function} [options.previewTransport] injectable preview request
+ * @param {Function} [options.onSubagentsChange] receives the editable canonical list
  * @returns {object} controller
  */
 export function createAgentsStep({
@@ -426,6 +489,9 @@ export function createAgentsStep({
     fetchImpl = null,
     isVisible = () => true,
     onChange = () => {},
+    previewPayload = () => ({}),
+    previewTransport = (payload) => apiClient.previewOnboardingSubagents(payload),
+    onSubagentsChange = () => {},
 } = {}) {
     const getDoc = typeof doc === 'function' ? doc : () => doc;
     const state = {
@@ -436,6 +502,9 @@ export function createAgentsStep({
         pageHideBound: null,
         pageHideTarget: null,
         listHtml: null,
+        previewGeneration: 0,
+        previewSignature: '',
+        previewStatusSignature: '',
     };
 
     function el(id) {
@@ -464,6 +533,38 @@ export function createAgentsStep({
     }
 
     let login = createLogin();
+    const subagents = createAvailableSubagentsEditor({
+        hostId: 'onboarding-available-subagents',
+        doc: getDoc,
+        win: () => getDoc()?.defaultView,
+        store,
+        onChange: onSubagentsChange,
+        baselineLabel: 'Generated draft',
+    });
+
+    async function refreshSubagentsPreview({ force = false } = {}) {
+        if (state.disposed) return;
+        const payload = {
+            ...(previewPayload() || {}),
+            ...subscriptionDeclaration({
+                connected: state.connected,
+                skipPresets: state.skipPresets,
+            }),
+        };
+        const signature = JSON.stringify(payload);
+        if (!force && signature === state.previewSignature && subagents.loaded) return;
+        state.previewSignature = signature;
+        const generation = ++state.previewGeneration;
+        try {
+            const response = await previewTransport(payload);
+            if (state.disposed || generation !== state.previewGeneration) return;
+            subagents.applyGeneratedPreview(response);
+            onSubagentsChange(subagents.setting);
+        } catch (error) {
+            if (state.disposed || generation !== state.previewGeneration) return;
+            subagents.setPreviewFailure(error);
+        }
+    }
 
     function ensureLogin() {
         if (!login || login.disposed) login = createLogin();
@@ -519,9 +620,13 @@ export function createAgentsStep({
             ? connectedHarnesses(store.snapshot)
             : [];
         const changed = next.join(',') !== state.connected.join(',');
+        const statusSignature = subagentPreviewStatusSignature(view, store.snapshot);
+        const statusChanged = statusSignature !== state.previewStatusSignature;
+        state.previewStatusSignature = statusSignature;
         state.connected = next;
         paint();
         if (changed) onChange([...state.connected]);
+        if (changed || statusChanged) refreshSubagentsPreview({ force: statusChanged });
     }
 
     /** Mount into the step DOM the wizard just rendered. */
@@ -546,6 +651,8 @@ export function createAgentsStep({
         // A remount rebuilds the DOM the wizard just replaced.
         state.listHtml = null;
         paint();
+        subagents.mount();
+        refreshSubagentsPreview();
         store.refresh();
     }
 
@@ -571,6 +678,7 @@ export function createAgentsStep({
         if (state.disposed) return;
         state.disposed = true;
         login?.detach();
+        subagents.destroy();
         if (state.unsubscribe) state.unsubscribe();
         state.unsubscribe = null;
         if (state.pageHideBound && state.pageHideTarget?.removeEventListener) {
@@ -595,7 +703,18 @@ export function createAgentsStep({
         // summary. Same store, same snapshot, one spelling.
         get snapshot() { return store?.snapshot || null; },
         get accountsKnown() { return accountsKnown(); },
-        setSkipPresets(value) { state.skipPresets = Boolean(value); paint(); },
+        get availableSubagents() { return subagents.setting; },
+        validateSubagents() { return subagents.validate(); },
+        refreshSubagentsPreview,
+        setSkipPresets(value) {
+            const next = Boolean(value);
+            if (next !== state.skipPresets) {
+                state.skipPresets = next;
+                state.previewSignature = '';
+                refreshSubagentsPreview();
+            }
+            paint();
+        },
         declaration({ skipPresets = state.skipPresets } = {}) {
             return subscriptionDeclaration({ connected: state.connected, skipPresets });
         },

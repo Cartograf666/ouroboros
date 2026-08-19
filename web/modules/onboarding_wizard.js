@@ -9,6 +9,7 @@ import {
     completionFailureNotice,
     createAgentsStep,
     familyLabels,
+    onboardingSettingsDraft,
     readCompletionAnswer,
 } from './onboarding_agents_step.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
@@ -31,7 +32,9 @@ import { installAltMenuSuppression } from './ui_helpers.js';
         // anything longer stops being a blip.
         const LOGIN_RELEASE_RETRIES = 2;
         const LOGIN_RELEASE_RETRY_MS = 600;
-        const MODEL_SLOTS = SETUP_CONTRACT.modelSlots || [];
+        // Heavy is legacy migration input, never an active/user-facing slot.
+        const MODEL_SLOTS = (SETUP_CONTRACT.modelSlots || []).filter((slot) =>
+            String(slot?.slot || '').toLowerCase() !== 'heavy' && slot?.settingKey !== 'OUROBOROS_MODEL_HEAVY');
         const REVIEW_MODES = SETUP_CONTRACT.reviewModes || [];
         const RUNTIME_MODES = SETUP_CONTRACT.runtimeModes || [];
         const LOCAL_ROUTING_MODES = SETUP_CONTRACT.localRoutingModes || [];
@@ -78,6 +81,7 @@ import { installAltMenuSuppression } from './ui_helpers.js';
         // explicit "finish without agent defaults" choice, and the typed reason
         // a completion attempt refused to write the preset.
         agentsConnected: [],
+        availableSubagents: null,
         skipSubscriptionPresets: false,
         presetFailure: null,
         // Set once completion SUCCEEDED but the receipt says the saved runtime
@@ -251,7 +255,6 @@ import { installAltMenuSuppression } from './ui_helpers.js';
         if (state.modelsDirty && !force) return;
         const defaults = MODEL_DEFAULTS[activeProviderProfile()] || MODEL_DEFAULTS.openrouter || {};
         state.mainModel = defaults.main || '';
-        state.heavyModel = defaults.heavy || '';
         state.lightModel = defaults.light || '';
         state.fallbackModel = defaults.fallback || '';
         state.modelsDirty = false;
@@ -292,8 +295,8 @@ import { installAltMenuSuppression } from './ui_helpers.js';
     }
 
     function validateModelsStep() {
-        // Only Main is required: Heavy/Light are optional (empty falls back to Main),
-        // and Fallback carries a default. Don't force the owner to fill every slot.
+        // Only Main is required; the remaining active slots are optional or
+        // already carry a default. Don't force the owner to fill every slot.
         if (!trim(state.mainModel)) {
             return 'Confirm the Main model before starting Ouroboros.';
         }
@@ -546,7 +549,6 @@ import { installAltMenuSuppression } from './ui_helpers.js';
             ['Total budget', formatUsd(state.totalBudget)],
             ['Per-task cost cap', formatUsd(state.perTaskCostUsd)],
             ['Main', trim(state.mainModel)],
-            ['Heavy', trim(state.heavyModel) || '(uses Main)'],
             ['Light', trim(state.lightModel) || '(uses Main)'],
             ['Fallback', trim(state.fallbackModel)],
         ];
@@ -575,9 +577,14 @@ import { installAltMenuSuppression } from './ui_helpers.js';
         // screen earlier spell a family the same way. Without it the summary
         // fell back to the bootstrap names and quietly undid an engine rename.
         const labels = familyLabels(state.agentsConnected, agentsStep?.snapshot);
-        if (!labels.length) return 'none connected (API access only)';
-        if (state.skipSubscriptionPresets) return `${labels.join(', ')} (finishing without agent defaults)`;
-        return `${labels.join(', ')} — will run commit review and delegated subagents`;
+        const actorCount = (agentsStep?.availableSubagents?.items
+            || state.availableSubagents?.items || []).length;
+        const actors = `${actorCount} Available subagent${actorCount === 1 ? '' : 's'}`;
+        if (!labels.length) return `${actors} · API/local access only`;
+        if (state.skipSubscriptionPresets) {
+            return `${actors} · ${labels.join(', ')} connected · automatic subscription preset skipped`;
+        }
+        return `${actors} · ${labels.join(', ')} connected`;
     }
 
     function shouldOfferPresetSkip() {
@@ -705,6 +712,8 @@ import { installAltMenuSuppression } from './ui_helpers.js';
             agentsStep = createAgentsStep({
                 isVisible: () => state.currentStep === 'agents',
                 onChange: (connected) => { state.agentsConnected = connected; },
+                previewPayload: () => onboardingSettingsDraft({ state, providerFields: PROVIDER_FIELDS, budgetFields: BUDGET_FIELDS, modelSlots: MODEL_SLOTS, trim }),
+                onSubagentsChange: (setting) => { state.availableSubagents = setting; },
             });
         }
         agentsStep.setSkipPresets(state.skipSubscriptionPresets);
@@ -918,7 +927,7 @@ import { installAltMenuSuppression } from './ui_helpers.js';
                         <div class="footer-actions">
                             <button class="btn btn-secondary" id="back-btn" type="button" ${index === 0 || state.saving ? 'disabled' : ''}>Back</button>
                             ${state.currentStep === 'summary' && shouldOfferPresetSkip() ? `
-                                <button class="btn btn-secondary" id="skip-presets-btn" type="button" ${state.saving ? 'disabled' : ''}>Finish without agent defaults</button>
+                                <button class="btn btn-secondary" id="skip-presets-btn" type="button" ${state.saving ? 'disabled' : ''}>Finish without subscription presets</button>
                             ` : ''}
                             <button class="btn btn-primary" id="next-btn" type="button" ${nextButtonShouldBeDisabled() ? 'disabled' : ''}>${escapeHtml(nextLabel)}</button>
                         </div>
@@ -1184,7 +1193,6 @@ import { installAltMenuSuppression } from './ui_helpers.js';
                     if (!pill) return;
                     const modelId = `openai-compatible::${pill.dataset.applyModel}`;
                     if (!trim(state.mainModel)) state.mainModel = modelId;
-                    if (!trim(state.heavyModel)) state.heavyModel = modelId;
                     if (!trim(state.lightModel)) state.lightModel = modelId;
                     if (!trim(state.fallbackModel)) state.fallbackModel = modelId;
                     state.modelsDirty = true;
@@ -1420,7 +1428,8 @@ import { installAltMenuSuppression } from './ui_helpers.js';
         const modelsError = validateModelsStep();
         const reviewError = validateReviewStep();
         const budgetError = validateBudgetStep();
-        state.error = providersError || modelsError || reviewError || budgetError;
+        const subagentsError = agentsStep?.validateSubagents?.()?.[0] || '';
+        state.error = providersError || modelsError || reviewError || budgetError || subagentsError;
         if (state.error) {
             render();
             return;
@@ -1435,19 +1444,11 @@ import { installAltMenuSuppression } from './ui_helpers.js';
                 // account state and re-proves install-time eligibility.
                 subscriptionsConnected: state.agentsConnected.length > 0,
                 skipSubscriptionPresets: state.skipSubscriptionPresets,
-                ...Object.fromEntries(PROVIDER_FIELDS.map((field) => [field.settingKey, trim(state[field.stateKey])])),
-                ...Object.fromEntries(BUDGET_FIELDS.map((field) => [field.settingKey, Number(state[field.stateKey] || 0)])),
-                OUROBOROS_REVIEW_ENFORCEMENT: trim(state.reviewEnforcement) || 'advisory',
-                OUROBOROS_SKILLS_REPO_PATH: trim(state.skillsRepoPath),
-                LOCAL_MODEL_SOURCE: trim(state.localSource),
-            LOCAL_MODEL_FILENAME: trim(state.localFilename),
-            LOCAL_MODEL_CONTEXT_LENGTH: Number(state.localContextLength || 0),
-                LOCAL_MODEL_N_GPU_LAYERS: Number(state.localGpuLayers || 0),
-                LOCAL_MODEL_CHAT_FORMAT: trim(state.localChatFormat),
-                LOCAL_ROUTING_MODE: trim(state.localSource) ? (trim(state.localRoutingMode) || 'cloud') : 'cloud',
-                ...Object.fromEntries(MODEL_SLOTS.map((slot) => [slot.settingKey, trim(state[slot.stateKey])])),
+                ...onboardingSettingsDraft({ state, providerFields: PROVIDER_FIELDS, budgetFields: BUDGET_FIELDS, modelSlots: MODEL_SLOTS, trim }),
+                // Completion validates this visible draft and never replaces it.
+                OUROBOROS_SUBAGENTS: agentsStep?.availableSubagents
+                    || state.availableSubagents,
             };
-        payload.OUROBOROS_RUNTIME_MODE = trim(state.runtimeMode) || 'advanced';
         try {
             await saveWizardPayload(payload);
         } catch (error) {

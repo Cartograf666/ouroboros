@@ -1,0 +1,77 @@
+"""Focused build-free guards for the Phase 1C Available subagents UI."""
+
+from __future__ import annotations
+
+import pathlib
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+MODULES = ROOT / "web" / "modules"
+
+
+def _read(path: pathlib.Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def test_available_subagents_is_one_canonical_settings_editor() -> None:
+    editor = _read(MODULES / "subagents_settings.js")
+    host = _read(MODULES / "settings.js")
+    assert "<h3>Available subagents</h3>" in editor
+    assert "OUROBOROS_SUBAGENTS" in editor
+    assert "collectSubagentsSettings" in host
+    assert "OUROBOROS_SUBAGENT_HARNESS" not in editor
+    assert "OUROBOROS_SUBAGENT_PROFILE" not in editor
+    assert "MAX_AVAILABLE_SUBAGENTS = 10" in editor
+    for action in ("data-subagent-add", "data-subagent-duplicate", "data-subagent-remove"):
+        assert action in editor
+
+
+def test_route_editor_extraction_does_not_merge_reviewer_semantics() -> None:
+    primitive = _read(MODULES / "route_editor_primitives.js")
+    reviewer = _read(MODULES / "reviewer_slots.js")
+    editor = _read(MODULES / "subagents_settings.js")
+    assert "route_editor_primitives.js" in reviewer
+    assert "route_editor_primitives.js" in editor
+    assert "credentialField: 'profile_id'" in reviewer
+    assert "credentialField: 'credential_profile_id'" in editor
+    assert "OUROBOROS_REVIEWER_SLOTS" not in primitive
+    assert "buildReviewerSlotsSetting" not in primitive
+
+
+def test_heavy_card_is_gone_but_provider_test_contract_and_controls_remain() -> None:
+    ui = _read(MODULES / "settings_ui.js")
+    host = _read(MODULES / "settings.js")
+    assert "['Heavy'," not in ui
+    assert "s-model-heavy" not in ui
+    assert "slot?.settingKey !== 'OUROBOROS_MODEL_HEAVY'" in host
+    assert "data-provider-test" in ui
+    assert "PROVIDER_TEST_INPUTS" in ui
+    assert "apiClient.providerTest({ provider_id: provider, overrides })" in host
+    assert "providerTestResultIsCurrent" in host
+
+
+def test_onboarding_previews_and_commits_the_visible_owner_draft() -> None:
+    client = _read(MODULES / "api_client.js")
+    step = _read(MODULES / "onboarding_agents_step.js")
+    wizard = _read(MODULES / "onboarding_wizard.js")
+    assert "'/api/onboarding/subagents/preview'" in client
+    assert "response?.available_subagents" in _read(MODULES / "subagents_settings.js")
+    assert "refreshSubagentsPreview" in step
+    assert "OUROBOROS_SUBAGENTS: agentsStep?.availableSubagents" in wizard
+    assert "Heavy', trim(state.heavyModel)" not in wizard
+    assert "slot?.settingKey !== 'OUROBOROS_MODEL_HEAVY'" in wizard
+
+
+def test_status_refresh_and_active_task_copy_keep_the_frozen_semantics() -> None:
+    editor = _read(MODULES / "subagents_settings.js")
+    host = _read(MODULES / "settings.js")
+    assert "await boundedStatusRefresh(store);" in editor
+    assert "Saved rows remain unchanged" in editor
+    assert "take effect for new child tasks" in host
+    assert "the current task keeps its existing routes" in host
+
+
+def test_new_frontend_modules_stay_within_the_context_target() -> None:
+    for name in ("route_editor_primitives.js", "subagents_settings.js"):
+        lines = _read(MODULES / name).count("\n") + 1
+        assert lines <= 1000, f"{name} grew to {lines} lines"

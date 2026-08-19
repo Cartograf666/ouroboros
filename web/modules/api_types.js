@@ -116,6 +116,13 @@
  */
 
 /**
+ * POST /api/onboarding/subagents/preview accepts the same open provider/local
+ * draft and subscription declarations as onboarding completion. It returns a
+ * canonical editable actor list without persisting anything.
+ * @typedef {OnboardingCompleteRequest} OnboardingSubagentsPreviewRequest
+ */
+
+/**
  * @typedef {Object} OnboardingSubagentsPreviewResponse
  * @property {boolean} ok
  * @property {Object} available_subagents

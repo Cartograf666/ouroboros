@@ -322,6 +322,7 @@ def test_onboarding_bootstrap_cannot_break_out_of_its_inline_script():
 
 def test_onboarding_wizard_module_keeps_its_multistep_contract():
     source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
+    draft_source = (REPO / "web/modules/onboarding_agents_step.js").read_text(encoding="utf-8")
 
     assert "const STEP_ORDER = bootstrap.stepOrder || (SETUP_CONTRACT.steps || []).map" in source
     assert "Add your access" in source or "Local model settings" in source
@@ -331,9 +332,12 @@ def test_onboarding_wizard_module_keeps_its_multistep_contract():
     assert "function nextButtonShouldBeDisabled()" in source
     assert "function syncCurrentStepActionState()" in source
     assert "return 'direct-multi';" in source
-    assert "PROVIDER_FIELDS.map((field) => [field.settingKey, trim(state[field.stateKey])])" in source
-    assert "MODEL_SLOTS.map((slot) => [slot.settingKey, trim(state[slot.stateKey])])" in source
-    assert "LOCAL_ROUTING_MODE: trim(state.localSource) ? (trim(state.localRoutingMode) || 'cloud') : 'cloud'" in source
+    assert "onboardingSettingsDraft({" in source
+    assert "function onboardingSettingsDraft({" in draft_source
+    assert "[field.settingKey, clean(state[field.stateKey])]" in draft_source
+    assert "[slot.settingKey, clean(state[slot.stateKey])]" in draft_source
+    assert "LOCAL_ROUTING_MODE: clean(state.localSource)" in draft_source
+    assert "clean(state.localRoutingMode) || 'cloud'" in draft_source
 
 
 def test_onboarding_steps_and_stylesheet_keep_their_owner_facing_shape():
@@ -455,7 +459,7 @@ def test_wizard_declares_the_subscription_intent_the_endpoint_expects():
     assert f"{SUBSCRIPTIONS_CONNECTED_FIELD}: state.agentsConnected.length > 0" in source
     assert f"{SKIP_SUBSCRIPTION_PRESETS_FIELD}: state.skipSubscriptionPresets" in source
     assert 'id="skip-presets-btn"' in source
-    assert "Finish without agent defaults" in source
+    assert "Finish without subscription presets" in source
     assert "saveWizard({ skipPresets: true })" in source
 
 
