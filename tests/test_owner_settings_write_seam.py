@@ -41,6 +41,16 @@ def isolated_settings(tmp_path, monkeypatch):
     cfg.reset_runtime_mode_baseline_for_tests()
 
 
+@pytest.fixture
+def _clean_subagent_env(monkeypatch):
+    for key in (
+        "OUROBOROS_SUBAGENTS",
+        "OUROBOROS_SUBAGENT_HARNESS",
+        "OUROBOROS_SUBAGENT_PROFILE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
 @contextlib.contextmanager
 def _foreign_lock(settings_path: pathlib.Path):
     """Hold the settings lock the way another PROCESS would: a real O_EXCL fd,
@@ -235,7 +245,7 @@ def test_generic_settings_save_rejects_malformed_available_subagents_without_wri
 
 
 def test_settings_get_reports_legacy_actor_source_without_materializing_it(
-    monkeypatch, isolated_settings,
+    monkeypatch, isolated_settings, _clean_subagent_env,
 ):
     from ouroboros.gateway import settings as settings_mod
 
@@ -262,7 +272,7 @@ def test_settings_get_reports_legacy_actor_source_without_materializing_it(
 
 
 def test_settings_get_builds_an_unsaved_api_candidate_through_the_shared_compiler(
-    monkeypatch, isolated_settings,
+    monkeypatch, isolated_settings, _clean_subagent_env,
 ):
     from ouroboros.gateway import settings as settings_mod
 

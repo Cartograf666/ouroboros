@@ -728,7 +728,7 @@ def test_settings_meta_declares_additive_meta_keys():
     from ouroboros.gateway.contracts import SettingsMeta
 
     declared = set(SettingsMeta.__annotations__.keys())
-    assert {"custom_secret_keys", "setup_contract", "available_subagents"} <= declared
+    assert {"custom_secret_keys", "setup_contract"} <= declared
 
 
 def test_command_inbound_matches_ws_endpoint_dispatch():

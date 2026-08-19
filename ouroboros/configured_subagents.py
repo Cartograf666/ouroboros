@@ -323,11 +323,30 @@ def resolve_configured_subagents(
                 f"OUROBOROS_SUBAGENT_HARNESS migration failed: {exc}",
                 raw=raw_legacy,
             )
-        items = [primary]
-        _append_legacy_model_rows(items, settings, include_ids={"legacy-heavy"})
         if default_candidate is not None:
-            _append_candidate_rows(items, default_candidate.items)
-        _append_legacy_model_rows(items, settings, include_ids={"fast-scout"})
+            # The Settings preview composes this candidate through the same
+            # linear compiler as onboarding.  Keep its canonical ids/order and
+            # append only a distinct custom legacy Heavy actor.
+            items = list(default_candidate.items)
+            primary_identity = (
+                primary.route.kind,
+                primary.route.target_id,
+                primary.route.credential_profile_id,
+            )
+            if not any(
+                (
+                    row.route.kind,
+                    row.route.target_id,
+                    row.route.credential_profile_id,
+                ) == primary_identity
+                for row in items
+            ):
+                items.insert(0, primary)
+            _append_legacy_model_rows(items, settings, include_ids={"legacy-heavy"})
+        else:
+            items = [primary]
+            _append_legacy_model_rows(items, settings, include_ids={"legacy-heavy"})
+            _append_legacy_model_rows(items, settings, include_ids={"fast-scout"})
         return ConfiguredSubagentsResolution(
             ConfiguredSubagents(enabled=True, items=tuple(items[:MAX_CONFIGURED_SUBAGENTS])),
             SOURCE_LEGACY_MIGRATED,
@@ -364,14 +383,33 @@ def resolve_settings_subagent_candidate(
     diagnostics: list[dict[str, Any]] = []
     legacy = str(settings.get("OUROBOROS_SUBAGENT_HARNESS") or "").strip()
     if settings.get(SUBAGENTS_SETTING) in (None, "") and legacy.lower() != "off":
-        from ouroboros.subscription_install_presets import compile_install_preset
+        from ouroboros.subscription_install_presets import compile_available_subagents
 
-        preset = compile_install_preset((), settings=settings)
-        if preset.ok:
-            default_candidate = normalize_configured_subagents(preset.available_subagents)[0]
-            diagnostics.extend(preset.diagnostics)
-        elif preset.refusal is not None:
-            diagnostics.append(preset.refusal.as_dict())
+        session_rows: tuple[dict[str, Any], ...] = ()
+        migration_valid = True
+        if legacy:
+            try:
+                primary = _legacy_session(
+                    legacy,
+                    str(settings.get("OUROBOROS_SUBAGENT_PROFILE") or "").strip(),
+                )
+            except ValueError:
+                # ``resolve_configured_subagents`` below owns the precise
+                # fail-closed diagnostic and preserves the malformed bytes.
+                migration_valid = False
+            else:
+                session_rows = ({
+                    "harness": primary.route.target_id.partition("=")[0],
+                    "target_id": primary.route.target_id,
+                    "credential_profile_id": primary.route.credential_profile_id,
+                    "effort": primary.effort,
+                },)
+        if migration_valid:
+            default_candidate, compiler_diagnostics = compile_available_subagents(
+                session_rows,
+                settings,
+            )
+            diagnostics.extend(compiler_diagnostics)
     resolution = resolve_configured_subagents(settings, default_candidate=default_candidate)
     if resolution.diagnostic:
         diagnostics.insert(0, {

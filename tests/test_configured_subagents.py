@@ -19,6 +19,7 @@ from ouroboros.configured_subagents import (
     normalize_configured_subagents,
     parse_configured_subagents,
     resolve_configured_subagents,
+    resolve_settings_subagent_candidate,
 )
 from ouroboros.server_runtime import apply_runtime_provider_defaults
 
@@ -41,6 +42,16 @@ def _row(row_id: str = "builder", **overrides):
 
 def _config(*rows, enabled=True):
     return {"enabled": enabled, "items": list(rows or (_row(),))}
+
+
+@pytest.fixture
+def _clean_subagent_env(monkeypatch):
+    for key in (
+        SUBAGENTS_SETTING,
+        "OUROBOROS_SUBAGENT_HARNESS",
+        "OUROBOROS_SUBAGENT_PROFILE",
+    ):
+        monkeypatch.delenv(key, raising=False)
 
 
 def test_strict_config_round_trips_object_and_json_to_one_canonical_string():
@@ -120,7 +131,9 @@ def test_valid_new_setting_wins_over_every_legacy_selector():
     assert [row.subagent_id for row in resolution.config.items] == ["new"]
 
 
-def test_legacy_singleton_and_account_pin_migrate_without_persisting():
+def test_legacy_singleton_and_account_pin_migrate_without_persisting(
+    _clean_subagent_env,
+):
     settings = {
         "OUROBOROS_SUBAGENT_HARNESS": "claude=claude-opus-5:high",
         "OUROBOROS_SUBAGENT_PROFILE": "owner-account",
@@ -143,7 +156,9 @@ def test_legacy_singleton_and_account_pin_migrate_without_persisting():
     ]
 
 
-def test_legacy_off_is_explicit_false_and_never_becomes_default_candidate():
+def test_legacy_off_is_explicit_false_and_never_becomes_default_candidate(
+    _clean_subagent_env,
+):
     candidate = parse_configured_subagents(_config(_row("candidate")))
     resolution = resolve_configured_subagents(
         {"OUROBOROS_SUBAGENT_HARNESS": " OFF "},
@@ -172,7 +187,7 @@ def test_legacy_off_preserves_custom_heavy_rows_without_reenabling_defaults():
     assert resolution.config.items[0].route.target_id == "owner/custom-heavy"
 
 
-def test_empty_is_undecided_and_candidate_remains_unsaved():
+def test_empty_is_undecided_and_candidate_remains_unsaved(_clean_subagent_env):
     settings = {"OUROBOROS_SUBAGENT_HARNESS": ""}
     candidate = parse_configured_subagents(_config(_row("candidate")))
     resolution = resolve_configured_subagents(settings, default_candidate=candidate)
@@ -216,7 +231,9 @@ def test_legacy_light_requires_a_truthful_provider_but_custom_heavy_is_preserved
     ]
 
 
-def test_custom_heavy_without_singleton_is_an_unsaved_undecided_migration_candidate():
+def test_custom_heavy_without_singleton_is_an_unsaved_undecided_migration_candidate(
+    _clean_subagent_env,
+):
     settings = {"OUROBOROS_MODEL_HEAVY": "owner/custom-heavy"}
     resolution = resolve_configured_subagents(settings)
 
@@ -258,7 +275,7 @@ def test_legacy_code_plus_local_flag_migrates_to_an_explicit_local_actor():
     ]
 
 
-def test_legacy_intent_precedes_and_deduplicates_compiler_defaults():
+def test_canonical_candidate_precedes_and_deduplicates_legacy_model_rows():
     candidate = parse_configured_subagents(_config(
         _row("primary-builder", route={
             "kind": "agent_session",
@@ -280,6 +297,54 @@ def test_legacy_intent_precedes_and_deduplicates_compiler_defaults():
     assert resolution.config is not None
     assert [row.route.target_id for row in resolution.config.items] == [
         "claude=claude-opus-5",
-        "owner/custom-heavy",
         "openai/gpt-5.6-luna",
+        "owner/custom-heavy",
+    ]
+
+
+def test_settings_legacy_singleton_uses_the_canonical_linear_compiler(
+    _clean_subagent_env,
+):
+    settings = {
+        "OUROBOROS_SUBAGENT_HARNESS": "claude=claude-opus-5:high",
+        "OUROBOROS_SUBAGENT_PROFILE": "owner-account",
+        "OUROBOROS_MODEL": "openai/gpt-5.6-sol",
+        "OUROBOROS_MODEL_LIGHT": "openai/gpt-5.6-luna",
+        "OUROBOROS_MODEL_HEAVY": "owner/custom-heavy",
+        "OPENROUTER_API_KEY": "configured",
+    }
+
+    resolution, diagnostics = resolve_settings_subagent_candidate(settings)
+
+    assert diagnostics == ()
+    assert resolution.source == SOURCE_LEGACY_MIGRATED
+    assert resolution.config is not None
+    assert [
+        (
+            row.subagent_id,
+            row.name,
+            row.route.target_id,
+            row.route.credential_profile_id,
+        )
+        for row in resolution.config.items
+    ] == [
+        ("primary-builder", "Primary builder", "claude=claude-opus-5", "owner-account"),
+        ("fast-scout", "Fast scout", "openai/gpt-5.6-luna", ""),
+        (
+            "independent-perspective",
+            "Independent perspective",
+            "openai/gpt-5.6-sol",
+            "",
+        ),
+        ("legacy-heavy", "Primary builder", "owner/custom-heavy", ""),
+    ]
+
+    duplicate_heavy = dict(settings)
+    duplicate_heavy["OUROBOROS_MODEL_HEAVY"] = "openai/gpt-5.6-sol"
+    deduplicated, _diagnostics = resolve_settings_subagent_candidate(duplicate_heavy)
+    assert deduplicated.config is not None
+    assert [row.subagent_id for row in deduplicated.config.items] == [
+        "primary-builder",
+        "fast-scout",
+        "independent-perspective",
     ]

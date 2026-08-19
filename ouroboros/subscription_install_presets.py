@@ -442,18 +442,28 @@ def _task_effort(settings: Mapping[str, Any]) -> str:
     return effort if effort in EFFORT_SCALE else "medium"
 
 
-def _compile_available_subagents(
+def compile_available_subagents(
     session_rows: Sequence[Mapping[str, Any]],
     settings: Mapping[str, Any],
 ) -> Tuple[Optional[ConfiguredSubagents], Tuple[Dict[str, Any], ...]]:
-    """Linear actor policy over truthful session and normalized API/local routes."""
+    """Linear actor policy over truthful session and normalized API/local routes.
+
+    Install discovery leaves ``credential_profile_id`` absent so Claudexor can
+    rotate accounts.  The bounded singleton migration may supply the same
+    resolved row with its historical pin; both paths deliberately share this
+    one composition policy.
+    """
     actors: list[ConfiguredSubagent] = []
     diagnostics: list[Dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
 
     for index, row in enumerate(session_rows):
         harness = str(row["harness"])
-        route = RouteSpec(ROUTE_KIND_AGENT_SESSION, str(row["target_id"]))
+        route = RouteSpec(
+            ROUTE_KIND_AGENT_SESSION,
+            str(row["target_id"]),
+            str(row.get("credential_profile_id") or "").strip(),
+        )
         identity = (route.kind, route.target_id, route.credential_profile_id)
         if identity in seen:
             continue
@@ -571,7 +581,7 @@ def compile_install_preset(
         task_rows, refusal = _resolve_surface(_compile_task_seats(connected), discovery)
         if refusal is not None:
             return SubscriptionInstallPreset(connected=connected, refusal=refusal)
-        available, diagnostics = _compile_available_subagents(task_rows, settings)
+        available, diagnostics = compile_available_subagents(task_rows, settings)
         if available is None:
             detail = diagnostics[0] if diagnostics else {}
             return SubscriptionInstallPreset(
@@ -655,6 +665,7 @@ __all__ = [
     "PresetRefusal",
     "PresetSeat",
     "SubscriptionInstallPreset",
+    "compile_available_subagents",
     "compile_install_preset",
     "connected_preset_harnesses",
 ]
