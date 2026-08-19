@@ -354,3 +354,37 @@ def test_dangling_reasoning_close_tag_does_not_leak_into_the_answer():
     with_tool = 'думаю вслух</think><tool_call>{"name": "read_file"}</tool_call>'
     body, _ = LLMClient._strip_reasoning_wrappers(with_tool)
     assert body.startswith("<tool_call>") and '"read_file"' in body
+
+
+def test_runtime_context_names_the_model_serving_the_task(monkeypatch):
+    """The agent must be able to answer "which model are you" from fact, not guess.
+
+    Live failure: asked in Russian which model processes the messages, the agent
+    answered "gpt-5.2". Its own visible reasoning shows where that came from — the
+    `model` parameter default on the `web_search` tool schema — while the request
+    was actually served by gemini-3.1-flash-lite. Nothing in the assembled prompt
+    named the model, so guessing was the only option left, and P6 forbids passing
+    a guess about oneself off as a fact.
+    """
+    from ouroboros.context import _runtime_model_route
+
+    monkeypatch.setenv("OUROBOROS_MODEL", "openai-compatible::gemini-3.1-flash-lite")
+    monkeypatch.setenv("USE_LOCAL_MAIN", "false")
+
+    route = _runtime_model_route(None)
+    assert route["model"] == "openai-compatible::gemini-3.1-flash-lite"
+    assert route["is_local"] is False
+    assert route["source"] == "configured_main_slot"
+
+    # A per-task override (chat picker / Telegram owner route) wins and is labelled.
+    class _Ctx:
+        task_model_override = "local-model"
+        task_use_local_override = True
+
+    route = _runtime_model_route(_Ctx())
+    assert route["model"] == "local-model"
+    assert route["is_local"] is True
+    assert route["source"] == "task_override"
+
+    # The claim is scoped: a fallback or switch_model may move the route mid-task.
+    assert "switch_model" in route["rule"]

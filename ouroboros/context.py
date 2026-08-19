@@ -456,6 +456,44 @@ def _promoted_task_toolset(env: Any) -> Dict[str, Any]:
     }
 
 
+def _runtime_model_route(ctx: Any) -> Dict[str, Any]:
+    """The route this task runs on, so the agent can answer truthfully about itself.
+
+    Nothing else in the prompt names the model. Asked "which model are you", the
+    agent had to GUESS, and it guessed from the nearest number in reach: a live
+    reply reported "gpt-5.2" because that is the default of the `model` parameter
+    on the `web_search` tool schema, while the request was actually served by
+    gemini-3.1-flash-lite. Fabricating a fact about itself is exactly what P6
+    forbids, and it was unavoidable while the fact was absent.
+
+    This is the route the task STARTS on. A cross-model fallback or an in-task
+    `switch_model` can move it, so the note says so rather than presenting a
+    per-round receipt the caller cannot honour.
+    """
+    override = str(getattr(ctx, "task_model_override", "") or "").strip()
+    try:
+        from ouroboros.config import _main_model
+
+        configured = _main_model()
+    except Exception:
+        configured = ""
+    model = override or configured
+    if override:
+        use_local = bool(getattr(ctx, "task_use_local_override", False))
+    else:
+        use_local = str(os.environ.get("USE_LOCAL_MAIN", "") or "").strip().lower() in {"1", "true", "yes", "on"}
+    return {
+        "model": model or "unknown",
+        "is_local": use_local,
+        "source": "task_override" if override else "configured_main_slot",
+        "rule": (
+            "This is the model serving this task; state it when asked instead of "
+            "inferring one from tool schemas or prompt text. A fallback or "
+            "switch_model may change it mid-task."
+        ),
+    }
+
+
 def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) -> str:
     try:
         git_branch, git_sha = get_git_info(env.repo_dir)
@@ -493,6 +531,7 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
             "allowed_resources": task.get("allowed_resources"),
         },
         "runtime_env": {"is_desktop": bool(os.environ.get("OUROBOROS_DESKTOP_MODE", "")), "platform": sys.platform},
+        "model_route": _runtime_model_route(ctx),
     }
     if isinstance(task.get("task_contract"), dict):
         runtime_data["task_contract"] = task.get("task_contract")
