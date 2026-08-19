@@ -193,15 +193,13 @@ document.addEventListener('click', (event) => {
 navDrawerBackdrop?.addEventListener('click', () => setMobileDrawerOpen(false));
 hydrateNavIcons();
 
-// perf2 P4.2: non-zero while openProjectPanel is building/painting a panel —
-// Main's chat instance defers its first hydration to it (bounded upper limit
-// lives in chat.js), so a fast project open never competes with Main replay.
+// While a Project panel paints, Main defers first hydration (bounded in chat.js).
 let projectPanelOpeningSince = 0;
 let mainChat;
-const stateSnapshots = createStateSnapshotSequencer((data, requestedAt) => {
+const stateSnapshots = createStateSnapshotSequencer((data, requestedAt, generation) => {
     renderProjectsNav(data.projects || [], data.project_chat_ids);
     applyTaskBindings(data.task_bindings || {});
-    hydrateOpenChatsFromState(data, requestedAt);
+    hydrateOpenChatsFromState(data, requestedAt, generation);
 });
 
 const ctx = {
@@ -226,10 +224,10 @@ const ctx = {
 mainChat = initChat(ctx);
 initFiles(ctx);
 
-function hydrateOpenChatsFromState(data, snapshotRequestedAt) {
-    mainChat?.hydrateStateSnapshot?.(data, snapshotRequestedAt);
+function hydrateOpenChatsFromState(data, snapshotRequestedAt, snapshotGeneration) {
+    mainChat?.hydrateStateSnapshot?.(data, snapshotRequestedAt, snapshotGeneration);
     for (const instance of projectInstances.values()) {
-        instance.hydrateStateSnapshot?.(data, snapshotRequestedAt);
+        instance.hydrateStateSnapshot?.(data, snapshotRequestedAt, snapshotGeneration);
     }
 }
 

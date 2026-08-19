@@ -259,7 +259,7 @@ export function createStateSnapshotSequencer(onApply, now = () => Date.now()) {
             const generation = Number(request?.generation) || 0;
             if (!generation || generation <= appliedGeneration) return false;
             appliedGeneration = generation;
-            onApply(data, request.requestedAt);
+            onApply(data, request.requestedAt, generation);
             return true;
         },
         isCurrent(request) {
@@ -443,9 +443,17 @@ export function routingAnnotationText(annotation) {
  * ids and never restart, so conclusion is final). Without this, a one-shot
  * hydration (project panels) could resurrect a finished turn indefinitely.
  */
-export function computeHydratedDirectActivities(existingMap, turnsList, chatId, snapshotBarrierMs = Infinity, concludedIds = null) {
+export function computeHydratedDirectActivities(
+    existingMap,
+    turnsList,
+    chatId,
+    snapshotBarrierMs = Infinity,
+    concludedIds = null,
+    snapshotGeneration = 0,
+) {
     const nextMap = new Map(existingMap || []);
     if (!Array.isArray(turnsList)) return nextMap;
+    const currentSnapshotGeneration = Number(snapshotGeneration) || 0;
     const currentChatTurns = turnsList.filter((t) => Number(t?.chat_id ?? 1) === chatId);
     const activeIdsInSnapshot = new Set();
     for (const turn of currentChatTurns) {
@@ -453,8 +461,9 @@ export function computeHydratedDirectActivities(existingMap, turnsList, chatId, 
         if (!aid) continue;
         if (concludedIds && concludedIds.has(aid)) continue;
         activeIdsInSnapshot.add(aid);
+        const hadExisting = nextMap.has(aid);
         const existing = nextMap.get(aid) || {};
-        nextMap.set(aid, {
+        const hydrated = {
             activityId: aid,
             kind: turn.kind || 'direct_chat',
             phase: turn.phase || 'thinking',
@@ -463,7 +472,13 @@ export function computeHydratedDirectActivities(existingMap, turnsList, chatId, 
             // server-clock started_at must never enter the barrier comparison
             // below (clock skew would let finished activities linger).
             startedAt: existing.startedAt || Date.now(),
-        });
+        };
+        // Snapshot-only rows carry HTTP provenance. A live frame overwrites
+        // the row without this marker and keeps request-start barrier authority.
+        if (existing.snapshotGeneration || (!hadExisting && currentSnapshotGeneration)) {
+            hydrated.snapshotGeneration = currentSnapshotGeneration || existing.snapshotGeneration;
+        }
+        nextMap.set(aid, hydrated);
     }
     for (const [aid, entry] of nextMap.entries()) {
         if (activeIdsInSnapshot.has(aid)) continue;
@@ -471,6 +486,15 @@ export function computeHydratedDirectActivities(existingMap, turnsList, chatId, 
         // kind-less typing entry is invisible to every snapshot source and is
         // concluded by its own final/summary frame instead.
         if (!SNAPSHOT_AUTHORITATIVE_KINDS.has(String(entry?.kind || ''))) continue;
+        const entrySnapshotGeneration = Number(entry?.snapshotGeneration) || 0;
+        if (
+            currentSnapshotGeneration
+            && entrySnapshotGeneration
+            && entrySnapshotGeneration < currentSnapshotGeneration
+        ) {
+            nextMap.delete(aid);
+            continue;
+        }
         const startedAt = Number(entry?.startedAt) || 0;
         if (startedAt >= snapshotBarrierMs) continue;
         nextMap.delete(aid);
@@ -491,9 +515,10 @@ export function reconcileHydratedDirectActivities(
     chatId,
     snapshotBarrierMs = Infinity,
     concludedIds = null,
+    snapshotGeneration = 0,
 ) {
     const activities = computeHydratedDirectActivities(
-        existingMap, turnsList, chatId, snapshotBarrierMs, concludedIds,
+        existingMap, turnsList, chatId, snapshotBarrierMs, concludedIds, snapshotGeneration,
     );
     const globallyActiveActivityIds = new Set();
     for (const turn of Array.isArray(turnsList) ? turnsList : []) {

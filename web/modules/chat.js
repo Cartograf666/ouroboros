@@ -735,8 +735,7 @@ export function createChatInstance({
                 if (data?.bg_consciousness_state?.detail) button.title = data.bg_consciousness_state.detail;
             }
         });
-        // Evolve/Consciousness now live inside the More menu; surface a small dot
-        // on the More summary so an active mode stays visible without opening it.
+        // Mark More while background mode is active in the menu.
         const moreSummary = headerActions?.querySelector('.chat-header-more > summary');
         if (moreSummary) {
             const anyActive = !!data?.evolution_enabled || !!data?.bg_consciousness_enabled;
@@ -753,13 +752,13 @@ export function createChatInstance({
         if (budgetFill) budgetFill.style.width = `${budget.fillPct}%`;
     }
 
-    function hydrateStateSnapshot(data, snapshotRequestedAt = Infinity) {
+    function hydrateStateSnapshot(data, snapshotRequestedAt = Infinity, snapshotGeneration = 0) {
         syncHeaderControlState(data);
         const activities = Array.isArray(data?.active_chat_activities)
             ? data.active_chat_activities
             : data?.active_direct_turns;
         if (Array.isArray(activities)) {
-            hydrateDirectActivities(activities, snapshotRequestedAt);
+            hydrateDirectActivities(activities, snapshotRequestedAt, snapshotGeneration);
         }
     }
 
@@ -4135,7 +4134,7 @@ export function createChatInstance({
         void reconcileMissingManagedTask(id);
     }
 
-    function hydrateDirectActivities(turnsList, snapshotBarrierMs = Infinity) {
+    function hydrateDirectActivities(turnsList, snapshotBarrierMs = Infinity, snapshotGeneration = 0) {
         if (!Array.isArray(turnsList)) return;
         const {
             activities: nextMap,
@@ -4143,7 +4142,8 @@ export function createChatInstance({
             disappearedManagedTaskIds,
             globallyActiveActivityIds,
         } = reconcileHydratedDirectActivities(
-            activeDirectActivities, turnsList, chatId, snapshotBarrierMs, concludedDirectActivities,
+            activeDirectActivities, turnsList, chatId, snapshotBarrierMs,
+            concludedDirectActivities, snapshotGeneration,
         );
         activeDirectActivities.clear();
         for (const [k, v] of nextMap.entries()) {

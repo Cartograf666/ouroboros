@@ -257,6 +257,69 @@ def test_ui_smoke_late_open_chat_shows_managed_activity(direct_server_with_data)
 
 
 @pytest.mark.ui_browser
+def test_ui_smoke_snapshot_apply_time_cannot_resurrect_root(
+    direct_server_with_data,  # noqa: F811
+):
+    """A snapshot-only root keeps HTTP generation provenance, even when two
+    request starts share one client-clock millisecond."""
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    url = direct_server_with_data["url"]
+    card = '.chat-live-card[data-task-id="snapshot-root"]'
+    activity = {
+        "activity_id": "snapshot-root", "chat_id": 1, "project_id": "",
+        "client_message_id": "", "kind": "managed_task", "phase": "working",
+        "started_at": 1.0,
+    }
+    try:
+        with sync_playwright() as pw:
+            browser, page = _launch(pw)
+            try:
+                _install_task_detail_gate(page)
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                _wait_status(page, "Online", timeout=30_000)
+                # Card/Stop exist, but no typing frame seeds the activity map.
+                page.evaluate(
+                    """() => window.__ouroWs.emit('chat', {
+                        type: 'chat', role: 'assistant', is_progress: true,
+                        chat_id: 1, task_id: 'snapshot-root', cancelable: true,
+                        content: 'Snapshot-only root is running.',
+                    })"""
+                )
+                page.wait_for_selector(f"{card} [data-cancel-run]")
+                page.evaluate("() => { window.__realDateNow = Date.now; Date.now = () => 100; }")
+                _start_reversed_state_response_race(page)
+
+                # N applies after N+1 started, so apply-time cannot become live provenance.
+                assert page.evaluate(
+                    "(activity) => window.__settleStateResponse(0, [activity])", activity
+                )
+                assert page.evaluate("() => window.__settleStateResponse(1, [])")
+                page.evaluate("() => { Date.now = window.__realDateNow; }")
+                page.wait_for_function("() => window.__taskDetailCalls.length === 1")
+                assert page.locator(f"{card} [data-cancel-run]").count() == 0
+                assert page.evaluate(
+                    """() => window.__settleTaskDetail({
+                        status: 'completed',
+                        root_phase_checkpoint: {post_task_synthesis: 'completed'},
+                        outcome_axes: {lifecycle: {status: 'completed'}},
+                    }, 200)"""
+                )
+                page.wait_for_function(
+                    "(sel) => document.querySelector(sel)?.dataset.finished === '1'", arg=card
+                )
+                assert page.locator(f"{card} .chat-live-phase").inner_text().strip() == "Done"
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise
+
+
+@pytest.mark.ui_browser
 def test_ui_smoke_reversed_state_responses_do_not_resurrect_main_root(
     direct_server_with_data,  # noqa: F811
 ):
