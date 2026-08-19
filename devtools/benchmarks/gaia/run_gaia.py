@@ -19,7 +19,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 
 from devtools.benchmarks.common.manifests import (
-    MODEL_SLOT_KEYS,
+    ACTIVE_MODEL_SLOT_KEYS,
     admit_benchmark_run,
     finalize_run_manifest,
     write_json,
@@ -154,7 +154,7 @@ def _render_run_settings(
     settings = json.loads(base_settings_path.read_text(encoding="utf-8"))
     settings.pop("OUROBOROS_MODEL_HEAVY", None)
     settings.pop("USE_LOCAL_HEAVY", None)
-    for key in MODEL_SLOT_KEYS:
+    for key in ACTIVE_MODEL_SLOT_KEYS:
         if key.startswith("OUROBOROS_EFFORT_"):
             continue
         if key not in _GAIA_PINNED_MODEL_KEYS:
@@ -224,7 +224,7 @@ def _settings_env(settings_path: pathlib.Path, solve_model: str, run_dir: pathli
         for k, v in settings.items()
         if k not in _PROVIDER_ENV_KEYS and v not in (None, "") and not isinstance(v, (list, dict))
     }
-    for key in MODEL_SLOT_KEYS:
+    for key in ACTIVE_MODEL_SLOT_KEYS:
         if key.startswith("OUROBOROS_EFFORT_") or key not in _GAIA_PINNED_MODEL_KEYS:
             continue
         if key in ("OUROBOROS_REVIEW_MODELS", "OUROBOROS_MODEL_VISION") and settings.get(key):
@@ -317,7 +317,7 @@ def _augment_manifest(manifest: dict, args: argparse.Namespace, root: pathlib.Pa
     """
     manifest["model_slots"] = {
         k: v for k, v in _settings_env(settings_path, args.solve_model, root).items()
-        if k in MODEL_SLOT_KEYS
+        if k in ACTIVE_MODEL_SLOT_KEYS
     }
     manifest["available_subagents"] = configured_subagents_snapshot(
         settings_path,

@@ -58,7 +58,7 @@ from devtools.benchmarks.common.manifests import (
     write_json,
 )
 from devtools.benchmarks.common.model_slots import (
-    configured_subagents_snapshot,
+    runtime_actor_snapshot,
     single_model_subagents_setting,
 )
 from devtools.benchmarks.common.result_index import append_result_index, task_result_row
@@ -67,9 +67,6 @@ from devtools.benchmarks.common.run_roots import (
     ensure_outside_repo,
     repo_root_from_devtools,
 )
-from ouroboros.configured_subagents import normalize_configured_subagents
-
-
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _WORKSPACE_ROOT = _REPO_ROOT.parent
 
@@ -726,7 +723,6 @@ def _preflight(config: PreflightConfig) -> dict[str, Any]:
     failures: list[str] = []
     details: dict[str, Any] = {}
     selected_model = str(config.model or "")
-    expected_subagents_raw = ""
     checkout = osworld_checkout_info(config.osworld_root)
     details["osworld_checkout"] = checkout
     if not checkout["exists"]:
@@ -755,21 +751,26 @@ def _preflight(config: PreflightConfig) -> dict[str, Any]:
             settings = json.loads(config.settings_path.read_text(encoding="utf-8"))
             selected_model = str(config.model or settings.get("OUROBOROS_MODEL") or "")
             details["model"] = selected_model
-            if selected_model:
-                expected_subagents_raw = single_model_subagents_setting(selected_model)
+            if not selected_model:
+                failures.append(
+                    "a measured model must be declared through --model or settings "
+                    "OUROBOROS_MODEL"
+                )
+            else:
                 try:
-                    _, local_subagents_raw = normalize_configured_subagents(
-                        settings.get("OUROBOROS_SUBAGENTS")
+                    declared_actor = runtime_actor_snapshot(
+                        settings,
+                        expected_model=selected_model,
                     )
                 except ValueError as exc:
-                    failures.append(f"OUROBOROS_SUBAGENTS invalid in settings: {exc}")
+                    failures.append(f"declared actor invalid in settings: {exc}")
                 else:
-                    details["available_subagents"] = json.loads(local_subagents_raw)
-                    if local_subagents_raw != expected_subagents_raw:
-                        failures.append(
-                            "OUROBOROS_SUBAGENTS in settings is not the exact one-model "
-                            f"OSWorld actor for {selected_model!r}"
-                        )
+                    details["declared_runtime_actor"] = declared_actor
+                    details["available_subagents"] = declared_actor["available_subagents"]
+                    failures.extend(
+                        f"declared settings {mismatch}"
+                        for mismatch in declared_actor["mismatches"]
+                    )
             from ouroboros.provider_models import PROVIDER_ENV_KEYS, provider_for_model
 
             provider = provider_for_model(selected_model)
@@ -827,23 +828,13 @@ def _preflight(config: PreflightConfig) -> dict[str, Any]:
             got = server_settings.get(key)
             if str(got).strip().lower() != str(want).strip().lower():
                 mismatches.append(f"{key}: server={got!r} expected={want!r}")
-        if config.model:
-            server_model = str(server_settings.get("OUROBOROS_MODEL") or "")
-            if server_model != config.model:
-                mismatches.append(f"OUROBOROS_MODEL: server={server_model!r} expected={config.model!r}")
-        if expected_subagents_raw:
-            try:
-                _, server_subagents_raw = normalize_configured_subagents(
-                    server_settings.get("OUROBOROS_SUBAGENTS")
-                )
-            except ValueError as exc:
-                mismatches.append(f"OUROBOROS_SUBAGENTS: server value invalid: {exc}")
-            else:
-                if server_subagents_raw != expected_subagents_raw:
-                    mismatches.append(
-                        "OUROBOROS_SUBAGENTS: target server does not expose the exact "
-                        f"one-model actor for {selected_model!r}"
-                    )
+        if selected_model:
+            target_actor = runtime_actor_snapshot(
+                server_settings,
+                expected_model=selected_model,
+            )
+            details["target_runtime_actor"] = target_actor
+            mismatches.extend(target_actor["mismatches"])
         details["server_scaffold_settings"] = {
             k: server_settings.get(k)
             for k in (
@@ -891,6 +882,20 @@ def _preflight(config: PreflightConfig) -> dict[str, Any]:
     except Exception as exc:
         failures.append(str(exc))
     return {"ok": not failures, "failures": failures, "details": details}
+
+
+def _bind_target_actor(manifest: dict[str, Any], preflight: dict[str, Any]) -> None:
+    """Record the actor exposed by the target, including allowed scaffold drift."""
+    target_actor = (preflight.get("details") or {}).get("target_runtime_actor") or {}
+    manifest["available_subagents"] = (
+        dict(target_actor.get("available_subagents") or {})
+        if isinstance(target_actor, dict)
+        else {}
+    )
+    manifest["harness"] = {
+        **(manifest.get("harness") or {}),
+        "target_runtime_actor": target_actor,
+    }
 
 
 def _json_from_text(raw: str) -> dict[str, Any]:
@@ -1632,10 +1637,6 @@ def _run_step_loop(args: argparse.Namespace, final: dict[str, Any],
     domain, example_id = paths.domain, paths.example_id
     base_manifest = paths.base_manifest
     osworld_root, task_path = paths.osworld_root, paths.task_path
-    base_manifest["available_subagents"] = configured_subagents_snapshot(
-        settings_path,
-        env_overrides=False,
-    )
     # Process/environment preparation belongs HERE, after the persisted admission boundary:
     # each of these probes the filesystem or mutates process state, so a refusal in any of
     # them must land on a run that already has a durable record.
@@ -1656,6 +1657,10 @@ def _run_step_loop(args: argparse.Namespace, final: dict[str, Any],
         allow_scaffold_mismatch=bool(args.allow_scaffold_mismatch),
     ))
     write_json(run_dir / "preflight.json", preflight)
+    # Bind the run to the actor the TARGET server actually exposed. This remains
+    # true for an explicit --allow-scaffold-mismatch ablation: the manifest records
+    # the drifted actor, never the nicer local declaration.
+    _bind_target_actor(base_manifest, preflight)
     # The attestation record travels with the manifest, not just the preflight file, so a
     # scored row can always be attributed to a runtime version + commit.
     base_manifest["extra"]["runtime_attestation"] = (

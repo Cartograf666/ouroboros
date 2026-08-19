@@ -488,13 +488,16 @@ from `--dataset`. Frontier-Bench runs on the pinned 0.18.0 (measured — see MET
 
 Ledgered smoke runs should go through the wrapper so `run_manifest.json` and
 the denominator-preserving `result_index.jsonl` are written beside the Harbor
-official output:
+official output. Its manifest derives Main/Light/fallback and the one API actor
+from the exact `--model` CLI value (plus an explicit Light override), never from
+ambient Heavy or a settings-template model:
 
 ```bash
 PYTHONPATH=/Users/anton/Ouroboros/repo \
 python devtools/benchmarks/terminal_bench/run_harbor_smoke.py \
   --run-root /Users/anton/Ouroboros/bench_runs/terminal_bench/smoke \
   --task terminal-bench/regex-log \
+  --model openai/gpt-5.5 \
   --n-concurrent 1 \
   --execute
 ```

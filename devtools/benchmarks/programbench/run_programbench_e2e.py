@@ -21,14 +21,14 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 
 from devtools.benchmarks.common.manifests import (
-    MODEL_SLOT_KEYS,
+    ACTIVE_MODEL_SLOT_KEYS,
     admit_benchmark_run,
     finalize_run_manifest,
     runtime_attestation,
     write_json,
 )
 from devtools.benchmarks.common.model_slots import (
-    configured_subagents_snapshot,
+    runtime_actor_snapshot,
     single_model_subagents_setting,
 )
 from devtools.benchmarks.common.official_commands import programbench_command_for_manifest
@@ -60,9 +60,11 @@ from devtools.benchmarks.programbench.schemas import PROGRAMBENCH_TIMEOUT_SEC
 from ouroboros.configured_subagents import normalize_configured_subagents
 from ouroboros.provider_models import migrate_model_value
 
-# Model-carrying slots only; the OUROBOROS_EFFORT_* entries in MODEL_SLOT_KEYS are
+# Model-carrying slots only; the OUROBOROS_EFFORT_* entries in ACTIVE_MODEL_SLOT_KEYS are
 # effort levels, not model ids.
-_MODEL_ID_SLOT_KEYS = tuple(key for key in MODEL_SLOT_KEYS if not key.startswith("OUROBOROS_EFFORT_"))
+_MODEL_ID_SLOT_KEYS = tuple(
+    key for key in ACTIVE_MODEL_SLOT_KEYS if not key.startswith("OUROBOROS_EFFORT_")
+)
 
 TASK_CHECKPOINT_BASENAME = "ouroboros_task_checkpoint.json"
 
@@ -159,7 +161,12 @@ def preflight_model_slots(settings_path: pathlib.Path, *, solve_model: str = "")
                 f"{configured!r}; the server would solve on the wrong model"
             )
     measured_model = expected_solve or slots.get("OUROBOROS_MODEL", "")
-    if measured_model:
+    if not measured_model:
+        problems.append(
+            "a measured model must be declared through --solve-model or settings "
+            "OUROBOROS_MODEL"
+        )
+    else:
         expected_subagents = single_model_subagents_setting(measured_model)
         try:
             _, normalized_subagents = normalize_configured_subagents(
@@ -522,13 +529,53 @@ def main() -> int:
         # the finalization seam instead of vanishing with the process.
         model_slots = preflight_model_slots(settings_path, solve_model=str(args.solve_model or ""))
         manifest["harness"]["model_slots_normalized"] = model_slots
-        # ProgramBench submits to an already-running server whose settings file is the
-        # declared authority.  Do not let the launcher's unrelated ambient env rewrite
-        # the recorded actor list.
-        manifest["available_subagents"] = configured_subagents_snapshot(
-            settings_path,
-            env_overrides=False,
-        )
+        measured_model = str(args.solve_model or model_slots.get("OUROBOROS_MODEL") or "").strip()
+        # The local settings declaration is not proof of what an already-running target
+        # server will execute. Fetch its effective settings, bind the top-level manifest
+        # projection to THAT actor, and refuse any mismatch before dataset work/tasks.
+        try:
+            target_settings = ouroboros_api_request(
+                str(args.ouroboros_url), "GET", "/api/settings", timeout=30
+            )
+            target_actor = runtime_actor_snapshot(
+                target_settings,
+                expected_model=measured_model,
+            )
+        except Exception as exc:
+            manifest["available_subagents"] = {}
+            manifest["harness"]["target_runtime_actor"] = {
+                "error": f"{type(exc).__name__}: {exc}"
+            }
+            final.update({
+                "outcome": "refused",
+                "exit_code": 2,
+                "refusal": {
+                    "stage": "target_actor_preflight",
+                    "reason": "target_settings_unavailable",
+                    "exit_code": 2,
+                },
+            })
+            print(f"[pb-e2e] FATAL: target actor preflight failed: {exc}", file=sys.stderr)
+            return 2
+        manifest["available_subagents"] = target_actor["available_subagents"]
+        manifest["harness"]["target_runtime_actor"] = target_actor
+        if target_actor["mismatches"]:
+            final.update({
+                "outcome": "refused",
+                "exit_code": 2,
+                "refusal": {
+                    "stage": "target_actor_preflight",
+                    "reason": "target_actor_mismatch",
+                    "exit_code": 2,
+                    "mismatches": list(target_actor["mismatches"]),
+                },
+            })
+            print(
+                "[pb-e2e] FATAL: target runtime does not match the declared measured actor: "
+                + "; ".join(target_actor["mismatches"]),
+                file=sys.stderr,
+            )
+            return 2
         instances = _load_instances(**selector)
         if not instances:
             final.update({"outcome": "refused", "exit_code": 1,

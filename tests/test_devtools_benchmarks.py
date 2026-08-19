@@ -4193,32 +4193,34 @@ def test_swe_pro_grade_ungraded_covers_unparseable_and_empty_requirements(tmp_pa
         assert verdict == "ungraded" and reason.startswith("output_unparseable") and column == "-"
 
 
+def _write_programbench_actor_settings(e2e, path):
+    model = "openai/gpt-5.5"
+    payload = {"OUROBOROS_MODEL": model,
+               "OUROBOROS_SUBAGENTS": e2e.single_model_subagents_setting(model)}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return payload
+
+
 def test_programbench_e2e_ledger_is_append_only_and_manifest_is_written_first(tmp_path, monkeypatch):
-    """P1.5 + P1.2 on the biggest spender: every row is appended the moment it exists (a crash
-    used to discard the whole run's ledger, and a resume silently replaced the previous run's
-    history), and the manifest — which carries the seed gate — is written BEFORE the first
-    instance instead of after the official eval."""
+    """ProgramBench records target-bound manifests before append-only instance rows."""
     from devtools.benchmarks.programbench import run_programbench_e2e as e2e
 
     run_root = tmp_path / "pb-run"
     settings = tmp_path / "settings.json"
-    settings.write_text("{}", encoding="utf-8")
+    target_settings = _write_programbench_actor_settings(e2e, settings)
     instances = [{"instance_id": "inst-a", "image_name": "img-a"}, {"instance_id": "inst-b", "image_name": "img-b"}]
     monkeypatch.setattr(e2e, "_load_instances", lambda **_k: list(instances))
     monkeypatch.setattr(e2e, "runtime_attestation", lambda url, repo: {"ok": True, "runtime_version": "6.75.0"})
+    monkeypatch.setattr(e2e, "ouroboros_api_request", lambda *_a, **_k: target_settings)
     monkeypatch.setattr(e2e, "run_root", lambda *_a, **_k: run_root)
 
     seen: list[str] = []
 
     def _fake_process(instance, cfg):
         seen.append(str(instance["instance_id"]))
-        # The ledger must already hold the FIRST row while the SECOND instance is still running.
         if len(seen) == 2:
             lines = (run_root / "result_index.jsonl").read_text(encoding="utf-8").splitlines()
             assert [json.loads(line)["instance_id"] for line in lines] == ["inst-a"]
-            # The manifest already exists mid-run and carries the seed gate. Assert the gate's
-            # SHAPE, never its verdict: `ok` mirrors the ambient checkout, so pinning it to False
-            # passes on a developer's dirty tree and fails on a clean CI checkout.
             gate = json.loads((run_root / "run_manifest.json").read_text(encoding="utf-8"))["seed_gate"]
             assert set(gate) >= {"ok", "reason", "require_clean", "allow_dirty_seed", "dirty", "git_available"}
             assert gate["require_clean"] is False and gate["allow_dirty_seed"] is True
@@ -5416,10 +5418,11 @@ def test_programbench_e2e_records_a_typed_outcome_on_its_failure_paths(tmp_path,
 
     out_root = tmp_path / "pb-e2e"
     settings = tmp_path / "settings.json"
-    settings.write_text("{}", encoding="utf-8")
+    target_settings = _write_programbench_actor_settings(e2e, settings)
     monkeypatch.setattr(e2e, "_load_instances",
                         lambda **_k: [{"instance_id": "inst-a", "image_name": "img-a"}])
     monkeypatch.setattr(e2e, "runtime_attestation", lambda url, repo: {"ok": True})
+    monkeypatch.setattr(e2e, "ouroboros_api_request", lambda *_a, **_k: target_settings)
     monkeypatch.setattr(e2e, "run_root", lambda *_a, **_k: out_root)
     monkeypatch.setattr(e2e, "_process_instance", lambda instance, cfg: e2e.task_result_row(
         benchmark="programbench", instance_id="inst-a", status="failed",
@@ -5534,10 +5537,11 @@ def test_programbench_e2e_persists_the_manifest_when_attestation_refuses(tmp_pat
 
     out_root = tmp_path / "pb-attest"
     settings = tmp_path / "settings.json"
-    settings.write_text("{}", encoding="utf-8")
+    target_settings = _write_programbench_actor_settings(e2e, settings)
     monkeypatch.setattr(e2e, "_load_instances",
                         lambda **_k: [{"instance_id": "inst-a", "image_name": "img-a"}])
     monkeypatch.setattr(e2e, "run_root", lambda *_a, **_k: out_root)
+    monkeypatch.setattr(e2e, "ouroboros_api_request", lambda *_a, **_k: target_settings)
 
     from devtools.benchmarks.common.manifests import RuntimeAttestationRefused
 

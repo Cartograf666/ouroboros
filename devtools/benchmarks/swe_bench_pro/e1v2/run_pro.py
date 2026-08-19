@@ -42,6 +42,7 @@ from devtools.benchmarks.common.run_roots import assert_outside_repo, ensure_out
 from devtools.benchmarks.common.model_slots import (
     configured_subagents_snapshot,
     pin_single_model,
+    single_model_slot_snapshot,
     single_model_subagents_setting,
 )
 
@@ -947,6 +948,22 @@ def _run_schedule(args, out_dir: pathlib.Path, vsuf: str, api_key: str) -> int:
                           "refusal": {"stage": "seed_shape", "exit_code": 2,
                                       "reason": refused.reason}})
             return 2
+        # These facts are pure CLI-derived run identity, so materialize them BEFORE
+        # the task loop; the retained finalizer persists them on every exit. If every
+        # selected task resumes from patch.diff,
+        # derive_run_settings() is never called; the old placement inside the solve
+        # branch then left the entire run carrying template/empty actor provenance.
+        manifest["model_slots"] = single_model_slot_snapshot(
+            args.solve_model,
+            review_slots=args.review_slots,
+            review_effort=args.review_effort,
+        )
+        manifest["available_subagents"] = configured_subagents_snapshot(
+            exact_model=args.solve_model,
+        )
+        manifest["harness"]["settings_template"] = str(
+            pathlib.Path(args.settings).expanduser()
+        )
         # The amendments above ride the RETAINED dict: `finalize_run_manifest` writes this same
         # path on every exit path, merging the terminal outcome/exit_code as it goes. Publishing
         # here instead put a pre-merge record — no terminal outcome at all — at the path a

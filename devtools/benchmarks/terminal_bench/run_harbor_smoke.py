@@ -15,7 +15,14 @@ from typing import Any
 if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 
-from devtools.benchmarks.common.manifests import admit_benchmark_run, finalize_run_manifest
+from devtools.benchmarks.common.manifests import (
+    admit_benchmark_run,
+    finalize_run_manifest,
+    write_json,
+)
+from devtools.benchmarks.common.model_slots import (
+    configured_subagents_snapshot,
+)
 from devtools.benchmarks.common.result_index import task_result_row, write_result_index
 from devtools.benchmarks.common.run_roots import (
     default_settings_path,
@@ -234,6 +241,17 @@ def main() -> int:
             },
         },
     )
+    effective_light = str(args.ouroboros_light_model or args.model)
+    manifest["model_slots"] = {
+        "OUROBOROS_MODEL": args.model,
+        "OUROBOROS_MODEL_LIGHT": effective_light,
+        "OUROBOROS_MODEL_FALLBACKS": args.model,
+    }
+    manifest["available_subagents"] = configured_subagents_snapshot(
+        exact_model=args.model,
+    )
+    # Durable before Harbor can spend: no ambient settings model/Heavy can survive.
+    write_json(manifest_path, manifest)
     if not actual_include_filters:
         manifest["requested_count"] = effective_n_tasks
     with finalize_run_manifest(manifest_path, manifest) as final:

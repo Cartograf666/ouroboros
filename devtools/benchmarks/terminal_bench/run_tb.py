@@ -22,7 +22,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 
 from devtools.benchmarks.common.manifests import (
-    MODEL_SLOT_KEYS,
+    ACTIVE_MODEL_SLOT_KEYS,
     admit_benchmark_run,
     finalize_run_manifest,
     model_slot_snapshot,
@@ -510,7 +510,7 @@ def resolved_model_slots(config: HarborCommandConfig) -> dict[str, str]:
         slots["OUROBOROS_MODEL_FALLBACKS"] = config.model
     if config.light_model:
         slots["OUROBOROS_MODEL_LIGHT"] = config.light_model
-    return {key: value for key, value in slots.items() if key in MODEL_SLOT_KEYS}
+    return {key: value for key, value in slots.items() if key in ACTIVE_MODEL_SLOT_KEYS}
 
 
 def augment_manifest(manifest: dict, config: HarborCommandConfig) -> None:
@@ -518,7 +518,7 @@ def augment_manifest(manifest: dict, config: HarborCommandConfig) -> None:
 
     Same shape and same seam as GAIA's ``_augment_manifest`` (``gaia/run_gaia.py``): the
     settings-derived facts are added AFTER admission and persisted by the finalization seam, and
-    they land under ``model_slots`` filtered to ``MODEL_SLOT_KEYS``. Keeping the field name and
+    they land under ``model_slots`` filtered to ``ACTIVE_MODEL_SLOT_KEYS``. Keeping the field name and
     filter identical across families is the point — an auditor reading any benchmark's
     ``run_manifest.json`` finds the model in the same place.
     """

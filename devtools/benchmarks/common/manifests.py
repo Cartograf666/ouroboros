@@ -51,12 +51,10 @@ CAMPAIGN_FATAL_PROVENANCE_REASONS = frozenset({
     "seed_head_unreadable",
 })
 
-# Keep Heavy in the READ vocabulary so pre-Available-subagents run manifests retain
-# their original meaning. New benchmark writers no longer author it; fixed-model child
-# execution is recorded/configured through the canonical OUROBOROS_SUBAGENTS setting.
-MODEL_SLOT_KEYS = (
+# Active projection used by every NEW run manifest and preflight. Heavy is not an
+# execution slot after Available subagents and must not leak in from ambient env/settings.
+ACTIVE_MODEL_SLOT_KEYS = (
     "OUROBOROS_MODEL",
-    "OUROBOROS_MODEL_HEAVY",
     "OUROBOROS_MODEL_LIGHT",
     "OUROBOROS_MODEL_VISION",
     "OUROBOROS_MODEL_CONSCIOUSNESS",
@@ -70,6 +68,15 @@ MODEL_SLOT_KEYS = (
     "OUROBOROS_EFFORT_TASK",
     "OUROBOROS_EFFORT_REVIEW",
     "OUROBOROS_EFFORT_SCOPE_REVIEW",
+)
+
+# Historical READ vocabulary. Old durable manifests can still carry Heavy and retain
+# their original meaning; new writers use ACTIVE_MODEL_SLOT_KEYS above. Keep the public
+# name for compatibility with existing artifact readers and cleanup code.
+MODEL_SLOT_KEYS = (
+    "OUROBOROS_MODEL",
+    "OUROBOROS_MODEL_HEAVY",
+    *ACTIVE_MODEL_SLOT_KEYS[1:],
 )
 
 
@@ -389,7 +396,7 @@ def model_slot_snapshot(settings_path: pathlib.Path | None = None, *,
         except Exception:
             settings = {}
     slots: dict[str, str] = {}
-    for key in MODEL_SLOT_KEYS:
+    for key in ACTIVE_MODEL_SLOT_KEYS:
         value = os.environ.get(key) if env_overrides else None
         if value is None:
             value = settings.get(key)

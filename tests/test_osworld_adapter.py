@@ -261,7 +261,8 @@ def test_preflight_verifies_server_scaffold_settings(tmp_path, monkeypatch):
 
     drifted = {"OUROBOROS_RUNTIME_MODE": "light", "OUROBOROS_SAFETY_MODE": "full",
                "OUROBOROS_MAX_WORKERS": 1, "OUROBOROS_MODEL": "openai/gpt-5.5",
-               "OUROBOROS_REVIEW_ENFORCEMENT": "advisory"}
+               "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
+               "OUROBOROS_SUBAGENTS": rsa.single_model_subagents_setting("openai/gpt-5.5")}
 
     def fake_http(url, timeout=5):
         if url.endswith("/api/state"):
@@ -307,3 +308,8 @@ def test_preflight_verifies_server_scaffold_settings(tmp_path, monkeypatch):
     result3 = rsa._preflight(relaxed)
     assert result3["ok"]
     assert result3["details"]["scaffold_mismatch_allowed"]
+    manifest = {"harness": {}}
+    rsa._bind_target_actor(manifest, result3)
+    assert manifest["available_subagents"]["items"][0]["route"]["target_id"] == (
+        "openai/gpt-5.5"
+    )

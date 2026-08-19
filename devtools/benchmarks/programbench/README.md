@@ -31,8 +31,10 @@ export OUROBOROS_BENCH_RUNS_ROOT=<workspace>/bench_runs
 # - The solve task itself disables claude_code_edit (house rule: benches measure
 #   the single-model Ouroboros harness, not an external coding agent).
 # - Active model slots pin openai/gpt-5.5, and OUROBOROS_SUBAGENTS contains one
-#   api_model row on that exact route. Preflight rejects a missing or different
-#   actor profile. The id must exist in the OpenRouter catalog
+#   api_model row on that exact route. Preflight requires a declared Main or
+#   --solve-model, then fetches the target server's /api/settings and binds the
+#   manifest to that actual actor; missing/different target state refuses before
+#   instance discovery or paid work. The id must exist in the OpenRouter catalog
 #   (there is no openai/gpt-5.5-mini there — it 400s on every task).
 
 # Terminal 1 — source server (not the desktop app; the sandboxed desktop cannot
@@ -51,7 +53,8 @@ python devtools/benchmarks/programbench/run_programbench_e2e.py \
 Useful flags:
 
 - `--instance-id <id>` — single task
-- `--solve-model <id>` — expected OUROBOROS_MODEL; validated against `--settings-path`
+- `--solve-model <id>` — expected measured model; validated against both
+  `--settings-path` and the target server's `/api/settings`
 - `--dry-run` — docker + `ouroboros_task_body.json` only (no solve)
 - `--skip-pull` — reuse already-pulled images
 - `--redo-existing` — rerun even when `submission.tar.gz` exists (clears the task checkpoint)

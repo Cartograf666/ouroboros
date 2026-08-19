@@ -90,8 +90,11 @@ a `FAIL` on any feasible task scores 0.
   on it. No default scout, second provider family, or session substrate can enter
   the run. Because the step CLI submits to an already-running server, preflight
   verifies that server exposes the same normalized one-row value; client env is
-  not accepted as proof. `settings_base.json` keeps secrets blank; fill keys at
-  run time, never commit.
+  not accepted as proof. The top-level manifest records the actor returned by the
+  target server even for an explicit `--allow-scaffold-mismatch` ablation, rather
+  than repeating the local declaration. The CU-bridge runner applies the same
+  target `/api/settings` comparison and refuses drift before claiming/booting the
+  VM. `settings_base.json` keeps secrets blank; fill keys at run time, never commit.
 - Step loop is memory-stateless per Ouroboros call (`--memory-mode empty`);
   cross-step continuity is only the action history + agent `notes` carried by
   the runner prompt.

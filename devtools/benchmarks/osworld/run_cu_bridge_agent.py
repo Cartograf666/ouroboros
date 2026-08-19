@@ -53,6 +53,7 @@ from devtools.benchmarks.common.manifests import (
     runtime_attestation,
     write_json,
 )
+from devtools.benchmarks.common.model_slots import runtime_actor_snapshot
 from devtools.benchmarks.common.result_index import (
     append_result_index,
     runtime_terminal_disclosure,
@@ -1405,6 +1406,50 @@ def _api(server: str, method: str, path: str, body: dict[str, Any] | None = None
     return json.loads(raw) if raw.strip().startswith(("{", "[")) else {"raw": raw}
 
 
+def _cu_actor_preflight(settings_path: Path, server: str) -> dict[str, Any]:
+    """Compare the declared CU actor with the actor exposed by the target server."""
+    failures: list[str] = []
+    declared: dict[str, Any] = {}
+    target: dict[str, Any] = {}
+    try:
+        loaded = json.loads(Path(settings_path).read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError("settings JSON is not an object")
+        measured_model = str(loaded.get("OUROBOROS_MODEL") or "").strip()
+        if not measured_model:
+            raise ValueError("settings must declare measured OUROBOROS_MODEL")
+        declared = runtime_actor_snapshot(loaded, expected_model=measured_model)
+        failures.extend(f"declared settings {item}" for item in declared["mismatches"])
+    except Exception as exc:
+        failures.append(f"declared actor unavailable: {type(exc).__name__}: {exc}")
+        return {"ok": False, "failures": failures, "declared": declared, "target": target}
+
+    try:
+        target_settings = _api(server, "GET", "/api/settings", timeout=10)
+        target = runtime_actor_snapshot(target_settings, expected_model=measured_model)
+        failures.extend(f"target server {item}" for item in target["mismatches"])
+    except Exception as exc:
+        failures.append(f"target actor unavailable: {type(exc).__name__}: {exc}")
+    return {
+        "ok": not failures,
+        "failures": failures,
+        "declared": declared,
+        "target": target,
+    }
+
+
+def _bind_cu_actor(manifest: dict[str, Any], actor_preflight: dict[str, Any]) -> None:
+    """Bind CU manifest provenance to the target actor, not the local declaration."""
+    target = actor_preflight.get("target") or {}
+    manifest["available_subagents"] = (
+        dict(target.get("available_subagents") or {})
+        if isinstance(target, dict)
+        else {}
+    )
+    manifest["harness"]["target_runtime_actor"] = target
+    manifest["harness"]["actor_preflight"] = actor_preflight
+
+
 def _text_declares_infeasible(value: Any) -> bool:
     return isinstance(value, str) and any(
         line.strip() == "TASK_INFEASIBLE" for line in value.splitlines()
@@ -1991,6 +2036,31 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
 
     example_id = run.example_id
     domain = run.domain
+
+    # The CU bridge submits to an already-running server. Its local settings file
+    # declares methodology, but only the target /api/settings says which actor will
+    # execute. Bind the top-level manifest to that actual actor and refuse drift
+    # before taking a claim or booting the VM.
+    actor_preflight = _cu_actor_preflight(settings_path, args.ouroboros_url)
+    _bind_cu_actor(run.base_manifest, actor_preflight)
+    if not actor_preflight["ok"]:
+        final.update({
+            "outcome": "blocked",
+            "exit_code": 2,
+            "refusal": {
+                "stage": "target_actor_preflight",
+                "reason": "target_actor_mismatch",
+                "exit_code": 2,
+            },
+        })
+        _write_outcome(
+            None,
+            "blocked",
+            "target_actor_mismatch",
+            "; ".join(actor_preflight["failures"]),
+            extra={"actor_preflight": actor_preflight},
+        )
+        return 2
 
     # Owner Q9=A+B / Q10: attest the RUNNING server (its HTTP `runtime_version`) against the
     # checkout it was started from (local HEAD + VERSION) before any paid work. The shared

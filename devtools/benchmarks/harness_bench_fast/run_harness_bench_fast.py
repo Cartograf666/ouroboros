@@ -15,7 +15,14 @@ from typing import Any
 if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 
-from devtools.benchmarks.common.manifests import admit_benchmark_run, finalize_run_manifest
+from devtools.benchmarks.common.manifests import (
+    admit_benchmark_run,
+    finalize_run_manifest,
+    write_json,
+)
+from devtools.benchmarks.common.model_slots import (
+    configured_subagents_snapshot,
+)
 from devtools.benchmarks.common.result_index import task_result_row, write_result_index
 from devtools.benchmarks.common.run_roots import assert_outside_repo, default_settings_path, repo_root_from_devtools, run_root
 
@@ -270,6 +277,17 @@ def main() -> int:
         },
         extra={"outcome": "started"},
     )
+    # The measured model is the CLI's exact value, not an ambient/template slot.
+    # Persist this before task discovery (which may invoke harness-bench itself).
+    manifest["model_slots"] = {
+        "OUROBOROS_MODEL": args.model,
+        "OUROBOROS_MODEL_LIGHT": args.model,
+        "OUROBOROS_MODEL_FALLBACKS": args.model,
+    }
+    manifest["available_subagents"] = configured_subagents_snapshot(
+        exact_model=args.model,
+    )
+    write_json(manifest_output, manifest)
 
     with finalize_run_manifest(manifest_output, manifest) as final:
         task_ids = _read_task_ids(bench_root, args.task, args.task_file)
@@ -319,4 +337,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

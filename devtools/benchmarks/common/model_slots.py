@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
-from typing import Any, MutableMapping, Optional
+from typing import Any, Mapping, MutableMapping, Optional
 
 from ouroboros.configured_subagents import (
     PRIMARY_RECOMMENDATION,
@@ -30,6 +30,7 @@ from ouroboros.configured_subagents import (
     ConfiguredSubagent,
     configured_subagents_dict,
     make_configured_subagents,
+    normalize_configured_subagents,
     parse_configured_subagents,
     serialize_configured_subagents,
 )
@@ -55,25 +56,100 @@ BENCHMARK_SUBAGENT_ID = "benchmark-model"
 BENCHMARK_SUBAGENT_NAME = "Benchmark model"
 
 
-def single_model_subagents_setting(model: str) -> str:
-    """Canonical one-row Available-subagents value for a fixed-model run."""
+def _benchmark_actor(model: str) -> ConfiguredSubagent:
+    """Canonical actor row shared by enabled and explicitly disabled benches."""
     target = str(model or "").strip()
     if not target:
         raise ValueError("single-model benchmark subagent requires a model")
-    config = make_configured_subagents((
-        ConfiguredSubagent(
-            subagent_id=BENCHMARK_SUBAGENT_ID,
-            name=BENCHMARK_SUBAGENT_NAME,
-            recommended_use=PRIMARY_RECOMMENDATION,
-            route=RouteSpec(ROUTE_KIND_API_MODEL, target),
-        ),
-    ))
+    return ConfiguredSubagent(
+        subagent_id=BENCHMARK_SUBAGENT_ID,
+        name=BENCHMARK_SUBAGENT_NAME,
+        recommended_use=PRIMARY_RECOMMENDATION,
+        route=RouteSpec(ROUTE_KIND_API_MODEL, target),
+    )
+
+
+def single_model_subagents_setting(model: str) -> str:
+    """Canonical one-row Available-subagents value for a fixed-model run."""
+    config = make_configured_subagents((_benchmark_actor(model),))
     return serialize_configured_subagents(config)
 
 
-def disabled_subagents_setting() -> str:
-    """Canonical explicit-off value for benches where delegation is out of scope."""
-    return serialize_configured_subagents(make_configured_subagents((), enabled=False))
+def disabled_subagents_setting(model: str = "") -> str:
+    """Canonical explicit-off value, optionally retaining the measured actor row.
+
+    A disabled list still records which API actor the benchmark measured; ``enabled=false``
+    remains the execution authority.  The empty form stays available for callers that truly
+    have no measured model rather than inventing one.
+    """
+    rows = (_benchmark_actor(model),) if str(model or "").strip() else ()
+    return serialize_configured_subagents(make_configured_subagents(rows, enabled=False))
+
+
+def single_model_slot_snapshot(
+    model: str,
+    *,
+    review_slots: int = 1,
+    review_effort: str = "",
+) -> dict[str, str]:
+    """Model-slot manifest projection derived only from the measured CLI model."""
+    pinned: dict[str, str] = {}
+    pin_single_model(
+        model,
+        review_slots=review_slots,
+        review_effort=review_effort,
+        target=pinned,
+    )
+    keys = (*SINGLE_MODEL_SLOT_KEYS, "OUROBOROS_REVIEW_MODELS")
+    if review_effort:
+        keys += ("OUROBOROS_EFFORT_REVIEW", "OUROBOROS_EFFORT_SCOPE_REVIEW")
+    return {key: pinned[key] for key in keys if pinned.get(key)}
+
+
+def runtime_actor_snapshot(
+    settings: Mapping[str, Any],
+    *,
+    expected_model: str,
+) -> dict[str, Any]:
+    """Normalize and compare the actor exposed by a target runtime's settings.
+
+    The caller owns transport and refusal policy.  This helper owns the one canonical parser
+    and comparison so ProgramBench and both OSWorld runners cannot disagree about what an
+    exact fixed-model actor means.  The returned payload is non-secret and manifest-safe.
+    """
+    model = str(expected_model or "").strip()
+    if not model:
+        raise ValueError("runtime actor comparison requires an expected model")
+    if not isinstance(settings, Mapping):
+        raise ValueError("runtime settings must be an object")
+
+    actual_model = str(settings.get("OUROBOROS_MODEL") or "").strip()
+    mismatches: list[str] = []
+    if actual_model != model:
+        mismatches.append(
+            f"OUROBOROS_MODEL: runtime={actual_model!r} expected={model!r}"
+        )
+
+    projection: dict[str, Any] = {}
+    parse_error = ""
+    try:
+        config, normalized = normalize_configured_subagents(settings.get(SUBAGENTS_SETTING))
+    except ValueError as exc:
+        parse_error = str(exc)
+        mismatches.append(f"{SUBAGENTS_SETTING}: runtime value invalid: {exc}")
+    else:
+        projection = configured_subagents_dict(config)
+        if normalized != single_model_subagents_setting(model):
+            mismatches.append(
+                f"{SUBAGENTS_SETTING}: runtime does not expose the exact one-model "
+                f"API actor for {model!r}"
+            )
+    return {
+        "model": actual_model,
+        "available_subagents": projection,
+        "mismatches": mismatches,
+        **({"parse_error": parse_error} if parse_error else {}),
+    }
 
 
 def configured_subagents_snapshot(

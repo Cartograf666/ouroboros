@@ -119,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA))
     parser.add_argument("--settings-path", default=str(DEFAULT_SETTINGS))
     parser.add_argument("--ouroboros-bin", default=os.environ.get("OUROBOROS_BIN") or str(DEFAULT_OUROBOROS_BIN))
-    parser.add_argument("--model", default="")
+    parser.add_argument("--model", required=True)
     parser.add_argument("--log-root", default="")
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--memory-mode", default="empty", choices=["empty", "forked", "shared"])
@@ -168,15 +168,14 @@ def main(argv: list[str] | None = None) -> int:
             "PYTHONUNBUFFERED": "1",
         }
     )
-    if args.model:
-        env.update(
-            {
-                "OUROBOROS_MODEL": args.model,
-                "OUROBOROS_MODEL_LIGHT": args.model,
-                "OUROBOROS_MODEL_FALLBACKS": args.model,
-                "OUROBOROS_SUBAGENTS": single_model_subagents_setting(args.model),
-            }
-        )
+    env.update(
+        {
+            "OUROBOROS_MODEL": args.model,
+            "OUROBOROS_MODEL_LIGHT": args.model,
+            "OUROBOROS_MODEL_FALLBACKS": args.model,
+            "OUROBOROS_SUBAGENTS": single_model_subagents_setting(args.model),
+        }
+    )
 
     cmd = [
         str(pathlib.Path(args.ouroboros_bin).expanduser()),
@@ -237,8 +236,12 @@ def main(argv: list[str] | None = None) -> int:
             "data_dir": str(data_dir),
             "settings_path": str(settings_path),
             "model": args.model,
+            "model_slots": {
+                "OUROBOROS_MODEL": args.model,
+                "OUROBOROS_MODEL_LIGHT": args.model,
+                "OUROBOROS_MODEL_FALLBACKS": args.model,
+            },
             "available_subagents": configured_subagents_snapshot(
-                settings_path,
                 exact_model=args.model,
             ),
             "memory_mode": args.memory_mode,
