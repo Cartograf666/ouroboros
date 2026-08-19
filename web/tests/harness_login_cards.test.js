@@ -10,7 +10,6 @@ import test from 'node:test';
 
 import { createClaudexorStatusStore } from '../modules/claudexor_status_store.js';
 import {
-    familyHasNoAccounts,
     normalizeProfileName,
     profileNameSubmission,
     preserveCardFocus,
@@ -18,7 +17,6 @@ import {
     LOGIN_CUSTODY_RELEASED,
     LOGIN_CUSTODY_RETAINED,
     LOGIN_CUSTODY_UNKNOWN,
-    LOGIN_CARD_COMPACT,
     cancelLoginJob,
     createLoginCardController,
     loginCardHtml,
@@ -35,6 +33,24 @@ function fakeHost() {
         contains: () => false,
         querySelector: () => null,
         querySelectorAll: () => [],
+    };
+}
+
+function interactiveHost() {
+    const listeners = new Map();
+    return {
+        innerHTML: '',
+        contains: () => false,
+        querySelector(selector) {
+            const marker = selector.match(/\[([^\]]+)\]/)?.[1] || '';
+            if (!marker || !this.innerHTML.includes(marker)) return null;
+            return {
+                open: false,
+                addEventListener(type, callback) { listeners.set(`${selector}:${type}`, callback); },
+            };
+        },
+        querySelectorAll: () => [],
+        click(selector) { listeners.get(`${selector}:click`)?.({ preventDefault() {} }); },
     };
 }
 
@@ -117,7 +133,8 @@ test('poll replaces the whole canonical envelope, preserving envelope-level devi
         fetchImpl: async (url, init = {}) => {
             if (url === '/api/claudexor/login' && init.method === 'POST') {
                 return json(200, { job_id: 'job-device', job: { state: 'running' },
-                    attach_command: 'claudexor setup attach job-device', disclosure_native: false });
+                    attach_command: 'claudexor setup attach job-device', attach_shell: 'powershell',
+                    setup_login_source: 'per_harness', disclosure_native: false });
             }
             if (init.method === 'DELETE') return json(200, { job: { state: 'cancelled' } });
             return json(200, {
@@ -134,6 +151,8 @@ test('poll replaces the whole canonical envelope, preserving envelope-level devi
     assert.equal(ctl.active?.envelope?.sequence, 2);
     assert.equal(ctl.active?.attachCommand, 'claudexor setup attach job-device',
         'replaceable poll envelope must not erase create-only metadata');
+    assert.equal(ctl.active?.attachShell, 'powershell');
+    assert.equal(ctl.active?.setupLoginSource, 'per_harness');
     assert.match(host.innerHTML, /data-open-signin/);
     assert.match(host.innerHTML, /ABCD-1234/);
     await ctl.dispose();
@@ -573,6 +592,48 @@ test('duplicate starts are COALESCED, so a double-click cannot create-cancel-cre
     t.mock.timers.reset();
 });
 
+test('the pending-start key includes transport and the external start uses the release guard', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    let releaseCreate = null;
+    const gate = new Promise((resolve) => { releaseCreate = resolve; });
+    const bodies = [];
+    let deletes = 0;
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, statusPayload(false)),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    const ctl = createLoginCardController({
+        host: fakeHost(), store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                bodies.push(JSON.parse(init.body));
+                if (bodies.length === 1) await gate;
+                return json(200, { job_id: `job-${bodies.length}`, job: { state: 'running' },
+                    ...(bodies.at(-1).transport === 'client_pty'
+                        ? { attach_command: 'claudexor setup attach job-2', attach_shell: 'posix' } : {}) });
+            }
+            if (init.method === 'DELETE') {
+                deletes += 1;
+                return json(200, { job: { state: 'cancelled' } });
+            }
+            return json(200, { job: { state: 'running' } });
+        },
+    });
+    const ordinary = ctl.start('codex', 'work');
+    const external = ctl.start('codex', 'work', 'client_pty');
+    assert.notEqual(ordinary, external, 'different transports must not coalesce');
+    releaseCreate();
+    await Promise.all([ordinary, external]);
+    assert.equal(bodies.length, 2);
+    assert.equal(bodies[0].transport, undefined);
+    assert.equal(bodies[1].transport, 'client_pty');
+    assert.equal(deletes, 1, 'the external start passed through the existing custody release guard');
+    assert.equal(ctl.active.jobId, 'job-2');
+    await ctl.dispose();
+    store.dispose();
+    t.mock.timers.reset();
+});
+
 test('an unknown dispose can retry cancellation against the same retained job id', async (t) => {
     // The verdict is only useful if the caller can act on it. A retained job
     // must stay cancellable — otherwise a host that refuses to remount while
@@ -969,46 +1030,91 @@ test('typed reconcile transport classifies proof, retryable conflict, malformed 
     }
 });
 
-test('compact mode drops the terminal fallback, the paste-code entry and Close, and keeps retry', () => {
-    const active = {
-        harness: 'claude', profile: '', startedAtMs: 0, engineDegraded: true,
-        attachCommand: 'claudexor setup attach j1', error: '', verdict: null, confirming: false,
-        envelope: { job: { state: 'waiting_for_input' }, deviceCode: {
-            flow: 'oauth_url_input', verificationUrl: 'https://example.test/signin', userCode: '' } },
-    };
-    const full = loginCardHtml(active, 999999);
-    assert.ok(full.includes('data-login-code-input'), 'full keeps the optional paste-code entry');
-    assert.ok(full.includes('data-login-advanced'), 'full keeps the collapsed terminal fallback');
-    assert.ok(full.includes('data-login-dismiss'));
+test('the pre-job external action creates client_pty and immediately exposes a labelled command', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, statusPayload(false)),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    const host = interactiveHost();
+    const bodies = [];
+    let deletes = 0;
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                const body = JSON.parse(init.body);
+                bodies.push(body);
+                if (!body.transport) return json(409, {
+                    error: 'terminal helper unavailable',
+                    code: 'terminal_transport_unavailable',
+                    required_actions: ['use_external_terminal'],
+                });
+                return json(200, {
+                    job_id: 'external-job', job: { state: 'running' },
+                    attach_command: 'CLAUDEXOR_CONFIG_DIR=/owned claudexor setup attach external-job',
+                    attach_shell: 'posix', disclosure_native: false,
+                    setup_login_source: 'per_harness',
+                });
+            }
+            if (init.method === 'DELETE') {
+                deletes += 1;
+                return json(200, { job: { state: 'cancelled' } });
+            }
+            return json(200, { job: { state: 'running' } });
+        },
+    });
+    await ctl.start('one', 'work');
+    assert.equal(ctl.active.absent, true);
+    assert.equal(ctl.active.custodyStatus, LOGIN_CUSTODY_RELEASED);
+    assert.ok(host.innerHTML.includes('data-login-external-terminal'));
+    host.click('[data-login-external-terminal]');
+    await flush();
+    assert.equal(bodies.length, 2);
+    assert.equal(bodies[1].transport, 'client_pty');
+    assert.equal(deletes, 0, 'the proven pre-job absence needs no invented DELETE');
+    assert.ok(host.innerHTML.includes('data-login-external-command'), host.innerHTML);
+    assert.ok(host.innerHTML.includes('Command for POSIX shell'), host.innerHTML);
+    assert.ok(host.innerHTML.includes('claudexor setup attach external-job'), host.innerHTML);
+    assert.equal(await ctl.dispose(), LOGIN_CUSTODY_RELEASED);
+    assert.equal(deletes, 1, 'dispose releases the newly created external job');
+    store.dispose();
+});
 
-    const compact = loginCardHtml(active, 999999, { mode: LOGIN_CARD_COMPACT });
-    // The sign-in action itself survives — a card that cannot start the login
-    // would be worse than none.
-    assert.ok(compact.includes('data-open-signin'), 'compact keeps the sign-in link');
-    assert.ok(compact.includes('data-login-state'), 'compact keeps the progress line');
-    assert.ok(!compact.includes('data-login-code-input'));
-    assert.ok(!compact.includes('data-login-advanced'));
-    assert.ok(!compact.includes('data-login-dismiss'));
-    assert.ok(compact.includes(`data-login-mode="${LOGIN_CARD_COMPACT}"`));
-
-    // A settled non-success verdict offers Try again in compact (the wizard has
-    // no account row behind it to retry from).
-    const failed = loginCardHtml({ ...active, verdict: { kind: 'unconfirmed', reason: 'auth_not_ready' } },
-        999999, { mode: LOGIN_CARD_COMPACT });
-    assert.ok(failed.includes('data-login-retry'));
-    assert.ok(failed.includes('Could not confirm the sign-in yet'));
-
-    const verified = loginCardHtml({ ...active, verdict: { kind: 'success', reason: '' } },
-        999999, { mode: LOGIN_CARD_COMPACT });
-    assert.ok(verified.includes('Connected.'));
-    assert.ok(!verified.includes('data-login-retry'), 'nothing to retry once verified');
+test('a durable native-command terminal receipt exposes the external action after polling', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, statusPayload(false)),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    const host = fakeHost();
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                return json(200, { job_id: 'durable-job', job: { state: 'running' } });
+            }
+            return json(200, { job: {
+                state: 'failed',
+                outcome: { reason: 'command_failed' },
+                nativeCommand: { errorCode: 'terminal_transport_failed' },
+            } });
+        },
+    });
+    await ctl.start('one', 'work');
+    t.mock.timers.tick(3000);
+    await flush();
+    assert.ok(host.innerHTML.includes('data-login-external-terminal'), host.innerHTML);
+    assert.ok(host.innerHTML.includes('Continue in external terminal'), host.innerHTML);
+    assert.equal(await ctl.dispose(), LOGIN_CUSTODY_RELEASED);
+    store.dispose();
+    t.mock.timers.reset();
 });
 
 // ---------------------------------------------------------------------------
-// The "name the account" face: an engine that refuses the DEFAULT login of an
-// EMPTY family at create time (HTTP 400) asks for a named account instead of
-// leaving a dead error. The discriminator is the STRUCTURAL pair (create-time
-// 400 ∧ zero accounts in the family) — never a harness name, never the prose.
+// The "name the account" face: an engine that returns the typed required-
+// profile action for a DEFAULT login asks for a named account instead of
+// leaving a dead error. The discriminator is the engine's exact typed code +
+// required action — never a harness name, family emptiness or prose.
 // ---------------------------------------------------------------------------
 
 function nameFaceStatusPayload(rows) {
@@ -1023,6 +1129,11 @@ function nameFaceStatusPayload(rows) {
 
 const ENGINE_SAID = 'harness "zephyr" has no default credential store: '
     + 'sign in from a named account (add one first, then start the login from it)';
+const REQUIRED_PROFILE = {
+    error: ENGINE_SAID,
+    code: 'credential_profile_required',
+    required_actions: ['add_named_account'],
+};
 
 test('create-400 on an EMPTY family becomes the name-the-account face, and its submit runs the standard NAMED flow', async () => {
     const store = createClaudexorStatusStore({
@@ -1038,7 +1149,7 @@ test('create-400 on an EMPTY family becomes the name-the-account face, and its s
             if (url === '/api/claudexor/login' && init.method === 'POST') {
                 const body = JSON.parse(init.body);
                 posts.push(body);
-                if (!body.profile_id) return json(400, { error: ENGINE_SAID, code: 'http_400' });
+                if (!body.profile_id) return json(400, REQUIRED_PROFILE);
                 return json(200, { job_id: 'job-named', job: { state: 'running', phase: 'awaiting_user' } });
             }
             if (init.method === 'DELETE') return json(200, { job: { state: 'cancelled' } });
@@ -1081,11 +1192,9 @@ test('create-400 on an EMPTY family becomes the name-the-account face, and its s
     store.dispose();
 });
 
-test('create-400 on a family that HAS accounts stays the ordinary error face', async () => {
+test('an unrelated create-400 stays ordinary even when the family is empty', async () => {
     const store = createClaudexorStatusStore({
-        fetchImpl: async () => json(200, nameFaceStatusPayload([
-            { harness_id: 'zephyr', native_login_detected: true },
-        ])),
+        fetchImpl: async () => json(200, nameFaceStatusPayload([])),
         doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
     });
     await store.refresh();
@@ -1102,8 +1211,60 @@ test('create-400 on a family that HAS accounts stays the ordinary error face', a
     await ctl.start('zephyr', '');
     assert.ok(host.innerHTML.includes('data-login-retry'), `ordinary error face: ${host.innerHTML}`);
     assert.ok(!host.innerHTML.includes('data-profile-name-input'),
-        'a 400 with existing accounts is not the missing-default-store shape');
+        'empty-family heuristics must not turn an unrelated 400 into a name request');
     await ctl.dispose();
+    store.dispose();
+});
+
+test('the typed required-profile action selects the name face independent of family rows', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, nameFaceStatusPayload([
+            { harness_id: 'zephyr', native_login_detected: true },
+        ])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await store.refresh();
+    const host = fakeHost();
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                return json(400, REQUIRED_PROFILE);
+            }
+            return json(404, {});
+        },
+    });
+    await ctl.start('zephyr', '');
+    assert.match(host.innerHTML, /data-profile-name-input/);
+    await ctl.dispose();
+    store.dispose();
+});
+
+test('required-profile code without its action and unrelated 409 remain ordinary errors', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, nameFaceStatusPayload([])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await store.refresh();
+    const host = fakeHost();
+    let response = json(400, {
+        error: ENGINE_SAID, code: 'credential_profile_required', required_actions: [],
+    });
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => (
+            url === '/api/claudexor/login' && init.method === 'POST'
+                ? response : json(404, {})),
+    });
+    await ctl.start('zephyr', '');
+    assert.ok(!host.innerHTML.includes('data-profile-name-input'));
+    response = json(409, { error: 'different conflict', code: 'credential_profile_ambiguous',
+        required_actions: ['disable_extra_profiles'] });
+    await ctl.start('zephyr', '');
+    assert.ok(!host.innerHTML.includes('data-profile-name-input'));
+    assert.equal(ctl.active.absent, true, 'a typed pre-job conflict proves no job exists');
+    assert.equal(ctl.active.custodyStatus, LOGIN_CUSTODY_RELEASED);
+    assert.equal(await ctl.dispose(), LOGIN_CUSTODY_RELEASED);
     store.dispose();
 });
 
@@ -1134,7 +1295,9 @@ test('create 5xx / transport death stays the ordinary error face even for an emp
     await ctl.start('zephyr', '');
     assert.ok(host.innerHTML.includes('data-login-retry'), host.innerHTML);
     assert.ok(!host.innerHTML.includes('data-profile-name-input'));
-    await ctl.dispose();
+    assert.equal(ctl.active.absent, false,
+        'untyped discovery/transport failure cannot prove whether create ran');
+    assert.equal(await ctl.dispose(), LOGIN_CUSTODY_UNKNOWN);
     store.dispose();
 });
 
@@ -1174,7 +1337,7 @@ test('Close on the name-the-account face detaches as released — the refused cr
         fetchImpl: async (url, init = {}) => {
             calls.push(`${init.method || 'GET'} ${url}`);
             if (url === '/api/claudexor/login' && init.method === 'POST') {
-                return json(400, { error: ENGINE_SAID });
+                return json(400, REQUIRED_PROFILE);
             }
             return json(404, {});
         },
@@ -1203,46 +1366,6 @@ test('the verify-race adopts the job\'s OWN resolved profile id, and only a stri
     assert.equal(resolvedJobProfileId({ job: { profileId: 42 } }), '');
 });
 
-test('a LIVE-shaped payload — one native pseudo-row per harness — reads empty only where no login was detected', async () => {
-    // The daemon emits a native pseudo-row for EVERY login-capable harness;
-    // presence alone is not an account. Only a DETECTED native login or a
-    // named profile makes a family non-empty — so an engine without a default
-    // credential store (its pseudo-row carries native_login_detected:false)
-    // still reaches the name-the-account face on a healthy, fully-read
-    // snapshot, not only on a degraded one.
-    const liveShaped = nameFaceStatusPayload([
-        { harness_id: 'claude', native_login_detected: true },
-        { harness_id: 'codex', native_login_detected: true },
-        { harness_id: 'cursor', native_login_detected: true },
-        { harness_id: 'zephyr', native_login_detected: false },
-    ]);
-    assert.equal(familyHasNoAccounts(liveShaped, 'zephyr'), true,
-        'an undetected pseudo-row is not an account');
-    assert.equal(familyHasNoAccounts(liveShaped, 'claude'), false,
-        'a detected native login is an account');
-
-    const store = createClaudexorStatusStore({
-        fetchImpl: async () => json(200, liveShaped),
-        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
-    });
-    await store.refresh();
-    const host = fakeHost();
-    const ctl = createLoginCardController({
-        host, store,
-        fetchImpl: async (url, init = {}) => {
-            if (url === '/api/claudexor/login' && init.method === 'POST') {
-                return json(400, { error: ENGINE_SAID, code: 'http_400' });
-            }
-            return json(404, {});
-        },
-    });
-    await ctl.start('zephyr', '');
-    assert.match(host.innerHTML, /data-profile-name-input/,
-        'the healthy live snapshot reaches the name face');
-    await ctl.dispose();
-    store.dispose();
-});
-
 test('preserveCardFocus keeps the caret in the name-the-account input across a re-render', () => {
     let focused = null;
     const nextInput = {
@@ -1261,63 +1384,6 @@ test('preserveCardFocus keeps the caret in the name-the-account input across a r
     preserveCardFocus(host, () => {}, { activeElement: prior });
     assert.equal(focused, nextInput, 'focus lands on the replacement input');
     assert.deepEqual(nextInput.sel, [2, 4], 'the selection survives the swap');
-});
-
-test('an UNREAD accounts facet still reaches the name face but discloses the unverified absence claim', async () => {
-    // Fresh install: the first Connect is what provisions the daemon, so no
-    // successful accounts read exists yet. The face must still offer the name
-    // (that is its main case) while saying the "no account yet" half of the
-    // discriminator is unverified.
-    const payload = nameFaceStatusPayload([]);
-    payload.reads = { catalog: 'ok', accounts: 'failed', quota: 'ok' };
-    const store = createClaudexorStatusStore({
-        fetchImpl: async () => json(200, payload),
-        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
-    });
-    await store.refresh();
-    const host = fakeHost();
-    const ctl = createLoginCardController({
-        host, store,
-        fetchImpl: async (url, init = {}) => {
-            if (url === '/api/claudexor/login' && init.method === 'POST') {
-                return json(400, { error: ENGINE_SAID, code: 'http_400' });
-            }
-            return json(404, {});
-        },
-    });
-    await ctl.start('zephyr', '');
-    assert.match(host.innerHTML, /data-profile-name-input/, 'name face still offered');
-    assert.match(host.innerHTML, /data-login-accounts-unread/, 'the unverified absence claim is disclosed');
-    await ctl.dispose();
-    store.dispose();
-});
-
-test('a READ-OK empty family asserts its emptiness without the unread disclosure', async () => {
-    const store = createClaudexorStatusStore({
-        fetchImpl: async () => {
-            const payload = nameFaceStatusPayload([]);
-            payload.reads = { catalog: 'ok', accounts: 'ok', quota: 'ok' };
-            return json(200, payload);
-        },
-        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
-    });
-    await store.refresh();
-    const host = fakeHost();
-    const ctl = createLoginCardController({
-        host, store,
-        fetchImpl: async (url, init = {}) => {
-            if (url === '/api/claudexor/login' && init.method === 'POST') {
-                return json(400, { error: ENGINE_SAID, code: 'http_400' });
-            }
-            return json(404, {});
-        },
-    });
-    await ctl.start('zephyr', '');
-    assert.match(host.innerHTML, /data-profile-name-input/);
-    assert.ok(!host.innerHTML.includes('data-login-accounts-unread'),
-        'a verified empty family carries no unverified-claim caveat');
-    await ctl.dispose();
-    store.dispose();
 });
 
 test('normalizeProfileName enforces the engine slug contract ^[a-z0-9][a-z0-9_-]{0,63}$', () => {

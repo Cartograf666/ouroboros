@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import os
 import pathlib
+import shlex
 import subprocess
 import threading
 import time
@@ -61,6 +62,9 @@ _ADMISSION_POLL_SEC = 0.15
 # CLAUDEXOR_MIN_VERSION (owner decision 5=A: no floor bump).
 _ROTATION_AUTO_SEMANTICS_MIN_VERSION = "3.6.0"
 _ROTATION_RECEIPT_NAME = "claudexor_rotation_provisioning.json"
+_SETUP_ATTACH_ROLE = "setup_attach"
+_SHELL_POSIX = "posix"
+_SHELL_POWERSHELL = "powershell"
 
 
 def _handshake_serving_mode(body: Any) -> str:
@@ -168,14 +172,78 @@ def resolve_claudexord() -> str:
     return resolve_external_claudexord()
 
 
-def attach_login_command(job_id: str) -> str:
-    """The copy-paste fallback card's command (D30): run by the USER in the
-    user's own terminal, outside the Ouroboros UI. There is no in-app terminal
-    and there will not be one."""
-    return (
-        f"CLAUDEXOR_CONFIG_DIR={owned_config_dir()} "
-        f"claudexor setup attach {str(job_id)}"
-    )
+def attach_login_shell() -> str:
+    """The explicit shell target for the host's copy-paste fallback."""
+    from ouroboros.platform_layer import IS_WINDOWS
+
+    return _SHELL_POWERSHELL if IS_WINDOWS else _SHELL_POSIX
+
+
+def resolve_attach_login_argv(engine: Any) -> list[str]:
+    """Resolve the packaged attach role on the exact serving engine.
+
+    A live daemon may intentionally lag the reviewed next-spawn pin.  The
+    handshake's version, build SHA and absolute entry therefore select the
+    preserved tree, whose own additive probe role is the capability fact.
+    Older probes remain readable but advertise no role, so they yield a typed
+    unavailable result rather than a bare ``claudexor`` PATH command.
+    """
+    from ouroboros.claudexor_runtime import ClaudexorRuntimeError, get_runtime_manager
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    row = engine if isinstance(engine, dict) else {}
+    try:
+        command = get_runtime_manager().resolve_serving_role_command(
+            engine_version=str(row.get("version") or ""),
+            engine_build_sha=str(row.get("sha") or ""),
+            engine_entry=str(row.get("entry") or ""),
+            role=_SETUP_ATTACH_ROLE,
+        )
+    except ClaudexorRuntimeError as exc:
+        if exc.code == "runtime_role_unavailable":
+            code = "terminal_transport_unsupported"
+            status_code = 409
+            actions: tuple[str, ...] = ()
+        elif exc.code in {
+            "runtime_probe_failed",
+            "runtime_probe_identity_mismatch",
+            "runtime_node_version_mismatch",
+        }:
+            code = "terminal_transport_probe_failed"
+            status_code = 503
+            actions = ("retry_setup_login",)
+        else:
+            code = "terminal_transport_unavailable"
+            status_code = 409
+            actions = ()
+        raise ClaudexorUnavailable(
+            code,
+            f"the packaged external-terminal recovery is unavailable: {exc}",
+            status_code=status_code,
+            required_actions=actions,
+        ) from exc
+    return [*command, "setup", "attach"]
+
+
+def attach_login_command(job_id: str, *, argv: list[str], shell: str = "") -> str:
+    """Render the already-probed packaged attach command for copy/paste."""
+    target = str(shell or attach_login_shell())
+    args = [str(value) for value in (*argv, str(job_id))]
+    env = {
+        "CLAUDEXOR_CONFIG_DIR": str(owned_config_dir()),
+        # Never let an operator socket redirect the exact packaged entry away
+        # from the owned config home.
+        "CLAUDEXOR_DAEMON_SOCK": "",
+    }
+    if target == _SHELL_POSIX:
+        assignments = [f"{key}={shlex.quote(value)}" for key, value in env.items()]
+        return " ".join([*assignments, *(shlex.quote(arg) for arg in args)])
+    if target == _SHELL_POWERSHELL:
+        quote = lambda value: "'" + value.replace("'", "''") + "'"
+        assignments = [f"$env:{key}={quote(value)}" for key, value in env.items()]
+        command = " ".join(["&", *(quote(arg) for arg in args)])
+        return "; ".join([*assignments, command])
+    raise ValueError(f"unsupported shell target: {target}")
 
 
 class OwnedClaudexorDaemon:
@@ -665,6 +733,8 @@ __all__ = [
     "read_ownership_marker",
     "verify_owned_home",
     "attach_login_command",
+    "attach_login_shell",
+    "resolve_attach_login_argv",
     "ensure_owned_gateway",
     "get_owned_daemon",
     "owned_config_dir",

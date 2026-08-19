@@ -716,18 +716,39 @@
  * @property {Object=} deviceCode
  * @property {string=} job_id
  * @property {boolean=} disclosure_native
+ * @property {('per_harness'|'legacy_global_operation')=} setup_login_source
+ * Present only after the exact serving package advertises setup_attach.
  * @property {string=} attach_command
+ * @property {('posix'|'powershell')=} attach_shell
  * @property {boolean=} ok
  */
 
 /**
- * Narrow typed problem envelope for login-job operations. required_actions is
- * the daemon's bounded top-level continuation list, not a client-side action
- * framework.
+ * Narrow typed problem envelope for login-job operations, including the
+ * marked setup-create retryable terminal-probe 503. required_actions is the
+ * daemon's bounded top-level continuation list, not a client-side action
+ * framework; an unmarked discovery/transport 503 stays generic.
  * @typedef {Object} ClaudexorLoginJobProblem
  * @property {string} error
  * @property {string=} code
  * @property {Array<string>=} required_actions
+ */
+
+/**
+ * @typedef {Object} ClaudexorVendorCredentialDisposition
+ * @property {'vendor'} owner
+ * @property {'left_unchanged'} state
+ * @property {'os_user'} scope
+ */
+
+/**
+ * Exact daemon receipt from deleting one credential-profile binding.
+ * @typedef {Object} ClaudexorCredentialProfileDeleteResponse
+ * @property {Object} profile
+ * @property {boolean} removed
+ * @property {('config_dir_removed'|'secret_deleted'|'none')} credentialCleanup
+ * @property {string=} cleanupWarning
+ * @property {ClaudexorVendorCredentialDisposition=} vendorCredentialDisposition
  */
 
 /**

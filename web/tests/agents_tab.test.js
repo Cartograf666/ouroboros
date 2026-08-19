@@ -35,6 +35,7 @@ import {
     rowActionLabel,
     serviceBannerLine,
     setAccountEnabled,
+    vendorCredentialRetainedNotice,
 } from '../modules/harness_accounts.js';
 import { pinnedAccountWarning } from '../modules/reviewer_slots.js';
 
@@ -121,14 +122,13 @@ test('several accounts of one family are grouped, counted, and called equivalent
     // used to hang off the native row only.
     assert.equal(familyActionLabel(codex, payload()), 'Add account');
 
-    // The claude family's failed vendor verification sits on a DISABLED
-    // account (enabled: false in the fixture): the owner already took it out
-    // of rotation, so the header does not shout "need attention" over it —
-    // the alarm belongs to the row's own badge. (An ENABLED failure keeps the
-    // family-level alarm; pinned in its own test below.)
+    // Both claude rows are DISABLED in the fixture. That owner-authored state
+    // outranks their failed/empty verification: the header does not shout
+    // "need attention" and does not pretend the remedy is another sign-in.
+    // (An ENABLED failure keeps the family-level alarm; pinned below.)
     const claude = groups.find((g) => g.harness === 'claude');
     assert.equal(claude.status.tone, 'muted');
-    assert.match(claude.status.label, /2 accounts · not signed in/);
+    assert.match(claude.status.label, /2 accounts · all disabled/);
 });
 
 test('one connected account reads as connected, not as a count', () => {
@@ -139,6 +139,10 @@ test('one connected account reads as connected, not as a count', () => {
     const cold = [{ harness: 'codex', profile_id: 'work', kind: 'profile', status: {} }];
     assert.deepEqual(familyStatus(cold, { accountsRead: 'ok' }),
         { tone: 'muted', label: '1 account · not signed in' });
+    const notRun = [{ harness: 'codex', profile_id: 'work', kind: 'profile',
+        status: { verification: 'not_run' } }];
+    assert.deepEqual(familyStatus(notRun, { accountsRead: 'ok' }),
+        { tone: 'muted', label: '1 account · not verified' });
 });
 
 test('"N accounts · rotating" counts only the accounts rotation can actually use', () => {
@@ -172,6 +176,21 @@ test('a disabled account is out of the rotation claim, and all-disabled is its o
     const allOff = mixed.map((row) => ({ ...row, enabled: false }));
     assert.deepEqual(familyStatus(allOff, { accountsRead: 'ok' }),
         { tone: 'muted', label: '2 accounts · all disabled' });
+    // Disabled rows are intentionally not probed by the engine. Their
+    // verification=not_run remains neutral but must not overwrite the owner's
+    // stronger structural state.
+    const allOffNotRun = allOff.map((row) => ({
+        ...row, status: { verification: 'not_run' },
+    }));
+    assert.deepEqual(familyStatus(allOffNotRun, { accountsRead: 'ok' }),
+        { tone: 'muted', label: '2 accounts · all disabled' });
+    // Once one row is enabled, that stronger all-disabled fact is gone and the
+    // unresolved probe remains honestly not verified.
+    const ambiguous = allOffNotRun.map((row, index) => ({
+        ...row, enabled: index === 0,
+    }));
+    assert.deepEqual(familyStatus(ambiguous, { accountsRead: 'ok' }),
+        { tone: 'muted', label: '2 accounts · not verified' });
     // …and the metadata line states the exclusion in words on the row itself.
     assert.match(accountMetaLine(allOff[0], payload()), /^disabled — excluded from rotation/);
 });
@@ -670,20 +689,60 @@ test('Remove consumes the non-input confirm boolean and performs the mutation on
 
 test('removing a named account goes through the engine contract, and says so', () => {
     const calls = [];
+    const receipt = { profile: {
+        profile_id: 'work', harness_id: 'codex', display_name: 'Work',
+        credential_kind: 'config_dir_login',
+        isolation_locator: '/data/claudexor/profiles/codex-work', secret_ref: null,
+        enabled: true, created_at: null,
+    }, removed: true, credentialCleanup: 'config_dir_removed',
+        cleanupWarning: 'owned profile storage cleanup needs manual inspection',
+        vendorCredentialDisposition: {
+            owner: 'vendor', state: 'left_unchanged', scope: 'os_user',
+        } };
     const fetchImpl = async (url, init) => {
         calls.push([url, init.method]);
-        return { ok: true, json: async () => ({ ok: true }) };
+        return { ok: true, json: async () => receipt };
     };
     return removeAccount('codex', 'work', { fetchImpl }).then((answer) => {
-        assert.deepEqual(answer, { ok: true });
+        assert.deepEqual(answer, receipt);
         assert.deepEqual(calls, [['/api/claudexor/credential-profiles/codex/work', 'DELETE']]);
         // The confirmation states the two facts an owner needs before agreeing:
-        // nothing is deleted vendor-side, and a pinned reviewer row or
-        // Delegation pin survives visibly instead of rerouting.
+        // vendor/OS sign-in may remain, and a pinned reviewer row or Delegation
+        // pin survives visibly instead of rerouting.
         const body = removeAccountConfirmBody('work', 'Codex');
-        assert.match(body, /Ouroboros deletes nothing on the Codex side/);
+        assert.match(body, /Vendor or OS credential storage may remain signed in/);
+        assert.match(body, /deletion receipt says when it was retained/);
         assert.match(body, /Reviewer rows and a Delegation pin pointing at this account stay visible/);
     });
+});
+
+test('only the exact vendor left-unchanged disposition produces a retained warning', () => {
+    const receipt = {
+        profile: {
+            profile_id: 'work', harness_id: 'codex', display_name: 'Work',
+            credential_kind: 'config_dir_login',
+            isolation_locator: '/data/claudexor/profiles/codex-work', secret_ref: null,
+            enabled: true, created_at: null,
+        },
+        removed: true,
+        credentialCleanup: 'config_dir_removed',
+        vendorCredentialDisposition: {
+            owner: 'vendor', state: 'left_unchanged', scope: 'os_user',
+        },
+    };
+    const notice = vendorCredentialRetainedNotice(receipt, 'work', 'Codex');
+    assert.equal(notice, 'Removed "work" from Codex. Claudexor left vendor credential '
+        + 'storage for this OS user unchanged; the vendor account may still be signed in '
+        + 'outside Ouroboros.');
+    for (const changed of [
+        {},
+        { vendorCredentialDisposition: null },
+        { vendorCredentialDisposition: { ...receipt.vendorCredentialDisposition, owner: 'claudexor' } },
+        { vendorCredentialDisposition: { ...receipt.vendorCredentialDisposition, state: 'removed' } },
+        { vendorCredentialDisposition: { ...receipt.vendorCredentialDisposition, scope: 'profile' } },
+    ]) {
+        assert.equal(vendorCredentialRetainedNotice(changed, 'work', 'Codex'), '');
+    }
 });
 
 test('a refused removal is reported as a refusal, never as a removal', () => {

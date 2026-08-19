@@ -90,6 +90,10 @@ export function verificationBadge(profile, { known = true } = {}) {
             // WORDS: local-store material has read `passed` a minute before a 401.
             return { tone: 'muted', label: 'Signed in — not verified live' };
         }
+        if (verification === 'not_run') {
+            // No probe ran, so this is unknown rather than a failed login.
+            return { tone: 'muted', label: 'Not verified' };
+        }
         if (verification) {
             return { tone: 'error', label: `Verification ${verification}` };
         }
@@ -496,14 +500,18 @@ export function familyStatus(rows, { accountsRead = READ_OK } = {}) {
     if (bad) {
         return verdict('error', `${bad} of ${rows.length} need attention`);
     }
+    // Enabled state is the structural owner choice. In particular, an engine
+    // deliberately does not probe disabled rows and reports `not_run`; that
+    // unknown verification must not hide the stronger fact that every account
+    // has been excluded from rotation.
+    if (rows.every((row) => row.enabled === false)) {
+        return verdict('muted', `${rows.length} account${rows.length === 1 ? '' : 's'} · all disabled`);
+    }
     const live = rows.filter((row) => String(row?.status?.verification || '') === 'passed'
         && row.enabled !== false).length;
     if (!live) {
-        const signedIn = rows.some((row) => String(row?.status?.verification || '') === 'passed');
-        // Signed in but every live login disabled is ITS OWN state: "not
-        // signed in" over a working, deliberately-disabled account would send
-        // the owner to a login that fixes nothing.
-        if (signedIn) return verdict('muted', `${rows.length} account${rows.length === 1 ? '' : 's'} · all disabled`);
+        const notRun = rows.some((row) => String(row?.status?.verification || '') === 'not_run');
+        if (notRun) return verdict('muted', `${rows.length} account${rows.length === 1 ? '' : 's'} · not verified`);
         return verdict('muted', `${rows.length} account${rows.length === 1 ? '' : 's'} · not signed in`);
     }
     if (live < rows.length) return verdict('ok', `${live} of ${rows.length} connected`);
@@ -813,10 +821,20 @@ export async function setAccountEnabled(harness, profileId, enabled, { fetchImpl
 }
 
 export function removeAccountConfirmBody(name, family) {
-    return `${family} will forget the account "${name}". Ouroboros deletes nothing on `
-        + `the ${family} side — sign in again any time to bring it back. Reviewer rows `
+    return `The Claudexor binding for ${family} account "${name}" will be removed. `
+        + 'Vendor or OS credential storage may remain signed in and is not changed by '
+        + `Ouroboros; the deletion receipt says when it was retained. Reviewer rows `
         + 'and a Delegation pin pointing at this account stay visible and are shown as '
         + 'unavailable until you repoint them.';
+}
+
+export function vendorCredentialRetainedNotice(receipt, name, family) {
+    const disposition = receipt?.vendorCredentialDisposition;
+    if (!disposition || disposition.owner !== 'vendor'
+        || disposition.state !== 'left_unchanged'
+        || disposition.scope !== 'os_user') return '';
+    return `Removed "${name}" from ${family}. Claudexor left vendor credential storage `
+        + 'for this OS user unchanged; the vendor account may still be signed in outside Ouroboros.';
 }
 
 // ---------------------------------------------------------------------------
@@ -828,6 +846,7 @@ const state = {
     loginCard: null,
     disposers: [],
     removeError: '',
+    removeNotice: '',
     initialized: false,
     // The owner asked to start the daemon and the wake refused. Rendered by the
     // service banner and expired ONLY when the daemon provably answers
@@ -963,8 +982,10 @@ function renderRows() {
     if (!host) return;
     const errorBox = document.getElementById('harness-accounts-error');
     if (errorBox) {
-        errorBox.hidden = !state.removeError;
-        errorBox.textContent = state.removeError;
+        const text = state.removeError || state.removeNotice;
+        errorBox.hidden = !text;
+        errorBox.textContent = text;
+        errorBox.dataset.tone = state.removeError ? 'error' : 'warn';
     }
     const payload = state.store.snapshot || {};
     const accountsRead = state.store.facet(FACET_ACCOUNTS);
@@ -1016,6 +1037,7 @@ async function toggleAccountEnabled(harness, profileId, enabled) {
     // box as removal, and the fresh read repaints the row from engine truth.
     if (!harness || !profileId) return;
     state.removeError = '';
+    state.removeNotice = '';
     try {
         await setAccountEnabled(harness, profileId, enabled);
     } catch (error) {
@@ -1047,8 +1069,11 @@ export async function confirmRemoveAccount(harness, profileId, {
     });
     if (answer !== true) return;
     state.removeError = '';
+    state.removeNotice = '';
     try {
-        await removeImpl(harness, profileId);
+        const receipt = await removeImpl(harness, profileId);
+        state.removeNotice = vendorCredentialRetainedNotice(
+            receipt, profileId, family);
     } catch (error) {
         state.removeError = `Could not remove "${profileId}": ${error.message || error}. `
             + 'The account is unchanged.';
@@ -1128,6 +1153,7 @@ async function _init(store) {
     _destroy();
     state.store = store;
     state.removeError = '';
+    state.removeNotice = '';
     state.wakeError = '';
     state.wakeBusy = false;
     ensureLoginCard();
