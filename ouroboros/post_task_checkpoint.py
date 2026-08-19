@@ -174,8 +174,8 @@ def set_root_post_task_checkpoint(
     status: str,
     *,
     stop_reason: str = "",
-) -> None:
-    """Merge the phase marker in the canonical budget-drive task result."""
+) -> Dict[str, Any] | None:
+    """Merge the phase marker and return the record actually stored, if any."""
     if not is_root_post_task(task):
         return
     task_id = str(task.get("id") or task.get("task_id") or "")
@@ -295,6 +295,7 @@ def set_root_post_task_checkpoint(
                     bridge.push_log(finalized_event)
             except Exception:
                 log.debug("Live push of finalized task cost skipped for %s", task_id, exc_info=True)
+    return stored
 
 
 def root_post_task_already_completed(env: Any, task: Dict[str, Any]) -> bool:

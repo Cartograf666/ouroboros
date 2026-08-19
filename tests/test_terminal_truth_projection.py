@@ -7,6 +7,7 @@ import json
 import threading
 from copy import deepcopy
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -857,7 +858,7 @@ def test_finalized_event_projects_actual_stored_terminal_truth(tmp_path, monkeyp
         lambda *args, **kwargs: {"accounted_usd": 7.0, "cost_final": True},
     )
 
-    checkpoint.set_root_post_task_checkpoint(
+    persisted = checkpoint.set_root_post_task_checkpoint(
         SimpleNamespace(drive_root=data),
         {"id": task_id, "root_task_id": task_id, "status": STATUS_COMPLETED},
         "degraded",
@@ -865,6 +866,7 @@ def test_finalized_event_projects_actual_stored_terminal_truth(tmp_path, monkeyp
     )
 
     stored = load_task_result(data, task_id)
+    assert persisted == stored
     assert stored["root_phase_checkpoint"] == canonical_checkpoint
     assert stored["cost_usd"] == 99.0
     events = [
@@ -901,13 +903,39 @@ def test_failed_checkpoint_write_emits_no_finalized_event(tmp_path, monkeypatch)
     )
     monkeypatch.setattr(checkpoint, "append_jsonl", lambda *args: appended.append(args))
 
-    checkpoint.set_root_post_task_checkpoint(
+    persisted = checkpoint.set_root_post_task_checkpoint(
         SimpleNamespace(drive_root=data),
         {"id": task_id, "root_task_id": task_id, "status": STATUS_COMPLETED},
         "completed",
     )
 
+    assert persisted is None
     assert appended == []
+
+
+def test_startup_recovery_surfaces_failed_running_checkpoint_persistence(tmp_path, monkeypatch):
+    import ouroboros.agent_task_pipeline as pipeline
+    import ouroboros.post_task_checkpoint as checkpoint
+
+    task_id = "failed-recovery-write"
+    write_task_result(
+        tmp_path,
+        task_id,
+        STATUS_COMPLETED,
+        root_task_id=task_id,
+        root_phase_checkpoint={
+            "phase": "task_acceptance", "status": "pass", "post_task_synthesis": "running"
+        },
+    )
+
+    monkeypatch.setattr(checkpoint, "write_task_result", Mock(side_effect=TimeoutError))
+
+    with pytest.raises(RuntimeError, match="did not persist a terminal checkpoint"):
+        pipeline.recover_pending_root_post_task_synthesis(tmp_path, tmp_path / "repo")
+
+    stored = load_task_result(tmp_path, task_id)
+    assert stored["root_phase_checkpoint"]["post_task_synthesis"] == "running"
+    assert "post_task_stop_reason" not in stored["root_phase_checkpoint"]
 
 
 def _write_history_rows(data, task_id):

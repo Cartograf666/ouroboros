@@ -470,12 +470,19 @@ def recover_pending_root_post_task_synthesis(
             drive_path=lambda rel, _root=root: _root / rel,
         )
         if phase == "running":
-            _set_root_post_task_checkpoint(
+            stored = _set_root_post_task_checkpoint(
                 env,
                 task,
                 "degraded",
                 stop_reason="restart_indeterminate_running",
             )
+            stored_checkpoint = (stored or {}).get("root_phase_checkpoint") or {}
+            stored_phase = str(stored_checkpoint.get("post_task_synthesis") or "")
+            if not _post_task_synthesis_is_terminal(stored_phase):
+                raise RuntimeError(
+                    "Root post-task synthesis recovery did not persist a terminal "
+                    f"checkpoint for {task_id} (stored={stored_phase or 'unavailable'})"
+                )
             recovered += 1
             continue
         usage = {
