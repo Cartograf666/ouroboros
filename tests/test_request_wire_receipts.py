@@ -374,6 +374,52 @@ def test_requested_custom_projection_is_first_class_and_never_committed(tmp_path
     assert not (tmp_path / "state" / wire.REQUEST_WIRE_STATE_FILE).exists()
 
 
+def test_custom_text_semantics_accept_requested_projection_but_not_pending_replacement():
+    source = _payload(choice="auto")
+    requested = bind_wire_candidate(
+        target=_target(),
+        api_surface="chat.completions",
+        source_payload=source,
+        candidate_spec=WireCandidateSpec(
+            "openai_chat_custom", "high", "requested_wire_form"
+        ),
+        requested_effort="high",
+        ladder_ordinal=1,
+    )
+    observation = observe_wire_semantics(
+        candidate=requested,
+        normalized_response={"role": "assistant", "content": "done"},
+        normalized_usage={},
+    )
+    assert observation.semantic_kind == "chat_message"
+    assert observation.custom_receipts == ()
+
+    replacement = PendingWireAction(_profile(source), {
+        "kind": "replace_dialect",
+        "axis": "tool",
+        "from": "function",
+        "to": "openai_chat_custom",
+        "reason_code": "provider_rejected_tool_dialect",
+    })
+    pending = bind_wire_candidate(
+        target=_target(),
+        api_surface="chat.completions",
+        source_payload=source,
+        candidate_spec=WireCandidateSpec(
+            "openai_chat_custom", "high", "provider_rejected_tool_dialect"
+        ),
+        requested_effort="high",
+        ladder_ordinal=2,
+        applied_actions=(WireAppliedAction.pending(replacement),),
+    )
+    with pytest.raises(ValueError, match="requires a custom tool call"):
+        observe_wire_semantics(
+            candidate=pending,
+            normalized_response={"role": "assistant", "content": "done"},
+            normalized_usage={},
+        )
+
+
 @pytest.mark.parametrize("mode", [None, "auto", "required"])
 def test_allowed_tools_projection_binds_subset_mode_and_identity(mode):
     allowed_block = {"tools": [{"type": "function", "name": "probe"}]}

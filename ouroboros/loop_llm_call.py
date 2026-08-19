@@ -887,6 +887,26 @@ def _send_main_candidate(
             return llm.chat(**kwargs)
 
 
+def _take_custom_receipts(
+    usage: Dict[str, Any],
+    msg: Dict[str, Any],
+    accumulated_usage: Dict[str, Any],
+) -> None:
+    from ouroboros.openai_chat_dispatch import (
+        CUSTOM_RECEIPTS_USAGE_KEY,
+        pop_custom_validation_receipts,
+    )
+    receipts = pop_custom_validation_receipts(usage, msg.get("tool_calls") or [])
+    accumulated_usage.pop(CUSTOM_RECEIPTS_USAGE_KEY, None)
+    if receipts:
+        accumulated_usage[CUSTOM_RECEIPTS_USAGE_KEY] = receipts
+
+
+def _clear_custom_receipts(accumulated_usage: Dict[str, Any]) -> None:
+    from ouroboros.openai_chat_dispatch import CUSTOM_RECEIPTS_USAGE_KEY
+    accumulated_usage.pop(CUSTOM_RECEIPTS_USAGE_KEY, None)
+
+
 def call_llm_with_retry(
     llm: LLMClient,
     messages: List[Dict[str, Any]],
@@ -994,6 +1014,7 @@ def call_llm_with_retry(
                 physical_context=physical_context, candidate_predicate=candidate_predicate,
             )
             msg = resp_msg
+            _take_custom_receipts(usage, msg, accumulated_usage)
             accumulated_usage.pop("_last_llm_error", None)
             accumulated_usage.pop("_last_llm_error_kind", None)
             accumulated_usage.pop("_last_llm_retry_same_request", None)
@@ -1146,6 +1167,7 @@ def call_llm_with_retry(
         except UsageAccountingError:
             raise  # Monetary/ledger rails are not provider failures.
         except Exception as e:
+            _clear_custom_receipts(accumulated_usage)
             if _record_llm_call_error(
                 e,
                 _LlmErrorContext(

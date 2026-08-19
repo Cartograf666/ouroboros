@@ -292,7 +292,10 @@ class BackgroundConsciousness:
             {"role": "system", "content": context},
             {"role": "user", "content": "Wake up. Think."},
         ]
-
+        _use_local_consciousness = os.environ.get(
+            "USE_LOCAL_CONSCIOUSNESS", ""
+        ).lower() in ("true", "1")
+        effort = resolve_effort("consciousness")
         total_cost = 0.0
         cost_final = True
         final_content = ""
@@ -300,16 +303,47 @@ class BackgroundConsciousness:
         all_pending_events = []
 
         try:
+            target = (
+                self._llm._resolve_remote_target(model)
+                if not _use_local_consciousness else None
+            )
             for round_idx in range(1, self._max_bg_rounds + 1):
                 if self._paused:
                     break
-                _use_local_consciousness = os.environ.get("USE_LOCAL_CONSCIOUSNESS", "").lower() in ("true", "1")
+                if target is not None:
+                    from ouroboros.openai_chat_dispatch import projected_context_size_bytes
+
+                    physical_chars = projected_context_size_bytes(
+                        messages,
+                        tools,
+                        provider=str(target.get("provider") or ""),
+                        reasoning_effort=effort,
+                    )
+                    if physical_chars > BG_CONTEXT_MAX_CHARS:
+                        error = (
+                            "Background consciousness physical context too large "
+                            f"({physical_chars:,} bytes including tools). "
+                            "Groom memory to continue."
+                        )
+                        self._last_idle_reason = "context_overflow"
+                        append_jsonl(self._drive_root / "logs" / "events.jsonl", {
+                            "ts": utc_now_iso(),
+                            "type": "consciousness_context_overflow",
+                            "error": error,
+                        })
+                        return False
+                    if physical_chars > BG_CONTEXT_WARN_CHARS:
+                        log.warning(
+                            "consciousness: physical context is large "
+                            "(%d bytes including tools)",
+                            physical_chars,
+                        )
                 self._emit_live_log(
                     "llm_round_started",
                     round=round_idx,
                     attempt=1,
                     model=model,
-                    reasoning_effort=resolve_effort("consciousness"),
+                    reasoning_effort=effort,
                     use_local=bool(_use_local_consciousness),
                 )
                 from ouroboros.llm_observability import chat_observed
@@ -322,10 +356,20 @@ class BackgroundConsciousness:
                     messages=messages,
                     model=model,
                     tools=tools,
-                    reasoning_effort=resolve_effort("consciousness"),
+                    reasoning_effort=effort,
                     max_tokens=65536,
                     use_local=_use_local_consciousness,
                 )
+                from ouroboros.openai_chat_dispatch import (
+                    custom_validation_by_call_id,
+                    pop_custom_validation_receipts,
+                )
+
+                wire_validation = pop_custom_validation_receipts(
+                    usage,
+                    msg.get("tool_calls") or [],
+                )
+                validation_by_id = custom_validation_by_call_id(wire_validation)
                 cost = float(usage["cost"]) if usage.get("cost") is not None else None
                 if cost is None:
                     cost_final = False
@@ -366,7 +410,7 @@ class BackgroundConsciousness:
                     round=round_idx,
                     attempt=1,
                     model=model,
-                    reasoning_effort=resolve_effort("consciousness"),
+                    reasoning_effort=effort,
                     prompt_tokens=int(usage.get("prompt_tokens") or 0),
                     completion_tokens=int(usage.get("completion_tokens") or 0),
                     cached_tokens=int(usage.get("cached_tokens") or 0),
@@ -389,7 +433,11 @@ class BackgroundConsciousness:
                 if tool_calls:
                     messages.append(msg)
                     for tc in tool_calls:
-                        result = self._execute_tool(tc, all_pending_events)
+                        result = self._execute_tool(
+                            tc,
+                            all_pending_events,
+                            validation_by_id.get(str(tc.get("id") or "")),
+                        )
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tc.get("id", ""),
@@ -591,9 +639,18 @@ class BackgroundConsciousness:
             if s.get("function", {}).get("name") in self._BG_TOOL_WHITELIST
         ]
 
-    def _execute_tool(self, tc: Dict[str, Any], all_pending_events: List[Dict[str, Any]]) -> str:
+    def _execute_tool(
+        self,
+        tc: Dict[str, Any],
+        all_pending_events: List[Dict[str, Any]],
+        custom_validation: Any = None,
+    ) -> str:
         """Execute a background tool call with timeout."""
         fn_name = tc.get("function", {}).get("name", "")
+        if custom_validation is not None and not custom_validation.allows_execution:
+            from ouroboros.openai_chat_dispatch import custom_tool_argument_error
+
+            return custom_tool_argument_error(fn_name, custom_validation)
         if fn_name not in self._BG_TOOL_WHITELIST:
             return f"Tool {fn_name} not available in background mode."
         try:

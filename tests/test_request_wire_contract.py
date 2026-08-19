@@ -733,6 +733,31 @@ def test_payload_effort_and_semantic_matrix_cover_all_current_carriers():
     assert wire_semantic_kind_allowed(none, "chat_message")
     assert not wire_semantic_kind_allowed(none, "function_tool_call")
 
+    def _custom_profile(choice):
+        source = _payload(tool_choice=choice)
+        projected = project_function_tool_request_to_openai_custom(
+            source["tools"], choice
+        )
+        source["tools"] = projected.catalog.wire_tools()
+        source["tool_choice"] = projected.tool_choice
+        return _profile(payload=source)
+
+    custom_required = _custom_profile("required")
+    custom_auto = _custom_profile("auto")
+    custom_none = _custom_profile("none")
+    assert wire_semantic_kind_allowed(
+        custom_required, "custom_tool_call_json_object"
+    )
+    assert not wire_semantic_kind_allowed(custom_required, "chat_message")
+    assert wire_semantic_kind_allowed(custom_auto, "chat_message")
+    assert wire_semantic_kind_allowed(
+        custom_auto, "custom_tool_call_json_object"
+    )
+    assert wire_semantic_kind_allowed(custom_none, "chat_message")
+    assert not wire_semantic_kind_allowed(
+        custom_none, "custom_tool_call_json_object"
+    )
+
     anthropic_payload = {
         "model": "claude-future",
         "thinking": {"type": "adaptive"},

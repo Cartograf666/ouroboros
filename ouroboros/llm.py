@@ -2874,38 +2874,16 @@ class LLMClient:
     def _sanitize_chat_completion_tools(
         tools: Optional[List[Dict[str, Any]]],
     ) -> List[Dict[str, Any]]:
-        sanitized_tools: List[Dict[str, Any]] = []
-        seen_tool_names: Set[str] = set()
-        provider_name_re = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
-        for tool in tools or []:
-            if not isinstance(tool, dict):
-                continue
-            tool_copy = dict(tool)
-            function = tool_copy.get("function") or {}
-            if isinstance(function, dict):
-                function_copy = dict(function)
-                name = str(function_copy.get("name") or "").strip()
-                if not name:
-                    continue
-                if not provider_name_re.match(name):
-                    log.warning("Dropping provider-invalid tool schema name: %s", name)
-                    continue
-                if name in seen_tool_names:
-                    log.warning("Dropping duplicate tool schema: %s", name)
-                    continue
-                seen_tool_names.add(name)
-                function_copy["name"] = name
-                function_copy["description"] = LLMClient._stringify_tool_description(
-                    function_copy.get("description")
-                )
-                if not isinstance(function_copy.get("parameters"), dict):
-                    function_copy["parameters"] = {"type": "object", "properties": {}}
-                tool_copy["function"] = function_copy
-            else:
-                continue
-            sanitized_tools.append(tool_copy)
-        sanitized_tools.sort(key=lambda tool: str((tool.get("function") or {}).get("name") or ""))
-        return sanitized_tools
+        from ouroboros.openai_chat_dispatch import sanitize_function_tools
+
+        def _warn(reason: str, name: str) -> None:
+            log.warning("Dropping %s tool schema name: %s", reason, name)
+
+        return sanitize_function_tools(
+            tools,
+            description_normalizer=LLMClient._stringify_tool_description,
+            on_drop=_warn,
+        )
 
     @staticmethod
     def _openrouter_main_web_search_tool() -> Optional[Dict[str, Any]]:
@@ -3537,14 +3515,15 @@ class LLMClient:
         from ouroboros.provider_models import supports_vision
         if not supports_vision(resolved_model):
             messages = self._replace_image_blocks_with_placeholder(messages)
-        # OpenAI reasoning models (gpt-5*, o-series) reject legacy max_tokens
-        # with a deterministic 400 — they require max_completion_tokens.
-        openai_reasoning_model = provider == "openai" and resolved_model.startswith(
-            ("gpt-5", "o1", "o3", "o4")
-        )
-        token_limit_key = "max_completion_tokens" if openai_reasoning_model else "max_tokens"
+        # Official direct OpenAI Chat uses the current completion-token carrier:
+        # provider-wide; model names are not capability authority across routes.
+        direct_openai = provider == "openai"
+        token_limit_key = "max_completion_tokens" if direct_openai else "max_tokens"
         if not target.get("supports_openrouter_extensions"):
-            # Non-OpenRouter providers do not accept cache_control.
+            prepared_tools = [
+                {k: v for k, v in tool.items() if k != "cache_control"}
+                for tool in self._sanitize_chat_completion_tools(tools)
+            ]
             clean_messages = self._strip_openrouter_roundtrip_metadata(
                 self._copy_messages_with_cache_policy(
                     messages,
@@ -3566,25 +3545,19 @@ class LLMClient:
                     # OpenAI's named affinity key keeps requests sharing the
                     # stable governance prefix on the same cache bucket.
                     kwargs["prompt_cache_key"] = cache_identity
-            if openai_reasoning_model:
-                # Direct-OpenAI route honors the configured OUROBOROS_EFFORT_*
-                # lanes instead of silently dropping them (OpenRouter parity).
-                # v6.57.0: clamp to the route's learned ceiling (e.g. a model that
-                # tops out at high never re-errors on a global xhigh — it clamps down).
+            requested_effort = normalize_reasoning_effort(reasoning_effort)
+            if direct_openai:
                 _oa_eff = self._clamp_effort_for_model(
                     str(target.get("usage_model") or resolved_model),
-                    normalize_reasoning_effort(reasoning_effort),
+                    requested_effort,
                 )
                 kwargs["reasoning_effort"] = _oa_eff
             if temperature is not None:
                 kwargs["temperature"] = temperature
             if response_format:
                 kwargs["response_format"] = dict(response_format)
-            if tools:
-                kwargs["tools"] = [
-                    {k: v for k, v in tool.items() if k != "cache_control"}
-                    for tool in self._sanitize_chat_completion_tools(tools)
-                ]
+            if prepared_tools:
+                kwargs["tools"] = prepared_tools
                 kwargs["tool_choice"] = tool_choice
             if bypass_response_cache and provider == "openai-compatible":
                 # Must ride in extra_body: the OpenAI SDK rejects unknown top-level
@@ -3727,6 +3700,7 @@ class LLMClient:
         target: Dict[str, Any],
         skip_cost_fetch: bool = False,
         prompt_cache_ttl: Optional[str] = None,
+        wire_completion: Any = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Normalize an OpenAI-compatible response; skip_cost_fetch keeps no_proxy pure."""
         usage = resp_dict.get("usage") or {}
@@ -3857,7 +3831,9 @@ class LLMClient:
         if _cache_note:
             usage["prompt_cache_breakpoints_reduced"] = _cache_note
 
-        return msg, usage
+        from ouroboros.openai_chat_dispatch import normalize_direct_openai_completion
+
+        return normalize_direct_openai_completion(msg, usage, wire_completion)
 
     @staticmethod
     def extract_display_reasoning(msg: Dict[str, Any]) -> str:
@@ -3925,8 +3901,14 @@ class LLMClient:
     ) -> Any:
         usage_model = str(target.get("usage_model") or target.get("resolved_model") or "")
 
-        def _send(candidate: Dict[str, Any]) -> Any:
-            candidate = _physical_candidate(candidate)
+        def _send(candidate: Any) -> Any:
+            from ouroboros.request_wire_receipts import WireCandidateManifest
+
+            candidate = (
+                candidate.physical_payload()
+                if isinstance(candidate, WireCandidateManifest)
+                else _physical_candidate(candidate)
+            )
             request = _attempt_request(target, candidate)
             try:
                 return _execute_candidate(
@@ -3941,6 +3923,37 @@ class LLMClient:
                 # it cannot misattach to a later non-clamping call (triad r4).
                 self._pop_effort_clamp_disclosure()
                 raise
+
+        def _recover_wire_source(
+            source: Dict[str, Any],
+            failure: Exception,
+            spec: Any,
+        ) -> Optional[Dict[str, Any]]:
+            from ouroboros.request_wire_contract import infer_tool_dialect, payload_effort
+
+            if spec.task_local:
+                return None
+            retry = self._retry_without_prompt_cache_parameter(source, target, failure)
+            if retry is None:
+                retry = self._retry_without_optional_sampling(source, usage_model, failure)
+            if (
+                retry is None
+                or payload_effort(retry) != payload_effort(source)
+                or infer_tool_dialect(retry) != "function"
+            ):
+                return None
+            return retry
+
+        from ouroboros.openai_chat_dispatch import dispatch_direct_openai_chat
+
+        wire_completion = dispatch_direct_openai_chat(
+            target,
+            _physical_candidate(kwargs),
+            send=_send,
+            recover_same_candidate=_recover_wire_source,
+        )
+        if wire_completion is not None:
+            return wire_completion
 
         def _recover_existing(candidate: Dict[str, Any], failure: Exception) -> Any:
             """Preserve the pre-v6.64 optional/signature recovery ladder."""
@@ -4178,6 +4191,7 @@ class LLMClient:
                     target,
                     skip_cost_fetch=True,
                     prompt_cache_ttl=prompt_cache_ttl,
+                    wire_completion=resp,
                 )
             finally:
                 try:
@@ -4207,6 +4221,7 @@ class LLMClient:
             resp.model_dump(),
             target,
             prompt_cache_ttl=prompt_cache_ttl,
+            wire_completion=resp,
         )
 
     def vision_query(

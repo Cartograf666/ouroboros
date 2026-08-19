@@ -6161,6 +6161,7 @@ def _measure_round_main_fit(
         rendered_mode=rendered_mode,
         round_id=_context_fit_round_id(ctx),
         automatic_pass_used=automatic_pass_used,
+        reasoning_effort=ctx.active_effort,
     )
     _remember_main_fit(ctx, disposition)
     return disposition
@@ -6956,18 +6957,21 @@ def run_llm_loop(
                     emit_progress=emit_progress, context_fit_plan=context_fit_plan,
                     active_context_mode=active_context_mode)
                 if msg is None:
-                    # Provider-death: salvage the useful workspace state like the
-                    # forced rails do, but terminalize as an infra failure — an
-                    # outage interrupts the task, it never completes it.
+                    # Provider death: terminal stop.
                     text, accumulated_usage, forced_trace = _handle_provider_unavailable(limit_ctx)
                     _merge_finalization_trace(llm_trace, forced_trace)
                     return text, accumulated_usage, llm_trace
 
+            from ouroboros.openai_chat_dispatch import CUSTOM_RECEIPTS_USAGE_KEY
+
             tool_calls = msg.get("tool_calls") or []
+            tools._ctx._request_wire_custom_receipts = accumulated_usage.pop(
+                CUSTOM_RECEIPTS_USAGE_KEY,
+                (),
+            )
             content = msg.get("content")
             _latch_final_answer_marker(llm_trace, content, current_tool_calls=tool_calls)
-            # F12: EVERY LLM response marks metered nanny progress (expensive
-            # no-tool rounds count); the delegate BASELINE moves post-tools only.
+            # Every metered response counts as nanny progress.
             _note_nanny_delegate_activity(tools._ctx, round_idx, accumulated_usage, [])
             if not tool_calls:
                 final_result = _no_tool_final_answer(

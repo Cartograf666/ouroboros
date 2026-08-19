@@ -692,9 +692,9 @@ def wire_semantic_kind_allowed(
         has_tool = kind == "anthropic_tool_use"
     elif profile.api_surface == "chat.completions":
         if profile.tool_dialect == "openai_chat_custom":
-            if kind != "custom_tool_call_json_object":
+            if kind not in {"chat_message", "custom_tool_call_json_object"}:
                 return False
-            has_tool = True
+            has_tool = kind == "custom_tool_call_json_object"
         elif profile.tool_dialect == "function":
             if kind not in {"chat_message", "function_tool_call"}:
                 return False
@@ -833,6 +833,16 @@ def observe_wire_semantics(
         raise ValueError("wire candidate required a tool call")
     if candidate.forbids_tool_call and observed:
         raise ValueError("wire candidate forbade tool calls")
+    if (
+        semantic_kind == "chat_message"
+        and profile.tool_dialect == "openai_chat_custom"
+        and any(
+            item.action.get("kind") == "replace_dialect"
+            and item.action.get("to") == "openai_chat_custom"
+            for item in candidate.pending
+        )
+    ):
+        raise ValueError("pending custom dialect evidence requires a custom tool call")
     sidecars = tuple(custom_receipts)
     if any(not isinstance(item, CustomArgumentValidationReceipt) for item in sidecars):
         raise ValueError("custom semantic sidecars must be typed")

@@ -66,12 +66,16 @@ def chat_observed(
             pass
         raise
     try:
+        from ouroboros.openai_chat_dispatch import CUSTOM_RECEIPTS_USAGE_KEY
+
+        public_usage = dict(usage)
+        public_usage.pop(CUSTOM_RECEIPTS_USAGE_KEY, None)
         persist_call(
             root,
             task_id=task_id or call_type,
             call_id=f"{call_id}_response",
             call_type=f"{call_type}_response",
-            payload={"message": msg, "usage": usage},
+            payload={"message": msg, "usage": public_usage},
             manifest={**_base_manifest(call_type, kwargs), "status": "ok"},
         )
     except Exception:
