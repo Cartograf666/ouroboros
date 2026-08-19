@@ -35,7 +35,12 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
-from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
+from ouroboros.utils import (
+    atomic_write_json,
+    is_credential_header_name,
+    read_json_dict,
+    utc_now_iso,
+)
 
 log = logging.getLogger(__name__)
 
@@ -199,10 +204,6 @@ def confirms_at_least(
 def _canonical_headers(headers: Optional[Dict[str, Any]]) -> Tuple[Tuple[str, str], ...]:
     if not isinstance(headers, dict):
         return ()
-    credential_names = {
-        "authorization", "proxy-authorization", "api-key", "x-api-key",
-        "x-goog-api-key", "anthropic-api-key", "openai-api-key",
-    }
     # Credentials are dispatch authentication, not route capability identity.
     # Omitting both value and presence keeps key rotation (or late key loading)
     # from invalidating otherwise identical route evidence.  Non-secret beta /
@@ -210,7 +211,7 @@ def _canonical_headers(headers: Optional[Dict[str, Any]]) -> Tuple[Tuple[str, st
     return tuple(sorted(
         (str(k).lower(), str(v))
         for k, v in headers.items()
-        if str(k).lower() not in credential_names
+        if not is_credential_header_name(k)
     ))
 
 
