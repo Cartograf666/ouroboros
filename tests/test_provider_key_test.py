@@ -488,6 +488,7 @@ def test_gigachat_probe_uses_one_ephemeral_client(monkeypatch):
     import sys
 
     observed = _bypass_accounting(monkeypatch)
+    monkeypatch.setenv("GIGACHAT_CREDENTIALS", "stale-environment-credentials")
     monkeypatch.setenv("GIGACHAT_ACCESS_TOKEN", "stale-environment-token")
     constructed = {}
     completion = types.SimpleNamespace(
@@ -511,12 +512,20 @@ def test_gigachat_probe_uses_one_ephemeral_client(monkeypatch):
     monkeypatch.setitem(sys.modules, "gigachat", types.SimpleNamespace(GigaChat=FakeGigaChat))
     client = LLMClient()
     result = client.probe_provider_readiness(
-        "gigachat::GigaChat-2-Max", settings={"GIGACHAT_CREDENTIALS": "key"},
+        "gigachat::GigaChat-2-Max",
+        settings={
+            "GIGACHAT_CREDENTIALS": "",
+            "GIGACHAT_USER": "draft-user",
+            "GIGACHAT_PASSWORD": "draft-password",
+        },
     )
     remote = constructed["client"]
     assert result["ok"] is True
     assert len(remote.calls) == len(observed) == 1
     assert remote.calls[0]["max_tokens"] == 16
+    assert constructed["credentials"] == ""
+    assert constructed["user"] == "draft-user"
+    assert constructed["password"] == "draft-password"
     assert constructed["access_token"] == ""
     assert constructed["max_retries"] == 0
     assert constructed["timeout"] == 20.0

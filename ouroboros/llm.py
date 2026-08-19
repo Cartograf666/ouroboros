@@ -3196,7 +3196,10 @@ class LLMClient:
             ("base_url", "base_url"),
         ):
             value = str(target.get(source) or "")
-            if value:
+            # Provider Test carries an explicit access-token field to suppress
+            # inherited auth.  Its empty credential is equally authoritative:
+            # omitting it would let the library reload GIGACHAT_CREDENTIALS.
+            if value or (source == "api_key" and "access_token" in target):
                 kwargs[destination] = value
         if "access_token" in target:
             kwargs["access_token"] = str(target.get("access_token") or "")
