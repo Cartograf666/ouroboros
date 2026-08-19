@@ -1407,7 +1407,7 @@ export function createChatInstance({
         markLiveCardCancelPending(taskId, soft);
         try {
             await requestStop(taskId, action);
-            // Durable detail heals a lost best-effort task_done publication.
+            // Durable detail heals lost best-effort task_done publication
             try {
                 reconcileCancelCardFromDetail(record, taskId, await fetchTaskDetail(taskId));
             } catch {
@@ -1437,7 +1437,7 @@ export function createChatInstance({
                 stored = await fetchTaskDetail(taskId);
             } catch {}
             if (stored === null) {
-                // Unknown truth cannot re-enable Stop or undo pending state.
+                // Only a fetched, live, non-pending detail restores the button.
                 return;
             }
             reconcileCancelCardFromDetail(record, taskId, stored);
