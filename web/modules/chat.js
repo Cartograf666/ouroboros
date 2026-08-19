@@ -579,9 +579,8 @@ export function createChatInstance({
     // Local user submissions awaiting server confirmation (clientMessageId
     // -> { clientMessageId, timestamp }).
     const pendingSubmissions = new Map();
-    // Conclusion ledger: ids concluded by a keyed final. Task ids never
-    // restart, so late typing frames / stale snapshots must not resurrect a
-    // concluded turn (project panels hydrate one-shot, no poll). Bounded FIFO.
+    // Bounded conclusions block late root typing and stale state snapshots; reusable
+    // logical task slots are cleared whenever their cycle settles.
     const concludedDirectActivities = new Map();
     const CONCLUDED_ACTIVITY_LEDGER_MAX = 200;
     // Retryable queue-loss candidates plus process-local single-flight reads.
@@ -609,6 +608,14 @@ export function createChatInstance({
             const oldest = concludedDirectActivities.keys().next().value;
             concludedDirectActivities.delete(oldest);
         }
+    }
+    function recordTerminalActivity(taskId) {
+        const id = String(taskId || '').trim();
+        if (!id) return;
+        activeDirectActivities.delete(id);
+        missingManagedTaskIds.delete(id);
+        if (REUSABLE_TASK_IDS.has(id)) concludedDirectActivities.delete(id);
+        else recordConcludedActivity(id);
     }
     let lastTerminalAttention = false;
     // Finished task ids hidden from routine syncs until reload/reconnect rebuilds history.
@@ -2464,12 +2471,10 @@ export function createChatInstance({
         const rawTs = msg?.ts || new Date().toISOString();
         if (registerEphemeralDecisionFrame(msg)) return;
         if (!taskId) return;
-        // P5: host-attested cancelable marker (live WS frames AND history replay
-        // via _PROGRESS_META_FIELDS). The supervisor stamps it ONLY on
-        // lineage-resolved non-subagent ROOTS, so the marker is the truth —
-        // re-deriving rootness from frame shape would wrongly reject a
-        // timeout-retry root (root_task_id names the ORIGINAL task while the
-        // endpoint cancels the current id). Direct-chat turns never carry it.
+        // The supervisor's cancelable stamp is authoritative for live WS frames and
+        // past history replay. Frame shape can misclassify timeout-retry roots because
+        // root_task_id names the original task while the endpoint cancels the
+        // current id; direct-chat turns never carry the stamp.
         if (msg?.cancelable === true && msg?.task_id) markTaskCancelable(String(msg.task_id));
         // Subagent lifecycle pings render as child cards linked to the parent;
         // they must not update the parent card's terminal state.
@@ -2489,6 +2494,7 @@ export function createChatInstance({
         }
         // Progress messages are visible status; do not force-open completed replay.
         const taskState = getTaskUiState(taskId, true);
+        const restartReusable = taskState?.completed && REUSABLE_TASK_IDS.has(taskId);
         if (taskState && !taskState.completed) taskState.forceCard = true;
         const summary = summarizeChatLiveEvent({
             type: 'send_message',
@@ -2527,6 +2533,7 @@ export function createChatInstance({
         if (!summary) return;
         const presented = withTaskCostMeta(summary, msg, { rawTs });
         queueTaskLiveUpdate(presented, taskId, normalizeLogTs(rawTs), presented.dedupeKey || '', rawTs);
+        if (restartReusable) forceTaskCard(taskId, rawTs);
         // Cluster B: history progress recs carry the coined name (live progress does
         // not — the live path uses the separate `task_named` event). Apply it after the
         // card exists so a reload shows the same title.
@@ -2766,13 +2773,7 @@ export function createChatInstance({
         queueTaskLiveUpdate(presented, taskId, normalizeLogTs(rawTs), presented.dedupeKey || '', rawTs);
         updateSubagentCardFromEvent(evt, rawTs);
         if (eventType === 'task_done') {
-            activeDirectActivities.delete(taskId);
-            if (REUSABLE_TASK_IDS.has(taskId)) {
-                missingManagedTaskIds.delete(taskId);
-                concludedDirectActivities.delete(taskId);
-            } else {
-                recordConcludedActivity(taskId);
-            }
+            recordTerminalActivity(taskId);
             syncChatStatus();
             const taskState = getTaskUiState(taskId, false);
             revealBufferedCardIfNeeded(taskState, { rawTs });
@@ -4113,7 +4114,7 @@ export function createChatInstance({
                 || concludedDirectActivities.has(taskId)
                 || !isTerminalTaskDetail(detail)
             ) return;
-            recordConcludedActivity(taskId);
+            recordTerminalActivity(taskId);
             finishLiveCard(taskId, taskTerminalPhase(detail));
         } catch {
             // No terminal fact was proved. A later existing snapshot retries.

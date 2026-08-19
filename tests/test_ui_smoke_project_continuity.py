@@ -295,14 +295,17 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 assert page.locator(f"{card} [data-cancel-run]").count() == 0
                 assert page.locator(card).get_attribute("data-finished") == "0"
 
-                # Unreachable and then nonterminal detail prove nothing; each is
-                # retried only on the next existing state snapshot.
+                # Unreachable and then completed-but-open detail prove nothing;
+                # each is retried only on the next existing state snapshot.
                 assert page.evaluate("() => window.__settleTaskDetail({}, 404)")
                 page.wait_for_timeout(100)
                 page.evaluate("() => window.__ouroWs.emit('projects_changed', {})")
                 page.wait_for_function("() => window.__taskDetailCalls.length === 2")
                 assert page.evaluate(
-                    "() => window.__settleTaskDetail({status: 'running'}, 200)"
+                    """() => window.__settleTaskDetail({
+                        status: 'completed',
+                        root_phase_checkpoint: {post_task_synthesis: 'pending_once'},
+                    }, 200)"""
                 )
                 page.wait_for_timeout(100)
                 assert page.locator(card).get_attribute("data-finished") == "0"
@@ -320,6 +323,7 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 assert page.evaluate(
                     """() => window.__settleTaskDetail({
                         status: 'completed',
+                        root_phase_checkpoint: {post_task_synthesis: 'completed'},
                         outcome_axes: {lifecycle: {status: 'completed'}},
                     }, 200)"""
                 )
@@ -427,20 +431,34 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 assert page.evaluate("() => window.__taskDetailCalls.length") == 4
                 _wait_status(page, "Online")
 
-                # Reusable logical slots may start another cycle after task_done.
-                state["activities"] = []
-                page.evaluate(
-                    """() => window.__ouroWs.emit('typing', {
-                        type: 'typing', chat_id: 1, activity_id: 'active',
-                        kind: 'managed_task', phase: 'working',
-                    })"""
-                )
+                # Durable fallback settles a reusable logical slot without
+                # permanently blocking its next Working cycle.
+                reusable_card = '.chat-live-card[data-task-id="active"]'
+                state["activities"] = [_activity("active")]
+                page.evaluate("() => window.__ouroWs.emit('projects_changed', {})")
                 _wait_status(page, "Working...")
                 page.evaluate(
-                    """() => window.__ouroWs.emit('log', {
-                        type: 'log', chat_id: 1,
-                        data: {type: 'task_done', task_id: 'active', status: 'completed'},
+                    """() => window.__ouroWs.emit('chat', {
+                        type: 'chat', role: 'assistant', is_progress: true,
+                        chat_id: 1, task_id: 'active', cancelable: true,
+                        content: 'Reusable cycle one.',
                     })"""
+                )
+                page.wait_for_selector(reusable_card)
+                page.wait_for_timeout(20)
+                state["activities"] = []
+                page.evaluate("() => window.__ouroWs.emit('projects_changed', {})")
+                page.wait_for_function("() => window.__taskDetailCalls.length === 5")
+                assert page.evaluate(
+                    """() => window.__settleTaskDetail({
+                        status: 'completed',
+                        root_phase_checkpoint: {post_task_synthesis: 'completed'},
+                        outcome_axes: {lifecycle: {status: 'completed'}},
+                    }, 200)"""
+                )
+                page.wait_for_function(
+                    "(sel) => document.querySelector(sel)?.dataset.finished === '1'",
+                    arg=reusable_card,
                 )
                 _wait_status(page, "Online")
                 page.evaluate(
@@ -450,6 +468,21 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                     })"""
                 )
                 _wait_status(page, "Working...")
+                page.evaluate(
+                    """() => window.__ouroWs.emit('chat', {
+                        type: 'chat', role: 'assistant', is_progress: true,
+                        chat_id: 1, task_id: 'active', cancelable: true,
+                        content: 'Reusable cycle two.',
+                    })"""
+                )
+                page.wait_for_function(
+                    """(sel) => {
+                        const card = document.querySelector(sel);
+                        return card?.dataset.finished === '0'
+                            && card.textContent.includes('Reusable cycle two.');
+                    }""",
+                    arg=reusable_card,
+                )
                 page.evaluate(
                     """() => window.__ouroWs.emit('log', {
                         type: 'log', chat_id: 1,
@@ -478,7 +511,7 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 )
                 page.wait_for_timeout(200)
                 assert page.evaluate("() => window.__taskDetailCalls") == [
-                    "truth-root", "truth-root", "truth-root", "rehome-root",
+                    "truth-root", "truth-root", "truth-root", "rehome-root", "active",
                 ]
             finally:
                 browser.close()

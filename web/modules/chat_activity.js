@@ -221,9 +221,13 @@ export function isTerminalTaskPhase(phase = '', terminal = false) {
 const TERMINAL_TASK_DETAIL_STATUSES = new Set([
     'completed', 'failed', 'cancelled', 'rejected_duplicate',
 ]);
+const OPEN_POST_TASK_SYNTHESIS_STATUSES = new Set(['pending_once', 'running']);
 
 export function isTerminalTaskDetail(record) {
-    return TERMINAL_TASK_DETAIL_STATUSES.has(String(record?.status || '').toLowerCase());
+    const status = String(record?.status || '').toLowerCase();
+    const synthesis = String(record?.root_phase_checkpoint?.post_task_synthesis || '').toLowerCase();
+    return TERMINAL_TASK_DETAIL_STATUSES.has(status)
+        && !(status === 'completed' && OPEN_POST_TASK_SYNTHESIS_STATUSES.has(synthesis));
 }
 
 // ---------------------------------------------------------------------------

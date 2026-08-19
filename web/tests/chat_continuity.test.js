@@ -152,6 +152,20 @@ test('durable detail terminality is narrow and outcome labels stay unchanged', (
     for (const status of ['completed', 'failed', 'cancelled', 'rejected_duplicate']) {
         assert.equal(isTerminalTaskDetail({ status }), true, status);
     }
+    for (const post_task_synthesis of ['pending_once', 'running']) {
+        assert.equal(isTerminalTaskDetail({
+            status: 'completed',
+            root_phase_checkpoint: { post_task_synthesis },
+        }), false, `completed/${post_task_synthesis}`);
+    }
+    assert.equal(isTerminalTaskDetail({
+        status: 'completed',
+        root_phase_checkpoint: { post_task_synthesis: 'completed' },
+    }), true, 'completed/completed');
+    assert.equal(isTerminalTaskDetail({
+        status: 'failed',
+        root_phase_checkpoint: { post_task_synthesis: 'running' },
+    }), true, 'failed/running');
     assert.equal(taskTerminalPhase({ status: 'completed' }), 'done');
     assert.equal(taskTerminalPhase({ status: 'cancelled' }), 'cancelled');
     assert.equal(taskTerminalPhase({ status: 'failed' }), 'error');
