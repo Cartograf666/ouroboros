@@ -403,7 +403,6 @@ def copy_child_task_result(parent_drive_root: pathlib.Path, task: Dict[str, Any]
         for key, value in child_result.items()
         if key not in {"task_id", "status"}
     }
-    payload = project_replica_task_result_fields(canonical_existing, payload)
     if isinstance(payload.get("artifacts"), list):
         payload["artifacts"] = _copy_child_artifacts_to_parent(
             parent_drive_root,
@@ -434,6 +433,7 @@ def copy_child_task_result(parent_drive_root: pathlib.Path, task: Dict[str, Any]
         parent_drive_root,
         task_id,
         child_status,
+        _field_projector=project_replica_task_result_fields,
         **payload,
     )
 

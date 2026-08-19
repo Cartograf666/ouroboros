@@ -4,14 +4,58 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
 
-from ouroboros.post_task_checkpoint import project_replica_task_result_fields
+from ouroboros.post_task_checkpoint import (
+    project_replica_task_result_fields,
+    project_root_post_task_checkpoint_fields,
+)
 from ouroboros.task_results import STATUS_COMPLETED, load_task_result, write_task_result
 from ouroboros.task_status import load_effective_task_result
+
+
+def _seed_atomic_race(tmp_path):
+    data = tmp_path / "data"
+    child = tmp_path / "child"
+    data.mkdir()
+    child.mkdir()
+    task_id = "atomic-root"
+    write_task_result(
+        data,
+        task_id,
+        STATUS_COMPLETED,
+        root_phase_checkpoint={
+            "phase": "task_acceptance",
+            "status": "not_required",
+            "pass_index": 0,
+            "post_task_synthesis": "pending_once",
+        },
+        cost_usd=1.0,
+        cost_final=False,
+        cost_with_children_partial=True,
+    )
+    write_task_result(
+        child,
+        task_id,
+        STATUS_COMPLETED,
+        result="accepted child answer",
+        producer_exit_code=23,
+        root_phase_checkpoint={
+            "phase": "task_acceptance",
+            "status": "pass",
+            "pass_index": 1,
+            "post_task_synthesis": "running",
+        },
+        cost_usd=7.0,
+        cost_final=False,
+        cost_with_children_partial=True,
+        total_rounds=7,
+    )
+    return data, child, task_id
 
 
 def _seed_split_result(
@@ -135,6 +179,31 @@ def test_replica_field_projector_is_pure_and_updated_at_is_metadata_only():
         {"updated_at": "2026-08-19T00:00:04+00:00"},
     )
     assert projected["updated_at"] == "2026-08-19T00:00:04+00:00"
+
+
+@pytest.mark.parametrize("stale_status", ["running", "degraded"])
+def test_root_patch_keeps_terminal_state_and_accounting_sticky(stale_status):
+    canonical = {
+        "root_phase_checkpoint": {
+            "phase": "task_acceptance",
+            "status": "pass",
+            "pass_index": 1,
+            "post_task_synthesis": "completed",
+            "post_task_stop_reason": "terminal_writer",
+        },
+        "cost_usd": 99.0,
+        "cost_final": True,
+    }
+    patch = {
+        "root_phase_checkpoint": {"post_task_synthesis": stale_status},
+        "cost_usd": 7.0,
+        "cost_final": False,
+    }
+
+    projected = project_root_post_task_checkpoint_fields(canonical, patch)
+    merged = {**canonical, **projected}
+
+    assert merged == canonical
 
 
 @pytest.mark.parametrize("canonical_post_task", ["completed", "degraded"])
@@ -365,6 +434,164 @@ def test_terminal_truth_is_stable_before_and_after_physical_copyback(
     )
     assert after["root_phase_checkpoint"] == before["root_phase_checkpoint"]
     assert after["updated_at"] == copyback_updated_at
+
+
+def test_delayed_copyback_projects_against_terminal_current_record(
+    tmp_path,
+    monkeypatch,
+):
+    """A copyback paused after its early read must reduce the later terminal record."""
+    import ouroboros.headless as headless
+
+    data, child, task_id = _seed_atomic_race(tmp_path)
+    entered_write = threading.Event()
+    release_write = threading.Event()
+    real_write = headless.write_task_result
+    outcome = {}
+
+    def delayed_write(*args, **kwargs):
+        entered_write.set()
+        assert release_write.wait(5)
+        return real_write(*args, **kwargs)
+
+    def copyback():
+        try:
+            outcome["result"] = headless.copy_child_task_result(
+                data, {"id": task_id, "drive_root": str(child)}
+            )
+        except BaseException as exc:  # surfaced in the parent test thread
+            outcome["error"] = exc
+
+    monkeypatch.setattr(headless, "write_task_result", delayed_write)
+    thread = threading.Thread(target=copyback, name="delayed-copyback")
+    thread.start()
+    assert entered_write.wait(5)
+
+    write_task_result(
+        data,
+        task_id,
+        STATUS_COMPLETED,
+        root_phase_checkpoint={
+            "phase": "task_acceptance",
+            "status": "not_required",
+            "pass_index": 0,
+            "post_task_synthesis": "completed",
+            "post_task_stop_reason": "terminal_writer",
+        },
+        cost_usd=99.0,
+        cost_final=True,
+        cost_with_children_partial=False,
+        total_rounds=99,
+    )
+    release_write.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert "error" not in outcome
+    stored = load_task_result(data, task_id)
+    assert outcome["result"] == stored
+    assert stored["root_phase_checkpoint"] == {
+        "phase": "task_acceptance",
+        "status": "pass",
+        "pass_index": 1,
+        "post_task_synthesis": "completed",
+        "post_task_stop_reason": "terminal_writer",
+    }
+    assert stored["producer_exit_code"] == 23
+    assert stored["cost_usd"] == 99.0
+    assert stored["cost_final"] is True
+    assert stored["cost_with_children_partial"] is False
+    assert stored["total_rounds"] == 99
+
+
+def test_delayed_terminal_checkpoint_merges_current_acceptance_and_stays_terminal(
+    tmp_path,
+    monkeypatch,
+):
+    """A terminal writer paused after its read keeps a racing child acceptance."""
+    import ouroboros.headless as headless
+    import ouroboros.post_task_checkpoint as checkpoint
+    import ouroboros.usage_accounting as usage_accounting
+    import supervisor.state as supervisor_state
+
+    data, child, task_id = _seed_atomic_race(tmp_path)
+    entered_write = threading.Event()
+    release_write = threading.Event()
+    real_write = checkpoint.write_task_result
+    outcome = {}
+
+    def delayed_write(*args, **kwargs):
+        entered_write.set()
+        assert release_write.wait(5)
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(checkpoint, "write_task_result", delayed_write)
+    monkeypatch.setattr(
+        supervisor_state,
+        "reconstruct_task_cost",
+        lambda *args, **kwargs: {
+            "cost_usd": 99.0,
+            "accounted_upper_bound_usd": 99.0,
+            "cost_final": True,
+            "cost_with_children_partial": False,
+            "total_rounds": 99,
+        },
+    )
+    monkeypatch.setattr(
+        usage_accounting,
+        "usage_breakdown",
+        lambda *args, **kwargs: {"accounted_usd": 99.0, "cost_final": True},
+    )
+    task = {
+        "id": task_id,
+        "root_task_id": task_id,
+        "budget_drive_root": str(data),
+        "status": STATUS_COMPLETED,
+    }
+
+    def finalize_checkpoint():
+        try:
+            checkpoint.set_root_post_task_checkpoint(
+                SimpleNamespace(drive_root=data), task, "completed"
+            )
+        except BaseException as exc:  # surfaced in the parent test thread
+            outcome["error"] = exc
+
+    thread = threading.Thread(
+        target=finalize_checkpoint,
+        name="delayed-terminal-checkpoint",
+    )
+    thread.start()
+    assert entered_write.wait(5)
+
+    copied = headless.copy_child_task_result(
+        data, {"id": task_id, "drive_root": str(child)}
+    )
+    assert copied["root_phase_checkpoint"]["status"] == "pass"
+    release_write.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert "error" not in outcome
+    stored = load_task_result(data, task_id)
+    assert stored["root_phase_checkpoint"]["status"] == "pass"
+    assert stored["root_phase_checkpoint"]["pass_index"] == 1
+    assert stored["root_phase_checkpoint"]["post_task_synthesis"] == "completed"
+    assert stored["producer_exit_code"] == 23
+    assert stored["cost_usd"] == 99.0
+    assert stored["cost_final"] is True
+    assert stored["cost_with_children_partial"] is False
+
+    # A stale/open root writer cannot reopen the terminal checkpoint or replace
+    # the snapshot with its provisional cost markers.
+    checkpoint.set_root_post_task_checkpoint(
+        SimpleNamespace(drive_root=data), task, "running"
+    )
+    after_open = load_task_result(data, task_id)
+    assert after_open["root_phase_checkpoint"] == stored["root_phase_checkpoint"]
+    assert after_open["cost_usd"] == 99.0
+    assert after_open["cost_final"] is True
+    assert after_open["cost_with_children_partial"] is False
 
 
 def _write_history_rows(data, task_id):

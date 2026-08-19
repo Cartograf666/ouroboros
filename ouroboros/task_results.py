@@ -248,27 +248,27 @@ def write_task_result(
     results_drive_root: Any,
     task_id: str,
     status: str,
+    *, _field_projector: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]]] = None,
     **fields: Any,
 ) -> Dict[str, Any]:
     """Merge-write a task result under a per-file lock.
 
-    Worker processes, the supervisor thread, and gateway handlers all
-    read-modify-write the same ``task_results/<id>.json``; the lock makes the
-    monotonic-status guard evaluate the CURRENT on-disk status, so the winner of
+    Worker processes, the supervisor thread, and gateway handlers all read-modify-write
+    the same ``task_results/<id>.json``; the lock evaluates the monotonic-status guard
+    against the CURRENT on-disk status, so the winner of
     a concurrent terminal race is decided by the monotonic reducer, not timing.
     Terminal statuses are sticky: natural completion WINS a late cancel (owner
     decision 4=A) — there is deliberately no override that lets a cancellation
     replace an already-completed result (discarding a result is a separate
-    explicit parent action, ``discard_child_result``).
+    explicit parent action, ``discard_child_result``). ``_field_projector`` is the narrow
+    custody seam for fields that depend on CURRENT; it runs under this same file lock.
     """
     path = task_result_path(results_drive_root, task_id)
     explicit_ts = str(fields.pop("ts", "") or "")
 
     def _merge(existing: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        # Monotonic lifecycle: never let a stale scheduled/running mirror
-        # overwrite a terminal outcome. This is the structural guard against
-        # "ghost" tasks that keep reporting scheduled/running after they were
-        # cancelled or finished.
+        # Monotonic lifecycle: never let a stale scheduled/running mirror overwrite a
+        # terminal outcome (the structural guard against post-terminal "ghost" tasks).
         existing_status = str(existing.get("status") or "")
         if existing and _is_status_regression(existing_status, status):
             # Surface the blocked transition: when debugging a "stuck" task this
@@ -276,10 +276,11 @@ def write_task_result(
             log.debug("Blocked status regression %s -> %s for task %s",
                       existing.get("status"), status, task_id)
             return None
+        projected_fields = _field_projector(existing, dict(fields)) if _field_projector else fields
         now = utc_now_iso()
         return {
             **existing,
-            **fields,
+            **projected_fields,
             "task_id": task_id,
             "status": status,
             "ts": explicit_ts or str(existing.get("ts") or now),
@@ -291,7 +292,6 @@ def write_task_result(
     # completed-vs-cancelled race depend on timing rather than the monotonic
     # reducer above. Callers may retry or fail their transition explicitly.
     return update_json_locked(path, _merge)
-
 
 
 # --------------------------------------------------------------------------- plan review state
