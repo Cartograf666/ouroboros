@@ -91,9 +91,18 @@
  */
 
 /**
+ * @typedef {Object} AvailableSubagentsSettingsMeta
+ * @property {string=} source
+ * @property {string=} diagnostic
+ * @property {Object[]=} diagnostics
+ * @property {Object|null=} candidate
+ */
+
+/**
  * @typedef {Object} SettingsMeta
  * @property {string[]=} custom_secret_keys
  * @property {Object=} setup_contract
+ * @property {AvailableSubagentsSettingsMeta=} available_subagents
  */
 
 /**
@@ -103,20 +112,30 @@
  * @typedef {Object} OnboardingCompleteRequest
  * @property {boolean=} subscriptionsConnected
  * @property {boolean=} skipSubscriptionPresets
+ * @property {Object=} OUROBOROS_SUBAGENTS
+ */
+
+/**
+ * @typedef {Object} OnboardingSubagentsPreviewResponse
+ * @property {boolean} ok
+ * @property {Object} available_subagents
+ * @property {string} source
+ * @property {Object[]} diagnostics
  */
 
 /**
  * @typedef {Object} OnboardingPresetProjection
  * @property {boolean} applied
- * @property {string} reason  // not_requested | not_install_time | skipped_by_owner | applied
+ * @property {string} reason  // not_requested | not_install_time | skipped_by_owner | configured_by_owner | applied
  * @property {string[]} harnesses
  * @property {Object} receipt  // per-seat resolution record; {} when nothing was applied
  */
 
 /**
  * Settings, runtime mode, the fresh-install safety default and the durable
- * completion fact land atomically on every success. Preset keys and the one-shot
- * preset marker land only when `preset.applied` is true.
+ * completion fact land atomically on every success. The one-shot preset marker
+ * lands only for the automatic `reason=applied` install preset; an explicit
+ * owner draft may be saved as `configured_by_owner` without reopening it.
  * @typedef {Object} OnboardingCompleteResponse
  * @property {boolean} ok
  * @property {string} status

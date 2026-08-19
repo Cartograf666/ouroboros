@@ -41,6 +41,7 @@ def test_apply_runtime_provider_defaults_autofills_official_openai_models():
     assert changed
     assert set(changed_keys) == {
         "OUROBOROS_MODEL",
+        "OUROBOROS_MODEL_HEAVY",
         "OUROBOROS_MODEL_LIGHT",
         "OUROBOROS_MODEL_FALLBACKS",
         # v6.82.0: deep self-review is a per-provider slot too, so a direct-only
@@ -51,7 +52,7 @@ def test_apply_runtime_provider_defaults_autofills_official_openai_models():
         "OUROBOROS_SCOPE_REVIEW_MODELS",
     }
     assert normalized["OUROBOROS_MODEL"] == "openai::gpt-5.6-terra"
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == "anthropic/claude-opus-4.6"
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
     assert normalized["OUROBOROS_MODEL_LIGHT"] == "openai::gpt-5.6-luna"
     assert normalized["OUROBOROS_MODEL_FALLBACKS"] == "openai::gpt-5.6-sol"
 
@@ -69,7 +70,7 @@ def test_apply_runtime_provider_defaults_autofills_official_openai_models():
     assert changed
     assert "OUROBOROS_MODEL" in changed_keys
     assert normalized["OUROBOROS_MODEL"] == "openai::gpt-5.6-terra"
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == "google/gemini-3.5-flash"
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
     assert normalized["OUROBOROS_MODEL_LIGHT"] == "openai::gpt-5.6-luna"
     assert normalized["OUROBOROS_REVIEW_MODELS"] == (
         "openai::gpt-5.6-terra,openai::gpt-5.6-terra,openai::gpt-5.6-terra"
@@ -109,6 +110,7 @@ def test_apply_runtime_provider_defaults_migrates_saved_openai_values():
     assert changed
     assert set(changed_keys) == {
         "OUROBOROS_MODEL",
+        "OUROBOROS_MODEL_HEAVY",
         "OUROBOROS_MODEL_LIGHT",
         "OUROBOROS_MODEL_FALLBACKS",
         # v6.82.0: deep self-review is a per-provider slot too, so a direct-only
@@ -118,10 +120,10 @@ def test_apply_runtime_provider_defaults_migrates_saved_openai_values():
         "OUROBOROS_SCOPE_REVIEW_MODEL",
         "OUROBOROS_SCOPE_REVIEW_MODELS",
     }
-    # Active Main/Light/Fallback defaults migrate. Heavy remains bounded legacy
-    # input so ConfiguredSubagent migration can preserve its exact old route.
+    # Active Main/Light/Fallback defaults migrate. The known shipped Heavy is
+    # product-authored, not custom owner intent, so it does not become an actor.
     assert normalized["OUROBOROS_MODEL"] == "openai::gpt-5.6-terra"
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == "openai/gpt-5.5"
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
     assert normalized["OUROBOROS_MODEL_LIGHT"] == "openai::gpt-5.6-luna"
     assert normalized["OUROBOROS_MODEL_FALLBACKS"] == "openai::gpt-5.6-sol"
     # v6.36.0 (D4): an explicit provider-matching review list is honored EXACTLY
@@ -280,6 +282,7 @@ def test_apply_runtime_provider_defaults_normalizes_anthropic_only_setup():
     assert changed
     assert set(changed_keys) == {
         "OUROBOROS_MODEL",
+        "OUROBOROS_MODEL_HEAVY",
         "OUROBOROS_MODEL_LIGHT",
         "OUROBOROS_MODEL_FALLBACKS",
         # v6.82.0: deep self-review is a per-provider slot too, so a direct-only
@@ -290,7 +293,7 @@ def test_apply_runtime_provider_defaults_normalizes_anthropic_only_setup():
         "OUROBOROS_SCOPE_REVIEW_MODELS",
     }
     assert normalized["OUROBOROS_MODEL"] == "anthropic::claude-opus-5"
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == "anthropic/claude-opus-4.6"
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
     assert normalized["OUROBOROS_MODEL_LIGHT"] == "anthropic::claude-sonnet-5"
     assert normalized["OUROBOROS_MODEL_FALLBACKS"] == "anthropic::claude-sonnet-5"
     assert normalized["OUROBOROS_REVIEW_MODELS"] == (
@@ -315,7 +318,7 @@ def test_apply_runtime_provider_defaults_normalizes_anthropic_only_setup():
     assert changed
     assert "OUROBOROS_MODEL" in changed_keys
     assert normalized["OUROBOROS_MODEL"] == "anthropic::claude-opus-5"
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == "google/gemini-3.5-flash"
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
     assert normalized["OUROBOROS_MODEL_LIGHT"] == "anthropic::claude-sonnet-5"
     assert normalized["OUROBOROS_REVIEW_MODELS"] == (
         "anthropic::claude-opus-5,"
@@ -509,7 +512,8 @@ def test_apply_runtime_provider_defaults_cloudru_migrates_populated_shipped_defa
     """The realistic save path: a Cloud.ru-only user whose settings already carry
     shipped non-cloudru defaults, including the immediately outgoing v6.104 Main
     and Light values. Every active model/review slot migrates to cloudru::;
-    legacy Heavy remains bounded migration input."""
+    the product-authored Heavy default is discarded rather than becoming an
+    owner-custom actor."""
     from ouroboros.server_runtime import apply_runtime_provider_defaults
 
     normalized, changed, _ = apply_runtime_provider_defaults({
@@ -524,7 +528,7 @@ def test_apply_runtime_provider_defaults_cloudru_migrates_populated_shipped_defa
     })
     assert changed
     assert normalized["OUROBOROS_MODEL"].startswith("cloudru::")
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == "google/gemini-3.5-flash"
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
     assert all(m.startswith("cloudru::") for m in normalized["OUROBOROS_REVIEW_MODELS"].split(","))
     assert normalized["OUROBOROS_SCOPE_REVIEW_MODEL"].startswith("cloudru::")
     assert normalized["OUROBOROS_SCOPE_REVIEW_MODELS"].startswith("cloudru::")
@@ -553,7 +557,7 @@ def test_apply_runtime_provider_defaults_gigachat_only_elevates_to_direct():
 def test_apply_runtime_provider_defaults_gigachat_credentials_migrates_shipped_defaults():
     """A GigaChat-only user (authorization key) whose settings still carry the
     shipped (non-gigachat) defaults: active Main/Light and every review/scope
-    reviewer slot migrate; legacy Heavy stays available to the actor migrator."""
+    reviewer slot migrate; the shipped Heavy is not misclassified as custom."""
     from ouroboros.server_runtime import apply_runtime_provider_defaults
 
     normalized, changed, _ = apply_runtime_provider_defaults({
@@ -569,7 +573,7 @@ def test_apply_runtime_provider_defaults_gigachat_credentials_migrates_shipped_d
     assert changed
     assert normalized["OUROBOROS_MODEL"].startswith("gigachat::")
     assert normalized["OUROBOROS_MODEL"] == "gigachat::GigaChat-2-Max"
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == "google/gemini-3.5-flash"
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
     assert all(m.startswith("gigachat::") for m in normalized["OUROBOROS_REVIEW_MODELS"].split(","))
     assert normalized["OUROBOROS_SCOPE_REVIEW_MODEL"].startswith("gigachat::")
     assert normalized["OUROBOROS_SCOPE_REVIEW_MODELS"].startswith("gigachat::")
@@ -597,12 +601,14 @@ def test_local_only_install_keeps_light_and_fallback_on_the_local_main_route():
 
     local_only = {
         "OUROBOROS_MODEL": SETTINGS_DEFAULTS["OUROBOROS_MODEL"],
+        "OUROBOROS_MODEL_HEAVY": "google/gemini-3.5-flash",
         "OUROBOROS_MODEL_LIGHT": SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"],
         "OUROBOROS_MODEL_FALLBACKS": SETTINGS_DEFAULTS["OUROBOROS_MODEL_FALLBACKS"],
         "LOCAL_MODEL_SOURCE": "repo/model.gguf",
         "USE_LOCAL_MAIN": True,
     }
     out, changed, keys = apply_runtime_provider_defaults(dict(local_only))
+    assert out["OUROBOROS_MODEL_HEAVY"] == ""
     assert out["OUROBOROS_MODEL_LIGHT"] == ""
     assert out["OUROBOROS_MODEL_FALLBACKS"] == ""
     assert changed and "OUROBOROS_MODEL_LIGHT" in keys
@@ -613,6 +619,15 @@ def test_local_only_install_keeps_light_and_fallback_on_the_local_main_route():
     remote = dict(local_only, OPENROUTER_API_KEY="sk-or-test")
     kept = apply_runtime_provider_defaults(remote)[0]["OUROBOROS_MODEL_LIGHT"]
     assert kept == SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"]
+
+    local_heavy = dict(
+        local_only,
+        USE_LOCAL_HEAVY=True,
+        OUROBOROS_MODEL_HEAVY="google/gemini-3.5-flash",
+    )
+    assert apply_runtime_provider_defaults(local_heavy)[0]["OUROBOROS_MODEL_HEAVY"] == (
+        "google/gemini-3.5-flash"
+    )
 
     # UPGRADE path: a local-only settings file still holding the immediately
     # outgoing shipped values is just as unreachable and must inherit local Main.

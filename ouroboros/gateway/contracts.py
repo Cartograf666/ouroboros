@@ -609,11 +609,25 @@ class SettingsNetworkMeta(TypedDict):
     warning: str
 
 
+class AvailableSubagentsSettingsMeta(TypedDict, total=False):
+    """Saved/migrated intent returned beside ``GET /api/settings``.
+
+    ``candidate`` is an unsaved canonical object.  Absence stays ``None``; a
+    read never materializes the value on disk.
+    """
+
+    source: str
+    diagnostic: str
+    diagnostics: list[Dict[str, Any]]
+    candidate: Optional[Dict[str, Any]]
+
+
 class SettingsMeta(SettingsNetworkMeta, total=False):
     """Complete ``GET /api/settings`` ``_meta`` block."""
 
     custom_secret_keys: list[str]
     setup_contract: Dict[str, Any]
+    available_subagents: AvailableSubagentsSettingsMeta
 
 
 class SettingsSaveResponse(TypedDict, total=False):
@@ -1109,6 +1123,16 @@ class OnboardingCompleteRequest(TypedDict, total=False):
 
     subscriptionsConnected: bool
     skipSubscriptionPresets: bool
+    OUROBOROS_SUBAGENTS: Dict[str, Any]
+
+
+class OnboardingSubagentsPreviewResponse(TypedDict):
+    """Read-only canonical actor draft returned to Settings/onboarding."""
+
+    ok: bool
+    available_subagents: Dict[str, Any]
+    source: str
+    diagnostics: list[Dict[str, Any]]
 
 
 class OnboardingPresetProjection(TypedDict):
@@ -1119,7 +1143,13 @@ class OnboardingPresetProjection(TypedDict):
     onboarding — absence is reported as absence, never as an empty success."""
 
     applied: bool
-    reason: str
+    reason: Literal[
+        "not_requested",
+        "not_install_time",
+        "skipped_by_owner",
+        "configured_by_owner",
+        "applied",
+    ]
     harnesses: list[str]
     receipt: Dict[str, Any]
 
@@ -1127,10 +1157,10 @@ class OnboardingPresetProjection(TypedDict):
 class OnboardingCompleteResponse(TypedDict):
     """The ONE success envelope. Settings, the next-boot runtime mode, the
     fresh-install safety default and the durable completion fact land ATOMICALLY
-    — every success carries all four. The preset keys and their one-shot marker
-    ride the same write only when ``preset.applied`` is true; an ordinary success
-    with ``not_requested``, ``skipped_by_owner`` or ``not_install_time`` persists
-    no preset and no marker, which is the D-4 design, not a partial save."""
+    — every success carries all four. The one-shot marker rides the same write
+    only for the automatic ``applied`` install preset. An explicit owner draft
+    can report ``configured_by_owner`` without reopening that install-time
+    window or changing reviewer defaults."""
 
     ok: bool
     status: str
@@ -1335,6 +1365,7 @@ __all__ = [
     "ActiveChatActivity",
     "EvolutionStateSnapshot",
     "SettingsNetworkMeta",
+    "AvailableSubagentsSettingsMeta",
     "SettingsMeta",
     "SettingsSaveResponse",
     "OwnerRuntimeModeResponse",
@@ -1344,6 +1375,7 @@ __all__ = [
     "OwnerSafetyModeResponse",
     "OnboardingCompleteRequest",
     "OnboardingCompleteResponse",
+    "OnboardingSubagentsPreviewResponse",
     "OnboardingPresetFailureResponse",
     "OnboardingPresetProjection",
     "SettingsPostCommitFailureResponse",

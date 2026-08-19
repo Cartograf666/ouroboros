@@ -102,11 +102,43 @@ def _compound_effort_conflict(route: RouteSpec, effort: str, where: str) -> None
         return
     from ouroboros.config import EFFORT_SCALE
 
-    encoded = model.rsplit("-", 1)[-1].lower()
+    # Cursor's real catalog can append the transport modifier ``-fast`` after
+    # the compound effort (for example ``...-high-fast``).  It is not a second
+    # effort and must not hide the one the model id already encodes.
+    compound_model = model[:-5] if model.lower().endswith("-fast") else model
+    encoded = compound_model.rsplit("-", 1)[-1].lower()
     if encoded in EFFORT_SCALE and encoded != effort:
         raise ValueError(
             f"{SUBAGENTS_SETTING}: {where} effort {effort!r} conflicts with compound route effort {encoded!r}"
         )
+
+
+def _validate_session_target(route: RouteSpec, where: str) -> None:
+    """Validate the Available-subagent ``harness[=model]`` public grammar.
+
+    Reviewer rows retain their established permissive parser.  New task actors
+    are stricter because their target is snapshotted as executable intent: a
+    legacy ``:effort`` suffix, an empty side of ``=``, or multiple separators
+    would otherwise be canonically persisted and fail only after dispatch.
+    """
+    if not route.is_session:
+        return
+    target = route.target_id
+    if any(ch.isspace() for ch in target) or ":" in target:
+        raise ValueError(
+            f"{SUBAGENTS_SETTING}: {where} session target must use harness[=model] without whitespace or legacy ':effort'"
+        )
+    if target.count("=") > 1:
+        raise ValueError(
+            f"{SUBAGENTS_SETTING}: {where} session target must contain at most one '='"
+        )
+    harness, separator, model = target.partition("=")
+    if not _ID_RE.fullmatch(harness):
+        raise ValueError(
+            f"{SUBAGENTS_SETTING}: {where} session harness must match [A-Za-z0-9][A-Za-z0-9_.-]{{0,63}}"
+        )
+    if separator and not model:
+        raise ValueError(f"{SUBAGENTS_SETTING}: {where} session model is empty")
 
 
 def _parse_payload(raw: Any) -> Mapping[str, Any]:
@@ -150,10 +182,12 @@ def parse_configured_subagents(raw: Any) -> ConfiguredSubagents:
         if row_id in seen:
             raise ValueError(f"{SUBAGENTS_SETTING}: subagent_id {row_id!r} appears twice")
         seen.add(row_id)
-        for field in ("name", "recommended_use"):
-            if not isinstance(row.get(field), str):
-                raise ValueError(f"{SUBAGENTS_SETTING}: {where}.{field} must be a string")
-        name = row["name"].strip() or row_id.replace("-", " ").replace("_", " ").title()
+        raw_name = row.get("name", "")
+        if not isinstance(raw_name, str):
+            raise ValueError(f"{SUBAGENTS_SETTING}: {where}.name must be a string")
+        if not isinstance(row.get("recommended_use"), str):
+            raise ValueError(f"{SUBAGENTS_SETTING}: {where}.recommended_use must be a string")
+        name = raw_name.strip() or row_id.replace("-", " ").replace("_", " ").title()
         route = parse_route_spec(
             row.get("route"),
             setting=SUBAGENTS_SETTING,
@@ -164,6 +198,7 @@ def parse_configured_subagents(raw: Any) -> ConfiguredSubagents:
             strict_strings=True,
             reject_api_pin=True,
         )
+        _validate_session_target(route, where)
         effort = _effort(row.get("effort"), where)
         _compound_effort_conflict(route, effort, where)
         items.append(
@@ -268,8 +303,10 @@ def resolve_configured_subagents(
 
     raw_legacy = str(settings.get("OUROBOROS_SUBAGENT_HARNESS") or "").strip()
     if raw_legacy.lower() == "off":
+        items: list[ConfiguredSubagent] = []
+        _append_legacy_model_rows(items, settings)
         return ConfiguredSubagentsResolution(
-            ConfiguredSubagents(enabled=False, items=()),
+            ConfiguredSubagents(enabled=False, items=tuple(items[:MAX_CONFIGURED_SUBAGENTS])),
             SOURCE_LEGACY_MIGRATED,
             raw=raw_legacy,
         )
@@ -287,38 +324,68 @@ def resolve_configured_subagents(
                 raw=raw_legacy,
             )
         items = [primary]
-        _append_legacy_model_rows(items, settings)
+        _append_legacy_model_rows(items, settings, include_ids={"legacy-heavy"})
+        if default_candidate is not None:
+            _append_candidate_rows(items, default_candidate.items)
+        _append_legacy_model_rows(items, settings, include_ids={"fast-scout"})
         return ConfiguredSubagentsResolution(
             ConfiguredSubagents(enabled=True, items=tuple(items[:MAX_CONFIGURED_SUBAGENTS])),
             SOURCE_LEGACY_MIGRATED,
             raw=raw_legacy,
         )
 
+    items: list[ConfiguredSubagent] = []
+    _append_legacy_model_rows(items, settings, include_ids={"legacy-heavy"})
     if default_candidate is not None:
-        items = list(default_candidate.items)
-        _append_legacy_model_rows(items, settings)
+        _append_candidate_rows(items, default_candidate.items)
+    _append_legacy_model_rows(items, settings, include_ids={"fast-scout"})
+    if items:
         return ConfiguredSubagentsResolution(
             make_configured_subagents(
                 items[:MAX_CONFIGURED_SUBAGENTS],
-                enabled=default_candidate.enabled,
+                enabled=default_candidate.enabled if default_candidate is not None else True,
             ),
-            SOURCE_UNDECIDED,
-            raw=raw_legacy,
-        )
-    items: list[ConfiguredSubagent] = []
-    _append_legacy_model_rows(items, settings)
-    if items:
-        return ConfiguredSubagentsResolution(
-            make_configured_subagents(items),
             SOURCE_UNDECIDED,
             raw=raw_legacy,
         )
     return ConfiguredSubagentsResolution(None, SOURCE_UNDECIDED, raw=raw_legacy)
 
 
+def resolve_settings_subagent_candidate(
+    settings: Mapping[str, Any],
+) -> tuple[ConfiguredSubagentsResolution, tuple[dict[str, Any], ...]]:
+    """Resolve the read-only Settings draft, including pure API/local defaults.
+
+    This is presentation-time candidate construction, not runtime enablement:
+    ``SOURCE_UNDECIDED`` remains unsaved and invisible to new-ID dispatch until
+    an explicit Settings save or onboarding completion materializes it.
+    """
+    default_candidate = None
+    diagnostics: list[dict[str, Any]] = []
+    legacy = str(settings.get("OUROBOROS_SUBAGENT_HARNESS") or "").strip()
+    if settings.get(SUBAGENTS_SETTING) in (None, "") and legacy.lower() != "off":
+        from ouroboros.subscription_install_presets import compile_install_preset
+
+        preset = compile_install_preset((), settings=settings)
+        if preset.ok:
+            default_candidate = normalize_configured_subagents(preset.available_subagents)[0]
+            diagnostics.extend(preset.diagnostics)
+        elif preset.refusal is not None:
+            diagnostics.append(preset.refusal.as_dict())
+    resolution = resolve_configured_subagents(settings, default_candidate=default_candidate)
+    if resolution.diagnostic:
+        diagnostics.insert(0, {
+            "code": "configured_subagents_invalid",
+            "message": resolution.diagnostic,
+        })
+    return resolution, tuple(diagnostics)
+
+
 def _append_legacy_model_rows(
     items: list[ConfiguredSubagent],
     settings: Mapping[str, Any],
+    *,
+    include_ids: Optional[set[str]] = None,
 ) -> None:
     from ouroboros.provider_models import model_has_credentials_in_settings
 
@@ -333,6 +400,8 @@ def _append_legacy_model_rows(
         ("legacy-heavy", "Primary builder", PRIMARY_RECOMMENDATION, heavy, ""),
         ("fast-scout", "Fast scout", SCOUT_RECOMMENDATION, light, "low"),
     ):
+        if include_ids is not None and row_id not in include_ids:
+            continue
         identity = (ROUTE_KIND_API_MODEL, model, "")
         if (
             not model
@@ -358,12 +427,45 @@ def _append_legacy_model_rows(
         seen.add(identity)
 
 
+def _append_candidate_rows(
+    items: list[ConfiguredSubagent],
+    candidates: Sequence[ConfiguredSubagent],
+) -> None:
+    """Merge compiler defaults after preserved legacy intent, by route identity."""
+    seen = {(row.route.kind, row.route.target_id, row.route.credential_profile_id) for row in items}
+    used_ids = {row.subagent_id for row in items}
+    for candidate in candidates:
+        identity = (
+            candidate.route.kind,
+            candidate.route.target_id,
+            candidate.route.credential_profile_id,
+        )
+        if identity in seen:
+            continue
+        row_id = candidate.subagent_id
+        suffix = 2
+        while row_id in used_ids:
+            row_id = f"{candidate.subagent_id}-{suffix}"
+            suffix += 1
+        items.append(
+            ConfiguredSubagent(
+                subagent_id=row_id,
+                name=candidate.name,
+                recommended_use=candidate.recommended_use,
+                route=candidate.route,
+                effort=candidate.effort,
+            )
+        )
+        seen.add(identity)
+        used_ids.add(row_id)
+
+
 def _legacy_model_target(settings: Mapping[str, Any], slot: str, key: str) -> str:
     model = str(settings.get(key) or "").strip()
     local = str(settings.get(f"USE_LOCAL_{slot}") or "").strip().lower()
     if local not in {"1", "true", "yes", "on"}:
         return model
-    if not model or not str(settings.get("LOCAL_MODEL_SOURCE") or "").strip():
+    if not model:
         return ""
     return model if model.endswith(" (local)") else f"{model} (local)"
 
@@ -401,5 +503,6 @@ __all__ = [
     "normalize_configured_subagents",
     "parse_configured_subagents",
     "resolve_configured_subagents",
+    "resolve_settings_subagent_candidate",
     "serialize_configured_subagents",
 ]

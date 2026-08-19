@@ -617,7 +617,13 @@ def compile_install_preset(
             SURFACE_SCOPE: resolved.get(SURFACE_SCOPE, []),
         },
         "discovery_counts": {h: len(discovery[h].model_ids) for h in connected},
-        "profile_pinned": False,  # D28: the daemon rotates accounts.
+        # Generated rows are deliberately unpinned so the daemon can rotate
+        # accounts.  An exact owner draft may still carry a pin, and the
+        # receipt must describe those saved bytes rather than the default.
+        "profile_pinned": any(
+            row.route.is_session and bool(row.route.credential_profile_id)
+            for row in available.items
+        ),
     }
     if capability:
         receipt["capability"] = dict(capability)

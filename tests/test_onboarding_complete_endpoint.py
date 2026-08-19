@@ -475,6 +475,41 @@ def test_an_old_unconfigured_install_is_not_retro_presetted(onboarding):
     assert saved["OUROBOROS_SAFETY_MODE"] == "full"
 
 
+def test_nonfresh_recovery_completion_still_saves_an_explicit_owner_draft(onboarding):
+    onboarding.settings_path.write_text(json.dumps({
+        "OUROBOROS_MODEL": "openai/gpt-5.6-luna",
+        SUBAGENTS_SETTING: "",
+        "OUROBOROS_REVIEWER_SLOTS": "owner-reviewer-bytes",
+    }), encoding="utf-8")
+    owner = {
+        "enabled": True,
+        "items": [{
+            "subagent_id": "owner-route",
+            "name": "Owner route",
+            "recommended_use": "Use this exact recovery draft.",
+            "route": {"kind": "api_model", "target_id": "openai/gpt-5.6-sol"},
+        }],
+    }
+
+    response = onboarding.client.post(
+        "/api/onboarding/complete",
+        json={
+            **WIZARD_PAYLOAD,
+            "subscriptionsConnected": True,
+            SUBAGENTS_SETTING: owner,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["preset"]["reason"] == "configured_by_owner"
+    assert response.json()["preset"]["applied"] is True
+    assert onboarding.calls["snapshot"] == 0
+    saved = onboarding.saved()
+    assert json.loads(saved[SUBAGENTS_SETTING]) == owner
+    assert saved["OUROBOROS_REVIEWER_SLOTS"] == "owner-reviewer-bytes"
+    assert not saved.get(PRESET_MARKER_KEY)
+
+
 def test_every_completion_records_the_durable_onboarding_fact(onboarding):
     """Including one that connected nothing: absence of a provider must never be
     able to re-open the install-time window later."""

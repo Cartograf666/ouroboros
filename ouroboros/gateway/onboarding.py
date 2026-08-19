@@ -707,7 +707,7 @@ async def api_onboarding_subagents_preview(request: Request) -> JSONResponse:
 
 
 def _persist(request: Request, old_settings: Dict[str, Any], current: Dict[str, Any],
-             pending_mode: str, safety_light: bool, preset_applied: bool,
+             pending_mode: str, safety_light: bool, install_preset_applied: bool,
              boundary: CommitBoundary, read_fingerprint: str) -> None:
     """The ONE write, plus the established post-save seams.
 
@@ -736,7 +736,9 @@ def _persist(request: Request, old_settings: Dict[str, Any], current: Dict[str, 
             to_save,
             authored_keys=authored,
             allow_safety_lowering=safety_light,
-            precondition=_write_precondition(preset_applied, safety_light, read_fingerprint),
+            precondition=_write_precondition(
+                install_preset_applied, safety_light, read_fingerprint,
+            ),
             boundary=boundary,
         )
         # STILL under the lock, symmetric with the generic save's locked body:
@@ -800,8 +802,23 @@ async def api_onboarding_complete(request: Request) -> JSONResponse:
         current["OUROBOROS_SAFETY_MODE"] = "light"
     preset: Optional[SubscriptionInstallPreset] = None
     preset_reason = "not_requested"
+    install_preset_applied = False
     if not eligible:
         preset_reason = "not_install_time"
+        # Install-time generation is closed, but an explicit canonical owner
+        # draft is still ordinary settings intent.  A recovery/retry completion
+        # must not answer 200 while silently discarding the editor value.  This
+        # path is pure: no daemon read, reviewer rewrite, or preset marker.
+        if owner_draft is not None:
+            preset, failure = await _compile_onboarding_preset(
+                current, subscriptions_connected=False, owner_draft=owner_draft,
+            )
+            if failure is not None:
+                return failure.as_response()
+            preset_reason = "configured_by_owner"
+            current.update(preset.settings_keys(
+                include_reviewer=False, include_marker=False,
+            ))
     elif skip_presets:
         preset_reason = "skipped_by_owner"
         if owner_draft is not None:
@@ -823,6 +840,7 @@ async def api_onboarding_complete(request: Request) -> JSONResponse:
         if failure is not None:
             return failure.as_response()
         preset_reason = "applied"
+        install_preset_applied = True
         # R8 ordering: provider normalization has ALREADY run over `current`;
         # the structured preset keys land on top of it, never through it.
         current.update(preset.settings_keys())
@@ -836,7 +854,7 @@ async def api_onboarding_complete(request: Request) -> JSONResponse:
     try:
         await asyncio.to_thread(
             _persist, request, old_settings, current, pending_mode, safety_light,
-            preset is not None, boundary, read_fingerprint,
+            install_preset_applied, boundary, read_fingerprint,
         )
     except Exception as exc:
         if boundary.committed:

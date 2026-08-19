@@ -69,6 +69,15 @@ def test_strict_config_round_trips_object_and_json_to_one_canonical_string():
             _config(_row(route={"kind": "agent_session", "target_id": "cursor=cursor-grok-4.6-high"}, effort="medium")),
             "conflicts with compound route effort",
         ),
+        (
+            _config(_row(route={"kind": "agent_session", "target_id": "cursor=cursor-grok-4.6-high-fast"}, effort="medium")),
+            "conflicts with compound route effort",
+        ),
+        (_config(_row(route={"kind": "agent_session", "target_id": "=gpt-5.6-sol"})), "session harness"),
+        (_config(_row(route={"kind": "agent_session", "target_id": "codex="})), "session model is empty"),
+        (_config(_row(route={"kind": "agent_session", "target_id": "codex=a=b"})), "at most one"),
+        (_config(_row(route={"kind": "agent_session", "target_id": "codex gpt-5.6-sol"})), "without whitespace"),
+        (_config(_row(route={"kind": "agent_session", "target_id": "codex=gpt-5.6-sol:high"})), "legacy ':effort'"),
     ],
 )
 def test_strict_parser_rejects_ambiguous_or_lossy_shapes(payload, match):
@@ -80,6 +89,17 @@ def test_maximum_ten_is_real_and_row_precise():
     parse_configured_subagents(_config(*(_row(f"row-{i}") for i in range(10))))
     with pytest.raises(ValueError, match=f"maximum is {MAX_CONFIGURED_SUBAGENTS}"):
         parse_configured_subagents(_config(*(_row(f"row-{i}") for i in range(11))))
+
+
+def test_optional_name_is_derived_but_an_explicit_non_string_is_rejected():
+    row = _row("owner_builder")
+    row.pop("name")
+    parsed = parse_configured_subagents(_config(row))
+    assert parsed.items[0].name == "Owner Builder"
+
+    row["name"] = 7
+    with pytest.raises(ValueError, match="name must be a string"):
+        parse_configured_subagents(_config(row))
 
 
 def test_valid_new_setting_wins_over_every_legacy_selector():
@@ -132,6 +152,22 @@ def test_legacy_off_is_explicit_false_and_never_becomes_default_candidate():
     assert resolution.config is not None
     assert resolution.config.enabled is False
     assert resolution.config.items == ()
+
+
+def test_legacy_off_preserves_custom_heavy_rows_without_reenabling_defaults():
+    candidate = parse_configured_subagents(_config(_row("must-not-default")))
+    resolution = resolve_configured_subagents(
+        {
+            "OUROBOROS_SUBAGENT_HARNESS": "off",
+            "OUROBOROS_MODEL_HEAVY": "anthropic::claude-opus-5",
+        },
+        default_candidate=candidate,
+    )
+
+    assert resolution.config is not None
+    assert resolution.config.enabled is False
+    assert [row.subagent_id for row in resolution.config.items] == ["legacy-heavy"]
+    assert resolution.config.items[0].route.target_id == "anthropic::claude-opus-5"
 
 
 def test_empty_is_undecided_and_candidate_remains_unsaved():
@@ -188,3 +224,41 @@ def test_custom_heavy_without_singleton_is_an_unsaved_undecided_migration_candid
         "anthropic::claude-opus-5",
     ]
     assert SUBAGENTS_SETTING not in settings
+
+
+def test_saved_local_heavy_intent_survives_a_temporarily_missing_source():
+    resolution = resolve_configured_subagents({
+        "OUROBOROS_MODEL_HEAVY": "owner-model",
+        "USE_LOCAL_HEAVY": True,
+        "LOCAL_MODEL_SOURCE": "",
+    })
+
+    assert resolution.config is not None
+    assert resolution.config.items[0].route.target_id == "owner-model (local)"
+
+
+def test_legacy_intent_precedes_and_deduplicates_compiler_defaults():
+    candidate = parse_configured_subagents(_config(
+        _row("primary-builder", route={
+            "kind": "agent_session",
+            "target_id": "claude=claude-opus-5",
+            "credential_profile_id": "",
+        }),
+        _row("fast-scout", route={
+            "kind": "api_model",
+            "target_id": "openai/gpt-5.6-luna",
+        }),
+    ))
+    resolution = resolve_configured_subagents({
+        "OUROBOROS_SUBAGENT_HARNESS": "claude=claude-opus-5",
+        "OUROBOROS_MODEL_HEAVY": "anthropic::claude-opus-5",
+        "OUROBOROS_MODEL_LIGHT": "openai/gpt-5.6-luna",
+        "OPENROUTER_API_KEY": "configured",
+    }, default_candidate=candidate)
+
+    assert resolution.config is not None
+    assert [row.route.target_id for row in resolution.config.items] == [
+        "claude=claude-opus-5",
+        "anthropic::claude-opus-5",
+        "openai/gpt-5.6-luna",
+    ]

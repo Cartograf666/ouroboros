@@ -261,6 +261,37 @@ def test_settings_get_reports_legacy_actor_source_without_materializing_it(
     assert json.loads(isolated_settings.read_text(encoding="utf-8")) == original
 
 
+def test_settings_get_builds_an_unsaved_api_candidate_through_the_shared_compiler(
+    monkeypatch, isolated_settings,
+):
+    from ouroboros.gateway import settings as settings_mod
+
+    original = {
+        "OPENROUTER_API_KEY": "configured",
+        "OUROBOROS_MODEL": "openai/gpt-5.6-sol",
+        "OUROBOROS_MODEL_LIGHT": "openai/gpt-5.6-luna",
+        "OUROBOROS_SUBAGENTS": "",
+        "OUROBOROS_SUBAGENT_HARNESS": "",
+    }
+    isolated_settings.write_text(json.dumps(original), encoding="utf-8")
+    app = Starlette(routes=[
+        Route("/api/settings", endpoint=settings_mod.api_settings_get, methods=["GET"]),
+    ])
+    app.state.drive_root = isolated_settings.parent
+    app.state.repo_dir = isolated_settings.parent
+
+    response = TestClient(app).get("/api/settings")
+
+    assert response.status_code == 200, response.text
+    projection = response.json()["_meta"]["available_subagents"]
+    assert projection["source"] == "undecided"
+    assert [row["route"]["target_id"] for row in projection["candidate"]["items"]] == [
+        "openai/gpt-5.6-sol",
+        "openai/gpt-5.6-luna",
+    ]
+    assert json.loads(isolated_settings.read_text(encoding="utf-8")) == original
+
+
 def test_a_malformed_body_says_saved_false(monkeypatch, isolated_settings):
     app = _settings_app(monkeypatch, isolated_settings)
     resp = TestClient(app).post("/api/settings", json=["not", "an", "object"])

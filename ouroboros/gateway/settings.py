@@ -995,12 +995,15 @@ async def api_settings_get(request: Request) -> JSONResponse:
     meta["setup_contract"] = build_setup_contract("web")
     from ouroboros.configured_subagents import (
         configured_subagents_dict,
-        resolve_configured_subagents,
+        resolve_settings_subagent_candidate,
     )
-    subagents = resolve_configured_subagents(settings)
+    # Pure API/local defaults only; the editor enriches a still-clean draft
+    # with connected sessions through the read-only preview endpoint.
+    subagents, candidate_diagnostics = resolve_settings_subagent_candidate(settings)
     meta["available_subagents"] = {
         "source": subagents.source,
         "diagnostic": subagents.diagnostic,
+        "diagnostics": candidate_diagnostics,
         "candidate": (
             configured_subagents_dict(subagents.config) if subagents.config is not None else None
         ),

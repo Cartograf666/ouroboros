@@ -284,6 +284,35 @@ def test_receipt_records_what_was_resolved_and_from_where():
     json.dumps(receipt)
 
 
+def test_owner_pinned_session_is_reported_truthfully_in_the_receipt():
+    from ouroboros.configured_subagents import parse_configured_subagents
+
+    owner = parse_configured_subagents({
+        "enabled": True,
+        "items": [{
+            "subagent_id": "owner-session",
+            "name": "Owner session",
+            "recommended_use": "Use the explicitly pinned owner account.",
+            "route": {
+                "kind": "agent_session",
+                "target_id": "claude=claude-opus-5",
+                "credential_profile_id": "owner-account",
+            },
+            "effort": "high",
+        }],
+    })
+    preset = compile_install_preset(
+        _discoveries("claude"),
+        configured_subagents=owner,
+        source="configured",
+    )
+
+    assert preset.ok, preset.refusal
+    assert preset.receipt["profile_pinned"] is True
+    saved_route = preset.receipt["available_subagents"]["items"][0]["route"]
+    assert saved_route["credential_profile_id"] == "owner-account"
+
+
 def test_compiler_reads_no_settings_and_carries_no_transport(monkeypatch):
     """The compiler is pure: everything it knows arrives as an argument.
 
