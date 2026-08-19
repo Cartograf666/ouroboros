@@ -74,6 +74,60 @@ def _install_task_detail_gate(page):
     )
 
 
+def _start_reversed_state_response_race(page):
+    """Hold the older app refresh; start a newer chat-header refresh behind it."""
+    page.route(
+        "**/api/owner/context-mode",
+        lambda route: route.fulfill(
+            content_type="application/json", body=json.dumps({"ok": True})
+        ),
+    )
+    page.evaluate(
+        r"""(() => {
+            const realFetch = window.fetch.bind(window);
+            const pending = [];
+            window.__stateResponsePending = pending;
+            window.fetch = (input, init) => {
+                const raw = typeof input === 'string' ? input : input?.url || '';
+                if (new URL(raw, location.href).pathname !== '/api/state') {
+                    return realFetch(input, init);
+                }
+                return new Promise((resolve) => pending.push({input, init, resolve}));
+            };
+            window.__settleStateResponse = async (index, activities, patch = {}) => {
+                const item = pending[index];
+                if (!item || item.settled) return false;
+                item.settled = true;
+                const response = await realFetch(item.input, item.init);
+                const payload = await response.json();
+                Object.assign(payload, patch || {});
+                payload.active_chat_activities = activities;
+                item.resolve(new Response(JSON.stringify(payload), {
+                    status: response.status,
+                    headers: {'Content-Type': 'application/json'},
+                }));
+                return true;
+            };
+            window.__failStateResponse = (index, status = 500) => {
+                const item = pending[index];
+                if (!item || item.settled) return false;
+                item.settled = true;
+                item.resolve(new Response('{}', {
+                    status, headers: {'Content-Type': 'application/json'},
+                }));
+                return true;
+            };
+            // app.js request is generation N and remains pending.
+            window.__ouroWs.emit('projects_changed', {});
+            // chat.js finally starts generation N+1 through its existing control refresh.
+            const control = document.querySelector('#chat-context-mode');
+            const next = control.dataset.contextMode === 'low' ? 'max' : 'low';
+            control.querySelector(`[data-mode="${next}"]`).click();
+        })()"""
+    )
+    page.wait_for_function("() => window.__stateResponsePending.length >= 2")
+
+
 @pytest.mark.ui_browser
 def test_ui_smoke_stale_history_rebuild_keeps_owner_bubble(direct_server_with_data):  # noqa: F811
     """Reconnect rebuild against a stale (empty) history keeps bubble + ack."""
@@ -194,6 +248,137 @@ def test_ui_smoke_late_open_chat_shows_managed_activity(direct_server_with_data)
                 # Queue authority concludes it: the task left PENDING/RUNNING.
                 state["managed"] = False
                 _wait_status(page, "Online", timeout=15_000)
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise
+
+
+@pytest.mark.ui_browser
+def test_ui_smoke_reversed_state_responses_do_not_resurrect_main_root(
+    direct_server_with_data,  # noqa: F811
+):
+    """A newer empty chat snapshot wins over an older active app snapshot."""
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    url = direct_server_with_data["url"]
+    card = '.chat-live-card[data-task-id="race-main-root"]'
+    activity = {
+        "activity_id": "race-main-root",
+        "chat_id": 1,
+        "project_id": "",
+        "client_message_id": "",
+        "kind": "managed_task",
+        "phase": "working",
+        "started_at": 1.0,
+    }
+    try:
+        with sync_playwright() as pw:
+            browser, page = _launch(pw)
+            try:
+                _install_task_detail_gate(page)
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                _wait_status(page, "Online", timeout=30_000)
+                page.evaluate(
+                    """() => {
+                        window.__ouroWs.emit('typing', {
+                            type: 'typing', chat_id: 1, activity_id: 'race-main-root',
+                            kind: 'managed_task', phase: 'working',
+                        });
+                        window.__ouroWs.emit('chat', {
+                            type: 'chat', role: 'assistant', is_progress: true,
+                            chat_id: 1, task_id: 'race-main-root', cancelable: true,
+                            content: 'Main race is running.',
+                        });
+                    }"""
+                )
+                page.wait_for_selector(f"{card} [data-cancel-run]")
+                page.wait_for_timeout(20)
+                _start_reversed_state_response_race(page)
+
+                # Generation N+1 returns first and proves queue loss.
+                assert page.evaluate(
+                    """() => window.__settleStateResponse(1, [], {
+                        task_bindings: {'fresh-binding': {project_id: 'fresh', chat_id: 77}},
+                    })"""
+                )
+                page.wait_for_function("() => window.__taskDetailCalls.length === 1")
+                assert page.locator(f"{card} [data-cancel-run]").count() == 0
+
+                # Generation N returns active later. It must mutate neither chat,
+                # Projects nav, nor the task-binding projection.
+                assert page.evaluate(
+                    """(activity) => window.__settleStateResponse(0, [activity], {
+                        projects: [{id: 'stale-project', name: 'Stale project',
+                                    chat_id: 999, lifecycle: 'active'}],
+                        project_chat_ids: [999],
+                        task_bindings: {'stale-binding': {project_id: 'stale-project', chat_id: 999}},
+                    })""",
+                    activity,
+                )
+                page.wait_for_timeout(100)
+                assert page.locator('[data-project-id="stale-project"]').count() == 0
+                assert page.evaluate(
+                    "() => Boolean(window.__ouroTaskBindings['fresh-binding'])"
+                    " && !window.__ouroTaskBindings['stale-binding']"
+                )
+
+                assert page.evaluate(
+                    """() => window.__settleTaskDetail({
+                        status: 'completed',
+                        root_phase_checkpoint: {post_task_synthesis: 'completed'},
+                        outcome_axes: {lifecycle: {status: 'completed'}},
+                    }, 200)"""
+                )
+                page.wait_for_function(
+                    "(sel) => document.querySelector(sel)?.dataset.finished === '1'",
+                    arg=card,
+                )
+                assert page.locator(f"{card} .chat-live-phase").inner_text().strip() == "Done"
+                assert page.evaluate("() => window.__taskDetailCalls") == ["race-main-root"]
+                _wait_status(page, "Online")
+
+                # A failed older CHAT request is presentation-only and must not
+                # roll back a newer successful APP response's header state.
+                before = page.evaluate("() => window.__stateResponsePending.length")
+                page.evaluate(
+                    """() => {
+                        const control = document.querySelector('#chat-context-mode');
+                        const next = control.dataset.contextMode === 'low' ? 'max' : 'low';
+                        control.querySelector(`[data-mode="${next}"]`).click();
+                    }"""
+                )
+                page.wait_for_function(
+                    "(before) => window.__stateResponsePending.length > before",
+                    arg=before,
+                )
+                failed_index = page.evaluate(
+                    "() => window.__stateResponsePending.length - 1"
+                )
+                success_index = page.evaluate(
+                    """() => {
+                        window.__ouroWs.emit('projects_changed', {});
+                        return window.__stateResponsePending.length - 1;
+                    }"""
+                )
+                assert page.evaluate(
+                    "(index) => window.__settleStateResponse(index, [], {evolution_enabled: true})",
+                    success_index,
+                )
+                page.wait_for_function(
+                    "() => document.querySelector('[data-chat-command=evolve]').classList.contains('on')"
+                )
+                assert page.evaluate(
+                    "(index) => window.__failStateResponse(index)", failed_index
+                )
+                page.wait_for_timeout(100)
+                assert page.locator('[data-chat-command="evolve"]').evaluate(
+                    "(node) => node.classList.contains('on')"
+                )
             finally:
                 browser.close()
     except PlaywrightError as exc:
@@ -627,6 +812,15 @@ def test_ui_smoke_open_project_panel_heals_lost_task_done_from_state_fanout(
     project_chat = int(project["chat_id"])
     status_sel = '[id="pchat-cont-panel-status"]'
     card = '#panel-pchat-cont-panel .chat-live-card[data-task-id="panel-root-1"]'
+    activity = {
+        "activity_id": "panel-root-1",
+        "chat_id": project_chat,
+        "project_id": "cont-panel",
+        "client_message_id": "",
+        "kind": "managed_task",
+        "phase": "working",
+        "started_at": 1.0,
+    }
 
     def _panel_status_is(page, expected, timeout=10_000):
         page.wait_for_function(
@@ -642,20 +836,7 @@ def test_ui_smoke_open_project_panel_heals_lost_task_done_from_state_fanout(
         with sync_playwright() as pw:
             browser, page = _launch(pw)
             try:
-                detail_calls = []
-
-                def _detail(route):
-                    detail_calls.append("panel-root-1")
-                    route.fulfill(
-                        content_type="application/json",
-                        body=json.dumps({
-                            "task_id": "panel-root-1",
-                            "status": "completed",
-                            "outcome_axes": {"lifecycle": {"status": "completed"}},
-                        }),
-                    )
-
-                page.route("**/api/tasks/panel-root-1", _detail)
+                _install_task_detail_gate(page)
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
                 page.click('.nav-project-row[data-project-id="cont-panel"]')
                 page.wait_for_selector("#project-panel:not([hidden])", timeout=30_000)
@@ -697,12 +878,26 @@ def test_ui_smoke_open_project_panel_heals_lost_task_done_from_state_fanout(
                 # registration even on a millisecond-resolution browser clock.
                 page.wait_for_timeout(20)
 
-                # No task_done is emitted. projects_changed invokes the existing
-                # app state refresh, whose snapshot is fanned into this live panel.
-                with page.expect_response("**/api/tasks/panel-root-1", timeout=10_000):
-                    page.evaluate(
-                        "() => window.__ouroWs.emit('projects_changed', {})"
-                    )
+                # The newer empty chat refresh applies before the older active app
+                # refresh. Its queue-loss fact must remain authoritative in-panel.
+                _start_reversed_state_response_race(page)
+                assert page.evaluate(
+                    "() => window.__settleStateResponse(1, [])"
+                )
+                page.wait_for_function("() => window.__taskDetailCalls.length === 1")
+                assert page.locator(f"{card} [data-cancel-run]").count() == 0
+                assert page.evaluate(
+                    "(activity) => window.__settleStateResponse(0, [activity])",
+                    activity,
+                )
+                page.wait_for_timeout(100)
+                assert page.evaluate(
+                    """() => window.__settleTaskDetail({
+                        status: 'completed',
+                        root_phase_checkpoint: {post_task_synthesis: 'completed'},
+                        outcome_axes: {lifecycle: {status: 'completed'}},
+                    }, 200)"""
+                )
                 page.wait_for_function(
                     "(sel) => [...document.querySelectorAll(sel)]"
                     ".some((node) => node.dataset.finished === '1')",
@@ -711,7 +906,7 @@ def test_ui_smoke_open_project_panel_heals_lost_task_done_from_state_fanout(
                 )
                 _panel_status_is(page, "Online")
                 assert page.locator(f"{card} .chat-live-phase").inner_text().strip() == "Done"
-                assert detail_calls == ["panel-root-1"]
+                assert page.evaluate("() => window.__taskDetailCalls") == ["panel-root-1"]
             finally:
                 browser.close()
     except PlaywrightError as exc:

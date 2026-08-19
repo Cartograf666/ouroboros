@@ -4,6 +4,7 @@ import { createWS } from './modules/ws.js';
 import { apiFetch, fetchJson } from './modules/api_client.js';
 import { loadVersion, initMatrixRain } from './modules/utils.js';
 import { initChat, createChatInstance } from './modules/chat.js';
+import { createStateSnapshotSequencer } from './modules/chat_activity.js';
 import { initFiles } from './modules/files.js';
 import { apiClient } from './modules/api_client.js';
 import { openNewProjectDialog, openProjectRowMenu } from './modules/project_create.js';
@@ -196,6 +197,12 @@ hydrateNavIcons();
 // Main's chat instance defers its first hydration to it (bounded upper limit
 // lives in chat.js), so a fast project open never competes with Main replay.
 let projectPanelOpeningSince = 0;
+let mainChat;
+const stateSnapshots = createStateSnapshotSequencer((data, requestedAt) => {
+    renderProjectsNav(data.projects || [], data.project_chat_ids);
+    applyTaskBindings(data.task_bindings || {});
+    hydrateOpenChatsFromState(data, requestedAt);
+});
 
 const ctx = {
     ws,
@@ -205,6 +212,7 @@ const ctx = {
     openSettingsTab,
     openDashboardTab,
     isProjectOpening: () => projectPanelOpeningSince > 0,
+    stateSnapshots,
     setBeforePageLeave: (handler) => {
         if (typeof handler !== 'function') return () => {};
         beforePageLeaveHandlers.push(handler);
@@ -215,7 +223,7 @@ const ctx = {
     },
 };
 
-const mainChat = initChat(ctx);
+mainChat = initChat(ctx);
 initFiles(ctx);
 
 function hydrateOpenChatsFromState(data, snapshotRequestedAt) {
@@ -536,17 +544,12 @@ document.getElementById('nav-projects-add')?.addEventListener('click', async (ev
 });
 
 async function refreshProjectsNav() {
-    const snapshotRequestedAt = Date.now();
+    const request = stateSnapshots.begin();
     try {
         const resp = await apiFetch('/api/state', { cache: 'no-store' });
         if (!resp.ok) return;
         const data = await resp.json();
-        renderProjectsNav(data.projects || [], data.project_chat_ids);
-        applyTaskBindings(data.task_bindings || {});
-        // This request already powers Project navigation. Fan its authoritative
-        // activity snapshot into every live chat instance instead of giving
-        // Project panels another timer/poll loop.
-        hydrateOpenChatsFromState(data, snapshotRequestedAt);
+        stateSnapshots.apply(request, data);
     } catch {}
 }
 

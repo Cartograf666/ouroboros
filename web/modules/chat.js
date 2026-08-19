@@ -218,6 +218,7 @@ export function initChat(ctx) {
 
 export function createChatInstance({
     ws, state, updateUnreadBadge, openSettingsTab, openDashboardTab,
+    stateSnapshots,
     chatId = 1, projectId = '', idPrefix = 'chat', mountEl = null,
     asPanel = false, title = 'Chat', initialScrollState = null,
     // perf2 P4.2: app.js signal "a project panel is opening right now" — Main
@@ -764,19 +765,21 @@ export function createChatInstance({
 
     async function refreshHeaderControlState(force = false) {
         if (!force && state.activePage !== 'chat') return;
-        // Snapshot authority barrier: the reply only knows activities that
-        // existed before this instant; later registrations survive hydration.
-        const snapshotRequestedAt = Date.now();
+        const request = stateSnapshots.begin();
         try {
             const resp = await apiFetch('/api/state', { cache: 'no-store' });
             if (!resp.ok) {
-                syncHeaderControlState({ accounting: { available: false } });
+                if (stateSnapshots.isCurrent(request)) {
+                    syncHeaderControlState({ accounting: { available: false } });
+                }
                 return;
             }
             const data = await resp.json();
-            hydrateStateSnapshot(data, snapshotRequestedAt);
+            stateSnapshots.apply(request, data);
         } catch {
-            syncHeaderControlState({ accounting: { available: false } });
+            if (stateSnapshots.isCurrent(request)) {
+                syncHeaderControlState({ accounting: { available: false } });
+            }
         }
     }
 
@@ -3909,12 +3912,12 @@ export function createChatInstance({
 
     let headerControlInterval = null;
     if (asPanel) {
-        // The panel has no global controls/budget to poll; seed the status from
+        // A panel has no global controls/budget to poll; seed the status from
         // the live socket so a late-created panel never gets stuck on
         // "Connecting…" (the one-shot WS `open` already fired before it existed;
         // future reconnects still update it via the shared `open` handler).
         if (ws.isConnected?.()) setStatus('online', 'Online');
-        // 1A: a panel created AFTER the socket opened missed the typing frame
+        // 1A a panel created AFTER the socket opened missed the typing frame
         // and the `open`-driven refresh — hydrate in-flight turns once from
         // the snapshot (per-instance closure filters to this panel's chat_id).
         refreshHeaderControlState(true);

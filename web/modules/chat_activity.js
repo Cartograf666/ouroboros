@@ -243,6 +243,32 @@ export function isTerminalTaskDetail(record) {
 const SNAPSHOT_AUTHORITATIVE_KINDS = new Set(['direct_chat', 'ephemeral_decision', 'managed_task']);
 
 /**
+ * One request/apply clock for every /api/state consumer on a page. Responses
+ * may finish in either order; once generation N applies, an older generation
+ * can no longer mutate any projection. requestedAt stays tied to request start
+ * so activity hydration keeps its WS-arrival barrier.
+ */
+export function createStateSnapshotSequencer(onApply, now = () => Date.now()) {
+    let requestedGeneration = 0;
+    let appliedGeneration = 0;
+    return {
+        begin() {
+            return { generation: ++requestedGeneration, requestedAt: now() };
+        },
+        apply(request, data) {
+            const generation = Number(request?.generation) || 0;
+            if (!generation || generation <= appliedGeneration) return false;
+            appliedGeneration = generation;
+            onApply(data, request.requestedAt);
+            return true;
+        },
+        isCurrent(request) {
+            return (Number(request?.generation) || 0) > appliedGeneration;
+        },
+    };
+}
+
+/**
  * Single status reducer for the chat header (owner decisions 2A/5A; managed
  * activities added by the project-continuity contract). Priority: disconnected
  * > background live card (Working...) > admitted managed work (Working...) >

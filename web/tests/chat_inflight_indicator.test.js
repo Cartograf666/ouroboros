@@ -5,6 +5,27 @@ import {
     computeDerivedChatStatus,
     computeHydratedDirectActivities,
 } from '../modules/chat.js';
+import { createStateSnapshotSequencer } from '../modules/chat_activity.js';
+
+test('state snapshots and failure authority stay monotonic across reversed completion', () => {
+    const applied = [];
+    const requestTimes = [100, 200];
+    const snapshots = createStateSnapshotSequencer(
+        (data, requestedAt) => applied.push({ data, requestedAt }),
+        () => requestTimes.shift(),
+    );
+    const older = snapshots.begin();
+    const newer = snapshots.begin();
+
+    assert.deepEqual(older, { generation: 1, requestedAt: 100 });
+    assert.deepEqual(newer, { generation: 2, requestedAt: 200 });
+    assert.equal(snapshots.isCurrent(older), true);
+    assert.equal(snapshots.apply(newer, { activities: [] }), true);
+    // An older non-OK/catch path can no longer regress the newer header.
+    assert.equal(snapshots.isCurrent(older), false);
+    assert.equal(snapshots.apply(older, { activities: ['stale-root'] }), false);
+    assert.deepEqual(applied, [{ data: { activities: [] }, requestedAt: 200 }]);
+});
 
 test('computeDerivedChatStatus: offline state when ws is disconnected', () => {
     const status = computeDerivedChatStatus({
