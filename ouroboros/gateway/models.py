@@ -13,7 +13,16 @@ from starlette.responses import JSONResponse
 
 from ouroboros.config import load_settings
 from ouroboros.gateway._helpers import json_error, json_exception
-from ouroboros.provider_models import resolve_minimax_base_url
+from ouroboros.observability import redact_projection
+from ouroboros.provider_models import (
+    ALL_PROVIDER_CREDENTIAL_KEYS,
+    DIRECT_PROVIDER_DEFAULTS,
+    MINIMAX_REGION_ENDPOINTS,
+    MODEL_SETTING_KEYS,
+    OPENROUTER_DEFAULTS,
+    provider_for_model,
+    resolve_minimax_base_url,
+)
 
 log = logging.getLogger(__name__)
 
@@ -258,14 +267,14 @@ def _provider_specs(
                 compatible_base_url,
             ),
         ))
-    elif openai_api_key and legacy_base_url:
+    elif legacy_base_url:
         specs.append((
             "openai-compatible",
             lambda client: _fetch_openai_compatible_model_catalog(
                 client,
                 "openai-compatible",
                 "OpenAI Compatible",
-                openai_api_key,
+                compatible_api_key or openai_api_key,
                 legacy_base_url,
             ),
         ))
@@ -491,6 +500,145 @@ async def api_openai_compatible_models(request: Request) -> JSONResponse:
         return JSONResponse({"error": f"HTTP {e.response.status_code}"}, status_code=502)
     except Exception as e:
         return json_exception(e)
+
+
+_PROVIDER_TEST_OVERRIDE_KEYS = ALL_PROVIDER_CREDENTIAL_KEYS
+_PROVIDER_TEST_KNOWN_IDS: frozenset[str] = frozenset({
+    "openrouter", "openai-compatible", *DIRECT_PROVIDER_DEFAULTS,
+})
+
+
+def _provider_test_model(provider_id: str, settings: dict) -> str:
+    """Resolve one deterministic runtime/default model without catalog I/O."""
+    for setting_key in MODEL_SETTING_KEYS:
+        for raw_model in str(settings.get(setting_key, "") or "").split(","):
+            model = raw_model.strip()
+            if model and provider_for_model(model) == provider_id:
+                return model
+    if provider_id == "openrouter":
+        return str(OPENROUTER_DEFAULTS.get("main") or "").strip()
+    return str((DIRECT_PROVIDER_DEFAULTS.get(provider_id) or {}).get("main") or "").strip()
+
+
+def _discover_provider_test_model(provider_id: str, settings: dict) -> str:
+    """Catalog discovery for the sole route without a maintained default."""
+    if provider_id != "openai-compatible":
+        return ""
+
+    async def load_first() -> str:
+        loader = dict(_provider_specs(settings)).get(provider_id)
+        if loader is None:
+            return ""
+        async with httpx.AsyncClient(timeout=httpx.Timeout(_CATALOG_HTTP_TIMEOUT_SEC)) as client:
+            items = await loader(client)
+        return str((items[0] if items else {}).get("value") or "").strip()
+
+    return asyncio.run(load_first())
+
+
+def _provider_test_log(provider_id: str, model: str, result: dict, duration_ms: int) -> None:
+    facts = redact_projection({
+        "provider_id": provider_id,
+        "model": model,
+        "ok": bool(result.get("ok")),
+        "error_category": str(result.get("error") or ""),
+        "status_code": result.get("status_code"),
+        "exception_type": str(result.get("exception_type") or ""),
+        "duration_ms": duration_ms,
+    }).value
+    logger = log.info if facts.get("ok") else log.warning
+    logger("provider_test result=%s", facts)
+
+
+def _run_provider_test_with_settings(provider_id: str, settings: dict) -> dict:
+    """Run selection, optional discovery, client construction and one send."""
+    from ouroboros.llm import LLMClient
+    from ouroboros.llm_probe import controlled_probe_error
+
+    started = time.perf_counter()
+    model = ""
+    try:
+        model = _provider_test_model(provider_id, settings)
+        if not model:
+            model = _discover_provider_test_model(provider_id, settings)
+        if not model:
+            result = {
+                "ok": False,
+                "error": "Provider is not configured",
+                "status_code": None,
+                "exception_type": "ProviderNotConfigured",
+            }
+        else:
+            result = LLMClient().probe_provider_readiness(model, settings=settings)
+    except Exception as exc:
+        result = controlled_probe_error(exc)
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    _provider_test_log(provider_id, model, result, duration_ms)
+    public = {"ok": bool(result.get("ok"))}
+    if not public["ok"]:
+        public["error"] = str(result.get("error") or "Model request failed")
+    return public
+
+
+def _run_provider_test(provider_id: str, overrides: dict[str, str]) -> dict:
+    """Load and merge the request-local draft inside the worker thread."""
+    settings = dict(load_settings())
+    if provider_id == "openai-compatible":
+        # No-edit requests retain the historical OPENAI_* fallback. An explicit
+        # Clear on the dedicated card must not silently restore the corresponding
+        # legacy value for this request-local probe.
+        legacy_fallbacks = {
+            "OPENAI_COMPATIBLE_API_KEY": "OPENAI_API_KEY",
+            "OPENAI_COMPATIBLE_BASE_URL": "OPENAI_BASE_URL",
+        }
+        if not any(str(settings.get(key, "") or "").strip() for key in legacy_fallbacks):
+            # A legacy install has no dedicated compatible pair yet. Preserve the
+            # saved half the owner did not edit while the other half is a draft.
+            for dedicated_key, legacy_key in legacy_fallbacks.items():
+                if dedicated_key not in overrides:
+                    settings[dedicated_key] = str(settings.get(legacy_key, "") or "").strip()
+        for dedicated_key, legacy_key in legacy_fallbacks.items():
+            if dedicated_key in overrides and not overrides[dedicated_key].strip():
+                settings[legacy_key] = ""
+    settings.update({key: value.strip() for key, value in overrides.items()})
+    minimax_region = str(settings.get("MINIMAX_REGION", "") or "").strip().lower()
+    if provider_id == "minimax" and minimax_region and minimax_region not in MINIMAX_REGION_ENDPOINTS:
+        return {"error": "unknown MiniMax region", "_http_status": 400}
+    return _run_provider_test_with_settings(provider_id, settings)
+
+
+async def api_provider_test(request: Request) -> JSONResponse:
+    """Run one request-local, physically accounted completion probe."""
+    try:
+        body = await request.json()
+    except Exception:
+        return json_error("request body must be a JSON object", 400)
+    if not isinstance(body, dict):
+        return json_error("request body must be a JSON object", 400)
+    provider_id = str(body.get("provider_id", "") or "").strip()
+    if not provider_id:
+        return json_error("provider_id is required", 400)
+    if provider_id not in _PROVIDER_TEST_KNOWN_IDS:
+        return json_error("unknown provider id", 400)
+
+    overrides = body.get("overrides")
+    if overrides is None:
+        overrides = {}
+    if not isinstance(overrides, dict):
+        return json_error("overrides must be an object", 400)
+    unknown = sorted(str(key) for key in overrides if str(key) not in _PROVIDER_TEST_OVERRIDE_KEYS)
+    if unknown:
+        return json_error(f"unsupported override keys: {', '.join(unknown)}", 400)
+    if any(not isinstance(value, str) for value in overrides.values()):
+        return json_error("override values must be strings", 400)
+
+    result = await asyncio.to_thread(
+        _run_provider_test,
+        provider_id,
+        {str(key): value for key, value in overrides.items()},
+    )
+    status_code = int(result.pop("_http_status", 200))
+    return JSONResponse(result, status_code=status_code)
 
 
 async def api_local_model_install_runtime(request: Request) -> JSONResponse:

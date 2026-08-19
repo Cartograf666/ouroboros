@@ -296,7 +296,14 @@ def check_stray_server_processes(env: Any) -> Tuple[Dict[str, Any], int]:
     neither this process tree, the recorded server process, nor any pid ever
     recorded in the custody ledger (conservative under-reporting: a reused
     ledger pid masks a stray rather than false-flagging a legitimate one). Scans
-    only THIS user's processes; non-POSIX platforms skip (pgrep-based)."""
+    only THIS user's processes; non-POSIX platforms skip (pgrep-based).
+
+    Each report carries a ``scope``: ``same_install`` when the command line names
+    THIS install's ``<REPO_DIR>/server.py``, else ``foreign``. The launcher reaps
+    proven same-install strays before every generation
+    (``ouroboros.launcher_server_reaper``), so a same_install WARN that persists
+    means one of: a direct (unmanaged) run of this checkout, a process spared for
+    lack of readable env proof, or a pid that survived the kill passes."""
     import os as _os
     import pathlib as _pathlib
     import re as _re
@@ -340,6 +347,23 @@ def check_stray_server_processes(env: Any) -> Tuple[Dict[str, Any], int]:
             r"(ouroboros(\.cli)?\s+server|ouroboros/(repo/)?server\.py|-m\s+ouroboros\.cli\s+server)",
             _re.IGNORECASE,
         )
+        # The reaper's own identity rule (exact argv token after a python
+        # interpreter, literal + resolved spellings): the scope label must agree
+        # with what the launcher sweep would actually treat as a server, or an
+        # editor merely opening server.py would read as a same_install stray.
+        try:
+            from ouroboros.config import REPO_DIR as _repo_dir
+            from ouroboros.launcher_server_reaper import (
+                command_names_our_server as _names_our_server,
+                install_server_path_forms as _server_path_forms,
+            )
+
+            same_install_paths = _server_path_forms(_repo_dir)
+        except Exception:
+            # The identity rule could not load: an unlabelled answer is honest,
+            # a hard 'foreign' would deny a genuine same-install stray.
+            same_install_paths = set()
+            _names_our_server = None
         stray: list[dict[str, Any]] = []
         for line in (out.stdout or "").splitlines():
             try:
@@ -368,7 +392,13 @@ def check_stray_server_processes(env: Any) -> Tuple[Dict[str, Any], int]:
                     continue
             except Exception:
                 pass
-            stray.append({"pid": pid, "command": command[:160]})
+            if _names_our_server is None:
+                scope = "unknown"
+            else:
+                scope = ("same_install"
+                         if _names_our_server(command or "", same_install_paths)
+                         else "foreign")
+            stray.append({"pid": pid, "command": command[:160], "scope": scope})
         if stray:
             log.warning("Stray ouroboros server process(es) outside this install: %s", stray)
             return {"status": "stray_processes", "processes": stray}, 1

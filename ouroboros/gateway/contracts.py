@@ -777,6 +777,16 @@ class ModelCatalogResponse(TypedDict, total=False):
     error: str
 
 
+class ProviderTestRequest(TypedDict):
+    provider_id: str
+    overrides: NotRequired[Dict[str, str]]
+
+
+class ProviderTestResponse(TypedDict):
+    ok: bool
+    error: NotRequired[str]
+
+
 class FileBrowserListResponse(TypedDict, total=False):
     root: str
     path: str
@@ -1206,6 +1216,7 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "POST /api/chat/upload",
     "DELETE /api/chat/upload",
     "POST /api/openai-compatible/models",
+    "POST /api/providers/test",
     "GET /api/local-model/status",
     "POST /api/local-model/start",
     "POST /api/local-model/stop",
@@ -1351,6 +1362,8 @@ __all__ = [
     "LocalModelStatusResponse",
     "McpStatusResponse",
     "ModelCatalogResponse",
+    "ProviderTestRequest",
+    "ProviderTestResponse",
     "FileBrowserListResponse",
     "ChatHistoryResponse",
     "ExecutorRef",

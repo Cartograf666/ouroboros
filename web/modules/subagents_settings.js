@@ -32,6 +32,7 @@ import {
     READ_UNREAD,
     accountRows,
     bindStatusSurface,
+    boundedStatusRefresh,
     claudexorStatus,
     facetGapClause,
     statusUnavailableNote,
@@ -573,7 +574,12 @@ function adoptStoreSnapshot() {
 }
 
 export async function reloadSubagentsSection() {
-    await state.store.refresh({ includeModels: true });
+    // Bounded await — the same rule as reloadReviewerSlots, or the fix there
+    // is defeated: loadSettings awaits BOTH via Promise.all, so one unbounded
+    // sibling keeps the Save button hostage to the cold-daemon probe. A warm
+    // daemon settles inside the beat; a cold one keeps refreshing in the
+    // background and the status surface binding repaints this section.
+    await boundedStatusRefresh(state.store);
     adoptStoreSnapshot();
     renderRows();
 }

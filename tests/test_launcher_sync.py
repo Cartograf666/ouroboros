@@ -301,6 +301,8 @@ def test_agent_lifecycle_preflight_cleans_host_service_port(monkeypatch):
     launcher._shutdown_event.clear()
     monkeypatch.setattr(launcher, "_host_service_port", lambda: 9876)
     monkeypatch.setattr(launcher, "_kill_stale_on_port", lambda port: killed.append(port))
+    # The per-generation stray sweep must never signal a real process from a test.
+    monkeypatch.setattr(launcher, "_reap_same_install_strays", lambda reason: [])
     monkeypatch.setattr(launcher, "start_agent", lambda port: FakeProcess())
     monkeypatch.setattr(launcher, "_poll_port_file", lambda timeout=30: 8765)
     monkeypatch.setattr(launcher, "_wait_for_server", lambda port, timeout=30.0: True)

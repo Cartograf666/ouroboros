@@ -152,6 +152,11 @@ export const apiClient = {
     ownerCapabilityAck: (payload) => jsonPost('/api/owner/capability-ack', payload),
     /** @returns {Promise<import('./api_types.js').OpenAICompatibleModelsResponse>} */
     openAICompatibleModels: (payload) => jsonPost('/api/openai-compatible/models', payload),
+    /**
+     * @param {import('./api_types.js').ProviderTestRequest} payload
+     * @returns {Promise<import('./api_types.js').ProviderTestResponse>}
+     */
+    providerTest: (payload) => jsonPost('/api/providers/test', payload),
     extensions: () => fetchJson('/api/extensions', { cache: 'no-store' }),
     skillLifecycleQueue: () => fetchJson('/api/skills/lifecycle-queue', { cache: 'no-store' }),
     /** @returns {Promise<import('./api_types.js').SkillDeleteResponse>} */

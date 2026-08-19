@@ -20,7 +20,7 @@
 // Pure helpers live at the top and are node-tested without a DOM.
 
 import { apiFetch } from './api_client.js';
-import { bindStatusSurface, claudexorStatus } from './claudexor_status_store.js';
+import { bindStatusSurface, boundedStatusRefresh, claudexorStatus } from './claudexor_status_store.js';
 import { formatRelativeAge } from './ui_helpers.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
@@ -752,8 +752,14 @@ export async function reloadReviewerSlots() {
     }
     // ONE status read for the whole app (the accounts panel and the Subagents
     // section share this request; `includeModels` is sticky, so no later read
-    // downgrades the snapshot these selects depend on).
-    await state.store.refresh({ includeModels: true });
+    // downgrades the snapshot these selects depend on). Awaited only for a
+    // BOUNDED beat: this read can wake a cold Claudexor daemon and walk
+    // per-harness model discovery, and awaiting it outright held the Save
+    // button (loadSettings awaits this function) hostage for the whole probe.
+    // A warm daemon settles inside the beat and keeps the exact old
+    // semantics; a cold one keeps refreshing in the background and the status
+    // surface binding repaints these rows when the snapshot lands.
+    await boundedStatusRefresh(state.store);
     adoptStatusSnapshot();
     renderRows();
 }

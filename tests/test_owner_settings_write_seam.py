@@ -341,3 +341,129 @@ def test_a_lock_held_read_does_not_wait_for_the_lock_it_holds(isolated_settings)
 
     assert settings["TOTAL_BUDGET"] == 42.0
     assert elapsed < 0.5, f"the lock-held read waited {elapsed:.2f}s for a lock it holds"
+
+
+def test_settings_save_body_runs_off_the_event_loop():
+    """The save body is synchronous work — validation, the disk write, env
+    projection, hot-reload side effects, and (when review keys changed)
+    NETWORK evidence fetches for the warning surface. On the event loop it
+    froze every other request and WebSocket for the whole save."""
+    import ast
+    import pathlib
+
+    src = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "ouroboros" / "gateway" / "settings.py"
+    ).read_text(encoding="utf-8")
+    endpoint_text = ""
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "api_settings_post":
+            endpoint_text = ast.unparse(node)
+    assert "asyncio.to_thread(_api_settings_post_sync" in endpoint_text
+
+    # Worker threads do not inherit the event loop's free serialization: a
+    # writer interleaving read-merge-write with another would silently drop
+    # keys. EVERY settings.py writer holds the seam-wide document lock — the
+    # generic save's threaded body and all five single-decision endpoints.
+    sync_text = ""
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.FunctionDef) and node.name == "_api_settings_post_sync":
+            sync_text = ast.unparse(node)
+    assert "settings_document_mutation" in sync_text
+    # Named per writer, not a substring count: a seventh writer added without
+    # the lock must FAIL this pin, and a refactor must not satisfy it by
+    # accident.
+    writers = {
+        "_api_settings_post_sync",
+        "_api_owner_runtime_mode_sync",
+        "_api_owner_auto_grant_sync",
+        "_api_owner_context_mode_sync",
+        "_api_owner_scope_review_floor_sync",
+        "_api_owner_safety_mode_sync",
+    }
+    # The loop must NEVER hold the document lock: every async settings writer
+    # delegates its locked body to a worker thread.
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name in {
+            "api_owner_runtime_mode", "api_owner_auto_grant", "api_owner_context_mode",
+            "api_owner_scope_review_floor", "api_owner_safety_mode",
+        }:
+            assert "asyncio.to_thread" in ast.unparse(node), (
+                f"{node.name} must run its locked body off the event loop"
+            )
+    seen = {}
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in writers:
+            seen[node.name] = ast.unparse(node)
+    assert set(seen) == writers, f"missing writer functions: {writers - set(seen)}"
+    for name, text in seen.items():
+        assert "settings_document_mutation" in text, (
+            f"{name} must hold the document lock across its read-merge-write"
+        )
+    # The onboarding transaction lives in its own module and holds the lock
+    # from its write through env projection and hot-reload (a fingerprint
+    # precondition refuses ITS stale merge, not a later writer's).
+    onboarding_src = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "ouroboros" / "gateway" / "onboarding.py"
+    ).read_text(encoding="utf-8")
+    for node in ast.walk(ast.parse(onboarding_src)):
+        if not isinstance(node, ast.With):
+            continue
+        header = "".join(ast.unparse(item.context_expr) for item in node.items)
+        if "settings_document_mutation" not in header:
+            continue
+        locked_body = "".join(ast.unparse(stmt) for stmt in node.body)
+        assert "_owner_write_settings(" in locked_body, (
+            "the onboarding write must sit inside the document lock"
+        )
+        assert "apply_settings_to_env(" in locked_body, (
+            "the lock must cover the environment projection, not just the write"
+        )
+        break
+    else:
+        raise AssertionError("onboarding.py holds no settings_document_mutation block")
+
+    # And any FUTURE writer: every _owner_write_settings call site in this
+    # module must live inside one of the locked writers above. The locked body
+    # itself is the one exemption — its caller _api_settings_post_sync holds
+    # the lock for it.
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in writers or node.name == "_api_settings_post_locked":
+                continue
+            if "_owner_write_settings(" in ast.unparse(node):
+                assert "settings_document_mutation" in ast.unparse(node), (
+                    f"new settings writer {node.name} does not hold the document lock"
+                )
+
+
+def test_reviewer_slots_reload_does_not_await_the_status_probe():
+    """The shared Claudexor status read can wake a cold daemon and walk model
+    discovery; awaiting it inside reloadReviewerSlots held the Save button
+    (loadSettings awaits that function) hostage for the whole probe. The
+    status surface binding repaints the rows when the snapshot lands."""
+    import pathlib
+
+    source = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "web" / "modules" / "reviewer_slots.js"
+    ).read_text(encoding="utf-8")
+    assert "await boundedStatusRefresh(state.store);" in source
+    assert "await state.store.refresh" not in source
+    # loadSettings awaits BOTH sections via Promise.all: one unbounded sibling
+    # would keep the Save button hostage to the same probe.
+    subagents = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "web" / "modules" / "subagents_settings.js"
+    ).read_text(encoding="utf-8")
+    assert "await boundedStatusRefresh(state.store);" in subagents
+    assert "await state.store.refresh" not in subagents
+    store = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "web" / "modules" / "claudexor_status_store.js"
+    ).read_text(encoding="utf-8")
+    assert "Promise.race([refresh, beat]).finally(() => { if (timer) clearTimeout(timer); });" in store, (
+        "the bounded beat must race the refresh (never cancel it) and clear "
+        "the losing timer"
+    )

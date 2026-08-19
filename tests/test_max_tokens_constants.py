@@ -35,6 +35,13 @@ def test_project_naming_max_tokens_pinned():
     assert 256 in found, f"Expected max_tokens=256 in project_naming.py, got {found}"
 
 
+def test_provider_test_max_tokens_pinned():
+    """The paid Provider Test remains one deliberately tiny 16-token probe."""
+    from ouroboros.llm_probe import PROVIDER_TEST_MAX_TOKENS
+
+    assert PROVIDER_TEST_MAX_TOKENS == 16
+
+
 def test_scope_review_max_tokens():
     """scope_review.py _SCOPE_MAX_TOKENS must be ≥100000."""
     from ouroboros.tools.scope_review import _SCOPE_MAX_TOKENS

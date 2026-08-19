@@ -56,6 +56,9 @@ from ouroboros.launcher_onboarding import (
     prepare_first_run_settings as _prepare_first_run_settings,
     present_first_run_onboarding as _present_first_run_onboarding,
 )
+from ouroboros.launcher_server_reaper import (
+    reap_same_install_strays as _reap_same_install_strays_impl,
+)
 from ouroboros.platform_layer import (
     BUNDLE_DIR_ENV,
     IS_LINUX,
@@ -596,8 +599,13 @@ def _kill_stale_on_port(port: int) -> None:
         kill_process_on_port(port)
         return
     try:
+        # -sTCP:LISTEN keeps this a listener sweep: a bare tcp:PORT selector
+        # also matches ESTABLISHED client sockets, and in browser mode the
+        # owner's own browser holds one — sweeping it violates the invariant
+        # documented on _open_browser_detached (the browser is the owner's
+        # application, outside custody). -nP avoids resolver stalls.
         result = subprocess.run(
-            ["lsof", "-ti", f"tcp:{port}"],
+            ["lsof", "-nP", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -629,6 +637,35 @@ def _kill_stale_runtime_ports(port: int) -> None:
     """Clear core runtime listener ports before start/restart."""
     _kill_stale_on_port(port)
     _kill_stale_on_port(_host_service_port())
+
+
+def _reap_same_install_strays(reason: str) -> list[int]:
+    """Kill leftover generations of THIS install's server; return proven survivors.
+
+    Only ever called while this process holds the single-instance pid lock, which is what makes the
+    identity rule sound: with the lock held, another process running this install's server.py under
+    this launcher's stamped environment cannot be a live peer's generation. Never called from a
+    panic or window-close path — Emergency Stop tears down what it owns and adds no new killing.
+    """
+    try:
+        return _reap_same_install_strays_impl(REPO_DIR, DATA_DIR, reason)
+    except Exception:
+        # A sweep that cannot run must not stop the launcher booting.
+        log.warning("Same-install stray sweep failed (%s)", reason, exc_info=True)
+        return []
+
+
+def _pre_generation_cleanup(port: int) -> list[int]:
+    """Clear the previous generation before starting a new one; returns proven stray survivors.
+
+    Per GENERATION, not once per launcher: exit-42 and crash restarts are where the observed
+    double-boot collisions began. Ordered recorded-cleanup -> stray sweep -> port sweep: the
+    recorded pid keeps its record-driven path with the record unlinked first, the tree kill runs
+    while PPID links are still live, and the port sweep stays the residual net."""
+    _cleanup_recorded_server_process("startup")
+    survivors = _reap_same_install_strays("startup")
+    _kill_stale_runtime_ports(port)
+    return survivors
 
 
 def _wait_for_server(port: int, timeout: float = 30.0, abort_event=None) -> bool:
@@ -709,10 +746,19 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
     global _agent_proc, _agent_job
     crash_times: list[float] = []
 
-    _cleanup_recorded_server_process("startup")
-    _kill_stale_runtime_ports(port)
-
     while not _shutdown_event.is_set():
+        survivors = _pre_generation_cleanup(port)
+        if survivors:
+            # Starting now would put a second generation on the same data directory — the exact
+            # collision this sweep exists to prevent. The next iteration re-sweeps.
+            log.error(
+                "Not starting the agent: same-install server process(es) %s are proven "
+                "launcher-managed strays but survived every kill pass. Retrying in 3s.",
+                survivors,
+            )
+            time.sleep(3)
+            continue
+
         try:
             PORT_FILE.unlink(missing_ok=True)
         except OSError:
@@ -759,7 +805,8 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
             # restart. No dependency sync — nothing about the checkout changed.
             _agent_restart_requested.clear()
             log.info("Restarting the agent to adopt the saved first-run configuration.")
-            _kill_stale_runtime_ports(port)
+            # No port sweep here: _pre_generation_cleanup at the top of the
+            # next iteration runs it as its third phase.
             continue
 
         if exit_code == RESTART_EXIT_CODE:
@@ -783,7 +830,7 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
                         "import them — see the pip output above for the cause.",
                         MAX_CRASH_RESTARTS, CRASH_WINDOW_SEC,
                     )
-            _kill_stale_runtime_ports(port)
+            # No port sweep here: _pre_generation_cleanup owns it next iteration.
             continue
 
         now = time.time()
@@ -794,7 +841,7 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
             break
 
         log.info("Agent crashed. Restarting in 3s...")
-        _kill_stale_runtime_ports(port)
+        # No port sweep here: _pre_generation_cleanup owns it next iteration.
         time.sleep(3)
 
 def _request_agent_restart() -> None:
@@ -1050,13 +1097,15 @@ def _headless_signal_handler(signum, frame) -> None:
     _shutdown_event.set()
 
 
-def _open_browser_detached(url: str) -> None:
+def _open_browser_detached(url: str) -> threading.Thread:
     """Open the default browser without ever blocking the caller.
 
     `webbrowser.open` waits for the child on a stdlib-resolved console
     browser (w3m/lynx or an unrecognized $BROWSER), which would stall the
     keep-alive loop for that browser's lifetime; the URL is already printed,
-    so the open is best-effort and rides a daemon thread.
+    so the open is best-effort and rides a daemon thread. Returns the thread
+    so a short-lived caller (the already-running notice) can bound-join it
+    before process exit would kill the daemon thread under the opener.
 
     DELIBERATE (owner-approved): the opened browser is the USER'S own
     application, intentionally outside process custody and launcher teardown —
@@ -1070,7 +1119,9 @@ def _open_browser_detached(url: str) -> None:
         except Exception:
             log.info("Could not open the default browser for %s", url, exc_info=True)
 
-    threading.Thread(target=_open, name="ouroboros-open-browser", daemon=True).start()
+    thread = threading.Thread(target=_open, name="ouroboros-open-browser", daemon=True)
+    thread.start()
+    return thread
 
 
 def _run_headless_main(url: str, port: int, lifecycle_thread: threading.Thread) -> None:
@@ -1135,10 +1186,31 @@ def main():
     if not acquire_pid_lock():
         log.error("Another instance already running.")
         if _headless:
+            # The lock loss usually races the FIRST launcher's bootstrap
+            # (repeated Open clicks): the port file may be absent (unlinked
+            # pre-start) or stale from an older run on another port. Poll
+            # briefly for a healthy server, re-reading the file between
+            # probes, so Open during bootstrap lands on the live UI; on
+            # timeout fall back to the last-read port (best-effort notice;
+            # the bound is soft — a probe straddling the deadline may run
+            # its own urlopen timeout, a couple of seconds of overshoot).
+            port = _read_port_file()
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not _wait_for_server(port, timeout=1.0):
+                time.sleep(0.5)
+                port = _read_port_file()
+            existing_url = f"http://127.0.0.1:{port}"
             print(
-                f"Ouroboros is already running at http://127.0.0.1:{_read_port_file()}",
+                f"Ouroboros is already running at {existing_url}",
                 file=sys.stderr,
             )
+            # Desktop-icon launches have no visible stderr, so the notice
+            # alone reads as "Open does nothing". Surface the running
+            # instance the same way a fresh headless boot would — open the
+            # default browser at it. Bounded join: the open rides a daemon
+            # thread (see _open_browser_detached), and returning immediately
+            # would end the process under the opener before it fires.
+            _open_browser_detached(existing_url).join(timeout=5.0)
             return
         webview.create_window(
             "Ouroboros",
@@ -1254,6 +1326,7 @@ def main():
 
     # Clear any stale server process or ports before starting the new agent
     _cleanup_recorded_server_process("preflight")
+    _reap_same_install_strays("preflight")
     _kill_stale_runtime_ports(port)
     try:
         PORT_FILE.unlink(missing_ok=True)

@@ -682,6 +682,10 @@ test('a model swapped at EQUAL count really reaches the pixels', async () => {
     try {
         initSubagentsSection({ store });
         applySubagentsSettings({ OUROBOROS_SUBAGENT_HARNESS: '' });
+        // The reload awaits the probe for a bounded beat; a fake store settles
+        // inside it, so this await IS the settlement boundary here — and it
+        // retires the reload's own render, keeping later caret-guard phases
+        // free of floating repaints.
         await reloadSubagentsSection();
         assert.ok(host.innerHTML.includes('old-model'), host.innerHTML);
         // The section's own binding is what keeps the shared read alive: a
@@ -740,7 +744,13 @@ test('the settings collector itself refuses to author from an unknown read', asy
     try {
         initSubagentsSection({ store });
         applySubagentsSettings({ OUROBOROS_SUBAGENT_HARNESS: '' });
-        await reloadSubagentsSection();
+        // The reload awaits the probe only for a bounded beat; the synchronous
+        // window before any settle is asserted first, then the reload is
+        // retired INSIDE the test so its render never outlives the fake DOM.
+        const reloading = reloadSubagentsSection();
+        assert.deepEqual(collectSubagentsSettings(), {},
+            'before any read settles the collector must stay silent');
+        await reloading;
         assert.deepEqual(collectSubagentsSettings(), {},
             'an unread account store must never author the delegation route');
 
@@ -748,7 +758,7 @@ test('the settings collector itself refuses to author from an unknown read', asy
             harnesses: [{ id: 'codex', display_name: 'Codex' }],
             native: [{ harness_id: 'codex', native_login_detected: true }],
         });
-        await reloadSubagentsSection();
+        await store.refresh({ includeModels: true });
         assert.ok('OUROBOROS_SUBAGENT_HARNESS' in collectSubagentsSettings(),
             'a genuinely read store authors normally');
         // The account pin rides its own key beside the route (D-U5): a saved

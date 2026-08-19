@@ -11,10 +11,11 @@ import {
 } from './subagents_settings.js';
 import { initHarnessAccounts } from './harness_accounts.js';
 import { openConfirmDialog } from './confirm_dialog.js';
-import { SECRET_KEYS, bindSecretInputs, bindSettingsTabs, renderSettingsPage } from './settings_ui.js';
+import { PROVIDER_TEST_INPUTS, SECRET_KEYS, bindSecretInputs, bindSettingsTabs, renderSettingsPage } from './settings_ui.js';
 import { showToast } from './toast.js';
 import { escapeHtmlAttr as escapeHtml, formatDualVersion } from './utils.js';
 import { apiClient, apiFetch, cleanExtensionRoute, extensionRoutePath } from './api_client.js';
+import { claudexorStatus } from './claudexor_status_store.js';
 import { collectSafeFieldValues, renderSafeField, setInlineStatus } from './ui_helpers.js';
 
 let markSettingsDirty = () => {};
@@ -70,7 +71,12 @@ function byId(id) {
 }
 
 function applyInputValue(id, value) {
-    byId(id).value = value === undefined || value === null ? '' : value;
+    const el = byId(id);
+    el.value = value === undefined || value === null ? '' : value;
+    // Server-applied snapshot (secrets arrive MASKED): lets the provider-test
+    // handler tell an owner edit apart from the mask, which must never be sent
+    // back as a credential.
+    el.dataset.appliedValue = el.value;
 }
 
 function applyCheckboxValue(id, value) {
@@ -127,7 +133,14 @@ function wireSecretRow(row) {
     const clear = row.querySelector('[data-row-secret-clear]');
     if (input) input.addEventListener('input', () => { if (input.value.trim()) delete input.dataset.forceClear; });
     if (toggle && input) toggle.addEventListener('click', () => { input.type = input.type === 'password' ? 'text' : 'password'; toggle.textContent = input.type === 'password' ? 'Show' : 'Hide'; });
-    if (clear && input) clear.addEventListener('click', () => { input.value = ''; input.type = 'password'; input.dataset.forceClear = '1'; if (toggle) toggle.textContent = 'Show'; markSettingsDirty(); });
+    if (clear && input) clear.addEventListener('click', () => {
+        input.value = ''; input.type = 'password'; input.dataset.forceClear = '1';
+        if (toggle) toggle.textContent = 'Show';
+        markSettingsDirty();
+        // Programmatic value changes fire no 'input' event, but a Clear is an
+        // edit like any other: the provider-test verdict listener must see it.
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
 }
 
 function customSecretRow(key = '', value = '') {
@@ -336,6 +349,22 @@ export function moreProvidersCredentialConfigured({
         || (has(gigachatUser) && has(gigachatPassword));
 }
 
+export function providerTestStatusText(result = {}) {
+    if (result?.ok === true) return 'Works';
+    const reason = String(result?.error || '').trim();
+    return reason ? `Not ready — ${reason}` : 'Not ready';
+}
+
+export function providerTestNetworkErrorStatus() {
+    return 'Not ready';
+}
+
+export function providerTestResultIsCurrent({
+    sentGeneration, currentGeneration, sentFingerprint, currentFingerprint,
+} = {}) {
+    return sentGeneration === currentGeneration && sentFingerprint === currentFingerprint;
+}
+
 export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     const page = document.createElement('div');
     page.id = 'page-settings';
@@ -368,6 +397,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     let settingsLoaded = false;
     let settingsBaseline = '';
     let settingsDirty = false;
+    const providerTestGenerations = new Map();
+    const providerTestsInFlight = new Set();
     initMcpSettings({ onChange: updateSettingsDirtyState });
     initReviewerSlots({ onChange: () => updateSettingsDirtyState() });
     initSubagentsSection({ onChange: () => updateSettingsDirtyState() });
@@ -430,8 +461,18 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         });
     }
 
+    // Top-level keys in sorted order: the dirty check compares these strings,
+    // and the status-settle baseline fold below inserts keys AFTER the fact —
+    // equality must not depend on object insertion order. Nested values keep
+    // native stringify (both sides build them through the same code path).
+    function stableSerializeDraft(draft) {
+        return JSON.stringify(Object.fromEntries(
+            Object.entries(draft).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+        ));
+    }
+
     function snapshotSettingsDraft() {
-        return JSON.stringify({
+        return stableSerializeDraft({
             ...collectBody(),
             OUROBOROS_RUNTIME_MODE_DRAFT: byId('s-runtime-mode')?.value || 'advanced',
             OUROBOROS_CONTEXT_MODE_DRAFT: byId('s-context-mode')?.value || 'max',
@@ -452,6 +493,34 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         settingsDirty = nextDirty;
         const indicator = byId('settings-unsaved-indicator');
         if (indicator) indicator.classList.toggle('is-visible', settingsDirty);
+    }
+
+    let baselineSettleDisposer = null;
+    function armCleanBaselineOnStatusSettle() {
+        // The sections' Claudexor status probe is fire-and-forget, so the
+        // baseline can be taken before the store-gated collectors have their
+        // facts — and their output changes when a snapshot lands (the accounts
+        // facet, the later include-models upgrade). Absent owner edits, no
+        // store arrival may read as an unsaved change; and every owner edit
+        // flips settingsDirty through its own input handler BEFORE any store
+        // notify, so re-baselining while the draft is clean can never mask
+        // one. Deliberately NOT a one-shot on everSettled: an earlier
+        // model-less read may have settled the store long before the upgrade
+        // this page's collectors actually feed on. A BARE subscription, not a
+        // status surface: this observer must react to snapshots the sections'
+        // own surfaces fetch, never arm the polling chain itself.
+        baselineSettleDisposer?.();
+        baselineSettleDisposer = claudexorStatus.subscribe(() => {
+            // CLEAN drafts only. Folding store-gated keys into a DIRTY baseline
+            // was tried and reverted: collectSubagentsSettings overlays the
+            // owner's unsaved Delegation edits onto the store facts, so the
+            // fold silently erased exactly those edits from the diff.
+            // Disclosed residual: a cold-daemon settle landing AFTER an owner
+            // edit stays inside the unsaved-changes diff until the next save —
+            // rare (the reloads wait a bounded beat for the probe first) and
+            // fail-safe (an over-eager indicator, never a lost edit).
+            if (!settingsDirty && settingsLoaded) setSettingsCleanBaseline();
+        });
     }
 
     function discardUnsavedSettingsDraft() {
@@ -528,6 +597,13 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
 
     function applySettings(s) {
         setupContract = s?._meta?.setup_contract || setupContract || {};
+        // A settings (re)load replaces the values every provider verdict was
+        // earned against — programmatic assignment fires no 'input' events, so
+        // the expiry listener cannot see it; expire the verdicts here.
+        Object.keys(PROVIDER_TEST_INPUTS).forEach((provider) => {
+            providerTestGenerations.set(provider, (providerTestGenerations.get(provider) || 0) + 1);
+        });
+        page.querySelectorAll('[data-provider-test-status]').forEach((el) => { el.textContent = ''; });
         applySecretInputs(page, s);
         INPUT_FIELDS.forEach(([id, key, fallback = '']) => applyInputValue(id, fallback && !s[key] ? fallback : s[key]));
         VALUE_FIELDS.forEach(([id, key, fallback]) => { byId(id).value = s[key] || fallback; });
@@ -654,8 +730,12 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         renderCustomSecrets(page, data);
         // Await the reviewer rows and the Subagents accounts BEFORE the clean
         // baseline: their async arrival must not read as an unsaved owner edit.
+        // (The Claudexor status probe inside them is fire-and-forget — a cold
+        // daemon must not hold the Save button — so its LATER settlement is
+        // re-baselined below.)
         await Promise.all([reloadReviewerSlots(), reloadSubagentsSection()]);
         setSettingsCleanBaseline();
+        armCleanBaselineOnStatusSettle();
         closeSettingsModelPickers();
         _renderNetworkHint(data._meta);
         renderClaudeCodeUi();
@@ -1119,6 +1199,74 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 renderClaudeCodeUi();
                 refreshClaudeCodeStatus();
             });
+        }
+    });
+
+    // Provider readiness probe: one short model request against the card draft.
+    page.querySelector('[data-settings-panel="providers"]')?.addEventListener('click', async (event) => {
+        const button = event.target instanceof Element ? event.target.closest('[data-provider-test]') : null;
+        if (!button) return;
+        const provider = button.dataset.providerTest;
+        if (providerTestsInFlight.has(provider)) return;
+        const status = page.querySelector(`[data-provider-test-status="${provider}"]`);
+        const collectOverrides = () => {
+            const overrides = {};
+            for (const [inputId, settingKey] of Object.entries(PROVIDER_TEST_INPUTS[provider] || {})) {
+                const input = byId(inputId);
+                const value = (input?.value || '').trim();
+                // Only owner-edited fields become overrides: saved secrets render
+                // as MASKED placeholders (gateway mask_settings_secret), and echoing
+                // a mask back as the credential would fail every already-saved key.
+                // An untouched field means "test the saved value server-side"; an
+                // edited-to-empty field (Clear included) sends an explicit empty
+                // override so the probe tests the visible draft, not the old key.
+                if (value !== (input?.dataset.appliedValue ?? '').trim()) {
+                    overrides[settingKey] = value;
+                }
+            }
+            return overrides;
+        };
+        const overrides = collectOverrides();
+        const sentFingerprint = JSON.stringify(overrides);
+        const sentGeneration = providerTestGenerations.get(provider) || 0;
+        providerTestsInFlight.add(provider);
+        button.disabled = true;
+        if (status) status.textContent = 'Testing…';
+        const resultIsCurrent = () => providerTestResultIsCurrent({
+            sentGeneration,
+            currentGeneration: providerTestGenerations.get(provider) || 0,
+            sentFingerprint,
+            currentFingerprint: JSON.stringify(collectOverrides()),
+        });
+        try {
+            const data = await apiClient.providerTest({ provider_id: provider, overrides });
+            if (status && resultIsCurrent()) status.textContent = providerTestStatusText(data);
+        } catch (_error) {
+            if (status && resultIsCurrent()) {
+                status.textContent = providerTestNetworkErrorStatus();
+            }
+        } finally {
+            providerTestsInFlight.delete(provider);
+            button.disabled = false;
+        }
+    });
+
+    // A displayed verdict is only good for the draft it tested: the moment any
+    // field of that card changes, the old OK/Failed would sit beside values it
+    // never saw — clear it instead of letting it vouch for the new draft.
+    page.querySelector('[data-settings-panel="providers"]')?.addEventListener('input', (event) => {
+        const target = event.target;
+        if (!(target instanceof Element) || !target.id) return;
+        for (const [provider, inputs] of Object.entries(PROVIDER_TEST_INPUTS)) {
+            if (target.id in inputs) {
+                providerTestGenerations.set(
+                    provider,
+                    (providerTestGenerations.get(provider) || 0) + 1,
+                );
+                const status = page.querySelector(`[data-provider-test-status="${provider}"]`);
+                if (status) status.textContent = '';
+                break;
+            }
         }
     });
 
