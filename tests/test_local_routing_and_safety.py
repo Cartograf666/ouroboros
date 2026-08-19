@@ -314,3 +314,43 @@ def test_health_probe_does_not_erase_the_launched_context_length(monkeypatch):
     )
     manager._wait_for_healthy(timeout=5.0)
     assert manager._context_length == 32768
+
+
+def test_dangling_reasoning_close_tag_does_not_leak_into_the_answer():
+    """A closing </think> whose opener never arrived is still reasoning, not answer.
+
+    Live output from a local GGUF model:
+
+        Пользователь спрашивает: ... Я должен ответить тем же языком ...
+        </think>Я вижу, что вы спрашиваете на русском языке — я отвечу по-русски.
+
+    _extract only matched a PAIRED <think>...</think>, so an unmatched closer left
+    both the tag and the whole reasoning block in the user-visible answer.
+    """
+    from ouroboros.llm import LLMClient
+
+    raw = (
+        "Пользователь спрашивает про проект.\n\n"
+        "Я должен ответить по-русски.</think>"
+        "Вот ответ."
+    )
+    body, reasoning = LLMClient._strip_reasoning_wrappers(raw)
+    assert body == "Вот ответ."
+    assert "</think>" not in body
+    assert "Я должен ответить" in reasoning
+
+    # A properly paired block keeps working, and prose after it survives.
+    paired = "<think>скрытое рассуждение</think>Видимый ответ."
+    body, reasoning = LLMClient._strip_reasoning_wrappers(paired)
+    assert body == "Видимый ответ."
+    assert reasoning == "скрытое рассуждение"
+
+    # Text with no reasoning markup is untouched.
+    plain = "Просто ответ без тегов."
+    body, reasoning = LLMClient._strip_reasoning_wrappers(plain)
+    assert body == plain and not reasoning
+
+    # A tool-call payload is never touched: the split happens before it.
+    with_tool = 'думаю вслух</think><tool_call>{"name": "read_file"}</tool_call>'
+    body, _ = LLMClient._strip_reasoning_wrappers(with_tool)
+    assert body.startswith("<tool_call>") and '"read_file"' in body

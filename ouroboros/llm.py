@@ -2456,6 +2456,30 @@ class LLMClient:
         cleaned_prefix = _extract("think", prefix)
         cleaned_prefix = _extract("reasoning", cleaned_prefix)
 
+        def _split_dangling_close(tag: str, s: str) -> str:
+            """Handle a closing tag whose opener never arrived.
+
+            Local GGUF models emit the opener inconsistently — it lands in a separate
+            field, or is dropped entirely — leaving a bare ``</think>`` mid-text. The
+            paired pattern above matches nothing then, so the tag AND the reasoning
+            before it stayed in the user-visible answer. The model's intent is
+            unambiguous: everything up to that closing tag is reasoning, everything
+            after is the answer.
+            """
+            close = re.compile(r"</" + re.escape(tag) + r"\s*>", re.IGNORECASE)
+            match = None
+            for match in close.finditer(s):
+                pass  # the LAST dangling close wins; earlier prose is all reasoning
+            if match is None:
+                return s
+            reasoning_head = s[: match.start()].strip()
+            if reasoning_head:
+                reasoning_parts.append(reasoning_head)
+            return s[match.end():]
+
+        cleaned_prefix = _split_dangling_close("think", cleaned_prefix)
+        cleaned_prefix = _split_dangling_close("reasoning", cleaned_prefix)
+
         combined = (cleaned_prefix.strip() + ("\n" if cleaned_prefix.strip() and suffix else "") + suffix).strip()
         return combined, "\n\n".join(reasoning_parts)
 
