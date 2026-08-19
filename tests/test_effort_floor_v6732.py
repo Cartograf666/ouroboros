@@ -20,6 +20,23 @@ LIVE_GEMINI_ERROR = (
 )
 
 
+class _Observed400(RuntimeError):
+    status_code = 400
+    body = {"error": {
+        "message": "Reasoning is mandatory for this endpoint and cannot be disabled.",
+        "code": 400,
+    }}
+
+
+def _wire_target():
+    return {
+        "provider": "openrouter",
+        "usage_model": "google/gemini-3.5-flash",
+        "resolved_model": "google/gemini-3.5-flash",
+        "base_url": "https://openrouter.example/v1",
+    }
+
+
 @pytest.fixture
 def _clean_effort_caches():
     from ouroboros.llm import LLMClient
@@ -159,7 +176,7 @@ def test_mandatory_reasoning_400_through_retry_ladder(
     def create_fn(**kwargs):
         sends.append(kwargs)
         if len(sends) == 1:
-            raise RuntimeError(LIVE_GEMINI_ERROR)
+            raise _Observed400(LIVE_GEMINI_ERROR)
         return {"ok": True}
 
     kwargs = {
@@ -167,13 +184,11 @@ def test_mandatory_reasoning_400_through_retry_ladder(
         "messages": [],
         "extra_body": {"reasoning": {"effort": "none", "exclude": False}},
     }
-    target = {"usage_model": "google/gemini-3.5-flash", "resolved_model": "google/gemini-3.5-flash"}
+    target = _wire_target()
     resp = client._create_chat_completion_with_retries(create_fn, kwargs, target)
     assert resp == {"ok": True}
     assert len(sends) == 2
     assert sends[1]["extra_body"]["reasoning"]["effort"] == "low"
-    # The disclosure survives to the response normalizer and lands in USAGE
-    # (the owner-visible llm_usage surface), not just the raw pending note.
     _, usage = client._normalize_remote_response(
         {"choices": [{"message": {"role": "assistant", "content": "ok"}}],
          "usage": {"prompt_tokens": 2, "completion_tokens": 1}},
@@ -181,21 +196,14 @@ def test_mandatory_reasoning_400_through_retry_ladder(
          "usage_model": "google/gemini-3.5-flash"},
         skip_cost_fetch=True,
     )
-    assert usage["reasoning_effort_clamped"] == {
-        "requested": "none",
-        "applied": "low",
-        "reason": "learned_floor",
-        "model": "google/gemini-3.5-flash",
-    }
+    assert "reasoning_effort_clamped" not in usage
+    assert "google/gemini-3.5-flash" not in LLMClient._EFFORT_FLOOR_CACHE
 
 
 def test_terminal_retry_death_discards_clamp_note(
     _clean_effort_caches, _isolated_data_dir, monkeypatch
 ):
-    """If the floored retry ALSO dies, the error propagates AND the pending
-    learned_floor note is discarded — a stale note must never misattach to a
-    later, unrelated response on this thread (adversarial r1: the discard at
-    all three driver sites was accepted plan-review behavior with no pin)."""
+    """A failed exact-route floor retry commits no model-global authority."""
     import pytest as _pytest
 
     import ouroboros.llm as llm_mod
@@ -207,30 +215,25 @@ def test_terminal_retry_death_discards_clamp_note(
 
     def create_fn(**kwargs):
         sends.append(kwargs)
-        raise RuntimeError(LIVE_GEMINI_ERROR)
+        raise _Observed400(LIVE_GEMINI_ERROR)
 
     kwargs = {
         "model": "google/gemini-3.5-flash",
         "messages": [],
         "extra_body": {"reasoning": {"effort": "none", "exclude": False}},
     }
-    target = {"usage_model": "google/gemini-3.5-flash", "resolved_model": "google/gemini-3.5-flash"}
+    target = _wire_target()
     with _pytest.raises(RuntimeError):
         client._create_chat_completion_with_retries(create_fn, kwargs, target)
     assert len(sends) == 2  # one floored retry, no loop
     assert client._pop_effort_clamp_disclosure() is None
-    # The floor itself is still learned (the endpoint fact holds even though
-    # this particular call died).
-    assert LLMClient._EFFORT_FLOOR_CACHE["google/gemini-3.5-flash"] == "low"
+    assert "google/gemini-3.5-flash" not in LLMClient._EFFORT_FLOOR_CACHE
 
 
 def test_mandatory_reasoning_body_400_in_http200_recovers(
     _clean_effort_caches, _isolated_data_dir, monkeypatch
 ):
-    """Triad r3 regression: OpenRouter can deliver the SAME mandatory-value 400
-    inside an HTTP-200 BODY (the v6.65.3-documented transport). The body-error
-    twin must feed it through the same recovery seam: floored retry, carrier
-    preserved, floor learned. An unmatched body-400 stays untouched."""
+    """HTTP-200 body 400 uses the same exact-route floor recovery seam."""
 
     class _FakeResp:
         def __init__(self, body):
@@ -260,13 +263,13 @@ def test_mandatory_reasoning_body_400_in_http200_recovers(
         "messages": [],
         "extra_body": {"reasoning": {"effort": "none", "exclude": False}},
     }
-    target = {"usage_model": "google/gemini-3.5-flash", "resolved_model": "google/gemini-3.5-flash"}
+    target = _wire_target()
     resp = client._create_chat_completion_with_retries(create_fn, kwargs, target)
     assert resp is good
     assert len(sends) == 2
     assert sends[1]["extra_body"]["reasoning"]["effort"] == "low"
-    assert LLMClient._EFFORT_FLOOR_CACHE["google/gemini-3.5-flash"] == "low"
-    assert client._pop_effort_clamp_disclosure()["reason"] == "learned_floor"
+    assert "google/gemini-3.5-flash" not in LLMClient._EFFORT_FLOOR_CACHE
+    assert client._pop_effort_clamp_disclosure() is None
 
     # Unmatched body-400: returned unchanged, single send, nothing learned.
     sends.clear()
@@ -504,7 +507,7 @@ def test_uae_on_floored_resend_discards_clamp_note(
         "messages": [],
         "extra_body": {"reasoning": {"effort": "none", "exclude": False}},
     }
-    target = {"usage_model": "google/gemini-3.5-flash", "resolved_model": "google/gemini-3.5-flash"}
+    target = _wire_target()
     with _pytest.raises(UsageAccountingError):
         client._create_chat_completion_with_retries(lambda **kw: body_err, kwargs, target)
     assert calls["n"] == 2  # initial send + aborted floored resend

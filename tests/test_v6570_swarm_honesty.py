@@ -293,7 +293,7 @@ def test_anthropic_direct_effort_rejection_degrades_gracefully(
     monkeypatch.setattr(_requests, "post", fake_post)
     client = LLMClient(api_key="test")
     LLMClient._REJECTED_PARAMS_CACHE.clear()
-    target = {"resolved_model": "claude-old", "usage_model": "anthropic/claude-old",
+    target = {"provider": "anthropic", "resolved_model": "claude-old", "usage_model": "anthropic/claude-old",
               "base_url": "https://api.anthropic.test", "api_key": "k"}
     msg, _ = client._chat_anthropic(target, [{"role": "user", "content": "hi"}], None, "high", 128, "auto")
     assert msg["content"] == "ok"
@@ -341,10 +341,7 @@ def test_openrouter_nested_reasoning_rejection_retries_and_learns(_clean_effort_
 def test_anthropic_direct_effort_mapping_and_clamp_disclosure(
     _clean_effort_ceiling_cache, monkeypatch
 ):
-    """Anthropic-direct: (a) our `minimal` maps to the provider floor `low` (its
-    documented set has no minimal — an out-of-range value would 400 and poison the
-    learned ceiling); (b) a learned-ceiling clamp lands in the RETURNED usage as
-    reasoning_effort_clamped (the durable llm_usage disclosure, adversarial r1)."""
+    """Anthropic maps minimal to low while legacy model-global clamps stay inert."""
     import requests as _requests
 
     from ouroboros.llm import LLMClient
@@ -368,7 +365,7 @@ def test_anthropic_direct_effort_mapping_and_clamp_disclosure(
 
     monkeypatch.setattr(_requests, "post", fake_post)
     client = LLMClient(api_key="test")
-    target = {"resolved_model": "claude-test-5", "usage_model": "anthropic/claude-test-5",
+    target = {"provider": "anthropic", "resolved_model": "claude-test-5", "usage_model": "anthropic/claude-test-5",
               "base_url": "https://api.anthropic.test", "api_key": "k"}
     msgs = [{"role": "user", "content": "hi"}]
 
@@ -378,11 +375,8 @@ def test_anthropic_direct_effort_mapping_and_clamp_disclosure(
 
     LLMClient._EFFORT_CEILING_CACHE["anthropic/claude-test-5"] = "high"
     _, usage2 = client._chat_anthropic(target, msgs, None, "xhigh", 128, "auto")
-    assert captured[-1]["output_config"] == {"effort": "high"}
-    assert usage2["reasoning_effort_clamped"] == {
-        "requested": "xhigh", "applied": "high",
-        "reason": "learned_ceiling", "model": "anthropic/claude-test-5",
-    }
+    assert captured[-1]["output_config"] == {"effort": "xhigh"}
+    assert "reasoning_effort_clamped" not in usage2
 
 
 def test_remote_lane_usage_carries_clamp_disclosure(_clean_effort_ceiling_cache):

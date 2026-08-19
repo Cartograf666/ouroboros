@@ -27,7 +27,7 @@ from ouroboros.utils import (
 )
 from ouroboros.config import get_consciousness_model, resolve_effort
 from ouroboros.pricing import infer_provider_from_model
-from ouroboros.llm import LLMClient
+from ouroboros.llm import LLMClient, add_usage
 from ouroboros.memory import Memory
 from ouroboros.context import (
     build_runtime_section, build_memory_sections,
@@ -298,6 +298,7 @@ class BackgroundConsciousness:
         effort = resolve_effort("consciousness")
         total_cost = 0.0
         cost_final = True
+        cycle_usage: Dict[str, Any] = {}
         final_content = ""
         round_idx = 0
         all_pending_events = []
@@ -376,6 +377,7 @@ class BackgroundConsciousness:
                 else:
                     total_cost += cost
                     self._bg_spent_usd += cost
+                add_usage(cycle_usage, usage)
 
                 # Global budget updates via events.py; direct updates would double-count.
 
@@ -462,6 +464,14 @@ class BackgroundConsciousness:
                 "cost_final": cost_final,
                 "rounds": round_idx,
                 "model": model,
+                **{
+                    key: cycle_usage[key]
+                    for key in (
+                        "request_wire", "request_wire_history",
+                        "request_wire_history_omitted",
+                    )
+                    if key in cycle_usage
+                },
             })
 
         except Exception as e:

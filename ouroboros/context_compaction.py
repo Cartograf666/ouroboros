@@ -24,6 +24,7 @@ from ouroboros.context_budget import (
     _UnitSummaryFailure,
     _UnsafeVisual,
 )
+from ouroboros.anthropic_native_custody import anthropic_tool_unit_active, custody_private_key
 
 log = logging.getLogger(__name__)
 
@@ -98,7 +99,6 @@ def _sha256(value: Any) -> str:
 
 
 def context_reclaim_transcript_sha256(messages: Sequence[Mapping[str, Any]]) -> str:
-    """Stable binding of the complete canonical transcript supplied to reclaim."""
     return _sha256(_canonical_bytes(list(messages)))
 
 
@@ -143,7 +143,7 @@ def _summary_projection(value: Any) -> Any:
             return {"type": "image_descriptor", "text": descriptor}
         projected: Dict[str, Any] = {}
         for key, item in value.items():
-            if str(key) == "_context_capsule":
+            if str(key) == "_context_capsule" or custody_private_key(key):
                 continue
             projected[str(key)] = _summary_projection(item)
         return projected
@@ -330,7 +330,7 @@ def _atomic_units(
             and len(result_ids) == len(set(result_ids))
             and set(result_ids) == set(call_ids)
         )
-        if complete:
+        if complete and not anthropic_tool_unit_active(messages, idx, end):
             unit = _unit_from_slice(
                 messages, idx, end,
                 trace_refs_by_tool_call_id=trace_refs,

@@ -220,11 +220,17 @@ def estimate_context_prompt_tokens(
     reasoning_effort: str = "",
 ) -> int:
     """Estimate the complete inspectable context shape with bounded images."""
+    from ouroboros.anthropic_native_custody import (
+        context_custody_proxy,
+        custody_private_key,
+    )
     from ouroboros.context_budget import IMAGE_BLOCK_CHAR_EQUIVALENT
     from ouroboros.openai_chat_dispatch import direct_openai_context_projections
 
     def project(value: Any) -> Any:
         if isinstance(value, dict):
+            if any(custody_private_key(key) for key in value):
+                value = context_custody_proxy(value)
             if str(value.get("type") or "") in {"image", "image_url"}:
                 return {
                     "type": str(value.get("type") or "image"),

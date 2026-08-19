@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import logging
 
 from ouroboros import model_concurrency
+from ouroboros.anthropic_native_custody import public_custody_projection
 from ouroboros.deadline_utils import seconds_until
 from ouroboros.llm import LLMClient, LocalContextTooLargeError, add_usage
 from ouroboros.observability import new_call_id, new_execution_id, persist_call
@@ -983,7 +984,7 @@ def call_llm_with_retry(
                     task_id=task_id,
                     call_id=f"{llm_call_id}_request",
                     call_type="llm_request",
-                    payload={
+                    payload=public_custody_projection({
                         "messages": messages,
                         "send_messages": send_messages,
                         "tools": tools or [],
@@ -993,7 +994,7 @@ def call_llm_with_retry(
                         "use_local": bool(use_local),
                         "allow_server_web_search": bool(allow_server_web_search),
                         "response_cache_bypass_requested": response_cache_bypass_requested,
-                    },
+                    }),
                     manifest={
                         "execution_id": execution_id,
                         "round_id": round_id,
@@ -1035,10 +1036,10 @@ def call_llm_with_retry(
                     task_id=task_id,
                     call_id=f"{llm_call_id}_response",
                     call_type="llm_response",
-                    payload={
+                    payload=public_custody_projection({
                         "message": msg,
                         "usage": usage,
-                    },
+                    }),
                     manifest={
                         "execution_id": execution_id,
                         "round_id": round_id,
