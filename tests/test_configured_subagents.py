@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -63,6 +64,25 @@ def test_strict_config_round_trips_object_and_json_to_one_canonical_string():
     assert canonical == normalize_configured_subagents(canonical)[1]
     assert configured_subagents_fingerprint(config_from_object) == (configured_subagents_fingerprint(config_from_json))
     assert LEGACY_SUBAGENT_COMPATIBILITY == "remove_after_next_minor_release"
+
+
+def test_shared_browser_backend_contract_fixture_has_identical_acceptance():
+    fixture_path = (
+        Path(__file__).resolve().parents[1]
+        / "web"
+        / "tests"
+        / "fixtures"
+        / "available_subagents_contract.json"
+    )
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+    for case in fixture["valid"]:
+        parsed = parse_configured_subagents(case["value"])
+        assert parsed.items, case["name"]
+
+    for case in fixture["invalid"]:
+        with pytest.raises(ValueError, match=".+"):
+            parse_configured_subagents(case["value"])
 
 
 @pytest.mark.parametrize(
