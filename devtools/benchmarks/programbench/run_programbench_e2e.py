@@ -27,6 +27,10 @@ from devtools.benchmarks.common.manifests import (
     runtime_attestation,
     write_json,
 )
+from devtools.benchmarks.common.model_slots import (
+    configured_subagents_snapshot,
+    single_model_subagents_setting,
+)
 from devtools.benchmarks.common.official_commands import programbench_command_for_manifest
 from devtools.benchmarks.common.result_index import append_result_index, task_result_row
 from devtools.benchmarks.common.run_roots import (
@@ -53,6 +57,7 @@ from devtools.benchmarks.programbench.programbench_adapter import (
     terminal_task_status,
 )
 from devtools.benchmarks.programbench.schemas import PROGRAMBENCH_TIMEOUT_SEC
+from ouroboros.configured_subagents import normalize_configured_subagents
 from ouroboros.provider_models import migrate_model_value
 
 # Model-carrying slots only; the OUROBOROS_EFFORT_* entries in MODEL_SLOT_KEYS are
@@ -153,6 +158,21 @@ def preflight_model_slots(settings_path: pathlib.Path, *, solve_model: str = "")
                 f"--solve-model {expected_solve!r} does not match settings OUROBOROS_MODEL "
                 f"{configured!r}; the server would solve on the wrong model"
             )
+    measured_model = expected_solve or slots.get("OUROBOROS_MODEL", "")
+    if measured_model:
+        expected_subagents = single_model_subagents_setting(measured_model)
+        try:
+            _, normalized_subagents = normalize_configured_subagents(
+                settings.get("OUROBOROS_SUBAGENTS")
+            )
+        except ValueError as exc:
+            problems.append(f"OUROBOROS_SUBAGENTS: {exc}")
+        else:
+            if normalized_subagents != expected_subagents:
+                problems.append(
+                    "OUROBOROS_SUBAGENTS does not contain the exact one-model "
+                    f"ProgramBench actor for {measured_model!r}"
+                )
     if problems:
         raise SystemExit(
             "model slot preflight failed for the "
@@ -502,6 +522,13 @@ def main() -> int:
         # the finalization seam instead of vanishing with the process.
         model_slots = preflight_model_slots(settings_path, solve_model=str(args.solve_model or ""))
         manifest["harness"]["model_slots_normalized"] = model_slots
+        # ProgramBench submits to an already-running server whose settings file is the
+        # declared authority.  Do not let the launcher's unrelated ambient env rewrite
+        # the recorded actor list.
+        manifest["available_subagents"] = configured_subagents_snapshot(
+            settings_path,
+            env_overrides=False,
+        )
         instances = _load_instances(**selector)
         if not instances:
             final.update({"outcome": "refused", "exit_code": 1,

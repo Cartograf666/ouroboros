@@ -195,13 +195,15 @@ def test_settings_template_follows_sprint_scaffold_defaults():
     for key, value in template.items():
         if key.endswith(("_API_KEY", "_TOKEN")):
             assert value == "", f"secret {key} must ship blank"
-    # single-model scaffold: solver slots all point at the same model
-    assert (
+    # Single-model scaffold: active solver slots and the one explicit API actor
+    # all point at the measured model; legacy Heavy is not authored.
+    assert template["OUROBOROS_MODEL"] == template["OUROBOROS_MODEL_LIGHT"]
+    assert template["OUROBOROS_MODEL"] == template["OUROBOROS_MODEL_FALLBACKS"]
+    actors = json.loads(template["OUROBOROS_SUBAGENTS"])
+    assert [row["route"]["target_id"] for row in actors["items"]] == [
         template["OUROBOROS_MODEL"]
-        == template["OUROBOROS_MODEL_HEAVY"]
-        == template["OUROBOROS_MODEL_LIGHT"]
-        == template["OUROBOROS_MODEL_FALLBACKS"]
-    )
+    ]
+    assert "OUROBOROS_MODEL_HEAVY" not in template
 
 
 def test_run_step_agent_refuses_live_desktop_server_url(tmp_path, monkeypatch):
@@ -238,8 +240,12 @@ def test_preflight_verifies_server_scaffold_settings(tmp_path, monkeypatch):
     data_dir = tmp_path / "data"
     (data_dir / "uploads").mkdir(parents=True)
     settings_path = tmp_path / "settings.json"
-    settings_path.write_text(json.dumps({"OUROBOROS_MODEL": "anthropic/claude-sonnet-4.6",
-                                         "ANTHROPIC_API_KEY": "k"}), encoding="utf-8")
+    actor_raw = rsa.single_model_subagents_setting("anthropic/claude-sonnet-4.6")
+    settings_path.write_text(json.dumps({
+        "OUROBOROS_MODEL": "anthropic/claude-sonnet-4.6",
+        "OUROBOROS_SUBAGENTS": actor_raw,
+        "ANTHROPIC_API_KEY": "k",
+    }), encoding="utf-8")
     task_path = tmp_path / "task.json"
     task_path.write_text("{}", encoding="utf-8")
     vmx = tmp_path / "vm.vmx"
@@ -282,7 +288,8 @@ def test_preflight_verifies_server_scaffold_settings(tmp_path, monkeypatch):
     # matching server -> ok; mismatch + explicit ablation flag -> ok but recorded
     matching = {"OUROBOROS_RUNTIME_MODE": "pro", "OUROBOROS_SAFETY_MODE": "light",
                 "OUROBOROS_MAX_WORKERS": 4, "OUROBOROS_MODEL": "anthropic/claude-sonnet-4.6",
-                "OUROBOROS_REVIEW_ENFORCEMENT": "blocking"}
+                "OUROBOROS_REVIEW_ENFORCEMENT": "blocking",
+                "OUROBOROS_SUBAGENTS": actor_raw}
 
     def fake_http_ok(url, timeout=5):
         if url.endswith("/api/state"):
@@ -300,4 +307,3 @@ def test_preflight_verifies_server_scaffold_settings(tmp_path, monkeypatch):
     result3 = rsa._preflight(relaxed)
     assert result3["ok"]
     assert result3["details"]["scaffold_mismatch_allowed"]
-

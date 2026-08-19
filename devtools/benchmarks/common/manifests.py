@@ -51,6 +51,9 @@ CAMPAIGN_FATAL_PROVENANCE_REASONS = frozenset({
     "seed_head_unreadable",
 })
 
+# Keep Heavy in the READ vocabulary so pre-Available-subagents run manifests retain
+# their original meaning. New benchmark writers no longer author it; fixed-model child
+# execution is recorded/configured through the canonical OUROBOROS_SUBAGENTS setting.
 MODEL_SLOT_KEYS = (
     "OUROBOROS_MODEL",
     "OUROBOROS_MODEL_HEAVY",

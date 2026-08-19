@@ -85,8 +85,13 @@ a `FAIL` on any feasible task scores 0.
   live system body.
 - `claude_code_edit` disabled per step (`--disable-tools claude_code_edit`) —
   benches measure the single-model Ouroboros harness.
-- Single-model: solver/review slots all point at the same model
-  (`settings_base.json`, secrets blank; fill keys at run time, never commit).
+- Single-model: solver/review slots all point at the same model, and
+  `settings_base.json` carries exactly one canonical Available-subagent API row
+  on it. No default scout, second provider family, or session substrate can enter
+  the run. Because the step CLI submits to an already-running server, preflight
+  verifies that server exposes the same normalized one-row value; client env is
+  not accepted as proof. `settings_base.json` keeps secrets blank; fill keys at
+  run time, never commit.
 - Step loop is memory-stateless per Ouroboros call (`--memory-mode empty`);
   cross-step continuity is only the action history + agent `notes` carried by
   the runner prompt.

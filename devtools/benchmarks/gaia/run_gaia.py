@@ -24,6 +24,10 @@ from devtools.benchmarks.common.manifests import (
     finalize_run_manifest,
     write_json,
 )
+from devtools.benchmarks.common.model_slots import (
+    configured_subagents_snapshot,
+    single_model_subagents_setting,
+)
 from devtools.benchmarks.common.run_roots import assert_outside_repo, run_root
 from ouroboros.config import SETTINGS_DEFAULTS
 from ouroboros.utils import truncate_review_artifact
@@ -32,7 +36,6 @@ REPO = pathlib.Path(__file__).resolve().parents[3]
 HERE = pathlib.Path(__file__).resolve().parent
 _GAIA_PINNED_MODEL_KEYS = {
     "OUROBOROS_MODEL",
-    "OUROBOROS_MODEL_HEAVY",
     "OUROBOROS_MODEL_LIGHT",
     "OUROBOROS_MODEL_VISION",
     "OUROBOROS_MODEL_CONSCIOUSNESS",
@@ -149,6 +152,8 @@ def _render_run_settings(
     main_web_search_max_total_results: int = 10,
 ) -> pathlib.Path:
     settings = json.loads(base_settings_path.read_text(encoding="utf-8"))
+    settings.pop("OUROBOROS_MODEL_HEAVY", None)
+    settings.pop("USE_LOCAL_HEAVY", None)
     for key in MODEL_SLOT_KEYS:
         if key.startswith("OUROBOROS_EFFORT_"):
             continue
@@ -158,6 +163,9 @@ def _render_run_settings(
             settings[key] = review_models or ",".join([solve_model] * 3)
         elif key:
             settings[key] = solve_model
+    # One exact API actor preserves fixed-model methodology even when the product's
+    # install defaults would otherwise add a Light scout or a session-backed row.
+    settings["OUROBOROS_SUBAGENTS"] = single_model_subagents_setting(solve_model)
     # A fixed MAIN reasoner may route vision to a SEPARATE model (e.g. sonnet main +
     # gpt-4o vision, the HAL methodology) without breaking the fixed-model claim.
     if vision_model:
@@ -311,6 +319,10 @@ def _augment_manifest(manifest: dict, args: argparse.Namespace, root: pathlib.Pa
         k: v for k, v in _settings_env(settings_path, args.solve_model, root).items()
         if k in MODEL_SLOT_KEYS
     }
+    manifest["available_subagents"] = configured_subagents_snapshot(
+        settings_path,
+        env_overrides=False,
+    )
     manifest.setdefault("extra", {})["image_input_mode"] = json.loads(
         settings_path.read_text(encoding="utf-8")
     ).get("OUROBOROS_IMAGE_INPUT_MODE", "")

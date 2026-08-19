@@ -34,7 +34,11 @@ if __package__ in {None, ""}:
 from devtools.benchmarks.common.manifests import runtime_attestation
 from devtools.benchmarks.common.secrets import isolated_credential_grants  # noqa: F401 (re-export)
 from ouroboros.context_mode_compat import normalize_context_mode_compat
-from ouroboros.provider_models import ALL_PROVIDER_CREDENTIAL_KEYS, provider_credential_plan
+from ouroboros.provider_models import (
+    ALL_PROVIDER_CREDENTIAL_KEYS,
+    LEGACY_MODEL_SETTING_KEYS,
+    provider_credential_plan,
+)
 from ouroboros.platform_layer import (
     kill_pid_tree,
     subprocess_new_group_kwargs,
@@ -79,6 +83,7 @@ _ISO_SETTINGS_ALLOW_PREFIX = ("OUROBOROS_MODEL", "OUROBOROS_EFFORT", "LOCAL_MODE
 # see _grant_provider_credentials. Deliberately NOT a `*_API_KEY` pattern either: a custom
 # skill secret could be named `<x>_API_KEY` and must NOT be copied.
 _ISO_SETTINGS_ALLOW_EXACT = frozenset({
+    "OUROBOROS_SUBAGENTS",
     "OUROBOROS_WEBSEARCH_MODEL", "OUROBOROS_REVIEW_MODELS",
     "OUROBOROS_SCOPE_REVIEW_MODELS", "OUROBOROS_SCOPE_REVIEW_MODEL",
     # Review policy knobs (non-secret): must propagate so settings.json's task-acceptance
@@ -136,6 +141,8 @@ def build_isolated_settings(live_cfg: dict, **overrides) -> dict:
     out: dict = {}
     for key, value in (live_cfg or {}).items():
         ks = str(key)
+        if ks in LEGACY_MODEL_SETTING_KEYS:
+            continue
         if ks in ALL_PROVIDER_CREDENTIAL_KEYS:
             continue  # gated below on the declared slots, never copied wholesale
         if ks in _ISO_SETTINGS_ALLOW_EXACT or ks.startswith(_ISO_SETTINGS_ALLOW_PREFIX):

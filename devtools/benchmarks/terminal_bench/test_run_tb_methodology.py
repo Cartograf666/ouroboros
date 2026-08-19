@@ -95,7 +95,7 @@ def test_pip_cache_mount_rejects_repo_path(monkeypatch):
 # --- apply_all_model + metadata -------------------------------------------------
 
 def test_apply_all_model_sets_forwarded_slots(monkeypatch):
-    for key in run_tb._ALL_MODEL_SLOT_KEYS + ("OUROBOROS_REVIEW_MODELS",):
+    for key in run_tb._ALL_MODEL_SLOT_KEYS + ("OUROBOROS_REVIEW_MODELS", "OUROBOROS_SUBAGENTS"):
         monkeypatch.delenv(key, raising=False)
     run_tb.apply_all_model("google/gemini-3.5-flash")
     import os
@@ -105,6 +105,8 @@ def test_apply_all_model_sets_forwarded_slots(monkeypatch):
     assert os.environ["OUROBOROS_REVIEW_MODELS"] == "google/gemini-3.5-flash"
     assert os.environ["OUROBOROS_EFFORT_REVIEW"] == "low"
     assert os.environ["OUROBOROS_EFFORT_SCOPE_REVIEW"] == "low"
+    actors = json.loads(os.environ["OUROBOROS_SUBAGENTS"])
+    assert [row["route"]["target_id"] for row in actors["items"]] == ["google/gemini-3.5-flash"]
     assert "CLAUDE_CODE_MODEL" in run_tb._ALL_MODEL_SLOT_KEYS  # claude_code_edit cannot leak a different model
     # Configurable: the 3-identical-reviewer / medium-effort path is still available.
     run_tb.apply_all_model("google/gemini-3.5-flash", review_slots=3, review_effort="medium")

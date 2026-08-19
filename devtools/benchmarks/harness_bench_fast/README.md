@@ -20,7 +20,9 @@ ouroboros run --memory-mode empty --quiet <prompt>
 
 Use a fresh/isolated `OUROBOROS_DATA_DIR` for benchmark runs unless you
 explicitly want carryover memory. The wrapper does not inject benchmark answers,
-grader hints, or task-specific shortcuts.
+grader hints, or task-specific shortcuts. When `--model` is supplied, it also
+writes the canonical one-row `OUROBOROS_SUBAGENTS` value for that exact API model,
+so fixed-model work cannot inherit another default child model or session route.
 
 Example:
 

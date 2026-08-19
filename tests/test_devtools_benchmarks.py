@@ -276,9 +276,8 @@ def test_executable_devtools_entrypoints_support_direct_help():
 
 
 def test_harness_bench_fast_wrapper_builds_ouroboros_run_command():
-    # The upgraded harness-bench-fast wrapper builds the `ouroboros run` command inline in
-    # main() (per-task logs, retries, --result-json-out, --start). Verify the command shape
-    # and the v6.39 Phase-2 slot rename (HEAVY/FALLBACKS, never the legacy CODE/FALLBACK).
+    # Inline CLI shape plus the fixed-model actor, without legacy model slots.
+    # Encoder owns bytes; test checks only the launcher wiring.
     from devtools.benchmarks.harness_bench_fast import ouroboros_cli_wrapper as w
 
     assert hasattr(w, "main")
@@ -287,7 +286,8 @@ def test_harness_bench_fast_wrapper_builds_ouroboros_run_command():
     ).read_text(encoding="utf-8")
     for token in ('"run",', '"--memory-mode",', '"--quiet",', '"--result-json-out",', '"--actor-id",'):
         assert token in src, token
-    assert '"OUROBOROS_MODEL_HEAVY": args.model' in src
+    assert '"OUROBOROS_SUBAGENTS": single_model_subagents_setting(args.model)' in src
+    assert '"OUROBOROS_MODEL_HEAVY": args.model' not in src
     assert "OUROBOROS_MODEL_CODE" not in src
 
 
@@ -1632,6 +1632,7 @@ def test_programbench_model_preflight_rejects_legacy_ids_on_direct_route(tmp_pat
 
 
 def test_programbench_model_preflight_keeps_openrouter_ids_and_checks_solve_model(tmp_path, monkeypatch):
+    from devtools.benchmarks.common.model_slots import single_model_subagents_setting
     from devtools.benchmarks.programbench.run_programbench_e2e import preflight_model_slots
 
     _scrub_model_route_env(monkeypatch)
@@ -1641,6 +1642,7 @@ def test_programbench_model_preflight_keeps_openrouter_ids_and_checks_solve_mode
             {
                 "OPENROUTER_API_KEY": "test-key",
                 "OUROBOROS_MODEL": "openai/gpt-5.5-mini",
+                "OUROBOROS_SUBAGENTS": single_model_subagents_setting("openai/gpt-5.5-mini"),
                 "OUROBOROS_REVIEW_MODELS": "openai/gpt-5.5-mini,openai/gpt-5.5-mini",
             }
         ),
@@ -1792,9 +1794,9 @@ def test_terminal_bench_adapter_defaults_to_required_acceptance_review(tmp_path)
     env = agent._container_env()
     assert env["OUROBOROS_TASK_REVIEW_MODE"] == "auto"
     assert env["OUROBOROS_MODEL"] == "openai/gpt-5.5"
-    # v6.39 slot rename: the bulk lane is OUROBOROS_MODEL_HEAVY (legacy _CODE retired);
-    # the container HEAVY lane reads os.environ["OUROBOROS_MODEL_HEAVY"], not _CODE.
-    assert env["OUROBOROS_MODEL_HEAVY"] == "openai/gpt-5.5"
+    actor = json.loads(env["OUROBOROS_SUBAGENTS"])["items"][0]["route"]
+    assert actor == {"kind": "api_model", "target_id": "openai/gpt-5.5"}
+    assert "OUROBOROS_MODEL_HEAVY" not in env
     assert env["OUROBOROS_MODEL_LIGHT"] == "google/gemini-3.5-flash"
 
 
@@ -6796,9 +6798,8 @@ def test_run_tb_manifest_records_the_model_the_run_actually_resolved(tmp_path, m
     # The measured model, NOT the ambient env decoy and NOT the settings-template decoy.
     assert slots["OUROBOROS_MODEL"] == "anthropic/claude-fable-5"
     assert slots["OUROBOROS_MODEL_LIGHT"] == "google/gemini-3.5-flash"
-    # The adapter drives HEAVY and the fallback chain off the same kwarg, so they must not
-    # imply a second model.
-    assert slots["OUROBOROS_MODEL_HEAVY"] == "anthropic/claude-fable-5"
+    # New manifests keep legacy Heavy absent.
+    assert "OUROBOROS_MODEL_HEAVY" not in slots
     assert slots["OUROBOROS_MODEL_FALLBACKS"] == "anthropic/claude-fable-5"
     assert "decoy/ambient-main" not in slots.values()
     assert "decoy/template-main" not in slots.values()

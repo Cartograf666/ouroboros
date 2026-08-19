@@ -32,6 +32,10 @@ DEFAULT_REPO = pathlib.Path(__file__).resolve().parents[3]
 if str(DEFAULT_REPO) not in sys.path:
     sys.path.insert(0, str(DEFAULT_REPO))
 
+from devtools.benchmarks.common.model_slots import (  # noqa: E402
+    configured_subagents_snapshot,
+    single_model_subagents_setting,
+)
 from devtools.benchmarks.common.result_index import runtime_terminal_disclosure  # noqa: E402
 
 DEFAULT_DATA = DEFAULT_REPO.parent / "data"
@@ -152,6 +156,8 @@ def main(argv: list[str] | None = None) -> int:
     started = time.time()
 
     env = os.environ.copy()
+    env.pop("OUROBOROS_MODEL_HEAVY", None)
+    env.pop("USE_LOCAL_HEAVY", None)
     env.update(
         {
             "OUROBOROS_REPO_DIR": str(repo_dir),
@@ -166,9 +172,9 @@ def main(argv: list[str] | None = None) -> int:
         env.update(
             {
                 "OUROBOROS_MODEL": args.model,
-                "OUROBOROS_MODEL_HEAVY": args.model,
                 "OUROBOROS_MODEL_LIGHT": args.model,
                 "OUROBOROS_MODEL_FALLBACKS": args.model,
+                "OUROBOROS_SUBAGENTS": single_model_subagents_setting(args.model),
             }
         )
 
@@ -231,6 +237,10 @@ def main(argv: list[str] | None = None) -> int:
             "data_dir": str(data_dir),
             "settings_path": str(settings_path),
             "model": args.model,
+            "available_subagents": configured_subagents_snapshot(
+                settings_path,
+                exact_model=args.model,
+            ),
             "memory_mode": args.memory_mode,
             "returncode": completed.returncode,
             "startup_retries": startup_retries,

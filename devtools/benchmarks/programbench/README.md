@@ -30,7 +30,9 @@ export OUROBOROS_BENCH_RUNS_ROOT=<workspace>/bench_runs
 #   OUROBOROS_SAFETY_MODE=light.
 # - The solve task itself disables claude_code_edit (house rule: benches measure
 #   the single-model Ouroboros harness, not an external coding agent).
-# - Model slots pin openai/gpt-5.5: the id must exist in the OpenRouter catalog
+# - Active model slots pin openai/gpt-5.5, and OUROBOROS_SUBAGENTS contains one
+#   api_model row on that exact route. Preflight rejects a missing or different
+#   actor profile. The id must exist in the OpenRouter catalog
 #   (there is no openai/gpt-5.5-mini there — it 400s on every task).
 
 # Terminal 1 — source server (not the desktop app; the sandboxed desktop cannot

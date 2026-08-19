@@ -39,7 +39,11 @@ from devtools.benchmarks.common.manifests import (
     model_slot_snapshot,
 )
 from devtools.benchmarks.common.run_roots import assert_outside_repo, ensure_outside_repo
-from devtools.benchmarks.common.model_slots import pin_single_model
+from devtools.benchmarks.common.model_slots import (
+    configured_subagents_snapshot,
+    pin_single_model,
+    single_model_subagents_setting,
+)
 
 PRO = pathlib.Path(__file__).resolve().parent              # .../swe_bench_pro/e1v2/
 ROOT = PRO.parent                                          # .../swe_bench_pro/
@@ -528,9 +532,9 @@ def run_instance(cid: str, row: dict, args, api_key: str, seed_settings: pathlib
         # OPENAI_API_KEY; forward it name-only (value via docker_env=os.environ below) when set.
         *(["-e", "OPENAI_API_KEY"] if os.environ.get("OPENAI_API_KEY", "").strip() else []),
         "-e", f"OUROBOROS_MODEL={args.solve_model}",
-        "-e", f"OUROBOROS_MODEL_HEAVY={args.solve_model}",
         "-e", f"OUROBOROS_MODEL_LIGHT={args.solve_model}",
         "-e", f"OUROBOROS_MODEL_FALLBACKS={args.solve_model}",
+        "-e", f"OUROBOROS_SUBAGENTS={single_model_subagents_setting(args.solve_model)}",
         # Runtime mode flows from the generated settings profile (seed settings.json);
         # only force it via env when --runtime-mode is explicitly set, so a profile's
         # mode is never silently overridden. Committed profiles all carry pro
@@ -1008,6 +1012,10 @@ def _run_schedule(args, out_dir: pathlib.Path, vsuf: str, api_key: str) -> int:
             # smoke, v6.76.0). Re-snapshotted from the DERIVED settings the container is about
             # to be handed; `harness.settings_template` keeps the template on record.
             manifest["model_slots"] = model_slot_snapshot(seed, env_overrides=False)
+            manifest["available_subagents"] = configured_subagents_snapshot(
+                seed,
+                env_overrides=False,
+            )
             manifest["harness"]["settings_template"] = str(pathlib.Path(args.settings).expanduser())
             manifest["harness"]["settings_derived"] = str(seed)
             print(f"\n[pro] === task {i}/{len(ids)}: {norm(cid)[:50]} === spent=${spent:.2f} cap=${task_total:.2f} lang={row.get('repo_language')}", file=sys.stderr)

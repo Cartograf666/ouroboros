@@ -48,6 +48,10 @@ from devtools.benchmarks.common.manifests import (  # noqa: E402
     admit_benchmark_run,
     finalize_run_manifest,
 )
+from devtools.benchmarks.common.model_slots import (  # noqa: E402
+    configured_subagents_snapshot,
+    disabled_subagents_setting,
+)
 from devtools.benchmarks.common.run_roots import assert_outside_repo, timestamp_run_id  # noqa: E402
 from devtools.benchmarks.common.server_runner import (  # noqa: E402
     IsolatedServer,
@@ -275,6 +279,9 @@ def _seed_settings(data_root: pathlib.Path, model: str = "") -> pathlib.Path:
     overrides = {
         "OUROBOROS_RUNTIME_MODE": "advanced",
         "OUROBOROS_POST_TASK_EVOLUTION": "false",
+        # Delegation is outside the measured editing surface.  Make that explicit
+        # instead of relying on disabled tool names or an empty legacy Heavy slot.
+        "OUROBOROS_SUBAGENTS": disabled_subagents_setting(),
         # Keep the measurement about EDITING: no end-of-task review passes, no
         # LLM safety calls (deterministic guards stay), no consciousness lane.
         "OUROBOROS_TASK_REVIEW_MODE": "off",
@@ -286,7 +293,6 @@ def _seed_settings(data_root: pathlib.Path, model: str = "") -> pathlib.Path:
         # the per-model comparison.
         overrides["OUROBOROS_MODEL"] = model
         overrides["OUROBOROS_MODEL_FALLBACKS"] = model
-        overrides["OUROBOROS_MODEL_HEAVY"] = ""
     cfg = build_isolated_settings(live_cfg, **overrides)
     cfg.setdefault("TOTAL_BUDGET", 50.0)
     settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -575,6 +581,10 @@ def main() -> int:
         data_root.mkdir(parents=True)
         clone = _clone_working_tree(run_root)
         settings_path = _seed_settings(data_root, model=args.model)
+        manifest["available_subagents"] = configured_subagents_snapshot(
+            settings_path,
+            env_overrides=False,
+        )
         if args.model:
             _log(f"main model lane pinned to {args.model}")
         seed_owner_state(data_root)

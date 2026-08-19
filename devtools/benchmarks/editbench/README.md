@@ -39,7 +39,10 @@ Each config restricts the editing toolset via `disabled_tools`; shell/process,
 web, delegation, review tools are disabled in EVERY config so the agent cannot
 bypass the editing tool under test (e.g. `sed` via run_command).
 `OUROBOROS_TASK_REVIEW_MODE=off`, `OUROBOROS_SAFETY_MODE=off` keep token counts
-about editing work only.
+about editing work only. Its isolated settings also write the canonical explicit
+`{"enabled":false,"items":[]}` Available-subagents value: delegation is outside
+the measured editing surface and cannot reappear through install defaults or a
+legacy Heavy value.
 
 - `write_file_only`, `edit_text_only`, `apply_patch_only`, `edit_batch_only`
   — exactly one editing tool available (`edit_sketch_only` was removed with the

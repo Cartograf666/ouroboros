@@ -588,10 +588,12 @@ The adapter sets:
 
 ```text
 OUROBOROS_MODEL
-OUROBOROS_MODEL_CODE
+OUROBOROS_SUBAGENTS = one api_model row on OUROBOROS_MODEL
 ```
 
-to the measured model inside the container. `OUROBOROS_MODEL_LIGHT` defaults to
+inside the container. The explicit actor row prevents Available-subagent defaults
+from introducing a Light scout, second family, or session-backed delegate into a
+fixed-model trial. `OUROBOROS_MODEL_LIGHT` defaults to
 `google/gemini-3.5-flash` and can be overridden with
 `--agent-kwarg ouroboros_light_model=<provider/model>` or `run_tb.py
 --light-model ...`. This avoids accidentally running safety checks and
@@ -625,7 +627,7 @@ The adapter template pins, and the methodology discloses:
   was 34% of all LLM calls in the k=5 run while the deterministic guards do
   the actual protecting. Light keeps the LLM check for integration tools only.
 - `claude_code_edit` disabled in every trial — benches measure the
-  single-model Ouroboros harness; the embedded Claude-Code delegate is a
+  single-model Ouroboros harness; an external agent-session delegate is a
   separate experiment.
 - `_DEADLINE_SAFETY_SEC=105` (was 30) — measured finalization overhead plus a
   provider-recovery margin, so trials finalize before Harbor's hard deadline

@@ -57,12 +57,17 @@ from devtools.benchmarks.common.manifests import (
     runtime_attestation,
     write_json,
 )
+from devtools.benchmarks.common.model_slots import (
+    configured_subagents_snapshot,
+    single_model_subagents_setting,
+)
 from devtools.benchmarks.common.result_index import append_result_index, task_result_row
 from devtools.benchmarks.common.run_roots import (
     assert_outside_repo,
     ensure_outside_repo,
     repo_root_from_devtools,
 )
+from ouroboros.configured_subagents import normalize_configured_subagents
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -720,6 +725,8 @@ def release_task_claim(claims_dir: Path, claim_key: str, lock_fd: int | None, *,
 def _preflight(config: PreflightConfig) -> dict[str, Any]:
     failures: list[str] = []
     details: dict[str, Any] = {}
+    selected_model = str(config.model or "")
+    expected_subagents_raw = ""
     checkout = osworld_checkout_info(config.osworld_root)
     details["osworld_checkout"] = checkout
     if not checkout["exists"]:
@@ -748,6 +755,21 @@ def _preflight(config: PreflightConfig) -> dict[str, Any]:
             settings = json.loads(config.settings_path.read_text(encoding="utf-8"))
             selected_model = str(config.model or settings.get("OUROBOROS_MODEL") or "")
             details["model"] = selected_model
+            if selected_model:
+                expected_subagents_raw = single_model_subagents_setting(selected_model)
+                try:
+                    _, local_subagents_raw = normalize_configured_subagents(
+                        settings.get("OUROBOROS_SUBAGENTS")
+                    )
+                except ValueError as exc:
+                    failures.append(f"OUROBOROS_SUBAGENTS invalid in settings: {exc}")
+                else:
+                    details["available_subagents"] = json.loads(local_subagents_raw)
+                    if local_subagents_raw != expected_subagents_raw:
+                        failures.append(
+                            "OUROBOROS_SUBAGENTS in settings is not the exact one-model "
+                            f"OSWorld actor for {selected_model!r}"
+                        )
             from ouroboros.provider_models import PROVIDER_ENV_KEYS, provider_for_model
 
             provider = provider_for_model(selected_model)
@@ -809,9 +831,28 @@ def _preflight(config: PreflightConfig) -> dict[str, Any]:
             server_model = str(server_settings.get("OUROBOROS_MODEL") or "")
             if server_model != config.model:
                 mismatches.append(f"OUROBOROS_MODEL: server={server_model!r} expected={config.model!r}")
+        if expected_subagents_raw:
+            try:
+                _, server_subagents_raw = normalize_configured_subagents(
+                    server_settings.get("OUROBOROS_SUBAGENTS")
+                )
+            except ValueError as exc:
+                mismatches.append(f"OUROBOROS_SUBAGENTS: server value invalid: {exc}")
+            else:
+                if server_subagents_raw != expected_subagents_raw:
+                    mismatches.append(
+                        "OUROBOROS_SUBAGENTS: target server does not expose the exact "
+                        f"one-model actor for {selected_model!r}"
+                    )
         details["server_scaffold_settings"] = {
             k: server_settings.get(k)
-            for k in ("OUROBOROS_RUNTIME_MODE", "OUROBOROS_SAFETY_MODE", "OUROBOROS_MAX_WORKERS", "OUROBOROS_MODEL")
+            for k in (
+                "OUROBOROS_RUNTIME_MODE",
+                "OUROBOROS_SAFETY_MODE",
+                "OUROBOROS_MAX_WORKERS",
+                "OUROBOROS_MODEL",
+                "OUROBOROS_SUBAGENTS",
+            )
         }
         if mismatches:
             message = (
@@ -1219,6 +1260,8 @@ Accessibility tree (may be empty/truncated):
         prompt_path.write_text(prompt, encoding="utf-8")
 
         env = os.environ.copy()
+        env.pop("OUROBOROS_MODEL_HEAVY", None)
+        env.pop("USE_LOCAL_HEAVY", None)
         # NB: `ouroboros run --url` submits over the gateway, so these env vars
         # configure only the CLI subprocess, NOT the executing server — the
         # disclosed scaffold defaults are ENFORCED by the preflight check of the
@@ -1237,9 +1280,9 @@ Accessibility tree (may be empty/truncated):
         if self.model:
             env.update({
                 "OUROBOROS_MODEL": self.model,
-                "OUROBOROS_MODEL_HEAVY": self.model,
                 "OUROBOROS_MODEL_LIGHT": self.model,
                 "OUROBOROS_MODEL_FALLBACKS": self.model,
+                "OUROBOROS_SUBAGENTS": single_model_subagents_setting(self.model),
             })
 
         cmd = [
@@ -1589,6 +1632,10 @@ def _run_step_loop(args: argparse.Namespace, final: dict[str, Any],
     domain, example_id = paths.domain, paths.example_id
     base_manifest = paths.base_manifest
     osworld_root, task_path = paths.osworld_root, paths.task_path
+    base_manifest["available_subagents"] = configured_subagents_snapshot(
+        settings_path,
+        env_overrides=False,
+    )
     # Process/environment preparation belongs HERE, after the persisted admission boundary:
     # each of these probes the filesystem or mutates process state, so a refusal in any of
     # them must land on a run that already has a durable record.
