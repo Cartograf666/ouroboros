@@ -5,10 +5,12 @@ from __future__ import annotations
 import logging
 import pathlib
 import threading
+from datetime import datetime, timezone
 from typing import Any, Dict
 
 from ouroboros.cost_projection import with_cost_aliases
 from ouroboros.task_results import (
+    TASK_COST_META_FIELDS,
     STATUS_COMPLETED,
     load_task_result,
     resolve_task_lineage,
@@ -20,6 +22,78 @@ log = logging.getLogger(__name__)
 
 POST_TASK_SYNTHESIS_LOCK = threading.Lock()
 POST_TASK_SYNTHESIS_INFLIGHT: set[tuple[str, str]] = set()
+POST_TASK_SYNTHESIS_OPEN_STATUSES = frozenset({"pending_once", "running"})
+POST_TASK_SYNTHESIS_TERMINAL_STATUSES = frozenset({"completed", "degraded"})
+_TERMINAL_ACCOUNTING_FIELDS = (
+    *TASK_COST_META_FIELDS,
+    "total_rounds",
+    "prompt_tokens",
+    "completion_tokens",
+)
+
+
+def post_task_synthesis_is_open(value: Any) -> bool:
+    """Return whether a root still owes post-task synthesis."""
+    return str(value or "") in POST_TASK_SYNTHESIS_OPEN_STATUSES
+
+
+def post_task_synthesis_is_terminal(value: Any) -> bool:
+    """Return whether canonical post-task synthesis has settled."""
+    return str(value or "") in POST_TASK_SYNTHESIS_TERMINAL_STATUSES
+
+
+def _parse_updated_at(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def project_replica_task_result_fields(
+    canonical_fields: Dict[str, Any],
+    replica_fields: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return the replica overlay permitted over a canonical task result.
+
+    A terminal canonical post-task checkpoint owns only its synthesis fields
+    and the accounting snapshot written with that checkpoint. The replica
+    continues to own acceptance, result, review, and trace fields. ``updated_at``
+    is monotonic projection metadata only; it never selects field authority.
+    """
+    overlay = dict(replica_fields)
+    canonical_checkpoint = canonical_fields.get("root_phase_checkpoint")
+    canonical_post_task = (
+        str(canonical_checkpoint.get("post_task_synthesis") or "")
+        if isinstance(canonical_checkpoint, dict)
+        else ""
+    )
+    if post_task_synthesis_is_terminal(canonical_post_task):
+        replica_checkpoint = overlay.get("root_phase_checkpoint")
+        merged_checkpoint = dict(canonical_checkpoint)
+        if isinstance(replica_checkpoint, dict):
+            merged_checkpoint.update(replica_checkpoint)
+        merged_checkpoint["post_task_synthesis"] = canonical_post_task
+        if "post_task_stop_reason" in canonical_checkpoint:
+            merged_checkpoint["post_task_stop_reason"] = canonical_checkpoint[
+                "post_task_stop_reason"
+            ]
+        overlay["root_phase_checkpoint"] = merged_checkpoint
+        for field in _TERMINAL_ACCOUNTING_FIELDS:
+            overlay.pop(field, None)
+
+    canonical_updated_at = _parse_updated_at(canonical_fields.get("updated_at"))
+    replica_updated_at = _parse_updated_at(overlay.get("updated_at"))
+    if canonical_updated_at is not None and (
+        replica_updated_at is None or canonical_updated_at > replica_updated_at
+    ):
+        overlay["updated_at"] = canonical_fields["updated_at"]
+    return overlay
 
 
 def is_root_post_task(task: Dict[str, Any]) -> bool:
@@ -69,7 +143,7 @@ def set_root_post_task_checkpoint(env: Any, task: Dict[str, Any], status: str) -
         saved = str(checkpoint.get("post_task_synthesis") or "") if isinstance(checkpoint, dict) else ""
         effective_status = saved if requested_status == "refresh" and saved else requested_status
         cost_fields: Dict[str, Any] = {"cost_final": False, "cost_with_children_partial": True}
-        if effective_status in {"completed", "degraded"}:
+        if post_task_synthesis_is_terminal(effective_status):
             try:
                 from ouroboros.usage_accounting import usage_breakdown
                 from supervisor.state import reconstruct_task_cost
@@ -128,7 +202,7 @@ def set_root_post_task_checkpoint(env: Any, task: Dict[str, Any], status: str) -
             )
         except Exception:
             log.debug("Failed to update root post-task checkpoint", exc_info=True)
-        if effective_status in {"completed", "degraded"}:
+        if post_task_synthesis_is_terminal(effective_status):
             finalized_event = {
                 "type": "task_cost_finalized",
                 "ts": utc_now_iso(),
@@ -167,5 +241,5 @@ def root_post_task_already_completed(env: Any, task: Dict[str, Any]) -> bool:
     checkpoint = existing.get("root_phase_checkpoint") if isinstance(existing, dict) else None
     return bool(
         isinstance(checkpoint, dict)
-        and checkpoint.get("post_task_synthesis") in {"completed", "degraded"}
+        and post_task_synthesis_is_terminal(checkpoint.get("post_task_synthesis"))
     )

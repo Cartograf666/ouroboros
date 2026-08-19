@@ -14,6 +14,7 @@ from starlette.responses import JSONResponse
 
 from ouroboros import get_version
 from ouroboros.gateway._helpers import json_exception, request_drive_root
+from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
 
 log = logging.getLogger(__name__)
 
@@ -187,7 +188,7 @@ def _managed_task_finalizing(drive_root: Any, task_id: str) -> bool:
         return False
     checkpoint = data.get("root_phase_checkpoint")
     synthesis = str(checkpoint.get("post_task_synthesis") or "") if isinstance(checkpoint, dict) else ""
-    finalizing = synthesis in {"pending_once", "running"}
+    finalizing = post_task_synthesis_is_open(synthesis)
     if len(_FINALIZING_MEMO) >= _FINALIZING_MEMO_MAX:
         _FINALIZING_MEMO.clear()
     _FINALIZING_MEMO[task_id] = (key, finalizing)

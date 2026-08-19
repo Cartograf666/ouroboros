@@ -14,6 +14,7 @@ from starlette.responses import JSONResponse, Response
 
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros.gateway._helpers import _TAIL_WINDOW_START_BYTES, read_rotated_jsonl_entries
+from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
 from ouroboros.task_results import TASK_COST_META_FIELDS as _TASK_COST_META_FIELDS
 from ouroboros.outcomes import normalize_outcome_axes
 from ouroboros.utils import utc_now_iso
@@ -511,7 +512,7 @@ def _annotate_terminal_task_truth(
             # whose canonical status stays scheduled/running until copy-back.
             # A failed/cancelled record stays terminal immediately, and a
             # record without a checkpoint keeps the legacy terminal semantics.
-            checkpoint_open = synthesis in {"pending_once", "running"}
+            checkpoint_open = post_task_synthesis_is_open(synthesis)
             if checkpoint_open and (status == "completed" or status not in FINAL_STATUSES):
                 finalizing_tasks.add(task_id)
             elif status in FINAL_STATUSES:

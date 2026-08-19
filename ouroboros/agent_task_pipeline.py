@@ -39,6 +39,8 @@ from ouroboros.post_task_checkpoint import (
     POST_TASK_SYNTHESIS_INFLIGHT as _POST_TASK_SYNTHESIS_INFLIGHT,
     POST_TASK_SYNTHESIS_LOCK as _POST_TASK_SYNTHESIS_LOCK,
     is_root_post_task as _is_root_post_task,
+    post_task_synthesis_is_open as _post_task_synthesis_is_open,
+    post_task_synthesis_is_terminal as _post_task_synthesis_is_terminal,
     root_checkpoint_roots as _root_checkpoint_roots,
     root_post_task_already_completed as _root_post_task_already_completed,
     set_root_post_task_checkpoint as _set_root_post_task_checkpoint,
@@ -456,7 +458,7 @@ def recover_pending_root_post_task_synthesis(
         task_id = str(stored.get("task_id") or stored.get("id") or "")
         checkpoint = stored.get("root_phase_checkpoint")
         phase = str(checkpoint.get("post_task_synthesis") or "") if isinstance(checkpoint, dict) else ""
-        if not task_id or phase not in {"pending_once", "running"}:
+        if not task_id or not _post_task_synthesis_is_open(phase):
             continue
         task = {**stored, "id": task_id, "root_task_id": str(stored.get("root_task_id") or task_id)}
         task.setdefault("budget_drive_root", str(root))
@@ -1053,7 +1055,12 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
         if _is_root_post_task(task):
             incoming_checkpoint = llm_trace.get("root_phase_checkpoint")
             existing_checkpoint = existing.get("root_phase_checkpoint")
-            if isinstance(existing_checkpoint, dict) and existing_checkpoint.get("post_task_synthesis") in {"completed", "degraded"}:
+            if (
+                isinstance(existing_checkpoint, dict)
+                and _post_task_synthesis_is_terminal(
+                    existing_checkpoint.get("post_task_synthesis")
+                )
+            ):
                 root_phase_checkpoint = dict(existing_checkpoint)
             elif isinstance(incoming_checkpoint, dict):
                 root_phase_checkpoint = dict(incoming_checkpoint)

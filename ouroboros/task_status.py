@@ -23,6 +23,7 @@ from ouroboros.outcomes import (
     infra_failed_axes,
     normalize_outcome_axes,
 )
+from ouroboros.post_task_checkpoint import project_replica_task_result_fields
 from ouroboros.task_results import (
     STATUS_CANCEL_REQUESTED,
     STATUS_CANCELLED,
@@ -632,7 +633,8 @@ def effective_task_result(
             else set()
         )
         parent_authoritative_fields = parent_authoritative_fields | _parent_workspace_artifact_lifecycle_fields(result)
-        for key, value in child_result.items():
+        child_overlay = project_replica_task_result_fields(result, child_result)
+        for key, value in child_overlay.items():
             if key in {"task_id", "parent_task_id", "root_task_id", "session_id", "actor_id", "delegation_role"}:
                 continue
             if key in parent_authoritative_fields:
