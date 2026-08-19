@@ -19,6 +19,11 @@ _NEWLY_RETIRED_SHIPPED_HEAVY_DEFAULTS = (
     "gigachat::GigaChat-2-Max",
     "minimax::MiniMax-M3",
 )
+_LOCAL_HEAVY_VALUES_THAT_MUST_SURVIVE_GLOBAL_RETIREMENT = (
+    "google/gemini-3.1-flash-lite",
+    "openai::gpt-5.4",
+    "openai/gpt-5.4-pro",
+)
 
 
 def test_has_startup_ready_provider_accepts_any_remote_key_or_local_routing():
@@ -220,10 +225,16 @@ def test_every_newly_retired_product_heavy_is_cleared_before_actor_migration(shi
     assert all(row.subagent_id != "legacy-heavy" for row in rows)
 
 
-@pytest.mark.parametrize("shipped_heavy", _NEWLY_RETIRED_SHIPPED_HEAVY_DEFAULTS)
-def test_local_override_preserves_historical_heavy_as_explicit_local_actor(shipped_heavy):
+@pytest.mark.parametrize(
+    "saved_heavy",
+    (
+        *_NEWLY_RETIRED_SHIPPED_HEAVY_DEFAULTS,
+        *_LOCAL_HEAVY_VALUES_THAT_MUST_SURVIVE_GLOBAL_RETIREMENT,
+    ),
+)
+def test_local_override_preserves_exact_heavy_value_as_explicit_local_actor(saved_heavy):
     normalized, changed, changed_keys = apply_runtime_provider_defaults({
-        "OUROBOROS_MODEL_HEAVY": shipped_heavy,
+        "OUROBOROS_MODEL_HEAVY": saved_heavy,
         "USE_LOCAL_HEAVY": True,
     })
 
@@ -232,7 +243,7 @@ def test_local_override_preserves_historical_heavy_as_explicit_local_actor(shipp
     assert changed_keys == []
     assert resolution.config is not None
     assert [(row.subagent_id, row.route.target_id) for row in resolution.config.items] == [
-        ("legacy-heavy", f"{shipped_heavy} (local)"),
+        ("legacy-heavy", f"{saved_heavy} (local)"),
     ]
 
 

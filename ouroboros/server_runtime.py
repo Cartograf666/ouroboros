@@ -216,6 +216,13 @@ def _refresh_retired_model_defaults(settings: dict) -> tuple[dict, list[str]]:
         "OUROBOROS_SCOPE_REVIEW_MODEL",
     ]
     for key in keys:
+        # A local Heavy value is explicit owner routing intent.  Preserve its
+        # exact model string even when it happens to match a globally retired
+        # cloud identifier; the local runtime may intentionally serve that ID.
+        if key == "OUROBOROS_MODEL_HEAVY" and _truthy_setting(
+            normalized.get("USE_LOCAL_HEAVY")
+        ):
+            continue
         value = _setting_text(normalized, key)
         replacement = _RETIRED_MODEL_DEFAULT_REPLACEMENTS.get(value)
         if replacement:

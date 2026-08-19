@@ -241,7 +241,7 @@ def test_saved_local_heavy_intent_survives_a_temporarily_missing_source():
 
 def test_legacy_code_plus_local_flag_migrates_to_an_explicit_local_actor():
     settings = {
-        "OUROBOROS_MODEL_CODE": "anthropic/claude-opus-4.7",
+        "OUROBOROS_MODEL_CODE": "openai/gpt-5.4-pro",
         "USE_LOCAL_CODE": True,
     }
     migrate_legacy_slot_keys(settings)
@@ -254,7 +254,7 @@ def test_legacy_code_plus_local_flag_migrates_to_an_explicit_local_actor():
     assert "USE_LOCAL_CODE" not in normalized
     assert resolution.config is not None
     assert [(row.subagent_id, row.route.target_id) for row in resolution.config.items] == [
-        ("legacy-heavy", "anthropic/claude-opus-4.7 (local)"),
+        ("legacy-heavy", "openai/gpt-5.4-pro (local)"),
     ]
 
 
