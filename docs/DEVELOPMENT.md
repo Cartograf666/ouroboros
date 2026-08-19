@@ -1032,6 +1032,14 @@ Before every commit, verify the following:
   otherwise. `evaluate` JS stays unavailable to subagents; `vlm_query` /
   `analyze_screenshot` are available. (Relaxed in v6.24.0 for local UI/build inspection;
   control-plane, private-range, and DNS-rebind denial preserved. See ARCHITECTURE.md.)
+- The canonical/replica terminal post-task/accounting field-custody projection
+  must live in one pure reducer reused by both physical copy-back and effective
+  reads; never blanket-overlay the replica over canonical truth. Every change
+  to that projection must add a stale-replica regression at both seams.
+- Push/live events are wakeups and a fast path, not terminal authority. Durable
+  task detail/history and authoritative snapshots must converge terminal UI
+  state through the existing refresh/reconnect seams; lifecycle changes must
+  exercise a lost or reordered terminal frame.
 - Effective task status belongs in `ouroboros/task_status.py`. Do not duplicate
   child-drive merge or terminality in gateways/tools. Task waits use
   `SETTLED_STATUSES`. Cancel INTENT is never a status value (Poltergeist phase A):
