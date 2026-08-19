@@ -260,8 +260,7 @@ def test_ui_smoke_late_open_chat_shows_managed_activity(direct_server_with_data)
 def test_ui_smoke_snapshot_apply_time_cannot_resurrect_root(
     direct_server_with_data,  # noqa: F811
 ):
-    """A snapshot-only root keeps HTTP generation provenance, even when two
-    request starts share one client-clock millisecond."""
+    """A progress root predating both requests cannot survive the newer empty snapshot."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
@@ -280,7 +279,8 @@ def test_ui_smoke_snapshot_apply_time_cannot_resurrect_root(
                 _install_task_detail_gate(page)
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
                 _wait_status(page, "Online", timeout=30_000)
-                # Card/Stop exist, but no typing frame seeds the activity map.
+                page.evaluate("() => { window.__realDateNow = Date.now; window.__testNow = Date.now(); Date.now = () => window.__testNow; }")
+                # The live frame predates both snapshot requests.
                 page.evaluate(
                     """() => window.__ouroWs.emit('chat', {
                         type: 'chat', role: 'assistant', is_progress: true,
@@ -289,7 +289,7 @@ def test_ui_smoke_snapshot_apply_time_cannot_resurrect_root(
                     })"""
                 )
                 page.wait_for_selector(f"{card} [data-cancel-run]")
-                page.evaluate("() => { window.__realDateNow = Date.now; Date.now = () => 100; }")
+                page.evaluate("() => { Date.now = () => window.__testNow + 1; }")
                 _start_reversed_state_response_race(page)
 
                 # N applies after N+1 started, so apply-time cannot become live provenance.
@@ -738,6 +738,26 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                     })"""
                 )
 
+                progress_card = '.chat-live-card[data-task-id="progress-only-root"]'
+                page.evaluate(
+                    """() => window.__ouroWs.emit('chat', {
+                        type: 'chat', role: 'assistant', is_progress: true, chat_id: 1,
+                        task_id: 'progress-only-root', cancelable: true, content: 'Working.',
+                    })"""
+                )
+                page.wait_for_selector(f"{progress_card} [data-cancel-run]")
+                page.evaluate("() => window.__ouroWs.emit('projects_changed', {})")
+                page.wait_for_function("() => window.__taskDetailCalls.length === 6")
+                assert page.locator(f"{progress_card} [data-cancel-run]").count() == 0
+                assert page.locator(progress_card).get_attribute("data-finished") == "0"
+                assert page.evaluate("() => window.__settleTaskDetail({status: 'completed'}, 200)")
+                page.wait_for_function(
+                    "(sel) => document.querySelector(sel)?.dataset.finished === '1'",
+                    arg=progress_card,
+                )
+                assert page.locator(f"{progress_card} .chat-live-phase").inner_text().strip() == "Done"
+                _wait_status(page, "Online")
+
                 # Even a synthetically kind-stamped known subagent never gains
                 # root task-detail convergence authority.
                 state["activities"] = []
@@ -760,6 +780,7 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 page.wait_for_timeout(200)
                 assert page.evaluate("() => window.__taskDetailCalls") == [
                     "truth-root", "truth-root", "truth-root", "rehome-root", "active",
+                    "progress-only-root",
                 ]
             finally:
                 browser.close()

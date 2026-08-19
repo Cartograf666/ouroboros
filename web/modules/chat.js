@@ -2473,10 +2473,7 @@ export function createChatInstance({
         const rawTs = msg?.ts || new Date().toISOString();
         if (registerEphemeralDecisionFrame(msg)) return;
         if (!taskId) return;
-        // The supervisor's cancelable stamp is authoritative for live WS frames and
-        // past history replay. Frame shape can misclassify timeout-retry roots because
-        // root_task_id names the original task while the endpoint cancels the
-        // current id; direct-chat turns never carry the stamp.
+        // Only host-attested cancelable progress grants Stop plus local managed-root authority.
         if (msg?.cancelable === true && msg?.task_id) markTaskCancelable(String(msg.task_id));
         // Subagent lifecycle pings render as child cards linked to the parent;
         // they must not update the parent card's terminal state.
@@ -4192,10 +4189,7 @@ export function createChatInstance({
         });
     });
 
-    // One socket, client-side fan-out: project instances take only their own
-    // thread. The MAIN instance keeps ordinary non-project traffic AND mirrors
-    // project progress/digests/logs as the "штаб", but never raw project chat
-    // user/assistant messages.
+    // Main mirrors project status, never raw project chat.
     const isProjectMirrorFrame = (msg) => {
         if (!msg) return false;
         if (msg.type === 'log') return true;
@@ -4260,6 +4254,17 @@ export function createChatInstance({
             if (msg.is_progress) {
                 showTaskIncidentToast(msg);
                 if (ephemeralDecision) return;
+                if (
+                    msg.cancelable === true
+                    && explicitTaskId
+                    && !isMirror
+                    && !msg.subagent_event
+                    && !subagentChildParents.has(explicitTaskId)
+                ) {
+                    showTyping(explicitTaskId, {
+                        kind: 'managed_task', phase: msg.phase || 'working',
+                    });
+                }
                 updateLiveCardFromProgressMessage(msg);
                 syncChatStatus();
                 return;
