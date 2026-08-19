@@ -37,6 +37,7 @@ def _owned_gateway_uses_each_test_transport(monkeypatch):
 
 def _start_with_contract(tmp_path, monkeypatch, contract):
     import ouroboros.tools.delegate as delegate
+    from ouroboros import subagent_runtime
     from ouroboros.contracts.task_constraint import TaskConstraint
     from ouroboros.gateways import claudexor as gw
     from ouroboros.tools.registry import ToolContext
@@ -73,7 +74,20 @@ def _start_with_contract(tmp_path, monkeypatch, contract):
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
     delegate._CUSTODY.clear()
-    payload = json.loads(delegate._delegate_start(ctx, "run the tests"))
+    snapshot = {
+        "schema": 1,
+        "selected_subagent_id": "economics-fixture",
+        "config_fingerprint": "economics-fixture-v1",
+        "route": {
+            "kind": "agent_session",
+            "target_id": "some-route=weak-model",
+            "credential_profile_id": "",
+        },
+        "effort": "low",
+    }
+    payload = json.loads(subagent_runtime.exact_start(
+        ctx, "run the tests", {"snapshot": snapshot}
+    ))
     delegate._CUSTODY.clear()
     assert payload["status"] == "started", payload
     return seen["request"]
@@ -653,45 +667,29 @@ def test_forced_wrapup_over_a_succeeded_run_stays_silent_below_threshold(tmp_pat
     assert _forced_delegation_note(ctx, {"tool_calls": []}) == ""
 
 
-# -- B1.1 addendum: the assignment-field truncator is STRICT (F11) --------------
+# -- Configured-session work order wire budget ---------------------------------
 
 
-def test_assignment_field_truncation_is_strict_with_the_marker_inside_the_budget():
-    """F11 (sol #9, probe 4050→4050): the generic preview helper's anti-waste
-    floor let a small overflow pass whole and appended its marker BEYOND the
-    limit. The assignment field is a bounded prompt-channel field: at 4000 it
-    passes untouched, at 4001 it is cut WITH the marker inside 4000, and a
-    multibyte tail is never severed mid-codepoint."""
-    from ouroboros.utils import truncate_within_limit
+def test_work_order_preserves_complete_fields_and_refuses_over_one_total_budget():
+    """No ordinary field becomes a misleading 4k prefix; the total wire bound is atomic."""
+    import pytest
+
+    from ouroboros.subagent_work_order import WorkOrderBudgetExceeded, compile_external_work_order
     from ouroboros.tools.delegate import _ASSIGNMENT_FIELD_CHARS
 
     limit = _ASSIGNMENT_FIELD_CHARS
-    assert limit == 4000
-
-    exact = "a" * limit
-    assert truncate_within_limit(exact, limit) == exact
-
-    over_by_one = "a" * (limit + 1)
-    out = truncate_within_limit(over_by_one, limit)
-    assert len(out) <= limit
-    assert "OMISSION NOTE" in out
-    assert f"original length {limit + 1}" in out
-
-    probe = "a" * 4050
-    out = truncate_within_limit(probe, limit)
-    assert len(out) <= limit, "the 4050→4050 passthrough is the exact probe defect"
-    assert "OMISSION NOTE" in out
-
-    unicode_text = "яё𐍈🚀" * 2000  # multibyte + astral-plane codepoints
-    out = truncate_within_limit(unicode_text, limit)
-    assert len(out) <= limit
-    assert "OMISSION NOTE" in out
-    out.encode("utf-8")  # a mid-codepoint cut would be impossible by slicing, prove it
+    assert limit == 40_000
+    ordinary = "яё𐍈🚀" * 2_000
+    rendered = compile_external_work_order({"id": "child", "objective": ordinary})
+    assert ordinary in rendered and "OMISSION NOTE" not in rendered
+    with pytest.raises(WorkOrderBudgetExceeded) as refused:
+        compile_external_work_order({"id": "child", "objective": "a" * (limit + 1)})
+    assert refused.value.chars > limit
+    assert len(refused.value.sha256) == 64
 
 
-def test_the_contract_block_rides_bounded_through_the_instructions(tmp_path, monkeypatch):
-    """End to end: an oversized objective lands in the run instructions AT the
-    strict bound, marker inside, never 4050 chars of field."""
+def test_an_ordinary_contract_field_reaches_the_run_instructions_complete(tmp_path, monkeypatch):
+    """End to end, the old per-field 4k prefix is gone from the wire."""
     request = _start_with_contract(tmp_path, monkeypatch, {
         "objective": "O" * 4050,
         "expected_output": "ok",
@@ -700,7 +698,5 @@ def test_the_contract_block_rides_bounded_through_the_instructions(tmp_path, mon
     start = instructions.index("HOST TASK OBJECTIVE")
     end = instructions.index("HOST EXPECTED OUTPUT")
     field = instructions[start:end]
-    # The whole labelled block stays within label + strict field budget (+ slack
-    # for the label sentence and separators).
-    assert "OMISSION NOTE" in field
-    assert "O" * 4001 not in field
+    assert "OMISSION NOTE" not in field
+    assert "O" * 4050 in field

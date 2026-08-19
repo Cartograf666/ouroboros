@@ -929,13 +929,14 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     })
     return _started_payload(handle, run_id, route, access, authority, root,
                             durable=durable, recovering=recovering,
+                            invocation_id=invocation_id,
                             snapshot_id=snapshot_id, target_root=target_root,
                             baseline_sha=baseline_sha)
 
 
 def _started_payload(handle: Dict[str, Any], run_id: str, route: Any, access: str,
                      authority: "DelegatedRunShape", root: str, *, durable: bool,
-                     recovering: bool, snapshot_id: str, target_root: str,
+                     recovering: bool, invocation_id: str, snapshot_id: str, target_root: str,
                      baseline_sha: str) -> str:
     """The one author of delegate_start's started result (note + payload).
 
@@ -982,8 +983,11 @@ def _started_payload(handle: Dict[str, Any], run_id: str, route: Any, access: st
         "scoped_home_requested": authority.delegated,
         "root": root,
         "custody_durable": durable,
+        "invocation_id": str(invocation_id or ""),
         "note": note,
     }
+    if not durable:
+        payload["pending_invocation_id"] = str(invocation_id or "")
     if snapshot_id:
         # The C1 binding, stated where the nanny can read it: the run's scope.root is
         # the EXECUTION snapshot; the authority target receives nothing until the
@@ -1403,6 +1407,8 @@ def _delegate_cancel(ctx: ToolContext, run_id: str, reason: str = "") -> str:
 
 
 def get_tools() -> List[ToolEntry]:
+    from ouroboros.config import get_task_abs_ceiling_sec
+
     return [
         ToolEntry("delegate_start", {
             "name": "delegate_start",
@@ -1436,10 +1442,14 @@ def get_tools() -> List[ToolEntry]:
                 "Returns a run_id: watch it with delegate_wait, stop it with "
                 "delegate_cancel. The run's output is a CLAIM you must check — you are the "
                 "host, so verification receipts are still yours to write. If no route is "
-                "configured or it is unavailable you get a typed refusal: think natively "
-                "instead of waiting."
+                "configured or it is unavailable you get a typed refusal: choose an "
+                "explicit configured alternative, wait, narrow, or report blocked."
             ),
-            "parameters": {"type": "object", "required": ["prompt"], "properties": {
+            "parameters": {
+                "type": "object",
+                "required": ["prompt"],
+                "anyOf": [{"required": ["subagent_id"]}, {"required": ["retry_of"]}],
+                "properties": {
                 "prompt": {"type": "string", "description": "The complete task for the delegated session."},
                 "subagent_id": {"type": "string", "description":
                     "Exact agent_session actor id from Available subagents. API actor ids are "
@@ -1466,7 +1476,8 @@ def get_tools() -> List[ToolEntry]:
                     "returns the run it already accepted instead of starting a second one. "
                     "Never set it for an intended new run — a plain call always starts a "
                     "NEW invocation, even with an identical prompt."},
-            }},
+                },
+            },
         }, _delegate_start_entry,
            timeout_sec=120),
         ToolEntry("delegate_wait", {
@@ -1488,11 +1499,6 @@ def get_tools() -> List[ToolEntry]:
             ),
             "parameters": {"type": "object", "required": ["run_id"], "properties": {
                 "run_id": {"type": "string", "description": "Run id from delegate_start."},
-                "wait_sec": {"type": "integer", "description":
-                    "How long THIS call holds before handing control back to you (clamped "
-                    "to the configured ceiling and to your own remaining deadline). It is a "
-                    "WINDOW, not a quiet cutoff: a run that is streaming keeps streaming to "
-                    "your human for the whole of it, and you get the whole batch at the end."},
                 "since_seq": {"type": "integer", "description": "Event cursor: advances past it are recorded as progress."},
                 "checkpoint_after_sec": {"type": "integer", "description":
                     "Optional one-shot future inspection time. Requires checkpoint_reason; "
@@ -1500,7 +1506,7 @@ def get_tools() -> List[ToolEntry]:
                 "checkpoint_reason": {"type": "string", "description":
                     "Why one proactive inspection is worth a model call. No repeating cadence."},
             }},
-        }, _delegate_wait_entry, timeout_sec=_CLAUDEXOR_MAX_SECONDS + 120),
+        }, _delegate_wait_entry, timeout_sec=get_task_abs_ceiling_sec() + 120),
         ToolEntry("delegate_cancel", {
             "name": "delegate_cancel",
             "description": (

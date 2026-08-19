@@ -29,6 +29,7 @@ from ouroboros.outcomes import (
     artifact_bundle_from_result,
     build_verification_ledger,
     derive_loop_outcome,
+    infra_failed_axes,
     maybe_write_verification_artifact,
     normalize_outcome_axes,
 )
@@ -590,7 +591,28 @@ def _derive_host_bound_loop_outcome(
 ) -> Dict[str, Any]:
     """Derive once from the current durable mutation-evidence binding."""
     _attach_host_mutation_projection(env, task, llm_trace)
-    return derive_loop_outcome(text or "", usage, llm_trace)
+    return _apply_terminal_custody_outcome(
+        env, task, derive_loop_outcome(text or "", usage, llm_trace),
+    )
+
+
+def _apply_terminal_custody_outcome(
+    env: Any, task: Dict[str, Any], loop_outcome: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Make the terminal custody audit authoritative for result and event axes."""
+
+    existing = load_task_result(env.drive_root, str(task.get("id") or "")) or {}
+    unreconciled = existing.get("delegated_runs_unreconciled")
+    if not isinstance(unreconciled, list) or not unreconciled:
+        return loop_outcome
+    return {
+        **loop_outcome,
+        "reason_code": "delegated_custody_unreconciled",
+        "outcome_axes": infra_failed_axes(
+            "delegated_custody_unreconciled",
+            review_trigger="delegate_terminal_reconciliation",
+        ),
+    }
 
 
 def emit_task_results(
@@ -986,6 +1008,11 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
                 expected_output=str(task.get("expected_output") or ""),
             )
         outcome_axes = normalize_outcome_axes({"outcome_axes": loop_outcome.get("outcome_axes")})
+        loop_outcome = _apply_terminal_custody_outcome(env, task, loop_outcome)
+        if str(loop_outcome.get("reason_code") or "") == "delegated_custody_unreconciled":
+            outcome_axes = normalize_outcome_axes(
+                {"outcome_axes": loop_outcome["outcome_axes"]}
+            )
         execution_status = str((outcome_axes.get("execution") or {}).get("status") or "")
         reason_code = str(loop_outcome.get("reason_code") or "")
         status = (

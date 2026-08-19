@@ -261,6 +261,41 @@ def test_selected_session_visibility_failure_blocks_without_native_substitution(
     assert amended.executor_resolution.reason == "delegate_tools_invisible"
 
 
+def test_blocked_session_bootstrap_wakes_first_turn_with_alternatives(monkeypatch, tmp_path):
+    from ouroboros import delegate_custody as custody
+    import ouroboros.subagent_runtime as runtime
+    from ouroboros.subagent_bootstrap import bootstrap_before_context
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    monkeypatch.setattr(runtime, "current_subagent_alternatives", lambda _exclude: [{
+        "subagent_id": "api-scout", "route_kind": "api_model",
+        "target_id": "google/gemini-3.7-flash", "availability": "check_at_dispatch",
+    }])
+    ctx = SimpleNamespace(task_id="child1", drive_root=tmp_path, budget_drive_root=str(tmp_path))
+    dispatch = SimpleNamespace(
+        blocked=True,
+        executor_resolution=SimpleNamespace(
+            reason="subscription_window_exhausted", reset_at="2030-01-01T00:00:00Z",
+        ),
+    )
+    out = json.loads(bootstrap_before_context(
+        ctx, {"id": "child1", "configured_subagent": snapshot}, dispatch,
+    ))
+    assert out["status"] == "configured_session_start_wake"
+    assert out["startup"] == {
+        "status": "temporarily_unavailable",
+        "reason": "subscription_window_exhausted",
+        "reset_at": "2030-01-01T00:00:00Z",
+        "selected_subagent_id": "session-builder",
+        "alternatives": [{
+            "subagent_id": "api-scout", "route_kind": "api_model",
+            "target_id": "google/gemini-3.7-flash", "availability": "check_at_dispatch",
+        }],
+        "host_fallback": False,
+    }
+    rows = [json.loads(line) for line in custody.event_log_path(tmp_path).read_text().splitlines()]
+    assert rows[-1]["type"] == "configured_subagent_startup_fault"
+
+
 def test_atomic_bootstrap_starts_before_wait_and_zero_nanny_rounds(monkeypatch, tmp_path):
     import ouroboros.tools.delegate as delegate
     import ouroboros.delegate_supervision as supervision
@@ -388,6 +423,7 @@ def test_atomic_start_attempt_does_not_trigger_legacy_no_delegate_nudges(tmp_pat
 
 
 def test_quiet_windows_renew_and_terminal_plus_mailbox_coalesce(tmp_path):
+    from ouroboros import delegate_custody as custody
     from ouroboros.delegate_supervision import supervised_wait
     from ouroboros.owner_mailbox import write_task_message
 
@@ -412,16 +448,57 @@ def test_quiet_windows_renew_and_terminal_plus_mailbox_coalesce(tmp_path):
     out = json.loads(supervised_wait(ctx, "run-1", wait_once=wait_once))
     assert len(calls) == 3
     assert out["status"] == "completed"
-    assert out["wake_events"] == [{
-        "type": "addressed_message",
-        "msg_id": "m1",
-        "kind": "task_message",
-        "provenance": "ancestor_task",
-        "source_task_id": "parent1",
-    }]
+    [message] = out["wake_events"]
+    assert message["msg_id"] == "m1"
+    assert message["provenance"] == "ancestor_task"
+    assert message["source_task_id"] == "parent1"
+    assert message["text"] == "new direction"
+    assert out["supervision_wake_id"]
+    event_types = {
+        json.loads(line)["type"]
+        for line in custody.event_log_path(tmp_path).read_text().splitlines()
+    }
+    assert {
+        "delegate_supervision_wait_entered",
+        "delegate_supervision_wait_renewed",
+        "delegate_supervision_wake_pending",
+    } <= event_types
+
+
+def test_pending_wake_replays_until_post_injection_ack(tmp_path):
+    from ouroboros.delegate_supervision import acknowledge_pending_wake, supervised_wait
+    from ouroboros.owner_mailbox import (
+        acknowledged_task_message_ids, write_task_message,
+    )
+    ctx = SimpleNamespace(
+        task_id="child1", drive_root=tmp_path, budget_drive_root=str(tmp_path),
+        task_metadata={"configured_subagent": {"config_fingerprint": "fp"}},
+    )
+    assert write_task_message(
+        tmp_path, "full durable direction", "child1", source_task_id="parent1",
+        provenance="ancestor_task", msg_id="m1",
+    )
+    first = json.loads(supervised_wait(
+        ctx, "run-1",
+        wait_once=lambda *_a, **_k: json.dumps({
+            "status": "no_progress", "run_id": "run-1", "last_seq": 4,
+        }),
+    ))
+    assert first["wake_events"][0]["text"] == "full durable direction"
+    assert acknowledged_task_message_ids(tmp_path, "child1") == set()
+    replay = json.loads(supervised_wait(
+        ctx, "run-1",
+        wait_once=lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("an unacknowledged wake must replay before another poll")
+        ),
+    ))
+    assert replay == first
+    assert acknowledge_pending_wake(ctx, replay)
+    assert acknowledged_task_message_ids(tmp_path, "child1") == {"m1"}
 
 
 def test_one_shot_checkpoint_is_reasoned_and_consumed(monkeypatch, tmp_path):
+    from ouroboros import delegate_custody as custody
     import ouroboros.delegate_supervision as supervision
 
     now = [100.0]
@@ -439,6 +516,8 @@ def test_one_shot_checkpoint_is_reasoned_and_consumed(monkeypatch, tmp_path):
         ctx, "run-1", checkpoint_after_sec=1,
         checkpoint_reason="inspect a promised artifact", wait_once=wait_once,
     ))
+    wake_id = out.pop("supervision_wake_id")
+    assert wake_id
     assert out == {
         "status": "inspection_checkpoint",
         "run_id": "run-1",
@@ -448,6 +527,12 @@ def test_one_shot_checkpoint_is_reasoned_and_consumed(monkeypatch, tmp_path):
     state = supervision.supervision_checkpoint(ctx)
     assert state["checkpoint"]["consumed"] is True
     assert state["checkpoint"]["consumed_by"] == "scheduled_checkpoint"
+    event_types = [
+        json.loads(line)["type"]
+        for line in custody.event_log_path(tmp_path).read_text().splitlines()
+    ]
+    assert "delegate_supervision_checkpoint_scheduled" in event_types
+    assert "delegate_supervision_checkpoint_consumed" in event_types
 
 
 def test_task_message_provenance_never_spoofs_owner(tmp_path):
@@ -465,16 +550,19 @@ def test_task_message_provenance_never_spoofs_owner(tmp_path):
     assert "Message from my human" not in rendered
 
 
-def test_ancestor_can_relay_verified_peer_output_without_owner_spoof(tmp_path):
+def test_ancestor_can_relay_to_a_true_grandchild_without_owner_spoof(tmp_path):
     from ouroboros.owner_mailbox import drain_owner_entries
     from ouroboros.task_results import STATUS_COMPLETED, STATUS_RUNNING, write_task_result
     from ouroboros.tools.core import _forward_to_worker
     from ouroboros.tools.registry import ToolContext
-
     child_drive = tmp_path / "target-drive"
     child_drive.mkdir()
     write_task_result(
-        tmp_path, "target", STATUS_RUNNING, parent_task_id="parent",
+        tmp_path, "middle", STATUS_RUNNING, parent_task_id="parent",
+        root_task_id="parent", result="running",
+    )
+    write_task_result(
+        tmp_path, "target", STATUS_RUNNING, parent_task_id="middle",
         root_task_id="parent", child_drive_root=str(child_drive), result="running",
     )
     write_task_result(
@@ -492,25 +580,64 @@ def test_ancestor_can_relay_verified_peer_output_without_owner_spoof(tmp_path):
     assert entry["source_task_id"] == "parent"
     assert entry["relayed_from_task_id"] == "peer"
 
+    # A shared root label plus a parent-cycle is not a descendant proof.
+    write_task_result(
+        tmp_path, "cycle-a", STATUS_RUNNING, parent_task_id="cycle-b",
+        root_task_id="parent", child_drive_root=str(child_drive), result="running",
+    )
+    write_task_result(
+        tmp_path, "cycle-b", STATUS_RUNNING, parent_task_id="cycle-a",
+        root_task_id="parent", result="running",
+    )
+    assert "TASK_FORBIDDEN" in _forward_to_worker(ctx, "cycle-a", "must not deliver")
+
 
 def test_replacement_is_refused_before_gateway_or_post(monkeypatch, tmp_path):
     from ouroboros import delegate_custody as custody
-    from ouroboros.tools.delegate import _delegate_start
+    import ouroboros.tools.delegate as delegate
     from ouroboros.tools.registry import ToolContext
     import ouroboros.claudexor_daemon as daemon
 
     custody._CUSTODY.clear()
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "codex=gpt-5.6-sol:high")
-    custody.record_started(tmp_path, custody.RunCustody(
-        run_id="run-old", task_id="child1", route_id="codex",
-    ))
+    old = custody.RunCustody(
+        run_id="run-old", task_id="child1", route_id="codex", snapshot_id="snap-old",
+    )
+    custody.record_started(tmp_path, old)
+    custody.emit(tmp_path, custody.SETTLED, {"run_id": "run-old", "task_id": "child1"})
+    custody.record_patch_captured(tmp_path, old)
+    custody._CUSTODY.clear()
     monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda: (_ for _ in ()).throw(
         AssertionError("gateway must not open before settlement guard")))
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "child1"
-    out = json.loads(_delegate_start(ctx, "replacement work"))
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    out = json.loads(delegate.exact_start(
+        ctx, "replacement work", {"snapshot": snapshot},
+    ))
     assert out["status"] == "refused"
     assert out["reason"] == "replacement_requires_settlement"
+    assert out["undisposed_patch_run_ids"] == ["run-old"]
+
+
+def test_terminal_boundary_reaudits_durable_pending_starts(monkeypatch, tmp_path):
+    from ouroboros import delegate_custody as custody
+    from ouroboros import delegate_terminal
+    from ouroboros.task_results import load_task_result
+    assert custody.record_start_requested(
+        tmp_path, run_id="", task_id="child1", invocation_id="inv-1",
+        idempotency_key="inv-1", max_seconds=30, request={"prompt": "complete brief"},
+        project_id="project-1", project_owned=False, route="codex",
+    )
+    monkeypatch.setattr(custody, "reconcile_task_runs", lambda *_a, **_k: [])
+    audit = delegate_terminal.terminal_reconcile_task(
+        tmp_path, "child1", trigger="test_terminal",
+    )
+    assert audit["pending_invocation_ids"] == ["inv-1"]
+    assert audit["unreconciled"] == ["invocation:inv-1"]
+    delegate_terminal.record_terminal_reconciliation(tmp_path, "child1", audit)
+    result = load_task_result(tmp_path, "child1")
+    assert result["delegated_runs_unreconciled"] == ["invocation:inv-1"]
 
 
 def test_worker_crash_mismatch_vetoes_without_post_and_cause_matrix(monkeypatch, tmp_path):
@@ -623,6 +750,57 @@ def test_same_run_crash_adoption_uses_exact_binding_and_never_posts(monkeypatch,
     }
 
 
+def test_settled_terminal_wake_survives_worker_crash_without_a_new_post(monkeypatch, tmp_path):
+    from ouroboros import delegate_custody as custody
+    import ouroboros.delegate_recovery as recovery
+    import ouroboros.tools.delegate as delegate
+    from ouroboros.subagent_work_order import work_order_fingerprint
+    from ouroboros.tools.registry import ToolContext
+    from ouroboros.utils import atomic_write_json
+    custody._CUSTODY.clear()
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    task = {
+        "id": "child1", "_attempt": 2, "configured_subagent": snapshot,
+        "drive_root": str(tmp_path), "task_constraint": {},
+        "task_contract": {"objective": "Build", "expected_output": "Patch"},
+    }
+    authority = recovery.authority_fingerprint_from_task(task)
+    custody.record_started(tmp_path, custody.RunCustody(
+        run_id="run-1", task_id="child1", route_id="codex",
+        selected_subagent_id="session-builder",
+        config_fingerprint=snapshot["config_fingerprint"],
+        authority_fingerprint=authority,
+        work_order_fingerprint=work_order_fingerprint(task),
+    ))
+    terminal = {
+        "status": "completed", "run_id": "run-1", "result": "full terminal result",
+        "supervision_wake_id": "wake-terminal",
+    }
+    wait_path = tmp_path / "state" / "delegate_supervision" / "child1.json"
+    wait_path.parent.mkdir(parents=True)
+    atomic_write_json(wait_path, {
+        "schema": 1, "run_id": "run-1", "status": "wake_pending",
+        "pending_wake": {
+            "wake_id": "wake-terminal", "payload": terminal,
+            "mailbox_ids": [], "interaction_ids": [],
+        },
+    })
+    custody.emit(tmp_path, custody.SETTLED, {"run_id": "run-1", "task_id": "child1"})
+    custody._CUSTODY.clear()
+    row = recovery.prepare_handoff(
+        tmp_path, task, cause=recovery.CAUSE_WORKER_CRASH,
+        old_attempt=1, new_attempt=2, worker_id=1, exitcode=1,
+    )
+    assert row["settled_terminal"] is True
+    monkeypatch.setattr(delegate, "exact_start", lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("settled terminal recovery must never issue another POST")
+    ))
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="child1")
+    out = recovery.adopt_handoff(ctx, task)
+    assert out["status"] == "settled_recovered"
+    assert out["wake"] == terminal
+
+
 def test_planned_restart_selectively_restores_sleeping_leaf_and_wait_state(monkeypatch, tmp_path):
     from ouroboros import delegate_custody as custody
     import ouroboros.claudexor_daemon as daemon
@@ -656,9 +834,17 @@ def test_planned_restart_selectively_restores_sleeping_leaf_and_wait_state(monke
     wait_path = tmp_path / "state" / "delegate_supervision" / "child1.json"
     wait_path.parent.mkdir(parents=True)
     atomic_write_json(wait_path, {
-        "schema": 1, "run_id": "run-1", "status": "sleeping", "journal_cursor": 7,
-        "mailbox_seen_ids": ["m-old"],
-        "last_wake": {"pending_interactions": [{"interaction_id": "quiz-1"}]},
+        "schema": 1, "run_id": "run-1", "status": "wake_pending", "journal_cursor": 7,
+        "mailbox_acknowledged_ids": ["m-old"],
+        "interaction_acknowledged_ids": [],
+        "pending_wake": {
+            "wake_id": "wake-1",
+            "payload": {
+                "status": "waiting_on_user", "supervision_wake_id": "wake-1",
+                "pending_interactions": [{"interaction_id": "quiz-1", "question": "Choose"}],
+            },
+            "mailbox_ids": [], "interaction_ids": ["quiz-1"],
+        },
         "checkpoint": {"reason": "inspect artifact", "consumed": False},
     })
     [preserved] = recovery.prepare_planned_restart_handoffs(
@@ -669,6 +855,15 @@ def test_planned_restart_selectively_restores_sleeping_leaf_and_wait_state(monke
     assert handoff["no_resume_veto_causes"] == list(recovery.NO_RESUME_CAUSES)
 
     old_pid = handoff["supervisor_pid"]
+    assert not recovery.acknowledge_observed_restart_exit(
+        tmp_path, supervisor_pid=old_pid + 1, exit_code=42,
+    )
+    assert not recovery.acknowledge_observed_restart_exit(
+        tmp_path, supervisor_pid=old_pid, exit_code=1,
+    )
+    assert recovery.acknowledge_observed_restart_exit(
+        tmp_path, supervisor_pid=old_pid, exit_code=42,
+    )
     monkeypatch.setattr(recovery.os, "getpid", lambda: old_pid + 100_000)
     monkeypatch.setattr(recovery, "_pid_alive", lambda _pid: False)
 
@@ -692,11 +887,16 @@ def test_planned_restart_selectively_restores_sleeping_leaf_and_wait_state(monke
     monkeypatch.setattr(delegate, "exact_start", lambda *_a, **_k: (_ for _ in ()).throw(
         AssertionError("planned handoff must adopt, never POST")
     ))
-    assert recovery.adopt_handoff(ctx, successor)["status"] == "adopted"
+    adopted = recovery.adopt_handoff(ctx, successor)
+    assert adopted["status"] == "adopted"
+    assert adopted["wake"]["pending_interactions"][0]["question"] == "Choose"
     restored = json.loads(wait_path.read_text(encoding="utf-8"))
     assert restored["journal_cursor"] == 7
-    assert restored["mailbox_seen_ids"] == ["m-old"]
+    assert restored["mailbox_acknowledged_ids"] == ["m-old"]
     assert restored["checkpoint"]["reason"] == "inspect artifact"
+    assert "run-1" not in interactions._REPORTED_INTERACTIONS
+    from ouroboros.delegate_supervision import acknowledge_pending_wake
+    assert acknowledge_pending_wake(ctx, adopted["wake"])
     assert interactions._REPORTED_INTERACTIONS["run-1"] == frozenset({"quiz-1"})
 
 
@@ -733,7 +933,7 @@ def test_only_approved_restart_causes_reserve_and_abrupt_gap_vetoes(monkeypatch,
     assert recovery.recoverable_task_ids(tmp_path) == set()
     monkeypatch.setattr(custody, "reconcile_task_runs", lambda *_a, **_k: [])
     assert recovery.pre_adopt_planned_handoffs(tmp_path, []) == set()
-    assert recovery._read(tmp_path, "child1")["veto_reason"] == "startup_restored_task_missing"
+    assert recovery._read(tmp_path, "child1")["veto_reason"] == "restart_transaction_missing"
 
 
 def test_planned_restart_kill_keeps_selected_child_even_if_parent_is_interrupted(
@@ -771,13 +971,16 @@ def test_api_row_is_refused_by_root_direct_exact_start_before_daemon(monkeypatch
     import ouroboros.tools.delegate as delegate
     import ouroboros.claudexor_daemon as daemon
     from ouroboros.tools.registry import ToolContext
-
     settings = _settings(_api_row())
     monkeypatch.setattr("ouroboros.config.load_settings", lambda: settings)
     monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda: (_ for _ in ()).throw(
         AssertionError("API rows never POST to Claudexor")))
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "root1"
+    schema = next(e.schema for e in delegate.get_tools() if e.name == "delegate_start")["parameters"]
+    assert schema["anyOf"] == [{"required": ["subagent_id"]}, {"required": ["retry_of"]}]
+    missing = json.loads(delegate.exact_start(ctx, "bounded leaf"))
+    assert missing["reason"] == "subagent_selection_required"
     out = json.loads(delegate.exact_start(
         ctx, "bounded leaf", {"subagent_id": "api-builder"},
     ))
@@ -786,8 +989,6 @@ def test_api_row_is_refused_by_root_direct_exact_start_before_daemon(monkeypatch
         ctx, "bounded leaf", {"subagent_id": "api-builder", "retry_of": "inv-old"},
     ))
     assert retry["reason"] == "retry_selector_conflict"
-
-
 def test_heavy_is_absent_from_active_runtime_and_vision_consumers(monkeypatch):
     from ouroboros.llm import LLMClient
     from ouroboros.tools.vision import _vision_capable_slot_candidates

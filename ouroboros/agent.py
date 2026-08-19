@@ -977,7 +977,7 @@ class OuroborosAgent:
         )
         if _exec_note:
             messages.append({"role": "user", "content": _exec_note})
-        subagent_bootstrap.append_startup_receipt(messages, startup_wake)
+        subagent_bootstrap.append_startup_receipt(ctx, messages, startup_wake)
         # The nanny postcondition's input fact for the loop's finalization seam:
         # THIS task was dispatched onto the delegated substrate. ALL economics
         # marks reset together per dispatch (F4) — defensive, since the
@@ -1012,7 +1012,7 @@ class OuroborosAgent:
         # rather than a new return value or module-level helper, so synthesis can
         # adopt p34's `SubagentExecutorResolution`/`executor_blocked_outcome` without
         # a same-named twin to dedup here.
-        if dispatch is not None and dispatch.blocked:
+        if dispatch is not None and dispatch.blocked and not startup_wake:
             _res = dispatch.executor_resolution
             cap_info["executor_blocked_reason"] = str(
                 (_res.reason if _res is not None else "")

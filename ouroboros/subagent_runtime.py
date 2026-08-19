@@ -364,6 +364,36 @@ def current_exact_start_selection() -> dict[str, Any]:
     return dict(_EXACT_START_SELECTION.get() or {})
 
 
+def current_subagent_alternatives(exclude_id: str = "") -> list[dict[str, Any]]:
+    """Project the current saved choices without ranking or probing them."""
+
+    try:
+        from ouroboros.config import load_settings
+
+        resolution = resolve_configured_subagents(
+            effective_runtime_subagent_settings(load_settings())
+        )
+    except Exception:
+        return []
+    config = resolution.config
+    if config is None or not config.enabled:
+        return []
+    excluded = str(exclude_id or "")
+    return [
+        {
+            "subagent_id": row.subagent_id,
+            "name": row.name,
+            "recommended_use": row.recommended_use,
+            "route_kind": row.route.kind,
+            "target_id": row.route.target_id,
+            "effort": row.effort,
+            "availability": "check_at_dispatch",
+        }
+        for row in config.items
+        if row.subagent_id != excluded
+    ]
+
+
 def exact_session_binding(raw_snapshot: Any) -> tuple[dict[str, Any], Any]:
     """Validate one snapshotted session row and construct its exact route."""
 
@@ -403,8 +433,6 @@ def prepare_delegate_start_actor(
     from ouroboros import delegate_custody as custody
     from ouroboros.delegate_recovery import unsettled_start_ids
     from ouroboros.delegate_shared import _fail
-    from ouroboros.subagents import get_subagent_harness, resolve_subagent_executor
-
     selected_snapshot = current_exact_start_selection().get("snapshot")
     if recovering:
         if selected_snapshot:
@@ -425,21 +453,15 @@ def prepare_delegate_start_actor(
             ),
         }, ""
 
-    if selected_snapshot is not None:
-        snapshot, route = exact_session_binding(selected_snapshot)
-        selected_id = str(snapshot.get("selected_subagent_id") or "")
-        config_fingerprint = str(snapshot.get("config_fingerprint") or "")
-    else:
-        route = get_subagent_harness()
-        selected_id = config_fingerprint = ""
-    if route is None:
-        resolution = resolve_subagent_executor("harness", route=None)
+    if selected_snapshot is None:
         return {}, _fail(
-            "delegate_start", resolution.reason,
-            "No delegated route is configured (OUROBOROS_SUBAGENT_HARNESS is empty). "
-            "Think natively instead — do not wait for a harness that does not exist.",
-            executor=resolution.executor,
+            "delegate_start", "subagent_selection_required",
+            "A fresh delegated start requires an explicit agent_session subagent_id. "
+            "Only retry_of may replay a selectorless immutable invocation.",
         )
+    snapshot, route = exact_session_binding(selected_snapshot)
+    selected_id = str(snapshot.get("selected_subagent_id") or "")
+    config_fingerprint = str(snapshot.get("config_fingerprint") or "")
     blockers = unsettled_start_ids(
         drive_root, str(getattr(ctx, "task_id", "") or "")
     )
@@ -477,6 +499,11 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
         if selected_id and selected_snapshot is not None:
             raise SubagentSelectionError(
                 "subagent_selector_conflict", "subagent_id cannot be combined with a snapshot."
+            )
+        if not str(options.get("retry_of") or "").strip() and not selected_id and selected_snapshot is None:
+            raise SubagentSelectionError(
+                "subagent_selection_required",
+                "A fresh delegated start requires subagent_id; only retry_of replays without it.",
             )
         if selected_id:
             from ouroboros.config import load_settings
@@ -530,6 +557,7 @@ __all__ = [
     "SubagentSelectionError",
     "apply_task_start_settings",
     "current_exact_start_selection",
+    "current_subagent_alternatives",
     "delegate_start_entry",
     "effective_runtime_subagent_settings",
     "exact_session_binding",

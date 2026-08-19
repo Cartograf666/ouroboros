@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping
 
-from ouroboros.subagent_work_order import compile_external_work_order
+from ouroboros.subagent_work_order import WorkOrderBudgetExceeded, compile_external_work_order
 
 
 def bootstrap_before_context(ctx: Any, task: Mapping[str, Any], dispatch: Any) -> str:
@@ -13,12 +13,41 @@ def bootstrap_before_context(ctx: Any, task: Mapping[str, Any], dispatch: Any) -
 
     configured = isinstance(task.get("configured_subagent"), dict)
     ctx.exact_model_route = configured
-    if not configured or dispatch is None or bool(getattr(dispatch, "blocked", False)):
+    if not configured or dispatch is None:
         return ""
+    snapshot = task.get("configured_subagent") if isinstance(task.get("configured_subagent"), dict) else {}
+    route = snapshot.get("route") if isinstance(snapshot.get("route"), dict) else {}
+    if bool(getattr(dispatch, "blocked", False)) and str(route.get("kind") or "") == "agent_session":
+        from ouroboros import delegate_custody as custody
+        from ouroboros.subagent_runtime import current_subagent_alternatives
+
+        availability = task.get("subagent_availability") if isinstance(task.get("subagent_availability"), dict) else {}
+        resolution = getattr(dispatch, "executor_resolution", None)
+        startup = {
+            "status": "temporarily_unavailable",
+            "reason": str(
+                getattr(resolution, "reason", "") or availability.get("reason")
+                or "configured_session_unavailable"
+            ),
+            "reset_at": str(getattr(resolution, "reset_at", "") or availability.get("reset_at") or ""),
+            "selected_subagent_id": str(snapshot.get("selected_subagent_id") or ""),
+            "alternatives": current_subagent_alternatives(
+                str(snapshot.get("selected_subagent_id") or "")
+            ),
+            "host_fallback": False,
+        }
+        custody.emit(custody.custody_root(ctx), "configured_subagent_startup_fault", {
+            "task_id": str(getattr(ctx, "task_id", "") or ""), **startup,
+        })
+        return json.dumps({
+            "status": "configured_session_start_wake", "startup": startup,
+        }, ensure_ascii=False, indent=2)
     return bootstrap_session_leaf(ctx, task, dispatch)
 
 
-def append_startup_receipt(messages: list[dict[str, Any]], startup_wake: str) -> None:
+def append_startup_receipt(
+    ctx: Any, messages: list[dict[str, Any]], startup_wake: str,
+) -> None:
     if not startup_wake:
         return
     messages.append({
@@ -29,6 +58,9 @@ def append_startup_receipt(messages: list[dict[str, Any]], startup_wake: str) ->
             "repeat the start or perform the substantive assignment natively as fallback."
         ),
     })
+    from ouroboros.delegate_supervision import acknowledge_pending_wake
+
+    acknowledge_pending_wake(ctx, startup_wake)
 
 
 def bootstrap_session_leaf(ctx: Any, task: Mapping[str, Any], dispatch: Any) -> str:
@@ -48,7 +80,20 @@ def bootstrap_session_leaf(ctx: Any, task: Mapping[str, Any], dispatch: Any) -> 
             "status": "configured_session_recovery_wake",
             "recovery": adoption,
         }, ensure_ascii=False, indent=2)
+    if adoption.get("status") == "settled_recovered":
+        return json.dumps({
+            "status": "configured_session_recovered_wake",
+            "recovery": adoption,
+            "wake": adoption.get("wake") if isinstance(adoption.get("wake"), dict) else {},
+        }, ensure_ascii=False, indent=2)
     if adoption.get("status") == "adopted":
+        pending_wake = adoption.get("wake") if isinstance(adoption.get("wake"), dict) else {}
+        if pending_wake:
+            return json.dumps({
+                "status": "configured_session_recovered_wake",
+                "recovery": adoption,
+                "wake": pending_wake,
+            }, ensure_ascii=False, indent=2)
         run_id = str(adoption.get("run_id") or "")
         from ouroboros.delegate_supervision import supervised_wait
 
@@ -64,7 +109,18 @@ def bootstrap_session_leaf(ctx: Any, task: Mapping[str, Any], dispatch: Any) -> 
         }, ensure_ascii=False, indent=2)
     from ouroboros.tools.delegate import exact_start
 
-    work_order = compile_external_work_order(task)
+    try:
+        work_order = compile_external_work_order(task)
+    except WorkOrderBudgetExceeded as exc:
+        return json.dumps({
+            "status": "configured_session_start_wake",
+            "startup": {
+                "status": "refused", "reason": "work_order_budget_exceeded",
+                "complete_chars": exc.chars, "wire_budget_chars": exc.limit,
+                "complete_sha256": exc.sha256,
+                "detail": "The complete brief was not truncated or sent. Narrow the child brief explicitly.",
+            },
+        }, ensure_ascii=False, indent=2)
     started_raw = exact_start(ctx, work_order, {"snapshot": snapshot})
     try:
         started = json.loads(started_raw)

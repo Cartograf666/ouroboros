@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import pathlib
+import uuid
 from dataclasses import asdict
 from typing import Any, Mapping, Optional
 
@@ -23,6 +24,7 @@ NO_RESUME_CAUSES = (
     "owner_restart", "panic", "external_signal", "worker_signal",
     "deadline", "timeout", "explicit_cancellation", "abrupt_whole_app_loss",
 )
+PLANNED_RESTART_TRANSACTION_ENV = "OUROBOROS_PLANNED_RESTART_TRANSACTION_ID"
 
 
 def _canonical_hash(value: Any) -> str:
@@ -88,6 +90,92 @@ def _write(drive_root: Any, row: dict[str, Any]) -> None:
     atomic_write_json(path, row)
 
 
+def _restart_transaction_path(drive_root: Any, transaction_id: str) -> pathlib.Path:
+    return (
+        pathlib.Path(drive_root) / "state" / "delegate_recovery_transactions"
+        / f"{transaction_id}.json"
+    )
+
+
+def _active_restart_transaction_path(drive_root: Any) -> pathlib.Path:
+    return pathlib.Path(drive_root) / "state" / "delegate_recovery_transactions" / "active.json"
+
+
+def _read_restart_transaction(drive_root: Any, transaction_id: str) -> dict[str, Any]:
+    try:
+        data = json.loads(
+            _restart_transaction_path(drive_root, transaction_id).read_text(encoding="utf-8")
+        )
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_restart_transaction(drive_root: Any, row: dict[str, Any]) -> None:
+    path = _restart_transaction_path(drive_root, str(row.get("transaction_id") or ""))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row["updated_at"] = utc_now_iso()
+    atomic_write_json(path, row)
+
+
+def acknowledge_observed_restart_exit(
+    drive_root: Any, *, supervisor_pid: int, exit_code: int,
+) -> bool:
+    """Launcher-side proof that the exact prepared generation exited with code 42."""
+
+    try:
+        active = json.loads(
+            _active_restart_transaction_path(drive_root).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return False
+    active = active if isinstance(active, dict) else {}
+    transaction_id = str(active.get("transaction_id") or "")
+    row = _read_restart_transaction(drive_root, transaction_id)
+    if (
+        not transaction_id
+        or row.get("status") != "prepared"
+        or int(row.get("supervisor_pid") or 0) != int(supervisor_pid)
+        or int(exit_code) != 42
+    ):
+        return False
+    row.update({
+        "status": "normal_exit_acknowledged", "exit_code": 42,
+        "exit_acknowledged_at": utc_now_iso(), "ack_source": "launcher_waitpid",
+    })
+    _write_restart_transaction(drive_root, row)
+    custody.emit(drive_root, "delegate_restart_transaction_acknowledged", {
+        "restart_transaction_id": transaction_id,
+        "supervisor_pid": int(supervisor_pid), "exit_code": 42,
+        "task_ids": list(row.get("task_ids") or []), "ack_source": "launcher_waitpid",
+    })
+    return True
+
+
+def _ack_direct_exec_successor(drive_root: Any) -> None:
+    """A same-PID successor carrying the one-shot token proves exec succeeded."""
+
+    transaction_id = str(os.environ.pop(PLANNED_RESTART_TRANSACTION_ENV, "") or "")
+    if not transaction_id:
+        return
+    row = _read_restart_transaction(drive_root, transaction_id)
+    if (
+        row.get("status") != "prepared"
+        or int(row.get("supervisor_pid") or 0) != os.getpid()
+    ):
+        return
+    row.update({
+        "status": "normal_exit_acknowledged", "exit_code": 42,
+        "exit_acknowledged_at": utc_now_iso(), "ack_source": "direct_exec_successor",
+    })
+    _write_restart_transaction(drive_root, row)
+    custody.emit(drive_root, "delegate_restart_transaction_acknowledged", {
+        "restart_transaction_id": transaction_id,
+        "supervisor_pid": os.getpid(), "exit_code": 42,
+        "task_ids": list(row.get("task_ids") or []), "ack_source": "direct_exec_successor",
+    })
+
+
 def _selected_session(task: Mapping[str, Any]) -> dict[str, Any]:
     snapshot = task.get("configured_subagent") if isinstance(task.get("configured_subagent"), dict) else {}
     route = snapshot.get("route") if isinstance(snapshot.get("route"), dict) else {}
@@ -104,6 +192,9 @@ def unsettled_start_ids(drive_root: Any, task_id: str) -> dict[str, list[str]]:
             str(row.get("invocation_id") or "") for row in custody.pending_invocations(drive_root)
             if str(row.get("task_id") or "") == mine
         ],
+        "undisposed_patch_run_ids": [
+            row.run_id for row in custody.undisposed_patches(drive_root) if row.task_id == mine
+        ],
     }
 
 
@@ -111,7 +202,14 @@ def reconcile_unrecoverable_task(drive_root: Any, task_id: str) -> None:
     """Fail-soft cancellation/settlement for a task without a valid successor."""
 
     try:
-        custody.reconcile_task_runs(drive_root, str(task_id or ""))
+        from ouroboros import delegate_terminal
+
+        result = delegate_terminal.terminal_reconcile_task(
+            drive_root, str(task_id or ""), trigger="unrecoverable_successor",
+        )
+        delegate_terminal.record_terminal_reconciliation(
+            drive_root, str(task_id or ""), result,
+        )
     except Exception:
         log.debug("Unrecoverable delegate reconciliation failed", exc_info=True)
 
@@ -195,21 +293,37 @@ def _restore_wait_checkpoint(drive_root: Any, row: Mapping[str, Any]) -> None:
     except (OSError, ValueError):
         state = {}
     state = state if isinstance(state, dict) and str(state.get("run_id") or run_id) == run_id else {}
-    state.update({"schema": 1, "run_id": run_id, "status": "adopted"})
+    pending_wake = row.get("pending_wake") if isinstance(row.get("pending_wake"), dict) else {}
+    state.update({
+        "schema": 1, "run_id": run_id,
+        "status": "wake_pending" if pending_wake else "adopted",
+    })
     state["journal_cursor"] = max(
         int(state.get("journal_cursor") or 0), int(row.get("journal_cursor") or 0)
     )
-    state["mailbox_seen_ids"] = sorted({
+    state["mailbox_acknowledged_ids"] = sorted({
         str(item) for item in [
-            *(state.get("mailbox_seen_ids") or []), *(row.get("mailbox_seen_ids") or []),
+            *(state.get("mailbox_acknowledged_ids") or []),
+            *(row.get("mailbox_acknowledged_ids") or []),
         ] if str(item)
     })
+    state["interaction_acknowledged_ids"] = sorted({
+        str(item) for item in [
+            *(state.get("interaction_acknowledged_ids") or []),
+            *(row.get("interaction_acknowledged_ids") or []),
+        ] if str(item)
+    })
+    if pending_wake:
+        state["pending_wake"] = dict(pending_wake)
+        payload = pending_wake.get("payload") if isinstance(pending_wake.get("payload"), dict) else {}
+        if payload:
+            state["last_wake"] = dict(payload)
     if isinstance(row.get("checkpoint"), dict):
         state["checkpoint"] = dict(row["checkpoint"])
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(path, state)
     interaction_ids = frozenset(
-        str(item) for item in (row.get("interaction_ids") or []) if str(item)
+        str(item) for item in (row.get("interaction_acknowledged_ids") or []) if str(item)
     )
     if interaction_ids and run_id:
         from ouroboros.delegate_interactions import _REPORTED_INTERACTIONS
@@ -226,6 +340,7 @@ def prepare_handoff(
     new_attempt: int,
     worker_id: int = 0,
     exitcode: Optional[int] = None,
+    restart_transaction_id: str = "",
 ) -> dict[str, Any]:
     """Persist one exact successor reservation, or return no reservation."""
 
@@ -235,28 +350,69 @@ def prepare_handoff(
     task_id = str(task.get("id") or "")
     if not snapshot or not task_id:
         return {}
+    supervision_path = (
+        pathlib.Path(drive_root) / "state" / "delegate_supervision" / f"{task_id}.json"
+    )
+    try:
+        supervision = json.loads(supervision_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        supervision = {}
+    supervision = supervision if isinstance(supervision, dict) else {}
+    pending_wake = (
+        supervision.get("pending_wake")
+        if isinstance(supervision.get("pending_wake"), dict)
+        and not supervision["pending_wake"].get("acknowledged_at")
+        else {}
+    )
+    if not pending_wake and supervision.get("status") == "awake":
+        acknowledged = (
+            supervision.get("last_acknowledged_wake")
+            if isinstance(supervision.get("last_acknowledged_wake"), dict) else {}
+        )
+        payload = (
+            acknowledged.get("payload")
+            if isinstance(acknowledged.get("payload"), dict) else {}
+        )
+        if payload:
+            replay_wake_id = uuid.uuid4().hex
+            pending_wake = {
+                **acknowledged,
+                "wake_id": replay_wake_id,
+                "payload": {
+                    **payload, "supervision_wake_id": replay_wake_id,
+                    "replayed_after_worker_loss": True,
+                },
+                "acknowledged_at": "",
+                "replay_reason": "acknowledged_in_dead_transcript",
+            }
     runs = [row for row in custody.open_runs(drive_root) if row.task_id == task_id]
     pending = [
         row for row in custody.pending_invocations(drive_root)
         if str(row.get("task_id") or "") == task_id
     ]
-    if len(runs) + len(pending) != 1:
+    settled_holder = None
+    if not runs and not pending:
+        pending_run_id = str(supervision.get("run_id") or "")
+        candidate = custody.replay(drive_root).get(pending_run_id)
+        if candidate is not None and candidate.task_id == task_id and candidate.settled:
+            settled_holder = candidate
+    if len(runs) + len(pending) + int(settled_holder is not None) != 1:
         return {}
     config_fingerprint = str(snapshot.get("config_fingerprint") or "")
     selected_subagent_id = str(snapshot.get("selected_subagent_id") or "")
-    holder: Any = runs[0] if runs else pending[0]
+    holder: Any = runs[0] if runs else pending[0] if pending else settled_holder
     holder_fp = str(
-        holder.config_fingerprint if runs else holder.get("config_fingerprint") or ""
+        holder.config_fingerprint if (runs or settled_holder is not None) else holder.get("config_fingerprint") or ""
     )
     authority_fp = authority_fingerprint_from_task(task)
     holder_authority = str(
-        holder.authority_fingerprint if runs else holder.get("authority_fingerprint") or ""
+        holder.authority_fingerprint if (runs or settled_holder is not None) else holder.get("authority_fingerprint") or ""
     )
     holder_selected = str(
-        holder.selected_subagent_id if runs else holder.get("selected_subagent_id") or ""
+        holder.selected_subagent_id if (runs or settled_holder is not None) else holder.get("selected_subagent_id") or ""
     )
     holder_work_order = str(
-        holder.work_order_fingerprint if runs else holder.get("work_order_fingerprint") or ""
+        holder.work_order_fingerprint if (runs or settled_holder is not None) else holder.get("work_order_fingerprint") or ""
     )
     work_order_fp = work_order_fingerprint(task)
     if (
@@ -268,28 +424,6 @@ def prepare_handoff(
         or holder_work_order != work_order_fp
     ):
         return {}
-    supervision_path = (
-        pathlib.Path(drive_root) / "state" / "delegate_supervision" / f"{task_id}.json"
-    )
-    try:
-        supervision = json.loads(supervision_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        supervision = {}
-    supervision = supervision if isinstance(supervision, dict) else {}
-
-    def _interaction_ids(value: Any) -> list[str]:
-        found: list[str] = []
-        if isinstance(value, dict):
-            identity = str(value.get("interaction_id") or value.get("interactionId") or "")
-            if identity:
-                found.append(identity)
-            for child in value.values():
-                found.extend(_interaction_ids(child))
-        elif isinstance(value, list):
-            for child in value:
-                found.extend(_interaction_ids(child))
-        return found
-
     row = {
         "schema": 1,
         "status": "reserved",
@@ -300,19 +434,24 @@ def prepare_handoff(
         "worker_id": int(worker_id),
         "supervisor_pid": os.getpid(),
         "exitcode": exitcode,
+        "restart_transaction_id": str(restart_transaction_id or ""),
         "selected_subagent_id": selected_subagent_id,
         "config_fingerprint": config_fingerprint,
         "authority_fingerprint": authority_fp,
         "work_order_fingerprint": work_order_fp,
-        "run_id": runs[0].run_id if runs else "",
+        "run_id": runs[0].run_id if runs else settled_holder.run_id if settled_holder else "",
         "pending_invocation_id": str(pending[0].get("invocation_id") or "") if pending else "",
-        "snapshot_id": runs[0].snapshot_id if runs else str(pending[0].get("snapshot_id") or ""),
-        "execution_root": runs[0].execution_root if runs else str(pending[0].get("execution_root") or ""),
-        "baseline_sha": runs[0].baseline_sha if runs else str(pending[0].get("baseline_sha") or ""),
-        "target_root": runs[0].target_root if runs else str(pending[0].get("target_root") or ""),
+        "settled_terminal": settled_holder is not None,
+        "snapshot_id": holder.snapshot_id if (runs or settled_holder) else str(holder.get("snapshot_id") or ""),
+        "execution_root": holder.execution_root if (runs or settled_holder) else str(holder.get("execution_root") or ""),
+        "baseline_sha": holder.baseline_sha if (runs or settled_holder) else str(holder.get("baseline_sha") or ""),
+        "target_root": holder.target_root if (runs or settled_holder) else str(holder.get("target_root") or ""),
         "journal_cursor": int(supervision.get("journal_cursor") or 0),
-        "mailbox_seen_ids": list(supervision.get("mailbox_seen_ids") or []),
-        "interaction_ids": sorted(set(_interaction_ids(supervision.get("last_wake")))),
+        "mailbox_acknowledged_ids": list(supervision.get("mailbox_acknowledged_ids") or []),
+        "interaction_acknowledged_ids": list(
+            supervision.get("interaction_acknowledged_ids") or []
+        ),
+        "pending_wake": dict(pending_wake),
         "checkpoint": supervision.get("checkpoint") if isinstance(supervision.get("checkpoint"), dict) else {},
         "no_resume_veto_causes": list(NO_RESUME_CAUSES),
         "created_at": utc_now_iso(),
@@ -335,8 +474,13 @@ def recoverable_task_ids(drive_root: Any) -> set[str]:
         planned_restart = (
             row.get("cause") == CAUSE_PLANNED_SELF_RESTART
             and (
-                row.get("status") == "pre_adopted"
-                or int(row.get("supervisor_pid") or 0) == os.getpid()
+                int(row.get("supervisor_pid") or 0) == os.getpid()
+                or (
+                    (tx := _read_restart_transaction(
+                        drive_root, str(row.get("restart_transaction_id") or "")
+                    )).get("status") == "normal_exit_acknowledged"
+                    and str(row.get("task_id") or "") in set(tx.get("task_ids") or [])
+                )
             )
         )
         if row.get("status") in {"reserved", "pre_adopted"} and (same_generation_crash or planned_restart):
@@ -356,10 +500,14 @@ def has_planned_restart_handoffs(drive_root: Any) -> bool:
 
 
 def prepare_planned_restart_handoffs(
-    drive_root: Any, running: Mapping[str, Any],
+    drive_root: Any,
+    running: Mapping[str, Any],
+    *,
+    restart_transaction_id: str = "",
 ) -> set[str]:
     """Reserve only exact tasks durably in event-only supervising sleep."""
 
+    transaction_id = str(restart_transaction_id or uuid.uuid4().hex)
     preserved: set[str] = set()
     for task_id, meta in dict(running or {}).items():
         task = meta.get("task") if isinstance(meta, dict) else None
@@ -372,7 +520,9 @@ def prepare_planned_restart_handoffs(
             checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if not isinstance(checkpoint, dict) or checkpoint.get("status") != "sleeping":
+        if not isinstance(checkpoint, dict) or checkpoint.get("status") not in {
+            "sleeping", "wake_pending",
+        }:
             continue
         old_attempt = int(meta.get("attempt") or task.get("_attempt") or 1)
         row = prepare_handoff(
@@ -383,16 +533,43 @@ def prepare_planned_restart_handoffs(
             new_attempt=old_attempt + 1,
             worker_id=int(meta.get("worker_id") or 0),
             exitcode=None,
+            restart_transaction_id=transaction_id,
         )
         if not row or str(row.get("run_id") or "") != str(checkpoint.get("run_id") or ""):
             if row:
                 veto_handoff(drive_root, str(task_id), "sleep_checkpoint_run_mismatch")
             continue
         row["journal_cursor"] = int(checkpoint.get("journal_cursor") or 0)
-        row["mailbox_seen_ids"] = list(checkpoint.get("mailbox_seen_ids") or [])
+        row["mailbox_acknowledged_ids"] = list(
+            checkpoint.get("mailbox_acknowledged_ids") or []
+        )
+        row["interaction_acknowledged_ids"] = list(
+            checkpoint.get("interaction_acknowledged_ids") or []
+        )
+        row["pending_wake"] = (
+            dict(checkpoint.get("pending_wake"))
+            if isinstance(checkpoint.get("pending_wake"), dict) else {}
+        )
         row["checkpoint"] = checkpoint.get("checkpoint") if isinstance(checkpoint.get("checkpoint"), dict) else {}
         _write(drive_root, row)
         preserved.add(str(task_id))
+    if preserved:
+        transaction = {
+            "schema": 1, "transaction_id": transaction_id, "status": "prepared",
+            "supervisor_pid": os.getpid(), "task_ids": sorted(preserved),
+            "prepared_at": utc_now_iso(), "expected_exit_code": 42,
+        }
+        _write_restart_transaction(drive_root, transaction)
+        active_path = _active_restart_transaction_path(drive_root)
+        active_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(active_path, {
+            "transaction_id": transaction_id, "supervisor_pid": os.getpid(),
+            "prepared_at": transaction["prepared_at"],
+        })
+        custody.emit(drive_root, "delegate_restart_transaction_prepared", {
+            "restart_transaction_id": transaction_id, "supervisor_pid": os.getpid(),
+            "task_ids": sorted(preserved), "expected_exit_code": 42,
+        })
     return preserved
 
 
@@ -401,8 +578,9 @@ def pre_adopt_planned_handoffs(
 ) -> set[str]:
     """Durably adopt exact planned-restart runs before startup orphan cleanup."""
 
+    _ack_direct_exec_successor(drive_root)
     adopted: set[str] = set()
-    pending = {
+    pending_tasks_by_id = {
         str(task.get("id") or ""): task
         for task in list(pending_tasks or []) if str(task.get("id") or "")
     }
@@ -418,15 +596,27 @@ def pre_adopt_planned_handoffs(
             "reserved", "pre_adopted",
         }:
             continue
-        task = pending.get(task_id)
+        task = pending_tasks_by_id.get(task_id)
         snapshot = _selected_session(task or {})
         old_pid = int(row.get("supervisor_pid") or 0)
+        transaction_id = str(row.get("restart_transaction_id") or "")
+        transaction = _read_restart_transaction(drive_root, transaction_id)
         mismatch = ""
         if no_resume_flag:
             mismatch = f"startup_no_resume:{no_resume_flag}"
+        elif not transaction_id:
+            mismatch = "restart_transaction_missing"
+        elif transaction.get("status") != "normal_exit_acknowledged":
+            mismatch = "restart_normal_exit_unproven"
+        elif int(transaction.get("supervisor_pid") or 0) != old_pid:
+            mismatch = "restart_transaction_pid_mismatch"
+        elif int(transaction.get("exit_code") or 0) != 42:
+            mismatch = "restart_transaction_exit_mismatch"
+        elif task_id not in set(transaction.get("task_ids") or []):
+            mismatch = "restart_transaction_task_mismatch"
         elif task is None:
             mismatch = "startup_restored_task_missing"
-        elif old_pid == os.getpid() or _pid_alive(old_pid):
+        elif old_pid != os.getpid() and _pid_alive(old_pid):
             mismatch = "previous_supervisor_generation_not_dead"
         elif int(row.get("new_attempt") or 0) != int(task.get("_attempt") or 1):
             mismatch = "startup_attempt_mismatch"
@@ -442,37 +632,70 @@ def pre_adopt_planned_handoffs(
             veto_handoff(drive_root, task_id, mismatch)
             continue
         runs = [candidate for candidate in custody.open_runs(drive_root) if candidate.task_id == task_id]
-        if len(runs) != 1 or not _holder_matches(row, runs[0], pending=False):
-            veto_handoff(drive_root, task_id, "startup_run_binding_mismatch")
-            continue
-        gateway = None
-        try:
-            from ouroboros.claudexor_daemon import ensure_owned_gateway
+        pending_invocations_for_task = [
+            candidate for candidate in custody.pending_invocations(drive_root)
+            if str(candidate.get("task_id") or "") == task_id
+        ]
+        settled = custody.replay(drive_root).get(str(row.get("run_id") or ""))
+        if row.get("settled_terminal") is True:
+            if (
+                runs
+                or pending_invocations_for_task
+                or settled is None
+                or not settled.settled
+                or not _holder_matches(row, settled, pending=False)
+            ):
+                veto_handoff(drive_root, task_id, "startup_settled_binding_mismatch")
+                continue
+            adopted_run_id = settled.run_id
+        elif str(row.get("pending_invocation_id") or ""):
+            if (
+                runs
+                or len(pending_invocations_for_task) != 1
+                or not _holder_matches(row, pending_invocations_for_task[0], pending=True)
+            ):
+                veto_handoff(drive_root, task_id, "startup_invocation_binding_mismatch")
+                continue
+            adopted_run_id = ""
+        else:
+            if len(runs) != 1 or not _holder_matches(row, runs[0], pending=False):
+                veto_handoff(drive_root, task_id, "startup_run_binding_mismatch")
+                continue
+            gateway = None
+            try:
+                from ouroboros.claudexor_daemon import ensure_owned_gateway
 
-            gateway = ensure_owned_gateway()
-            gateway.get_run(runs[0].run_id)
-        except Exception:
-            veto_handoff(drive_root, task_id, "startup_run_unprovable")
-            continue
-        finally:
-            if gateway is not None:
-                gateway.close()
+                gateway = ensure_owned_gateway()
+                gateway.get_run(runs[0].run_id)
+            except Exception:
+                veto_handoff(drive_root, task_id, "startup_run_unprovable")
+                continue
+            finally:
+                if gateway is not None:
+                    gateway.close()
+            adopted_run_id = runs[0].run_id
         row.update({"status": "pre_adopted", "pre_adopted_at": utc_now_iso()})
         try:
             _write(drive_root, row)
         except Exception:
             try:
                 custody.reconcile_task_runs(drive_root, task_id)
-            finally:
-                continue
-        custody.emit(drive_root, "delegate_run_adopted", {
-            "task_id": task_id,
-            "run_id": runs[0].run_id,
-            "cause": CAUSE_PLANNED_SELF_RESTART,
-            "phase": "before_startup_orphan_sweep",
-            "config_fingerprint": str(row.get("config_fingerprint") or ""),
-            "authority_fingerprint": str(row.get("authority_fingerprint") or ""),
-        })
+            except Exception:
+                pass
+            continue
+        custody.emit(
+            drive_root,
+            "delegate_recovery_pre_adopted" if not adopted_run_id else "delegate_run_adopted",
+            {
+                "task_id": task_id,
+                "run_id": adopted_run_id,
+                "pending_invocation_id": str(row.get("pending_invocation_id") or ""),
+                "cause": CAUSE_PLANNED_SELF_RESTART,
+                "phase": "before_startup_orphan_sweep",
+                "config_fingerprint": str(row.get("config_fingerprint") or ""),
+                "authority_fingerprint": str(row.get("authority_fingerprint") or ""),
+            },
+        )
         adopted.add(task_id)
     return adopted
 
@@ -500,8 +723,23 @@ def adopt_handoff(ctx: Any, task: Mapping[str, Any]) -> dict[str, Any]:
         return {"status": "none"}
     snapshot = _selected_session(task)
     expected_attempt = int(task.get("_attempt") or 1)
+    planned_restart_mismatch = ""
+    if row.get("cause") == CAUSE_PLANNED_SELF_RESTART:
+        transaction_id = str(row.get("restart_transaction_id") or "")
+        transaction = _read_restart_transaction(drive, transaction_id)
+        if not transaction_id:
+            planned_restart_mismatch = "restart_transaction_missing"
+        elif transaction.get("status") != "normal_exit_acknowledged":
+            planned_restart_mismatch = "restart_normal_exit_unproven"
+        elif int(transaction.get("supervisor_pid") or 0) != int(row.get("supervisor_pid") or 0):
+            planned_restart_mismatch = "restart_transaction_pid_mismatch"
+        elif int(transaction.get("exit_code") or 0) != 42:
+            planned_restart_mismatch = "restart_transaction_exit_mismatch"
+        elif task_id not in set(transaction.get("task_ids") or []):
+            planned_restart_mismatch = "restart_transaction_task_mismatch"
     if (
-        row.get("cause") not in _ALLOWED_CAUSES
+        planned_restart_mismatch
+        or row.get("cause") not in _ALLOWED_CAUSES
         or (
             row.get("cause") == CAUSE_WORKER_CRASH
             and int(row.get("supervisor_pid") or 0) != os.getpid()
@@ -512,13 +750,45 @@ def adopt_handoff(ctx: Any, task: Mapping[str, Any]) -> dict[str, Any]:
         or str(row.get("authority_fingerprint") or "") != authority_fingerprint_from_task(task)
         or str(row.get("work_order_fingerprint") or "") != work_order_fingerprint(task)
     ):
-        veto_handoff(drive, task_id, "successor_binding_mismatch")
-        return {"status": "recovery_required", "reason": "successor_binding_mismatch"}
+        reason = planned_restart_mismatch or "successor_binding_mismatch"
+        veto_handoff(drive, task_id, reason)
+        return {"status": "recovery_required", "reason": reason}
     runs = [candidate for candidate in custody.open_runs(drive) if candidate.task_id == task_id]
     pending = [
         candidate for candidate in custody.pending_invocations(drive)
         if str(candidate.get("task_id") or "") == task_id
     ]
+    pending_wake = row.get("pending_wake") if isinstance(row.get("pending_wake"), dict) else {}
+    wake_payload = (
+        dict(pending_wake.get("payload"))
+        if isinstance(pending_wake.get("payload"), dict) else {}
+    )
+    if row.get("settled_terminal") is True:
+        settled = custody.replay(drive).get(str(row.get("run_id") or ""))
+        if runs or pending or settled is None or not settled.settled or not _holder_matches(
+            row, settled, pending=False,
+        ):
+            veto_handoff(drive, task_id, "settled_terminal_binding_mismatch")
+            return {"status": "recovery_required", "reason": "settled_terminal_binding_mismatch"}
+        try:
+            _restore_wait_checkpoint(drive, row)
+        except Exception:
+            return {"status": "recovery_required", "reason": "checkpoint_restore_failed"}
+        row.update({"status": "adopted", "adopted_at": utc_now_iso()})
+        try:
+            _write(drive, row)
+        except Exception:
+            return {"status": "recovery_required", "reason": "adoption_record_unwritable"}
+        custody.emit(drive, "delegate_run_adopted", {
+            "task_id": task_id, "run_id": settled.run_id,
+            "cause": str(row.get("cause") or ""), "phase": "settled_wake_replay",
+            "config_fingerprint": str(row.get("config_fingerprint") or ""),
+            "authority_fingerprint": str(row.get("authority_fingerprint") or ""),
+        })
+        return {
+            "status": "settled_recovered", "run_id": settled.run_id,
+            "cause": row.get("cause"), "wake": wake_payload,
+        }
     if len(runs) + len(pending) != 1:
         veto_handoff(drive, task_id, "ambiguous_or_missing_leaf")
         return {"status": "recovery_required", "reason": "ambiguous_or_missing_leaf"}
@@ -582,13 +852,18 @@ def adopt_handoff(ctx: Any, task: Mapping[str, Any]) -> dict[str, Any]:
         "authority_fingerprint": str(row.get("authority_fingerprint") or ""),
         "new_attempt": expected_attempt,
     })
-    return {"status": "adopted", "run_id": run_id, "cause": row.get("cause")}
+    return {
+        "status": "adopted", "run_id": run_id, "cause": row.get("cause"),
+        **({"wake": wake_payload} if wake_payload else {}),
+    }
 
 
 __all__ = [
     "CAUSE_PLANNED_SELF_RESTART",
     "CAUSE_WORKER_CRASH",
     "NO_RESUME_CAUSES",
+    "PLANNED_RESTART_TRANSACTION_ENV",
+    "acknowledge_observed_restart_exit",
     "adopt_handoff",
     "authority_fingerprint_from_context",
     "authority_fingerprint_from_task",

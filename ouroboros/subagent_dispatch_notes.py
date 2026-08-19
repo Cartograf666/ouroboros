@@ -139,8 +139,8 @@ def executor_blocked_outcome(decision: SubagentExecutorResolution) -> Tuple[str,
             "⚠️ EXECUTOR_UNAVAILABLE: this subagent was pinned to the delegated "
             f"substrate (executor='harness'), but {detail}, so the pin cannot be "
             "honored. The task was NOT run on metered API tokens. Fix the tool "
-            "policy / task contract that hides the delegate verbs, or schedule "
-            "again with executor='auto' to accept metered spend."
+            "policy / task contract that hides the delegate verbs, or explicitly "
+            "select another Available subagent."
         )
         # Literal codes (not `decision.reason`) so the provenance drift guard
         # keeps seeing every code the runtime can emit.
@@ -158,10 +158,10 @@ def executor_blocked_outcome(decision: SubagentExecutorResolution) -> Tuple[str,
         "what the pin exists to prevent. "
         + ("This harness structurally cannot run delegated work (its manifest does not "
            "support it), so waiting will not heal it: change the delegated route, or "
-           "schedule it again with executor='auto' to accept metered spend."
+           "select another Available subagent explicitly."
            if ":delegation_" in decision.reason else
-           "Reschedule once the route recovers, or "
-           "schedule it again with executor='auto' to accept metered spend.")
+           "Reschedule once the route recovers, or explicitly select another "
+           "Available subagent.")
     )
     return text, {
         "execution_status": "infra_failed",

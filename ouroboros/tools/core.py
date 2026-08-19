@@ -1984,6 +1984,37 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
     return header + "\n\n" + "\n".join(matches)
 
 
+def _durable_descendant_of(
+    drive_root: pathlib.Path,
+    task_id: str,
+    task: Dict[str, Any],
+    ancestor_id: str,
+    *,
+    max_hops: int = 64,
+) -> bool:
+    """Follow the durable parent chain; shared-root labels are not ancestry proof."""
+
+    from ouroboros.task_status import load_effective_task_result
+
+    current_id = str(task_id or "")
+    current = task if isinstance(task, dict) else {}
+    seen = {current_id}
+    for _hop in range(max_hops):
+        parent_id = str(current.get("parent_task_id") or "").strip()
+        if not parent_id:
+            return False
+        if parent_id == ancestor_id:
+            return True
+        if parent_id in seen:
+            return False
+        seen.add(parent_id)
+        current = load_effective_task_result(drive_root, parent_id)
+        if not current:
+            return False
+        current_id = parent_id
+    return False
+
+
 def _forward_to_worker(
     ctx: ToolContext, task_id: str, message: str, relayed_from_task_id: str = "",
 ) -> str:
@@ -2023,12 +2054,9 @@ def _forward_to_worker(
     except Exception:
         log.debug("forward_to_worker cancel-pending check failed for %s", tid, exc_info=True)
     current_task_id = str(getattr(ctx, "task_id", "") or "").strip()
-    target_parent = str(data.get("parent_task_id") or "").strip()
-    target_root = str(data.get("root_task_id") or "").strip()
     if not current_task_id:
         return "⚠️ TASK_FORBIDDEN: forward_to_worker requires an active task context."
-    allowed = target_parent == current_task_id or target_root == current_task_id
-    if not allowed:
+    if not _durable_descendant_of(status_drive_root, tid, data, current_task_id):
         return f"⚠️ TASK_FORBIDDEN: task {tid} is not a child or descendant of the current task."
     relayed_from = str(relayed_from_task_id or "").strip()
     provenance = "ancestor_task"
@@ -2038,9 +2066,9 @@ def _forward_to_worker(
         except ValueError as exc:
             return f"⚠️ TOOL_ARG_ERROR (forward_to_worker): {exc}"
         source = load_effective_task_result(status_drive_root, relayed_from)
-        source_parent = str(source.get("parent_task_id") or "").strip()
-        source_root = str(source.get("root_task_id") or "").strip()
-        if not source or not (source_parent == current_task_id or source_root == current_task_id):
+        if not source or not _durable_descendant_of(
+            status_drive_root, relayed_from, source, current_task_id,
+        ):
             return (
                 f"⚠️ TASK_FORBIDDEN: relay source {relayed_from} is not a child or "
                 "descendant of the current task."

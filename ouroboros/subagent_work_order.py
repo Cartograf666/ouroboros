@@ -6,15 +6,26 @@ import json
 from hashlib import sha256
 from typing import Any, Mapping
 
-from ouroboros.utils import truncate_within_limit
+_WORK_ORDER_CHARS = 40_000
+# Historical import name retained for tests/callers which only need the public
+# wire budget. It is no longer a per-field truncation limit.
+_FIELD_CHARS = _WORK_ORDER_CHARS
 
-_FIELD_CHARS = 4_000
+
+class WorkOrderBudgetExceeded(ValueError):
+    """A complete work order cannot fit the one explicit wire budget."""
+
+    def __init__(self, *, chars: int, sha256_hex: str) -> None:
+        super().__init__(f"complete work order is {chars} characters (budget {_WORK_ORDER_CHARS})")
+        self.chars = int(chars)
+        self.sha256 = str(sha256_hex)
+        self.limit = _WORK_ORDER_CHARS
 
 
 def _text(value: Any) -> str:
     if isinstance(value, list):
         value = "\n".join(f"- {item}" for item in value if str(item).strip())
-    return truncate_within_limit(str(value or "").strip(), _FIELD_CHARS)
+    return str(value or "").strip()
 
 
 def assignment_instructions(ctx: Any) -> str:
@@ -38,9 +49,7 @@ def assignment_instructions(ctx: Any) -> str:
     return "\n\n".join(parts)
 
 
-def compile_external_work_order(task: Mapping[str, Any]) -> str:
-    """Compile the scheduled child brief into the exact external leaf prompt."""
-
+def _render_external_work_order(task: Mapping[str, Any]) -> str:
     contract = task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {}
     sections: list[tuple[str, Any]] = [
         ("OBJECTIVE", task.get("objective") or contract.get("objective") or task.get("description")),
@@ -71,6 +80,17 @@ def compile_external_work_order(task: Mapping[str, Any]) -> str:
     return "\n\n".join(rendered)
 
 
+def compile_external_work_order(task: Mapping[str, Any]) -> str:
+    """Compile one complete brief or refuse instead of sending a false prefix."""
+
+    rendered = _render_external_work_order(task)
+    if len(rendered) > _WORK_ORDER_CHARS:
+        raise WorkOrderBudgetExceeded(
+            chars=len(rendered), sha256_hex=sha256(rendered.encode("utf-8")).hexdigest(),
+        )
+    return rendered
+
+
 def start_binding_fingerprints(ctx: Any, prompt: str) -> tuple[str, str]:
     """Digest the exact brief and the existing normalized task authority."""
 
@@ -83,12 +103,12 @@ def start_binding_fingerprints(ctx: Any, prompt: str) -> tuple[str, str]:
 
 
 def work_order_fingerprint(task: Mapping[str, Any]) -> str:
-    """Digest the one canonical scheduled-child brief."""
+    """Digest the complete canonical brief, including an over-budget one."""
 
-    return sha256(compile_external_work_order(task).encode("utf-8")).hexdigest()
+    return sha256(_render_external_work_order(task).encode("utf-8")).hexdigest()
 
 
 __all__ = [
-    "assignment_instructions", "compile_external_work_order", "start_binding_fingerprints",
-    "work_order_fingerprint",
+    "WorkOrderBudgetExceeded", "assignment_instructions", "compile_external_work_order",
+    "start_binding_fingerprints", "work_order_fingerprint",
 ]

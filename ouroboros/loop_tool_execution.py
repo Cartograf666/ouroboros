@@ -1188,11 +1188,18 @@ def process_tool_results(
             "tool_call_id": exec_result["tool_call_id"],
             "content": truncated_result
         })
+        ctx = getattr(tools, "_ctx", None) if tools is not None else None
+        if fn_name == "delegate_wait" and ctx is not None:
+            try:
+                from ouroboros.delegate_supervision import acknowledge_pending_wake
+
+                acknowledge_pending_wake(ctx, truncated_result)
+            except Exception:
+                log.debug("Failed to acknowledge injected delegate wake", exc_info=True)
 
         # Retain the pre-truncation trace ref per tool_call_id so the context
         # reclaim materializer can bind exact tool CAS refs into its capsules.
         trace_ref = exec_result.get("trace_ref")
-        ctx = getattr(tools, "_ctx", None) if tools is not None else None
         if ctx is not None and isinstance(trace_ref, dict) and trace_ref:
             refs = getattr(ctx, "_tool_trace_refs", None)
             if not isinstance(refs, dict):

@@ -1955,6 +1955,7 @@ def kill_workers(
     disable_reason: str = "",
     preserve_pending: bool = False,
     preserve_running_task_ids: Optional[set[str]] = None,
+    reconcile_delegate_custody: bool = True,
 ) -> None:
     global _WORKER_POOL_DISABLED_REASON
     from supervisor import queue
@@ -1987,6 +1988,25 @@ def kill_workers(
                 for task_id, meta in RUNNING.items()
                 if isinstance(meta, dict) and task_id not in preserve_running
             }
+
+            def _audit_delegate_terminal(task_id: str, trigger: str) -> None:
+                if not reconcile_delegate_custody:
+                    return
+                try:
+                    from ouroboros import delegate_terminal
+
+                    audit = delegate_terminal.terminal_reconcile_task(
+                        DRIVE_ROOT, task_id, trigger=trigger,
+                    )
+                    delegate_terminal.record_terminal_reconciliation(
+                        DRIVE_ROOT, task_id, audit,
+                    )
+                except Exception:
+                    log.warning(
+                        "Terminal delegate reconciliation failed for %s", task_id,
+                        exc_info=True,
+                    )
+
             for task_id in list(RUNNING):
                 meta = RUNNING.get(task_id) or {}
                 task = meta.get("task") if isinstance(meta, dict) and isinstance(meta.get("task"), dict) else {}
@@ -1997,6 +2017,7 @@ def kill_workers(
                     RUNNING.pop(str(task_id), None)
                     continue
                 try:
+                    _audit_delegate_terminal(str(task_id), "worker_pool_kill")
                     persisted = _write_failure_result(task_id, reason=result_reason, status=terminal_status)
                     if archive_service_logs:
                         try:
@@ -2020,6 +2041,7 @@ def kill_workers(
                     if parent_id and (parent_id in running_task_ids or root_id in interrupted_roots):
                         tid = str(task.get("id") or "")
                         if tid:
+                            _audit_delegate_terminal(tid, "pending_parent_interrupted")
                             persisted = _write_failure_result(
                                 tid,
                                 reason="Parent task was interrupted before this child started.",
@@ -2036,6 +2058,7 @@ def kill_workers(
                     tid = task.get("id")
                     if tid:
                         try:
+                            _audit_delegate_terminal(str(tid), "pending_pool_kill")
                             persisted = _write_failure_result(tid, reason=result_reason, status=terminal_status)
                         except Exception:
                             log.warning("Failed to write failure result for pending task %s", tid, exc_info=True)

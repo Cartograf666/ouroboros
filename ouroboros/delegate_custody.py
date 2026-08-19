@@ -1240,17 +1240,17 @@ def pending_invocations(drive_root: Any,
 
 def release_task_runs(drive_root: Any, task_id: str, *,
                       gateway_factory: Optional[Callable[[], Any]] = None) -> List[Dict[str, Any]]:
-    """Settle or cancel the runs a task still holds, as its loop exits.
+    """Run the one non-panic terminal custody boundary for a normal loop exit."""
 
-    The in-process twin of ``reconcile_orphaned_runs``: this runs in the very process
-    that started them, so the memo IS complete here and the durable scan is not needed —
-    a task that delegated nothing pays nothing. The durable path still covers the case
-    this one cannot: a worker that died before reaching its own teardown. Without this,
-    a terminalized parent left its run mutating until the next 10-minute sweep.
-    """
-    mine = str(task_id or "")
-    held = [c for c in list(_CUSTODY.values()) if c.task_id == mine and mine and not c.settled]
-    return _reconcile_each(drive_root, held, gateway_factory) if held else []
+    from ouroboros.delegate_terminal import (
+        record_terminal_reconciliation, terminal_reconcile_task,
+    )
+
+    result = terminal_reconcile_task(
+        drive_root, task_id, gateway_factory=gateway_factory, trigger="loop_exit",
+    )
+    record_terminal_reconciliation(drive_root, task_id, result)
+    return list(result.get("outcomes") or [])
 
 
 def reconcile_task_runs(drive_root: Any, task_id: str, *,

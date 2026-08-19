@@ -35,6 +35,47 @@ def _mailbox_path(drive_root: pathlib.Path, task_id: str) -> pathlib.Path:
     return pathlib.Path(drive_root) / _MAILBOX_DIR / f"{validate_task_id(task_id)}.jsonl"
 
 
+def _ack_path(drive_root: pathlib.Path, task_id: str) -> pathlib.Path:
+    return pathlib.Path(drive_root) / _MAILBOX_DIR / f"{validate_task_id(task_id)}.acks.jsonl"
+
+
+def acknowledged_task_message_ids(drive_root: pathlib.Path, task_id: str) -> set[str]:
+    """Read durable delivery acknowledgements for supervision-owned messages."""
+
+    path = _ack_path(drive_root, task_id)
+    if not path.exists():
+        return set()
+    found: set[str] = set()
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(row, dict) and str(row.get("msg_id") or ""):
+                found.add(str(row["msg_id"]))
+    except OSError:
+        log.warning("Failed to read task-message acknowledgements for %s", task_id, exc_info=True)
+    return found
+
+
+def acknowledge_task_messages(
+    drive_root: pathlib.Path, task_id: str, msg_ids: List[str], *, wake_id: str,
+) -> bool:
+    """Acknowledge messages only after their wake was injected into a transcript."""
+
+    path = _ack_path(drive_root, task_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = acknowledged_task_message_ids(drive_root, task_id)
+    for msg_id in [str(item) for item in msg_ids if str(item) and str(item) not in existing]:
+        if not append_jsonl(path, {
+            "ts": utc_now_iso(), "type": "task_message_acknowledged",
+            "task_id": str(task_id), "msg_id": msg_id, "wake_id": str(wake_id or ""),
+        }):
+            return False
+    return True
+
+
 def write_owner_message(
     drive_root: pathlib.Path,
     text: str,
@@ -159,6 +200,7 @@ def drain_owner_entries(
         return []
     if seen_ids is None:
         seen_ids = set()
+    seen_ids.update(acknowledged_task_message_ids(drive_root, task_id))
     try:
         content = path.read_text(encoding="utf-8").strip()
         if not content:
@@ -229,9 +271,9 @@ def drain_owner_messages(
 
 def cleanup_task_mailbox(drive_root: pathlib.Path, task_id: str) -> None:
     """Remove a task's mailbox file after task completes."""
-    path = _mailbox_path(drive_root, task_id)
-    try:
-        if path.exists():
-            path.unlink()
-    except Exception:
-        log.debug("Failed to cleanup mailbox for task %s", task_id, exc_info=True)
+    for path in (_mailbox_path(drive_root, task_id), _ack_path(drive_root, task_id)):
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            log.debug("Failed to cleanup mailbox for task %s", task_id, exc_info=True)
