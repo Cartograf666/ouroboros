@@ -42,7 +42,12 @@ terminal surface, and none may be added.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import re
+import subprocess
+import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Dict, List
 
@@ -72,6 +77,18 @@ _LOGIN_TRANSPORTS = ("", "client_pty")
 # structural marker for the one feature, and it is the catalog ID — the
 # engine's own stable identifier for the operation, not the path spelling.
 _LOGIN_INPUT_OPERATION_ID = "post:setup.jobs.id.input"
+_HARNESS_INSTALL_TIMEOUT_SEC = 300.0
+_HARNESS_INSTALL_STDOUT_LIMIT = 64 * 1024
+_HARNESS_INSTALL_CORE_FIELDS = frozenset({
+    "ok", "dryRun", "exitCode", "target", "harness", "command",
+    "installLocation", "installedBinary", "installedVersion", "pinnedVersion",
+    "verification",
+})
+_HARNESS_INSTALL_PROVENANCE_FIELDS = frozenset({"installerSha256", "installerByteLength"})
+_LOCAL_INSTALL_VERIFICATIONS = frozenset({
+    "release_verified", "deterministic_only", "unattended_unpinned",
+})
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _login_disclosure_native(operations: List[Dict[str, Any]]) -> bool:
@@ -484,6 +501,197 @@ def _login_job_response(job: Dict[str, Any], **metadata: Any) -> Dict[str, Any]:
     return out
 
 
+def _is_immediate_missing_cli_job(job: Dict[str, Any], harness: str, gateway: Any) -> bool:
+    """Match only the pinned engine's synchronous missing-vendor-CLI result."""
+    if not isinstance(job, dict):
+        return False
+    outcome = job.get("outcome")
+    if (
+        not isinstance(job.get("jobId"), str)
+        or not job["jobId"]
+        or job.get("harness") != harness
+        or job.get("action") != "login"
+        or job.get("state") != "not_supported"
+        or job.get("phase") != "completed"
+        or not isinstance(outcome, dict)
+        or outcome.get("reason") != "not_supported"
+        or "command" not in job
+        or job.get("command") is not None
+        or job.get("authorization") is not None
+        or job.get("nativeCommand") is not None
+    ):
+        return False
+
+    from ouroboros.claudexor_runtime import get_runtime_manager
+
+    pin = get_runtime_manager().pin
+    return bool(
+        pin is not None
+        and pin.cli_entrypoint is not None
+        and gateway.engine_version == pin.version
+        and gateway.engine_build_sha == pin.build_sha
+    )
+
+
+def _drain_installer_stdout(pipe: Any, output: bytearray, state: Dict[str, bool]) -> None:
+    try:
+        while True:
+            chunk = pipe.read(8192)
+            if not chunk:
+                break
+            remaining = _HARNESS_INSTALL_STDOUT_LIMIT - len(output)
+            if remaining > 0:
+                output.extend(chunk[:remaining])
+            if len(chunk) > remaining:
+                state["overflow"] = True
+    except Exception:
+        state["read_error"] = True
+    finally:
+        try:
+            pipe.close()
+        except Exception:
+            pass
+
+
+def _valid_install_success(payload: Any, harness: str) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    fields = frozenset(payload)
+    with_provenance = _HARNESS_INSTALL_CORE_FIELDS | _HARNESS_INSTALL_PROVENANCE_FIELDS
+    if fields not in (_HARNESS_INSTALL_CORE_FIELDS, with_provenance):
+        return False
+    verification = payload.get("verification")
+    if (
+        payload.get("ok") is not True
+        or payload.get("dryRun") is not False
+        or type(payload.get("exitCode")) is not int
+        or payload["exitCode"] != 0
+        or payload.get("target") != "local"
+        or payload.get("harness") != harness
+        or not isinstance(payload.get("command"), str)
+        or not payload["command"]
+        or not isinstance(payload.get("installLocation"), str)
+        or not payload["installLocation"]
+        or not isinstance(payload.get("installedBinary"), str)
+        or not os.path.isabs(payload["installedBinary"])
+        or not isinstance(payload.get("installedVersion"), str)
+        or not payload["installedVersion"].strip()
+        or len(payload["installedVersion"]) > 256
+        or not isinstance(verification, str)
+        or verification not in _LOCAL_INSTALL_VERIFICATIONS
+        or (
+            verification == "unattended_unpinned"
+            and payload.get("pinnedVersion") is not None
+        )
+        or (
+            verification != "unattended_unpinned"
+            and not (
+                isinstance(payload.get("pinnedVersion"), str)
+                and bool(payload["pinnedVersion"])
+            )
+        )
+    ):
+        return False
+    if fields == with_provenance:
+        return bool(
+            verification == "unattended_unpinned"
+            and isinstance(payload.get("installerSha256"), str)
+            and _SHA256_HEX.fullmatch(payload["installerSha256"])
+            and type(payload.get("installerByteLength")) is int
+            and payload["installerByteLength"] > 0
+        )
+    return True
+
+
+def _install_harness_cli(harness: str) -> None:
+    from ouroboros.claudexor_runtime import ClaudexorRuntimeError, get_runtime_manager
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+    from ouroboros.platform_layer import (
+        kill_process_tree,
+        merge_hidden_kwargs,
+        subprocess_new_group_kwargs,
+    )
+
+    try:
+        command = get_runtime_manager().ensure_cli_command()
+    except ClaudexorRuntimeError as exc:
+        raise ClaudexorUnavailable(exc.code, str(exc)) from exc
+    if len(command) != 2:
+        raise ClaudexorUnavailable(
+            "runtime_cli_unavailable", "the exact managed Claudexor CLI is not selectable"
+        )
+    argv = [
+        *command, "harness", "install", harness,
+        "--target", "local", "--yes", "--json",
+    ]
+    kwargs = merge_hidden_kwargs(subprocess_new_group_kwargs())
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            **kwargs,
+        )
+    except OSError as exc:
+        raise ClaudexorUnavailable(
+            "harness_install_spawn_failed",
+            f"managed Claudexor installer could not start: {type(exc).__name__}",
+        ) from exc
+
+    output = bytearray()
+    state: Dict[str, bool] = {}
+    reader = threading.Thread(
+        target=_drain_installer_stdout,
+        args=(proc.stdout, output, state),
+        name="claudexor-installer-stdout",
+        daemon=True,
+    )
+    reader.start()
+    try:
+        try:
+            exit_code = proc.wait(timeout=_HARNESS_INSTALL_TIMEOUT_SEC)
+        except subprocess.TimeoutExpired as exc:
+            kill_process_tree(proc)
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                pass
+            raise ClaudexorUnavailable(
+                "harness_install_timeout",
+                f"managed Claudexor installer exceeded {_HARNESS_INSTALL_TIMEOUT_SEC:.0f}s",
+            ) from exc
+    finally:
+        reader.join(timeout=10)
+        if reader.is_alive():
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            reader.join(timeout=1)
+        if reader.is_alive():
+            state["read_error"] = True
+
+    if exit_code != 0:
+        raise ClaudexorUnavailable(
+            "harness_install_failed", f"managed Claudexor installer exited with code {exit_code}"
+        )
+    if state.get("overflow") or state.get("read_error"):
+        raise ClaudexorUnavailable(
+            "harness_install_invalid_response", "managed Claudexor installer output was invalid"
+        )
+    try:
+        payload = json.loads(bytes(output))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ClaudexorUnavailable(
+            "harness_install_invalid_response", "managed Claudexor installer returned invalid JSON"
+        ) from exc
+    if not _valid_install_success(payload, harness):
+        raise ClaudexorUnavailable(
+            "harness_install_invalid_response", "managed Claudexor installer receipt was invalid"
+        )
+
+
 def _login_create(body: Dict[str, Any]) -> Dict[str, Any]:
     from ouroboros.claudexor_daemon import attach_login_command, ensure_owned_gateway
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
@@ -520,15 +728,25 @@ def _login_create(body: Dict[str, Any]) -> Dict[str, Any]:
         request_body = _build_login_request(
             harness, profile_id, transport, login_flow,
             disclosure_native=disclosure_native)
-        try:
-            job = gateway.setup_job_create(request_body)
-        except ClaudexorUnavailable as exc:
-            # Mark WHERE the daemon answered: only a 400 from the job CREATE is
-            # a verdict about the requested login shape (the pass-through the
-            # endpoint forwards). A handshake or discovery 400 earlier in this
-            # block is engine/protocol trouble and stays the honest 503.
-            exc.login_create_verdict = True
-            raise
+        def _create() -> Dict[str, Any]:
+            try:
+                return gateway.setup_job_create(request_body)
+            except ClaudexorUnavailable as exc:
+                # Mark WHERE the daemon answered: only a 400 from the job CREATE
+                # is a verdict about the requested login shape (the pass-through
+                # the endpoint forwards). A handshake or discovery 400 earlier in
+                # this block is engine/protocol trouble and stays the honest 503.
+                exc.login_create_verdict = True
+                raise
+
+        job = _create()
+        # Connect is the owner's consent. If the exact pinned engine answers
+        # this FIRST create with its structural pre-command missing-binary
+        # terminal job, install that vendor CLI once and create the job once
+        # more; a second refusal is returned, never looped.
+        if _is_immediate_missing_cli_job(job, harness, gateway):
+            _install_harness_cli(harness)
+            job = _create()
     job_id = str(job.get("id") or job.get("jobId") or "")
     metadata: Dict[str, Any] = {"job_id": job_id, "disclosure_native": disclosure_native}
     if request_body.get("transport") == "client_pty" and job_id:

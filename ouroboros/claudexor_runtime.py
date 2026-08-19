@@ -40,6 +40,7 @@ _PIN_FILENAME = "claudexor_runtime_pin.json"
 _SEED_DIR_NAME = "claudexor-runtime"
 _RUNTIME_META_FILENAME = "managed-runtime.json"
 _NODE_META_FILENAME = "managed-node.json"
+_NODE_META_SCHEMA_VERSION = 2
 _INSTALL_LOCK_FILENAME = "install.lock"
 _INSTALL_LOCK_STALE_SEC = 1800.0
 _INSTALL_LOCK_WAIT_SEC = 4.0
@@ -58,6 +59,7 @@ _PIN_FIELDS = frozenset({
     "node_version",
     "node_artifacts",
     "entrypoint",
+    "cli_entrypoint",
 })
 _NODE_ARTIFACT_FIELDS = frozenset({"archive_url", "sha256", "size_bytes", "executable"})
 _NODE_PLATFORM_KEYS = frozenset({
@@ -149,6 +151,7 @@ class ClaudexorRuntimePin:
     node_version: str
     node_artifacts: Mapping[str, NodeRuntimeArtifact]
     entrypoint: str
+    cli_entrypoint: Optional[str] = None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "ClaudexorRuntimePin":
@@ -162,6 +165,9 @@ class ClaudexorRuntimePin:
                 details.append(f"unknown fields: {', '.join(unknown)}")
             raise ClaudexorRuntimeError("runtime_pin_invalid", "; ".join(details))
         try:
+            cli_entrypoint = raw["cli_entrypoint"]
+            if cli_entrypoint is not None and not isinstance(cli_entrypoint, str):
+                raise TypeError("cli_entrypoint must be a string or null")
             pin = cls(
                 version=str(raw["version"]),
                 build_sha=str(raw["build_sha"]),
@@ -175,6 +181,7 @@ class ClaudexorRuntimePin:
                     for key, value in dict(raw["node_artifacts"]).items()
                 },
                 entrypoint=str(raw["entrypoint"]),
+                cli_entrypoint=cli_entrypoint,
             )
         except (TypeError, ValueError) as exc:
             raise ClaudexorRuntimeError(
@@ -228,6 +235,8 @@ class ClaudexorRuntimePin:
                 artifact.validate()
         if not _safe_archive_relative_path(self.entrypoint):
             errors.append("entrypoint must be a safe relative archive path")
+        if self.cli_entrypoint is not None and not _safe_archive_relative_path(self.cli_entrypoint):
+            errors.append("cli_entrypoint must be null or a safe relative archive path")
         if errors:
             raise ClaudexorRuntimeError("runtime_pin_invalid", "; ".join(errors))
 
@@ -529,6 +538,42 @@ class ClaudexorRuntimeManager:
         external = _compatibility_binary()
         return [external] if external else []
 
+    def resolve_cli_command(self) -> list[str]:
+        """Read-only exact managed CLI selection; never consult PATH/overrides."""
+        if self._pin_error or self._pin is None or self._pin.cli_entrypoint is None:
+            return []
+        return self._managed_cli_command()
+
+    def ensure_cli_command(self) -> list[str]:
+        """Provision the pin-bound closure and POSIX Node/npm CLI toolchain."""
+        with self._lock:
+            pin = self._pin
+            if self._pin_error:
+                raise ClaudexorRuntimeError(
+                    self._pin_error_code or "runtime_pin_invalid", self._pin_error
+                )
+            if pin is None or pin.cli_entrypoint is None:
+                raise ClaudexorRuntimeError(
+                    "runtime_cli_unavailable",
+                    "the reviewed Claudexor closure has no managed CLI entrypoint",
+                )
+            try:
+                self._cli_node_artifact(pin)
+                command = self._managed_cli_command()
+                if not command:
+                    self._install(pin, require_npm=True)
+                    command = self._managed_cli_command()
+                if not command:
+                    raise ClaudexorRuntimeError(
+                        "runtime_cli_unavailable",
+                        "the exact managed Claudexor CLI/toolchain is not selectable",
+                    )
+                self._last_error = ""
+                return command
+            except ClaudexorRuntimeError as exc:
+                self._last_error = f"{exc.code}: {exc}"
+                raise
+
     def ensure(self) -> list[str]:
         """Foreground install/repair/update intent, returning the next command."""
         with self._lock:
@@ -699,16 +744,25 @@ class ClaudexorRuntimeManager:
         build_sha = str(raw.get("build_sha") or "")
         node_version = str(raw.get("node_version") or "")
         entrypoint = str(raw.get("entrypoint") or "")
+        cli_entrypoint = raw.get("cli_entrypoint")
         if (
             raw.get("schema_version") != 1
             or not _SEMVER.fullmatch(version)
             or not _GIT_SHA.fullmatch(build_sha)
             or not _SEMVER.fullmatch(node_version)
             or not _safe_archive_relative_path(entrypoint)
+            or (cli_entrypoint is not None and (
+                not isinstance(cli_entrypoint, str)
+                or not _safe_archive_relative_path(cli_entrypoint)
+            ))
         ):
             return {}
         try:
             if not (root / pathlib.PurePosixPath(entrypoint)).is_file():
+                return {}
+            if cli_entrypoint is not None and not (
+                root / pathlib.PurePosixPath(cli_entrypoint)
+            ).is_file():
                 return {}
         except OSError:
             return {}
@@ -732,11 +786,17 @@ class ClaudexorRuntimeManager:
             "node_version": pin.node_version,
             "entrypoint": pin.entrypoint,
         }
+        if pin.cli_entrypoint is not None:
+            expected["cli_entrypoint"] = pin.cli_entrypoint
         if any(raw.get(key) != value for key, value in expected.items()):
             return {}
         entrypoint = root / pathlib.PurePosixPath(pin.entrypoint)
         try:
             if not entrypoint.is_file():
+                return {}
+            if pin.cli_entrypoint is not None and not (
+                root / pathlib.PurePosixPath(pin.cli_entrypoint)
+            ).is_file():
                 return {}
         except OSError:
             return {}
@@ -761,6 +821,26 @@ class ClaudexorRuntimeManager:
         platform_key = node_distribution_platform()
         if not platform_key:
             return ""
+        return self._resolve_managed_node(pin, platform_key)
+
+    @staticmethod
+    def _archive_npm_cli(artifact: NodeRuntimeArtifact, platform_key: str) -> str:
+        if platform_key.startswith("win32-"):
+            return ""
+        executable = pathlib.PurePosixPath(artifact.executable)
+        if executable.parts[-2:] != ("bin", "node"):
+            return ""
+        return str(executable.parent.parent / "lib/node_modules/npm/bin/npm-cli.js")
+
+    @staticmethod
+    def _managed_npm_cli(node: pathlib.Path) -> pathlib.Path:
+        return node.parent.parent / "lib/node_modules/npm/bin/npm-cli.js"
+
+    def _resolve_managed_node(
+        self, pin: ClaudexorRuntimePin, platform_key: str, *, require_npm: bool = False
+    ) -> str:
+        from ouroboros.platform_layer import embedded_node_candidates, probe_node_version
+
         root = managed_node_dir(pin, platform_key)
         try:
             raw = json.loads((root / _NODE_META_FILENAME).read_text(encoding="utf-8"))
@@ -769,8 +849,8 @@ class ClaudexorRuntimeManager:
         artifact = pin.node_artifacts.get(platform_key)
         if artifact is None:
             return ""
+        archive_npm_cli = self._archive_npm_cli(artifact, platform_key)
         expected = {
-            "schema_version": 1,
             "version": pin.node_version,
             "platform": platform_key,
             "archive_url": artifact.archive_url,
@@ -780,13 +860,51 @@ class ClaudexorRuntimeManager:
         }
         if not isinstance(raw, dict) or any(raw.get(key) != value for key, value in expected.items()):
             return ""
+        schema = raw.get("schema_version")
+        if schema not in (1, _NODE_META_SCHEMA_VERSION):
+            return ""
+        if require_npm and (
+            schema != _NODE_META_SCHEMA_VERSION
+            or not archive_npm_cli
+            or raw.get("archive_npm_cli") != archive_npm_cli
+        ):
+            return ""
         candidate = embedded_node_candidates(root)[0]
         try:
-            if candidate.is_file() and probe_node_version(str(candidate)) == pin.node_version:
-                return str(candidate)
+            if not candidate.is_file() or probe_node_version(str(candidate)) != pin.node_version:
+                return ""
+            if require_npm and not self._managed_npm_cli(candidate).is_file():
+                return ""
+            return str(candidate)
         except OSError:
-            pass
-        return ""
+            return ""
+
+    def _resolve_node_toolchain(self, pin: ClaudexorRuntimePin) -> str:
+        from ouroboros.platform_layer import node_distribution_platform
+
+        platform_key = node_distribution_platform()
+        if not platform_key or platform_key.startswith("win32-"):
+            return ""
+        return self._resolve_managed_node(pin, platform_key, require_npm=True)
+
+    def _cli_node_artifact(
+        self, pin: ClaudexorRuntimePin
+    ) -> tuple[str, NodeRuntimeArtifact]:
+        from ouroboros.platform_layer import node_distribution_platform
+
+        platform_key = node_distribution_platform()
+        artifact = pin.node_artifacts.get(platform_key)
+        if (
+            not platform_key
+            or platform_key.startswith("win32-")
+            or artifact is None
+            or not self._archive_npm_cli(artifact, platform_key)
+        ):
+            raise ClaudexorRuntimeError(
+                "runtime_cli_platform_unsupported",
+                "the reviewed platform has no managed Node/npm CLI toolchain contract",
+            )
+        return platform_key, artifact
 
     def _ensure_node(self, pin: ClaudexorRuntimePin) -> str:
         """Provision the pin's exact Node only when no exact packaged copy exists."""
@@ -804,12 +922,31 @@ class ClaudexorRuntimeManager:
             )
         cache = managed_runtime_root() / "cache" / artifact.archive_name
         archive = fetch_node_archive(artifact, cache)
-        self._promote_node(pin, platform_key, artifact, archive)
+        self._promote_node(
+            pin, platform_key, artifact, archive,
+            include_npm=pin.cli_entrypoint is not None,
+        )
         node = self._resolve_node(pin)
         if not node:
             raise ClaudexorRuntimeError(
                 "runtime_node_install_failed",
                 "the exact managed Node was not selectable after installation",
+            )
+        return node
+
+    def _ensure_node_toolchain(self, pin: ClaudexorRuntimePin) -> str:
+        node = self._resolve_node_toolchain(pin)
+        if node:
+            return node
+        platform_key, artifact = self._cli_node_artifact(pin)
+        cache = managed_runtime_root() / "cache" / artifact.archive_name
+        archive = fetch_node_archive(artifact, cache)
+        self._promote_node(pin, platform_key, artifact, archive, include_npm=True)
+        node = self._resolve_node_toolchain(pin)
+        if not node:
+            raise ClaudexorRuntimeError(
+                "runtime_node_install_failed",
+                "the exact managed Node/npm toolchain was not selectable after installation",
             )
         return node
 
@@ -819,6 +956,8 @@ class ClaudexorRuntimeManager:
         platform_key: str,
         artifact: NodeRuntimeArtifact,
         archive: pathlib.Path,
+        *,
+        include_npm: bool = False,
     ) -> None:
         from ouroboros.platform_layer import embedded_node_candidates, probe_node_version
         from ouroboros.utils import atomic_write_json
@@ -833,7 +972,12 @@ class ClaudexorRuntimeManager:
             staging.mkdir(parents=False, exist_ok=False)
             node = embedded_node_candidates(staging)[0]
             node.parent.mkdir(parents=True, exist_ok=True)
-            self._extract_node_archive(archive, artifact, node)
+            archive_npm_cli = self._archive_npm_cli(artifact, platform_key) if include_npm else ""
+            npm_root = self._managed_npm_cli(node).parent.parent if archive_npm_cli else None
+            self._extract_node_archive(
+                archive, artifact, node,
+                archive_npm_cli=archive_npm_cli, npm_root=npm_root,
+            )
             try:
                 node.chmod(0o755)
             except OSError:
@@ -844,17 +988,19 @@ class ClaudexorRuntimeManager:
                     "runtime_node_version_mismatch",
                     f"managed Node {actual or 'unknown'} does not match the reviewed {pin.node_version}",
                 )
+            metadata = {
+                "schema_version": _NODE_META_SCHEMA_VERSION if archive_npm_cli else 1,
+                "version": pin.node_version,
+                "platform": platform_key,
+                "archive_url": artifact.archive_url,
+                "archive_sha256": artifact.sha256,
+                "archive_size": artifact.size_bytes,
+                "archive_executable": artifact.executable,
+            }
+            if archive_npm_cli:
+                metadata["archive_npm_cli"] = archive_npm_cli
             atomic_write_json(
-                staging / _NODE_META_FILENAME,
-                {
-                    "schema_version": 1,
-                    "version": pin.node_version,
-                    "platform": platform_key,
-                    "archive_url": artifact.archive_url,
-                    "archive_sha256": artifact.sha256,
-                    "archive_size": artifact.size_bytes,
-                    "archive_executable": artifact.executable,
-                },
+                staging / _NODE_META_FILENAME, metadata,
                 trailing_newline=True,
                 fsync=True,
             )
@@ -883,11 +1029,16 @@ class ClaudexorRuntimeManager:
 
     @staticmethod
     def _extract_node_archive(
-        archive: pathlib.Path, artifact: NodeRuntimeArtifact, destination: pathlib.Path
+        archive: pathlib.Path, artifact: NodeRuntimeArtifact, destination: pathlib.Path,
+        *, archive_npm_cli: str = "", npm_root: Optional[pathlib.Path] = None,
     ) -> None:
-        """Copy only the exact Node executable from its review-bound archive."""
+        """Copy exact Node and, when requested, a regular-file POSIX npm tree."""
         try:
             if artifact.archive_name.endswith(".zip"):
+                if archive_npm_cli or npm_root is not None:
+                    raise ClaudexorRuntimeError(
+                        "runtime_node_archive_invalid", "Windows npm extraction is unsupported"
+                    )
                 with zipfile.ZipFile(archive) as bundle:
                     info = bundle.getinfo(artifact.executable)
                     if info.is_dir():
@@ -910,6 +1061,54 @@ class ClaudexorRuntimeManager:
                         )
                     with source, destination.open("xb") as sink:
                         shutil.copyfileobj(source, sink)
+                    if archive_npm_cli:
+                        if npm_root is None or not _safe_archive_relative_path(archive_npm_cli):
+                            raise ClaudexorRuntimeError(
+                                "runtime_node_archive_invalid", "reviewed npm path is invalid"
+                            )
+                        npm_prefix_path = pathlib.PurePosixPath(archive_npm_cli).parent.parent
+                        npm_prefix = str(npm_prefix_path)
+                        selected, seen = [], set()
+                        for npm_member in bundle.getmembers():
+                            name = str(npm_member.name or "")
+                            if name != npm_prefix and not name.startswith(npm_prefix + "/"):
+                                continue
+                            if name in seen or not _safe_archive_relative_path(name):
+                                raise ClaudexorRuntimeError(
+                                    "runtime_node_archive_invalid",
+                                    "Node archive has a duplicate or unsafe npm path",
+                                )
+                            seen.add(name)
+                            if not (npm_member.isdir() or npm_member.isreg()):
+                                raise ClaudexorRuntimeError(
+                                    "runtime_node_archive_invalid",
+                                    f"Node npm entry {name!r} is a link or special file",
+                                )
+                            selected.append(npm_member)
+                        if archive_npm_cli not in seen:
+                            raise ClaudexorRuntimeError(
+                                "runtime_node_archive_invalid",
+                                "Node archive lacks the reviewed npm entrypoint",
+                            )
+                        for npm_member in selected:
+                            relative = pathlib.PurePosixPath(npm_member.name).relative_to(npm_prefix_path)
+                            target = npm_root.joinpath(*relative.parts)
+                            if npm_member.isdir():
+                                target.mkdir(parents=True, exist_ok=True)
+                                continue
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            npm_source = bundle.extractfile(npm_member)
+                            if npm_source is None:
+                                raise ClaudexorRuntimeError(
+                                    "runtime_node_archive_invalid",
+                                    f"Node npm entry {npm_member.name!r} could not be read",
+                                )
+                            with npm_source, target.open("xb") as sink:
+                                shutil.copyfileobj(npm_source, sink)
+                            try:
+                                target.chmod(npm_member.mode & 0o777)
+                            except OSError:
+                                pass
         except ClaudexorRuntimeError:
             raise
         except (KeyError, OSError, tarfile.TarError, zipfile.BadZipFile) as exc:
@@ -931,7 +1130,18 @@ class ClaudexorRuntimeManager:
             self._probe(command, pin)
         return command
 
-    def _install(self, pin: ClaudexorRuntimePin) -> None:
+    def _managed_cli_command(self) -> list[str]:
+        pin = self._pin
+        if pin is None or pin.cli_entrypoint is None or not self._managed_metadata():
+            return []
+        node = self._resolve_node_toolchain(pin)
+        cli = managed_runtime_dir(pin) / pathlib.PurePosixPath(pin.cli_entrypoint)
+        try:
+            return [node, str(cli)] if node and cli.is_file() else []
+        except OSError:
+            return []
+
+    def _install(self, pin: ClaudexorRuntimePin, *, require_npm: bool = False) -> None:
         from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
 
         root = managed_runtime_root()
@@ -943,16 +1153,25 @@ class ClaudexorRuntimeManager:
             metadata=f"pid={os.getpid()} version={pin.version} build_sha={pin.build_sha}\n",
         )
         if lock_fd is None:
-            if self._managed_command():
+            command = self._managed_cli_command() if require_npm else self._managed_command()
+            if command:
                 return
             raise ClaudexorRuntimeError(
                 "runtime_install_in_progress", "another process is installing the managed runtime"
             )
         self._installing = True
         try:
-            self._ensure_node(pin)
+            if require_npm:
+                self._ensure_node_toolchain(pin)
+            else:
+                self._ensure_node(pin)
             try:
-                if self._managed_command(probe=True):
+                command = (
+                    self._managed_cli_command()
+                    if require_npm
+                    else self._managed_command(probe=True)
+                )
+                if command:
                     return
             except ClaudexorRuntimeError:
                 pass
@@ -1011,21 +1230,29 @@ class ClaudexorRuntimeManager:
                 )
             command = [node, str(staging / pathlib.PurePosixPath(pin.entrypoint))]
             self._probe(command, pin)
+            if pin.cli_entrypoint is not None and not (
+                staging / pathlib.PurePosixPath(pin.cli_entrypoint)
+            ).is_file():
+                raise ClaudexorRuntimeError(
+                    "runtime_archive_invalid", "runtime archive lacks its reviewed CLI entrypoint"
+                )
             from ouroboros.utils import atomic_write_json
 
+            metadata = {
+                "schema_version": 1,
+                "version": pin.version,
+                "build_sha": pin.build_sha,
+                "protocol_major": pin.protocol_major,
+                "archive_sha256": pin.sha256,
+                "archive_size": pin.size_bytes,
+                "node_version": pin.node_version,
+                "entrypoint": pin.entrypoint,
+                "archive_source": archive_source,
+            }
+            if pin.cli_entrypoint is not None:
+                metadata["cli_entrypoint"] = pin.cli_entrypoint
             atomic_write_json(
-                staging / _RUNTIME_META_FILENAME,
-                {
-                    "schema_version": 1,
-                    "version": pin.version,
-                    "build_sha": pin.build_sha,
-                    "protocol_major": pin.protocol_major,
-                    "archive_sha256": pin.sha256,
-                    "archive_size": pin.size_bytes,
-                    "node_version": pin.node_version,
-                    "entrypoint": pin.entrypoint,
-                    "archive_source": archive_source,
-                },
+                staging / _RUNTIME_META_FILENAME, metadata,
                 trailing_newline=True,
                 fsync=True,
             )
