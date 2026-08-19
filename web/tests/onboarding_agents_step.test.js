@@ -40,7 +40,7 @@ function snapshotWith(harnesses) {
     return {
         daemon: { state: 'running' },
         reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' },
-        harnesses: [{ id: 'claude' }, { id: 'codex' }, { id: 'cursor' }],
+        harnesses: [{ id: 'claude' }, { id: 'codex' }, { id: 'cursor' }, { id: 'agy' }],
         profiles: {
             harnessAccounts: harnesses.map((harness) => ({
                 harness_id: harness, native_login_detected: true,
@@ -173,6 +173,26 @@ test('one connected account declares the preset request and promises nothing cer
     assert.match(text, /will try to/);
     assert.match(text, /nothing is changed/);
     assert.doesNotMatch(text, /guarantee|always/i);
+});
+
+test('an Antigravity-only setup promises task actors but no reviewer migration', () => {
+    const snapshot = snapshotWith(['agy']);
+    assert.deepEqual(connectedHarnesses(snapshot), ['agy']);
+    const text = agentsOutcomeText(['agy'], { snapshot });
+    assert.match(text, /Antigravity is connected/);
+    assert.match(text, /subscription-backed choices to Available subagents/);
+    assert.match(text, /task-only/);
+    assert.match(text, /does not change reviewer routes/);
+    assert.doesNotMatch(text, /move commit review|scope pass|advisory pre-review/);
+});
+
+test('a mixed reviewer-capable and task-only setup names each capability separately', () => {
+    const snapshot = snapshotWith(['codex', 'agy']);
+    const text = agentsOutcomeText(['codex', 'agy'], { snapshot });
+    assert.match(text, /Codex and Antigravity are connected/);
+    assert.match(text, /Codex can also move commit review/);
+    assert.match(text, /Antigravity is task-only/);
+    assert.doesNotMatch(text, /Antigravity can also move commit review/);
 });
 
 test('several accounts are named in family order and the rows say they rotate', () => {
@@ -547,6 +567,50 @@ test('the generated onboarding draft shows a credentialed one-harness API scout 
     assert.match(dom.nodes.get('onboarding-available-subagents').innerHTML, /Codex builder/);
     assert.match(dom.nodes.get('onboarding-available-subagents').innerHTML, /Generated draft/);
     assert.deepEqual(step.validateSubagents(), []);
+
+    step.detach();
+    store.dispose();
+});
+
+test('a model change regenerates a clean onboarding draft and invalidates the older receipt', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, snapshotWith([])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+        pollMs: 5000,
+    });
+    const dom = fakeDom();
+    let model = 'openai/model-a';
+    const step = createAgentsStep({
+        doc: dom.doc,
+        store,
+        previewPayload: () => ({ OUROBOROS_MODEL: model }),
+        previewTransport: async (payload) => ({
+            source: 'onboarding_default',
+            diagnostics: [],
+            available_subagents: {
+                enabled: true,
+                items: [
+                    {
+                        subagent_id: 'main-builder',
+                        name: 'Main builder',
+                        recommended_use: 'Use the current main model.',
+                        route: { kind: 'api_model', target_id: payload.OUROBOROS_MODEL },
+                    },
+                ],
+            },
+        }),
+    });
+    step.mount();
+    await flush();
+    assert.equal(step.availableSubagents.items[0].route.target_id, 'openai/model-a');
+    assert.equal(step.generatedPreviewReady, true);
+
+    model = 'openai/model-b';
+    step.invalidateGeneratedPreview();
+    assert.equal(step.generatedPreviewReady, false);
+    assert.equal(await step.refreshSubagentsPreview({ force: true }), true);
+    assert.equal(step.availableSubagents.items[0].route.target_id, 'openai/model-b');
+    assert.equal(step.generatedPreviewReady, true);
 
     step.detach();
     store.dispose();

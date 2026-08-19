@@ -9,7 +9,7 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
 export const ROUTE_KIND_API_MODEL = 'api_model';
 export const ROUTE_KIND_AGENT_SESSION = 'agent_session';
 export const API_ROUTE_CHOICE = 'api';
-export const EFFORT_CHOICES = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
+export const EFFORT_CHOICES = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 export function mintStableId(prefix, takenIds) {
     const taken = new Set(takenIds || []);
@@ -31,6 +31,22 @@ export function splitSessionTarget(target) {
     const eq = raw.indexOf('=');
     if (eq < 0) return { harness: raw, model: '' };
     return { harness: raw.slice(0, eq), model: raw.slice(eq + 1) };
+}
+
+/** Effort already encoded in a Cursor/Agy compound model slug, if any. */
+export function compoundSessionEffort(target) {
+    const { harness, model } = splitSessionTarget(target);
+    if (!['cursor', 'agy'].includes(String(harness || '')) || !model) return '';
+    const compound = model.toLowerCase().endsWith('-fast') ? model.slice(0, -5) : model;
+    const encoded = compound.slice(compound.lastIndexOf('-') + 1).toLowerCase();
+    return EFFORT_CHOICES.includes(encoded) ? encoded : '';
+}
+
+/** Return the encoded effort only when a separate field contradicts it. */
+export function compoundSessionEffortConflict(target, effort) {
+    const encoded = compoundSessionEffort(target);
+    const requested = String(effort || '').trim().toLowerCase();
+    return encoded && requested && encoded !== requested ? encoded : '';
 }
 
 export function encodeRouteChoice(row) {

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pathlib
 
-
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 MODULES = ROOT / "web" / "modules"
 
@@ -60,6 +59,28 @@ def test_onboarding_previews_and_commits_the_visible_owner_draft() -> None:
     assert "OUROBOROS_SUBAGENTS: agentsStep?.availableSubagents" in wizard
     assert "Heavy', trim(state.heavyModel)" not in wizard
     assert "slot?.settingKey !== 'OUROBOROS_MODEL_HEAVY'" in wizard
+
+
+def test_preview_contract_and_task_only_agy_copy_are_explicit() -> None:
+    types = _read(MODULES / "api_types.js")
+    step = _read(MODULES / "onboarding_agents_step.js")
+    assert "@typedef {Object} OnboardingSubagentsPreviewResponse" in types
+    assert "@property {boolean} ok" in types
+    assert "@property {AvailableSubagentsSetting} available_subagents" in types
+    assert "@property {Object[]} diagnostics" in types
+    assert "{ harness: 'agy', label: 'Antigravity' }" in step
+    assert "task-only and does" in step
+
+
+def test_generated_preview_is_background_and_whole_draft_clean_gated() -> None:
+    editor = _read(MODULES / "subagents_settings.js")
+    host = _read(MODULES / "settings.js")
+    wizard = _read(MODULES / "onboarding_wizard.js")
+    assert "void maybeRefreshGeneratedPreview({ force: true });" in editor
+    assert "isOuterDraftClean: () => !settingsDirty" in host
+    assert "if (settingsLoaded && !settingsDirty) setSettingsCleanBaseline();" in host
+    assert "void agentsStep.refreshSubagentsPreview({ force: true });" in wizard
+    assert "agentsStep?.invalidateGeneratedPreview();" in wizard
 
 
 def test_status_refresh_and_active_task_copy_keep_the_frozen_semantics() -> None:

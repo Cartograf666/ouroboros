@@ -1,14 +1,18 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import test from 'node:test';
 
 import {
     ROUTE_KIND_AGENT_SESSION,
     ROUTE_KIND_API_MODEL,
+    compoundSessionEffort,
+    compoundSessionEffortConflict,
     normalizeRouteSpec,
     serializeRouteSpec,
 } from '../modules/route_editor_primitives.js';
 import {
     MAX_AVAILABLE_SUBAGENTS,
+    availableSubagentsHasExplicitDraft,
     availableSubagentRowMarkup,
     availableSubagentsLoadValue,
     availableSubagentsSavePayload,
@@ -21,6 +25,11 @@ import {
     validateAvailableSubagentsSetting,
 } from '../modules/subagents_settings.js';
 import { buildReviewerSlotsSetting } from '../modules/reviewer_slots.js';
+
+const CONTRACT_FIXTURE = JSON.parse(fs.readFileSync(
+    new URL('./fixtures/available_subagents_contract.json', import.meta.url),
+    'utf8',
+));
 
 function apiRow(overrides = {}) {
     return {
@@ -89,6 +98,24 @@ test('canonical parser accepts object or JSON and refuses unknown saved fields',
     assert.match(apiPin.error, /account pin on an API route/);
 });
 
+test('the shared strict contract fixture has the same accept/reject boundary in the UI', () => {
+    for (const fixture of CONTRACT_FIXTURE.valid) {
+        const parsed = parseAvailableSubagentsSetting(fixture.value);
+        assert.ok(parsed.setting, `${fixture.name}: ${parsed.error}`);
+    }
+    for (const fixture of CONTRACT_FIXTURE.invalid) {
+        const parsed = parseAvailableSubagentsSetting(fixture.value);
+        assert.equal(parsed.setting, null, fixture.name);
+        assert.ok(parsed.error, fixture.name);
+    }
+
+    assert.equal(compoundSessionEffort('agy=gemini-3.7-flash-high-fast'), 'high');
+    assert.equal(
+        compoundSessionEffortConflict('cursor=gpt-5.6-sol-high-fast', 'medium'),
+        'high',
+    );
+});
+
 test('an unloaded or malformed view cannot replace the owner setting', () => {
     assert.deepEqual(availableSubagentsSavePayload({ loaded: false, setting: setting() }), {});
     assert.deepEqual(availableSubagentsSavePayload({
@@ -99,6 +126,36 @@ test('an unloaded or malformed view cannot replace the owner setting', () => {
     assert.deepEqual(availableSubagentsSavePayload({ loaded: true, setting: setting([apiRow()]) }), {
         OUROBOROS_SUBAGENTS: setting([apiRow()]),
     });
+});
+
+test('only an omitted draft may stay out of an unrelated Settings save', () => {
+    const editor = createAvailableSubagentsEditor({
+        doc: null,
+        win: null,
+        allowUnloadedOmission: true,
+    });
+    editor.load(undefined, { source: 'undecided', allowOmission: true });
+    assert.deepEqual(editor.validate(), []);
+    assert.deepEqual(editor.collect(), {});
+
+    editor.load({ enabled: true, items: [{ ...apiRow(), recommended_use: 7 }] }, {
+        source: 'configured',
+        allowOmission: false,
+    });
+    assert.match(editor.validate()[0], /recommended use must be a string/);
+    assert.deepEqual(editor.collect(), {});
+
+    assert.equal(availableSubagentsHasExplicitDraft({}), false);
+    assert.equal(availableSubagentsHasExplicitDraft({
+        OUROBOROS_SUBAGENTS: '',
+        _meta: { available_subagents: { candidate: null } },
+    }), false);
+    assert.equal(availableSubagentsHasExplicitDraft({
+        _meta: { available_subagents: { candidate: { enabled: true, items: [] } } },
+    }), true);
+    assert.equal(availableSubagentsHasExplicitDraft({
+        OUROBOROS_SUBAGENTS: '{malformed owner bytes',
+    }), true);
 });
 
 test('object and serialized settings compare as the same new-child-task intent', () => {
@@ -201,6 +258,54 @@ test('a clean undecided Settings draft is enriched from connected status through
     assert.equal(editor.dirty, false);
 });
 
+test('Settings status reload does not await preview and late preview obeys the whole-draft gate', async () => {
+    const releases = [];
+    let outerDraftClean = true;
+    let applied = 0;
+    const store = {
+        error: '',
+        snapshot: { profiles: { harnessAccounts: [], profiles: [] }, harnesses: [] },
+        facet: () => 'ok',
+        subscribe: () => () => {},
+        refresh: async () => {},
+    };
+    const editor = createAvailableSubagentsEditor({
+        store,
+        doc: null,
+        win: null,
+        isOuterDraftClean: () => outerDraftClean,
+        onGeneratedApply: () => { applied += 1; },
+        previewGenerated: () => new Promise((resolve) => { releases.push(resolve); }),
+    });
+    editor.load(setting([apiRow()]), { source: 'undecided' });
+
+    await editor.reloadStatus();
+    assert.equal(releases.length, 1, 'preview starts in the background');
+    assert.equal(editor.setting.items[0].subagent_id, 'api_scout');
+
+    outerDraftClean = false;
+    releases.shift()({
+        available_subagents: setting([sessionRow()]),
+        source: 'onboarding_default',
+        diagnostics: [],
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(editor.setting.items[0].subagent_id, 'api_scout');
+    assert.equal(applied, 0);
+
+    outerDraftClean = true;
+    const refresh = editor.refreshGeneratedPreview({ force: true });
+    assert.equal(releases.length, 1);
+    releases.shift()({
+        available_subagents: setting([sessionRow()]),
+        source: 'onboarding_default',
+        diagnostics: [],
+    });
+    assert.equal(await refresh, true);
+    assert.equal(editor.setting.items[0].subagent_id, 'codex_builder');
+    assert.equal(applied, 1);
+});
+
 test('a late generated preview cannot replace a newly loaded configured document', async () => {
     let releasePreview;
     const store = {
@@ -285,6 +390,9 @@ test('saved unavailable session route and account remain selectable', () => {
 test('preview replaces only a clean generated baseline', () => {
     assert.equal(generatedPreviewCanReplace({ dirty: false, parsedSetting: setting() }), true);
     assert.equal(generatedPreviewCanReplace({ dirty: true, parsedSetting: setting() }), false);
+    assert.equal(generatedPreviewCanReplace({
+        dirty: false, outerDraftClean: false, parsedSetting: setting(),
+    }), false);
     assert.equal(generatedPreviewCanReplace({ dirty: false, parsedSetting: null }), false);
 
     const editor = createAvailableSubagentsEditor({ doc: null, win: null });

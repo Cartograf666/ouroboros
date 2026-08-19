@@ -91,6 +91,28 @@
  */
 
 /**
+ * @typedef {Object} AvailableSubagentRoute
+ * @property {'api_model'|'agent_session'} kind
+ * @property {string} target_id
+ * @property {string=} credential_profile_id
+ */
+
+/**
+ * @typedef {Object} AvailableSubagentItem
+ * @property {string} subagent_id
+ * @property {string} name
+ * @property {string} recommended_use
+ * @property {AvailableSubagentRoute} route
+ * @property {string=} effort
+ */
+
+/**
+ * @typedef {Object} AvailableSubagentsSetting
+ * @property {boolean} enabled
+ * @property {AvailableSubagentItem[]} items
+ */
+
+/**
  * @typedef {Object} AvailableSubagentsSettingsMeta
  * @property {string=} source
  * @property {string=} diagnostic
@@ -125,7 +147,7 @@
 /**
  * @typedef {Object} OnboardingSubagentsPreviewResponse
  * @property {boolean} ok
- * @property {Object} available_subagents
+ * @property {AvailableSubagentsSetting} available_subagents
  * @property {string} source
  * @property {Object[]} diagnostics
  */

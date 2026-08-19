@@ -27,11 +27,6 @@ import { installAltMenuSuppression } from './ui_helpers.js';
         const STEP_META = Object.fromEntries((SETUP_CONTRACT.steps || []).map((step) => [step.id, step]));
         const PROVIDER_FIELDS = SETUP_CONTRACT.providerFields || [];
         const PROVIDER_PROFILES = SETUP_CONTRACT.providerProfiles || {};
-        // Bounded, because completion must not hang on an engine that is down:
-        // three tries over ~1.2s converts a blip into a proven cancel, and
-        // anything longer stops being a blip.
-        const LOGIN_RELEASE_RETRIES = 2;
-        const LOGIN_RELEASE_RETRY_MS = 600;
         // Heavy is legacy migration input, never an active/user-facing slot.
         const MODEL_SLOTS = (SETUP_CONTRACT.modelSlots || []).filter((slot) =>
             String(slot?.slot || '').toLowerCase() !== 'heavy' && slot?.settingKey !== 'OUROBOROS_MODEL_HEAVY');
@@ -204,6 +199,10 @@ import { installAltMenuSuppression } from './ui_helpers.js';
 
     function markStepEdited() {
         state.error = '';
+        // The preview owns generated rows only. Invalidate any response that
+        // started against the previous provider/local/model/settings draft;
+        // an owner-edited actor list ignores this through its own dirty gate.
+        agentsStep?.invalidateGeneratedPreview();
         syncCurrentStepActionState();
     }
 
@@ -322,10 +321,9 @@ import { installAltMenuSuppression } from './ui_helpers.js';
     }
 
     function validateCurrentStep() {
-        // 'agents' is deliberately absent from this list: the step is SKIPPABLE
-        // and can never block completion. A subscription is an amplifier, never
-        // an admission gate (D-1) — the launch requirement was already met on
-        // the access step.
+        // 'agents' is deliberately absent from this per-step navigation gate: a
+        // subscription is an amplifier, never an admission requirement. Final
+        // completion separately validates the visible canonical actor draft.
         if (state.currentStep === 'providers') return validateProvidersStep();
         if (state.currentStep === 'models') return validateModelsStep();
         if (state.currentStep === 'review_mode') return validateReviewStep();
@@ -341,6 +339,12 @@ import { installAltMenuSuppression } from './ui_helpers.js';
             return;
         }
         if (state.currentStep === 'providers') applyModelDefaults(false);
+        if (['providers', 'models', 'review_mode', 'budget'].includes(state.currentStep)) {
+            // Preview is enrichment, never a navigation gate. Refresh in the
+            // background after the step has a valid complete draft; Finish
+            // checks the receipt only if generated rows still own the editor.
+            if (agentsStep) void agentsStep.refreshSubagentsPreview({ force: true });
+        }
         const index = STEP_ORDER.indexOf(state.currentStep);
         if (index >= 0 && index < STEP_ORDER.length - 1) {
             state.currentStep = STEP_ORDER[index + 1];
@@ -971,6 +975,7 @@ import { installAltMenuSuppression } from './ui_helpers.js';
                 const target = button.getAttribute('data-clear');
                 if (clearActions[target]) clearActions[target]();
                 state.error = '';
+                agentsStep?.invalidateGeneratedPreview();
                 render();
             });
         });
@@ -1027,7 +1032,12 @@ import { installAltMenuSuppression } from './ui_helpers.js';
                     markStepEdited();
                 });
             });
-        if (localPreset) localPreset.addEventListener('change', () => { applyPresetSelection(localPreset.value); state.error = ''; render(); });
+        if (localPreset) localPreset.addEventListener('change', () => {
+            applyPresetSelection(localPreset.value);
+            state.error = '';
+            agentsStep?.invalidateGeneratedPreview();
+            render();
+        });
         bindStateInput(localSource, 'localSource', () => {
             state.localPreset = detectLocalPresetSelection();
             if (localPreset) localPreset.value = state.localPreset || '';
@@ -1047,6 +1057,7 @@ import { installAltMenuSuppression } from './ui_helpers.js';
             button.addEventListener('click', () => {
                 state.localRoutingMode = button.getAttribute('data-local-mode');
                 state.error = '';
+                agentsStep?.invalidateGeneratedPreview();
                 render();
             });
         });
@@ -1196,6 +1207,7 @@ import { installAltMenuSuppression } from './ui_helpers.js';
                     if (!trim(state.lightModel)) state.lightModel = modelId;
                     if (!trim(state.fallbackModel)) state.fallbackModel = modelId;
                     state.modelsDirty = true;
+                    agentsStep?.invalidateGeneratedPreview();
                     render();
                 });
             }
@@ -1231,7 +1243,7 @@ import { installAltMenuSuppression } from './ui_helpers.js';
             )).join('');
             panel.hidden = false;
         }
-            Object.entries(modelInputMap).forEach(([id, key]) => {
+        Object.entries(modelInputMap).forEach(([id, key]) => {
             const input = document.getElementById(id);
             if (!input) return;
             input.addEventListener('focus', () => {
@@ -1242,9 +1254,13 @@ import { installAltMenuSuppression } from './ui_helpers.js';
                 state[key] = input.value;
                 state.modelsDirty = true;
                 state.error = '';
+                agentsStep?.invalidateGeneratedPreview();
                 closeSuggestions(input);
                 renderSuggestions(input);
                 syncCurrentStepActionState();
+            });
+            input.addEventListener('change', () => {
+                void agentsStep?.refreshSubagentsPreview({ force: true });
             });
         });
         root.querySelectorAll('.wizard-model-suggestions').forEach((panel) => {
@@ -1278,6 +1294,7 @@ import { installAltMenuSuppression } from './ui_helpers.js';
             button.addEventListener('click', () => {
                 state.reviewEnforcement = button.getAttribute('data-review-mode');
                 state.error = '';
+                agentsStep?.invalidateGeneratedPreview();
                 render();
             });
         });
@@ -1285,6 +1302,7 @@ import { installAltMenuSuppression } from './ui_helpers.js';
             button.addEventListener('click', () => {
                 state.runtimeMode = button.getAttribute('data-runtime-mode');
                 state.error = '';
+                agentsStep?.invalidateGeneratedPreview();
                 render();
             });
         });
@@ -1400,24 +1418,7 @@ import { installAltMenuSuppression } from './ui_helpers.js';
 
     async function saveWizardPayload(payload) {
         const result = await completeOnboardingAtomically(payload);
-        // Ask once for the exact custody result. A known retained job cannot be
-        // improved by repeating cancel; only an unknown transport result gets
-        // the existing bounded retry window. Completion still leaves honestly:
-        // detach is local-only and never claims the process stopped.
-        let custody = agentsStep ? await agentsStep.dispose() : 'released';
-        for (let attempt = 0; custody === 'unknown' && attempt < LOGIN_RELEASE_RETRIES; attempt += 1) {
-            await new Promise((resolve) => setTimeout(resolve, LOGIN_RELEASE_RETRY_MS));
-            custody = await agentsStep.dispose();
-        }
-        if (custody === 'retained') {
-            console.warn('onboarding: the agent engine could not confirm that the sign-in process stopped; '
-                + 'the next Connect will return to that attempt.');
-        } else if (custody === 'unknown') {
-            console.warn('onboarding: sign-in cleanup remained unknown after '
-                + `${LOGIN_RELEASE_RETRIES + 1} attempts; the agent engine still owns that job `
-                + 'and the next Connect will recover its current state.');
-        }
-        agentsStep?.detach();
+        await agentsStep?.disposeForCompletion();
         agentsStep = null;
         announceCompletion(result);
         return 'ok';
@@ -1429,26 +1430,32 @@ import { installAltMenuSuppression } from './ui_helpers.js';
         const reviewError = validateReviewStep();
         const budgetError = validateBudgetStep();
         const subagentsError = agentsStep?.validateSubagents?.()?.[0] || '';
-        state.error = providersError || modelsError || reviewError || budgetError || subagentsError;
+        const previewError = agentsStep && !agentsStep.generatedPreviewReady
+            ? (agentsStep.previewPending
+                ? 'Available subagents are still updating from your latest setup choices. Try Finish again in a moment.'
+                : `Available subagents could not be refreshed from your latest setup choices${agentsStep.previewError ? `: ${agentsStep.previewError}` : '.'}`)
+            : '';
+        state.error = providersError || modelsError || reviewError || budgetError
+            || subagentsError || previewError;
         if (state.error) {
             render();
             return;
         }
-            if (skipPresets) state.skipSubscriptionPresets = true;
-            state.saving = true;
-            state.error = '';
-            render();
-            const payload = {
-                // What this step OBSERVED, plus the owner's explicit escape
-                // hatch. Neither is authority: the endpoint re-reads live
-                // account state and re-proves install-time eligibility.
-                subscriptionsConnected: state.agentsConnected.length > 0,
-                skipSubscriptionPresets: state.skipSubscriptionPresets,
-                ...onboardingSettingsDraft({ state, providerFields: PROVIDER_FIELDS, budgetFields: BUDGET_FIELDS, modelSlots: MODEL_SLOTS, trim }),
-                // Completion validates this visible draft and never replaces it.
-                OUROBOROS_SUBAGENTS: agentsStep?.availableSubagents
-                    || state.availableSubagents,
-            };
+        if (skipPresets) state.skipSubscriptionPresets = true;
+        state.saving = true;
+        state.error = '';
+        render();
+        const payload = {
+            // What this step OBSERVED, plus the owner's explicit escape
+            // hatch. Neither is authority: the endpoint re-reads live
+            // account state and re-proves install-time eligibility.
+            subscriptionsConnected: state.agentsConnected.length > 0,
+            skipSubscriptionPresets: state.skipSubscriptionPresets,
+            ...onboardingSettingsDraft({ state, providerFields: PROVIDER_FIELDS, budgetFields: BUDGET_FIELDS, modelSlots: MODEL_SLOTS, trim }),
+            // Completion validates this visible draft and never replaces it.
+            OUROBOROS_SUBAGENTS: agentsStep?.availableSubagents
+                || state.availableSubagents,
+        };
         try {
             await saveWizardPayload(payload);
         } catch (error) {

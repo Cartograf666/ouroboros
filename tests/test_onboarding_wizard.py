@@ -1086,21 +1086,19 @@ def test_onboarding_frontend_exempts_unchanged_prefilled_keys_from_length_check(
     assert len(CONFIGURED_SECRET_PLACEHOLDER) < 10
 
 
-def test_completion_branches_on_typed_login_custody_before_detach():
-    """The IIFE consumer retries only unknown cleanup, then leaves honestly."""
-    source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
+def test_agents_step_owns_typed_login_custody_before_wizard_announcement():
+    """The step retries only unknown cleanup, then leaves honestly."""
+    source = (REPO / "web/modules/onboarding_agents_step.js").read_text(encoding="utf-8")
 
-    body = source.split("async function saveWizardPayload", 1)[1].split("\n    }", 1)[0]
+    body = source.split("async function disposeForCompletion", 1)[1].split("\n    }", 1)[0]
     # Ordering is judged on CODE only: both names also appear in the comments
     # that explain the ordering, and matching those would pass on prose alone.
     code = "\n".join(line for line in body.splitlines()
                      if not line.strip().startswith("//"))
 
     # Awaited, and its typed answer kept.
-    assert "agentsStep ? await agentsStep.dispose() : 'released'" in code
-    assert "'released'" in code
-    # The announcement comes AFTER the disposal, not before it.
-    assert code.index("dispose()") < code.index("announceCompletion")
+    assert "let custody = await dispose()" in code
+    assert "return login ? login.dispose() : 'released';" in source
     assert "custody === 'retained'" in code
     assert "custody === 'unknown'" in code
     assert "released === false" not in code
@@ -1108,16 +1106,23 @@ def test_completion_branches_on_typed_login_custody_before_detach():
     # proceeds directly to local detach because another cancel proves nothing.
     retry = code.index("for (let attempt = 0; custody === 'unknown'")
     retained = code.index("custody === 'retained'")
-    detach = code.index("agentsStep?.detach()")
-    drop = code.index("agentsStep = null")
-    announce = code.index("announceCompletion")
-    assert retry < retained < detach < drop < announce
+    detach = code.index("detach()")
+    assert retry < retained < detach
     assert "LOGIN_RELEASE_RETRIES" in code and "LOGIN_RELEASE_RETRY_MS" in code
     assert source.count("const LOGIN_RELEASE_RETRIES = ") == 1
     retries = int(source.split("const LOGIN_RELEASE_RETRIES = ", 1)[1].split(";", 1)[0])
     delay = int(source.split("const LOGIN_RELEASE_RETRY_MS = ", 1)[1].split(";", 1)[0])
     assert 1 <= retries <= 5 and 100 <= delay <= 2000, (
         "the retry must stay a blip-sized bound, not a stall")
+
+    wizard = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
+    save = wizard.split("async function saveWizardPayload", 1)[1].split("\n    }", 1)[0]
+    save_code = "\n".join(line for line in save.splitlines()
+                          if not line.strip().startswith("//"))
+    dispose = save_code.index("await agentsStep?.disposeForCompletion()")
+    drop = save_code.index("agentsStep = null")
+    announce = save_code.index("announceCompletion")
+    assert dispose < drop < announce
 
 
 def test_the_review_step_spells_a_family_the_way_the_agents_step_did():

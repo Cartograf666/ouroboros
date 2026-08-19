@@ -5,6 +5,7 @@ import { applyMcpSettings, collectMcpSettings, initMcpSettings } from './mcp_set
 import { collectReviewerSlots, initReviewerSlots, reloadReviewerSlots } from './reviewer_slots.js';
 import {
     applySubagentsSettings,
+    availableSubagentsPreviewPayload,
     collectSubagentsSettings,
     initSubagentsSection,
     reloadSubagentsSection,
@@ -396,9 +397,13 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     initReviewerSlots({ onChange: () => updateSettingsDirtyState() });
     initSubagentsSection({
         onChange: () => updateSettingsDirtyState(),
-        previewGenerated: ({ subscriptionsConnected }) => apiClient.previewOnboardingSubagents({
-            subscriptionsConnected,
-        }),
+        isOuterDraftClean: () => !settingsDirty,
+        onGeneratedApply: () => {
+            if (settingsLoaded && !settingsDirty) setSettingsCleanBaseline();
+        },
+        previewGenerated: ({ subscriptionsConnected }) => apiClient.previewOnboardingSubagents(
+            availableSubagentsPreviewPayload(collectBody(), subscriptionsConnected),
+        ),
     });
     initHarnessAccounts();
 
@@ -499,7 +504,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         // baseline can be taken before the store-gated collectors have their
         // facts — and their output changes when a snapshot lands (the accounts
         // facet, the later include-models upgrade). Absent owner edits, no
-            // store arrival may read as an unsaved change; and every owner edit
+        // store arrival may read as an unsaved change; and every owner edit
         // flips settingsDirty through its own input handler BEFORE any store
         // notify, so re-baselining while the draft is clean can never mask
         // one. Deliberately NOT a one-shot on everSettled: an earlier
@@ -731,12 +736,16 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         // daemon must not hold the Save button — so its LATER settlement is
         // re-baselined below.)
         await Promise.all([reloadReviewerSlots(), reloadSubagentsSection()]);
+        // Mark the document loaded before taking the baseline. A generated
+        // preview may settle in the microtask between these statements; its
+        // clean-gated callback must be allowed to fold that exact draft into
+        // the baseline rather than leave a false unsaved change behind.
+        settingsLoaded = true;
         setSettingsCleanBaseline();
         armCleanBaselineOnStatusSettle();
         closeSettingsModelPickers();
         _renderNetworkHint(data._meta);
         renderClaudeCodeUi();
-        settingsLoaded = true;
         markSettingsDirty = updateSettingsDirtyState;
         syncSettingsLoadState();
         startClaudeCodePolling();

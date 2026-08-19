@@ -16,6 +16,7 @@ import {
     EFFORT_CHOICES,
     ROUTE_KIND_AGENT_SESSION,
     ROUTE_KIND_API_MODEL,
+    compoundSessionEffortConflict,
     composeSessionTarget,
     decodeRouteChoice,
     describeExecutionEvidence,
@@ -54,12 +55,17 @@ function canonicalRow(row) {
         apiKind: ROUTE_KIND_API_MODEL,
         credentialField: 'credential_profile_id',
     });
+    route.target_id = String(route.target_id || '').trim();
+    if (route.credential_profile_id !== undefined) {
+        route.credential_profile_id = String(route.credential_profile_id || '').trim();
+        if (!route.credential_profile_id) delete route.credential_profile_id;
+    }
     return {
-        subagent_id: String(row?.subagent_id || ''),
-        name: String(row?.name || ''),
+        subagent_id: String(row?.subagent_id || '').trim(),
+        name: String(row?.name || '').trim(),
         recommended_use: String(row?.recommended_use || ''),
         route,
-        ...(row?.effort ? { effort: String(row.effort) } : {}),
+        ...(row?.effort ? { effort: String(row.effort).trim().toLowerCase() } : {}),
     };
 }
 
@@ -100,6 +106,10 @@ export function parseAvailableSubagentsSetting(value) {
     if (typeof input.enabled !== 'boolean' || !Array.isArray(input.items)) {
         return { setting: null, error: 'saved value needs a boolean enabled flag and an items list' };
     }
+    if (input.items.length > MAX_AVAILABLE_SUBAGENTS) {
+        return { setting: null, error: `saved value has more than ${MAX_AVAILABLE_SUBAGENTS} rows` };
+    }
+    const canonicalItems = [];
     for (const [index, row] of input.items.entries()) {
         if (!row || typeof row !== 'object' || Array.isArray(row)) {
             return { setting: null, error: `row ${index + 1} must be an object` };
@@ -108,6 +118,18 @@ export function parseAvailableSubagentsSetting(value) {
         if (rowUnknown.length) {
             return { setting: null, error: `row ${index + 1} has unknown field: ${rowUnknown[0]}` };
         }
+        if (typeof row.subagent_id !== 'string') {
+            return { setting: null, error: `row ${index + 1} stable ID must be a string` };
+        }
+        if (row.name !== undefined && typeof row.name !== 'string') {
+            return { setting: null, error: `row ${index + 1} name must be a string` };
+        }
+        if (typeof row.recommended_use !== 'string') {
+            return { setting: null, error: `row ${index + 1} recommended use must be a string` };
+        }
+        if (row.effort !== undefined && row.effort !== null && typeof row.effort !== 'string') {
+            return { setting: null, error: `row ${index + 1} effort must be a string` };
+        }
         if (!row.route || typeof row.route !== 'object' || Array.isArray(row.route)) {
             return { setting: null, error: `row ${index + 1} needs a route object` };
         }
@@ -115,15 +137,35 @@ export function parseAvailableSubagentsSetting(value) {
         if (routeUnknown.length) {
             return { setting: null, error: `row ${index + 1} route has unknown field: ${routeUnknown[0]}` };
         }
-        if (![ROUTE_KIND_API_MODEL, ROUTE_KIND_AGENT_SESSION].includes(row.route.kind)) {
+        if (typeof row.route.kind !== 'string') {
+            return { setting: null, error: `row ${index + 1} route kind must be a string` };
+        }
+        if (typeof row.route.target_id !== 'string') {
+            return { setting: null, error: `row ${index + 1} route target must be a string` };
+        }
+        if (row.route.credential_profile_id !== undefined
+            && row.route.credential_profile_id !== null
+            && typeof row.route.credential_profile_id !== 'string') {
+            return { setting: null, error: `row ${index + 1} account pin must be a string` };
+        }
+        const routeKind = row.route.kind.trim().toLowerCase();
+        if (![ROUTE_KIND_API_MODEL, ROUTE_KIND_AGENT_SESSION].includes(routeKind)) {
             return { setting: null, error: `row ${index + 1} has unsupported route kind` };
         }
-        if (row.route.kind !== ROUTE_KIND_AGENT_SESSION && row.route.credential_profile_id) {
+        if (routeKind !== ROUTE_KIND_AGENT_SESSION
+            && String(row.route.credential_profile_id || '').trim()) {
             return { setting: null, error: `row ${index + 1} has an account pin on an API route` };
         }
+        canonicalItems.push(canonicalRow({
+            ...row,
+            route: { ...row.route, kind: routeKind },
+        }));
     }
+    const setting = { enabled: input.enabled, items: canonicalItems };
+    const errors = validateAvailableSubagentsSetting(setting);
+    if (errors.length) return { setting: null, error: `saved value is invalid: ${errors[0]}` };
     return {
-        setting: { enabled: input.enabled, items: input.items.map(canonicalRow) },
+        setting,
         error: '',
     };
 }
@@ -168,6 +210,11 @@ export function validateAvailableSubagentsSetting(setting) {
         if (row.effort && !EFFORT_CHOICES.includes(String(row.effort))) {
             errors.push(`${label} has an unsupported reasoning effort.`);
         }
+        const encodedEffort = route.kind === ROUTE_KIND_AGENT_SESSION
+            ? compoundSessionEffortConflict(route.target_id, row.effort) : '';
+        if (encodedEffort) {
+            errors.push(`${label} effort “${row.effort}” conflicts with compound route effort “${encodedEffort}”.`);
+        }
     });
     return errors;
 }
@@ -201,8 +248,20 @@ export function availableSubagentsSavePayload({ loaded = false, parseError = '',
     return { OUROBOROS_SUBAGENTS: buildAvailableSubagentsSetting(setting) };
 }
 
-export function generatedPreviewCanReplace({ dirty = false, parsedSetting = null } = {}) {
-    return !dirty && Boolean(parsedSetting);
+/** Preview the current Settings draft without turning its generated actor rows into owner input. */
+export function availableSubagentsPreviewPayload(settingsDraft, subscriptionsConnected) {
+    const payload = {
+        ...(settingsDraft || {}),
+        subscriptionsConnected: Boolean(subscriptionsConnected),
+    };
+    delete payload.OUROBOROS_SUBAGENTS;
+    return payload;
+}
+
+export function generatedPreviewCanReplace({
+    dirty = false, outerDraftClean = true, parsedSetting = null,
+} = {}) {
+    return !dirty && outerDraftClean && Boolean(parsedSetting);
 }
 
 function diagnosticsText(diagnostics, out = []) {
@@ -379,6 +438,9 @@ export function createAvailableSubagentsEditor({
     store = claudexorStatus,
     onChange = () => {},
     onDirtyChange = () => {},
+    isOuterDraftClean = () => true,
+    onGeneratedApply = () => {},
+    allowUnloadedOmission = false,
     previewGenerated = null,
     baselineLabel = 'Saved intent',
 } = {}) {
@@ -387,6 +449,7 @@ export function createAvailableSubagentsEditor({
     const state = {
         loaded: false,
         parseError: '',
+        unloadedOmissionAllowed: false,
         setting: { enabled: true, items: [] },
         source: '',
         diagnostics: [],
@@ -417,6 +480,11 @@ export function createAvailableSubagentsEditor({
 
     function validationErrors() {
         if (!state.loaded) {
+            // An unrelated Settings save may omit a field the response did not
+            // load at all. Once the response carries saved bytes or an explicit
+            // migration/repair candidate, though, its parse error is actionable
+            // and must block rather than masquerade as an accepted repair.
+            if (state.unloadedOmissionAllowed) return [];
             return [state.parseError
                 || 'Available subagents draft is still loading. Retry the preview before finishing.'];
         }
@@ -574,7 +642,7 @@ export function createAvailableSubagentsEditor({
         return true;
     }
 
-    function load(value, { source = '', diagnostics = [] } = {}) {
+    function load(value, { source = '', diagnostics = [], allowOmission = false } = {}) {
         // Invalidate a preview launched for the previous settings document.
         // A late response must never overwrite a freshly loaded configured row.
         state.previewGeneration += 1;
@@ -582,6 +650,9 @@ export function createAvailableSubagentsEditor({
         const parsed = parseAvailableSubagentsSetting(value);
         state.loaded = Boolean(parsed.setting);
         state.parseError = parsed.error;
+        state.unloadedOmissionAllowed = Boolean(
+            allowUnloadedOmission && allowOmission && !parsed.setting,
+        );
         if (parsed.setting) state.setting = attachUiKeys(parsed.setting, state.setting.items);
         state.source = String(source || '');
         state.diagnostics = diagnostics;
@@ -596,8 +667,15 @@ export function createAvailableSubagentsEditor({
         const parsed = parseAvailableSubagentsSetting(response?.available_subagents);
         state.source = String(response?.source || state.source || 'onboarding_default');
         state.diagnostics = response?.diagnostics || [];
+        let outerDraftClean = false;
+        try {
+            outerDraftClean = Boolean(isOuterDraftClean());
+        } catch (error) {
+            outerDraftClean = false;
+        }
         const canApply = generatedPreviewCanReplace({
             dirty: state.dirty,
+            outerDraftClean,
             parsedSetting: parsed.setting,
         });
         if (canApply) {
@@ -605,6 +683,7 @@ export function createAvailableSubagentsEditor({
             state.parseError = '';
             state.setting = attachUiKeys(parsed.setting, state.setting.items);
             onDirtyChange(false);
+            onGeneratedApply(buildAvailableSubagentsSetting(state.setting));
         } else if (!parsed.setting && !state.loaded) {
             state.parseError = parsed.error;
         }
@@ -633,13 +712,22 @@ export function createAvailableSubagentsEditor({
         await boundedStatusRefresh(store);
         adoptStatus();
         paint();
-        await maybeRefreshGeneratedPreview({ force: true });
+        // Generated rows are enrichment, never a second unbounded gate on the
+        // Settings critical path. The response is generation- and clean-gated.
+        void maybeRefreshGeneratedPreview({ force: true });
     }
 
     async function maybeRefreshGeneratedPreview({ force = false } = {}) {
         if (typeof previewGenerated !== 'function' || state.source !== 'undecided' || state.dirty) {
             return false;
         }
+        let outerDraftClean = false;
+        try {
+            outerDraftClean = Boolean(isOuterDraftClean());
+        } catch (error) {
+            outerDraftClean = false;
+        }
+        if (!outerDraftClean) return false;
         const connected = state.accountsKnown
             ? [...connectedHarnessIds(state.snapshot)].sort()
             : [];
@@ -655,8 +743,9 @@ export function createAvailableSubagentsEditor({
             // This is still the unsaved migration/default candidate.  Preserve
             // that provenance so a later clean account-status change may
             // refresh it again; onboarding editors keep the endpoint source.
-            applyGeneratedPreview({ ...response, source: state.source });
-            return true;
+            const result = applyGeneratedPreview({ ...response, source: state.source });
+            if (!result.applied) state.previewSignature = '';
+            return result.applied;
         } catch (error) {
             if (generation !== state.previewGeneration) return false;
             setPreviewFailure(error);
@@ -708,6 +797,7 @@ export function createAvailableSubagentsEditor({
         load,
         paint,
         reloadStatus,
+        refreshGeneratedPreview: maybeRefreshGeneratedPreview,
         applyGeneratedPreview,
         setPreviewFailure,
         validate: validationErrors,
@@ -802,8 +892,22 @@ export function availableSubagentsLoadValue(settings) {
     return settings?._meta?.available_subagents?.candidate ?? raw;
 }
 
+/** Whether this response carries owner or repair bytes that must be fixed in-place. */
+export function availableSubagentsHasExplicitDraft(settings) {
+    const raw = settings?.OUROBOROS_SUBAGENTS;
+    if (raw !== undefined && raw !== null && raw !== '') return true;
+    const meta = settings?._meta?.available_subagents;
+    return meta != null
+        && Object.prototype.hasOwnProperty.call(meta, 'candidate')
+        && meta.candidate !== undefined
+        && meta.candidate !== null
+        && meta.candidate !== '';
+}
+
 export function initSubagentsSection({
     onChange,
+    isOuterDraftClean,
+    onGeneratedApply,
     previewGenerated = null,
     store = claudexorStatus,
 } = {}) {
@@ -811,6 +915,11 @@ export function initSubagentsSection({
     settingsEditor = createAvailableSubagentsEditor({
         store,
         onChange: typeof onChange === 'function' ? onChange : () => {},
+        isOuterDraftClean: typeof isOuterDraftClean === 'function'
+            ? isOuterDraftClean : () => true,
+        onGeneratedApply: typeof onGeneratedApply === 'function'
+            ? onGeneratedApply : () => {},
+        allowUnloadedOmission: true,
         previewGenerated,
     });
     settingsEditor.mount();
@@ -822,6 +931,7 @@ export function applySubagentsSettings(settings) {
     settingsEditor.load(availableSubagentsLoadValue(settings), {
         source: settingsSource(settings),
         diagnostics: meta.diagnostics || meta.diagnostic || [],
+        allowOmission: !availableSubagentsHasExplicitDraft(settings),
     });
 }
 
