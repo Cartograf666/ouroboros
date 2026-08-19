@@ -215,8 +215,15 @@ const ctx = {
     },
 };
 
-initChat(ctx);
+const mainChat = initChat(ctx);
 initFiles(ctx);
+
+function hydrateOpenChatsFromState(data, snapshotRequestedAt) {
+    mainChat?.hydrateStateSnapshot?.(data, snapshotRequestedAt);
+    for (const instance of projectInstances.values()) {
+        instance.hydrateStateSnapshot?.(data, snapshotRequestedAt);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Multi-project navigation + right thread panel (v6.32.0). Projects come from
@@ -529,12 +536,17 @@ document.getElementById('nav-projects-add')?.addEventListener('click', async (ev
 });
 
 async function refreshProjectsNav() {
+    const snapshotRequestedAt = Date.now();
     try {
         const resp = await apiFetch('/api/state', { cache: 'no-store' });
         if (!resp.ok) return;
         const data = await resp.json();
         renderProjectsNav(data.projects || [], data.project_chat_ids);
         applyTaskBindings(data.task_bindings || {});
+        // This request already powers Project navigation. Fan its authoritative
+        // activity snapshot into every live chat instance instead of giving
+        // Project panels another timer/poll loop.
+        hydrateOpenChatsFromState(data, snapshotRequestedAt);
     } catch {}
 }
 

@@ -53,12 +53,14 @@ import {
     computeHydratedDirectActivities,
     formatMsgTime,
     headerBudgetPresentation,
+    isTerminalTaskDetail,
     isTerminalTaskPhase,
     liveLineRowToggleKey,
     mergeStickyCostMeta,
     partitionLocalEchoJournal,
     projectCollapsedActivity,
     rawTimestampEpoch,
+    reconcileHydratedDirectActivities,
     reconnectBannerText,
     routingAnnotationText,
     taskCostMeta,
@@ -73,11 +75,13 @@ export {
     computeHydratedDirectActivities,
     headerBudgetPresentation,
     insertTimelineNode,
+    isTerminalTaskDetail,
     isTerminalTaskPhase,
     liveLineRowToggleKey,
     mergeStickyCostMeta,
     projectCollapsedActivity,
     rawTimestampEpoch,
+    reconcileHydratedDirectActivities,
     taskCostMeta,
     taskCostProjection,
 };
@@ -570,8 +574,7 @@ export function createChatInstance({
     // suppresses the transient card while preserving the typed routing annotation
     // and any non-empty final conversational answer as separate UI roles.
     const ephemeralDecisionTaskIds = new Set();
-    // Server-confirmed in-flight direct/ephemeral turns
-    // (activityId -> { activityId, kind, phase, clientMessageId, startedAt }).
+    // Server-confirmed in-flight direct/ephemeral/managed activities.
     const activeDirectActivities = new Map();
     // Local user submissions awaiting server confirmation (clientMessageId
     // -> { clientMessageId, timestamp }).
@@ -581,8 +584,10 @@ export function createChatInstance({
     // concluded turn (project panels hydrate one-shot, no poll). Bounded FIFO.
     const concludedDirectActivities = new Map();
     const CONCLUDED_ACTIVITY_LEDGER_MAX = 200;
-    // Local-echo journal: owner rows kept until server history confirms
-    // their client_message_id (partitionLocalEchoJournal).
+    // Retryable queue-loss candidates plus process-local single-flight reads.
+    const missingManagedTaskIds = new Set();
+    const managedTaskDetailReads = new Set();
+    // Owner rows kept until history confirms client_message_id.
     const localEchoJournal = new Map();
     const LOCAL_ECHO_JOURNAL_MAX = 50;
 
@@ -597,6 +602,7 @@ export function createChatInstance({
     function recordConcludedActivity(activityId) {
         const aid = String(activityId || '').trim();
         if (!aid) return;
+        missingManagedTaskIds.delete(aid);
         concludedDirectActivities.delete(aid);
         concludedDirectActivities.set(aid, Date.now());
         while (concludedDirectActivities.size > CONCLUDED_ACTIVITY_LEDGER_MAX) {
@@ -739,6 +745,16 @@ export function createChatInstance({
         if (budgetFill) budgetFill.style.width = `${budget.fillPct}%`;
     }
 
+    function hydrateStateSnapshot(data, snapshotRequestedAt = Infinity) {
+        syncHeaderControlState(data);
+        const activities = Array.isArray(data?.active_chat_activities)
+            ? data.active_chat_activities
+            : data?.active_direct_turns;
+        if (Array.isArray(activities)) {
+            hydrateDirectActivities(activities, snapshotRequestedAt);
+        }
+    }
+
     async function refreshHeaderControlState(force = false) {
         if (!force && state.activePage !== 'chat') return;
         // Snapshot authority barrier: the reply only knows activities that
@@ -751,15 +767,7 @@ export function createChatInstance({
                 return;
             }
             const data = await resp.json();
-            syncHeaderControlState(data);
-            // Combined snapshot (direct turns + queue roots); the legacy
-            // direct-only field is the older-server fallback.
-            const activities = Array.isArray(data?.active_chat_activities)
-                ? data.active_chat_activities
-                : data?.active_direct_turns;
-            if (Array.isArray(activities)) {
-                hydrateDirectActivities(activities, snapshotRequestedAt);
-            }
+            hydrateStateSnapshot(data, snapshotRequestedAt);
         } catch {
             syncHeaderControlState({ accounting: { available: false } });
         }
@@ -1320,12 +1328,7 @@ export function createChatInstance({
         record.cancelRunBtn = btn;
     }
 
-    // Interim "Cancelling…" phase (phase A cancel redesign): the durable cancel
-    // intent is recorded and the supervisor is confirming the teardown — the
-    // card stays honestly LIVE (never an instant "Cancelled" lie) and resolves
-    // on the settled task_done: Cancelled, or Completed when the run finished
-    // first (completion wins). S3 (Q1): a pending SOFT stop shows "Finalizing…"
-    // instead — a bounded final turn is running before the same intent settles.
+    // Pending intent stays live until settled; soft stop shows Finalizing….
     function markLiveCardCancelPending(taskId = '', soft = false) {
         const record = liveCardRecords.get(String(taskId || '').trim());
         if (!record || record.finished || !record.phaseEl) return;
@@ -1336,8 +1339,7 @@ export function createChatInstance({
         record.phaseEl.className = 'chat-live-phase working cancelling';
     }
 
-    // Early final on a managed root: hold the card on a sticky "Finalizing…"
-    // until the settled task_done (post-task synthesis still runs).
+    // Early final stays live while post-task synthesis runs.
     function markLiveCardFinalizing(taskId = '') {
         const record = liveCardRecords.get(String(taskId || '').trim());
         if (!record || record.finished || !record.phaseEl) return;
@@ -1397,79 +1399,43 @@ export function createChatInstance({
         const priorPhase = captureLiveCardPhase(record);
         markLiveCardCancelPending(taskId, soft);
         try {
-            // Immediate: answered only after the teardown finished, so a resolved
-            // promise means the run is really down. Soft (Q1): a 202 arrives with
-            // the durable intent open while the bounded finalization runs — the
-            // card stays "Finalizing…". A refusal throws and is toasted below.
             await requestStop(taskId, action);
-            // Backend publication is fail-soft past the durable boundary, so a 200
-            // can arrive with the task_done event lost. Reconcile from the durable
-            // record through the same terminal seam replay uses — idempotent with
-            // a later event, so double resolution is harmless.
+            // Durable detail heals a lost best-effort task_done publication.
             try {
                 reconcileCancelCardFromDetail(record, taskId, await fetchTaskDetail(taskId));
             } catch {
                 // The card still resolves on its own frame if one arrives.
             }
-            // Immediate: the card resolves via the existing task_done frames and
-            // the button stays disabled until then. Soft: the hard escalation
-            // must stay REACHABLE during the wait (Q1), so re-enable the trigger
-            // (the pending menu offers only "Stop now").
+            // Soft stop keeps hard escalation reachable while finalizing.
             if (btn && !record.finished && record.cancelPendingPolicy === 'finalize') {
                 btn.disabled = false;
             }
         } catch (exc) {
-            // 404 = nothing live anymore (natural completion beat the cancel):
-            // graceful no-op, the card resolves on its own terminal frame.
             if (exc?.status === 404 || record.finished) {
-                // Completion-wins race: the run finished while the request was in
-                // flight, so there is nothing to cancel. RESYNC rather than leave a
-                // dead disabled button — the card resolves on its own terminal
-                // frame, and until then the action is simply no longer offered.
-                // `cancelableTaskIds` is the eligibility AUTHORITY — clearing the
-                // record flag alone left the button mounted and merely re-enabled.
+                // Completion won: remove the dead action, then reconcile detail.
                 cancelableTaskIds.delete(taskId);
                 record.cancelable = false;
                 syncCancelRunButton(record);
-                // REAL resync, not just button removal: 404 says the task is no
-                // longer live, but if its terminal frame was lost this card would
-                // sit "Working" forever. Ask the durable record and resolve the
-                // card through the same terminal seam replay uses.
                 try {
                     reconcileCancelCardFromDetail(record, taskId, await fetchTaskDetail(taskId));
                 } catch {
-                    // The card still resolves on its own frame if one arrives;
-                    // nothing worse than the pre-resync behavior.
+                    // A later terminal frame can still resolve the card.
                 }
                 return;
             }
             showToast(`Cancel failed: ${exc?.message || exc}`, 'error');
-            // GR3-10: reconcile the durable detail BEFORE touching the button —
-            // a non-404 failure can sit over a task whose durable record is
-            // already terminal (finish the card, button stays gone) or whose
-            // durable intent really is pending (keep the button disabled and
-            // the honest "Cancelling…"). Only a genuinely-live, non-pending
-            // task gets its prior phase restored and the button re-enabled.
+            // Reconcile durable truth before restoring any optimistic UI.
             let stored = null;
             try {
                 stored = await fetchTaskDetail(taskId);
-            } catch {
-                // Typed state unreachable — handled by the null guard below.
-            }
+            } catch {}
             if (stored === null) {
-                // GR4-5: the detail fetch itself failed, so NOTHING was proven —
-                // restoring the prior phase and re-enabling Cancel would assert
-                // "not pending" without evidence. Keep the pending presentation
-                // and the disabled button; the next reconcile/poll (or the
-                // task_done frame) resolves the card either way.
+                // Unknown truth cannot re-enable Stop or undo pending state.
                 return;
             }
-            // The shared seam: pending keeps the interim, a terminal record
-            // finishes the card (same path replay uses).
             reconcileCancelCardFromDetail(record, taskId, stored);
             const stillPending = Boolean(taskCancelPending(stored));
             if (record.finished || stillPending) return;
-            // Only a fetched, live, non-pending detail restores the button.
             if (btn) btn.disabled = false;
             restoreLiveCardPhase(record, priorPhase);
             record.cancelPendingPolicy = '';
@@ -2800,12 +2766,14 @@ export function createChatInstance({
         queueTaskLiveUpdate(presented, taskId, normalizeLogTs(rawTs), presented.dedupeKey || '', rawTs);
         updateSubagentCardFromEvent(evt, rawTs);
         if (eventType === 'task_done') {
-            // The settled task_done concludes the managed activity too: panels
-            // hydrate one-shot (no poll), so the header must not stay Working.
-            if (activeDirectActivities.delete(taskId)) {
+            activeDirectActivities.delete(taskId);
+            if (REUSABLE_TASK_IDS.has(taskId)) {
+                missingManagedTaskIds.delete(taskId);
+                concludedDirectActivities.delete(taskId);
+            } else {
                 recordConcludedActivity(taskId);
-                syncChatStatus();
             }
+            syncChatStatus();
             const taskState = getTaskUiState(taskId, false);
             revealBufferedCardIfNeeded(taskState, { rawTs });
         }
@@ -4086,6 +4054,9 @@ export function createChatInstance({
             }
             return;
         }
+        // Fresh live evidence outranks a task-detail read woken by an older
+        // queue-loss snapshot. The in-flight read may finish, but cannot apply.
+        missingManagedTaskIds.delete(actId);
         activeDirectActivities.set(actId, {
             activityId: actId,
             // '' = not registry-tracked (queued managed task): visible in the
@@ -4111,16 +4082,79 @@ export function createChatInstance({
         typingEl.style.display = 'none';
     }
 
+    function revokeManagedTaskCancelAuthority(taskId) {
+        cancelableTaskIds.delete(taskId);
+        const record = liveCardRecords.get(taskId);
+        if (!record) return;
+        record.cancelable = false;
+        syncCancelRunButton(record);
+    }
+
+    async function reconcileMissingManagedTask(taskId) {
+        if (
+            destroyed
+            || managedTaskDetailReads.has(taskId)
+            || concludedDirectActivities.has(taskId)
+            || activeDirectActivities.has(taskId)
+            || !missingManagedTaskIds.has(taskId)
+        ) return;
+        const record = liveCardRecords.get(taskId);
+        if (subagentChildParents.has(taskId) || record?.isSubagent) {
+            missingManagedTaskIds.delete(taskId);
+            return;
+        }
+        managedTaskDetailReads.add(taskId);
+        try {
+            const detail = await fetchTaskDetail(taskId);
+            if (
+                destroyed
+                || !missingManagedTaskIds.has(taskId)
+                || activeDirectActivities.has(taskId)
+                || concludedDirectActivities.has(taskId)
+                || !isTerminalTaskDetail(detail)
+            ) return;
+            recordConcludedActivity(taskId);
+            finishLiveCard(taskId, taskTerminalPhase(detail));
+        } catch {
+            // No terminal fact was proved. A later existing snapshot retries.
+        } finally {
+            managedTaskDetailReads.delete(taskId);
+        }
+    }
+
+    function observeMissingManagedTask(taskId) {
+        const id = String(taskId || '').trim();
+        if (!id || concludedDirectActivities.has(id)) return;
+        const record = liveCardRecords.get(id);
+        if (subagentChildParents.has(id) || record?.isSubagent) return;
+        missingManagedTaskIds.add(id);
+        void reconcileMissingManagedTask(id);
+    }
+
     function hydrateDirectActivities(turnsList, snapshotBarrierMs = Infinity) {
         if (!Array.isArray(turnsList)) return;
-        const nextMap = computeHydratedDirectActivities(
-            activeDirectActivities, turnsList, chatId, snapshotBarrierMs, concludedDirectActivities);
+        const {
+            activities: nextMap,
+            departedManagedTaskIds,
+            disappearedManagedTaskIds,
+            globallyActiveActivityIds,
+        } = reconcileHydratedDirectActivities(
+            activeDirectActivities, turnsList, chatId, snapshotBarrierMs, concludedDirectActivities,
+        );
         activeDirectActivities.clear();
         for (const [k, v] of nextMap.entries()) {
             activeDirectActivities.set(k, v);
+            if (v.kind === 'managed_task') missingManagedTaskIds.delete(k);
             if (v.clientMessageId) {
                 pendingSubmissions.delete(v.clientMessageId);
             }
+        }
+        for (const taskId of globallyActiveActivityIds) missingManagedTaskIds.delete(taskId);
+        for (const taskId of departedManagedTaskIds) revokeManagedTaskCancelAuthority(taskId);
+        for (const taskId of disappearedManagedTaskIds) observeMissingManagedTask(taskId);
+        // Null or nonterminal detail retries on the next authoritative snapshot.
+        for (const taskId of missingManagedTaskIds) {
+            if (!activeDirectActivities.has(taskId)) void reconcileMissingManagedTask(taskId);
         }
         syncChatStatus();
     }
@@ -4586,6 +4620,9 @@ export function createChatInstance({
         restoreScrollPosition,
         refreshHistory,
         cancelHistoryPaint,
+        // app.js fans its already-existing /api/state refresh to every open
+        // thread; panels gain convergence without acquiring their own poll.
+        hydrateStateSnapshot,
         // True once a history snapshot has actually been fetched and painted;
         // app.js uses it to decide whether a reopen needs a forced repaint.
         hasPaintedHistory: () => historyLoaded && lastHistorySyncSucceeded,
@@ -4624,6 +4661,8 @@ export function createChatInstance({
             subagentChildParents.clear();
             subagentTerminalChildren.clear();
             cancelableTaskIds.clear();
+            missingManagedTaskIds.clear();
+            managedTaskDetailReads.clear();
             ephemeralDecisionTaskIds.clear();
             retiredTaskIds.clear();
             pendingUserBubbles.clear();

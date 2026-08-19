@@ -214,6 +214,18 @@ export function isTerminalTaskPhase(phase = '', terminal = false) {
     return Boolean(terminal) || ['done', 'lifecycle_error', 'cancelled'].includes(phase);
 }
 
+// Durable task detail is allowed to finish a card only at one of the task
+// result store's genuinely-settled statuses. In particular, interrupted and
+// the legacy cancel_requested latch remain retryable rather than becoming a
+// fabricated Done/Cancelled projection.
+const TERMINAL_TASK_DETAIL_STATUSES = new Set([
+    'completed', 'failed', 'cancelled', 'rejected_duplicate',
+]);
+
+export function isTerminalTaskDetail(record) {
+    return TERMINAL_TASK_DETAIL_STATUSES.has(String(record?.status || '').toLowerCase());
+}
+
 // ---------------------------------------------------------------------------
 // In-flight chat activity status (owner decisions 1A-5A; managed continuity).
 // ---------------------------------------------------------------------------
@@ -434,4 +446,44 @@ export function computeHydratedDirectActivities(existingMap, turnsList, chatId, 
         nextMap.delete(aid);
     }
     return nextMap;
+}
+
+/**
+ * Hydrate one authoritative activity snapshot and identify the narrower event
+ * that can wake durable task-detail convergence: a host-stamped managed root
+ * observed before this request, now absent from the GLOBAL snapshot. A root
+ * still listed under another chat merely departed locally. Direct/ephemeral
+ * removals still update header status without task-detail/card authority.
+ */
+export function reconcileHydratedDirectActivities(
+    existingMap,
+    turnsList,
+    chatId,
+    snapshotBarrierMs = Infinity,
+    concludedIds = null,
+) {
+    const activities = computeHydratedDirectActivities(
+        existingMap, turnsList, chatId, snapshotBarrierMs, concludedIds,
+    );
+    const globallyActiveActivityIds = new Set();
+    for (const turn of Array.isArray(turnsList) ? turnsList : []) {
+        const activityId = String(turn?.activity_id || '').trim();
+        if (activityId) globallyActiveActivityIds.add(activityId);
+    }
+    const departedManagedTaskIds = [];
+    const disappearedManagedTaskIds = [];
+    for (const [activityId, entry] of existingMap || []) {
+        if (String(entry?.kind || '') !== 'managed_task') continue;
+        if (activities.has(activityId)) continue;
+        if (concludedIds?.has(activityId)) continue;
+        departedManagedTaskIds.push(activityId);
+        if (globallyActiveActivityIds.has(activityId)) continue;
+        disappearedManagedTaskIds.push(activityId);
+    }
+    return {
+        activities,
+        departedManagedTaskIds,
+        disappearedManagedTaskIds,
+        globallyActiveActivityIds,
+    };
 }

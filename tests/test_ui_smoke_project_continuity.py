@@ -3,16 +3,17 @@
 Lives in its own module (not test_ui_smoke_playwright.py) so the giant smoke
 module stays under the size-ratchet byte gate. Reuses its server fixture.
 
-Four observable scenarios:
+Observable scenarios include:
 1. A stale history rebuild (response assembled before the send was logged)
    must not erase the owner's optimistic bubble or its routing receipt.
 2. A chat opened AFTER a managed task started shows Working... from the
    /api/state activity snapshot, and the snapshot's absence concludes it.
 3. An early final answer holds the card on "Finalizing…" —
    task_cost_finalized does not resolve it, the settled task_done does.
-4. A project panel (one-shot hydration, no /api/state poll) concludes its
-   managed activity on the settled task_done: the header returns to Online
-   even though the early final did not conclude the turn.
+4. Queue loss removes Stop before a single-flight task-detail read settles;
+   null/nonterminal reads retry, while terminal detail concludes exactly once.
+5. An already-open Project panel consumes the app's existing state snapshot
+   fanout and heals a lost task_done without acquiring its own poll.
 """
 
 from __future__ import annotations
@@ -38,6 +39,38 @@ def _wait_status(page, expected, timeout=10_000):
         }""",
         arg=expected,
         timeout=timeout,
+    )
+
+
+def _install_task_detail_gate(page):
+    """Hold task-detail fetches in page JS so assertions can inspect in-flight UI."""
+    page.add_init_script(
+        r"""(() => {
+            const realFetch = window.fetch.bind(window);
+            window.__taskDetailCalls = [];
+            window.__taskDetailPending = [];
+            window.fetch = (input, init) => {
+                const raw = typeof input === 'string' ? input : input?.url || '';
+                const path = new URL(raw, window.location.href).pathname;
+                if (/^\/api\/tasks\/[^/]+$/.test(path)) {
+                    const taskId = decodeURIComponent(path.split('/').pop());
+                    window.__taskDetailCalls.push(taskId);
+                    return new Promise((resolve) => {
+                        window.__taskDetailPending.push({ taskId, resolve });
+                    });
+                }
+                return realFetch(input, init);
+            };
+            window.__settleTaskDetail = (payload, status = 200) => {
+                const pending = window.__taskDetailPending.shift();
+                if (!pending) return false;
+                pending.resolve(new Response(JSON.stringify(payload), {
+                    status,
+                    headers: { 'Content-Type': 'application/json' },
+                }));
+                return true;
+            };
+        })()"""
     )
 
 
@@ -170,6 +203,292 @@ def test_ui_smoke_late_open_chat_shows_managed_activity(direct_server_with_data)
 
 
 @pytest.mark.ui_browser
+def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_data):  # noqa: F811
+    """Lost task_done heals from existing state snapshots plus durable detail."""
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    url = direct_server_with_data["url"]
+    card = '.chat-live-card[data-task-id="truth-root"]'
+    try:
+        with sync_playwright() as pw:
+            browser, page = _launch(pw)
+            try:
+                _install_task_detail_gate(page)
+
+                def _activity(task_id, chat_id=1):
+                    return {
+                        "activity_id": task_id,
+                        "chat_id": chat_id,
+                        "project_id": "",
+                        "client_message_id": "",
+                        "kind": "managed_task",
+                        "phase": "working",
+                        "started_at": 1.0,
+                    }
+
+                state = {"activities": [_activity("truth-root")]}
+
+                def _inject(route):
+                    response = route.fetch()
+                    payload = response.json()
+                    payload["active_chat_activities"] = list(state["activities"])
+                    route.fulfill(content_type="application/json", body=json.dumps(payload))
+
+                page.route("**/api/state*", _inject)
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                _wait_status(page, "Working...", timeout=30_000)
+
+                # Visible root card plus host-attested Stop authority.
+                page.evaluate(
+                    """() => window.__ouroWs.emit('chat', {
+                        type: 'chat', role: 'assistant', is_progress: true,
+                        chat_id: 1, task_id: 'truth-root', cancelable: true,
+                        content: 'Still working.', ts: '2026-08-19T10:00:00+00:00',
+                    })"""
+                )
+                page.wait_for_selector(f"{card} [data-cancel-run]", timeout=10_000)
+
+                # Final prose arrives while post-task work is still live.
+                page.evaluate(
+                    """() => window.__ouroWs.emit('chat', {
+                        type: 'chat', role: 'assistant', chat_id: 1,
+                        task_id: 'truth-root', task_phase: 'finalizing',
+                        content: 'The early answer is already visible.',
+                        ts: '2026-08-19T10:00:01+00:00',
+                    })"""
+                )
+                page.wait_for_function(
+                    """(sel) => document.querySelector(sel + ' .chat-live-phase')
+                        ?.textContent.trim() === 'Finalizing…'""",
+                    arg=card,
+                )
+                page.evaluate(
+                    """(sel) => {
+                        window.__finishTransitions = 0;
+                        window.__finishObserver = new MutationObserver((rows) => {
+                            for (const row of rows) {
+                                if (row.attributeName === 'data-finished'
+                                    && row.target.dataset.finished === '1') {
+                                    window.__finishTransitions += 1;
+                                }
+                            }
+                        });
+                        window.__finishObserver.observe(document.querySelector(sel), {
+                            attributes: true, attributeFilter: ['data-finished'],
+                        });
+                    }""",
+                    card,
+                )
+
+                # Two existing state refresh wakeups overlap. Queue loss revokes
+                # Stop synchronously, and only one detail read may be in flight.
+                state["activities"] = []
+                page.evaluate(
+                    """() => {
+                        window.__ouroWs.emit('projects_changed', {});
+                        window.__ouroWs.emit('projects_changed', {});
+                    }"""
+                )
+                page.wait_for_function("() => window.__taskDetailCalls.length === 1")
+                assert page.locator(f"{card} [data-cancel-run]").count() == 0
+                assert page.locator(card).get_attribute("data-finished") == "0"
+
+                # Unreachable and then nonterminal detail prove nothing; each is
+                # retried only on the next existing state snapshot.
+                assert page.evaluate("() => window.__settleTaskDetail({}, 404)")
+                page.wait_for_timeout(100)
+                page.evaluate("() => window.__ouroWs.emit('projects_changed', {})")
+                page.wait_for_function("() => window.__taskDetailCalls.length === 2")
+                assert page.evaluate(
+                    "() => window.__settleTaskDetail({status: 'running'}, 200)"
+                )
+                page.wait_for_timeout(100)
+                assert page.locator(card).get_attribute("data-finished") == "0"
+
+                # Another overlapping pair remains single-flight.
+                page.evaluate(
+                    """() => {
+                        window.__ouroWs.emit('projects_changed', {});
+                        window.__ouroWs.emit('projects_changed', {});
+                    }"""
+                )
+                page.wait_for_function("() => window.__taskDetailCalls.length === 3")
+                page.wait_for_timeout(150)
+                assert page.evaluate("() => window.__taskDetailCalls.length") == 3
+                assert page.evaluate(
+                    """() => window.__settleTaskDetail({
+                        status: 'completed',
+                        outcome_axes: {lifecycle: {status: 'completed'}},
+                    }, 200)"""
+                )
+                page.wait_for_function(
+                    "(sel) => document.querySelector(sel)?.dataset.finished === '1'",
+                    arg=card,
+                )
+                assert page.locator(f"{card} .chat-live-phase").inner_text().strip() == "Done"
+                _wait_status(page, "Online")
+                assert page.evaluate("() => window.__finishTransitions") == 1
+
+                # Old snapshot and late typing cannot resurrect a concluded id.
+                state["activities"] = [_activity("truth-root")]
+                page.evaluate("() => window.__ouroWs.emit('projects_changed', {})")
+                page.wait_for_timeout(150)
+                page.evaluate(
+                    """() => window.__ouroWs.emit('typing', {
+                        type: 'typing', chat_id: 1, activity_id: 'truth-root',
+                        kind: 'managed_task', phase: 'working',
+                    })"""
+                )
+                page.wait_for_timeout(100)
+                assert page.evaluate("() => window.__taskDetailCalls.length") == 3
+                assert page.evaluate("() => window.__finishTransitions") == 1
+                _wait_status(page, "Online")
+
+                # Rehoming removes local activity and Stop without declaring the
+                # globally-live task terminal or reading its durable detail.
+                rehome_card = '.chat-live-card[data-task-id="rehome-root"]'
+                state["activities"] = [_activity("rehome-root")]
+                page.evaluate("() => window.__ouroWs.emit('projects_changed', {})")
+                _wait_status(page, "Working...")
+                page.evaluate(
+                    """() => window.__ouroWs.emit('chat', {
+                        type: 'chat', role: 'assistant', is_progress: true,
+                        chat_id: 1, task_id: 'rehome-root', cancelable: true,
+                        content: 'Moving to its Project.',
+                    })"""
+                )
+                page.wait_for_selector(f"{rehome_card} [data-cancel-run]")
+                page.wait_for_timeout(20)
+                state["activities"] = [_activity("rehome-root", 9)]
+                with page.expect_response("**/api/state*", timeout=10_000):
+                    page.evaluate("() => window.__ouroWs.emit('projects_changed', {})")
+                page.wait_for_function(
+                    "(sel) => document.querySelector(sel + ' [data-cancel-run]') === null",
+                    arg=rehome_card,
+                )
+                assert page.evaluate("() => window.__taskDetailCalls.length") == 3
+                assert page.locator(rehome_card).get_attribute("data-finished") == "0"
+
+                # If an earlier absent snapshot already started a read, a later
+                # rehome snapshot clears that candidate and its terminal response
+                # cannot finish the still-running card.
+                state["activities"] = [_activity("rehome-root")]
+                page.evaluate("() => window.__ouroWs.emit('projects_changed', {})")
+                page.wait_for_timeout(100)
+                page.evaluate(
+                    """() => window.__ouroWs.emit('chat', {
+                        type: 'chat', role: 'assistant', is_progress: true,
+                        chat_id: 1, task_id: 'rehome-root', cancelable: true,
+                        content: 'Still moving.',
+                    })"""
+                )
+                page.wait_for_selector(f"{rehome_card} [data-cancel-run]")
+                state["activities"] = []
+                page.evaluate("() => window.__ouroWs.emit('projects_changed', {})")
+                page.wait_for_function("() => window.__taskDetailCalls.length === 4")
+                state["activities"] = [_activity("rehome-root", 9)]
+                with page.expect_response("**/api/state*", timeout=10_000):
+                    page.evaluate("() => window.__ouroWs.emit('projects_changed', {})")
+                page.wait_for_timeout(50)
+                assert page.evaluate(
+                    """() => window.__settleTaskDetail({
+                        status: 'completed',
+                        outcome_axes: {lifecycle: {status: 'completed'}},
+                    }, 200)"""
+                )
+                page.wait_for_timeout(100)
+                assert page.locator(rehome_card).get_attribute("data-finished") == "0"
+
+                # Fast terminal truth ledgers a root even though rehome left no
+                # local activity/missing entry; late typing and old state stay inert.
+                page.evaluate(
+                    """() => window.__ouroWs.emit('log', {
+                        type: 'log', chat_id: 1,
+                        data: {type: 'task_done', task_id: 'rehome-root', status: 'completed'},
+                    })"""
+                )
+                page.wait_for_function(
+                    "(sel) => document.querySelector(sel)?.dataset.finished === '1'",
+                    arg=rehome_card,
+                )
+                state["activities"] = [_activity("rehome-root")]
+                page.evaluate(
+                    """() => {
+                        window.__ouroWs.emit('typing', {
+                            type: 'typing', chat_id: 1, activity_id: 'rehome-root',
+                            kind: 'managed_task', phase: 'working',
+                        });
+                        window.__ouroWs.emit('projects_changed', {});
+                    }"""
+                )
+                page.wait_for_timeout(150)
+                assert page.evaluate("() => window.__taskDetailCalls.length") == 4
+                _wait_status(page, "Online")
+
+                # Reusable logical slots may start another cycle after task_done.
+                state["activities"] = []
+                page.evaluate(
+                    """() => window.__ouroWs.emit('typing', {
+                        type: 'typing', chat_id: 1, activity_id: 'active',
+                        kind: 'managed_task', phase: 'working',
+                    })"""
+                )
+                _wait_status(page, "Working...")
+                page.evaluate(
+                    """() => window.__ouroWs.emit('log', {
+                        type: 'log', chat_id: 1,
+                        data: {type: 'task_done', task_id: 'active', status: 'completed'},
+                    })"""
+                )
+                _wait_status(page, "Online")
+                page.evaluate(
+                    """() => window.__ouroWs.emit('typing', {
+                        type: 'typing', chat_id: 1, activity_id: 'active',
+                        kind: 'managed_task', phase: 'working',
+                    })"""
+                )
+                _wait_status(page, "Working...")
+                page.evaluate(
+                    """() => window.__ouroWs.emit('log', {
+                        type: 'log', chat_id: 1,
+                        data: {type: 'task_done', task_id: 'active', status: 'completed'},
+                    })"""
+                )
+
+                # Even a synthetically kind-stamped known subagent never gains
+                # root task-detail convergence authority.
+                state["activities"] = []
+                page.evaluate(
+                    """() => {
+                        window.__ouroWs.emit('chat', {
+                            type: 'chat', role: 'assistant', is_progress: true,
+                            chat_id: 1, task_id: 'parent-root',
+                            parent_task_id: 'parent-root', subagent_task_id: 'child-root',
+                            delegation_role: 'subagent', subagent_role: 'reviewer',
+                            subagent_event: 'running', content: 'Reviewing.',
+                        });
+                        window.__ouroWs.emit('typing', {
+                            type: 'typing', chat_id: 1, activity_id: 'child-root',
+                            kind: 'managed_task', phase: 'working',
+                        });
+                        window.__ouroWs.emit('projects_changed', {});
+                    }"""
+                )
+                page.wait_for_timeout(200)
+                assert page.evaluate("() => window.__taskDetailCalls") == [
+                    "truth-root", "truth-root", "truth-root", "rehome-root",
+                ]
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise
+
+
+@pytest.mark.ui_browser
 def test_ui_smoke_early_final_holds_finalizing_until_task_done(direct_server_with_data):  # noqa: F811
     """Finalizing hold: early final -> Finalizing…, cost checkpoint does not
     resolve the card, task_done does."""
@@ -259,9 +578,10 @@ def test_ui_smoke_early_final_holds_finalizing_until_task_done(direct_server_wit
 
 
 @pytest.mark.ui_browser
-def test_ui_smoke_project_panel_concludes_activity_on_task_done(direct_server_with_data):  # noqa: F811
-    """Panels never poll /api/state; the settled task_done must conclude the
-    managed activity so the panel header does not stay Working... forever."""
+def test_ui_smoke_open_project_panel_heals_lost_task_done_from_state_fanout(
+    direct_server_with_data,  # noqa: F811
+):
+    """The app's existing state refresh converges an already-open panel."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
@@ -273,6 +593,7 @@ def test_ui_smoke_project_panel_concludes_activity_on_task_done(direct_server_wi
     project = create_project(data_dir, "cont-panel", name="Continuity panel")
     project_chat = int(project["chat_id"])
     status_sel = '[id="pchat-cont-panel-status"]'
+    card = '#panel-pchat-cont-panel .chat-live-card[data-task-id="panel-root-1"]'
 
     def _panel_status_is(page, expected, timeout=10_000):
         page.wait_for_function(
@@ -288,6 +609,20 @@ def test_ui_smoke_project_panel_concludes_activity_on_task_done(direct_server_wi
         with sync_playwright() as pw:
             browser, page = _launch(pw)
             try:
+                detail_calls = []
+
+                def _detail(route):
+                    detail_calls.append("panel-root-1")
+                    route.fulfill(
+                        content_type="application/json",
+                        body=json.dumps({
+                            "task_id": "panel-root-1",
+                            "status": "completed",
+                            "outcome_axes": {"lifecycle": {"status": "completed"}},
+                        }),
+                    )
+
+                page.route("**/api/tasks/panel-root-1", _detail)
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
                 page.click('.nav-project-row[data-project-id="cont-panel"]')
                 page.wait_for_selector("#project-panel:not([hidden])", timeout=30_000)
@@ -303,7 +638,19 @@ def test_ui_smoke_project_panel_concludes_activity_on_task_done(direct_server_wi
                 )
                 _panel_status_is(page, "Working...")
 
-                # The early final does NOT conclude the turn (post-task runs).
+                # A visible root card carries host-attested Stop authority.
+                page.evaluate(
+                    """(chatId) => window.__ouroWs.emit('chat', {
+                        type: 'chat', role: 'assistant', is_progress: true,
+                        chat_id: chatId, task_id: 'panel-root-1', cancelable: true,
+                        content: 'Project work is running.',
+                        ts: '2026-08-19T11:00:00+00:00',
+                    })""",
+                    project_chat,
+                )
+                page.wait_for_selector(f"{card} [data-cancel-run]", timeout=10_000)
+
+                # Early final prose does not conclude while post-task work runs.
                 page.evaluate(
                     """(chatId) => window.__ouroWs.emit('chat', {
                         type: 'chat', role: 'assistant', chat_id: chatId,
@@ -313,19 +660,25 @@ def test_ui_smoke_project_panel_concludes_activity_on_task_done(direct_server_wi
                     project_chat,
                 )
                 _panel_status_is(page, "Working...")
+                # Make the next request barrier strictly newer than the typing
+                # registration even on a millisecond-resolution browser clock.
+                page.wait_for_timeout(20)
 
-                # The settled task_done concludes the activity; header settles.
-                page.evaluate(
-                    """(chatId) => window.__ouroWs.emit('log', {
-                        type: 'log', chat_id: chatId,
-                        data: { type: 'task_done', task_id: 'panel-root-1',
-                                status: 'completed',
-                                outcome_axes: { lifecycle: { status: 'completed' } },
-                                ts: '2026-08-17T11:00:05+00:00' },
-                    })""",
-                    project_chat,
+                # No task_done is emitted. projects_changed invokes the existing
+                # app state refresh, whose snapshot is fanned into this live panel.
+                with page.expect_response("**/api/tasks/panel-root-1", timeout=10_000):
+                    page.evaluate(
+                        "() => window.__ouroWs.emit('projects_changed', {})"
+                    )
+                page.wait_for_function(
+                    "(sel) => [...document.querySelectorAll(sel)]"
+                    ".some((node) => node.dataset.finished === '1')",
+                    arg=card,
+                    timeout=10_000,
                 )
                 _panel_status_is(page, "Online")
+                assert page.locator(f"{card} .chat-live-phase").inner_text().strip() == "Done"
+                assert detail_calls == ["panel-root-1"]
             finally:
                 browser.close()
     except PlaywrightError as exc:
