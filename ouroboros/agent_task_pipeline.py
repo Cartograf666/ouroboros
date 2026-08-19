@@ -470,16 +470,12 @@ def recover_pending_root_post_task_synthesis(
             drive_path=lambda rel, _root=root: _root / rel,
         )
         if phase == "running":
-            degraded = dict(checkpoint)
-            degraded.update({
-                "post_task_synthesis": "degraded",
-                "post_task_stop_reason": "restart_indeterminate_running",
-            })
-            write_task_result(
-                root, task_id, str(task.get("status") or STATUS_COMPLETED),
-                root_phase_checkpoint=degraded,
+            _set_root_post_task_checkpoint(
+                env,
+                task,
+                "degraded",
+                stop_reason="restart_indeterminate_running",
             )
-            _set_root_post_task_checkpoint(env, task, "refresh")
             recovered += 1
             continue
         usage = {

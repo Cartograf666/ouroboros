@@ -594,6 +594,183 @@ def test_delayed_terminal_checkpoint_merges_current_acceptance_and_stays_termina
     assert after_open["cost_with_children_partial"] is False
 
 
+def test_startup_recovery_merges_child_acceptance_after_stale_scan(
+    tmp_path,
+    monkeypatch,
+):
+    import ouroboros.agent_task_pipeline as pipeline
+    import ouroboros.headless as headless
+    import ouroboros.task_results as task_results
+    import ouroboros.usage_accounting as usage_accounting
+    import supervisor.state as supervisor_state
+
+    data, child, task_id = _seed_atomic_race(tmp_path)
+    write_task_result(
+        data,
+        task_id,
+        STATUS_COMPLETED,
+        root_task_id=task_id,
+        root_phase_checkpoint={
+            "phase": "task_acceptance",
+            "status": "not_required",
+            "pass_index": 0,
+            "post_task_synthesis": "running",
+        },
+    )
+    scan_complete = threading.Event()
+    release_scan = threading.Event()
+    real_list = task_results.list_task_results
+    outcome = {}
+
+    def delayed_list(root):
+        rows = real_list(root)
+        scan_complete.set()
+        assert release_scan.wait(5)
+        return rows
+
+    monkeypatch.setattr(task_results, "list_task_results", delayed_list)
+    monkeypatch.setattr(
+        supervisor_state,
+        "reconstruct_task_cost",
+        lambda *args, **kwargs: {"cost_usd": 99.0, "cost_final": True},
+    )
+    monkeypatch.setattr(
+        usage_accounting,
+        "usage_breakdown",
+        lambda *args, **kwargs: {"accounted_usd": 99.0, "cost_final": True},
+    )
+
+    def recover():
+        try:
+            outcome["count"] = pipeline.recover_pending_root_post_task_synthesis(
+                data, tmp_path / "repo"
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=recover, name="delayed-startup-recovery")
+    thread.start()
+    assert scan_complete.wait(5)
+    copied = headless.copy_child_task_result(
+        data, {"id": task_id, "drive_root": str(child)}
+    )
+    assert copied["root_phase_checkpoint"]["status"] == "pass"
+    release_scan.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert "error" not in outcome
+    assert outcome["count"] == 1
+    stored = load_task_result(data, task_id)
+    assert stored["root_phase_checkpoint"] == {
+        "phase": "task_acceptance",
+        "status": "pass",
+        "pass_index": 1,
+        "post_task_synthesis": "degraded",
+        "post_task_stop_reason": "restart_indeterminate_running",
+    }
+    assert stored["cost_usd"] == 99.0
+    assert stored["cost_final"] is True
+
+
+def test_finalized_event_projects_actual_stored_terminal_truth(tmp_path, monkeypatch):
+    import ouroboros.post_task_checkpoint as checkpoint
+    import ouroboros.usage_accounting as usage_accounting
+    import supervisor.state as supervisor_state
+
+    data = tmp_path / "data"
+    data.mkdir()
+    task_id = "event-truth"
+    canonical_checkpoint = {
+        "phase": "task_acceptance",
+        "status": "pass",
+        "pass_index": 1,
+        "post_task_synthesis": "completed",
+        "post_task_stop_reason": "canonical_terminal",
+    }
+    write_task_result(
+        data,
+        task_id,
+        STATUS_COMPLETED,
+        root_task_id=task_id,
+        root_phase_checkpoint=canonical_checkpoint,
+        cost_usd=99.0,
+        accounted_upper_bound_usd=99.0,
+        cost_usd_with_children=99.0,
+        accounted_upper_bound_usd_with_children=99.0,
+        cost_final=True,
+        cost_with_children_partial=False,
+        total_rounds=99,
+    )
+    monkeypatch.setattr(
+        supervisor_state,
+        "reconstruct_task_cost",
+        lambda *args, **kwargs: {
+            "cost_usd": 7.0,
+            "accounted_upper_bound_usd": 7.0,
+            "cost_final": True,
+            "total_rounds": 7,
+        },
+    )
+    monkeypatch.setattr(
+        usage_accounting,
+        "usage_breakdown",
+        lambda *args, **kwargs: {"accounted_usd": 7.0, "cost_final": True},
+    )
+
+    checkpoint.set_root_post_task_checkpoint(
+        SimpleNamespace(drive_root=data),
+        {"id": task_id, "root_task_id": task_id, "status": STATUS_COMPLETED},
+        "degraded",
+        stop_reason="stale_degraded_attempt",
+    )
+
+    stored = load_task_result(data, task_id)
+    assert stored["root_phase_checkpoint"] == canonical_checkpoint
+    assert stored["cost_usd"] == 99.0
+    events = [
+        json.loads(line)
+        for line in (data / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    finalized = events[-1]
+    assert finalized["type"] == "task_cost_finalized"
+    assert finalized["post_task_status"] == "completed"
+    assert finalized["cost_usd"] == 99.0
+    assert finalized["cost_usd_with_children"] == 99.0
+    assert finalized["cost_final"] is True
+    assert finalized["total_rounds"] == 99
+
+
+def test_failed_checkpoint_write_emits_no_finalized_event(tmp_path, monkeypatch):
+    import ouroboros.post_task_checkpoint as checkpoint
+
+    data = tmp_path / "data"
+    data.mkdir()
+    task_id = "failed-write"
+    write_task_result(
+        data,
+        task_id,
+        STATUS_COMPLETED,
+        root_task_id=task_id,
+        root_phase_checkpoint={"post_task_synthesis": "running"},
+    )
+    appended = []
+    monkeypatch.setattr(
+        checkpoint,
+        "write_task_result",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("write failed")),
+    )
+    monkeypatch.setattr(checkpoint, "append_jsonl", lambda *args: appended.append(args))
+
+    checkpoint.set_root_post_task_checkpoint(
+        SimpleNamespace(drive_root=data),
+        {"id": task_id, "root_task_id": task_id, "status": STATUS_COMPLETED},
+        "completed",
+    )
+
+    assert appended == []
+
+
 def _write_history_rows(data, task_id):
     logs = data / "logs"
     logs.mkdir(parents=True, exist_ok=True)

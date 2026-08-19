@@ -120,8 +120,6 @@ def project_root_post_task_checkpoint_fields(
     canonical_post_task = str(current.get("post_task_synthesis") or "")
     patch_post_task = str(patch.get("post_task_synthesis") or "")
 
-    if "post_task_stop_reason" in patch:
-        current["post_task_stop_reason"] = patch["post_task_stop_reason"]
     if post_task_synthesis_is_terminal(canonical_post_task):
         current["post_task_synthesis"] = canonical_post_task
         if isinstance(canonical_checkpoint, dict) and "post_task_stop_reason" in canonical_checkpoint:
@@ -131,8 +129,11 @@ def project_root_post_task_checkpoint_fields(
         if patch_post_task != canonical_post_task:
             for field in _TERMINAL_ACCOUNTING_FIELDS:
                 overlay.pop(field, None)
-    elif patch_post_task:
-        current["post_task_synthesis"] = patch_post_task
+    else:
+        if "post_task_stop_reason" in patch:
+            current["post_task_stop_reason"] = patch["post_task_stop_reason"]
+        if patch_post_task:
+            current["post_task_synthesis"] = patch_post_task
     overlay["root_phase_checkpoint"] = current
     return overlay
 
@@ -163,7 +164,13 @@ def root_checkpoint_roots(env: Any, task: Dict[str, Any]) -> list[pathlib.Path]:
         return []
 
 
-def set_root_post_task_checkpoint(env: Any, task: Dict[str, Any], status: str) -> None:
+def set_root_post_task_checkpoint(
+    env: Any,
+    task: Dict[str, Any],
+    status: str,
+    *,
+    stop_reason: str = "",
+) -> None:
     """Merge the phase marker in the canonical budget-drive task result."""
     if not is_root_post_task(task):
         return
@@ -224,8 +231,12 @@ def set_root_post_task_checkpoint(env: Any, task: Dict[str, Any], status: str) -
         # otherwise this producer persists a DIVERGED pair: an honest name still
         # carrying the pre-refresh amount beside a corrected alias.
         cost_fields = with_cost_aliases(cost_fields)
+        checkpoint_patch = {"post_task_synthesis": effective_status}
+        if stop_reason:
+            checkpoint_patch["post_task_stop_reason"] = str(stop_reason)
+        stored: Dict[str, Any] | None = None
         try:
-            write_task_result(
+            stored = write_task_result(
                 authority_root,
                 task_id,
                 str(existing.get("status") or task.get("status") or STATUS_COMPLETED),
@@ -235,19 +246,31 @@ def set_root_post_task_checkpoint(env: Any, task: Dict[str, Any], status: str) -
                 budget_drive_root=str(authority_root),
                 child_drive_root=task.get("child_drive_root") or task.get("drive_root"),
                 project_id=str(task.get("project_id") or ""),
-                root_phase_checkpoint={"post_task_synthesis": effective_status},
+                root_phase_checkpoint=checkpoint_patch,
                 **cost_fields,
             )
         except Exception:
             log.debug("Failed to update root post-task checkpoint", exc_info=True)
-        if post_task_synthesis_is_terminal(effective_status):
+        stored_checkpoint = (
+            stored.get("root_phase_checkpoint") if isinstance(stored, dict) else None
+        )
+        stored_post_task = (
+            str(stored_checkpoint.get("post_task_synthesis") or "")
+            if isinstance(stored_checkpoint, dict)
+            else ""
+        )
+        if post_task_synthesis_is_terminal(stored_post_task):
             finalized_event = {
                 "type": "task_cost_finalized",
                 "ts": utc_now_iso(),
                 "task_id": task_id,
-                "root_task_id": str(task.get("root_task_id") or task_id),
-                "post_task_status": effective_status,
-                **cost_fields,
+                "root_task_id": str(stored.get("root_task_id") or task.get("root_task_id") or task_id),
+                "post_task_status": stored_post_task,
+                **{
+                    field: stored[field]
+                    for field in _TERMINAL_ACCOUNTING_FIELDS
+                    if field in stored
+                },
             }
     if finalized_event is not None:
         try:
