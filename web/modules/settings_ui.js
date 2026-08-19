@@ -171,7 +171,7 @@ function providerSettingsCard(spec) {
         .join('');
     const test = spec.testProvider ? `
             <div class="settings-toolbar">
-                <button type="button" class="settings-ghost-btn" data-provider-test="${spec.testProvider}">Test</button>
+                <button type="button" class="settings-ghost-btn" data-provider-test="${spec.testProvider}" title="Sends one short model request. Provider charges may apply.">Test</button>
                 <span class="settings-inline-status" data-provider-test-status="${spec.testProvider}"></span>
             </div>
         ` : '';

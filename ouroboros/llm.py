@@ -1320,7 +1320,18 @@ class LLMClient:
             return f"minimax/{resolved_model}"
         return f"openai-compatible/{resolved_model}"
 
-    def _resolve_remote_target(self, model: str) -> Dict[str, Any]:
+    def _resolve_remote_target(
+        self,
+        model: str,
+        settings: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        explicit_settings = settings is not None
+
+        def configured(key: str, default: Any = "") -> Any:
+            if explicit_settings:
+                return settings.get(key, default)  # type: ignore[union-attr]
+            return os.environ.get(key, default)
+
         provider, resolved_model = self._parse_provider_model(model)
         usage_model = self._qualified_model_name(provider, resolved_model)
 
@@ -1329,7 +1340,7 @@ class LLMClient:
                 "provider": provider,
                 "resolved_model": resolved_model,
                 "usage_model": usage_model,
-                "api_key": os.environ.get("OPENAI_API_KEY", ""),
+                "api_key": configured("OPENAI_API_KEY", ""),
                 "base_url": "https://api.openai.com/v1",
                 "default_headers": {},
                 "supports_openrouter_extensions": False,
@@ -1342,7 +1353,7 @@ class LLMClient:
                 "provider": provider,
                 "resolved_model": resolved_model,
                 "usage_model": self._qualified_model_name(provider, resolved_model),
-                "api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
+                "api_key": configured("ANTHROPIC_API_KEY", ""),
                 "base_url": "https://api.anthropic.com/v1",
                 "default_headers": {},
                 "supports_openrouter_extensions": False,
@@ -1354,8 +1365,8 @@ class LLMClient:
                 "provider": provider,
                 "resolved_model": resolved_model,
                 "usage_model": usage_model,
-                "api_key": os.environ.get("MINIMAX_API_KEY", ""),
-                "base_url": resolve_minimax_base_url(os.environ.get("MINIMAX_REGION", "")),
+                "api_key": configured("MINIMAX_API_KEY", ""),
+                "base_url": resolve_minimax_base_url(configured("MINIMAX_REGION", "")),
                 "default_headers": {},
                 "supports_openrouter_extensions": False,
                 "supports_generation_cost": False,
@@ -1366,9 +1377,9 @@ class LLMClient:
                 "provider": provider,
                 "resolved_model": resolved_model,
                 "usage_model": usage_model,
-                "api_key": os.environ.get("CLOUDRU_FOUNDATION_MODELS_API_KEY", ""),
+                "api_key": configured("CLOUDRU_FOUNDATION_MODELS_API_KEY", ""),
                 "base_url": (
-                    os.environ.get("CLOUDRU_FOUNDATION_MODELS_BASE_URL", "") or ""
+                    configured("CLOUDRU_FOUNDATION_MODELS_BASE_URL", "") or ""
                 ).strip() or "https://foundation-models.api.cloud.ru/v1",
                 "default_headers": {},
                 "supports_openrouter_extensions": False,
@@ -1381,18 +1392,18 @@ class LLMClient:
             # holds the authorization key (base64 client_id:secret) for the OAuth
             # flow, OR user/password for basic auth against an internal endpoint.
             # base_url/scope/verify are carried for the `_chat_gigachat` path.
-            verify_raw = (os.environ.get("GIGACHAT_VERIFY_SSL_CERTS", "") or "").strip().lower()
+            verify_raw = (configured("GIGACHAT_VERIFY_SSL_CERTS", "") or "").strip().lower()
             return {
                 "provider": provider,
                 "resolved_model": resolved_model,
                 "usage_model": usage_model,
-                "api_key": os.environ.get("GIGACHAT_CREDENTIALS", ""),
-                "user": (os.environ.get("GIGACHAT_USER", "") or "").strip(),
-                "password": os.environ.get("GIGACHAT_PASSWORD", "") or "",
+                "api_key": configured("GIGACHAT_CREDENTIALS", ""),
+                "user": (configured("GIGACHAT_USER", "") or "").strip(),
+                "password": configured("GIGACHAT_PASSWORD", "") or "",
                 "base_url": (
-                    os.environ.get("GIGACHAT_BASE_URL", "") or ""
+                    configured("GIGACHAT_BASE_URL", "") or ""
                 ).strip() or "https://api.giga.chat/v1",
-                "scope": (os.environ.get("GIGACHAT_SCOPE", "") or "").strip() or "GIGACHAT_API_PERS",
+                "scope": (configured("GIGACHAT_SCOPE", "") or "").strip() or "GIGACHAT_API_PERS",
                 "verify_ssl_certs": verify_raw not in ("0", "false", "no", "off"),
                 "default_headers": {},
                 "supports_openrouter_extensions": False,
@@ -1400,22 +1411,32 @@ class LLMClient:
             }
 
         if provider == "openai-compatible":
-            compatible_key = (os.environ.get("OPENAI_COMPATIBLE_API_KEY", "") or "").strip()
-            compatible_base_url = (os.environ.get("OPENAI_COMPATIBLE_BASE_URL", "") or "").strip()
-            legacy_base_url = (os.environ.get("OPENAI_BASE_URL", "") or "").strip()
-            legacy_key = (os.environ.get("OPENAI_API_KEY", "") or "").strip()
+            compatible_key = (configured("OPENAI_COMPATIBLE_API_KEY", "") or "").strip()
+            compatible_base_url = (configured("OPENAI_COMPATIBLE_BASE_URL", "") or "").strip()
+            legacy_base_url = (configured("OPENAI_BASE_URL", "") or "").strip()
+            legacy_key = (configured("OPENAI_API_KEY", "") or "").strip()
+            # A request-local mapping is authoritative as a PAIR: when its
+            # dedicated compatible endpoint is present, an explicitly empty
+            # compatible key must not be rehydrated from the legacy OpenAI key.
+            # Ordinary env-based chat keeps the historical per-field fallback.
+            if explicit_settings and compatible_base_url:
+                api_key = compatible_key
+                base_url = compatible_base_url
+            else:
+                api_key = compatible_key or legacy_key
+                base_url = compatible_base_url or legacy_base_url
             return {
                 "provider": provider,
                 "resolved_model": resolved_model,
                 "usage_model": usage_model,
-                "api_key": compatible_key or legacy_key,
-                "base_url": compatible_base_url or legacy_base_url,
+                "api_key": api_key,
+                "base_url": base_url,
                 "default_headers": {},
                 "supports_openrouter_extensions": False,
                 "supports_generation_cost": False,
             }
 
-        current_api_key = self._api_key_override
+        current_api_key = configured("OPENROUTER_API_KEY", "") if explicit_settings else self._api_key_override
         if current_api_key is None:
             current_api_key = os.environ.get("OPENROUTER_API_KEY", "")
         return {
@@ -1423,7 +1444,7 @@ class LLMClient:
             "resolved_model": resolved_model,
             "usage_model": usage_model,
             "api_key": current_api_key,
-            "base_url": self._base_url,
+            "base_url": "https://openrouter.ai/api/v1" if explicit_settings else self._base_url,
             "default_headers": {
                 "HTTP-Referer": "https://ouroboros.local/",
                 "X-Title": "Ouroboros",
@@ -1436,108 +1457,55 @@ class LLMClient:
         target = self._resolve_remote_target("openrouter::")
         return self._get_remote_client(target)
 
+    @staticmethod
+    def _new_remote_client(target: Dict[str, Any]):
+        from openai import OpenAI
+
+        kwargs: Dict[str, Any] = {
+            "api_key": str(target.get("api_key") or ""),
+            "max_retries": 0,
+        }
+        base_url = str(target.get("base_url") or "")
+        headers = dict(target.get("default_headers") or {})
+        if base_url:
+            kwargs["base_url"] = base_url
+        if headers:
+            kwargs["default_headers"] = headers
+        return OpenAI(**kwargs)
+
     def _get_remote_client(self, target: Dict[str, Any]):
         base_url = str(target.get("base_url") or "")
         api_key = str(target.get("api_key") or "")
-        headers_dict = dict(target.get("default_headers") or {})
-        headers = tuple(sorted((str(k), str(v)) for k, v in headers_dict.items()))
+        headers = tuple(sorted(
+            (str(k), str(v)) for k, v in dict(target.get("default_headers") or {}).items()
+        ))
         cache_key = (str(target.get("provider") or ""), base_url, api_key, headers)
-
-        client = self._remote_clients.get(cache_key)
-        if client is None:
-            from openai import OpenAI
-
-            kwargs: Dict[str, Any] = {
-                "api_key": api_key,
-                "max_retries": 0,
-            }
-            if base_url:
-                kwargs["base_url"] = base_url
-            if headers_dict:
-                kwargs["default_headers"] = headers_dict
-            client = OpenAI(**kwargs)
-            self._remote_clients[cache_key] = client
-        return client
+        if cache_key not in self._remote_clients:
+            self._remote_clients[cache_key] = self._new_remote_client(target)
+        return self._remote_clients[cache_key]
 
     def probe_oversized_context(
         self, model: str, content: str, *,
         base_url: str = "", max_output_tokens: int = 8, timeout: float = 20.0,
         api_key: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Capability probe: send ONE deliberately over-window request on the model's
-        OpenAI-compatible route and report the RAW outcome for window classification.
+        from ouroboros.llm_probe import probe_oversized_context
 
-        This is a capability check, NOT a chat turn: it deliberately bypasses the
-        chat-round path (a probe must not count as an LLM round) but still records its
-        physical provider attempt in monetary accounting, and NEVER raises. The expected free case is a 4xx pre-inference
-        reject whose body carries the limit; a rare 200-accept returns the echo +
-        prompt_tokens (the caller treats it as possibly-paid -> owner-ack, never a
-        silent confirm). When an explicit ``base_url`` is given (Settings save/toggle
-        passes the route being fingerprinted) it overrides the env-resolved one so a
-        route change verifies the NEW endpoint. Returns
-        ``{ok, status_code, body, echoed_text, usage_prompt}``.
-        """
-        try:
-            target = self._resolve_remote_target(model)
-            if str(base_url or "").strip():
-                target = {**target, "base_url": str(base_url).strip()}
-            if api_key is not None:
-                target = {**target, "api_key": api_key}
-            oai = self._get_remote_client(target)
-            # resolved_model is the provider REQUEST model ("gpt-5.5"), not the
-            # slash-qualified usage/tracking name the API would reject.
-            resolved_model = str(target.get("resolved_model") or model.split("::")[-1])
-            provider = str(target.get("provider") or "")
-        except Exception as exc:  # pragma: no cover - setup failure -> fail-closed
-            return {"ok": False, "status_code": None, "body": f"probe setup failed: {type(exc).__name__}",
-                    "echoed_text": "", "usage_prompt": 0}
-        # Direct OpenAI GPT-5/o-series reject ``max_tokens`` and require
-        # ``max_completion_tokens``; other OpenAI-compatible stacks take max_tokens.
-        cap = {"max_completion_tokens": max_output_tokens} if provider == "openai" else {"max_tokens": max_output_tokens}
-        probe_payload = {
-            "model": resolved_model,
-            "messages": [{"role": "user", "content": content}],
-            "temperature": 0,
-            **cap,
-        }
+        return probe_oversized_context(
+            self, model, content, base_url=base_url,
+            max_output_tokens=max_output_tokens, timeout=timeout, api_key=api_key,
+        )
 
-        def _dispatch_probe() -> Any:
-            candidate = _physical_candidate(probe_payload)
-            request = _attempt_request(target, candidate, source="capability_probe")
-            return _execute_candidate(
-                request,
-                lambda: oai.with_options(timeout=timeout).chat.completions.create(**candidate),
-                _candidate_before_dispatch(candidate, request),
-            )
+    def probe_provider_readiness(
+        self,
+        model: str,
+        *,
+        settings: Dict[str, Any],
+        timeout: float = 20.0,
+    ) -> Dict[str, Any]:
+        from ouroboros.llm_probe import probe_provider_readiness
 
-        try:
-            if current_usage_scope() is None:
-                # Owner/settings probes run outside a task, but they are still
-                # physical provider attempts. Give that system activity one
-                # stable ledger identity instead of misclassifying it as an
-                # unattributed task. A task-bound probe keeps its caller's
-                # canonical task/root attribution and budget rails unchanged.
-                with usage_scope(UsageScope(
-                    task_id="system:capability_probe",
-                    root_task_id="system:capability_probe",
-                    category="capability_probe",
-                    source="capability_probe",
-                )):
-                    resp = _dispatch_probe()
-            else:
-                resp = _dispatch_probe()
-            echoed, usage_prompt = "", 0
-            try:
-                echoed = str(resp.choices[0].message.content or "")
-                usage_prompt = int(getattr(getattr(resp, "usage", None), "prompt_tokens", 0) or 0)
-            except Exception:
-                pass
-            return {"ok": True, "status_code": 200, "body": "", "echoed_text": echoed, "usage_prompt": usage_prompt}
-        except Exception as exc:
-            status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
-            body = str(getattr(exc, "message", "") or getattr(exc, "body", "") or str(exc))
-            return {"ok": False, "status_code": status if isinstance(status, int) else None,
-                    "body": body, "echoed_text": "", "usage_prompt": 0}
+        return probe_provider_readiness(self, model, settings=settings, timeout=timeout)
 
     def _get_local_client(self):
         port = int(os.environ.get("LOCAL_MODEL_PORT", "8766"))
@@ -3205,6 +3173,39 @@ class LLMClient:
     # ------------------------------------------------------------------
     # GigaChat (native `gigachat` library — NOT OpenAI-compatible)
     # ------------------------------------------------------------------
+    @staticmethod
+    def _new_gigachat_client(
+        target: Dict[str, Any],
+        timeout: Optional[float] = None,
+        max_retries: Optional[int] = None,
+    ):
+        """Build a GigaChat library client for the given target."""
+        try:
+            from gigachat import GigaChat
+        except ImportError as exc:  # pragma: no cover - exercised only without the dep
+            raise RuntimeError(
+                "The 'gigachat' package is required to use gigachat:: models. "
+                "Install it with: pip install gigachat"
+            ) from exc
+        kwargs: Dict[str, Any] = {
+            "scope": str(target.get("scope") or "GIGACHAT_API_PERS"),
+            "verify_ssl_certs": bool(target.get("verify_ssl_certs", True)),
+        }
+        for source, destination in (
+            ("api_key", "credentials"), ("user", "user"), ("password", "password"),
+            ("base_url", "base_url"),
+        ):
+            value = str(target.get(source) or "")
+            if value:
+                kwargs[destination] = value
+        if "access_token" in target:
+            kwargs["access_token"] = str(target.get("access_token") or "")
+        if timeout and timeout > 0:
+            kwargs["timeout"] = float(timeout)
+        if max_retries is not None:
+            kwargs["max_retries"] = max_retries
+        return GigaChat(**kwargs)
+
     def _get_gigachat_client(self, target: Dict[str, Any], timeout: Optional[float] = None):
         """Build (and cache) a GigaChat library client for the given target.
 
@@ -3226,29 +3227,9 @@ class LLMClient:
         timeout_key = float(timeout) if timeout and timeout > 0 else None
         cache_key = (credentials, user, password, scope, base_url, verify, timeout_key)
 
-        client = self._gigachat_clients.get(cache_key)
-        if client is None:
-            try:
-                from gigachat import GigaChat
-            except ImportError as exc:  # pragma: no cover - exercised only without the dep
-                raise RuntimeError(
-                    "The 'gigachat' package is required to use gigachat:: models. "
-                    "Install it with: pip install gigachat"
-                ) from exc
-            kwargs: Dict[str, Any] = {"scope": scope, "verify_ssl_certs": verify}
-            if credentials:
-                kwargs["credentials"] = credentials
-            if user:
-                kwargs["user"] = user
-            if password:
-                kwargs["password"] = password
-            if base_url:
-                kwargs["base_url"] = base_url
-            if timeout_key is not None:
-                kwargs["timeout"] = timeout_key
-            client = GigaChat(**kwargs)
-            self._gigachat_clients[cache_key] = client
-        return client
+        if cache_key not in self._gigachat_clients:
+            self._gigachat_clients[cache_key] = self._new_gigachat_client(target, timeout=timeout)
+        return self._gigachat_clients[cache_key]
 
     @staticmethod
     def _gigachat_text(content: Any) -> str:

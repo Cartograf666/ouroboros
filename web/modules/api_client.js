@@ -152,7 +152,10 @@ export const apiClient = {
     ownerCapabilityAck: (payload) => jsonPost('/api/owner/capability-ack', payload),
     /** @returns {Promise<import('./api_types.js').OpenAICompatibleModelsResponse>} */
     openAICompatibleModels: (payload) => jsonPost('/api/openai-compatible/models', payload),
-    // A failed provider probe is a 200 with ok:false — resolve it, do not reject.
+    /**
+     * @param {import('./api_types.js').ProviderTestRequest} payload
+     * @returns {Promise<import('./api_types.js').ProviderTestResponse>}
+     */
     providerTest: (payload) => jsonPost('/api/providers/test', payload),
     extensions: () => fetchJson('/api/extensions', { cache: 'no-store' }),
     skillLifecycleQueue: () => fetchJson('/api/skills/lifecycle-queue', { cache: 'no-store' }),

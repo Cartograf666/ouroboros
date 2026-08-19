@@ -13,7 +13,16 @@ from starlette.responses import JSONResponse
 
 from ouroboros.config import load_settings
 from ouroboros.gateway._helpers import json_error, json_exception
-from ouroboros.provider_models import MINIMAX_REGION_ENDPOINTS, resolve_minimax_base_url
+from ouroboros.observability import redact_projection
+from ouroboros.provider_models import (
+    ALL_PROVIDER_CREDENTIAL_KEYS,
+    DIRECT_PROVIDER_DEFAULTS,
+    MINIMAX_REGION_ENDPOINTS,
+    MODEL_SETTING_KEYS,
+    OPENROUTER_DEFAULTS,
+    provider_for_model,
+    resolve_minimax_base_url,
+)
 
 log = logging.getLogger(__name__)
 
@@ -258,14 +267,14 @@ def _provider_specs(
                 compatible_base_url,
             ),
         ))
-    elif openai_api_key and legacy_base_url:
+    elif legacy_base_url:
         specs.append((
             "openai-compatible",
             lambda client: _fetch_openai_compatible_model_catalog(
                 client,
                 "openai-compatible",
                 "OpenAI Compatible",
-                openai_api_key,
+                compatible_api_key or openai_api_key,
                 legacy_base_url,
             ),
         ))
@@ -493,201 +502,143 @@ async def api_openai_compatible_models(request: Request) -> JSONResponse:
         return json_exception(e)
 
 
-# Only provider credential/endpoint keys may be overridden by the Settings Test
-# button; anything else must go through the ordinary settings save path.
-_PROVIDER_TEST_OVERRIDE_KEYS: frozenset[str] = frozenset({
-    "OPENROUTER_API_KEY",
-    "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "MINIMAX_API_KEY",
-    "MINIMAX_REGION",
-    "OPENAI_COMPATIBLE_API_KEY",
-    "OPENAI_COMPATIBLE_BASE_URL",
-    "OPENAI_BASE_URL",
-    "CLOUDRU_FOUNDATION_MODELS_API_KEY",
-    "CLOUDRU_FOUNDATION_MODELS_BASE_URL",
-    "GIGACHAT_CREDENTIALS",
-    "GIGACHAT_USER",
-    "GIGACHAT_PASSWORD",
-    "GIGACHAT_SCOPE",
-    "GIGACHAT_BASE_URL",
-    "GIGACHAT_VERIFY_SSL_CERTS",
-})
-
-# Every provider id _provider_specs can ever emit: a typo'd id must read as
-# "unknown provider id", not as the not-configured answer a real provider gives.
+_PROVIDER_TEST_OVERRIDE_KEYS = ALL_PROVIDER_CREDENTIAL_KEYS
 _PROVIDER_TEST_KNOWN_IDS: frozenset[str] = frozenset({
-    "openrouter", "openai", "anthropic", "minimax",
-    "openai-compatible", "cloudru", "gigachat",
+    "openrouter", "openai-compatible", *DIRECT_PROVIDER_DEFAULTS,
 })
 
-# The credential-class subset of the allowlist: what error redaction scrubs.
-# Redacting every override value would also scrub innocents like 'true' or
-# 'global_en' out of unrelated words in provider error messages.
-_PROVIDER_TEST_SECRET_KEYS: frozenset[str] = frozenset({
-    "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
-    "MINIMAX_API_KEY", "OPENAI_COMPATIBLE_API_KEY",
-    "CLOUDRU_FOUNDATION_MODELS_API_KEY", "GIGACHAT_CREDENTIALS",
-    "GIGACHAT_PASSWORD",
-})
 
-# An endpoint-shaping override may never be paired with a SAVED credential:
-# the probe authenticates against whatever endpoint it is given, so accepting
-# a caller-supplied URL/region alone would send the stored key to a server the
-# owner never configured. Changing the endpoint (or the connection's TLS
-# verification — the same trust boundary) requires re-entering, in the same
-# request, EVERY credential of that provider that would be used: any one saved
-# credential riding along is the exfiltration this guard exists to stop.
-_PROVIDER_TEST_ENDPOINT_GUARDS: dict[str, tuple[str, ...]] = {
-    "OPENAI_BASE_URL": ("OPENAI_API_KEY",),
-    # The legacy OpenAI key rides in the tuple because CLEARING the compatible
-    # base URL activates _provider_specs' legacy-pair fallback — the probe's
-    # destination changes and the saved legacy key would ride along.
-    "OPENAI_COMPATIBLE_BASE_URL": ("OPENAI_COMPATIBLE_API_KEY", "OPENAI_API_KEY"),
-    "CLOUDRU_FOUNDATION_MODELS_BASE_URL": ("CLOUDRU_FOUNDATION_MODELS_API_KEY",),
-    "GIGACHAT_BASE_URL": ("GIGACHAT_CREDENTIALS", "GIGACHAT_PASSWORD"),
-    "GIGACHAT_VERIFY_SSL_CERTS": ("GIGACHAT_CREDENTIALS", "GIGACHAT_PASSWORD"),
-    "MINIMAX_REGION": ("MINIMAX_API_KEY",),
-}
+def _provider_test_model(provider_id: str, settings: dict) -> str:
+    """Resolve one deterministic runtime/default model without catalog I/O."""
+    for setting_key in MODEL_SETTING_KEYS:
+        for raw_model in str(settings.get(setting_key, "") or "").split(","):
+            model = raw_model.strip()
+            if model and provider_for_model(model) == provider_id:
+                return model
+    if provider_id == "openrouter":
+        return str(OPENROUTER_DEFAULTS.get("main") or "").strip()
+    return str((DIRECT_PROVIDER_DEFAULTS.get(provider_id) or {}).get("main") or "").strip()
+
+
+def _discover_provider_test_model(provider_id: str, settings: dict) -> str:
+    """Catalog discovery for the sole route without a maintained default."""
+    if provider_id != "openai-compatible":
+        return ""
+
+    async def load_first() -> str:
+        loader = dict(_provider_specs(settings)).get(provider_id)
+        if loader is None:
+            return ""
+        async with httpx.AsyncClient(timeout=httpx.Timeout(_CATALOG_HTTP_TIMEOUT_SEC)) as client:
+            items = await loader(client)
+        return str((items[0] if items else {}).get("value") or "").strip()
+
+    return asyncio.run(load_first())
+
+
+def _provider_test_log(provider_id: str, model: str, result: dict, duration_ms: int) -> None:
+    facts = redact_projection({
+        "provider_id": provider_id,
+        "model": model,
+        "ok": bool(result.get("ok")),
+        "error_category": str(result.get("error") or ""),
+        "status_code": result.get("status_code"),
+        "exception_type": str(result.get("exception_type") or ""),
+        "duration_ms": duration_ms,
+    }).value
+    logger = log.info if facts.get("ok") else log.warning
+    logger("provider_test result=%s", facts)
+
+
+def _run_provider_test_with_settings(provider_id: str, settings: dict) -> dict:
+    """Run selection, optional discovery, client construction and one send."""
+    from ouroboros.llm import LLMClient
+    from ouroboros.llm_probe import controlled_probe_error
+
+    started = time.perf_counter()
+    model = ""
+    try:
+        model = _provider_test_model(provider_id, settings)
+        if not model:
+            model = _discover_provider_test_model(provider_id, settings)
+        if not model:
+            result = {
+                "ok": False,
+                "error": "Provider is not configured",
+                "status_code": None,
+                "exception_type": "ProviderNotConfigured",
+            }
+        else:
+            result = LLMClient().probe_provider_readiness(model, settings=settings)
+    except Exception as exc:
+        result = controlled_probe_error(exc)
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    _provider_test_log(provider_id, model, result, duration_ms)
+    public = {"ok": bool(result.get("ok"))}
+    if not public["ok"]:
+        public["error"] = str(result.get("error") or "Model request failed")
+    return public
+
+
+def _run_provider_test(provider_id: str, overrides: dict[str, str]) -> dict:
+    """Load and merge the request-local draft inside the worker thread."""
+    settings = dict(load_settings())
+    if provider_id == "openai-compatible":
+        # No-edit requests retain the historical OPENAI_* fallback. An explicit
+        # Clear on the dedicated card must not silently restore the corresponding
+        # legacy value for this request-local probe.
+        legacy_fallbacks = {
+            "OPENAI_COMPATIBLE_API_KEY": "OPENAI_API_KEY",
+            "OPENAI_COMPATIBLE_BASE_URL": "OPENAI_BASE_URL",
+        }
+        if not any(str(settings.get(key, "") or "").strip() for key in legacy_fallbacks):
+            # A legacy install has no dedicated compatible pair yet. Preserve the
+            # saved half the owner did not edit while the other half is a draft.
+            for dedicated_key, legacy_key in legacy_fallbacks.items():
+                if dedicated_key not in overrides:
+                    settings[dedicated_key] = str(settings.get(legacy_key, "") or "").strip()
+        for dedicated_key, legacy_key in legacy_fallbacks.items():
+            if dedicated_key in overrides and not overrides[dedicated_key].strip():
+                settings[legacy_key] = ""
+    settings.update({key: value.strip() for key, value in overrides.items()})
+    minimax_region = str(settings.get("MINIMAX_REGION", "") or "").strip().lower()
+    if provider_id == "minimax" and minimax_region and minimax_region not in MINIMAX_REGION_ENDPOINTS:
+        return {"error": "unknown MiniMax region", "_http_status": 400}
+    return _run_provider_test_with_settings(provider_id, settings)
 
 
 async def api_provider_test(request: Request) -> JSONResponse:
-    """Probe one provider's catalog with entered-but-unsaved credentials.
-
-    A failed fetch is a 200 with ``ok: false`` — the endpoint itself worked and
-    the failure is the answer the owner asked for. Only contract misuse is 4xx.
-    Credential VALUES never appear in the response or in the log line.
-    """
+    """Run one request-local, physically accounted completion probe."""
     try:
-        try:
-            body = await request.json()
-        except Exception:
-            return json_error("request body must be a JSON object", 400)
-        if not isinstance(body, dict):
-            return json_error("request body must be a JSON object", 400)
-        provider_id = str(body.get("provider_id", "") or "").strip()
-        if not provider_id:
-            return json_error("provider_id is required", 400)
-        if provider_id not in _PROVIDER_TEST_KNOWN_IDS:
-            return json_error("unknown provider id", 400)
+        body = await request.json()
+    except Exception:
+        return json_error("request body must be a JSON object", 400)
+    if not isinstance(body, dict):
+        return json_error("request body must be a JSON object", 400)
+    provider_id = str(body.get("provider_id", "") or "").strip()
+    if not provider_id:
+        return json_error("provider_id is required", 400)
+    if provider_id not in _PROVIDER_TEST_KNOWN_IDS:
+        return json_error("unknown provider id", 400)
 
-        overrides = body.get("overrides")
-        if overrides is None:
-            overrides = {}
-        if not isinstance(overrides, dict):
-            return json_error("overrides must be an object", 400)
-        unknown = sorted(str(key) for key in overrides if str(key) not in _PROVIDER_TEST_OVERRIDE_KEYS)
-        if unknown:
-            return json_error(f"unsupported override keys: {', '.join(unknown)}", 400)
+    overrides = body.get("overrides")
+    if overrides is None:
+        overrides = {}
+    if not isinstance(overrides, dict):
+        return json_error("overrides must be an object", 400)
+    unknown = sorted(str(key) for key in overrides if str(key) not in _PROVIDER_TEST_OVERRIDE_KEYS)
+    if unknown:
+        return json_error(f"unsupported override keys: {', '.join(unknown)}", 400)
+    if any(not isinstance(value, str) for value in overrides.values()):
+        return json_error("override values must be strings", 400)
 
-        merged = dict(load_settings())
-        for endpoint_key, credential_keys in _PROVIDER_TEST_ENDPOINT_GUARDS.items():
-            if endpoint_key not in overrides:
-                continue
-            submitted = str(overrides.get(endpoint_key, "") or "").strip()
-            saved = str(merged.get(endpoint_key, "") or "").strip()
-            if endpoint_key == "GIGACHAT_VERIFY_SSL_CERTS":
-                # Boolean semantics, not spelling: unset means verify (the
-                # loader's own default), so submitting 'true' over an empty
-                # saved value confirms the existing trust boundary rather than
-                # changing it — raw string comparison would refuse a no-op.
-                as_bool = lambda text, default: (  # noqa: E731
-                    default if not text else text.lower() not in ("0", "false", "no", "off")
-                )
-                if as_bool(submitted, True) == as_bool(saved, True):
-                    continue
-            elif submitted == saved:
-                continue
-            # An EXPLICIT empty endpoint override still changes the probe's
-            # destination (the loader falls back to a default or legacy
-            # endpoint), so it takes the same credential re-entry as any
-            # other endpoint change.
-            # EVERY credential that would still be non-empty after the merge
-            # must itself come from this request: satisfying the guard with one
-            # re-entered secret while another saved one rides along (e.g. a
-            # GigaChat password submitted, OAuth credentials kept) is the same
-            # exfiltration through a side door.
-            for ck in credential_keys:
-                effective = str(overrides.get(ck, merged.get(ck, "")) or "").strip()
-                if effective and ck not in overrides:
-                    return json_error(
-                        "changing the endpoint requires re-entering the credential in the "
-                        "same request: saved keys are never sent to an unsaved endpoint",
-                        400,
-                    )
-        for key, value in overrides.items():
-            # Every submitted override is an explicit owner edit: a non-empty
-            # value replaces the saved one, an EMPTY value unsets it (the owner
-            # cleared the field and wants the draft tested, not the saved key).
-            # "Use saved" is expressed by omitting the key entirely.
-            merged[str(key)] = str(value or "").strip()
-
-        # A typo'd region would silently resolve to the default endpoint and
-        # answer OK for a deployment the owner never selected.
-        minimax_region = str(merged.get("MINIMAX_REGION", "") or "").strip().lower()
-        if provider_id == "minimax" and minimax_region and minimax_region not in MINIMAX_REGION_ENDPOINTS:
-            return json_error("unknown MiniMax region", 400)
-
-        specs = dict(_provider_specs(merged))
-        loader = specs.get(provider_id)
-        if loader is None:
-            return json_error("provider is not configured (missing key or base URL)", 400)
-
-        # Not routed through _load_provider: its log line carries the raw
-        # exception, and this endpoint promises credential values never reach
-        # the response OR the log — provider errors can embed the base URL with
-        # inlined credentials. Redaction covers the raw value AND its
-        # percent-encoded spellings, because HTTP clients normalize userinfo
-        # and query values before they ever appear in an error message.
-        import re as _re
-        import urllib.parse as _urlparse
-
-        import base64 as _base64
-
-        secret_forms: set[str] = set()
-        short_forms: set[str] = set()
-        for key in _PROVIDER_TEST_SECRET_KEYS:
-            value = str(merged.get(key, "") or "").strip()
-            if not value:
-                continue
-            b64 = _base64.b64encode(value.encode("utf-8")).decode("ascii")
-            for form in (value, _urlparse.quote(value, safe=""), _urlparse.quote_plus(value), b64):
-                # A 1-3 char credential is degenerate but still a credential:
-                # plain replacement would mangle innocent words around it, so
-                # short forms are scrubbed only as standalone tokens.
-                (secret_forms if len(form) > 3 else short_forms).add(form)
-        secrets = sorted(secret_forms, key=len, reverse=True)
-
-        def _redacted(text: str) -> str:
-            for secret in secrets:
-                text = text.replace(secret, "***")
-            for short in short_forms:
-                text = _re.sub(rf"(?<![A-Za-z0-9]){_re.escape(short)}(?![A-Za-z0-9])", "***", text)
-            return text[:500]
-
-        started = time.perf_counter()
-        timeout = httpx.Timeout(_CATALOG_HTTP_TIMEOUT_SEC)
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                items = await loader(client)
-        except Exception as exc:
-            duration_ms = int((time.perf_counter() - started) * 1000)
-            stage = _catalog_error_stage(exc)
-            log.warning(
-                "provider_test provider=%s stage=%s duration_ms=%s error=%s",
-                provider_id, stage, duration_ms, _redacted(str(exc)),
-            )
-            return JSONResponse({
-                "ok": False, "error": _redacted(str(exc)), "stage": stage, "duration_ms": duration_ms,
-            })
-        duration_ms = int((time.perf_counter() - started) * 1000)
-        log.info(
-            "provider_test provider=%s stage=success duration_ms=%s item_count=%s",
-            provider_id, duration_ms, len(items),
-        )
-        return JSONResponse({"ok": True, "model_count": len(items), "duration_ms": duration_ms})
-    except Exception as e:
-        return json_exception(e)
+    result = await asyncio.to_thread(
+        _run_provider_test,
+        provider_id,
+        {str(key): value for key, value in overrides.items()},
+    )
+    status_code = int(result.pop("_http_status", 200))
+    return JSONResponse(result, status_code=status_code)
 
 
 async def api_local_model_install_runtime(request: Request) -> JSONResponse:

@@ -349,6 +349,22 @@ export function moreProvidersCredentialConfigured({
         || (has(gigachatUser) && has(gigachatPassword));
 }
 
+export function providerTestStatusText(result = {}) {
+    if (result?.ok === true) return 'Works';
+    const reason = String(result?.error || '').trim();
+    return reason ? `Not ready — ${reason}` : 'Not ready';
+}
+
+export function providerTestNetworkErrorStatus() {
+    return 'Not ready';
+}
+
+export function providerTestResultIsCurrent({
+    sentGeneration, currentGeneration, sentFingerprint, currentFingerprint,
+} = {}) {
+    return sentGeneration === currentGeneration && sentFingerprint === currentFingerprint;
+}
+
 export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     const page = document.createElement('div');
     page.id = 'page-settings';
@@ -381,6 +397,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     let settingsLoaded = false;
     let settingsBaseline = '';
     let settingsDirty = false;
+    const providerTestGenerations = new Map();
+    const providerTestsInFlight = new Set();
     initMcpSettings({ onChange: updateSettingsDirtyState });
     initReviewerSlots({ onChange: () => updateSettingsDirtyState() });
     initSubagentsSection({ onChange: () => updateSettingsDirtyState() });
@@ -582,6 +600,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         // A settings (re)load replaces the values every provider verdict was
         // earned against — programmatic assignment fires no 'input' events, so
         // the expiry listener cannot see it; expire the verdicts here.
+        Object.keys(PROVIDER_TEST_INPUTS).forEach((provider) => {
+            providerTestGenerations.set(provider, (providerTestGenerations.get(provider) || 0) + 1);
+        });
         page.querySelectorAll('[data-provider-test-status]').forEach((el) => { el.textContent = ''; });
         applySecretInputs(page, s);
         INPUT_FIELDS.forEach(([id, key, fallback = '']) => applyInputValue(id, fallback && !s[key] ? fallback : s[key]));
@@ -1181,13 +1202,12 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         }
     });
 
-    // Provider credential probe: runs the catalog fetcher against what is typed
-    // in the card right now, so a bad key surfaces here instead of on the first
-    // real task. Values leave the browser only inside this one POST body.
+    // Provider readiness probe: one short model request against the card draft.
     page.querySelector('[data-settings-panel="providers"]')?.addEventListener('click', async (event) => {
         const button = event.target instanceof Element ? event.target.closest('[data-provider-test]') : null;
         if (!button) return;
         const provider = button.dataset.providerTest;
+        if (providerTestsInFlight.has(provider)) return;
         const status = page.querySelector(`[data-provider-test-status="${provider}"]`);
         const collectOverrides = () => {
             const overrides = {};
@@ -1207,29 +1227,26 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             return overrides;
         };
         const overrides = collectOverrides();
+        const sentFingerprint = JSON.stringify(overrides);
+        const sentGeneration = providerTestGenerations.get(provider) || 0;
+        providerTestsInFlight.add(provider);
         button.disabled = true;
         if (status) status.textContent = 'Testing…';
-        // The probe answers for the draft it was given; a draft edited while the
-        // request was in flight would wear a verdict it never earned. Applies to
-        // BOTH outcomes — 4xx contract answers reject through the client and
-        // land in the catch branch, and they are just as draft-dependent.
-        // (Edits AFTER the verdict landed are handled by the input listener
-        // below, which clears a stale verdict the moment a field changes.)
-        const withDraftNote = (verdict) => (
-            JSON.stringify(collectOverrides()) !== JSON.stringify(overrides)
-                ? `${verdict} — for the previous draft; the fields changed while testing, test again`
-                : verdict
-        );
+        const resultIsCurrent = () => providerTestResultIsCurrent({
+            sentGeneration,
+            currentGeneration: providerTestGenerations.get(provider) || 0,
+            sentFingerprint,
+            currentFingerprint: JSON.stringify(collectOverrides()),
+        });
         try {
             const data = await apiClient.providerTest({ provider_id: provider, overrides });
-            if (status) {
-                status.textContent = withDraftNote(data.ok
-                    ? `OK — ${data.model_count} model(s)`
-                    : `Failed: ${data.error} (${data.stage})`);
+            if (status && resultIsCurrent()) status.textContent = providerTestStatusText(data);
+        } catch (_error) {
+            if (status && resultIsCurrent()) {
+                status.textContent = providerTestNetworkErrorStatus();
             }
-        } catch (error) {
-            if (status) status.textContent = withDraftNote(`Failed: ${String(error?.message || error || 'unknown error')}`);
         } finally {
+            providerTestsInFlight.delete(provider);
             button.disabled = false;
         }
     });
@@ -1242,6 +1259,10 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         if (!(target instanceof Element) || !target.id) return;
         for (const [provider, inputs] of Object.entries(PROVIDER_TEST_INPUTS)) {
             if (target.id in inputs) {
+                providerTestGenerations.set(
+                    provider,
+                    (providerTestGenerations.get(provider) || 0) + 1,
+                );
                 const status = page.querySelector(`[data-provider-test-status="${provider}"]`);
                 if (status) status.textContent = '';
                 break;

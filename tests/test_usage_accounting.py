@@ -65,6 +65,40 @@ def test_attempt_lifecycle_and_root_projection(data_root):
     assert [row["seq"] for row in rows] == [1, 2, 3]
 
 
+def test_unresolved_reason_is_redacted_before_truncation_and_fails_closed(
+    data_root, monkeypatch,
+):
+    secret = "dXNlcjpiYXNpYy1zZWNyZXQtdmFsdWU="
+    reservation = ua.reserve_attempt(_request(data_root))
+    ua.mark_dispatched(reservation)
+    ua.mark_unresolved(reservation, f"{'x' * 485} Basic {secret}")
+
+    reason = _ledger(data_root)[-1]["reason"]
+    assert secret not in reason
+    assert reason.endswith(" ***REDACTED***")
+
+    from ouroboros import observability
+
+    monkeypatch.setattr(
+        observability,
+        "redact_projection",
+        lambda _value: (_ for _ in ()).throw(RuntimeError("redactor failed")),
+    )
+    fallback = ua.reserve_attempt(_request(data_root, task_id="fallback"))
+    ua.mark_dispatched(fallback)
+    raw = f"must-not-persist:{secret}"
+    facts = ua._provider_exception_facts(RuntimeError(raw))
+    assert facts == (
+        None,
+        "",
+        "RuntimeError",
+        "RuntimeError: provider error details unavailable",
+    )
+    assert raw not in json.dumps(facts)
+    ua.mark_unresolved(fallback, raw)
+    assert _ledger(data_root)[-1]["reason"] == "provider_outcome_unknown:redaction_failed"
+
+
 def test_projection_uses_explicit_runtime_limit_over_environment(data_root):
     assert ua.usage_projection(data_root, global_limit_usd=7.5)["limit_usd"] == 7.5
 

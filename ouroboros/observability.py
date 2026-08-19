@@ -108,6 +108,7 @@ _SECRET_KEY_SEGMENT_MARKERS: Tuple[Tuple[str, ...], ...] = (
 )
 _TOKEN_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
     ("bearer_token", re.compile(r"(?i)\bBearer\s+[A-Za-z0-9_\-./+=]{16,}")),
+    ("basic_auth", re.compile(r"(?i)\bBasic\s+[A-Za-z0-9+/=]{16,}")),
     ("openai_key", re.compile(r"\bsk-[A-Za-z0-9_\-]{20,}\b")),
     ("github_token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{30,})\b")),
     ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
@@ -126,6 +127,10 @@ _TOKEN_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
         "url_credentials",
         re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^/@\s:]+):([^/@\s]+)@"),
     ),
+)
+_SECRET_QUERY_PARAM_RE = re.compile(
+    r"(?i)(?P<prefix>[?&])(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)"
+    r"(?P<separator>=)(?P<value>[^&#\s]+)"
 )
 _SECRET_LITERAL_RE = re.compile(
     r"""(?im)(?P<prefix>(?:^|[\s,{])["']?[A-Za-z_][A-Za-z0-9_-]*["']?\s*[:=]\s*["']?)(?P<value>[^"'\s,}]{12,})(?P<suffix>["']?)"""
@@ -394,6 +399,18 @@ def _redact_text(text: str, records: List[RedactionRecord], path: str) -> str:
             return "***REDACTED***"
 
         out = pattern.sub(_repl, out)
+
+    def _query_param_repl(match: re.Match[str]) -> str:
+        if not _is_secret_key_name(match.group("key")):
+            return match.group(0)
+        records.append(RedactionRecord(path=path, rule="secret_query_parameter"))
+        return (
+            f"{match.group('prefix')}{match.group('key')}"
+            f"{match.group('separator')}***REDACTED***"
+        )
+
+    out = _SECRET_QUERY_PARAM_RE.sub(_query_param_repl, out)
+
     def _literal_repl(match: re.Match[str]) -> str:
         prefix = match.group("prefix")
         key_match = _SECRET_LITERAL_KEY_RE.search(prefix)

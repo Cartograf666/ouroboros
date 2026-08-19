@@ -79,6 +79,18 @@
  */
 
 /**
+ * @typedef {Object} ProviderTestRequest
+ * @property {string} provider_id
+ * @property {Object<string, string>=} overrides
+ */
+
+/**
+ * @typedef {Object} ProviderTestResponse
+ * @property {boolean} ok
+ * @property {string=} error
+ */
+
+/**
  * @typedef {Object} SettingsMeta
  * @property {string[]=} custom_secret_keys
  * @property {Object=} setup_contract

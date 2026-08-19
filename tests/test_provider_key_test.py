@@ -1,491 +1,668 @@
-"""Settings-page provider credential probe (POST /api/providers/test).
+"""One-shot Settings provider-readiness probe."""
 
-The endpoint exercises the ordinary catalog fetcher with entered-but-unsaved
-values so a bad key is caught at paste time rather than on the first real task.
-All literals here are placeholders that cannot be mistaken for real credentials.
-"""
+from __future__ import annotations
 
 import asyncio
+import copy
 import json
-import pathlib
+import types
 
 import httpx
-import ouroboros.gateway.models as model_catalog_api
+import pytest
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-WEB = REPO_ROOT / "web" / "modules"
+import ouroboros.gateway.models as provider_api
+from ouroboros.llm import LLMClient
+from ouroboros.usage_accounting import current_usage_scope
 
 
 class _Request:
     def __init__(self, payload):
-        self._payload = payload
+        self.payload = payload
 
     async def json(self):
-        return self._payload
+        return self.payload
+
+
+class _Completion:
+    def __init__(self, payload=None):
+        self.payload = payload or {
+            "choices": [{"message": {"role": "assistant", "content": "not literally OK"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "cost": 0.001},
+        }
+
+    def model_dump(self):
+        return copy.deepcopy(self.payload)
+
+
+class _Remote:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = []
+        self.timeouts = []
+        self.closed = False
+        self.chat = types.SimpleNamespace(
+            completions=types.SimpleNamespace(create=self.create),
+        )
+
+    def with_options(self, **kwargs):
+        self.timeouts.append(kwargs.get("timeout"))
+        return self
+
+    def create(self, **payload):
+        self.calls.append(payload)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    def close(self):
+        self.closed = True
 
 
 def _post(payload):
-    response = asyncio.run(model_catalog_api.api_provider_test(_Request(payload)))
+    response = asyncio.run(provider_api.api_provider_test(_Request(payload)))
     return response.status_code, json.loads(response.body.decode("utf-8"))
 
 
-def test_provider_test_uses_unsaved_overrides(monkeypatch):
-    monkeypatch.setattr(model_catalog_api, "load_settings", lambda: {})
-    captured = {}
+def _bypass_accounting(monkeypatch):
+    import ouroboros.llm as llm_module
 
-    async def fake_compatible(_client, provider_id, provider_label, api_key, base_url):
-        captured.update({"api_key": api_key, "base_url": base_url})
-        return [
-            model_catalog_api._build_model_catalog_entry(provider_id, provider_label, "model-a", "model-a"),
-            model_catalog_api._build_model_catalog_entry(provider_id, provider_label, "model-b", "model-b"),
-        ]
+    observed = []
 
-    monkeypatch.setattr(model_catalog_api, "_fetch_openai_compatible_model_catalog", fake_compatible)
+    def execute(request, send):
+        observed.append((request, current_usage_scope()))
+        return send()
 
-    status, payload = _post({
-        "provider_id": "openai-compatible",
-        "overrides": {
-            "OPENAI_COMPATIBLE_API_KEY": "unit-test-credential",
-            "OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-base-url.example/v1",
-        },
-    })
-
-    assert status == 200
-    assert payload["ok"] is True
-    assert payload["model_count"] == 2
-    assert isinstance(payload["duration_ms"], int)
-    assert captured == {
-        "api_key": "unit-test-credential",
-        "base_url": "https://unit-test-base-url.example/v1",
-    }
+    monkeypatch.setattr(llm_module, "execute_physical_attempt", execute)
+    return observed
 
 
-def test_provider_test_rejects_unknown_override_without_echoing_value(monkeypatch):
-    monkeypatch.setattr(model_catalog_api, "load_settings", lambda: {})
-
-    status, payload = _post({
-        "provider_id": "openai-compatible",
-        "overrides": {"OUROBOROS_NOT_A_PROVIDER_KEY": "unit-test-credential"},
-    })
-
+@pytest.mark.parametrize(
+    "payload,error",
+    [
+        ([], "JSON object"),
+        ({}, "provider_id is required"),
+        ({"provider_id": "openrouterr"}, "unknown provider id"),
+        ({"provider_id": "openrouter", "overrides": []}, "overrides must be an object"),
+        ({"provider_id": "openrouter", "overrides": {"NOT_ALLOWED": "x"}}, "unsupported override"),
+        ({"provider_id": "openrouter", "overrides": {"OPENROUTER_API_KEY": 7}}, "must be strings"),
+    ],
+)
+def test_provider_test_rejects_contract_misuse_before_thread(monkeypatch, payload, error):
+    monkeypatch.setattr(provider_api, "load_settings", lambda: {})
+    monkeypatch.setattr(
+        provider_api.asyncio,
+        "to_thread",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not dispatch")),
+    )
+    status, body = _post(payload)
     assert status == 400
-    assert "OUROBOROS_NOT_A_PROVIDER_KEY" in payload["error"]
-    # The rejection names key names only — never the submitted value.
-    assert "unit-test-credential" not in json.dumps(payload)
+    assert error in body["error"]
+    assert "x" not in body["error"] or "override" in body["error"]
 
 
-def test_provider_test_requires_a_configured_provider(monkeypatch):
-    monkeypatch.setattr(model_catalog_api, "load_settings", lambda: {})
-
-    status, payload = _post({"provider_id": "openrouter"})
-
-    assert status == 400
-    assert payload["error"] == "provider is not configured (missing key or base URL)"
-
-
-def test_provider_test_reports_fetch_failure_as_ok_false(monkeypatch):
-    monkeypatch.setattr(model_catalog_api, "load_settings", lambda: {})
-
-    async def fake_compatible(_client, _provider_id, _provider_label, _api_key, _base_url):
-        raise httpx.ConnectError("boom")
-
-    monkeypatch.setattr(model_catalog_api, "_fetch_openai_compatible_model_catalog", fake_compatible)
-
-    status, payload = _post({
-        "provider_id": "openai-compatible",
-        "overrides": {
-            # The credential rides along: an endpoint override alone is refused
-            # by the exfiltration guard.
-            "OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-base-url.example/v1",
-            "OPENAI_COMPATIBLE_API_KEY": "unit-test-credential",
-        },
-    })
-
-    # The endpoint worked; the provider did not. That is a 200 with ok:false.
-    assert status == 200
-    assert payload["ok"] is False
-    assert payload["stage"] == "connect"
-    assert payload["error"] == "boom"
-
-
-def test_provider_test_route_is_registered():
-    source = (REPO_ROOT / "ouroboros" / "gateway" / "router.py").read_text(encoding="utf-8")
-    assert "api_provider_test," in source
-    assert 'Route("/api/providers/test", endpoint=api_provider_test, methods=["POST"])' in source
-
-
-def test_provider_test_ui_surface_is_wired():
-    settings_ui = (WEB / "settings_ui.js").read_text(encoding="utf-8")
-    settings = (WEB / "settings.js").read_text(encoding="utf-8")
-    api_client = (WEB / "api_client.js").read_text(encoding="utf-8")
-
-    assert 'data-provider-test="${spec.testProvider}">Test</button>' in settings_ui
-    assert 'data-provider-test-status="${spec.testProvider}"' in settings_ui
-    assert "export const PROVIDER_TEST_INPUTS" in settings_ui
-    assert "providerTest: (payload) => jsonPost('/api/providers/test', payload)," in api_client
-    assert "closest('[data-provider-test]')" in settings
-    assert "apiClient.providerTest({ provider_id: provider, overrides })" in settings
-    # Mask-echo guard: saved secrets render masked; only owner-edited values may
-    # become overrides, or every already-saved key would fail its own test.
-    assert "el.dataset.appliedValue = el.value;" in settings
-    assert "value !== (input?.dataset.appliedValue ?? '').trim()" in settings
-
-
-def test_provider_test_unknown_provider_id_is_distinct(monkeypatch):
-    monkeypatch.setattr(model_catalog_api, "load_settings", lambda: {})
-    status, body = _post({"provider_id": "openrouterr"})
-    assert status == 400
-    assert "unknown provider id" in body.get("error", "")
-
-
-def test_provider_test_rejects_non_object_bodies():
-    class _BrokenRequest:
+def test_provider_test_rejects_unparseable_json():
+    class Broken:
         async def json(self):
-            raise ValueError("not json")
+            raise ValueError("bad")
 
-    response = asyncio.run(model_catalog_api.api_provider_test(_BrokenRequest()))
+    response = asyncio.run(provider_api.api_provider_test(Broken()))
     assert response.status_code == 400
 
-    status, body = _post(["provider_id", "openrouter"])
-    assert status == 400
-    assert "JSON object" in body.get("error", "")
 
+def test_provider_test_runs_sync_work_behind_one_to_thread(monkeypatch):
+    calls = []
 
-def test_provider_test_empty_override_unsets_the_saved_value(monkeypatch):
-    # The owner cleared the field: the probe must test the visible draft, not
-    # the saved key — with the only credential unset, the provider is reported
-    # not configured instead of a misleading OK against the old value.
+    async def fake_to_thread(fn, *args):
+        calls.append((fn, args))
+        return {"ok": True}
+
     monkeypatch.setattr(
-        model_catalog_api,
+        provider_api,
         "load_settings",
-        lambda: {"OPENROUTER_API_KEY": "unit-test-credential"},
+        lambda: (_ for _ in ()).throw(AssertionError("event loop must not load settings")),
     )
+    monkeypatch.setattr(provider_api.asyncio, "to_thread", fake_to_thread)
+    status, body = _post({"provider_id": "openrouter"})
+    assert status == 200 and body == {"ok": True}
+    assert calls == [(provider_api._run_provider_test, ("openrouter", {}))]
+
+
+def test_minimax_region_validation_runs_in_worker(monkeypatch):
+    monkeypatch.setattr(provider_api, "load_settings", lambda: {})
+    monkeypatch.setattr(
+        provider_api,
+        "_run_provider_test_with_settings",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("must not probe")),
+    )
+    status, body = _post({
+        "provider_id": "minimax",
+        "overrides": {"MINIMAX_API_KEY": "x", "MINIMAX_REGION": "mars"},
+    })
+    assert status == 400
+    assert body == {"error": "unknown MiniMax region"}
+
+
+def test_saved_key_and_draft_url_reach_request_local_target(monkeypatch):
+    saved = {
+        "OPENAI_COMPATIBLE_API_KEY": "saved-key",
+        "OPENAI_COMPATIBLE_BASE_URL": "https://saved.example/v1",
+        "OUROBOROS_MODEL": "openai-compatible::draft-model",
+    }
+    original = copy.deepcopy(saved)
+    captured = {}
+
+    def fake_probe(self, model, *, settings, timeout=20.0):
+        captured.update(self._resolve_remote_target(model, settings=settings))
+        return {"ok": True, "status_code": 200, "exception_type": ""}
+
+    monkeypatch.setattr(provider_api, "load_settings", lambda: copy.deepcopy(saved))
+    monkeypatch.setattr(LLMClient, "probe_provider_readiness", fake_probe)
+    request = {
+        "provider_id": "openai-compatible",
+        "overrides": {"OPENAI_COMPATIBLE_BASE_URL": "https://draft.example/v1"},
+    }
+    request_before = copy.deepcopy(request)
+    status, body = _post(request)
+    assert status == 200 and body == {"ok": True}
+    assert captured["api_key"] == "saved-key"
+    assert captured["base_url"] == "https://draft.example/v1"
+    assert saved == original
+    assert request == request_before
+
+
+@pytest.mark.parametrize(
+    "overrides,expected_key,expected_base_url",
+    [
+        (
+            {"OPENAI_COMPATIBLE_BASE_URL": "https://draft.example/v1"},
+            "legacy-saved-key",
+            "https://draft.example/v1",
+        ),
+        (
+            {"OPENAI_COMPATIBLE_API_KEY": "draft-key"},
+            "draft-key",
+            "https://legacy.example/v1",
+        ),
+    ],
+)
+def test_legacy_compatible_pair_survives_single_field_draft(
+    monkeypatch, overrides, expected_key, expected_base_url,
+):
+    saved = {
+        "OPENAI_API_KEY": "legacy-saved-key",
+        "OPENAI_BASE_URL": "https://legacy.example/v1",
+        "OPENAI_COMPATIBLE_API_KEY": "",
+        "OPENAI_COMPATIBLE_BASE_URL": "",
+        "OUROBOROS_MODEL": "openai-compatible::draft-model",
+    }
+    captured = {}
+
+    def fake_probe(self, model, *, settings, timeout=20.0):
+        captured["settings"] = copy.deepcopy(settings)
+        captured.update(self._resolve_remote_target(model, settings=settings))
+        return {"ok": True, "status_code": 200, "exception_type": ""}
+
+    monkeypatch.setattr(provider_api, "load_settings", lambda: copy.deepcopy(saved))
+    monkeypatch.setattr(LLMClient, "probe_provider_readiness", fake_probe)
+    status, body = _post({"provider_id": "openai-compatible", "overrides": overrides})
+
+    assert status == 200 and body == {"ok": True}
+    assert captured["api_key"] == expected_key
+    assert captured["base_url"] == expected_base_url
+    assert captured["settings"]["OPENAI_COMPATIBLE_API_KEY"] == expected_key
+    assert captured["settings"]["OPENAI_COMPATIBLE_BASE_URL"] == expected_base_url
+
+
+@pytest.mark.parametrize("legacy_key", ["", "stale-legacy-key"])
+def test_compatible_discovery_and_probe_share_effective_mixed_pair(
+    monkeypatch, legacy_key,
+):
+    saved = {
+        "OPENAI_COMPATIBLE_API_KEY": "dedicated-key",
+        "OPENAI_COMPATIBLE_BASE_URL": "",
+        "OPENAI_API_KEY": legacy_key,
+        "OPENAI_BASE_URL": "https://legacy.example/v1",
+    }
+    calls = []
+
+    async def fake_catalog(_client, _provider_id, _label, api_key, base_url):
+        calls.append(("catalog", api_key, base_url))
+        return [{"value": "openai-compatible::catalog-model"}]
+
+    def fake_probe(self, model, *, settings, timeout=20.0):
+        target = self._resolve_remote_target(model, settings=settings)
+        calls.append(("probe", target["api_key"], target["base_url"]))
+        return {"ok": True, "status_code": 200, "exception_type": ""}
+
+    monkeypatch.setattr(provider_api, "load_settings", lambda: copy.deepcopy(saved))
+    monkeypatch.setattr(provider_api, "_fetch_openai_compatible_model_catalog", fake_catalog)
+    monkeypatch.setattr(LLMClient, "probe_provider_readiness", fake_probe)
+
+    status, body = _post({"provider_id": "openai-compatible"})
+
+    assert status == 200 and body == {"ok": True}
+    expected = ("dedicated-key", "https://legacy.example/v1")
+    assert calls == [("catalog", *expected), ("probe", *expected)]
+
+
+def test_explicit_empty_draft_key_is_not_rehydrated(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "environment-key")
+    monkeypatch.setattr(provider_api, "load_settings", lambda: {
+        "OPENROUTER_API_KEY": "saved-key",
+        "OUROBOROS_MODEL": "openai/test-model",
+    })
     status, body = _post({
         "provider_id": "openrouter",
         "overrides": {"OPENROUTER_API_KEY": ""},
     })
-    assert status == 400
-    assert "not configured" in body.get("error", "")
-
-
-def test_provider_test_rejects_an_unknown_minimax_region(monkeypatch):
-    # resolve_minimax_base_url silently maps unknown regions to the default
-    # endpoint; a typo'd region must not come back as an OK for a deployment
-    # the owner never selected.
-    monkeypatch.setattr(
-        model_catalog_api,
-        "load_settings",
-        lambda: {"MINIMAX_API_KEY": "unit-test-credential"},
-    )
-    status, body = _post({
-        "provider_id": "minimax",
-        "overrides": {
-            # The credential rides along: a region override alone is refused by
-            # the exfiltration guard (a region change IS an endpoint change).
-            "MINIMAX_REGION": "definitely-not-a-region",
-            "MINIMAX_API_KEY": "unit-test-credential",
-        },
-    })
-    assert status == 400
-    assert "region" in body.get("error", "")
-
-
-def test_provider_test_redacts_credentials_from_error_answers(monkeypatch):
-    # Provider exceptions can embed the base URL with inlined credentials; the
-    # endpoint promises credential values never reach the response or the log.
-    monkeypatch.setattr(
-        model_catalog_api,
-        "load_settings",
-        lambda: {
-            "OPENAI_COMPATIBLE_API_KEY": "unit-test-credential",
-            "OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-base-url.example/v1",
-        },
-    )
-
-    async def exploding(client, provider_id, provider_label, api_key, base_url):
-        raise httpx.ConnectError(f"connect to {base_url}?key=unit-test-credential failed")
-
-    monkeypatch.setattr(
-        model_catalog_api, "_fetch_openai_compatible_model_catalog", exploding
-    )
-    status, body = _post({"provider_id": "openai-compatible"})
     assert status == 200
-    assert body["ok"] is False and body["stage"] == "connect"
-    assert "unit-test-credential" not in json.dumps(body)
+    assert body == {"ok": False, "error": "Provider is not configured"}
 
 
-def test_provider_test_never_pairs_a_saved_key_with_an_unsaved_endpoint(monkeypatch):
-    # Accepting a caller-supplied base URL alone would send the STORED key to a
-    # server the owner never configured — an exfiltration primitive, not a probe.
-    monkeypatch.setattr(
-        model_catalog_api,
-        "load_settings",
-        lambda: {
-            "OPENAI_COMPATIBLE_API_KEY": "unit-test-credential",
-            "OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-base-url.example/v1",
-        },
-    )
-    status, body = _post({
-        "provider_id": "openai-compatible",
-        "overrides": {"OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-attacker.example/v1"},
+def test_cleared_compatible_draft_does_not_restore_legacy_pair(monkeypatch):
+    monkeypatch.setattr(provider_api, "load_settings", lambda: {
+        "OPENAI_API_KEY": "saved-legacy-key",
+        "OPENAI_BASE_URL": "https://legacy.example/v1",
+        "OUROBOROS_MODEL": "openai-compatible::draft-model",
     })
-    assert status == 400
-    assert "re-entering the credential" in body.get("error", "")
-
-    # Same endpoint value as saved: nothing new is being paired — allowed.
-    async def fake_fetch(client, provider_id, provider_label, api_key, base_url):
-        return [{"value": "openai-compatible::unit-test-model"}]
-
     monkeypatch.setattr(
-        model_catalog_api, "_fetch_openai_compatible_model_catalog", fake_fetch
-    )
-    status, body = _post({
-        "provider_id": "openai-compatible",
-        "overrides": {"OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-base-url.example/v1"},
-    })
-    assert status == 200 and body["ok"] is True
-
-    # New endpoint WITH a re-entered credential: the owner typed both — allowed.
-    status, body = _post({
-        "provider_id": "openai-compatible",
-        "overrides": {
-            "OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-other.example/v1",
-            "OPENAI_COMPATIBLE_API_KEY": "unit-test-other-credential",
-        },
-    })
-    assert status == 200 and body["ok"] is True
-
-
-def test_provider_test_redacts_percent_encoded_credential_forms(monkeypatch):
-    monkeypatch.setattr(
-        model_catalog_api,
-        "load_settings",
-        lambda: {
-            "OPENAI_COMPATIBLE_API_KEY": "unit test credential@x",
-            "OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-base-url.example/v1",
-        },
-    )
-
-    async def exploding(client, provider_id, provider_label, api_key, base_url):
-        import urllib.parse
-
-        raise httpx.ConnectError(
-            "connect to https://"
-            + urllib.parse.quote("unit test credential@x", safe="")
-            + "@host failed"
-        )
-
-    monkeypatch.setattr(
-        model_catalog_api, "_fetch_openai_compatible_model_catalog", exploding
-    )
-    status, body = _post({"provider_id": "openai-compatible"})
-    assert status == 200 and body["ok"] is False
-    joined = json.dumps(body)
-    assert "unit%20test%20credential%40x" not in joined
-    assert "unit test credential@x" not in joined
-
-
-def test_provider_test_constants_stay_in_sync_with_provider_specs():
-    # Both constants are hand-maintained mirrors of _provider_specs; this pin
-    # fails the moment a provider is added there without updating them.
-    import inspect
-
-    settings = {
-        "OPENROUTER_API_KEY": "unit-test-credential",
-        "OPENAI_API_KEY": "unit-test-credential",
-        "ANTHROPIC_API_KEY": "unit-test-credential",
-        "MINIMAX_API_KEY": "unit-test-credential",
-        "OPENAI_COMPATIBLE_API_KEY": "unit-test-credential",
-        "OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-base-url.example/v1",
-        "CLOUDRU_FOUNDATION_MODELS_API_KEY": "unit-test-credential",
-        "GIGACHAT_CREDENTIALS": "unit-test-credential",
-    }
-    emitted = {pid for pid, _loader in model_catalog_api._provider_specs(settings)}
-    assert emitted == set(model_catalog_api._PROVIDER_TEST_KNOWN_IDS)
-
-    source = inspect.getsource(model_catalog_api._provider_specs)
-    for key in model_catalog_api._PROVIDER_TEST_OVERRIDE_KEYS:
-        assert f'"{key}"' in source, f"allowlisted key {key} is not read by _provider_specs"
-    assert model_catalog_api._PROVIDER_TEST_SECRET_KEYS <= model_catalog_api._PROVIDER_TEST_OVERRIDE_KEYS
-    assert set(model_catalog_api._PROVIDER_TEST_ENDPOINT_GUARDS) <= model_catalog_api._PROVIDER_TEST_OVERRIDE_KEYS
-
-
-def test_endpoint_guard_requires_every_configured_credential_re_entered(monkeypatch):
-    # Satisfying the guard with one re-entered secret while another saved one
-    # rides along (password submitted, OAuth credentials kept) is the same
-    # exfiltration through a side door.
-    monkeypatch.setattr(
-        model_catalog_api,
-        "load_settings",
-        lambda: {
-            "GIGACHAT_CREDENTIALS": "unit-test-credential",
-            "GIGACHAT_PASSWORD": "unit-test-password",
-            "GIGACHAT_USER": "unit-test-user",
-        },
-    )
-    status, body = _post({
-        "provider_id": "gigachat",
-        "overrides": {
-            "GIGACHAT_BASE_URL": "https://unit-test-attacker.example/v1",
-            "GIGACHAT_PASSWORD": "unit-test-password",
-        },
-    })
-    assert status == 400
-    assert "re-entering the credential" in body.get("error", "")
-
-    async def fake_gigachat(_credentials, _scope, _base_url, _verify, _user="", _password=""):
-        return [{"value": "gigachat::unit-test-model"}]
-
-    monkeypatch.setattr(model_catalog_api, "_fetch_gigachat_model_catalog", fake_gigachat)
-    status, body = _post({
-        "provider_id": "gigachat",
-        "overrides": {
-            "GIGACHAT_BASE_URL": "https://unit-test-other.example/v1",
-            "GIGACHAT_CREDENTIALS": "unit-test-other-credential",
-            "GIGACHAT_PASSWORD": "unit-test-other-password",
-        },
-    })
-    assert status == 200 and body["ok"] is True
-
-
-def test_tls_verification_toggle_is_endpoint_guarded(monkeypatch):
-    # Turning off certificate verification changes the connection's trust
-    # boundary exactly like a URL change: saved credentials must not ride.
-    monkeypatch.setattr(
-        model_catalog_api,
-        "load_settings",
-        lambda: {"GIGACHAT_CREDENTIALS": "unit-test-credential"},
-    )
-    status, body = _post({
-        "provider_id": "gigachat",
-        "overrides": {"GIGACHAT_VERIFY_SSL_CERTS": "false"},
-    })
-    assert status == 400
-    assert "re-entering the credential" in body.get("error", "")
-
-
-def test_short_credentials_are_redacted_as_standalone_tokens(monkeypatch):
-    monkeypatch.setattr(
-        model_catalog_api,
-        "load_settings",
-        lambda: {
-            "OPENAI_COMPATIBLE_API_KEY": "abc",
-            "OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-base-url.example/v1",
-        },
-    )
-
-    async def exploding(client, provider_id, provider_label, api_key, base_url):
-        raise httpx.ConnectError("bad token abc rejected; abcdef is a different word")
-
-    monkeypatch.setattr(
-        model_catalog_api, "_fetch_openai_compatible_model_catalog", exploding
-    )
-    status, body = _post({"provider_id": "openai-compatible"})
-    assert status == 200 and body["ok"] is False
-    assert " abc " not in f' {body["error"]} '.replace("***", " *** ")
-    # An innocent longer word sharing the prefix stays legible.
-    assert "abcdef" in body["error"]
-
-
-def test_an_explicit_empty_endpoint_override_is_still_an_endpoint_change(monkeypatch):
-    # Unsetting the saved endpoint reroutes the probe to a default or legacy
-    # destination — a destination change like any other while a saved key rides.
-    monkeypatch.setattr(
-        model_catalog_api,
-        "load_settings",
-        lambda: {
-            "CLOUDRU_FOUNDATION_MODELS_API_KEY": "unit-test-credential",
-            "CLOUDRU_FOUNDATION_MODELS_BASE_URL": "https://unit-test-base-url.example/v1",
-        },
-    )
-    status, body = _post({
-        "provider_id": "cloudru",
-        "overrides": {"CLOUDRU_FOUNDATION_MODELS_BASE_URL": ""},
-    })
-    assert status == 400
-    assert "re-entering the credential" in body.get("error", "")
-
-
-def test_verify_ssl_guard_ignores_semantic_noops(monkeypatch):
-    # Unset means verify (the loader default), so an explicit 'true' confirms
-    # the existing trust boundary; only an actual flip demands re-entry.
-    monkeypatch.setattr(
-        model_catalog_api,
-        "load_settings",
-        lambda: {"GIGACHAT_CREDENTIALS": "unit-test-credential"},
-    )
-
-    async def fake_gigachat(_credentials, _scope, _base_url, _verify, _user="", _password=""):
-        return [{"value": "gigachat::unit-test-model"}]
-
-    monkeypatch.setattr(model_catalog_api, "_fetch_gigachat_model_catalog", fake_gigachat)
-    status, body = _post({
-        "provider_id": "gigachat",
-        "overrides": {"GIGACHAT_VERIFY_SSL_CERTS": "true"},
-    })
-    assert status == 200 and body["ok"] is True
-
-
-def test_provider_card_clear_buttons_dispatch_input_for_verdict_expiry():
-    # BOTH clear handlers (provider cards' .secret-clear and custom secret
-    # rows') must fire 'input': verdict expiry listens for it exclusively.
-    settings_ui = (WEB / "settings_ui.js").read_text(encoding="utf-8")
-    settings = (WEB / "settings.js").read_text(encoding="utf-8")
-    assert settings_ui.count("dispatchEvent(new Event('input', { bubbles: true }))") == 1
-    assert settings.count("dispatchEvent(new Event('input', { bubbles: true }))") == 1
-
-
-def test_clearing_the_compat_endpoint_guards_the_legacy_fallback_key(monkeypatch):
-    # An empty compatible base URL activates the legacy OPENAI pair at runtime:
-    # the destination changes and the saved legacy key must not ride along.
-    monkeypatch.setattr(
-        model_catalog_api,
-        "load_settings",
-        lambda: {
-            "OPENAI_COMPATIBLE_API_KEY": "unit-test-credential",
-            "OPENAI_COMPATIBLE_BASE_URL": "https://unit-test-base-url.example/v1",
-            "OPENAI_API_KEY": "unit-test-legacy-credential",
-            "OPENAI_BASE_URL": "https://unit-test-legacy.example/v1",
-        },
+        LLMClient,
+        "_new_remote_client",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("must not dispatch")),
     )
     status, body = _post({
         "provider_id": "openai-compatible",
         "overrides": {
-            "OPENAI_COMPATIBLE_BASE_URL": "",
             "OPENAI_COMPATIBLE_API_KEY": "",
+            "OPENAI_COMPATIBLE_BASE_URL": "",
         },
     })
-    assert status == 400
-    assert "re-entering the credential" in body.get("error", "")
+    assert status == 200
+    assert body == {"ok": False, "error": "Provider is not configured"}
 
 
-def test_provider_test_redacts_base64_credential_forms(monkeypatch):
-    import base64
+@pytest.mark.parametrize(
+    "model,settings,expected",
+    [
+        ("openai/test", {"OPENROUTER_API_KEY": ""}, {
+            "provider": "openrouter", "api_key": "", "base_url": "https://openrouter.ai/api/v1",
+        }),
+        ("openai::gpt-5.6-terra", {"OPENAI_API_KEY": "oa"}, {
+            "provider": "openai", "api_key": "oa", "base_url": "https://api.openai.com/v1",
+        }),
+        ("anthropic::claude-opus-5", {"ANTHROPIC_API_KEY": "ant"}, {
+            "provider": "anthropic", "api_key": "ant", "base_url": "https://api.anthropic.com/v1",
+        }),
+        ("minimax::MiniMax-M3", {"MINIMAX_API_KEY": "mm", "MINIMAX_REGION": "cn_zh"}, {
+            "provider": "minimax", "api_key": "mm", "base_url": "https://api.minimaxi.com/v1",
+        }),
+        ("cloudru::model", {
+            "CLOUDRU_FOUNDATION_MODELS_API_KEY": "cloud",
+            "CLOUDRU_FOUNDATION_MODELS_BASE_URL": "https://cloud.example/v1",
+        }, {"provider": "cloudru", "api_key": "cloud", "base_url": "https://cloud.example/v1"}),
+        ("gigachat::GigaChat-2-Max", {
+            "GIGACHAT_CREDENTIALS": "giga", "GIGACHAT_USER": "u", "GIGACHAT_PASSWORD": "p",
+            "GIGACHAT_SCOPE": "GIGACHAT_API_CORP", "GIGACHAT_BASE_URL": "https://giga.example/v1",
+            "GIGACHAT_VERIFY_SSL_CERTS": "false",
+        }, {
+            "provider": "gigachat", "api_key": "giga", "user": "u", "password": "p",
+            "scope": "GIGACHAT_API_CORP", "base_url": "https://giga.example/v1",
+            "verify_ssl_certs": False,
+        }),
+        ("openai-compatible::model", {
+            "OPENAI_COMPATIBLE_API_KEY": "compat",
+            "OPENAI_COMPATIBLE_BASE_URL": "https://compat.example/v1",
+            "OPENAI_API_KEY": "", "OPENAI_BASE_URL": "",
+        }, {
+            "provider": "openai-compatible", "api_key": "compat",
+            "base_url": "https://compat.example/v1",
+        }),
+        ("openai-compatible::model", {
+            "OPENAI_COMPATIBLE_API_KEY": "",
+            "OPENAI_COMPATIBLE_BASE_URL": "https://compat.example/v1",
+            "OPENAI_API_KEY": "legacy-must-not-win",
+            "OPENAI_BASE_URL": "https://legacy.example/v1",
+        }, {
+            "provider": "openai-compatible", "api_key": "",
+            "base_url": "https://compat.example/v1",
+        }),
+    ],
+)
+def test_explicit_settings_mapping_is_authoritative(monkeypatch, model, settings, expected):
+    for key in provider_api._PROVIDER_TEST_OVERRIDE_KEYS:
+        monkeypatch.setenv(key, "environment-value")
+    original = copy.deepcopy(settings)
+    client = LLMClient(api_key="constructor-key", base_url="https://constructor.example/v1")
+    target = client._resolve_remote_target(model, settings=settings)
+    for key, value in expected.items():
+        assert target[key] == value
+    assert settings == original
+    assert client._remote_clients == {}
 
+
+@pytest.mark.parametrize(
+    "provider,settings,expected",
+    [
+        ("openai", {"OUROBOROS_MODEL": "openai::main"}, "openai::main"),
+        ("anthropic", {
+            "OUROBOROS_MODEL": "openai::main",
+            "OUROBOROS_MODEL_HEAVY": "anthropic::heavy",
+            "OUROBOROS_MODEL_LIGHT": "anthropic::light",
+            "CLAUDE_CODE_MODEL": "claude-name-only",
+        }, "anthropic::heavy"),
+        ("cloudru", {}, "cloudru::zai-org/GLM-4.7"),
+        ("openrouter", {"CLAUDE_AGENT_SDK_MODEL": "opus"}, "google/gemini-3.7-flash"),
+        ("openai-compatible", {
+            "OUROBOROS_MODEL_FALLBACKS": "openai::other,openai-compatible::chosen",
+        }, "openai-compatible::chosen"),
+        ("openai-compatible", {}, ""),
+    ],
+)
+def test_provider_test_model_selection(provider, settings, expected):
+    assert provider_api._provider_test_model(provider, settings) == expected
+
+
+def test_catalog_is_used_only_for_compatible_discovery(monkeypatch):
+    discoveries = []
+    probes = []
+
+    def discover(provider, _settings):
+        discoveries.append(provider)
+        return "openai-compatible::catalog-first"
+
+    def probe(self, model, *, settings, timeout=20.0):
+        probes.append(model)
+        return {"ok": True, "status_code": 200, "exception_type": ""}
+
+    monkeypatch.setattr(provider_api, "_discover_provider_test_model", discover)
+    monkeypatch.setattr(LLMClient, "probe_provider_readiness", probe)
+    assert provider_api._run_provider_test_with_settings(
+        "openrouter", {"OPENROUTER_API_KEY": "key"},
+    ) == {"ok": True}
+    assert discoveries == []
+    assert probes == ["google/gemini-3.7-flash"]
+    assert provider_api._run_provider_test_with_settings("openai-compatible", {
+        "OPENAI_COMPATIBLE_BASE_URL": "https://compat.example/v1",
+    }) == {"ok": True}
+    assert discoveries == ["openai-compatible"]
+    assert probes[-1] == "openai-compatible::catalog-first"
+
+
+@pytest.mark.parametrize(
+    "discovery,error",
+    [
+        (lambda *_args: "", "Provider is not configured"),
+        (lambda *_args: (_ for _ in ()).throw(httpx.ConnectError("secret raw body")),
+         "Could not reach provider"),
+    ],
+)
+def test_discovery_failure_stops_before_generation(monkeypatch, discovery, error):
+    monkeypatch.setattr(provider_api, "_discover_provider_test_model", discovery)
     monkeypatch.setattr(
-        model_catalog_api,
-        "load_settings",
-        lambda: {"GIGACHAT_CREDENTIALS": "unit-test-credential"},
+        LLMClient,
+        "probe_provider_readiness",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not generate")),
     )
-    encoded = base64.b64encode(b"unit-test-credential").decode("ascii")
-
-    async def exploding(_credentials, _scope, _base_url, _verify, _user="", _password=""):
-        raise RuntimeError(f"authorization header Basic {encoded} rejected")
-
-    monkeypatch.setattr(model_catalog_api, "_fetch_gigachat_model_catalog", exploding)
-    status, body = _post({"provider_id": "gigachat"})
-    assert status == 200 and body["ok"] is False
-    assert encoded not in json.dumps(body)
+    assert provider_api._run_provider_test_with_settings(
+        "openai-compatible", {},
+    ) == {"ok": False, "error": error}
 
 
-def test_settings_reload_expires_provider_verdicts():
-    settings = (WEB / "settings.js").read_text(encoding="utf-8")
-    apply_at = settings.index("function applySettings(s)")
-    secret_at = settings.index("applySecretInputs(page, s);", apply_at)
-    expiry = settings.index(
-        "querySelectorAll('[data-provider-test-status]')", apply_at
+@pytest.mark.parametrize(
+    "model,settings,token_key",
+    [
+        ("openai/test", {"OPENROUTER_API_KEY": "key"}, "max_tokens"),
+        ("openai::gpt-5.6-terra", {"OPENAI_API_KEY": "key"}, "max_completion_tokens"),
+        ("openai-compatible::test", {
+            "OPENAI_COMPATIBLE_API_KEY": "key",
+            "OPENAI_COMPATIBLE_BASE_URL": "https://compat.example/v1",
+            "OPENAI_API_KEY": "", "OPENAI_BASE_URL": "",
+        }, "max_tokens"),
+    ],
+)
+def test_openai_class_probe_is_one_minimal_attempt(monkeypatch, model, settings, token_key):
+    observed = _bypass_accounting(monkeypatch)
+    remote = _Remote([_Completion({
+        "choices": [{"message": {"role": "assistant", "content": None, "reasoning": "done"}}],
+        "usage": {"prompt_tokens": 2, "completion_tokens": 0},
+    })])
+    client = LLMClient()
+    monkeypatch.setattr(client, "_new_remote_client", lambda _target: remote)
+    result = client.probe_provider_readiness(model, settings=settings)
+    assert result["ok"] is True
+    assert len(remote.calls) == len(observed) == 1
+    payload = remote.calls[0]
+    assert payload[token_key] == 16
+    assert set(payload) <= {"model", "messages", token_key, "extra_body"}
+    assert payload["messages"] == [{"role": "user", "content": "Reply OK"}]
+    for forbidden in ("tools", "reasoning", "reasoning_effort", "temperature", "response_format", "web_search"):
+        assert forbidden not in payload
+    if model == "openai/test":
+        assert payload["extra_body"] == {"provider": {"allow_fallbacks": False}}
+    request, scope = observed[0]
+    assert request.max_completion_tokens == 16
+    assert request.source == "provider_test"
+    assert (scope.task_id, scope.root_task_id, scope.category, scope.source) == (
+        "system:provider_test", "system:provider_test", "provider_test", "provider_test",
     )
-    assert apply_at < expiry < secret_at, (
-        "a settings (re)load replaces the tested values programmatically — no "
-        "input events fire, so applySettings itself must expire the verdicts"
+    assert client._remote_clients == {}
+    assert remote.closed is True
+
+
+def test_anthropic_probe_accepts_empty_completion(monkeypatch):
+    observed = _bypass_accounting(monkeypatch)
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"content": [], "stop_reason": "max_tokens", "usage": {"input_tokens": 2}}
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response()
+
+    import requests
+
+    monkeypatch.setattr(requests, "post", post)
+    result = LLMClient().probe_provider_readiness(
+        "anthropic::claude-opus-5", settings={"ANTHROPIC_API_KEY": "key"},
     )
+    assert result["ok"] is True
+    assert len(calls) == len(observed) == 1
+    url, kwargs = calls[0]
+    assert url == "https://api.anthropic.com/v1/messages"
+    assert kwargs["json"] == {
+        "model": "claude-opus-5",
+        "messages": [{"role": "user", "content": "Reply OK"}],
+        "max_tokens": 16,
+    }
+
+
+def test_gigachat_probe_uses_one_ephemeral_client(monkeypatch):
+    import sys
+
+    observed = _bypass_accounting(monkeypatch)
+    monkeypatch.setenv("GIGACHAT_ACCESS_TOKEN", "stale-environment-token")
+    constructed = {}
+    completion = types.SimpleNamespace(
+        choices=[types.SimpleNamespace(message=types.SimpleNamespace(content="anything"))],
+        usage=types.SimpleNamespace(prompt_tokens=2, completion_tokens=1),
+    )
+    class FakeGigaChat:
+        def __init__(self, **kwargs):
+            constructed.update(kwargs)
+            self.calls = []
+            self.closed = False
+            constructed["client"] = self
+
+        def chat(self, payload):
+            self.calls.append(payload)
+            return completion
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setitem(sys.modules, "gigachat", types.SimpleNamespace(GigaChat=FakeGigaChat))
+    client = LLMClient()
+    result = client.probe_provider_readiness(
+        "gigachat::GigaChat-2-Max", settings={"GIGACHAT_CREDENTIALS": "key"},
+    )
+    remote = constructed["client"]
+    assert result["ok"] is True
+    assert len(remote.calls) == len(observed) == 1
+    assert remote.calls[0]["max_tokens"] == 16
+    assert constructed["access_token"] == ""
+    assert constructed["max_retries"] == 0
+    assert constructed["timeout"] == 20.0
+    assert client._gigachat_clients == {}
+    assert remote.closed is True
+
+
+def test_failure_and_malformed_success_never_retry_or_learn(monkeypatch):
+    observed = _bypass_accounting(monkeypatch)
+    before_rejected = copy.deepcopy(LLMClient._REJECTED_PARAMS_CACHE)
+    before_ceilings = copy.deepcopy(LLMClient._EFFORT_CEILING_CACHE)
+
+    class Unauthorized(RuntimeError):
+        status_code = 401
+
+    for outcome, expected in (
+        (Unauthorized("raw secret key=unit-test-secret"), "Invalid key"),
+        (_Completion({"usage": {}}), "Model request failed"),
+    ):
+        remote = _Remote([outcome])
+        client = LLMClient()
+        monkeypatch.setattr(client, "_new_remote_client", lambda _target, remote=remote: remote)
+        result = client.probe_provider_readiness(
+            "openai/test", settings={"OPENROUTER_API_KEY": "key"},
+        )
+        assert result == {
+            "ok": False,
+            "error": expected,
+            "status_code": 401 if isinstance(outcome, Unauthorized) else None,
+            "exception_type": "Unauthorized" if isinstance(outcome, Unauthorized) else "ProbeEnvelopeError",
+        }
+        assert len(remote.calls) == 1
+    assert len(observed) == 2
+    assert LLMClient._REJECTED_PARAMS_CACHE == before_rejected
+    assert LLMClient._EFFORT_CEILING_CACHE == before_ceilings
+
+
+def test_typed_payment_required_maps_to_no_credits():
+    from ouroboros.llm_probe import controlled_probe_error
+
+    error = RuntimeError("raw provider billing body")
+    error.status_code = 402
+    assert controlled_probe_error(error)["error"] == "No credits"
+
+
+def test_ephemeral_openai_client_disables_sdk_retries(monkeypatch):
+    captured = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=FakeOpenAI))
+    LLMClient._new_remote_client({
+        "api_key": "key", "base_url": "https://example.test/v1", "default_headers": {"X": "Y"},
+    })
+    assert captured == {
+        "api_key": "key", "base_url": "https://example.test/v1",
+        "default_headers": {"X": "Y"}, "max_retries": 0,
+    }
+
+
+def test_provider_test_attempts_are_physically_accounted_without_chat_side_effects(
+    monkeypatch, tmp_path,
+):
+    import ouroboros.usage_accounting as accounting
+
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("OUROBOROS_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    monkeypatch.setattr(accounting, "_reservation_cost", lambda _request: 0.01)
+
+    class RateLimited(RuntimeError):
+        status_code = 429
+
+    remote = _Remote([_Completion(), RateLimited("raw provider body")])
+    client = LLMClient()
+    monkeypatch.setattr(client, "_new_remote_client", lambda _target: remote)
+    settings = {"OPENROUTER_API_KEY": "key"}
+    assert client.probe_provider_readiness("openai/test", settings=settings)["ok"] is True
+    assert client.probe_provider_readiness("openai/test", settings=settings)["error"] == "Rate limited"
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "state" / "usage_attempts.jsonl").read_text().splitlines()
+    ]
+    by_attempt = {}
+    for row in rows:
+        if row.get("kind") == "attempt":
+            by_attempt.setdefault(row["attempt_id"], []).append(row)
+    assert len(by_attempt) == 2
+    finals = [attempt_rows[-1] for attempt_rows in by_attempt.values()]
+    assert sorted(row["state"] for row in finals) == ["settled", "unresolved"]
+    for attempt_rows in by_attempt.values():
+        assert [row["state"] for row in attempt_rows[:2]] == ["reserved", "dispatched"]
+        assert attempt_rows[-1]["task_id"] == "system:provider_test"
+        assert attempt_rows[-1]["root_task_id"] == "system:provider_test"
+        assert attempt_rows[-1]["category"] == "provider_test"
+        assert attempt_rows[-1]["source"] == "provider_test"
+    events_path = tmp_path / "logs" / "events.jsonl"
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    assert not any(row.get("type") in {"llm_round", "llm_usage", "chat", "progress"} for row in events)
+    assert not (tmp_path / "task_results").exists()
+    assert not (tmp_path / "logs" / "chat.jsonl").exists()
+    assert not (tmp_path / "logs" / "progress.jsonl").exists()
+
+
+def test_response_log_and_accounting_expose_only_controlled_error(
+    monkeypatch, caplog, tmp_path,
+):
+    import ouroboros.usage_accounting as accounting
+
+    secret = "sk-or-unit-test-secret-value-123456789"
+    encoded = "c2stb3ItdW5pdC10ZXN0LXNlY3JldC12YWx1ZS0xMjM0NTY3ODk="
+    raw = RuntimeError(
+        f"connect https://user:{secret}@host/v1?api_key={secret} Basic {encoded}"
+    )
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("OUROBOROS_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    monkeypatch.setattr(accounting, "_reservation_cost", lambda _request: 0.01)
+    remote = _Remote([raw])
+    monkeypatch.setattr(LLMClient, "_new_remote_client", lambda _self, _target: remote)
+    monkeypatch.setattr(provider_api, "load_settings", lambda: {
+        "OPENROUTER_API_KEY": secret,
+        "OUROBOROS_MODEL": "openai/test",
+    })
+    with caplog.at_level("WARNING"):
+        status, body = _post({"provider_id": "openrouter"})
+    assert status == 200
+    assert body == {"ok": False, "error": "Model request failed"}
+    ledger = (tmp_path / "state" / "usage_attempts.jsonl").read_text()
+    rendered = json.dumps(body) + caplog.text + ledger
+    assert secret not in rendered
+    assert encoded not in rendered
+    assert "user:" not in rendered
+    assert f"api_key={secret}" not in rendered
+    assert f"Basic {encoded}" not in rendered
+    final = json.loads(ledger.splitlines()[-1])
+    assert final["state"] == "unresolved"
+    assert "***REDACTED***" in final["reason"]
+
+
+def test_provider_test_registry_is_derived_from_provider_defaults():
+    assert provider_api._PROVIDER_TEST_KNOWN_IDS == {
+        "openrouter", "openai", "anthropic", "cloudru", "gigachat", "minimax",
+        "openai-compatible",
+    }
+    assert provider_api._PROVIDER_TEST_OVERRIDE_KEYS == provider_api.ALL_PROVIDER_CREDENTIAL_KEYS

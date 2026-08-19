@@ -965,7 +965,15 @@ def release_attempt(
 
 
 def mark_unresolved(reservation: AttemptReservation, reason: str) -> None:
-    _transition(reservation, "unresolved", reason=str(reason or "provider_outcome_unknown")[:500])
+    try:
+        from ouroboros.observability import redact_projection
+
+        safe_reason = str(redact_projection(
+            str(reason or "provider_outcome_unknown"),
+        ).value)
+    except Exception:
+        safe_reason = "provider_outcome_unknown:redaction_failed"
+    _transition(reservation, "unresolved", reason=safe_reason[:500])
 
 
 def terminalize_abandoned_attempt(
@@ -1155,7 +1163,7 @@ def _provider_exception_facts(exc: BaseException) -> Tuple[Optional[int], str, s
         from ouroboros.observability import redact_projection
         message = str(redact_projection(message).value)
     except Exception:
-        pass
+        message = f"{type(exc).__name__}: provider error details unavailable"
     return status, str(code or ""), str(error_type or type(exc).__name__), message
 
 

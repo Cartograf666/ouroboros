@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pathlib
 import re
-from typing import get_args, get_type_hints
+from typing import get_args, get_origin, get_type_hints
 
 from ouroboros.gateway.contracts import (
     HTTP_ENDPOINTS,
@@ -11,22 +11,28 @@ from ouroboros.gateway.contracts import (
     ActiveDirectTurn,
     ChatInbound,
     ChatOutbound,
-    TypingOutbound,
+    ClaudexorLoginJobProblem,
+    ClaudexorLoginJobResponse,
+    ClaudexorStatusReads,
+    ClaudexorStatusResponse,
     OnboardingCompleteRequest,
     OnboardingCompleteResponse,
     OnboardingPresetFailureResponse,
     OnboardingPresetProjection,
+    OwnerHurryProjection,
     OwnerScopeReviewFloorResponse,
     PhotoOutbound,
+    ProviderTestRequest,
+    ProviderTestResponse,
     SettingsPostCommitFailureResponse,
     SkillDeleteResponse,
     SkillLifecycleQueueResponse,
-    OwnerHurryProjection,
     StateResponse,
     TaskCostBreakdown,
     TaskDetailResponse,
     TaskHurryRequest,
     TaskHurryResponse,
+    TypingOutbound,
     UpdateApplyErrorResponse,
     UpdateApplyRequest,
     UpdateApplySuccessResponse,
@@ -35,10 +41,6 @@ from ouroboros.gateway.contracts import (
     UpdatePreflightResponse,
     UpdateStatusReadyOutbound,
     VideoOutbound,
-    ClaudexorLoginJobProblem,
-    ClaudexorLoginJobResponse,
-    ClaudexorStatusReads,
-    ClaudexorStatusResponse,
 )
 from ouroboros.gateway.router import collect_routes
 
@@ -67,6 +69,55 @@ def _js_typedef_fields(text: str, name: str) -> set[str]:
 
 def _contains_none(annotation) -> bool:
     return annotation is type(None) or any(_contains_none(arg) for arg in get_args(annotation))
+
+
+def _notrequired_fields(cls) -> set[str]:
+    """Read NotRequired markers robustly on supported Python 3.10 setups."""
+    marked = set()
+    for name, ann in cls.__annotations__.items():
+        rendered = getattr(ann, "__forward_arg__", None) or str(ann)
+        if rendered.startswith("NotRequired["):
+            marked.add(name)
+    return marked
+
+
+def _js_typedef_properties(text: str, name: str) -> set[tuple[str, str]]:
+    match = re.search(rf"@typedef \{{Object\}} {name}\b(?P<body>.*?)\n \*/", text, re.S)
+    assert match, f"api_types.js missing {name}"
+    return set(re.findall(
+        r"^\s*\*\s+@property\s+\{([^}]*)\}\s+([A-Za-z_][A-Za-z0-9_]*)\s*$",
+        match.group("body"),
+        re.M,
+    ))
+
+
+def test_provider_test_gateway_contract_shape_is_exact():
+    request_hints = get_type_hints(ProviderTestRequest, include_extras=True)
+    response_hints = get_type_hints(ProviderTestResponse, include_extras=True)
+
+    assert set(request_hints) == {"provider_id", "overrides"}
+    assert _notrequired_fields(ProviderTestRequest) == {"overrides"}
+    assert request_hints["provider_id"] is str
+    overrides_type = get_args(request_hints["overrides"])[0]
+    assert get_origin(overrides_type) is dict
+    assert get_args(overrides_type) == (str, str)
+
+    assert set(response_hints) == {"ok", "error"}
+    assert _notrequired_fields(ProviderTestResponse) == {"error"}
+    assert response_hints["ok"] is bool
+    assert get_args(response_hints["error"]) == (str,)
+
+    text = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "api_types.js").read_text(
+        encoding="utf-8"
+    )
+    assert _js_typedef_properties(text, "ProviderTestRequest") == {
+        ("string", "provider_id"),
+        ("Object<string, string>=", "overrides"),
+    }
+    assert _js_typedef_properties(text, "ProviderTestResponse") == {
+        ("boolean", "ok"),
+        ("string=", "error"),
+    }
 
 
 def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
@@ -103,6 +154,8 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "HealthResponse",
         "SettingsMeta",
         "OpenAICompatibleModelsResponse",
+        "ProviderTestRequest",
+        "ProviderTestResponse",
         "UiPreferencesResponse",
         "ChatInbound",
         "ChatOutbound",
@@ -157,6 +210,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
                 OnboardingCompleteRequest, OnboardingPresetProjection,
                 OnboardingCompleteResponse, OnboardingPresetFailureResponse,
                 SettingsPostCommitFailureResponse,
+                ProviderTestRequest, ProviderTestResponse,
                 ClaudexorLoginJobResponse, ClaudexorLoginJobProblem,
                 ClaudexorStatusReads, ClaudexorStatusResponse):
         expected = set(get_type_hints(cls, include_extras=True))
@@ -207,14 +261,6 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     # stamp the typed fields only for registry-tracked turns (optional).
     # (__required_keys__ ignores NotRequired on some 3.10 setups, so inspect
     # the declared annotations instead.)
-    def _notrequired_fields(cls) -> set:
-        marked = set()
-        for name, ann in cls.__annotations__.items():
-            rendered = getattr(ann, "__forward_arg__", None) or str(ann)
-            if rendered.startswith("NotRequired["):
-                marked.add(name)
-        return marked
-
     assert _notrequired_fields(ActiveDirectTurn) == set(), (
         "ActiveDirectTurn snapshot rows always emit every field: keep them all required"
     )
