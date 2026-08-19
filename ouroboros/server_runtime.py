@@ -119,6 +119,16 @@ _PRIOR_SHIPPED_SLOT_DEFAULTS = {
 # migration authority for these slots.  Keeping the classification here lets
 # active consumers ignore Heavy without laundering an old default into a new
 # explicit API actor.
+_RETIRED_SHIPPED_HEAVY_DEFAULTS = frozenset({
+    # Pre-Heavy CODE defaults that were migrated into the Heavy key on upgrade.
+    "anthropic/claude-opus-4.7",
+    "anthropic::claude-opus-4-7",
+    # Provider defaults retired in the same change that removed active Heavy.
+    "openai::gpt-5.6-sol",
+    "anthropic::claude-opus-5",
+    # Prior GigaChat default replaced before Heavy retirement.
+    "gigachat::GigaChat-3-Ultra",
+})
 _SHIPPED_LEGACY_HEAVY_DEFAULTS = frozenset({
     *_PRIOR_SHIPPED_SLOT_DEFAULTS.get("OUROBOROS_MODEL_HEAVY", set()),
     *(
@@ -126,6 +136,12 @@ _SHIPPED_LEGACY_HEAVY_DEFAULTS = frozenset({
         for provider_defaults in _DIRECT_PROVIDER_LEGACY_DEFAULTS.values()
         for value in provider_defaults.get("OUROBOROS_MODEL_HEAVY", set())
     ),
+    *(
+        str(provider_defaults.get("heavy", "") or "").strip()
+        for provider_defaults in DIRECT_PROVIDER_DEFAULTS.values()
+        if str(provider_defaults.get("heavy", "") or "").strip()
+    ),
+    *_RETIRED_SHIPPED_HEAVY_DEFAULTS,
 })
 _ALL_MODEL_SLOT_KEYS = tuple(_MODEL_ROLE_SETTING_KEYS.values())
 _SCOPE_REVIEW_LEGACY_DEFAULTS = frozenset({

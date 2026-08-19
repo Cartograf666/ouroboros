@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from ouroboros.config import migrate_legacy_slot_keys
 from ouroboros.configured_subagents import (
     MAX_CONFIGURED_SUBAGENTS,
     LEGACY_SUBAGENT_COMPATIBILITY,
@@ -19,6 +20,7 @@ from ouroboros.configured_subagents import (
     parse_configured_subagents,
     resolve_configured_subagents,
 )
+from ouroboros.server_runtime import apply_runtime_provider_defaults
 
 
 def _row(row_id: str = "builder", **overrides):
@@ -159,7 +161,7 @@ def test_legacy_off_preserves_custom_heavy_rows_without_reenabling_defaults():
     resolution = resolve_configured_subagents(
         {
             "OUROBOROS_SUBAGENT_HARNESS": "off",
-            "OUROBOROS_MODEL_HEAVY": "anthropic::claude-opus-5",
+            "OUROBOROS_MODEL_HEAVY": "owner/custom-heavy",
         },
         default_candidate=candidate,
     )
@@ -167,7 +169,7 @@ def test_legacy_off_preserves_custom_heavy_rows_without_reenabling_defaults():
     assert resolution.config is not None
     assert resolution.config.enabled is False
     assert [row.subagent_id for row in resolution.config.items] == ["legacy-heavy"]
-    assert resolution.config.items[0].route.target_id == "anthropic::claude-opus-5"
+    assert resolution.config.items[0].route.target_id == "owner/custom-heavy"
 
 
 def test_empty_is_undecided_and_candidate_remains_unsaved():
@@ -202,7 +204,7 @@ def test_legacy_light_requires_a_truthful_provider_but_custom_heavy_is_preserved
     resolution = resolve_configured_subagents(
         {
             "OUROBOROS_SUBAGENT_HARNESS": "codex=gpt-5.6-sol",
-            "OUROBOROS_MODEL_HEAVY": "anthropic::claude-opus-5",
+            "OUROBOROS_MODEL_HEAVY": "owner/custom-heavy",
             "OUROBOROS_MODEL_LIGHT": "openai::gpt-5.6-luna",
         }
     )
@@ -210,18 +212,18 @@ def test_legacy_light_requires_a_truthful_provider_but_custom_heavy_is_preserved
     assert resolution.config is not None
     assert [row.route.target_id for row in resolution.config.items] == [
         "codex=gpt-5.6-sol",
-        "anthropic::claude-opus-5",
+        "owner/custom-heavy",
     ]
 
 
 def test_custom_heavy_without_singleton_is_an_unsaved_undecided_migration_candidate():
-    settings = {"OUROBOROS_MODEL_HEAVY": "anthropic::claude-opus-5"}
+    settings = {"OUROBOROS_MODEL_HEAVY": "owner/custom-heavy"}
     resolution = resolve_configured_subagents(settings)
 
     assert resolution.source == SOURCE_UNDECIDED
     assert resolution.config is not None
     assert [row.route.target_id for row in resolution.config.items] == [
-        "anthropic::claude-opus-5",
+        "owner/custom-heavy",
     ]
     assert SUBAGENTS_SETTING not in settings
 
@@ -235,6 +237,25 @@ def test_saved_local_heavy_intent_survives_a_temporarily_missing_source():
 
     assert resolution.config is not None
     assert resolution.config.items[0].route.target_id == "owner-model (local)"
+
+
+def test_legacy_code_plus_local_flag_migrates_to_an_explicit_local_actor():
+    settings = {
+        "OUROBOROS_MODEL_CODE": "anthropic/claude-opus-4.7",
+        "USE_LOCAL_CODE": True,
+    }
+    migrate_legacy_slot_keys(settings)
+    normalized, changed, changed_keys = apply_runtime_provider_defaults(settings)
+    resolution = resolve_configured_subagents(normalized)
+
+    assert not changed
+    assert changed_keys == []
+    assert "OUROBOROS_MODEL_CODE" not in normalized
+    assert "USE_LOCAL_CODE" not in normalized
+    assert resolution.config is not None
+    assert [(row.subagent_id, row.route.target_id) for row in resolution.config.items] == [
+        ("legacy-heavy", "anthropic/claude-opus-4.7 (local)"),
+    ]
 
 
 def test_legacy_intent_precedes_and_deduplicates_compiler_defaults():
@@ -251,7 +272,7 @@ def test_legacy_intent_precedes_and_deduplicates_compiler_defaults():
     ))
     resolution = resolve_configured_subagents({
         "OUROBOROS_SUBAGENT_HARNESS": "claude=claude-opus-5",
-        "OUROBOROS_MODEL_HEAVY": "anthropic::claude-opus-5",
+        "OUROBOROS_MODEL_HEAVY": "owner/custom-heavy",
         "OUROBOROS_MODEL_LIGHT": "openai/gpt-5.6-luna",
         "OPENROUTER_API_KEY": "configured",
     }, default_candidate=candidate)
@@ -259,6 +280,6 @@ def test_legacy_intent_precedes_and_deduplicates_compiler_defaults():
     assert resolution.config is not None
     assert [row.route.target_id for row in resolution.config.items] == [
         "claude=claude-opus-5",
-        "anthropic::claude-opus-5",
+        "owner/custom-heavy",
         "openai/gpt-5.6-luna",
     ]

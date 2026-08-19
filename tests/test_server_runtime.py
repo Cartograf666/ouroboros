@@ -1,9 +1,24 @@
+import pytest
+
 from ouroboros.server_runtime import (
     apply_runtime_provider_defaults,
     has_startup_ready_provider,
     needs_local_model_autostart,
 )
 from ouroboros.config import SETTINGS_DEFAULTS
+from ouroboros.configured_subagents import resolve_configured_subagents
+
+
+_NEWLY_RETIRED_SHIPPED_HEAVY_DEFAULTS = (
+    "anthropic/claude-opus-4.7",
+    "anthropic::claude-opus-4-7",
+    "openai::gpt-5.6-sol",
+    "anthropic::claude-opus-5",
+    "cloudru::zai-org/GLM-4.7",
+    "gigachat::GigaChat-3-Ultra",
+    "gigachat::GigaChat-2-Max",
+    "minimax::MiniMax-M3",
+)
 
 
 def test_has_startup_ready_provider_accepts_any_remote_key_or_local_routing():
@@ -133,9 +148,9 @@ def test_apply_runtime_provider_defaults_migrates_saved_openai_values():
     assert normalized["OUROBOROS_REVIEW_MODELS"] == "openai::gpt-5.5"
 
 
-def test_apply_runtime_provider_defaults_keeps_explicit_official_openai_review_models():
-    # All model slots explicit provider-prefixed non-legacy values (gpt-5.5-mini never
-    # shipped as a default); scope review model already in direct format.
+def test_apply_runtime_provider_defaults_clears_shipped_openai_heavy_and_keeps_review_models():
+    # Sol was a product-authored Heavy default, while the review models below are
+    # explicit owner choices and remain byte-for-byte unchanged.
     normalized, changed, changed_keys = apply_runtime_provider_defaults({
         "OPENAI_API_KEY": "sk-openai",
         "OUROBOROS_MODEL": "openai::gpt-5.6-terra",
@@ -148,8 +163,9 @@ def test_apply_runtime_provider_defaults_keeps_explicit_official_openai_review_m
         "OUROBOROS_SCOPE_REVIEW_MODELS": "openai::gpt-5.6-terra",  # already in direct format
     })
 
-    assert not changed
-    assert changed_keys == []
+    assert changed
+    assert changed_keys == ["OUROBOROS_MODEL_HEAVY"]
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
     assert normalized["OUROBOROS_REVIEW_MODELS"] == "openai::gpt-5.6-terra,openai::gpt-5.5-mini"
 
 
@@ -157,7 +173,7 @@ def test_apply_runtime_provider_defaults_preserves_duplicate_scope_slots_for_ope
     normalized, changed, changed_keys = apply_runtime_provider_defaults({
         "OPENAI_API_KEY": "sk-openai",
         "OUROBOROS_MODEL": "openai::gpt-5.6-sol",
-        "OUROBOROS_MODEL_HEAVY": "openai::gpt-5.6-sol",
+        "OUROBOROS_MODEL_HEAVY": "openai::owner-selected-heavy",
         "OUROBOROS_MODEL_LIGHT": "openai::gpt-5.5-mini",
         "OUROBOROS_MODEL_FALLBACKS": "openai::gpt-5.5-mini",
         "OUROBOROS_MODEL_DEEP_SELF_REVIEW": "openai::gpt-5.6-sol",
@@ -171,7 +187,7 @@ def test_apply_runtime_provider_defaults_preserves_duplicate_scope_slots_for_ope
     assert normalized["OUROBOROS_SCOPE_REVIEW_MODELS"] == "openai::gpt-5.6-sol,openai::gpt-5.6-sol,openai::gpt-5.6-sol"
 
 
-def test_apply_runtime_provider_defaults_preserves_current_opus47_defaults_with_openrouter():
+def test_apply_runtime_provider_defaults_clears_shipped_opus47_heavy_with_openrouter():
     current_openrouter = "anthropic/claude-opus-" + "4.7"
     current_claude_code = "claude-opus-" + "4-7[1m]"
     normalized, changed, changed_keys = apply_runtime_provider_defaults({
@@ -182,12 +198,42 @@ def test_apply_runtime_provider_defaults_preserves_current_opus47_defaults_with_
         "CLAUDE_CODE_MODEL": current_claude_code,
     })
 
-    assert not changed
-    assert changed_keys == []
+    assert changed
+    assert changed_keys == ["OUROBOROS_MODEL_HEAVY"]
     assert normalized["OUROBOROS_MODEL"] == current_openrouter
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == current_openrouter
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
     assert normalized["OUROBOROS_REVIEW_MODELS"] == f"openai/gpt-5.5,{current_openrouter}"
     assert normalized["CLAUDE_CODE_MODEL"] == current_claude_code
+
+
+@pytest.mark.parametrize("shipped_heavy", _NEWLY_RETIRED_SHIPPED_HEAVY_DEFAULTS)
+def test_every_newly_retired_product_heavy_is_cleared_before_actor_migration(shipped_heavy):
+    normalized, changed, changed_keys = apply_runtime_provider_defaults({
+        "OUROBOROS_MODEL_HEAVY": shipped_heavy,
+    })
+
+    resolution = resolve_configured_subagents(normalized)
+    rows = () if resolution.config is None else resolution.config.items
+    assert changed
+    assert changed_keys == ["OUROBOROS_MODEL_HEAVY"]
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
+    assert all(row.subagent_id != "legacy-heavy" for row in rows)
+
+
+@pytest.mark.parametrize("shipped_heavy", _NEWLY_RETIRED_SHIPPED_HEAVY_DEFAULTS)
+def test_local_override_preserves_historical_heavy_as_explicit_local_actor(shipped_heavy):
+    normalized, changed, changed_keys = apply_runtime_provider_defaults({
+        "OUROBOROS_MODEL_HEAVY": shipped_heavy,
+        "USE_LOCAL_HEAVY": True,
+    })
+
+    resolution = resolve_configured_subagents(normalized)
+    assert not changed
+    assert changed_keys == []
+    assert resolution.config is not None
+    assert [(row.subagent_id, row.route.target_id) for row in resolution.config.items] == [
+        ("legacy-heavy", f"{shipped_heavy} (local)"),
+    ]
 
 
 def test_apply_runtime_provider_defaults_refreshes_retired_gpt54_defaults():
@@ -223,7 +269,7 @@ def test_apply_runtime_provider_defaults_migrates_legacy_scope_model_for_openai_
         normalized, changed, changed_keys = apply_runtime_provider_defaults({
             "OPENAI_API_KEY": "sk-openai",
             "OUROBOROS_MODEL": "openai::gpt-5.6-terra",
-            "OUROBOROS_MODEL_HEAVY": "openai::gpt-5.6-sol",
+            "OUROBOROS_MODEL_HEAVY": "openai::owner-selected-heavy",
             "OUROBOROS_MODEL_LIGHT": "openai::gpt-5.5-mini",
             "OUROBOROS_MODEL_FALLBACKS": "openai::gpt-5.5-mini",
         "OUROBOROS_MODEL_DEEP_SELF_REVIEW": "openai::gpt-5.6-sol",
