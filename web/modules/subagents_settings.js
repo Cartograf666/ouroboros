@@ -34,7 +34,7 @@ import {
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
 export const MAX_AVAILABLE_SUBAGENTS = 10;
-export const SUBAGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+export const SUBAGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 
 const SETTING_KEYS = new Set(['enabled', 'items']);
 const ROW_KEYS = new Set(['subagent_id', 'name', 'recommended_use', 'route', 'effort']);
@@ -141,7 +141,7 @@ export function validateAvailableSubagentsSetting(setting) {
         const label = `Row ${index + 1}`;
         const id = String(row?.subagent_id || '').trim();
         if (!SUBAGENT_ID_PATTERN.test(id)) {
-            errors.push(`${label} needs a stable ID using letters, numbers, _ or - (maximum 64 characters).`);
+            errors.push(`${label} needs a stable ID using letters, numbers, ., _ or - (maximum 64 characters).`);
         } else if (ids.has(id)) {
             errors.push(`${label} repeats stable ID “${id}”.`);
         }
@@ -155,6 +155,15 @@ export function validateAvailableSubagentsSetting(setting) {
         }
         if (route.kind !== ROUTE_KIND_AGENT_SESSION && route.credential_profile_id) {
             errors.push(`${label} can pin an account only for an Agent session.`);
+        }
+        if (route.kind === ROUTE_KIND_AGENT_SESSION) {
+            const target = String(route.target_id || '');
+            const parts = target.split('=');
+            if (/\s|:/.test(target) || parts.length > 2
+                || !SUBAGENT_ID_PATTERN.test(parts[0] || '')
+                || (parts.length === 2 && !parts[1])) {
+                errors.push(`${label} Agent session must use harness or harness=model without whitespace or legacy :effort.`);
+            }
         }
         if (row.effort && !EFFORT_CHOICES.includes(String(row.effort))) {
             errors.push(`${label} has an unsupported reasoning effort.`);
@@ -370,6 +379,7 @@ export function createAvailableSubagentsEditor({
     store = claudexorStatus,
     onChange = () => {},
     onDirtyChange = () => {},
+    previewGenerated = null,
     baselineLabel = 'Saved intent',
 } = {}) {
     const getDoc = typeof doc === 'function' ? doc : () => doc;
@@ -390,6 +400,8 @@ export function createAvailableSubagentsEditor({
         signature: '',
         statusDisposer: null,
         catalogDisposer: null,
+        previewSignature: '',
+        previewGeneration: 0,
     };
 
     function host() {
@@ -563,6 +575,10 @@ export function createAvailableSubagentsEditor({
     }
 
     function load(value, { source = '', diagnostics = [] } = {}) {
+        // Invalidate a preview launched for the previous settings document.
+        // A late response must never overwrite a freshly loaded configured row.
+        state.previewGeneration += 1;
+        state.previewSignature = '';
         const parsed = parseAvailableSubagentsSetting(value);
         state.loaded = Boolean(parsed.setting);
         state.parseError = parsed.error;
@@ -617,6 +633,35 @@ export function createAvailableSubagentsEditor({
         await boundedStatusRefresh(store);
         adoptStatus();
         paint();
+        await maybeRefreshGeneratedPreview({ force: true });
+    }
+
+    async function maybeRefreshGeneratedPreview({ force = false } = {}) {
+        if (typeof previewGenerated !== 'function' || state.source !== 'undecided' || state.dirty) {
+            return false;
+        }
+        const connected = state.accountsKnown
+            ? [...connectedHarnessIds(state.snapshot)].sort()
+            : [];
+        const signature = JSON.stringify([state.accountsKnown, connected]);
+        if (!force && signature === state.previewSignature) return false;
+        state.previewSignature = signature;
+        const generation = ++state.previewGeneration;
+        try {
+            const response = await previewGenerated({
+                subscriptionsConnected: state.accountsKnown && connected.length > 0,
+            });
+            if (generation !== state.previewGeneration) return false;
+            // This is still the unsaved migration/default candidate.  Preserve
+            // that provenance so a later clean account-status change may
+            // refresh it again; onboarding editors keep the endpoint source.
+            applyGeneratedPreview({ ...response, source: state.source });
+            return true;
+        } catch (error) {
+            if (generation !== state.previewGeneration) return false;
+            setPreviewFailure(error);
+            return false;
+        }
     }
 
     function mount({ bindStatus = true } = {}) {
@@ -627,7 +672,11 @@ export function createAvailableSubagentsEditor({
                 includeModels: true,
                 doc: getDoc,
                 win: getWin,
-                listener: () => { adoptStatus(); paint(); },
+                listener: () => {
+                    adoptStatus();
+                    paint();
+                    void maybeRefreshGeneratedPreview();
+                },
             });
         }
         if (!state.catalogDisposer) {
@@ -747,20 +796,32 @@ function settingsSource(settings) {
         || 'configured');
 }
 
-export function initSubagentsSection({ onChange, store = claudexorStatus } = {}) {
+export function availableSubagentsLoadValue(settings) {
+    const raw = settings?.OUROBOROS_SUBAGENTS;
+    if (raw !== undefined && raw !== null && raw !== '') return raw;
+    return settings?._meta?.available_subagents?.candidate ?? raw;
+}
+
+export function initSubagentsSection({
+    onChange,
+    previewGenerated = null,
+    store = claudexorStatus,
+} = {}) {
     destroySubagentsSection();
     settingsEditor = createAvailableSubagentsEditor({
         store,
         onChange: typeof onChange === 'function' ? onChange : () => {},
+        previewGenerated,
     });
     settingsEditor.mount();
 }
 
 export function applySubagentsSettings(settings) {
     if (!settingsEditor) return;
-    settingsEditor.load(settings?.OUROBOROS_SUBAGENTS, {
+    const meta = settings?._meta?.available_subagents || {};
+    settingsEditor.load(availableSubagentsLoadValue(settings), {
         source: settingsSource(settings),
-        diagnostics: settings?._meta?.available_subagents?.diagnostics || [],
+        diagnostics: meta.diagnostics || meta.diagnostic || [],
     });
 }
 

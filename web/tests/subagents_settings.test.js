@@ -10,6 +10,7 @@ import {
 import {
     MAX_AVAILABLE_SUBAGENTS,
     availableSubagentRowMarkup,
+    availableSubagentsLoadValue,
     availableSubagentsSavePayload,
     buildAvailableSubagentsSetting,
     createAvailableSubagentsEditor,
@@ -136,9 +137,97 @@ test('validation protects stable unique IDs, route shape, effort and ten-row lim
     assert.match(validateAvailableSubagentsSetting(setting([
         apiRow({ effort: 'ultra' }),
     ])).join(' '), /unsupported reasoning effort/);
+    assert.deepEqual(validateAvailableSubagentsSetting(setting([
+        apiRow({ subagent_id: 'owner.scout' }),
+    ])), []);
+    assert.match(validateAvailableSubagentsSetting(setting([
+        sessionRow({ route: { kind: ROUTE_KIND_AGENT_SESSION, target_id: 'codex=' } }),
+    ])).join(' '), /harness=model/);
     const tooMany = Array.from({ length: MAX_AVAILABLE_SUBAGENTS + 1 }, (_, index) =>
         apiRow({ subagent_id: `actor_${index}` }));
     assert.match(validateAvailableSubagentsSetting(setting(tooMany)).join(' '), /at most 10/);
+});
+
+test('Settings loads the backend migration candidate when no new setting is materialized', () => {
+    const candidate = setting([apiRow()]);
+    assert.deepEqual(availableSubagentsLoadValue({
+        OUROBOROS_SUBAGENTS: '',
+        _meta: { available_subagents: { source: 'undecided', candidate } },
+    }), candidate);
+    const configured = JSON.stringify(setting([sessionRow()]));
+    assert.equal(availableSubagentsLoadValue({
+        OUROBOROS_SUBAGENTS: configured,
+        _meta: { available_subagents: { candidate } },
+    }), configured);
+});
+
+test('a clean undecided Settings draft is enriched from connected status through preview', async () => {
+    const requests = [];
+    const store = {
+        error: '',
+        snapshot: {
+            harnesses: [{ id: 'codex', status: 'ok', models: [{ id: 'gpt-5.6-sol-high' }] }],
+            profiles: {
+                harnessAccounts: [],
+                profiles: [{
+                    profile: { harness_id: 'codex', profile_id: 'owner', enabled: true },
+                    status: { verification: 'passed' },
+                }],
+            },
+        },
+        facet: () => 'ok',
+        subscribe: () => () => {},
+        refresh: async () => {},
+    };
+    const editor = createAvailableSubagentsEditor({
+        store,
+        doc: null,
+        win: null,
+        previewGenerated: async (request) => {
+            requests.push(request);
+            return {
+                available_subagents: setting([sessionRow()]),
+                source: 'onboarding_default',
+                diagnostics: [],
+            };
+        },
+    });
+    editor.load(setting([apiRow()]), { source: 'undecided' });
+
+    await editor.reloadStatus();
+
+    assert.deepEqual(requests, [{ subscriptionsConnected: true }]);
+    assert.equal(editor.setting.items[0].subagent_id, 'codex_builder');
+    assert.equal(editor.dirty, false);
+});
+
+test('a late generated preview cannot replace a newly loaded configured document', async () => {
+    let releasePreview;
+    const store = {
+        error: '',
+        snapshot: { profiles: { harnessAccounts: [], profiles: [] }, harnesses: [] },
+        facet: () => 'ok',
+        subscribe: () => () => {},
+        refresh: async () => {},
+    };
+    const editor = createAvailableSubagentsEditor({
+        store,
+        doc: null,
+        win: null,
+        previewGenerated: () => new Promise((resolve) => { releasePreview = resolve; }),
+    });
+    editor.load(setting([apiRow()]), { source: 'undecided' });
+    const pending = editor.reloadStatus();
+    while (!releasePreview) await new Promise((resolve) => setImmediate(resolve));
+    editor.load(setting([sessionRow()]), { source: 'configured' });
+    releasePreview({
+        available_subagents: setting([apiRow({ subagent_id: 'stale' })]),
+        source: 'onboarding_default',
+        diagnostics: [],
+    });
+    await pending;
+
+    assert.equal(editor.setting.items[0].subagent_id, 'codex_builder');
 });
 
 test('save materializes a readable name but never rewrites stable identity or purpose', () => {

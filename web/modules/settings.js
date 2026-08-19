@@ -394,7 +394,12 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     const providerTestsInFlight = new Set();
     initMcpSettings({ onChange: updateSettingsDirtyState });
     initReviewerSlots({ onChange: () => updateSettingsDirtyState() });
-    initSubagentsSection({ onChange: () => updateSettingsDirtyState() });
+    initSubagentsSection({
+        onChange: () => updateSettingsDirtyState(),
+        previewGenerated: ({ subscriptionsConnected }) => apiClient.previewOnboardingSubagents({
+            subscriptionsConnected,
+        }),
+    });
     initHarnessAccounts();
 
     function anthropicKeyConfigured() {
