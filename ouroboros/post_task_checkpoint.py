@@ -109,6 +109,10 @@ def project_root_post_task_checkpoint_fields(
     proactive namer's explicit ``refresh`` can update the final cost snapshot.
     """
     overlay = dict(patch_fields)
+    if canonical_fields.get("status"):
+        # This writer enriches the current lifecycle record; it never owns a
+        # possibly stale pre-lock lifecycle transition.
+        overlay["status"] = canonical_fields["status"]
     canonical_checkpoint = canonical_fields.get("root_phase_checkpoint")
     patch_checkpoint = overlay.get("root_phase_checkpoint")
     current = (

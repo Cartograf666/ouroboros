@@ -594,6 +594,145 @@ def test_delayed_terminal_checkpoint_merges_current_acceptance_and_stays_termina
     assert after_open["cost_with_children_partial"] is False
 
 
+def test_terminal_checkpoint_uses_current_lifecycle_status_before_regression_guard(
+    tmp_path,
+    monkeypatch,
+):
+    """A stale pre-lock status must not abort the terminal checkpoint projection."""
+    import ouroboros.headless as headless
+    import ouroboros.post_task_checkpoint as checkpoint
+    import ouroboros.usage_accounting as usage_accounting
+    import supervisor.state as supervisor_state
+
+    data = tmp_path / "data"
+    child = tmp_path / "child"
+    data.mkdir()
+    child.mkdir()
+    task_id = "status-race-root"
+    write_task_result(
+        data,
+        task_id,
+        "scheduled",
+        root_task_id=task_id,
+        root_phase_checkpoint={
+            "phase": "task_acceptance",
+            "status": "not_required",
+            "pass_index": 0,
+            "post_task_synthesis": "running",
+        },
+        cost_usd=1.0,
+        cost_final=False,
+        cost_with_children_partial=True,
+    )
+    write_task_result(
+        child,
+        task_id,
+        STATUS_COMPLETED,
+        result="accepted child answer",
+        producer_exit_code=23,
+        root_phase_checkpoint={
+            "phase": "task_acceptance",
+            "status": "pass",
+            "pass_index": 1,
+            "post_task_synthesis": "running",
+        },
+        cost_usd=7.0,
+        cost_final=False,
+        cost_with_children_partial=True,
+        total_rounds=7,
+    )
+
+    stale_read_complete = threading.Event()
+    release_stale_reader = threading.Event()
+    real_load = checkpoint.load_task_result
+    outcome = {}
+
+    def delayed_load(*args, **kwargs):
+        loaded = real_load(*args, **kwargs)
+        if threading.current_thread().name == "stale-status-checkpoint":
+            stale_read_complete.set()
+            assert release_stale_reader.wait(5)
+        return loaded
+
+    monkeypatch.setattr(checkpoint, "load_task_result", delayed_load)
+    monkeypatch.setattr(
+        supervisor_state,
+        "reconstruct_task_cost",
+        lambda *args, **kwargs: {
+            "cost_usd": 99.0,
+            "accounted_upper_bound_usd": 99.0,
+            "cost_final": True,
+            "cost_with_children_partial": False,
+            "total_rounds": 99,
+        },
+    )
+    monkeypatch.setattr(
+        usage_accounting,
+        "usage_breakdown",
+        lambda *args, **kwargs: {"accounted_usd": 99.0, "cost_final": True},
+    )
+
+    def finalize_checkpoint():
+        try:
+            checkpoint.set_root_post_task_checkpoint(
+                SimpleNamespace(drive_root=data),
+                {
+                    "id": task_id,
+                    "root_task_id": task_id,
+                    "budget_drive_root": str(data),
+                    "status": "scheduled",
+                },
+                "completed",
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(
+        target=finalize_checkpoint,
+        name="stale-status-checkpoint",
+    )
+    thread.start()
+    assert stale_read_complete.wait(5)
+
+    copied = headless.copy_child_task_result(
+        data,
+        {"id": task_id, "drive_root": str(child)},
+    )
+    assert copied["status"] == STATUS_COMPLETED
+    assert copied["root_phase_checkpoint"]["status"] == "pass"
+    assert copied["root_phase_checkpoint"]["post_task_synthesis"] == "running"
+    release_stale_reader.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert "error" not in outcome
+    stored = load_task_result(data, task_id)
+    assert stored["status"] == STATUS_COMPLETED
+    assert stored["root_phase_checkpoint"] == {
+        "phase": "task_acceptance",
+        "status": "pass",
+        "pass_index": 1,
+        "post_task_synthesis": "completed",
+    }
+    assert stored["producer_exit_code"] == 23
+    assert stored["cost_usd"] == 99.0
+    assert stored["cost_final"] is True
+    assert stored["cost_with_children_partial"] is False
+    assert stored["total_rounds"] == 99
+    events = [
+        json.loads(line)
+        for line in (data / "logs" / "events.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    finalized = events[-1]
+    assert finalized["type"] == "task_cost_finalized"
+    assert finalized["post_task_status"] == "completed"
+    assert finalized["cost_usd"] == 99.0
+    assert finalized["cost_final"] is True
+    assert finalized["total_rounds"] == 99
+
+
 def test_startup_recovery_merges_child_acceptance_after_stale_scan(
     tmp_path,
     monkeypatch,

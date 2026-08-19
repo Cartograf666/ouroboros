@@ -261,28 +261,28 @@ def write_task_result(
     decision 4=A) — there is deliberately no override that lets a cancellation
     replace an already-completed result (discarding a result is a separate
     explicit parent action, ``discard_child_result``). ``_field_projector`` is the narrow
-    custody seam for fields that depend on CURRENT; it runs under this same file lock.
+    custody seam for fields and status that depend on CURRENT; it runs under this same lock.
     """
     path = task_result_path(results_drive_root, task_id)
     explicit_ts = str(fields.pop("ts", "") or "")
 
     def _merge(existing: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        # Monotonic lifecycle: never let a stale scheduled/running mirror overwrite a
-        # terminal outcome (the structural guard against post-terminal "ghost" tasks).
+        projected_fields = _field_projector(existing, {**fields, "status": status}) if _field_projector else dict(fields)
+        projected_status = str(projected_fields.pop("status", status))
+        # Monotonic lifecycle: no stale mirror may overwrite a terminal outcome.
         existing_status = str(existing.get("status") or "")
-        if existing and _is_status_regression(existing_status, status):
+        if existing and _is_status_regression(existing_status, projected_status):
             # Surface the blocked transition: when debugging a "stuck" task this
             # is the only signal that a stale/late write was intentionally dropped.
             log.debug("Blocked status regression %s -> %s for task %s",
-                      existing.get("status"), status, task_id)
+                      existing.get("status"), projected_status, task_id)
             return None
-        projected_fields = _field_projector(existing, dict(fields)) if _field_projector else fields
         now = utc_now_iso()
         return {
             **existing,
             **projected_fields,
             "task_id": task_id,
-            "status": status,
+            "status": projected_status,
             "ts": explicit_ts or str(existing.get("ts") or now),
             "updated_at": now,
         }

@@ -57,6 +57,21 @@ def test_same_terminal_status_enrichment_allowed(drive):
     assert data["trace_summary"] == "trace"
 
 
+def test_replica_projector_keeps_terminal_lifecycle_guard(drive):
+    from ouroboros.post_task_checkpoint import project_replica_task_result_fields
+
+    tr.write_task_result(drive, "t", tr.STATUS_CANCELLED, result="cancelled")
+    result = tr.write_task_result(
+        drive,
+        "t",
+        tr.STATUS_COMPLETED,
+        _field_projector=project_replica_task_result_fields,
+        result="late child",
+    )
+    assert result["status"] == tr.STATUS_CANCELLED
+    assert result["result"] == "cancelled"
+
+
 def test_cancel_requested_blocks_running_but_allows_cancelled(drive):
     tr.write_task_result(drive, "t", tr.STATUS_CANCEL_REQUESTED)
     tr.write_task_result(drive, "t", tr.STATUS_RUNNING)
