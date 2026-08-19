@@ -45,6 +45,7 @@ from ouroboros.task_results import STATUS_RUNNING, write_task_result
 from ouroboros.contracts.task_constraint import normalize_task_constraint
 from ouroboros.contracts.task_contract import attach_task_contract
 from ouroboros.outcomes import infra_failed_axes
+from ouroboros import subagent_bootstrap, subagent_runtime
 from ouroboros.subagents import (
     CapabilityDelta,
     SubagentExecutorResolution,
@@ -316,7 +317,7 @@ def preflight_delegate_visibility(
             reason=derive_capability_reason(reasons, delta.substrate_disclosures),
             **changes)
 
-    pinned = str(task.get("requested_executor") or "auto").strip().lower() == "harness"
+    pinned = isinstance(task.get("configured_subagent"), dict) or str(task.get("requested_executor") or "auto").strip().lower() == "harness"
     reason = "delegate_tools_invisible"
     try:
         available = set(tools.available_tools())
@@ -354,7 +355,7 @@ def preflight_delegate_visibility(
     ))
 
 
-def reset_nanny_economics_marks(ctx: Any, *, route_dispatched: bool) -> None:
+def reset_nanny_economics_marks(ctx: Any, *, route_dispatched: bool, delegate_activity_seed: bool = False) -> None:
     """Reset EVERY nanny-economics mark for a fresh dispatch (F4).
 
     DEFENSIVE, not load-bearing: ``_prepare_task_context`` builds a FRESH
@@ -364,7 +365,7 @@ def reset_nanny_economics_marks(ctx: Any, *, route_dispatched: bool) -> None:
     ctx._nanny_route_dispatched = bool(route_dispatched)
     ctx._nanny_finalization_injected = False
     ctx._nanny_metered_progress = None
-    ctx._nanny_delegate_baseline = None
+    ctx._nanny_delegate_baseline = ({"round": 0, "cost": 0.0} if delegate_activity_seed else None)
     ctx._nanny_reminder_mark = None
 
 
@@ -688,7 +689,7 @@ class OuroborosAgent:
                 reasoning_effort=task.get("reasoning_effort"),
                 task_group_id=task.get("task_group_id"),
                 task_group=task.get("task_group"),
-                subagent_envelope=task.get("subagent_envelope"),
+                subagent_envelope=task.get("subagent_envelope"), configured_subagent=task.get("configured_subagent"), parent_cognitive_route=task.get("parent_cognitive_route"), subagent_availability=task.get("subagent_availability"),
                 metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
                 # Ingress-captured owner-message identity (v6.73.0): persisted on the
                 # durable record so a post-hoc "Turn into project" binds the start
@@ -824,7 +825,7 @@ class OuroborosAgent:
             "reasoning_effort",
             "task_group_id",
             "task_group",
-            "subagent_envelope",
+            "subagent_envelope", "configured_subagent", "parent_cognitive_route", "subagent_availability",
             "executor_ref",
             "original_task_id",
             "timeout_retry_from",
@@ -947,6 +948,7 @@ class OuroborosAgent:
                 ctx.task_model_override = str(task_metadata.get("model") or "").strip()
                 if "use_local_model" in task_metadata:
                     ctx.task_use_local_override = bool(task_metadata.get("use_local_model"))
+        startup_wake = subagent_bootstrap.bootstrap_before_context(ctx, task, dispatch)
         self._capture_mutation_baseline(task, task_metadata)
 
         self._emit_typing_start()
@@ -975,6 +977,7 @@ class OuroborosAgent:
         )
         if _exec_note:
             messages.append({"role": "user", "content": _exec_note})
+        subagent_bootstrap.append_startup_receipt(messages, startup_wake)
         # The nanny postcondition's input fact for the loop's finalization seam:
         # THIS task was dispatched onto the delegated substrate. ALL economics
         # marks reset together per dispatch (F4) — defensive, since the
@@ -983,7 +986,7 @@ class OuroborosAgent:
             dispatch is not None
             and dispatch.executor_resolution is not None
             and dispatch.executor_resolution.executor == "harness"
-        ))
+        ), delegate_activity_seed=bool(startup_wake))
 
         budget_remaining = None
         budget_accounting_status = "available"
@@ -1031,8 +1034,7 @@ class OuroborosAgent:
         """Run one task under the root/subtree monetary attribution scope."""
         # Hot-reload settings so UI changes affect the next task without restart.
         try:
-            from ouroboros.config import load_settings, apply_settings_to_env
-            apply_settings_to_env(load_settings())
+            subagent_runtime.apply_task_start_settings()
         except Exception:
             pass
 

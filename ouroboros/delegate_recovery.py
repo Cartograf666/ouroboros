@@ -1,0 +1,605 @@
+"""Narrow successor proofs for configured-session worker/restart recovery."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import pathlib
+from dataclasses import asdict
+from typing import Any, Mapping, Optional
+
+from ouroboros import delegate_custody as custody
+from ouroboros.subagent_work_order import work_order_fingerprint
+from ouroboros.utils import atomic_write_json, utc_now_iso
+
+log = logging.getLogger(__name__)
+
+CAUSE_WORKER_CRASH = "non_signal_worker_crash"
+CAUSE_PLANNED_SELF_RESTART = "planned_self_restart"
+_ALLOWED_CAUSES = {CAUSE_WORKER_CRASH, CAUSE_PLANNED_SELF_RESTART}
+NO_RESUME_CAUSES = (
+    "owner_restart", "panic", "external_signal", "worker_signal",
+    "deadline", "timeout", "explicit_cancellation", "abrupt_whole_app_loss",
+)
+
+
+def _canonical_hash(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+        .encode("utf-8")
+    ).hexdigest()
+
+
+def authority_fingerprint_from_task(task: Mapping[str, Any]) -> str:
+    from ouroboros.contracts.task_constraint import normalize_task_constraint
+
+    contract = task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {}
+    normalized_constraint = normalize_task_constraint(task.get("task_constraint"))
+    constraint = asdict(normalized_constraint) if normalized_constraint is not None else {}
+
+    def _root(value: Any) -> str:
+        text = str(value or "").strip()
+        return str(pathlib.Path(text).resolve(strict=False)) if text else ""
+
+    return _canonical_hash({
+        "task_id": str(task.get("id") or ""),
+        "workspace_root": _root(task.get("workspace_root")),
+        "workspace_mode": str(task.get("workspace_mode") or ""),
+        "drive_root": _root(task.get("drive_root")),
+        "task_constraint": constraint,
+        "allowed_resources": contract.get("allowed_resources") if isinstance(contract.get("allowed_resources"), dict) else {},
+        "executor_ref": task.get("executor_ref") if isinstance(task.get("executor_ref"), dict) else {},
+    })
+
+
+def authority_fingerprint_from_context(ctx: Any) -> str:
+    meta = getattr(ctx, "task_metadata", {})
+    meta = meta if isinstance(meta, dict) else {}
+    return authority_fingerprint_from_task({
+        **meta,
+        "id": str(getattr(ctx, "task_id", "") or ""),
+        "drive_root": str(getattr(ctx, "drive_root", "") or ""),
+        "workspace_root": str(getattr(ctx, "workspace_root", "") or meta.get("workspace_root") or ""),
+        "workspace_mode": str(getattr(ctx, "workspace_mode", "") or meta.get("workspace_mode") or ""),
+        "task_constraint": getattr(ctx, "task_constraint", None) or meta.get("task_constraint") or {},
+        "task_contract": getattr(ctx, "task_contract", None) or meta.get("task_contract") or {},
+        "executor_ref": getattr(ctx, "executor_ref", None) or meta.get("executor_ref") or {},
+    })
+
+
+def _path(drive_root: Any, task_id: str) -> pathlib.Path:
+    return pathlib.Path(drive_root) / "state" / "delegate_recovery" / f"{task_id}.json"
+
+
+def _read(drive_root: Any, task_id: str) -> dict[str, Any]:
+    try:
+        data = json.loads(_path(drive_root, task_id).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write(drive_root: Any, row: dict[str, Any]) -> None:
+    path = _path(drive_root, str(row.get("task_id") or ""))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row["updated_at"] = utc_now_iso()
+    atomic_write_json(path, row)
+
+
+def _selected_session(task: Mapping[str, Any]) -> dict[str, Any]:
+    snapshot = task.get("configured_subagent") if isinstance(task.get("configured_subagent"), dict) else {}
+    route = snapshot.get("route") if isinstance(snapshot.get("route"), dict) else {}
+    return snapshot if str(route.get("kind") or "") == "agent_session" else {}
+
+
+def unsettled_start_ids(drive_root: Any, task_id: str) -> dict[str, list[str]]:
+    """Durable run/start blockers which must settle before replacement."""
+
+    mine = str(task_id or "")
+    return {
+        "open_run_ids": [row.run_id for row in custody.open_runs(drive_root) if row.task_id == mine],
+        "pending_invocation_ids": [
+            str(row.get("invocation_id") or "") for row in custody.pending_invocations(drive_root)
+            if str(row.get("task_id") or "") == mine
+        ],
+    }
+
+
+def reconcile_unrecoverable_task(drive_root: Any, task_id: str) -> None:
+    """Fail-soft cancellation/settlement for a task without a valid successor."""
+
+    try:
+        custody.reconcile_task_runs(drive_root, str(task_id or ""))
+    except Exception:
+        log.debug("Unrecoverable delegate reconciliation failed", exc_info=True)
+
+
+def prepare_worker_crash_handoff(
+    drive_root: Any,
+    task: Mapping[str, Any],
+    *,
+    old_attempt: int,
+    new_attempt: int,
+    worker_id: int,
+    exitcode: Optional[int],
+) -> dict[str, Any]:
+    """Reserve one same-generation successor and settle anything unprovable."""
+
+    try:
+        row = prepare_handoff(
+            drive_root, task, cause=CAUSE_WORKER_CRASH,
+            old_attempt=old_attempt, new_attempt=new_attempt,
+            worker_id=worker_id, exitcode=exitcode,
+        )
+    except Exception:
+        log.debug("Worker-crash delegate handoff preparation failed", exc_info=True)
+        row = {}
+    if not row and isinstance(task.get("configured_subagent"), dict):
+        reconcile_unrecoverable_task(drive_root, str(task.get("id") or ""))
+    return row
+
+
+def veto_worker_retry_handoff(
+    drive_root: Any, task_id: str, handoff: Mapping[str, Any], admission_block: str,
+) -> None:
+    if not handoff:
+        return
+    try:
+        veto_handoff(drive_root, task_id, f"retry_admission_blocked:{admission_block}")
+    except Exception:
+        log.debug("Admission-blocked handoff veto failed", exc_info=True)
+
+
+def _holder_matches(row: Mapping[str, Any], holder: Any, *, pending: bool) -> bool:
+    def _value(name: str) -> str:
+        return str(holder.get(name) or "") if pending else str(getattr(holder, name, "") or "")
+
+    identity = "pending_invocation_id" if pending else "run_id"
+    holder_identity = _value("invocation_id" if pending else "run_id")
+    if holder_identity != str(row.get(identity) or ""):
+        return False
+    return all(
+        _value(name) == str(row.get(name) or "")
+        for name in (
+            "selected_subagent_id", "config_fingerprint", "authority_fingerprint",
+            "work_order_fingerprint", "snapshot_id", "execution_root",
+            "baseline_sha", "target_root",
+        )
+    )
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _restore_wait_checkpoint(drive_root: Any, row: Mapping[str, Any]) -> None:
+    """Restore cursor/mailbox/interaction facts before successor wait resumes."""
+
+    task_id = str(row.get("task_id") or "")
+    run_id = str(row.get("run_id") or "")
+    path = pathlib.Path(drive_root) / "state" / "delegate_supervision" / f"{task_id}.json"
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        state = {}
+    state = state if isinstance(state, dict) and str(state.get("run_id") or run_id) == run_id else {}
+    state.update({"schema": 1, "run_id": run_id, "status": "adopted"})
+    state["journal_cursor"] = max(
+        int(state.get("journal_cursor") or 0), int(row.get("journal_cursor") or 0)
+    )
+    state["mailbox_seen_ids"] = sorted({
+        str(item) for item in [
+            *(state.get("mailbox_seen_ids") or []), *(row.get("mailbox_seen_ids") or []),
+        ] if str(item)
+    })
+    if isinstance(row.get("checkpoint"), dict):
+        state["checkpoint"] = dict(row["checkpoint"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, state)
+    interaction_ids = frozenset(
+        str(item) for item in (row.get("interaction_ids") or []) if str(item)
+    )
+    if interaction_ids and run_id:
+        from ouroboros.delegate_interactions import _REPORTED_INTERACTIONS
+
+        _REPORTED_INTERACTIONS[run_id] = interaction_ids
+
+
+def prepare_handoff(
+    drive_root: Any,
+    task: Mapping[str, Any],
+    *,
+    cause: str,
+    old_attempt: int,
+    new_attempt: int,
+    worker_id: int = 0,
+    exitcode: Optional[int] = None,
+) -> dict[str, Any]:
+    """Persist one exact successor reservation, or return no reservation."""
+
+    if cause not in _ALLOWED_CAUSES:
+        return {}
+    snapshot = _selected_session(task)
+    task_id = str(task.get("id") or "")
+    if not snapshot or not task_id:
+        return {}
+    runs = [row for row in custody.open_runs(drive_root) if row.task_id == task_id]
+    pending = [
+        row for row in custody.pending_invocations(drive_root)
+        if str(row.get("task_id") or "") == task_id
+    ]
+    if len(runs) + len(pending) != 1:
+        return {}
+    config_fingerprint = str(snapshot.get("config_fingerprint") or "")
+    selected_subagent_id = str(snapshot.get("selected_subagent_id") or "")
+    holder: Any = runs[0] if runs else pending[0]
+    holder_fp = str(
+        holder.config_fingerprint if runs else holder.get("config_fingerprint") or ""
+    )
+    authority_fp = authority_fingerprint_from_task(task)
+    holder_authority = str(
+        holder.authority_fingerprint if runs else holder.get("authority_fingerprint") or ""
+    )
+    holder_selected = str(
+        holder.selected_subagent_id if runs else holder.get("selected_subagent_id") or ""
+    )
+    holder_work_order = str(
+        holder.work_order_fingerprint if runs else holder.get("work_order_fingerprint") or ""
+    )
+    work_order_fp = work_order_fingerprint(task)
+    if (
+        not config_fingerprint
+        or not selected_subagent_id
+        or holder_fp != config_fingerprint
+        or holder_selected != selected_subagent_id
+        or holder_authority != authority_fp
+        or holder_work_order != work_order_fp
+    ):
+        return {}
+    supervision_path = (
+        pathlib.Path(drive_root) / "state" / "delegate_supervision" / f"{task_id}.json"
+    )
+    try:
+        supervision = json.loads(supervision_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        supervision = {}
+    supervision = supervision if isinstance(supervision, dict) else {}
+
+    def _interaction_ids(value: Any) -> list[str]:
+        found: list[str] = []
+        if isinstance(value, dict):
+            identity = str(value.get("interaction_id") or value.get("interactionId") or "")
+            if identity:
+                found.append(identity)
+            for child in value.values():
+                found.extend(_interaction_ids(child))
+        elif isinstance(value, list):
+            for child in value:
+                found.extend(_interaction_ids(child))
+        return found
+
+    row = {
+        "schema": 1,
+        "status": "reserved",
+        "cause": cause,
+        "task_id": task_id,
+        "old_attempt": int(old_attempt),
+        "new_attempt": int(new_attempt),
+        "worker_id": int(worker_id),
+        "supervisor_pid": os.getpid(),
+        "exitcode": exitcode,
+        "selected_subagent_id": selected_subagent_id,
+        "config_fingerprint": config_fingerprint,
+        "authority_fingerprint": authority_fp,
+        "work_order_fingerprint": work_order_fp,
+        "run_id": runs[0].run_id if runs else "",
+        "pending_invocation_id": str(pending[0].get("invocation_id") or "") if pending else "",
+        "snapshot_id": runs[0].snapshot_id if runs else str(pending[0].get("snapshot_id") or ""),
+        "execution_root": runs[0].execution_root if runs else str(pending[0].get("execution_root") or ""),
+        "baseline_sha": runs[0].baseline_sha if runs else str(pending[0].get("baseline_sha") or ""),
+        "target_root": runs[0].target_root if runs else str(pending[0].get("target_root") or ""),
+        "journal_cursor": int(supervision.get("journal_cursor") or 0),
+        "mailbox_seen_ids": list(supervision.get("mailbox_seen_ids") or []),
+        "interaction_ids": sorted(set(_interaction_ids(supervision.get("last_wake")))),
+        "checkpoint": supervision.get("checkpoint") if isinstance(supervision.get("checkpoint"), dict) else {},
+        "no_resume_veto_causes": list(NO_RESUME_CAUSES),
+        "created_at": utc_now_iso(),
+    }
+    _write(drive_root, row)
+    return row
+
+
+def recoverable_task_ids(drive_root: Any) -> set[str]:
+    root = pathlib.Path(drive_root) / "state" / "delegate_recovery"
+    if not root.exists():
+        return set()
+    task_ids: set[str] = set()
+    for path in root.glob("*.json"):
+        row = _read(drive_root, path.stem)
+        same_generation_crash = (
+            row.get("cause") == CAUSE_WORKER_CRASH
+            and int(row.get("supervisor_pid") or 0) == os.getpid()
+        )
+        planned_restart = (
+            row.get("cause") == CAUSE_PLANNED_SELF_RESTART
+            and (
+                row.get("status") == "pre_adopted"
+                or int(row.get("supervisor_pid") or 0) == os.getpid()
+            )
+        )
+        if row.get("status") in {"reserved", "pre_adopted"} and (same_generation_crash or planned_restart):
+            task_ids.add(str(row.get("task_id") or ""))
+    return {task_id for task_id in task_ids if task_id}
+
+
+def has_planned_restart_handoffs(drive_root: Any) -> bool:
+    root = pathlib.Path(drive_root) / "state" / "delegate_recovery"
+    if not root.exists():
+        return False
+    return any(
+        (row := _read(drive_root, path.stem)).get("status") in {"reserved", "pre_adopted"}
+        and row.get("cause") == CAUSE_PLANNED_SELF_RESTART
+        for path in root.glob("*.json")
+    )
+
+
+def prepare_planned_restart_handoffs(
+    drive_root: Any, running: Mapping[str, Any],
+) -> set[str]:
+    """Reserve only exact tasks durably in event-only supervising sleep."""
+
+    preserved: set[str] = set()
+    for task_id, meta in dict(running or {}).items():
+        task = meta.get("task") if isinstance(meta, dict) else None
+        if not isinstance(task, dict):
+            continue
+        checkpoint_path = (
+            pathlib.Path(drive_root) / "state" / "delegate_supervision" / f"{task_id}.json"
+        )
+        try:
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(checkpoint, dict) or checkpoint.get("status") != "sleeping":
+            continue
+        old_attempt = int(meta.get("attempt") or task.get("_attempt") or 1)
+        row = prepare_handoff(
+            drive_root,
+            task,
+            cause=CAUSE_PLANNED_SELF_RESTART,
+            old_attempt=old_attempt,
+            new_attempt=old_attempt + 1,
+            worker_id=int(meta.get("worker_id") or 0),
+            exitcode=None,
+        )
+        if not row or str(row.get("run_id") or "") != str(checkpoint.get("run_id") or ""):
+            if row:
+                veto_handoff(drive_root, str(task_id), "sleep_checkpoint_run_mismatch")
+            continue
+        row["journal_cursor"] = int(checkpoint.get("journal_cursor") or 0)
+        row["mailbox_seen_ids"] = list(checkpoint.get("mailbox_seen_ids") or [])
+        row["checkpoint"] = checkpoint.get("checkpoint") if isinstance(checkpoint.get("checkpoint"), dict) else {}
+        _write(drive_root, row)
+        preserved.add(str(task_id))
+    return preserved
+
+
+def pre_adopt_planned_handoffs(
+    drive_root: Any, pending_tasks: list[Mapping[str, Any]],
+) -> set[str]:
+    """Durably adopt exact planned-restart runs before startup orphan cleanup."""
+
+    adopted: set[str] = set()
+    pending = {
+        str(task.get("id") or ""): task
+        for task in list(pending_tasks or []) if str(task.get("id") or "")
+    }
+    root = pathlib.Path(drive_root) / "state" / "delegate_recovery"
+    no_resume_flag = next((
+        name for name in ("owner_restart_no_resume.flag", "panic_stop.flag")
+        if (pathlib.Path(drive_root) / "state" / name).exists()
+    ), "")
+    for path in root.glob("*.json") if root.exists() else ():
+        task_id = path.stem
+        row = _read(drive_root, task_id)
+        if row.get("cause") != CAUSE_PLANNED_SELF_RESTART or row.get("status") not in {
+            "reserved", "pre_adopted",
+        }:
+            continue
+        task = pending.get(task_id)
+        snapshot = _selected_session(task or {})
+        old_pid = int(row.get("supervisor_pid") or 0)
+        mismatch = ""
+        if no_resume_flag:
+            mismatch = f"startup_no_resume:{no_resume_flag}"
+        elif task is None:
+            mismatch = "startup_restored_task_missing"
+        elif old_pid == os.getpid() or _pid_alive(old_pid):
+            mismatch = "previous_supervisor_generation_not_dead"
+        elif int(row.get("new_attempt") or 0) != int(task.get("_attempt") or 1):
+            mismatch = "startup_attempt_mismatch"
+        elif str(row.get("config_fingerprint") or "") != str(snapshot.get("config_fingerprint") or ""):
+            mismatch = "startup_config_mismatch"
+        elif str(row.get("selected_subagent_id") or "") != str(snapshot.get("selected_subagent_id") or ""):
+            mismatch = "startup_actor_mismatch"
+        elif str(row.get("authority_fingerprint") or "") != authority_fingerprint_from_task(task):
+            mismatch = "startup_authority_mismatch"
+        elif str(row.get("work_order_fingerprint") or "") != work_order_fingerprint(task):
+            mismatch = "startup_work_order_mismatch"
+        if mismatch:
+            veto_handoff(drive_root, task_id, mismatch)
+            continue
+        runs = [candidate for candidate in custody.open_runs(drive_root) if candidate.task_id == task_id]
+        if len(runs) != 1 or not _holder_matches(row, runs[0], pending=False):
+            veto_handoff(drive_root, task_id, "startup_run_binding_mismatch")
+            continue
+        gateway = None
+        try:
+            from ouroboros.claudexor_daemon import ensure_owned_gateway
+
+            gateway = ensure_owned_gateway()
+            gateway.get_run(runs[0].run_id)
+        except Exception:
+            veto_handoff(drive_root, task_id, "startup_run_unprovable")
+            continue
+        finally:
+            if gateway is not None:
+                gateway.close()
+        row.update({"status": "pre_adopted", "pre_adopted_at": utc_now_iso()})
+        try:
+            _write(drive_root, row)
+        except Exception:
+            try:
+                custody.reconcile_task_runs(drive_root, task_id)
+            finally:
+                continue
+        custody.emit(drive_root, "delegate_run_adopted", {
+            "task_id": task_id,
+            "run_id": runs[0].run_id,
+            "cause": CAUSE_PLANNED_SELF_RESTART,
+            "phase": "before_startup_orphan_sweep",
+            "config_fingerprint": str(row.get("config_fingerprint") or ""),
+            "authority_fingerprint": str(row.get("authority_fingerprint") or ""),
+        })
+        adopted.add(task_id)
+    return adopted
+
+
+def veto_handoff(drive_root: Any, task_id: str, reason: str) -> dict[str, Any]:
+    row = _read(drive_root, task_id)
+    if not row:
+        return {}
+    row.update({"status": "vetoed", "veto_reason": str(reason or "recovery_mismatch")})
+    _write(drive_root, row)
+    try:
+        custody.reconcile_task_runs(drive_root, task_id)
+    except Exception:
+        pass
+    return row
+
+
+def adopt_handoff(ctx: Any, task: Mapping[str, Any]) -> dict[str, Any]:
+    """Adopt the exact live run/pending invocation before any new start or LLM."""
+
+    drive = custody.custody_root(ctx)
+    task_id = str(task.get("id") or "")
+    row = _read(drive, task_id)
+    if not row or row.get("status") not in {"reserved", "pre_adopted"}:
+        return {"status": "none"}
+    snapshot = _selected_session(task)
+    expected_attempt = int(task.get("_attempt") or 1)
+    if (
+        row.get("cause") not in _ALLOWED_CAUSES
+        or (
+            row.get("cause") == CAUSE_WORKER_CRASH
+            and int(row.get("supervisor_pid") or 0) != os.getpid()
+        )
+        or int(row.get("new_attempt") or 0) != expected_attempt
+        or str(row.get("config_fingerprint") or "") != str(snapshot.get("config_fingerprint") or "")
+        or str(row.get("selected_subagent_id") or "") != str(snapshot.get("selected_subagent_id") or "")
+        or str(row.get("authority_fingerprint") or "") != authority_fingerprint_from_task(task)
+        or str(row.get("work_order_fingerprint") or "") != work_order_fingerprint(task)
+    ):
+        veto_handoff(drive, task_id, "successor_binding_mismatch")
+        return {"status": "recovery_required", "reason": "successor_binding_mismatch"}
+    runs = [candidate for candidate in custody.open_runs(drive) if candidate.task_id == task_id]
+    pending = [
+        candidate for candidate in custody.pending_invocations(drive)
+        if str(candidate.get("task_id") or "") == task_id
+    ]
+    if len(runs) + len(pending) != 1:
+        veto_handoff(drive, task_id, "ambiguous_or_missing_leaf")
+        return {"status": "recovery_required", "reason": "ambiguous_or_missing_leaf"}
+    if runs:
+        run = runs[0]
+        if not _holder_matches(row, run, pending=False):
+            veto_handoff(drive, task_id, "run_binding_mismatch")
+            return {"status": "recovery_required", "reason": "run_binding_mismatch"}
+        gateway = None
+        try:
+            from ouroboros.claudexor_daemon import ensure_owned_gateway
+
+            gateway = ensure_owned_gateway()
+            gateway.get_run(run.run_id)
+        except Exception as exc:
+            veto_handoff(drive, task_id, f"run_unprovable:{type(exc).__name__}")
+            return {"status": "recovery_required", "reason": "run_unprovable"}
+        finally:
+            if gateway is not None:
+                gateway.close()
+        run_id = run.run_id
+    else:
+        pending_id = str(pending[0].get("invocation_id") or "")
+        if not _holder_matches(row, pending[0], pending=True):
+            veto_handoff(drive, task_id, "invocation_binding_mismatch")
+            return {"status": "recovery_required", "reason": "invocation_binding_mismatch"}
+        from ouroboros.subagent_work_order import compile_external_work_order
+        from ouroboros.tools.delegate import exact_start
+
+        result = exact_start(ctx, compile_external_work_order(task), {"retry_of": pending_id})
+        try:
+            parsed = json.loads(result)
+        except (TypeError, ValueError):
+            parsed = {}
+        if str(parsed.get("status") or "") != "started":
+            veto_handoff(drive, task_id, "pending_recovery_failed")
+            return {"status": "recovery_required", "reason": "pending_recovery_failed", "detail": parsed}
+        run_id = str(parsed.get("run_id") or "")
+    try:
+        _restore_wait_checkpoint(drive, {**row, "run_id": run_id})
+    except Exception:
+        try:
+            custody.reconcile_task_runs(drive, task_id)
+        except Exception:
+            pass
+        return {"status": "recovery_required", "reason": "checkpoint_restore_failed"}
+    row.update({"status": "adopted", "run_id": run_id, "adopted_at": utc_now_iso()})
+    try:
+        _write(drive, row)
+    except Exception:
+        try:
+            custody.reconcile_task_runs(drive, task_id)
+        except Exception:
+            pass
+        return {"status": "recovery_required", "reason": "adoption_record_unwritable"}
+    custody.emit(drive, "delegate_run_adopted", {
+        "task_id": task_id,
+        "run_id": run_id,
+        "cause": str(row.get("cause") or ""),
+        "config_fingerprint": str(row.get("config_fingerprint") or ""),
+        "authority_fingerprint": str(row.get("authority_fingerprint") or ""),
+        "new_attempt": expected_attempt,
+    })
+    return {"status": "adopted", "run_id": run_id, "cause": row.get("cause")}
+
+
+__all__ = [
+    "CAUSE_PLANNED_SELF_RESTART",
+    "CAUSE_WORKER_CRASH",
+    "NO_RESUME_CAUSES",
+    "adopt_handoff",
+    "authority_fingerprint_from_context",
+    "authority_fingerprint_from_task",
+    "has_planned_restart_handoffs",
+    "prepare_handoff",
+    "prepare_planned_restart_handoffs",
+    "prepare_worker_crash_handoff",
+    "pre_adopt_planned_handoffs",
+    "reconcile_unrecoverable_task",
+    "recoverable_task_ids",
+    "unsettled_start_ids",
+    "veto_handoff",
+    "veto_worker_retry_handoff",
+]

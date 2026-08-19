@@ -1103,6 +1103,7 @@ SUBAGENT_RESOLUTION_FIELDS: tuple[str, ...] = (
     "tool_profile",
     "capability_delta",
     "subagent_envelope",
+    "subagent_availability",
 )
 
 
@@ -1132,6 +1133,7 @@ class SubagentDispatch:
     # instead of re-deriving them from strings.
     executor_resolution: SubagentExecutorResolution | None = None
     legacy_ignored: Dict[str, str] = field(default_factory=dict)
+    availability: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def blocked(self) -> bool:
@@ -1150,7 +1152,7 @@ class SubagentDispatch:
         keys off the task, so an added axis is one edit here instead of a field-by-
         field mapping repeated in four modules that drift apart one release later.
         """
-        return {
+        fields = {
             "effective_model_lane": self.lane.effective_lane,
             "model": self.lane.model,
             "use_local_model": self.lane.use_local_model,
@@ -1160,6 +1162,9 @@ class SubagentDispatch:
             "tool_profile": self.profile,
             "capability_delta": self.delta.as_dict(),
         }
+        if self.availability:
+            fields["subagent_availability"] = dict(self.availability)
+        return fields
 
 
 def resolve_subagent_dispatch(
@@ -1178,6 +1183,11 @@ def resolve_subagent_dispatch(
     constraint); everything here is derived from it. A stored field from a retired
     schema is ignored and SAID SO rather than obeyed or dropped.
     """
+    if isinstance(task.get("configured_subagent"), dict):
+        from ouroboros.subagent_runtime import resolve_configured_actor_dispatch
+
+        return resolve_configured_actor_dispatch(task, task_type=task_type)
+
     requested_lane = str(task.get("requested_model_lane") or task.get("model_lane") or "auto")
     try:
         requested_lane = normalize_subagent_model_lane(requested_lane)

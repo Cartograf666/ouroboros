@@ -40,10 +40,19 @@ def dispatch_executor_note(decision: Optional[SubagentExecutorResolution],
         return ""
     if decision.executor == "harness":
         route = decision.route.route_id if decision.route else ""
+        configured_atomic = lane is not None and lane.provenance == "configured_subagent"
         note = (
             f"EXECUTOR: your parent scheduled you on the delegated substrate ({route}). "
-            "You are a NANNY. Decide your delegation plan FIRST — right after reading "
-            "your objective and constraints, before any substantive work. Cost classes: "
+            "You are a NANNY. "
+            + (
+                "The host starts the exact selected external leaf and enters supervising "
+                "wait BEFORE your first model round; the startup/wake receipt in this "
+                "transcript is authoritative. Do not repeat that start. "
+                if configured_atomic else
+                "Decide your delegation plan FIRST — right after reading your objective "
+                "and constraints, before any substantive work. "
+            )
+            + "Cost classes: "
             "a subscription-lane run has known-zero marginal cost when the route reports "
             "its settled spend as $0 (an estimated or undisclosed spend is estimated/unknown, "
             "not zero); every token YOU think on is metered API money. "

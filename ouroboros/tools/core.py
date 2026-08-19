@@ -1984,9 +1984,11 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
     return header + "\n\n" + "\n".join(matches)
 
 
-def _forward_to_worker(ctx: ToolContext, task_id: str, message: str) -> str:
+def _forward_to_worker(
+    ctx: ToolContext, task_id: str, message: str, relayed_from_task_id: str = "",
+) -> str:
     """Forward a message to a running worker task's mailbox."""
-    from ouroboros.owner_mailbox import write_owner_message
+    from ouroboros.owner_mailbox import write_task_message
     from ouroboros.task_results import STATUS_RUNNING, validate_task_id
     from ouroboros.task_status import FINAL_STATUSES, load_effective_task_result
 
@@ -2028,9 +2030,35 @@ def _forward_to_worker(ctx: ToolContext, task_id: str, message: str) -> str:
     allowed = target_parent == current_task_id or target_root == current_task_id
     if not allowed:
         return f"⚠️ TASK_FORBIDDEN: task {tid} is not a child or descendant of the current task."
+    relayed_from = str(relayed_from_task_id or "").strip()
+    provenance = "ancestor_task"
+    if relayed_from:
+        try:
+            relayed_from = validate_task_id(relayed_from)
+        except ValueError as exc:
+            return f"⚠️ TOOL_ARG_ERROR (forward_to_worker): {exc}"
+        source = load_effective_task_result(status_drive_root, relayed_from)
+        source_parent = str(source.get("parent_task_id") or "").strip()
+        source_root = str(source.get("root_task_id") or "").strip()
+        if not source or not (source_parent == current_task_id or source_root == current_task_id):
+            return (
+                f"⚠️ TASK_FORBIDDEN: relay source {relayed_from} is not a child or "
+                "descendant of the current task."
+            )
+        provenance = "peer_via_ancestor"
     child_drive = str(data.get("child_drive_root") or data.get("headless_child_drive_root") or data.get("drive_root") or "").strip()
     mailbox_drive = pathlib.Path(child_drive) if child_drive else pathlib.Path(ctx.drive_root)
-    write_owner_message(mailbox_drive, message, task_id=tid, msg_id=uuid.uuid4().hex)
+    written = write_task_message(
+        mailbox_drive,
+        message,
+        task_id=tid,
+        source_task_id=current_task_id,
+        provenance=provenance,
+        relayed_from_task_id=relayed_from,
+        msg_id=uuid.uuid4().hex,
+    )
+    if not written:
+        return f"⚠️ TASK_MESSAGE_UNWRITTEN: message to task {tid} was not persisted."
     return f"Message forwarded to task {tid}"
 
 def get_tools() -> List[ToolEntry]:
@@ -2183,14 +2211,16 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("forward_to_worker", {
             "name": "forward_to_worker",
             "description": (
-                "Forward a message to a running worker task's mailbox. "
-                "Use when my human sends a message during your active conversation "
-                "that is relevant to a specific running background task. "
-                "The worker will see it as [Message from my human] on its next LLM round."
+                "Send an addressed task-tree message to a running child or descendant. "
+                "The mailbox preserves you as the ancestor sender; it never labels this "
+                "message as owner dialogue. Arbitrary unrelated tasks remain unreachable."
             ),
             "parameters": {"type": "object", "properties": {
                 "task_id": {"type": "string", "description": "ID of the running task to forward to"},
                 "message": {"type": "string", "description": "Message text to forward"},
+                "relayed_from_task_id": {"type": "string", "description":
+                    "Optional sibling/descendant task whose output this ancestor relays. "
+                    "The recipient sees both peer and ancestor provenance."},
             }, "required": ["task_id", "message"]},
         }, _forward_to_worker),
     ]

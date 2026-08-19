@@ -124,6 +124,11 @@ class RunCustody:
     # for every deliberately new ``delegate_start``. ``idempotency_key`` above is the content-derived identity
     # used to FIND a pending invocation; this id is what actually rides the wire.
     invocation_id: str = ""
+    # Configured-actor binding. Empty on historical/root-legacy delegate starts.
+    selected_subagent_id: str = ""
+    config_fingerprint: str = ""
+    work_order_fingerprint: str = ""
+    authority_fingerprint: str = ""
     ledger_recorded: bool = False
     settled: bool = False
     # The containment disclosure is a FACT about the run, so it is written once. A nanny
@@ -286,6 +291,8 @@ _STARTED_STR_FIELDS: Tuple[Tuple[str, str], ...] = tuple(
         "parent_task_id", "ledger_root", "idempotency_key", "invocation_id",
         "snapshot_id", "execution_root", "baseline_sha", "target_root",
         "authority_source", "access", "mode", "isolation",
+        "selected_subagent_id", "config_fingerprint", "work_order_fingerprint",
+        "authority_fingerprint",
     )
 )
 # Progress carried forward from a previous row: an idempotent re-start writes a
@@ -300,7 +307,8 @@ _STARTED_PROGRESS_FLAGS: Tuple[str, ...] = (
 # first recorded fact is authoritative and is never erased or retargeted.
 _STARTED_FIRST_WINS_FACTS: Tuple[str, ...] = (
     "snapshot_id", "execution_root", "baseline_sha", "target_root",
-    "authority_source", "resource_ref")
+    "authority_source", "resource_ref", "selected_subagent_id",
+    "config_fingerprint", "work_order_fingerprint", "authority_fingerprint")
 
 
 def _merge_started_into(entry: RunCustody, previous: RunCustody) -> None:
@@ -630,6 +638,10 @@ def invocation_record(drive_root: Any, invocation_id: str) -> Optional[Dict[str,
                 "target_root": str(row.get("target_root") or ""),
                 "authority_source": str(row.get("authority_source") or ""),
                 "resource_ref": row.get("resource_ref") if isinstance(row.get("resource_ref"), dict) else {},
+                "selected_subagent_id": str(row.get("selected_subagent_id") or ""),
+                "config_fingerprint": str(row.get("config_fingerprint") or ""),
+                "work_order_fingerprint": str(row.get("work_order_fingerprint") or ""),
+                "authority_fingerprint": str(row.get("authority_fingerprint") or ""),
             }
         elif kind == STARTED:
             state, run_id = "started", str(row.get("run_id") or "")
@@ -1221,42 +1233,9 @@ def pending_invocations(drive_root: Any,
     same rule as ``invocation_record``); a record whose canonical body never
     landed is excluded (nothing byte-identical can be replayed). ``rows`` shares
     one pre-read snapshot with ``replay`` (atomic payload busy claim)."""
-    found: Dict[str, Dict[str, Any]] = {}
-    state: Dict[str, str] = {}
-    for row in rows if rows is not None else _iter_rows(event_log_path(drive_root)):
-        invocation_id = str(row.get("invocation_id") or "")
-        if not invocation_id:
-            continue
-        kind = str(row.get("type") or "")
-        if kind == START_REQUESTED and invocation_id not in found:
-            found[invocation_id] = {
-                "invocation_id": invocation_id,
-                "task_id": str(row.get("task_id") or ""),
-                "request": row.get("request") if isinstance(row.get("request"), dict) else None,
-                "route": str(row.get("route") or ""),
-                "project_id": str(row.get("project_id") or ""),
-                "project_owned": bool(row.get("project_owned")),
-                "idempotency_key": str(row.get("idempotency_key") or ""),
-                "root_task_id": str(row.get("root_task_id") or ""),
-                "parent_task_id": str(row.get("parent_task_id") or ""),
-                # The FULL C1 isolation binding, not just the GC key: recovery
-                # re-records it on the bound run's STARTED row (snapshot_id alone
-                # left recovered runs bindingless and their snapshots GC-deleted).
-                "snapshot_id": str(row.get("snapshot_id") or ""),
-                "execution_root": str(row.get("execution_root") or ""),
-                "baseline_sha": str(row.get("baseline_sha") or ""),
-                "target_root": str(row.get("target_root") or ""),
-                "authority_source": str(row.get("authority_source") or ""),
-                "resource_ref": row.get("resource_ref") if isinstance(row.get("resource_ref"), dict) else {},
-            }
-        elif kind == STARTED:
-            state[invocation_id] = "started"
-        elif kind == START_FAILED and row.get("definite") is True \
-                and state.get(invocation_id) != "started":
-            state[invocation_id] = "failed_definite"
-    return [record for invocation_id, record in found.items()
-            if state.get(invocation_id, "pending") == "pending"
-            and isinstance(record["request"], dict) and record["request"]]
+    from ouroboros.delegate_pending import pending_invocations as replay_pending
+
+    return replay_pending(drive_root, rows)
 
 
 def release_task_runs(drive_root: Any, task_id: str, *,
@@ -1300,6 +1279,7 @@ def reconcile_orphaned_runs(
     running_task_ids: Optional[set] = None,
     *,
     gateway_factory: Optional[Callable[[], Any]] = None,
+    recoverable_task_ids: Optional[set] = None,
 ) -> List[Dict[str, Any]]:
     """Settle or cancel every open run whose owning task is no longer running.
 
@@ -1310,14 +1290,16 @@ def reconcile_orphaned_runs(
     """
     if running_task_ids is None:
         return []
-    orphans = [c for c in open_runs(drive_root) if c.task_id and c.task_id not in running_task_ids]
+    spared = set(recoverable_task_ids or ())
+    live_or_reserved = set(running_task_ids) | spared
+    orphans = [c for c in open_runs(drive_root) if c.task_id and c.task_id not in live_or_reserved]
     # The class ONE STEP EARLIER (P34R.2): an invocation whose POST the daemon may have
     # accepted but whose worker died before record_started has no run row for the sweep
     # above to find — a live mutating run nobody could ever collect. Recovered here on
     # the SAME owner-is-gone predicate; a pending invocation whose owner is ALIVE stays
     # untouched, because that owner holds the retry token and decides.
     stray = [record for record in pending_invocations(drive_root)
-             if record["task_id"] and record["task_id"] not in running_task_ids]
+             if record["task_id"] and record["task_id"] not in live_or_reserved]
     return _reconcile_each(drive_root, orphans, gateway_factory, pending=stray)
 
 
@@ -1420,6 +1402,10 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
         # belongs there like every other (P34R.1).
         ledger_root=str(drive_root),
         idempotency_key=str(record["idempotency_key"]), invocation_id=invocation_id,
+        selected_subagent_id=str(record.get("selected_subagent_id") or ""),
+        config_fingerprint=str(record.get("config_fingerprint") or ""),
+        work_order_fingerprint=str(record.get("work_order_fingerprint") or ""),
+        authority_fingerprint=str(record.get("authority_fingerprint") or ""),
         # The C1 isolation binding survives recovery VERBATIM: the recovered run
         # executes in the snapshot the original attempt provisioned (the replayed
         # body's scope.root), so its STARTED row must name that binding or the

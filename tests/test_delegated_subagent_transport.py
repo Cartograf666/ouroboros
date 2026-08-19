@@ -2656,16 +2656,7 @@ def test_custody_survives_the_worker_that_started_the_run(tmp_path, monkeypatch)
 
 def test_the_invocation_id_is_reused_on_retry_and_fresh_per_intended_start(
         tmp_path, monkeypatch):
-    """One LOGICAL INVOCATION ID per intended invocation, reused ONLY by explicit
-    token. Both wire-level failure shapes are pinned: a fresh uuid4 per POST (an
-    accepted start whose response was lost comes back as a SECOND live run) and any
-    content-matched reuse (an INTENDED new start of the same prompt silently
-    inheriting the old handle -- the owner's contract: intended new start = NEW id).
-    A start with an unknown outcome hands back pending_invocation_id; only a call
-    presenting it as retry_of replays the invocation -- the STORED canonical body,
-    byte-identical by construction even when the route config drifted between the
-    attempts, under the original key (the engine 409s a same-key-different-digest
-    replay). A bound or definitely refused invocation is never replayed."""
+    """Only retry_of reuses an unsettled invocation; replacement waits for settlement."""
     import httpx
 
     import ouroboros.delegate_custody as dc
@@ -2720,24 +2711,37 @@ def test_the_invocation_id_is_reused_on_retry_and_fresh_per_intended_start(
     token = lost["pending_invocation_id"]
     assert token == keys[0] and "retry_of" in lost["retry_hint"]
 
-    # 2. A plain identical call is an INTENDED NEW start: fresh id, never the token.
-    fresh = json.loads(delegate._delegate_start(ctx, prompt))
-    assert fresh["status"] == "started"
-    assert keys[1] != token, "content-matched reuse is forbidden: new intention, new id"
-    assert fresh["idempotent_recovery"] is False
+    # 2. A plain identical call is an intended replacement, but the unknown
+    # first POST has not settled. The replacement fence refuses before the wire.
+    blocked = json.loads(delegate._delegate_start(ctx, prompt))
+    assert blocked["reason"] == "replacement_requires_settlement"
+    assert len(keys) == 1
 
     # 3. Only the EXPLICIT token replays the invocation -- the STORED body verbatim,
     #    even though the route config drifted between the attempts.
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:high")
     retried = json.loads(delegate._delegate_start(ctx, prompt, retry_of=token))
     assert retried["status"] == "started" and retried["idempotent_recovery"] is True
-    assert keys[2] == token, "the retry must present the original invocation id"
-    assert bodies[2] == bodies[0], "the retry must replay the RECORDED body, not re-derive it"
-    assert bodies[2]["maxSeconds"] == 120 and bodies[2]["effort"] == "low"
+    assert keys[1] == token, "the retry must present the original invocation id"
+    assert bodies[1] == bodies[0], "the retry must replay the RECORDED body, not re-derive it"
+    assert bodies[1]["maxSeconds"] == 120 and bodies[1]["effort"] == "low"
 
     # The id lives in the run's durable record and survives the worker.
     delegate._CUSTODY.clear()
     assert dc.replay(tmp_path)[retried["run_id"]].invocation_id == token
+    assert dc.emit(tmp_path, dc.SETTLED, {
+        "run_id": retried["run_id"], "task_id": "t-a",
+    })
+
+    # Once the old invocation is durably settled, a plain identical call is a
+    # genuinely NEW intention: fresh id, never content-matched reuse.
+    fresh = json.loads(delegate._delegate_start(ctx, prompt))
+    assert fresh["status"] == "started"
+    assert keys[2] != token, "content-matched reuse is forbidden: new intention, new id"
+    assert fresh["idempotent_recovery"] is False
+    assert dc.emit(tmp_path, dc.SETTLED, {
+        "run_id": fresh["run_id"], "task_id": "t-a",
+    })
 
     # 4-5. A bound invocation is never re-posted; an unknown token is refused.
     again = json.loads(delegate._delegate_start(ctx, prompt, retry_of=token))
@@ -2759,7 +2763,7 @@ def test_the_invocation_id_is_reused_on_retry_and_fresh_per_intended_start(
     assert mismatch["reason"] == "retry_prompt_mismatch"
 
     assert len(keys) == 5, "refused retry_of shapes must never reach the wire"
-    assert len({keys[0], keys[1], keys[3], keys[4]}) == 4, "one id per intended invocation"
+    assert len({keys[0], keys[2], keys[3], keys[4]}) == 4, "one id per intended invocation"
     delegate._CUSTODY.clear()
 
 
@@ -2915,6 +2919,7 @@ def test_a_retry_testifies_about_the_stored_invocation_not_the_current_config(
                            ("idempotency_key", original["idempotency_key"])):
         assert started[fact] == expected, f"custody row lies about {fact}: {started[fact]!r}"
     assert dc.replay(drive)[retried["run_id"]].model == "model-old"
+    assert dc.emit(drive, dc.SETTLED, {"run_id": retried["run_id"], "task_id": "t-a"})
 
     # 4. A DEFINITE refusal of a retry settles the STORED attempt's resources: the
     #    project the original start registered and owned is the one retired.

@@ -16,6 +16,7 @@ _MAILBOX_DIR = "memory/owner_mailbox"
 # owner dialogue; control kinds carry supervisor->worker protocol signals and
 # are routed structurally (never shown as user prose).
 KIND_OWNER_TEXT = "owner_text"
+KIND_TASK_MESSAGE = "task_message"
 KIND_FINALIZE_NOW = "finalize_now"
 # Owner "hurry" control (HQ1, 2026-08-15): a task-local typed acceleration
 # directive — NEVER owner dialogue and NEVER revoked after drain (restart
@@ -63,6 +64,64 @@ def write_owner_message(
     except Exception:
         log.warning("Failed to write owner message for task %s", task_id, exc_info=True)
         return False
+
+
+def write_task_message(
+    drive_root: pathlib.Path,
+    text: str,
+    task_id: str,
+    *,
+    source_task_id: str,
+    provenance: str = "ancestor_task",
+    relayed_from_task_id: str = "",
+    msg_id: Optional[str] = None,
+) -> bool:
+    """Write an addressed task-tree message without forging owner provenance."""
+
+    if provenance not in {"ancestor_task", "peer_via_ancestor", "system"}:
+        return False
+    path = _mailbox_path(drive_root, task_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "msg_id": msg_id or uuid.uuid4().hex,
+        "ts": utc_now_iso(),
+        "text": str(text or ""),
+        "kind": KIND_TASK_MESSAGE,
+        "provenance": provenance,
+        "source_task_id": str(source_task_id or ""),
+    }
+    if relayed_from_task_id:
+        entry["relayed_from_task_id"] = str(relayed_from_task_id)
+    try:
+        return bool(append_jsonl(path, entry))
+    except Exception:
+        log.warning("Failed to write task message for task %s", task_id, exc_info=True)
+        return False
+
+
+def deliver_task_message(
+    entry: Dict[str, Any], task_id: str, event_queue: Any, append_message: Any,
+) -> None:
+    """Render typed provenance and publish the corresponding worker event."""
+
+    provenance = str(entry.get("provenance") or "ancestor_task")
+    source = str(entry.get("source_task_id") or "unknown")
+    relayed = str(entry.get("relayed_from_task_id") or "")
+    if provenance == "peer_via_ancestor" and relayed:
+        prefix = f"[Message from task {relayed}, relayed by ancestor {source}]"
+    elif provenance == "system":
+        prefix = "[System task message]"
+    else:
+        prefix = f"[Message from ancestor task {source}]"
+    append_message(f"{prefix}\n{entry.get('text') or ''}")
+    if event_queue is not None:
+        try:
+            event_queue.put_nowait({
+                "type": "task_message_injected", "task_id": task_id,
+                "source_task_id": source, "provenance": provenance,
+            })
+        except Exception:
+            pass
 
 
 def revoke_owner_control(
@@ -144,6 +203,10 @@ def drain_owner_entries(
                 # dead-wire class this sprint closes).
                 if isinstance(entry.get("client_surface"), dict) and entry.get("client_surface"):
                     drained["client_surface"] = dict(entry["client_surface"])
+                if kind == KIND_TASK_MESSAGE:
+                    drained["provenance"] = str(entry.get("provenance") or "ancestor_task")
+                    drained["source_task_id"] = str(entry.get("source_task_id") or "")
+                    drained["relayed_from_task_id"] = str(entry.get("relayed_from_task_id") or "")
                 entries.append(drained)
         return entries
     except Exception:
