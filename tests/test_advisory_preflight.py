@@ -19,6 +19,13 @@ from ouroboros.tools.claude_advisory_review import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _explicit_enabled_advisory(monkeypatch):
+    """These tests exercise the advisory path, independent of ambient review slots."""
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
+    monkeypatch.delenv("OUROBOROS_ADVISORY_REVIEW_ROUTE", raising=False)
+
+
 def _make_agent_repo(tmp_path: pathlib.Path) -> pathlib.Path:
     """Create a minimal fake agent-repo layout (ouroboros/__init__.py present)."""
     (tmp_path / "ouroboros").mkdir()
