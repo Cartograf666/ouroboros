@@ -938,10 +938,9 @@ class CapabilityDelta:
     compared in the same place. This record is that place, and
     ``resolve_subagent_dispatch`` is its only author.
 
-    The effort axis names a DERIVED value, not a request: since v6.87.28 no parent
-    can ask for an effort, so what a route's learned band is measured against is the
-    effort ``config.resolve_effort`` gives this task type. A route that caps it below
-    the owner's own setting is still a reduction, and still the owner's business.
+    The effort axis names the scheduling-derived pre-wire value, not a physical
+    provider result. Exact route/request adaptation happens later and is disclosed
+    by ``usage.request_wire`` rather than authored into this scheduling record.
     """
 
     requested_lane: str = "auto"
@@ -1001,10 +1000,9 @@ def capability_delta_disclosures(delta: Mapping[str, Any]) -> List[str]:
     parts: List[str] = []
     if lane_is_weaker(str(delta.get("effective_lane") or ""), str(delta.get("resolved_lane") or "")):
         parts.append(f"model_lane {lane_delta_phrase(delta)}")
-    # RANK, not inequality: `effective_effort` is the whole learned band, so a route
-    # with a floor can land ABOVE the derived effort, and "runs BELOW what was asked
-    # for — effort none->low" is a false alarm the moment any OTHER axis puts this
-    # delta into a reduction.
+    # Keep rank-based rendering for older durable deltas. The current resolver writes
+    # the same pre-wire derived/effective effort; physical adaptation is disclosed by
+    # usage.request_wire instead of this scheduling record.
     from ouroboros.config import effort_rank
 
     derived = str(delta.get("derived_effort") or "")
@@ -1160,9 +1158,8 @@ def resolve_subagent_dispatch(
     """THE resolution point: where power, effort, route, profile and executor meet.
 
     It runs at DISPATCH, from the child's durable record, because that is the last
-    moment at which the answer is still true. Two of its inputs are live — whether a
-    harness route exists, and what band that route's model has learned — and a queued
-    child can wait out a whole outage. Resolving at schedule time produced a record
+    moment at which route availability is still current; a queued child can wait out
+    a whole outage. Resolving at schedule time produced a record
     that claimed an answer about a moment that had already passed; resolving twice
     produced two records that disagreed about the same child.
 
@@ -1264,10 +1261,8 @@ def resolve_subagent_dispatch(
     constraint = task.get("task_constraint") if isinstance(task.get("task_constraint"), dict) else {}
     return SubagentDispatch(
         lane=lane,
-        # The DERIVED effort, not the clamped one. The dispatcher re-clamps per
-        # model on every call, and a fallback route with a wider band must not
-        # inherit this route's ceiling through the stored value; what this route
-        # will really run is reported by the delta.
+        # Pass the scheduling-derived effort unchanged. Each physical call owns any
+        # exact route/request adaptation and reports it through usage.request_wire.
         effort=derived_effort,
         executor=executor,
         route=route if executor == "harness" else "",

@@ -1,8 +1,7 @@
 """Provider-neutral, same-route request-wire recovery driver.
 
-This leaf owns request-shape adaptation, never provider/model/API choice. Reactive
-actions remain pending until the exact physical attempt succeeds; only then may the frozen
-store receipt make them durable.
+This leaf owns request-shape adaptation, never provider/model/API choice. Learnable
+actions stay pending until exact success; task-local degraded-rung repairs never persist.
 """
 
 from __future__ import annotations

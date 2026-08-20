@@ -362,11 +362,9 @@ def get_effort_ceiling(drive_root: Any, fingerprint: str) -> str:
 # Historical VALUE-TOO-LOW mirror of effort_ceilings. Some endpoints make
 # reasoning mandatory, but current adaptation is exact-route, success-confirmed
 # request-wire evidence. These model-global rows remain diagnostic/read-compatible.
-# LIFECYCLE ASYMMETRY (deliberate): ceilings are sticky (a model's max supported
-# effort is a stable model property), floors EXPIRE like rejected_params —
-# whether reasoning can be disabled is provider POLICY that changes; if the
-# provider later allows disabling it again, behavior self-heals after the TTL at
-# the cost of one reactive 400. Fail-open everywhere.
+# Historical lifecycle remains readable: ceilings are sticky, while floors expire
+# like rejected_params. Since normal dispatch ignores this namespace, expiry changes
+# diagnostic state only; exact-route request-wire evidence owns runtime self-healing.
 
 _EFFORT_FLOORS_TTL_SEC = 14 * 24 * 3600.0
 
