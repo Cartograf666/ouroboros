@@ -1378,7 +1378,7 @@ def test_owner_scope_review_floor_deprecation_notice_crosses_the_wire(tmp_path, 
 def test_login_job_browser_envelopes_keep_their_required_discriminators():
     """The recovery UI cannot classify a success without job or a problem
     without error; operation-specific metadata remains additive."""
-    from typing import get_origin, get_type_hints
+    from typing import get_args, get_origin, get_type_hints
 
     from typing_extensions import Required
 
@@ -1407,6 +1407,9 @@ def test_login_job_browser_envelopes_keep_their_required_discriminators():
         "code",
         "required_actions",
     }
+    assert get_args(success["setup_login_source"]) == (
+        "per_harness", "setup_job_admission", "legacy_global_operation",
+    )
     assert all(get_origin(annotation) is not Required
                for key, annotation in success.items() if key != "job")
     assert all(get_origin(annotation) is not Required

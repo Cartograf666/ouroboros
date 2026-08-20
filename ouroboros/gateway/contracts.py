@@ -986,7 +986,9 @@ class ClaudexorLoginJobResponse(TypedDict, total=False):
     # create-only metadata
     job_id: str
     disclosure_native: bool
-    setup_login_source: Literal["per_harness", "legacy_global_operation"]
+    setup_login_source: Literal[
+        "per_harness", "setup_job_admission", "legacy_global_operation"
+    ]
     attach_command: str
     attach_shell: Literal["posix", "powershell"]
     # input-only compatibility bit

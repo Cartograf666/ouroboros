@@ -31,9 +31,10 @@ wherever the engine can host the flow itself — codex device-code today, and
 other harnesses according to the engine's per-harness, host-effective
 ``setupLogin`` fact: the job snapshot's transient overlay carries the sign-in
 link and supported input. Only a legacy row that truly omits that field may
-consult the old engine-global operations catalog. Explicit null or malformed
-current evidence never falls back. ``external_terminal`` produces a labelled,
-platform-correct copy-paste command for the USER'S OWN terminal. Before any
+consult the old engine-global operations catalog. Explicit null delegates
+support to the typed setup-create admission; malformed current evidence never
+falls back. ``external_terminal`` produces a labelled, platform-correct
+copy-paste command for the USER'S OWN terminal. Before any
 profile/job mutation, the serving handshake's version/build/entry selects the
 preserved packaged Node + runtime entry and that entry's fresh probe must
 advertise ``setup_attach``; old probes without the additive role are honestly
@@ -84,9 +85,9 @@ _LOGIN_INPUT_OPERATION_ID = "post:setup.jobs.id.input"
 
 # Current engines publish the EFFECTIVE setup-login choice on each harness
 # row. Keep the four wire states separate: omission is the one legacy signal;
-# explicit null is an authoritative "not supported"; a valid object selects a
-# transport; and a malformed/current row is a capability gap, never permission
-# to guess from the old engine-global operation catalog.
+# explicit null requires the authoritative setup-create admission; a valid
+# object selects a transport; and a malformed/current row is a capability gap,
+# never permission to guess from the old engine-global operation catalog.
 _SETUP_LOGIN_ABSENT = "absent"
 _SETUP_LOGIN_NULL = "null"
 _SETUP_LOGIN_OBJECT = "object"
@@ -559,6 +560,10 @@ def _login_job_response(job: Dict[str, Any], **metadata: Any) -> Dict[str, Any]:
     return out
 
 
+
+
+
+
 def _login_create(body: Dict[str, Any]) -> Dict[str, Any]:
     from ouroboros.claudexor_daemon import (
         attach_login_command,
@@ -583,20 +588,28 @@ def _login_create(body: Dict[str, Any]) -> Dict[str, Any]:
     with ensure_owned_gateway() as gateway:
         # The current contract is per HARNESS and per HOST. Only an exact row
         # whose setupLogin key is genuinely absent may use the old global
-        # operation signal; explicit null and malformed current evidence do
-        # not authorize a fallback or any profile/setup mutation.
+        # operation signal. Explicit null delegates support to the typed
+        # setup/profile admission; malformed current evidence authorizes no
+        # profile/setup mutation.
         capability_state, setup_mode = _harness_setup_login(
             gateway.agent_capabilities(), harness)
         setup_login_source = "per_harness"
         if capability_state == _SETUP_LOGIN_NULL:
-            raise ValueError("this agent does not support subscription sign-in")
-        if capability_state == _SETUP_LOGIN_MALFORMED:
+            # A current null is ambiguous while the vendor CLI is absent: the
+            # authoritative setup-create boundary distinguishes an admitted
+            # managed-login family from an unsupported harness before job
+            # mutation. Keep an omitted transport omitted so that boundary,
+            # and the one exact post-install retry, can recompute the real mode.
+            setup_login_source = "setup_job_admission"
+            disclosure_native = not explicit_external_transport
+        elif capability_state == _SETUP_LOGIN_MALFORMED:
             raise ClaudexorUnavailable(
                 "setup_login_capability_malformed",
                 "the agent service did not publish a valid setup-login capability "
                 f"for {harness}",
+                status_code=503,
             )
-        if capability_state == _SETUP_LOGIN_OBJECT:
+        elif capability_state == _SETUP_LOGIN_OBJECT:
             if explicit_external_transport:
                 # The card's explicit recovery action is allowed to select the
                 # existing client_pty transport even when the host normally
@@ -658,15 +671,31 @@ def _login_create(body: Dict[str, Any]) -> Dict[str, Any]:
                     # or transport failure still becomes the proxy's honest 503.
                     exc.login_profile_verdict = True
                     raise
-        try:
-            job = gateway.setup_job_create(request_body)
-        except ClaudexorUnavailable as exc:
-            # Mark WHERE the daemon answered: only the job-CREATE boundary may
-            # pass its frozen 400/409 or terminal-probe 503 verdict through.
-            # The same status during handshake/discovery is engine/protocol
-            # trouble and stays the honest generic 503.
-            exc.login_create_verdict = True
-            raise
+
+        def _create() -> Dict[str, Any]:
+            try:
+                return gateway.setup_job_create(request_body)
+            except ClaudexorUnavailable as exc:
+                # Mark WHERE the daemon answered: only a 400 from the job CREATE
+                # is a verdict about the requested login shape (the pass-through
+                # the endpoint forwards). A handshake or discovery 400 earlier in
+                # this block is engine/protocol trouble and stays the honest 503.
+                exc.login_create_verdict = True
+                raise
+
+        job = _create()
+        # Connect is the owner's consent. If the exact pinned engine answers
+        # this FIRST create with its structural pre-command missing-binary
+        # terminal job, install that vendor CLI once and create the job once
+        # more; a second refusal is returned, never looped.
+        from ouroboros.claudexor_daemon import (
+            install_missing_harness_cli,
+            is_immediate_missing_cli_job,
+        )
+
+        if is_immediate_missing_cli_job(job, harness, gateway):
+            install_missing_harness_cli(harness)
+            job = _create()
     job_id = str(job.get("id") or job.get("jobId") or "")
     metadata: Dict[str, Any] = {
         "job_id": job_id,

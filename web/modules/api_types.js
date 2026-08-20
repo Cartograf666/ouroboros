@@ -723,7 +723,7 @@
  * @property {Object=} deviceCode
  * @property {string=} job_id
  * @property {boolean=} disclosure_native
- * @property {('per_harness'|'legacy_global_operation')=} setup_login_source
+ * @property {('per_harness'|'setup_job_admission'|'legacy_global_operation')=} setup_login_source
  * Present only after the exact serving package advertises setup_attach.
  * @property {string=} attach_command
  * @property {('posix'|'powershell')=} attach_shell
