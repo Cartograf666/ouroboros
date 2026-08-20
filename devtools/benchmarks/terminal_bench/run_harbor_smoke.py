@@ -21,7 +21,7 @@ from devtools.benchmarks.common.manifests import (
     write_json,
 )
 from devtools.benchmarks.common.model_slots import (
-    configured_subagents_snapshot,
+    fixed_model_actor_snapshot,
 )
 from devtools.benchmarks.common.result_index import task_result_row, write_result_index
 from devtools.benchmarks.common.run_roots import (
@@ -144,8 +144,9 @@ def _harbor_task_outcomes(result_path: pathlib.Path) -> list[dict[str, object]]:
     return sorted(outcomes, key=lambda item: str(item["instance_id"]))
 
 
-def _harbor_child_env(repo_root: pathlib.Path) -> dict[str, str]:
-    env = dict(os.environ)
+def _harbor_child_env(repo_root: pathlib.Path,
+                      pinned_env: dict[str, str]) -> dict[str, str]:
+    env = dict(pinned_env)
     existing = env.get("PYTHONPATH", "")
     entries = [str(repo_root)]
     if existing:
@@ -179,6 +180,8 @@ def main() -> int:
     args = parser.parse_args()
 
     repo_root = repo_root_from_devtools()
+    child_env = dict(os.environ)
+    fixed_actor = fixed_model_actor_snapshot(args.model, target=child_env)
     settings_path = pathlib.Path(args.settings_path).expanduser() if args.settings_path else default_settings_path()
     run_root = assert_outside_repo(
         pathlib.Path(args.run_root).expanduser() if args.run_root else default_run_root("terminal_bench"),
@@ -247,9 +250,8 @@ def main() -> int:
         "OUROBOROS_MODEL_LIGHT": effective_light,
         "OUROBOROS_MODEL_FALLBACKS": args.model,
     }
-    manifest["available_subagents"] = configured_subagents_snapshot(
-        exact_model=args.model,
-    )
+    manifest["available_subagents"] = fixed_actor["available_subagents"]
+    manifest["harness"]["fixed_model_actor"] = fixed_actor
     # Durable before Harbor can spend: no ambient settings model/Heavy can survive.
     write_json(manifest_path, manifest)
     if not actual_include_filters:
@@ -267,7 +269,11 @@ def main() -> int:
         if args.execute:
             before_results = set(_harbor_results(run_root))
             try:
-                completed = subprocess.run(cmd, cwd=repo_root, env=_harbor_child_env(repo_root))
+                completed = subprocess.run(
+                    cmd,
+                    cwd=repo_root,
+                    env=_harbor_child_env(repo_root, child_env),
+                )
             except Exception as exc:
                 harbor_result_error = f"{type(exc).__name__}: {exc}"
                 status = "harness_failed"

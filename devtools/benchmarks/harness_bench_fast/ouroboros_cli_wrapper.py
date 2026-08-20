@@ -33,8 +33,7 @@ if str(DEFAULT_REPO) not in sys.path:
     sys.path.insert(0, str(DEFAULT_REPO))
 
 from devtools.benchmarks.common.model_slots import (  # noqa: E402
-    configured_subagents_snapshot,
-    pin_single_model,
+    fixed_model_actor_snapshot,
 )
 from devtools.benchmarks.common.result_index import runtime_terminal_disclosure  # noqa: E402
 
@@ -156,9 +155,7 @@ def main(argv: list[str] | None = None) -> int:
     started = time.time()
 
     env = os.environ.copy()
-    fixed_model_env: dict[str, str] = {}
-    pin_single_model(args.model, target=fixed_model_env)
-    env.update(fixed_model_env)
+    fixed_actor = fixed_model_actor_snapshot(args.model, target=env)
     env.update(
         {
             "OUROBOROS_REPO_DIR": str(repo_dir),
@@ -228,14 +225,9 @@ def main(argv: list[str] | None = None) -> int:
             "data_dir": str(data_dir),
             "settings_path": str(settings_path),
             "model": args.model,
-            "model_slots": {
-                "OUROBOROS_MODEL": args.model,
-                "OUROBOROS_MODEL_LIGHT": args.model,
-                "OUROBOROS_MODEL_FALLBACKS": args.model,
-            },
-            "available_subagents": configured_subagents_snapshot(
-                exact_model=args.model,
-            ),
+            "model_slots": fixed_actor["model_slots"],
+            "available_subagents": fixed_actor["available_subagents"],
+            "fixed_model_actor": fixed_actor,
             "memory_mode": args.memory_mode,
             "returncode": completed.returncode,
             "startup_retries": startup_retries,

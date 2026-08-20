@@ -408,3 +408,33 @@ def pin_single_model(
         sink["OUROBOROS_EFFORT_REVIEW"] = review_effort
         sink["OUROBOROS_EFFORT_SCOPE_REVIEW"] = review_effort
     return sink
+
+
+def fixed_model_actor_snapshot(
+    model: str,
+    *,
+    review_slots: int = 1,
+    review_effort: str = "",
+    target: Optional[MutableMapping[str, str]] = None,
+) -> dict[str, Any]:
+    """Pin one execution mapping and return its complete manifest-safe actor.
+
+    Callers pass the SAME mapping they will hand to the subprocess.  This closes
+    the provenance gap where launchers recorded three model strings while ambient
+    local/reviewer routes still governed execution.  A fresh mapping is used only
+    when a root manifest needs the contract but a child wrapper owns execution.
+    """
+    sink: MutableMapping[str, str] = {} if target is None else target
+    pin_single_model(
+        model,
+        review_slots=review_slots,
+        review_effort=review_effort,
+        target=sink,
+    )
+    snapshot = runtime_actor_snapshot(sink, expected_model=model)
+    if snapshot["mismatches"]:
+        raise RuntimeError(
+            "fixed-model actor compiler produced an inconsistent contract: "
+            + "; ".join(str(item) for item in snapshot["mismatches"])
+        )
+    return snapshot

@@ -13,6 +13,7 @@ from devtools.benchmarks.common.manifests import MODEL_SLOT_KEYS, model_slot_sna
 from devtools.benchmarks.common.model_slots import (
     configured_subagents_snapshot,
     disabled_subagents_setting,
+    fixed_model_actor_snapshot,
     pin_single_model,
     runtime_actor_snapshot,
     single_model_slot_snapshot,
@@ -111,7 +112,7 @@ def test_pin_single_model_replaces_legacy_heavy_and_prior_actor_list():
         }),
         "OUROBOROS_SUBAGENTS": single_model_subagents_setting("decoy/actor"),
     }
-    pin_single_model("openai/gpt-5.5", target=target)
+    snapshot = fixed_model_actor_snapshot("openai/gpt-5.5", target=target)
     assert "OUROBOROS_MODEL_HEAVY" not in target
     assert "USE_LOCAL_HEAVY" not in target
     assert _only_target(target["OUROBOROS_SUBAGENTS"]) == "openai/gpt-5.5"
@@ -125,6 +126,8 @@ def test_pin_single_model_replaces_legacy_heavy_and_prior_actor_list():
     assert [row.target_id for row in reviewers.scope] == ["openai/gpt-5.5"]
     assert all(not row.is_session for row in (*reviewers.triad, *reviewers.scope))
     assert reviewers.advisory.enabled is False
+    assert snapshot["mismatches"] == []
+    assert snapshot["reviewer_slots"]["advisory"]["enabled"] is False
 
 
 def test_pin_single_model_preserves_canonical_local_route_semantics():
@@ -601,9 +604,35 @@ def test_harness_and_harbor_manifests_use_exact_cli_model(tmp_path, monkeypatch)
     )
     monkeypatch.setenv("OUROBOROS_MODEL", "decoy/ambient")
     monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "decoy/ambient-heavy")
+    monkeypatch.setenv("CLAUDE_CODE_MODEL", "foreign-sdk-model")
+    monkeypatch.setenv(REVIEWER_SLOTS_ENV, json.dumps({
+        "triad": [{"slot_id": "foreign-t", "route": {
+            "kind": "agent_session", "target_id": "codex=gpt-5.6-sol"}}],
+        "scope": [{"slot_id": "foreign-s", "route": {
+            "kind": "api_chat", "target_id": "foreign/scope"}}],
+        "advisory": {"enabled": True, "route": {
+            "kind": "api_chat", "target_id": "foreign-advisory"}},
+    }))
+    for key in ("USE_LOCAL_MAIN", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK",
+                "USE_LOCAL_CONSCIOUSNESS"):
+        monkeypatch.setenv(key, "true")
+
+    def assert_complete_actor(manifest):
+        actor = manifest["harness"]["fixed_model_actor"]
+        assert actor["mismatches"] == []
+        assert not any(actor["local_routes"].values())
+        assert actor["reviewer_slots"]["advisory"]["enabled"] is False
+        assert {row["route"]["target_id"] for row in actor["reviewer_slots"]["triad"]} == {measured}
 
     hbf_root = tmp_path / "hbf"
-    monkeypatch.setattr(hbf, "_read_task_ids", lambda *_a, **_k: ["task_1"])
+
+    def discover_hbf(*_a, **_k):
+        assert_complete_actor(json.loads(
+            (hbf_root / "run_manifest.json").read_text(encoding="utf-8")
+        ))
+        return ["task_1"]
+
+    monkeypatch.setattr(hbf, "_read_task_ids", discover_hbf)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -628,6 +657,7 @@ def test_harness_and_harbor_manifests_use_exact_cli_model(tmp_path, monkeypatch)
     assert set(hbf_manifest["model_slots"].values()) == {measured}
     assert "OUROBOROS_MODEL_HEAVY" not in hbf_manifest["model_slots"]
     assert _only_target(json.dumps(hbf_manifest["available_subagents"])) == measured
+    assert_complete_actor(hbf_manifest)
 
     smoke_root = tmp_path / "smoke"
     monkeypatch.setattr(smoke, "repo_root_from_devtools", lambda: REPO)
@@ -652,6 +682,7 @@ def test_harness_and_harbor_manifests_use_exact_cli_model(tmp_path, monkeypatch)
     assert set(smoke_manifest["model_slots"].values()) == {measured}
     assert "OUROBOROS_MODEL_HEAVY" not in smoke_manifest["model_slots"]
     assert _only_target(json.dumps(smoke_manifest["available_subagents"])) == measured
+    assert_complete_actor(smoke_manifest)
 
 
 def test_swe_pro_derived_profile_overrides_actor_without_heavy(tmp_path):

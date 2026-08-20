@@ -1007,6 +1007,36 @@ def _attempt_manifests(run_dir):
             for d in _attempt_dirs(run_dir)]
 
 
+def test_target_actor_is_durable_before_claim_and_survives_claim_crash(
+        tmp_path, monkeypatch):
+    from devtools.benchmarks.osworld import run_step_agent
+
+    claims = tmp_path / "claims"
+    rcb, _env = _cu_bridge_stubs(monkeypatch, tmp_path)
+    argv, results = _cu_bridge_argv(tmp_path, claims)
+    monkeypatch.setattr(sys, "argv", argv)
+    observed = {"claim": False}
+
+    def crash_at_first_external_boundary(*_args, **_kwargs):
+        manifests = _attempt_manifests(results / "chrome" / "abc")
+        assert len(manifests) == 1
+        actor = manifests[0]["harness"]["target_runtime_actor"]
+        assert actor["mismatches"] == []
+        assert not any(actor["local_routes"].values())
+        assert actor["reviewer_slots"]["advisory"]["enabled"] is False
+        assert manifests[0]["available_subagents"] == actor["available_subagents"]
+        observed["claim"] = True
+        raise RuntimeError("synthetic claim-boundary crash")
+
+    monkeypatch.setattr(run_step_agent, "acquire_task_claim", crash_at_first_external_boundary)
+    assert rcb.main() == 1
+
+    assert observed["claim"] is True
+    final = _attempt_manifests(results / "chrome" / "abc")[0]
+    assert final["extra"]["outcome"] == "adapter_error"
+    assert final["harness"]["target_runtime_actor"]["reviewer_slots"]
+
+
 def test_two_overlapping_attempts_never_share_one_canonical_record(tmp_path, monkeypatch, capsys):
     """The claim is only half the protection if both attempts still write the same files.
 

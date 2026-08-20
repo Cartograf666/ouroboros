@@ -286,7 +286,7 @@ def test_harness_bench_fast_wrapper_builds_ouroboros_run_command():
     ).read_text(encoding="utf-8")
     for token in ('"run",', '"--memory-mode",', '"--quiet",', '"--result-json-out",', '"--actor-id",'):
         assert token in src, token
-    assert "pin_single_model(args.model, target=fixed_model_env)" in src
+    assert "fixed_model_actor_snapshot(args.model, target=env)\n" in src
     assert '"OUROBOROS_MODEL_HEAVY": args.model' not in src
     assert "OUROBOROS_MODEL_CODE" not in src
 

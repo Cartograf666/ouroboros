@@ -17,6 +17,7 @@ import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
+from typing import Any
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
@@ -30,7 +31,7 @@ from devtools.benchmarks.common.manifests import (
 )
 from devtools.benchmarks.common.model_slots import (
     configured_subagents_snapshot,
-    pin_single_model,
+    fixed_model_actor_snapshot,
 )
 from devtools.benchmarks.common.run_roots import (
     default_settings_path,
@@ -78,7 +79,8 @@ _ALL_MODEL_SLOT_KEYS = (
 )
 
 
-def apply_all_model(model: str, review_slots: int = 1, review_effort: str = "low") -> None:
+def apply_all_model(model: str, review_slots: int = 1,
+                    review_effort: str = "low") -> dict[str, Any]:
     """Force every FORWARDED model slot to ``model`` for a single-model run. Mutates only this
     process's env, which propagates to the harbor subprocess and the in-container adapter; it does
     NOT edit repo config defaults. The container's internal Consciousness role defaults to Main,
@@ -91,10 +93,11 @@ def apply_all_model(model: str, review_slots: int = 1, review_effort: str = "low
     This is a BENCHMARK setting, NOT a claim that the review subsystem got more reliable
     (single_reviewer_no_diversity stays loud). EFFORT_SCOPE_REVIEW is set too for completeness
     ("там и там"); scope review does not fire on a terminal-bench task (it is a commit-time gate)."""
-    pin_single_model(
+    return fixed_model_actor_snapshot(
         model,
         review_slots=review_slots,
         review_effort=review_effort,
+        target=os.environ,
     )
 
 
@@ -958,8 +961,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
 
+    fixed_actor: dict[str, Any] = {}
     if args.all_model:
-        apply_all_model(args.all_model, review_slots=args.review_slots, review_effort=args.review_effort)
+        fixed_actor = apply_all_model(
+            args.all_model,
+            review_slots=args.review_slots,
+            review_effort=args.review_effort,
+        )
         args.model = args.all_model
         args.light_model = args.all_model
     if not args.model:
@@ -1085,6 +1093,15 @@ def main(argv: list[str] | None = None) -> int:
             ),
         },
     )
+    if fixed_actor:
+        manifest["model_slots"] = {
+            key: value for key, value in fixed_actor["model_slots"].items()
+            if key not in _UNFORWARDED_MODEL_SLOT_KEYS
+        }
+        manifest["available_subagents"] = fixed_actor["available_subagents"]
+        manifest["harness"]["fixed_model_actor"] = fixed_actor
+        # Durable before job-config discovery/version probes and the Harbor subprocess.
+        write_json(manifest_path, manifest)
     with finalize_run_manifest(manifest_path, manifest) as final:
         job_dir.mkdir(parents=True, exist_ok=True)
         metadata_path.write_text(
