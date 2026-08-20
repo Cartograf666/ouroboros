@@ -64,6 +64,109 @@ def test_configured_api_actor_is_requested_native_without_fallback_note(monkeypa
     assert dispatch_executor_note(dispatch.executor_resolution, dispatch.lane) == ""
 
 
+def test_configured_api_actor_without_credentials_refuses_with_alternatives(monkeypatch):
+    from ouroboros.subagent_dispatch_notes import executor_blocked_outcome
+    from ouroboros.subagent_runtime import resolve_configured_actor_dispatch
+
+    monkeypatch.setattr(
+        "ouroboros.provider_models.model_has_credentials",
+        lambda _model: False,
+    )
+    monkeypatch.setattr(
+        "ouroboros.subagent_runtime.current_subagent_alternatives",
+        lambda excluded: [{
+            "subagent_id": "session-builder",
+            "name": "Session builder",
+            "route_kind": "agent_session",
+            "availability": "check_at_dispatch",
+        }] if excluded == "api-builder" else [],
+    )
+    snapshot = _snapshot(_settings(_api_row(), _session_row()), "api-builder")
+    dispatch = resolve_configured_actor_dispatch({
+        "id": "child1",
+        "type": "task",
+        "configured_subagent": snapshot,
+        "task_constraint": {},
+    }, task_type="task")
+
+    assert dispatch.blocked is True
+    assert dispatch.executor == "blocked"
+    assert dispatch.route == ""
+    assert dispatch.executor_resolution.reason == "credentials_unavailable"
+    assert dispatch.availability == {
+        "observed_at": dispatch.availability["observed_at"],
+        "status": "credentials_unavailable",
+        "reason": "credentials_unavailable",
+        "route_kind": "api_model",
+        "selected_subagent_id": "api-builder",
+        "alternatives": [{
+            "subagent_id": "session-builder",
+            "name": "Session builder",
+            "route_kind": "agent_session",
+            "availability": "check_at_dispatch",
+        }],
+        "host_fallback": False,
+    }
+    text, usage = executor_blocked_outcome(
+        dispatch.executor_resolution,
+        availability=dispatch.availability,
+    )
+    assert "selected API-model actor has no usable credentials" in text
+    assert "session-builder" in text
+    assert "delegated substrate" not in text
+    assert "executor='harness'" not in text
+    assert usage["reason_code"] == "subagent_executor_unavailable"
+    assert usage["unavailable_reason"] == "credentials_unavailable"
+    assert usage["host_fallback"] is False
+
+
+def test_uncredentialed_api_actor_stops_before_the_llm_loop(monkeypatch, tmp_path):
+    from ouroboros import agent as agent_module
+    from ouroboros.agent import Env, OuroborosAgent
+
+    repo, drive = tmp_path / "repo", tmp_path / "drive"
+    repo.mkdir()
+    drive.mkdir()
+    monkeypatch.setattr(
+        "ouroboros.provider_models.model_has_credentials", lambda _model: False,
+    )
+    monkeypatch.setattr(
+        "ouroboros.subagent_runtime.current_subagent_alternatives",
+        lambda excluded: [{"subagent_id": "session-builder"}]
+        if excluded == "api-builder" else [],
+    )
+    monkeypatch.setattr(OuroborosAgent, "_log_worker_boot_once", lambda self: None)
+    monkeypatch.setattr(agent_module, "build_llm_messages", lambda **_kwargs: ([], {}))
+    calls = []
+    monkeypatch.setattr(
+        agent_module,
+        "run_llm_loop",
+        lambda **kwargs: calls.append(kwargs) or ("unexpected", {}, {}),
+    )
+
+    snapshot = _snapshot(_settings(_api_row(), _session_row()), "api-builder")
+    agent = OuroborosAgent(Env(repo_dir=repo, drive_root=drive))
+    events = agent._handle_task_scoped({
+        "id": "api-child",
+        "type": "task",
+        "chat_id": 1,
+        "text": "Use the exact API actor",
+        "delegation_role": "subagent",
+        "configured_subagent": snapshot,
+        "task_constraint": {},
+        "drive_root": str(drive),
+        "budget_drive_root": str(drive),
+    })
+
+    assert calls == []
+    result = json.loads((drive / "task_results" / "api-child.json").read_text())
+    assert result["outcome_axes"]["execution"]["status"] == "infra_failed"
+    assert result["reason_code"] == "subagent_executor_unavailable"
+    assert result["subagent_availability"]["host_fallback"] is False
+    assert "session-builder" in result["result"]
+    assert any(event.get("type") == "task_done" for event in events)
+
+
 def test_context_build_exception_propagates_after_exact_leaf_bootstrap(monkeypatch, tmp_path):
     from ouroboros import agent as agent_module
     import ouroboros.claudexor_daemon as daemon

@@ -523,12 +523,16 @@ def _enqueue_through_supervisor(tmp_path, monkeypatch, *, parent_lane: str = "",
                 "ouroboros.subagents.route_health",
                 lambda *_args, **_kwargs: ("configured_session_route_unavailable", ""),
             )
-        elif legacy_lane == "light":
-            target = str(config.get_light_model() or config.get_main_model())
-        elif legacy_lane == "heavy":
-            target = str(config.get_heavy_model() or config.get_main_model())
         else:
-            target = str(os.environ.get("OUROBOROS_MODEL") or "provider::main")
+            monkeypatch.setattr(
+                "ouroboros.provider_models.model_has_credentials", lambda _model: True,
+            )
+            if legacy_lane == "light":
+                target = str(config.get_light_model() or config.get_main_model())
+            elif legacy_lane == "heavy":
+                target = str(config.get_heavy_model() or config.get_main_model())
+            else:
+                target = str(os.environ.get("OUROBOROS_MODEL") or "provider::main")
         schedule_kwargs["subagent_id"] = configure_test_subagent(
             monkeypatch,
             subagent_id="session-actor" if is_session else "api-actor",

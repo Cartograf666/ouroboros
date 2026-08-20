@@ -336,29 +336,41 @@ def resolve_configured_actor_dispatch(
         model = route_target[:-8].strip() if use_local else route_target
         model_identity = normalize_model_identity(route_target)
         available = bool(model_has_credentials(route_target))
+        unavailable = "" if available else "credentials_unavailable"
+        executor = "native" if available else "blocked"
         lane = dataclass_replace(lane, model=model, use_local_model=use_local)
         availability = {
             "observed_at": observed_at,
             "status": "ready" if available else "credentials_unavailable",
+            "reason": unavailable,
             "route_kind": route_kind,
+            "selected_subagent_id": str(snapshot.get("selected_subagent_id") or ""),
+            "alternatives": (
+                [] if available else current_subagent_alternatives(
+                    str(snapshot.get("selected_subagent_id") or "")
+                )
+            ),
+            "host_fallback": False,
         }
         effective_effort = _route_effort(model_identity, derived_effort)
-        reasons = (
-            (f"route_effort_ceiling={effective_effort}",)
-            if effort_rank(effective_effort) < effort_rank(derived_effort) else ()
-        )
+        reasons = []
+        if effort_rank(effective_effort) < effort_rank(derived_effort):
+            reasons.append(f"route_effort_ceiling={effective_effort}")
+        if unavailable:
+            reasons.append(unavailable)
         delta = CapabilityDelta(
             derived_effort=derived_effort,
             effective_effort=effective_effort,
-            requested_executor="native", effective_executor="native",
+            requested_executor="native", effective_executor=executor,
             reason=derive_capability_reason(reasons), reduced=bool(reasons),
-            reduction_reasons=reasons,
+            reduction_reasons=tuple(reasons),
         )
         return SubagentDispatch(
-            lane=lane, effort=derived_effort, executor="native", route=route_target,
+            lane=lane, effort=derived_effort, executor=executor,
+            route=route_target if available else "",
             profile=profile, delta=delta,
             executor_resolution=SubagentExecutorResolution(
-                "native", "native", reason="requested_native",
+                "native", executor, reason=unavailable or "requested_native",
             ),
             availability=availability,
         )

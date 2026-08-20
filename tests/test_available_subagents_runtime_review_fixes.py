@@ -338,6 +338,9 @@ def test_configured_actor_effort_ceiling_is_a_typed_reduction(
     nanny_model = f"openai/review-fix-{route_kind}"
     monkeypatch.setitem(LLMClient._EFFORT_CEILING_CACHE, nanny_model, "low")
     if route_kind == "api_model":
+        monkeypatch.setattr(
+            "ouroboros.provider_models.model_has_credentials", lambda _model: True,
+        )
         route = {"kind": route_kind, "target_id": f"openai::review-fix-{route_kind}"}
         cognitive = {}
     else:

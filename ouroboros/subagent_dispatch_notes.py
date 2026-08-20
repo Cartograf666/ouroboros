@@ -11,6 +11,7 @@ historical names, so every existing import and monkeypatch target keeps working
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, Optional, Tuple
 
 from ouroboros.subagents import SubagentExecutorResolution, SubagentLaneResolution
@@ -124,11 +125,36 @@ def dispatch_executor_note(decision: Optional[SubagentExecutorResolution],
     )
 
 
-def executor_blocked_outcome(decision: SubagentExecutorResolution) -> Tuple[str, Dict[str, Any]]:
+def executor_blocked_outcome(
+    decision: SubagentExecutorResolution,
+    *,
+    availability: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Dict[str, Any]]:
     """The terminal ``(text, usage)`` of a child that was pinned and could not run.
 
     Deliberately NOT a fallback: the task ends unrun and typed, having spent nothing.
     """
+    availability = availability if isinstance(availability, dict) else {}
+    if (
+        availability.get("route_kind") == "api_model"
+        or (decision.requested == "native" and decision.reason == "credentials_unavailable")
+    ):
+        alternatives = availability.get("alternatives")
+        alternatives = alternatives if isinstance(alternatives, list) else []
+        text = (
+            "⚠️ SUBAGENT_UNAVAILABLE: the selected API-model actor has no usable "
+            "credentials for its exact configured route. The task was NOT run and the "
+            "host did not substitute another model or substrate. Current configured "
+            "alternatives (not ranked): "
+            + json.dumps(alternatives, ensure_ascii=False, sort_keys=True)
+        )
+        return text, {
+            "execution_status": "infra_failed",
+            "reason_code": "subagent_executor_unavailable",
+            "unavailable_reason": "credentials_unavailable",
+            "alternatives": alternatives,
+            "host_fallback": False,
+        }
     if decision.reason in ("delegate_tools_invisible", "delegate_visibility_unverified"):
         # Q1A preflight (2026-08-10 amendments): the route is healthy but the
         # child's MATERIALIZED toolset does not carry the delegate verbs — or

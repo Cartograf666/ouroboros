@@ -121,7 +121,7 @@ def _record_executor_resolution(
                 log.debug("Failed to append subscription-window beacon", exc_info=True)
 
 
-def _blocked_executor_terminal(cap_info: Dict[str, Any]) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+def _blocked_executor_terminal(cap_info: Dict[str, Any], task: Optional[Dict[str, Any]] = None) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """p34's typed terminal for a blocked executor pin, rebuilt from the facts
     cap_info carried across the (ctx, messages, cap_info) seam. The placeholder
     method p2 kept for exactly this synthesis is deleted; this is the one body."""
@@ -130,7 +130,8 @@ def _blocked_executor_terminal(cap_info: Dict[str, Any]) -> Tuple[str, Dict[str,
         executor="blocked",
         reason=str(cap_info.get("executor_blocked_reason") or ""),
         reset_at=str(cap_info.get("executor_blocked_reset_at") or ""),
-    ))
+    ), availability=(task or {}).get("subagent_availability")
+        if isinstance((task or {}).get("subagent_availability"), dict) else {})
     return text, usage, {"reasoning_notes": ["subagent_executor_unavailable"], "tool_calls": []}
 
 
@@ -1124,7 +1125,7 @@ class OuroborosAgent:
             self._record_executor_facts(task)
 
             if str(cap_info.get("executor_blocked_reason") or ""):
-                text, usage, llm_trace = _blocked_executor_terminal(cap_info)
+                text, usage, llm_trace = _blocked_executor_terminal(cap_info, task)
             elif task_type_str == "deep_self_review":
                 # Deep self-review bypasses the tool loop.
                 try:
