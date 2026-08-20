@@ -147,11 +147,15 @@ def test_pin_loader_distinguishes_unpublished_from_partial(tmp_path):
     assert "missing fields" in str(excinfo.value)
 
 
-def test_tracked_pin_keeps_the_pre_cli_release_explicitly_daemon_only():
+def test_tracked_pin_names_a_cli_capable_release():
+    """The reviewed pin is the ONE selector of the delivered engine/CLI: the
+    tracked release must carry the CLI entrypoint or Connect's vendor-CLI
+    install path is structurally unreachable (the exact finding every reviewer
+    of this proposal converged on while the pin was still pre-CLI 3.6.0)."""
     pin = runtime.load_runtime_pin()
     assert pin is not None
-    assert pin.version == "3.6.0"
-    assert pin.cli_entrypoint is None
+    assert pin.version == "3.8.0"
+    assert pin.cli_entrypoint == "claudexor.bundle.cjs"
 
 
 def test_managed_runtime_layout_stays_inside_legacy_windows_path_budget(
@@ -345,10 +349,14 @@ def test_clean_source_install_fetches_exact_managed_node_in_the_same_ensure(
     assert metadata["version"] == NODE_VERSION
 
 
-def test_pre_cli_pin_reuses_legacy_node_metadata_without_download(tmp_path, monkeypatch):
+def test_daemon_only_resolution_reuses_legacy_node_metadata_without_download(tmp_path, monkeypatch):
+    """Schema-1 node metadata written by a pre-CLI install stays valid for the
+    DAEMON's resolution even under a CLI-capable pin: the executable-only node
+    keeps serving claudexord, while the CLI resolver separately demands the
+    schema-2 npm pair (its own tests below)."""
     _data_plane(monkeypatch, tmp_path)
     pin = runtime.load_runtime_pin()
-    assert pin is not None and pin.version == "3.6.0" and pin.cli_entrypoint is None
+    assert pin is not None and pin.cli_entrypoint is not None
     artifact = pin.node_artifacts["linux-x64"]
     root = runtime.managed_node_dir(pin, "linux-x64")
     node = root / "node-standalone" / "bin" / "node"
