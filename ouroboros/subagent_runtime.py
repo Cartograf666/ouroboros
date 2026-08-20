@@ -72,6 +72,71 @@ def effective_runtime_subagent_settings(settings: Mapping[str, Any]) -> dict[str
     return effective
 
 
+def model_visible_subagent_catalog(settings: Mapping[str, Any]) -> dict[str, Any]:
+    """Project saved, dispatchable rows without probing or ranking them."""
+
+    resolution = resolve_configured_subagents(settings)
+    config = resolution.config
+    if (
+        resolution.source in {SOURCE_INVALID, SOURCE_UNDECIDED}
+        or config is None
+        or not config.enabled
+        or not config.items
+    ):
+        return {}
+
+    rows: list[dict[str, Any]] = []
+    for row in config.items:
+        session = row.route.is_session
+        projected: dict[str, Any] = {
+            "subagent_id": row.subagent_id,
+            "name": row.name,
+            "recommended_use": row.recommended_use,
+            "route_class": "Agent session" if session else "API model",
+            "requested_effort": row.effort or "(not explicitly set)",
+        }
+        if session:
+            projected["requested_target"] = row.route.target_id
+            if row.route.credential_profile_id:
+                projected["account_policy"] = "explicit profile pin"
+                projected["credential_profile_id"] = row.route.credential_profile_id
+            else:
+                projected["account_policy"] = "automatic compatible account selection"
+        else:
+            projected["requested_model"] = row.route.target_id
+            projected["account_policy"] = (
+                "API provider credentials (session account selection does not apply)"
+            )
+        rows.append(projected)
+
+    return {
+        "source": resolution.source,
+        "config_fingerprint": configured_subagents_fingerprint(config),
+        "rows": rows,
+        "selection_guidance": (
+            "Choose subagent_id from the owner descriptions and saved route intent. "
+            "Prefer suitable Agent session choices often when they fit, to reduce "
+            "incremental API spend; use API model choices when their described strengths "
+            "fit. The host does not rank or substitute rows."
+        ),
+        "dispatch_contract": (
+            "schedule_subagent attempts the exact selected row. If live dispatch finds it "
+            "unavailable, it returns a typed refusal; choose the next action or another "
+            "subagent_id."
+        ),
+    }
+
+
+def current_model_visible_subagent_catalog() -> dict[str, Any]:
+    """Read the current normalized settings and return the stable catalog."""
+
+    from ouroboros.config import load_settings
+
+    return model_visible_subagent_catalog(
+        effective_runtime_subagent_settings(load_settings())
+    )
+
+
 def apply_task_start_settings() -> None:
     """Project the provider-normalized in-memory snapshot for one task start."""
 
@@ -557,11 +622,13 @@ __all__ = [
     "SubagentSelectionError",
     "apply_task_start_settings",
     "current_exact_start_selection",
+    "current_model_visible_subagent_catalog",
     "current_subagent_alternatives",
     "delegate_start_entry",
     "effective_runtime_subagent_settings",
     "exact_session_binding",
     "exact_start",
+    "model_visible_subagent_catalog",
     "prepare_delegate_start_actor",
     "resolve_configured_actor_dispatch",
     "select_subagent_snapshot",

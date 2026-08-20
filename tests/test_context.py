@@ -1698,8 +1698,8 @@ def test_settled_continuation_with_open_obligations_survives_age_retirement(tmp_
 
 
 # ---------------------------------------------------------------------------
-# B4-lite: capabilities["delegation"] — configured route + honestly-labeled
-# HISTORICAL observations (never live health).
+# B4-lite: capabilities["delegation"] — honestly-labeled HISTORICAL
+# observations only (never saved intent or live health).
 # ---------------------------------------------------------------------------
 
 
@@ -1718,7 +1718,7 @@ def _delegation_fact(tmp_path, monkeypatch):
     return payload["capabilities"]
 
 
-def test_delegation_fact_carries_configured_route_and_historical_rows(tmp_path, monkeypatch):
+def test_delegation_fact_carries_historical_rows_and_profile_evidence(tmp_path, monkeypatch):
     root = _delegation_data_root(tmp_path, monkeypatch)
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "claudexor=opus-5:high")
     (root / "state" / "reviewer_slot_last_execution.json").write_text(json.dumps({
@@ -1726,7 +1726,12 @@ def test_delegation_fact_carries_configured_route_and_historical_rows(tmp_path, 
             "ts": "2026-08-18T01:02:03+00:00",
             "surface": "triad",
             "status": "ok",
-            "effective": {"route": "agent_session:claudexor", "model": "opus-5"},
+            "requested": {"profile_id": "requested-review-profile"},
+            "effective": {
+                "route": "agent_session:claudexor",
+                "model": "opus-5",
+                "profile_id": "applied-review-profile",
+            },
         },
         "triad_2": {
             "ts": "2026-08-18T01:02:04+00:00",
@@ -1743,17 +1748,19 @@ def test_delegation_fact_carries_configured_route_and_historical_rows(tmp_path, 
         "route": "claudexor",
         "requested_model": "opus-5",
         "applied_model": "claude-opus-5",
+        "requested_profile": "requested-delegate-profile",
+        "applied_profile": "applied-delegate-profile",
         "run_id": "run-1",
     }), encoding="utf-8")
 
     capabilities = _delegation_fact(tmp_path, monkeypatch)
     delegation = capabilities["delegation"]
 
-    assert delegation["configured_route"] == {
-        "harness": "claudexor", "model": "opus-5", "effort": "high",
-    }
+    assert "configured_route" not in delegation
     rows = {row["slot"]: row for row in delegation["reviewer_slots_last"]}
     assert rows["triad_1"]["outcome"] == "ok"
+    assert rows["triad_1"]["requested_profile"] == "requested-review-profile"
+    assert rows["triad_1"]["applied_profile"] == "applied-review-profile"
     assert "failure_code" not in rows["triad_1"]
     assert rows["triad_2"]["outcome"] == "failed"
     assert rows["triad_2"]["failure_code"] == "subscription_window_exhausted"
@@ -1764,6 +1771,8 @@ def test_delegation_fact_carries_configured_route_and_historical_rows(tmp_path, 
     last = delegation["subagent_last_delegation"]
     assert last["route"] == "claudexor"
     assert last["applied_model"] == "claude-opus-5"
+    assert last["requested_profile"] == "requested-delegate-profile"
+    assert last["applied_profile"] == "applied-delegate-profile"
     assert last["observed"] == "last observed at 2026-08-18T02:00:00+00:00"
     assert "historical" not in rows["triad_1"]["observed"]
     # The prompt-visible note teaches the semantics ONCE: rows are history, live
@@ -1797,14 +1806,9 @@ def test_delegation_fact_absent_files_mean_absent_observations_not_health(tmp_pa
     _delegation_data_root(tmp_path, monkeypatch)
     monkeypatch.delenv("OUROBOROS_SUBAGENT_HARNESS", raising=False)
 
-    delegation = _delegation_fact(tmp_path, monkeypatch)["delegation"]
+    capabilities = _delegation_fact(tmp_path, monkeypatch)
 
-    assert delegation["configured_route"] == "not configured"
-    assert "reviewer_slots_last" not in delegation
-    assert "subagent_last_delegation" not in delegation
-    # Nothing in the fact may read as a live-health claim.
-    assert "healthy" not in json.dumps(
-        {k: v for k, v in delegation.items() if k != "note"})
+    assert "delegation" not in capabilities
 
 
 def test_delegation_fact_failure_never_drops_capability_digest(tmp_path, monkeypatch):
