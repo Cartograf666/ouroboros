@@ -947,7 +947,7 @@ class OuroborosAgent:
         with self._owner_message_admission_lock:
             self._current_task_metadata = dict(task_metadata)
 
-        from ouroboros.project_facts import resolve_project_id
+        from ouroboros.project_facts import apply_project_model_route, resolve_project_id
 
         # Project scope flows to tools via ctx.project_id and to context build via
         # resolve_project_id(task) in build_llm_messages (Env is frozen — never mutate it).
@@ -1008,6 +1008,7 @@ class OuroborosAgent:
             ctx.begin_acceptance_fence = self._begin_acceptance_fence
             ctx.inspect_acceptance_fence = self._inspect_acceptance_fence
             ctx.end_acceptance_fence = self._end_acceptance_fence
+        apply_project_model_route(ctx, self.env.drive_root, _resolved_project_id, task)
         if str(task_metadata.get("delegation_role") or "").lower() == "subagent":
             model_override = str(task_metadata.get("model") or "").strip()
             if model_override:

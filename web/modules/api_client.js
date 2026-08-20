@@ -126,7 +126,8 @@ export const apiClient = {
     projectFromTask: (taskId, id, name, objectiveHint = '') => jsonPost('/api/projects/from-task', { task_id: taskId, id, name, objective_hint: objectiveHint }),
     /** @param {import('./api_types.js').ProjectCreateRequest} payload */
     projectCreate: (payload) => jsonPost('/api/projects', payload),
-    projectUpdate: (projectId, name) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/update`, { name }),
+    /** @param {import('./api_types.js').ProjectUpdateRequest} updates */
+    projectUpdate: (projectId, updates) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/update`, updates),
     /** @returns {Promise<import('./api_types.js').ProjectDeleteResponse>} */
     projectDelete: (projectId) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/delete`, {}),
     /** @returns {Promise<import('./api_types.js').FsDirsResponse>} */

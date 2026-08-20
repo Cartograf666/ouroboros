@@ -61,7 +61,8 @@ def test_projects_registry_stamps_schema_version(tmp_path):
     data.mkdir()
     create_project(data, "p1", name="P1", origin="test")
     payload = json.loads((data / "state" / "projects.json").read_text(encoding="utf-8"))
-    assert payload.get("_schema_version") == 2
+    # v6.101.0 bumped 2 -> 3 for the additive per-project `model` field.
+    assert payload.get("_schema_version") == 3
     assert any(p.get("id") == "p1" for p in payload.get("projects", []))
 
 

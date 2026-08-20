@@ -16,6 +16,7 @@ import {
     nextJobPollDelay,
 } from '../modules/harness_login_cards.js';
 import { reviewerSlotsSavePayload } from '../modules/reviewer_slots.js';
+import { decideProjectModelChange } from '../modules/project_create.js';
 
 // ---------------------------------------------------------------------------
 // marketplace: update-to-version prompt (window.prompt was dead on desktop).
@@ -221,4 +222,47 @@ test('a loaded populated set serializes exactly as the setting builder emits it'
     assert.equal(parsed.scope[0].route.profile_id, 'koshak');
     assert.equal('effort' in parsed.scope[0], false);
     assert.equal(parsed.advisory.enabled, false);
+});
+
+// ---------------------------------------------------------------------------
+// projects: the per-project model dialog (v6.101.0). Empty is an EDIT, not a
+// cancel — it clears the override back to the global Main slot.
+// ---------------------------------------------------------------------------
+
+test('decideProjectModelChange: empty clears, cancel skips, junk is refused', () => {
+    // Cancel (and Escape/backdrop, which resolve the same shape) changes nothing.
+    assert.deepEqual(
+        decideProjectModelChange({ current: 'anthropic/claude-opus-5', dialogResult: { confirmed: false, value: '' } }),
+        { action: 'skip' },
+    );
+
+    // Confirmed-empty on a project that HAS a model is the clear.
+    assert.deepEqual(
+        decideProjectModelChange({ current: 'anthropic/claude-opus-5', dialogResult: { confirmed: true, value: '  ' } }),
+        { action: 'save', model: '' },
+    );
+
+    // Confirmed-empty on a project that already inherits writes nothing.
+    assert.deepEqual(
+        decideProjectModelChange({ current: '', dialogResult: { confirmed: true, value: '' } }),
+        { action: 'skip' },
+    );
+
+    // A new id is saved trimmed.
+    assert.deepEqual(
+        decideProjectModelChange({ current: '', dialogResult: { confirmed: true, value: ' x-ai/grok-4.5 ' } }),
+        { action: 'save', model: 'x-ai/grok-4.5' },
+    );
+
+    // Same value re-confirmed is not a write.
+    assert.deepEqual(
+        decideProjectModelChange({ current: 'x-ai/grok-4.5', dialogResult: { confirmed: true, value: 'x-ai/grok-4.5' } }),
+        { action: 'skip' },
+    );
+
+    // Client-side refusals mirror the server contract (whitespace + length).
+    assert.equal(decideProjectModelChange({ dialogResult: { confirmed: true, value: 'a b' } }).action, 'error');
+    const tooLong = decideProjectModelChange({ dialogResult: { confirmed: true, value: 'x'.repeat(201) } });
+    assert.equal(tooLong.action, 'error');
+    assert.ok(tooLong.error.includes('200'));
 });

@@ -445,9 +445,19 @@ async def api_projects_create(request: Request) -> JSONResponse:
 
 
 async def api_project_update(request: Request) -> JSONResponse:
-    """POST /api/projects/{project_id}/update — rename (the only mutable UI field)."""
+    """POST /api/projects/{project_id}/update — the owner-mutable project fields.
+
+    ``name`` renames. ``model`` (v6.101.0) sets the project's own reasoning model;
+    sending it EMPTY is a legal write that clears the override back to the global
+    Main slot, so presence of the key — not truthiness — decides what is updated.
+    """
     try:
-        from ouroboros.projects_registry import PROJECT_NAME_MAX, get_project, update_project
+        from ouroboros.projects_registry import (
+            PROJECT_MODEL_MAX,
+            PROJECT_NAME_MAX,
+            get_project,
+            update_project,
+        )
 
         project_id = str(request.path_params.get("project_id") or "").strip()
         body = await request.json()
@@ -456,15 +466,33 @@ async def api_project_update(request: Request) -> JSONResponse:
         drive_root = request_drive_root(request)
         if get_project(drive_root, project_id) is None:
             return JSONResponse({"error": f"unknown project: {project_id}"}, status_code=404)
-        name = str(body.get("name") or "").strip()
-        if not name:
-            return JSONResponse({"error": "name is required"}, status_code=400)
-        if len(name) > PROJECT_NAME_MAX:
-            return JSONResponse(
-                {"error": f"name must be <= {PROJECT_NAME_MAX} characters"},
-                status_code=400,
-            )
-        entry = update_project(drive_root, project_id, name=name)
+        updates: dict = {}
+        if "name" in body or "model" not in body:
+            # Rename stays the default shape: a body with neither key is the old
+            # "name is required" error, not a silent no-op write.
+            name = str(body.get("name") or "").strip()
+            if not name:
+                return JSONResponse({"error": "name is required"}, status_code=400)
+            if len(name) > PROJECT_NAME_MAX:
+                return JSONResponse(
+                    {"error": f"name must be <= {PROJECT_NAME_MAX} characters"},
+                    status_code=400,
+                )
+            updates["name"] = name
+        if "model" in body:
+            model = str(body.get("model") or "").strip()
+            if len(model) > PROJECT_MODEL_MAX:
+                return JSONResponse(
+                    {"error": f"model must be <= {PROJECT_MODEL_MAX} characters"},
+                    status_code=400,
+                )
+            if any(ch.isspace() or ord(ch) < 32 for ch in model):
+                return JSONResponse(
+                    {"error": "model must not contain whitespace or control characters"},
+                    status_code=400,
+                )
+            updates["model"] = model
+        entry = update_project(drive_root, project_id, **updates)
         _broadcast_projects_changed(str((entry or {}).get("id") or project_id), (entry or {}).get("chat_id"))
         return JSONResponse({"project": entry})
     except Exception as exc:
