@@ -855,8 +855,8 @@ def preflight_native_fallback_lane(task: Mapping[str, Any]) -> SubagentLaneResol
     delegate-visibility preflight just demoted to native executes the work
     ITSELF on metered tokens, so the policy must not survive the demotion: the
     lane re-resolves exactly as a native dispatch would have (explicit request,
-    else parent inheritance — never policy-light), and the model/effort the
-    record states follow the re-resolved lane.
+    else parent inheritance — never policy-light), and the recorded model follows
+    that lane. Effort remains the task-type-derived pre-wire setting.
     """
     requested_lane = str(task.get("requested_model_lane") or task.get("model_lane") or "auto")
     try:
@@ -873,24 +873,18 @@ def preflight_native_fallback_dispatch(
     """The preflight's harness→native fallback, with the lane RE-RESOLVED (F10).
 
     The falsified dispatch resolved its lane under the harness policy (auto ⇒
-    light) and measured its effort band against that cheap model. Keeping them
-    would run a native child of a heavy parent on policy-light — the delta is
-    rebuilt from the re-resolved lane: the lane axes, the effort re-measured
-    against the model that will actually run, the executor reduction, and the
-    preflight reason. The caller (``agent.preflight_delegate_visibility``)
+    light). Keeping it would run a native child of a heavy parent on policy-light,
+    so the delta is rebuilt from the re-resolved lane axes, unchanged scheduling
+    effort, executor reduction, and preflight reason. The caller
+    (``agent.preflight_delegate_visibility``)
     re-stamps the record and envelope; ``agent._prepare_task_context`` re-syncs
     the metadata projection and the ToolContext model override off them.
     """
     import dataclasses
 
-    from ouroboros.config import effort_rank
-
     lane = preflight_native_fallback_lane(task)
     derived_effort = dispatch.delta.derived_effort
-    effective_effort = _route_effort(lane.model, derived_effort)
     reasons: List[str] = []
-    if derived_effort and effort_rank(effective_effort) < effort_rank(derived_effort):
-        reasons.append(f"route_effort_ceiling={effective_effort}")
     if lane.reduced:
         reasons.append(f"lane_slot_unavailable={lane.resolved_from}")
     reasons.append(reason)
@@ -899,7 +893,7 @@ def preflight_native_fallback_dispatch(
         resolved_lane=lane.resolved_from,
         effective_lane=lane.effective_lane,
         lane_provenance=lane.provenance,
-        effective_effort=effective_effort,
+        effective_effort=derived_effort,
         effective_executor="native",
         reduction_reasons=tuple(reasons),
         reason=derive_capability_reason(reasons),
@@ -931,11 +925,10 @@ class CapabilityDelta:
     """What was ASKED for versus what was GIVEN, on every axis at once.
 
     A child could land below its request in several unrelated places — an inherited
-    lane, a lane slot that is not configured, an effort the route caps, an executor
-    pin no route can honor — and not one of them announced itself. The reductions
-    were spread across the resolver, the model getters, the LLM client and (for the
-    executor) nowhere at all, so "what was asked" and "what was given" were never
-    compared in the same place. This record is that place, and
+    lane, a lane slot that is not configured, or an executor pin no route can honor —
+    and not one of them announced itself. Those scheduling reductions were spread
+    across the resolver, model getters and executor path, so "what was asked" and
+    "what was given" were never compared in the same place. This record is that place, and
     ``resolve_subagent_dispatch`` is its only author.
 
     The effort axis names the scheduling-derived pre-wire value, not a physical
@@ -1034,17 +1027,6 @@ def lane_delta_phrase(delta: Mapping[str, Any]) -> str:
     if resolved and resolved != requested:
         return f"{requested}(inherited {resolved})->{effective}"
     return f"{requested}->{effective}"
-
-
-def _route_effort(model: str, effort: str) -> str:
-    """Return the pre-wire effort selected by scheduling.
-
-    Exact provider/model/API/request-shape adaptation happens only at the physical
-    request seam and is disclosed by ``usage.request_wire``.  Legacy model-global
-    evidence is diagnostic and cannot claim what an as-yet-unbuilt request will run.
-    """
-    del model
-    return effort
 
 
 # The durable keys a scheduling request may state. Everything the dispatch
@@ -1215,14 +1197,11 @@ def resolve_subagent_dispatch(
         requested_executor == "auto" and executor_reason == "harness_not_configured"
     ):
         executor_reason = ""
-    from ouroboros.config import effort_rank, resolve_effort
+    from ouroboros.config import resolve_effort
 
     derived_effort = resolve_effort(task_type or str(task.get("type") or "task"))
-    effective_effort = _route_effort(lane.model, derived_effort)
 
     reasons: List[str] = []
-    if effort_rank(effective_effort) < effort_rank(derived_effort):
-        reasons.append(f"route_effort_ceiling={effective_effort}")
     if lane.reduced:
         reasons.append(f"lane_slot_unavailable={lane.resolved_from}")
     if executor_reason:
@@ -1248,7 +1227,7 @@ def resolve_subagent_dispatch(
         derived_effort=derived_effort,
         # Scheduling's pre-wire effort. Exact route/request adaptation, if needed,
         # is reported only after the physical call in usage.request_wire.
-        effective_effort=effective_effort,
+        effective_effort=derived_effort,
         requested_executor=requested_executor,
         effective_executor=executor,
         reduction_reasons=tuple(reasons),
