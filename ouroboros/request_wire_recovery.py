@@ -1,8 +1,7 @@
 """Provider-neutral, same-route request-wire recovery driver.
 
-This leaf owns only request-shape adaptation.  It cannot choose a provider,
-model, or API surface.  Reactive actions remain pending until the exact
-physical attempt produces terminal semantic success; only then may the frozen
+This leaf owns request-shape adaptation, never provider/model/API choice. Reactive
+actions remain pending until the exact physical attempt succeeds; only then may the frozen
 store receipt make them durable.
 """
 
@@ -749,7 +748,8 @@ def _plan_retry(status_code: Optional[int], message: str) -> Optional[Dict[str, 
             for item in existing
         ):
             return None
-        applications = (*existing, WireAppliedAction.pending(pending))
+        applied = WireAppliedAction.reactive(pending, task_local=registered.candidate.task_local)
+        applications = (*existing, applied)
         if len(applications) > _MAX_COMPOSED_ACTIONS:
             return None
         from ouroboros.openai_chat_dispatch import is_direct_openai_ladder_candidate

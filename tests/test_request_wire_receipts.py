@@ -267,6 +267,25 @@ def test_requested_effort_is_physical_and_nonrequested_none_requires_task_local_
     assert candidate.task_local
 
 
+def test_task_local_reactive_action_only_drops_nonreasoning_fields():
+    source = _payload(effort="none")
+    profile = _profile(source)
+    optional = PendingWireAction(profile, {
+        "kind": "drop_field",
+        "fields": ["temperature"],
+        "reason_code": "provider_unsupported_field",
+    })
+    assert WireAppliedAction.reactive(optional, task_local=True).source == "task_local"
+
+    reasoning = PendingWireAction(profile, {
+        "kind": "drop_field",
+        "fields": ["reasoning_effort"],
+        "reason_code": "provider_unsupported_field",
+    })
+    with pytest.raises(ValueError, match="same-rung repair"):
+        WireAppliedAction.reactive(reasoning, task_local=True)
+
+
 def test_requested_custom_projection_is_first_class_and_never_committed(tmp_path):
     source = _payload()
     source["messages"] = [

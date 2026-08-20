@@ -148,17 +148,31 @@ class WireAppliedAction:
         if not normalized:
             raise ValueError("invalid applied wire action")
         if self.source == "task_local":
-            if not (
+            availability_fallback = (
                 normalized.get("kind") == "set_value"
                 and normalized.get("to") == "none"
                 and normalized.get("reason_code") == "task_local_availability_fallback"
-            ):
-                raise ValueError("task-local wire action is reserved for explicit none")
+            )
+            same_rung_repair = (
+                normalized.get("kind") == "drop_field"
+                and not set(normalized.get("fields") or ()).intersection(
+                    _REASONING_DROP_FIELDS)
+                and bool(validate_durable_wire_action_for_profile(self.profile, normalized))
+            )
+            if not availability_fallback and not same_rung_repair:
+                raise ValueError("invalid task-local same-rung repair")
         object.__setattr__(self, "action", _freeze_wire_action(normalized))
 
     @classmethod
     def pending(cls, item: PendingWireAction) -> "WireAppliedAction":
         return cls(item.profile, item.action, "pending")
+
+    @classmethod
+    def reactive(
+        cls, item: PendingWireAction, *, task_local: bool = False,
+    ) -> "WireAppliedAction":
+        """Keep a degraded-rung repair ephemeral instead of learnable pending evidence."""
+        return cls(item.profile, item.action, "task_local" if task_local else "pending")
 
     @classmethod
     def task_local(cls, item: EphemeralWireAdjustment) -> "WireAppliedAction":

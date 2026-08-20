@@ -1249,9 +1249,8 @@ def resolve_subagent_dispatch(
         effective_lane=lane.effective_lane,
         lane_provenance=lane.provenance,
         derived_effort=derived_effort,
-        # The effort the route will ACTUALLY run — the whole learned band through
-        # the same call the dispatcher clamps with, so a route with a learned FLOOR
-        # is reported honestly and is not called a reduction.
+        # Scheduling's pre-wire effort. Exact route/request adaptation, if needed,
+        # is reported only after the physical call in usage.request_wire.
         effective_effort=effective_effort,
         requested_executor=requested_executor,
         effective_executor=executor,

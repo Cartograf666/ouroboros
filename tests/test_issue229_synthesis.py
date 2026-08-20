@@ -18,7 +18,10 @@ from ouroboros.request_wire_contract import (
     canonical_sha256,
     read_wire_action_records,
 )
-from ouroboros.usage_accounting import PhysicalAttemptCapture
+from ouroboros.usage_accounting import (
+    PhysicalAttemptCapture,
+    PhysicalAttemptLimitExceeded,
+)
 
 
 class _Response:
@@ -111,7 +114,7 @@ def _body_rejection(message, *, param):
     })
 
 
-def _install_transport(monkeypatch, responses):
+def _install_transport(monkeypatch, responses, *, max_sends=None):
     sent = []
     queue = list(responses)
     capture = {"value": None}
@@ -132,6 +135,8 @@ def _install_transport(monkeypatch, responses):
 
     def execute(request, send, before_dispatch=None):
         del before_dispatch
+        if max_sends is not None and len(sent) >= max_sends:
+            raise PhysicalAttemptLimitExceeded("test physical attempt rail exhausted")
         response = send()
         attempt_id = f"attempt-{len(sent)}"
         capture["value"] = PhysicalAttemptCapture(
@@ -314,6 +319,87 @@ def test_custom_pending_repair_is_discarded_before_fresh_function(
     assert "temperature" in sent[2]
     assert usage["request_wire"]["ladder_ordinal"] == 2
     assert usage["request_wire"]["applied_actions"] == []
+
+
+@pytest.mark.parametrize("body_error", [False, True])
+def test_task_local_none_composes_nonlearning_same_rung_repair(
+    tmp_path, monkeypatch, body_error,
+):
+    evidence_root = tmp_path / "wire-evidence"
+    monkeypatch.setattr(
+        wire_contract, "canonical_wire_evidence_root", lambda: evidence_root,
+    )
+    reject = _body_rejection if body_error else _Rejected
+    client, sent = _install_transport(monkeypatch, [
+        reject("custom tools are not supported", param="tools[0].type"),
+        reject(
+            "reasoning is not compatible with function tools; must use none",
+            param="reasoning_effort",
+        ),
+        reject("temperature is not supported", param="temperature"),
+        _text_success(),
+    ])
+
+    _message, usage = client.chat(
+        [{"role": "user", "content": "Use a tool if needed."}],
+        "openai::future-reasoning-model",
+        tools=_tools(),
+        reasoning_effort="medium",
+        temperature=0.2,
+    )
+
+    assert [
+        (item["tools"][0]["type"], item["reasoning_effort"], "temperature" in item)
+        for item in sent
+    ] == [
+        ("custom", "medium", True),
+        ("function", "medium", True),
+        ("function", "none", True),
+        ("function", "none", False),
+    ]
+    disclosure = usage["request_wire"]
+    assert disclosure["ladder_ordinal"] == 3
+    assert disclosure["task_local"] is True
+    assert [item["source"] for item in disclosure["applied_actions"]] == [
+        "task_local", "task_local",
+    ]
+    rejected_profile = build_request_wire_profile(
+        _target(), sent[2], api_surface="chat.completions",
+    )
+    assert read_wire_action_records(rejected_profile) == ()
+
+
+def test_task_local_same_rung_repair_still_obeys_physical_attempt_rail(
+    tmp_path, monkeypatch,
+):
+    evidence_root = tmp_path / "wire-evidence"
+    monkeypatch.setattr(
+        wire_contract, "canonical_wire_evidence_root", lambda: evidence_root,
+    )
+    client, sent = _install_transport(monkeypatch, [
+        _Rejected("custom tools are not supported", param="tools[0].type"),
+        _Rejected(
+            "reasoning is not compatible with function tools; must use none",
+            param="reasoning_effort",
+        ),
+        _Rejected("temperature is not supported", param="temperature"),
+        _text_success(),
+    ], max_sends=3)
+
+    with pytest.raises(PhysicalAttemptLimitExceeded):
+        client.chat(
+            [{"role": "user", "content": "Use a tool if needed."}],
+            "openai::future-reasoning-model",
+            tools=_tools(),
+            reasoning_effort="medium",
+            temperature=0.2,
+        )
+
+    assert len(sent) == 3
+    rejected_profile = build_request_wire_profile(
+        _target(), sent[2], api_surface="chat.completions",
+    )
+    assert read_wire_action_records(rejected_profile) == ()
 
 
 def test_ordered_request_wire_history_survives_main_and_structured_compaction(
