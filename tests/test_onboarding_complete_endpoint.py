@@ -335,6 +335,24 @@ def test_api_only_preview_is_read_only_and_never_reads_claudexor(onboarding):
     assert onboarding.calls["supervisor"] == 0
 
 
+def test_preview_does_not_persist_unrelated_context_mode_compat(onboarding):
+    legacy_bytes = (
+        b'{"OUROBOROS_CONTEXT_MODE":"low",'
+        b'"OPENROUTER_API_KEY":"sk-or-v1-existing-owner-key"}\n'
+    )
+    onboarding.settings_path.write_bytes(legacy_bytes)
+
+    response = onboarding.client.post(
+        "/api/onboarding/subagents/preview", json=dict(WIZARD_PAYLOAD),
+    )
+
+    assert response.status_code == 200, response.text
+    assert onboarding.settings_path.read_bytes() == legacy_bytes
+    assert onboarding.calls["snapshot"] == 0
+    assert onboarding.calls["env"] == []
+    assert onboarding.calls["supervisor"] == 0
+
+
 def test_local_only_preview_materializes_only_local_routes_without_daemon_read(onboarding):
     response = onboarding.client.post(
         "/api/onboarding/subagents/preview",

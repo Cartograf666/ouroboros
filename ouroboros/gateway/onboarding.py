@@ -53,6 +53,7 @@ from ouroboros.gateway.owner_settings import (
     SettingsLockUnavailable,
     SettingsPreconditionFailed,
     _owner_audit,
+    _owner_read_settings_raw,
     _owner_write_settings,
     post_commit_failure_response,
     settings_document_mutation,
@@ -614,12 +615,20 @@ def _settings_fingerprint() -> str:
         return f"unreadable:{type(exc).__name__}:{uuid4()}"
 
 
-def _prepared_settings(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
+def _prepared_settings(
+    body: Dict[str, Any],
+    *,
+    base_settings: Optional[Mapping[str, Any]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
     """(old_settings, prepared_settings, error) through the SHARED validator."""
     from ouroboros.config import load_settings
     from ouroboros.onboarding_wizard import prepare_onboarding_settings
 
-    old_settings = load_settings()
+    # Completion keeps the ordinary runtime loader (including its established
+    # one-shot compatibility migrations).  The read-only preview passes the
+    # existing pure owner-reader so merely rendering an unsaved draft can never
+    # persist unrelated compatibility state.
+    old_settings = dict(base_settings) if base_settings is not None else load_settings()
     prepared, error = prepare_onboarding_settings(body, old_settings)
     if error:
         return old_settings, {}, str(error)
@@ -677,7 +686,10 @@ async def api_onboarding_subagents_preview(request: Request) -> JSONResponse:
             draft_error, 400, code="invalid_available_subagents",
             diagnostics=[{"code": "invalid_available_subagents", "message": draft_error}],
         )
-    _old_settings, current, error = _prepared_settings(body)
+    _old_settings, current, error = _prepared_settings(
+        body,
+        base_settings=_owner_read_settings_raw(),
+    )
     if error:
         return unsaved_error(
             error, 400, code="invalid_onboarding_settings",
