@@ -745,9 +745,9 @@ class ClaudexorRuntimeManager:
         The reviewed pin selects the *next* daemon spawn.  A live daemon may
         keep serving an older preserved tree while that pin is already staged,
         so a recovery command binds instead to all three handshake identity
-        fields.  Schema-v1 metadata locates the preserved Node and entry; a
-        fresh side-effect-free probe establishes the additive role without
-        rewriting metadata underneath the live process.
+        fields.  Supported schema-1/2 metadata locates the preserved Node and
+        entry; a fresh side-effect-free probe establishes the additive role
+        without rewriting metadata underneath the live process.
         """
         version = str(engine_version or "").strip()
         build_sha = str(engine_build_sha or "").strip()
@@ -930,15 +930,25 @@ class ClaudexorRuntimeManager:
         root = managed_runtime_root() / "node" / f"{version}-{platform_key}"
         try:
             raw = json.loads((root / _NODE_META_FILENAME).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except OSError:
             return ""
+        except ValueError as exc:
+            raise ClaudexorRuntimeError(
+                "runtime_serving_node_metadata_invalid",
+                "the preserved Node metadata is not valid JSON",
+            ) from exc
+        schema = raw.get("schema_version") if isinstance(raw, dict) else None
         if (
             not isinstance(raw, dict)
-            or raw.get("schema_version") != 1
+            or type(schema) is not int
+            or schema not in (1, _NODE_META_SCHEMA_VERSION)
             or raw.get("version") != version
             or raw.get("platform") != platform_key
         ):
-            return ""
+            raise ClaudexorRuntimeError(
+                "runtime_serving_node_metadata_invalid",
+                "the preserved Node metadata has an unsupported or malformed schema",
+            )
         candidate = embedded_node_candidates(root)[0]
         try:
             if candidate.is_file() and probe_node_version(str(candidate)) == version:

@@ -390,6 +390,71 @@ def test_daemon_only_resolution_reuses_legacy_node_metadata_without_download(tmp
     assert runtime.ClaudexorRuntimeManager(pin)._ensure_node(pin) == str(node)
 
 
+@pytest.mark.parametrize("schema", [1, 2])
+def test_preserved_node_reader_accepts_exact_supported_metadata_schemas(
+    tmp_path, monkeypatch, schema
+):
+    _data_plane(monkeypatch, tmp_path)
+    root = runtime.managed_runtime_root() / "node" / f"{NODE_VERSION}-linux-x64"
+    node = root / "node-standalone" / "bin" / "node"
+    node.parent.mkdir(parents=True)
+    node.write_bytes(b"exact node\n")
+    metadata = {
+        "schema_version": schema,
+        "version": NODE_VERSION,
+        "platform": "linux-x64",
+        "archive_url": f"https://node.example.test/node-v{NODE_VERSION}-linux-x64.tar.gz",
+        "archive_sha256": "a" * 64,
+        "archive_size": 123,
+        "archive_executable": f"node-v{NODE_VERSION}-linux-x64/bin/node",
+    }
+    if schema == 2:
+        metadata["archive_npm_cli"] = (
+            f"node-v{NODE_VERSION}-linux-x64/lib/node_modules/npm/bin/npm-cli.js"
+        )
+    (root / "managed-node.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    import ouroboros.platform_layer as platform
+
+    monkeypatch.setattr(platform, "bundled_resource_bases", lambda: [])
+    monkeypatch.setattr(platform, "node_distribution_platform", lambda: "linux-x64")
+    monkeypatch.setattr(
+        platform, "embedded_node_candidates",
+        lambda base: [pathlib.Path(base) / "node-standalone" / "bin" / "node"],
+    )
+    monkeypatch.setattr(
+        platform, "probe_node_version",
+        lambda candidate: NODE_VERSION if candidate == str(node) else "",
+    )
+
+    manager = runtime.ClaudexorRuntimeManager(None)
+    assert manager._resolve_preserved_node(NODE_VERSION) == str(node.resolve())
+
+
+@pytest.mark.parametrize("payload", [
+    {"schema_version": 3, "version": NODE_VERSION, "platform": "linux-x64"},
+    {"schema_version": True, "version": NODE_VERSION, "platform": "linux-x64"},
+    {"schema_version": "2", "version": NODE_VERSION, "platform": "linux-x64"},
+    {"schema_version": 2, "version": "bad", "platform": "linux-x64"},
+    [],
+])
+def test_preserved_node_reader_rejects_future_or_malformed_metadata_typed(
+    tmp_path, monkeypatch, payload
+):
+    _data_plane(monkeypatch, tmp_path)
+    root = runtime.managed_runtime_root() / "node" / f"{NODE_VERSION}-linux-x64"
+    root.mkdir(parents=True)
+    (root / "managed-node.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    import ouroboros.platform_layer as platform
+
+    monkeypatch.setattr(platform, "bundled_resource_bases", lambda: [])
+    monkeypatch.setattr(platform, "node_distribution_platform", lambda: "linux-x64")
+    with pytest.raises(runtime.ClaudexorRuntimeError) as excinfo:
+        runtime.ClaudexorRuntimeManager(None)._resolve_preserved_node(NODE_VERSION)
+    assert excinfo.value.code == "runtime_serving_node_metadata_invalid"
+
+
 def test_cli_command_installs_exact_closure_and_managed_node_npm_tree(tmp_path, monkeypatch):
     _data_plane(monkeypatch, tmp_path)
     source_root = tmp_path / "bundle"

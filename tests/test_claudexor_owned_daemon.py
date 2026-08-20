@@ -1394,33 +1394,65 @@ def test_login_create_prefers_each_harness_setup_mode_over_global_operations(mon
     assert "attach_command" in external
 
 
-@pytest.mark.parametrize("setup_login,expected_code", [
-    (None, "unsupported"),
-    ({"mode": "future"}, "setup_login_capability_malformed"),
+def test_null_setup_login_preserves_omitted_and_explicit_transport(monkeypatch, tmp_path):
+    """Null delegates support admission to setup create without consulting
+    the legacy operation catalog. Omitted remains omitted; an explicit
+    client_pty request remains exact and receives the attach metadata."""
+    capabilities = {"harnesses": [{"id": "one", "setupLogin": None}]}
+    native, sent = _create_login(
+        monkeypatch, tmp_path, {"harness": "one"},
+        operations=[], capabilities=capabilities, raises=True)
+    assert "transport" not in sent
+    assert native["disclosure_native"] is True
+    assert native["setup_login_source"] == "setup_job_admission"
+    assert "attach_command" not in native
+
+    external, sent = _create_login(
+        monkeypatch, tmp_path, {"harness": "one", "transport": "client_pty"},
+        operations=[], capabilities=capabilities, raises=True)
+    assert sent["transport"] == "client_pty"
+    assert external["disclosure_native"] is False
+    assert external["setup_login_source"] == "setup_job_admission"
+    assert "attach_command" in external
+
+
+@pytest.mark.parametrize("profile_id,expected_calls", [
+    ("", {"operations": 0, "profile": 0, "setup": 1}),
+    ("named", {"operations": 0, "profile": 1, "setup": 0}),
 ])
-def test_null_or_malformed_setup_login_never_mutates_or_falls_back(
-        monkeypatch, setup_login, expected_code):
-    """A current null/malformed field stops before profile create, operations
-    fallback and setup-job create. Only own-property absence is legacy."""
+def test_null_setup_login_unsupported_admission_makes_no_mutation(
+        monkeypatch, profile_id, expected_calls):
+    """The producer rejects an unsupported unnamed family at setup admission,
+    and a named family at its pre-write profile admission. Neither path uses
+    the legacy catalog or creates durable profile/job state."""
     from ouroboros.gateway.claudexor_accounts import _login_create
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
     calls = {"operations": 0, "profile": 0, "setup": 0}
+    durable = {"profiles": [], "jobs": []}
+    refusal = ClaudexorUnavailable(
+        "invalid_request", "unsupported harness", status_code=400)
 
     class Gateway:
         def agent_capabilities(self):
-            return {"harnesses": [{"id": "one", "setupLogin": setup_login}]}
+            return {"harnesses": [{"id": "one", "setupLogin": None}]}
 
         def operations(self):
             calls["operations"] += 1
             return [_INPUT_OP]
 
-        def create_credential_profile(self, *_args):
+        def create_credential_profile(self, harness, profile_id):
             calls["profile"] += 1
+            if harness == "one":
+                raise refusal
+            durable["profiles"].append((harness, profile_id))
 
-        def setup_job_create(self, *_args):
+        def setup_job_create(self, request):
             calls["setup"] += 1
-            return {"id": "impossible"}
+            if request.get("harness") == "one":
+                raise refusal
+            durable["jobs"].append(dict(request))
+            return {"id": "job-created", "state": "queued"}
 
     class GatewayCtx:
         def __enter__(self):
@@ -1431,13 +1463,36 @@ def test_null_or_malformed_setup_login_never_mutates_or_falls_back(
 
     monkeypatch.setattr(
         "ouroboros.claudexor_daemon.ensure_owned_gateway", lambda: GatewayCtx())
-    if expected_code == "unsupported":
-        with pytest.raises(ValueError, match="does not support subscription sign-in"):
-            _login_create({"harness": "one", "profile_id": "named"})
-    else:
-        with pytest.raises(ClaudexorUnavailable) as malformed:
-            _login_create({"harness": "one", "profile_id": "named"})
-        assert malformed.value.code == expected_code
+    with pytest.raises(ClaudexorUnavailable) as unsupported:
+        _login_create({"harness": "one", "profile_id": profile_id})
+    assert unsupported.value is refusal
+    assert calls == expected_calls
+    assert durable == {"profiles": [], "jobs": []}
+
+
+def test_malformed_setup_login_fails_before_any_mutation_or_legacy_fallback(monkeypatch):
+    from ouroboros.gateway.claudexor_accounts import _login_create
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    calls = {"operations": 0, "profile": 0, "setup": 0}
+
+    class Gateway:
+        def agent_capabilities(self):
+            return {"harnesses": [{"id": "one", "setupLogin": {"mode": "future"}}]}
+        def operations(self): calls["operations"] += 1
+        def create_credential_profile(self, *_args): calls["profile"] += 1
+        def setup_job_create(self, *_args): calls["setup"] += 1
+
+    class GatewayCtx:
+        def __enter__(self): return Gateway()
+        def __exit__(self, *_args): return False
+
+    monkeypatch.setattr(
+        "ouroboros.claudexor_daemon.ensure_owned_gateway", lambda: GatewayCtx())
+    with pytest.raises(ClaudexorUnavailable) as malformed:
+        _login_create({"harness": "one", "profile_id": "named"})
+    assert malformed.value.code == "setup_login_capability_malformed"
+    assert malformed.value.status_code == 503
     assert calls == {"operations": 0, "profile": 0, "setup": 0}
 
 
@@ -1703,7 +1758,10 @@ def test_login_installs_and_retries_exactly_once(monkeypatch, retry_job):
 
         def __enter__(self): return self
         def __exit__(self, *_args): return False
-        def operations(self): return [_INPUT_OP]
+        def agent_capabilities(self):
+            return {"harnesses": [{"id": "cursor", "setupLogin": None}]}
+        def operations(self):
+            pytest.fail("current null must not consult the legacy operations catalog")
 
         def setup_job_create(self, request):
             requests.append(dict(request))
@@ -1715,7 +1773,9 @@ def test_login_installs_and_retries_exactly_once(monkeypatch, retry_job):
 
     assert installs == ["cursor"]
     assert len(requests) == 2 and requests[0] == requests[1]
+    assert "transport" not in requests[0]
     assert answer["job"] == retry_job
+    assert answer["setup_login_source"] == "setup_job_admission"
 
 
 def test_install_success_receipt_is_strict_and_provenance_is_a_pair():

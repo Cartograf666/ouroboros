@@ -1293,11 +1293,12 @@ Before every commit, verify the following:
   from the profile list, and an unknown `next_up.kind` on either wire is a
   fail-safe refusal that still lets the configured-seat scan answer.
 - Agent sign-in consumes the exact harness row's optional-without-default
-  `setupLogin` field as four states: absent is legacy, null is unsupported, a
-  valid object selects `in_app` or `external_terminal`, and malformed present
-  data is a gap. Only absence may consult the old global operations catalog.
-  An explicit `client_pty` request overrides a normal `in_app` mode; an omitted
-  request follows the engine row. Never add a harness-name branch for this
+  `setupLogin` field as four states: absent is legacy, null delegates support
+  to the exact pinned engine's typed setup/profile admission, a valid object
+  selects `in_app` or `external_terminal`, and malformed present data is a gap.
+  Only absence may consult the old global operations catalog. The null path is
+  stamped `setup_job_admission`: an omitted transport stays omitted and an
+  explicit `client_pty` stays exact. Never add a harness-name branch for this
   choice. Typed required-profile and duplicate codes decide their respective
   flows; only an old generic 409 (`internal_error` on 3.6.0, or `http_409` when
   no body code survived) may use an exact same-harness/same-profile read-back.
