@@ -247,8 +247,13 @@ def test_generic_settings_save_rejects_malformed_available_subagents_without_wri
 def test_settings_get_reports_legacy_actor_source_without_materializing_it(
     monkeypatch, isolated_settings, _clean_subagent_env,
 ):
+    from ouroboros import config as cfg
     from ouroboros.gateway import settings as settings_mod
 
+    # Other endpoint tests exercise server.py's legacy compatibility wrapper,
+    # which intentionally rebinds this gateway module in-process. This direct
+    # gateway test pins the real reader it is meant to exercise.
+    monkeypatch.setattr(settings_mod, "load_settings", cfg.load_settings)
     original = {
         "OUROBOROS_SUBAGENT_HARNESS": "codex=gpt-5.6-sol:high",
         "OUROBOROS_SUBAGENT_PROFILE": "owner-profile",
@@ -274,8 +279,14 @@ def test_settings_get_reports_legacy_actor_source_without_materializing_it(
 def test_settings_get_builds_an_unsaved_api_candidate_through_the_shared_compiler(
     monkeypatch, isolated_settings, _clean_subagent_env,
 ):
+    from ouroboros import config as cfg
     from ouroboros.gateway import settings as settings_mod
+    from ouroboros.server_runtime import apply_runtime_provider_defaults
 
+    monkeypatch.setattr(settings_mod, "load_settings", cfg.load_settings)
+    monkeypatch.setattr(
+        settings_mod, "apply_runtime_provider_defaults", apply_runtime_provider_defaults,
+    )
     original = {
         "OPENROUTER_API_KEY": "configured",
         "OUROBOROS_MODEL": "openai/gpt-5.6-sol",
