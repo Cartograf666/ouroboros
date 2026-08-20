@@ -482,6 +482,7 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                     response = route.fetch()
                     payload = response.json()
                     payload["active_chat_activities"] = list(state["activities"])
+                    payload["project_chat_ids"] = [9] if any(a.get("chat_id") == 9 for a in state["activities"]) else []
                     route.fulfill(content_type="application/json", body=json.dumps(payload))
 
                 page.route("**/api/state*", _inject)
@@ -598,8 +599,6 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 assert page.evaluate("() => window.__finishTransitions") == 1
                 _wait_status(page, "Online")
 
-                # Rehoming removes local activity and Stop without declaring the
-                # globally-live task terminal or reading its durable detail.
                 rehome_card = '.chat-live-card[data-task-id="rehome-root"]'
                 state["activities"] = [_activity("rehome-root")]
                 page.evaluate("() => window.__ouroWs.emit('projects_changed', {})")
@@ -622,6 +621,8 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 )
                 assert page.evaluate("() => window.__taskDetailCalls.length") == 3
                 assert page.locator(rehome_card).get_attribute("data-finished") == "0"
+                page.evaluate("() => window.__ouroWs.emit('chat', {type: 'chat', role: 'assistant', is_progress: true, chat_id: 9, task_id: 'rehome-root', cancelable: true, content: 'Project work continues.'})")
+                assert page.locator(f"{rehome_card} [data-cancel-run]").count() == 0
 
                 # If an earlier absent snapshot already started a read, a later
                 # rehome snapshot clears that candidate and its terminal response

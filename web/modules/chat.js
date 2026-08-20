@@ -2468,15 +2468,16 @@ export function createChatInstance({
         return summary ? withTaskCostMeta(summary, evt, { rawTs }) : null;
     }
 
-    function updateLiveCardFromProgressMessage(msg) {
+    function updateLiveCardFromProgressMessage(msg, { grantCancelAuthority = true } = {}) {
         const taskId = msg?.task_id || activeLiveGroupId || '';
         const rawTs = msg?.ts || new Date().toISOString();
         if (registerEphemeralDecisionFrame(msg)) return;
         if (!taskId) return;
-        // Only host-attested cancelable progress grants Stop plus local managed-root authority.
-        if (msg?.cancelable === true && msg?.task_id) markTaskCancelable(String(msg.task_id));
-        // Subagent lifecycle pings render as child cards linked to the parent;
-        // they must not update the parent card's terminal state.
+        // Mirrored progress never grants local Stop authority.
+        if (grantCancelAuthority && msg?.cancelable === true && msg?.task_id) {
+            markTaskCancelable(String(msg.task_id));
+        }
+        // Child lifecycle pings must not update the parent's terminal state.
         const lifecycleParent = String(msg?.parent_task_id || '').trim();
         if (
             msg?.subagent_event
@@ -2485,8 +2486,7 @@ export function createChatInstance({
         ) {
             return;
         }
-        // A known subagent child's own (non-lifecycle) progress stays on the child
-        // card so parallel work remains visible without expanding the parent.
+        // Keep a known child's own progress on its card.
         if (subagentChildParents.has(taskId)) {
             routeSubagentProgressToCard(taskId, msg);
             return;
@@ -4265,7 +4265,7 @@ export function createChatInstance({
                         kind: 'managed_task', phase: msg.phase || 'working',
                     });
                 }
-                updateLiveCardFromProgressMessage(msg);
+                updateLiveCardFromProgressMessage(msg, { grantCancelAuthority: !isMirror });
                 syncChatStatus();
                 return;
             }
