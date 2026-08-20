@@ -180,8 +180,14 @@ def main() -> int:
     args = parser.parse_args()
 
     repo_root = repo_root_from_devtools()
+    effective_light = str(args.ouroboros_light_model or "").strip() or args.model
     child_env = dict(os.environ)
-    fixed_actor = fixed_model_actor_snapshot(args.model, target=child_env)
+    fixed_actor = fixed_model_actor_snapshot(
+        args.model,
+        light_model=effective_light,
+        target=child_env,
+    )
+    actor_slots = fixed_actor["model_slots"]
     settings_path = pathlib.Path(args.settings_path).expanduser() if args.settings_path else default_settings_path()
     run_root = assert_outside_repo(
         pathlib.Path(args.run_root).expanduser() if args.run_root else default_run_root("terminal_bench"),
@@ -195,7 +201,7 @@ def main() -> int:
     task_names = actual_include_filters or [f"selection-slot-{idx + 1}" for idx in range(effective_n_tasks)]
     cmd = harbor_command(
         task_names=actual_include_filters,
-        model=args.model,
+        model=actor_slots["OUROBOROS_MODEL"],
         run_root=run_root,
         dataset=args.dataset,
         harbor_bin=args.harbor_bin,
@@ -204,7 +210,7 @@ def main() -> int:
         k=args.k,
         agent_setup_timeout_multiplier=args.agent_setup_timeout_multiplier,
         environment_build_timeout_multiplier=args.environment_build_timeout_multiplier,
-        light_model=args.ouroboros_light_model,
+        light_model=actor_slots["OUROBOROS_MODEL_LIGHT"],
         options={"execute": args.execute, "host_settings_path": str(settings_path)},
     )
     ledger_output = (
@@ -244,11 +250,13 @@ def main() -> int:
             },
         },
     )
-    effective_light = str(args.ouroboros_light_model or args.model)
     manifest["model_slots"] = {
-        "OUROBOROS_MODEL": args.model,
-        "OUROBOROS_MODEL_LIGHT": effective_light,
-        "OUROBOROS_MODEL_FALLBACKS": args.model,
+        key: actor_slots[key]
+        for key in (
+            "OUROBOROS_MODEL",
+            "OUROBOROS_MODEL_LIGHT",
+            "OUROBOROS_MODEL_FALLBACKS",
+        )
     }
     manifest["available_subagents"] = fixed_actor["available_subagents"]
     manifest["harness"]["fixed_model_actor"] = fixed_actor

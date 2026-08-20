@@ -188,6 +188,7 @@ def runtime_actor_snapshot(
     settings: Mapping[str, Any],
     *,
     expected_model: str,
+    expected_light_model: str = "",
 ) -> dict[str, Any]:
     """Normalize and compare the actor exposed by a target runtime's settings.
 
@@ -198,6 +199,7 @@ def runtime_actor_snapshot(
     model = str(expected_model or "").strip()
     if not model:
         raise ValueError("runtime actor comparison requires an expected model")
+    light_model = str(expected_light_model or "").strip() or model
     if not isinstance(settings, Mapping):
         raise ValueError("runtime settings must be an object")
 
@@ -213,8 +215,8 @@ def runtime_actor_snapshot(
             f"OUROBOROS_MODEL: runtime={actual_model!r} expected={model!r}"
         )
     # Empty optional slots mean "no alternate actor" and are therefore safe. Every non-empty
-    # active slot must resolve only to the measured model: Light, fallback, reviewer, vision or
-    # another live role can all execute work and would otherwise contaminate a fixed-model run.
+    # active slot must resolve only to its compiled actor: Light may be an explicit documented
+    # helper override, while fallback, reviewer, vision and every other live role stay on Main.
     # ACTIVE_MODEL_SLOT_KEYS deliberately excludes legacy Heavy, so historical settings remain
     # readable without resurrecting it as an execution authority.
     structured_review_raw = str(settings.get(REVIEWER_SLOTS_ENV) or "").strip()
@@ -226,23 +228,31 @@ def runtime_actor_snapshot(
         # projection and may be stale on disk without being executable.
         if structured_review_raw and key in _STRUCTURED_REVIEW_SHADOWS:
             continue
+        expected = light_model if key == "OUROBOROS_MODEL_LIGHT" else model
         configured = [item.strip() for item in raw.split(",") if item.strip()]
-        foreign = [item for item in configured if item != model]
+        foreign = [item for item in configured if item != expected]
         if foreign:
             mismatches.append(
-                f"{key}: runtime={raw!r} expected empty or only {model!r}"
+                f"{key}: runtime={raw!r} expected empty or only {expected!r}"
             )
 
-    expected_local = provider_for_model(model) == "local"
+    expected_local_routes = {
+        key: provider_for_model(
+            light_model if key == "USE_LOCAL_LIGHT" else model
+        ) == "local"
+        for key in _ACTIVE_LOCAL_ROUTE_KEYS
+    }
     local_routes = {
         key: str(settings.get(key) or "").strip().lower() in {"1", "true", "yes", "on"}
         for key in _ACTIVE_LOCAL_ROUTE_KEYS
     }
     for key, uses_local in local_routes.items():
+        expected_local = expected_local_routes[key]
         if uses_local != expected_local:
+            routed_model = light_model if key == "USE_LOCAL_LIGHT" else model
             mismatches.append(
                 f"{key}: runtime local route={uses_local!r} expected={expected_local!r} "
-                f"for measured model {model!r}"
+                f"for routed model {routed_model!r}"
             )
 
     reviewer_projection: dict[str, Any] = {}
@@ -374,9 +384,13 @@ def pin_single_model(
     review_slots: int = 1,
     review_effort: str = "",
     target: Optional[MutableMapping[str, str]] = None,
+    *,
+    light_model: str = "",
 ) -> MutableMapping[str, str]:
-    """Pin every model slot to ``model`` and set the review triad to ``review_slots``
-    copies of it.
+    """Pin every execution route to ``model``, except an explicit Light helper.
+
+    Reviewers, fallback and Available subagents always remain on Main.  ``light_model``
+    exists only for launchers whose public methodology already exposes that override.
 
     ``target=None`` mutates ``os.environ`` (host-subprocess path, e.g. Terminal-Bench);
     pass a settings dict to update it instead (e.g. SWE-bench Pro ``derive_run_settings``).
@@ -389,9 +403,14 @@ def pin_single_model(
     sink.pop("USE_LOCAL_HEAVY", None)
     for key in SINGLE_MODEL_SLOT_KEYS:
         sink[key] = model
+    effective_light = str(light_model or "").strip() or model
+    sink["OUROBOROS_MODEL_LIGHT"] = effective_light
     local_value = "true" if provider_for_model(model) == "local" else "false"
     for key in _ACTIVE_LOCAL_ROUTE_KEYS:
         sink[key] = local_value
+    sink["USE_LOCAL_LIGHT"] = (
+        "true" if provider_for_model(effective_light) == "local" else "false"
+    )
     sink[SUBAGENTS_SETTING] = single_model_subagents_setting(model)
     sink["OUROBOROS_REVIEW_MODELS"] = ",".join([model] * max(1, int(review_slots)))
     sink[REVIEWER_SLOTS_ENV] = single_model_reviewer_slots_setting(
@@ -413,11 +432,12 @@ def pin_single_model(
 def fixed_model_actor_snapshot(
     model: str,
     *,
+    light_model: str = "",
     review_slots: int = 1,
     review_effort: str = "",
     target: Optional[MutableMapping[str, str]] = None,
 ) -> dict[str, Any]:
-    """Pin one execution mapping and return its complete manifest-safe actor.
+    """Compile one execution mapping and return its complete manifest-safe actor.
 
     Callers pass the SAME mapping they will hand to the subprocess.  This closes
     the provenance gap where launchers recorded three model strings while ambient
@@ -430,8 +450,13 @@ def fixed_model_actor_snapshot(
         review_slots=review_slots,
         review_effort=review_effort,
         target=sink,
+        light_model=light_model,
     )
-    snapshot = runtime_actor_snapshot(sink, expected_model=model)
+    snapshot = runtime_actor_snapshot(
+        sink,
+        expected_model=model,
+        expected_light_model=light_model,
+    )
     if snapshot["mismatches"]:
         raise RuntimeError(
             "fixed-model actor compiler produced an inconsistent contract: "

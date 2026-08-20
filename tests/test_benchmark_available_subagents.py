@@ -149,6 +149,47 @@ def test_pin_single_model_preserves_canonical_local_route_semantics():
     assert all(actor["local_routes"].values())
 
 
+@pytest.mark.parametrize(
+    "light_model,uses_local_light",
+    (
+        ("anthropic/claude-sonnet-4.6", False),
+        ("owner/light (local)", True),
+    ),
+)
+def test_fixed_model_actor_compiles_explicit_light_route(
+    light_model, uses_local_light
+):
+    model = "openai/gpt-5.5"
+    target = {
+        "OUROBOROS_MODEL_LIGHT": "foreign/light",
+        "USE_LOCAL_LIGHT": "true",
+    }
+    actor = fixed_model_actor_snapshot(
+        model,
+        light_model=light_model,
+        target=target,
+    )
+
+    assert actor["mismatches"] == []
+    assert actor["model_slots"]["OUROBOROS_MODEL"] == model
+    assert actor["model_slots"]["OUROBOROS_MODEL_LIGHT"] == light_model
+    assert actor["model_slots"]["OUROBOROS_MODEL_FALLBACKS"] == model
+    assert actor["local_routes"] == {
+        "USE_LOCAL_MAIN": False,
+        "USE_LOCAL_LIGHT": uses_local_light,
+        "USE_LOCAL_FALLBACK": False,
+        "USE_LOCAL_CONSCIOUSNESS": False,
+    }
+    assert _only_target(target["OUROBOROS_SUBAGENTS"]) == model
+    target["USE_LOCAL_LIGHT"] = str(not uses_local_light).lower()
+    drifted = runtime_actor_snapshot(
+        target,
+        expected_model=model,
+        expected_light_model=light_model,
+    )
+    assert any("USE_LOCAL_LIGHT" in item for item in drifted["mismatches"])
+
+
 def test_disabled_encoder_is_explicit_empty_off():
     config = parse_configured_subagents(disabled_subagents_setting())
     assert config.enabled is False
