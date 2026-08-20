@@ -7,28 +7,35 @@ default pytest run via pyproject.toml addopts. They run only on:
   - workflow_dispatch (manual)
   - tag push (v*)
 
-Each test is individually skipped when its API key is absent, so the job
-stays green even if only a subset of keys is configured.
-
-`LLMClient.chat()` returns a `(msg_dict, usage_dict)` tuple since v4.44.0.
-The shared assertion below also handles the legacy flat-dict shape so tests
-do not need to track the underlying client refactor.
-
-Parametrized in v5.15.x — 8 near-identical per-provider tests collapsed
-into 2 parametrized tables (``basic_chat`` and ``isolation``).
+Optional provider smokes skip when their API key is absent. The shipped-default
+OpenAI reasoning/tool canary requires ``OPENAI_API_KEY`` in the official GitHub
+job, so deleting that secret cannot turn the contract alarm into a green no-op.
 """
 
+from __future__ import annotations
+
 import os
+import uuid
+
 import pytest
 
-# Skip the entire module during routine pytest runs that use addopts -m "not integration".
-# The mark also works as a per-test filter.
+from ouroboros.provider_models import OPENAI_DIRECT_DEFAULTS
+from tests.provider_contract_ci import (
+    registry_openai_canary_tool,
+    require_openai_canary_key,
+    run_openai_reasoning_tool_canary,
+    skip_on_provider_environmental_error,
+    unique_openai_direct_defaults,
+)
+
 integration = pytest.mark.integration
+_OPENAI_REASONING_TOOL_MODELS = unique_openai_direct_defaults()
 
 
 def _get_llm_client():
     """Lazy import to avoid breaking collection when ouroboros is not installed."""
     from ouroboros.llm import LLMClient
+
     return LLMClient()
 
 
@@ -37,15 +44,14 @@ def _assert_basic_response(result, expected_provider=None):
     if isinstance(result, tuple):
         msg, usage = result
     else:
-        msg, usage = result, result.get("usage", {}) if isinstance(result, dict) else {}
+        msg = result
+        usage = result.get("usage", {}) if isinstance(result, dict) else {}
 
     text = ""
     if isinstance(msg, dict):
         text = msg.get("content", "") or ""
         if isinstance(text, list):
-            text = " ".join(
-                b.get("text", "") for b in text if isinstance(b, dict)
-            )
+            text = " ".join(block.get("text", "") for block in text if isinstance(block, dict))
         if not text and expected_provider == "cloudru" and msg.get("reasoning"):
             pytest.skip(
                 "Cloud.ru returned reasoning-only output without final content; "
@@ -53,123 +59,40 @@ def _assert_basic_response(result, expected_provider=None):
                 "emit a final answer for this smoke prompt."
             )
     assert text, f"Empty response from LLM: {result}"
-
     assert isinstance(usage, dict), f"Usage is not a dict: {type(usage)}"
     assert usage.get("prompt_tokens", 0) > 0, f"No prompt_tokens in usage: {usage}"
     assert usage.get("completion_tokens", 0) > 0, f"No completion_tokens in usage: {usage}"
-
     if expected_provider:
         resolved = usage.get("provider", "") or usage.get("resolved_model", "") or ""
         assert expected_provider.lower() in resolved.lower(), (
-            f"Expected provider '{expected_provider}' in resolved model, "
-            f"got '{resolved}'"
+            f"Expected provider '{expected_provider}' in resolved model, got '{resolved}'"
         )
 
 
-# Provider name → (env var name, model id, expected_provider check)
-#
-# anthropic_direct uses the current production direct Anthropic default. This
-# is a routing smoke (auth + request shape); provider billing/quota/rate-limit
-# errors are still treated as environmental below.
+# The former direct-OpenAI gpt-4o-mini text row is intentionally absent. The
+# registry/default-derived canary below asserts the same direct route plus exact
+# shipped model identity, positive usage, custom+medium wire disclosure, and a
+# real continuation. Keeping the stale text row would add cost without coverage.
 _PROVIDER_MATRIX = [
-    ("openrouter",       "OPENROUTER_API_KEY",                 "anthropic/claude-sonnet-4.6", "openrouter"),
-    ("openai_direct",    "OPENAI_API_KEY",                     "openai::gpt-4o-mini",         "openai"),
-    ("anthropic_direct", "ANTHROPIC_API_KEY",                  "anthropic::claude-sonnet-5", "anthropic"),
-    ("cloudru",          "CLOUDRU_FOUNDATION_MODELS_API_KEY",  "cloudru::zai-org/GLM-4.7",    "cloudru"),
+    (
+        "openrouter",
+        "OPENROUTER_API_KEY",
+        "anthropic/claude-sonnet-4.6",
+        "openrouter",
+    ),
+    (
+        "anthropic_direct",
+        "ANTHROPIC_API_KEY",
+        "anthropic::claude-sonnet-5",
+        "anthropic",
+    ),
+    (
+        "cloudru",
+        "CLOUDRU_FOUNDATION_MODELS_API_KEY",
+        "cloudru::zai-org/GLM-4.7",
+        "cloudru",
+    ),
 ]
-
-
-def _skip_on_provider_environmental_error(provider_id: str, exc: BaseException) -> None:
-    """If exc is a known environmental (non-code) provider error, skip the
-    test instead of failing.
-
-    Includes:
-    - ``credit balance is too low`` — Anthropic billing
-    - ``insufficient_quota`` — OpenAI billing
-    - ``rate_limit_exceeded`` / 429 — transient rate limits
-    - 5xx provider errors — transient upstream/provider outages
-    - expired/denied API keys for optional provider smoke lanes
-    - provider transport disconnects for Cloud.ru CI smoke
-
-    These are CI-environment problems, not regressions in routing code.
-    The full body is still printed to stderr for postmortem.
-    """
-    import sys as _sys
-    resp = getattr(exc, "response", None)
-    body = ""
-    if resp is not None:
-        body = resp.text or ""
-        print(f"[{provider_id}] HTTP {resp.status_code} body: {body[:500]}", file=_sys.stderr)
-    lowered = body.lower()
-    chain = []
-    cur = exc
-    seen = set()
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        chain.append(str(cur))
-        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
-    message = "\n".join(chain).lower()
-    if (
-        "credit balance is too low" in lowered
-        or "insufficient_quota" in lowered
-        or "rate_limit" in lowered
-        or "key is expired" in lowered
-        or "api key verification failed" in lowered
-        or "accessdenied" in lowered
-        or (resp is not None and resp.status_code == 429)
-        or (resp is not None and 500 <= int(getattr(resp, "status_code", 0) or 0) < 600)
-        or (
-            provider_id == "cloudru"
-            and "server disconnected without sending a response" in message
-        )
-    ):
-        detail = body[:200] if body else str(exc)[:200]
-        pytest.skip(f"[{provider_id}] environmental provider error (not a routing regression): {detail}")
-
-
-def test_provider_environmental_error_skips_expired_key():
-    class Response:
-        status_code = 403
-        text = '{"message":"API key verification failed: key is expired","code":"AccessDenied"}'
-
-    exc = RuntimeError("forbidden")
-    exc.response = Response()
-
-    with pytest.raises(pytest.skip.Exception):
-        _skip_on_provider_environmental_error("cloudru", exc)
-
-
-def test_provider_environmental_error_skips_provider_5xx():
-    class Response:
-        status_code = 504
-        text = '{"error_msg":"504 Gateway Time-out"}'
-
-    exc = RuntimeError("provider timeout")
-    exc.response = Response()
-
-    with pytest.raises(pytest.skip.Exception):
-        _skip_on_provider_environmental_error("cloudru", exc)
-
-
-def test_provider_environmental_error_skips_cloudru_disconnect():
-    exc = RuntimeError("APIConnectionError: Server disconnected without sending a response.")
-
-    with pytest.raises(pytest.skip.Exception):
-        _skip_on_provider_environmental_error("cloudru", exc)
-
-
-def test_provider_environmental_error_does_not_skip_generic_cloudru_connection_error():
-    exc = RuntimeError("APIConnectionError: Connection error.")
-
-    _skip_on_provider_environmental_error("cloudru", exc)
-
-
-def test_provider_environmental_error_checks_cloudru_disconnect_cause_chain():
-    exc = RuntimeError("APIConnectionError: Connection error.")
-    exc.__cause__ = RuntimeError("httpx.RemoteProtocolError: Server disconnected without sending a response.")
-
-    with pytest.raises(pytest.skip.Exception):
-        _skip_on_provider_environmental_error("cloudru", exc)
 
 
 @integration
@@ -179,31 +102,53 @@ def test_provider_environmental_error_checks_cloudru_disconnect_cause_chain():
     ids=[entry[0] for entry in _PROVIDER_MATRIX],
 )
 def test_provider_basic_chat(provider_id, env_key, model, expected_provider):
-    """Verify each provider responds to a minimal chat request.
-
-    Uses explicit ``max_tokens=1024`` rather than the chat() default (65536)
-    because some direct provider model variants cap output below the
-    default and reject the request with HTTP 400. This is a routing smoke;
-    a low token budget is sufficient for "Respond with exactly: OK".
-
-    Known environmental (non-code) provider errors — empty Anthropic
-    credit balance, OpenAI insufficient_quota, 429 rate limits — are
-    surfaced as test skips, not failures (they indicate CI account
-    state, not a regression in this repo).
-    """
+    """Verify each optional provider responds to a bounded text request."""
     if not os.environ.get(env_key):
         pytest.skip(f"{env_key} not set")
-    client = _get_llm_client()
     try:
-        result = client.chat(
+        result = _get_llm_client().chat(
             messages=[{"role": "user", "content": "Respond with exactly: OK"}],
             model=model,
             max_tokens=1024,
         )
     except Exception as exc:  # noqa: BLE001
-        _skip_on_provider_environmental_error(provider_id, exc)
+        skip_on_provider_environmental_error(provider_id, exc)
         raise
     _assert_basic_response(result, expected_provider=expected_provider)
+
+
+@integration
+@pytest.mark.parametrize(
+    "model",
+    _OPENAI_REASONING_TOOL_MODELS,
+    ids=[model.split("::", 1)[-1] for model in _OPENAI_REASONING_TOOL_MODELS],
+)
+def test_openai_shipped_reasoning_models_custom_tool_continuation(model, tmp_path):
+    """Alarm on the exact shipped direct-OpenAI reasoning/tool contract.
+
+    Every unique model from the provider-default SSOT must preserve requested
+    ``medium`` on the production custom-tool path. The Main row additionally
+    replays the returned canonical assistant call, submits an ordinary
+    ``role=tool`` result carrying a nonce, and requires the exact final marker
+    that was absent from the initial prompt.
+    Continuation is one provider/API/dialect protocol class, so repeating that
+    second turn for every model would add cost and flake surface without a new
+    contract; each model still gets its own first-turn wire acceptance alarm.
+    Quota/429/5xx/timeout are typed inconclusive; every contract/auth/model/tool/
+    reasoning 4xx remains red.
+    """
+    require_openai_canary_key()
+    try:
+        run_openai_reasoning_tool_canary(
+            _get_llm_client(),
+            model=model,
+            tool=registry_openai_canary_tool(tmp_path),
+            nonce=uuid.uuid4().hex,
+            continue_to_final=model == OPENAI_DIRECT_DEFAULTS["main"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        skip_on_provider_environmental_error("openai_direct", exc)
+        raise
 
 
 @integration
@@ -213,16 +158,12 @@ def test_provider_basic_chat(provider_id, env_key, model, expected_provider):
 )
 def test_gigachat_basic_chat():
     """Verify GigaChat direct routing via the gigachat library works."""
-    client = _get_llm_client()
-    result = client.chat(
+    result = _get_llm_client().chat(
         messages=[{"role": "user", "content": "Respond with exactly: OK"}],
         model="gigachat::GigaChat-3-Ultra",
     )
     _assert_basic_response(result, expected_provider="gigachat")
 
-
-# Isolation tests: clear competing provider keys so LLMClient can only route
-# through the single provider under test.
 
 _COMPETING_KEYS = [
     "OPENROUTER_API_KEY",
@@ -235,14 +176,24 @@ _COMPETING_KEYS = [
     "ANTHROPIC_API_KEY",
 ]
 
-# Isolation parametrize — same matrix minus the OpenAI-compatible /
-# Cloud.ru-isolated pairings the legacy file ran. The matrix mirrors
-# _PROVIDER_MATRIX entries that have an isolation companion.
+# Direct OpenAI needs no duplicate gpt-4o-mini isolation row: its explicit
+# ``openai::`` route and exact usage identity are asserted by the stronger canary.
 _ISOLATION_MATRIX = [
-    ("openrouter",       "OPENROUTER_API_KEY",                 "anthropic/claude-sonnet-4.6"),
-    ("openai_direct",    "OPENAI_API_KEY",                     "openai::gpt-4o-mini"),
-    ("anthropic_direct", "ANTHROPIC_API_KEY",                  "anthropic::claude-sonnet-5"),
-    ("cloudru",          "CLOUDRU_FOUNDATION_MODELS_API_KEY",  "cloudru::zai-org/GLM-4.7"),
+    (
+        "openrouter",
+        "OPENROUTER_API_KEY",
+        "anthropic/claude-sonnet-4.6",
+    ),
+    (
+        "anthropic_direct",
+        "ANTHROPIC_API_KEY",
+        "anthropic::claude-sonnet-5",
+    ),
+    (
+        "cloudru",
+        "CLOUDRU_FOUNDATION_MODELS_API_KEY",
+        "cloudru::zai-org/GLM-4.7",
+    ),
 ]
 
 
@@ -253,25 +204,20 @@ _ISOLATION_MATRIX = [
     ids=[entry[0] for entry in _ISOLATION_MATRIX],
 )
 def test_provider_isolation(provider_id, env_key, model, monkeypatch):
-    """Each provider works when it is the only configured provider.
-
-    Environmental provider errors (empty credit, quota, rate limits)
-    skip via _skip_on_provider_environmental_error rather than fail.
-    """
+    """Each optional provider works when it is the only configured provider."""
     if not os.environ.get(env_key):
         pytest.skip(f"{env_key} not set")
     for key in _COMPETING_KEYS:
         if key != env_key:
             monkeypatch.delenv(key, raising=False)
-    client = _get_llm_client()
     try:
-        result = client.chat(
+        result = _get_llm_client().chat(
             messages=[{"role": "user", "content": "Say hello"}],
             model=model,
             max_tokens=1024,
         )
     except Exception as exc:  # noqa: BLE001
-        _skip_on_provider_environmental_error(provider_id, exc)
+        skip_on_provider_environmental_error(provider_id, exc)
         raise
     _assert_basic_response(result)
 
@@ -286,8 +232,7 @@ def test_gigachat_isolation(monkeypatch):
     for key in _COMPETING_KEYS:
         if key != "GIGACHAT_CREDENTIALS":
             monkeypatch.delenv(key, raising=False)
-    client = _get_llm_client()
-    result = client.chat(
+    result = _get_llm_client().chat(
         messages=[{"role": "user", "content": "Say hello"}],
         model="gigachat::GigaChat-3-Ultra",
     )

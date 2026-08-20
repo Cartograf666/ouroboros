@@ -24,6 +24,7 @@ from ouroboros.context_budget import (
     _UnitSummaryFailure,
     _UnsafeVisual,
 )
+from ouroboros.anthropic_native_custody import anthropic_tool_unit_active, custody_private_key
 
 log = logging.getLogger(__name__)
 
@@ -33,7 +34,6 @@ _SUMMARY_OUTPUT_TOKENS = 32_768
 _BLOCKS_PER_BATCH = 8
 _MIN_CAPSULE_BYTES = 512
 _SHA256_HEX = frozenset("0123456789abcdef")
-
 _SUMMARY_GUIDANCE = (
     "Summarize each supplied context source without dropping late facts. Preserve "
     "the actor's hypotheses, exact consequential errors, tool inputs when they "
@@ -87,7 +87,6 @@ def _reclaim_tokens_for_byte_delta(byte_delta: int, measurement_density: float) 
 def _context_tokens_for_messages(
     messages: Sequence[Mapping[str, Any]], measurement_density: float,
 ) -> int:
-    """Use the same bounded message projection and density as ContextFit."""
     from ouroboros.context_fit import estimate_context_prompt_tokens
     _reclaim_tokens_for_byte_delta(0, measurement_density)
     estimate = estimate_context_prompt_tokens(list(messages))
@@ -100,7 +99,6 @@ def _sha256(value: Any) -> str:
 
 
 def context_reclaim_transcript_sha256(messages: Sequence[Mapping[str, Any]]) -> str:
-    """Stable binding of the complete canonical transcript supplied to reclaim."""
     return _sha256(_canonical_bytes(list(messages)))
 
 
@@ -130,7 +128,6 @@ def _unique_refs(values: Sequence[Any]) -> Tuple[Dict[str, Any], ...]:
 
 
 def _summary_projection(value: Any) -> Any:
-    """Return every actor-visible byte, replacing only safely-described visuals."""
     if isinstance(value, Mapping):
         kind = str(value.get("type") or "").strip().lower()
         if kind in {"image", "image_url"}:
@@ -146,7 +143,7 @@ def _summary_projection(value: Any) -> Any:
             return {"type": "image_descriptor", "text": descriptor}
         projected: Dict[str, Any] = {}
         for key, item in value.items():
-            if str(key) == "_context_capsule":
+            if str(key) == "_context_capsule" or custody_private_key(key):
                 continue
             projected[str(key)] = _summary_projection(item)
         return projected
@@ -333,7 +330,7 @@ def _atomic_units(
             and len(result_ids) == len(set(result_ids))
             and set(result_ids) == set(call_ids)
         )
-        if complete:
+        if complete and not anthropic_tool_unit_active(messages, idx, end):
             unit = _unit_from_slice(
                 messages, idx, end,
                 trace_refs_by_tool_call_id=trace_refs,
@@ -374,7 +371,6 @@ def _typed_context_overflow(exc: BaseException) -> bool:
                        getattr(capture, "provider_error_type", None)))
     if any(str(value or "").strip().lower() in _TYPED_CONTEXT_OVERFLOW_CODES for value in candidates):
         return True
-    # Untyped shapes: the shared Main markers still authorize the split.
     return _context_overflow_message(str(exc))
 
 
@@ -498,17 +494,20 @@ def _call_summarizer(
                   + "\nCall emit_context_summaries exactly once, with one entry for every source_id.\n"
                   + source_json)
         try:
-            message, _usage = chat_observed(
-                client,
-                messages=[{"role": "user", "content": prompt}],
-                tools=[_CONTEXT_SUMMARIES_TOOL],
-                tool_choice="required",
-                **common,
+            from ouroboros.openai_chat_dispatch import call_with_custom_validation_continuation
+            message, observed_usage, executable = call_with_custom_validation_continuation(
+                lambda request_messages: chat_observed(
+                    client, messages=request_messages,
+                    tools=[_CONTEXT_SUMMARIES_TOOL], tool_choice="required", **common,
+                ),
+                [{"role": "user", "content": prompt}],
             )
-            _record_usage(usage_total, _usage)
-            parsed = _parse_structured_summaries(message)
-            if parsed:
-                return parsed
+            for _usage in observed_usage:
+                _record_usage(usage_total, _usage)
+            if executable:
+                parsed = _parse_structured_summaries(message)
+                if parsed:
+                    return parsed
         except Exception as exc:
             if _typed_context_overflow(exc):
                 raise SummarizerContextOverflow(str(exc)) from exc
@@ -653,7 +652,6 @@ def _fold_summaries(
                     if set(folded) == {fold_part.source_id} else ""
             except (SummarizerContextOverflow, _UnitSummaryFailure):
                 text = ""
-            # Child summaries are covered, so fold failure may concatenate them.
             next_nodes.append((fold_id, text or labelled))
         nodes = next_nodes
     return nodes[0][1]

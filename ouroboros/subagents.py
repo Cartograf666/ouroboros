@@ -855,8 +855,8 @@ def preflight_native_fallback_lane(task: Mapping[str, Any]) -> SubagentLaneResol
     delegate-visibility preflight just demoted to native executes the work
     ITSELF on metered tokens, so the policy must not survive the demotion: the
     lane re-resolves exactly as a native dispatch would have (explicit request,
-    else parent inheritance — never policy-light), and the model/effort the
-    record states follow the re-resolved lane.
+    else parent inheritance — never policy-light), and the recorded model follows
+    that lane. Effort remains the task-type-derived pre-wire setting.
     """
     requested_lane = str(task.get("requested_model_lane") or task.get("model_lane") or "auto")
     try:
@@ -873,24 +873,18 @@ def preflight_native_fallback_dispatch(
     """The preflight's harness→native fallback, with the lane RE-RESOLVED (F10).
 
     The falsified dispatch resolved its lane under the harness policy (auto ⇒
-    light) and measured its effort band against that cheap model. Keeping them
-    would run a native child of a heavy parent on policy-light — the delta is
-    rebuilt from the re-resolved lane: the lane axes, the effort re-measured
-    against the model that will actually run, the executor reduction, and the
-    preflight reason. The caller (``agent.preflight_delegate_visibility``)
+    light). Keeping it would run a native child of a heavy parent on policy-light,
+    so the delta is rebuilt from the re-resolved lane axes, unchanged scheduling
+    effort, executor reduction, and preflight reason. The caller
+    (``agent.preflight_delegate_visibility``)
     re-stamps the record and envelope; ``agent._prepare_task_context`` re-syncs
     the metadata projection and the ToolContext model override off them.
     """
     import dataclasses
 
-    from ouroboros.config import effort_rank
-
     lane = preflight_native_fallback_lane(task)
     derived_effort = dispatch.delta.derived_effort
-    effective_effort = _route_effort(lane.model, derived_effort)
     reasons: List[str] = []
-    if derived_effort and effort_rank(effective_effort) < effort_rank(derived_effort):
-        reasons.append(f"route_effort_ceiling={effective_effort}")
     if lane.reduced:
         reasons.append(f"lane_slot_unavailable={lane.resolved_from}")
     reasons.append(reason)
@@ -899,7 +893,7 @@ def preflight_native_fallback_dispatch(
         resolved_lane=lane.resolved_from,
         effective_lane=lane.effective_lane,
         lane_provenance=lane.provenance,
-        effective_effort=effective_effort,
+        effective_effort=derived_effort,
         effective_executor="native",
         reduction_reasons=tuple(reasons),
         reason=derive_capability_reason(reasons),
@@ -931,17 +925,15 @@ class CapabilityDelta:
     """What was ASKED for versus what was GIVEN, on every axis at once.
 
     A child could land below its request in several unrelated places — an inherited
-    lane, a lane slot that is not configured, an effort the route caps, an executor
-    pin no route can honor — and not one of them announced itself. The reductions
-    were spread across the resolver, the model getters, the LLM client and (for the
-    executor) nowhere at all, so "what was asked" and "what was given" were never
-    compared in the same place. This record is that place, and
+    lane, a lane slot that is not configured, or an executor pin no route can honor —
+    and not one of them announced itself. Those scheduling reductions were spread
+    across the resolver, model getters and executor path, so "what was asked" and
+    "what was given" were never compared in the same place. This record is that place, and
     ``resolve_subagent_dispatch`` is its only author.
 
-    The effort axis names a DERIVED value, not a request: since v6.87.28 no parent
-    can ask for an effort, so what a route's learned band is measured against is the
-    effort ``config.resolve_effort`` gives this task type. A route that caps it below
-    the owner's own setting is still a reduction, and still the owner's business.
+    The effort axis names the scheduling-derived pre-wire value, not a physical
+    provider result. Exact route/request adaptation happens later and is disclosed
+    by ``usage.request_wire`` rather than authored into this scheduling record.
     """
 
     requested_lane: str = "auto"
@@ -1001,10 +993,9 @@ def capability_delta_disclosures(delta: Mapping[str, Any]) -> List[str]:
     parts: List[str] = []
     if lane_is_weaker(str(delta.get("effective_lane") or ""), str(delta.get("resolved_lane") or "")):
         parts.append(f"model_lane {lane_delta_phrase(delta)}")
-    # RANK, not inequality: `effective_effort` is the whole learned band, so a route
-    # with a floor can land ABOVE the derived effort, and "runs BELOW what was asked
-    # for — effort none->low" is a false alarm the moment any OTHER axis puts this
-    # delta into a reduction.
+    # Keep rank-based rendering for older durable deltas. The current resolver writes
+    # the same pre-wire derived/effective effort; physical adaptation is disclosed by
+    # usage.request_wire instead of this scheduling record.
     from ouroboros.config import effort_rank
 
     derived = str(delta.get("derived_effort") or "")
@@ -1036,25 +1027,6 @@ def lane_delta_phrase(delta: Mapping[str, Any]) -> str:
     if resolved and resolved != requested:
         return f"{requested}(inherited {resolved})->{effective}"
     return f"{requested}->{effective}"
-
-
-def _route_effort(model: str, effort: str) -> str:
-    """The effort this route will ACTUALLY run: the request clamped into the route's
-    learned band by the SAME call the dispatcher makes.
-
-    It used to read the ceiling alone, which is half of the band the dispatcher
-    clamps to — so a route with a learned FLOOR (v6.73.2, endpoints where reasoning
-    is mandatory) had its delta report the request verbatim while the call ran
-    something else. Falls back to the request on any failure: a missing evidence
-    store must never block scheduling.
-    """
-    try:
-        from ouroboros.llm import LLMClient
-
-        return str(LLMClient.clamp_effort_for_route(str(model or ""), effort) or effort)
-    except Exception:  # pragma: no cover - evidence store is advisory
-        log.debug("Effort-band lookup failed for %r", model, exc_info=True)
-        return effort
 
 
 # The durable keys a scheduling request may state. Everything the dispatch
@@ -1168,9 +1140,8 @@ def resolve_subagent_dispatch(
     """THE resolution point: where power, effort, route, profile and executor meet.
 
     It runs at DISPATCH, from the child's durable record, because that is the last
-    moment at which the answer is still true. Two of its inputs are live — whether a
-    harness route exists, and what band that route's model has learned — and a queued
-    child can wait out a whole outage. Resolving at schedule time produced a record
+    moment at which route availability is still current; a queued child can wait out
+    a whole outage. Resolving at schedule time produced a record
     that claimed an answer about a moment that had already passed; resolving twice
     produced two records that disagreed about the same child.
 
@@ -1226,14 +1197,11 @@ def resolve_subagent_dispatch(
         requested_executor == "auto" and executor_reason == "harness_not_configured"
     ):
         executor_reason = ""
-    from ouroboros.config import effort_rank, resolve_effort
+    from ouroboros.config import resolve_effort
 
     derived_effort = resolve_effort(task_type or str(task.get("type") or "task"))
-    effective_effort = _route_effort(lane.model, derived_effort)
 
     reasons: List[str] = []
-    if effort_rank(effective_effort) < effort_rank(derived_effort):
-        reasons.append(f"route_effort_ceiling={effective_effort}")
     if lane.reduced:
         reasons.append(f"lane_slot_unavailable={lane.resolved_from}")
     if executor_reason:
@@ -1257,10 +1225,9 @@ def resolve_subagent_dispatch(
         effective_lane=lane.effective_lane,
         lane_provenance=lane.provenance,
         derived_effort=derived_effort,
-        # The effort the route will ACTUALLY run — the whole learned band through
-        # the same call the dispatcher clamps with, so a route with a learned FLOOR
-        # is reported honestly and is not called a reduction.
-        effective_effort=effective_effort,
+        # Scheduling's pre-wire effort. Exact route/request adaptation, if needed,
+        # is reported only after the physical call in usage.request_wire.
+        effective_effort=derived_effort,
         requested_executor=requested_executor,
         effective_executor=executor,
         reduction_reasons=tuple(reasons),
@@ -1273,10 +1240,8 @@ def resolve_subagent_dispatch(
     constraint = task.get("task_constraint") if isinstance(task.get("task_constraint"), dict) else {}
     return SubagentDispatch(
         lane=lane,
-        # The DERIVED effort, not the clamped one. The dispatcher re-clamps per
-        # model on every call, and a fallback route with a wider band must not
-        # inherit this route's ceiling through the stored value; what this route
-        # will really run is reported by the delta.
+        # Pass the scheduling-derived effort unchanged. Each physical call owns any
+        # exact route/request adaptation and reports it through usage.request_wire.
         effort=derived_effort,
         executor=executor,
         route=route if executor == "harness" else "",

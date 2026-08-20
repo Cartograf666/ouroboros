@@ -284,6 +284,7 @@ def update_json_locked(
     timeout_sec: float = 4.0,
     stale_sec: float = 90.0,
     strict_existing_dict: bool = False,
+    reject_existing_empty_dict: bool = False,
 ) -> Dict[str, Any]:
     """Locked read-modify-write of a durable JSON dict file.
 
@@ -298,6 +299,9 @@ def update_json_locked(
     silently reintroduce the exact lost-update class this helper removes.
     When ``strict_existing_dict`` is true, an existing malformed/non-object
     JSON file raises ``ValueError`` instead of being mistaken for a new file.
+    ``reject_existing_empty_dict`` additionally distinguishes an absent store
+    from an existing empty object for schema-bearing callers: only absence may
+    initialize a new schema.
     """
     from ouroboros.platform_layer import (
         acquire_exclusive_file_lock,
@@ -314,6 +318,7 @@ def update_json_locked(
             f"update_json_locked: could not acquire {lock_path} within {timeout_sec}s"
         )
     try:
+        existed = path.exists()
         current = read_json_dict(path)
         if current is None:
             if strict_existing_dict and path.exists():
@@ -321,6 +326,10 @@ def update_json_locked(
                     "update_json_locked: existing JSON is malformed or is not an object"
                 )
             current = {}
+        if reject_existing_empty_dict and existed and not current:
+            raise ValueError(
+                "update_json_locked: existing empty JSON object has no schema"
+            )
         updated = mutator(current)
         if updated is None:
             return current
@@ -680,6 +689,29 @@ def _secret_key_name(key: str) -> bool:
     snake = raw.lower() if raw.upper() == raw else _re.sub(r"(?<!^)(?=[A-Z])", "_", raw).lower()
     normalized = _re.sub(r"[^a-z0-9]+", "_", snake).strip("_")
     return bool(_SECRET_KEY_NAME_RE.match(normalized))
+
+
+CREDENTIAL_HEADER_NAMES = frozenset({
+    "authorization",
+    "proxy-authorization",
+    "api-key",
+    "x-api-key",
+    "x-goog-api-key",
+    "anthropic-api-key",
+    "openai-api-key",
+    "cookie",
+})
+
+
+def is_secret_key_name(key: Any) -> bool:
+    """Public credential-name classifier shared by durable identity builders."""
+    return _secret_key_name(str(key or ""))
+
+
+def is_credential_header_name(key: Any) -> bool:
+    """Whether a header is authentication state rather than route capability."""
+    normalized = str(key or "").strip().lower()
+    return normalized in CREDENTIAL_HEADER_NAMES or is_secret_key_name(normalized)
 
 
 def _secret_placeholder_value(value: str) -> bool:

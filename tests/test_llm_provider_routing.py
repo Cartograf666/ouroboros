@@ -32,7 +32,7 @@ def test_build_remote_kwargs_uses_max_completion_tokens_for_openai_gpt5(monkeypa
     assert "max_tokens" not in kwargs
 
 
-def test_build_remote_kwargs_keeps_max_tokens_for_openai_gpt41(monkeypatch):
+def test_build_remote_kwargs_uses_current_carriers_provider_wide_for_openai(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
 
     client = LLMClient()
@@ -47,8 +47,9 @@ def test_build_remote_kwargs_keeps_max_tokens_for_openai_gpt41(monkeypatch):
         None,
     )
 
-    assert kwargs["max_tokens"] == 512
-    assert "max_completion_tokens" not in kwargs
+    assert kwargs["max_completion_tokens"] == 512
+    assert kwargs["reasoning_effort"] == "high"
+    assert "max_tokens" not in kwargs
 
 
 def test_build_remote_kwargs_normalizes_tool_descriptions_for_openrouter():
