@@ -159,7 +159,8 @@ def _retry_binding_refusal(record: Dict[str, Any], retry_token: str) -> str:
         "This retry replays a MUTATING invocation recorded BEFORE private "
         "execution snapshots (no snapshot/baseline binding), so replaying it "
         "would write directly into the shared tree. Start a new run with a "
-        "plain delegate_start — it takes its own snapshot and returns its "
+        "plain delegate_start(subagent_id=..., prompt=...) — it takes its own "
+        "snapshot and returns its "
         "diff for explicit integration.",
         retry_of=retry_token, recorded_root=target_root,
         snapshot_id=snapshot_id, baseline_sha=baseline_sha)
@@ -177,7 +178,8 @@ def _validated_invocation(drive: Any, retry_token: str, task_id: str,
     if record is None:
         return None, _fail("delegate_start", "unknown_invocation",
                            "retry_of names an invocation with no durable record on this "
-                           "drive. Start a new run with a plain delegate_start.",
+                           "drive. Start a new run with a plain "
+                           "delegate_start(subagent_id=..., prompt=...).",
                            retry_of=retry_token)
     if record["task_id"] != task_id:
         return None, _fail("delegate_start", "invocation_not_owned",
@@ -192,14 +194,16 @@ def _validated_invocation(drive: Any, retry_token: str, task_id: str,
     if record["state"] == "failed_definite":
         return None, _fail("delegate_start", "invocation_definitely_refused",
                            "That invocation was definitively refused by the daemon; its "
-                           "id is retired. Start a new run with a plain delegate_start.",
+                           "id is retired. Start a new run with a plain "
+                           "delegate_start(subagent_id=..., prompt=...).",
                            retry_of=retry_token)
     body = record["request"]
     if not isinstance(body, dict) or not body:
         return None, _fail("delegate_start", "invocation_request_unrecorded",
                            "That invocation's durable row carries no canonical request "
                            "body, so it cannot be replayed byte-identically. Start a "
-                           "new run with a plain delegate_start.",
+                           "new run with a plain "
+                           "delegate_start(subagent_id=..., prompt=...).",
                            retry_of=retry_token)
     if str(body.get("prompt") or "") != text:
         return None, _fail("delegate_start", "retry_prompt_mismatch",
@@ -309,7 +313,8 @@ def _resolve_retry_invocation(ctx: ToolContext, drive: pathlib.Path, retry_token
                     "This retry replays a MUTATING invocation whose private "
                     "execution snapshot no longer exists on disk, so the recorded "
                     "binding cannot be reproduced. Start a new run with a plain "
-                    "delegate_start (it will take a fresh snapshot).",
+                    "delegate_start(subagent_id=..., prompt=...) (it will take a "
+                    "fresh snapshot).",
                     retry_of=retry_token, snapshot_id=snapshot_id)
     return _RetryBinding(
         request_body=request_body,
@@ -733,7 +738,8 @@ def _payload_mutation_authority(
     if getattr(binding, "root", "") != "skill_payload" or getattr(binding, "operation", "") != "write":
         return None, None, _fail(
             "delegate_start", "payload_binding_mismatch",
-            "delegate_start(root='skill_payload') requires a skill_payload.write "
+            "delegate_start(subagent_id=..., prompt=..., root='skill_payload') "
+            "requires a skill_payload.write "
             "binding; got "
             f"{getattr(binding, 'root', '')!r}/{getattr(binding, 'operation', '')!r}.")
     if getattr(binding, "profile", "") not in _PAYLOAD_PRINCIPAL_PROFILES:

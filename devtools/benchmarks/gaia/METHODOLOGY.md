@@ -9,7 +9,10 @@ does not rewrite the scorer or normalize Ouroboros's core `final_answer`.
 - **Fixed-model Track A.** `settings_base.json` is the committed base template;
   `run_gaia.py` renders a per-run settings file that pins Ouroboros runtime,
   review, and vision model slots to the solve model and disables post-task
-  evolution. The default validation model is `google/gemini-2.5-pro`; Sonnet 4.5
+  evolution. It also serializes exactly one canonical Available-subagent API row
+  on that solve model. This prevents install defaults from adding a Light scout,
+  a second provider family, or an agent-session substrate to a fixed-model run.
+  The default validation model is `google/gemini-2.5-pro`; Sonnet 4.5
   is documented as the later headline comparator against HAL Generalist, not run
   by default here. GAIA permits web browsing; the fixed-model purity boundary is
   whether a *second reasoning model* enters the scaffold.

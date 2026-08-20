@@ -609,11 +609,25 @@ class SettingsNetworkMeta(TypedDict):
     warning: str
 
 
+class AvailableSubagentsSettingsMeta(TypedDict, total=False):
+    """Saved/migrated intent returned beside ``GET /api/settings``.
+
+    ``candidate`` is an unsaved canonical object.  Absence stays ``None``; a
+    read never materializes the value on disk.
+    """
+
+    source: str
+    diagnostic: str
+    diagnostics: list[Dict[str, Any]]
+    candidate: Optional[Dict[str, Any]]
+
+
 class SettingsMeta(SettingsNetworkMeta, total=False):
     """Complete ``GET /api/settings`` ``_meta`` block."""
 
     custom_secret_keys: list[str]
     setup_contract: Dict[str, Any]
+    available_subagents: AvailableSubagentsSettingsMeta
 
 
 class SettingsSaveResponse(TypedDict, total=False):
@@ -1125,14 +1139,24 @@ class OnboardingCompleteRequest(TypedDict, total=False):
     DECLARATIONS about the onboarding run itself.
 
     The settings keys of the shared setup contract ride through unchanged (open
-    shape, same payload the wizard already builds); only the two subscription
-    flags are typed here, because they are not settings. Neither is authority:
+    shape, same payload the wizard already builds); the two subscription flags
+    and canonical actor draft are typed here. None is authority:
     ``subscriptionsConnected`` only tells the server to read the live
     agent account state, and the server re-proves fresh-install status
     on its own before applying anything."""
 
     subscriptionsConnected: bool
     skipSubscriptionPresets: bool
+    OUROBOROS_SUBAGENTS: Dict[str, Any]
+
+
+class OnboardingSubagentsPreviewResponse(TypedDict):
+    """Read-only canonical actor draft returned to Settings/onboarding."""
+
+    ok: bool
+    available_subagents: Dict[str, Any]
+    source: str
+    diagnostics: list[Dict[str, Any]]
 
 
 class OnboardingPresetProjection(TypedDict):
@@ -1143,6 +1167,8 @@ class OnboardingPresetProjection(TypedDict):
     onboarding — absence is reported as absence, never as an empty success."""
 
     applied: bool
+    # Open string ABI. Emitted values include not_requested, not_install_time,
+    # skipped_by_owner, configured_by_owner, and applied.
     reason: str
     harnesses: list[str]
     receipt: Dict[str, Any]
@@ -1289,6 +1315,7 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     # overlay frame, plain browser). /api/onboarding stays the readiness probe.
     "GET /onboarding",
     "GET /api/onboarding",
+    "POST /api/onboarding/subagents/preview",
     "POST /api/onboarding/complete",
     "GET /api/claude-code/status",
     "POST /api/claude-code/install",
@@ -1358,6 +1385,7 @@ __all__ = [
     "ActiveChatActivity",
     "EvolutionStateSnapshot",
     "SettingsNetworkMeta",
+    "AvailableSubagentsSettingsMeta",
     "SettingsMeta",
     "SettingsSaveResponse",
     "OwnerRuntimeModeResponse",
@@ -1367,6 +1395,7 @@ __all__ = [
     "OwnerSafetyModeResponse",
     "OnboardingCompleteRequest",
     "OnboardingCompleteResponse",
+    "OnboardingSubagentsPreviewResponse",
     "OnboardingPresetFailureResponse",
     "OnboardingPresetProjection",
     "SettingsPostCommitFailureResponse",

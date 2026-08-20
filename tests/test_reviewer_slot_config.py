@@ -74,10 +74,14 @@ def test_structured_config_round_trips(monkeypatch):
     (lambda p: p["triad"][1]["route"].__setitem__("target_id", "codex::gpt-5.6"), "'::'"),
     (lambda p: p["triad"][1].__setitem__("slot_id", "t_api"), "appears twice"),
     (lambda p: p["triad"][0].__setitem__("effort", "enormous"), "unknown effort"),
+    (lambda p: p["triad"][1].update({
+        "route": {"kind": "agent_session", "target_id": "cursor=gpt-5.6-sol-high-fast"},
+        "effort": "medium",
+    }), "conflicts with compound route effort"),
     (lambda p: p.__setitem__("bogus", 1), "unknown top-level keys"),
     (lambda p: p.__setitem__("triad", p["triad"] * 6), f"limit is {TRIAD_SLOT_LIMIT}"),
 ], ids=["empty-triad", "empty-scope", "vendor-kind", "empty-target", "double-colon",
-        "dup-slot-id", "bad-effort", "unknown-key", "triad-cap"])
+        "dup-slot-id", "bad-effort", "compound-effort-conflict", "unknown-key", "triad-cap"])
 def test_malformed_structured_config_refuses_typed(mutate, fragment):
     payload = json.loads(json.dumps(_STRUCTURED))
     mutate(payload)

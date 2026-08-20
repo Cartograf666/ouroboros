@@ -3603,7 +3603,7 @@ def test_ui_smoke_window_pagehide_detaches_login_without_lifecycle_http(direct_s
                             addEventListener: (_t, fn) => { connect = fn; }};
                         const host = {innerHTML: '', querySelector: () => null};
                         const list = {innerHTML: '', querySelectorAll: () => [button]};
-                        const other = {textContent: '', hidden: false, dataset: {}};
+                        const other = document.createElement('div');
                         const doc = {defaultView: window, getElementById: (id) =>
                             id === 'agents-login-host' ? host
                                 : id === 'agents-family-list' ? list : other};

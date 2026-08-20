@@ -152,11 +152,14 @@ def test_child_contract_restates_claims_after_parent_spread():
     assert claimed["success_criteria"] == []
 
 
-def test_schedule_subagent_claims_end_to_end(tmp_path):
+def test_schedule_subagent_claims_end_to_end(tmp_path, monkeypatch):
     import queue
 
     from ouroboros.tools.control import _schedule_task
     from ouroboros.tools.registry import ToolContext
+    from tests._shared import configure_test_subagent
+
+    subagent_id = configure_test_subagent(monkeypatch)
 
     event_queue: queue.Queue = queue.Queue()
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
@@ -171,6 +174,7 @@ def test_schedule_subagent_claims_end_to_end(tmp_path):
 
     result = _schedule_task(
         ctx,
+        subagent_id=subagent_id,
         objective="Build the collision module",
         expected_output="A working module",
         acceptance_claims=["hull overlap is rejected", "  ", ""],

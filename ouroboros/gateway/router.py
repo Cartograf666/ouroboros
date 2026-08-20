@@ -70,7 +70,10 @@ def collect_routes(
         api_claudexor_status,
         api_claudexor_wake,
     )
-    from ouroboros.gateway.onboarding import api_onboarding_complete
+    from ouroboros.gateway.onboarding import (
+        api_onboarding_complete,
+        api_onboarding_subagents_preview,
+    )
     from ouroboros.gateway.settings import api_reviewer_slots
     from ouroboros.gateway.mcp import api_mcp_refresh, api_mcp_status, api_mcp_test
     from ouroboros.gateway.models import (
@@ -203,6 +206,11 @@ def collect_routes(
         Route("/api/onboarding", endpoint=onboarding),
         # ONE atomic owner-scoped completion (D-8): replaces the wizard's old
         # POST /api/settings + POST /api/owner/runtime-mode pair.
+        Route(
+            "/api/onboarding/subagents/preview",
+            endpoint=api_onboarding_subagents_preview,
+            methods=["POST"],
+        ),
         Route(
             "/api/onboarding/complete",
             endpoint=api_onboarding_complete,

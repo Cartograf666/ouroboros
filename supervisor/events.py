@@ -498,6 +498,8 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
     task_group_id = str(fields.get("task_group_id") or "")
     task_group = fields.get("task_group") if isinstance(fields.get("task_group"), dict) else {}
     subagent_envelope = fields.get("subagent_envelope") if isinstance(fields.get("subagent_envelope"), dict) else {}
+    configured_subagent = fields.get("configured_subagent") if isinstance(fields.get("configured_subagent"), dict) else {}
+    parent_cognitive_route = fields.get("parent_cognitive_route") if isinstance(fields.get("parent_cognitive_route"), dict) else {}
     task: Dict[str, Any] = {
         "id": tid,
         "type": "task",
@@ -533,6 +535,8 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
         "task_group_id": task_group_id,
         "task_group": task_group,
         "subagent_envelope": subagent_envelope,
+        "configured_subagent": configured_subagent,
+        "parent_cognitive_route": parent_cognitive_route,
         "metadata": {
             "parent_task_id": parent_id,
             "root_task_id": root_task_id,
@@ -555,6 +559,8 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
             "task_group_id": task_group_id,
             "task_group": task_group,
             "subagent_envelope": subagent_envelope,
+            "configured_subagent": configured_subagent,
+            "parent_cognitive_route": parent_cognitive_route,
         },
     }
     if not drive_root:
@@ -3372,6 +3378,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
     task_group_id = str(evt.get("task_group_id") or "").strip()
     task_group = evt.get("task_group") if isinstance(evt.get("task_group"), dict) else {}
     subagent_envelope = evt.get("subagent_envelope") if isinstance(evt.get("subagent_envelope"), dict) else {}
+    configured_subagent = evt.get("configured_subagent") if isinstance(evt.get("configured_subagent"), dict) else {}
+    parent_cognitive_route = evt.get("parent_cognitive_route") if isinstance(evt.get("parent_cognitive_route"), dict) else {}
     task_constraint = evt.get("task_constraint") if isinstance(evt.get("task_constraint"), dict) else None
     required_capabilities = [
         str(item or "").strip().lower()
@@ -3432,6 +3440,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
         "task_group_id": task_group_id,
         "task_group": task_group,
         "subagent_envelope": subagent_envelope,
+        "configured_subagent": configured_subagent,
+        "parent_cognitive_route": parent_cognitive_route,
     }
     if delegation_role == "subagent" and (not str(evt.get("objective") or "").strip() or not expected_output):
         detail = "Subagent rejected: schedule_subagent requires objective and expected_output."
@@ -3662,6 +3672,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             "task_group_id": task_group_id,
             "task_group": task_group,
             "subagent_envelope": subagent_envelope,
+            "configured_subagent": configured_subagent,
+            "parent_cognitive_route": parent_cognitive_route,
             "parent_id": parent_id,
         })
         admitted = ctx.enqueue_task(task)

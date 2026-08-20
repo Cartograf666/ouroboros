@@ -48,8 +48,11 @@ def test_schedule_subagent_emits_intent_only_and_no_task_group(monkeypatch, tmp_
     from ouroboros.task_results import STATUS_REQUESTED
     from ouroboros.tools.control import _schedule_task
     from ouroboros.tools.registry import ToolContext
+    from tests._shared import configure_test_subagent
 
-    monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "heavy-model")
+    subagent_id = configure_test_subagent(
+        monkeypatch, target="openai/heavy-model",
+    )
     event_queue: queue.Queue = queue.Queue()
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "parent1"
@@ -61,16 +64,18 @@ def test_schedule_subagent_emits_intent_only_and_no_task_group(monkeypatch, tmp_
 
     result = _schedule_task(
         ctx,
+        subagent_id=subagent_id,
         objective="Review the design",
         expected_output="One findings list",
         role="reviewer",
-        model_lane="heavy",
     )
 
     assert "TOOL_ARG_ERROR" not in result
     event = event_queue.get_nowait()
     assert event_queue.empty()
-    assert event["requested_model_lane"] == "heavy"
+    assert event["requested_model_lane"] == "auto"
+    assert event["requested_executor"] == "native"
+    assert event["configured_subagent"]["selected_subagent_id"] == subagent_id
     assert event["parent_model_lane"] == "main"
     assert "effective_model_lane" not in event and "model" not in event
     # One request, one child: the lane fan-out that a group id existed for has not
@@ -82,7 +87,8 @@ def test_schedule_subagent_emits_intent_only_and_no_task_group(monkeypatch, tmp_
 
     path = tmp_path / "task_results" / f"{event['task_id']}.json"
     data = json.loads(path.read_text(encoding="utf-8"))
-    assert data["requested_model_lane"] == "heavy"
+    assert data["requested_model_lane"] == "auto"
+    assert data["configured_subagent"]["selected_subagent_id"] == subagent_id
     assert data["parent_model_lane"] == "main"
     assert "model" not in data and "effective_model_lane" not in data
     assert "task_group_id" not in data
@@ -94,6 +100,9 @@ def test_schedule_subagent_drive_failure_is_fail_closed(monkeypatch, tmp_path):
     import ouroboros.tools.control as control
     from ouroboros.headless import HEADLESS_TASKS_DIR
     from ouroboros.tools.registry import ToolContext
+    from tests._shared import configure_test_subagent
+
+    subagent_id = configure_test_subagent(monkeypatch)
 
     def fake_prepare(_root, _tid, _mode):
         raise RuntimeError("boom")
@@ -109,6 +118,7 @@ def test_schedule_subagent_drive_failure_is_fail_closed(monkeypatch, tmp_path):
 
     result = control._schedule_task(
         ctx,
+        subagent_id=subagent_id,
         objective="Review the design",
         expected_output="One findings list",
         role="reviewer",

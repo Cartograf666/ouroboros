@@ -1026,7 +1026,18 @@ def _prepare_public_builtin_args(entry: "ToolEntry", args: dict[str, Any]) -> st
 
     _normalize_tool_call_args(entry, args)
     public_params = set(_entry_public_params(entry))
-    if _entry_has_public_param_schema(entry) and any(key not in public_params for key in args):
+    # A handler may name a bounded set of execution-only legacy parameters.  They
+    # remain absent from its model-visible schema and are therefore usable only by
+    # callers replaying the former wire shape through this real registry path.  The
+    # handler still owns deterministic migration/refusal; this generic seam neither
+    # chooses a route nor special-cases a tool name.
+    hidden_legacy = {
+        str(name)
+        for name in (getattr(entry.handler, "_hidden_legacy_params", ()) or ())
+        if str(name)
+    }
+    accepted_params = public_params | hidden_legacy
+    if _entry_has_public_param_schema(entry) and any(key not in accepted_params for key in args):
         return _format_tool_arg_error(entry)
     try:
         inspect.signature(entry.handler).bind(object(), **args)

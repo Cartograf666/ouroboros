@@ -42,6 +42,12 @@ def _wait_status(page, expected, timeout=10_000):
     )
 
 
+def _goto_main_ready(page, url, expected="Online"):
+    page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+    _wait_status(page, expected, timeout=30_000)
+    page.get_by_text("Ouroboros has awakened", exact=True).wait_for(timeout=30_000)
+
+
 def _install_task_detail_gate(page):
     """Hold task-detail fetches in page JS so assertions can inspect in-flight UI."""
     page.add_init_script(
@@ -149,9 +155,7 @@ def test_ui_smoke_stale_history_rebuild_keeps_owner_bubble(direct_server_with_da
                         body=json.dumps({"messages": []}),
                     ),
                 )
-                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-                page.wait_for_selector("#chat-status", state="attached", timeout=30_000)
-                _wait_status(page, "Online", timeout=30_000)
+                _goto_main_ready(page, url)
 
                 page.fill("#chat-input", "please keep this message visible")
                 page.click("#chat-send")
@@ -240,10 +244,9 @@ def test_ui_smoke_late_open_chat_shows_managed_activity(direct_server_with_data)
                     )
 
                 page.route("**/api/state*", _inject)
-                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                _goto_main_ready(page, url, "Working...")
                 # The managed activity arrives purely from the snapshot: this
                 # page never saw a typing frame or a progress card.
-                _wait_status(page, "Working...", timeout=30_000)
 
                 # Queue authority concludes it: the task left PENDING/RUNNING.
                 state["managed"] = False
@@ -277,8 +280,7 @@ def test_ui_smoke_snapshot_apply_time_cannot_resurrect_root(
             browser, page = _launch(pw)
             try:
                 _install_task_detail_gate(page)
-                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-                _wait_status(page, "Online", timeout=30_000)
+                _goto_main_ready(page, url)
                 page.evaluate("() => { window.__realDateNow = Date.now; window.__testNow = Date.now(); Date.now = () => window.__testNow; }")
                 # The live frame predates both snapshot requests.
                 page.evaluate(
@@ -344,8 +346,7 @@ def test_ui_smoke_reversed_state_responses_do_not_resurrect_main_root(
             browser, page = _launch(pw)
             try:
                 _install_task_detail_gate(page)
-                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-                _wait_status(page, "Online", timeout=30_000)
+                _goto_main_ready(page, url)
                 page.evaluate(
                     """() => {
                         window.__ouroWs.emit('typing', {
@@ -487,8 +488,7 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 history = {"messages": []}
                 page.route("**/api/state*", _inject)
                 page.route("**/api/chat/history*", lambda route: route.fulfill(content_type="application/json", body=json.dumps(history)))
-                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-                _wait_status(page, "Working...", timeout=30_000)
+                _goto_main_ready(page, url, "Working...")
 
                 page.evaluate(
                     """() => window.__ouroWs.emit('chat', {
@@ -805,9 +805,7 @@ def test_ui_smoke_early_final_holds_finalizing_until_task_done(direct_server_wit
         with sync_playwright() as pw:
             browser, page = _launch(pw)
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-                page.wait_for_selector("#chat-status", state="attached", timeout=30_000)
-                _wait_status(page, "Online", timeout=30_000)
+                _goto_main_ready(page, url)
 
                 # A tool call makes the root card visible.
                 page.evaluate(
@@ -923,7 +921,8 @@ def test_ui_smoke_open_project_panel_heals_lost_task_done_from_state_fanout(
             try:
                 _install_task_detail_gate(page)
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-                page.click('.nav-project-row[data-project-id="cont-panel"]')
+                with page.expect_response(lambda response: response.url.endswith("/api/ui/preferences") and response.request.method == "POST", timeout=30_000):
+                    page.click('.nav-project-row[data-project-id="cont-panel"]')
                 page.wait_for_selector("#project-panel:not([hidden])", timeout=30_000)
                 _panel_status_is(page, "Online", timeout=30_000)
 

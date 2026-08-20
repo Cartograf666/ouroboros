@@ -35,7 +35,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
   │   ├── owner_stop.py        ← (S3, Q1) Owner graceful-stop episode: `finalize_then_cancel` policy for `POST /api/tasks/{id}/cancel` — the SAME durable cancel intent (policy is an axis on the intent, monotonic: immediate HARDENS a pending graceful and never softens back). Ingress `begin_graceful_stop` acknowledges 202-pending; `orchestrate_graceful_stop` settles live descendants FIRST and feeds a bounded child-result projection into the root's final turn; `sweep_owner_stop_hold` (called from `sweep_cancel_intents`) idempotently arms the episode — deterministic `owner_stop_control_id`, one typed `finalize_now` mailbox control whose first line is the `owner_requested_finalization` literal (loop routes it to its own rail: ZERO or ONE tool-less model turn, retained-candidate reuse, never the deadline's false reason), one owner toast — and feeds custody instead when the root already settled, never started, or the effective deadline expired: the grace budget starts only when the loop actually DRAINS the control (durable `control_drained_at` stamp on the intent, first drain wins), bounded by an outer `request + OWNER_STOP_OUTER_CAP_SEC` safety cap — before the drain only the outer cap applies, after it `min(drain + grace, request + outer cap)`; neither anchor is ever extended by progress. `running_owner_stop_tasks` lets `supervisor/queue.py` bypass generic timeout rails for held tasks; a COMPLETED finalize root suppresses the redundant cascade summary (Q4)
   │   ├── schedule_time.py     ← Cron/timezone schedule time parsing helpers
   │   ├── evolution_lifecycle.py ← Evolution campaign state + transaction lifecycle (moved from queue.py in v6.30.0): campaign file IO, start/pause, begin/update transaction, cycle-outcome recording, deterministic no_op/abandoned worktree cleanup, owner cycle reports, supervisor auto-restart request
-  │   ├── events.py            ← Event dispatcher (worker→supervisor events) + managed-update assisted-merge orphan watchdog hook; also composes the frozen subagent task text (`_compose_subagent_text`), whose acting `[WRITE SURFACE]` block states the write-root BOUNDARY only ("All changes land inside the write root only") — execution framing belongs to the dispatch-time executor note, because the composed text is frozen before the executor is known (decision 2A)
+  │   ├── events.py            ← Event dispatcher (worker→supervisor events) + managed-update assisted-merge orphan watchdog hook; also composes the frozen subagent task text (`_compose_subagent_text`), whose acting `[WRITE SURFACE]` block states only the write-root authority boundary. Actor identity/route come from the immutable configured snapshot, and session startup/wake facts are injected by bootstrap/supervision rather than inferred from this prose.
   │   ├── steering.py          ← Owner steering-message delivery to running tasks (extracted verbatim from `events.py` at the byte-pin boundary): mailbox routing to the drive the worker drains, plus the typed refusal while a cancel intent is pending (steering is fenced during a stop, which is what makes the owner-stop single-turn rail safe)
   │   ├── git_ops.py           ← Git operations (clone, checkout, rescue, rollback, push, credential helper) and the shared bounded local-Git process runner
   │   ├── update_source.py     ← Official update source selection and network policy applied through the shared bounded Git runner
@@ -51,7 +51,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── cli.py               ← Source/headless CLI over gateway tasks, logs, settings, skills, marketplace, local-model, and MCP wrappers
       ├── packaged_cli.py      ← Packaged desktop CLI bridge: resolves bundle roots, bootstraps the launcher-managed repo, and delegates to cli.py
       ├── packaged_cli_install.py ← Packaged CLI installer planning/execution for user-local command shims
-      ├── agent.py             ← Task orchestrator (the dispatch-time executor note pair moved to `subagent_dispatch_notes.py`; same-name re-exports kept here)
+      ├── agent.py             ← Task orchestrator (the compatibility dispatch-note pair moved to `subagent_dispatch_notes.py`; same-name re-exports remain for legacy callers)
       ├── agent_startup_checks.py ← Startup verification and health checks
       ├── agent_task_pipeline.py  ← Task execution pipeline orchestration; emits a per-task `swarm_efficiency` rollup (subagent_count/wave_count/Σ inter-wave latency/lanes_requested — the lanes the fan-out waves ASKED for; a rollup built from pre-dispatch fanout events cannot truthfully report effective lanes, which are per-child dispatch facts on each child's own record) for fan-out tasks only, and freezes one shared non-final subtree-cost snapshot for summary/reflection before the terminal checkpoint records final spend
       ├── task_finalization.py ← Terminal delivery + sealed final ground truth (extracted from agent_task_pipeline.py at its module ceiling): live final-answer delivery before blocking post-task (final event selected by the finalizing task's id, never the first buffered send_message; buffered copy retained under one `delivery_id`), the sealed final package (delivered text + the durable result's own artifact manifest) fed to summary/reflection as a prompt input (never a validator), and the moved swarm-efficiency rollup
@@ -63,7 +63,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── event_bus.py         ← Typed in-process event bus for skill subscriptions
       ├── evolution_checkpoints.py ← Append-only campaign/eval checkpoint ledger for evolution progress
       ├── improvement_backlog.py ← Durable advisory improvement backlog: recurrence-counted dedup (bump count/last_seen, never drop), priority+recurrence+recency ranking, close-on-commit (`close_backlog_items`), and size-triggered non-error-gated LLM grooming (`groom_backlog`); parser-safe locked writer; entries carry priority/kind (bug/improvement/capability_idea)
-      ├── loop.py              ← High-level LLM tool loop; one-shot no-op-attempt finalization nudge (declared expected_output + zero effects + no FINAL ANSWER); (v6.51.0) a one-shot ADVISORY red-verification finalization nudge (ordered before the receipt-absent nudge) when the latest host-attested verify receipt is unreconciled-RED (`outcomes.latest_unreconciled_failed_verification`) — re-check / explain / fix; (v6.52.2) a one-shot ADVISORY masked-verification nudge (ordered after the red nudge) when the latest PASSing verify check can launder its exit code (`outcomes.latest_unreconciled_masked_verification`) — re-ground without the masking pipe or explain; (v6.53.0) continuous explicit `FINAL ANSWER:` latching captures the latest typed candidate every round (tool-count-stamped, no prose mining) so review/nudge/forced-finalization paths do not erase a structured answer, and intrinsic no-deadline pacing asks for a salvageable current answer on long tasks; (v6.60.0) ALL marker prompting (P2 marker nudge, pacing salvage phrases, the context instruction) is gated on `task_contract.answer_protocol="final_answer_line"` via the `answer_protocol_active` SSOT — the latch/extractor stay unconditional; (v6.61.4) the protocol gate is SUFFICIENT for the P2 marker nudge — it no longer also requires a declared `expected_output` (a contract may carry the deliverable in `objective` while `expected_output` is empty; the latter therefore cannot suppress that salvage surface), and `extract_final_answer` structurally rejects the snake_case outcome-tier ledger identifiers (`best_effort`/`blocked_with_evidence`) as answers — internal enum vocabulary is never a deliverable (a reviewed run shipped `FINAL ANSWER: blocked_with_evidence` verbatim); `solved` stays extractable as an ordinary English word; (v6.90.0) a one-shot NANNY finalization nudge (ordered first): a child dispatched onto the delegated substrate (executor=harness) finalizing with ZERO `delegate_start` calls gets one structural reminder to delegate or state why not, and the forced-finalization paths carry the same fact as a NOTE inside their one final prompt instead of re-looping; (2026-08-10 amendments) the nudge reads durable custody evidence from the CANONICAL (budget) root via `delegate_custody.custody_root` — the same root the writes land on, so split-root children are no longer blind — and branches PENDING ≠ FAILED: a started-but-unsettled run gets a "still pending — delegate_wait before finalizing" reminder (never a failure accusation, which would invite a duplicate concurrent run), `NANNY_DELEGATED_RUN_FAILED` is reserved for terminal non-success settles, and the nudge is suppressed entirely when the delegate verbs are policy-hidden from the child's toolset; a really-INJECTED (non-empty) nudge is additionally stamped by the WORKER as a durable custody row on the canonical root (`delegate_evidence.record_nanny_nudge_stamp` — never the ctx latch, which is set even on suppression), and a COMPLETED harness child with zero delegated runs then carries the typed `nanny_finalized_after_nudge_without_delegation` substrate disclosure on its envelope (decision 3A: visibility, never a gate)
+      ├── loop.py              ← High-level LLM tool loop; one-shot no-op-attempt finalization nudge (declared expected_output + zero effects + no FINAL ANSWER); (v6.51.0) a one-shot ADVISORY red-verification finalization nudge (ordered before the receipt-absent nudge) when the latest host-attested verify receipt is unreconciled-RED (`outcomes.latest_unreconciled_failed_verification`) — re-check / explain / fix; (v6.52.2) a one-shot ADVISORY masked-verification nudge (ordered after the red nudge) when the latest PASSing verify check can launder its exit code (`outcomes.latest_unreconciled_masked_verification`) — re-ground without the masking pipe or explain; (v6.53.0) continuous explicit `FINAL ANSWER:` latching captures the latest typed candidate every round (tool-count-stamped, no prose mining) so review/nudge/forced-finalization paths do not erase a structured answer, and intrinsic no-deadline pacing asks for a salvageable current answer on long tasks; (v6.60.0) ALL marker prompting (P2 marker nudge, pacing salvage phrases, the context instruction) is gated on `task_contract.answer_protocol="final_answer_line"` via the `answer_protocol_active` SSOT — the latch/extractor stay unconditional; (v6.61.4) the protocol gate is SUFFICIENT for the P2 marker nudge — it no longer also requires a declared `expected_output` (a contract may carry the deliverable in `objective` while `expected_output` is empty; the latter therefore cannot suppress that salvage surface), and `extract_final_answer` structurally rejects the snake_case outcome-tier ledger identifiers (`best_effort`/`blocked_with_evidence`) as answers — internal enum vocabulary is never a deliverable (a reviewed run shipped `FINAL ANSWER: blocked_with_evidence` verbatim); `solved` stays extractable as an ordinary English word; (v6.90.0) a one-shot NANNY finalization nudge (ordered first): a harness-dispatched child finalizing with ZERO durable start attempts gets one structural reminder to delegate or state why not, and the forced-finalization paths carry the same fact as a NOTE inside their one final prompt instead of re-looping; configured atomic bootstrap records blocked and uncustodied start attempts too, so an exact-route startup fault is not accused of skipping delegation; (2026-08-10 amendments) the nudge reads durable custody evidence from the CANONICAL (budget) root via `delegate_custody.custody_root` — the same root the writes land on, so split-root children are no longer blind — and branches PENDING ≠ FAILED: a started-but-unsettled run gets a "still pending — delegate_wait before finalizing" reminder (never a failure accusation, which would invite a duplicate concurrent run), `NANNY_DELEGATED_RUN_FAILED` is reserved for terminal non-success settles, and the nudge is suppressed entirely when the delegate verbs are policy-hidden from the child's toolset; a really-INJECTED (non-empty) nudge is additionally stamped by the WORKER as a durable custody row on the canonical root (`delegate_evidence.record_nanny_nudge_stamp` — never the ctx latch, which is set even on suppression), and a COMPLETED harness child with zero delegated runs then carries the typed `nanny_finalized_after_nudge_without_delegation` substrate disclosure on its envelope (decision 3A: visibility, never a gate)
       ├── loop_llm_call.py     ← Single-round LLM call + usage accounting
       ├── task_pacing.py       ← Task-pacing SSOT: deadline/cost milestones, finalization reserve, BudgetSnapshot, and acceptance-review launch/improvement rails. v6.64 reserves at least 200s for the first review and then `max(configured_floor, 1.5×EWMA)` from existing timing events (`alpha=0.5`); an explicit `max_improvement_passes` always binds, otherwise the shared `OUROBOROS_REVIEW_MAX_CYCLES` cap binds under every policy incl. Required+Blocking (`unlimited` = no local count cap; deadline/global rails still apply). Legacy `until_deadline` and `stall_rounds_threshold` are accepted for one compatibility window with a deprecation event. v6.74.4 (figlet incident mitigation): workspace deliveries (`_workspace_delivery`, canonical `is_workspace_mode()` with an attribute fallback) get one shared commit-neutral tree sentence (`_TREE_FLUSH_SENTENCE` — commit-neutral because acting self_worktree subagents cannot commit and a moved HEAD fails patch capture closed) on the 10% deadline flush, the ~80% cost wrap-up, and a late FIRST cost milestone that would otherwise suppress the wrap-up; non-workspace texts stay byte-identical. Disclosed residual (mitigation, not closure): a forced tool-less exit crossed inside one long round with no pacing note or acceptance capsule in the terminal stretch can still ship an unverified last edit — the structural verification-freshness seam is an owner-pending follow-up.
       ├── vision_routing.py    ← (v6.45) Send-time image routing SSOT: inline vision vs generic captions vs placeholders on a per-send message copy, controlled by `OUROBOROS_IMAGE_INPUT_MODE` and `OUROBOROS_MODEL_VISION`
@@ -110,7 +110,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── projects_registry.py ← Multi-project registry: durable `data/state/projects.json` with immutable id/chat identity, 80-character display names, working-folder facts, `active|deleting|tombstoned` lifecycle, routing fence/generation, and visible revision; deletion preserves bindings/history/folder/memory and an id can never resurrect
       ├── project_dialogue.py  ← Read-only canonical Project dialogue lens plus append-only presentation annotations (`logs/chat_annotations.jsonl`); projects reference original chat rows instead of copying/mirroring them, and the sidecar never owns routing or Project state. (v6.73.0) `build_owner_message_ref` builds the origin identity AT INGRESS (identity by value — the content-hash lookup `find_owner_message_ref` was deleted as the anti-pattern instance); `project_origin_rows` returns the binding-held origin refs+texts the history lens synthesizes when a canonical row left the read window
       ├── project_lease.py     ← One-writer-per-project lease (v6.32.0): `assign_tasks` serializes top-level tasks of the same STORED `project_id`; same-project subagent swarm exempt; `project_id==""` is no lane
-      ├── context.py           ← LLM context-source builder and public compatibility API for consciousness / ordinary-task message assembly
+      ├── context.py           ← LLM context-source builder and public compatibility API; `_capture_context_core` places the ordered JSON from `current_model_visible_subagent_catalog()` under `## Available subagents` in the semi-stable block, while dated execution history stays dynamic.
       ├── client_surface.py    ← Owner Surface Fact SSOT: closed-key bounded normalizer for the SPA's per-message sending-surface observables, the surface-identity projection (viewport/narrow_layout excluded — a resize is not a device change), and the mailbox surface-change note
       ├── context_fit.py       ← Ordinary Main task-local fit authority: deterministic Max/Low projections from one immutable captured core, one labelled T/W measurement and typed reclaim deficit, with no routing/retry/global-mode authority; physical sizing includes the largest permitted direct-OpenAI function/custom projection and private Anthropic custody bytes without exposing them; commit/scope review stay outside this path
       ├── context_budget.py    ← Context-window budget vocabulary and typed reclaim request/receipt SSOT, including the owner-Low 200K economy target and static section/image bounds; it owns no trigger, timer, route, or retry policy
@@ -123,11 +123,20 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── coop_checkpoint.py   ← Quiescent checkpoint commits for dirty host-minted genesis/coop roots. Triggered when a root settles with no live tree and again when the last child settles beneath an already-terminal root; `supervisor/events.py` detects both conditions and runs the bounded git chain off the event-drain thread. Owner-attached folders are never auto-committed, credential-shaped files remain excluded and disclosed, and quiescence is revalidated immediately before mutation.
       ├── delegate_output.py  ← Staged-output + read-receipt cluster for delegated runs (extracted from tools/delegate.py for the module-size gate; delegate.py re-exports it so sibling code and tests keep one name): `_stage_full_output` writes the WHOLE terminal detail atomically under the task drive (`delegated_runs/<run>.json`, sha256 + byte length recorded), and `acknowledge_staged_output_read` — hooked into `read_file`'s task_drive path — credits DELIVERED character ranges until contiguous EOF coverage, then writes the once-per-run durable `delegate_run_output_consumed` row (disclosure, never a gate)
       ├── delegate_containment.py ← Containment verification for one delegated run (extracted whole from tools/delegate.py for the module-size gate, v6.90.0): `_widened_access` reads the ENGINE-derived effective access back off the run and names a wider-than-asked profile; `_home_isolation_breach` verifies the applied scoped HOME off the attempt artifacts against TWO EXACT FACTS (phase A3, 2026-08-11): a recorded `harness_home_isolated: false`, or an applied home EQUAL to the operator's own. Nothing else is enforced — a home NESTED under `$HOME` is the engine's own layout on boundary-less hosts and flows to the disclosed-unconfined path (`home_nested_under_operator_home` reports it, and the evidence reader keeps `verified: false` plus the durable unconfined row even when an OS boundary WAS recorded, so a nested home is never relabelled as isolation); absence of either fact stays absence, reported as unproven rather than enforced
-      ├── delegate_progress.py ← What a delegated run did during ONE `delegate_wait` window (extracted from tools/delegate.py for the module-size gate): `WindowObservations` records every journal-cursor advance and `emit` pushes it to the LIVE progress surface (`ctx.emit_progress_fn`) at observation time, while `window_payload` hands the model the whole sequence once, at expiry — the timer is what the model waits out, never the human's stream. A batch is read off the DATA (the longest overlap between the previous tail and this one), never off `lastSeq` or the tail's length — a harness may publish several timeline rows per cursor step, or move the cursor without publishing any. The advance list is bounded inside the `delegate_wait` result budget by shedding event LABELS oldest-first, each shedding disclosed on its row, then by shedding from the HEAD behind an omission marker; the spine (one row per advance, `seq` + `at_sec`) yields whole only when the rest of the payload leaves no room for even the floor, and says so through that same marker. `poll_bound` is the ONE place a read bound is computed — what the window has left, floored at `SHORT_POLL_TIMEOUT_SEC` and never raised above the gateway's own read default — and the two entry points that use it differ only in what SILENCE means: `bounded_poll` (every poll from the opening one on, while the window still has time) lets a `ClaudexorUnavailable` propagate — with ONE narrow exception (v6.90.0): the engine's transient Git atomic-object ENOENT (`is_transient_git_object_race`: ENOENT naming `.git/objects/…/tmp_obj_*`) gets a single immediate re-read, the same tolerance the CI platform gate already carried while the production poll kept failing, `expiring_poll` (the last poll of a spent window) swallows it into a graceful expiry
+      ├── delegate_progress.py ← Low-level bounded Claudexor poll/progress observation used by supervision: journal advances stream to the human and update the cursor, but are not themselves model-wake events. `poll_bound` owns each transport read bound and the existing transient Git-object retry; `delegate_supervision.py` owns renewal and wake semantics above it.
       ├── delegate_interactions.py ← Interactive-question cluster for delegated runs (extracted from tools/delegate.py for the module-size gate; delegate.py re-exports it): the process-local reported-question memo (`_REPORTED_INTERACTIONS` — a known question does not re-trigger the immediate return; popped on a delivered/already_resolved answer so the next wait re-reports promptly), the bounded inline projection `_bounded_interactions` (EVERY harness-authored DISPLAY scalar bounded — question, options, header, source, timestamps — cuts counted; the answer keys ride whole, see below), the immediate typed `waiting_on_user` payload (full set spills whole to the task drive under an interaction-addressed immutable name `<run>.<sha12>.interactions.json` with a sha256/size receipt; a compact `advances` ride-along keeps the cut-short window's journal sequence), and `_delegate_answer` (strict pre-POST row validation — string-only labels, non-empty label-or-freeText per row, no coercion; the answer keys `interaction_id`/`question_id` ride WHOLE, never truncated; engine-typed outcomes relayed verbatim; only a PAYLOAD-SEMANTIC 4xx — 400/409/413/422 — maps to the `rejected` shape, a spent subscription window is the distinct `subscription_window_exhausted` outcome carrying `reset_at`, and `delivery_unknown` is reserved for transport death/5xx plus every other non-definite status and carries a bounded detail re-read; a `timeout_at`-bearing question benign-declines at the engine timeout while `timeout_at=null` waits until answered; an internal monotonic deadline strictly below the ToolEntry timeout budgets handshake/POST/re-read and returns typed on exhaustion without further wire calls)
       ├── delegate_shared.py  ← Shared nanny-verb LEAF (phase B facade split): the single author of the typed delegate refusal (`_fail`), the custody-rooted `_emit`, and run-ownership resolution (`_owned_run` — OWNED/FOREIGN/UNKNOWN replayed from the durable rows). Extracted from tools/delegate.py to break the facade import cycle; one-way seam — the leaf never imports the facade back, and `tools.delegate` re-exports the same objects
-      ├── subagent_dispatch_notes.py ← Child-facing executor-axis notes (moved whole from `agent.py` at its size ceiling, B1/F7): `dispatch_executor_note` — the dispatched child's visible substrate marker, whose harness branch conditionally SUPERSEDES any native-self-execution framing in the frozen task text (thinking-work routes through delegate_start/delegate_wait; the parent's step-by-step context is the delegated run's WORK ORDER) and rides only the FINAL post-preflight harness dispatch — and `executor_blocked_outcome`, the typed zero-spend terminal of an unhonorable pin; `agent` re-exports both under the historical names
-      ├── subagents.py         ← Subagent axis vocabularies (model lane / executor), the single dispatch-time resolution (`resolve_subagent_dispatch` → `capability_delta`), and structured lineage/usage envelopes. `capability_delta.reason` is DERIVED (`derive_capability_reason`) from the typed additive lists `reduction_reasons` (dispatch-time axes) / `substrate_disclosures` (completion-seam facts) at every writer, so the string and the lists cannot diverge; old string-only durable records stay readable; `route_health` is the one route-manifest reader — a caller carrying a manually pinned credential profile (reviewer-slot rows) passes the harness-row status THROUGH so the engine's typed refusal is authoritative for the pin (a row with no default credential store reads "unavailable" forever by design), while catalog-absence, access-profile, version-floor and quota checks apply to every caller
+      ├── route_spec.py        ← Neutral route primitive shared by Available subagents and reviewer rows: route-kind/target/pin normalization and effort validation, while each semantic owner retains its own public spelling and policy.
+      ├── configured_subagents.py ← Canonical `OUROBOROS_SUBAGENTS` parser/serializer, strict row validation, stable ids, legacy Heavy/singleton migration candidate, source diagnostics, and deterministic fingerprinting; owner free text is never host-parsed.
+      ├── subagent_runtime.py  ← Active configured-actor runtime: immutable task-start snapshots, exact `subagent_id` selection, API-child versus session-nanny dispatch, typed alternatives, exact-start binding, parent cognitive-route inheritance, and the bounded deterministic legacy-input seam.
+      ├── subagent_work_order.py ← One complete external work-order compiler from the scheduled child's objective/context/output/constraints/acceptance/authority; refuses an oversized order instead of truncating it.
+      ├── subagent_bootstrap.py ← Pre-first-LLM bootstrap for configured session nannies: adopt/reconcile first, start the exact selected leaf once, inject the durable startup receipt, and enter supervision only after a custody-durable start.
+      ├── delegate_supervision.py ← Event-only sleeping-nanny loop over the low-level wait: quiet windows renew without a model call; terminal/interaction/fault/addressed-message/control or one explicit reasoned checkpoint becomes a durable pending/acknowledged wake.
+      ├── delegate_recovery.py ← Narrow exact-leaf recovery for a proven non-signal worker crash and an explicit planned-self-restart handoff; validates task/config/worktree/authority/run/cursor bindings before adoption and vetoes every no-resume cause.
+      ├── delegate_pending.py  ← Durable pending-invocation replay helpers: preserve the original idempotency key and canonical start body when a start response/custody write is uncertain.
+      ├── delegate_terminal.py ← Task-scoped delegated-run reconciliation and terminal custody audit persistence used by the agent's settlement path.
+      ├── subagent_dispatch_notes.py ← Child-facing compatibility dispatch notes and typed blocked outcome; configured session nannies receive an atomic-start receipt instead of the historical "plan delegation first" instruction. `agent` keeps the historical re-exports.
+      ├── subagents.py         ← Structured lineage/usage envelopes and bounded legacy lane/executor compatibility. Tasks carrying a `configured_subagent` snapshot dispatch through `subagent_runtime`; old durable records and explicitly compatible legacy calls retain their historical interpretation without becoming the active selector.
       ├── subagent_worktrees.py ← Acting self_worktree lifecycle: provision/remove/prune isolated git worktrees (outside repo/ and data/) + durable registry (state/subagent_worktrees.json) + cross-process ops lock; startup orphan reconciliation; also provisions durable from-scratch genesis projects (provision_genesis_project, never registry/GC); also owns the C1 delegated-exec snapshot lifecycle: `provision_execution_snapshot` builds a synthetic baseline of the target's REAL tree (temporary index, sensitive veto decided before hashing) pinned by a `refs/ouroboros/delegated/` ref and checks out a detached private worktree, registered durably with kind `delegated_exec`; `provision_payload_snapshot` is the STANDALONE sibling for one exact non-Git skill payload (the loader-visible inventory is copied — confined symlinks preserved as symlinks, absolute ones rewritten relative, escapes dropped — Git is initialized only inside the private copy, the pre-copy skill-loader content hash is the CAS baseline, and a post-copy hash mismatch aborts as a writer race; registered with `standalone=true`, cleanup touches no target-repo command); removal only by explicit disposition (`remove_execution_snapshot`) or by the custody-cross-checked startup GC (`prune_execution_snapshots`, durable `delegated_snapshot_prune` event; skipped fail-closed with a `delegated_snapshot_prune_skipped` row when the custody log is unreadable)
       ├── artifacts.py         ← Task-scoped artifact helpers shared by user-file tools, process outputs, and outcome finalization. (v6.52.0, P1) `stage_task_attachments` stages every task's INPUT attachments (CLI/API, desktop chat, and other external callers) into the agent-readable `artifact_store/attachments/` (skips secret SOURCES via the tool_access SSOT blocklist, bounded), returning a manifest of `read_file(root='artifact_store', path='attachments/<name>')` entries; `collect_task_artifact_records` EXCLUDES that subdir so staged inputs are never recorded as deliverables. (v6.52.2) `record_task_scratch`/`read_task_scratch_fingerprints` persist {abs_path: sha256} FINGERPRINTS of the run_command/run_script `scratch=[...]` ephemeral-verification files to `.scratch_manifest.json` (written to BOTH budget + live drive roots) so `headless.write_workspace_patch_artifacts` EXCLUDES a file from the workspace patch ONLY while its current content still matches (a later real file at the same path is never dropped). (v6.56.0) scratch declarations are IDEMPOTENT/ADOPTABLE: re-declaring a manifest path is ok, and an existing untracked in-cwd file may be adopted — its sha is recorded via the same SSOT writer at declaration time, so the sha-gate still excludes it only while unmodified (tracked / outside-cwd / outside-worktree declarations stay blocked); the undeclared-output guard stat-verifies candidates POST-exec (exists + mtime ≥ start−slack) for both run_command and run_script, so import strings/CLI flags/heredoc bodies no longer read as writes (v6.100.0, CR1) `delegated_capture_read_target` narrowly rebinds artifact_store READ ops for the owning task's `delegated_runs/` prefix to the canonical drive so a split-drive nanny can inspect its captured patch.
       ├── retention.py         ← Unified GC retention SSOT: clamp/age-cutoff helpers + legacy-key seed picker used by worktree/task-drive/service-log startup pruning
@@ -149,12 +158,12 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── reviewer_window.py   ← Reviewer context-window SSOT for every review surface (triad, scope, plan, deep self-review): ONE typed `ReviewerWindow` per ROUTE (window/status/stale/observed_at + computed `blocking_authority_allowed`, v6.87.44) with a metadata-only probe serialised by a per-route lock and rate-limited by `probe`'s own evidence TTL, never by a process-lifetime memo that would outlive the record (v6.87.45), fail-closed sub-floor when no evidence exists, and output/tokenizer reserves scaled to a sub-1M window so a small-window slot gets a fit-sized pack instead of a zero limit (v6.87.22; replaces the hardcoded 1M assumption each surface carried)
       ├── triad_review.py      ← Shared multi-model review primitives: JSON-array extraction is reused by repo + skill review; per-actor records, quorum/degraded accounting, and model-error events power the skill-review path. It also owns the review OUTPUT CONTRACT text rendered by the repo-triad, repo-advisory and scope prompts (skill review states its own contract in `skill_review.py`): findings-only (`REVIEW_JSON_ARRAY_CONTRACT`) and required-matrix (`REVIEW_JSON_MATRIX_CONTRACT`, no all-clear — advisory selects it whenever `expected_items` is supplied). A clean findings-only verdict is recognised only when the WHOLE response — modulo one optional code fence — is `[]`, optionally followed by the `NO_FINDINGS` sentinel and nothing else. Any surrounding prose, and the sentinel without the array, are parse failures: a refusal cannot be distinguished from a benign preamble by structure, so neither is accepted. (A valid non-empty array is of course the normal findings path; it is simply never a *clean* verdict, even with the sentinel appended.) Keeping the text beside `empty_array_is_verified_clean` — the parser that enforces it — is what stops the two from drifting apart
       ├── onboarding_wizard.py ← Shared desktop/web onboarding bootstrap + validation
-      ├── subscription_install_presets.py ← PURE install-time preset compiler (D-3/D-9): connected agent harnesses + live model discovery → OUROBOROS_REVIEWER_SLOTS (triad/scope/advisory) + OUROBOROS_SUBAGENT_HARNESS, or a typed refusal naming the seat. Exact discovery ids only (ordered per-family alias table); never pins a credential profile; validates its own output through reviewer_slot_config.parse_reviewer_slots rather than keeping a second schema. Claude/Codex/Cursor seats come from one per-harness policy catalog plus linear delegation/triad/scope priorities, not a powerset table. RECOGNIZED harnesses also include agy since the Claudexor 3.5.0 pickup (issue #232), but every connected combination containing it keeps the typed `matrix_row_absent` refusal until the owner dictates its seats
+      ├── subscription_install_presets.py ← PURE sibling install compilers fed by one normalized settings draft and, only when subscriptions were declared, one live discovery snapshot. Task actors include every supported connected Claude/Codex/Cursor/Agy harness plus truthful API/local Main/Light routes; reviewer defaults independently consume only ratified Claude/Codex/Cursor policies. Output is linear, unpinned, exact-discovery-backed, and all-or-nothing; Agy defaults to `gemini-3.7-flash-high` without creating a reviewer seat.
       ├── settings_setup_contract.py ← SSOT for Settings/Onboarding setup contract, derived bootstrap state, and setup payload validation
       ├── owner_mailbox.py      ← Per-task user message mailbox (compat module name)
       ├── launcher_bootstrap.py ← Bundle-to-repo bootstrap and managed sync helpers (used by launcher.py)
       ├── launcher_server_reaper.py ← POSIX same-install server discovery, pre-signal descendant capture, root-first termination, live identity revalidation, and bounded survivor reporting used by the PID-lock-owning launcher
-      ├── provider_models.py   ← Provider-specific model ID helpers, direct-provider defaults (OpenAI, Anthropic, MiniMax, Cloud.ru, GigaChat)
+      ├── provider_models.py   ← Provider-specific model ID helpers and direct-provider defaults, plus the shared `ACTIVE_MODEL_SETTING_KEYS` versus `LEGACY_MODEL_SETTING_KEYS` split that keeps Heavy out of startup, Provider Test and every new active model consumer while migration/history can still read it.
       ├── runtime_mode_policy.py ← Runtime-mode protected-path policy (safety-critical files, frozen contracts, release/managed invariants) shared by registry, git tools, and Claude gateway guards
       ├── schedule_contract.py ← Schedule id, 5-field cron, and IANA timezone validation SSOT shared by gateway, manifests, and supervisor queue
       ├── reflection.py        ← Execution reflection and pattern capture
@@ -226,7 +235,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── onboarding.py    ← POST /api/onboarding/complete — the ONE atomic owner-scoped completion (D-8): server-side install-time latch (no recorded completion + no preset generation + no settings file), shared setup validation + startup gate, ONE live agent-account/model read whose harnesses come from the engine's own durable seat facts (an API-key seat is never a subscription; a spent quota window is not a missing subscription), preset compile, provider normalization then preset keys, a single settings write whose eligibility is re-proved under the settings lock, then supervisor start. A daemon that cannot answer is a typed 503 that persists nothing and keeps the wizard open
       │   ├── owner_settings.py ← the shared owner settings WRITE seam: the settings lock is a precondition of the write (timed-out acquisition = typed refusal, never an unlocked write), a locked-in precondition, and the `CommitBoundary` that separates "nothing was saved" from "saved, and a later step failed"
       │   ├── settings.py      ← /api/settings, /api/owner/*, onboarding, Claude runtime status/repair handlers; (6.1/D22) GET /api/reviewer-slots — the parsed slot rows (structured or migrated, labeled by source), the real row limits (triad 10 / scope 4 / advisory 1), and the «выполняется как» last-execution projection per slot_id; a malformed structured value returns a typed config_error beside the editor instead of a 500
-      │   ├── control.py       ← reset, command, git/update, and evolution-data handlers; schedule_subagent reports the requested lane only (the axes resolve at dispatch, and a reduction reaches the parent through `capability_delta` in the child's result), wait_task emits a burst/absorb advisory when other children are still in flight, and the descriptions steer burst+absorb and cooperative-multi-builder (external_workspace, omit write_root) vs genesis
+      │   ├── control.py       ← reset, command, git/update, and evolution-data handlers; `schedule_subagent` publishes the strict `subagent_id` + objective + expected-output contract and snapshots that exact configured actor, while its hidden legacy parameters exist only for deterministic migration; `wait_task` emits a burst/absorb advisory when other children are still in flight, and the descriptions steer burst+absorb and cooperative-multi-builder (external_workspace, omit write_root) vs genesis
       │   ├── schedules.py     ← queue-backed cron schedule HTTP surface (list/upsert/delete)
       │   ├── files.py         ← File Browser + chat upload endpoints
       │   ├── ui_preferences.py ← owner-local UI preferences (`state/ui_preferences.json`): widget order, nested subagent expansion, and UI defaults
@@ -278,7 +287,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── task_tree.py     ← (v6.38.0) Task-tree coordination tools tree_note/tree_read (the swarm blackboard + child→parent beacons; storage/kind SSOT in ouroboros/task_tree_ledger.py)
       │   ├── followup.py      ← `schedule_followup`: ONE one-shot deferred follow-up (`{"type":"once","run_at":ISO}` trigger) written into the EXISTING supervisor scheduled-task table (`state/scheduled_tasks.json`) — the supervisor tick enqueues it once at/after run_at as an ordinary root task under normal admission; agent-authored verbatim objective (no host template), typed refusals (delegated subagents may not mint future root tasks; cap 2 pending per task; over-limit text refused, never truncated)
       │   ├── join_ledger.py   ← Soft-join decision authority: validates direct lineage and exact current child-result hashes for tagged `tree_note(kind="decision")` dispositions (`integrated`, `irrelevant`, `deferred`) — single-child or batch `children` array form, each batch entry validated individually — appends the sole authoritative task-tree row, rejects stale hashes as `CHILD_RESULT_STALE`, and keeps `peek_task`, `discard_child_result`, constraint override, cancellation, and shared child-decision helpers. The hash covers status, full result, trace summary, artifact status, and stable artifact identities, not cost/timestamps/queue diagnostics/parent decisions; task-result fields are derived read projections only.
-      │   ├── delegate.py     ← Nanny verbs for DELEGATED subagent cognition on the owner's already-paid Claudexor session: `delegate_start` (host-derived authority — access profile, run mode, isolation and the `delegated` scoped-HOME marker all follow the calling task's own authority via `subagents.delegated_run_shape`; no argument can widen them; the one additive selector `root="skill_payload"` + `bucket` + `skill_name` lets a TOP-LEVEL task delegate one exact installed non-Git skill payload through a fresh `ResolvedResourceBinding` for the `skill_payload.write` authority it already holds — the run then edits a private STANDALONE snapshot and the live payload receives nothing until the explicit apply), a time-bounded `delegate_wait` (progress cursor, containment verification against the run's OWN artifacts — judged against the GRANTED shape replayed from the durable custody row, never re-derived from live context — terminal payload bounded inside `tool_result_limit` with the full result staged to the task drive and read back to EOF), `delegate_cancel` (four typed outcomes — nothing claims terminal without a receipt), and `delegate_answer` (the run's pending interactive question answered by its own nanny — custody-gated like cancel, typed outcomes; the cluster lives in `ouroboros/delegate_interactions.py`). Run LIFECYCLE, custody, settlement and reconciliation are `ouroboros/delegate_custody.py`; transport is `gateways/claudexor.py`; route policy is `ouroboros/subagents.py`. This module is nanny BEHAVIOUR only
+      │   ├── delegate.py     ← Nanny verb facade: exact `delegate_start(subagent_id=..., prompt=...)` / idempotent `retry_of`, event-only `delegate_wait` with optional one-shot reasoned checkpoint, custody-gated `delegate_cancel`, and typed `delegate_answer`. Scheduled session leaves are normally started by `subagent_bootstrap` before the nanny's first LLM call; direct starts and bootstrap share `subagent_runtime.exact_start`. Host-derived authority, private snapshot integration, exact `skill_payload` resource selection, terminal output staging, verified settlement and no-widening rules remain unchanged. Supervision is `delegate_supervision.py`, recovery is `delegate_recovery.py`, custody is `delegate_custody.py`, and transport is `gateways/claudexor.py`.
       │   ├── delegate_integration.py ← The C1 integration seam of the nanny verbs (extracted from tools/delegate.py for the module-size gate; delegate.py re-exports it so sibling code and tests keep one name): `_mutation_authority` derives the unified host authority record `{target_root, source, capture_mode}` for a mutating run (acting write_root vs B5 external-workspace root, typed refusals on any disagreement), `_provision_snapshot` registers + describes the private execution snapshot durably BEFORE any start intent, `_resolve_retry_invocation`/`_validated_invocation`/`_retry_binding_refusal` rebuild a retried start from its ONE durable invocation record and re-prove the C1 binding (pre-C1 mutating rows refused; moved workspace refused; GC-collected snapshot refused), and `_capture_terminal_patch` idempotently captures a terminal mutating run's diff from its snapshot for explicit `integrate_delegated_patch` disposition. It also owns the exact SKILL-PAYLOAD delegation cluster (restored D10 target class, owner option A 2026-08-14): `_payload_mutation_authority` grants `authority_source="skill_payload"` only on a fresh `ResolvedResourceBinding` for a top-level principal (busy-check refuses a second delegation while the same payload has open custody), the host-minted semantic `resource_ref` {root, source, skill_name, target, baseline payload hash} rides custody durably and is re-resolved by `_rebind_payload_reference` at retry and apply, `_write_payload_patch_artifacts` captures over the skill-loader inventory (`git diff --binary` transport so UTF-8-with-NUL survives; junk the loader excludes never enters; an added/modified non-UTF-8 file is a typed capture failure; reserved lifecycle/control paths are reported as `blocked_reserved_paths`, never silently filtered), and `integrate_payload_patch` applies the candidate into the live NON-Git payload — fresh binding must equal the recorded target, whole-payload content-hash CAS (already-applied content disposes idempotently), reserved paths refuse the WHOLE apply with the candidate preserved, index-free `git apply` with the live payload as cwd, no `.git`/staging created there, and any payload-mutating apply outcome — success or post-apply hash mismatch — queues `request_extension_reconcile` while enablement/grants stay untouched and the existing review goes stale by content hash
       │   └── subagent_integration.py ← integrate_subagent_patch: parent's manifest-first integration of an acting subagent's workspace.patch. For self_worktree children it applies into ctx.active_repo_dir() (sha256-verified, 3-way --index, protected-path gated, top-only lineage check, genesis refused), stages but never commits. For external_workspace children it verifies the child wrote in the same active external workspace and records an audited verdict without re-applying the patch; (v6.58.0) a NON-workspace parent integrating a COOP child (write_root = a host-minted tree under the subagent-projects root) gets a read-only verification + a SUCCESSFUL `coop_already_in_tree` no-op verdict instead of a parent-missing error — the work is already in the shared tree, which `coop_checkpoint.checkpoint_commit_coop_roots` checkpoint-commits at root finalization. Also compare_subagent_patches: read-only best-of-N helper that shows several children's candidate patches side by side for LLM-first synthesis
       ├── process_containment.py ← `ProcessContainer` for the hermetic gate: env-token membership (`OURO_PROC_CONTAINER_*`, /proc environ on Linux, `ps -E` on macOS, kill-on-close Job Object on Windows), read from LIVE kernel state at reap time; an alive or undeterminable member is an honest hard-block answer, never a kill guarantee. Policy layer over platform_layer's OS primitives
@@ -568,15 +577,19 @@ Packaged startup is an ordered ownership transaction. The launcher prepares the 
 
 Onboarding runs after the gateway because a first-run owner must be able to reach `/api/*` — connecting an agent subscription is a live API conversation, not a form field. A gateway without a supervisor is exactly the state the readiness predicate below already produces, so this ordering needs no second server, mode, or onboarding state machine. `ouroboros/launcher_onboarding.py` owns that presentation (readiness decision, setup window, window-lifecycle bridge) so the launcher stays the process/window orchestrator. When completion reports that a boot-pinned value changed, the launcher recycles the managed server through its existing lifecycle loop rather than counting the exit as a crash. Neither the launcher's pre-server normalization nor the server's boot normalization may CREATE `settings.json`: on a genuinely fresh install the first bytes of that file are the owner's own onboarding save, and the fresh-install proofs are gated on its absence.
 
-`has_startup_ready_provider()` is a structural gate, not a network, credential, entitlement, model, or local-process probe. It returns true for any non-empty recognized remote configuration: OpenRouter, OpenAI, Anthropic, MiniMax, Cloud.ru, an OpenAI-compatible base URL, GigaChat credentials, or the GigaChat user/password pair. It also accepts any task-capable local routing flag (`USE_LOCAL_MAIN`, `USE_LOCAL_HEAVY`, `USE_LOCAL_LIGHT`, or `USE_LOCAL_FALLBACK`). `LOCAL_MODEL_SOURCE` by itself is insufficient, but a routing flag does not prove the model process is already live. When the predicate is false, the server marks startup complete without starting workers so the web UI can serve the blocking onboarding overlay; a later successful settings save hot-starts the supervisor.
+`has_startup_ready_provider()` is a structural gate, not a network, credential, entitlement, model, or local-process probe. It returns true for any non-empty recognized remote configuration: OpenRouter, OpenAI, Anthropic, MiniMax, Cloud.ru, an OpenAI-compatible base URL, GigaChat credentials, or the GigaChat user/password pair. It also accepts any active task-capable local routing flag (`USE_LOCAL_MAIN`, `USE_LOCAL_LIGHT`, or `USE_LOCAL_FALLBACK`). `USE_LOCAL_HEAVY` is legacy migration input only and cannot make a runtime startup-ready. `LOCAL_MODEL_SOURCE` by itself is insufficient, but a routing flag does not prove the model process is already live. When the predicate is false, the server marks startup complete without starting workers so the web UI can serve the blocking onboarding overlay; a later successful settings save hot-starts the supervisor.
 
 Every host renders one served page. `GET /onboarding` returns `onboarding_template.html` with the `settings_setup_contract` bootstrap injected and links `onboarding.css` plus `web/modules/onboarding_wizard.js` as ordinary static assets, so wizard steps can import the same modules the rest of the UI uses — an inlined `srcdoc` string cannot. The desktop setup window opens that URL, the blocking overlay frames it, and a browser owner can open it directly. `GET /api/onboarding` remains the readiness probe: 204 once the structural gate passes, otherwise the same page. The route is side-effect-free. The flow is providers/access, agents, model slots, review enforcement plus initial runtime mode, budget, and summary; it does not configure context mode. The agents step sits directly after access because it explains what that access already bought: a compact three-rung ladder (one API key or local model runs Ouroboros, one agent plan moves delegated subagents and commit/scope review onto that plan, several accounts rotate) beside one static inline diagram of the rotation. It is skippable, owns no input, and mounts the shared login cards in `full` mode rather than `compact`, because compact omits the paste-code entry a Claude login needs when its localhost callback cannot complete. Every account fact it renders comes from the shared Claudexor status store, and what it observed becomes the completion payload's `subscriptionsConnected` declaration — a request to look at the daemon, never an authority. Provider fields may coexist, rare fields remain mounted inside the “More options” disclosure, and the visible model defaults update from the current provider profile. An Anthropic key typed but not yet saved still reveals the Claude-runtime card without presenting the backend's expected no-key state as an error.
 
 Completion is one HTTP conversation on every host: `POST /api/onboarding/complete` (`gateway/onboarding.py`) replaces the earlier `POST /api/settings` + `POST /api/owner/runtime-mode` pair whose failure between the two writes left providers saved and runtime mode not. The order is fixed: re-prove install-time status server-side (a payload boolean is a request, never an authority), validate through the shared setup validator and the same structural startup gate, read ONE live agent-account/model snapshot when the payload declares that subscriptions were connected, compile the install preset, apply ordinary provider normalization FIRST and add the structured preset keys on top of it, persist settings + next-boot runtime mode + the fresh-install safety default + the one-shot preset marker + the durable completion fact in a single write whose eligibility is re-proved under the settings lock, and only then start the supervisor. Install time means three proofs together, because "no startup-ready provider" is a state an old install reaches whenever its key stops working: onboarding has never completed here (`OUROBOROS_ONBOARDING_COMPLETED_AT`, written by every completion, including a skipped or subscription-less one), no preset generation has been applied, and there is no `settings.json` yet — the same genuinely-fresh-install rule the wizard already uses for the `light` safety default. `GET /api/onboarding` is a pure read: it still normalizes what the wizard displays but never persists, because a read that creates `settings.json` silently disqualifies both install-time latches. Compatible-model discovery, Claude-runtime status/repair, and local-runtime controls likewise use the ordinary endpoints rather than a parallel desktop bridge. There is no second completion path: neither the `POST /api/settings` + `/api/owner/runtime-mode` pair nor a desktop `save_wizard` bridge survives, and the desktop setup window's bridge is window lifecycle only. The one reason a desktop-only save ever existed — authoring the initial `OUROBOROS_SAFETY_MODE=light`, which neither the shared validator nor the generic settings endpoint may do — is discharged by this endpoint on its own server-side freshness proof. A completion that fails AFTER the bytes reach disk reports that it saved, together with the stage that failed, rather than claiming nothing was written. A 2xx is not a completion by itself: only the exact success envelope is, because the saved runtime mode and the restart receipt both live in that body, and an unparseable body is unknown rather than empty. When completion changes something the running process pinned at boot — its runtime-mode baseline — the desktop launcher recycles the managed server it owns rather than showing a restart nag, the framed overlay shows its restart card, and a plain browser tab shows the wizard's own saved-but-restart-required screen instead of navigating into an app running a different mode than the owner chose. A provider save can start the previously absent supervisor in the current process. The overlay frames the wizard sandboxed but with popup permission: the agent sign-in link is the step's primary action and a sandbox without it blocks that click silently.
 
-`ouroboros/subscription_install_presets.py` is the preset compiler — pure, no I/O, given the harnesses the daemon says it can actually run a subscription session for plus their live model discovery. Which harnesses those are is the engine's answer, not a re-derivation, and it is the DURABLE half of that answer. The engine publishes `next_up`, the credential an unpinned run would take next — computed daemon-side from enabled profiles, native readiness and QUOTA, and documented by the engine as informational rather than a routing gate. That verdict is DUAL-WIRE (unified-accounts contract): a unified engine (feature fact `unified_accounts`, from its own operations catalog) serves every account as a named registry row, emits `harnessAccounts` as an empty compatibility key, and carries the verdict in the additive top-level `accountPools: [{harness_id, next_up}]` (union `profile | api_key_route | none`); a legacy engine keeps it on the per-harness accounts row (union `profile | native | none`). `gateway/onboarding.py::subscription_routable_harnesses` reads the pool first and the legacy row second — a pool row is a full accounts authority (the empty legacy list must not silently drop a unified harness from the preset), `api_key_route` refuses exactly like the legacy native `api_key` route, an unknown kind on either wire is a fail-safe refusal that still lets the configured-seat scan answer, and routing is never re-derived from the profile list client-side. A preset is a once-only install-time decision, so a quota window that happens to be spent during onboarding must not delete a harness from it permanently: `next_up` decides first and its seat is what the receipt records, but when it refuses, a subscription seat that is merely out of capacity still counts and the refusal is kept as a capacity note. The durable seat is credential KIND, enabled, present and vendor-verified — a named profile, or the signed-in default login whose effective route is the vendor session rather than an API key (`auth_preference` can put a key ahead of a session that exists, and that is durable). A NATIVE default seat counts only when the harness row is enabled AND runnable — the row is that seat's only runnability signal, which keeps the deliberate signed-in-but-unavailable refusal — while a NAMED-profile seat is vouched by its own doctor probe and therefore counts on a structurally unavailable row (an engine whose harness has no default credential store, agy/Claudexor INV-135, reports the row "unavailable" forever; refusing on the row alone made the matrix_row_absent refusal unreachable), with the row status disclosed in the routable evidence. A signed-in account is not the question, and neither is whether a run would start this second. When at least one supported agent subscription is connected at install time, every surface that can run on a subscription moves onto it: the commit triad, the scope rows, the advisory pre-reviewer (`OUROBOROS_REVIEWER_SLOTS`) and the delegated subagent default (`OUROBOROS_SUBAGENT_HARNESS`). The compiler derives those seats from one per-harness policy catalog plus linear delegation, triad and scope priority orders; adding a harness does not require a powerset table. A single connected Claude, Codex or Cursor harness receives three independent triad slots for its selected model, while a mixed set receives one slot per connected core harness. Antigravity is recognized at this boundary, but every connected set containing it retains the v6.104.0 typed `matrix_row_absent` refusal until the owner dictates its seats; nothing is guessed or persisted. The API model slots stay untouched, because the root loop is an API LLM client that a subscription cannot serve. Owner shorthand is resolved to EXACT discovery ids through a small ordered per-family alias table, and a seat that no live id satisfies is a typed refusal that persists nothing — a guessed id would be written into the reviewer configuration the owner believes is live and would only fail later, inside a real review. Reasoning effort rides the row's `effort` field for harnesses whose model ids are effort-free and additionally the compound slug for a harness that spells effort inside the id. Credential profiles are never pinned by the preset, because the daemon rotates them. A daemon that cannot answer at save time is a typed 503 that keeps the wizard open and offers an explicit finish-without-agent-defaults path; presets apply at install time only and are never re-derived afterwards.
+`ouroboros/subscription_install_presets.py` is a pure compiler with two sibling products, not a reviewer/subagent matrix. Its Available-subagent projection runs for every eligible completion: normalized API/local settings alone are enough for API-only and local-only installs, while a declared subscription causes `gateway/onboarding.py` to read exactly one live Claudexor snapshot before the settings transaction. That snapshot remains the authority for supported harnesses, exact model ids, enabled accounts and the daemon's quota-aware unpinned `next_up` fact; the browser and compiler do not re-derive account routing from profile names.
 
-Validation is deliberately structural. At least one exposed remote configuration or a local model source is required; local-only setup must also route at least one lane locally. Main is required, while Heavy, Light, Vision, Consciousness, and Fallback keep their documented inheritance/empty semantics. Review enforcement and runtime mode must be known enum values, budgets must be finite and positive, MiniMax region is closed to its supported values, and a Hugging Face local source needs a filename. Credential length is checked only when that field changed in the submitted payload. Rechecking an unchanged short legacy value would reject the whole form, including the replacement typed elsewhere, and make that value impossible to repair.
+The task-actor compiler emits one real unpinned `agent_session` row for every connected supported harness (Claude, Codex, Cursor and Agy), then adds credentialed API/local actors linearly: a Light-derived Fast scout, and in the one-session case a distinct effective Main route as Independent perspective when it differs from the scout. It deduplicates identical routes and never constructs a powerset. Agy's automatic row is `gemini-3.7-flash-high`; other discovered Agy models remain editor choices. The reviewer compiler consumes only independently ratified Claude/Codex/Cursor policy. Consequently Agy-only setup succeeds with its task actor and leaves existing provider-normalized API/local reviewer defaults intact, while mixed Agy+core setup produces the same reviewer bytes as the core subset alone. Missing required exact discovery returns a typed pre-write refusal and persists neither a partial task preset nor a partial reviewer preset.
+
+`POST /api/onboarding/subagents/preview` runs the same compiler against the open provider/local draft and optional live snapshot without persisting. The editable result is the value later submitted as `OUROBOROS_SUBAGENTS`; an owner-edited canonical draft is validated and preserved rather than regenerated. Completion persists that actor value, the independent reviewer disposition, the preset receipt, completion facts and other onboarding settings through the existing one-write document-lock/fingerprint boundary. Network discovery happens before the lock. A daemon failure keeps the wizard open and offers the explicit finish-without-agent-defaults path; a read or failed refresh never rewrites saved intent.
+
+Validation is deliberately structural. At least one exposed remote configuration or a local model source is required; local-only setup must also route at least one active lane locally. Main is required, while Light, Vision, Consciousness, and Fallback keep their documented inheritance/empty semantics. Heavy remains readable only for bounded migration into an explicit API actor and is absent from active validation/model selection. Review enforcement and runtime mode must be known enum values, budgets must be finite and positive, MiniMax region is closed to its supported values, and a Hugging Face local source needs a filename. Credential length is checked only when that field changed in the submitted payload. Rechecking an unchanged short legacy value would reject the whole form, including the replacement typed elsewhere, and make that value impossible to repair.
 
 Closing the desktop setup window without saving is non-fatal: launcher startup continues and the main web surface remains available, where `/api/onboarding` still mounts the blocking overlay until structural readiness is satisfied. In Linux browser mode the setup window is skipped entirely and that same web overlay is the first-run owner surface. Claude-runtime repair remains optional and fail-soft so a broken Anthropic tooling lane does not prevent an otherwise configured provider from starting.
 
@@ -641,7 +654,7 @@ Owner-message continuity is journal-backed: each locally sent owner row is kept 
 
 Task activity is collapsed into a live task card per root instead of flooding the transcript with individual tool and progress bubbles. `log_events.js` keeps the live task card and grouped task cards on one reducer across Chat and Dashboard Logs. A card keeps a concise latest activity line and an expandable chronological timeline; server-truncated result or trace rows fetch their complete typed task record on demand into a bounded viewer. The compact card is therefore a navigation/presentation projection, not the full result authority.
 
-Subagents render as distinct child cards keyed by their actual child task ids. Parent cards retain lineage references without duplicating the child's final answer into the parent timeline. Nested children are collapsed by default to keep deep trees scannable, while review evidence remains expanded when hiding it would conceal actor, model, route, verdict, or capability provenance. Requested model lane, effective model lane, delegated executor route, and terminal execution evidence remain separate fields: a dispatch intention must not be redrawn as proof of where the run actually settled.
+Subagents render as distinct child cards keyed by their actual child task ids. Parent cards retain lineage references without duplicating the child's final answer into the parent timeline. Nested children are collapsed by default to keep deep trees scannable, while review evidence remains expanded when hiding it would conceal actor, model, route, verdict, or capability provenance. The selected `subagent_id`/configured snapshot, requested route, effective engine route/model/account and terminal execution evidence remain separate facts: saved or dispatch intent must not be redrawn as proof of where the run actually settled. Legacy lane/executor fields remain readable on historical cards only.
 
 Card cost is sticky task-scope evidence. Only frames that carry task accounting status, finality, subtree, reservation, or unknown-cost fields may update it; an unrelated per-call `cost_usd` delta is never relabelled as the task total. The precedence is unavailable, then pending, then final, with newer evidence winning within one class. Costless heartbeat or rendering frames cannot erase a known value, and a transient unavailable read cannot overwrite a later honest measurement. Dashboard accounting and task-detail accounting continue to derive from the physical-attempt ledger rather than from the card.
 
@@ -713,7 +726,9 @@ Account status refresh runs immediately and on visible page/tab activation but d
 
 Review lanes edits one structured reviewer configuration. Each triad, scope, or optional advisory row chooses either API delivery or a coding-agent session, then its model, optional credential profile, and effort. API models use free text with catalogue suggestions; agent-session models come from the selected harness. Saved choices that disappear from discovery remain visible as unavailable rather than silently changing to the first option. Capability labels configure nothing; the server-returned limits and last effective execution disclose what a saved row actually ran as, including capability deltas. An unloaded or unreachable view authors no replacement. A successfully loaded empty triad/scope is sent as shown so backend validation returns the real error instead of the browser falsely reporting that nothing changed. A row pinned to an account discovery no longer lists keeps its pin and is disclosed once, above the rows, as unavailable rather than silently rerouted — and only on the word of a facet that was actually read: an account pin answers to the `accounts` facet and a model to `catalog`, and while that facet is unread or failed the row says the pin was not checked instead of "not in discovery". The all-delegated disclosure is neutral routing information: commit and scope review run on subscriptions and wait for capacity rather than falling back to API spend, while task acceptance and skill review remain API-only on the shipped defaults; plan review follows each triad row's own delivery kind.
 
-The Delegation section distinguishes an ordinary API child from delegated work on a connected subscription. It is the single place the subagent story is configured: route, engine model, an optional account pin, the mutative permission, how many children a root may run, how deep they may nest, and, behind a collapsed disclosure, the two roots where a child checks out a worktree or builds a from-scratch project. Delegation selects the harness, an optional engine model and an optional account (the same options fragment the reviewer rows use; empty = the engine's quota-aware automatic rotation, a saved pin discovery cannot see keeps its option instead of being silently erased, and a harness switch visibly drops the pin), while the API-side subagent still drives, observes, and checks the delegated session. The latest settled delegated run is shown from durable evidence, with requested-versus-applied model differences — and the applied ACCOUNT, including a requested-versus-ran pin mismatch — disclosed rather than rewritten. No connected account yields an explanatory state, not a toggle whose every dispatch silently falls back.
+**Available subagents** is the single task-actor editor. Its list-level Enabled flag and at most ten stable rows are the saved `OUROBOROS_SUBAGENTS` intent. The owner sees numbered rows and authors one prose field, Description (`recommended_use`), alongside the structured API-model or Agent-session route, optional effort and optional session account pin. Stable ids and compatibility names remain internal, are generated automatically for new/duplicated rows, and are preserved across edits; a changing visual ordinal never becomes durable identity. The editor shares only neutral route/model/account/status primitives with Review lanes; reviewer quorum, roles and schema stay separate. Empty session pin means Claudexor's compatible-account rotation. A saved route, model or pin that disappears from discovery remains visible and editable, labeled unavailable or not checked according to the exact status facet rather than silently rewritten.
+
+Saved intent and live evidence are separate axes. The row status distinguishes saved/generated/draft intent from current availability and may show the last actual requested→effective run evidence. A status/catalog/accounts failure annotates the rows but never erases them. Settings GET may offer an unsaved migration/default candidate when no canonical value exists; the editor materializes it only on Save. A late bounded status or preview response may replace a still-clean generated baseline, never an owner-edited draft, and unchanged repaint preserves focus/caret. Generic Settings save strictly validates and canonicalizes the already-materialized value before the existing serialized off-event-loop owner transaction. A running task retains its immutable start snapshot and the save response says changes apply from the next task.
 
 Mutative subagents use Off, Auto, and On. An explicit Off or On applies to every acting surface. Auto delegates the default to runtime mode: Advanced and Pro allow worktree, external-workspace, and genesis writers; Light allows only children that build outside the Ouroboros runtime (external workspace and genesis) and keeps a self-worktree child off. Read-only children remain available. The setting is owner-controlled, applies from the next task, and is independent of whether the execution route is API or a coding-agent subscription.
 
@@ -1062,11 +1077,15 @@ Advisory availability is evaluated from the current configured slot and route, n
 `usage_ledger.py` owns the durable append-only physical-attempt ledger: cross-process locking, sequence and transition validation, append+fsync, replay, and loud tail quarantine. `usage_accounting.py` is the one-way policy layer above it: route pricing, reservations, settlement, scopes, budget fences, imports, projections, and admission. The substrate never imports policy. This is a structural boundary around the monetary authority: a pricing or budget-policy change cannot redefine valid ledger storage, and a locking or repair change cannot silently change what an attempt costs. Compatibility events, state mirrors, task fields, and UI projections may carry attempt ids and derived totals but never become a second charge source.
 ### Delegated subagents (Claudexor transport + the nanny)
 
-Children coordinate through `tree_note` and `tree_read`; only the parent may use `override_delegation_constraint`. Workspace children retain scoped `knowledge_read` and `knowledge_list`, and a child that discovers harder work may raise its own cognitive lane with `switch_model` without widening filesystem or commit authority.
+Children coordinate through `tree_note` and `tree_read`; only the parent may use `override_delegation_constraint`. Both read-only and acting children can use the existing descendant-scoped `forward_to_worker` carrier to address their own running descendants (or relay one descendant through the ancestor); the durable ancestry check grants no unrelated-task reach. Workspace children retain scoped `knowledge_read` and `knowledge_list`, and recursive delegation never widens filesystem, budget, depth, deadline, commit or owner authority.
 
-`schedule_subagent` requires a focused `objective` and `expected_output`; its optional fields describe child-local context, constraints, memory, capability needs, cognitive lane, executor, write surface, narrower deadline, delegation budget, and acceptance claims. Lineage, workspace/resource bounds, and the remaining parent budget are host-derived. Acceptance claims belong only to that child: blank values normalize away and omission never inherits the parent's claims.
+`OUROBOROS_SUBAGENTS` is the active task-actor SSOT. Its strict `{enabled, items}` value contains at most ten `ConfiguredSubagent` rows. Each row has a stable `subagent_id`, display name, owner-authored English `recommended_use`, one normalized route (`api_model` or `agent_session`), optional effort and an optional session credential pin. The description is selection context only: host code never parses, ranks or maps its words to task text. API models and session harnesses therefore occupy one LLM-selectable list without pretending they have the same topology.
 
-Scheduling reports intent only. At dispatch, `subagents.resolve_subagent_dispatch` derives the effective lane/model, configured effort, executor, route, tool profile, and any capability reduction without branching on a harness vendor. It does not claim which account executed the run: the applied credential profile is an engine receipt fact (`authRoute.profileId` at settlement), while the REQUESTED pin — `OUROBOROS_SUBAGENT_PROFILE`, riding the run request as `credentialProfileId` — is recorded on the durable STARTED custody row so the «Last delegated run» receipt can disclose a requested-versus-ran mismatch. A pin is strict: route health judges a pinned route against that subject exactly (a healthy sibling account cannot vouch for a spent pin), and an exhausted pinned window is a typed refusal, never a silent rotation; harness-wide health stays the rule for automatic rotation, whose account choice remains Claudexor's business. `swarm_efficiency` and pre-dispatch `swarm_fanout` likewise report requested lanes rather than inventing execution evidence.
+`schedule_subagent` requires `subagent_id`, a focused `objective`, and `expected_output`. Its remaining public fields describe child-local context, constraints, memory, capability needs, write surface, narrower deadline, delegation budget and acceptance claims. There is no model-visible `model_lane` or `executor` axis and no public `effort` override: the selected row is the complete execution choice. Lineage, workspace/resource bounds, parent cognitive route and remaining budget are host-derived. Acceptance claims belong only to that child; blank values normalize away and omission never inherits the parent's claims.
+
+At scheduling, `subagent_runtime.select_subagent_snapshot` validates the exact id against the canonical enabled list and copies an immutable normalized snapshot into the child task: selected id, config fingerprint, name/description provenance, source, route, effort and selection time. Settings edits affect later children only. An `api_model` row becomes an ordinary recursive API child on that exact model/effort. Its executable model keeps the saved direct-provider `provider::model` spelling; only the canonical ` (local)` marker is removed for a local call, while slash-normalized identity remains comparison/telemetry data and never selects transport. An `agent_session` row becomes an ordinary recursive Ouroboros nanny whose exact external leaf is bound by the same snapshot. Requested route/model/account/access and effective engine facts remain separate in custody receipts; an explicit pin is strict, while an empty pin delegates compatible-account rotation to Claudexor.
+
+The old `model_lane`/`executor` resolver remains only for old durable records and the one compatibility window. A live legacy-only call is accepted only when its explicit selectors map deterministically to exactly one migrated configured row; omitted/ambiguous `auto`, zero matches or multiple matches return `subagent_selection_required`. Supplying `subagent_id` with legacy selectors is a typed conflict. For those historical lane envelopes, `schedule_subagent` reports the requested lane only; effective facts remain on the dispatched child record rather than being invented before dispatch. `subagents.resolve_subagent_dispatch` immediately hands a task carrying `configured_subagent` to `subagent_runtime`, so legacy Heavy/lane/executor policy cannot reinterpret an active selection.
 
 `wait_task` and `get_task_result` return the full single-child handoff. They include a disclosed, ten-row verification-receipt projection ordered with every still-outstanding red or masked pass first and the newest remaining receipts after it; the exact omitted count is carried. Receipts are read from the canonical root, with the recorded child drive as a pre-copy-back fallback. `wait_tasks` deliberately remains batch-compact: `task_id, status, cost_usd, child_result_sha256, outcome_axes, result, trace_summary, capability_delta when the child has something to disclose, duplicate_of`.
 
@@ -1098,11 +1117,14 @@ number the harness never gave (BIBLE P1 — the gap is represented, never filled
 instead is an honest loss of finality. Closing this needs a spend disclosure from
 Claudexor, not a guess here.
 
-A delegated subagent is an ORDINARY subagent acting as a **nanny**: it keeps its place
-in the task tree, its deadline and its authority, but instead of thinking on metered
-API tokens it starts a Claudexor run, watches it, and brings the result home. Because
-the nanny IS the host, verification receipts stay host-authored and the harness's
-output is a claim to check, never proof.
+An `agent_session` subagent is an ordinary recursive task-tree child acting as a
+**nanny** over one bounded external leaf. The task node keeps lineage, authority,
+deadline, budget, acceptance, cancellation and the ability to create descendants;
+the Claude Code/Codex/Cursor/Agy process remains a non-recursive tool leaf. This is
+why session rows do not flatten the task tree into harness processes. The nanny is
+the host: verification receipts stay host-authored and harness output is a claim to
+check, never proof. An `api_model` row has no nanny/leaf split; that API child is the
+recursive actor itself.
 
 `gateways/claudexor.py` is pure transport. It reads the daemon descriptor for
 `{host, port, tokenPath}` — `<config_dir>/daemon/control-api.json` under the owned
@@ -1254,59 +1276,89 @@ The one resolved absolute argv is retained while the job is created, then receiv
 job id and is rendered as inert POSIX or PowerShell text (`&` before PowerShell's quoted
 executable), with the owned config root and inherited daemon-socket override cleared.
 
-**Four nanny verbs** (`tools/delegate.py`), registered in both delegated-child
-profiles as well as the ordinary top-level catalog: `delegate_start`,
-`delegate_wait`, `delegate_cancel`, `delegate_answer`. There is deliberately no
-`hurry`: Claudexor's only control verb is `cancel`, and cancelling a reviewer destroys
-the very verdict the hurry wanted. `delegate_wait` is time-bounded and progress-aware —
-it returns early on a terminal state, a containment fault, or a NEW pending interactive
-question, and otherwise HOLDS its window: a real advance of the run's JOURNAL cursor
-(`lastSeq`) is streamed to the human
-immediately (`ouroboros/delegate_progress.py` → `ctx.emit_progress_fn`) and recorded,
-then handed to the model once at expiry as the `advances` sequence. SSE `: ping`
-keepalives still cannot pose as progress: they never reach the cursor. Returning on the
-FIRST advance made the window meaningless against a healthy streaming run and cost a
-full-context nanny round per event batch. The window is measured from BEFORE the
-connection (the opening handshake and first poll are part of what the call holds), and
-EVERY read it issues is bounded by what the window has left
-(`delegate_progress.poll_bound`: floored at `SHORT_POLL_TIMEOUT_SEC`, never above the
-gateway's own 60s read default) — an unbounded in-loop poll carried that default and
-answered past the deadline the clamp exists to protect. The last poll of a spent window
-is bounded rather than skipped, so terminal and breach are judged on fresh data — a run
-that finished during the last sleep would otherwise be reported as still running — and a
-daemon too slow to answer THAT one (`delegate_progress.expiring_poll`) expires the window
-gracefully instead of failing the tool. Any EARLIER failure stays the typed
-`ClaudexorUnavailable` refusal it was (`delegate_progress.bounded_poll`): a daemon that
-dies mid-window has no expiry to report, and relaying it as a completed quiet wait would
-invent both the duration and the silence. A silent non-terminal run returns a typed
-`no_progress` reason so the nanny keeps reading its mailbox; the hard kill stays with
-the task watchdog. While a wait holds its window it also grants a typed
-**external-wait lease** (`external_wait_lease` supervisor event): the idle rail —
-and ONLY the idle rail — spares a leased task, because a bounded host-side hold
-over a live delegated run is legitimate silence; the WORKER bounds the lease by
-min(window+grace, task deadline, the run's own `maxSeconds` horizon,
-`delegate_progress.EXTERNAL_WAIT_LEASE_CEILING_SEC`); the supervisor's own clamp is
-exactly one — it re-clamps the stored expiry to
-`now + EXTERNAL_WAIT_LEASE_CEILING_SEC` against a malformed worker value, and
-re-derives none of the other bounds. Each grant carries a unique `lease_id` and
-the release names it, so a stale release from an abandoned wait thread cannot
-blank a newer grant; the lease is released in the wait's own `finally`, and never
-consulted by the explicit deadline, the absolute ceiling, budget fences, or
-cancel.
+**Four nanny verbs** (`tools/delegate.py`) remain: `delegate_start`,
+`delegate_wait`, `delegate_cancel`, and `delegate_answer`. There is deliberately no
+fake `hurry`: current Claudexor exposes cancel and answers to a pending interaction,
+not truthful arbitrary in-place steering. `delegate_start` now takes an exact
+`agent_session` `subagent_id` (or recovery-only `retry_of`). API actor ids are refused
+there and must be scheduled as recursive children. A scheduled configured nanny
+normally does not call start at all: `subagent_bootstrap.bootstrap_before_context`
+compiles the complete work order and calls the shared `exact_start` primitive before
+the nanny's first model call. Root-direct bounded work and same-nanny replacement use
+the same primitive with an explicit id. `delegate_start(subagent_id=..., prompt=...,
+root="skill_payload", bucket=..., skill_name=...)` remains the orthogonal
+exact-resource selector: the id
+chooses transport while the existing resource binding chooses payload authority.
+
+`delegate_wait` is model-visible as an **event-only sleep**, not a caller-sized poll.
+`delegate_supervision.supervised_wait` renews its low-level bounded transport windows
+inside host code. Journal cursor advances continue streaming to the human and update
+the durable cursor but do not return to the model. A meaningful terminal settlement,
+new interaction, containment/transport/custody fault, addressed owner/task message,
+cancel/deadline control, or recovery judgment becomes a durable pending wake; that
+wake is injected and acknowledged once, and is replayed after a worker interruption
+until acknowledged. Quiet renewal emits supervision telemetry and makes zero LLM
+calls. The existing external-wait lease still protects legitimate host-side silence
+from the idle rail; deadline, absolute ceiling, budget and cancellation remain outer
+bounds.
+
+The nanny may deliberately request one future inspection by supplying both
+`checkpoint_after_sec` and a free-text `checkpoint_reason`. It wakes once at that
+time, or an earlier real event consumes the checkpoint. Every later inspection needs
+a fresh model decision. There is no repeating cadence, journal-progress wake, host
+stall classifier, or hidden polling loop. On a wake the nanny retains its full normal
+tool surface and inherited parent model/effort route. Its role contract is to inspect,
+coordinate, answer, wait, cancel/replace, evaluate, integrate or explicitly create a
+different child — not to implement the same healthy leaf's assignment in parallel.
+That semantic boundary is prompt/review/receipt enforced; host code does not reduce
+the nanny to a controller allowlist.
+
+**Recovery is exact and cause-specific, not generic task resurrection.** A proven
+non-signal worker crash may reserve the same task id as a recoverable successor before
+requeue; the custody orphan sweep receives that narrow fence, and the successor adopts
+the exact run or pending invocation before any LLM call or new start. A planned agent
+self-restart first persists `delegate_restart_transaction_prepared` for each exact
+sleeping/wake-pending nanny, including config/work-order/authority/worktree/run or
+pending-invocation/cursor/message/interaction/checkpoint fingerprints. The launcher
+acknowledges the expected exit-42 transaction, and startup pre-adopts those handoffs
+before ordinary custody cleanup. Adoption is durably recorded before supervision
+continues; a terminal observed in the gap settles once.
+
+The original atomic leaf proves its actor/work order against the task-start snapshot. If
+the same nanny explicitly replaced that settled leaf, or a root task explicitly started a
+bounded leaf directly, the one current durable custody holder is instead the immutable
+actor/config/work-order authority for handoff. Task authority and the holder's exact
+worktree/run binding are still re-proved, and zero or multiple current holders refuse;
+recovery never reselects from mutable settings or issues a new semantic start.
+
+Owner restart, panic, external or worker signal, deadline/timeout, explicit cancellation
+and abrupt whole-app loss are explicit no-resume causes: they cancel/settle instead of
+claiming continuity that was never handed off. Any missing, conflicting, vetoed or
+ambiguous binding returns typed recovery-required/reconciliation and never starts a
+duplicate mutator. This adds no public `PARKED` state: the task remains ordinary
+`RUNNING` in one worker while sleeping. Key supervision telemetry is
+`delegate_supervision_wait_entered`, `delegate_supervision_wait_renewed`,
+`delegate_supervision_wake_pending`, `delegate_supervision_wake_replayed`,
+`delegate_supervision_wake_acknowledged`,
+`delegate_supervision_checkpoint_scheduled` and
+`delegate_supervision_checkpoint_consumed`; recovery emits
+`delegate_restart_transaction_prepared`,
+`delegate_restart_transaction_acknowledged`, `delegate_recovery_pre_adopted` and
+`delegate_run_adopted`.
 
 **A run's question is the nanny's to answer** (owner decision 7=A). The engine's
 run detail carries `pendingInteractions` — the full question text, header, options
 and `multi_select`, read by the ONE normalizer `gateways.claudexor.pending_interactions`
-— and `delegate_wait` returns IMMEDIATELY with a typed `status="waiting_on_user"`
-payload when a NEW interaction appears, instead of burning the rest of the window
-(and up to the engine's whole answer timeout) in dead metered polling. An oversized
+— and supervision wakes IMMEDIATELY with a typed `status="waiting_on_user"`
+payload when a NEW interaction appears, instead of burning the engine's answer timeout
+in dead metered polling. An oversized
 question set spills WHOLE to `task_drive` with a sha256/size receipt and a counted
 bounded preview inline; the answer keys (`interaction_id` / `question_id`) ride
-WHOLE, never truncated, because they are echoed verbatim into `delegate_answer`. A
-question the model has already been shown does not
-re-trigger the immediate return — a nanny that escalated to its owner keeps holding
-windows instead of busy-looping, with the known question riding every expiry
-payload — and the engine's interaction timeout (benign decline; the run continues
+WHOLE, never truncated, because they are echoed verbatim into `delegate_answer`.
+Supervision records delivered interaction ids durably and acknowledges them only after
+transcript injection, so a question the nanny already received neither re-triggers a
+model round nor disappears across worker recovery. The engine's interaction timeout
+(benign decline; the run continues
 on stated assumptions) is the backstop only for a question that CARRIES a
 `timeout_at`: a null `timeout_at` means no automatic expiry — the run waits until
 answered. `delegate_answer` is custody-gated like
@@ -1328,138 +1380,93 @@ with the outcome reported honestly — "host-cancelled" only on a verified
 receipt, and a verify read that finds the run already succeeded consumes that
 terminal as the slot's ordinary result). The codex lane has
 no mid-run channel: a terminal with `outcome_facts.reason=input_required` is
-answered by a plain NEW `delegate_start` carrying the assignment plus the answers —
+answered by a plain NEW `delegate_start(subagent_id=..., prompt=...)` carrying the
+assignment plus the answers —
 never the engine's rerun/decision verb, which would start a run outside this
 task's custody trail. `delegate_answer` is deliberately absent from
-`agent.preflight_delegate_visibility`'s required set: a nanny without it is
-degraded (a `timeout_at`-bearing question benign-declines; one without waits),
-never custody-broken.
+the configured session bootstrap's required tool set: a nanny without it is degraded
+(a `timeout_at`-bearing question benign-declines; one without waits), never
+custody-broken.
 
-**Execution rule table** (`subagents.resolve_subagent_executor`, pure over supplied
-health facts): `auto` + no route → native; `auto` + healthy → nanny; `auto` + an
-exhausted subscription window → native with a visible
-`subscription_window_exhausted` capability delta and `reset_at` when known; `auto` +
-any other unavailability → native with a visible marker; explicit `harness` +
-unavailable or exhausted → a typed blocker; `native` → native. Window exhaustion also
-emits an advisory `delegation_constraint` beacon that wakes the parent's sliced wait
-without gating admission, leaving it to wait for a known reset, accept metered
-execution, or reshape fan-out.
+**Configured dispatch is exact.** `subagent_runtime.resolve_configured_actor_dispatch`
+reads only the immutable task snapshot. An API row resolves to the exact API
+model/effort and an ordinary recursive child. A session row re-checks the exact saved
+route and resolves to a nanny on the parent's captured cognitive model/effort; it does
+not force Light. Disabled/malformed/unknown/unavailable choices return a typed reason,
+current alternatives and any known reset time with `host_fallback: false`. The host
+never ranks alternatives, changes session work to API/native work, or picks the first
+healthy row. Claudexor may rotate compatible accounts inside one unpinned route; that
+is credential transport, not a different actor choice.
 
-The table is applied **at dispatch**, in `subagents.dispatch_executor_resolution` (reached
-through the ONE dispatch resolution `subagents.resolve_subagent_dispatch`, whose entry
-point `agent.resolve_dispatch_axes` carries the is-this-a-child guard), which is the
-last moment at which refusing still costs nothing. `subagents.probe_subagent_executor`
-is its impure companion: it gathers the health facts once (handshake, manifest, quota —
-and asks the daemon nothing at all when no route is configured or the request is
-`native`) and hands them to the pure table. A blocked pin ends the child unrun through
-`agent.executor_blocked_outcome` — `infra_failed` / `subagent_executor_unavailable` —
-rather than falling through to the worker, because a fallback would bill the owner for
-precisely the spend the pin was chosen to avoid. The `auto` rows carry a **visible
-marker** into the child's own context (`subagent_dispatch_notes.dispatch_executor_note`,
-re-exported by `agent`): a nanny is told
-to decide its delegation plan FIRST — right after its objective/constraints — with typed
-cost classes (a subscription-lane run has known-zero marginal cost when the route reports
-its settled spend as $0; the child's own tokens are metered API money; never "free"
-unqualified), that a SUCCESSFUL delegated run is verified and integrated rather than
-rebuilt (follow-up work is delegated too), and a child that fell back to metered tokens
-is told its route was unavailable instead of discovering it by spending. The harness
-branch additionally SUPERSEDES, conditionally and without quoting it, any
-native-self-execution framing in the frozen task text (decision 2A): thinking-work
-routes through delegate_start/delegate_wait, the child's own rounds are for
-verification/integration/acceptance, and the parent's step-by-step context is the
-WORK ORDER for the delegated run's prompt. The note rides only the FINAL
-post-preflight harness dispatch — a native or preflight-demoted child keeps the
-schedule-time framing, which since B2 is itself boundary-only. Appended as a
-per-task dispatch message, never injected into the stable cached prefix.
-`subagents.route_health` is the ONE
-manifest reader, shared by the dispatcher and by `delegate_start`, so the two cannot
-disagree about the same route. When the caller carries a manually pinned credential
-profile (reviewer-slot rows today), the harness-row STATUS refusal is skipped and the
-request passes through — the engine's typed refusal is authoritative for a pinned run,
-because a row with no default credential store reads "unavailable" forever by design
-while its named profiles work; every other check (catalog absence, access profile,
-version floor, quota) applies unchanged.
+For a configured session row, route preflight and start happen in the child bootstrap,
+before ordinary context assembly and before any LLM call. Bootstrap first attempts a
+valid exact recovery handoff. Otherwise `subagent_work_order` compiles one complete
+external assignment from the immutable child contract and authority, and `exact_start`
+issues one idempotent request for the selected row. A custody-durable `started` receipt
+injects the exact run/route facts into the nanny transcript and immediately enters
+supervising wait. A preflight/start refusal wakes the nanny with typed alternatives and
+zero pre-start nanny rounds. `started_uncustodied` is a startup custody fault, not a
+healthy third state: the exact run/invocation is surfaced, quiet supervision does not
+begin, and no replacement may start until the original run is proven terminal or
+absent. Recovery replays its stored canonical request and idempotency key rather than
+issuing a second semantic start.
 
-**Delegation visibility in context is history, not health.** The runtime context's
-capability digest (`context.build_runtime_section`) carries a compact
-`capabilities["delegation"]` fact: the CONFIGURED route (`OUROBOROS_SUBAGENT_HARNESS`
-as `get_subagent_harness` parses it, or `"not configured"`) plus honestly-labeled
-HISTORICAL observations — per reviewer slot the last recorded execution from
-`state/reviewer_slot_last_execution.json` (outcome, plus the typed `failure_code` /
-`reset_at` facts when B1 recorded them) and the last delegated run from
-`state/subagent_last_delegation.json`, each stamped `last observed at <ts>`
-(the verbatim `historical, not live health` disclaimer lives once in the fact's
-note, never repeated per row). It is pure file reads over the existing receipt
-projections — no daemon probes, no new health authority: LIVE lane facts arrive from
-plan-review wave rows and typed delegate refusals, and the fact's own note teaches
-exactly that. Absent receipt files mean an absent observation, never "healthy", and
-the block fails soft on its own (a read failure drops this fact, not the capability
-digest around it).
+The public `delegate_start` and atomic bootstrap share the same exact route-health and
+start primitive. A retry must replay the already-bound invocation; a scheduled nanny
+uses its task snapshot; root-direct or same-nanny replacement supplies an explicit
+session `subagent_id`. No path chooses a first/healthy alternative. Tool visibility is
+checked as part of configured bootstrap: a selected session whose required custody
+verbs are unavailable returns a typed startup refusal. It never triggers the historical
+preflight-native fallback or a second lane/model resolution.
 
-**Nanny economics are delegation-first.** The executor axis is resolved BEFORE the
-lane, and a harness-dispatched child whose request said `auto` lands on the LIGHT
-model lane by dispatch policy — its own rounds are custody chores around a $0 run;
-an explicit lane always wins, a native child keeps plain inheritance, and the lane's
-`provenance` (`requested` / `inherited` / `policy`) rides the capability delta so
-the decision source stays readable. An admission-verified `require_lane` delegation
-constraint suppresses that light policy default too: admission stamps the verified
-lane onto the child record as `required_model_lane` (a `SUBAGENT_INTENT_FIELDS`
-member, so it survives the queue snapshot), and the dispatch honors it — the lane
-the gate verified is the lane dispatched. The child raises itself with `switch_model` for
-genuine acceptance judgment; the switch is a per-round override visible in
-`llm_usage` rows and never rewrites the dispatch record. The child's
-objective/expected_output from its immutable task contract ride STRUCTURALLY in the
-host-authored `instructions` of every delegated run, so the nanny does not copy its
-contract into each prompt (the retry path still replays the stored wire body
-byte-identically). And the old permanent nudge silence after one successful run is
-gone: the loop keeps a per-round baseline of exact delegate tool-call transitions,
-and a nanny whose OWN metered rounds/$ since the last delegated-run activity cross
-the `task_pacing.NANNY_REMINDER_*` thresholds hears a proportional plain-user-message
-reminder — repeating per threshold-width, never a cap (owner decision 2=B) — both
-periodically (self-checkpoint style) and at finalization
-(`NANNY_METERED_OVERRUN`).
+**Model-visible selection is a bounded semi-stable catalog.**
+`subagent_runtime.model_visible_subagent_catalog(settings)` projects every saved row
+in owner order, verbatim description included: stable id/name, route class, requested
+model or session target, requested effort, and automatic-versus-pinned account policy.
+It also carries the config fingerprint, source, LLM-first selection guidance and the
+exact-start-or-typed-refusal dispatch contract. Invalid, undecided/unsaved, disabled or
+empty configuration projects nothing, matching new-id dispatch authority rather than
+advertising an actor the scheduler would refuse.
 
-A second, later check closes the class the dispatch table cannot see: the route can be
-healthy while the child's MATERIALIZED toolset hides the delegate verbs (child profile,
-contract `disabled_tools`, credential/resource availability, or policy drift).
-`agent.preflight_delegate_visibility` runs once at toolset materialization — after the
-real `ToolContext` is set, before the first paid LLM round — and when a
-harness-dispatched child cannot see ALL THREE delegate verbs (`delegate_start`,
-`delegate_wait`, `delegate_cancel` — a child that can start but not wait is still
-broken): an AUTO-resolved dispatch falls back LOUDLY to native (typed
-`delegate_tools_invisible` capability delta, the same durable/live surfaces
-re-recorded — events row, RUNNING record, supervisor mirror). That fallback
-RE-RESOLVES lane, model, and effort off the NATIVE policy
-(`subagents.preflight_native_fallback_dispatch`) — the harness light-lane default
-must not survive onto a child that now thinks on metered tokens — and re-syncs the
-task record, metadata, `ToolContext` override, envelope, and live projection to the
-re-resolution. An EXPLICITLY pinned
-harness ends unrun through `agent.executor_blocked_outcome` with the distinct
-`delegate_tools_invisible` reason code — the fix is tool policy, not waiting for the
-route. A broken toolset introspection follows the same split: pinned fails CLOSED
-(the probe cannot prove the pinned contract is executable), auto proceeds fail-open
-with a `delegate_visibility_unverified` note on the capability delta. At the
-completion seam the durable result then separates the PLAN from the FACT:
-`actual_substrate` (`harness_used`/`harness_attempted`/`native_only`, from the custody
-evidence alone) rides the envelope beside `effective_executor`, a harness dispatch that ended
-`native_only` amends its `capability_delta` through `_disclose_native_only_substrate` —
-the facts land in the typed `substrate_disclosures` list (`delegated_substrate_unused`,
-plus `nanny_finalized_after_nudge_without_delegation` when the durably-stamped
-finalization nudge was ignored and the child COMPLETED) with `reason` re-derived from
-the lists — and the
-`wait_tasks` batch projection carries the compact `execution_evidence` block — see the
-§11.1 `ChatOutbound.execution_evidence` row.
+`current_model_visible_subagent_catalog()` reads the current saved settings plus the
+task-start-normalized legacy environment overlay, and `context._capture_context_core` serializes the ordered JSON
+under `## Available subagents` in the semi-stable context block before memory/knowledge.
+There is no fresh Claudexor probe and no host ranking on each LLM round. Dated reviewer
+and delegated-run observations remain in the dynamic `capabilities["delegation"]`
+projection with the existing `historical, not live health` disclaimer; the retired
+singleton `configured_route` fact is gone. Dispatch/start remains the authoritative
+live check and returns current typed alternatives/reset evidence. A failure building
+either projection drops only that fact, not the surrounding context.
 
-**Read-only and mutating children share one nanny and one transport.** The only
+**Nanny economics are structurally quiet.** The external leaf starts from the complete
+parent brief before the nanny can spend a model round. While the leaf is healthy,
+supervision performs zero LLM calls regardless of journal activity. On a real wake the
+nanny uses the parent's captured model and effort, with full ordinary reasoning power,
+so difficult acceptance and recovery are not forced onto Light. The work-order fields
+ride host-authored instructions and retry replays the stored body byte-identically.
+Metered nanny calls, overlapping tool work, descendants and delegated spend all remain
+visible in the ordinary usage/custody receipts; observability and review expose
+co-building rather than a host semantic classifier trying to prevent it.
+
+At completion, durable evidence still separates selected intent from execution fact.
+`actual_substrate` (`harness_used` / `harness_attempted` / `native_only`) derives only
+from custody rows; unreadable evidence yields no zero-count/native claim. Requested
+and effective harness/model/account/access, start/settlement states, disclosed or
+unknown spend, patch disposition and output-read completion remain queryable. A typed
+startup refusal or selected route failure does not authorize productive work on a
+different substrate. Another session route is an explicit exact start; API fallback is
+an explicit separately visible recursive child selected by an LLM.
+
+**Read-only and mutating session rows share one nanny transport.** The only
 difference is the run shape, and the shape has ONE owner —
-`subagents.delegated_run_shape`. For the generic lane it answers a single question —
+`subagents.delegated_run_shape`. For the ordinary workspace path it answers a single question —
 is this an acting child? — asked of the live `ToolContext` by
 `tools/delegate._derive_authority` (`tool_access.active_tool_profile`) and of
-the task record by `subagents.dispatch_executor_resolution`
+the configured task snapshot by `subagent_runtime.resolve_configured_actor_dispatch`
 (`tool_access.predicted_subagent_profile`); neither reassembles the shape,
 because a profile changed in one place and an isolation or a marker left behind in the
 other is silent and unsafe in exactly one branch. The EXACT-RESOURCE lane is the
-second, explicit entry: `delegate_start(root="skill_payload", bucket, skill_name)`
+second, explicit entry: `delegate_start(subagent_id=..., prompt=..., root="skill_payload", bucket=..., skill_name=...)`
 selects one installed non-native skill payload, authorized through a fresh
 `ResolvedResourceBinding` for `skill_payload.write` (top-level task profiles only)
 rather than through the acting-child question.
@@ -1708,8 +1715,8 @@ above. Four things follow, and they are one mechanism, not four:
   healthy, finished, successful runs. Unproven is REPORTED, so silence is never read as
   success and never enforced as a breach.
 
-**The model cannot widen its own authority.** `delegate_start` exposes `prompt`,
-`max_seconds`, recovery-only `retry_of`, and the exact-resource selector
+**The model cannot widen its own authority.** `delegate_start` exposes `prompt`, exact
+session `subagent_id`, `max_seconds`, recovery-only `retry_of`, and the exact-resource selector
 (`root="skill_payload"` + `bucket` + `skill_name`). The retry may replay only the same task's
 stored canonical body under its original idempotency key; prompt or ownership mismatch
 is rejected, and it cannot change route, root, access, or permissions. There is no
@@ -1733,41 +1740,37 @@ entitled to is cancelled and returned as a typed `access_profile_widened` refusa
 narrower effective profile is fine — live probing confirms the engine itself clamps
 `workspace_write` down to `readonly` on an `ask` run.
 
-**Harness-agnostic by construction.** `OUROBOROS_SUBAGENT_HARNESS` holds an OPAQUE
-route (`harness[=model][:effort]`, Claudexor's own reviewer-panel spelling) that is
-passed through as `primaryHarness`. Health comes from the published capability manifest
-(`GET /v2/agent-capabilities`) and quota from `GET /v2/quota`; Ouroboros asks for an
-access PROFILE (`readonly` / `workspace_write`, derived host-side from the calling
-task's own authority — the model cannot widen it) and lets Claudexor choose the
-mechanism. No harness-name branch selects a CAPABILITY anywhere in the core. There
-are exactly three harness-name branches in total, all in
-`gateway/claudexor_accounts.py` (the ledgered C2 set): they obey the engine's own
-asymmetric login wire schema — `loginFlow` exists only for codex and sending it to
-another harness is a hard 400 — and are recorded as a disclosed residual, not as
-capability dispatch. The sweep behind that count is regex over source, so a branch
-on a harness name COMPUTED at runtime would not appear in it.
+**Harness-agnostic by construction.** An `agent_session` row holds an opaque Claudexor
+target (`harness` or `harness=model`) plus optional credential pin and effort. Health
+comes from the published manifest/catalog/quota surfaces; Ouroboros asks for an access
+profile (`readonly` / `workspace_write`) derived from task authority and lets Claudexor
+choose the harness-specific mechanism. No harness-name branch selects a capability or
+fallback in core dispatch. The small login-wire asymmetries remain presentation/control
+adapters in `gateway/claudexor_accounts.py`, not task-routing policy.
 
-Rationale for the narrow setting key: `OUROBOROS_SUBAGENT_HARNESS` is read ONLY by the
-subagent scheduler and is deliberately absent from `provider_models.MODEL_SETTING_KEYS`.
-A session-only route is not an API model identity; letting it into that sweep would
-poison credential planning, pricing, and provenance. The OPTIONAL account pin is the
-SIBLING key `OUROBOROS_SUBAGENT_PROFILE`, not a fourth grammar position: extending the
-route grammar would move every parser of it (web mirror, preset compiler, docs) in
-lockstep, while the sibling key is read only inside `get_subagent_harness`, which folds
-it into the existing `DelegationRoute.profile_id` — the same field reviewer-slot pins
-already ride to the engine as `credentialProfileId`.
+`OUROBOROS_SUBAGENTS` deliberately contains both API and session routes because it is
+an actor-selection setting, not a provider-model sweep. `route_spec.py` shares the
+neutral route/pin/effort primitive with reviewer rows while preserving their different
+public spellings (`api_model` + `credential_profile_id` versus `api_chat` +
+`profile_id`) and semantic owners. Provider credentials/base URLs stay global. The
+active provider-model key set excludes Heavy so Provider Test, catalog/provenance and
+credential planning cannot resurrect it.
 
-**Subscription-first (owner decision, 2026-08-09 — strengthen, never narrow).** With no
-explicit owner choice, delegation turns ON by itself as soon as ONE connected account
-exists, and a native/local session counts: `verification_source: local_store` means the
-login material was detected on disk, not re-proved against the vendor this second, and
-that is deliberately enough (`subagents_settings.connectedHarnesses`). A review pass
-proposed gating the default on vendor-level verification; the owner declined it outright
-— Ouroboros should prefer a subscription over the API budget, and that gate would leave
-delegation off on exactly the machines whose subscriptions are sitting right there. The
-UI still shows the weaker provenance honestly ("local session — not verified live"); it
-just does not withhold the default. `web/tests/subagents_settings.test.js` fails if a
-later change narrows the rule.
+The singleton `OUROBOROS_SUBAGENT_HARNESS` / `OUROBOROS_SUBAGENT_PROFILE`,
+`OUROBOROS_MODEL_HEAVY`, `USE_LOCAL_HEAVY`, and live lane/executor fields are bounded
+migration/history inputs only. When the canonical list is absent, a parseable singleton
+produces a session candidate with its pin, custom Heavy may produce an explicit API row,
+and Light may supply the Fast scout. Literal `off` becomes `enabled=false`; absent/empty
+is `undecided`; malformed non-empty input fails closed. Reads do not persist the
+candidate. Once a valid canonical list exists it wins, is not double-written back to
+legacy keys, and every active task freezes its own snapshot.
+
+**Subscription preference remains LLM-first.** Onboarding and a clean undecided
+Settings draft surface every real connected session actor rather than a singleton, so
+subscriptions are easy to choose and often reduce incremental API spend. They also
+surface real API/local scouts and perspectives instead of hiding them as fallback.
+After an exact selection the host either starts that route or reports why it could not;
+it never turns the preference into a keyword router or an automatic API substitution.
 
 **Read provenance on the accounts surface.** `GET /api/claudexor/status` carries a
 `reads` block (`ClaudexorStatusReads`: `catalog` / `accounts` / `quota`, each `ok` |
@@ -2247,8 +2250,8 @@ Runtime floors:
 | OUROBOROS_RESCUE_GIT_TIMEOUT_SEC | 300 | Per-process wall-clock ceiling for the rescue graph. Timed-out Git process trees are terminated and the existing rescue policy receives a disclosed nonzero result; managed rollback remains fail-open. |
 | OUROBOROS_TRUST_NONLOCAL_BIND_WITHOUT_PASSWORD | unset | Env-only Docker/Kubernetes escape hatch. When set to `1`, Settings may save ordinary changes while a wildcard/non-localhost bind has no `OUROBOROS_NETWORK_PASSWORD`; use only behind ingress auth, VPN, private networking, or an auth proxy. |
 | OUROBOROS_MODEL | google/gemini-3.7-flash | Main reasoning model (primary real default; worker slots below are empty→Main unless noted) |
-| OUROBOROS_MODEL_HEAVY | "" | Strong acting/coding lane for mutative first-level subagents (`auto` routes a writing child here). Empty means use `OUROBOROS_MODEL`. (Renamed from `OUROBOROS_MODEL_CODE`; stored/legacy values migrate.) |
-| OUROBOROS_MODEL_LIGHT | openai/gpt-5.6-luna | Fast/cheap model for safety, compact routing, lightweight helper calls, and deep subagents. Empty means use `OUROBOROS_MODEL` (a real cheap default ships since v6.82.0) |
+| OUROBOROS_MODEL_HEAVY | "" | **Legacy migration/history only.** A non-empty owner value may seed an explicit API Available-subagent row when `OUROBOROS_SUBAGENTS` is absent; it is excluded from active model-key enumeration, Provider Test, startup readiness and new scheduling. Old records remain readable. |
+| OUROBOROS_MODEL_LIGHT | openai/gpt-5.6-luna | Fast/cheap model for safety, compact routing and lightweight helper calls; it may seed the default Fast scout API actor. Empty means use `OUROBOROS_MODEL`. It never forces a session nanny's cognitive route. |
 | OUROBOROS_MODEL_VISION | "" | Vision/caption model slot for send-time image captioning and VLM helpers. Empty means use `OUROBOROS_MODEL` for normal remote routes; local/blind routes require an explicit reachable vision slot for caption fallback. Legacy `OUROBOROS_VISION_MODEL` settings migrate here. |
 | OUROBOROS_IMAGE_INPUT_MODE | auto | Image routing mode for model calls: `auto` keeps inline images for vision-capable active models and captions for blind models; `caption` always replaces image blocks with text captions; `inline` sends pixels only when supported; `off` replaces images with placeholders. |
 | OUROBOROS_VISION_CAPTION_TIMEOUT_SEC | 90 | Provider timeout for send-time image caption sub-calls (`vision_routing.py`); keeps caption fallback from occupying the main loop indefinitely. |
@@ -2270,13 +2273,14 @@ Runtime floors:
 | OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS | (empty) | Owner control for acting children. Explicit true/false applies to every surface. Empty is Settings **Auto**: advanced/pro enables all surfaces; light enables external workspace/genesis but keeps self-worktree off. The UI persists the empty value and displays the truthful effective state rather than converting Auto into a permanent override. |
 | OUROBOROS_SUBAGENT_WORKTREE_ROOT | (empty) | Filesystem root for acting self_worktree checkouts; empty = ~/Ouroboros/subagent_worktrees (kept outside repo/ and data/) |
 | OUROBOROS_SUBAGENT_PROJECTS_ROOT | (empty) | Durable root for genesis ("from scratch") subagent projects; empty = ~/Ouroboros/projects (outside repo/ and data/). Never age-pruned. |
-| OUROBOROS_SUBAGENT_HARNESS | (empty) | Opaque Claudexor route `harness[=model][:effort]`. Settings owns the optional model tail; the engine receipt owns applied model/account truth and any requested/applied delta. Empty means delegation is off but undecided, while literal `off` records an owner choice. Only the subagent scheduler reads this key: a session route is not an API-model identity and must not enter credential or pricing planning. |
-| OUROBOROS_SUBAGENT_PROFILE | (empty) | Optional Delegation account pin: a Claudexor credential-profile id riding delegated run requests verbatim as `credentialProfileId`. Empty = the engine's quota-aware rotation pool (presets never author it). Read ONLY inside `get_subagent_harness`, folded into `DelegationRoute.profile_id`; a pin is strict — per-subject route health, typed refusal on an exhausted pinned window. |
-| OUROBOROS_DELEGATE_WAIT_SEC | 120 | (v6.87.8) Default WINDOW for ONE `delegate_wait` call. The call returns earlier only on a terminal state or a containment fault; journal-cursor advances stream to the human live and are handed to the model at expiry, so this bounds how long the nanny stays out of its mailbox. Narrowed further to the task's own remaining deadline minus the finalization grace. |
-| OUROBOROS_DELEGATE_WAIT_MAX_SEC | 1800 | (v6.87.8) Ceiling for a caller-supplied `delegate_wait` window. The hard kill stays with the task watchdog; this tunes the passive wait only. Itself clamped to `config.DELEGATE_WAIT_CEILING_SEC` (2100), the tool's own per-call executor timeout — a larger value would produce a killed tool call rather than a longer wait, so it is refused rather than promised. |
+| OUROBOROS_SUBAGENTS | (empty) | Canonical Available-subagents SSOT: strict JSON `{enabled:boolean,items:[...]}`, maximum ten rows. Each row selects one complete `api_model` or `agent_session` actor by stable `subagent_id`, with name, free-text `recommended_use`, route, optional effort and optional session credential pin. Empty means bounded legacy/undecided resolution, not an enabled singleton. |
+| OUROBOROS_SUBAGENT_HARNESS | (empty) | **Legacy migration/live-compatibility input only.** A parseable route may seed one migrated session row while the canonical setting is absent; literal `off` migrates to disabled. It is not the active scheduler SSOT. |
+| OUROBOROS_SUBAGENT_PROFILE | (empty) | **Legacy sibling pin only.** Preserved on the migrated singleton row; new session pins live inside that row's `route.credential_profile_id`. |
+| OUROBOROS_DELEGATE_WAIT_SEC | 120 | Internal low-level transport window used by `delegate_supervision` while renewing a quiet event-only sleep. It is not exposed as a model-visible `delegate_wait` duration and expiry does not wake the LLM. |
+| OUROBOROS_DELEGATE_WAIT_MAX_SEC | 1800 | Legacy/internal ceiling for bounded low-level wait windows. Public supervision is governed by meaningful events, the optional one-shot checkpoint, and the task/run outer deadlines rather than a caller-sized poll. |
 | OUROBOROS_DELIVERABLES_ROOT | (empty) | (v6.38.0) Visible container for UNNAMED user deliverables; empty = ~/Ouroboros/Deliverables (sibling of the projects root, outside repo/ and data/, never GC-pruned). A BARE `user_files` filename (no directory) lands here instead of cluttering the home root; an explicit placement (`Desktop/…`, `Downloads/…`, any path WITH a directory) is honored under home as given. `user_files_path_block_reason` allows this container past the workspace-overlap guard only while it stays a genuine sibling of (never overlapping/containing) the hard data/repo/budget drives. |
 | OUROBOROS_GC_RETENTION_DAYS | 7 | Unified age (days) for startup garbage collection of ALL disposable runtime artifacts: acting worktrees, terminal task drives, and leftover service logs (hard max 365; math SSOT in `ouroboros/retention.py`). Deprecated per-subsystem retention keys are migrated into this on settings load. |
-| OUROBOROS_RESTART_DRAIN_MAX_SEC | 120 | Agent-requested restarts drain first: while any RUNNING task still heartbeats, the restart waits up to this many seconds before proceeding fail-closed (0 = restart immediately). Owner restarts are not drained. |
+| OUROBOROS_RESTART_DRAIN_MAX_SEC | 120 | Agent-requested restarts drain ordinary work first, then may persist exact handoffs only for custody-durable sleeping/wake-pending nannies before expected exit 42. Owner restart is a no-resume cause and is not drained into this adoption lane. |
 | TOTAL_BUDGET | 200.0 | Total budget in USD |
 | OUROBOROS_PER_TASK_COST_USD | 50.0 | Hard per-task cost cap in USD over the WHOLE task tree (own calls + subagents): wired as `UsageScope.root_limit_usd`, enforced pre-dispatch by the physical-attempt ledger (`reserve_attempt`), and latched as the durable root budget fence on first refusal. Since v6.91 the in-task graceful stop (`task_pacing.resolve_cost_ceiling`) also binds to it — min(pct-of-global, cap − absolute planning margin) against TREE-accounted spend — so a best-effort wrap-up fires before the fence. The cap stops the task on its own even when no finite global budget exists (`TOTAL_BUDGET` unset): the two axes are independent components of the ceiling, not a gate on one another. (The pre-v6.64 "soft threshold" semantics is gone; the label was stale from 2026-07-14 to v6.91.) |
 | OUROBOROS_RUB_USD_RATE | (empty) | Explicit RUB→USD divisor for cloud.ru catalog token costs. Empty/invalid means cloud.ru cost is unknown; there is no implicit FX fallback. |
@@ -2298,6 +2302,7 @@ Runtime floors:
 | OUROBOROS_REVIEW_MODELS | google/gemini-3.7-flash,openai/gpt-5.6-terra,anthropic/claude-opus-5 | Ordered reviewer slots shared by triad/plan/task/skill review; duplicate model IDs are independent slots. When OUROBOROS_REVIEWER_SLOTS is set this key becomes a runtime PROJECTION of its api_chat triad rows (for the API-pinned surfaces, D15) — never a second write |
 | OUROBOROS_REVIEWER_SLOTS | (empty) | (6.1) Structured reviewer-slot SSOT (`reviewer_slot_config.py`): JSON `{triad[], scope[], advisory}`; each row `{slot_id, route:{kind: api_chat\|agent_session, target_id}, effort}` with a STABLE owner-assigned slot_id (never an array index). Empty = read the legacy comma keys + phase-5 route envs as the migration source. Malformed value refuses typed at save AND at review time on every surface except task acceptance (owner-approved residual: acceptance still reads the projected legacy/default env keys); env-apply logs and leaves legacy keys unprojected |
 | OUROBOROS_SUBSCRIPTION_PRESET_VERSION | (empty) | One-shot INSTALL-TIME marker recording which generation of the agent-subscription preset (`subscription_install_presets.py`) this install received. Written only by `POST /api/onboarding/complete`, beside the preset it records; endpoint-authored and DISK-ONLY (`config.ENDPOINT_AUTHORED_SETTINGS`), so the generic save's merge skip blocks the request body while the loader and the environment projection keep the key out of `os.environ` in both directions — an environment-only marker used to be persisted by an ordinary settings POST. Its ABSENCE authorizes nothing — every install that predates presets lacks it too, which is why install time is proved by all three of: no recorded completion, no preset generation, and no `settings.json` yet |
+| OUROBOROS_SUBAGENT_PRESET_RECEIPT | (empty) | Endpoint-authored, disk-only receipt for the compiled Available-subagent/reviewer preset, including source/fingerprint and disclosed diagnostics. It is evidence, never an alternate actor setting. |
 | OUROBOROS_ONBOARDING_COMPLETED_AT | (empty) | The durable "onboarding finished here" timestamp, written by EVERY completion of `POST /api/onboarding/complete` — including one that connected no subscription and one that skipped the preset. Same endpoint-authored disk-only treatment as the preset marker: an environment timestamp alone once answered `not_install_time` on a genuinely fresh install and closed the window with no preset installed. It exists because `has_startup_ready_provider` being false is a state an OLD install reaches whenever its provider key stops working: without a recorded completion, that alone re-opened the install-time window and wrote presets over the owner's own reviewer/subagent configuration |
 | OUROBOROS_SCOPE_REVIEW_MODELS | openai/gpt-5.6-terra | Comma-separated scope reviewer slots; falls back from legacy `OUROBOROS_SCOPE_REVIEW_MODEL`. Designated-default window evidence: OpenRouter `/models` metadata reports gpt-5.6-terra context_length=1,050,000 (checked 2026-07-29) — satisfies the BIBLE P3 ≥1M floor |
 | OUROBOROS_TASK_REVIEW_MODE | auto | Task acceptance mode: `off`, `auto`, or `required`. Only the root owns the verdict. `auto` and `required` host-review queued/headless/scheduled substantive roots and effectful direct turns; pure conversation and child authority are skipped. `required` combines with `OUROBOROS_REVIEW_ENFORCEMENT`: advisory records/finalizes honestly after available improvement, while blocking repeats until evidence-backed clean acceptance or a real rail, subject to any explicit task-local pass cap. |
@@ -2347,7 +2352,7 @@ Runtime floors:
 | LOCAL_MODEL_CONTEXT_LENGTH | 16384 | Context window for local model |
 | LOCAL_MODEL_N_GPU_LAYERS | 0 | GPU layers (-1=all, 0=CPU/mmap) |
 | USE_LOCAL_MAIN | false | Route main model to local server |
-| USE_LOCAL_HEAVY | false | Route heavy model to local server |
+| USE_LOCAL_HEAVY | false | **Legacy migration/history only.** It may qualify a legacy Heavy value when building an unsaved migration candidate; it is excluded from active local startup/model routing. |
 | USE_LOCAL_LIGHT | false | Route light model to local server |
 | USE_LOCAL_CONSCIOUSNESS | false | Route background consciousness model slot to local server |
 | USE_LOCAL_FALLBACK | false | Route fallback model to local server |

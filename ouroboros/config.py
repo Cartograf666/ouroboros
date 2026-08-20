@@ -22,7 +22,6 @@ from ouroboros.provider_models import OPENROUTER_DEFAULTS, OPENROUTER_REVIEW_DEF
 from ouroboros.secret_masking import strip_masked_secrets
 from ouroboros.update_channels import UPDATE_SETTINGS_DEFAULTS, normalize_update_channel
 
-
 # Paths
 HOME = pathlib.Path.home()
 APP_ROOT = pathlib.Path(os.environ.get("OUROBOROS_APP_ROOT", HOME / "Ouroboros"))
@@ -36,8 +35,7 @@ RESTART_EXIT_CODE = 42
 PANIC_EXIT_CODE = 99
 AGENT_SERVER_PORT = 8765
 FINALIZATION_GRACE_DEFAULT_SEC = 120
-# Owner finalize-then-stop OUTER safety cap (S3, owner decisions 2026-08-15),
-# from the stop REQUEST; the grace budget above starts only at control DELIVERY
+# Owner finalization outer cap starts at the stop request; grace starts at control delivery
 # (the loop's mailbox drain). No summary by this cap -> honest custody cancel.
 OWNER_STOP_OUTER_CAP_SEC = 600
 # Cadence for intrinsic self-pacing checkpoints when a task has NO deadline_at
@@ -207,9 +205,11 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # Pre-commit review: comma-separated provider-tagged model list
     "OUROBOROS_REVIEW_MODELS": ",".join(OPENROUTER_REVIEW_DEFAULTS["triad"]),
     "OUROBOROS_REVIEWER_SLOTS": "",  # structured slot SSOT (reviewer_slot_config.py); "" = legacy comma keys
+    "OUROBOROS_SUBAGENTS": "",  # configured task-actor SSOT; "" = bounded legacy/undecided read
     # INSTALL-TIME facts: the agent-preset generation this install received, and WHEN onboarding last completed
     # (recorded on EVERY completion). Endpoint-authored and disk-only — see ENDPOINT_AUTHORED_SETTINGS.
     "OUROBOROS_SUBSCRIPTION_PRESET_VERSION": "",
+    "OUROBOROS_SUBAGENT_PRESET_RECEIPT": "",
     "OUROBOROS_ONBOARDING_COMPLETED_AT": "",
     # Pre-commit review enforcement: advisory | blocking
     "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
@@ -1062,7 +1062,7 @@ _DISK_AUTHORED_SETTINGS = ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUT
 # ENDPOINT-AUTHORED, DISK-ONLY: install-time facts POST /api/onboarding/complete alone writes. The ratchets above
 # are disk-authored yet DO project once the file carries them; these never leave disk in EITHER direction — an env
 # timestamp alone closed the onboarding window on a fresh install, and an env marker was then persisted by a save.
-ENDPOINT_AUTHORED_SETTINGS = frozenset({"OUROBOROS_SUBSCRIPTION_PRESET_VERSION", "OUROBOROS_ONBOARDING_COMPLETED_AT"})
+ENDPOINT_AUTHORED_SETTINGS = frozenset({"OUROBOROS_SUBSCRIPTION_PRESET_VERSION", "OUROBOROS_SUBAGENT_PRESET_RECEIPT", "OUROBOROS_ONBOARDING_COMPLETED_AT"})
 
 
 def _guard_context_mode_lowering(settings: dict, *, allow_context_lowering: bool = False) -> None:

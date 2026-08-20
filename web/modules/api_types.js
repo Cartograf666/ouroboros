@@ -91,9 +91,40 @@
  */
 
 /**
+ * @typedef {Object} AvailableSubagentRoute
+ * @property {'api_model'|'agent_session'} kind
+ * @property {string} target_id
+ * @property {string=} credential_profile_id
+ */
+
+/**
+ * @typedef {Object} AvailableSubagentItem
+ * @property {string} subagent_id
+ * @property {string} name
+ * @property {string} recommended_use
+ * @property {AvailableSubagentRoute} route
+ * @property {string=} effort
+ */
+
+/**
+ * @typedef {Object} AvailableSubagentsSetting
+ * @property {boolean} enabled
+ * @property {AvailableSubagentItem[]} items
+ */
+
+/**
+ * @typedef {Object} AvailableSubagentsSettingsMeta
+ * @property {string=} source
+ * @property {string=} diagnostic
+ * @property {Object[]=} diagnostics
+ * @property {Object|null=} candidate
+ */
+
+/**
  * @typedef {Object} SettingsMeta
  * @property {string[]=} custom_secret_keys
  * @property {Object=} setup_contract
+ * @property {AvailableSubagentsSettingsMeta=} available_subagents
  */
 
 /**
@@ -103,20 +134,37 @@
  * @typedef {Object} OnboardingCompleteRequest
  * @property {boolean=} subscriptionsConnected
  * @property {boolean=} skipSubscriptionPresets
+ * @property {Object=} OUROBOROS_SUBAGENTS
+ */
+
+/**
+ * POST /api/onboarding/subagents/preview accepts the same open provider/local
+ * draft and subscription declarations as onboarding completion. It returns a
+ * canonical editable actor list without persisting anything.
+ * @typedef {OnboardingCompleteRequest} OnboardingSubagentsPreviewRequest
+ */
+
+/**
+ * @typedef {Object} OnboardingSubagentsPreviewResponse
+ * @property {boolean} ok
+ * @property {AvailableSubagentsSetting} available_subagents
+ * @property {string} source
+ * @property {Object[]} diagnostics
  */
 
 /**
  * @typedef {Object} OnboardingPresetProjection
  * @property {boolean} applied
- * @property {string} reason  // not_requested | not_install_time | skipped_by_owner | applied
+ * @property {string} reason  // not_requested | not_install_time | skipped_by_owner | configured_by_owner | applied
  * @property {string[]} harnesses
  * @property {Object} receipt  // per-seat resolution record; {} when nothing was applied
  */
 
 /**
  * Settings, runtime mode, the fresh-install safety default and the durable
- * completion fact land atomically on every success. Preset keys and the one-shot
- * preset marker land only when `preset.applied` is true.
+ * completion fact land atomically on every success. The one-shot preset marker
+ * lands only for the automatic `reason=applied` install preset; an explicit
+ * owner draft may be saved as `configured_by_owner` without reopening it.
  * @typedef {Object} OnboardingCompleteResponse
  * @property {boolean} ok
  * @property {string} status
@@ -389,9 +437,7 @@
  * @property {"origin_omission"=} system_type
  */
 
-/**
- * Additive /api/chat/history fact for a project-owned row mirrored into Main.
- * It cannot grant Main-local cancel authority.
+/** Additive history fact: a project-owned Main mirror cannot grant cancel authority.
  * @typedef {Object} ProjectMirrorHistoryFields
  * @property {boolean=} project_mirror
  */
@@ -700,6 +746,21 @@
  */
 
 /**
+ * Last settled external leaf projected for the Available-subagents editor.
+ * `selected_subagent_id` is optional only for pre-migration receipts, which
+ * cannot be truthfully attached to a current row.
+ * @typedef {Object} SubagentLastDelegation
+ * @property {string=} selected_subagent_id
+ * @property {string=} route
+ * @property {string=} requested_model
+ * @property {string=} applied_model
+ * @property {string=} requested_profile
+ * @property {string=} applied_profile
+ * @property {string=} run_id
+ * @property {string=} ts
+ */
+
+/**
  * @typedef {Object} ClaudexorStatusResponse
  * @property {Object=} daemon
  * @property {string=} config_dir
@@ -708,7 +769,7 @@
  * @property {Array<Object>=} quota
  * @property {ClaudexorStatusReads=} reads
  * @property {boolean=} unified_accounts
- * @property {Object=} subagent_last_delegation
+ * @property {SubagentLastDelegation=} subagent_last_delegation
  * @property {string=} error
  */
 
