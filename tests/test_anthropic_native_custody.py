@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import pathlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -521,12 +522,17 @@ def test_background_preserves_receipt_and_aggregates_round_disclosures(
     monkeypatch.setattr(
         consciousness.BackgroundConsciousness,
         "_execute_tool",
-        lambda _self, _call, _events: "tool-result",
+        lambda _self, _call, _events, _validation: "tool-result",
     )
 
     bg = object.__new__(consciousness.BackgroundConsciousness)
     bg._drive_root = tmp_path
-    bg._llm = object()
+    bg._llm = SimpleNamespace(_resolve_remote_target=lambda _model: {
+        "provider": "anthropic",
+        "resolved_model": "claude-future",
+        "usage_model": "anthropic/claude-future",
+        "base_url": "https://api.anthropic.com",
+    })
     bg._max_bg_rounds = 2
     bg._paused = False
     bg._event_queue = None
