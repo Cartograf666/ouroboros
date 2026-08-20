@@ -14,6 +14,7 @@ import re
 from typing import Any, Callable, Dict, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 from ouroboros.openai_chat_custom import (
+    CustomToolProjectionError,
     custom_receipts_prove_wire_acceptance,
     normalize_openai_custom_tool_calls,
     project_function_tool_request_to_openai_custom,
@@ -488,15 +489,18 @@ def direct_openai_context_projections(
         or infer_tool_dialect({"tools": canonical_tools}) != "function"
     ):
         return ((canonical_messages, canonical_tools),)
-    projected = project_function_tool_request_to_openai_custom(
-        canonical_tools,
-        tool_choice,
-    )
-    custom_messages = project_messages_for_openai_custom(
-        canonical_messages,
-        projected.catalog,
-    )
-    custom_tools = projected.catalog.wire_tools()
+    try:
+        projected = project_function_tool_request_to_openai_custom(
+            canonical_tools,
+            tool_choice,
+        )
+        custom_messages = project_messages_for_openai_custom(
+            canonical_messages,
+            projected.catalog,
+        )
+        custom_tools = projected.catalog.wire_tools()
+    except CustomToolProjectionError:
+        return ((canonical_messages, canonical_tools),)
     return (
         (canonical_messages, canonical_tools),
         (custom_messages, custom_tools),

@@ -443,3 +443,45 @@ def test_current_109_tool_registry_exposes_and_measures_both_projections(tmp_pat
         provider="openai",
         reasoning_effort="medium",
     ) == max(token_sizes)
+
+
+def test_context_sizing_uses_canonical_projection_for_unknown_historical_tool():
+    tools = [_read_tool()]
+    messages = [
+        {"role": "user", "content": "Use a tool."},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call-unknown",
+                "type": "function",
+                "function": {"name": "unknown_tool", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-unknown",
+            "content": "Unknown tool: unknown_tool",
+        },
+    ]
+
+    projections = dispatch.direct_openai_context_projections(
+        messages,
+        tools,
+        provider="openai",
+        reasoning_effort="medium",
+    )
+
+    assert projections == ((messages, tools),)
+    assert dispatch.projected_context_size_bytes(
+        messages,
+        tools,
+        provider="openai",
+        reasoning_effort="medium",
+    ) > 0
+    assert estimate_context_prompt_tokens(
+        messages,
+        tools,
+        provider="openai",
+        reasoning_effort="medium",
+    ) > 0
