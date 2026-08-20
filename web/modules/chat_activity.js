@@ -214,6 +214,22 @@ export function isTerminalTaskPhase(phase = '', terminal = false) {
     return Boolean(terminal) || ['done', 'lifecycle_error', 'cancelled'].includes(phase);
 }
 
+// Durable task detail is allowed to finish a card only at one of the task
+// result store's genuinely-settled statuses. In particular, interrupted and
+// the legacy cancel_requested latch remain retryable rather than becoming a
+// fabricated Done/Cancelled projection.
+const TERMINAL_TASK_DETAIL_STATUSES = new Set([
+    'completed', 'failed', 'cancelled', 'rejected_duplicate',
+]);
+const OPEN_POST_TASK_SYNTHESIS_STATUSES = new Set(['pending_once', 'running']);
+
+export function isTerminalTaskDetail(record) {
+    const status = String(record?.status || '').toLowerCase();
+    const synthesis = String(record?.root_phase_checkpoint?.post_task_synthesis || '').toLowerCase();
+    return TERMINAL_TASK_DETAIL_STATUSES.has(status)
+        && !(status === 'completed' && OPEN_POST_TASK_SYNTHESIS_STATUSES.has(synthesis));
+}
+
 // ---------------------------------------------------------------------------
 // In-flight chat activity status (owner decisions 1A-5A; managed continuity).
 // ---------------------------------------------------------------------------
@@ -225,6 +241,32 @@ export function isTerminalTaskPhase(phase = '', terminal = false) {
 // without a kind stamp (legacy frames, subagents) stay exempt — they are
 // concluded by their own final/summary frames, as before.
 const SNAPSHOT_AUTHORITATIVE_KINDS = new Set(['direct_chat', 'ephemeral_decision', 'managed_task']);
+
+/**
+ * One request/apply clock for every /api/state consumer on a page. Responses
+ * may finish in either order; once generation N applies, an older generation
+ * can no longer mutate any projection. requestedAt stays tied to request start
+ * so activity hydration keeps its WS-arrival barrier.
+ */
+export function createStateSnapshotSequencer(onApply, now = () => Date.now()) {
+    let requestedGeneration = 0;
+    let appliedGeneration = 0;
+    return {
+        begin() {
+            return { generation: ++requestedGeneration, requestedAt: now() };
+        },
+        apply(request, data) {
+            const generation = Number(request?.generation) || 0;
+            if (!generation || generation <= appliedGeneration) return false;
+            appliedGeneration = generation;
+            onApply(data, request.requestedAt, generation);
+            return true;
+        },
+        isCurrent(request) {
+            return (Number(request?.generation) || 0) > appliedGeneration;
+        },
+    };
+}
 
 /**
  * Single status reducer for the chat header (owner decisions 2A/5A; managed
@@ -401,9 +443,17 @@ export function routingAnnotationText(annotation) {
  * ids and never restart, so conclusion is final). Without this, a one-shot
  * hydration (project panels) could resurrect a finished turn indefinitely.
  */
-export function computeHydratedDirectActivities(existingMap, turnsList, chatId, snapshotBarrierMs = Infinity, concludedIds = null) {
+export function computeHydratedDirectActivities(
+    existingMap,
+    turnsList,
+    chatId,
+    snapshotBarrierMs = Infinity,
+    concludedIds = null,
+    snapshotGeneration = 0,
+) {
     const nextMap = new Map(existingMap || []);
     if (!Array.isArray(turnsList)) return nextMap;
+    const currentSnapshotGeneration = Number(snapshotGeneration) || 0;
     const currentChatTurns = turnsList.filter((t) => Number(t?.chat_id ?? 1) === chatId);
     const activeIdsInSnapshot = new Set();
     for (const turn of currentChatTurns) {
@@ -411,8 +461,9 @@ export function computeHydratedDirectActivities(existingMap, turnsList, chatId, 
         if (!aid) continue;
         if (concludedIds && concludedIds.has(aid)) continue;
         activeIdsInSnapshot.add(aid);
+        const hadExisting = nextMap.has(aid);
         const existing = nextMap.get(aid) || {};
-        nextMap.set(aid, {
+        const hydrated = {
             activityId: aid,
             kind: turn.kind || 'direct_chat',
             phase: turn.phase || 'thinking',
@@ -421,7 +472,13 @@ export function computeHydratedDirectActivities(existingMap, turnsList, chatId, 
             // server-clock started_at must never enter the barrier comparison
             // below (clock skew would let finished activities linger).
             startedAt: existing.startedAt || Date.now(),
-        });
+        };
+        // Snapshot-only rows carry HTTP provenance. A live frame overwrites
+        // the row without this marker and keeps request-start barrier authority.
+        if (existing.snapshotGeneration || (!hadExisting && currentSnapshotGeneration)) {
+            hydrated.snapshotGeneration = currentSnapshotGeneration || existing.snapshotGeneration;
+        }
+        nextMap.set(aid, hydrated);
     }
     for (const [aid, entry] of nextMap.entries()) {
         if (activeIdsInSnapshot.has(aid)) continue;
@@ -429,9 +486,59 @@ export function computeHydratedDirectActivities(existingMap, turnsList, chatId, 
         // kind-less typing entry is invisible to every snapshot source and is
         // concluded by its own final/summary frame instead.
         if (!SNAPSHOT_AUTHORITATIVE_KINDS.has(String(entry?.kind || ''))) continue;
+        const entrySnapshotGeneration = Number(entry?.snapshotGeneration) || 0;
+        if (
+            currentSnapshotGeneration
+            && entrySnapshotGeneration
+            && entrySnapshotGeneration < currentSnapshotGeneration
+        ) {
+            nextMap.delete(aid);
+            continue;
+        }
         const startedAt = Number(entry?.startedAt) || 0;
         if (startedAt >= snapshotBarrierMs) continue;
         nextMap.delete(aid);
     }
     return nextMap;
+}
+
+/**
+ * Hydrate one authoritative activity snapshot and identify the narrower event
+ * that can wake durable task-detail convergence: a host-stamped managed root
+ * observed before this request, now absent from the GLOBAL snapshot. A root
+ * still listed under another chat merely departed locally. Direct/ephemeral
+ * removals still update header status without task-detail/card authority.
+ */
+export function reconcileHydratedDirectActivities(
+    existingMap,
+    turnsList,
+    chatId,
+    snapshotBarrierMs = Infinity,
+    concludedIds = null,
+    snapshotGeneration = 0,
+) {
+    const activities = computeHydratedDirectActivities(
+        existingMap, turnsList, chatId, snapshotBarrierMs, concludedIds, snapshotGeneration,
+    );
+    const globallyActiveActivityIds = new Set();
+    for (const turn of Array.isArray(turnsList) ? turnsList : []) {
+        const activityId = String(turn?.activity_id || '').trim();
+        if (activityId) globallyActiveActivityIds.add(activityId);
+    }
+    const departedManagedTaskIds = [];
+    const disappearedManagedTaskIds = [];
+    for (const [activityId, entry] of existingMap || []) {
+        if (String(entry?.kind || '') !== 'managed_task') continue;
+        if (activities.has(activityId)) continue;
+        if (concludedIds?.has(activityId)) continue;
+        departedManagedTaskIds.push(activityId);
+        if (globallyActiveActivityIds.has(activityId)) continue;
+        disappearedManagedTaskIds.push(activityId);
+    }
+    return {
+        activities,
+        departedManagedTaskIds,
+        disappearedManagedTaskIds,
+        globallyActiveActivityIds,
+    };
 }

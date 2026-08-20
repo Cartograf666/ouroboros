@@ -7,9 +7,11 @@ import test from 'node:test';
 import {
     computeDerivedChatStatus,
     computeHydratedDirectActivities,
+    isTerminalTaskDetail,
     partitionLocalEchoJournal,
+    reconcileHydratedDirectActivities,
 } from '../modules/chat_activity.js';
-import { summarizeChatLiveEvent } from '../modules/log_events.js';
+import { summarizeChatLiveEvent, taskTerminalPhase } from '../modules/log_events.js';
 
 // ---------------------------------------------------------------------------
 // Local-echo journal: a stale history snapshot must not erase the owner's row.
@@ -87,6 +89,86 @@ test('a managed typing entry upgrades to the snapshot kind and phase', () => {
     const updated = computeHydratedDirectActivities(existing, snapshot, 1, 5_000);
     assert.equal(updated.get('root-1').phase, 'finalizing');
     assert.equal(updated.get('root-1').startedAt, 50);  // client clock preserved
+});
+
+test('managed queue loss candidates require prior host kind and request-start ordering', () => {
+    const existing = new Map([
+        ['lost-root', { activityId: 'lost-root', kind: 'managed_task', phase: 'working', startedAt: 100 }],
+        ['fresh-root', { activityId: 'fresh-root', kind: 'managed_task', phase: 'working', startedAt: 5_000 }],
+        ['kindless-child', { activityId: 'kindless-child', kind: '', phase: 'thinking', startedAt: 100 }],
+        ['direct-turn', { activityId: 'direct-turn', kind: 'direct_chat', phase: 'thinking', startedAt: 100 }],
+    ]);
+    const result = reconcileHydratedDirectActivities(existing, [], 1, 5_000);
+
+    assert.deepEqual(result.departedManagedTaskIds, ['lost-root']);
+    assert.deepEqual(result.disappearedManagedTaskIds, ['lost-root']);
+    assert.ok(!result.activities.has('lost-root'));
+    assert.ok(result.activities.has('fresh-root'));  // equality is newer-than-snapshot safe
+    assert.ok(result.activities.has('kindless-child'));  // subagent/legacy has no snapshot authority
+    assert.ok(!result.activities.has('direct-turn'));  // header-only removal, no task-detail authority
+});
+
+test('managed rehome departs locally without becoming globally missing', () => {
+    const existing = new Map([
+        ['root-1', { activityId: 'root-1', kind: 'managed_task', phase: 'working', startedAt: 100 }],
+    ]);
+    const rehomed = [
+        { activity_id: 'root-1', chat_id: 9, kind: 'managed_task', phase: 'working' },
+    ];
+    const result = reconcileHydratedDirectActivities(existing, rehomed, 1, 5_000);
+
+    assert.equal(result.activities.size, 0);
+    assert.deepEqual(result.departedManagedTaskIds, ['root-1']);
+    assert.deepEqual(result.disappearedManagedTaskIds, []);
+    assert.ok(result.globallyActiveActivityIds.has('root-1'));
+
+    // The same global fact is returned after the local entry is already gone,
+    // allowing a caller to clear an earlier retry candidate without recapture.
+    const later = reconcileHydratedDirectActivities(new Map(), rehomed, 1, 6_000);
+    assert.ok(later.globallyActiveActivityIds.has('root-1'));
+    assert.deepEqual(later.disappearedManagedTaskIds, []);
+});
+
+test('concluded managed roots cannot be recaptured or resurrected by an old snapshot', () => {
+    const concluded = new Map([['done-root', 123]]);
+    const existing = new Map([
+        ['done-root', { activityId: 'done-root', kind: 'managed_task', phase: 'working', startedAt: 100 }],
+    ]);
+    const result = reconcileHydratedDirectActivities(
+        existing,
+        [{ activity_id: 'done-root', chat_id: 1, kind: 'managed_task', phase: 'working' }],
+        1,
+        5_000,
+        concluded,
+    );
+    assert.equal(result.activities.size, 0);
+    assert.deepEqual(result.disappearedManagedTaskIds, []);
+});
+
+test('durable detail terminality is narrow and outcome labels stay unchanged', () => {
+    for (const status of ['', 'requested', 'scheduled', 'running', 'interrupted', 'cancel_requested']) {
+        assert.equal(isTerminalTaskDetail({ status }), false, status);
+    }
+    for (const status of ['completed', 'failed', 'cancelled', 'rejected_duplicate']) {
+        assert.equal(isTerminalTaskDetail({ status }), true, status);
+    }
+    for (const post_task_synthesis of ['pending_once', 'running']) {
+        assert.equal(isTerminalTaskDetail({
+            status: 'completed',
+            root_phase_checkpoint: { post_task_synthesis },
+        }), false, `completed/${post_task_synthesis}`);
+    }
+    assert.equal(isTerminalTaskDetail({
+        status: 'completed',
+        root_phase_checkpoint: { post_task_synthesis: 'completed' },
+    }), true, 'completed/completed');
+    assert.equal(isTerminalTaskDetail({
+        status: 'failed',
+        root_phase_checkpoint: { post_task_synthesis: 'running' },
+    }), true, 'failed/running');
+    assert.equal(taskTerminalPhase({ status: 'completed' }), 'done');
+    assert.equal(taskTerminalPhase({ status: 'cancelled' }), 'cancelled');
+    assert.equal(taskTerminalPhase({ status: 'failed' }), 'error');
 });
 
 // ---------------------------------------------------------------------------
