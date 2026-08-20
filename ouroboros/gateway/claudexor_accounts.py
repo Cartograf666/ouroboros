@@ -559,6 +559,10 @@ def _login_job_response(job: Dict[str, Any], **metadata: Any) -> Dict[str, Any]:
     return out
 
 
+
+
+
+
 def _login_create(body: Dict[str, Any]) -> Dict[str, Any]:
     from ouroboros.claudexor_daemon import (
         attach_login_command,
@@ -658,15 +662,31 @@ def _login_create(body: Dict[str, Any]) -> Dict[str, Any]:
                     # or transport failure still becomes the proxy's honest 503.
                     exc.login_profile_verdict = True
                     raise
-        try:
-            job = gateway.setup_job_create(request_body)
-        except ClaudexorUnavailable as exc:
-            # Mark WHERE the daemon answered: only the job-CREATE boundary may
-            # pass its frozen 400/409 or terminal-probe 503 verdict through.
-            # The same status during handshake/discovery is engine/protocol
-            # trouble and stays the honest generic 503.
-            exc.login_create_verdict = True
-            raise
+
+        def _create() -> Dict[str, Any]:
+            try:
+                return gateway.setup_job_create(request_body)
+            except ClaudexorUnavailable as exc:
+                # Mark WHERE the daemon answered: only a 400 from the job CREATE
+                # is a verdict about the requested login shape (the pass-through
+                # the endpoint forwards). A handshake or discovery 400 earlier in
+                # this block is engine/protocol trouble and stays the honest 503.
+                exc.login_create_verdict = True
+                raise
+
+        job = _create()
+        # Connect is the owner's consent. If the exact pinned engine answers
+        # this FIRST create with its structural pre-command missing-binary
+        # terminal job, install that vendor CLI once and create the job once
+        # more; a second refusal is returned, never looped.
+        from ouroboros.claudexor_daemon import (
+            install_missing_harness_cli,
+            is_immediate_missing_cli_job,
+        )
+
+        if is_immediate_missing_cli_job(job, harness, gateway):
+            install_missing_harness_cli(harness)
+            job = _create()
     job_id = str(job.get("id") or job.get("jobId") or "")
     metadata: Dict[str, Any] = {
         "job_id": job_id,

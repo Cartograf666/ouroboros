@@ -1616,6 +1616,285 @@ def test_login_create_keeps_the_codex_invariant_on_both_engines(monkeypatch, tmp
     )
 
 
+def _missing_cli_job(harness="cursor", job_id="setup-1"):
+    return {
+        "jobId": job_id,
+        "harness": harness,
+        "action": "login",
+        "state": "not_supported",
+        "phase": "completed",
+        "outcome": {"reason": "not_supported"},
+        "command": None,
+    }
+
+
+def _install_receipt(**updates):
+    receipt = {
+        "ok": True,
+        "dryRun": False,
+        "exitCode": 0,
+        "target": "local",
+        "harness": "cursor",
+        "command": "vendor install command",
+        "installLocation": "~/.local/bin",
+        "installedBinary": "/managed/claudexor/bin/cursor-agent",
+        "installedVersion": "1.2.3",
+        "pinnedVersion": None,
+        "verification": "unattended_unpinned",
+    }
+    receipt.update(updates)
+    return receipt
+
+
+def test_immediate_missing_cli_trigger_requires_exact_job_and_engine(monkeypatch):
+    from types import SimpleNamespace
+
+    from ouroboros import claudexor_runtime as runtime
+    from ouroboros.claudexor_daemon import is_immediate_missing_cli_job as _is_immediate_missing_cli_job
+
+    pin = SimpleNamespace(
+        version="3.4.0", build_sha="1" * 40, cli_entrypoint="claudexor.bundle.cjs")
+    monkeypatch.setattr(runtime, "get_runtime_manager", lambda: SimpleNamespace(pin=pin))
+    gateway = SimpleNamespace(engine_version=pin.version, engine_build_sha=pin.build_sha)
+    job = _missing_cli_job()
+    assert _is_immediate_missing_cli_job(job, "cursor", gateway) is True
+
+    mutations = (
+        {"state": "failed"},
+        {"phase": "verifying"},
+        {"outcome": {"reason": "timed_out"}},
+        {"command": "claudexor setup attach setup-1"},
+        {"authorization": {}},
+        {"nativeCommand": {}},
+        {"harness": "codex"},
+        {"action": "logout"},
+        {"jobId": ""},
+    )
+    for mutation in mutations:
+        assert _is_immediate_missing_cli_job({**job, **mutation}, "cursor", gateway) is False
+    without_command = dict(job)
+    without_command.pop("command")
+    assert _is_immediate_missing_cli_job(without_command, "cursor", gateway) is False
+    gateway.engine_build_sha = "2" * 40
+    assert _is_immediate_missing_cli_job(job, "cursor", gateway) is False
+    pin.cli_entrypoint = None
+    gateway.engine_build_sha = pin.build_sha
+    assert _is_immediate_missing_cli_job(job, "cursor", gateway) is False
+
+
+@pytest.mark.parametrize("retry_job", [
+    {"jobId": "setup-2", "state": "queued"},
+    _missing_cli_job(job_id="setup-2"),
+])
+def test_login_installs_and_retries_exactly_once(monkeypatch, retry_job):
+    from types import SimpleNamespace
+
+    from ouroboros import claudexor_runtime as runtime
+    from ouroboros.gateway import claudexor_accounts as accounts
+
+    pin = SimpleNamespace(
+        version="3.4.0", build_sha="1" * 40, cli_entrypoint="claudexor.bundle.cjs")
+    monkeypatch.setattr(runtime, "get_runtime_manager", lambda: SimpleNamespace(pin=pin))
+    requests, installs = [], []
+
+    class Gateway:
+        engine_version = pin.version
+        engine_build_sha = pin.build_sha
+
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def operations(self): return [_INPUT_OP]
+
+        def setup_job_create(self, request):
+            requests.append(dict(request))
+            return _missing_cli_job() if len(requests) == 1 else retry_job
+
+    monkeypatch.setattr(owned, "ensure_owned_gateway", lambda: Gateway())
+    monkeypatch.setattr(owned, "install_missing_harness_cli", installs.append)
+    answer = accounts._login_create({"harness": "cursor"})
+
+    assert installs == ["cursor"]
+    assert len(requests) == 2 and requests[0] == requests[1]
+    assert answer["job"] == retry_job
+
+
+def test_install_success_receipt_is_strict_and_provenance_is_a_pair():
+    from ouroboros.claudexor_daemon import _valid_install_success
+
+    assert _valid_install_success(_install_receipt(), "cursor") is True
+    assert _valid_install_success(_install_receipt(
+        installerSha256="a" * 64, installerByteLength=123), "cursor") is True
+    assert _valid_install_success(_install_receipt(
+        harness="codex", verification="release_verified", pinnedVersion="1.2.3",
+        installLocation="~/.claudexor/node/bin"), "codex") is True
+    assert _valid_install_success(_install_receipt(
+        harness="opencode", verification="deterministic_only", pinnedVersion="1.2.3",
+        installLocation="~/.claudexor/node/bin"), "opencode") is True
+
+    missing_binary = _install_receipt()
+    missing_binary.pop("installedBinary")
+    missing_version = _install_receipt()
+    missing_version.pop("installedVersion")
+    invalid = (
+        missing_binary,
+        missing_version,
+        _install_receipt(pinnedVersion="latest"),
+        _install_receipt(verification="release_verified"),
+        _install_receipt(installerSha256="a" * 64),
+        _install_receipt(installerSha256="A" * 64, installerByteLength=123),
+        _install_receipt(installerSha256="a" * 64, installerByteLength=0),
+        _install_receipt(installerSha256="a" * 64, installerByteLength=True),
+        _install_receipt(
+            verification="release_verified", pinnedVersion="1.2.3",
+            installerSha256="a" * 64, installerByteLength=123),
+        _install_receipt(code="unexpected"),
+        _install_receipt(refusal="unexpected"),
+        _install_receipt(message="unexpected"),
+        _install_receipt(verification="human_observed"),
+        _install_receipt(verification={}),
+        _install_receipt(exitCode=True),
+        _install_receipt(installedBinary="cursor-agent"),
+        _install_receipt(installedBinary=""),
+        _install_receipt(installedVersion=""),
+        _install_receipt(installedVersion="   "),
+        _install_receipt(installedVersion="v" * 257),
+    )
+    assert all(not _valid_install_success(receipt, "cursor") for receipt in invalid)
+
+
+def test_installer_invocation_is_exact_grouped_and_stdout_bounded(monkeypatch):
+    import io
+    import subprocess
+    from types import SimpleNamespace
+
+    from ouroboros import claudexor_runtime as runtime
+    from ouroboros import platform_layer
+
+    command = ["/exact/node", "/exact/closure/claudexor.bundle.cjs"]
+    monkeypatch.setattr(runtime, "get_runtime_manager", lambda: SimpleNamespace(
+        ensure_cli_command=lambda: command))
+    monkeypatch.setattr(platform_layer, "subprocess_new_group_kwargs", lambda: {
+        "start_new_session": True})
+    monkeypatch.setattr(platform_layer, "merge_hidden_kwargs", dict)
+    seen = {}
+
+    class Process:
+        stdout = io.BytesIO(json.dumps(_install_receipt()).encode())
+
+        def wait(self, timeout):
+            seen.setdefault("timeouts", []).append(timeout)
+            return 0
+
+    import ouroboros.tools.shell as shell
+    from ouroboros.claudexor_daemon import owned_config_dir
+
+    def popen(argv, **kwargs):
+        seen["argv"], seen["kwargs"] = argv, kwargs
+        # /panic snapshots the tracked set under this lock: the spawn must be
+        # atomic with registration, so the lock is held HERE (round-2 finding).
+        seen["lock_held_during_spawn"] = shell._subprocess_lock.locked()
+        return Process()
+
+    monkeypatch.setattr(owned.subprocess, "Popen", popen)
+    owned.install_missing_harness_cli("cursor")
+    assert seen["argv"] == [
+        *command, "harness", "install", "cursor",
+        "--target", "local", "--yes", "--json",
+    ]
+    env = seen["kwargs"].pop("env")
+    assert seen["kwargs"] == {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.DEVNULL,
+        "start_new_session": True,
+    }
+    # The installer acts on the OWNED data plane, exactly like the daemon it
+    # repairs — never the operator's personal Claudexor home.
+    assert env["CLAUDEXOR_CONFIG_DIR"] == str(owned_config_dir())
+    assert "CLAUDEXOR_DAEMON_SOCK" not in env
+    assert "CLAUDEXOR_CONTROL_PORT" not in env
+    assert seen["lock_held_during_spawn"] is True
+    output, state = bytearray(), {}
+    owned._drain_installer_stdout(
+        io.BytesIO(b"x" * (owned._HARNESS_INSTALL_STDOUT_LIMIT + 1)), output, state)
+    assert len(output) == owned._HARNESS_INSTALL_STDOUT_LIMIT
+    assert state == {"overflow": True}
+
+
+def test_installer_timeout_kills_the_process_tree(monkeypatch):
+    import io
+    import subprocess
+    from types import SimpleNamespace
+
+    from ouroboros import claudexor_runtime as runtime
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+    from ouroboros import platform_layer
+
+    monkeypatch.setattr(runtime, "get_runtime_manager", lambda: SimpleNamespace(
+        ensure_cli_command=lambda: ["/exact/node", "/exact/cli.cjs"]))
+    monkeypatch.setattr(platform_layer, "subprocess_new_group_kwargs", lambda: {})
+    monkeypatch.setattr(platform_layer, "merge_hidden_kwargs", dict)
+    waits = []
+
+    class Process:
+        pid = 42
+        stdout = io.BytesIO()
+
+        def wait(self, timeout):
+            waits.append(timeout)
+            if len(waits) == 1:
+                raise subprocess.TimeoutExpired("installer", timeout)
+            return -9
+
+    proc = Process()
+    monkeypatch.setattr(owned.subprocess, "Popen", lambda *_a, **_kw: proc)
+    killed = []
+    import ouroboros.tools.shell as shell
+
+    monkeypatch.setattr(shell, "_kill_process_group", killed.append)
+    with pytest.raises(ClaudexorUnavailable) as excinfo:
+        owned.install_missing_harness_cli("cursor")
+    assert excinfo.value.code == "harness_install_timeout"
+    assert killed == [proc]
+    from ouroboros.config import get_claudexor_harness_install_timeout_sec
+
+    assert waits == [get_claudexor_harness_install_timeout_sec(), 10]
+    assert proc not in shell._active_subprocesses, "a timed-out installer must not stay tracked"
+
+
+def test_installer_child_is_panic_tracked_for_its_whole_run(monkeypatch):
+    """/panic kills only tools.shell-tracked subprocess trees before os._exit
+    (BIBLE: every subprocess tree stops immediately). The vendor installer must
+    therefore sit in that set exactly while it runs — the allowlisted raw Popen
+    is legitimate ONLY because of this registration."""
+    import io
+    from types import SimpleNamespace
+
+    from ouroboros import claudexor_runtime as runtime
+    from ouroboros import platform_layer
+    import ouroboros.tools.shell as shell
+
+    monkeypatch.setattr(runtime, "get_runtime_manager", lambda: SimpleNamespace(
+        ensure_cli_command=lambda: ["/exact/node", "/exact/cli.cjs"]))
+    monkeypatch.setattr(platform_layer, "subprocess_new_group_kwargs", lambda: {})
+    monkeypatch.setattr(platform_layer, "merge_hidden_kwargs", dict)
+    observed = {}
+
+    class Process:
+        pid = 43
+        stdout = io.BytesIO(json.dumps(_install_receipt()).encode())
+
+        def wait(self, timeout):
+            observed["tracked_during_wait"] = self in shell._active_subprocesses
+            return 0
+
+    proc = Process()
+    monkeypatch.setattr(owned.subprocess, "Popen", lambda *_a, **_kw: proc)
+    owned.install_missing_harness_cli("cursor")
+    assert observed["tracked_during_wait"] is True, "panic sweep must see the live installer"
+    assert proc not in shell._active_subprocesses, "custody ends with the request"
+
+
 def _input_request(job_id: str, body: dict):
     from starlette.requests import Request
 
@@ -3470,3 +3749,38 @@ def test_receipt_write_failure_warns_loudly_and_never_breaks_the_reconcile(
     message = warned[0].getMessage()
     assert "claudexor_rotation_provisioning.json" in message, "the warning names the path"
     assert "No space left on device" in message, "the warning names the error"
+
+
+def test_handshake_records_the_engine_build_sha_beside_its_version():
+    """The auto-install trigger compares the LIVE engine's build sha with the
+    reviewed pin's, so the handshake must keep that fact, not just the version.
+    An engine that reports no sha leaves it empty rather than guessed."""
+    import httpx
+
+    from ouroboros.gateways import claudexor as cx
+
+    def _handshake(engine: dict) -> cx.ClaudexorGateway:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "protocolMajor": cx.CLAUDEXOR_PROTOCOL_MAJOR,
+                "compatible": True,
+                "engine": engine,
+            })
+
+        gateway = cx.ClaudexorGateway(cx.DaemonEndpoint("127.0.0.1", 1, "secret-token"))
+        gateway._client = httpx.Client(
+            base_url="http://127.0.0.1:1",
+            transport=httpx.MockTransport(handler),
+            headers=dict(gateway._client.headers),
+        )
+        with gateway:
+            gateway.handshake()
+            return gateway
+
+    stamped = _handshake({"version": cx.CLAUDEXOR_MIN_VERSION, "sha": "a" * 40})
+    assert stamped.engine_version == cx.CLAUDEXOR_MIN_VERSION
+    assert stamped.engine_build_sha == "a" * 40
+
+    unstamped = _handshake({"version": cx.CLAUDEXOR_MIN_VERSION})
+    assert unstamped.engine_version == cx.CLAUDEXOR_MIN_VERSION
+    assert unstamped.engine_build_sha == ""

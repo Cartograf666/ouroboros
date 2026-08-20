@@ -149,6 +149,7 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC": 8,
     # Skill lifecycle lane deadline (wedged-job loud-failure bound).
     "OUROBOROS_SKILL_LIFECYCLE_TIMEOUT_SEC": 1800,
+    "OUROBOROS_CLAUDEXOR_HARNESS_INSTALL_TIMEOUT_SEC": 300,
     "OUROBOROS_SOFT_TIMEOUT_SEC": 600,
     # NOTE: OUROBOROS_HARD_TIMEOUT_SEC no longer terminates tasks — the flat wall-clock
     # kill was replaced by the activity model below (idle + subtree-liveness, abs ceiling).
@@ -1491,6 +1492,8 @@ def get_mcp_tool_timeout_sec() -> int:
 
 def get_vision_caption_timeout_sec() -> int:
     return _clamped_number_setting("OUROBOROS_VISION_CAPTION_TIMEOUT_SEC", low=1, cast=int)
+def get_claudexor_harness_install_timeout_sec() -> int:
+    return _clamped_number_setting("OUROBOROS_CLAUDEXOR_HARNESS_INSTALL_TIMEOUT_SEC", low=1, cast=int)
 
 
 def get_finalization_grace_sec(settings: Optional[dict] = None) -> int:
