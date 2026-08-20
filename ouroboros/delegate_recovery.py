@@ -331,6 +331,31 @@ def _restore_wait_checkpoint(drive_root: Any, row: Mapping[str, Any]) -> None:
         _REPORTED_INTERACTIONS[run_id] = interaction_ids
 
 
+def _successor_pending_wake(value: Any) -> dict[str, Any]:
+    """Remove attempt-local loop controls from a successor's replay payload."""
+    wake = dict(value) if isinstance(value, dict) else {}
+    payload = wake.get("payload") if isinstance(wake.get("payload"), dict) else {}
+    events = payload.get("wake_events") if isinstance(payload.get("wake_events"), list) else []
+    if not events:
+        return wake
+    from ouroboros.delegate_supervision import _LOOP_CONTROL_KINDS, _QUIET_STATUSES
+
+    kept = [
+        dict(item) for item in events if isinstance(item, dict)
+        and str(item.get("kind") or "") not in _LOOP_CONTROL_KINDS
+    ]
+    if len(kept) == len(events):
+        return wake
+    payload = dict(payload)
+    if kept:
+        payload["wake_events"] = kept
+    else:
+        payload.pop("wake_events", None)
+    if not kept and str(payload.get("status") or "") in _QUIET_STATUSES:
+        return {}
+    return {**wake, "payload": payload}
+
+
 def prepare_handoff(
     drive_root: Any,
     task: Mapping[str, Any],
@@ -385,6 +410,7 @@ def prepare_handoff(
                 "acknowledged_at": "",
                 "replay_reason": "acknowledged_in_dead_transcript",
             }
+    pending_wake = _successor_pending_wake(pending_wake)
     runs = [row for row in custody.open_runs(drive_root) if row.task_id == task_id]
     pending = [
         row for row in custody.pending_invocations(drive_root)

@@ -767,7 +767,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             # is the LOOKUP identity only; the wire key stays the invocation id,
             # and a retry replays the STORED body byte-identically regardless.
             instructions = _host_instructions(
-                authority, _assignment_instructions(ctx),
+                authority, "" if bool(actor.get("compiled_work_order")) else _assignment_instructions(ctx),
                 payload_skill=(str((record_auth.get("resource_ref") or {})
                                    .get("skill_name") or "")
                                if payload_auth is not None else ""))
@@ -1271,6 +1271,7 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                     record_last_delegation(
                         route=entry.route_id, requested_model=entry.model,
                         applied_model=str(payload.get("model") or ""), run_id=rid,
+                        selected_subagent_id=entry.selected_subagent_id,
                         # Applied = the settlement receipt's authRoute fact (never invented); requested replays off STARTED.
                         requested_profile=entry.profile_id,
                         applied_profile=str((summary.get("authRoute") or {}).get("profileId") or ""))

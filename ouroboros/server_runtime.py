@@ -414,14 +414,31 @@ def has_local_routing(settings: dict) -> bool:
 
 
 def needs_local_model_autostart(settings: dict) -> bool:
-    """Return True when any configured model lane needs the local server running."""
-    return any(
+    """Return True when a configured root lane or API subagent needs local serving."""
+    if any(
         _truthy_setting(settings.get(k))
         for k in (
             "USE_LOCAL_MAIN", "USE_LOCAL_LIGHT",
             "USE_LOCAL_CONSCIOUSNESS", "USE_LOCAL_FALLBACK",
         )
-    )
+    ):
+        return True
+    try:
+        from ouroboros.configured_subagents import resolve_configured_subagents
+
+        resolution = resolve_configured_subagents(settings)
+        config = resolution.config
+        return bool(
+            config
+            and config.enabled
+            and any(
+                row.route.kind == "api_model"
+                and row.route.target_id.endswith(" (local)")
+                for row in config.items
+            )
+        )
+    except Exception:
+        return False
 
 
 def has_startup_ready_provider(settings: dict) -> bool:

@@ -349,7 +349,9 @@ def resolve_configured_actor_dispatch(
         return SubagentDispatch(
             lane=lane, effort=derived_effort, executor="native", route=route_target,
             profile=profile, delta=delta,
-            executor_resolution=SubagentExecutorResolution("native", "native"),
+            executor_resolution=SubagentExecutorResolution(
+                "native", "native", reason="requested_native",
+            ),
             availability=availability,
         )
 
@@ -498,7 +500,8 @@ def prepare_delegate_start_actor(
     from ouroboros import delegate_custody as custody
     from ouroboros.delegate_recovery import unsettled_start_ids
     from ouroboros.delegate_shared import _fail
-    selected_snapshot = current_exact_start_selection().get("snapshot")
+    selection = current_exact_start_selection()
+    selected_snapshot = selection.get("snapshot")
     if recovering:
         if selected_snapshot:
             return {}, _fail(
@@ -543,6 +546,7 @@ def prepare_delegate_start_actor(
         "config_fingerprint": config_fingerprint,
         "work_order_fingerprint": work_order_fingerprint,
         "authority_fingerprint": authority_fingerprint,
+        "compiled_work_order": bool(selection.get("compiled_work_order")),
     }, ""
 
 
@@ -552,6 +556,7 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
     options = dict(spec or {})
     selected_id = str(options.pop("subagent_id", "") or "").strip()
     selected_snapshot = options.pop("snapshot", None)
+    compiled_work_order = bool(options.pop("compiled_work_order", False))
     try:
         if str(options.get("retry_of") or "").strip() and (
             selected_id or selected_snapshot is not None
@@ -584,7 +589,10 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
 
         return _fail("delegate_start", exc.code, exc.detail)
 
-    token = _EXACT_START_SELECTION.set({"snapshot": selected_snapshot})
+    token = _EXACT_START_SELECTION.set({
+        "snapshot": selected_snapshot,
+        "compiled_work_order": compiled_work_order,
+    })
     try:
         from ouroboros.tools.delegate import _delegate_start
 

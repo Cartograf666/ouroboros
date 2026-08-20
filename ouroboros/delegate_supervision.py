@@ -9,11 +9,12 @@ import uuid
 from typing import Any, Callable, Optional
 
 from ouroboros import delegate_custody as custody
-from ouroboros.owner_mailbox import drain_owner_entries
+from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, KIND_HURRY, drain_owner_entries
 from ouroboros.utils import atomic_write_json, utc_now_iso
 
 _TICK_SEC = 3
 _QUIET_STATUSES = {"progress", "no_progress"}
+_LOOP_CONTROL_KINDS = {KIND_FINALIZE_NOW, KIND_HURRY}
 
 
 def _state_path(ctx: Any) -> pathlib.Path:
@@ -59,6 +60,10 @@ def _addressed_wakes(ctx: Any, state: dict[str, Any]) -> list[dict[str, Any]]:
     seen = {
         str(item) for item in (state.get("mailbox_acknowledged_ids") or []) if str(item)
     }
+    seen.update(
+        str(item) for item in (getattr(ctx, "_loop_mailbox_seen_ids", set()) or set())
+        if str(item)
+    )
     entries = drain_owner_entries(
         pathlib.Path(getattr(ctx, "drive_root", custody.custody_root(ctx))),
         str(getattr(ctx, "task_id", "") or ""),
@@ -297,6 +302,7 @@ def supervised_wait(
                 "mailbox_ids": [
                     str(item.get("msg_id") or "") for item in wakes
                     if str(item.get("msg_id") or "")
+                    and str(item.get("kind") or "") not in _LOOP_CONTROL_KINDS
                 ],
                 "interaction_ids": sorted(_interaction_ids(payload)),
                 "created_at": utc_now_iso(),

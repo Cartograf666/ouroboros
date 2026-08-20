@@ -41,17 +41,26 @@ def dispatch_executor_note(decision: Optional[SubagentExecutorResolution],
     if decision.executor == "harness":
         route = decision.route.route_id if decision.route else ""
         configured_atomic = lane is not None and lane.provenance == "configured_subagent"
+        if configured_atomic:
+            return (
+                f"EXECUTOR: your parent selected the configured agent-session route ({route}). "
+                "You are its Ouroboros NANNY. Before this first model round, the host "
+                "performed the atomic exact-route bootstrap decision and any authorized "
+                "start attempt. The typed startup/wake receipt alone says whether a leaf "
+                "is live, recovered, or refused. Do not repeat a receipt-proven start or "
+                "adoption in parallel. You retain your full ordinary tool surface and judgment: "
+                "supervise and inspect evidence, coordinate task-tree messages, answer "
+                "authorized leaf questions, wait again, and accept or reject the result. "
+                "When correction is necessary and no truthful in-place control exists, "
+                "verify cancellation and terminal settlement before starting a replacement. "
+                "Any API-backed or otherwise separate work must be an explicit separate "
+                "child, so its authorship and spend remain visible."
+            )
         note = (
             f"EXECUTOR: your parent scheduled you on the delegated substrate ({route}). "
             "You are a NANNY. "
-            + (
-                "The host starts the exact selected external leaf and enters supervising "
-                "wait BEFORE your first model round; the startup/wake receipt in this "
-                "transcript is authoritative. Do not repeat that start. "
-                if configured_atomic else
-                "Decide your delegation plan FIRST — right after reading your objective "
-                "and constraints, before any substantive work. "
-            )
+            + "Decide your delegation plan FIRST — right after reading your objective "
+            "and constraints, before any substantive work. "
             + "Cost classes: "
             "a subscription-lane run has known-zero marginal cost when the route reports "
             "its settled spend as $0 (an estimated or undisclosed spend is estimated/unknown, "

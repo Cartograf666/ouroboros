@@ -54,8 +54,11 @@ def append_startup_receipt(
         "role": "user",
         "content": (
             "[CONFIGURED SESSION STARTUP / WAKE RECEIPT]\n" + startup_wake
-            + "\nThe external start already happened atomically. Judge this wake; do not "
-            "repeat the start or perform the substantive assignment natively as fallback."
+            + "\nThe host completed the exact-route bootstrap decision before this round. "
+            "This typed receipt alone says whether a leaf started, was recovered, or was "
+            "refused. Do not repeat a receipt-proven start/adoption or perform the "
+            "substantive assignment natively as fallback. A refusal or recovery_required "
+            "receipt does not imply a live leaf; act on its alternatives, reset, or recovery facts."
         ),
     })
     from ouroboros.delegate_supervision import acknowledge_pending_wake
@@ -121,7 +124,10 @@ def bootstrap_session_leaf(ctx: Any, task: Mapping[str, Any], dispatch: Any) -> 
                 "detail": "The complete brief was not truncated or sent. Narrow the child brief explicitly.",
             },
         }, ensure_ascii=False, indent=2)
-    started_raw = exact_start(ctx, work_order, {"snapshot": snapshot})
+    started_raw = exact_start(ctx, work_order, {
+        "snapshot": snapshot,
+        "compiled_work_order": True,
+    })
     try:
         started = json.loads(started_raw)
     except (TypeError, ValueError):

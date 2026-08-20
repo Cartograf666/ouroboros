@@ -35,7 +35,9 @@ def _owned_gateway_uses_each_test_transport(monkeypatch):
 # -- B1.1: the contract rides the host instructions ----------------------------
 
 
-def _start_with_contract(tmp_path, monkeypatch, contract):
+def _start_with_contract(
+    tmp_path, monkeypatch, contract, *, prompt="run the tests", compiled_work_order=False,
+):
     import ouroboros.tools.delegate as delegate
     from ouroboros import subagent_runtime
     from ouroboros.contracts.task_constraint import TaskConstraint
@@ -85,9 +87,10 @@ def _start_with_contract(tmp_path, monkeypatch, contract):
         },
         "effort": "low",
     }
-    payload = json.loads(subagent_runtime.exact_start(
-        ctx, "run the tests", {"snapshot": snapshot}
-    ))
+    payload = json.loads(subagent_runtime.exact_start(ctx, prompt, {
+        "snapshot": snapshot,
+        "compiled_work_order": compiled_work_order,
+    }))
     delegate._CUSTODY.clear()
     assert payload["status"] == "started", payload
     return seen["request"]
@@ -700,3 +703,29 @@ def test_an_ordinary_contract_field_reaches_the_run_instructions_complete(tmp_pa
     field = instructions[start:end]
     assert "OMISSION NOTE" not in field
     assert "O" * 4050 in field
+
+
+def test_atomic_compiled_work_order_sends_dynamic_brief_once(tmp_path, monkeypatch):
+    from ouroboros.subagent_work_order import compile_external_work_order
+
+    objective = "UNIQUE_ATOMIC_OBJECTIVE"
+    task = {
+        "id": "t-nanny",
+        "objective": objective,
+        "expected_output": "verified patch",
+        "task_contract": {
+            "objective": objective,
+            "expected_output": "verified patch",
+        },
+    }
+    work_order = compile_external_work_order(task)
+    request = _start_with_contract(
+        tmp_path,
+        monkeypatch,
+        task["task_contract"],
+        prompt=work_order,
+        compiled_work_order=True,
+    )
+    assert request["prompt"].count(objective) == 1
+    assert objective not in request["instructions"]
+    assert "git commit" in request["instructions"]

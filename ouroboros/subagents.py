@@ -252,6 +252,7 @@ def _last_delegation_path():
 
 def record_last_delegation(*, route: str, requested_model: str,
                            applied_model: str, run_id: str,
+                           selected_subagent_id: str = "",
                            requested_profile: str = "",
                            applied_profile: str = "") -> None:
     """Record the last delegated run's route + requested/applied model + account.
@@ -285,6 +286,7 @@ def record_last_delegation(*, route: str, requested_model: str,
             "applied_model": str(applied_model or ""),
             "requested_profile": str(requested_profile or ""),
             "applied_profile": str(applied_profile or ""),
+            "selected_subagent_id": str(selected_subagent_id or ""),
             "run_id": str(run_id or ""),
         }, ensure_ascii=False, indent=1))
     except Exception:

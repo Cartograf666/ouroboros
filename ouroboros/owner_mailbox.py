@@ -40,7 +40,7 @@ def _ack_path(drive_root: pathlib.Path, task_id: str) -> pathlib.Path:
 
 
 def acknowledged_task_message_ids(drive_root: pathlib.Path, task_id: str) -> set[str]:
-    """Read durable delivery acknowledgements for supervision-owned messages."""
+    """Read the shared durable acknowledgements for transcript-delivered messages."""
 
     path = _ack_path(drive_root, task_id)
     if not path.exists():
@@ -62,7 +62,7 @@ def acknowledged_task_message_ids(drive_root: pathlib.Path, task_id: str) -> set
 def acknowledge_task_messages(
     drive_root: pathlib.Path, task_id: str, msg_ids: List[str], *, wake_id: str,
 ) -> bool:
-    """Acknowledge messages only after their wake was injected into a transcript."""
+    """Acknowledge messages only after their full content entered a transcript."""
 
     path = _ack_path(drive_root, task_id)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -74,6 +74,17 @@ def acknowledge_task_messages(
         }):
             return False
     return True
+
+
+def acknowledge_transcript_entry(
+    drive_root: pathlib.Path, task_id: str, entry: Dict[str, Any], *, wake_id: str = "loop_delivery",
+) -> None:
+    """Durably acknowledge one mailbox entry after transcript injection."""
+    msg_id = str(entry.get("msg_id") or "")
+    if msg_id and not acknowledge_task_messages(
+        drive_root, task_id, [msg_id], wake_id=wake_id,
+    ):
+        log.warning("Mailbox delivery acknowledgement failed for %s", msg_id)
 
 
 def write_owner_message(

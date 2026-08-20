@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from ouroboros.server_runtime import (
@@ -47,6 +49,34 @@ def test_consciousness_local_lane_autostarts_but_is_not_startup_ready():
     }
     assert needs_local_model_autostart(settings)
     assert not has_startup_ready_provider(settings)
+
+
+def test_enabled_local_api_subagents_autostart_without_becoming_root_readiness():
+    from ouroboros.configured_subagents import SUBAGENTS_SETTING
+
+    actor = json.dumps({
+        "enabled": True,
+        "items": [{
+            "subagent_id": "local-scout",
+            "name": "Local scout",
+            "recommended_use": "Use the owner's local model.",
+            "route": {"kind": "api_model", "target_id": "owner-model (local)"},
+            "effort": "high",
+        }],
+    })
+    actor_only = {SUBAGENTS_SETTING: actor}
+    assert needs_local_model_autostart(actor_only)
+    assert not has_startup_ready_provider(actor_only)
+    assert needs_local_model_autostart({**actor_only, "OPENAI_API_KEY": "remote-main"})
+
+    disabled = json.loads(actor)
+    disabled["enabled"] = False
+    assert not needs_local_model_autostart({SUBAGENTS_SETTING: json.dumps(disabled)})
+
+    assert needs_local_model_autostart({
+        "OUROBOROS_MODEL_HEAVY": "owner-heavy",
+        "USE_LOCAL_HEAVY": True,
+    })
 
 
 def test_apply_runtime_provider_defaults_autofills_official_openai_models():

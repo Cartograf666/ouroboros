@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -104,6 +105,57 @@ def test_attempt_incremented_before_requeue(tmp_path):
     assert len(enqueued) == 1, "Task should be requeued once"
     assert enqueued[0]["_attempt"] == 2, f"Expected _attempt=2, got {enqueued[0].get('_attempt')}"
     assert not service_dir.exists(), "Child-drive service logs should be archived after worker death"
+
+
+def test_worker_main_exits_after_post_bootstrap_task_exception(monkeypatch, tmp_path):
+    """A caught task exception must become a non-signal process exit for handoff."""
+    import ouroboros.agent as agent_module
+    import ouroboros.config as config
+    import ouroboros.extension_loader as extension_loader
+    import ouroboros.platform_layer as platform_layer
+    import ouroboros.process_custody as process_custody
+    import ouroboros.utils as utils
+    import supervisor.workers as W
+
+    repo = tmp_path / "repo"
+    drive = tmp_path / "drive"
+    repo.mkdir()
+    (drive / "logs").mkdir(parents=True)
+
+    class InputQueue:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self):
+            self.calls += 1
+            return (
+                {"id": "child1", "type": "task"}
+                if self.calls == 1
+                else {"type": "shutdown"}
+            )
+
+    class Agent:
+        def handle_task(self, _task):
+            raise RuntimeError("post-bootstrap context build failed")
+
+    incoming = InputQueue()
+    crashes = []
+    monkeypatch.setattr(W, "_bind_worker_repo_root", lambda *_a, **_k: None)
+    monkeypatch.setattr(W, "_prepare_worker_task_runtime", lambda: None)
+    monkeypatch.setattr(W, "_log_worker_crash", lambda *args: crashes.append(args))
+    monkeypatch.setattr(platform_layer, "create_new_session", lambda: None)
+    monkeypatch.setattr(process_custody, "start_parent_lifeline", lambda **_k: None)
+    monkeypatch.setattr(config, "initialize_runtime_mode_baseline", lambda: None)
+    monkeypatch.setattr(config, "get_skills_repo_path", lambda: "")
+    monkeypatch.setattr(extension_loader, "reload_all", lambda *_a, **_k: None)
+    monkeypatch.setattr(agent_module, "make_agent", lambda **_k: Agent())
+    monkeypatch.setattr(utils, "set_log_sink", lambda _sink: None)
+    monkeypatch.setattr(utils, "get_git_info", lambda _repo: ("test", "sha"))
+
+    W.worker_main(0, incoming, SimpleNamespace(put=lambda _event: None), str(repo), str(drive))
+
+    assert incoming.calls == 1, "the worker must not accept another task after a task crash"
+    assert len(crashes) == 1 and crashes[0][2] == "handle_task"
 
 
 def test_crash_retry_admission_block_terminalizes_task(tmp_path):

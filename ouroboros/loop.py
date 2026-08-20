@@ -3211,13 +3211,7 @@ def _drain_incoming_messages(
     _owner_msg_seen: set,
     owner_ctx: Any = None,
 ) -> Dict[str, Any]:
-    """Inject owner messages received during task execution.
-
-    Returns typed control signals drained from the mailbox (currently
-    ``{"finalize_now": reason}`` when the supervisor opened a finalization
-    grace window); control entries are routed structurally, never injected
-    as owner prose.
-    """
+    """Injects dialogue; returns typed controls."""
     controls: Dict[str, Any] = {}
     while not incoming_messages.empty():
         try:
@@ -3244,7 +3238,10 @@ def _drain_incoming_messages(
             break
 
     if drive_root is not None and task_id:
-        from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_TEXT, KIND_TASK_MESSAGE, deliver_task_message, drain_owner_entries
+        from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_TEXT, KIND_TASK_MESSAGE, acknowledge_transcript_entry, deliver_task_message, drain_owner_entries
+
+        if owner_ctx:
+            owner_ctx._loop_mailbox_seen_ids = _owner_msg_seen
         for entry in drain_owner_entries(drive_root, task_id=task_id, seen_ids=_owner_msg_seen):
             kind = entry.get("kind") or KIND_OWNER_TEXT
             if kind == KIND_FINALIZE_NOW:
@@ -3269,6 +3266,7 @@ def _drain_incoming_messages(
             dmsg = entry.get("text") or ""
             if kind == KIND_TASK_MESSAGE:
                 deliver_task_message(entry, task_id, event_queue, lambda text: _append_or_merge_user_message(messages, text))
+                acknowledge_transcript_entry(drive_root, task_id, entry)
                 continue
             _record_owner_directive(
                 owner_ctx,
@@ -3279,6 +3277,7 @@ def _drain_incoming_messages(
             from ouroboros.client_surface import noted_owner_text
 
             _append_or_merge_user_message(messages, _owner_marked_content(noted_owner_text(owner_ctx, entry, dmsg)))
+            acknowledge_transcript_entry(drive_root, task_id, entry)
             if event_queue is not None:
                 try:
                     event_queue.put_nowait({
