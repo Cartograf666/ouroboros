@@ -35,12 +35,17 @@ _BINDINGS_NAME = "project_task_bindings.json"
 # additive fields (git provenance, trusted_at) migrate deliberately. Old rows read
 # as version 0; new fields must stay additive with safe-empty defaults because
 # reconcile_projects mints rows that will lack them.
-_REGISTRY_SCHEMA_VERSION = 2
+# v6.101.0: rows carry an optional per-project `model` (empty = inherit the
+# global Main slot), so the bump is deliberate rather than silent.
+_REGISTRY_SCHEMA_VERSION = 3
 # v6.73.0: project_task_bindings.json gains source_text / origin_absent fields.
 _BINDINGS_SCHEMA_VERSION = 1
 _LOCK = threading.RLock()
 
 PROJECT_NAME_MAX = 80
+# A model id is a provider-prefixed free-form string (same shape the Main slot
+# accepts); the cap only stops a pathological write, it is not a catalog gate.
+PROJECT_MODEL_MAX = 200
 PROJECT_ACTIVE = "active"
 PROJECT_DELETING = "deleting"
 PROJECT_TOMBSTONED = "tombstoned"
@@ -106,6 +111,8 @@ def _normalize_project_row(value: Dict[str, Any]) -> Dict[str, Any]:
         except (TypeError, ValueError):
             row[field] = 0
     row["delete_error"] = str(row.get("delete_error") or "")
+    # Legacy rows predate the per-project model; empty means "inherit Main".
+    row["model"] = str(row.get("model") or "").strip()
     return row
 
 
@@ -114,6 +121,16 @@ def _validated_name(value: Any, fallback: str = "") -> str:
     if len(name) > PROJECT_NAME_MAX:
         raise ValueError(f"project name must be <= {PROJECT_NAME_MAX} characters")
     return name
+
+
+def _validated_model(value: Any) -> str:
+    """Normalize a per-project model id. Empty is legal and means "inherit Main"."""
+    model = str(value or "").strip()
+    if len(model) > PROJECT_MODEL_MAX:
+        raise ValueError(f"project model must be <= {PROJECT_MODEL_MAX} characters")
+    if any(ch.isspace() or ord(ch) < 32 for ch in model):
+        raise ValueError("project model must not contain whitespace or control characters")
+    return model
 
 
 def _save(drive_root: Any, data: Dict[str, Any]) -> None:
@@ -455,6 +472,22 @@ def get_project(drive_root: Any, project_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def project_model(drive_root: Any, project_id: str) -> str:
+    """The project's own model id, or ``""`` when it inherits the global Main slot.
+
+    Read-only and failure-tolerant: a missing project, an unreadable registry, or a
+    row written before v6.101.0 all resolve to "inherit", never to a wrong route.
+    """
+    if not str(project_id or "").strip():
+        return ""
+    try:
+        entry = get_project(drive_root, project_id) or {}
+    except Exception:
+        log.debug("project model lookup failed", exc_info=True)
+        return ""
+    return str(entry.get("model") or "").strip()
+
+
 def get_reserved_project(drive_root: Any, project_id: str) -> Optional[Dict[str, Any]]:
     """Lookup irrespective of lifecycle (history/recovery only)."""
     pid = sanitize_project_id(project_id)
@@ -498,6 +531,8 @@ def create_project(
             "name": _validated_name(name, pid),
             "chat_id": project_chat_id(pid),
             "working_dir": str(working_dir or "").strip(),
+            # Empty = inherit the global Main slot (the only behavior before v6.101.0).
+            "model": "",
             "origin": str(origin or "owner"),
             "created_at": utc_now_iso(),
             "last_active_at": utc_now_iso(),
@@ -523,6 +558,10 @@ def update_project(drive_root: Any, project_id: str, **updates: Any) -> Optional
         return None
     allowed = {
         "name", "working_dir", "last_active_at", "provenance", "clone_url", "trusted_at",
+        # v6.101.0: the project's own reasoning model. Empty = inherit the global
+        # Main slot; it is applied to this project's ROOT turns only (agent.py),
+        # never to subagents, whose lane economics stay global.
+        "model",
         # Write-once legacy-activity fact seeded by the boot-reconcile backfill
         # (_backfill_thread_activity); read by projects_summary's derivation.
         "thread_activity_seen",
@@ -541,6 +580,8 @@ def update_project(drive_root: Any, project_id: str, **updates: Any) -> Optional
                     continue
                 if key == "name":
                     value = _validated_name(value, str(entry.get("id") or ""))
+                elif key == "model":
+                    value = _validated_model(value)
                 entry[key] = value
             _save(drive_root, data)
             return dict(entry)
@@ -866,6 +907,7 @@ def projects_summary(drive_root: Any, *, limit: int = 50) -> List[Dict[str, Any]
             "name": project.get("name"),
             "chat_id": project.get("chat_id"),
             "working_dir": project.get("working_dir") or "",
+            "model": project.get("model") or "",
             "provenance": project.get("provenance") or "",
             "last_active_at": project.get("last_active_at") or "",
             "lifecycle": project.get("lifecycle") or PROJECT_ACTIVE,
@@ -880,6 +922,7 @@ def projects_summary(drive_root: Any, *, limit: int = 50) -> List[Dict[str, Any]
 __all__ = [
     "PROJECT_ACTIVE",
     "PROJECT_DELETING",
+    "PROJECT_MODEL_MAX",
     "PROJECT_NAME_MAX",
     "PROJECT_TOMBSTONED",
     "all_task_bindings",
@@ -897,6 +940,7 @@ __all__ = [
     "list_reserved_projects",
     "list_sidebar_projects",
     "project_binding_for_task",
+    "project_model",
     "project_chat_for_task",
     "project_thread_note_for_task",
     "project_chat_for_task_tree",

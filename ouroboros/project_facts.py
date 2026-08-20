@@ -17,9 +17,12 @@ so project facts cannot contaminate the global memory.
 from __future__ import annotations
 
 import hashlib
+import logging
 import pathlib
 import re
 from typing import Any, Dict
+
+log = logging.getLogger(__name__)
 
 _SAFE = re.compile(r"[^a-zA-Z0-9_.-]")
 # Windows reserved device names (case-insensitive, incl. extension variants like
@@ -189,3 +192,48 @@ def project_reflections_path(project_id: str) -> pathlib.Path:
     """Durable per-project execution reflections (full text lives HERE for
     project-scoped roots; the canonical log carries a bounded pointer row)."""
     return _project_store_root(project_id) / "logs" / "task_reflections.jsonl"
+
+
+def apply_project_model_route(ctx: Any, drive_root: Any, project_id: str, task: Any = None) -> str:
+    """Pin a project-scoped task to the project's OWN model, and report it.
+
+    A Project may carry its own reasoning model (v6.101.0). The scope is
+    deliberately narrow: it governs the project's own turns — root tasks and its
+    chat lane — and nothing else. ``resolve_project_id`` already returns ``""``
+    for a subagent that merely inherited a workspace, and for the one case a child
+    DOES carry the scope explicitly, the delegate resolution downstream of this
+    call re-stamps the route, so a project preference can never silently re-route
+    a delegated swarm.
+
+    The route is written in the SAME two places the delegated path already keeps
+    in lockstep: ``ctx.task_model_override`` (what the loop sends) and the task's
+    ``model`` (what ``context_fit`` resolves the exact route and context window
+    from). Writing only the first is the defect this shape avoids — the plan would
+    then be probed against the global Main model and could hand a Max-context
+    claim to a model that never confirmed one. A child's own resolved model is
+    never clobbered.
+
+    An unset project model, an unknown project, or an unreadable registry all
+    leave both untouched — the task then inherits the global Main slot, which is
+    the only behavior that existed before. Returns the applied model (``""`` when
+    the route was left alone).
+    """
+    if not str(project_id or "").strip():
+        return ""
+    try:
+        from ouroboros.projects_registry import project_model
+
+        model = project_model(drive_root, project_id)
+    except Exception:
+        log.debug("project model route lookup failed", exc_info=True)
+        return ""
+    if not model:
+        return ""
+    ctx.task_model_override = model
+    if isinstance(task, dict) and str(task.get("delegation_role") or "") != "subagent":
+        task["model"] = model
+    log.info(
+        "Project model route: project=%s model=%s (task=%s)",
+        project_id, model, (task or {}).get("id") if isinstance(task, dict) else "",
+    )
+    return model

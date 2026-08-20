@@ -395,15 +395,27 @@ class ProjectCreateRequest(TypedDict, total=False):
     with_workspace: bool
 
 
+class ProjectUpdateRequest(TypedDict, total=False):
+    """POST /api/projects/{project_id}/update body. ``name`` renames. ``model``
+    (v6.101.0) sets this project's own reasoning model; an EMPTY string is a legal
+    write that clears the override back to the global Main slot, so the key's
+    PRESENCE — not its truthiness — selects what the call updates."""
+
+    name: str
+    model: str
+
+
 class ProjectEntry(TypedDict, total=False):
     """A registry project row as returned by the projects endpoints. ``provenance``
     (attached|cloned|genesis|none) and ``clone_url`` are historical facts;
-    operational git data is always read live from ``.git``."""
+    operational git data is always read live from ``.git``. ``model`` is the
+    per-project route (empty = inherit the global Main slot)."""
 
     id: str
     name: str
     chat_id: int
     working_dir: str
+    model: str
     provenance: str
     clone_url: str
     trusted_at: str
