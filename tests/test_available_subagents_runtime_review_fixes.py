@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pathlib
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -327,7 +329,7 @@ def test_api_actor_strips_only_the_canonical_local_marker():
 
 
 @pytest.mark.parametrize("route_kind", ["api_model", "agent_session"])
-def test_configured_actor_effort_ceiling_is_a_typed_reduction(
+def test_configured_actor_preserves_requested_effort_until_request_wire(
     monkeypatch, route_kind,
 ):
     import ouroboros.claudexor_daemon as daemon
@@ -370,10 +372,42 @@ def test_configured_actor_effort_ceiling_is_a_typed_reduction(
         task_type="research",
     )
     assert dispatch.delta.derived_effort == "max"
-    assert dispatch.delta.effective_effort == "low"
-    assert dispatch.delta.reduction_reasons == ("route_effort_ceiling=low",)
-    assert dispatch.delta.reason == "route_effort_ceiling=low"
-    assert dispatch.delta.reduced is True
+    assert dispatch.delta.effective_effort == "max"
+    assert dispatch.delta.reduction_reasons == ()
+    assert dispatch.delta.reason == ""
+    assert dispatch.delta.reduced is False
+
+
+def test_delegate_start_recipes_match_the_fresh_start_schema():
+    from ouroboros.tools import delegate
+
+    schema = next(
+        entry.schema for entry in delegate.get_tools() if entry.name == "delegate_start"
+    )["parameters"]
+    assert schema["required"] == ["prompt"]
+    assert {tuple(row["required"]) for row in schema["anyOf"]} == {
+        ("subagent_id",), ("retry_of",),
+    }
+
+    repo = pathlib.Path(__file__).parents[1]
+    recipe_paths = (
+        "prompts/SYSTEM.md",
+        "docs/ARCHITECTURE.md",
+        "docs/DEVELOPMENT.md",
+        "docs/CHECKLISTS.md",
+        "ouroboros/subagent_dispatch_notes.py",
+        "ouroboros/tools/control.py",
+        "ouroboros/tools/delegate.py",
+        "ouroboros/tools/delegate_integration.py",
+    )
+    for relative in recipe_paths:
+        text = (repo / relative).read_text(encoding="utf-8")
+        recipes = re.findall(r"\bdelegate_start\(([^)]*)\)", text, flags=re.DOTALL)
+        assert recipes, f"expected at least one delegate_start recipe in {relative}"
+        for recipe in recipes:
+            assert re.search(r"\bprompt\s*=", recipe), (relative, recipe)
+            if not re.search(r"\bretry_of\s*=", recipe):
+                assert re.search(r"\bsubagent_id\s*=", recipe), (relative, recipe)
 
 
 def test_delegate_recovery_uses_platform_pid_probe(monkeypatch):

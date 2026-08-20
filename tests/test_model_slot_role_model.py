@@ -22,12 +22,15 @@ from ouroboros import subagents
 @pytest.fixture(autouse=True)
 def _owned_gateway_uses_each_test_transport(monkeypatch):
     from ouroboros import claudexor_daemon
-    from ouroboros.gateways import claudexor as gateway_module
+
+    class _Gateway:
+        def close(self):
+            pass
 
     monkeypatch.setattr(
         claudexor_daemon,
         "ensure_owned_gateway",
-        lambda: gateway_module.ClaudexorGateway(),
+        _Gateway,
     )
 
 

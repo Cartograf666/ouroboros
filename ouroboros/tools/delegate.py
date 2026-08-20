@@ -380,7 +380,8 @@ def _terminal_payload(run_id: str, detail: Dict[str, Any],
             "This run ended NEEDING INPUT (outcome_facts.reason=input_required — "
             "see outcome_facts.work_state.required_inputs). Its harness has no "
             "mid-run question channel, so the question arrives as this terminal. Answer it by "
-            "starting a plain NEW delegate_start whose prompt carries the original "
+            "starting a plain NEW delegate_start(subagent_id=..., prompt=...) whose "
+            "prompt carries the original "
             "assignment plus the answers; custody of the new run stays with you. "
             "Do not look for a rerun/decision verb — none exists on this surface."
         )
@@ -841,8 +842,9 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             return _fail("delegate_start", "queued_without_run_id",
                          f"Claudexor returned a queued handle without a run id: {handle!r}",
                          pending_invocation_id=invocation_id,
-                         retry_hint="to retry THIS start call delegate_start with "
-                                    "retry_of=pending_invocation_id; a plain call starts a NEW run",
+                         retry_hint="to retry THIS start call use "
+                                    "delegate_start(prompt=..., "
+                                    "retry_of=pending_invocation_id); a plain call starts a NEW run",
                          **_retire_orphaned_registration(ctx, gateway, owned_project_id,
                                                          definite_refusal=False,
                                                          reason="queued_without_run_id",
@@ -858,8 +860,9 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         # the id, so no token rides a refusal.
         pending = ({} if definite or not invocation_id else
                    {"pending_invocation_id": invocation_id,
-                    "retry_hint": "to retry THIS start call delegate_start with "
-                                  "retry_of=pending_invocation_id; a plain call starts a NEW run"})
+                    "retry_hint": "to retry THIS start call use "
+                                  "delegate_start(prompt=..., "
+                                  "retry_of=pending_invocation_id); a plain call starts a NEW run"})
         return _fail("delegate_start", exc.code, str(exc), executor="blocked",
                      reset_at=getattr(exc, "reset_at", ""), **pending,
                      **_retire_orphaned_registration(ctx, gateway, owned_project_id,
@@ -1544,7 +1547,8 @@ def get_tools() -> List[ToolEntry]:
                 "post a different answer for the same interaction). Codex-lane runs "
                 "have no mid-run questions: a run that ENDS needing input "
                 "(outcome_facts.reason=input_required) is answered with a plain NEW "
-                "delegate_start whose prompt carries the assignment plus the answers "
+                "delegate_start(subagent_id=..., prompt=...) whose prompt carries the "
+                "assignment plus the answers "
                 "— there is no rerun/decision verb, and custody stays with you."
             ),
             "parameters": {"type": "object",
