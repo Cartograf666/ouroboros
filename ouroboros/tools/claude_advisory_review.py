@@ -1224,20 +1224,39 @@ def _audit_bypass(ctx: ToolContext, snapshot_hash: str, commit_message: str,
 
 
 def _identical_diff_cap_note() -> str:
-    """Schema-build-time NOTE about the identical-diff attempt cap, derived from the
-    shared OUROBOROS_REVIEW_MAX_CYCLES (never a hardcoded number)."""
+    """Schema-build-time NOTE about Max-Review-Cycles semantics on the commit
+    gate, derived from the shared OUROBOROS_REVIEW_MAX_CYCLES (never a
+    hardcoded number). Identical bytes are never re-reviewed for pay: from the
+    FIRST review-verdict block, resubmitting the byte-identical staged diff
+    without a NEW rebuttal never buys a new review (identical_diff_refused);
+    the knob itself counts PAID triad+scope cycles per task. Whether either
+    state blocks the commit follows enforcement (the honest caveat below)."""
     from ouroboros.review_cycles import review_max_cycles
 
     cap = review_max_cycles()
+    base = (
+        "NOTE: identical bytes are never re-reviewed for pay — after ANY review-verdict "
+        "block, a byte-identical resubmission to commit_reviewed buys no new review "
+        "(identical_diff_refused, quoting the recorded verdict) until the diff changes "
+        "or a NEW review_rebuttal is supplied (a rebuttal new to the streak buys exactly "
+        "one paid re-review; a repeated one buys none)."
+    )
+    caveat = (
+        " In both states, under blocking enforcement the commit is refused for free; "
+        "under advisory the commit proceeds with a loud durable disclosure and no new "
+        "review spend."
+    )
     if cap is None:
         return (
-            "NOTE: no identical-diff cap is configured (OUROBOROS_REVIEW_MAX_CYCLES=unlimited): "
-            "commit_reviewed never refuses a resubmission on cap grounds."
+            f"{base} OUROBOROS_REVIEW_MAX_CYCLES=unlimited: no per-root-task ceiling on "
+            f"paid triad+scope cycles is configured.{caveat}"
         )
     return (
-        f"NOTE: after {cap} genuine review-verdict block(s) of a byte-identical staged diff "
-        "(the shared OUROBOROS_REVIEW_MAX_CYCLES cap), commit_reviewed refuses further "
-        "attempts (attempt_cap_reached) until the diff changes or a review_rebuttal is provided."
+        f"{base} The shared OUROBOROS_REVIEW_MAX_CYCLES cap bounds PAID triad+scope "
+        f"cycles per ROOT task (shared across the whole task tree; a follow-up task "
+        f"starts its own): after {cap} paid cycle(s) commit_reviewed buys no further "
+        "review (typed review_cycles_exhausted event; every dispatched wave counts, "
+        f"only undispatched attempts stay outside the count).{caveat}"
     )
 
 

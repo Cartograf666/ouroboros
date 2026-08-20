@@ -549,10 +549,19 @@ depth layers.
 Every commit is a release. Before commit, update all version carriers together:
 `VERSION`, `pyproject.toml` (PEP 440 canonical form), README badge/changelog, and
 `docs/ARCHITECTURE.md` header. Then use `commit_reviewed`; the commit path creates
-the annotated `v{VERSION}` tag automatically after the commit. After the configured number of genuine
-review-verdict blocks of a byte-identical staged diff, `commit_reviewed` refuses
-further attempts (`attempt_cap_reached`) — change the diff, provide a
-`review_rebuttal`, or escalate to the owner.
+the annotated `v{VERSION}` tag automatically after the commit. Identical bytes are
+never re-reviewed for pay: after ANY review-verdict block, resubmitting the
+byte-identical staged diff is refused for free (`identical_diff_refused`, quoting
+the recorded verdict) — change the diff, provide a NEW `review_rebuttal` (a
+rebuttal new to the streak buys exactly one paid re-review; a repeated one is
+refused free), or escalate to the owner. The Max Review Cycles setting bounds
+PAID triad+scope cycles per ROOT task — the whole task tree shares one ceiling
+(a follow-up task starts its own); on exhaustion no further review is bought
+and the typed `review_cycles_exhausted` event fires (every dispatched wave
+counts; undispatched refusals and replays do not) — finalize honestly or ask
+the owner to raise the cap. In both states, under blocking enforcement the
+commit is refused for free; under advisory the commit proceeds with a loud
+durable disclosure and no new review spend.
 
 ## Git Attribution
 

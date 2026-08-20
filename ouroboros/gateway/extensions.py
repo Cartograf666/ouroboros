@@ -1051,8 +1051,28 @@ def _skill_review_history_detail_sync(
         "raw_actor_records": degraded_actors,
         "error": error_note,
     }
+    markdown = render_skill_review_block(outcome, attempt_idx=attempt)
+    # Max-Review-Cycles accounting facts (Q16/Q17 auditability) ride the
+    # free-form markdown detail: the response contract
+    # (SkillReviewHistoryDetailResponse) is typed to exactly four fields, so
+    # adding response keys would need an api_types version bump — the rendered
+    # detail string is the additive channel. Legacy rows without the facts
+    # render nothing.
+    accounting = []
+    if record.get("paid"):
+        accounting.append("paid panel dispatch (counts toward Max Review Cycles)")
+    if record.get("replayed_from_ts"):
+        accounting.append(f"free replay of the {record.get('replayed_from_ts')} verdict")
+    if record.get("review_contract_fingerprint"):
+        accounting.append(
+            f"panel contract {str(record.get('review_contract_fingerprint'))[:12]}…"
+        )
+    if record.get("rebuttal_sha256"):
+        accounting.append(f"rebuttal sha256 {str(record.get('rebuttal_sha256'))[:12]}…")
+    if accounting:
+        markdown += "\n\n_Review accounting: " + "; ".join(accounting) + "._"
     return {
-        "markdown": render_skill_review_block(outcome, attempt_idx=attempt),
+        "markdown": markdown,
         "status": status,
         "content_hash": outcome["content_hash"],
         "job_status": str(record.get("job_status") or ""),

@@ -1486,7 +1486,10 @@ class TestGitWiring:
         source = inspect.getsource(git._repo_commit_push)
         assert "_run_reviewed_stage_cycle" in source
         shared_source = inspect.getsource(git._run_reviewed_stage_cycle)
-        assert "_check_advisory_freshness" in shared_source
+        # The advisory-freshness check lives in the extracted gate helper the
+        # stage cycle calls before any paid dispatch.
+        assert "_advisory_and_tests_gate" in shared_source
+        assert "_check_advisory_freshness" in inspect.getsource(git._advisory_and_tests_gate)
         assert "_run_parallel_review" in shared_source
         parallel_source = inspect.getsource(git._run_parallel_review)
         assert "run_scope_review" in parallel_source

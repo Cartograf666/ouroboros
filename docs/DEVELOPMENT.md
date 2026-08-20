@@ -802,12 +802,38 @@ Review Cycles" 1 / 2 / 3 / 5 / ∞). Its per-gate meaning is documented in that
 module and is literally: plan review — paid reviewer-panel cycles per task;
 task acceptance — paid panel runs per task, `improvement passes = cycles − 1`
 (the retired `OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES` is migrated into the shared key at
-settings load — cycles = passes + 1 — and never binds at runtime); commit gate — consecutive review-blocks of a
-BYTE-IDENTICAL staged diff before the identical-diff attempt cap refuses another
-triad+scope run (changing the diff starts a fresh streak; a rebuttal lifts the
-cap for that attempt only; the default moved from a hardcoded 3 to the shared 2). `unlimited` removes the
-local count everywhere; deadline, budget and lifecycle rails still bind. A
-malformed value fails closed to the bounded default and is logged once.
+settings load — cycles = passes + 1 — and never binds at runtime); commit gate
+— paid triad+scope cycles per ROOT task (the whole task tree shares one
+ceiling; a manual session is its own task; a follow-up task is a fresh root;
+the paid fact is recorded on the attempt row at dispatch and the count is
+derived from the attempt ledger); skill review — paid reviewer-panel
+dispatches per ceiling key (the root task for task-driven groups; the manual
+lane is scoped per content snapshot, so revised content restarts its count;
+one chunked wave = ONE cycle). `unlimited` removes the local count
+everywhere; deadline, budget and lifecycle rails still bind. A malformed
+value fails closed to the bounded default and is logged once.
+
+Anti-pattern: paying for byte-identical review material. Never dispatch a paid
+reviewer wave for material a gate has already reviewed under the same review
+contract — the commit gate refuses a byte-identical staged diff for free from
+the FIRST verdict-block (`identical_diff_refused`, quoting the recorded
+verdict), and skill review replays a recorded substantive verdict for an
+identical snapshot at $0 (only while the persisted review state still covers
+it). A rebuttal is identified by CONTENT (sha256): a hash new to the streak
+buys exactly ONE paid re-review; a repeated hash is refused free. The exact
+rule keeps two axes distinct. Refusal-streak eligibility is about VERDICTS:
+only substantive reviewer verdicts build (or end) the identical-bytes refusal
+streak, and a rebuttal is "spent" only by the substantive verdict it bought —
+never when it was refused undispatched or when its wave died on infra. Money
+accounting is about DISPATCH: the limit counts PAID cycles, and every
+physically dispatched wave counts whatever its terminal — so a dispatched
+infra terminal (quorum failure, transport death, timeout) consumes money but
+not the rebuttal, while infra facts refused at assembly (fit overflow,
+sub-floor window) never dispatched and stay outside the count; the paid fact
+is recorded write-ahead at first dispatch. Byte-identical resubmissions are
+refused before any spend. Exhaustion is always the typed
+`review_cycles_exhausted` event with honest exits, never a silent grind or
+another paid dispatch.
 
 `docs/CHECKLISTS.md` is the only reviewer-question, severity, and output SSOT.
 Architecture owns the dataflow; this section owns operator sequence. Finish all
