@@ -1039,22 +1039,14 @@ def lane_delta_phrase(delta: Mapping[str, Any]) -> str:
 
 
 def _route_effort(model: str, effort: str) -> str:
-    """The effort this route will ACTUALLY run: the request clamped into the route's
-    learned band by the SAME call the dispatcher makes.
+    """Return the pre-wire effort selected by scheduling.
 
-    It used to read the ceiling alone, which is half of the band the dispatcher
-    clamps to — so a route with a learned FLOOR (v6.73.2, endpoints where reasoning
-    is mandatory) had its delta report the request verbatim while the call ran
-    something else. Falls back to the request on any failure: a missing evidence
-    store must never block scheduling.
+    Exact provider/model/API/request-shape adaptation happens only at the physical
+    request seam and is disclosed by ``usage.request_wire``.  Legacy model-global
+    evidence is diagnostic and cannot claim what an as-yet-unbuilt request will run.
     """
-    try:
-        from ouroboros.llm import LLMClient
-
-        return str(LLMClient.clamp_effort_for_route(str(model or ""), effort) or effort)
-    except Exception:  # pragma: no cover - evidence store is advisory
-        log.debug("Effort-band lookup failed for %r", model, exc_info=True)
-        return effort
+    del model
+    return effort
 
 
 # The durable keys a scheduling request may state. Everything the dispatch

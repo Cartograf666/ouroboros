@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import json
-from types import SimpleNamespace
 
 import pytest
 
@@ -380,6 +379,18 @@ def test_reasoning_integrity_canary_rejects_explicit_none_and_clamp():
     with pytest.raises(AssertionError):
         assert_openai_canary_usage(clamped, model)
 
+    neutral_repair = _fake_usage(model, 1)
+    neutral_repair["request_wire"]["applied_actions"] = [{
+        "source": "pending",
+        "profile_fingerprint": "e" * 64,
+        "action": {
+            "kind": "drop_field",
+            "fields": ["temperature"],
+            "reason_code": "provider_unsupported_field",
+        },
+    }]
+    assert_openai_canary_usage(neutral_repair, model)
+
 
 def _canonical_canary_call(call_id):
     return {
@@ -416,6 +427,21 @@ def test_production_custom_none_text_is_semantic_success(monkeypatch, tmp_path):
         [{"role": "user", "content": "Use the supplied tool result."}],
         "none",
     )
+    resolved_model = model.split("::", 1)[-1]
+    source = {
+        "model": resolved_model,
+        "messages": [{"role": "user", "content": "Use the supplied tool result."}],
+        "reasoning_effort": "medium",
+        "max_completion_tokens": OPENAI_CANARY_MAX_TOKENS,
+        "tools": [copy.deepcopy(tool)],
+        "tool_choice": "none",
+    }
+    target = {
+        "provider": "openai",
+        "resolved_model": resolved_model,
+        "usage_model": normalize_model_identity(model),
+        "base_url": "https://api.openai.com/v1",
+    }
     assert candidate.forbids_tool_call is True
     assert candidate.applied_actions == ()
     foundation_observation = observe_wire_semantics(
@@ -429,6 +455,7 @@ def test_production_custom_none_text_is_semantic_success(monkeypatch, tmp_path):
     assert foundation_observation.semantic_kind == "chat_message"
 
     import ouroboros.openai_chat_dispatch as dispatch
+    import ouroboros.request_wire_recovery as recovery
 
     attempt_id = "phase2c-custom-none-text"
     capture = PhysicalAttemptCapture(
@@ -445,30 +472,31 @@ def test_production_custom_none_text_is_semantic_success(monkeypatch, tmp_path):
         },
         provider_status_code=200,
     )
-    bound = dispatch.BoundDirectOpenAICompletion(
-        SimpleNamespace(model_dump=lambda: {}),
-        candidate,
-        capture,
-    )
     issued = []
-    real_bind = dispatch.bind_wire_compatibility_receipt
+    real_bind = recovery.bind_wire_compatibility_receipt
 
     def record_receipt(**kwargs):
         receipt = real_bind(**kwargs)
         issued.append(receipt)
         return receipt
 
-    monkeypatch.setattr(dispatch, "bind_wire_compatibility_receipt", record_receipt)
-    message, usage = dispatch.normalize_direct_openai_completion(
-        {"role": "assistant", "content": "phase2c semantic text"},
-        {
-            "provider": "openai",
-            "resolved_model": normalize_model_identity(model),
-            "prompt_tokens": 12,
-            "completion_tokens": 4,
-        },
-        bound,
-    )
+    monkeypatch.setattr(recovery, "bind_wire_compatibility_receipt", record_receipt)
+    with recovery.request_wire_call_scope():
+        recovery.register_wire_candidate(
+            candidate, source_payload=source, target=target,
+        )
+        recovery.note_wire_send_succeeded(capture)
+        message, usage = dispatch.normalize_direct_openai_completion(
+            {"role": "assistant", "content": "phase2c semantic text"},
+            {
+                "provider": "openai",
+                "resolved_model": normalize_model_identity(model),
+                "prompt_tokens": 12,
+                "completion_tokens": 4,
+            },
+            None,
+        )
+        recovery.finalize_wire_response(message, usage)
 
     assert message == {"role": "assistant", "content": "phase2c semantic text"}
     assert dispatch.CUSTOM_RECEIPTS_USAGE_KEY not in usage

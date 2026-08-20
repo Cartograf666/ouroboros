@@ -194,8 +194,21 @@ def assert_openai_canary_usage(usage, model):
     assert disclosure["applied_tool_dialect"] == "openai_chat_custom"
     assert disclosure["reason_code"] == "requested_wire_form"
     assert disclosure["ladder_ordinal"] == 1
-    assert disclosure["applied_actions"] == []
     assert disclosure["task_local"] is False
+    actions = disclosure.get("applied_actions")
+    assert isinstance(actions, list)
+    for applied in actions:
+        assert isinstance(applied, dict) and applied.get("source") != "task_local"
+        action = applied.get("action")
+        assert isinstance(action, dict)
+        assert action.get("kind") != "replace_dialect"
+        assert not (
+            action.get("kind") == "set_value" and action.get("field") == "effort"
+        )
+        assert not set(action.get("fields") or ()).intersection({
+            "reasoning_effort", "thinking", "output_config",
+            "extra_body.reasoning",
+        })
     assert disclosure["attempt_id"]
     for key in (
         "source_profile_fingerprint",

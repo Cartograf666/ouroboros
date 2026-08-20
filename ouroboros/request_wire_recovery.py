@@ -225,7 +225,40 @@ def _bind_with_applications(
     source_payload: Mapping[str, Any],
     requested_effort: str,
     applications: Sequence[WireAppliedAction],
+    fixed_spec: Optional[WireCandidateSpec] = None,
+    fixed_ordinal: Optional[int] = None,
 ) -> WireCandidateManifest:
+    if fixed_spec is not None:
+        effort = requested_effort
+        dialect = fixed_spec.tool_dialect
+        for item in applications:
+            action = item.action
+            if action.get("kind") == "set_value":
+                effort = apply_effort_action(effort, action)
+            elif action.get("kind") == "drop_field" and set(
+                action.get("fields") or ()
+            ) & {
+                "reasoning_effort", "thinking", "output_config",
+                NESTED_REASONING_FIELD,
+            }:
+                effort = "provider_default"
+            elif action.get("kind") == "replace_dialect":
+                dialect = str(action.get("to") or dialect)
+        spec = WireCandidateSpec(
+            dialect,
+            effort,
+            fixed_spec.reason_code,
+            fixed_spec.task_local,
+        )
+        return bind_wire_candidate(
+            target=target,
+            api_surface=api_surface,
+            source_payload=source_payload,
+            candidate_spec=spec,
+            requested_effort=requested_effort,
+            ladder_ordinal=fixed_ordinal or 1,
+            applied_actions=applications,
+        )
     if applications:
         current = bind_wire_candidate(
             target=target,
@@ -261,6 +294,112 @@ def _bind_with_applications(
         ),
         requested_effort=requested_effort,
         ladder_ordinal=1,
+    )
+
+
+def _first_durable_action(
+    target: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    api_surface: str,
+    requested_effort: str,
+    applications: Sequence[WireAppliedAction],
+    *,
+    allow_dialect: bool,
+) -> Optional[WireAppliedAction]:
+    seen = {
+        (item.profile.fingerprint, wire_action_identity(item.action))
+        for item in applications
+    }
+    for profile, action in _records_for_step(
+        target, payload, api_surface, requested_effort,
+    ):
+        if not allow_dialect and action.get("kind") == "replace_dialect":
+            continue
+        if action.get("kind") == "drop_field" and not all(
+            _field_is_present(payload, str(field))
+            for field in action.get("fields") or ()
+        ):
+            continue
+        if (
+            action.get("kind") == "replace_dialect"
+            and action.get("from") != infer_tool_dialect(payload)
+        ):
+            continue
+        identity = (profile.fingerprint, wire_action_identity(action))
+        if identity not in seen:
+            return WireAppliedAction(profile, action, "durable")
+    return None
+
+
+def _direct_openai_tool_source(
+    target: Mapping[str, Any], payload: Mapping[str, Any],
+) -> bool:
+    provider = str(target.get("provider") or "").strip().lower()
+    return provider == "openai" and infer_tool_dialect(payload) == "function" and (
+        payload_effort(payload) not in {"", "none"}
+    )
+
+
+def _prepare_direct_openai_candidate(
+    target: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    api_surface: str,
+) -> WireCandidateManifest:
+    requested = payload_effort(payload)
+    source = copy.deepcopy(dict(payload))
+    applications: list[WireAppliedAction] = []
+    for _ in range(_MAX_COMPOSED_ACTIONS):
+        function_candidate = _bind_with_applications(
+            target=target,
+            api_surface=api_surface,
+            source_payload=source,
+            requested_effort=requested,
+            applications=applications,
+            fixed_spec=WireCandidateSpec("function", requested, "requested_wire_form"),
+            fixed_ordinal=1,
+        )
+        addition = _first_durable_action(
+            target,
+            function_candidate.physical_payload(),
+            api_surface,
+            requested,
+            applications,
+            allow_dialect=False,
+        )
+        if addition is None:
+            break
+        applications.append(addition)
+
+    custom_spec = WireCandidateSpec("openai_chat_custom", requested, "requested_wire_form")
+    for _ in range(_MAX_COMPOSED_ACTIONS - len(applications)):
+        custom_candidate = _bind_with_applications(
+            target=target,
+            api_surface=api_surface,
+            source_payload=source,
+            requested_effort=requested,
+            applications=applications,
+            fixed_spec=custom_spec,
+            fixed_ordinal=1,
+        )
+        addition = _first_durable_action(
+            target,
+            custom_candidate.physical_payload(),
+            api_surface,
+            requested,
+            applications,
+            allow_dialect=False,
+        )
+        if addition is None:
+            return custom_candidate
+        applications.append(addition)
+    return _bind_with_applications(
+        target=target,
+        api_surface=api_surface,
+        source_payload=source,
+        requested_effort=requested,
+        applications=applications,
+        fixed_spec=custom_spec,
+        fixed_ordinal=1,
     )
 
 
@@ -367,7 +506,11 @@ def prepare_wire_payload_for_send(
         _WIRE_CALL_STATE.set(replace(state, current=existing, settled=None))
         return existing.candidate.physical_payload()
     try:
-        candidate = _prepare_durable_candidate(target, detached, api_surface)
+        candidate = (
+            _prepare_direct_openai_candidate(target, detached, api_surface)
+            if _direct_openai_tool_source(target, detached)
+            else _prepare_durable_candidate(target, detached, api_surface)
+        )
     except (TypeError, ValueError):
         candidate = None
     if candidate is None:
@@ -378,6 +521,11 @@ def prepare_wire_payload_for_send(
         return detached
     register_wire_candidate(candidate, source_payload=detached, target=target)
     return candidate.physical_payload()
+
+
+def current_wire_candidate() -> Optional[WireCandidateManifest]:
+    current = _WIRE_CALL_STATE.get().current
+    return current.candidate if current is not None else None
 
 
 def note_wire_send_succeeded(capture: Any) -> None:
@@ -478,7 +626,6 @@ def _names_exact_scalar_value(message: str, value: Any) -> bool:
 
 
 def _names_exact_effort_value(message: str, effort: str) -> bool:
-    """Recognize only a named physical effort value/tier, never route prose."""
     return bool(effort and _names_exact_scalar_value(message, effort))
 
 
@@ -569,9 +716,6 @@ def _classify_action(
         return None
     if effort_implicated and value_implicated:
         return None
-    # A provider that repeats the current value without identifying it as a
-    # value/tier has supplied ambiguous evidence.  Never widen that prose into
-    # a carrier-wide drop: another exact 4xx is safer than durable cognition loss.
     if effort_implicated and current_effort in error_tokens:
         return None
     named = []
@@ -617,12 +761,17 @@ def _plan_retry(status_code: Optional[int], message: str) -> Optional[Dict[str, 
         applications = (*existing, WireAppliedAction.pending(pending))
         if len(applications) > _MAX_COMPOSED_ACTIONS:
             return None
+        from ouroboros.openai_chat_dispatch import is_direct_openai_ladder_candidate
+
+        direct_rung = is_direct_openai_ladder_candidate(registered.candidate)
         candidate = _bind_with_applications(
             target=registered.target,
             api_surface=registered.candidate.source_profile.api_surface,
             source_payload=registered.source_payload,
             requested_effort=registered.candidate.requested_effort,
             applications=applications,
+            fixed_spec=(registered.candidate.candidate_spec if direct_rung else None),
+            fixed_ordinal=(registered.candidate.ladder_ordinal if direct_rung else None),
         )
         register_wire_candidate(
             candidate,
@@ -634,8 +783,38 @@ def _plan_retry(status_code: Optional[int], message: str) -> Optional[Dict[str, 
         return None
 
 
+def _plan_direct_dialect_retry(
+    error: Any,
+    *,
+    body_error: bool,
+) -> Optional[Dict[str, Any]]:
+    state = _WIRE_CALL_STATE.get()
+    registered = state.current
+    if registered is None:
+        return None
+    try:
+        from ouroboros.openai_chat_dispatch import plan_direct_openai_dialect_candidate
+
+        candidate = plan_direct_openai_dialect_candidate(
+            target=registered.target,
+            source_payload=registered.source_payload,
+            current=registered.candidate,
+            error=error,
+            body_error=body_error,
+        )
+        if candidate is None:
+            return None
+        register_wire_candidate(
+            candidate,
+            source_payload=registered.source_payload,
+            target=registered.target,
+        )
+        return candidate.physical_payload()
+    except (TypeError, ValueError):
+        return None
+
+
 def plan_wire_retry_from_exception(exc: BaseException) -> Optional[Dict[str, Any]]:
-    """Plan one closed action only from an observed parameter 4xx."""
     if _context_overflow_evidence(exc):
         return None
     status, message = _status_and_message_from_exception(exc)
@@ -720,7 +899,15 @@ def plan_next_wire_retry(
         plan_wire_retry_from_exception(error)
         if isinstance(error, BaseException) else None
     )
-    return planned or plan_nonlearning_optional_retry(
+    if planned is not None:
+        return planned
+    dialect_retry = _plan_direct_dialect_retry(
+        error,
+        body_error=body_error,
+    )
+    if dialect_retry is not None:
+        return dialect_retry
+    return plan_nonlearning_optional_retry(
         payload,
         error=error,
         body_error=body_error,
@@ -735,9 +922,6 @@ def finalize_wire_response(
 ) -> None:
     """Disclose the physical candidate and commit only terminal semantic success."""
     state = _WIRE_CALL_STATE.get()
-    if isinstance(normalized_usage.get("request_wire"), Mapping):
-        _WIRE_CALL_STATE.set(replace(state, settled=None))
-        return
     settled = state.settled
     if settled is None:
         return
@@ -747,6 +931,9 @@ def finalize_wire_response(
         from ouroboros.request_wire_attempt import WireUsageDisclosure
 
         disclosure = WireUsageDisclosure.from_candidate(candidate, capture).as_dict()
+        existing = normalized_usage.get("request_wire")
+        if isinstance(existing, Mapping) and dict(existing) != disclosure:
+            raise ValueError("request-wire disclosure differs from settled candidate")
         normalized_usage["request_wire"] = disclosure
         disclosures = (*state.disclosures, copy.deepcopy(disclosure))
         state = replace(state, disclosures=disclosures, settled=None)

@@ -282,9 +282,9 @@ class WireCandidateManifest:
         if task_local and pending:
             raise ValueError("degraded success cannot confirm unrelated pending evidence")
         if self.requested_tool_projection:
-            if any(item.source != "durable" for item in self.applied_actions):
+            if any(item.source == "task_local" for item in self.applied_actions):
                 raise ValueError(
-                    "requested custom projection may compose only with durable actions"
+                    "requested custom projection cannot carry task-local actions"
                 )
             if any(
                 item.action.get("kind") == "replace_dialect"
@@ -594,9 +594,9 @@ def bind_wire_candidate(
         and candidate_spec.reason_code == "requested_wire_form"
     ):
         requested_projection = REQUESTED_FUNCTION_TO_CUSTOM
-        if any(item.source != "durable" for item in applications):
+        if any(item.source == "task_local" for item in applications):
             raise ValueError(
-                "requested custom projection may compose only with durable actions"
+                "requested custom projection cannot carry task-local actions"
             )
         if any(item.action.get("kind") == "replace_dialect" for item in applications):
             raise ValueError("requested custom projection is not a dialect action")

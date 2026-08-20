@@ -1087,15 +1087,8 @@ def test_a_lane_with_no_configured_slot_reports_the_model_it_really_got(tmp_path
     assert capability_delta_prompt_block(dispatch) == ""
 
 
-def test_a_route_effort_ceiling_is_disclosed_at_dispatch(tmp_path, monkeypatch):
-    """The learned per-route effort ceiling reached `llm_usage` and nothing else, so a
-    child ran below the effort the owner configured and nobody was told. Effort is no
-    longer requestable, so what the ceiling is measured against is the DERIVED effort
-    — the owner's setting for this task type, which is still the owner's business.
-
-    The STORED effort stays that derived value on purpose: the dispatcher re-clamps
-    per model, and a fallback route with a wider band must not inherit this route's
-    ceiling."""
+def test_legacy_model_global_ceiling_is_not_dispatch_authority(tmp_path, monkeypatch):
+    """Scheduling reports requested effort; exact wire disclosure owns adaptation."""
     from ouroboros.agent import capability_delta_prompt_block
     from ouroboros.llm import LLMClient
 
@@ -1106,9 +1099,9 @@ def test_a_route_effort_ceiling_is_disclosed_at_dispatch(tmp_path, monkeypatch):
 
     task, dispatch = _dispatched(tmp_path / "ceiling", monkeypatch, model_lane="light")
     delta = task["capability_delta"]
-    assert (delta["derived_effort"], delta["effective_effort"]) == ("max", "low")
-    assert delta["reason"] == "route_effort_ceiling=low"
-    assert "effort max->low" in capability_delta_prompt_block(dispatch)
+    assert (delta["derived_effort"], delta["effective_effort"]) == ("max", "max")
+    assert delta["reason"] == ""
+    assert "effort" not in capability_delta_prompt_block(dispatch)
     assert task["reasoning_effort"] == "max"
 
     # An effort inside the band is not a delta.
@@ -1230,14 +1223,8 @@ def test_an_inherited_lane_that_lands_on_main_is_as_loud_as_an_explicit_one(tmp_
     assert capability_delta_prompt_block(quiet) == ""
 
 
-def test_the_effort_the_delta_reports_is_the_effort_the_dispatcher_will_run(tmp_path, monkeypatch):
-    """`effective_effort` claims to be "the effort this route will actually run", and
-    it was derived from the route's CEILING alone — half of the `[floor, ceiling]`
-    band `_clamp_effort_for_model` clamps to. A route with a learned floor (v6.73.2,
-    endpoints where reasoning is mandatory) therefore had the delta report the
-    derived effort verbatim while the call ran something else. Both go through one
-    body, and a floor that RAISES the effort is reported honestly without being
-    called a reduction."""
+def test_scheduler_effort_stays_pre_wire_until_exact_route_disclosure(tmp_path, monkeypatch):
+    """Legacy floors stay diagnostic; physical request usage reports any adjustment."""
     from ouroboros.agent import capability_delta_prompt_block
     from ouroboros.llm import LLMClient
 
@@ -1249,10 +1236,8 @@ def test_the_effort_the_delta_reports_is_the_effort_the_dispatcher_will_run(tmp_
 
     task, dispatch = _dispatched(tmp_path / "floor", monkeypatch, model_lane="light")
     delta = task["capability_delta"]
-    dispatcher = LLMClient.clamp_effort_for_route("provider::cheap", "none")
-    assert dispatcher == "low"
-    assert delta["effective_effort"] == dispatcher
-    # Being given MORE than was derived is not a reduction, so nothing shouts.
+    assert LLMClient.clamp_effort_for_route("provider::cheap", "none") == "low"
+    assert delta["effective_effort"] == "none"
     assert delta["reduced"] is False
     assert capability_delta_prompt_block(dispatch) == ""
 

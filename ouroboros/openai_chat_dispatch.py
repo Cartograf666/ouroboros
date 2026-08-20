@@ -11,7 +11,6 @@ from __future__ import annotations
 import copy
 import json
 import re
-from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 from ouroboros.openai_chat_custom import (
@@ -22,7 +21,7 @@ from ouroboros.openai_chat_custom import (
 )
 from ouroboros.request_wire_contract import (
     EphemeralWireAdjustment,
-    build_request_wire_profile,
+    apply_effort_action,
     canonical_sha256,
     infer_tool_dialect,
     payload_effort,
@@ -32,15 +31,8 @@ from ouroboros.request_wire_receipts import (
     WireAppliedAction,
     WireCandidateManifest,
     WireCandidateSpec,
-    WireUsageDisclosure,
     bind_wire_candidate,
-    bind_wire_compatibility_receipt,
-    direct_openai_tool_candidate_ladder,
     observe_wire_semantics,
-)
-from ouroboros.usage_accounting import (
-    PhysicalAttemptCapture,
-    last_physical_attempt_capture,
 )
 
 REQUEST_WIRE_USAGE_KEY = "request_wire"
@@ -71,19 +63,6 @@ _HISTORY_ERROR_MARKERS = (
     "tool message for",
     "tool_call_id",
 )
-
-
-@dataclass(frozen=True)
-class BoundDirectOpenAICompletion:
-    """Provider response plus the exact candidate/capture that produced it."""
-
-    response: Any
-    candidate: WireCandidateManifest
-    physical_attempt: PhysicalAttemptCapture
-
-    def model_dump(self) -> Dict[str, Any]:
-        value = self.response.model_dump()
-        return dict(value) if isinstance(value, Mapping) else {}
 
 
 def _direct_openai_custom_request(
@@ -136,70 +115,6 @@ def sanitize_function_tools(
         prepared.append(tool_copy)
     prepared.sort(key=lambda item: str((item.get("function") or {}).get("name") or ""))
     return prepared
-
-
-def _task_local_none_action(
-    target: Mapping[str, Any],
-    source_payload: Mapping[str, Any],
-    requested_effort: str,
-) -> WireAppliedAction:
-    profile = build_request_wire_profile(
-        target,
-        source_payload,
-        api_surface="chat.completions",
-    )
-    adjustment = EphemeralWireAdjustment(profile, {
-        "kind": "set_value",
-        "field": "effort",
-        "mode": "exact",
-        "from": requested_effort,
-        "to": "none",
-        "reason_code": "task_local_availability_fallback",
-    })
-    return WireAppliedAction.task_local(adjustment)
-
-
-def _bind_candidate(
-    target: Mapping[str, Any],
-    source_payload: Mapping[str, Any],
-    spec: WireCandidateSpec,
-    ordinal: int,
-) -> WireCandidateManifest:
-    requested_effort = payload_effort(source_payload)
-    actions: Tuple[WireAppliedAction, ...] = ()
-    if spec.task_local:
-        actions = (_task_local_none_action(
-            target,
-            source_payload,
-            requested_effort,
-        ),)
-    return bind_wire_candidate(
-        target=target,
-        api_surface="chat.completions",
-        source_payload=source_payload,
-        candidate_spec=spec,
-        requested_effort=requested_effort,
-        ladder_ordinal=ordinal,
-        applied_actions=actions,
-    )
-
-
-def direct_openai_candidate_ladder(
-    target: Mapping[str, Any],
-    source_payload: Mapping[str, Any],
-) -> Tuple[WireCandidateManifest, ...]:
-    """Bind the frozen custom -> function -> task-local-none physical order."""
-    if not _direct_openai_custom_request(target, source_payload):
-        return ()
-    effort = payload_effort(source_payload)
-    specs = direct_openai_tool_candidate_ladder(
-        effort,
-        remaining_physical_attempts=3,
-    )
-    return tuple(
-        _bind_candidate(target, source_payload, spec, ordinal)
-        for ordinal, spec in enumerate(specs, start=1)
-    )
 
 
 def _error_facts(value: Any) -> Tuple[int, str, str, str]:
@@ -277,16 +192,108 @@ def exact_tool_dialect_rejection(
     return bool(dialect_named and rejection_named)
 
 
-def _body_has_exact_rejection(
-    completion: BoundDirectOpenAICompletion,
-) -> bool:
-    payload = completion.model_dump()
-    error = payload.get("error")
-    if not isinstance(error, Mapping):
-        return False
-    return exact_tool_dialect_rejection(
-        _BodyError(payload),
-        completion.candidate,
+def is_direct_openai_ladder_candidate(candidate: WireCandidateManifest) -> bool:
+    """Whether a manifest belongs to the owner-selected custom/function/none rail."""
+    return bool(
+        candidate.source_profile.provider == "openai"
+        and candidate.source_profile.api_surface == "chat.completions"
+        and candidate.source_profile.tool_dialect == "function"
+        and candidate.requested_effort != "none"
+        and candidate.ladder_ordinal in {1, 2, 3}
+    )
+
+
+def _applied_effort(
+    requested: str,
+    actions: Sequence[WireAppliedAction],
+) -> str:
+    effort = requested
+    for item in actions:
+        action = item.action
+        if action.get("kind") == "set_value":
+            effort = apply_effort_action(effort, action)
+        elif action.get("kind") == "drop_field" and set(
+            action.get("fields") or ()
+        ) & {"reasoning_effort", "thinking", "output_config", "extra_body.reasoning"}:
+            effort = "provider_default"
+    return effort
+
+
+def plan_direct_openai_dialect_candidate(
+    *,
+    target: Mapping[str, Any],
+    source_payload: Mapping[str, Any],
+    current: WireCandidateManifest,
+    error: Any,
+    body_error: bool,
+) -> Optional[WireCandidateManifest]:
+    """Advance one cognition-preserving rung, or create the final task-local none."""
+    if not is_direct_openai_ladder_candidate(current):
+        return None
+    value = _BodyError({"error": dict(error)}) if body_error and isinstance(
+        error, Mapping
+    ) else error
+    if not isinstance(value, BaseException) or not exact_tool_dialect_rejection(
+        value, current,
+    ):
+        return None
+    requested = current.requested_effort
+    durable = tuple(
+        item for item in current.applied_actions
+        if item.source == "durable"
+        and item.profile.tool_dialect == "function"
+        and item.action.get("kind") != "replace_dialect"
+    )
+    api_surface = current.source_profile.api_surface
+    if current.accepted_profile.tool_dialect == "openai_chat_custom":
+        if any(item.source == "pending" for item in current.applied_actions):
+            return None
+        return bind_wire_candidate(
+            target=target,
+            api_surface=api_surface,
+            source_payload=source_payload,
+            candidate_spec=WireCandidateSpec(
+                "function",
+                _applied_effort(requested, durable),
+                "provider_rejected_tool_dialect",
+            ),
+            requested_effort=requested,
+            ladder_ordinal=2,
+            applied_actions=durable,
+        )
+    if current.accepted_profile.tool_dialect != "function":
+        return None
+    baseline = bind_wire_candidate(
+        target=target,
+        api_surface=api_surface,
+        source_payload=source_payload,
+        candidate_spec=WireCandidateSpec(
+            "function",
+            _applied_effort(requested, durable),
+            "provider_rejected_tool_dialect",
+        ),
+        requested_effort=requested,
+        ladder_ordinal=2,
+        applied_actions=durable,
+    )
+    adjustment = EphemeralWireAdjustment(baseline.accepted_profile, {
+        "kind": "set_value",
+        "field": "effort",
+        "mode": "exact",
+        "from": payload_effort(baseline.physical_payload()),
+        "to": "none",
+        "reason_code": "task_local_availability_fallback",
+    })
+    return bind_wire_candidate(
+        target=target,
+        api_surface=api_surface,
+        source_payload=source_payload,
+        candidate_spec=WireCandidateSpec(
+            "function", "none", "task_local_availability_fallback", task_local=True,
+        ),
+        requested_effort=requested,
+        ladder_ordinal=3,
+        applied_actions=(*durable, WireAppliedAction.task_local(adjustment)),
     )
 
 
@@ -299,97 +306,19 @@ class _BodyError(Exception):
         self.param = error.get("param")
         super().__init__(str(error.get("message") or "provider body error"))
 
-
-def dispatch_direct_openai_chat(
-    target: Mapping[str, Any],
-    source_payload: Mapping[str, Any],
-    *,
-    send: Callable[[WireCandidateManifest], Any],
-    recover_same_candidate: Optional[
-        Callable[
-            [Mapping[str, Any], BaseException, WireCandidateSpec],
-            Optional[Dict[str, Any]],
-        ]
-    ] = None,
-) -> Optional[BoundDirectOpenAICompletion]:
-    """Run the exact same-route ladder; the accounting rail authorizes each send."""
-    source = copy.deepcopy(dict(source_payload))
-    if not _direct_openai_custom_request(target, source):
-        return None
-    specs = direct_openai_tool_candidate_ladder(
-        payload_effort(source),
-        remaining_physical_attempts=3,
-    )
-    for index, spec in enumerate(specs):
-        candidate = _bind_candidate(target, source, spec, index + 1)
-        recovered = False
-        while True:
-            try:
-                response = send(candidate)
-            except Exception as exc:
-                if exact_tool_dialect_rejection(exc, candidate):
-                    if index == len(specs) - 1:
-                        raise
-                    break
-                retry_source = (
-                    recover_same_candidate(source, exc, candidate.candidate_spec)
-                    if recover_same_candidate is not None and not recovered
-                    else None
-                )
-                if retry_source is None:
-                    raise
-                source = copy.deepcopy(retry_source)
-                candidate = _bind_candidate(
-                    target,
-                    source,
-                    candidate.candidate_spec,
-                    candidate.ladder_ordinal,
-                )
-                recovered = True
-                continue
-            capture = last_physical_attempt_capture()
-            if not isinstance(capture, PhysicalAttemptCapture):
-                raise ValueError("direct OpenAI candidate lacks its physical-attempt capture")
-            bound = BoundDirectOpenAICompletion(response, candidate, capture)
-            if _body_has_exact_rejection(bound):
-                if index == len(specs) - 1:
-                    return bound
-                break
-            payload = bound.model_dump()
-            if isinstance(payload.get("error"), Mapping):
-                retry_source = (
-                    recover_same_candidate(
-                        source,
-                        _BodyError(payload),
-                        candidate.candidate_spec,
-                    )
-                    if recover_same_candidate is not None and not recovered
-                    else None
-                )
-                if retry_source is not None:
-                    source = copy.deepcopy(retry_source)
-                    candidate = _bind_candidate(
-                        target,
-                        source,
-                        candidate.candidate_spec,
-                        candidate.ladder_ordinal,
-                    )
-                    recovered = True
-                    continue
-            return bound
-    return None
-
-
 def normalize_direct_openai_completion(
     message: Mapping[str, Any],
     usage: MutableMapping[str, Any],
     bound: Any,
 ) -> Tuple[Dict[str, Any], MutableMapping[str, Any]]:
-    """Normalize a bound physical result and attach non-history receipts to usage."""
+    """Normalize custom calls; the shared recovery finalizer owns commit/disclosure."""
     canonical_message = dict(message)
-    if not isinstance(bound, BoundDirectOpenAICompletion):
+    del bound
+    from ouroboros.request_wire_recovery import current_wire_candidate
+
+    candidate = current_wire_candidate()
+    if candidate is None:
         return canonical_message, usage
-    candidate = bound.candidate
     receipts: Tuple[CustomArgumentValidationReceipt, ...] = ()
     if candidate.accepted_profile.tool_dialect == "openai_chat_custom":
         calls = canonical_message.get("tool_calls") or []
@@ -404,21 +333,12 @@ def normalize_direct_openai_completion(
             and "provider_error" not in usage
         )
         if text_success or custom_receipts_prove_wire_acceptance(receipts):
-            observation = observe_wire_semantics(
+            observe_wire_semantics(
                 candidate=candidate,
                 normalized_response=canonical_message,
                 normalized_usage=usage,
                 custom_receipts=receipts,
             )
-            bind_wire_compatibility_receipt(
-                candidate=candidate,
-                physical_attempt=bound.physical_attempt,
-                semantic_observation=observation,
-            )
-    usage[REQUEST_WIRE_USAGE_KEY] = WireUsageDisclosure.from_candidate(
-        candidate,
-        bound.physical_attempt,
-    ).as_dict()
     if receipts:
         usage[CUSTOM_RECEIPTS_USAGE_KEY] = receipts
     return canonical_message, usage
@@ -610,7 +530,6 @@ def projected_context_size_bytes(
 
 
 __all__ = (
-    "BoundDirectOpenAICompletion",
     "CUSTOM_RECEIPTS_USAGE_KEY",
     "REQUEST_WIRE_USAGE_KEY",
     "custom_tool_argument_error",
@@ -618,10 +537,10 @@ __all__ = (
     "custom_validation_by_call_id",
     "call_with_custom_validation_continuation",
     "direct_openai_context_projections",
-    "direct_openai_candidate_ladder",
-    "dispatch_direct_openai_chat",
     "exact_tool_dialect_rejection",
+    "is_direct_openai_ladder_candidate",
     "normalize_direct_openai_completion",
+    "plan_direct_openai_dialect_candidate",
     "pop_custom_validation_receipts",
     "projected_context_size_bytes",
     "sanitize_function_tools",

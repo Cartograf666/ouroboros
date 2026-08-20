@@ -7,8 +7,6 @@ import json
 import pathlib
 from types import SimpleNamespace
 
-import pytest
-
 import ouroboros.consciousness as consciousness
 import ouroboros.context_compaction as context_compaction
 import ouroboros.llm as llm_module
@@ -16,12 +14,10 @@ import ouroboros.llm_observability as llm_observability
 import ouroboros.openai_chat_dispatch as dispatch
 from ouroboros.context_fit import estimate_context_prompt_tokens
 from ouroboros.openai_chat_custom import normalize_openai_custom_tool_calls
-from ouroboros.request_wire_contract import canonical_sha256
 from ouroboros.request_wire_receipts import (
     WireCandidateSpec,
     bind_wire_candidate,
 )
-from ouroboros.usage_accounting import PhysicalAttemptCapture
 from ouroboros.utils import estimate_tokens
 
 
@@ -257,30 +253,6 @@ class _HistoryError(Exception):
         }}
 
 
-class _Response:
-    def __init__(self, payload):
-        self.payload = payload
-
-    def model_dump(self):
-        return copy.deepcopy(self.payload)
-
-
-def _candidate_capture(candidate):
-    return PhysicalAttemptCapture(
-        attempt_id="attempt-history",
-        model=candidate.physical_model,
-        provider=candidate.accepted_profile.provider,
-        state="settled",
-        candidate_measurement_kind="canonical_json_v1",
-        candidate_raw_sha256=candidate.candidate_sha256,
-        candidate_manifest_ref={
-            "path": "physical/attempt-history.json",
-            "call_id": "attempt-history",
-            "sha256": canonical_sha256("attempt-history"),
-        },
-    )
-
-
 def _dispatch_source():
     return {
         "model": "future-model-without-prefix",
@@ -291,45 +263,43 @@ def _dispatch_source():
     }
 
 
+def _initial_custom_candidate():
+    source = _dispatch_source()
+    return bind_wire_candidate(
+        target=_target(),
+        api_surface="chat.completions",
+        source_payload=source,
+        candidate_spec=WireCandidateSpec(
+            "openai_chat_custom", "medium", "requested_wire_form",
+        ),
+        requested_effort="medium",
+        ladder_ordinal=1,
+    )
+
+
 def test_history_exception_cannot_advance_the_dialect_ladder():
-    sent = []
-
-    def send(candidate):
-        sent.append(candidate)
-        raise _HistoryError()
-
-    with pytest.raises(_HistoryError):
-        dispatch.dispatch_direct_openai_chat(
-            _target(),
-            _dispatch_source(),
-            send=send,
-        )
-    assert len(sent) == 1
-    assert dispatch.exact_tool_dialect_rejection(_HistoryError(), sent[0]) is False
+    candidate = _initial_custom_candidate()
+    error = _HistoryError()
+    assert dispatch.exact_tool_dialect_rejection(error, candidate) is False
+    assert dispatch.plan_direct_openai_dialect_candidate(
+        target=_target(),
+        source_payload=_dispatch_source(),
+        current=candidate,
+        error=error,
+        body_error=False,
+    ) is None
 
 
-def test_history_body_error_cannot_advance_the_dialect_ladder(monkeypatch):
-    sent = []
-    captures = []
-
-    def send(candidate):
-        sent.append(candidate)
-        captures.append(_candidate_capture(candidate))
-        return _Response(_HistoryError().body)
-
-    monkeypatch.setattr(
-        dispatch,
-        "last_physical_attempt_capture",
-        lambda: captures[-1],
-    )
-    bound = dispatch.dispatch_direct_openai_chat(
-        _target(),
-        _dispatch_source(),
-        send=send,
-    )
-    assert bound is not None
-    assert len(sent) == 1
-    assert bound.candidate.accepted_profile.tool_dialect == "openai_chat_custom"
+def test_history_body_error_cannot_advance_the_dialect_ladder():
+    candidate = _initial_custom_candidate()
+    error = _HistoryError().body["error"]
+    assert dispatch.plan_direct_openai_dialect_candidate(
+        target=_target(),
+        source_payload=_dispatch_source(),
+        current=candidate,
+        error=error,
+        body_error=True,
+    ) is None
 
 
 def test_background_remeasures_growth_before_every_physical_send(monkeypatch, tmp_path):

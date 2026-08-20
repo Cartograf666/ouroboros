@@ -28,6 +28,11 @@ from ouroboros.request_wire_receipts import (
     WireAppliedAction,
     WireCandidateSpec,
     bind_wire_candidate,
+    direct_openai_tool_candidate_ladder,
+)
+from ouroboros.request_wire_recovery import (
+    register_wire_candidate,
+    request_wire_call_scope,
 )
 from ouroboros.usage_accounting import (
     PhysicalAttemptCapture,
@@ -199,7 +204,7 @@ def _install_transport(monkeypatch, client, responses, *, no_proxy=False, max_se
 
     monkeypatch.setattr(llm_module, "_execute_candidate", execute)
     monkeypatch.setattr(
-        dispatch,
+        llm_module,
         "last_physical_attempt_capture",
         lambda: capture_holder["value"],
     )
@@ -268,7 +273,7 @@ def test_public_chat_model_agnostic_custom_normalize_and_continuation(monkeypatc
     assert dispatch.CUSTOM_RECEIPTS_USAGE_KEY not in final_usage
 
 
-def test_pending_custom_replacement_text_cannot_bind_compatibility(monkeypatch):
+def test_pending_custom_replacement_text_cannot_bind_compatibility():
     source = {
         "model": "future-model-without-prefix",
         "messages": [{"role": "user", "content": "Use a tool."}],
@@ -303,50 +308,20 @@ def test_pending_custom_replacement_text_cannot_bind_compatibility(monkeypatch):
         ladder_ordinal=2,
         applied_actions=(WireAppliedAction.pending(replacement),),
     )
-    capture = PhysicalAttemptCapture(
-        attempt_id="attempt-pending-custom",
-        model=candidate.physical_model,
-        provider=candidate.accepted_profile.provider,
-        state="settled",
-        candidate_measurement_kind="canonical_json_v1",
-        candidate_raw_sha256=candidate.candidate_sha256,
-        candidate_manifest_ref={
-            "path": "physical/attempt-pending-custom.json",
-            "call_id": "attempt-pending-custom",
-            "sha256": canonical_sha256("attempt-pending-custom"),
-        },
-    )
-    bound = dispatch.BoundDirectOpenAICompletion(
-        _text_response(),
-        candidate,
-        capture,
-    )
-    compatibility_binds = []
-    monkeypatch.setattr(
-        dispatch,
-        "bind_wire_compatibility_receipt",
-        lambda **kwargs: compatibility_binds.append(kwargs),
-    )
-
-    with pytest.raises(ValueError, match="requires a custom tool call"):
-        dispatch.normalize_direct_openai_completion(
-            {"role": "assistant", "content": "done"},
-            {},
-            bound,
-        )
-    assert compatibility_binds == []
+    with request_wire_call_scope():
+        register_wire_candidate(candidate, source_payload=source, target=_target())
+        with pytest.raises(ValueError, match="requires a custom tool call"):
+            dispatch.normalize_direct_openai_completion(
+                {"role": "assistant", "content": "done"}, {}, None,
+            )
 
 
 def test_exact_rejections_preserve_custom_function_none_reason_order(monkeypatch):
     client = LLMClient(api_key="test")
-    ladder = dispatch.direct_openai_candidate_ladder(_target(), {
-        "model": "future-model-without-prefix",
-        "messages": [{"role": "user", "content": "Use a tool."}],
-        "reasoning_effort": "medium",
-        "tool_choice": "auto",
-        "tools": _tools(),
-    })
-    assert [item.candidate_spec.reason_code for item in ladder] == [
+    ladder = direct_openai_tool_candidate_ladder(
+        "medium", remaining_physical_attempts=3,
+    )
+    assert [item.reason_code for item in ladder] == [
         "requested_wire_form",
         "provider_rejected_tool_dialect",
         "task_local_availability_fallback",
@@ -540,7 +515,16 @@ def test_generic_effort_value_rejection_is_not_a_tool_dialect_rejection():
         "tool_choice": "auto",
         "tools": _tools(),
     }
-    candidate = dispatch.direct_openai_candidate_ladder(_target(), source)[0]
+    candidate = bind_wire_candidate(
+        target=_target(),
+        api_surface="chat.completions",
+        source_payload=source,
+        candidate_spec=WireCandidateSpec(
+            "openai_chat_custom", "medium", "requested_wire_form",
+        ),
+        requested_effort="medium",
+        ladder_ordinal=1,
+    )
     error = _DialectError(
         "reasoning_effort value medium is unsupported for this model",
         param="reasoning_effort",

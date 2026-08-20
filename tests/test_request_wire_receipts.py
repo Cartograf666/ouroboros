@@ -340,7 +340,7 @@ def test_requested_custom_projection_is_first_class_and_never_committed(tmp_path
         "to": "openai_chat_custom",
         "reason_code": "provider_rejected_tool_dialect",
     })
-    with pytest.raises(ValueError, match="compose only with durable actions"):
+    with pytest.raises(ValueError, match="not a dialect action"):
         bind_wire_candidate(
             target=_target(),
             api_surface="chat.completions",

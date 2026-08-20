@@ -3901,16 +3901,8 @@ class LLMClient:
         kwargs: Dict[str, Any],
         target: Dict[str, Any],
     ) -> Any:
-        usage_model = str(target.get("usage_model") or target.get("resolved_model") or "")
-
-        def _send(candidate: Any) -> Any:
-            from ouroboros.request_wire_receipts import WireCandidateManifest
-
-            candidate = (
-                candidate.physical_payload()
-                if isinstance(candidate, WireCandidateManifest)
-                else _physical_candidate(candidate)
-            )
+        def _send(candidate: Dict[str, Any]) -> Any:
+            candidate = _physical_candidate(candidate)
             candidate = prepare_wire_payload_for_send(
                 target, candidate, api_surface="chat.completions",
             )
@@ -3931,37 +3923,6 @@ class LLMClient:
             except Exception:
                 note_wire_send_failed()
                 raise
-
-        def _recover_wire_source(
-            source: Dict[str, Any],
-            failure: Exception,
-            spec: Any,
-        ) -> Optional[Dict[str, Any]]:
-            from ouroboros.request_wire_contract import infer_tool_dialect, payload_effort
-
-            if spec.task_local:
-                return None
-            retry = self._retry_without_prompt_cache_parameter(source, target, failure)
-            if retry is None:
-                retry = self._retry_without_optional_sampling(source, usage_model, failure)
-            if (
-                retry is None
-                or payload_effort(retry) != payload_effort(source)
-                or infer_tool_dialect(retry) != "function"
-            ):
-                return None
-            return retry
-
-        from ouroboros.openai_chat_dispatch import dispatch_direct_openai_chat
-
-        wire_completion = dispatch_direct_openai_chat(
-            target,
-            _physical_candidate(kwargs),
-            send=_send,
-            recover_same_candidate=_recover_wire_source,
-        )
-        if wire_completion is not None:
-            return wire_completion
 
         def _body_error(response: Any) -> Optional[Dict[str, Any]]:
             try:
