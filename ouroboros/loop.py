@@ -6799,10 +6799,7 @@ def run_llm_loop(
         active_context_mode = _preferred_context_mode
     llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
     accumulated_usage: Dict[str, Any] = {}
-    # Published as a live reference so blocking tools (wait_task/wait_tasks/
-    # delegate_wait) can read RECORDED per-send facts — e.g. the APPLIED
-    # prompt-cache TTL (`_last_prompt_cache_ttl`) behind the cache-horizon
-    # disclosure — without a second, route-derived predictor.
+    # Shared live reference to recorded per-send facts for blocking tools.
     tools._ctx._accumulated_usage = accumulated_usage
     max_retries = 3
     cost_ceiling = _resolve_task_cost_ceiling(ctx, budget_remaining_usd)

@@ -22,7 +22,6 @@ from ouroboros.provider_models import OPENROUTER_DEFAULTS, OPENROUTER_REVIEW_DEF
 from ouroboros.secret_masking import strip_masked_secrets
 from ouroboros.update_channels import UPDATE_SETTINGS_DEFAULTS, normalize_update_channel
 
-
 # Paths
 HOME = pathlib.Path.home()
 APP_ROOT = pathlib.Path(os.environ.get("OUROBOROS_APP_ROOT", HOME / "Ouroboros"))
@@ -36,8 +35,7 @@ RESTART_EXIT_CODE = 42
 PANIC_EXIT_CODE = 99
 AGENT_SERVER_PORT = 8765
 FINALIZATION_GRACE_DEFAULT_SEC = 120
-# Owner finalize-then-stop OUTER safety cap (S3, owner decisions 2026-08-15),
-# from the stop REQUEST; the grace budget above starts only at control DELIVERY
+# Owner finalization outer cap starts at the stop request; grace starts at control delivery
 # (the loop's mailbox drain). No summary by this cap -> honest custody cancel.
 OWNER_STOP_OUTER_CAP_SEC = 600
 # Cadence for intrinsic self-pacing checkpoints when a task has NO deadline_at
