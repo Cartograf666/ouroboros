@@ -563,8 +563,11 @@ test('the generated onboarding draft shows a credentialed one-harness API scout 
     assert.equal(previews.length >= 1, true);
     assert.equal(previews.at(-1).subscriptionsConnected, true);
     assert.equal(step.availableSubagents.items[0].subagent_id, 'api_fast_scout');
-    assert.match(dom.nodes.get('onboarding-available-subagents').innerHTML, /Fast API scout/);
-    assert.match(dom.nodes.get('onboarding-available-subagents').innerHTML, /Codex builder/);
+    assert.match(dom.nodes.get('onboarding-available-subagents').innerHTML, /Subagent 1/);
+    assert.match(dom.nodes.get('onboarding-available-subagents').innerHTML, /Fast independent research before implementation/);
+    assert.match(dom.nodes.get('onboarding-available-subagents').innerHTML, /Subagent 2/);
+    assert.match(dom.nodes.get('onboarding-available-subagents').innerHTML, /Workspace implementation/);
+    assert.doesNotMatch(dom.nodes.get('onboarding-available-subagents').innerHTML, /data-subagent-field="(?:id|name)"/);
     assert.match(dom.nodes.get('onboarding-available-subagents').innerHTML, /Generated draft/);
     assert.deepEqual(step.validateSubagents(), []);
 

@@ -1241,12 +1241,15 @@ Before every commit, verify the following:
 - One capability, one section. The whole task-actor story lives in Agents →
   **Available subagents** (`web/modules/subagents_settings.js`), beside but not
   inside Review lanes. It edits one canonical `OUROBOROS_SUBAGENTS` object with a
-  list-level Enabled flag and at most ten stable rows. Each row owns its id, name,
-  free-text Recommended use, API-model or Agent-session route, optional effort and
-  optional session account pin. The write permission, active/depth counts and path
-  roots remain orthogonal controls in that section; `OUROBOROS_MAX_WORKERS` stays in
-  Advanced because it sizes the process pool. Never render a second control over
-  the same settings key.
+  list-level Enabled flag and at most ten stable rows. The UI numbers rows and asks
+  the owner for one prose field, Description (`recommended_use`); id and compatibility
+  name stay automatic and hidden, while API-model or Agent-session route, optional
+  effort and optional session account pin remain structured controls. Never derive
+  durable identity from the visual ordinal: removing a preceding row must not change
+  task snapshots or receipts. The write permission, active/depth counts and path roots
+  remain orthogonal controls in that section; `OUROBOROS_MAX_WORKERS` stays in Advanced
+  because it sizes the process pool. Never render a second control over the same
+  settings key.
   Share only neutral route/model/account/effort/status primitives with reviewer
   rows (`route_editor_primitives.js`). Preserve the two public schemas: task API
   routes serialize `api_model`, reviewer routes `api_chat`; task pins serialize

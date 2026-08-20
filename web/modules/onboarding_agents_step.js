@@ -489,8 +489,8 @@ export function agentsStepHtml() {
         <div class="panel-card" id="agents-available-subagents-card">
             <h3>Available subagents</h3>
             <div class="agent-ladder-note">
-                This generated draft is what Ouroboros will see. Edit names, recommended uses,
-                routes, models, effort, or account pins before finishing setup.
+                This generated draft is what Ouroboros will see. Describe when each numbered
+                subagent is useful, then adjust its route, model, effort, or account pin if needed.
             </div>
             ${availableSubagentsEditorHost('onboarding-available-subagents')}
         </div>

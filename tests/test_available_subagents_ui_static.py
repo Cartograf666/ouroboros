@@ -21,6 +21,11 @@ def test_available_subagents_is_one_canonical_settings_editor() -> None:
     assert "OUROBOROS_SUBAGENT_HARNESS" not in editor
     assert "OUROBOROS_SUBAGENT_PROFILE" not in editor
     assert "MAX_AVAILABLE_SUBAGENTS = 10" in editor
+    assert 'class="available-subagent-heading"' in editor
+    assert 'Subagent ${ordinal}' in editor
+    assert 'data-subagent-field="recommended_use"' in editor
+    assert 'data-subagent-field="id"' not in editor
+    assert 'data-subagent-field="name"' not in editor
     for action in ("data-subagent-add", "data-subagent-duplicate", "data-subagent-remove"):
         assert action in editor
 

@@ -940,7 +940,6 @@ textarea:focus {
   background: var(--panel-3);
 }
 
-.available-subagent-identity,
 .available-subagent-route {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -949,7 +948,13 @@ textarea:focus {
 
 .available-subagent-route { grid-template-columns: repeat(4, minmax(120px, 1fr)); }
 
-.available-subagent-identity label,
+.available-subagent-heading {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--type-body);
+  font-weight: 600;
+}
+
 .available-subagent-purpose {
   display: flex;
   flex-direction: column;
@@ -1282,7 +1287,6 @@ textarea:focus {
     grid-template-columns: 1fr;
   }
 
-  .available-subagent-identity,
   .available-subagent-route {
     grid-template-columns: 1fr;
   }

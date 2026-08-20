@@ -345,6 +345,25 @@ test('save materializes a readable name but never rewrites stable identity or pu
     assert.equal(built.items[0].recommended_use, '  owner text  ');
 });
 
+test('the editor shows a numbered row and only one owner-authored prose field', () => {
+    const html = availableSubagentRowMarkup(apiRow(), {
+        catalogKnown: false,
+        accountsKnown: false,
+        quotaKnown: false,
+        statusError: '',
+        snapshot: null,
+    }, 2);
+
+    assert.match(html, /class="available-subagent-heading"[^>]*>Subagent 3</);
+    assert.match(html, />Description\s*<textarea data-subagent-field="recommended_use"/);
+    assert.equal((html.match(/<textarea\b/g) || []).length, 1);
+    assert.doesNotMatch(html, /data-subagent-field="(?:id|name)"/);
+    assert.doesNotMatch(html, />Stable ID<|<label>Name/);
+    assert.match(html, /data-subagent-field="model"/);
+    assert.match(html, /aria-labelledby="available-subagent-api_scout-heading"/);
+    assert.match(html, /aria-label="Duplicate Subagent 3"/);
+});
+
 test('API and session rows render different controls; account belongs only to session', () => {
     const state = {
         catalogKnown: true,
@@ -365,11 +384,11 @@ test('API and session rows render different controls; account belongs only to se
         },
     };
     const apiHtml = availableSubagentRowMarkup(apiRow(), state);
-    assert.match(apiHtml, /aria-label="API model"/);
+    assert.match(apiHtml, /aria-label="API model for Subagent 1"/);
     assert.doesNotMatch(apiHtml, /data-subagent-field="account"/);
 
     const sessionHtml = availableSubagentRowMarkup(sessionRow(), state);
-    assert.match(sessionHtml, /aria-label="Agent session model"/);
+    assert.match(sessionHtml, /aria-label="Agent session model for Subagent 1"/);
     assert.match(sessionHtml, /data-subagent-field="account"/);
     assert.match(sessionHtml, /Account: koshak \(pinned\)/);
 });
@@ -633,4 +652,5 @@ test('Settings section keeps global task-authority controls beside the actor lis
     assert.match(html, /id="s-subagent-depth"/);
     assert.match(html, /id="s-subagent-worktree-root"/);
     assert.match(html, /id="s-subagent-projects-root"/);
+    assert.doesNotMatch(html, /chooses one by its stable ID/);
 });

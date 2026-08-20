@@ -557,7 +557,6 @@
     background: var(--surface-card-soft);
 }
 
-.available-subagent-identity,
 .available-subagent-route {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -568,7 +567,13 @@
     grid-template-columns: repeat(4, minmax(130px, 1fr));
 }
 
-.available-subagent-identity label,
+.available-subagent-heading {
+    margin: 0;
+    color: var(--text-primary);
+    font-size: var(--type-body);
+    font-weight: 600;
+}
+
 .available-subagent-purpose {
     display: flex;
     flex-direction: column;
@@ -873,7 +878,6 @@
         align-items: stretch;
     }
 
-    .available-subagent-identity,
     .available-subagent-route {
         grid-template-columns: 1fr;
     }

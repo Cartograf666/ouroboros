@@ -340,7 +340,10 @@ function restoreFocus(host, saved) {
     host.scrollTop = saved.scrollTop;
 }
 
-export function availableSubagentRowMarkup(row, state) {
+export function availableSubagentRowMarkup(row, state, index = 0) {
+    const ordinal = index + 1;
+    const rowKey = row._uiKey || row.subagent_id;
+    const headingId = `available-subagent-${rowKey}-heading`;
     const session = row.route.kind === ROUTE_KIND_AGENT_SESSION;
     const split = session ? splitSessionTarget(row.route.target_id) : { harness: '', model: '' };
     const harnesses = harnessMap(state.snapshot);
@@ -362,32 +365,25 @@ export function availableSubagentRowMarkup(row, state) {
     const meta = [savedIntentStatus(row, state), gap, evidence ? `Last actual run: ${evidence}` : '']
         .filter(Boolean).join(' · ');
     return `
-        <article class="available-subagent-row" data-subagent-row="${escapeHtml(row._uiKey || row.subagent_id)}">
-            <div class="available-subagent-identity">
-                <label>Stable ID
-                    <input data-subagent-field="id" value="${escapeHtml(row.subagent_id)}" autocomplete="off" spellcheck="false">
-                </label>
-                <label>Name
-                    <input data-subagent-field="name" value="${escapeHtml(row.name)}" autocomplete="off">
-                </label>
-            </div>
-            <label class="available-subagent-purpose">Recommended use
-                <textarea data-subagent-field="recommended_use" rows="2" placeholder="When should Ouroboros choose this subagent?">${escapeHtml(row.recommended_use)}</textarea>
+        <article class="available-subagent-row" data-subagent-row="${escapeHtml(rowKey)}" aria-labelledby="${escapeHtml(headingId)}">
+            <h4 class="available-subagent-heading" id="${escapeHtml(headingId)}">Subagent ${ordinal}</h4>
+            <label class="available-subagent-purpose">Description
+                <textarea data-subagent-field="recommended_use" rows="2" aria-label="Description for Subagent ${ordinal}" placeholder="When should Ouroboros choose this subagent?">${escapeHtml(row.recommended_use)}</textarea>
             </label>
             <div class="available-subagent-route">
-                ${selectHtml('data-subagent-field="route" aria-label="Subagent type"', routeGroups, encodeRouteChoice(row))}
+                ${selectHtml(`data-subagent-field="route" aria-label="Type for Subagent ${ordinal}"`, routeGroups, encodeRouteChoice(row))}
                 ${session
-                    ? selectHtml('data-subagent-field="model" aria-label="Agent session model"', [{ label: '', options: modelOptions }], split.model)
-                    : `<input data-subagent-field="model" list="available-subagent-api-model-catalog" value="${escapeHtml(row.route.target_id || '')}" placeholder="provider/model-id" autocomplete="off" spellcheck="false" aria-label="API model">`}
+                    ? selectHtml(`data-subagent-field="model" aria-label="Agent session model for Subagent ${ordinal}"`, [{ label: '', options: modelOptions }], split.model)
+                    : `<input data-subagent-field="model" list="available-subagent-api-model-catalog" value="${escapeHtml(row.route.target_id || '')}" placeholder="provider/model-id" autocomplete="off" spellcheck="false" aria-label="API model for Subagent ${ordinal}">`}
                 ${session
-                    ? selectHtml('data-subagent-field="account" aria-label="Agent session account"', [{ label: '', options: profileOptions }], row.route.credential_profile_id || '')
+                    ? selectHtml(`data-subagent-field="account" aria-label="Agent session account for Subagent ${ordinal}"`, [{ label: '', options: profileOptions }], row.route.credential_profile_id || '')
                     : ''}
-                ${effortSelectHtml('data-subagent-field="effort" aria-label="Subagent reasoning effort"', row.effort || '', 'route default')}
+                ${effortSelectHtml(`data-subagent-field="effort" aria-label="Reasoning effort for Subagent ${ordinal}"`, row.effort || '', 'route default')}
             </div>
             <div class="available-subagent-meta">${escapeHtml(meta)}</div>
             <div class="available-subagent-actions">
-                <button type="button" class="settings-ghost-btn" data-subagent-duplicate>Duplicate</button>
-                <button type="button" class="settings-ghost-btn" data-subagent-remove>Remove</button>
+                <button type="button" class="settings-ghost-btn" data-subagent-duplicate aria-label="Duplicate Subagent ${ordinal}">Duplicate</button>
+                <button type="button" class="settings-ghost-btn" data-subagent-remove aria-label="Remove Subagent ${ordinal}">Remove</button>
             </div>
         </article>`;
 }
@@ -505,14 +501,6 @@ export function createAvailableSubagentsEditor({
                 (item) => (item._uiKey || item.subagent_id) === rowElement.dataset.subagentRow,
             );
             if (!row) return;
-            rowElement.querySelector('[data-subagent-field="id"]')?.addEventListener('input', (event) => {
-                row.subagent_id = String(event.target.value || '');
-                markDirty();
-            });
-            rowElement.querySelector('[data-subagent-field="name"]')?.addEventListener('input', (event) => {
-                row.name = String(event.target.value || '');
-                markDirty();
-            });
             rowElement.querySelector('[data-subagent-field="recommended_use"]')?.addEventListener('input', (event) => {
                 row.recommended_use = String(event.target.value || '');
                 markDirty();
@@ -598,7 +586,7 @@ export function createAvailableSubagentsEditor({
             <div data-subagents-validation class="available-subagents-diagnostics" data-tone="error" ${errors.length ? '' : 'hidden'}>${escapeHtml(errors[0] || '')}</div>
             <div class="available-subagents-list">
                 ${state.loaded
-                    ? state.setting.items.map((row) => availableSubagentRowMarkup(row, state)).join('')
+                    ? state.setting.items.map((row, index) => availableSubagentRowMarkup(row, state, index)).join('')
                         || '<div class="available-subagents-empty">No subagents configured. Add one, or leave the list empty to make no actors available.</div>'
                     : '<div class="available-subagents-empty">The saved configuration could not be loaded, so this editor will not replace it.</div>'}
             </div>
@@ -806,9 +794,9 @@ export function renderSubagentsSection() {
         <div class="form-section" id="subagents-section">
             <h3>Available subagents</h3>
             <div class="settings-section-copy">
-                Ouroboros sees every row while this list is enabled and chooses one by its stable ID.
-                Each row is a complete execution choice; a route that is unavailable stays saved and
-                returns an explicit refusal instead of silently changing actor or model. An unpinned
+                Describe when Ouroboros should choose each numbered subagent, then select how it runs.
+                Internal references stay stable automatically. A route that is unavailable stays saved
+                and returns an explicit refusal instead of silently changing actor or model. An unpinned
                 session row may rotate among compatible healthy accounts for that same route.
             </div>
             ${availableSubagentsEditorHost()}
