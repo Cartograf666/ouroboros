@@ -1640,6 +1640,17 @@ def _advisory_pre_sdk_gate(
                 "readiness_warnings": readiness_warnings,
             })
         ctx.emit_progress_fn("Tests passed ✓ — proceeding with advisory SDK call.")
+        # Single-run contract for managed-update resolutions (Q10): a green full
+        # hermetic run here is durable proof for the exact candidate tree; the
+        # managed commit gate reuses it instead of paying a second full run.
+        try:
+            from supervisor.update_merge import record_managed_tests_evidence
+
+            record_managed_tests_evidence(
+                getattr(ctx, "task_id", ""), getattr(ctx, "task_metadata", None)
+            )
+        except Exception:
+            log.debug("managed tests evidence recording failed", exc_info=True)
 
     return readiness_warnings, changed_files, None
 

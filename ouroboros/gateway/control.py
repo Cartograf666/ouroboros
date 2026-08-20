@@ -401,7 +401,7 @@ def _quiesce_repo_writers(reason: str) -> list[str]:
     return [f"service:{label}" for label in failed] + custody_blockers
 
 
-def _fence_failure(blockers: list[str]) -> JSONResponse:
+def _fence_failure(blockers: list[str], stash_note: str = "") -> JSONResponse:
     restart_required = not all(str(item).startswith("active:") for item in blockers)
     return JSONResponse(
         {
@@ -412,6 +412,7 @@ def _fence_failure(blockers: list[str]) -> JSONResponse:
             "reason": "update_writer_fence_blocked",
             "blockers": blockers,
             "restart_required": restart_required,
+            **({"stash_note": stash_note} if stash_note else {}),
         },
         status_code=409,
     )
@@ -463,19 +464,125 @@ def _restart_response(request: Request, *, strategy: str, plan: dict) -> JSONRes
     )
 
 
-def _start_assisted_merge_fenced(plan: dict) -> JSONResponse:
-    """Stage the exact planned merge and enqueue its one reviewed resolver."""
+def _stash_local_work_fenced(
+    *, branch: str, base_sha: str, target_sha: str, plan: dict
+) -> tuple[dict | None, JSONResponse | None]:
+    """Shared stash-first prologue for BOTH update lanes (owner decisions Q1=C, Q9).
+
+    Runs AFTER the writer fence and BEFORE the authoritative replan, so the final
+    plan — conflict inventory included — is computed from the exact clean tree the
+    merge will run on (a plan computed over dirty content that a later stash
+    removes could route to the wrong lane). Writes the durable ``stashing_local_work``
+    tx BEFORE the stash mutation (boot recovery restores a crash in between) and
+    fails closed on an unexplained still-dirty tree. Returns ``(tx, None)`` on
+    success or ``(None, error_response)``."""
     import uuid as _uuid
 
+    from supervisor.git_ops import git_capture
+    from supervisor.update_merge import (
+        clear_update_tx,
+        stash_local_changes_for_update,
+        write_update_tx,
+    )
+
+    attempt_id = _uuid.uuid4().hex[:12]
+    tx = {
+        "phase": "stashing_local_work",
+        "pre_update_sha": base_sha,
+        "pre_update_branch": branch,
+        "base_sha": base_sha,
+        "target_sha": target_sha,
+        "target_ref": str(plan.get("target_ref") or ""),
+        "update_channel": str(plan.get("update_channel") or ""),
+        "attempt_id": attempt_id,
+        "stash_sha": "",
+        "local_work_carrier": "none",
+        "requested_at": utc_now_iso(),
+    }
+    rc_ds, dirty_now, dirty_error = git_capture(["git", "status", "--porcelain"])
+    if rc_ds != 0:
+        _respawn_workers_after_failed_update()
+        return None, JSONResponse(
+            {"error": f"could not inspect local changes before the update: {dirty_error}"},
+            status_code=409,
+        )
+    if dirty_now.strip():
+        write_update_tx(tx)
+        stash_status, stash_sha, stash_error = stash_local_changes_for_update(attempt_id)
+        if stash_status == "ok" and not stash_sha:
+            rc_rs, still_dirty, _rse = git_capture(["git", "status", "--porcelain"])
+            if rc_rs != 0 or still_dirty.strip():
+                stash_status, stash_error = "push_failed", (
+                    "the worktree still reports local changes after an empty stash"
+                )
+        if stash_status == "lookup_unknown":
+            # The entry EXISTS but cannot be listed: KEEP the durable
+            # stashing_local_work tx — boot retries the lookup and restores;
+            # clearing it here would orphan the owner's work behind an HTTP
+            # error that may never be seen.
+            _respawn_workers_after_failed_update()
+            return None, JSONResponse(
+                {"error": f"could not verify the update stash: {stash_error}",
+                 "reason": "stash_lookup_unknown"},
+                status_code=409,
+            )
+        if stash_status != "ok":
+            clear_update_tx()
+            _respawn_workers_after_failed_update()
+            return None, JSONResponse(
+                {"error": f"could not preserve local changes before the update: {stash_error}"},
+                status_code=409,
+            )
+        tx["stash_sha"] = stash_sha
+        tx["local_work_carrier"] = "stash" if stash_sha else "none"
+        write_update_tx(tx)
+        if stash_sha:
+            # The stash commit is now the ONLY durable home of the owner's
+            # uncommitted+untracked work — pin it for BOTH lanes so gc or a
+            # stash drop can never lose it.
+            from supervisor.update_merge import create_rescue_local_ref
+
+            if not create_rescue_local_ref(stash_sha):
+                note = _unwind_stashed_update(tx, "stash_pin_failed")
+                _respawn_workers_after_failed_update()
+                return None, JSONResponse(
+                    {"error": "could not durably pin the local update stash",
+                     **({"stash_note": note} if note else {})},
+                    status_code=409,
+                )
+    return tx, None
+
+
+def _unwind_stashed_update(tx: dict, context: str) -> str:
+    """Undo the stash prologue when the update aborts before any repo mutation:
+    restore the exact stash entry (marker-guarded — a crash between the stash
+    apply and its drop must not let boot's replay wipe the already-restored
+    copy) and clear the tx. Returns a disclosure note ("" when clean)."""
+    from supervisor.update_merge import clear_update_tx, restore_stash_with_marker
+
+    note = restore_stash_with_marker(tx, context)
+    if not clear_update_tx():
+        note = (note + "; " if note else "") + "the update transaction marker could not be cleared"
+    return note
+
+
+def _start_assisted_merge_fenced(plan: dict, tx: dict) -> JSONResponse:
+    """Stage the exact planned merge and enqueue its one reviewed resolver.
+
+    ``tx`` is the shared stash-first prologue transaction: the owner's dirty and
+    untracked work already rides its stash entry (``stash_sha``), the tree is
+    clean, and ``plan`` was computed from that clean tree — so
+    ``plan.local_snapshot == base_sha`` and the merge needs no synthetic
+    snapshot commit."""
     from supervisor.git_ops import (
         BRANCH_DEV, _collect_repo_sync_state, _create_rescue_snapshot,
     )
     from supervisor.state import budget_remaining, load_state
     from supervisor.update_merge import (
         assisted_writer_gate_reason,
-        create_rescue_local_ref,
         enqueue_assisted_resolution_task,
         ensure_assisted_resolver_ready,
+        existing_failed_update_ref,
         materialize_assisted_merge_live,
         write_update_tx,
     )
@@ -486,44 +593,159 @@ def _start_assisted_merge_fenced(plan: dict) -> JSONResponse:
     target_sha = str(plan.get("target_sha") or "")
     local_snapshot = str(plan.get("local_snapshot") or "")
     if not local_snapshot or not target_sha:
+        note = _unwind_stashed_update(tx, "assisted_admission_failed")
         _respawn_workers_after_failed_update()
-        return JSONResponse({"error": "could not build local snapshot / target"}, status_code=409)
+        return JSONResponse(
+            {"error": "could not build local snapshot / target",
+             **({"stash_note": note} if note else {})},
+            status_code=409,
+        )
     try:
         remaining = budget_remaining(load_state() or {}, strict=True)
     except Exception:
+        note = _unwind_stashed_update(tx, "assisted_admission_failed")
         _respawn_workers_after_failed_update()
         return JSONResponse(
-            {"error": "Assisted update cannot start because model budget authority is unavailable."},
+            {"error": "Assisted update cannot start because model budget authority is unavailable.",
+             **({"stash_note": note} if note else {})},
             status_code=409,
         )
     if remaining <= 0:
+        note = _unwind_stashed_update(tx, "assisted_admission_failed")
         _respawn_workers_after_failed_update()
         return JSONResponse(
-            {"error": "Assisted update needs model budget to review local changes; nothing was changed."},
+            {"error": "Assisted update needs model budget to review local changes; nothing was changed.",
+             **({"stash_note": note} if note else {})},
+            status_code=409,
+        )
+    # Affordability floor: a resolution that cannot buy even ONE full triad+scope
+    # review wave would mutate the live tree into a conflicted merge and then
+    # stall mid-review. "One full wave" is priced HONESTLY at the review packs'
+    # own worst-case caps — the shared 920K-token input SSOT per API row, the
+    # triad's default output reserve, and the scope reviewer's 100K output
+    # reserve — with the shared reservation math (agent-session rows ride
+    # subscriptions, not USD budget); fail-open on estimator errors, mirroring
+    # review_wave_admission's own contract.
+    admission = {"fits": True}
+    try:
+        from ouroboros.reviewer_slot_config import commit_scope_rows, commit_triad_rows
+        from ouroboros.tools.review_helpers import REVIEW_PROMPT_TOKEN_BUDGET
+        from ouroboros.usage_accounting import review_wave_admission
+
+        triad_models = [
+            row.target_id for row in commit_triad_rows()
+            if not row.is_session and row.target_id
+        ]
+        scope_models = [
+            row.target_id for row in commit_scope_rows()
+            if not row.is_session and row.target_id
+        ]
+        prompt_chars_cap = int(REVIEW_PROMPT_TOKEN_BUDGET) * 4
+        estimated_total = 0.0
+        any_estimate = False
+        unpriced_total = 0
+        for models, max_out in ((triad_models, 65_536), (scope_models, 100_000)):
+            if not models:
+                continue
+            part = review_wave_admission(
+                root_task_id="managed-update-admission",
+                models=models,
+                prompt_chars=prompt_chars_cap,
+                max_completion_tokens=max_out,
+                remaining_usd_override=float(remaining),
+            )
+            part_estimate = part.get("estimated_wave_usd")
+            unpriced_total += int(part.get("unpriced_slots") or 0)
+            if part_estimate is not None:
+                estimated_total += float(part_estimate)
+                any_estimate = True
+            else:
+                # The estimator failed open for this whole surface: every one of
+                # its slots is unknown, not silently zero.
+                unpriced_total += len(models)
+        session_slots = sum(
+            1 for row in (*commit_triad_rows(), *commit_scope_rows()) if row.is_session
+        )
+        if any_estimate:
+            admission = {
+                "fits": estimated_total <= float(remaining) + 1e-9,
+                "estimated_wave_usd": round(estimated_total, 6),
+                "remaining_usd": float(remaining),
+                "unpriced_slots": unpriced_total,
+                "session_slots": session_slots,
+            }
+        if admission.get("fits", True) and (unpriced_total or (session_slots and not any_estimate)):
+            # An ADMITTED wave with unknowable parts must not read as a fully
+            # priced estimate later (P1: represent the gap) — one durable line.
+            try:
+                from supervisor.git_ops import DRIVE_ROOT as _dr
+                from ouroboros.utils import append_jsonl as _aj, utc_now_iso as _n
+
+                _aj(_dr / "logs" / "supervisor.jsonl", {
+                    "ts": _n(), "type": "managed_update_wave_floor_partial_unknown",
+                    "estimated_wave_usd": admission.get("estimated_wave_usd"),
+                    "unpriced_slots": unpriced_total, "session_slots": session_slots,
+                    "remaining_usd": float(remaining),
+                })
+            except Exception:
+                log.debug("wave-floor partial-unknown event write failed", exc_info=True)
+    except Exception:
+        log.debug("assisted admission wave estimate failed open", exc_info=True)
+        admission = {"fits": True}
+        try:
+            from supervisor.git_ops import DRIVE_ROOT as _dr2
+            from ouroboros.utils import append_jsonl as _aj2, utc_now_iso as _n2
+
+            _aj2(_dr2 / "logs" / "supervisor.jsonl", {
+                "ts": _n2(), "type": "managed_update_wave_floor_estimator_failed",
+                "remaining_usd": float(remaining),
+            })
+        except Exception:
+            log.debug("estimator-failure event write failed", exc_info=True)
+    if not admission.get("fits", True):
+        note = _unwind_stashed_update(tx, "assisted_admission_failed")
+        _respawn_workers_after_failed_update()
+        estimated = admission.get("estimated_wave_usd")
+        try:
+            from supervisor.git_ops import DRIVE_ROOT
+            from ouroboros.utils import append_jsonl, utc_now_iso as _now
+
+            append_jsonl(DRIVE_ROOT / "logs" / "supervisor.jsonl", {
+                "ts": _now(), "type": "managed_update_wave_floor_refused",
+                "estimated_wave_usd": estimated, "remaining_usd": admission.get("remaining_usd"),
+            })
+        except Exception:
+            log.debug("wave-floor refusal event write failed", exc_info=True)
+        return JSONResponse(
+            {"error": (
+                "Assisted update needs enough model budget for at least one full "
+                f"review wave ({'at least ' if admission.get('unpriced_slots') else ''}≈${estimated} "
+                "estimated at the review packs' worst-case caps for the configured reviewer panel"
+                + (f"; {admission['unpriced_slots']} slot(s) unpriced" if admission.get("unpriced_slots") else "")
+                + f", ${round(float(remaining), 2)} remaining); nothing was changed."
+            ),
+             "estimated_wave_usd": estimated,
+             "remaining_usd": admission.get("remaining_usd"),
+             "unpriced_slots": admission.get("unpriced_slots", 0),
+             **({"stash_note": note} if note else {})},
             status_code=409,
         )
 
     _create_rescue_snapshot(
         branch, "ui_update_assisted_merge", _collect_repo_sync_state(),
     )
-    if not create_rescue_local_ref(local_snapshot):
-        _respawn_workers_after_failed_update()
-        return JSONResponse({"error": "could not preserve the local update snapshot"}, status_code=409)
 
     st = load_state() or {}
     try:
         owner_chat_id = int(st.get("owner_chat_id") or 0)
     except (TypeError, ValueError):
         owner_chat_id = 0
+    import uuid as _uuid
+
     task_id = "update_assisted_merge_" + _uuid.uuid4().hex[:8]
-    tx = {
+    prior_attempt_ref = existing_failed_update_ref(target_sha, not_at=base_sha)
+    tx.update({
         "phase": "materializing_assisted",
-        "pre_update_sha": base_sha,
-        "pre_update_branch": branch,
-        "base_sha": base_sha,
-        "target_sha": target_sha,
-        "target_ref": str(plan.get("target_ref") or ""),
-        "update_channel": str(plan.get("update_channel") or ""),
         "local_snapshot": local_snapshot,
         "conflict_paths": (
             list(plan.get("code_conflict_paths") or [])
@@ -532,8 +754,8 @@ def _start_assisted_merge_fenced(plan: dict) -> JSONResponse:
         "task_id": task_id,
         "owner_chat_id": owner_chat_id,
         "resolution_attempts": 0,
-        "requested_at": utc_now_iso(),
-    }
+        **({"failed_update_ref": prior_attempt_ref} if prior_attempt_ref else {}),
+    })
     close_repo_writer_admission(assisted_writer_gate_reason(tx))
     if not ensure_assisted_resolver_ready(base_sha):
         blockers = kill_workers_for_update(
@@ -541,19 +763,56 @@ def _start_assisted_merge_fenced(plan: dict) -> JSONResponse:
             terminal_status="interrupted",
         )
         if blockers:
-            return _fence_failure([f"resolver:{item}" for item in blockers])
+            # Even with hung writers the tree itself was never touched: bring the
+            # stashed work back and drop the prologue tx, or the owner is left
+            # with invisible work and a commit-blocking marker until a restart.
+            note = _unwind_stashed_update(tx, "assisted_resolver_fence_blocked")
+            return _fence_failure([f"resolver:{item}" for item in blockers], stash_note=note)
+        # Nothing touched the tree yet: bring the stashed work back and drop the
+        # prologue tx so the owner simply retries.
+        note = _unwind_stashed_update(tx, "assisted_resolver_not_ready")
         _respawn_workers_after_failed_update()
         return JSONResponse(
-            {"error": "Assisted update could not boot its resolver before staging conflicts."},
+            {"error": "Assisted update could not boot its resolver before staging conflicts.",
+             **({"stash_note": note} if note else {})},
+            status_code=409,
+        )
+    # Final late-mutation guard: the resolver boot above can wait ~90s and the
+    # writer fence stops Ouroboros, not humans — re-verify the exact planned
+    # state IMMEDIATELY before the first destructive command.
+    from supervisor.update_merge import destructive_apply_guard
+
+    guard_reason = destructive_apply_guard(branch, base_sha)
+    if guard_reason:
+        note = _unwind_stashed_update(tx, "late_local_changes")
+        _respawn_workers_after_failed_update()
+        return JSONResponse(
+            {"error": f"the repository changed before the merge could be staged ({guard_reason}); "
+                      "nothing was applied — retry the update",
+             "reason": "late_local_changes",
+             **({"stash_note": note} if note else {})},
             status_code=409,
         )
     write_update_tx(tx)
-    ok, msg = materialize_assisted_merge_live(branch, local_snapshot, target_sha, base_sha)
+    ok, msg, m0_tree = materialize_assisted_merge_live(branch, local_snapshot, target_sha, base_sha)
     if not ok:
         return _rollback_fenced_update(
             "assisted_materialize_failed", f"could not stage the merge: {msg}"
         )
     tx["phase"] = "assisted_resolution"
+    tx["m0_tree"] = m0_tree
+    # Truthful work list: mechanical projection (VERSION) may have resolved a
+    # path the plan still counted — the resolver's objective and the review
+    # anchors read the ACTUAL live conflict inventory.
+    try:
+        from supervisor.update_merge import live_unmerged_paths
+
+        actual_conflicts = live_unmerged_paths()
+        # None = Git error: keep the plan's list, never claim "no conflicts".
+        if actual_conflicts is not None:
+            tx["conflict_paths"] = actual_conflicts
+    except Exception:
+        log.debug("live conflict inventory refresh failed; keeping the plan's list", exc_info=True)
     write_update_tx(tx)
     if not enqueue_assisted_resolution_task(tx):
         return _rollback_fenced_update(
@@ -563,12 +822,15 @@ def _start_assisted_merge_fenced(plan: dict) -> JSONResponse:
     return JSONResponse({"status": "assisted_started", "task_id": task_id, "merge_plan": plan})
 
 
-def _apply_clean_merge_fenced(request: Request, plan: dict) -> JSONResponse:
-    """Land one exact clean plan transactionally, then request restart."""
-    import uuid
+def _apply_clean_merge_fenced(request: Request, plan: dict, tx: dict) -> JSONResponse:
+    """Land one exact clean plan transactionally, then request restart.
 
+    ``tx`` is the shared stash-first prologue transaction (owner decision Q1=C:
+    dirty local work rides the stash, never committed history; Q9 unified both
+    lanes behind one prologue). The tree is already clean and ``plan`` was
+    computed from it."""
     from supervisor.git_ops import (
-        BRANCH_DEV, _collect_repo_sync_state, _create_rescue_snapshot, git_capture,
+        BRANCH_DEV, _collect_repo_sync_state, _create_rescue_snapshot,
     )
     from supervisor.update_merge import (
         apply_managed_merge_update,
@@ -579,62 +841,35 @@ def _apply_clean_merge_fenced(request: Request, plan: dict) -> JSONResponse:
     branch = BRANCH_DEV
     merge_commit = str(plan.get("merge_commit") or "")
     if not merge_commit:
+        note = _unwind_stashed_update(tx, "clean_apply_admission_failed")
         _respawn_workers_after_failed_update()
-        return JSONResponse({"error": "clean update plan did not produce a target commit"}, status_code=409)
+        return JSONResponse(
+            {"error": "clean update plan did not produce a target commit",
+             **({"stash_note": note} if note else {})},
+            status_code=409,
+        )
     _create_rescue_snapshot(
         branch, "ui_update_apply_merge", _collect_repo_sync_state(),
     )
-    attempt_id = uuid.uuid4().hex[:12]
-    tx = {
-        "pre_update_sha": str(plan.get("base_sha") or ""),
-        "pre_update_branch": branch,
-        "target_sha": str(plan.get("target_sha") or ""),
-        "target_ref": str(plan.get("target_ref") or ""),
-        "update_channel": str(plan.get("update_channel") or ""),
-        "merge_commit": merge_commit,
-        "phase": "stashing_local_work",
-        "pre_restart_smoke": "pending",
-        "rollback_attempted": False,
-        "attempt_id": attempt_id,
-        "stash_sha": "",
-    }
-    # Owner decision (Q1=C): dirty local work never enters committed history on a
-    # clean auto-update. The decision to stash binds to the LIVE worktree at apply
-    # time (not the plan's possibly-stale dirty count), the durable pre-stash tx
-    # phase lands BEFORE the stash mutation (boot recovers a crash in between),
-    # and an unexplained still-dirty tree fails closed instead of being cleaned.
-    stash_sha = ""
-    rc_ds, dirty_now, dirty_error = git_capture(["git", "status", "--porcelain"])
-    if rc_ds != 0:
+    from supervisor.update_merge import destructive_apply_guard
+
+    guard_reason = destructive_apply_guard(branch, str(tx.get("pre_update_sha") or ""))
+    if guard_reason:
+        note = _unwind_stashed_update(tx, "late_local_changes")
         _respawn_workers_after_failed_update()
         return JSONResponse(
-            {"error": f"could not inspect local changes before the update: {dirty_error}"},
+            {"error": f"the repository changed before the update could be applied ({guard_reason}); "
+                      "nothing was applied — retry the update",
+             "reason": "late_local_changes",
+             **({"stash_note": note} if note else {})},
             status_code=409,
         )
-    if dirty_now.strip():
-        from supervisor.update_merge import (
-            clear_update_tx,
-            stash_local_changes_for_update,
-            write_update_tx as _write_tx,
-        )
-
-        _write_tx(tx)
-        stash_ok, stash_sha, stash_error = stash_local_changes_for_update(attempt_id)
-        if stash_ok and not stash_sha:
-            rc_rs, still_dirty, _rse = git_capture(["git", "status", "--porcelain"])
-            if rc_rs != 0 or still_dirty.strip():
-                stash_ok, stash_error = False, (
-                    "the worktree still reports local changes after an empty stash"
-                )
-        if not stash_ok:
-            clear_update_tx()
-            _respawn_workers_after_failed_update()
-            return JSONResponse(
-                {"error": f"could not preserve local changes before the update: {stash_error}"},
-                status_code=409,
-            )
-    tx["stash_sha"] = stash_sha
-    tx["phase"] = "pending_boot_smoke"
+    tx.update({
+        "merge_commit": merge_commit,
+        "phase": "pending_boot_smoke",
+        "pre_restart_smoke": "pending",
+        "rollback_attempted": False,
+    })
     write_update_tx(tx)
     ok, msg = apply_managed_merge_update(branch, merge_commit)
     if not ok:
@@ -688,6 +923,20 @@ def _apply_smart_update_fenced(
         blockers = _quiesce_repo_writers("smart")
         if blockers:
             return _fence_failure(blockers)
+        # Stash-first (Q9): the owner's dirty + untracked work moves to a stash
+        # BEFORE the authoritative replan, so the final plan — conflict inventory
+        # and lane choice included — describes the exact clean tree the merge
+        # will actually run on.
+        from supervisor.git_ops import BRANCH_DEV as _branch_dev
+
+        tx, stash_failure = _stash_local_work_fenced(
+            branch=_branch_dev,
+            base_sha=expected_base_sha,
+            target_sha=expected_target_sha,
+            plan=plan,
+        )
+        if stash_failure is not None:
+            return stash_failure
         plan2 = plan_managed_update_merge(fetch=False, build=True)
         if (
             not plan2.get("available")
@@ -696,14 +945,36 @@ def _apply_smart_update_fenced(
             or str(plan2.get("target_ref") or "") != str(plan.get("target_ref") or "")
             or str(plan2.get("update_channel") or "") != str(plan.get("update_channel") or "")
         ):
+            note = _unwind_stashed_update(tx, "plan_changed_after_stash")
             _respawn_workers_after_failed_update()
             return JSONResponse(
-                {"error": "the update plan changed while writers were stopping; nothing was applied", "reason": "release_moved", "merge_plan": plan2},
+                {"error": "the update plan changed while writers were stopping; nothing was applied",
+                 "reason": "release_moved", "merge_plan": plan2,
+                 **({"stash_note": note} if note else {})},
+                status_code=409,
+            )
+        # Q1=C / Q9 hard invariant: the replan must describe the CLEAN post-stash
+        # tree. Late local changes (a human editing on the host between the stash
+        # and this point — writers are fenced, humans are not) would otherwise
+        # ride the synthetic-snapshot path into committed history or be wiped by
+        # the destructive apply. Fail closed and disclose.
+        if (
+            int(plan2.get("local_dirty_count") or 0) != 0
+            or str(plan2.get("local_snapshot") or "") != expected_base_sha
+        ):
+            note = _unwind_stashed_update(tx, "late_local_changes")
+            _respawn_workers_after_failed_update()
+            return JSONResponse(
+                {"error": (
+                    "local changes appeared after the update stash; nothing was applied — "
+                    "retry the update"
+                ), "reason": "late_local_changes",
+                 **({"stash_note": note} if note else {})},
                 status_code=409,
             )
         if _plan_is_clean(plan2):
-            return _apply_clean_merge_fenced(request, plan2)
-        return _start_assisted_merge_fenced(plan2)
+            return _apply_clean_merge_fenced(request, plan2, tx)
+        return _start_assisted_merge_fenced(plan2, tx)
     except Exception as exc:
         log.warning("managed smart update failed after writer fence", exc_info=True)
         from supervisor.update_merge import active_update_tx as _active_tx

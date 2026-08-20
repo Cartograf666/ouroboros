@@ -73,6 +73,27 @@ def rescue_pointer_note(tx: Dict[str, Any]) -> str:
     )
 
 
+VERSION_CARRIER_PATHS = frozenset({
+    "VERSION", "pyproject.toml", "README.md", "docs/ARCHITECTURE.md",
+    "web/package.json", "web/modules/api_types.js",
+})
+
+
+def carrier_guidance(conflicts: List[str]) -> str:
+    """Version-carrier guidance for the resolver (owner decisions Q8/Q24): the landed
+    update carries the TARGET's version; prose and history stay the fork's own."""
+    if not any(_norm(path) in VERSION_CARRIER_PATHS for path in conflicts):
+        return ""
+    return (
+        " Version carriers: the update lands under the official target's version — VERSION is "
+        "already projected and every NON-conflicted carrier token (pyproject.toml, "
+        "web/package.json, the README badge, the docs/ARCHITECTURE.md header, install pages) is "
+        "already synced mechanically. In carriers you resolve yourself, make version tokens match "
+        "VERSION exactly. In the README Version History table keep BOTH sides' rows (never delete "
+        "this fork's local history rows); resolve prose conflicts on their merits."
+    )
+
+
 def assisted_objective(tx: Dict[str, Any]) -> str:
     """Objective text for the single authorized assisted-resolution task."""
     target = str(tx.get("target_sha") or "")[:12]
@@ -87,12 +108,22 @@ def assisted_objective(tx: Dict[str, Any]) -> str:
             "The merge itself is clean, but it combines local and official history and therefore "
             "requires review. Inspect the staged combination and correct it if needed."
         )
+    retry_note = ""
+    if str(tx.get("failed_update_ref") or ""):
+        retry_note = (
+            f" A previous attempt at this same update is preserved on branch {tx['failed_update_ref']}; "
+            "you may read files from it for reference, but resolve the staged merge in front of you."
+        )
     return (
         f"A managed Ouroboros update (target {target}) has been merged into your working tree by the "
         "supervisor: MERGE_HEAD is set and the combined tree is staged for review. Do NOT run any git "
         "command (fetch/merge/commit/checkout are blocked) — the merge is already staged for you. "
         f"{work} Do not discard either side merely because a file is normally restricted. When ready, "
         "run `advisory_review` with the commit message, then `commit_reviewed` (it will create the reviewed "
-        "2-parent merge commit), then `request_restart` to finish landing the update."
-        f"{rescue_pointer_note(tx)}"
+        "2-parent merge commit), then `request_restart` to finish landing the update. "
+        f"Terminal contract: if this task ends WITHOUT that reviewed merge commit landing (given up, "
+        f"cancelled, or review not passed), the supervisor rolls the repository back to the pre-update "
+        f"state; your resolution work is normally preserved (best-effort) on branch failed-update-{target} "
+        "plus a rescue snapshot, and the owner can simply retry the update."
+        f"{carrier_guidance(conflicts)}{retry_note}{rescue_pointer_note(tx)}"
     )

@@ -40,7 +40,8 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
   │   ├── git_ops.py           ← Git operations (clone, checkout, rescue, rollback, push, credential helper) and the shared bounded local-Git process runner
   │   ├── update_source.py     ← Official update source selection and network policy applied through the shared bounded Git runner
   │   ├── update_recovery.py   ← Exact owner Restore/promotion: pinned prior HEAD, rescue-before-reset, and one captured SHA for local/remote promotion
-  │   ├── update_merge.py      ← Managed-update engine: exact-target 3-way plan, direct clean fast-forward, reviewed assisted merge materialization, transaction, verified rollback/smoke, and boot recovery
+  │   ├── update_merge.py      ← Managed-update engine: exact-target 3-way plan, direct clean fast-forward, reviewed assisted merge materialization (stash-first: both lanes stash dirty work before the authoritative replan; VERSION + mechanical carrier tokens projected to the target before the M0 pin), transaction (carries `m0_tree`, `tests_evidence`, `stash_sha`/`local_work_carrier`, `failed_update_ref`), verified rollback/smoke, and boot recovery
+  │   ├── update_candidate.py  ← Candidate/carrier primitives split out of `update_merge.py` (re-exported there): private-index worktree tree serialization, rerere-neutral merge flags, the deterministic `failed-update-<target12>` preservation branch (synthetic commit for uncommitted resolutions), stash push/restore with the marker-guarded replay contract, and the single-run `tests_evidence` proof (green pre-commit hermetic run pinned to the exact candidate tree; the managed commit gate reuses it instead of a duplicate run)
   │   └── update_merge_policy.py ← Presentation-only doc/code/hot conflict labels; every conflict uses the same reviewed assisted path
   │
   └── ouroboros/               ← Agent core (runs inside worker processes)

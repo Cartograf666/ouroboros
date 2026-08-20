@@ -106,8 +106,8 @@ def test_stash_roundtrip_restores_local_work(tmp_path, monkeypatch):
     (repo / "a.txt").write_text("dirty\n")
     (repo / "untracked.txt").write_text("scratch\n")
 
-    ok, stash_sha, error = update_merge.stash_local_changes_for_update("t1")
-    assert ok and stash_sha, error
+    status, stash_sha, error = update_merge.stash_local_changes_for_update("t1")
+    assert status == "ok" and stash_sha, error
     assert not _git(repo, "status", "--porcelain").stdout.strip()
 
     restored, note = update_merge.restore_update_stash(stash_sha, context="test")
@@ -121,8 +121,8 @@ def test_stash_on_clean_tree_is_a_noop(tmp_path, monkeypatch):
     repo, head = _init_repo(tmp_path)
     _point_at(monkeypatch, tmp_path, repo, head)
 
-    ok, stash_sha, error = update_merge.stash_local_changes_for_update("t2")
-    assert ok and stash_sha == "", (stash_sha, error)
+    status, stash_sha, error = update_merge.stash_local_changes_for_update("t2")
+    assert status == "ok" and stash_sha == "", (stash_sha, error)
     assert update_merge.restore_update_stash("", context="test") == (True, "")
 
 
@@ -130,8 +130,8 @@ def test_conflicting_restore_keeps_stash_and_discloses(tmp_path, monkeypatch):
     repo, head = _init_repo(tmp_path)
     _point_at(monkeypatch, tmp_path, repo, head)
     (repo / "a.txt").write_text("dirty conflicting edit\n")
-    ok, stash_sha, _error = update_merge.stash_local_changes_for_update("t3")
-    assert ok and stash_sha
+    status, stash_sha, _error = update_merge.stash_local_changes_for_update("t3")
+    assert status == "ok" and stash_sha
     # The updated tree rewrites the same lines the stash carries.
     (repo / "a.txt").write_text("official rewrite\n")
     _git(repo, "add", "-A")
@@ -151,8 +151,8 @@ def test_boot_finalize_restores_stash_and_is_replay_safe(tmp_path, monkeypatch):
     pre = _git(repo, "rev-parse", "HEAD").stdout.strip()
     target = _git(repo, "rev-parse", "remote-sim").stdout.strip()
     (repo / "a.txt").write_text("owner work in flight\n")
-    ok, stash_sha, _error = update_merge.stash_local_changes_for_update("boot1")
-    assert ok and stash_sha
+    status, stash_sha, _error = update_merge.stash_local_changes_for_update("boot1")
+    assert status == "ok" and stash_sha
     _git(repo, "merge", "-q", "--no-ff", "-m", "landed update", target)
     update_merge.write_update_tx({
         "phase": "pending_boot_smoke", "pre_update_sha": pre,
@@ -179,8 +179,8 @@ def test_boot_recovers_pre_apply_stash_crash(tmp_path, monkeypatch):
     repo, head = _init_repo(tmp_path)
     _point_at(monkeypatch, tmp_path, repo, head)
     (repo / "a.txt").write_text("mid-stash crash work\n")
-    ok, stash_sha, _error = update_merge.stash_local_changes_for_update("crash1")
-    assert ok and stash_sha
+    status, stash_sha, _error = update_merge.stash_local_changes_for_update("crash1")
+    assert status == "ok" and stash_sha
     update_merge.write_update_tx({
         "phase": "stashing_local_work", "pre_update_sha": "x" * 40,
         "pre_update_branch": head, "target_sha": "y" * 40,
@@ -215,6 +215,29 @@ def test_rollback_resume_after_restore_keeps_owner_work(tmp_path, monkeypatch):
 
     assert ok, message
     assert (repo / "a.txt").read_text() == "restored owner work\n"
+
+
+def test_stash_push_with_unreadable_list_fails_closed(tmp_path, monkeypatch):
+    """A successful push whose entry cannot be LISTED must refuse the update:
+    proceeding with an empty sha would orphan a real stash entry that no later
+    restore would ever find."""
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    (repo / "work.txt").write_text("dirty\n")
+
+    real_capture = git_ops.git_capture
+
+    def flaky_list(cmd):
+        if cmd[:3] == ["git", "stash", "list"]:
+            return 1, "", "stash storage unreadable"
+        return real_capture(cmd)
+
+    monkeypatch.setattr(git_ops, "git_capture", flaky_list)
+
+    status, sha, error = update_merge.stash_local_changes_for_update("flaky-list")
+
+    assert status == "lookup_unknown" and sha == ""
+    assert "recover" in error or "git stash list" in error
 
 
 def test_managed_post_commit_gate_ignores_skip_tests_and_env(monkeypatch):
@@ -272,8 +295,8 @@ def test_rollback_restores_stashed_local_work(tmp_path, monkeypatch):
     pre = _git(repo, "rev-parse", "HEAD").stdout.strip()
     target = _git(repo, "rev-parse", "remote-sim").stdout.strip()
     (repo / "a.txt").write_text("keep this local work\n")
-    ok, stash_sha, _error = update_merge.stash_local_changes_for_update("t4")
-    assert ok and stash_sha
+    status, stash_sha, _error = update_merge.stash_local_changes_for_update("t4")
+    assert status == "ok" and stash_sha
     _git(repo, "checkout", "-q", "-B", head, target)
     update_merge.write_update_tx({
         "phase": "pending_boot_smoke", "pre_update_sha": pre,

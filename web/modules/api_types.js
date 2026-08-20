@@ -1020,6 +1020,9 @@
  * @property {boolean=} restart_required
  * @property {UpdateMergePlan=} merge_plan
  * @property {Object=} smoke
+ * @property {string=} stash_note Stash-first prologue disclosure: how stashed local work was unwound.
+ * @property {?number=} estimated_wave_usd Wave-floor admission estimate (worst-case review-pack caps).
+ * @property {?number=} remaining_usd Remaining model budget the floor compared against.
  */
 
 /**

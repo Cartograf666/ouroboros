@@ -131,6 +131,7 @@ BAND_PATHS = {
     "ouroboros/agent_startup_checks.py": None,
     "ouroboros/extension_process_runner.py": None,
     "ouroboros/gateway/contracts.py": None,
+    "ouroboros/gateway/control.py": "Entered the band from 966 lines: the update-flow redesign added the shared stash-first prologue (_stash_local_work_fenced/_unwind_stashed_update) and the review-wave affordability floor to the update apply orchestration (update-flow-redesign sprint, Q9/Q10 owner decisions).",
     "ouroboros/gateway/extensions.py": None,
     "ouroboros/gateway/history.py": None,
     "ouroboros/gateway/settings.py": "Retiring persistent auto-Low removed the former giant debt; the remaining owner and reviewer settings endpoints stay centralized while tracked in the shrinking band.",

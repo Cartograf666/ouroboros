@@ -503,6 +503,53 @@ def _stage_candidate_for_review(
     return classification_paths, advisory_paths, None
 
 
+def _tests_preflight_block_message(managed_needs_proof: bool, test_err: str) -> str:
+    """The red-preflight block text. Managed merges get the honest mandate
+    wording: the env/skip escapes the ordinary text offers do NOT lift the
+    managed requirement — they only defer the same mandatory suite to the
+    post-commit gate, which would commit and then roll the merge back on red."""
+    if managed_needs_proof:
+        return (
+            "⚠️ TESTS_PREFLIGHT_BLOCKED: The full hermetic suite is MANDATORY for a "
+            "managed update resolution and must be green BEFORE review and commit.\n"
+            "skip_tests and OUROBOROS_PRE_PUSH_TESTS are not honored for managed "
+            "merges: an unproven candidate pays the same suite at the commit gate "
+            "and a red result rolls the merge back. Fix the failures below, then "
+            "re-run commit_reviewed.\n\n"
+            f"{test_err}"
+        )
+    return (
+        "⚠️ TESTS_PREFLIGHT_BLOCKED: Tests must pass before triad + scope review "
+        "when advisory is bypassed.\n"
+        "Fix the failures below, then re-run commit_reviewed (or drop "
+        "skip_advisory_review=True to run the full advisory flow).\n"
+        "Set OUROBOROS_PRE_PUSH_TESTS=0 to skip tests entirely.\n\n"
+        f"{test_err}"
+    )
+
+
+def _managed_candidate_needs_proof(ctx: ToolContext) -> bool:
+    """Managed single-run mandate (Q10): True when the authorized resolver's
+    CURRENT candidate tree carries no recorded green-suite proof (advisory ran
+    with skip_tests, or the tree changed since) — the compensating preflight
+    must then run PRE-commit, before paid review and before any commit exists,
+    regardless of skip_tests/doc-only, so a red candidate is fixed in place
+    instead of committed and rolled back."""
+    if not _authorized_managed_update_resolver(ctx):
+        return False
+    try:
+        from supervisor.update_merge import (
+            managed_tests_evidence_covers,
+            worktree_snapshot_tree,
+        )
+
+        cand_tree, _cand_err = worktree_snapshot_tree("HEAD")
+        return not (cand_tree and managed_tests_evidence_covers(cand_tree))
+    except Exception:
+        log.debug("managed proof check failed; running the preflight", exc_info=True)
+        return True
+
+
 def _run_reviewed_stage_cycle(
     ctx: ToolContext,
     commit_message: str,
@@ -609,23 +656,20 @@ def _run_reviewed_stage_cycle(
     # preflight instead of skipping both advisory and tests.
     _diff_aware = (os.environ.get("OUROBOROS_PREFLIGHT_DIFF_AWARE", "true") or "true").strip().lower() in ("true", "1", "yes")
     _doc_only = _diff_aware and _diff_is_doc_only(classification_paths)
-    if _advisory_bypassed and not skip_tests and not _doc_only:
+    _managed_needs_proof = _managed_candidate_needs_proof(ctx)
+    if (_advisory_bypassed and not skip_tests and not _doc_only) or _managed_needs_proof:
         try:
             ctx.emit_progress_fn(
-                "Advisory bypassed — running test preflight before triad + scope review..."
+                "Managed candidate lacks a pre-commit test proof — running the mandatory "
+                "hermetic suite before review..."
+                if _managed_needs_proof
+                else "Advisory bypassed — running test preflight before triad + scope review..."
             )
         except Exception:
             pass
         test_err = _run_review_preflight_tests(ctx)
         if test_err:
-            msg = (
-                "⚠️ TESTS_PREFLIGHT_BLOCKED: Tests must pass before triad + scope review "
-                "when advisory is bypassed.\n"
-                "Fix the failures below, then re-run commit_reviewed (or drop "
-                "skip_advisory_review=True to run the full advisory flow).\n"
-                "Set OUROBOROS_PRE_PUSH_TESTS=0 to skip tests entirely.\n\n"
-                f"{test_err}"
-            )
+            msg = _tests_preflight_block_message(_managed_needs_proof, test_err)
             try:
                 run_cmd(["git", "reset", "HEAD"], cwd=ctx.repo_dir)
             except Exception:
@@ -647,6 +691,13 @@ def _run_reviewed_stage_cycle(
                 "message": msg,
                 "block_reason": "tests_preflight_blocked",
             }
+        # Q10 single-run: this green preflight IS the managed pre-commit proof.
+        try:
+            from supervisor.update_merge import record_managed_tests_evidence
+
+            record_managed_tests_evidence(getattr(ctx, "task_id", ""), getattr(ctx, "task_metadata", None))
+        except Exception:
+            log.debug("managed tests evidence recording failed", exc_info=True)
     elif _advisory_bypassed:
         if skip_tests and _doc_only:
             _skip_reason = "skip_tests + doc_only"
@@ -1122,12 +1173,37 @@ def _managed_post_commit_tests_gate(
     suite rolls the assisted merge back instead of shipping a warning (ordinary
     commits keep the warning-only contract later in the flow). The gate is
     MANDATORY: neither the caller's skip_tests nor OUROBOROS_PRE_PUSH_TESTS=0
-    can wave a managed merge through untested. The terminal record carries the
-    same review metadata/fingerprints as every sibling failure record, so an
-    operator can reconstruct WHICH reviewed revision the gate rejected."""
+    can wave a managed merge through untested — but the mandate is "the full
+    suite provably ran green on the exact committed tree", not "run it twice":
+    when the resolver's pre-commit run (advisory preflight or the compensating
+    bypass preflight) recorded tests_evidence for a tree byte-identical to the
+    committed one, that proof is reused and the duplicate run is skipped (Q10).
+    The terminal record carries the same review metadata/fingerprints as every
+    sibling failure record, so an operator can reconstruct WHICH reviewed
+    revision the gate rejected."""
     if not managed_tx:
         return None
     del skip_tests  # deliberately ignored for managed merges
+    try:
+        committed_tree = run_cmd(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=ctx.repo_dir
+        ).strip()
+    except Exception:
+        committed_tree = ""
+    try:
+        from supervisor.update_merge import managed_tests_evidence_covers
+
+        if managed_tests_evidence_covers(committed_tree):
+            try:
+                ctx.emit_progress_fn(
+                    "Managed post-commit tests: reusing the green pre-commit hermetic "
+                    "run (exact tree match) — no duplicate suite run."
+                )
+            except Exception:
+                pass
+            return None
+    except Exception:
+        log.debug("managed tests evidence check failed; running the suite", exc_info=True)
     post_test_error = _post_commit_result(
         ctx, commit_message, False, test_warning_ref, force=True,
     )
