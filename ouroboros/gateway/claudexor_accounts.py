@@ -77,7 +77,6 @@ _LOGIN_TRANSPORTS = ("", "client_pty")
 # structural marker for the one feature, and it is the catalog ID — the
 # engine's own stable identifier for the operation, not the path spelling.
 _LOGIN_INPUT_OPERATION_ID = "post:setup.jobs.id.input"
-_HARNESS_INSTALL_TIMEOUT_SEC = 300.0
 _HARNESS_INSTALL_STDOUT_LIMIT = 64 * 1024
 _HARNESS_INSTALL_CORE_FIELDS = frozenset({
     "ok", "dryRun", "exitCode", "target", "harness", "command",
@@ -605,12 +604,12 @@ def _valid_install_success(payload: Any, harness: str) -> bool:
 
 def _install_harness_cli(harness: str) -> None:
     from ouroboros.claudexor_runtime import ClaudexorRuntimeError, get_runtime_manager
+    from ouroboros.config import get_claudexor_harness_install_timeout_sec
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
-    from ouroboros.platform_layer import (
-        kill_process_tree,
-        merge_hidden_kwargs,
-        subprocess_new_group_kwargs,
-    )
+    from ouroboros.platform_layer import merge_hidden_kwargs, subprocess_new_group_kwargs
+    # The same custody set /panic reaps (isolated_deps._run is the template):
+    # an in-flight vendor installer must not survive an emergency stop.
+    from ouroboros.tools.shell import _active_subprocesses, _kill_process_group, _subprocess_lock
 
     try:
         command = get_runtime_manager().ensure_cli_command()
@@ -648,20 +647,27 @@ def _install_harness_cli(harness: str) -> None:
         daemon=True,
     )
     reader.start()
+    timeout_sec = get_claudexor_harness_install_timeout_sec()
+    with _subprocess_lock:
+        _active_subprocesses.add(proc)
     try:
         try:
-            exit_code = proc.wait(timeout=_HARNESS_INSTALL_TIMEOUT_SEC)
+            exit_code = proc.wait(timeout=timeout_sec)
         except subprocess.TimeoutExpired as exc:
-            kill_process_tree(proc)
+            _kill_process_group(proc)
             try:
                 proc.wait(timeout=10)
             except Exception:
                 pass
             raise ClaudexorUnavailable(
                 "harness_install_timeout",
-                f"managed Claudexor installer exceeded {_HARNESS_INSTALL_TIMEOUT_SEC:.0f}s",
+                f"managed Claudexor installer exceeded {timeout_sec:d}s",
             ) from exc
     finally:
+        with _subprocess_lock:
+            _active_subprocesses.discard(proc)
+        # Bounded CLEANUP of an already-finished/killed child's pipe, not a
+        # behavioral wait: the drain thread ends when the pipe does.
         reader.join(timeout=10)
         if reader.is_alive():
             try:

@@ -1145,12 +1145,51 @@ def test_installer_timeout_kills_the_process_tree(monkeypatch):
     proc = Process()
     monkeypatch.setattr(accounts.subprocess, "Popen", lambda *_a, **_kw: proc)
     killed = []
-    monkeypatch.setattr(platform_layer, "kill_process_tree", killed.append)
+    import ouroboros.tools.shell as shell
+
+    monkeypatch.setattr(shell, "_kill_process_group", killed.append)
     with pytest.raises(ClaudexorUnavailable) as excinfo:
         accounts._install_harness_cli("cursor")
     assert excinfo.value.code == "harness_install_timeout"
     assert killed == [proc]
-    assert waits == [accounts._HARNESS_INSTALL_TIMEOUT_SEC, 10]
+    from ouroboros.config import get_claudexor_harness_install_timeout_sec
+
+    assert waits == [get_claudexor_harness_install_timeout_sec(), 10]
+    assert proc not in shell._active_subprocesses, "a timed-out installer must not stay tracked"
+
+
+def test_installer_child_is_panic_tracked_for_its_whole_run(monkeypatch):
+    """/panic kills only tools.shell-tracked subprocess trees before os._exit
+    (BIBLE: every subprocess tree stops immediately). The vendor installer must
+    therefore sit in that set exactly while it runs — the allowlisted raw Popen
+    is legitimate ONLY because of this registration."""
+    import io
+    from types import SimpleNamespace
+
+    from ouroboros import claudexor_runtime as runtime
+    from ouroboros.gateway import claudexor_accounts as accounts
+    from ouroboros import platform_layer
+    import ouroboros.tools.shell as shell
+
+    monkeypatch.setattr(runtime, "get_runtime_manager", lambda: SimpleNamespace(
+        ensure_cli_command=lambda: ["/exact/node", "/exact/cli.cjs"]))
+    monkeypatch.setattr(platform_layer, "subprocess_new_group_kwargs", lambda: {})
+    monkeypatch.setattr(platform_layer, "merge_hidden_kwargs", dict)
+    observed = {}
+
+    class Process:
+        pid = 43
+        stdout = io.BytesIO(json.dumps(_install_receipt()).encode())
+
+        def wait(self, timeout):
+            observed["tracked_during_wait"] = self in shell._active_subprocesses
+            return 0
+
+    proc = Process()
+    monkeypatch.setattr(accounts.subprocess, "Popen", lambda *_a, **_kw: proc)
+    accounts._install_harness_cli("cursor")
+    assert observed["tracked_during_wait"] is True, "panic sweep must see the live installer"
+    assert proc not in shell._active_subprocesses, "custody ends with the request"
 
 
 def _input_request(job_id: str, body: dict):

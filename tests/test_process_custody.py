@@ -52,9 +52,10 @@ _POPEN_ALLOWLIST = {
     "ouroboros/tools/skill_exec.py",      # bounded skill run (waited + tracked)
     "ouroboros/tools/skill_preflight.py", # waited preflight child
     "ouroboros/marketplace/isolated_deps.py",  # waited installer child
-    # Connect's vendor-CLI install: ONE waited child under a hard timeout whose
-    # tree is killed on expiry, in the same class as the other waited installers
-    # above — never a long-lived process that could outlive the request.
+    # Connect's vendor-CLI install: ONE waited child under a configured hard
+    # timeout, registered in tools.shell._active_subprocesses for its whole
+    # run (isolated_deps._run template), so /panic's tracked-subprocess sweep
+    # kills an in-flight installer before os._exit.
     "ouroboros/gateway/claudexor_accounts.py",
     "ouroboros/gateways/claude_code.py",  # waited readonly child (timeout-bound)
     "ouroboros/extension_process_runner.py",  # waited extension child
