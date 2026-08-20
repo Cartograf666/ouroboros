@@ -232,9 +232,6 @@
  * @property {boolean=} cancelable
  *   v6.82 (P5): host-attested — this frame's task is a supervisor-queue task that
  *   POST /api/tasks/{id}/cancel can force-cancel (never set for direct-chat turns).
- * @property {boolean=} project_mirror
- *   History-only producer fact: this project-owned row is mirrored into Main
- *   for presentation and cannot grant Main-local cancel authority.
  * @property {?number=} cost_usd
  * @property {?number=} accounted_upper_bound_usd
  *   C2: the additive HONEST name for cost_usd — an accounted upper bound, not a
@@ -390,6 +387,13 @@
  * @typedef {Object} ProjectOriginHistoryFields
  * @property {boolean=} origin_projected
  * @property {"origin_omission"=} system_type
+ */
+
+/**
+ * Additive /api/chat/history fact for a project-owned row mirrored into Main.
+ * It cannot grant Main-local cancel authority.
+ * @typedef {Object} ProjectMirrorHistoryFields
+ * @property {boolean=} project_mirror
  */
 
 /**
