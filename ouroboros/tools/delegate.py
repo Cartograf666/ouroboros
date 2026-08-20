@@ -635,8 +635,7 @@ def _start_request(ctx: ToolContext, route: Any, authority: "DelegatedRunShape",
 
 def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = None,
                     retry_of: Optional[str] = None, root: Optional[str] = None,
-                    bucket: Optional[str] = None, skill_name: Optional[str] = None,
-                    _resolved_binding: Any = None) -> str:
+                    bucket: Optional[str] = None, skill_name: Optional[str] = None, _resolved_binding: Any = None) -> str:
     from ouroboros.claudexor_daemon import ensure_owned_gateway
     from ouroboros.delegate_evidence import record_start_blocked
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
@@ -709,12 +708,8 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         return _fail("delegate_start", exc.code, str(exc), executor=resolution.executor)
 
     try:
-        # Health is asked about the whole SHAPE, so the same reader that refuses a route
-        # which cannot write also refuses an ENGINE that cannot confine a delegated
-        # harness's HOME. Both come back here as a typed blocker; neither can degrade
-        # into starting the run anyway. On a retry the route and the shape are the
-        # STORED invocation's, so the answer is about the run actually being replayed —
-        # not about whatever the environment names today.
+        # Health checks the stored route/confinement shape on retries, never current
+        # environment defaults; blockers stay typed instead of falling through to API spend.
         unavailable, reset_at = route_health(
             gateway, route.route_id, authority, route_model=route.model, pinned_profile=route.profile_id)
         resolution = resolve_subagent_executor(

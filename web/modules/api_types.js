@@ -437,9 +437,7 @@
  * @property {"origin_omission"=} system_type
  */
 
-/**
- * Additive /api/chat/history fact for a project-owned row mirrored into Main.
- * It cannot grant Main-local cancel authority.
+/** Additive history fact: a project-owned Main mirror cannot grant cancel authority.
  * @typedef {Object} ProjectMirrorHistoryFields
  * @property {boolean=} project_mirror
  */
