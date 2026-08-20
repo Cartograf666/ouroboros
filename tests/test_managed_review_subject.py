@@ -889,7 +889,11 @@ def test_guidance_critical_findings_by_enforcement():
     # hard gate. Both branches now state that honestly.
     assert "Fix ALL critical findings" not in blocking
     assert "already satisfies the commit gate's advisory-freshness requirement" in blocking
-    assert "review debt the commit gate acknowledges" in blocking
+    # A5a tightened wording: the durable record is the advisory RUN record; the
+    # "acknowledged" event exists only under advisory enforcement, so the
+    # blocking branch must not claim the commit gate acknowledges the debt.
+    assert "recorded durably on the advisory run record" in blocking
+    assert "commit gate acknowledges" not in blocking
     assert "commit_reviewed is available" in blocking
     assert "blocking triad and scope reviews are the gate" in blocking
     assert "bypasses only the freshness/debt checks" in blocking
@@ -1020,14 +1024,15 @@ def test_review_status_next_step_honors_enforcement(tmp_path, monkeypatch):
     monkeypatch.setattr(adv, "_get_review_enforcement", lambda: "advisory")
     advisory_next = json.loads(adv._handle_review_status(ctx=ctx))["next_step"]
     assert "recorded durably" in advisory_next
-    assert "review debt the commit gate acknowledges" not in advisory_next
+    assert "recorded durably on the advisory run record" not in advisory_next
 
     monkeypatch.setattr(adv, "_get_review_enforcement", lambda: "blocking")
     blocking_next = json.loads(adv._handle_review_status(ctx=ctx))["next_step"]
     # R6 superseded pin: the blocking branch is honest now, never the old
     # "Fix ALL critical findings … or audited skip" false dichotomy.
     assert "Fix ALL critical findings" not in blocking_next
-    assert "review debt the commit gate acknowledges" in blocking_next
+    assert "recorded durably on the advisory run record" in blocking_next
+    assert "commit gate acknowledges" not in blocking_next
     assert "commit_reviewed is available" in blocking_next
 
 

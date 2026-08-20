@@ -148,6 +148,13 @@ def attempt_block_class(item: Any) -> str:
         return ""
     if str(getattr(item, "block_reason", "") or "") in _REFUSAL_BLOCK_REASONS:
         return ""
+    if str(getattr(item, "phase", "") or "") == "revalidation":
+        # Post-review revalidation blocks (fingerprint drift, fingerprint
+        # unavailable, review_subject_binding_mismatch) are facts about the
+        # GATE, never reviewer verdicts: they must not anchor identical-diff
+        # refusal quotes nor build a refusal streak, while their dispatched
+        # wave (paid=True on the merged row) still counts toward the ceiling.
+        return BLOCK_CLASS_INFRA
     if str(getattr(item, "phase", "") or "") != "blocking_review":
         return ""  # preflight/advisory-gate rows are neither verdict nor infra
     reason = str(getattr(item, "block_reason", "") or "")

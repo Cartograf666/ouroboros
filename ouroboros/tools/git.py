@@ -39,6 +39,7 @@ from ouroboros.tools.claude_advisory_review import (
     advisory_gate_unavailable,
 )
 from ouroboros.tools.commit_gate import (
+    BLOCK_CLASS_INFRA,
     IDENTICAL_DIFF_BLOCK_REASON,
     _check_advisory_freshness,
     _check_overlapping_review_attempt,
@@ -706,6 +707,10 @@ def _subject_binding_mismatch_outcome(
         block_details=mismatch_msg,
         duration_sec=time.time() - commit_start,
         phase="revalidation",
+        # Infra by construction (A1 composition): a binding mismatch is a gate
+        # fact, not a reviewer verdict — it must never build a refusal streak
+        # nor anchor an identical-diff refusal quote.
+        block_class=BLOCK_CLASS_INFRA,
         pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
         fingerprint_status="invalid",
     )

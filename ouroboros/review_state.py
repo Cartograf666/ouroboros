@@ -1670,7 +1670,7 @@ _STRIPPED_DETAILS_LIMIT = 600
 _STRIPPED_MESSAGE_LIMIT = 300
 
 
-def _strip_attempt_heavy_payload(item: CommitAttemptRecord) -> None:
+def _strip_attempt_heavy_payload(item: CommitAttemptRecord, *, force: bool = False) -> None:
     """Compact one preserved accounting row that fell outside the newest-50
     ledger window (F1 follow-up: paid-row immortality must not make the hot
     load-modify-save state file grow by full reviewer raw output forever).
@@ -1687,8 +1687,10 @@ def _strip_attempt_heavy_payload(item: CommitAttemptRecord) -> None:
     THROUGH ``scope_raw_result``, so ``block_class`` is materialized before
     that evidence is dropped — the row keeps its refusal-anchor authority.
     ``raw_stripped=True`` marks the compaction for audits; full payloads live
-    only in the newest-50 window."""
-    if bool(getattr(item, "raw_stripped", False)):
+    only in the newest-50 window. ``force=True`` re-compacts a row ALREADY
+    marked stripped — the terminal-merge path uses it when a merge onto a
+    stripped row would otherwise resurrect the heavy payloads it carries in."""
+    if bool(getattr(item, "raw_stripped", False)) and not force:
         return
     if not item.block_class:
         try:
@@ -1736,7 +1738,15 @@ def _merge_attempt(existing: CommitAttemptRecord, incoming: CommitAttemptRecord)
             getattr(incoming, "raw_stripped", False) or getattr(existing, "raw_stripped", False)
         ),
     )
-    return CommitAttemptRecord(**data)
+    merged = CommitAttemptRecord(**data)
+    if merged.raw_stripped:
+        # A late terminal merging onto an already-compacted row (a stale
+        # in-flight row that slid past the newest-50 window) must not
+        # resurrect heavy reviewer raw payloads onto it: re-strip the merged
+        # result — accounting facts (paid/root_task_id/fingerprints/
+        # block_class/critical_findings) all survive the strip by design.
+        _strip_attempt_heavy_payload(merged, force=True)
+    return merged
 
 
 def infer_review_phase(status: str, block_reason: str = "") -> str:

@@ -245,15 +245,31 @@ def _managed_update_code_tool_block(ctx: Any, name: str) -> str:
 
 
 def _authorized_managed_update_resolver(ctx: Any) -> bool:
-    """Whether this task is the durable tx-authorized assisted resolver."""
+    """Whether this task is the durable tx-authorized assisted resolver.
+
+    Fail-closed bool for every authority consumer (False = no extra powers).
+    The AUTHORITY-READ failure is additionally distinguished from an honest
+    "not the resolver" via a typed ctx marker (``_managed_authority_read_error``:
+    set on an unreadable read, cleared on every successful evaluation), so the
+    review-subject builder can fail LOUDLY instead of silently reviewing a
+    possibly-managed candidate as an ordinary full staged capture."""
     try:
         from supervisor.update_merge import authorized_assisted_task
 
-        return bool(authorized_assisted_task(
+        authorized = bool(authorized_assisted_task(
             getattr(ctx, "task_id", ""),
             getattr(ctx, "task_metadata", None),
         ))
-    except Exception:
+        try:
+            setattr(ctx, "_managed_authority_read_error", "")
+        except Exception:
+            pass
+        return authorized
+    except Exception as exc:
+        try:
+            setattr(ctx, "_managed_authority_read_error", repr(exc))
+        except Exception:
+            pass
         return False
 
 

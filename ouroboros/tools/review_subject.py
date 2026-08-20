@@ -186,6 +186,14 @@ class ManagedReviewSubject:
     resolution_paths: int        # disclosed counter: paths of the reviewed delta
     fallback_full_diff: bool     # True → M0 missing, diff is the FULL HEAD→S diff
     unified: int = 3
+    # Which S this subject serializes — "gate" (the real index: the staged
+    # candidate) or "advisory" (the live worktree snapshot). Prose that names
+    # the candidate must stay surface-correct: on the advisory surface the
+    # full candidate is the WORKTREE, not the staged index.
+    surface: str = "gate"
+
+    def _candidate_noun(self) -> str:
+        return "staged candidate" if self.surface != "advisory" else "worktree candidate"
 
     def counters_line(self) -> str:
         full = (
@@ -227,14 +235,14 @@ class ManagedReviewSubject:
             # the FULL candidate is rendered, official delta included.
             lead_tail = (
                 "M0 is unavailable, so the diff rendered below is the FULL "
-                "staged candidate vs the local pre-update HEAD — it INCLUDES "
-                "the already-released official base→target delta."
+                f"{self._candidate_noun()} vs the local pre-update HEAD — it "
+                "INCLUDES the already-released official base→target delta."
             )
         else:
             lead_tail = (
-                "M0 is unavailable, so the review subject is the FULL staged "
-                "candidate — it INCLUDES the already-released official "
-                "base→target delta."
+                "M0 is unavailable, so the review subject is the FULL "
+                f"{self._candidate_noun()} — it INCLUDES the already-released "
+                "official base→target delta."
             )
         lines = [
             "## Managed-update resolution review subject",
@@ -260,8 +268,8 @@ class ManagedReviewSubject:
         if self.fallback_full_diff:
             if body_rendered:
                 fallback_tail = (
-                    "the FULL staged candidate diff is rendered below instead of "
-                    "the resolution delta — it includes the entire "
+                    f"the FULL {self._candidate_noun()} diff is rendered below "
+                    "instead of the resolution delta — it includes the entire "
                     "already-released official delta."
                 )
             else:
@@ -333,6 +341,20 @@ def managed_review_subject(
         log.warning("managed review subject: authority predicate failed", exc_info=True)
         return None
     if not authorized:
+        # "Not the resolver" is only trustworthy when the authority EVIDENCE was
+        # readable. The predicate marks an unreadable read on the ctx (typed
+        # marker, cleared on every successful evaluation): reviewing then would
+        # either present a managed candidate as an ordinary staged diff or an
+        # ordinary diff under a possibly-active managed tx — fail loudly on the
+        # same channel as the staged capture instead (mutative tools are blocked
+        # closed in that state anyway, see _managed_update_code_tool_block).
+        read_error = str(getattr(ctx, "_managed_authority_read_error", "") or "")
+        if read_error:
+            raise StagedDiffUnavailable(
+                "managed-update authority evidence is unreadable — the review "
+                "subject cannot be determined (not proven managed, not proven "
+                f"ordinary): {read_error}"
+            )
         return None
 
     # From here on the caller IS the authorized managed resolver: a failed or
@@ -415,6 +437,7 @@ def managed_review_subject(
         full_candidate_paths=_full_candidate_path_count(repo_dir, staged_tree),
         resolution_paths=len(name_status),
         fallback_full_diff=fallback,
+        surface=surface,
     )
 
 

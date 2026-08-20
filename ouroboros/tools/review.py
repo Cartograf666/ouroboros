@@ -1488,14 +1488,15 @@ def _dispatch_unified_review(ctx: ToolContext, commit_message: str, prepared: di
     model_results = result.get("results", [])
     if not model_results:
         ctx._last_review_block_reason = "infra_failure"
-        blocked_msg = (
-            "⚠️ REVIEW_BLOCKED: Review returned no results from any model — "
-            "commit cannot proceed without a successful review."
-        )
+        # Withheld Q28-A not_dispatched seat records survive an empty panel —
+        # their merge point (_collect_review_findings) is never reached here.
+        if getattr(ctx, "_triad_withheld_seat_records", None):
+            ctx._last_triad_raw_results = list(ctx._triad_withheld_seat_records)
+        blocked_msg = ("⚠️ REVIEW_BLOCKED: Review returned no results from any "
+                       "model — commit cannot proceed without a successful review.")
         return _handle_review_block_or_warning(
             ctx, blocking_review, blocked_msg,
-            "Review enforcement=Advisory: review returned no model results; commit proceeding anyway. ",
-        )
+            "Review enforcement=Advisory: review returned no model results; commit proceeding anyway. ")
 
     critical_fails, advisory_warns, errored_models, _triad_raw = _collect_review_findings(ctx, model_results)
     models_total = len(model_results)

@@ -1605,7 +1605,7 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
             # can still block. The audited skip bypasses only the advisory
             # freshness/debt checks, never these findings.
             return _with_choices(
-                f"Advisory found {len(fresh_critical)} critical issue(s). This fresh advisory already satisfies the commit gate's advisory-freshness requirement; the findings are recorded durably as review debt the commit gate acknowledges, and commit_reviewed is available — the blocking triad and scope reviews are the gate that can still block. Fix the critical findings and re-run advisory_review so they are marked PASS; skip_advisory_review=True (audited) bypasses only the freshness/debt checks, not these findings."
+                f"Advisory found {len(fresh_critical)} critical issue(s). This fresh advisory already satisfies the commit gate's advisory-freshness requirement; the findings are recorded durably on the advisory run record, and commit_reviewed is available — the blocking triad and scope reviews are the gate that can still block. Fix the critical findings and re-run advisory_review so they are marked PASS; skip_advisory_review=True (audited) bypasses only the freshness/debt checks, not these findings."
             )
         return _with_choices(
             f"Advisory found {len(fresh_critical)} critical issue(s). Findings are recorded durably; enforcement is advisory — you decide which to apply, and commit_reviewed is available. Re-run advisory_review after fixes, or deliberately choose the audited advisory skip."
