@@ -13,10 +13,17 @@ from types import SimpleNamespace
 
 import pytest
 
+from devtools.benchmarks.common.model_slots import pin_single_model
 from devtools.benchmarks.osworld import run_step_agent as rsa
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _fixed_actor_settings(model: str) -> dict[str, str]:
+    settings: dict[str, str] = {}
+    pin_single_model(model, target=settings)
+    return settings
 
 
 @pytest.fixture(autouse=True)
@@ -240,12 +247,10 @@ def test_preflight_verifies_server_scaffold_settings(tmp_path, monkeypatch):
     data_dir = tmp_path / "data"
     (data_dir / "uploads").mkdir(parents=True)
     settings_path = tmp_path / "settings.json"
-    actor_raw = rsa.single_model_subagents_setting("anthropic/claude-sonnet-4.6")
-    settings_path.write_text(json.dumps({
-        "OUROBOROS_MODEL": "anthropic/claude-sonnet-4.6",
-        "OUROBOROS_SUBAGENTS": actor_raw,
-        "ANTHROPIC_API_KEY": "k",
-    }), encoding="utf-8")
+    matching = _fixed_actor_settings("anthropic/claude-sonnet-4.6")
+    declared = dict(matching)
+    declared["ANTHROPIC_API_KEY"] = "k"
+    settings_path.write_text(json.dumps(declared), encoding="utf-8")
     task_path = tmp_path / "task.json"
     task_path.write_text("{}", encoding="utf-8")
     vmx = tmp_path / "vm.vmx"
@@ -287,10 +292,9 @@ def test_preflight_verifies_server_scaffold_settings(tmp_path, monkeypatch):
     assert "OUROBOROS_REVIEW_ENFORCEMENT" in joined
 
     # matching server -> ok; mismatch + explicit ablation flag -> ok but recorded
-    matching = {"OUROBOROS_RUNTIME_MODE": "pro", "OUROBOROS_SAFETY_MODE": "light",
-                "OUROBOROS_MAX_WORKERS": 4, "OUROBOROS_MODEL": "anthropic/claude-sonnet-4.6",
-                "OUROBOROS_REVIEW_ENFORCEMENT": "blocking",
-                "OUROBOROS_SUBAGENTS": actor_raw}
+    matching.update({"OUROBOROS_RUNTIME_MODE": "pro", "OUROBOROS_SAFETY_MODE": "light",
+                     "OUROBOROS_MAX_WORKERS": 4,
+                     "OUROBOROS_REVIEW_ENFORCEMENT": "blocking"})
 
     def fake_http_ok(url, timeout=5):
         if url.endswith("/api/state"):

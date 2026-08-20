@@ -30,10 +30,14 @@ export OUROBOROS_BENCH_RUNS_ROOT=<workspace>/bench_runs
 #   OUROBOROS_SAFETY_MODE=light.
 # - The solve task itself disables claude_code_edit (house rule: benches measure
 #   the single-model Ouroboros harness, not an external coding agent).
-# - Active model slots pin openai/gpt-5.5, and OUROBOROS_SUBAGENTS contains one
-#   api_model row on that exact route. Preflight requires a declared Main or
+# - Active model slots pin openai/gpt-5.5, local routing is explicitly off,
+#   OUROBOROS_SUBAGENTS contains one api_model row on that exact route, and the
+#   authoritative reviewer panel contains only exact API triad/scope rows. The
+#   Claude-SDK advisory is explicitly disabled instead of receiving an OpenRouter
+#   model id. Preflight requires a declared Main or
 #   --solve-model, then fetches the target server's /api/settings and binds the
-#   manifest to that actual actor; missing/different target state refuses before
+#   manifest to that effective actor and reviewer/local-route projection;
+#   missing/different target state refuses before
 #   instance discovery or paid work. The id must exist in the OpenRouter catalog
 #   (there is no openai/gpt-5.5-mini there — it 400s on every task).
 

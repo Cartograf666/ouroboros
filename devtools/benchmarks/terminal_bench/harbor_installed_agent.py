@@ -375,6 +375,11 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
             "OUROBOROS_MODEL",
             "OUROBOROS_MODEL_LIGHT",
             "OUROBOROS_SUBAGENTS",
+            "OUROBOROS_REVIEWER_SLOTS",
+            "USE_LOCAL_MAIN",
+            "USE_LOCAL_LIGHT",
+            "USE_LOCAL_FALLBACK",
+            "USE_LOCAL_CONSCIOUSNESS",
             # OUROBOROS_MODEL_FALLBACK is deliberately NOT forwarded: the
             # benchmark metric must stay single-model (a host-configured
             # fallback would silently contaminate the measurement).

@@ -286,7 +286,7 @@ def test_harness_bench_fast_wrapper_builds_ouroboros_run_command():
     ).read_text(encoding="utf-8")
     for token in ('"run",', '"--memory-mode",', '"--quiet",', '"--result-json-out",', '"--actor-id",'):
         assert token in src, token
-    assert '"OUROBOROS_SUBAGENTS": single_model_subagents_setting(args.model)' in src
+    assert "pin_single_model(args.model, target=fixed_model_env)" in src
     assert '"OUROBOROS_MODEL_HEAVY": args.model' not in src
     assert "OUROBOROS_MODEL_CODE" not in src
 
@@ -4193,10 +4193,12 @@ def test_swe_pro_grade_ungraded_covers_unparseable_and_empty_requirements(tmp_pa
         assert verdict == "ungraded" and reason.startswith("output_unparseable") and column == "-"
 
 
-def _write_programbench_actor_settings(e2e, path):
+def _write_programbench_actor_settings(_e2e, path):
+    from devtools.benchmarks.common.model_slots import pin_single_model
+
     model = "openai/gpt-5.5"
-    payload = {"OUROBOROS_MODEL": model,
-               "OUROBOROS_SUBAGENTS": e2e.single_model_subagents_setting(model)}
+    payload = {}
+    pin_single_model(model, target=payload)
     path.write_text(json.dumps(payload), encoding="utf-8")
     return payload
 

@@ -95,7 +95,15 @@ def test_pip_cache_mount_rejects_repo_path(monkeypatch):
 # --- apply_all_model + metadata -------------------------------------------------
 
 def test_apply_all_model_sets_forwarded_slots(monkeypatch):
-    for key in run_tb._ALL_MODEL_SLOT_KEYS + ("OUROBOROS_REVIEW_MODELS", "OUROBOROS_SUBAGENTS"):
+    for key in run_tb._ALL_MODEL_SLOT_KEYS + (
+        "OUROBOROS_REVIEW_MODELS", "OUROBOROS_SUBAGENTS",
+        "OUROBOROS_REVIEWER_SLOTS", "CLAUDE_CODE_MODEL",
+        "OUROBOROS_MODEL_VISION", "OUROBOROS_MODEL_CONSCIOUSNESS",
+        "OUROBOROS_MODEL_FALLBACKS", "OUROBOROS_MODEL_DEEP_SELF_REVIEW",
+        "USE_LOCAL_MAIN", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK",
+        "USE_LOCAL_CONSCIOUSNESS", "OUROBOROS_MODEL_HEAVY", "USE_LOCAL_HEAVY",
+        "OUROBOROS_EFFORT_REVIEW", "OUROBOROS_EFFORT_SCOPE_REVIEW",
+    ):
         monkeypatch.delenv(key, raising=False)
     run_tb.apply_all_model("google/gemini-3.5-flash")
     import os
@@ -107,11 +115,54 @@ def test_apply_all_model_sets_forwarded_slots(monkeypatch):
     assert os.environ["OUROBOROS_EFFORT_SCOPE_REVIEW"] == "low"
     actors = json.loads(os.environ["OUROBOROS_SUBAGENTS"])
     assert [row["route"]["target_id"] for row in actors["items"]] == ["google/gemini-3.5-flash"]
-    assert "CLAUDE_CODE_MODEL" in run_tb._ALL_MODEL_SLOT_KEYS  # claude_code_edit cannot leak a different model
+    reviewers = json.loads(os.environ["OUROBOROS_REVIEWER_SLOTS"])
+    assert [row["route"]["target_id"] for row in reviewers["triad"]] == [
+        "google/gemini-3.5-flash"
+    ]
+    assert [row["route"]["target_id"] for row in reviewers["scope"]] == [
+        "google/gemini-3.5-flash"
+    ]
+    assert reviewers["advisory"]["enabled"] is False
+    assert os.environ["CLAUDE_CODE_MODEL"] == ""
+    assert all(os.environ[key] == "false" for key in (
+        "USE_LOCAL_MAIN", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK",
+        "USE_LOCAL_CONSCIOUSNESS",
+    ))
     # Configurable: the 3-identical-reviewer / medium-effort path is still available.
     run_tb.apply_all_model("google/gemini-3.5-flash", review_slots=3, review_effort="medium")
     assert os.environ["OUROBOROS_REVIEW_MODELS"] == "google/gemini-3.5-flash,google/gemini-3.5-flash,google/gemini-3.5-flash"
     assert os.environ["OUROBOROS_EFFORT_REVIEW"] == "medium"
+    reviewers = json.loads(os.environ["OUROBOROS_REVIEWER_SLOTS"])
+    assert len(reviewers["triad"]) == 3
+    assert {row["effort"] for row in reviewers["triad"]} == {"medium"}
+
+
+def test_adapter_forwards_fixed_model_execution_contract(tmp_path, monkeypatch):
+    import devtools.benchmarks.terminal_bench.harbor_installed_agent as tb_agent
+
+    model = "openai/gpt-5.5"
+    for key in (
+        *run_tb._ALL_MODEL_SLOT_KEYS,
+        "OUROBOROS_MODEL_FALLBACKS", "OUROBOROS_MODEL_CONSCIOUSNESS",
+        "OUROBOROS_MODEL_VISION", "OUROBOROS_SUBAGENTS", "OUROBOROS_REVIEWER_SLOTS",
+        "CLAUDE_CODE_MODEL", "OUROBOROS_REVIEW_MODELS", "OUROBOROS_EFFORT_REVIEW",
+        "OUROBOROS_EFFORT_SCOPE_REVIEW", "USE_LOCAL_MAIN", "USE_LOCAL_LIGHT",
+        "USE_LOCAL_FALLBACK", "USE_LOCAL_CONSCIOUSNESS", "OUROBOROS_MODEL_HEAVY",
+        "USE_LOCAL_HEAVY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    run_tb.apply_all_model(model)
+    env = tb_agent.OuroborosTerminalBenchAgent(logs_dir=tmp_path)._container_env()
+    reviewers = json.loads(env["OUROBOROS_REVIEWER_SLOTS"])
+    assert {row["route"]["target_id"] for row in reviewers["triad"]} == {model}
+    assert {row["route"]["target_id"] for row in reviewers["scope"]} == {model}
+    assert reviewers["advisory"]["enabled"] is False
+    assert "CLAUDE_CODE_MODEL" not in env
+    assert all(env[key] == "false" for key in (
+        "USE_LOCAL_MAIN", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK",
+        "USE_LOCAL_CONSCIOUSNESS",
+    ))
 
 
 def test_metadata_omits_web_search_when_web_disabled(monkeypatch):

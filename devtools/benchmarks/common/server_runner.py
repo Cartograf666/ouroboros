@@ -66,6 +66,7 @@ STALE_INHERITED_ENV_KEYS = (
     # advanced sandbox — strip it so the sanitized settings win.
     "OUROBOROS_BOOT_RUNTIME_MODE",
     "USE_LOCAL_MAIN", "USE_LOCAL_CODE", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK",
+    "USE_LOCAL_CONSCIOUSNESS", "OUROBOROS_REVIEWER_SLOTS",
     # Owner/control SECRETS must never leak into the isolated server's env (untrusted
     # benchmark tasks run here). Provider creds are loaded from the sanitized settings.json.
     "GITHUB_TOKEN", "GITHUB_REPO", "OUROBOROS_NETWORK_PASSWORD",
@@ -84,6 +85,7 @@ _ISO_SETTINGS_ALLOW_PREFIX = ("OUROBOROS_MODEL", "OUROBOROS_EFFORT", "LOCAL_MODE
 # skill secret could be named `<x>_API_KEY` and must NOT be copied.
 _ISO_SETTINGS_ALLOW_EXACT = frozenset({
     "OUROBOROS_SUBAGENTS",
+    "OUROBOROS_REVIEWER_SLOTS",
     "OUROBOROS_WEBSEARCH_MODEL", "OUROBOROS_REVIEW_MODELS",
     "OUROBOROS_SCOPE_REVIEW_MODELS", "OUROBOROS_SCOPE_REVIEW_MODEL",
     # Review policy knobs (non-secret): must propagate so settings.json's task-acceptance

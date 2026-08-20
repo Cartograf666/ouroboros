@@ -30,7 +30,7 @@ from devtools.benchmarks.common.manifests import (
 )
 from devtools.benchmarks.common.model_slots import (
     configured_subagents_snapshot,
-    single_model_subagents_setting,
+    pin_single_model,
 )
 from devtools.benchmarks.common.run_roots import (
     default_settings_path,
@@ -65,8 +65,9 @@ FRONTIER_BENCH_DATASET = "frontier-bench/frontier-bench"
 # Only slots the in-container adapter actually forwards (harbor_installed_agent._container_env).
 # Deliberately omitted because the container already covers them: the internal Consciousness
 # role defaults to Main, the adapter pins both fallback spellings to Main, and child selection is
-# the explicit one-row Available-subagents value below. CLAUDE_CODE_MODEL IS included (and the
-# adapter forwards it) so the legacy disabled-tool contract cannot introduce a different model.
+# the explicit one-row Available-subagents value below. The Claude SDK advisory is explicitly
+# disabled by the structured fixed-model reviewer panel, so CLAUDE_CODE_MODEL stays empty rather
+# than receiving a provider-routed model id from a different namespace.
 _ALL_MODEL_SLOT_KEYS = (
     "OUROBOROS_MODEL",
     "OUROBOROS_MODEL_LIGHT",
@@ -74,7 +75,6 @@ _ALL_MODEL_SLOT_KEYS = (
     "OUROBOROS_WEBSEARCH_MODEL",
     "OUROBOROS_SCOPE_REVIEW_MODELS",
     "OUROBOROS_SCOPE_REVIEW_MODEL",
-    "CLAUDE_CODE_MODEL",
 )
 
 
@@ -91,14 +91,11 @@ def apply_all_model(model: str, review_slots: int = 1, review_effort: str = "low
     This is a BENCHMARK setting, NOT a claim that the review subsystem got more reliable
     (single_reviewer_no_diversity stays loud). EFFORT_SCOPE_REVIEW is set too for completeness
     ("там и там"); scope review does not fire on a terminal-bench task (it is a commit-time gate)."""
-    os.environ.pop("OUROBOROS_MODEL_HEAVY", None)
-    os.environ.pop("USE_LOCAL_HEAVY", None)
-    for key in _ALL_MODEL_SLOT_KEYS:
-        os.environ[key] = model
-    os.environ["OUROBOROS_SUBAGENTS"] = single_model_subagents_setting(model)
-    os.environ["OUROBOROS_REVIEW_MODELS"] = ",".join([model] * max(1, int(review_slots)))
-    os.environ["OUROBOROS_EFFORT_REVIEW"] = review_effort
-    os.environ["OUROBOROS_EFFORT_SCOPE_REVIEW"] = review_effort
+    pin_single_model(
+        model,
+        review_slots=review_slots,
+        review_effort=review_effort,
+    )
 
 
 @dataclass

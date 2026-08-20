@@ -34,7 +34,7 @@ if str(DEFAULT_REPO) not in sys.path:
 
 from devtools.benchmarks.common.model_slots import (  # noqa: E402
     configured_subagents_snapshot,
-    single_model_subagents_setting,
+    pin_single_model,
 )
 from devtools.benchmarks.common.result_index import runtime_terminal_disclosure  # noqa: E402
 
@@ -156,8 +156,9 @@ def main(argv: list[str] | None = None) -> int:
     started = time.time()
 
     env = os.environ.copy()
-    env.pop("OUROBOROS_MODEL_HEAVY", None)
-    env.pop("USE_LOCAL_HEAVY", None)
+    fixed_model_env: dict[str, str] = {}
+    pin_single_model(args.model, target=fixed_model_env)
+    env.update(fixed_model_env)
     env.update(
         {
             "OUROBOROS_REPO_DIR": str(repo_dir),
@@ -168,15 +169,6 @@ def main(argv: list[str] | None = None) -> int:
             "PYTHONUNBUFFERED": "1",
         }
     )
-    env.update(
-        {
-            "OUROBOROS_MODEL": args.model,
-            "OUROBOROS_MODEL_LIGHT": args.model,
-            "OUROBOROS_MODEL_FALLBACKS": args.model,
-            "OUROBOROS_SUBAGENTS": single_model_subagents_setting(args.model),
-        }
-    )
-
     cmd = [
         str(pathlib.Path(args.ouroboros_bin).expanduser()),
         "run",

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from devtools.benchmarks.common.model_slots import single_model_subagents_setting
+from devtools.benchmarks.common.model_slots import pin_single_model
 from devtools.benchmarks.osworld import run_cu_bridge_agent as rcb
 from ouroboros.extension_loader import extension_surface_name
 
@@ -23,10 +23,9 @@ _CU_ACTOR_MODEL = "openai/gpt-5.5"
 
 
 def _cu_actor_settings():
-    return {
-        "OUROBOROS_MODEL": _CU_ACTOR_MODEL,
-        "OUROBOROS_SUBAGENTS": single_model_subagents_setting(_CU_ACTOR_MODEL),
-    }
+    settings = {}
+    pin_single_model(_CU_ACTOR_MODEL, target=settings)
+    return settings
 
 
 def test_infeasible_checks_final_answer_fields_only():

@@ -17,13 +17,19 @@ from devtools.benchmarks.common.model_slots import (
     runtime_actor_snapshot,
     single_model_slot_snapshot,
     single_model_subagents_setting,
+    single_model_reviewer_slots_setting,
 )
-from devtools.benchmarks.common.server_runner import build_isolated_settings
+from devtools.benchmarks.common.server_runner import (
+    STALE_INHERITED_ENV_KEYS,
+    build_isolated_settings,
+)
 from ouroboros.config import SETTINGS_DEFAULTS
 from ouroboros.configured_subagents import (
     parse_configured_subagents,
     serialize_configured_subagents,
 )
+from ouroboros.provider_models import provider_for_model, review_model_uses_local
+from ouroboros.reviewer_slot_config import REVIEWER_SLOTS_ENV, parse_reviewer_slots
 
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -65,6 +71,12 @@ def _only_target(raw: object) -> str:
     return row.route.target_id
 
 
+def _fixed_actor_settings(model: str, *, review_slots: int = 1) -> dict[str, str]:
+    settings: dict[str, str] = {}
+    pin_single_model(model, review_slots=review_slots, target=settings)
+    return settings
+
+
 def _scrub_model_route_env(monkeypatch) -> None:
     from devtools.benchmarks.common.manifests import MODEL_SLOT_KEYS
 
@@ -82,12 +94,56 @@ def test_pin_single_model_replaces_legacy_heavy_and_prior_actor_list():
     target = {
         "OUROBOROS_MODEL_HEAVY": "decoy/heavy",
         "USE_LOCAL_HEAVY": "true",
+        "USE_LOCAL_MAIN": "true",
+        "USE_LOCAL_LIGHT": "true",
+        "USE_LOCAL_FALLBACK": "true",
+        "USE_LOCAL_CONSCIOUSNESS": "true",
+        "CLAUDE_CODE_MODEL": "foreign-sdk-model",
+        REVIEWER_SLOTS_ENV: json.dumps({
+            "triad": [{
+                "slot_id": "foreign-triad",
+                "route": {"kind": "agent_session", "target_id": "codex=gpt-5.6-sol"},
+            }],
+            "scope": [{
+                "slot_id": "foreign-scope",
+                "route": {"kind": "api_chat", "target_id": "foreign/scope"},
+            }],
+        }),
         "OUROBOROS_SUBAGENTS": single_model_subagents_setting("decoy/actor"),
     }
     pin_single_model("openai/gpt-5.5", target=target)
     assert "OUROBOROS_MODEL_HEAVY" not in target
     assert "USE_LOCAL_HEAVY" not in target
     assert _only_target(target["OUROBOROS_SUBAGENTS"]) == "openai/gpt-5.5"
+    assert all(target[key] == "false" for key in (
+        "USE_LOCAL_MAIN", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK",
+        "USE_LOCAL_CONSCIOUSNESS",
+    ))
+    assert target["CLAUDE_CODE_MODEL"] == ""
+    reviewers = parse_reviewer_slots(target[REVIEWER_SLOTS_ENV])
+    assert [row.target_id for row in reviewers.triad] == ["openai/gpt-5.5"]
+    assert [row.target_id for row in reviewers.scope] == ["openai/gpt-5.5"]
+    assert all(not row.is_session for row in (*reviewers.triad, *reviewers.scope))
+    assert reviewers.advisory.enabled is False
+
+
+def test_pin_single_model_preserves_canonical_local_route_semantics():
+    model = "owner/model (local)"
+    target = _fixed_actor_settings(model, review_slots=2)
+    assert provider_for_model(model) == "local"
+    assert review_model_uses_local(model) is True
+    assert all(target[key] == "true" for key in (
+        "USE_LOCAL_MAIN", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK",
+        "USE_LOCAL_CONSCIOUSNESS",
+    ))
+    reviewers = parse_reviewer_slots(target[REVIEWER_SLOTS_ENV])
+    assert [row.target_id for row in reviewers.triad] == [model, model]
+    assert [row.target_id for row in reviewers.scope] == [model]
+    assert all(not row.is_session for row in (*reviewers.triad, *reviewers.scope))
+    assert reviewers.advisory.enabled is False
+    actor = runtime_actor_snapshot(target, expected_model=model)
+    assert actor["mismatches"] == []
+    assert all(actor["local_routes"].values())
 
 
 def test_disabled_encoder_is_explicit_empty_off():
@@ -104,50 +160,94 @@ def test_disabled_encoder_can_retain_one_exact_measured_actor():
 
 
 def test_runtime_actor_snapshot_compares_main_and_canonical_actor():
-    actor = single_model_subagents_setting("openai/gpt-5.5")
-    exact = runtime_actor_snapshot(
-        {
-            "OUROBOROS_MODEL": "openai/gpt-5.5",
-            "OUROBOROS_MODEL_LIGHT": "openai/gpt-5.5",
-            "OUROBOROS_MODEL_FALLBACKS": "openai/gpt-5.5, openai/gpt-5.5",
-            "OUROBOROS_MODEL_VISION": "",
-            "OUROBOROS_SUBAGENTS": actor,
-        },
-        expected_model="openai/gpt-5.5",
-    )
+    model = "openai/gpt-5.5"
+    settings = _fixed_actor_settings(model)
+    settings["OUROBOROS_MODEL_FALLBACKS"] = f"{model}, {model}"
+    exact = runtime_actor_snapshot(settings, expected_model=model)
     assert exact["mismatches"] == []
-    assert exact["model_slots"] == {
-        "OUROBOROS_MODEL": "openai/gpt-5.5",
-        "OUROBOROS_MODEL_LIGHT": "openai/gpt-5.5",
-        "OUROBOROS_MODEL_FALLBACKS": "openai/gpt-5.5, openai/gpt-5.5",
-    }
-    assert _only_target(json.dumps(exact["available_subagents"])) == "openai/gpt-5.5"
+    assert exact["model_slots"]["OUROBOROS_MODEL_FALLBACKS"] == f"{model}, {model}"
+    assert not any(exact["local_routes"].values())
+    assert exact["reviewer_slots"]["advisory"]["enabled"] is False
+    assert _only_target(json.dumps(exact["available_subagents"])) == model
 
-    contaminated = runtime_actor_snapshot(
-        {
-            "OUROBOROS_MODEL": "openai/gpt-5.5",
-            "OUROBOROS_MODEL_LIGHT": "anthropic/foreign-light",
-            "OUROBOROS_MODEL_FALLBACKS": "openai/gpt-5.5,anthropic/foreign-fallback",
-            "OUROBOROS_SUBAGENTS": actor,
-        },
-        expected_model="openai/gpt-5.5",
+    contaminated_settings = dict(settings)
+    contaminated_settings["OUROBOROS_MODEL_LIGHT"] = "anthropic/foreign-light"
+    contaminated_settings["OUROBOROS_MODEL_FALLBACKS"] = (
+        f"{model},anthropic/foreign-fallback"
     )
+    contaminated = runtime_actor_snapshot(contaminated_settings, expected_model=model)
     assert any("OUROBOROS_MODEL_LIGHT" in item for item in contaminated["mismatches"])
     assert any("OUROBOROS_MODEL_FALLBACKS" in item for item in contaminated["mismatches"])
 
-    drifted = runtime_actor_snapshot(
-        {
-            "OUROBOROS_MODEL": "anthropic/claude-fable-5",
-            "OUROBOROS_SUBAGENTS": single_model_subagents_setting(
-                "anthropic/claude-fable-5"
-            ),
-        },
-        expected_model="openai/gpt-5.5",
-    )
-    assert len(drifted["mismatches"]) == 2
+    other = "anthropic/claude-fable-5"
+    drifted = runtime_actor_snapshot(_fixed_actor_settings(other), expected_model=model)
+    assert any("OUROBOROS_MODEL:" in item for item in drifted["mismatches"])
+    assert any("OUROBOROS_SUBAGENTS" in item for item in drifted["mismatches"])
     assert _only_target(json.dumps(drifted["available_subagents"])) == (
-        "anthropic/claude-fable-5"
+        other
     )
+
+
+@pytest.mark.parametrize(
+    "kind,target,needle",
+    (
+        ("api_chat", "foreign/reviewer", "foreign/reviewer"),
+        ("agent_session", "codex=gpt-5.6-sol-high", "agent_session"),
+    ),
+)
+def test_runtime_actor_snapshot_refuses_foreign_or_session_reviewer_rows(
+    kind, target, needle
+):
+    model = "openai/gpt-5.5"
+    settings = _fixed_actor_settings(model)
+    payload = json.loads(settings[REVIEWER_SLOTS_ENV])
+    payload["triad"][0]["route"] = {"kind": kind, "target_id": target}
+    settings[REVIEWER_SLOTS_ENV] = json.dumps(payload)
+    snapshot = runtime_actor_snapshot(settings, expected_model=model)
+    assert any(needle in item for item in snapshot["mismatches"])
+
+
+def test_runtime_actor_snapshot_refuses_enabled_foreign_advisory():
+    model = "openai/gpt-5.5"
+    settings = _fixed_actor_settings(model)
+    payload = json.loads(settings[REVIEWER_SLOTS_ENV])
+    payload["advisory"] = {
+        "enabled": True,
+        "route": {"kind": "api_chat", "target_id": "foreign-sdk-model"},
+        "effort": "high",
+    }
+    settings[REVIEWER_SLOTS_ENV] = json.dumps(payload)
+    snapshot = runtime_actor_snapshot(settings, expected_model=model)
+    assert any("advisory is enabled" in item for item in snapshot["mismatches"])
+
+
+def test_runtime_actor_snapshot_uses_structured_reviewers_not_stale_legacy_strings():
+    model = "openai/gpt-5.5"
+    settings = _fixed_actor_settings(model, review_slots=3)
+    settings.update({
+        "OUROBOROS_REVIEW_MODELS": "foreign/stale-triad",
+        "OUROBOROS_SCOPE_REVIEW_MODELS": "foreign/stale-scope",
+        "OUROBOROS_SCOPE_REVIEW_MODEL": "foreign/stale-singular",
+        "CLAUDE_CODE_MODEL": "foreign-stale-sdk-model",
+    })
+    snapshot = runtime_actor_snapshot(settings, expected_model=model)
+    assert snapshot["mismatches"] == []
+    assert [row["route"]["target_id"] for row in snapshot["reviewer_slots"]["triad"]] == [
+        model, model, model,
+    ]
+    assert snapshot["reviewer_slots"]["advisory"]["enabled"] is False
+
+
+@pytest.mark.parametrize(
+    "local_key",
+    ("USE_LOCAL_MAIN", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK", "USE_LOCAL_CONSCIOUSNESS"),
+)
+def test_runtime_actor_snapshot_refuses_each_remote_to_local_route_drift(local_key):
+    model = "openai/gpt-5.5"
+    settings = _fixed_actor_settings(model)
+    settings[local_key] = True
+    snapshot = runtime_actor_snapshot(settings, expected_model=model)
+    assert any(local_key in item for item in snapshot["mismatches"])
 
 
 def test_single_model_slot_snapshot_is_cli_derived_and_has_no_heavy():
@@ -178,10 +278,28 @@ def test_committed_single_model_profiles_use_one_canonical_actor(relative: str, 
 )
 def test_target_attached_profiles_override_foreign_runtime_defaults(relative, expected):
     payload = json.loads((REPO / relative).read_text(encoding="utf-8"))
+    triad_count = len([item for item in payload["OUROBOROS_REVIEW_MODELS"].split(",")
+                       if item.strip()])
+    scope_count = len([item for item in payload["OUROBOROS_SCOPE_REVIEW_MODELS"].split(",")
+                       if item.strip()])
+    assert payload[REVIEWER_SLOTS_ENV] == single_model_reviewer_slots_setting(
+        expected,
+        review_slots=triad_count,
+        scope_slots=scope_count,
+        review_effort=payload["OUROBOROS_EFFORT_REVIEW"],
+        scope_effort=payload["OUROBOROS_EFFORT_SCOPE_REVIEW"],
+    )
+    assert payload["CLAUDE_CODE_MODEL"] == ""
+    assert all(payload[key] is False for key in (
+        "USE_LOCAL_MAIN", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK",
+        "USE_LOCAL_CONSCIOUSNESS",
+    ))
     effective = dict(SETTINGS_DEFAULTS)
     effective.update(payload)
     actor = runtime_actor_snapshot(effective, expected_model=expected)
     assert actor["mismatches"] == []
+    assert not any(actor["local_routes"].values())
+    assert actor["reviewer_slots"]["advisory"]["enabled"] is False
     assert all(
         item.strip() == expected
         for raw in actor["model_slots"].values()
@@ -205,14 +323,21 @@ def test_benchmark_snapshot_records_canonical_actor_and_refuses_malformed(tmp_pa
 
 
 def test_isolated_settings_copy_active_actor_but_not_legacy_heavy():
-    raw = single_model_subagents_setting("openai/gpt-5.5")
+    model = "openai/gpt-5.5"
+    raw = single_model_subagents_setting(model)
+    reviewers = single_model_reviewer_slots_setting(model)
     isolated = build_isolated_settings({
-        "OUROBOROS_MODEL": "openai/gpt-5.5",
+        "OUROBOROS_MODEL": model,
         "OUROBOROS_MODEL_HEAVY": "decoy/heavy",
         "OUROBOROS_SUBAGENTS": raw,
+        REVIEWER_SLOTS_ENV: reviewers,
     })
     assert isolated["OUROBOROS_SUBAGENTS"] == raw
+    assert isolated[REVIEWER_SLOTS_ENV] == reviewers
     assert "OUROBOROS_MODEL_HEAVY" not in isolated
+    assert {REVIEWER_SLOTS_ENV, "USE_LOCAL_CONSCIOUSNESS"}.issubset(
+        STALE_INHERITED_ENV_KEYS
+    )
 
 
 def test_legacy_heavy_read_vocabulary_does_not_leak_into_new_projection(
@@ -300,10 +425,7 @@ def test_programbench_binds_manifest_to_target_actor_and_refuses_before_discover
     monkeypatch.setattr(
         e2e,
         "ouroboros_api_request",
-        lambda *_a, **_k: {
-            "OUROBOROS_MODEL": actual,
-            "OUROBOROS_SUBAGENTS": single_model_subagents_setting(actual),
-        },
+        lambda *_a, **_k: _fixed_actor_settings(actual),
     )
     monkeypatch.setattr(
         e2e,
@@ -335,8 +457,7 @@ def test_programbench_target_actor_is_durable_before_discovery_and_first_task_cr
     from devtools.benchmarks.programbench import run_programbench_e2e as e2e
 
     measured = "openai/gpt-5.5"
-    target_settings = single_model_slot_snapshot(measured)
-    target_settings["OUROBOROS_SUBAGENTS"] = single_model_subagents_setting(measured)
+    target_settings = _fixed_actor_settings(measured)
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps(target_settings), encoding="utf-8")
     out = tmp_path / "run"
@@ -352,6 +473,8 @@ def test_programbench_target_actor_is_durable_before_discovery_and_first_task_cr
         assert actor["mismatches"] == []
         assert actor["model"] == measured
         assert actor["model_slots"]["OUROBOROS_MODEL"] == measured
+        assert not any(actor["local_routes"].values())
+        assert actor["reviewer_slots"]["advisory"]["enabled"] is False
         assert durable["available_subagents"] == actor["available_subagents"]
 
     observed = {"discovery": False, "first_task": False}
@@ -426,34 +549,22 @@ def test_osworld_cu_bridge_validates_declared_and_target_actor(tmp_path, monkeyp
     from devtools.benchmarks.osworld import run_cu_bridge_agent as cu
 
     model = "openai/gpt-5.5"
+    exact = _fixed_actor_settings(model)
     settings = tmp_path / "settings.json"
-    settings.write_text(
-        json.dumps({
-            "OUROBOROS_MODEL": model,
-            "OUROBOROS_SUBAGENTS": single_model_subagents_setting(model),
-        }),
-        encoding="utf-8",
-    )
+    settings.write_text(json.dumps(exact), encoding="utf-8")
     monkeypatch.setattr(
         cu,
         "_api",
-        lambda *_a, **_k: {
-            "OUROBOROS_MODEL": model,
-            "OUROBOROS_SUBAGENTS": single_model_subagents_setting(model),
-        },
+        lambda *_a, **_k: dict(exact),
     )
     assert cu._cu_actor_preflight(settings, "http://target")["ok"] is True
 
-    monkeypatch.setattr(
-        cu,
-        "_api",
-        lambda *_a, **_k: {
-            "OUROBOROS_MODEL": model,
-            "OUROBOROS_MODEL_LIGHT": "anthropic/foreign-light",
-            "OUROBOROS_MODEL_FALLBACKS": "anthropic/foreign-fallback",
-            "OUROBOROS_SUBAGENTS": single_model_subagents_setting(model),
-        },
-    )
+    contaminated_settings = dict(exact)
+    contaminated_settings.update({
+        "OUROBOROS_MODEL_LIGHT": "anthropic/foreign-light",
+        "OUROBOROS_MODEL_FALLBACKS": "anthropic/foreign-fallback",
+    })
+    monkeypatch.setattr(cu, "_api", lambda *_a, **_k: contaminated_settings)
     contaminated = cu._cu_actor_preflight(settings, "http://target")
     assert contaminated["ok"] is False
     assert any("OUROBOROS_MODEL_LIGHT" in item for item in contaminated["failures"])
@@ -463,10 +574,7 @@ def test_osworld_cu_bridge_validates_declared_and_target_actor(tmp_path, monkeyp
     monkeypatch.setattr(
         cu,
         "_api",
-        lambda *_a, **_k: {
-            "OUROBOROS_MODEL": other,
-            "OUROBOROS_SUBAGENTS": single_model_subagents_setting(other),
-        },
+        lambda *_a, **_k: _fixed_actor_settings(other),
     )
     drifted = cu._cu_actor_preflight(settings, "http://target")
     assert drifted["ok"] is False
