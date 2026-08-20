@@ -25,7 +25,7 @@ DEFAULT_PYTEST_ARGS = ["tests/", "-q", "--tb=line", "--no-header"]
 # tomllib parse): README pins Python 3.10+ and tomllib is 3.11+.
 LANE_EXCLUSION_EXPR = (
     "not integration and not browser and not ui_browser and not ui_browser_docker "
-    "and not portable_detail and not skill_smoke"
+    "and not portable_detail and not skill_smoke and not size_ratchet"
 )
 
 # Mirrors ci.yml `quick-test`/`full-test` exactly, including the per-test timeout

@@ -1876,12 +1876,31 @@ function iterator preserves the narrower runtime scope and exact lexical qualnam
 through AST literals, never Python import execution. It records exact repo-relative
 module debt above 1600 lines, exact `(path, qualname)` function debt above 300 lines,
 the exact-current 1001-1500 band with rationale authority for new or re-entered paths,
-and exact byte debt above 200,000 UTF-8 bytes. `scripts/regenerate_size_ratchet.py`
-bootstraps only from an exact Git source SHA and updates the live candidate. Validation
-proves bootstrap contents against that immutable tree, audits every first-parent
-candidate tree and manifest transition through `HEAD`, then compares the working tree;
-debt can shrink but cannot be swapped, re-entered without its required authority, grow
-on the byte axis, or survive as a stale record. `MAX_TOTAL_FUNCTIONS` remains the coarse
+and exact byte debt above 200,000 UTF-8 bytes. Validation
+(`ouroboros/review.py::validate_size_ratchet`) proves the live and staged manifests
+exact against their trees and shrink-only against the merge-aware committed authority:
+the previous manifest resolves from `HEAD`'s tree, falls back to ANY parent whose tree
+carries it, and a checkout with no committed manifest anywhere bootstraps from its own
+tree (baselines must match that tree). There is no first-parent history replay — a
+fork whose local line predates the manifest is never condemned by inherited topology.
+Enforcement is split by surface: the OFFICIAL repository CI runs the blocking
+`size_ratchet` pytest lane (tip exactness plus
+`validate_size_ratchet_transition_against_base`, the pairwise base-vs-tip transition
+against the CI event base), while every local surface — default pytest lanes,
+`check_worktree_readiness`, `codebase_health` — reports the same findings as warnings.
+Two residuals of that official line are accepted and disclosed: pairwise validation
+covers only the `event.before`/`base.sha` → `HEAD` interval, so growth-and-rollback
+inside one push/PR interval — including a same-interval retire-and-re-enter — is not
+caught anywhere (accepted owner tradeoff); and the official line's only block is
+post-push/PR CI, so its authority presupposes repository branch protection / required
+status checks on the `ouroboros` branch — a repo-settings prerequisite outside this
+codebase, escalated to the owner separately.
+Within a validated pair, debt can shrink but cannot be swapped, re-entered without its
+required authority, grow on the byte axis, or survive as a stale record.
+`scripts/regenerate_size_ratchet.py` refuses an unmerged index, resolves its previous
+manifest merge-aware, and validates the rendered candidate in memory
+(`validate_size_ratchet_candidate`) before overwriting the checked-in file.
+`MAX_TOTAL_FUNCTIONS` remains the coarse
 runtime ceiling and any raise requires its one-line campaign rationale.
 The same sprint added a deterministic hot-store growth health invariant:
 `agent_startup_checks.py::hot_store_growth_notes` (surfaced in every task
@@ -2414,7 +2433,7 @@ Claude Runtime Status appears when an Anthropic key exists or when backend/runti
 
 The local `ouroboros-stable` ref also remains a recovery fallback maintained by explicit promotion; that local role does not select the official QA feed. Colab seeds it from the already validated shared Stable release when possible and otherwise from the selected validated channel, then leaves it pinned until promotion. Launcher metadata describes bootstrap provenance only. Runtime status, preflight, Colab bootstrap, and apply resolve the selected channel and exact fetched SHA themselves, so an older frozen launcher cannot silently redirect updates. Stable additionally requires the shared plain release tag; QA and Development do not use version comparison as an admission gate.
 
-The main CI workflow has five roles: fork-safe quick checks with no provider secrets; the full cross-platform matrix; trusted provider integration; official-skill install, preflight, review, dependency, and keyless execution smoke; and tag-triggered build/release. Quick and full checkouts fetch complete history because the size ratchet fails closed unless its immutable bootstrap and every first-parent transition are locally provable. Secret-bearing skill review runs before any step that imports downloaded plugin code, and a missing required key is red rather than skipped. Release jobs build three platform archives, an AppImage, and three native Linux package assets, verify each final asset, produce checksums, SBOMs and source-bound attestations, and recheck the remote annotated tag against the event SHA before draft creation and publication.
+The main CI workflow has five roles: fork-safe quick checks with no provider secrets; the full cross-platform matrix; trusted provider integration; official-skill install, preflight, review, dependency, and keyless execution smoke; and tag-triggered build/release. Quick and full jobs each run a dedicated blocking `size_ratchet` pytest step — the ONLY enforcing surface for the repository size gates (local runs exclude the marker and warn): manifest exactness on the tip plus the pairwise shrink-only transition against the event base passed in `OURO_SIZE_RATCHET_BASE_REF` (PR base SHA / push `event.before`; an all-zeros, missing, or unresolvable base degrades to the tip's parent manifest, verified against the parent's own tree — never a skip — while a resolvable base without the manifest fails closed; only a checkout with no parent manifest at all bootstraps with the transition skipped). Their checkouts still fetch complete history so the explicit base ref stays resolvable and other unaudited consumers keep their view. Secret-bearing skill review runs before any step that imports downloaded plugin code, and a missing required key is red rather than skipped. Release jobs build three platform archives, an AppImage, and three native Linux package assets, verify each final asset, produce checksums, SBOMs and source-bound attestations, and recheck the remote annotated tag against the event SHA before draft creation and publication.
 
 Tool-schema compatibility has two CI layers. Fork-safe pull-request tests build the
 complete shipped built-in catalog without loading MCP or extensions, validate every

@@ -393,6 +393,25 @@ P7 makes context fit a maintenance constraint, not a line-count aesthetic.
   reviewer checklist 2(c), not a deterministic size-test gate. Existing
   baseline debt is not retroactively a failing tree. Any advisory ratchet must
   publish its AST counting scope and bind its baseline to the final SHA.
+- Enforcement surfaces: the OFFICIAL repository's CI runs the dedicated
+  `size_ratchet` pytest lane as a blocking third step in quick-test and
+  full-test — manifest exactness against the tip tree plus the pairwise
+  shrink-only transition against the event base
+  (`OURO_SIZE_RATCHET_BASE_REF`). Local surfaces never block on size: the
+  default pytest lanes exclude the marker, and `check_worktree_readiness`
+  (advisory preflight) and `codebase_health` report the same
+  `validate_size_ratchet` findings as "official CI will enforce" warnings.
+  The lane blocks only in post-push/PR CI, so its authority presupposes
+  branch protection / required status checks on the official `ouroboros`
+  branch (a repository-settings prerequisite outside this codebase).
+  There is no committed-history replay: the previous manifest resolves
+  merge-aware from `HEAD` or any of its parents, and a checkout with no
+  committed manifest anywhere bootstraps from its own tree — so a locally
+  evolved fork can always take an official update without being trapped by
+  structural debt it inherited, while the official line keeps ratcheting.
+  `scripts/regenerate_size_ratchet.py` validates its rendered candidate
+  BEFORE writing it and refuses an unmerged index with a typed
+  "merge in progress" error.
 - Prefer deleting dead/duplicate authority before raising a cap. Add an
   abstraction only when it removes concrete coupling or preserves a stable
   extension seam.
@@ -863,9 +882,9 @@ Before every commit, verify the following:
 - [ ] **Tool** (`{verb}_{noun}`): thin LLM-callable wrapper. Validates input, formats output.
 
 #### Module Size & Complexity
-- [ ] Module stays near one context window (~1000 lines target; exact-path 1600 hard-gate debt is checked in, stale entries fail, and new/re-entered 1001-1500 paths carry a rationale)
+- [ ] Module stays near one context window (~1000 lines target; exact-path 1600 hard-gate debt is checked in, stale entries fail the official-CI `size_ratchet` lane and warn locally, and new/re-entered 1001-1500 paths carry a rationale)
 - [ ] No non-grandfathered Python function or method exceeds the 300-line hard gate (`FUNCTION_DEBT` exact `(path, qualname)` keys are the exception SSOT); methods above 150 lines trigger decomposition review
-- [ ] Total Python function count stays under the current smoke hard gate (consult `ouroboros/review.py::MAX_TOTAL_FUNCTIONS` for the active value; bump with a comment if a feature requires more headroom)
+- [ ] Total Python function count stays under `ouroboros/review.py::MAX_TOTAL_FUNCTIONS` (enforced by the official-CI `size_ratchet` lane, warned locally like the other size gates; bump with a comment if a feature requires more headroom)
 - [ ] More than eight parameters is a decomposition signal; consider a typed context object, but do not claim a hard gate or mark existing baseline debt noncompliant
 - [ ] No gratuitous abstract layers (Bible P7)
 
@@ -1817,7 +1836,8 @@ it as a release-artifact install or contributor development environment.
 
 Default local pytest excludes costly or environment-dependent lanes:
 `integration`, `browser`, `ui_browser`, `ui_browser_docker`,
-`portable_detail`, and `skill_smoke`. CI opts into them explicitly:
+`portable_detail`, `skill_smoke`, and `size_ratchet`. CI opts into them
+explicitly:
 
 - `integration` runs real provider checks, including Cloud.ru when
   `CLOUDRU_FOUNDATION_MODELS_API_KEY` is configured and GigaChat when
@@ -1868,6 +1888,23 @@ Default local pytest excludes costly or environment-dependent lanes:
   ubuntu shard (an LLM verdict is OS-independent). Paid step (~$1.2/run,
   ~$2.4 with the single fresh verdict retry); a missing key is a hard red,
   not a skip.
+
+- `size_ratchet` carries the live-repo size gates: exact-manifest smoke and
+  the module/function hard gates (`tests/test_smoke.py`), the generator
+  `--check` exactness half (`tests/test_repo_health_smoke.py`), and the
+  pairwise base-vs-tip transition check. It is the ONLY blocking surface for
+  repository size: official-repository CI runs `python -m pytest tests/ -m
+  size_ratchet` as a dedicated third step in quick-test AND full-test, with
+  `OURO_SIZE_RATCHET_BASE_REF` naming the event base (PR base SHA / push
+  `event.before`; an all-zeros or unresolvable base degrades to the tip's
+  parent manifest, verified against the parent's own tree — never a skip —
+  while a resolvable base without the manifest fails closed).
+  Default local runs exclude the marker and surface the same
+  `validate_size_ratchet` findings as warnings through
+  `check_worktree_readiness` and `codebase_health`; fixture-based ratchet
+  unit tests stay in the default lanes — only checks against the live repo
+  carry the marker. Its tests must not carry the `serial` marker (same
+  single-lane rule as `skill_smoke`).
 
 When adding a new opt-in lane, register the marker in `pyproject.toml`, add
 a collect-only zero-test guard in CI, and keep the default local addopts

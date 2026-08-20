@@ -1,6 +1,8 @@
 """Shared helpers for the review stack (advisory, triad, scope reviews).
 
-No imports from other ouroboros.tools modules to avoid circular deps.
+No imports from other ouroboros.tools modules to avoid circular deps; the one
+sanctioned exception is the ``release_sync`` compatibility re-export of
+``check_worktree_version_sync`` (moved to its version-sync home).
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
+from ouroboros.tools.release_sync import check_worktree_version_sync  # noqa: F401 - moved to its version-sync home; compatibility re-export
 from ouroboros.utils import (
     sanitize_tool_result_for_log,
     truncate_review_artifact as _truncate_review_artifact,
@@ -1419,42 +1422,6 @@ def get_advisory_runtime_diagnostics(model: str, prompt_chars: int,
     return diag
 
 
-def check_worktree_version_sync(repo_dir) -> str:
-    """Return a non-fatal warning when release version carriers disagree."""
-    from ouroboros.tools.release_sync import (
-        is_release_version,
-        version_carrier_desyncs,
-    )
-    repo_dir = Path(repo_dir)
-    try:
-        version_path = repo_dir / "VERSION"
-        if not version_path.exists():
-            return ""
-        version_str = version_path.read_text(encoding="utf-8").strip()
-        if not is_release_version(version_str):
-            return ""
-
-        def _read(rel_path: str) -> str:
-            return path.read_text(encoding="utf-8") if (path := repo_dir / rel_path).exists() else ""
-        desync = version_carrier_desyncs(
-            version_str,
-            pyproject_text=_read("pyproject.toml"),
-            uv_lock_text=_read("uv.lock"),
-            web_package_text=_read("web/package.json"),
-            readme_text=_read("README.md"),
-            arch_text=_read("docs/ARCHITECTURE.md"),
-            api_types_text=_read("web/modules/api_types.js"),
-            download_readme_text=_read("README.md"),
-            site_install_text=_read("site/install/index.html"),
-            docs_install_text=_read("docs/install/index.html"),
-        )
-        if desync:
-            return f"VERSION={version_str} but {', '.join(desync)} differ. Sync version carriers before committing."
-    except Exception:
-        pass
-    return ""
-
-
 def check_worktree_readiness(
     repo_dir: "Path",
     paths: "list[str] | None" = None,
@@ -1536,6 +1503,30 @@ def check_worktree_readiness(
             )
     except Exception:
         pass
+
+    # 5. Size-ratchet findings. Never blocking here: the official repository's
+    # CI ``size_ratchet`` lane is the enforcing surface; this warning lets the
+    # agent regenerate the manifest or shrink the debt before the official
+    # line rejects the same finding. Cheap since the history replay retired
+    # (one live inventory plus a couple of git object reads).
+    try:
+        from ouroboros.review import validate_size_ratchet  # local import: ouroboros.review imports this module
+
+        for finding in validate_size_ratchet(repo_dir):
+            warnings.append(f"official CI will enforce: {finding}")
+    except Exception as exc:
+        # A broken validator must not silently disable the only local surface —
+        # but only for a REAL checkout: fixture trees without .git legitimately
+        # cannot run the validator and must stay warning-free.
+        try:
+            is_real_checkout = (pathlib.Path(repo_dir) / ".git").exists()
+        except Exception:
+            is_real_checkout = False
+        if is_real_checkout:
+            warnings.append(
+                f"size-ratchet validator unavailable ({type(exc).__name__}); "
+                "the official CI lane still enforces"
+            )
 
     return warnings
 
