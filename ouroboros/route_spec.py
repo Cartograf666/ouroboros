@@ -86,10 +86,34 @@ def route_spec_dict(route: RouteSpec, *, api_kind: str, pin_key: str) -> dict[st
     return payload
 
 
+def validate_compound_session_effort(
+    route: RouteSpec,
+    effort: str,
+    *,
+    setting: str,
+    where: str,
+) -> None:
+    """Reject two contradictory effort authorities on Cursor/Agy routes."""
+    if not route.is_session or not effort:
+        return
+    harness, separator, model = route.target_id.partition("=")
+    if not separator or harness not in {"cursor", "agy"}:
+        return
+    from ouroboros.config import EFFORT_SCALE
+
+    compound_model = model[:-5] if model.lower().endswith("-fast") else model
+    encoded = compound_model.rsplit("-", 1)[-1].lower()
+    if encoded in EFFORT_SCALE and encoded != effort:
+        raise ValueError(
+            f"{setting}: {where} effort {effort!r} conflicts with compound route effort {encoded!r}"
+        )
+
+
 __all__ = [
     "ROUTE_KIND_AGENT_SESSION",
     "ROUTE_KIND_API_MODEL",
     "RouteSpec",
     "parse_route_spec",
     "route_spec_dict",
+    "validate_compound_session_effort",
 ]

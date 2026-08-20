@@ -27,9 +27,9 @@ import { installAltMenuSuppression } from './ui_helpers.js';
         const STEP_META = Object.fromEntries((SETUP_CONTRACT.steps || []).map((step) => [step.id, step]));
         const PROVIDER_FIELDS = SETUP_CONTRACT.providerFields || [];
         const PROVIDER_PROFILES = SETUP_CONTRACT.providerProfiles || {};
-        // Heavy is legacy migration input, never an active/user-facing slot.
-        const MODEL_SLOTS = (SETUP_CONTRACT.modelSlots || []).filter((slot) =>
-            String(slot?.slot || '').toLowerCase() !== 'heavy' && slot?.settingKey !== 'OUROBOROS_MODEL_HEAVY');
+        // The backend contract exports active slots only. Heavy remains a
+        // bounded stored-value migration input and never enters this editor.
+        const MODEL_SLOTS = SETUP_CONTRACT.modelSlots || [];
         const REVIEW_MODES = SETUP_CONTRACT.reviewModes || [];
         const RUNTIME_MODES = SETUP_CONTRACT.runtimeModes || [];
         const LOCAL_ROUTING_MODES = SETUP_CONTRACT.localRoutingModes || [];

@@ -15,6 +15,7 @@ import {
     availableSubagentsHasExplicitDraft,
     availableSubagentRowMarkup,
     availableSubagentsLoadValue,
+    availableSubagentsRenderSignature,
     availableSubagentsSavePayload,
     buildAvailableSubagentsSetting,
     createAvailableSubagentsEditor,
@@ -385,6 +386,167 @@ test('saved unavailable session route and account remain selectable', () => {
     assert.match(html, /gpt-5.6-sol-high \(not in discovery\)/);
     assert.match(html, /Account: koshak \(not in discovery\)/);
     assert.match(html, /currently unavailable/);
+});
+
+test('session status never calls a missing model or failed pin available', () => {
+    const state = {
+        catalogKnown: true,
+        accountsKnown: true,
+        quotaKnown: true,
+        statusError: '',
+        snapshot: {
+            harnesses: [{
+                id: 'codex', status: 'ok', enabled: true,
+                models: [{ id: 'different-model' }],
+            }],
+            profiles: { harnessAccounts: [], profiles: [{
+                profile: { harness_id: 'codex', profile_id: 'koshak', enabled: true },
+                status: { verification: 'failed' },
+            }] },
+            quota: [],
+        },
+    };
+    const missingModel = availableSubagentRowMarkup(sessionRow(), state);
+    assert.match(missingModel, /selected model gpt-5\.6-sol-high currently unavailable/);
+    assert.doesNotMatch(missingModel, /available now/);
+
+    state.snapshot.harnesses[0].models = [{ id: 'gpt-5.6-sol-high' }];
+    const failedPin = availableSubagentRowMarkup(sessionRow(), state);
+    assert.match(failedPin, /pinned account koshak currently unavailable/);
+    assert.doesNotMatch(failedPin, /available now/);
+});
+
+test('session status uses model-scoped quota and keeps missing quota as not proven', () => {
+    const state = {
+        catalogKnown: true,
+        accountsKnown: true,
+        quotaKnown: false,
+        statusError: '',
+        snapshot: {
+            harnesses: [{
+                id: 'codex', status: 'ok', enabled: true,
+                models: [{ id: 'gpt-5.6-sol-high' }],
+            }],
+            profiles: { harnessAccounts: [], profiles: [{
+                profile: { harness_id: 'codex', profile_id: 'koshak', enabled: true },
+                status: { verification: 'passed' },
+            }] },
+            quota: [],
+        },
+    };
+    assert.match(availableSubagentRowMarkup(sessionRow(), state), /quota not checked/);
+    assert.doesNotMatch(availableSubagentRowMarkup(sessionRow(), state), /available now/);
+
+    state.quotaKnown = true;
+    state.snapshot.quota = [{
+        subject: { harness: 'codex', subject_id: 'koshak' },
+        freshness: 'fresh',
+        constraints: [{
+            applies_to_models: ['gpt-5.6-sol'], used_ratio: 1,
+        }],
+    }];
+    const exhausted = availableSubagentRowMarkup(sessionRow(), state);
+    assert.match(exhausted, /pinned account koshak limit reached/);
+    assert.doesNotMatch(exhausted, /available now/);
+
+    state.snapshot.quota[0].constraints[0].applies_to_models = ['other-model'];
+    assert.match(availableSubagentRowMarkup(sessionRow(), state), /available now/);
+});
+
+test('session render signature follows account-pool routing verdict changes', () => {
+    const state = {
+        loaded: true, parseError: '', setting: setting([apiRow(), sessionRow({
+            route: {
+                kind: ROUTE_KIND_AGENT_SESSION,
+                target_id: 'codex=gpt-5.6-sol-high',
+                credential_profile_id: '',
+            },
+        })]), baselineLabel: 'Saved intent',
+        source: 'configured', diagnostics: [], statusError: '', catalogKnown: true,
+        accountsKnown: true, quotaKnown: true, apiModels: [],
+        snapshot: {
+            harnesses: [{
+                id: 'codex', status: 'ok', enabled: true,
+                models: [{ id: 'gpt-5.6-sol-high' }],
+            }],
+            profiles: {
+                profiles: [{
+                    profile: { harness_id: 'codex', profile_id: 'p1', enabled: true },
+                    status: { verification: 'passed' },
+                }],
+                harnessAccounts: [],
+                accountPools: [{ harness_id: 'codex', next_up: { kind: 'profile', profile_id: 'p1' } }],
+            },
+            quota: [],
+        },
+    };
+    const available = availableSubagentsRenderSignature(state);
+    state.snapshot.profiles.accountPools[0].next_up = { kind: 'none' };
+    assert.notEqual(availableSubagentsRenderSignature(state), available);
+});
+
+test('session render signature expires a cooldown without a changed payload', () => {
+    const cooldownUntil = Date.parse('2030-01-01T00:00:00Z');
+    const state = {
+        loaded: true, parseError: '', setting: setting(), baselineLabel: 'Saved intent',
+        source: 'configured', diagnostics: [], statusError: '', catalogKnown: true,
+        accountsKnown: true, quotaKnown: true, apiModels: [],
+        snapshot: {
+            harnesses: [{
+                id: 'codex', status: 'ok', enabled: true,
+                models: [{ id: 'gpt-5.6-sol-high' }],
+            }],
+            profiles: { profiles: [{
+                profile: { harness_id: 'codex', profile_id: 'koshak', enabled: true },
+                status: { verification: 'passed' },
+            }] },
+            quota: [{
+                subject: { harness: 'codex', subject_id: 'koshak' },
+                freshness: 'fresh', constraints: [{
+                    cooldown_until: '2030-01-01T00:00:00Z', applies_to_models: ['gpt-5.6-sol'],
+                }],
+            }],
+        },
+    };
+    const cooling = availableSubagentsRenderSignature(state, cooldownUntil - 1);
+    const healed = availableSubagentsRenderSignature(state, cooldownUntil + 1);
+    assert.notEqual(healed, cooling);
+});
+
+test('last actual execution uses the one typed receipt and only its exact actor id', () => {
+    const state = {
+        catalogKnown: false,
+        accountsKnown: false,
+        quotaKnown: false,
+        statusError: '',
+        snapshot: {
+            harnesses: [], profiles: {}, quota: [],
+            subagent_last_delegation: {
+                selected_subagent_id: 'codex_builder',
+                route: 'codex',
+                requested_model: 'gpt-5.6-sol-high',
+                applied_model: 'GPT-5.6 Sol High',
+                requested_profile: 'koshak',
+                applied_profile: 'koshak',
+                run_id: 'run-1',
+                ts: new Date().toISOString(),
+            },
+        },
+    };
+    const matching = availableSubagentRowMarkup(sessionRow(), state);
+    assert.match(matching, /Last actual run: codex session/);
+    assert.match(matching, /GPT-5\.6 Sol High/);
+    assert.match(matching, /account koshak/);
+
+    const other = availableSubagentRowMarkup(sessionRow({ subagent_id: 'other' }), state);
+    assert.doesNotMatch(other, /Last actual run:/);
+
+    state.snapshot.subagent_last_delegation.applied_model = '';
+    state.snapshot.subagent_last_delegation.applied_profile = '';
+    const oldReceipt = availableSubagentRowMarkup(sessionRow(), state);
+    assert.match(oldReceipt, /Last actual run: codex session · model not disclosed/);
+    assert.doesNotMatch(oldReceipt, /Last actual run:[^<]*gpt-5\.6-sol-high/);
+    assert.doesNotMatch(oldReceipt, /Last actual run:[^<]*account koshak/);
 });
 
 test('preview replaces only a clean generated baseline', () => {

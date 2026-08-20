@@ -224,6 +224,22 @@ export function effortSelectHtml(attrs, selected, surfaceDefault = 'route defaul
 
 export function describeExecutionEvidence(entry) {
     if (!entry || typeof entry !== 'object') return '';
+    if ('requested_model' in entry || 'applied_model' in entry) {
+        const parts = [];
+        const route = String(entry.route || '');
+        if (route) parts.push(`${route} session`);
+        // Last-actual evidence is APPLIED telemetry only. Older receipts may
+        // retain the requested route while omitting what the harness actually
+        // served; never dress that requested value up as execution truth.
+        const model = String(entry.applied_model || '');
+        if (model) parts.push(model);
+        else if (entry.requested_model) parts.push('model not disclosed');
+        const account = String(entry.applied_profile || '');
+        if (account) parts.push(`account ${account}`);
+        const when = formatRelativeAge(Date.parse(entry.ts || ''), 'just now');
+        if (when) parts.push(when);
+        return parts.join(' · ');
+    }
     const effective = entry.effective || entry;
     const parts = [];
     const route = String(effective.route || effective.kind || '');

@@ -66,9 +66,7 @@ const NUMBER_FIELDS = [
 ];
 
 function setupModelSlots() {
-    const slots = Array.isArray(setupContract.modelSlots) ? setupContract.modelSlots : [];
-    return slots.filter((slot) => String(slot?.slot || '').toLowerCase() !== 'heavy'
-        && slot?.settingKey !== 'OUROBOROS_MODEL_HEAVY');
+    return Array.isArray(setupContract.modelSlots) ? setupContract.modelSlots : [];
 }
 
 function byId(id) {

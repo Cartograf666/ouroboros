@@ -40,9 +40,15 @@ def test_route_editor_extraction_does_not_merge_reviewer_semantics() -> None:
 def test_heavy_card_is_gone_but_provider_test_contract_and_controls_remain() -> None:
     ui = _read(MODULES / "settings_ui.js")
     host = _read(MODULES / "settings.js")
+    setup = _read(ROOT / "ouroboros" / "settings_setup_contract.py")
     assert "['Heavy'," not in ui
     assert "s-model-heavy" not in ui
-    assert "slot?.settingKey !== 'OUROBOROS_MODEL_HEAVY'" in host
+    assert "OUROBOROS_MODEL_HEAVY" not in host
+    light_copy = "Fast summaries, lightweight internal work, reflections, and the default Fast scout. Empty uses Main."
+    assert light_copy in ui
+    assert light_copy in setup
+    assert "all deep subagents" not in ui
+    assert "all deep subagents" not in setup
     assert "data-provider-test" in ui
     assert "PROVIDER_TEST_INPUTS" in ui
     assert "apiClient.providerTest({ provider_id: provider, overrides })" in host
@@ -58,7 +64,7 @@ def test_onboarding_previews_and_commits_the_visible_owner_draft() -> None:
     assert "refreshSubagentsPreview" in step
     assert "OUROBOROS_SUBAGENTS: agentsStep?.availableSubagents" in wizard
     assert "Heavy', trim(state.heavyModel)" not in wizard
-    assert "slot?.settingKey !== 'OUROBOROS_MODEL_HEAVY'" in wizard
+    assert "OUROBOROS_MODEL_HEAVY" not in wizard
 
 
 def test_preview_contract_and_task_only_agy_copy_are_explicit() -> None:
@@ -70,6 +76,8 @@ def test_preview_contract_and_task_only_agy_copy_are_explicit() -> None:
     assert "@property {Object[]} diagnostics" in types
     assert "{ harness: 'agy', label: 'Antigravity' }" in step
     assert "task-only and does" in step
+    assert "@typedef {Object} SubagentLastDelegation" in types
+    assert "@property {SubagentLastDelegation=} subagent_last_delegation" in types
 
 
 def test_generated_preview_is_background_and_whole_draft_clean_gated() -> None:
@@ -93,6 +101,8 @@ def test_status_refresh_and_active_task_copy_keep_the_frozen_semantics() -> None
 
 
 def test_new_frontend_modules_stay_within_the_context_target() -> None:
-    for name in ("route_editor_primitives.js", "subagents_settings.js"):
+    for name in (
+        "route_editor_primitives.js", "subagent_status_primitives.js", "subagents_settings.js",
+    ):
         lines = _read(MODULES / name).count("\n") + 1
         assert lines <= 1000, f"{name} grew to {lines} lines"

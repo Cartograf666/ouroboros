@@ -48,6 +48,7 @@ from ouroboros.route_spec import (
     ROUTE_KIND_AGENT_SESSION as SHARED_ROUTE_KIND_SESSION,
     ROUTE_KIND_API_MODEL as SHARED_ROUTE_KIND_API,
     parse_route_spec,
+    validate_compound_session_effort,
 )
 
 REVIEWER_SLOTS_ENV = "OUROBOROS_REVIEWER_SLOTS"
@@ -161,9 +162,13 @@ def _parse_slot(row: Any, where: str, seen_ids: set) -> ConfiguredReviewerSlot:
         pin_key="profile_id",
     )
     kind = ROUTE_KIND_SESSION if route.is_session else ROUTE_KIND_API
+    effort = _valid_effort(row.get("effort"), where)
+    validate_compound_session_effort(
+        route, effort, setting=REVIEWER_SLOTS_ENV, where=where,
+    )
     return ConfiguredReviewerSlot(
         slot_id=slot_id, kind=kind, target_id=route.target_id,
-        effort=_valid_effort(row.get("effort"), where),
+        effort=effort,
         session_target=route.target_id if kind == ROUTE_KIND_SESSION else "",
         profile_id=route.credential_profile_id if kind == ROUTE_KIND_SESSION else "",
     )
@@ -207,11 +212,15 @@ def _parse_advisory(raw: Any) -> AdvisorySlotConfig:
         pin_key="profile_id",
         allow_empty_target=True,
     )
+    effort = _valid_effort(raw.get("effort"), "advisory") or "low"
+    validate_compound_session_effort(
+        shared_route, effort, setting=REVIEWER_SLOTS_ENV, where="advisory",
+    )
     return AdvisorySlotConfig(
         enabled=bool(raw.get("enabled", True)),
         kind=kind,
         target_id=shared_route.target_id,
-        effort=_valid_effort(raw.get("effort"), "advisory") or "low",
+        effort=effort,
         profile_id=shared_route.credential_profile_id,
     )
 

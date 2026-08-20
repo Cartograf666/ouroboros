@@ -14,6 +14,7 @@ from ouroboros.route_spec import (
     RouteSpec,
     parse_route_spec,
     route_spec_dict,
+    validate_compound_session_effort,
 )
 
 SUBAGENTS_SETTING = "OUROBOROS_SUBAGENTS"
@@ -92,25 +93,6 @@ def _effort(raw: Any, where: str) -> str:
             f"{SUBAGENTS_SETTING}: {where} names an unknown effort {effort!r}; valid: {', '.join(EFFORT_SCALE)}"
         )
     return effort
-
-
-def _compound_effort_conflict(route: RouteSpec, effort: str, where: str) -> None:
-    if not route.is_session or not effort:
-        return
-    harness, sep, model = route.target_id.partition("=")
-    if not sep or harness not in {"cursor", "agy"}:
-        return
-    from ouroboros.config import EFFORT_SCALE
-
-    # Cursor's real catalog can append the transport modifier ``-fast`` after
-    # the compound effort (for example ``...-high-fast``).  It is not a second
-    # effort and must not hide the one the model id already encodes.
-    compound_model = model[:-5] if model.lower().endswith("-fast") else model
-    encoded = compound_model.rsplit("-", 1)[-1].lower()
-    if encoded in EFFORT_SCALE and encoded != effort:
-        raise ValueError(
-            f"{SUBAGENTS_SETTING}: {where} effort {effort!r} conflicts with compound route effort {encoded!r}"
-        )
 
 
 def _validate_session_target(route: RouteSpec, where: str) -> None:
@@ -200,7 +182,9 @@ def parse_configured_subagents(raw: Any) -> ConfiguredSubagents:
         )
         _validate_session_target(route, where)
         effort = _effort(row.get("effort"), where)
-        _compound_effort_conflict(route, effort, where)
+        validate_compound_session_effort(
+            route, effort, setting=SUBAGENTS_SETTING, where=where,
+        )
         items.append(
             ConfiguredSubagent(
                 subagent_id=row_id,
@@ -250,6 +234,33 @@ def configured_subagents_fingerprint(config: ConfiguredSubagents) -> str:
     return hashlib.sha256(serialize_configured_subagents(config).encode("utf-8")).hexdigest()
 
 
+def _materialized_source(
+    settings: Mapping[str, Any], config: ConfiguredSubagents,
+) -> str:
+    """Recover endpoint-authored provenance only for the exact saved bytes.
+
+    The preset receipt is evidence, never an alternate actor setting.  Its
+    source remains meaningful only while its canonical fingerprint still
+    matches ``OUROBOROS_SUBAGENTS``; any owner edit makes the materialized
+    value ordinary configured intent without needing to delete old evidence.
+    """
+    raw = settings.get(SUBAGENTS_RECEIPT_KEY)
+    try:
+        receipt = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return SOURCE_CONFIGURED
+    if not isinstance(receipt, Mapping):
+        return SOURCE_CONFIGURED
+    source = str(receipt.get("source") or "")
+    if source not in {SOURCE_ONBOARDING_DEFAULT, SOURCE_LEGACY_MIGRATED}:
+        return SOURCE_CONFIGURED
+    if str(receipt.get("available_subagents_fingerprint") or "") != (
+        configured_subagents_fingerprint(config)
+    ):
+        return SOURCE_CONFIGURED
+    return source
+
+
 def _legacy_session(raw: str, profile_id: str) -> ConfiguredSubagent:
     text = raw.strip()
     if any(ch.isspace() for ch in text) or "::" in text:
@@ -288,9 +299,10 @@ def resolve_configured_subagents(
     raw_new = settings.get(SUBAGENTS_SETTING)
     if raw_new not in (None, ""):
         try:
+            config = parse_configured_subagents(raw_new)
             return ConfiguredSubagentsResolution(
-                parse_configured_subagents(raw_new),
-                SOURCE_CONFIGURED,
+                config,
+                _materialized_source(settings, config),
                 raw=raw_new,
             )
         except ValueError as exc:

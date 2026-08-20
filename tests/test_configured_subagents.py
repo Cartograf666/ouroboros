@@ -14,7 +14,9 @@ from ouroboros.configured_subagents import (
     SOURCE_CONFIGURED,
     SOURCE_INVALID,
     SOURCE_LEGACY_MIGRATED,
+    SOURCE_ONBOARDING_DEFAULT,
     SOURCE_UNDECIDED,
+    SUBAGENTS_RECEIPT_KEY,
     SUBAGENTS_SETTING,
     configured_subagents_fingerprint,
     normalize_configured_subagents,
@@ -149,6 +151,45 @@ def test_valid_new_setting_wins_over_every_legacy_selector():
     assert resolution.config is not None
     assert resolution.config.enabled is False
     assert [row.subagent_id for row in resolution.config.items] == ["new"]
+
+
+@pytest.mark.parametrize("source", [SOURCE_ONBOARDING_DEFAULT, SOURCE_LEGACY_MIGRATED])
+def test_exact_preset_receipt_preserves_source_until_owner_edits_the_rows(source):
+    raw = _config(_row("generated"))
+    parsed = parse_configured_subagents(raw)
+    receipt = {
+        "source": source,
+        "available_subagents_fingerprint": configured_subagents_fingerprint(parsed),
+    }
+    settings = {
+        SUBAGENTS_SETTING: json.dumps(raw),
+        SUBAGENTS_RECEIPT_KEY: json.dumps(receipt),
+    }
+
+    generated = resolve_configured_subagents(settings)
+    assert generated.source == source
+
+    edited = json.loads(settings[SUBAGENTS_SETTING])
+    edited["items"][0]["name"] = "Owner edited"
+    settings[SUBAGENTS_SETTING] = json.dumps(edited)
+    configured = resolve_configured_subagents(settings)
+    assert configured.source == SOURCE_CONFIGURED
+
+
+@pytest.mark.parametrize("receipt", [
+    "not-json",
+    {"source": SOURCE_ONBOARDING_DEFAULT, "available_subagents_fingerprint": "wrong"},
+    {"source": "invented", "available_subagents_fingerprint": "unused"},
+])
+def test_untrusted_preset_receipt_never_relabels_owner_configuration(receipt):
+    raw = _config(_row("owner"))
+    resolution = resolve_configured_subagents({
+        SUBAGENTS_SETTING: raw,
+        SUBAGENTS_RECEIPT_KEY: (
+            receipt if isinstance(receipt, str) else json.dumps(receipt)
+        ),
+    })
+    assert resolution.source == SOURCE_CONFIGURED
 
 
 def test_legacy_singleton_and_account_pin_migrate_without_persisting(

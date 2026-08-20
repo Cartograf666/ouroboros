@@ -201,9 +201,28 @@ def test_prepare_onboarding_settings_sets_all_local_routes():
 
     assert error is None
     assert prepared["USE_LOCAL_MAIN"] is True
-    assert prepared["USE_LOCAL_HEAVY"] is True
     assert prepared["USE_LOCAL_LIGHT"] is True
+    assert prepared["USE_LOCAL_CONSCIOUSNESS"] is True
     assert prepared["USE_LOCAL_FALLBACK"] is True
+
+
+def test_onboarding_never_authors_or_rewrites_legacy_heavy():
+    payload = _base_payload()
+    payload["LOCAL_MODEL_SOURCE"] = "Qwen/Qwen2.5-7B-Instruct-GGUF"
+    payload["LOCAL_MODEL_FILENAME"] = "qwen2.5-7b-instruct-q3_k_m.gguf"
+    payload["LOCAL_ROUTING_MODE"] = "all"
+    payload["OUROBOROS_MODEL_HEAVY"] = "incoming/zombie-heavy"
+    payload["USE_LOCAL_HEAVY"] = False
+    current = {
+        "OUROBOROS_MODEL_HEAVY": "owner/legacy-heavy",
+        "USE_LOCAL_HEAVY": True,
+    }
+
+    prepared, error = prepare_onboarding_settings(payload, current)
+
+    assert error is None
+    assert prepared["OUROBOROS_MODEL_HEAVY"] == "owner/legacy-heavy"
+    assert prepared["USE_LOCAL_HEAVY"] is True
 
 
 def test_prepare_onboarding_settings_preserves_non_wizard_provider_fields():
@@ -248,14 +267,13 @@ def test_prepare_onboarding_settings_accepts_openai_compatible_setup():
     assert prepared["OUROBOROS_MODEL"] == "openai-compatible::llama3"
 
 
-def test_prepare_onboarding_settings_accepts_empty_heavy_and_light():
-    """Role-model (v6.39): only Main is required; empty Heavy/Light fall back to Main, so
+def test_prepare_onboarding_settings_accepts_empty_light():
+    """Role-model (v6.39): only Main is required; empty Light falls back to Main, so
     the owner is not forced to fill every slot (mirrors the relaxed JS validateModelsStep
     and the live desktop launcher path)."""
     payload = _base_payload()
     payload["OPENAI_API_KEY"] = "sk-openai-1234567890"
     payload["OUROBOROS_MODEL"] = "openai::gpt-5.5"
-    payload["OUROBOROS_MODEL_HEAVY"] = ""
     payload["OUROBOROS_MODEL_LIGHT"] = ""
 
     prepared, error = prepare_onboarding_settings(payload, {})
@@ -350,6 +368,16 @@ def test_onboarding_steps_and_stylesheet_keep_their_owner_facing_shape():
     assert {"Keys + local", "model slots"} <= rails
     assert "@media (max-width: 720px)" in css
     assert "scroll-snap-type: x proximity;" in css
+
+
+def test_setup_contract_exports_active_model_slots_only():
+    contract = build_setup_contract("web")
+    setting_keys = {slot["settingKey"] for slot in contract["modelSlots"]}
+
+    assert "OUROBOROS_MODEL_HEAVY" not in setting_keys
+    assert "OUROBOROS_MODEL_HEAVY" not in repr(contract["modelSlots"])
+    assert all("heavy" not in defaults for defaults in build_setup_bootstrap({}, "web")["modelDefaults"].values())
+    assert all(len(mode["flags"]) == 4 for mode in contract["localRoutingModes"])
 
 
 # --------------------------------------------------------------------------

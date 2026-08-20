@@ -741,6 +741,21 @@
  */
 
 /**
+ * Last settled external leaf projected for the Available-subagents editor.
+ * `selected_subagent_id` is optional only for pre-migration receipts, which
+ * cannot be truthfully attached to a current row.
+ * @typedef {Object} SubagentLastDelegation
+ * @property {string=} selected_subagent_id
+ * @property {string=} route
+ * @property {string=} requested_model
+ * @property {string=} applied_model
+ * @property {string=} requested_profile
+ * @property {string=} applied_profile
+ * @property {string=} run_id
+ * @property {string=} ts
+ */
+
+/**
  * @typedef {Object} ClaudexorStatusResponse
  * @property {Object=} daemon
  * @property {string=} config_dir
@@ -749,7 +764,7 @@
  * @property {Array<Object>=} quota
  * @property {ClaudexorStatusReads=} reads
  * @property {boolean=} unified_accounts
- * @property {Object=} subagent_last_delegation
+ * @property {SubagentLastDelegation=} subagent_last_delegation
  * @property {string=} error
  */
 

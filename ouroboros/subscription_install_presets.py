@@ -183,10 +183,9 @@ class SurfacePolicy:
 
 
 @dataclass(frozen=True)
-class HarnessPolicy:
-    """Per-harness model choices; combination behavior lives in ordered rules."""
+class ReviewerHarnessPolicy:
+    """Review-only model choices; task actors have an independent catalog."""
 
-    subagent: SurfacePolicy
     advisory: SurfacePolicy
     triad: SurfacePolicy
     scope: SurfacePolicy
@@ -196,21 +195,18 @@ def _surface(preference: str, effort: str) -> SurfacePolicy:
     return SurfacePolicy(preference=preference, effort=effort)
 
 
-_HARNESS_POLICIES: Dict[str, HarnessPolicy] = {
-    HARNESS_CLAUDE: HarnessPolicy(
-        subagent=_surface("opus-5", "medium"),
+_REVIEWER_POLICIES: Dict[str, ReviewerHarnessPolicy] = {
+    HARNESS_CLAUDE: ReviewerHarnessPolicy(
         advisory=_surface("sonnet-5", "low"),
         triad=_surface("opus-5", "medium"),
         scope=_surface("opus-5", "medium"),
     ),
-    HARNESS_CODEX: HarnessPolicy(
-        subagent=_surface("gpt-5.6-sol", "medium"),
+    HARNESS_CODEX: ReviewerHarnessPolicy(
         advisory=_surface("gpt-5.6-terra", "medium"),
         triad=_surface("gpt-5.6-sol", "medium"),
         scope=_surface("gpt-5.6-sol", "medium"),
     ),
-    HARNESS_CURSOR: HarnessPolicy(
-        subagent=_surface("grok-4.6", "high"),
+    HARNESS_CURSOR: ReviewerHarnessPolicy(
         advisory=_surface("grok-4.6", "medium"),
         triad=_surface("grok-4.6", "medium"),
         scope=_surface("grok-4.6", "high"),
@@ -218,13 +214,14 @@ _HARNESS_POLICIES: Dict[str, HarnessPolicy] = {
 }
 
 _TASK_POLICIES: Dict[str, SurfacePolicy] = {
-    harness: policy.subagent for harness, policy in _HARNESS_POLICIES.items()
+    HARNESS_CLAUDE: _surface("opus-5", "medium"),
+    HARNESS_CODEX: _surface("gpt-5.6-sol", "medium"),
+    HARNESS_CURSOR: _surface("grok-4.6", "high"),
+    HARNESS_AGY: _surface("gemini-3.7-flash", "high"),
 }
-_TASK_POLICIES[HARNESS_AGY] = _surface("gemini-3.7-flash", "high")
 
 _POLICY_HARNESSES = (HARNESS_CLAUDE, HARNESS_CODEX, HARNESS_CURSOR)
 REVIEWER_PRESET_HARNESSES = _POLICY_HARNESSES
-_DELEGATION_ORDER = _POLICY_HARNESSES
 _ADVISORY_ORDER = _POLICY_HARNESSES
 _TRIAD_ORDER = (HARNESS_CLAUDE, HARNESS_CODEX, HARNESS_CURSOR)
 _SCOPE_ORDER = (HARNESS_CODEX, HARNESS_CLAUDE, HARNESS_CURSOR)
@@ -235,14 +232,13 @@ def _first_connected(order: Sequence[str], connected: set[str]) -> str:
 
 
 def _policy_seat(surface: str, position: int, harness: str) -> PresetSeat:
-    spec = getattr(_HARNESS_POLICIES[harness], surface)
+    spec = getattr(_REVIEWER_POLICIES[harness], surface)
     return _seat(surface, position, harness, spec.preference, spec.effort)
 
 
 def _compile_policy_seats(connected: Sequence[str]) -> Dict[str, Tuple[PresetSeat, ...]]:
     """Apply linear priority rules; no powerset row grows when a harness is added."""
     present = set(connected)
-    primary = _first_connected(_DELEGATION_ORDER, present)
     advisory = _first_connected(_ADVISORY_ORDER, present)
     scope = _first_connected(_SCOPE_ORDER, present)
 
@@ -251,7 +247,6 @@ def _compile_policy_seats(connected: Sequence[str]) -> Dict[str, Tuple[PresetSea
         triad_harnesses *= 3
 
     return {
-        SURFACE_SUBAGENT: (_policy_seat(SURFACE_SUBAGENT, 1, primary),),
         SURFACE_ADVISORY: (_policy_seat(SURFACE_ADVISORY, 1, advisory),),
         SURFACE_TRIAD: tuple(
             _policy_seat(SURFACE_TRIAD, position, harness)

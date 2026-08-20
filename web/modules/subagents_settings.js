@@ -5,6 +5,7 @@
 import {
     FACET_ACCOUNTS,
     FACET_CATALOG,
+    FACET_QUOTA,
     READ_OK,
     accountRows,
     bindStatusSurface,
@@ -32,6 +33,7 @@ import {
     sessionModelOptions,
     splitSessionTarget,
 } from './route_editor_primitives.js';
+import { sessionRouteAvailability } from './subagent_status_primitives.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
 export const MAX_AVAILABLE_SUBAGENTS = 10;
@@ -299,15 +301,10 @@ function connectedHarnessIds(snapshot) {
 }
 
 function executionFor(snapshot, subagentId) {
-    const sources = [
-        snapshot?.available_subagent_last_executions,
-        snapshot?.subagent_last_executions,
-        snapshot?.last_subagent_executions,
-    ];
-    for (const source of sources) {
-        if (source && typeof source === 'object' && source[subagentId]) return source[subagentId];
-    }
-    return null;
+    const receipt = snapshot?.subagent_last_delegation;
+    if (!receipt || typeof receipt !== 'object') return null;
+    return String(receipt.selected_subagent_id || '') === String(subagentId || '')
+        ? receipt : null;
 }
 
 function savedIntentStatus(row, state) {
@@ -315,23 +312,7 @@ function savedIntentStatus(row, state) {
     if (row.route.kind !== ROUTE_KIND_AGENT_SESSION) {
         return `${intent} · API model · availability is checked when a child starts`;
     }
-    const { harness } = splitSessionTarget(row.route.target_id);
-    if (!state.catalogKnown || !state.accountsKnown || state.statusError) {
-        return `${intent} · Agent session · live availability not checked`;
-    }
-    const harnesses = harnessMap(state.snapshot);
-    if (!harnesses[harness]) return `${intent} · ${harness} · currently unavailable`;
-    if (!connectedHarnessIds(state.snapshot).has(harness)) {
-        return `${intent} · ${harness} · no usable account currently`;
-    }
-    const pin = String(row.route.credential_profile_id || '');
-    if (pin) {
-        const profiles = indexProfilesByHarness(state.snapshot)[harness] || [];
-        if (!profiles.some((profile) => profile.id === pin && profile.enabled !== false)) {
-            return `${intent} · ${harness} · pinned account ${pin} currently unavailable`;
-        }
-    }
-    return `${intent} · ${harness} · available now`;
+    return `${intent} · ${sessionRouteAvailability(row, state)}`;
 }
 
 function focusSnapshot(host, doc) {
@@ -411,7 +392,7 @@ export function availableSubagentRowMarkup(row, state) {
         </article>`;
 }
 
-export function availableSubagentsRenderSignature(state) {
+export function availableSubagentsRenderSignature(state, nowMs = Date.now()) {
     return JSON.stringify([
         state.loaded,
         state.parseError,
@@ -422,10 +403,13 @@ export function availableSubagentsRenderSignature(state) {
         state.statusError,
         state.catalogKnown,
         state.accountsKnown,
+        state.quotaKnown,
         state.snapshot?.harnesses || [],
-        indexProfilesByHarness(state.snapshot),
-        state.snapshot?.available_subagent_last_executions || null,
-        state.snapshot?.subagent_last_executions || null,
+        accountRows(state.snapshot),
+        state.snapshot?.quota || [],
+        state.snapshot?.subagent_last_delegation || null,
+        (state.setting?.items || []).map((row) => row?.route?.kind === ROUTE_KIND_AGENT_SESSION
+            ? sessionRouteAvailability(row, state, nowMs) : ''),
         state.apiModels,
     ]);
 }
@@ -458,6 +442,7 @@ export function createAvailableSubagentsEditor({
         statusError: '',
         catalogKnown: false,
         accountsKnown: false,
+        quotaKnown: false,
         snapshot: null,
         apiModels: [],
         signature: '',
@@ -475,6 +460,7 @@ export function createAvailableSubagentsEditor({
         state.statusError = store?.error || '';
         state.catalogKnown = store?.facet?.(FACET_CATALOG) === READ_OK;
         state.accountsKnown = store?.facet?.(FACET_ACCOUNTS) === READ_OK;
+        state.quotaKnown = store?.facet?.(FACET_QUOTA) === READ_OK;
         state.snapshot = store?.snapshot || null;
     }
 
@@ -822,7 +808,8 @@ export function renderSubagentsSection() {
             <div class="settings-section-copy">
                 Ouroboros sees every row while this list is enabled and chooses one by its stable ID.
                 Each row is a complete execution choice; a route that is unavailable stays saved and
-                returns an explicit refusal instead of silently changing to another model or account.
+                returns an explicit refusal instead of silently changing actor or model. An unpinned
+                session row may rotate among compatible healthy accounts for that same route.
             </div>
             ${availableSubagentsEditorHost()}
             <div class="settings-effort-card">
