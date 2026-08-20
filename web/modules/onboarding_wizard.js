@@ -1425,6 +1425,10 @@ import { installAltMenuSuppression } from './ui_helpers.js';
     }
 
     async function saveWizard({ skipPresets = false } = {}) {
+        if (skipPresets) {
+            state.skipSubscriptionPresets = true;
+            await agentsStep?.setSkipPresets(true);
+        }
         const providersError = validateProvidersStep();
         const modelsError = validateModelsStep();
         const reviewError = validateReviewStep();
@@ -1441,14 +1445,11 @@ import { installAltMenuSuppression } from './ui_helpers.js';
             render();
             return;
         }
-        if (skipPresets) state.skipSubscriptionPresets = true;
         state.saving = true;
         state.error = '';
         render();
         const payload = {
-            // What this step OBSERVED, plus the owner's explicit escape
-            // hatch. Neither is authority: the endpoint re-reads live
-            // account state and re-proves install-time eligibility.
+            // Observations are not authority: the endpoint re-proves eligibility.
             subscriptionsConnected: state.agentsConnected.length > 0,
             skipSubscriptionPresets: state.skipSubscriptionPresets,
             ...onboardingSettingsDraft({ state, providerFields: PROVIDER_FIELDS, budgetFields: BUDGET_FIELDS, modelSlots: MODEL_SLOTS, trim }),

@@ -802,11 +802,15 @@ export function createAgentsStep({
         invalidateGeneratedPreview,
         setSkipPresets(value) {
             const next = Boolean(value);
+            let refreshed = Promise.resolve(true);
             if (next !== state.skipPresets) {
                 state.skipPresets = next;
-                refreshSubagentsPreview();
+                refreshed = refreshSubagentsPreview({ force: true });
+            } else if (!subagents.dirty && !state.previewPending) {
+                refreshed = refreshSubagentsPreview({ force: true });
             }
             paint();
+            return refreshed;
         },
         declaration({ skipPresets = state.skipPresets } = {}) {
             return subscriptionDeclaration({ connected: state.connected, skipPresets });

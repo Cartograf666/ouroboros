@@ -832,11 +832,53 @@ test('the skip choice is reflected in the outcome the owner reads before finishi
     step.mount();
     await flush();
 
-    step.setSkipPresets(true);
+    await step.setSkipPresets(true);
     assert.match(dom.nodes.get('agents-outcome').textContent, /skip the automatic subscription preset/i);
     assert.deepEqual(step.declaration(), {
         subscriptionsConnected: true, skipSubscriptionPresets: true,
     });
+    step.detach();
+    store.dispose();
+});
+
+test('the skip choice refreshes a failed subscription preview before completion', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, snapshotWith(['claude'])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+        pollMs: 5000,
+    });
+    const dom = fakeDom();
+    const previews = [];
+    const step = createAgentsStep({
+        doc: dom.doc,
+        store,
+        previewTransport: async (payload) => {
+            previews.push(payload);
+            if (!payload.skipSubscriptionPresets) throw new Error('subscription preview unavailable');
+            return {
+                source: 'api_default',
+                diagnostics: [],
+                available_subagents: {
+                    enabled: true,
+                    items: [{
+                        subagent_id: 'api-scout',
+                        name: 'API scout',
+                        recommended_use: 'Use when subscription presets are skipped.',
+                        route: { kind: 'api_model', target_id: 'openai/gpt-5.6-luna' },
+                    }],
+                },
+            };
+        },
+    });
+    step.mount();
+    await flush();
+    assert.equal(step.generatedPreviewReady, false);
+
+    assert.equal(await step.setSkipPresets(true), true);
+    assert.equal(previews.at(-1).skipSubscriptionPresets, true);
+    assert.equal(step.generatedPreviewReady, true);
+    assert.equal(step.availableSubagents.items[0].subagent_id, 'api-scout');
+
     step.detach();
     store.dispose();
 });
