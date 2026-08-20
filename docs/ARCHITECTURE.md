@@ -2319,6 +2319,7 @@ Runtime floors:
 | OUROBOROS_MAX_ROUNDS | 200 | Main-loop LLM round ceiling per task (hot-reloadable) |
 | OUROBOROS_TRANSIENT_RETRY_MAX | 6 | Same-model attempt budget for transient provider failures (finish_reason=null, 429/5xx); floored at the base retry budget |
 | OUROBOROS_SKILL_LIFECYCLE_TIMEOUT_SEC | 1800 | Skill lifecycle lane deadline before a wedged job fails loudly |
+| OUROBOROS_CLAUDEXOR_HARNESS_INSTALL_TIMEOUT_SEC | 300 | Hard ceiling on Connect's one-shot vendor-CLI install through the exact managed Claudexor CLI; on expiry the panic-tracked installer's process group is killed and Connect returns a typed refusal |
 | OUROBOROS_BUNDLE_DIR | (unset) | Packaged bundle root, handed down by `launcher.start_agent` / `packaged_cli` so a child of the embedded interpreter can find bundled payloads (`node-standalone`, `ripgrep-standalone`). Set by the launcher, not by the owner. |
 | OUROBOROS_BG_MAX_ROUNDS | 10 | Max LLM rounds per consciousness cycle |
 | OUROBOROS_BG_WAKEUP_MIN | 30 | Min wakeup interval (seconds) |

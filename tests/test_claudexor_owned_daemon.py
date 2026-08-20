@@ -1093,8 +1093,14 @@ def test_installer_invocation_is_exact_grouped_and_stdout_bounded(monkeypatch):
             seen.setdefault("timeouts", []).append(timeout)
             return 0
 
+    import ouroboros.tools.shell as shell
+    from ouroboros.claudexor_daemon import owned_config_dir
+
     def popen(argv, **kwargs):
         seen["argv"], seen["kwargs"] = argv, kwargs
+        # /panic snapshots the tracked set under this lock: the spawn must be
+        # atomic with registration, so the lock is held HERE (round-2 finding).
+        seen["lock_held_during_spawn"] = shell._subprocess_lock.locked()
         return Process()
 
     monkeypatch.setattr(accounts.subprocess, "Popen", popen)
@@ -1103,12 +1109,19 @@ def test_installer_invocation_is_exact_grouped_and_stdout_bounded(monkeypatch):
         *command, "harness", "install", "cursor",
         "--target", "local", "--yes", "--json",
     ]
+    env = seen["kwargs"].pop("env")
     assert seen["kwargs"] == {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.DEVNULL,
         "start_new_session": True,
     }
+    # The installer acts on the OWNED data plane, exactly like the daemon it
+    # repairs — never the operator's personal Claudexor home.
+    assert env["CLAUDEXOR_CONFIG_DIR"] == str(owned_config_dir())
+    assert "CLAUDEXOR_DAEMON_SOCK" not in env
+    assert "CLAUDEXOR_CONTROL_PORT" not in env
+    assert seen["lock_held_during_spawn"] is True
     output, state = bytearray(), {}
     accounts._drain_installer_stdout(
         io.BytesIO(b"x" * (accounts._HARNESS_INSTALL_STDOUT_LIMIT + 1)), output, state)

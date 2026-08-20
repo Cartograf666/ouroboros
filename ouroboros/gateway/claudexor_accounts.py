@@ -623,15 +623,32 @@ def _install_harness_cli(harness: str) -> None:
         *command, "harness", "install", harness,
         "--target", "local", "--yes", "--json",
     ]
+    # The SAME data-plane binding the owned daemon starts with: the config-dir
+    # override is the complete relocatable root (D30), and the cross-home
+    # overrides the daemon scrubs must not reach the installer either —
+    # otherwise the CLI acts on the operator's personal Claudexor home.
+    from ouroboros.claudexor_daemon import owned_config_dir
+
+    env = dict(os.environ)
+    env["CLAUDEXOR_CONFIG_DIR"] = str(owned_config_dir())
+    for crossing in ("CLAUDEXOR_DAEMON_SOCK", "CLAUDEXOR_CONTROL_PORT"):
+        env.pop(crossing, None)
     kwargs = merge_hidden_kwargs(subprocess_new_group_kwargs())
+    timeout_sec = get_claudexor_harness_install_timeout_sec()
     try:
-        proc = subprocess.Popen(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            **kwargs,
-        )
+        # Registration is atomic WITH the spawn: /panic snapshots the tracked
+        # set under this same lock, so it can never observe the child alive
+        # but untracked (the round-2 reviewer's interleaving).
+        with _subprocess_lock:
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                **kwargs,
+            )
+            _active_subprocesses.add(proc)
     except OSError as exc:
         raise ClaudexorUnavailable(
             "harness_install_spawn_failed",
@@ -647,9 +664,6 @@ def _install_harness_cli(harness: str) -> None:
         daemon=True,
     )
     reader.start()
-    timeout_sec = get_claudexor_harness_install_timeout_sec()
-    with _subprocess_lock:
-        _active_subprocesses.add(proc)
     try:
         try:
             exit_code = proc.wait(timeout=timeout_sec)
