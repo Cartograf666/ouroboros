@@ -250,21 +250,34 @@ def _authorized_managed_update_resolver(ctx: Any) -> bool:
     Fail-closed bool for every authority consumer (False = no extra powers).
     The AUTHORITY-READ failure is additionally distinguished from an honest
     "not the resolver" via a typed ctx marker (``_managed_authority_read_error``:
-    set on an unreadable read, cleared on every successful evaluation), so the
-    review-subject builder can fail LOUDLY instead of silently reviewing a
-    possibly-managed candidate as an ordinary full staged capture."""
+    set on an unreadable read AND on a corrupt tx marker, cleared on every
+    healthy evaluation), so the review-subject builder can fail LOUDLY instead
+    of silently reviewing a possibly-managed candidate as an ordinary full
+    staged capture."""
     try:
-        from supervisor.update_merge import authorized_assisted_task
+        from supervisor.update_merge import authorized_assisted_task_strict
 
-        authorized = bool(authorized_assisted_task(
+        marker_status, tx = authorized_assisted_task_strict(
             getattr(ctx, "task_id", ""),
             getattr(ctx, "task_metadata", None),
-        ))
+        )
         try:
-            setattr(ctx, "_managed_authority_read_error", "")
+            if marker_status == "corrupt":
+                # A tx marker EXISTS but cannot be parsed: authority stays
+                # False (fail-closed) for every bool consumer, but the loud
+                # A4 channel must fire — clearing the marker here would let
+                # the review subject silently treat a possibly-managed
+                # candidate as an ordinary full staged diff.
+                setattr(
+                    ctx, "_managed_authority_read_error",
+                    "update_tx_corrupt: the managed update transaction marker "
+                    "exists but could not be parsed",
+                )
+            else:
+                setattr(ctx, "_managed_authority_read_error", "")
         except Exception:
             pass
-        return authorized
+        return bool(tx)
     except Exception as exc:
         try:
             setattr(ctx, "_managed_authority_read_error", repr(exc))

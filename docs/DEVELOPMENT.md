@@ -836,7 +836,10 @@ sub-floor window) never dispatched and stay outside the count; the paid fact
 is recorded write-ahead at first dispatch. Byte-identical resubmissions are
 refused before any spend. Exhaustion is always the typed
 `review_cycles_exhausted` event with honest exits, never a silent grind or
-another paid dispatch.
+another paid dispatch. The paid-cycle ceiling counts dispatched waves under
+BOTH enforcement modes; under advisory enforcement a commit after exhaustion
+proceeds as a free replay with a loud typed disclosure (no new review spend),
+while blocking enforcement refuses it.
 
 `docs/CHECKLISTS.md` is the only reviewer-question, severity, and output SSOT.
 Architecture owns the dataflow; this section owns operator sequence. Finish all

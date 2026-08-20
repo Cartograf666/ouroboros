@@ -860,6 +860,14 @@ def _run_reviewed_stage_cycle(
     require_release_tag: bool = True,
 ) -> Dict[str, Any]:
     skip_advisory_pre_review = bool(skip_advisory_review or skip_advisory_pre_review)
+    # In-attempt semantics for the managed subject↔binding assertion: the set
+    # must only ever hold subject trees built during THIS attempt. The paid
+    # path resets it again inside run_parallel_review (harmless double reset),
+    # but the advisory free-replay branch skips that dispatch entirely — a
+    # stale set left by a previous paid attempt would then be compared against
+    # the CURRENT binding tree and permanently block the free-replay commit
+    # (typed review_subject_binding_mismatch on every retry).
+    ctx._last_review_subject_trees = set()
     classification_paths, advisory_paths, stage_error = _stage_candidate_for_review(
         ctx,
         commit_message,
@@ -2605,14 +2613,17 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             # entry that --diff-filter=U misses), then mark the crash-window phase before the
             # native 2-parent commit (MERGE_HEAD is still set, so `git commit` records both
             # parents — reviewed pre_update_sha + target).
-            from supervisor.update_merge import managed_assisted_marker_check, write_update_tx
+            from supervisor.update_merge import managed_assisted_marker_check, update_tx_phase
 
             _mok, _merr = managed_assisted_marker_check()
             if not _mok:
                 return _fail(_merr)
-            _committing = dict(_managed_tx)
-            _committing["phase"] = "committing_assisted"
-            write_update_tx(_committing)
+            # Merge-write onto the FRESH durable tx: ``_managed_tx`` was
+            # snapshotted BEFORE the stage cycle, and the compensating tests
+            # preflight records ``tests_evidence`` into the durable marker
+            # mid-attempt — a wholesale snapshot write here would drop that
+            # proof and force the post-commit gate to pay a duplicate run.
+            update_tx_phase(_managed_tx, {"phase": "committing_assisted"})
 
         try:
             run_cmd(["git", "commit", "-m", commit_message], cwd=ctx.repo_dir)

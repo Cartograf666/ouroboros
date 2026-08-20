@@ -357,6 +357,82 @@ def test_advisory_replay_reasons_drive_the_stage_cycle_to_a_disclosed_pass(
     assert replays and replays[-1]["reason"] == expected_reason
 
 
+def test_managed_advisory_ceiling_replay_survives_stale_subject_trees(
+    tmp_path, monkeypatch,
+):
+    """Synthesis wave W1 (cross-lane interference): the MANAGED resolver's
+    advisory free replay skips run_parallel_review — previously the ONLY reset
+    point of ``ctx._last_review_subject_trees`` — so subject-tree residue from
+    a previous PAID attempt was compared against the CURRENT binding tree and
+    blocked every retry with a typed review_subject_binding_mismatch (ceiling
+    still exhausted -> replay again -> same stale set: the managed update
+    dead-ended). The stage cycle now resets the set at every attempt start."""
+    from ouroboros.review_state import CommitAttemptRecord, make_repo_key, update_state, _utc_now
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
+    monkeypatch.setenv(KEY, "1")
+    git_mod, ctx, progress = _stage_cycle_harness(tmp_path, monkeypatch, fingerprint="fp-m")
+    monkeypatch.setattr(
+        git_mod, "_fingerprint_staged_diff",
+        lambda repo_dir: {
+            "ok": True, "fingerprint": "fp-m",
+            "binding": {"tree_sha": "tree-NEW"},
+        },
+    )
+    monkeypatch.setattr(git_mod, "_authorized_managed_update_resolver", lambda c: True)
+    monkeypatch.setattr(
+        git_mod, "_run_parallel_review",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("free replay must not dispatch")),
+    )
+    repo_key = make_repo_key(pathlib.Path(ctx.repo_dir))
+    update_state(ctx.drive_root, lambda s: s.attempts.append(CommitAttemptRecord(
+        ts=_utc_now(), commit_message="m", status="blocked", repo_key=repo_key,
+        tool_name="commit_reviewed", task_id="root-1", attempt=1,
+        phase="blocking_review", block_reason="quorum_failure", block_class="infra",
+        paid=True, root_task_id="root-1", pre_review_fingerprint="fp-old",
+    )))
+    # Residue of the previous PAID attempt in this same resolver task/ctx.
+    ctx._last_review_subject_trees = {"tree-OLD"}
+
+    outcome = git_mod._run_reviewed_stage_cycle(ctx, "resolve", 0.0)
+
+    assert outcome["status"] == "passed", outcome
+    assert any("paid-cycle ceiling exhausted" in n for n in progress)
+
+
+def test_managed_in_attempt_subject_mismatch_still_blocks(tmp_path, monkeypatch):
+    """W1 control: the per-attempt reset must not weaken the assertion — a
+    subject tree recorded DURING the attempt that diverges from the binding
+    tree still blocks with the typed mismatch (and only in-attempt trees are
+    asserted: pre-attempt residue never reaches the message)."""
+    git_mod, ctx, _progress = _stage_cycle_harness(tmp_path, monkeypatch, fingerprint="fp-c")
+    monkeypatch.setattr(
+        git_mod, "_fingerprint_staged_diff",
+        lambda repo_dir: {
+            "ok": True, "fingerprint": "fp-c",
+            "binding": {"tree_sha": "tree-REAL"},
+        },
+    )
+    monkeypatch.setattr(git_mod, "_authorized_managed_update_resolver", lambda c: True)
+    ctx._last_review_subject_trees = {"tree-STALE-RESIDUE"}  # must be irrelevant
+
+    def _wave(inner_ctx, *a, **kw):
+        inner_ctx._last_review_subject_trees.add("tree-WRONG")
+        return None, None, "", []
+
+    monkeypatch.setattr(git_mod, "_run_parallel_review", _wave)
+    monkeypatch.setattr(
+        git_mod, "_aggregate_review_verdict", lambda *a, **kw: (False, "", "", [], []),
+    )
+
+    outcome = git_mod._run_reviewed_stage_cycle(ctx, "resolve", 0.0)
+
+    assert outcome["status"] == "blocked"
+    assert outcome["block_reason"] == "review_subject_binding_mismatch"
+    assert "tree-WRONG" in outcome["message"]
+    assert "tree-STALE-RESIDUE" not in outcome["message"]
+
+
 # ---------------------------------------------------------------------------
 # F3 — the skill dispatch marker: four wave outcomes, one paid unit each
 

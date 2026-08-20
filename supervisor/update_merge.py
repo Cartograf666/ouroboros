@@ -25,7 +25,8 @@ from supervisor import git_ops as _g
 from supervisor.update_candidate import (  # noqa: F401
     _MERGE_NEUTRAL_FLAGS, _git_run, _merge_head_sha, _preserve_failed_update_attempt,
     _rev_parse, existing_failed_update_ref, live_unmerged_paths,
-    managed_tests_evidence_covers, record_managed_tests_evidence, worktree_snapshot_tree,
+    managed_tests_evidence_covers, record_managed_tests_evidence, update_tx_phase,
+    worktree_snapshot_tree,
     find_update_stash_sha, restore_stash_with_marker, restore_update_stash,
     stash_local_changes_for_update, lookup_update_stash,
     destructive_apply_guard, project_version_carriers,
@@ -546,20 +547,33 @@ def active_update_tx() -> Dict[str, Any]:
     return tx or {"phase": "corrupt"}
 
 
+def authorized_assisted_task_strict(
+    task_id: str, task_metadata: Optional[Dict[str, Any]] = None
+) -> Tuple[str, Dict[str, Any]]:
+    """Typed variant of ``authorized_assisted_task``: ``(marker_status, tx)``.
+
+    ``marker_status`` is the raw ``read_update_tx_strict`` status, so a caller
+    that must distinguish REAL marker corruption from an honest "not the
+    resolver" (the authority predicate's loud A4 channel) can read it here.
+    ``tx`` is non-empty only for the authorized resolver of a valid assisted
+    tx — every authorization miss, corruption included, yields ``{}``."""
+    status, tx = read_update_tx_strict()
+    if status != "valid":
+        return status, {}
+    if str(tx.get("phase") or "") not in _ASSISTED_PHASES:
+        return status, {}
+    if str(tx.get("task_id") or "") != str(task_id or ""):
+        return status, {}
+    if not assisted_task_metadata_authorizes(tx, task_metadata):
+        return status, {}
+    return status, tx
+
+
 def authorized_assisted_task(
     task_id: str, task_metadata: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """Return the active assisted tx only for its host-enqueued resolver task."""
-    status, tx = read_update_tx_strict()
-    if status != "valid":
-        return {}
-    if str(tx.get("phase") or "") not in _ASSISTED_PHASES:
-        return {}
-    if str(tx.get("task_id") or "") != str(task_id or ""):
-        return {}
-    if not assisted_task_metadata_authorizes(tx, task_metadata):
-        return {}
-    return tx
+    return authorized_assisted_task_strict(task_id, task_metadata)[1]
 
 
 def create_rescue_local_ref(local_snapshot: str) -> str:
@@ -1369,15 +1383,17 @@ def managed_assisted_postcommit(tx: Dict[str, Any], commit_sha: str) -> Tuple[bo
     FAIL roll back to pre_update_sha (the agent's resolution survives on the deterministic
     ``failed-update-<target12>`` branch + the rescue snapshot). On PASS the agent calls
     ``request_restart`` and boot finalize verifies the healthy boot. Returns (ok, message)."""
-    tx = dict(tx)
-    tx["phase"] = "pending_boot_smoke"
-    tx["merge_commit"] = commit_sha
-    tx["pre_restart_smoke"] = _PRE_RESTART_SMOKE_PENDING
-    write_update_tx(tx)
+    # Merge-write onto the FRESH durable tx (never the caller's pre-stage-cycle
+    # snapshot): in-attempt keys like ``tests_evidence`` must survive this
+    # phase transition — see ``update_tx_phase``.
+    tx = update_tx_phase(tx, {
+        "phase": "pending_boot_smoke",
+        "merge_commit": commit_sha,
+        "pre_restart_smoke": _PRE_RESTART_SMOKE_PENDING,
+    })
     smoke = update_restart_smoke()
     if smoke.get("ok"):
-        tx["pre_restart_smoke"] = _PRE_RESTART_SMOKE_PASSED
-        write_update_tx(tx)
+        tx = update_tx_phase(tx, {"pre_restart_smoke": _PRE_RESTART_SMOKE_PASSED})
         return True, (
             "✅ Managed update committed as a reviewed 2-parent merge and passed the pre-restart "
             "smoke. Call `request_restart` now to finish landing the update."

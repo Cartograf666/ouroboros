@@ -205,6 +205,29 @@ def record_managed_tests_evidence(
     return tree
 
 
+def update_tx_phase(base_tx: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge-write a managed phase transition onto the FRESH durable tx.
+
+    The commit flow holds a tx snapshot taken at attempt start, while
+    in-attempt writers merge keys into the DURABLE marker mid-attempt (e.g.
+    the compensating tests preflight recording ``tests_evidence``). Writing
+    the stale snapshot wholesale silently drops those keys — the post-commit
+    gate would then re-buy the full hermetic suite it already holds proof for
+    (and a flaky red there rolls back a green-proven candidate). This helper
+    re-reads the durable tx and applies ONLY the caller's intended key changes
+    on top, refusing to drop keys the durable record carries. When the durable
+    marker is absent or corrupt, the caller's snapshot is the only substrate
+    left — fall back to it (downstream strict readers still fail closed on a
+    corrupt marker). Returns the tx dict actually written."""
+    from supervisor import update_merge as _um
+
+    status, current = _um.read_update_tx_strict()
+    merged = dict(current) if status == "valid" else dict(base_tx)
+    merged.update(patch)
+    _um.write_update_tx(merged)
+    return merged
+
+
 def managed_tests_evidence_covers(committed_tree: str) -> bool:
     """True when the durable tx carries a green-suite proof for EXACTLY this tree."""
     if not committed_tree:

@@ -395,6 +395,13 @@ def test_managed_flow_runs_the_hermetic_suite_exactly_once(tmp_path, monkeypatch
     monkeypatch.setenv("OUROBOROS_PRE_PUSH_TESTS", "1")
     monkeypatch.setattr(preflight_runner, "run_hermetic_pytest", _counting_runner)
 
+    # _repo_commit_push ordering: the managed tx snapshot is taken BEFORE the
+    # stage cycle — i.e. BEFORE the compensating preflight records its proof.
+    managed_tx, block = update_merge.managed_assisted_tx_for(
+        ctx.task_id, ctx.task_metadata
+    )
+    assert managed_tx and not block
+
     # B11 first half: no evidence covers the candidate tree yet -> the managed
     # mandate forces the pre-commit run even under skip_tests + doc-only.
     assert git_mod._managed_candidate_needs_proof(ctx) is True
@@ -414,6 +421,15 @@ def test_managed_flow_runs_the_hermetic_suite_exactly_once(tmp_path, monkeypatch
     tmrs._git(repo, "commit", "-q", "-m", "managed resolution")
     committed_tree = tmrs._git(repo, "rev-parse", "HEAD^{tree}").stdout.strip()
     assert committed_tree == evidence["tree"]
+    # The REAL commit path's phase transition, driven with the same STALE
+    # snapshot _repo_commit_push holds: the merge-write must preserve the
+    # in-attempt proof (synthesis wave W2 — a wholesale snapshot write here
+    # dropped tests_evidence and re-bought the suite at the post-commit gate).
+    committing = update_merge.update_tx_phase(
+        managed_tx, {"phase": "committing_assisted"}
+    )
+    assert committing["phase"] == "committing_assisted"
+    assert (update_merge.read_update_tx().get("tests_evidence") or {}).get("tree") == evidence["tree"]
     monkeypatch.setattr(
         git_mod, "_post_commit_result",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("duplicate suite run")),
@@ -424,6 +440,58 @@ def test_managed_flow_runs_the_hermetic_suite_exactly_once(tmp_path, monkeypatch
     assert gate is None
     assert runs == [str(repo)], "the managed flow paid for the hermetic suite twice"
     assert any("no duplicate suite run" in note for note in progress)
+
+
+def test_managed_phase_writes_merge_onto_fresh_tx_not_stale_snapshot(
+    tmp_path, monkeypatch,
+):
+    """Synthesis wave W2 pin (both converted sites): every managed phase
+    transition is a read-modify-write on a FRESH tx read. The commit flow's
+    snapshot predates the compensating preflight's ``tests_evidence`` write —
+    a wholesale snapshot write (the old ``write_update_tx(dict(snapshot))``)
+    silently dropped the proof, forcing a duplicate hermetic run at the
+    post-commit gate where a flaky red rolls back a green-proven candidate."""
+    repo, head, plan, tx = tua._materialized_conflict_tx(tmp_path, monkeypatch)
+    meta = tua._authority_metadata(tx)
+    monkeypatch.setenv("OUROBOROS_PRE_PUSH_TESTS", "1")
+
+    # Snapshot BEFORE the stage cycle (git.py _repo_commit_push ordering).
+    managed_tx, block = update_merge.managed_assisted_tx_for("resolver", meta)
+    assert managed_tx and not block
+
+    # Mid-attempt, the compensating preflight went green -> durable proof.
+    tree = update_merge.record_managed_tests_evidence("resolver", meta)
+    assert tree and update_merge.managed_tests_evidence_covers(tree)
+
+    # Site 1: the committing_assisted transition with the STALE snapshot.
+    committing = update_merge.update_tx_phase(
+        managed_tx, {"phase": "committing_assisted"}
+    )
+    assert committing["phase"] == "committing_assisted"
+    assert update_merge.managed_tests_evidence_covers(tree), (
+        "the committing_assisted phase write clobbered the in-attempt "
+        "tests_evidence"
+    )
+
+    # Site 2: managed_assisted_postcommit (also fed the stale snapshot) must
+    # preserve the proof across BOTH of its phase writes.
+    monkeypatch.setattr(update_merge, "update_restart_smoke", lambda: {"ok": True})
+    ok, msg = update_merge.managed_assisted_postcommit(dict(managed_tx), "f" * 40)
+    assert ok, msg
+    current = update_merge.read_update_tx()
+    assert current["phase"] == "pending_boot_smoke"
+    assert current["pre_restart_smoke"] == "passed"
+    assert current["merge_commit"] == "f" * 40
+    assert update_merge.managed_tests_evidence_covers(tree), (
+        "the postcommit phase writes clobbered the in-attempt tests_evidence"
+    )
+
+    # Helper contract: an absent durable marker falls back to the caller's
+    # snapshot (the only substrate left) instead of resurrecting nothing.
+    assert update_merge.clear_update_tx()
+    merged = update_merge.update_tx_phase(dict(managed_tx), {"phase": "rolling_back"})
+    assert merged["phase"] == "rolling_back"
+    assert merged["task_id"] == managed_tx["task_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -700,17 +768,36 @@ def test_authority_read_failure_fails_loud_not_silent_capture(tmp_path, monkeypa
     assert managed_review_subject(ctx, repo) is not None
     assert getattr(ctx, "_managed_authority_read_error", "") == ""
 
-    # The tx STORAGE breaks at the predicate's read: the typed loud failure —
-    # never a silent degradation to the ordinary staged capture.
+    # REAL corruption: the durable tx marker file exists but cannot be parsed.
+    # authorized_assisted_task maps that to {} without raising — the predicate
+    # must still propagate the corrupt distinction (typed ctx marker) so the
+    # subject builder fails LOUDLY instead of silently reviewing the managed
+    # candidate as an ordinary full staged diff (synthesis wave W3).
+    marker_path = update_merge._update_tx_marker_path()
+    marker_path.write_text("{not json", encoding="utf-8")
+    with pytest.raises(StagedDiffUnavailable, match="authority evidence is unreadable"):
+        managed_review_subject(ctx, repo)
+    assert "update_tx_corrupt" in getattr(ctx, "_managed_authority_read_error", "")
+    # The corrupt marker is loud for ANY task under the active-but-unreadable
+    # tx — an ordinary diff must not be reviewed as provably non-managed.
+    corrupt_stranger = SimpleNamespace(
+        task_id="someone-else", task_metadata=None, repo_dir=str(repo)
+    )
+    with pytest.raises(StagedDiffUnavailable, match="authority evidence is unreadable"):
+        managed_review_subject(corrupt_stranger, repo)
+
+    # The exception channel (tx STORAGE read raising) stays loud too.
     def _boom(*_a, **_k):
         raise OSError("tx storage unreadable")
 
-    monkeypatch.setattr(update_merge, "authorized_assisted_task", _boom)
-    with pytest.raises(StagedDiffUnavailable, match="authority evidence is unreadable"):
-        managed_review_subject(ctx, repo)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(update_merge, "authorized_assisted_task_strict", _boom)
+        with pytest.raises(StagedDiffUnavailable, match="authority evidence is unreadable"):
+            managed_review_subject(ctx, repo)
 
-    # An honest "not the resolver" still degrades to the ordinary path (None).
-    monkeypatch.setattr(update_merge, "authorized_assisted_task", lambda *_a, **_k: {})
+    # An honest "not the resolver" (valid marker, other task) still degrades
+    # to the ordinary path (None) with a clear marker.
+    update_merge.write_update_tx(_tx)
     stranger = SimpleNamespace(task_id="someone-else", task_metadata=None, repo_dir=str(repo))
     assert managed_review_subject(stranger, repo) is None
     assert getattr(stranger, "_managed_authority_read_error", "") == ""
