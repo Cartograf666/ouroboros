@@ -316,6 +316,8 @@ def test_clean_source_install_fetches_exact_managed_node_in_the_same_ensure(
 
     assert pathlib.Path(command[0]).is_relative_to(runtime.managed_runtime_root())
     assert pathlib.Path(command[0]).parts[-3:] == ("node-standalone", "bin", "node")
+    assert manager._resolve_preserved_node(NODE_VERSION) == str(
+        pathlib.Path(command[0]).resolve())
     assert not (source_root / "node-standalone").exists()
     metadata = json.loads(
         (
@@ -467,6 +469,100 @@ def test_probe_requires_exact_bundled_node_and_stamped_identity(tmp_path, monkey
         manager._probe(["/bundle/node", "/runtime/daemon.js"], pin)
     assert excinfo.value.code == "runtime_probe_identity_mismatch"
     assert "CLAUDEXOR_BUILD_SHA" not in seen["env"]
+
+
+def test_serving_role_uses_exact_preserved_tree_not_staged_pin(tmp_path, monkeypatch):
+    """A staged target cannot author a command for the still-serving daemon."""
+    _data_plane(monkeypatch, tmp_path)
+    archive = _archive(tmp_path / "runtime.tar.gz")
+    pin = _pin(archive, version="4.0.0")
+    manager = runtime.ClaudexorRuntimeManager(pin)
+
+    serving_root = runtime.managed_runtime_root() / f"3.7.0-{OLD_BUILD_SHA[:12]}"
+    _metadata(serving_root, version="3.7.0", build_sha=OLD_BUILD_SHA)
+    serving_entry = (serving_root / "dist" / "claudexord.js").resolve()
+    staged_entry = runtime.managed_runtime_dir(pin) / "dist" / "claudexord.js"
+    _metadata(runtime.managed_runtime_dir(pin), version=pin.version, build_sha=pin.build_sha)
+
+    monkeypatch.setattr(manager, "_resolve_preserved_node", lambda _version: "/exact/node")
+    seen = {}
+
+    def probe(command, *, expected_node_version):
+        seen["command"] = command
+        seen["node_version"] = expected_node_version
+        return ({
+            "version": "3.7.0",
+            "buildSha": OLD_BUILD_SHA,
+            "roles": ["future_role", "setup_attach"],
+        }, NODE_VERSION)
+
+    monkeypatch.setattr(manager, "_probe_payload", probe)
+    command = manager.resolve_serving_role_command(
+        engine_version="3.7.0",
+        engine_build_sha=OLD_BUILD_SHA,
+        engine_entry=str(serving_entry),
+        role="setup_attach",
+    )
+    assert command == ["/exact/node", str(serving_entry)]
+    assert seen == {"command": command, "node_version": NODE_VERSION}
+    assert str(staged_entry) not in command
+
+
+def test_old_serving_probe_without_role_is_unavailable_and_metadata_stays_bytes(
+    tmp_path, monkeypatch
+):
+    """Schema-v1 metadata needs no repair; the live probe owns role truth."""
+    _data_plane(monkeypatch, tmp_path)
+    archive = _archive(tmp_path / "runtime.tar.gz")
+    manager = runtime.ClaudexorRuntimeManager(_pin(archive, version="4.0.0"))
+    serving_root = runtime.managed_runtime_root() / f"3.6.0-{OLD_BUILD_SHA[:12]}"
+    _metadata(serving_root, version="3.6.0", build_sha=OLD_BUILD_SHA)
+    metadata_path = serving_root / "managed-runtime.json"
+    before = metadata_path.read_bytes()
+
+    monkeypatch.setattr(manager, "_resolve_preserved_node", lambda _version: "/exact/node")
+    monkeypatch.setattr(
+        manager,
+        "_probe_payload",
+        lambda _command, *, expected_node_version: (
+            {"version": "3.6.0", "buildSha": OLD_BUILD_SHA},
+            expected_node_version,
+        ),
+    )
+    with pytest.raises(runtime.ClaudexorRuntimeError) as excinfo:
+        manager.resolve_serving_role_command(
+            engine_version="3.6.0",
+            engine_build_sha=OLD_BUILD_SHA,
+            engine_entry=str(serving_root / "dist" / "claudexord.js"),
+            role="setup_attach",
+        )
+    assert excinfo.value.code == "runtime_role_unavailable"
+    assert metadata_path.read_bytes() == before
+
+
+def test_serving_role_refuses_same_identity_from_a_different_entry(tmp_path, monkeypatch):
+    _data_plane(monkeypatch, tmp_path)
+    archive = _archive(tmp_path / "runtime.tar.gz")
+    manager = runtime.ClaudexorRuntimeManager(_pin(archive))
+    serving_root = runtime.managed_runtime_root() / f"3.6.0-{OLD_BUILD_SHA[:12]}"
+    _metadata(serving_root, version="3.6.0", build_sha=OLD_BUILD_SHA)
+    foreign_entry = tmp_path / "foreign" / "claudexord.js"
+    foreign_entry.parent.mkdir(parents=True)
+    foreign_entry.write_text("fixture\n", encoding="utf-8")
+    monkeypatch.setattr(
+        manager,
+        "_probe_payload",
+        lambda *_args, **_kwargs: pytest.fail("an unbound entry must not be probed"),
+    )
+
+    with pytest.raises(runtime.ClaudexorRuntimeError) as excinfo:
+        manager.resolve_serving_role_command(
+            engine_version="3.6.0",
+            engine_build_sha=OLD_BUILD_SHA,
+            engine_entry=str(foreign_entry),
+            role="setup_attach",
+        )
+    assert excinfo.value.code == "runtime_serving_tree_unavailable"
 
 
 def test_failed_candidate_probe_preserves_existing_target(tmp_path, monkeypatch):

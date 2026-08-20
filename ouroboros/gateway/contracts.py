@@ -969,7 +969,9 @@ class ClaudexorLoginJobResponse(TypedDict, total=False):
     nested under it (the double ``job.job`` was issue #124).
 
     Operation metadata rides BESIDE the job: create adds ``job_id``,
-    ``disclosure_native`` and (fallback engines only) ``attach_command``;
+    ``disclosure_native``, ``setup_login_source`` and (external-terminal
+    flows whose exact packaged attach role was proven) the labelled
+    ``attach_command`` / ``attach_shell`` pair;
     input keeps its ``ok`` bit; the snapshot poll is the daemon's own
     ``{job, cursor, sequence, deviceCode?}`` envelope passed through
     verbatim, so the transient sign-in disclosure lives at the ENVELOPE
@@ -984,9 +986,29 @@ class ClaudexorLoginJobResponse(TypedDict, total=False):
     # create-only metadata
     job_id: str
     disclosure_native: bool
+    setup_login_source: Literal["per_harness", "legacy_global_operation"]
     attach_command: str
+    attach_shell: Literal["posix", "powershell"]
     # input-only compatibility bit
     ok: bool
+
+
+class ClaudexorVendorCredentialDisposition(TypedDict):
+    """What profile deletion did to a vendor-owned host-user credential."""
+
+    owner: Literal["vendor"]
+    state: Literal["left_unchanged"]
+    scope: Literal["os_user"]
+
+
+class ClaudexorCredentialProfileDeleteResponse(TypedDict):
+    """Exact daemon receipt returned by credential-profile deletion."""
+
+    profile: Dict[str, Any]
+    removed: bool
+    credentialCleanup: Literal["config_dir_removed", "secret_deleted", "none"]
+    cleanupWarning: NotRequired[str]
+    vendorCredentialDisposition: NotRequired[ClaudexorVendorCredentialDisposition]
 
 
 class ClaudexorLoginJobProblem(TypedDict, total=False):
@@ -996,11 +1018,11 @@ class ClaudexorLoginJobProblem(TypedDict, total=False):
     ``required_actions`` naming the engine's continuation (e.g. reconcile's
     409 ``setup_termination_unconfirmed`` carries
     ``["retry_setup_reconciliation"]``). Daemon 404/410 job-absence verdicts,
-    the operation-scoped input/reconcile 409s, and a create-time daemon 400 —
-    the engine's verdict on the requested login SHAPE (e.g. a harness with no
-    default credential store refusing a default login) — ride this shape with
-    their original status, stable code and the engine's own sentence;
-    transport failure and daemon 5xx stay the proxy's 503.
+    the operation-scoped input/reconcile 409s, and setup-create 400/409 or the
+    frozen retryable 503 terminal-transport probe verdict ride this shape with
+    their original status, stable code, actions and the engine's own sentence.
+    Unmarked transport/discovery 503s and other daemon 5xx stay the proxy's
+    generic 503.
     Not an action framework: the list mirrors the daemon's own top-level
     ``ControlProblem.requiredActions`` (at most 16 strings of at most 512
     chars) and nothing else."""
@@ -1377,6 +1399,8 @@ __all__ = [
     "ClaudexorStatusResponse",
     "ClaudexorLoginJobResponse",
     "ClaudexorLoginJobProblem",
+    "ClaudexorVendorCredentialDisposition",
+    "ClaudexorCredentialProfileDeleteResponse",
     "TaskEvent",
     "TaskCancelResponse",
     "TaskHurryRequest",

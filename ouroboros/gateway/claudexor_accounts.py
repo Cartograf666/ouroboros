@@ -20,23 +20,26 @@ through VERBATIM (it already has that shape; wrapping it again was issue #124's
 double ``job.job``). Daemon 404/410 job-absence verdicts pass through for
 poll/cancel/reconcile; typed 409 passes through only for input and reconcile,
 with stable ``code`` plus ``required_actions`` when the engine names the
-continuation. A create-time daemon 400 — the engine refusing the REQUESTED
-login shape (e.g. a harness with no default credential store refusing a
-default login) — passes through with its status, code and the engine's own
-sentence. Transport failure, daemon 5xx, and untyped poll/cancel conflicts
-collapse to this proxy's honest 503.
+continuation. A create-time daemon 400/409 — or the frozen retryable 503
+terminal-transport probe verdict — passes through with its status, code,
+actions and the engine's own sentence. Transport/discovery failure before
+setup creation, other daemon 5xx, and untyped poll/cancel conflicts collapse
+to this proxy's honest 503.
 
 Login shapes ("красота-сначала", D30): a structural link/device-code card
 wherever the engine can host the flow itself — codex device-code today, and
-claude/cursor via the engine's disclosure-driven login modes (3.3.7): the job
-snapshot's transient overlay carries the ``oauth_url`` sign-in link, and a
-claude job additionally accepts the browser's paste-code through
-``POST /v2/setup/jobs/{id}/input``. Capability is discovered from the engine's
-own ``/v2/operations`` catalog, never assumed. The FALLBACK — only for an
-engine that predates those modes — is a copy-paste ``claudexor setup attach
-<jobId>`` command the user runs in the USER'S OWN terminal outside this UI,
-demoted card-side to a collapsed Advanced affordance. There is no in-app
-terminal surface, and none may be added.
+other harnesses according to the engine's per-harness, host-effective
+``setupLogin`` fact: the job snapshot's transient overlay carries the sign-in
+link and supported input. Only a legacy row that truly omits that field may
+consult the old engine-global operations catalog. Explicit null or malformed
+current evidence never falls back. ``external_terminal`` produces a labelled,
+platform-correct copy-paste command for the USER'S OWN terminal. Before any
+profile/job mutation, the serving handshake's version/build/entry selects the
+preserved packaged Node + runtime entry and that entry's fresh probe must
+advertise ``setup_attach``; old probes without the additive role are honestly
+unsupported. The exact argv is retained through job creation and rendered only
+after its id exists, demoted card-side to a collapsed Advanced affordance.
+There is no PATH-CLI or in-app terminal surface, and none may be added.
 """
 
 from __future__ import annotations
@@ -44,7 +47,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -64,6 +67,12 @@ READ_FAILED = "failed"
 # default to the engine-hosted flow is decided per-engine from the
 # /v2/operations catalog (see _login_disclosure_native), never assumed.
 _LOGIN_TRANSPORTS = ("", "client_pty")
+_TERMINAL_TRANSPORT_ERROR_CODES = {
+    "terminal_transport_unavailable",
+    "terminal_transport_unsupported",
+    "terminal_transport_probe_failed",
+    "terminal_transport_failed",
+}
 
 # The engine advertises its disclosure-driven login modes (3.3.7 contract) by
 # implementing the setup-job input route: `POST /v2/setup/jobs/:id/input`
@@ -73,9 +82,74 @@ _LOGIN_TRANSPORTS = ("", "client_pty")
 # engine's own stable identifier for the operation, not the path spelling.
 _LOGIN_INPUT_OPERATION_ID = "post:setup.jobs.id.input"
 
+# Current engines publish the EFFECTIVE setup-login choice on each harness
+# row. Keep the four wire states separate: omission is the one legacy signal;
+# explicit null is an authoritative "not supported"; a valid object selects a
+# transport; and a malformed/current row is a capability gap, never permission
+# to guess from the old engine-global operation catalog.
+_SETUP_LOGIN_ABSENT = "absent"
+_SETUP_LOGIN_NULL = "null"
+_SETUP_LOGIN_OBJECT = "object"
+_SETUP_LOGIN_MALFORMED = "malformed"
+_SETUP_LOGIN_TRANSPORTS = {
+    "in_app": "",
+    "external_terminal": "client_pty",
+}
+
+# Claudexor 3.6.0 assigned the generic ``internal_error`` code to a duplicate
+# profile's HTTP 409. Neither spelling is sufficient on its own: only the
+# canonical exact-row read below can turn one of these legacy conflicts into
+# an idempotent retry.
+_LEGACY_PROFILE_CONFLICT_CODES = {"http_409", "internal_error"}
+
+
+def _harness_setup_login(capabilities: Dict[str, Any], harness: str) -> Tuple[str, str]:
+    """Return ``(wire_state, mode)`` for exactly one harness catalog row.
+
+    The wire deliberately makes ``setupLogin`` optional *and* nullable. An old
+    3.6.0-shaped row omits it; a current producer owns the key and emits either
+    null or ``{mode}``. Missing/duplicate harness rows and invalid values are
+    malformed current evidence, not legacy omission.
+    """
+    rows = capabilities.get("harnesses") if isinstance(capabilities, dict) else None
+    if not isinstance(rows, list):
+        return _SETUP_LOGIN_MALFORMED, ""
+    matches = [row for row in rows
+               if isinstance(row, dict) and str(row.get("id") or "") == harness]
+    if len(matches) != 1:
+        return _SETUP_LOGIN_MALFORMED, ""
+    row = matches[0]
+    if "setupLogin" not in row:
+        return _SETUP_LOGIN_ABSENT, ""
+    setup = row.get("setupLogin")
+    if setup is None:
+        return _SETUP_LOGIN_NULL, ""
+    if not isinstance(setup, dict):
+        return _SETUP_LOGIN_MALFORMED, ""
+    mode = setup.get("mode")
+    if not isinstance(mode, str) or mode not in _SETUP_LOGIN_TRANSPORTS:
+        return _SETUP_LOGIN_MALFORMED, ""
+    return _SETUP_LOGIN_OBJECT, mode
+
+
+def _credential_profile_registered(payload: Dict[str, Any], harness: str,
+                                   profile_id: str) -> bool:
+    """Whether an exact named profile exists in the daemon's canonical read."""
+    profiles = payload.get("profiles") if isinstance(payload, dict) else None
+    if not isinstance(profiles, list):
+        return False
+    for wrapper in profiles:
+        profile = wrapper.get("profile") if isinstance(wrapper, dict) else None
+        if not isinstance(profile, dict):
+            continue
+        if (str(profile.get("harness_id") or "") == harness
+                and str(profile.get("profile_id") or "") == profile_id):
+            return True
+    return False
+
 
 def _login_disclosure_native(operations: List[Dict[str, Any]]) -> bool:
-    """Does this engine host claude/cursor logins itself (no Terminal)?
+    """Legacy compatibility: did the old engine publish setup-job input?
 
     True iff the ``/v2/operations`` catalog advertises the setup-job input
     route under its EXACT catalog id. The path spelling is deliberately NOT a
@@ -85,7 +159,8 @@ def _login_disclosure_native(operations: List[Dict[str, Any]]) -> bool:
     OLD engine down the transportless path, whose daemon-side default is the
     macOS Terminal.app handoff D30 forbids. A false NEGATIVE only costs the
     attach fallback, which works on every engine. Pure for unit tests; a
-    caller that could not READ the catalog must pass [] and get False."""
+    caller that could not READ the catalog must pass [] and get False. Current
+    per-harness rows never use this engine-global signal."""
     for op in operations:
         if not isinstance(op, dict):
             continue
@@ -445,14 +520,12 @@ def _build_login_request(harness: str, profile_id: str, transport: str,
     client_pty job without it is a hard 400 — and loginFlow exists ONLY for
     codex, so it is never sent for another harness (that too is a 400).
 
-    ``disclosure_native`` is the /v2/operations answer (see
-    _login_disclosure_native): on such an engine a NON-codex login omits the
-    transport so the engine hosts the flow itself and discloses the sign-in
-    link through the snapshot overlay — no Terminal, no attach command needed.
-    On an older engine the omitted transport would default daemon-side to the
-    macOS Terminal.app handoff D30 forbids, so client_pty is forced instead:
-    the card polls the sealed job and offers the copy-paste attach command as
-    the demoted Advanced fallback.
+    ``disclosure_native`` is the resolved request behavior: normally selected
+    by per-harness ``setupLogin.mode``; only a legacy row with that key absent
+    may derive it from _login_disclosure_native. True omits the transport so
+    the engine hosts the flow and discloses the sign-in link through the
+    snapshot overlay. False forces client_pty for non-codex legacy/external
+    flows, whose copy-paste attach command is the demoted Advanced fallback.
     """
     request: Dict[str, Any] = {"harness": harness, "action": "login", "authRequest": "subscription"}
     if profile_id:
@@ -462,7 +535,9 @@ def _build_login_request(harness: str, profile_id: str, transport: str,
     if transport:
         request["transport"] = transport
     if harness == "codex" and transport == "client_pty":
-        login_flow = login_flow or "browser_redirect"
+        # This is a transport invariant, not a caller preference: device_auth
+        # is daemon-owned and Claudexor rejects it on a client_pty job.
+        login_flow = "browser_redirect"
     if login_flow and harness == "codex":
         request["loginFlow"] = login_flow
     return request
@@ -485,7 +560,12 @@ def _login_job_response(job: Dict[str, Any], **metadata: Any) -> Dict[str, Any]:
 
 
 def _login_create(body: Dict[str, Any]) -> Dict[str, Any]:
-    from ouroboros.claudexor_daemon import attach_login_command, ensure_owned_gateway
+    from ouroboros.claudexor_daemon import (
+        attach_login_command,
+        attach_login_shell,
+        ensure_owned_gateway,
+        resolve_attach_login_argv,
+    )
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
     harness = str(body.get("harness") or "").strip()
@@ -496,46 +576,109 @@ def _login_create(body: Dict[str, Any]) -> Dict[str, Any]:
     if transport not in _LOGIN_TRANSPORTS:
         raise ValueError("transport must be omitted or 'client_pty' (the Terminal.app handoff transport is not offered)")
     login_flow = str(body.get("login_flow") or "").strip()
+    explicit_external_transport = transport == "client_pty"
     # Provisioning moment: the FIRST login action is what spawns the owned
     # daemon (and thereby flips default discovery to it) — an owner action,
     # never a boot-time side effect.
     with ensure_owned_gateway() as gateway:
-        # Capability, not folklore: the engine's own route catalog says whether
-        # it hosts claude/cursor logins itself (disclosure-driven, 3.3.7). A
-        # catalog read failure fails CLOSED onto the attach fallback — it works
-        # on every engine, while a mis-defaulted transport on an old engine
-        # would be the forbidden Terminal.app handoff.
-        try:
-            disclosure_native = _login_disclosure_native(gateway.operations())
-        except Exception:
-            log.debug("operations catalog read failed; assuming pre-disclosure engine", exc_info=True)
-            disclosure_native = False
-        if profile_id:
-            try:
-                gateway.create_credential_profile(harness, profile_id)
-            except Exception:
-                # An existing registration is fine; the login job below is
-                # what decides whether the profile is usable.
-                log.debug("credential-profile create skipped", exc_info=True)
+        # The current contract is per HARNESS and per HOST. Only an exact row
+        # whose setupLogin key is genuinely absent may use the old global
+        # operation signal; explicit null and malformed current evidence do
+        # not authorize a fallback or any profile/setup mutation.
+        capability_state, setup_mode = _harness_setup_login(
+            gateway.agent_capabilities(), harness)
+        setup_login_source = "per_harness"
+        if capability_state == _SETUP_LOGIN_NULL:
+            raise ValueError("this agent does not support subscription sign-in")
+        if capability_state == _SETUP_LOGIN_MALFORMED:
+            raise ClaudexorUnavailable(
+                "setup_login_capability_malformed",
+                "the agent service did not publish a valid setup-login capability "
+                f"for {harness}",
+            )
+        if capability_state == _SETUP_LOGIN_OBJECT:
+            if explicit_external_transport:
+                # The card's explicit recovery action is allowed to select the
+                # existing client_pty transport even when the host normally
+                # supports in-app login. An omitted request still follows the
+                # engine's exact per-harness mode below.
+                disclosure_native = False
+            else:
+                transport = _SETUP_LOGIN_TRANSPORTS[setup_mode]
+                disclosure_native = setup_mode == "in_app"
+        else:
+            setup_login_source = "legacy_global_operation"
+            if explicit_external_transport:
+                disclosure_native = False
+            else:
+                try:
+                    disclosure_native = _login_disclosure_native(gateway.operations())
+                except Exception:
+                    log.debug("legacy operations catalog read failed; using attach fallback", exc_info=True)
+                    disclosure_native = False
         request_body = _build_login_request(
             harness, profile_id, transport, login_flow,
             disclosure_native=disclosure_native)
+        attach_argv: list[str] = []
+        if request_body.get("transport") == "client_pty":
+            # Preflight BEFORE profile registration or setup-job creation. An
+            # old serving probe has no setup_attach role; returning a missing
+            # command after creating its client_pty job would strand that job.
+            # Preserve this one exact argv through creation so a staged pin or
+            # concurrent next-spawn selection can never change the command.
+            handshake = gateway.handshake()
+            engine = handshake.get("engine") if isinstance(handshake, dict) else None
+            try:
+                attach_argv = resolve_attach_login_argv(engine)
+            except ClaudexorUnavailable as exc:
+                exc.login_create_verdict = True
+                raise
+        if profile_id:
+            try:
+                gateway.create_credential_profile(harness, profile_id)
+            except ClaudexorUnavailable as exc:
+                if exc.code == "credential_profile_exists":
+                    pass
+                elif (int(getattr(exc, "status_code", 0) or 0) == 409
+                      and exc.code in _LEGACY_PROFILE_CONFLICT_CODES):
+                    # Claudexor 3.6.0 did not have the typed duplicate code.
+                    # Its generic conflict is idempotent only after the daemon's
+                    # exact read proves this same harness/profile row exists.
+                    try:
+                        exists = _credential_profile_registered(
+                            gateway.credential_profiles(), harness, profile_id)
+                    except Exception:
+                        exists = False
+                    if not exists:
+                        exc.login_profile_verdict = True
+                        raise
+                else:
+                    # Validation/conflict failures are daemon verdicts and keep
+                    # their status/code/actions at the browser boundary. A 5xx
+                    # or transport failure still becomes the proxy's honest 503.
+                    exc.login_profile_verdict = True
+                    raise
         try:
             job = gateway.setup_job_create(request_body)
         except ClaudexorUnavailable as exc:
-            # Mark WHERE the daemon answered: only a 400 from the job CREATE is
-            # a verdict about the requested login shape (the pass-through the
-            # endpoint forwards). A handshake or discovery 400 earlier in this
-            # block is engine/protocol trouble and stays the honest 503.
+            # Mark WHERE the daemon answered: only the job-CREATE boundary may
+            # pass its frozen 400/409 or terminal-probe 503 verdict through.
+            # The same status during handshake/discovery is engine/protocol
+            # trouble and stays the honest generic 503.
             exc.login_create_verdict = True
             raise
     job_id = str(job.get("id") or job.get("jobId") or "")
-    metadata: Dict[str, Any] = {"job_id": job_id, "disclosure_native": disclosure_native}
+    metadata: Dict[str, Any] = {
+        "job_id": job_id,
+        "disclosure_native": disclosure_native,
+        "setup_login_source": setup_login_source,
+    }
     if request_body.get("transport") == "client_pty" and job_id:
         # The fallback card's copy-paste command, run OUTSIDE this UI. Read
         # from the REQUEST actually sent (the non-codex default is forced
         # inside the builder, not in the caller's local variable).
-        metadata["attach_command"] = attach_login_command(job_id)
+        metadata["attach_command"] = attach_login_command(job_id, argv=attach_argv)
+        metadata["attach_shell"] = attach_login_shell()
     return _login_job_response(job, **metadata)
 
 
@@ -549,23 +692,30 @@ async def api_claudexor_login(request: Request) -> JSONResponse:
     except ValueError as exc:
         return json_error(str(exc), 400)
     except ClaudexorUnavailable as exc:
-        if (int(getattr(exc, "status_code", 0) or 0) == 400
-                and getattr(exc, "login_create_verdict", False)):
-            # The daemon ANSWERED and refused this create request (HTTP 400):
-            # a verdict about the requested login SHAPE — e.g. an engine whose
-            # harness has no default credential store refuses a default login
-            # and says to sign in from a named account instead. Collapsing it
-            # to 503 hid both the status and the engine's sentence, leaving
-            # the card a dead "unavailable" error for a condition the owner
-            # can fix by naming an account. Pass status, stable code and the
-            # engine's own message through in the frozen problem envelope
-            # (``ClaudexorLoginJobProblem``). Transport failure and daemon
-            # 5xx — unproven, not verdicts — stay this proxy's honest 503.
+        status = int(getattr(exc, "status_code", 0) or 0)
+        profile_verdict = bool(getattr(exc, "login_profile_verdict", False))
+        create_verdict = bool(getattr(exc, "login_create_verdict", False))
+        create_problem = create_verdict and (
+            status in (400, 409)
+            or (status == 503 and exc.code in _TERMINAL_TRANSPORT_ERROR_CODES)
+        )
+        if profile_verdict or create_problem:
+            # The daemon ANSWERED and refused either profile registration or
+            # setup creation. Preserve profile-create 4xx verdicts — including
+            # a typed required-profile action and non-idempotent conflicts —
+            # instead of collapsing them to daemon unavailability. Setup-job
+            # create keeps its frozen 400/409 plus retryable 503 boundary. Pass
+            # status, stable code and the engine's own message through in the
+            # frozen problem envelope
+            # (``ClaudexorLoginJobProblem``). Transport/discovery failure
+            # before this marked create stage and other daemon 5xx — unproven,
+            # not verdicts — stay this proxy's honest generic 503.
             extra: Dict[str, Any] = {"code": exc.code}
             actions = tuple(getattr(exc, "required_actions", ()) or ())
             if actions:
                 extra["required_actions"] = list(actions)
-            return json_error(str(exc), 400, **extra)
+            browser_status = status if 400 <= status < 500 else 503
+            return json_error(str(exc), browser_status, **extra)
         return json_error(f"{exc.code}: {exc}", 503)
     except Exception as exc:
         log.exception("api_claudexor_login failed")
@@ -724,8 +874,7 @@ def _remove_credential_profile(harness: str, profile_id: str) -> Dict[str, Any]:
     endpoint = discover_daemon_at(owned_config_dir())
     with ClaudexorGateway(endpoint) as gateway:
         gateway.handshake()
-        gateway.delete_credential_profile(harness, profile_id)
-    return {"ok": True, "harness": harness, "profile_id": profile_id}
+        return gateway.delete_credential_profile(harness, profile_id)
 
 
 def _update_credential_profile(harness: str, profile_id: str, enabled: bool) -> Dict[str, Any]:

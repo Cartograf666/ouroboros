@@ -1292,6 +1292,36 @@ Before every commit, verify the following:
   the per-harness accounts row — pool first, legacy second, never re-derived
   from the profile list, and an unknown `next_up.kind` on either wire is a
   fail-safe refusal that still lets the configured-seat scan answer.
+- Agent sign-in consumes the exact harness row's optional-without-default
+  `setupLogin` field as four states: absent is legacy, null is unsupported, a
+  valid object selects `in_app` or `external_terminal`, and malformed present
+  data is a gap. Only absence may consult the old global operations catalog.
+  An explicit `client_pty` request overrides a normal `in_app` mode; an omitted
+  request follows the engine row. Never add a harness-name branch for this
+  choice. Typed required-profile and duplicate codes decide their respective
+  flows; only an old generic 409 (`internal_error` on 3.6.0, or `http_409` when
+  no body code survived) may use an exact same-harness/same-profile read-back.
+  Project external-terminal recovery only from the exact required action or
+  durable native-command error code, and start its new job through the existing
+  custody-release guard. Before profile registration or job creation, bind the
+  recovery argv to the live handshake's exact engine version, build SHA and
+  absolute entry, locate its preserved exact-Node runtime without consulting
+  the staged next-spawn pin, and require that same entry's fresh `--probe` to
+  advertise the additive `setup_attach` role. A missing role on an old probe is
+  a typed 409 with no job; a failed/identity-mismatched probe is a retryable
+  typed 503. Retain that argv through job creation, then render it in full and
+  compact through the owning `claudexor_daemon.py` consumer for POSIX or PowerShell
+  target, with owned `CLAUDEXOR_CONFIG_DIR` and an empty inherited
+  `CLAUDEXOR_DAEMON_SOCK`; label the shell, and do not execute the text.
+- Credential-profile DELETE remains a thin receipt-preserving proxy. Frontend
+  contracts require the daemon's `profile`, `removed` and exact
+  `credentialCleanup` (`config_dir_removed | secret_deleted | none`), with
+  `cleanupWarning` and vendor disposition optional. Frontend
+  code may show the retained-vendor warning only for the exact
+  `vendorCredentialDisposition` tuple `vendor/left_unchanged/os_user`;
+  `verification=not_run` is neutral unknown while `failed` is an error. Mirror
+  additive response fields in Python TypedDicts and `web/modules/api_types.js`,
+  and extend the field-parity plus focused Python/Node fixtures together.
 - Owner settings writes go through `gateway/owner_settings.py`. The settings
   lock is a PRECONDITION of the write, not a hint: `_acquire_settings_lock`
   answers `None` on timeout and a writer that proceeds anyway is unlocked while
