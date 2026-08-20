@@ -301,7 +301,7 @@ def resolve_configured_actor_dispatch(
 
     # Lazy import avoids a module cycle: subagents calls this only after defining
     # the shared dispatch dataclasses and route helpers used below.
-    from ouroboros.config import resolve_effort
+    from ouroboros.config import effort_rank, resolve_effort
     from ouroboros.provider_models import model_has_credentials, normalize_model_identity
     from ouroboros.subagents import (
         CapabilityDelta,
@@ -333,7 +333,8 @@ def resolve_configured_actor_dispatch(
 
     if route_kind == "api_model":
         use_local = route_target.endswith(" (local)")
-        model = normalize_model_identity(route_target)
+        model = route_target[:-8].strip() if use_local else route_target
+        model_identity = normalize_model_identity(route_target)
         available = bool(model_has_credentials(route_target))
         lane = dataclass_replace(lane, model=model, use_local_model=use_local)
         availability = {
@@ -341,10 +342,17 @@ def resolve_configured_actor_dispatch(
             "status": "ready" if available else "credentials_unavailable",
             "route_kind": route_kind,
         }
+        effective_effort = _route_effort(model_identity, derived_effort)
+        reasons = (
+            (f"route_effort_ceiling={effective_effort}",)
+            if effort_rank(effective_effort) < effort_rank(derived_effort) else ()
+        )
         delta = CapabilityDelta(
             derived_effort=derived_effort,
-            effective_effort=_route_effort(model, derived_effort),
+            effective_effort=effective_effort,
             requested_executor="native", effective_executor="native",
+            reason=derive_capability_reason(reasons), reduced=bool(reasons),
+            reduction_reasons=reasons,
         )
         return SubagentDispatch(
             lane=lane, effort=derived_effort, executor="native", route=route_target,
@@ -408,13 +416,18 @@ def resolve_configured_actor_dispatch(
         "status": "unavailable" if unavailable else "ready",
         "reason": unavailable, "reset_at": reset_at, "route_kind": route_kind,
     }
-    reasons = (unavailable,) if unavailable else ()
+    effective_effort = _route_effort(nanny_model, nanny_effort)
+    reasons = []
+    if effort_rank(effective_effort) < effort_rank(nanny_effort):
+        reasons.append(f"route_effort_ceiling={effective_effort}")
+    if unavailable:
+        reasons.append(unavailable)
     delta = CapabilityDelta(
         derived_effort=nanny_effort,
-        effective_effort=_route_effort(nanny_model, nanny_effort),
+        effective_effort=effective_effort,
         requested_executor="harness", effective_executor=executor,
         reason=derive_capability_reason(reasons), reduced=bool(reasons),
-        reduction_reasons=reasons,
+        reduction_reasons=tuple(reasons),
     )
     resolution = SubagentExecutorResolution(
         "harness", executor, exact_route if exact_route.route_id else None,

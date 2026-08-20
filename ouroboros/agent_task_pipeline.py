@@ -601,7 +601,7 @@ def _apply_terminal_custody_outcome(
 ) -> Dict[str, Any]:
     """Make the terminal custody audit authoritative for result and event axes."""
 
-    existing = load_task_result(env.drive_root, str(task.get("id") or "")) or {}
+    existing = load_task_result(task.get("budget_drive_root") or env.drive_root, str(task.get("id") or "")) or {}
     unreconciled = existing.get("delegated_runs_unreconciled")
     if not isinstance(unreconciled, list) or not unreconciled:
         return loop_outcome

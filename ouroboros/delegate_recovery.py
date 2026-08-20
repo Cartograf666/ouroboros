@@ -251,15 +251,12 @@ def veto_worker_retry_handoff(
 
 
 def _holder_matches(row: Mapping[str, Any], holder: Any, *, pending: bool) -> bool:
-    def _value(name: str) -> str:
-        return str(holder.get(name) or "") if pending else str(getattr(holder, name, "") or "")
-
     identity = "pending_invocation_id" if pending else "run_id"
-    holder_identity = _value("invocation_id" if pending else "run_id")
+    holder_identity = _holder_value(holder, "invocation_id" if pending else "run_id", pending=pending)
     if holder_identity != str(row.get(identity) or ""):
         return False
     return all(
-        _value(name) == str(row.get(name) or "")
+        _holder_value(holder, name, pending=pending) == str(row.get(name) or "")
         for name in (
             "selected_subagent_id", "config_fingerprint", "authority_fingerprint",
             "work_order_fingerprint", "snapshot_id", "execution_root",
@@ -268,18 +265,52 @@ def _holder_matches(row: Mapping[str, Any], holder: Any, *, pending: bool) -> bo
     )
 
 
+def _holder_value(holder: Any, name: str, *, pending: bool) -> str:
+    return (
+        str(holder.get(name) or "")
+        if pending else str(getattr(holder, name, "") or "")
+    )
+
+
+def _successor_binding_mismatch(row: Mapping[str, Any], task: Mapping[str, Any]) -> str:
+    """Re-prove task authority plus the exact leaf binding reserved at handoff.
+
+    The first atomic leaf is bound to the task snapshot.  An explicit same-nanny
+    replacement (or a root-direct leaf) has its own later durable actor/work-order
+    binding, so recovery follows that unique custody holder rather than retargeting it
+    back to the task's initial actor.
+    """
+
+    if str(row.get("authority_fingerprint") or "") != authority_fingerprint_from_task(task):
+        return "authority_mismatch"
+    binding_source = str(row.get("actor_binding_source") or "task_snapshot")
+    if binding_source == "current_custody_holder":
+        if all(
+            str(row.get(name) or "")
+            for name in (
+                "selected_subagent_id", "config_fingerprint", "work_order_fingerprint",
+            )
+        ):
+            return ""
+        return "current_holder_binding_incomplete"
+    if binding_source != "task_snapshot":
+        return "actor_binding_source_invalid"
+    snapshot = _selected_session(task)
+    if str(row.get("config_fingerprint") or "") != str(snapshot.get("config_fingerprint") or ""):
+        return "config_mismatch"
+    if str(row.get("selected_subagent_id") or "") != str(snapshot.get("selected_subagent_id") or ""):
+        return "actor_mismatch"
+    if str(row.get("work_order_fingerprint") or "") != work_order_fingerprint(task):
+        return "work_order_mismatch"
+    return ""
+
+
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+    from ouroboros.platform_layer import pid_is_alive
+
+    return bool(pid_is_alive(pid))
 
 
 def _restore_wait_checkpoint(drive_root: Any, row: Mapping[str, Any]) -> None:
@@ -371,9 +402,8 @@ def prepare_handoff(
 
     if cause not in _ALLOWED_CAUSES:
         return {}
-    snapshot = _selected_session(task)
     task_id = str(task.get("id") or "")
-    if not snapshot or not task_id:
+    if not task_id:
         return {}
     supervision_path = (
         pathlib.Path(drive_root) / "state" / "delegate_supervision" / f"{task_id}.json"
@@ -424,31 +454,32 @@ def prepare_handoff(
             settled_holder = candidate
     if len(runs) + len(pending) + int(settled_holder is not None) != 1:
         return {}
-    config_fingerprint = str(snapshot.get("config_fingerprint") or "")
-    selected_subagent_id = str(snapshot.get("selected_subagent_id") or "")
     holder: Any = runs[0] if runs else pending[0] if pending else settled_holder
-    holder_fp = str(
-        holder.config_fingerprint if (runs or settled_holder is not None) else holder.get("config_fingerprint") or ""
-    )
+    holder_is_pending = bool(pending)
+    config_fingerprint = _holder_value(holder, "config_fingerprint", pending=holder_is_pending)
+    selected_subagent_id = _holder_value(holder, "selected_subagent_id", pending=holder_is_pending)
+    holder_work_order = _holder_value(holder, "work_order_fingerprint", pending=holder_is_pending)
+    holder_authority = _holder_value(holder, "authority_fingerprint", pending=holder_is_pending)
     authority_fp = authority_fingerprint_from_task(task)
-    holder_authority = str(
-        holder.authority_fingerprint if (runs or settled_holder is not None) else holder.get("authority_fingerprint") or ""
-    )
-    holder_selected = str(
-        holder.selected_subagent_id if (runs or settled_holder is not None) else holder.get("selected_subagent_id") or ""
-    )
-    holder_work_order = str(
-        holder.work_order_fingerprint if (runs or settled_holder is not None) else holder.get("work_order_fingerprint") or ""
-    )
-    work_order_fp = work_order_fingerprint(task)
     if (
         not config_fingerprint
         or not selected_subagent_id
-        or holder_fp != config_fingerprint
-        or holder_selected != selected_subagent_id
+        or not holder_work_order
         or holder_authority != authority_fp
-        or holder_work_order != work_order_fp
     ):
+        return {}
+    snapshot = _selected_session(task)
+    task_snapshot_matches_holder = bool(
+        snapshot
+        and selected_subagent_id == str(snapshot.get("selected_subagent_id") or "")
+        and config_fingerprint == str(snapshot.get("config_fingerprint") or "")
+        and holder_work_order == work_order_fingerprint(task)
+    )
+    # A pending invocation is replayed through its original idempotency key, which
+    # still performs a POST.  The replacement/root-direct extension is adoption-only:
+    # it follows an already-started (or already-settled) exact leaf and never widens
+    # into replaying a selector that was not the task-start snapshot.
+    if holder_is_pending and not task_snapshot_matches_holder:
         return {}
     row = {
         "schema": 1,
@@ -464,7 +495,10 @@ def prepare_handoff(
         "selected_subagent_id": selected_subagent_id,
         "config_fingerprint": config_fingerprint,
         "authority_fingerprint": authority_fp,
-        "work_order_fingerprint": work_order_fp,
+        "work_order_fingerprint": holder_work_order,
+        "actor_binding_source": (
+            "task_snapshot" if task_snapshot_matches_holder else "current_custody_holder"
+        ),
         "run_id": runs[0].run_id if runs else settled_holder.run_id if settled_holder else "",
         "pending_invocation_id": str(pending[0].get("invocation_id") or "") if pending else "",
         "settled_terminal": settled_holder is not None,
@@ -623,7 +657,6 @@ def pre_adopt_planned_handoffs(
         }:
             continue
         task = pending_tasks_by_id.get(task_id)
-        snapshot = _selected_session(task or {})
         old_pid = int(row.get("supervisor_pid") or 0)
         transaction_id = str(row.get("restart_transaction_id") or "")
         transaction = _read_restart_transaction(drive_root, transaction_id)
@@ -646,14 +679,8 @@ def pre_adopt_planned_handoffs(
             mismatch = "previous_supervisor_generation_not_dead"
         elif int(row.get("new_attempt") or 0) != int(task.get("_attempt") or 1):
             mismatch = "startup_attempt_mismatch"
-        elif str(row.get("config_fingerprint") or "") != str(snapshot.get("config_fingerprint") or ""):
-            mismatch = "startup_config_mismatch"
-        elif str(row.get("selected_subagent_id") or "") != str(snapshot.get("selected_subagent_id") or ""):
-            mismatch = "startup_actor_mismatch"
-        elif str(row.get("authority_fingerprint") or "") != authority_fingerprint_from_task(task):
-            mismatch = "startup_authority_mismatch"
-        elif str(row.get("work_order_fingerprint") or "") != work_order_fingerprint(task):
-            mismatch = "startup_work_order_mismatch"
+        elif binding_mismatch := _successor_binding_mismatch(row, task):
+            mismatch = f"startup_{binding_mismatch}"
         if mismatch:
             veto_handoff(drive_root, task_id, mismatch)
             continue
@@ -747,7 +774,6 @@ def adopt_handoff(ctx: Any, task: Mapping[str, Any]) -> dict[str, Any]:
     row = _read(drive, task_id)
     if not row or row.get("status") not in {"reserved", "pre_adopted"}:
         return {"status": "none"}
-    snapshot = _selected_session(task)
     expected_attempt = int(task.get("_attempt") or 1)
     planned_restart_mismatch = ""
     if row.get("cause") == CAUSE_PLANNED_SELF_RESTART:
@@ -771,10 +797,7 @@ def adopt_handoff(ctx: Any, task: Mapping[str, Any]) -> dict[str, Any]:
             and int(row.get("supervisor_pid") or 0) != os.getpid()
         )
         or int(row.get("new_attempt") or 0) != expected_attempt
-        or str(row.get("config_fingerprint") or "") != str(snapshot.get("config_fingerprint") or "")
-        or str(row.get("selected_subagent_id") or "") != str(snapshot.get("selected_subagent_id") or "")
-        or str(row.get("authority_fingerprint") or "") != authority_fingerprint_from_task(task)
-        or str(row.get("work_order_fingerprint") or "") != work_order_fingerprint(task)
+        or _successor_binding_mismatch(row, task)
     ):
         reason = planned_restart_mismatch or "successor_binding_mismatch"
         veto_handoff(drive, task_id, reason)
