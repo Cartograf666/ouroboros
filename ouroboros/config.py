@@ -280,6 +280,18 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # pinning a worker on a dead socket.
     "OUROBOROS_WEBSEARCH_TIMEOUT_SEC": 480,
     "OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC": 2700,
+    # Per-request timeout for the LOCAL llama.cpp lane. Was a hardcoded 180s, which
+    # inverted the transport SSOT above: the SLOWEST route carried the SHORTEST
+    # deadline by 15x. A quantized 20B+ GGUF that prefills ~10k tokens and then
+    # reasons does not finish in three minutes on consumer hardware, so a main-loop
+    # round on a large local model timed out structurally, not because anything
+    # was actually wrong with the request.
+    "OUROBOROS_LOCAL_REQUEST_TIMEOUT_SEC": 1800,
+    # Owner-facing progress ticker: how long a running task may stay SILENT before
+    # the heartbeat thread renders its current phase into the chat. A silence
+    # filler, not a metronome — a task emitting real progress lines never trips
+    # it. 0 disables the ticker entirely.
+    "OUROBOROS_PROGRESS_TICKER_SEC": 60,
     # v6.54.3 (1.5): plan_task deadline scaling. With a task deadline the planning swarm's
     # wait ceiling is min(configured ceiling, remaining/4); below this floor plan_task SKIPS
     # with a typed reason + telemetry rather than eat the tail of the budget.
@@ -1015,6 +1027,25 @@ def get_llm_transport_read_timeout_sec() -> float:
 
     The DEAD-SOCKET bound, not a latency target; explicit per-call timeouts win."""
     return _clamped_number_setting("OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC", low=60.0, high=7200.0)
+
+
+def get_local_request_timeout_sec() -> float:
+    """Per-request timeout for the local llama.cpp chat lane.
+
+    The local server is the slowest route the loop can take and the one most likely
+    to spend minutes on prefill before the first token, so it needs a MORE generous
+    deadline than the remote transport bound, not a stricter one."""
+    return _clamped_number_setting("OUROBOROS_LOCAL_REQUEST_TIMEOUT_SEC", low=60.0, high=7200.0)
+
+
+def get_progress_ticker_sec() -> float:
+    """Silence window before the heartbeat thread emits a task's current phase.
+
+    Returns 0.0 when the ticker is disabled. Not clamped to a floor above zero:
+    the disable value has to survive, and the heartbeat tick interval already
+    bounds how often this can actually fire."""
+    value = _clamped_number_setting("OUROBOROS_PROGRESS_TICKER_SEC", low=0.0, high=3600.0)
+    return 0.0 if value <= 0 else max(value, 15.0)
 
 
 def get_acceptance_review_est_sec() -> float:

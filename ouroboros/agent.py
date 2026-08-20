@@ -1557,6 +1557,59 @@ class OuroborosAgent:
             "executor_route": str(metadata.get("executor_route") or ""),
         }
 
+    def _live_children_clause(self, task_id: str) -> str:
+        """``N subagents running`` for the ticker, or "" when the task has no live
+        children. Read from the SAME status root ``get_task_result`` uses, so a
+        forked child drive is not mistaken for an empty subtree. Never raises: a
+        status line is not worth failing a heartbeat tick over."""
+        try:
+            from ouroboros.task_status import FINAL_STATUSES, find_child_tasks
+
+            metadata = self._current_task_metadata if isinstance(self._current_task_metadata, dict) else {}
+            status_root = pathlib.Path(
+                str(metadata.get("budget_drive_root") or "") or str(self.env.drive_root)
+            )
+            children = [
+                row for row in find_child_tasks(
+                    status_root,
+                    parent_task_id=task_id,
+                    root_task_id=str(metadata.get("root_task_id") or task_id),
+                    exclude_task_id=task_id,
+                    scope="direct",
+                    materialize_artifacts=False,
+                )
+                if isinstance(row, dict)
+            ]
+            live = [
+                child for child in children
+                if str(child.get("status") or "") not in FINAL_STATUSES
+            ]
+            if not live:
+                return ""
+            return f"{len(live)} of {len(children)} subagents still running"
+        except Exception:
+            log.debug("Live-children clause unavailable for the progress ticker", exc_info=True)
+            return ""
+
+    def _maybe_emit_progress_tick(self, task_id: str) -> None:
+        """Emit the current phase when the task has gone quiet for the ticker window.
+
+        Gated on time since the LAST progress line, not on a fixed schedule: a task
+        already narrating itself (tool results, review verdicts, fallbacks) does not
+        need a second voice on top. An unstamped task renders "" and stays silent
+        rather than inventing a reassuring "still working"."""
+        from ouroboros import task_activity
+        from ouroboros.config import get_progress_ticker_sec
+
+        window = get_progress_ticker_sec()
+        if window <= 0:
+            return
+        if time.time() - float(self._last_progress_ts or 0.0) < window:
+            return
+        line = task_activity.render(task_id, extra=self._live_children_clause(task_id))
+        if line:
+            self._emit_progress(line)
+
     def _start_task_heartbeat_loop(self, task_id: str) -> Optional[threading.Event]:
         if not task_id.strip():
             return None
@@ -1575,6 +1628,10 @@ class OuroborosAgent:
                 self._last_activity_ts = time.time()
                 if emit:
                     self._emit_task_heartbeat(task_id, "running")
+                    try:
+                        self._maybe_emit_progress_tick(task_id)
+                    except Exception:
+                        log.debug("Progress ticker failed", exc_info=True)
 
         threading.Thread(target=_loop, daemon=True).start()
         return stop

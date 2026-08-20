@@ -94,6 +94,19 @@ def _is_structured_context_overflow_exception(exc: BaseException) -> bool:
     return bool(values & CONTEXT_OVERFLOW_CODES)
 
 
+def _is_request_timeout_exception(exc: BaseException) -> bool:
+    """Whether *exc* is a request that ran out of time rather than a failed one.
+
+    Matched on the SDK class name plus the transport wording, because the local
+    lane sits behind whichever httpx/openai versions are installed and both layers
+    raise their own timeout types."""
+    names = {type(exc).__name__} | {base.__name__ for base in type(exc).__mro__}
+    if names & {"APITimeoutError", "Timeout", "TimeoutException", "ReadTimeout", "WriteTimeout", "PoolTimeout", "ConnectTimeout"}:
+        return True
+    text = str(exc).lower()
+    return "timed out" in text or "timeout" in text
+
+
 def _is_structured_context_overflow_body(error: Any) -> bool:
     return bool(_structured_error_values(error) & CONTEXT_OVERFLOW_CODES)
 
@@ -2357,10 +2370,17 @@ class LLMClient:
         if clean_tools and tool_choice != "none":
             kwargs["tools"] = clean_tools
             kwargs["tool_choice"] = tool_choice
-        if timeout and timeout > 0:
-            kwargs["timeout"] = max(float(timeout), 180.0)
-        else:
-            kwargs["timeout"] = 180.0
+        from ouroboros.config import get_local_request_timeout_sec
+
+        # The local lane is the SLOWEST route the loop can take: a large quantized
+        # GGUF prefills five figures of prompt tokens before its first output token.
+        # The old hardcoded 180s floor made that structural — a main-loop round on a
+        # 20B+ local model timed out on prefill alone. The configured value is a
+        # floor, never a ceiling: an explicit caller timeout may only raise it.
+        local_floor = get_local_request_timeout_sec()
+        kwargs["timeout"] = (
+            max(float(timeout), local_floor) if timeout and timeout > 0 else local_floor
+        )
 
         candidate = _physical_candidate(kwargs)
         local_target = {"provider": "local", "usage_model": "local-model"}
@@ -2392,6 +2412,15 @@ class LLMClient:
                     raise LocalContextTooLargeError(
                         f"local context window exceeded and the payload cannot be resent unchanged: {err}"
                     ) from exc
+                if _is_request_timeout_exception(exc):
+                    # A timeout is NOT a dead server: llama.cpp is still generating in
+                    # its single slot. Re-POSTing queues behind that work, so the three
+                    # attempts here serialized into 3x the timeout and returned nothing
+                    # -- the caller saw one APITimeoutError after 3x the wall clock it
+                    # had budgeted. Surface the first one and let the caller's retry
+                    # policy, which knows the task deadline, decide what happens next.
+                    log.warning("Local model request timed out after %ss; not resending", candidate.get("timeout"))
+                    raise
                 if "APIConnectionError" in err or "Connection refused" in err or "ConnectError" in err:
                     log.warning("Local model server unreachable (attempt %d/3); checking autostart...", attempt + 1)
                     try:
