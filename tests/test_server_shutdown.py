@@ -365,4 +365,7 @@ def test_panic_stop_kills_services_without_log_finalization(monkeypatch, tmp_pat
 
     assert foreground_calls == [((tmp_path,), {"wait": False})]
     assert service_calls == [((tmp_path,), {"wait": False})]
-    assert worker_calls == [{"force": True, "archive_service_logs": False}]
+    assert worker_calls == [{
+        "force": True, "archive_service_logs": False,
+        "reconcile_delegate_custody": False,
+    }]

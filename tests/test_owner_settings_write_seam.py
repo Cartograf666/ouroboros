@@ -41,6 +41,16 @@ def isolated_settings(tmp_path, monkeypatch):
     cfg.reset_runtime_mode_baseline_for_tests()
 
 
+@pytest.fixture
+def _clean_subagent_env(monkeypatch):
+    for key in (
+        "OUROBOROS_SUBAGENTS",
+        "OUROBOROS_SUBAGENT_HARNESS",
+        "OUROBOROS_SUBAGENT_PROFILE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
 @contextlib.contextmanager
 def _foreign_lock(settings_path: pathlib.Path):
     """Hold the settings lock the way another PROCESS would: a real O_EXCL fd,
@@ -186,6 +196,121 @@ def test_every_generic_validation_refusal_says_saved_false(monkeypatch, isolated
     assert resp.status_code == 400, resp.text
     assert resp.json()["saved"] is False, resp.text
     assert not isolated_settings.exists()
+
+
+def test_generic_settings_save_validates_and_canonicalizes_available_subagents(
+    monkeypatch, isolated_settings,
+):
+    from ouroboros.configured_subagents import SUBAGENTS_SETTING, parse_configured_subagents
+
+    app = _settings_app(monkeypatch, isolated_settings)
+    payload = {
+        "enabled": True,
+        "items": [{
+            "subagent_id": "owner-row",
+            "name": "",
+            "recommended_use": "Use for owner-selected work.",
+            "route": {"kind": "api_model", "target_id": "openai/gpt-5.6-sol"},
+        }],
+    }
+    response = TestClient(app).post("/api/settings", json={SUBAGENTS_SETTING: payload})
+
+    assert response.status_code == 200, response.text
+    saved = json.loads(isolated_settings.read_text(encoding="utf-8"))
+    canonical = saved[SUBAGENTS_SETTING]
+    assert isinstance(canonical, str)
+    parsed = parse_configured_subagents(canonical)
+    assert parsed.items[0].name == "Owner Row"
+
+
+def test_generic_settings_save_rejects_malformed_available_subagents_without_write(
+    monkeypatch, isolated_settings,
+):
+    from ouroboros.configured_subagents import SUBAGENTS_SETTING
+
+    app = _settings_app(monkeypatch, isolated_settings)
+    response = TestClient(app).post("/api/settings", json={SUBAGENTS_SETTING: {
+        "enabled": True,
+        "items": [{
+            "subagent_id": "bad",
+            "name": "Bad",
+            "recommended_use": "Bad",
+            "route": {"kind": "api_model", "target_id": "x", "extra": True},
+        }],
+    }})
+
+    assert response.status_code == 400, response.text
+    assert response.json()["saved"] is False
+    assert not isolated_settings.exists()
+
+
+def test_settings_get_reports_legacy_actor_source_without_materializing_it(
+    monkeypatch, isolated_settings, _clean_subagent_env,
+):
+    from ouroboros import config as cfg
+    from ouroboros.gateway import settings as settings_mod
+
+    # Other endpoint tests exercise server.py's legacy compatibility wrapper,
+    # which intentionally rebinds this gateway module in-process. This direct
+    # gateway test pins the real reader it is meant to exercise.
+    monkeypatch.setattr(settings_mod, "load_settings", cfg.load_settings)
+    original = {
+        "OUROBOROS_SUBAGENT_HARNESS": "codex=gpt-5.6-sol:high",
+        "OUROBOROS_SUBAGENT_PROFILE": "owner-profile",
+    }
+    isolated_settings.write_text(json.dumps(original), encoding="utf-8")
+    monkeypatch.setattr(settings_mod, "apply_runtime_provider_defaults", lambda s: (s, False, []))
+    app = Starlette(routes=[
+        Route("/api/settings", endpoint=settings_mod.api_settings_get, methods=["GET"]),
+    ])
+    app.state.drive_root = isolated_settings.parent
+    app.state.repo_dir = isolated_settings.parent
+    response = TestClient(app).get("/api/settings")
+
+    assert response.status_code == 200, response.text
+    projection = response.json()["_meta"]["available_subagents"]
+    assert projection["source"] == "legacy_migrated"
+    assert projection["candidate"]["items"][0]["route"]["credential_profile_id"] == (
+        "owner-profile"
+    )
+    assert json.loads(isolated_settings.read_text(encoding="utf-8")) == original
+
+
+def test_settings_get_builds_an_unsaved_api_candidate_through_the_shared_compiler(
+    monkeypatch, isolated_settings, _clean_subagent_env,
+):
+    from ouroboros import config as cfg
+    from ouroboros.gateway import settings as settings_mod
+    from ouroboros.server_runtime import apply_runtime_provider_defaults
+
+    monkeypatch.setattr(settings_mod, "load_settings", cfg.load_settings)
+    monkeypatch.setattr(
+        settings_mod, "apply_runtime_provider_defaults", apply_runtime_provider_defaults,
+    )
+    original = {
+        "OPENROUTER_API_KEY": "configured",
+        "OUROBOROS_MODEL": "openai/gpt-5.6-sol",
+        "OUROBOROS_MODEL_LIGHT": "openai/gpt-5.6-luna",
+        "OUROBOROS_SUBAGENTS": "",
+        "OUROBOROS_SUBAGENT_HARNESS": "",
+    }
+    isolated_settings.write_text(json.dumps(original), encoding="utf-8")
+    app = Starlette(routes=[
+        Route("/api/settings", endpoint=settings_mod.api_settings_get, methods=["GET"]),
+    ])
+    app.state.drive_root = isolated_settings.parent
+    app.state.repo_dir = isolated_settings.parent
+
+    response = TestClient(app).get("/api/settings")
+
+    assert response.status_code == 200, response.text
+    projection = response.json()["_meta"]["available_subagents"]
+    assert projection["source"] == "undecided"
+    assert [row["route"]["target_id"] for row in projection["candidate"]["items"]] == [
+        "openai/gpt-5.6-sol",
+        "openai/gpt-5.6-luna",
+    ]
+    assert json.loads(isolated_settings.read_text(encoding="utf-8")) == original
 
 
 def test_a_malformed_body_says_saved_false(monkeypatch, isolated_settings):
@@ -457,8 +582,8 @@ def test_reviewer_slots_reload_does_not_await_the_status_probe():
         pathlib.Path(__file__).resolve().parents[1]
         / "web" / "modules" / "subagents_settings.js"
     ).read_text(encoding="utf-8")
-    assert "await boundedStatusRefresh(state.store);" in subagents
-    assert "await state.store.refresh" not in subagents
+    assert "await boundedStatusRefresh(store);" in subagents
+    assert "await store.refresh" not in subagents
     store = (
         pathlib.Path(__file__).resolve().parents[1]
         / "web" / "modules" / "claudexor_status_store.js"

@@ -11,6 +11,7 @@ historical names, so every existing import and monkeypatch target keeps working
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, Optional, Tuple
 
 from ouroboros.subagents import SubagentExecutorResolution, SubagentLaneResolution
@@ -40,10 +41,28 @@ def dispatch_executor_note(decision: Optional[SubagentExecutorResolution],
         return ""
     if decision.executor == "harness":
         route = decision.route.route_id if decision.route else ""
+        configured_atomic = lane is not None and lane.provenance == "configured_subagent"
+        if configured_atomic:
+            return (
+                f"EXECUTOR: your parent selected the configured agent-session route ({route}). "
+                "You are its Ouroboros NANNY. Before this first model round, the host "
+                "performed the atomic exact-route bootstrap decision and any authorized "
+                "start attempt. The typed startup/wake receipt alone says whether a leaf "
+                "is live, recovered, or refused. Do not repeat a receipt-proven start or "
+                "adoption in parallel. You retain your full ordinary tool surface and judgment: "
+                "supervise and inspect evidence, coordinate task-tree messages, answer "
+                "authorized leaf questions, wait again, and accept or reject the result. "
+                "When correction is necessary and no truthful in-place control exists, "
+                "verify cancellation and terminal settlement before starting a replacement. "
+                "Any API-backed or otherwise separate work must be an explicit separate "
+                "child, so its authorship and spend remain visible."
+            )
         note = (
             f"EXECUTOR: your parent scheduled you on the delegated substrate ({route}). "
-            "You are a NANNY. Decide your delegation plan FIRST — right after reading "
-            "your objective and constraints, before any substantive work. Cost classes: "
+            "You are a NANNY. "
+            + "Decide your delegation plan FIRST — right after reading your objective "
+            "and constraints, before any substantive work. "
+            + "Cost classes: "
             "a subscription-lane run has known-zero marginal cost when the route reports "
             "its settled spend as $0 (an estimated or undisclosed spend is estimated/unknown, "
             "not zero); every token YOU think on is metered API money. "
@@ -52,7 +71,8 @@ def dispatch_executor_note(decision: Optional[SubagentExecutorResolution],
             "believing it. After a delegated run SUCCEEDS, your job is to VERIFY and "
             "INTEGRATE its output — never to rebuild the same work yourself on metered "
             "tokens. Follow-up work (fixes, the next increment, a retry with a corrected "
-            "prompt) is delegated too, with a new delegate_start; your own metered rounds "
+            "prompt) is delegated too, with a new "
+            "delegate_start(subagent_id=..., prompt=...); your own metered rounds "
             "are for judgment — acceptance, integration, honest settlement — not for "
             "co-building around a $0 run. If your run asks a question (delegate_wait "
             "returns waiting_on_user), answer it from the task context with "
@@ -106,11 +126,36 @@ def dispatch_executor_note(decision: Optional[SubagentExecutorResolution],
     )
 
 
-def executor_blocked_outcome(decision: SubagentExecutorResolution) -> Tuple[str, Dict[str, Any]]:
+def executor_blocked_outcome(
+    decision: SubagentExecutorResolution,
+    *,
+    availability: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Dict[str, Any]]:
     """The terminal ``(text, usage)`` of a child that was pinned and could not run.
 
     Deliberately NOT a fallback: the task ends unrun and typed, having spent nothing.
     """
+    availability = availability if isinstance(availability, dict) else {}
+    if (
+        availability.get("route_kind") == "api_model"
+        or (decision.requested == "native" and decision.reason == "credentials_unavailable")
+    ):
+        alternatives = availability.get("alternatives")
+        alternatives = alternatives if isinstance(alternatives, list) else []
+        text = (
+            "⚠️ SUBAGENT_UNAVAILABLE: the selected API-model actor has no usable "
+            "credentials for its exact configured route. The task was NOT run and the "
+            "host did not substitute another model or substrate. Current configured "
+            "alternatives (not ranked): "
+            + json.dumps(alternatives, ensure_ascii=False, sort_keys=True)
+        )
+        return text, {
+            "execution_status": "infra_failed",
+            "reason_code": "subagent_executor_unavailable",
+            "unavailable_reason": "credentials_unavailable",
+            "alternatives": alternatives,
+            "host_fallback": False,
+        }
     if decision.reason in ("delegate_tools_invisible", "delegate_visibility_unverified"):
         # Q1A preflight (2026-08-10 amendments): the route is healthy but the
         # child's MATERIALIZED toolset does not carry the delegate verbs — or
@@ -130,8 +175,8 @@ def executor_blocked_outcome(decision: SubagentExecutorResolution) -> Tuple[str,
             "⚠️ EXECUTOR_UNAVAILABLE: this subagent was pinned to the delegated "
             f"substrate (executor='harness'), but {detail}, so the pin cannot be "
             "honored. The task was NOT run on metered API tokens. Fix the tool "
-            "policy / task contract that hides the delegate verbs, or schedule "
-            "again with executor='auto' to accept metered spend."
+            "policy / task contract that hides the delegate verbs, or explicitly "
+            "select another Available subagent."
         )
         # Literal codes (not `decision.reason`) so the provenance drift guard
         # keeps seeing every code the runtime can emit.
@@ -149,10 +194,10 @@ def executor_blocked_outcome(decision: SubagentExecutorResolution) -> Tuple[str,
         "what the pin exists to prevent. "
         + ("This harness structurally cannot run delegated work (its manifest does not "
            "support it), so waiting will not heal it: change the delegated route, or "
-           "schedule it again with executor='auto' to accept metered spend."
+           "select another Available subagent explicitly."
            if ":delegation_" in decision.reason else
-           "Reschedule once the route recovers, or "
-           "schedule it again with executor='auto' to accept metered spend.")
+           "Reschedule once the route recovers, or explicitly select another "
+           "Available subagent.")
     )
     return text, {
         "execution_status": "infra_failed",

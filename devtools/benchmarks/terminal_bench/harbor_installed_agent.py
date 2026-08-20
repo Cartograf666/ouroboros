@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from devtools.benchmarks.common.manifests import openrouter_key_remaining, repo_provenance, write_json
+from devtools.benchmarks.common.model_slots import single_model_subagents_setting
 from devtools.benchmarks.common.result_index import RUNTIME_TRUNCATION_REASON_CODES
 
 try:  # Harbor is an optional benchmark dependency.
@@ -372,8 +373,13 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
             "GIGACHAT_VERIFY_SSL_CERTS",
             "GIGACHAT_PROFANITY_CHECK",
             "OUROBOROS_MODEL",
-            "OUROBOROS_MODEL_HEAVY",  # v6.39 slot rename (legacy OUROBOROS_MODEL_CODE -> _HEAVY)
             "OUROBOROS_MODEL_LIGHT",
+            "OUROBOROS_SUBAGENTS",
+            "OUROBOROS_REVIEWER_SLOTS",
+            "USE_LOCAL_MAIN",
+            "USE_LOCAL_LIGHT",
+            "USE_LOCAL_FALLBACK",
+            "USE_LOCAL_CONSCIOUSNESS",
             # OUROBOROS_MODEL_FALLBACK is deliberately NOT forwarded: the
             # benchmark metric must stay single-model (a host-configured
             # fallback would silently contaminate the measurement).
@@ -424,7 +430,7 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
 
         if self.ouroboros_model:
             env["OUROBOROS_MODEL"] = self.ouroboros_model
-            env["OUROBOROS_MODEL_HEAVY"] = self.ouroboros_model
+            env["OUROBOROS_SUBAGENTS"] = single_model_subagents_setting(self.ouroboros_model)
         if self.ouroboros_light_model:
             env["OUROBOROS_MODEL_LIGHT"] = self.ouroboros_light_model
         if self.reasoning_effort:

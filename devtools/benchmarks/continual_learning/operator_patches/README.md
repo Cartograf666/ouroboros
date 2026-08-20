@@ -7,7 +7,10 @@ top of the bundle copy inside the external continual-learning-bench checkout
 (`patch -p0 < <file>` from the checkout root, adjusting paths):
 
 1. `_launcher.v6560.patch` — write the declared `OUROBOROS_SAFETY_MODE=light`
-   into the isolated settings at creation. v6.56.0 added an owner-guard that
+   and the canonical `OUROBOROS_SUBAGENTS` bytes into isolated settings at
+   creation. `IsolatedServer` strips inherited runtime env; this makes the
+   benchmark's explicit one-actor profile authoritative there too. v6.56.0
+   added an owner-guard that
    refuses env-side `full -> light` lowering at server boot
    (`_guard_safety_mode_lowering`), which killed every isolated server with
    uvicorn rc=3; the reference v6.52.2 run had no guard and was effectively
@@ -80,8 +83,9 @@ itself) is the supported path for v6.56.0 bridge runs.
    `OUROBOROS_EFFORT_REVIEW`, `OUROBOROS_EFFORT_SCOPE_REVIEW`,
    `OUROBOROS_REVIEW_ENFORCEMENT`, `OUROBOROS_SAFETY_MODE`,
    `OUROBOROS_MAX_SUBAGENT_DEPTH`, `OUROBOROS_MAX_WORKERS`,
-   `OUROBOROS_CONTEXT_MODE` — explicit host exports win over the hardcoded
-   CC-parity defaults (runtime=advanced, 3× reviewer list, uniform effort).
+   `OUROBOROS_CONTEXT_MODE`, `OUROBOROS_SUBAGENTS` — explicit host exports
+   win over the hardcoded CC-parity defaults (runtime=advanced, 3× reviewer
+   list, uniform effort).
    Launcher side: `run_clb.py` forwards these knobs from the settings template
    (and fixes CLBENCH_SOLVE_DISABLED_TOOLS string-vs-list join). Without the
    patch pair a campaign asking runtime=pro / single low-effort reviewer /
@@ -198,6 +202,10 @@ the external checkout root (a clean clone at `549998d` plus the patches above).
    SUPERSEDES patches 1-8 for the official-path (run-all) flow; the bridge-path patches
    remain for archaeology. Working tree: /mnt/data/a.razzhigaev/clb_official_v681/bench,
    branch `ouroboros-submission`.
+
+   Current Ouroboros launchers also pass the canonical one-actor
+   `OUROBOROS_SUBAGENTS` bytes through this adapter. The patch no longer authors
+   legacy Heavy; it transports the value produced by the Phase-1A encoder.
 
 ## Addendum (luna ablation campaign, 2026-07-31)
 

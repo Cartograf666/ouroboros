@@ -26,21 +26,49 @@ from ouroboros.tool_capabilities import (
 NANNY_TOOLS = {"delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer"}
 
 
+def _transport_snapshot(route):
+    target = route.route_id + (f"={route.model}" if route.model else "")
+    return {
+        "schema": 1, "selected_subagent_id": "transport-fixture",
+        "config_fingerprint": "transport-fixture-v1",
+        "route": {"kind": "agent_session", "target_id": target,
+                  "credential_profile_id": route.profile_id},
+        "effort": route.effort,
+    }
+
+
 @pytest.fixture(autouse=True)
 def _owned_gateway_uses_each_test_transport(monkeypatch):
-    """Keep transport fixtures below the new lifecycle seam.
-
-    Runtime delivery has its own focused suite; this module supplies a fake
-    gateway per case and should keep exercising nanny/transport behavior.
-    """
-    from ouroboros import claudexor_daemon
+    """Bind route ID."""
+    from ouroboros import claudexor_daemon, delegate_custody, subagent_runtime
     from ouroboros.gateways import claudexor as gateway_module
+    from ouroboros.tools import delegate
 
     monkeypatch.setattr(
         claudexor_daemon,
         "ensure_owned_gateway",
         lambda: gateway_module.ClaudexorGateway(),
     )
+    original_actor = delegate.prepare_delegate_start_actor
+
+    def explicit_transport_actor(ctx, drive_root, **kwargs):
+        if kwargs.get("recovering"):
+            return original_actor(ctx, drive_root, **kwargs)
+        route = subagents.get_subagent_harness()
+        if route is None:
+            return original_actor(ctx, drive_root, **kwargs)
+        token = subagent_runtime._EXACT_START_SELECTION.set({
+            "snapshot": _transport_snapshot(route),
+        })
+        try:
+            return original_actor(ctx, drive_root, **kwargs)
+        finally:
+            subagent_runtime._EXACT_START_SELECTION.reset(token)
+
+    delegate_custody._CUSTODY.clear()
+    monkeypatch.setattr(delegate, "prepare_delegate_start_actor", explicit_transport_actor)
+    yield
+    delegate_custody._CUSTODY.clear()
 
 
 # -- 3.1 the narrow setting key ------------------------------------------------
@@ -458,7 +486,7 @@ def test_delegate_start_refuses_typed_when_no_route_is_configured(tmp_path, monk
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     payload = json.loads(_delegate_start(ctx, "do a thing"))
     assert payload["status"] == "refused"
-    assert payload["reason"] == "harness_not_configured"
+    assert payload["reason"] == "subagent_selection_required"
 
 
 # -- 3.6 accounting ------------------------------------------------------------
@@ -926,7 +954,7 @@ def test_a_stale_unknown_executor_value_degrades_to_auto_not_to_a_crash(monkeypa
 # -- 4. mutating AND read-only children, one nanny, one transport ---------------
 
 
-def _delegating_ctx(tmp_path, *, acting: bool):
+def _delegating_ctx(tmp_path, *, acting: bool, task_id: str = "t-nanny"):
     from ouroboros.contracts.task_constraint import TaskConstraint
     from ouroboros.tools.registry import ToolContext
 
@@ -960,7 +988,7 @@ def _delegating_ctx(tmp_path, *, acting: bool):
     if acting:
         ctx.workspace_root = str(worktree)
         ctx.workspace_mode = "self_worktree"
-    ctx.task_id = "t-nanny"
+    ctx.task_id = task_id
     ctx.task_metadata = {"root_task_id": "t-root", "parent_task_id": "t-root"}
     return ctx
 
@@ -987,7 +1015,8 @@ def _started_request(tmp_path, *, acting: bool, monkeypatch,
         def register_project(self, root): raise AssertionError("must reuse the registration")
         def start_run(self, request, *, idempotency_key=""):
             seen["request"] = request
-            return {"runId": "run-1", "runDir": "/tmp/run-1"}
+            run_id = f"run-{'write' if acting else 'read'}"
+            return {"runId": run_id, "runDir": f"/tmp/{run_id}"}
         def close(self): pass
 
     _Stub.engine_version = engine_version
@@ -997,7 +1026,10 @@ def _started_request(tmp_path, *, acting: bool, monkeypatch,
     monkeypatch.setenv("OUROBOROS_SUBAGENT_WORKTREE_ROOT", str(tmp_path / "snap_root"))
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
     delegate._CUSTODY.clear()
-    payload = json.loads(delegate._delegate_start(_delegating_ctx(tmp_path, acting=acting), "edit the README"))
+    task_id = f"t-nanny-{'write' if acting else 'read'}"
+    payload = json.loads(delegate._delegate_start(
+        _delegating_ctx(tmp_path, acting=acting, task_id=task_id), "edit the README"
+    ))
     delegate._CUSTODY.clear()
     assert payload["status"] == expect, payload
     return seen.get("request"), payload
@@ -1052,7 +1084,9 @@ def test_the_model_has_no_argument_that_could_widen_the_profile():
     # `retry_of` names an INVOCATION, not authority (ownership-checked replay);
     # root/bucket/skill_name are a SELECTOR resolved through the same
     # ResolvedResourceBinding authorizer as ordinary writes (R1 item 9).
-    assert properties == {"prompt", "max_seconds", "retry_of", "root", "bucket", "skill_name"}
+    assert properties == {
+        "prompt", "subagent_id", "max_seconds", "retry_of", "root", "bucket", "skill_name",
+    }
     assert entry.schema["parameters"]["properties"]["root"]["enum"] == ["skill_payload"]
     assert not properties & {"access", "mode", "isolation", "scope", "write_surface", "cwd"}
 
@@ -2656,16 +2690,7 @@ def test_custody_survives_the_worker_that_started_the_run(tmp_path, monkeypatch)
 
 def test_the_invocation_id_is_reused_on_retry_and_fresh_per_intended_start(
         tmp_path, monkeypatch):
-    """One LOGICAL INVOCATION ID per intended invocation, reused ONLY by explicit
-    token. Both wire-level failure shapes are pinned: a fresh uuid4 per POST (an
-    accepted start whose response was lost comes back as a SECOND live run) and any
-    content-matched reuse (an INTENDED new start of the same prompt silently
-    inheriting the old handle -- the owner's contract: intended new start = NEW id).
-    A start with an unknown outcome hands back pending_invocation_id; only a call
-    presenting it as retry_of replays the invocation -- the STORED canonical body,
-    byte-identical by construction even when the route config drifted between the
-    attempts, under the original key (the engine 409s a same-key-different-digest
-    replay). A bound or definitely refused invocation is never replayed."""
+    """Only retry_of reuses an unsettled invocation; replacement waits for settlement."""
     import httpx
 
     import ouroboros.delegate_custody as dc
@@ -2720,24 +2745,37 @@ def test_the_invocation_id_is_reused_on_retry_and_fresh_per_intended_start(
     token = lost["pending_invocation_id"]
     assert token == keys[0] and "retry_of" in lost["retry_hint"]
 
-    # 2. A plain identical call is an INTENDED NEW start: fresh id, never the token.
-    fresh = json.loads(delegate._delegate_start(ctx, prompt))
-    assert fresh["status"] == "started"
-    assert keys[1] != token, "content-matched reuse is forbidden: new intention, new id"
-    assert fresh["idempotent_recovery"] is False
+    # 2. A plain identical call is an intended replacement, but the unknown
+    # first POST has not settled. The replacement fence refuses before the wire.
+    blocked = json.loads(delegate._delegate_start(ctx, prompt))
+    assert blocked["reason"] == "replacement_requires_settlement"
+    assert len(keys) == 1
 
     # 3. Only the EXPLICIT token replays the invocation -- the STORED body verbatim,
     #    even though the route config drifted between the attempts.
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:high")
     retried = json.loads(delegate._delegate_start(ctx, prompt, retry_of=token))
     assert retried["status"] == "started" and retried["idempotent_recovery"] is True
-    assert keys[2] == token, "the retry must present the original invocation id"
-    assert bodies[2] == bodies[0], "the retry must replay the RECORDED body, not re-derive it"
-    assert bodies[2]["maxSeconds"] == 120 and bodies[2]["effort"] == "low"
+    assert keys[1] == token, "the retry must present the original invocation id"
+    assert bodies[1] == bodies[0], "the retry must replay the RECORDED body, not re-derive it"
+    assert bodies[1]["maxSeconds"] == 120 and bodies[1]["effort"] == "low"
 
     # The id lives in the run's durable record and survives the worker.
     delegate._CUSTODY.clear()
     assert dc.replay(tmp_path)[retried["run_id"]].invocation_id == token
+    assert dc.emit(tmp_path, dc.SETTLED, {
+        "run_id": retried["run_id"], "task_id": "t-a",
+    })
+
+    # Once the old invocation is durably settled, a plain identical call is a
+    # genuinely NEW intention: fresh id, never content-matched reuse.
+    fresh = json.loads(delegate._delegate_start(ctx, prompt))
+    assert fresh["status"] == "started"
+    assert keys[2] != token, "content-matched reuse is forbidden: new intention, new id"
+    assert fresh["idempotent_recovery"] is False
+    assert dc.emit(tmp_path, dc.SETTLED, {
+        "run_id": fresh["run_id"], "task_id": "t-a",
+    })
 
     # 4-5. A bound invocation is never re-posted; an unknown token is refused.
     again = json.loads(delegate._delegate_start(ctx, prompt, retry_of=token))
@@ -2759,7 +2797,7 @@ def test_the_invocation_id_is_reused_on_retry_and_fresh_per_intended_start(
     assert mismatch["reason"] == "retry_prompt_mismatch"
 
     assert len(keys) == 5, "refused retry_of shapes must never reach the wire"
-    assert len({keys[0], keys[1], keys[3], keys[4]}) == 4, "one id per intended invocation"
+    assert len({keys[0], keys[2], keys[3], keys[4]}) == 4, "one id per intended invocation"
     delegate._CUSTODY.clear()
 
 
@@ -2915,13 +2953,17 @@ def test_a_retry_testifies_about_the_stored_invocation_not_the_current_config(
                            ("idempotency_key", original["idempotency_key"])):
         assert started[fact] == expected, f"custody row lies about {fact}: {started[fact]!r}"
     assert dc.replay(drive)[retried["run_id"]].model == "model-old"
+    assert dc.emit(drive, dc.SETTLED, {"run_id": retried["run_id"], "task_id": "t-a"})
 
     # 4. A DEFINITE refusal of a retry settles the STORED attempt's resources: the
     #    project the original start registered and owned is the one retired.
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "route-a=model-old:low")
     root_c = tmp_path / "root-c"; root_c.mkdir()
     script[:] = ["transport_error", "definite_refusal"]
-    lost2 = json.loads(delegate._delegate_start(_ctx(root_c), "other work"))
+    lost2 = json.loads(delegate.exact_start(
+        _ctx(root_c), "other work",
+        {"snapshot": _transport_snapshot(subagents.parse_subagent_harness("route-a=model-old:low"))},
+    ))
     assert lost2["reason"] == "daemon_unreachable"
     prj_c = projects[str(root_c)]
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "route-b=model-new:high")
@@ -3344,17 +3386,11 @@ def test_reconciliation_recovers_a_pending_invocation_whose_worker_died(tmp_path
 
 
 def test_a_start_whose_custody_row_did_not_land_does_not_claim_to_be_custodied(tmp_path, monkeypatch):
-    """`append_jsonl` returns whether the write landed precisely so important events can be
-    handled rather than pretended; custody discarded that signal and logged the loss at
-    DEBUG. The write that IS the new SSOT was therefore best-effort: a failed row left a
-    LIVE overpowered run that only this process could name — the exact leak the module
-    exists to close, silently reintroduced under the fix.
+    """A successful POST without a durable STARTED row is a named custody fault.
 
-    Only the STARTED (and, for the twin check, SETTLED) appends fail here: a failed
-    START_REQUESTED row now refuses the launch before any POST
-    (test_no_post_fires_when_the_start_request_row_did_not_land), so the uncustodied
-    shape this test pins is the narrower one — the request row landed, the run really
-    started, and the row that IS custody did not land."""
+    START_REQUESTED lands, so the live run keeps its original invocation identity;
+    only STARTED/SETTLED persistence is faulted here.
+    """
     import ouroboros.delegate_custody as dc
     import ouroboros.tools.delegate as delegate
     from ouroboros.gateways import claudexor as gw
@@ -3375,14 +3411,12 @@ def test_a_start_whose_custody_row_did_not_land_does_not_claim_to_be_custodied(t
 
     assert out["run_id"] == "run-live", "the run really did start; that is not in doubt"
     assert out["custody_durable"] is False
+    assert out["invocation_id"] and out["pending_invocation_id"] == out["invocation_id"]
     assert out["status"] == "started_uncustodied", (
         "a start nothing outside this worker can name must not wear the plain name")
     assert "CUSTODY IS NOT DURABLE" in out["note"]
     assert dc.lookup(tmp_path, "t-a", "run-live")[0] == dc.UNKNOWN, "the premise of the claim"
 
-    # The twin surface, the same predicate: `settled` means "the durable fact exists". A
-    # settlement whose row never landed stays retryable instead of closing custody on a
-    # claim that dies with this process.
     entry = dc.RunCustody(run_id="run-2", task_id="t-a", route_id="r", model="m",
                           project_id="p", project_owned=False, ledger_root=str(tmp_path))
     entry.ledger_recorded = True
@@ -4651,9 +4685,10 @@ def test_a_terminalizing_parent_releases_the_run_it_still_holds(tmp_path):
 
     live = _LiveRunStub(run_id="run-held")
     dc._CUSTODY.clear()
-    dc._CUSTODY["run-held"] = dc.RunCustody(run_id="run-held", task_id="t-parent", route_id="r",
-                                            model="m", project_id="p", project_owned=False,
-                                            ledger_root=str(tmp_path))
+    dc.record_started(tmp_path, dc.RunCustody(
+        run_id="run-held", task_id="t-parent", route_id="r",
+        model="m", project_id="p", project_owned=False, ledger_root=str(tmp_path),
+    ))
     assert dc.release_task_runs(tmp_path, "t-someone-else", gateway_factory=lambda: live) == []
     assert live.cancels == [], "another task's run is not this task's to release"
 
@@ -4779,31 +4814,23 @@ def test_a_breach_whose_cancel_was_never_verified_is_not_reported_as_cancelled(
     assert "The run was cancelled." not in out["detail"], out["detail"]
 
 
-def test_the_configured_wait_ceiling_cannot_promise_more_than_the_tool_can_serve():
-    """`OUROBOROS_DELEGATE_WAIT_MAX_SEC` accepted up to 86,400 while `delegate_wait`'s
-    own per-call executor timeout is 2100 and the tool is neither per-call-timeout
-    configurable nor deadline-clamped — so everything above the window max bought a
-    KILLED tool call instead of the graceful typed no-progress return the wait
-    exists to give. F5 (grok blocking): the window max is a HARD 1800, decoupled
-    from the ToolEntry timeout, and the whole chain is STRICT —
-    window (1800) < tool-kill (2100) < lease absolute ceiling (2400) — so a full
-    window plus its teardown always fits under the executor timeout, and the
-    executor timeout always fits under the idle-rail lease."""
+def test_the_public_wait_is_event_only_and_its_outer_bound_matches_task_lifetime():
+    """The model cannot request a fake return window; the host renews quiet windows."""
     import os
 
     from ouroboros.config import (
         DELEGATE_WAIT_CEILING_SEC,
         DELEGATE_WAIT_WINDOW_MAX_SEC,
         get_delegate_wait_max_sec,
+        get_task_abs_ceiling_sec,
     )
     from ouroboros.delegate_progress import EXTERNAL_WAIT_LEASE_CEILING_SEC
     from ouroboros.loop_tool_execution import _DEADLINE_CLAMPED_TOOLS, _PER_CALL_TIMEOUT_TOOLS
     from ouroboros.tools.delegate import get_tools
 
     entry = next(e for e in get_tools() if e.schema["name"] == "delegate_wait")
-    assert DELEGATE_WAIT_CEILING_SEC == entry.timeout_sec
-    # The strict inequality chain, pinned by value so no member can drift onto
-    # another: a window EQUAL to the executor timeout has zero teardown margin.
+    assert "wait_sec" not in entry.schema["parameters"]["properties"]
+    assert entry.timeout_sec == get_task_abs_ceiling_sec() + 120
     assert DELEGATE_WAIT_WINDOW_MAX_SEC < DELEGATE_WAIT_CEILING_SEC < EXTERNAL_WAIT_LEASE_CEILING_SEC
     assert (DELEGATE_WAIT_WINDOW_MAX_SEC, DELEGATE_WAIT_CEILING_SEC,
             EXTERNAL_WAIT_LEASE_CEILING_SEC) == (1800, 2100, 2400)

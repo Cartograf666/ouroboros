@@ -92,6 +92,7 @@ _restart_requested = threading.Event()
 # control endpoints that restart on the owner's behalf). The single fact the
 # re-exec needs to decide whether the runtime-mode ratchet pin rides along.
 _owner_restart_requested = threading.Event()
+_planned_delegate_restart_transaction_id = ""
 _LAUNCHER_MANAGED = str(os.environ.get("OUROBOROS_MANAGED_BY_LAUNCHER", "") or "").strip() == "1"
 
 # Captured in main() for Settings LAN-reachability metadata.
@@ -1051,6 +1052,7 @@ def _reconcile_delegated_runs(running_task_ids: set) -> None:
     try:
         from ouroboros.claudexor_daemon import ensure_owned_gateway
         from ouroboros.delegate_custody import reconcile_orphaned_runs
+        from ouroboros.delegate_recovery import recoverable_task_ids
 
         # The tick runs on the supervisor loop thread: a daemon sitting in its
         # recovery-only admission window must not hold that thread for the default
@@ -1058,6 +1060,7 @@ def _reconcile_delegated_runs(running_task_ids: set) -> None:
         outcomes = reconcile_orphaned_runs(
             DATA_DIR, running_task_ids=running_task_ids,
             gateway_factory=lambda: ensure_owned_gateway(admission_wait_sec=0),
+            recoverable_task_ids=recoverable_task_ids(DATA_DIR),
         )
         if outcomes:
             log.info("Delegated-run reconciliation handled %d orphan(s): %s", len(outcomes), outcomes)
@@ -2002,6 +2005,12 @@ def _run_supervisor(settings: dict) -> None:
         kill_workers(preserve_pending=True)
         spawn_workers(max_workers)
         persist_queue_snapshot(reason="startup")
+        try:
+            from ouroboros.delegate_recovery import pre_adopt_planned_handoffs
+
+            pre_adopt_planned_handoffs(DATA_DIR, list(PENDING))
+        except Exception:
+            log.debug("Planned delegate pre-adoption failed", exc_info=True)
         _resume_interrupted_project_deletions()
         # Original startup order preserved: drive prunes, custody sweep (reap
         # orphaned processes), THEN worktree prune.
@@ -2361,11 +2370,29 @@ def _perform_supervisor_restart(
             ctx.send_with_budget(int(st["owner_chat_id"]), f"⚠️ Restart skipped: {msg}")
         return
     cleanup_status, cleanup_reason = _shutdown_task_cleanup_args(restart_requested=True)
+    global _planned_delegate_restart_transaction_id
+    _planned_delegate_restart_transaction_id = ""
+    planned_handoffs: set[str] = set()
+    restart_transaction_id = uuid.uuid4().hex
+    try:
+        from ouroboros.delegate_recovery import prepare_planned_restart_handoffs
+
+        planned_handoffs = prepare_planned_restart_handoffs(
+            ctx.DRIVE_ROOT, ctx.RUNNING,
+            restart_transaction_id=restart_transaction_id,
+        )
+    except Exception:
+        log.debug("Planned self-restart delegate handoff preparation failed", exc_info=True)
+    restart_kill_kwargs = _managed_update_pending_kwargs()
+    if planned_handoffs:
+        _planned_delegate_restart_transaction_id = restart_transaction_id
+        restart_kill_kwargs["preserve_pending"] = True
     ctx.kill_workers(
         force=True,
         terminal_status=cleanup_status,
         result_reason=cleanup_reason,
-        **_managed_update_pending_kwargs(),
+        preserve_running_task_ids=planned_handoffs,
+        **restart_kill_kwargs,
     )
     st2 = ctx.load_state()
     st2["session_id"] = uuid.uuid4().hex
@@ -2389,6 +2416,14 @@ def _request_restart_exit(owner: bool = False) -> None:
 def _managed_update_pending_kwargs() -> dict:
     """Preserve queued work while a durable tx or its pre-tx quiesce owns restart."""
     try:
+        from ouroboros.delegate_recovery import has_planned_restart_handoffs
+
+        if (
+            has_planned_restart_handoffs(DATA_DIR)
+            and _restart_requested.is_set()
+            and not _owner_restart_requested.is_set()
+        ):
+            return {"preserve_pending": True}
         from supervisor.update_merge import active_update_tx
 
         if active_update_tx():
@@ -3028,6 +3063,12 @@ def main() -> int:
         log.info("Exiting with code %d (restart signal).", RESTART_EXIT_CODE)
         _emergency_process_cleanup(port_sweep=False)
         if not _LAUNCHER_MANAGED:
+            if _planned_delegate_restart_transaction_id:
+                from ouroboros.delegate_recovery import PLANNED_RESTART_TRANSACTION_ENV
+
+                os.environ[PLANNED_RESTART_TRANSACTION_ENV] = (
+                    _planned_delegate_restart_transaction_id
+                )
             _restart_current_process(args.host, actual_port)
         os._exit(RESTART_EXIT_CODE)
 

@@ -774,6 +774,16 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
         proc.wait()
         exit_code = proc.returncode
         log.info("Agent exited with code %d", exit_code)
+        if exit_code == RESTART_EXIT_CODE:
+            try:
+                from ouroboros.delegate_recovery import acknowledge_observed_restart_exit
+
+                if not acknowledge_observed_restart_exit(
+                    DATA_DIR, supervisor_pid=proc.pid, exit_code=exit_code,
+                ):
+                    log.info("No prepared delegated-restart transaction required acknowledgement.")
+            except Exception:
+                log.warning("Could not acknowledge delegated restart transaction", exc_info=True)
         _cleanup_recorded_server_group_for_pid(proc.pid, "agent_exit")
 
         with _agent_lock:

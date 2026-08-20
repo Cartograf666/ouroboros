@@ -4290,12 +4290,9 @@ class LLMClient:
     def available_models(self) -> List[str]:
         """Return list of available models from env (for switch_model tool schema)."""
         main = self.default_model()
-        heavy = os.environ.get("OUROBOROS_MODEL_HEAVY", "")
         light = os.environ.get("OUROBOROS_MODEL_LIGHT", "")
         models = [main]
-        if heavy and heavy != main:
-            models.append(heavy)
-        if light and light != main and light != heavy:
+        if light and light != main:
             models.append(light)
         return models
 

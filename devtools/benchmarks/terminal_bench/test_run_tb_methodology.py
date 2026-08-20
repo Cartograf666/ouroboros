@@ -94,22 +94,215 @@ def test_pip_cache_mount_rejects_repo_path(monkeypatch):
 
 # --- apply_all_model + metadata -------------------------------------------------
 
+def _poison_fixed_actor_env(monkeypatch):
+    monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", json.dumps({
+        "triad": [{"slot_id": "foreign-t", "route": {
+            "kind": "agent_session", "target_id": "codex=gpt-5.6-sol"}}],
+        "scope": [{"slot_id": "foreign-s", "route": {
+            "kind": "api_chat", "target_id": "foreign/scope"}}],
+        "advisory": {"enabled": True, "route": {
+            "kind": "api_chat", "target_id": "foreign-advisory"}},
+    }))
+    monkeypatch.setenv("CLAUDE_CODE_MODEL", "foreign-sdk-model")
+    monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "foreign/heavy")
+    for key in ("USE_LOCAL_MAIN", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK",
+                "USE_LOCAL_CONSCIOUSNESS"):
+        monkeypatch.setenv(key, "true")
+
+
 def test_apply_all_model_sets_forwarded_slots(monkeypatch):
-    for key in run_tb._ALL_MODEL_SLOT_KEYS + ("OUROBOROS_REVIEW_MODELS",):
+    for key in run_tb._ALL_MODEL_SLOT_KEYS + (
+        "OUROBOROS_REVIEW_MODELS", "OUROBOROS_SUBAGENTS",
+        "OUROBOROS_REVIEWER_SLOTS", "CLAUDE_CODE_MODEL",
+        "OUROBOROS_MODEL_VISION", "OUROBOROS_MODEL_CONSCIOUSNESS",
+        "OUROBOROS_MODEL_FALLBACKS", "OUROBOROS_MODEL_DEEP_SELF_REVIEW",
+        "USE_LOCAL_MAIN", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK",
+        "USE_LOCAL_CONSCIOUSNESS", "OUROBOROS_MODEL_HEAVY", "USE_LOCAL_HEAVY",
+        "OUROBOROS_EFFORT_REVIEW", "OUROBOROS_EFFORT_SCOPE_REVIEW",
+    ):
         monkeypatch.delenv(key, raising=False)
-    run_tb.apply_all_model("google/gemini-3.5-flash")
+    _poison_fixed_actor_env(monkeypatch)
+    actor = run_tb.apply_all_model("google/gemini-3.5-flash")
     import os
+    assert actor["mismatches"] == []
+    assert actor["reviewer_slots"]["advisory"]["enabled"] is False
+    assert "OUROBOROS_MODEL_HEAVY" not in os.environ
     for key in run_tb._ALL_MODEL_SLOT_KEYS:
         assert os.environ[key] == "google/gemini-3.5-flash"
     # Single-model run defaults to ONE reviewer at low effort (3 identical = monoculture, no diversity).
     assert os.environ["OUROBOROS_REVIEW_MODELS"] == "google/gemini-3.5-flash"
     assert os.environ["OUROBOROS_EFFORT_REVIEW"] == "low"
     assert os.environ["OUROBOROS_EFFORT_SCOPE_REVIEW"] == "low"
-    assert "CLAUDE_CODE_MODEL" in run_tb._ALL_MODEL_SLOT_KEYS  # claude_code_edit cannot leak a different model
+    actors = json.loads(os.environ["OUROBOROS_SUBAGENTS"])
+    assert [row["route"]["target_id"] for row in actors["items"]] == ["google/gemini-3.5-flash"]
+    reviewers = json.loads(os.environ["OUROBOROS_REVIEWER_SLOTS"])
+    assert [row["route"]["target_id"] for row in reviewers["triad"]] == [
+        "google/gemini-3.5-flash"
+    ]
+    assert [row["route"]["target_id"] for row in reviewers["scope"]] == [
+        "google/gemini-3.5-flash"
+    ]
+    assert reviewers["advisory"]["enabled"] is False
+    assert os.environ["CLAUDE_CODE_MODEL"] == ""
+    assert all(os.environ[key] == "false" for key in (
+        "USE_LOCAL_MAIN", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK",
+        "USE_LOCAL_CONSCIOUSNESS",
+    ))
     # Configurable: the 3-identical-reviewer / medium-effort path is still available.
     run_tb.apply_all_model("google/gemini-3.5-flash", review_slots=3, review_effort="medium")
     assert os.environ["OUROBOROS_REVIEW_MODELS"] == "google/gemini-3.5-flash,google/gemini-3.5-flash,google/gemini-3.5-flash"
     assert os.environ["OUROBOROS_EFFORT_REVIEW"] == "medium"
+    reviewers = json.loads(os.environ["OUROBOROS_REVIEWER_SLOTS"])
+    assert len(reviewers["triad"]) == 3
+    assert {row["effort"] for row in reviewers["triad"]} == {"medium"}
+
+
+def test_all_model_actor_is_durable_before_tb_external_probe(tmp_path, monkeypatch):
+    model = "openai/gpt-5.5"
+    run_root = tmp_path / "run"
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    _poison_fixed_actor_env(monkeypatch)
+
+    def external_probe(_binary):
+        manifest = json.loads((run_root / "run_manifest.json").read_text(encoding="utf-8"))
+        actor = manifest["harness"]["fixed_model_actor"]
+        assert actor["mismatches"] == []
+        assert not any(actor["local_routes"].values())
+        assert actor["reviewer_slots"]["advisory"]["enabled"] is False
+        assert {row["route"]["target_id"] for row in actor["reviewer_slots"]["triad"]} == {model}
+        return "test-harbor"
+
+    monkeypatch.setattr(run_tb, "harbor_version", external_probe)
+    assert run_tb.main([
+        "--all-model", model, "--allow-low-k", "--allow-dirty-seed",
+        "--run-root", str(run_root), "--submission-root", str(tmp_path / "submission"),
+        "--settings-path", str(settings),
+    ]) == 0
+
+
+def test_adapter_forwards_fixed_model_execution_contract(tmp_path, monkeypatch):
+    import devtools.benchmarks.terminal_bench.harbor_installed_agent as tb_agent
+
+    model = "openai/gpt-5.5"
+    for key in (
+        *run_tb._ALL_MODEL_SLOT_KEYS,
+        "OUROBOROS_MODEL_FALLBACKS", "OUROBOROS_MODEL_CONSCIOUSNESS",
+        "OUROBOROS_MODEL_VISION", "OUROBOROS_SUBAGENTS", "OUROBOROS_REVIEWER_SLOTS",
+        "CLAUDE_CODE_MODEL", "OUROBOROS_REVIEW_MODELS", "OUROBOROS_EFFORT_REVIEW",
+        "OUROBOROS_EFFORT_SCOPE_REVIEW", "USE_LOCAL_MAIN", "USE_LOCAL_LIGHT",
+        "USE_LOCAL_FALLBACK", "USE_LOCAL_CONSCIOUSNESS", "OUROBOROS_MODEL_HEAVY",
+        "USE_LOCAL_HEAVY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    run_tb.apply_all_model(model)
+    env = tb_agent.OuroborosTerminalBenchAgent(logs_dir=tmp_path)._container_env()
+    reviewers = json.loads(env["OUROBOROS_REVIEWER_SLOTS"])
+    assert {row["route"]["target_id"] for row in reviewers["triad"]} == {model}
+    assert {row["route"]["target_id"] for row in reviewers["scope"]} == {model}
+    assert reviewers["advisory"]["enabled"] is False
+    assert "CLAUDE_CODE_MODEL" not in env
+    assert all(env[key] == "false" for key in (
+        "USE_LOCAL_MAIN", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK",
+        "USE_LOCAL_CONSCIOUSNESS",
+    ))
+
+
+@pytest.mark.parametrize(
+    "light_model,uses_local_light",
+    (
+        ("anthropic/claude-sonnet-4.6", False),
+        ("owner/light (local)", True),
+    ),
+)
+def test_harbor_smoke_child_uses_the_durable_pinned_actor(
+    tmp_path, monkeypatch, light_model, uses_local_light
+):
+    from devtools.benchmarks.terminal_bench import run_harbor_smoke as smoke
+    import devtools.benchmarks.terminal_bench.harbor_installed_agent as tb_agent
+
+    model = "openai/gpt-5.5"
+    run_root = tmp_path / "smoke"
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    _poison_fixed_actor_env(monkeypatch)
+
+    def fake_harbor(cmd, **kwargs):
+        assert cmd[0] == "harbor"
+        agent_kwargs = {
+            cmd[index + 1].split("=", 1)[0]: cmd[index + 1].split("=", 1)[1]
+            for index, token in enumerate(cmd[:-1])
+            if token == "--agent-kwarg"
+        }
+        assert agent_kwargs["ouroboros_model"] == model
+        assert agent_kwargs["ouroboros_light_model"] == light_model
+        manifest = json.loads((run_root / "run_manifest.json").read_text(encoding="utf-8"))
+        actor = manifest["harness"]["fixed_model_actor"]
+        env = kwargs["env"]
+        forwarded_keys = (
+            "OUROBOROS_MODEL", "OUROBOROS_MODEL_LIGHT",
+            "OUROBOROS_MODEL_FALLBACKS", "OUROBOROS_SUBAGENTS",
+            "OUROBOROS_REVIEWER_SLOTS", "CLAUDE_CODE_MODEL",
+            "USE_LOCAL_MAIN", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK",
+            "USE_LOCAL_CONSCIOUSNESS", "OUROBOROS_MODEL_HEAVY",
+            "USE_LOCAL_HEAVY",
+        )
+        for key in forwarded_keys:
+            if key in env:
+                monkeypatch.setenv(key, env[key])
+            else:
+                monkeypatch.delenv(key, raising=False)
+        container_env = tb_agent.OuroborosTerminalBenchAgent(
+            logs_dir=tmp_path / "adapter-logs",
+            ouroboros_model=agent_kwargs["ouroboros_model"],
+            ouroboros_light_model=agent_kwargs["ouroboros_light_model"],
+            host_settings_path=agent_kwargs["host_settings_path"],
+        )._container_env()
+        reviewers = json.loads(container_env["OUROBOROS_REVIEWER_SLOTS"])
+        subagents = json.loads(container_env["OUROBOROS_SUBAGENTS"])
+        assert actor["mismatches"] == []
+        assert actor["model_slots"]["OUROBOROS_MODEL"] == model
+        assert actor["model_slots"]["OUROBOROS_MODEL_LIGHT"] == light_model
+        assert actor["model_slots"]["OUROBOROS_MODEL_FALLBACKS"] == model
+        assert actor["local_routes"] == {
+            "USE_LOCAL_MAIN": False,
+            "USE_LOCAL_LIGHT": uses_local_light,
+            "USE_LOCAL_FALLBACK": False,
+            "USE_LOCAL_CONSCIOUSNESS": False,
+        }
+        assert manifest["model_slots"] == {
+            key: actor["model_slots"][key]
+            for key in (
+                "OUROBOROS_MODEL",
+                "OUROBOROS_MODEL_LIGHT",
+                "OUROBOROS_MODEL_FALLBACKS",
+            )
+        }
+        assert container_env["OUROBOROS_MODEL"] == model
+        assert container_env["OUROBOROS_MODEL_LIGHT"] == light_model
+        assert container_env["OUROBOROS_MODEL_FALLBACK"] == model
+        assert container_env["OUROBOROS_MODEL_FALLBACKS"] == model
+        assert [row["route"]["target_id"] for row in subagents["items"]] == [model]
+        assert {row["route"]["target_id"] for row in reviewers["triad"]} == {model}
+        assert {row["route"]["target_id"] for row in reviewers["scope"]} == {model}
+        assert reviewers["advisory"]["enabled"] is False
+        assert container_env["USE_LOCAL_MAIN"] == "false"
+        assert container_env["USE_LOCAL_LIGHT"] == str(uses_local_light).lower()
+        assert container_env["USE_LOCAL_FALLBACK"] == "false"
+        assert container_env["USE_LOCAL_CONSCIOUSNESS"] == "false"
+        assert "CLAUDE_CODE_MODEL" not in container_env
+        assert "OUROBOROS_MODEL_HEAVY" not in container_env
+        return subprocess.CompletedProcess(cmd, 1)
+
+    monkeypatch.setattr(smoke.subprocess, "run", fake_harbor)
+    monkeypatch.setattr(smoke.sys, "argv", [
+        "run_harbor_smoke.py", "--model", model,
+        "--ouroboros-light-model", light_model,
+        "--execute", "--allow-dirty-seed",
+        "--run-root", str(run_root), "--settings-path", str(settings),
+    ])
+    assert smoke.main() == 1
 
 
 def test_metadata_omits_web_search_when_web_disabled(monkeypatch):

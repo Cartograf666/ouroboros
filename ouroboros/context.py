@@ -477,9 +477,7 @@ def _promoted_task_toolset(env: Any) -> Dict[str, Any]:
 
 
 def _delegation_capability_fact() -> Optional[Dict[str, Any]]:
-    """B4-lite: the CONFIGURED delegation route plus honestly-labeled HISTORICAL
-    observations (last recorded execution per reviewer slot and the last
-    delegated run).
+    """B4-lite: honestly-labeled HISTORICAL delegation observations.
 
     Deliberately NOT live health — receipts prove what the last execution did,
     not what a lane can do now; live lane facts arrive from plan-review wave
@@ -491,24 +489,14 @@ def _delegation_capability_fact() -> Optional[Dict[str, Any]]:
     """
     try:
         from ouroboros.reviewer_slot_config import reviewer_slot_last_executions
-        from ouroboros.subagents import get_subagent_harness, subagent_last_delegation
+        from ouroboros.subagents import subagent_last_delegation
 
         def _observed_label(ts: Any) -> str:
             # Timestamp only: the verbatim "historical, not live health" disclaimer
             # lives ONCE in the note below, never repeated per row.
             return f"last observed at {str(ts or '').strip() or 'unknown time'}"
 
-        route = get_subagent_harness()
         delegation: Dict[str, Any] = {
-            "configured_route": (
-                {
-                    "harness": route.route_id,
-                    "model": route.model,
-                    "effort": route.effort,
-                }
-                if route is not None
-                else "not configured"
-            ),
             "note": (
                 "Every row here is historical, not live health (the last "
                 "recorded execution per reviewer slot / delegated run): "
@@ -528,6 +516,12 @@ def _delegation_capability_fact() -> Optional[Dict[str, Any]]:
                             else "unknown"),
                 "observed": _observed_label(row.get("ts")),
             }
+            requested = row.get("requested") if isinstance(row.get("requested"), dict) else {}
+            effective = row.get("effective") if isinstance(row.get("effective"), dict) else {}
+            if requested.get("profile_id"):
+                fact["requested_profile"] = str(requested["profile_id"])
+            if effective.get("profile_id"):
+                fact["applied_profile"] = str(effective["profile_id"])
             # B1's typed failure facts, forwarded only when recorded (a dated
             # window carries reset_at without a code and an undated one the
             # code without a reset — read both independently).
@@ -539,12 +533,21 @@ def _delegation_capability_fact() -> Optional[Dict[str, Any]]:
             delegation["reviewer_slots_last"] = slot_rows
         last = subagent_last_delegation()
         if isinstance(last, dict) and last:
-            delegation["subagent_last_delegation"] = {
+            last_fact = {
                 "route": str(last.get("route") or ""),
                 "requested_model": str(last.get("requested_model") or ""),
                 "applied_model": str(last.get("applied_model") or ""),
                 "observed": _observed_label(last.get("ts")),
             }
+            if last.get("requested_profile"):
+                last_fact["requested_profile"] = str(last["requested_profile"])
+            if last.get("applied_profile"):
+                last_fact["applied_profile"] = str(last["applied_profile"])
+            if last.get("selected_subagent_id"):
+                last_fact["selected_subagent_id"] = str(last["selected_subagent_id"])
+            delegation["subagent_last_delegation"] = last_fact
+        if len(delegation) == 1:
+            return None
         return delegation
     except Exception:
         log.debug("Failed to build delegation capability fact", exc_info=True)
@@ -650,8 +653,8 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
                 "spawn acting subagents."
             ),
         }
-        # B4-lite: configured route + honestly-labeled HISTORY, never live
-        # health. Own nested fail-soft inside the helper: a failure there must
+        # B4-lite: honestly-labeled HISTORY, never live health. Own nested
+        # fail-soft inside the helper: a failure there must
         # never drop the whole capabilities digest above.
         _delegation_fact = _delegation_capability_fact()
         if _delegation_fact is not None:
@@ -1356,6 +1359,17 @@ def _capture_context_core(
         docs_need_development = _task_requires_development_context(task)
 
     semi_stable_parts = []
+    try:
+        from ouroboros.subagent_runtime import current_model_visible_subagent_catalog
+
+        subagent_catalog = current_model_visible_subagent_catalog()
+        if subagent_catalog:
+            semi_stable_parts.append(
+                "## Available subagents\n\n"
+                + json.dumps(subagent_catalog, ensure_ascii=False, indent=1)
+            )
+    except Exception:
+        log.debug("Failed to build Available subagents catalog", exc_info=True)
     semi_stable_parts.extend(build_memory_sections(memory, partition="stable"))
 
     semi_stable_parts.extend(build_knowledge_sections(env, project_id=resolve_project_id(task)))

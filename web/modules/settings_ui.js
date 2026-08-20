@@ -21,8 +21,7 @@ const SETTINGS_TABS = [
 
 const MODEL_CARDS = [
     ['Main', 'Primary reasoning model.', 's-model', 's-local-main', 'google/gemini-3.7-flash'],
-    ['Heavy', 'Strong acting/coding lane for mutative first-level subagents. Empty uses Main.', 's-model-heavy', 's-local-heavy', ''],
-    ['Light', 'Fast summaries, lightweight tasks, and all deep subagents. Empty uses Main.', 's-model-light', 's-local-light', 'openai/gpt-5.6-luna'],
+    ['Light', 'Fast summaries, lightweight internal work, reflections, and the default Fast scout. Empty uses Main.', 's-model-light', 's-local-light', 'openai/gpt-5.6-luna'],
     ['Vision', 'Caption and VLM lane. Empty uses Main.', 's-model-vision', '', ''],
     ['Consciousness', 'High-horizon background consciousness. Empty uses Main.', 's-model-consciousness', 's-local-consciousness', ''],
     ['Fallback', 'Resilience and degraded path (comma-separated chain).', 's-model-fallback', 's-local-fallback', 'openai/gpt-5.6-luna'],
@@ -404,8 +403,9 @@ export function renderSettingsPage() {
                 <section class="settings-panel" data-settings-panel="agents">
                     <div class="settings-section-copy">
                         The agents Ouroboros delegates to, and what each of them is allowed to do:
-                        the subscription accounts, who reviews commits, and how subagents are run.
-                        API keys stay in Providers; API model ids and effort lanes stay in Models.
+                        the subscription accounts, who reviews commits, and the complete execution
+                        choices available to child tasks. API keys stay in Providers; global model
+                        lanes stay in Models, while each Available subagent owns its route here.
                     </div>
                     <!-- ONE service banner for the whole tab: the single place a
                          daemon or runtime problem is explained, instead of the

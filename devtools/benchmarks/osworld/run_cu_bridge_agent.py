@@ -53,6 +53,7 @@ from devtools.benchmarks.common.manifests import (
     runtime_attestation,
     write_json,
 )
+from devtools.benchmarks.common.model_slots import runtime_actor_snapshot
 from devtools.benchmarks.common.result_index import (
     append_result_index,
     runtime_terminal_disclosure,
@@ -1405,6 +1406,50 @@ def _api(server: str, method: str, path: str, body: dict[str, Any] | None = None
     return json.loads(raw) if raw.strip().startswith(("{", "[")) else {"raw": raw}
 
 
+def _cu_actor_preflight(settings_path: Path, server: str) -> dict[str, Any]:
+    """Compare the declared CU actor with the actor exposed by the target server."""
+    failures: list[str] = []
+    declared: dict[str, Any] = {}
+    target: dict[str, Any] = {}
+    try:
+        loaded = json.loads(Path(settings_path).read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError("settings JSON is not an object")
+        measured_model = str(loaded.get("OUROBOROS_MODEL") or "").strip()
+        if not measured_model:
+            raise ValueError("settings must declare measured OUROBOROS_MODEL")
+        declared = runtime_actor_snapshot(loaded, expected_model=measured_model)
+        failures.extend(f"declared settings {item}" for item in declared["mismatches"])
+    except Exception as exc:
+        failures.append(f"declared actor unavailable: {type(exc).__name__}: {exc}")
+        return {"ok": False, "failures": failures, "declared": declared, "target": target}
+
+    try:
+        target_settings = _api(server, "GET", "/api/settings", timeout=10)
+        target = runtime_actor_snapshot(target_settings, expected_model=measured_model)
+        failures.extend(f"target server {item}" for item in target["mismatches"])
+    except Exception as exc:
+        failures.append(f"target actor unavailable: {type(exc).__name__}: {exc}")
+    return {
+        "ok": not failures,
+        "failures": failures,
+        "declared": declared,
+        "target": target,
+    }
+
+
+def _bind_cu_actor(manifest: dict[str, Any], actor_preflight: dict[str, Any]) -> None:
+    """Bind CU manifest provenance to the target actor, not the local declaration."""
+    target = actor_preflight.get("target") or {}
+    manifest["available_subagents"] = (
+        dict(target.get("available_subagents") or {})
+        if isinstance(target, dict)
+        else {}
+    )
+    manifest["harness"]["target_runtime_actor"] = target
+    manifest["harness"]["actor_preflight"] = actor_preflight
+
+
 def _text_declares_infeasible(value: Any) -> bool:
     return isinstance(value, str) and any(
         line.strip() == "TASK_INFEASIBLE" for line in value.splitlines()
@@ -1720,12 +1765,41 @@ def main() -> int:
                                   extra={"allow_dirty_seed": bool(args.allow_dirty_seed)})
             return 2
 
+        paths = CuBridgePaths(
+            osworld_root=osworld_root, task_path=task_path, repo_dir=repo_dir,
+            data_dir=data_dir, settings_path=settings_path,
+            claims_dir=claims_dir, claim_key=claim_key,
+        )
+        try:
+            example, instruction, blocked = _prepare_cu_bridge(args, run, paths)
+        except BaseException:
+            # Preparation is outside the active finalizer so a successful actor can be
+            # checkpointed without publishing a pre-merge terminal record. Any failure
+            # still enters the ONE terminal seam before it propagates.
+            with finalize_run_manifest(manifest_path, run.base_manifest):
+                raise
+
+        if blocked:
+            with finalize_run_manifest(manifest_path, run.base_manifest) as final:
+                refusal = {
+                    "stage": blocked["stage"],
+                    "reason": blocked["reason"],
+                    "exit_code": 2,
+                }
+                final.update({"outcome": "blocked", "exit_code": 2, "refusal": refusal})
+                _write_cu_outcome(
+                    run, None, "blocked", blocked["reason"], blocked["error"],
+                    extra=blocked.get("extra") or None,
+                )
+            return 2
+
+        # This is an in-progress checkpoint, still outside the terminal seam. It binds the
+        # complete successful target actor before claim acquisition, VM boot, or paid POST.
+        write_json(manifest_path, run.base_manifest)
         with finalize_run_manifest(manifest_path, run.base_manifest) as final:
-            return _run_cu_bridge(args, final, run, CuBridgePaths(
-                osworld_root=osworld_root, task_path=task_path, repo_dir=repo_dir,
-                data_dir=data_dir, settings_path=settings_path,
-                claims_dir=claims_dir, claim_key=claim_key,
-            ))
+            return _run_cu_bridge(
+                args, final, run, paths, example=example, instruction=instruction,
+            )
     finally:
         _mirror_canonical_manifest(run)
 
@@ -1734,7 +1808,9 @@ def _mirror_canonical_manifest(run: CuBridgeRun) -> None:
     """Copy the attempt's manifest to the shared canonical path, IF this attempt owns the task."""
     if not run.owns_task or not run.base_manifest:
         return
-    write_json(run.run_dir / "task_run_manifest.json", run.base_manifest)
+    write_json(
+        run.run_dir / "task_run_manifest.json", run.base_manifest,
+    )
 
 
 @dataclass
@@ -1931,9 +2007,73 @@ def _write_cu_outcome(run: CuBridgeRun, reward: float | None, status: str, reaso
     return outcome
 
 
+def _prepare_cu_bridge(
+    args: argparse.Namespace,
+    run: CuBridgeRun,
+    paths: CuBridgePaths,
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    """Resolve and bind every pre-claim fact outside the active terminal seam."""
+    from devtools.benchmarks.osworld.run_step_agent import osworld_checkout_info
+
+    repo_dir, settings_path = paths.repo_dir, paths.settings_path
+    _ensure_vmrun_on_path()
+    sys.path.insert(0, str(paths.osworld_root))
+    checkout = osworld_checkout_info(paths.osworld_root)
+    run.base_manifest["dataset"] = _dataset_name(str(checkout.get("variant") or "unknown"))
+    effective_rounds = _effective_max_rounds(settings_path)
+    run.base_manifest["harness"] = {
+        **(run.base_manifest.get("harness") or {}),
+        "osworld_checkout": checkout,
+        "max_rounds_effective": effective_rounds,
+        "step_budget": _step_budget(args, effective_rounds),
+    }
+    _refuse_uncapped_step_claim(run.base_manifest["harness"]["step_budget"])
+    _refuse_wrong_dataset_commit(getattr(args, "expect_dataset_commit", ""), checkout)
+
+    example = json.loads(paths.task_path.read_text(encoding="utf-8"))
+    run.example_id = str(example.get("id") or run.example_id)
+    run.base_manifest["requested_task_ids"] = [run.example_id]
+    instruction = str(example["instruction"])
+
+    try:
+        run.base_manifest["extra"] = {
+            **(run.base_manifest.get("extra") or {}),
+            "runtime_attestation": runtime_attestation(args.ouroboros_url, repo_dir),
+        }
+    except RuntimeAttestationRefused as exc:
+        reason = str(exc.attestation.get("reason") or "") or "runtime_attestation_failed"
+        run.base_manifest["extra"] = {
+            **(run.base_manifest.get("extra") or {}),
+            "runtime_attestation": dict(exc.attestation),
+        }
+        return example, instruction, {
+            "stage": "runtime_attestation",
+            "reason": reason,
+            "error": f"{type(exc).__name__}: {exc}",
+            "extra": {"runtime_attestation": dict(exc.attestation)},
+        }
+    except RuntimeError as exc:
+        return example, instruction, {
+            "stage": "runtime_attestation",
+            "reason": "runtime_attestation_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    actor_preflight = _cu_actor_preflight(settings_path, args.ouroboros_url)
+    _bind_cu_actor(run.base_manifest, actor_preflight)
+    if not actor_preflight["ok"]:
+        return example, instruction, {
+            "stage": "target_actor_preflight",
+            "reason": "target_actor_mismatch",
+            "error": "; ".join(actor_preflight["failures"]),
+            "extra": {"actor_preflight": actor_preflight},
+        }
+    return example, instruction, {}
+
+
 def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridgeRun,
-                   paths: CuBridgePaths) -> int:
-    """Everything AFTER admission: attestation, lane claim, VM boot, the agent run, evaluate.
+                   paths: CuBridgePaths, *, example: dict[str, Any], instruction: str) -> int:
+    """Everything AFTER durable actor binding: claim, VM boot, agent run, evaluate.
 
     Split out of `main()` so the statements preceding `admit_benchmark_run()` stay trivially
     auditable — the seam meta-test walks them with `ast` and denies every filesystem, docker,
@@ -1948,84 +2088,19 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
         claim_stale_sec,
         construct_desktop_env,
         mark_task_scored,
-        osworld_checkout_info,
         record_unconfirmed_score,
         release_task_claim,
     )
-    osworld_root, task_path = paths.osworld_root, paths.task_path
+    osworld_root = paths.osworld_root
     repo_dir, data_dir, settings_path = paths.repo_dir, paths.data_dir, paths.settings_path
     claims_dir, claim_key = paths.claims_dir, paths.claim_key
     run_dir = run.run_dir
-    # Process/environment preparation, after the persisted admission boundary (see main()).
-    _ensure_vmrun_on_path()
-    sys.path.insert(0, str(osworld_root))
-
-    # Late facts the admission manifest could not carry: they need a git probe and a file read,
-    # both of which are forbidden before the run is on disk.
-    checkout = osworld_checkout_info(osworld_root)
-    run.base_manifest["dataset"] = _dataset_name(str(checkout.get("variant") or "unknown"))
-    effective_rounds = _effective_max_rounds(settings_path)
-    run.base_manifest["harness"] = {
-        **(run.base_manifest.get("harness") or {}),
-        "osworld_checkout": checkout,
-        "max_rounds_effective": effective_rounds,
-        "step_budget": _step_budget(args, effective_rounds),
-    }
-    # Fail CLOSED before the VM boots: a declared step budget the server cannot
-    # honor would publish a "Max steps: N" claim the run never enforced, and a
-    # checkout other than the campaign's grades a different exam.
-    _refuse_uncapped_step_claim(run.base_manifest["harness"]["step_budget"])
-    _refuse_wrong_dataset_commit(getattr(args, "expect_dataset_commit", ""), checkout)
-
-    example = json.loads(task_path.read_text(encoding="utf-8"))
-    run.example_id = str(example.get("id") or run.example_id)
-    run.base_manifest["requested_task_ids"] = [run.example_id]
-    instruction = str(example["instruction"])
-    # `task.json` is a CANONICAL artefact in the shared `run_dir`, so it is written once the
-    # claim is held (below), not here: a lane that steps aside must not have touched the
-    # holder's directory on its way past.
-
     def _write_outcome(reward: float | None, status: str, reason: str, error: str = "",
                        extra: dict[str, Any] | None = None) -> dict[str, Any]:
         return _write_cu_outcome(run, reward, status, reason, error, extra)
 
     example_id = run.example_id
     domain = run.domain
-
-    # Owner Q9=A+B / Q10: attest the RUNNING server (its HTTP `runtime_version`) against the
-    # checkout it was started from (local HEAD + VERSION) before any paid work. The shared
-    # helper fails CLOSED by raising, so a typed `blocked` row keeps the denominator honest
-    # instead of a bare traceback. Deliberately BEFORE the claim: a config-wide skew must not
-    # park a lock that nobody will clear.
-    #
-    # A refusal CARRIES the record it built (`RuntimeAttestationRefused.attestation`), so the
-    # durable manifest keeps the EXACT typed reason plus `runtime_version`, `repo_head` and
-    # `repo_version` rather than the string `runtime_attestation_failed` — the identities this
-    # provenance contract exists to preserve, discarded at the moment they matter most.
-    try:
-        run.base_manifest["extra"] = {
-            **(run.base_manifest.get("extra") or {}),
-            "runtime_attestation": runtime_attestation(args.ouroboros_url, repo_dir),
-        }
-    except RuntimeAttestationRefused as exc:
-        reason = str(exc.attestation.get("reason") or "") or "runtime_attestation_failed"
-        run.base_manifest["extra"] = {
-            **(run.base_manifest.get("extra") or {}),
-            "runtime_attestation": dict(exc.attestation),
-        }
-        final.update({"outcome": "blocked", "exit_code": 2,
-                      "refusal": {"stage": "runtime_attestation",
-                                  "reason": reason, "exit_code": 2}})
-        _write_outcome(None, "blocked", reason, f"{type(exc).__name__}: {exc}",
-                       extra={"runtime_attestation": dict(exc.attestation)})
-        return 2
-    except RuntimeError as exc:
-        # No record to keep (raised before one was built).
-        final.update({"outcome": "blocked", "exit_code": 2,
-                      "refusal": {"stage": "runtime_attestation",
-                                  "reason": "runtime_attestation_failed", "exit_code": 2}})
-        _write_outcome(None, "blocked", "runtime_attestation_failed", f"{type(exc).__name__}: {exc}")
-        return 2
 
     # Multi-lane claim: take the task exclusively or step aside. Deliberately BEFORE
     # the skill seed and the VM boot, and deliberately WITHOUT writing a ledger row —
