@@ -131,7 +131,6 @@ BAND_PATHS = {
     "ouroboros/agent_startup_checks.py": None,
     "ouroboros/claudexor_runtime.py": None,
     "ouroboros/extension_process_runner.py": None,
-    "ouroboros/gateway/claudexor_accounts.py": "D30 Connect gains the owner-consented vendor-CLI install: a strict structural matcher for the pinned engine's missing-binary job, a bounded single-JSON installer reader, and a receipt validator. The band entry is the cost of keeping every vendor recipe in Claudexor and zero of them here.",
     "ouroboros/gateway/contracts.py": None,
     "ouroboros/gateway/extensions.py": None,
     "ouroboros/gateway/history.py": None,
