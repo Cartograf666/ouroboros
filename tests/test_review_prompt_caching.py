@@ -1048,6 +1048,11 @@ def test_scope_prompt_records_stable_boundary(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_warm_supported_params_cache_used_when_fetch_skipped(monkeypatch):
+    from ouroboros.request_wire_recovery import (
+        prepare_wire_payload_for_send,
+        request_wire_call_scope,
+    )
+
     client = LLMClient(api_key="test")
     monkeypatch.setattr(LLMClient, "_SUPPORTED_PARAMS_FETCHED", True)
     monkeypatch.setattr(
@@ -1060,11 +1065,16 @@ def test_warm_supported_params_cache_used_when_fetch_skipped(monkeypatch):
         "usage_model": "anthropic/claude-fable-5",
         "supports_openrouter_extensions": True,
     }
-    kwargs = client._build_remote_kwargs(
-        target, [{"role": "user", "content": "x"}], "high", 512, "auto", 0.2, None,
-        skip_capability_fetch=True,
-    )
-    assert "temperature" not in kwargs  # proactively stripped from the warm cache
+    with request_wire_call_scope():
+        kwargs = client._build_remote_kwargs(
+            target, [{"role": "user", "content": "x"}], "high", 512, "auto", 0.2, None,
+            skip_capability_fetch=True,
+        )
+        physical = prepare_wire_payload_for_send(
+            target, kwargs, api_surface="chat.completions"
+        )
+    assert kwargs["temperature"] == 0.2
+    assert "temperature" not in physical
 
 
 # ---------------------------------------------------------------------------

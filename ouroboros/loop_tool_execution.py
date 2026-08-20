@@ -1011,15 +1011,49 @@ def handle_tool_calls(
     emit_progress: Callable[[str], None],
 ) -> int:
     """Execute tool calls, append results, and return error count."""
+    from ouroboros.openai_chat_dispatch import (
+        custom_tool_argument_error,
+        custom_validation_by_call_id,
+    )
+
+    validation = tuple(
+        getattr(tools._ctx, "_request_wire_custom_receipts", ()) or ()
+    )
+    tools._ctx._request_wire_custom_receipts = ()
+    validation_by_id = custom_validation_by_call_id(validation)
+
+    def _execute(tc: Dict[str, Any]) -> Dict[str, Any]:
+        receipt = validation_by_id.get(str(tc.get("id") or ""))
+        if receipt is not None and not receipt.allows_execution:
+            fn_name = str((tc.get("function") or {}).get("name") or "").strip()
+            result = custom_tool_argument_error(fn_name, receipt)
+            return {
+                "tool_call_id": str(tc.get("id") or ""),
+                "fn_name": fn_name,
+                "result": result,
+                "is_error": True,
+                "tool_args": {},
+                "args_for_log": {},
+                "is_code_tool": fn_name in tools.CODE_TOOLS,
+                "result_meta": _extract_result_metadata(fn_name, result, True),
+            }
+        return _execute_with_timeout(
+            tools,
+            tc,
+            drive_logs,
+            _get_tool_timeout(
+                tools,
+                str(tc["function"]["name"] or "").strip(),
+                _tc_args(tc),
+            ),
+            task_id,
+            stateful_executor,
+        )
+
     can_parallel = tool_calls_can_run_parallel(tool_calls)
 
     if not can_parallel:
-        results = [
-            _execute_with_timeout(tools, tc, drive_logs,
-                                  _get_tool_timeout(tools, str(tc["function"]["name"] or "").strip(), _tc_args(tc)), task_id,
-                                  stateful_executor)
-            for tc in tool_calls
-        ]
+        results = [_execute(tc) for tc in tool_calls]
     else:
         max_workers = min(len(tool_calls), 8)
         executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -1027,17 +1061,8 @@ def handle_tool_calls(
             future_to_index = {
                 executor.submit(
                     contextvars.copy_context().run,
-                    _execute_with_timeout,
-                    tools,
+                    _execute,
                     tc,
-                    drive_logs,
-                    _get_tool_timeout(
-                        tools,
-                        str(tc["function"]["name"] or "").strip(),
-                        _tc_args(tc),
-                    ),
-                    task_id,
-                    stateful_executor,
                 ): idx
                 for idx, tc in enumerate(tool_calls)
             }

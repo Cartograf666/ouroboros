@@ -449,8 +449,8 @@ def get_consciousness_model() -> str:
     return str(os.environ.get("OUROBOROS_MODEL_CONSCIOUSNESS", "") or "").strip() or _main_model()
 
 # v6.57.0 — EFFORT_SCALE: ORDERED reasoning-effort SSOT (low→high), the single place a tier
-# is defined (settings, llm.py builder, switch_model enum, subagent lanes). xhigh/max extend
-# none..high; llm.py clamps a request DOWN to each model's learned ceiling (BIBLE P1: disclosed).
+# is defined (settings, llm.py builder, switch_model enum, subagent lanes). Exact-route
+# request-wire recovery, not legacy model-global evidence, owns provider adaptation.
 EFFORT_SCALE: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 

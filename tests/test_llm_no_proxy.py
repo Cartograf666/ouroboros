@@ -313,11 +313,19 @@ def test_chat_remote_no_proxy_retries_openrouter_parameter_rejection():
     messages = [{"role": "user", "content": "hello"}]
     captured_kwargs = []
 
+    class ParameterRejection(RuntimeError):
+        status_code = 404
+        body = {"error": {
+            "message": "No endpoints found for requested parameter temperature",
+        }}
+
     class FakeCompletions:
         def create(self, **kwargs):
             captured_kwargs.append(kwargs)
             if len(captured_kwargs) == 1:
-                raise RuntimeError("404 No endpoints found that can handle the requested parameters")
+                raise ParameterRejection(
+                    "404 No endpoints found for requested parameter temperature"
+                )
             return MagicMock(
                 model_dump=lambda: {
                     "choices": [{"message": {"role": "assistant", "content": "ok", "tool_calls": None}}],

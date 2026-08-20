@@ -35,7 +35,12 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
-from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
+from ouroboros.utils import (
+    atomic_write_json,
+    is_credential_header_name,
+    read_json_dict,
+    utc_now_iso,
+)
 
 log = logging.getLogger(__name__)
 
@@ -199,10 +204,6 @@ def confirms_at_least(
 def _canonical_headers(headers: Optional[Dict[str, Any]]) -> Tuple[Tuple[str, str], ...]:
     if not isinstance(headers, dict):
         return ()
-    credential_names = {
-        "authorization", "proxy-authorization", "api-key", "x-api-key",
-        "x-goog-api-key", "anthropic-api-key", "openai-api-key",
-    }
     # Credentials are dispatch authentication, not route capability identity.
     # Omitting both value and presence keeps key rotation (or late key loading)
     # from invalidating otherwise identical route evidence.  Non-secret beta /
@@ -210,7 +211,7 @@ def _canonical_headers(headers: Optional[Dict[str, Any]]) -> Tuple[Tuple[str, st
     return tuple(sorted(
         (str(k).lower(), str(v))
         for k, v in headers.items()
-        if str(k).lower() not in credential_names
+        if not is_credential_header_name(k)
     ))
 
 
@@ -315,16 +316,10 @@ def _age_seconds(ts: str) -> float:
 # It NEVER touches window records, so the BIBLE P3 ≥1M scope-review floor
 # evidence path is untouched. Value shape:
 #   {"ceiling": "<effort>", "observed_at": iso, "reason": "provider_rejected"}
-# KEYING (deliberate, r4 disclosure): the key is the NORMALIZED MODEL IDENTITY
-# (llm.normalize_model_identity — provider-scoped model id), NOT the full route
-# fingerprint the window evidence uses. Effort-level support is treated as a
-# MODEL property: a ceiling learned on one base_url applies to the model on all
-# routes. Coarser than per-route, and self-healing — the floor in llm.py keeps
-# a bad endpoint from poisoning below "low", and clamps are disclosed per call.
-# The ceiling is the highest effort a route ACCEPTED after a provider rejected a
-# higher one (learned by the reject-and-step-down walk in llm.py). Fail-open:
-# any error → no ceiling (send the requested effort). Owner-configured efforts are
-# still honored UP TO the learned real ceiling; clamping is disclosed in usage.
+# KEYING: this historical namespace uses NORMALIZED MODEL IDENTITY rather than
+# the exact route fingerprint used by current request-wire compatibility. It is
+# retained for diagnostics and upgrade regression compatibility only; production
+# request construction, scheduling, and recovery do not consult it as authority.
 
 def record_effort_ceiling(drive_root: Any, fingerprint: str, ceiling: str) -> None:
     """Persist the learned reasoning-effort ceiling. The key is the normalized
@@ -364,17 +359,12 @@ def get_effort_ceiling(drive_root: Any, fingerprint: str) -> str:
 
 
 # --- Learned reasoning-effort floors (v6.73.2) ----------------------------------
-# The VALUE-TOO-LOW mirror of effort_ceilings: some endpoints make reasoning
-# MANDATORY (e.g. Gemini's "Reasoning is mandatory for this endpoint and cannot
-# be disabled" 400 on effort "none"). llm.py learns a floor of "low" from such a
-# rejection and later calls clamp UP to it (disclosed per call as
-# reasoning_effort_clamped reason="learned_floor"). Same namespace design and
-# NORMALIZED-MODEL-IDENTITY keying as effort_ceilings/rejected_params.
-# LIFECYCLE ASYMMETRY (deliberate): ceilings are sticky (a model's max supported
-# effort is a stable model property), floors EXPIRE like rejected_params —
-# whether reasoning can be disabled is provider POLICY that changes; if the
-# provider later allows disabling it again, behavior self-heals after the TTL at
-# the cost of one reactive 400. Fail-open everywhere.
+# Historical VALUE-TOO-LOW mirror of effort_ceilings. Some endpoints make
+# reasoning mandatory, but current adaptation is exact-route, success-confirmed
+# request-wire evidence. These model-global rows remain diagnostic/read-compatible.
+# Historical lifecycle remains readable: ceilings are sticky, while floors expire
+# like rejected_params. Since normal dispatch ignores this namespace, expiry changes
+# diagnostic state only; exact-route request-wire evidence owns runtime self-healing.
 
 _EFFORT_FLOORS_TTL_SEC = 14 * 24 * 3600.0
 

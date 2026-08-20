@@ -477,16 +477,19 @@ def persist_call(
 
     By default the AUTHORITATIVE blob (``full_payload_ref``) is the REDACTED value:
     secret VALUES are masked while structure, paths, model route, and all non-secret
-    text/reasoning are preserved (P1 reconstructibility) — so a leaked secret never
-    lands on disk. ``full_payload_redacted=True`` declares this honestly; the
-    ``redaction`` manifest lists every rule that fired. Set
+    text/reasoning are preserved (P1 reconstructibility), except explicit native
+    reasoning custody whose projection retains only type/order/size/digest metadata.
+    ``full_payload_redacted=True`` declares this honestly; the ``redaction`` manifest
+    lists every rule that fired. Set
     ``OUROBOROS_OBSERVABILITY_KEEP_RAW=1`` for a trusted local debug session to persist
     the raw payload instead (``full_payload_redacted=False``). ``keep_raw=True``
     forces that existing private raw-plus-projection path for an authoritative
     checkpoint; ``None`` preserves the environment/default behavior.
     """
 
-    redacted = redact_projection(payload)
+    from ouroboros.anthropic_native_custody import observability_custody_projection
+
+    redacted = redact_projection(observability_custody_projection(payload))
     effective_keep_raw = keep_raw
     if effective_keep_raw is None:
         effective_keep_raw = (
@@ -511,6 +514,10 @@ def persist_call(
             "call_type": call_type,
             "full_payload_ref": full_ref,
             "full_payload_redacted": full_redacted,
+            "full_payload_custody": (
+                "private_unredacted_cas"
+                if effective_keep_raw else "redacted_projection_cas"
+            ),
             "redacted_projection_ref": projection_ref,
             "redaction": redacted.manifest(),
             **dict(manifest or {}),
@@ -539,16 +546,21 @@ def persist_physical_candidate(
     ``persist_call`` refs describe the redacted-by-default CAS blob; the two
     digest domains are deliberately labelled rather than equated.
     """
+    from ouroboros.anthropic_native_custody import physical_custody_projection
+
+    projected = physical_custody_projection(candidate)
     return persist_call(
         drive_root,
         task_id=task_id,
         call_id=attempt_id,
         call_type="physical_llm_candidate",
-        payload=candidate,
+        payload=projected,
+        keep_raw=False,
         manifest={
             "candidate_manifest_kind": "physical_llm_candidate",
             "candidate_raw_digest_basis": "canonical_json_v1_pre_redaction",
             "redacted_projection_digest_basis": "observability_json_v1_post_default_redaction_cas",
+            "anthropic_native_custody_projected": projected != candidate,
             **dict(candidate_facts),
         },
     )

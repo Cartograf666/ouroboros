@@ -290,7 +290,8 @@ When adding or changing a provider, update one coherent route contract:
 1. credential/readiness detection and exact model-id migration;
 2. Main/Light/Fallback and reviewer-slot defaults without overwriting explicit
    owner choices;
-3. tool, reasoning, image, and cache-control translation at `llm.py`;
+3. canonical tool/reasoning/image/cache intent at `llm.py`, with provider wire
+   projection and exact-route recovery delegated to the small transport leaves;
 4. nullable pricing/settlement and truthful capability omissions;
 5. review and scope routing, including sourced context-window evidence;
 6. direct-provider and single-provider regression tests.
@@ -303,14 +304,41 @@ partial review occurred. Current model ids and defaults belong in code/config,
 not in this handbook.
 
 The `-pro` suffix is an OpenRouter routing slug, not an official OpenAI model id.
-Until a Responses-API lane exists, a direct OpenAI slot uses the plain Sol id;
-projecting the slug into chat completions would turn an owner route choice into
-a guaranteed 404. This is a compatibility constraint, not a mutable capability
-table.
+A direct OpenAI Chat slot uses the plain Sol id; projecting the slug into Chat
+Completions would turn an owner route choice into a guaranteed 404. This is a
+compatibility constraint, not a mutable capability table or a reason to migrate
+the conversation to Responses.
 
 Provider-specific optional features may be unavailable on another single
 provider, but the core loop must degrade explicitly rather than crash or silently
 reroute.
+
+Canonical assistant history and tool schemas are function-shaped across
+providers. Do not add a second stored transcript for a provider dialect.
+Direct OpenAI tool conversations stay on Chat Completions: the physical copy is
+custom-first when non-`none` reasoning is requested, an exact custom rejection
+may fall back to function with the same effort, and explicit `none` is a
+task-local last resort only after both cognition-preserving forms fail. Direct
+OpenAI sends `reasoning_effort` and `max_completion_tokens` provider-wide;
+model-name prefixes are not admission authority.
+
+All learned request-shape adaptation goes through the one provider-neutral
+request-wire driver. Its identity is the exact provider/endpoint/API/model and
+request shape, its action vocabulary is closed (`set_value`, `drop_field`, and
+a registered `replace_dialect`), and it may never execute provider prose or
+switch route. Reactive evidence becomes durable only after semantic success on
+the exact settled physical candidate, expires after the shared TTL, and is
+applied under the caller's existing attempt rail. Explicit `none` is never
+durable. Legacy model-global effort/rejected-parameter stores are diagnostics,
+not scheduling or normal dispatch authority.
+
+Direct Anthropic is the deliberate exception to a purely reconstructed
+provider transcript: while a native tool turn is unfinished, keep one private,
+route-bound receipt of the whole assistant `content` list and replay it
+byte-for-byte before the matching tool results. Scrub it on any
+provider/endpoint/API/model change, fence that active unit from compaction, and
+exclude thinking text, signatures, and redacted data from summarizer/public
+observability. Do not synthesize an effort-to-`budget_tokens` policy.
 
 ## Module Size & Complexity
 
@@ -1298,6 +1326,11 @@ Before every commit, verify the following:
 
 #### LLM Call Rules
 - [ ] New LLM calls go through the shared `LLMClient` / `llm.py` layer — no ad-hoc HTTP clients or direct provider SDKs outside that layer. **Exception (v5.7.0+):** skill / extension `plugin.py` modules may call providers directly because they have not yet been migrated to a host-mediated `api.invoke_llm(...)` bridge. When that bridge lands, the exception goes away. Runtime callers (anything inside `ouroboros/`) must still use `LLMClient`.
+- [ ] Keep canonical messages/tools provider-neutral and function-shaped. A provider dialect is an outbound physical projection and inbound normalization only; it must not mutate stored history or create a second compaction/replay contract. Direct OpenAI Chat custom-origin arguments carry private parser-issued receipts bound to the exact physical catalog/full schema. Main, Background Consciousness, and structured compaction must consume those receipts before execution; never persist them in public usage or observability.
+- [ ] Use the one same-route request-wire driver for optional-parameter, reasoning-carrier, and registered tool-dialect recovery. Key evidence by the exact credential-free route and relevant request predicate; compose only typed actions; require semantic success bound to the settled physical attempt before a write; keep the shared TTL and malformed-state fail-open behavior. Never turn provider prose into a model/provider/API switch, never raise a caller's attempt rail, and never persist a task-local explicit-`none` fallback.
+- [ ] `usage.request_wire` describes the terminal candidate returned by one LLM call. Nested aggregation preserves those terminal disclosures in ordered `request_wire_history` with explicit omission accounting; it does not copy failed physical sends or replace `state/usage_attempts.jsonl`. Keep these evidence domains distinct in names, docs, and tests.
+- [ ] Official direct OpenAI Chat sends `max_completion_tokens` and the requested `reasoning_effort` for the provider route as a whole, not for a hand-maintained model-name allowlist. Every eligible function-tool/non-`none` call begins custom+same effort; generic repairs stay on that rung; exact custom rejection creates fresh function+the original effort; exact function rejection may create task-local function+`none`. Keep ordinals fixed at 1/2/3 and never persist custom→function as learned dialect evidence. The last rung exists only within remaining physical-attempt authority. There is no Responses migration in this contract.
+- [ ] Preserve exact direct-Anthropic native assistant content only as private unfinished-turn custody: same-route replay must include the complete original block list/order and every opaque member; cross-route send, summarizer input, and public observability must scrub values. The active assistant/tool-result unit cannot compact until a later successful assistant response consumes it. Owner `none` is `thinking.type=disabled`; do not guess legacy manual-thinking budgets.
 - [ ] Every core-mediated physical provider send goes through `usage_accounting.execute_physical_attempt[_async]`: reserve, mark dispatched, then settle/unresolve. A transport retry is a new attempt. `llm_usage`, state, and UI counters are projections carrying attempt ids, never a second monetary authority. Provider tier pricing and any empirical tokenizer margin affect only a known reservation; settlement prefers actual provider usage/cost. Unknown price reserves `None`, remains nullable in usage events, and never blocks a model merely because its tariff is unavailable. An external skill with granted model-provider credentials is explicitly unknown/unmetered when it bypasses core transport—not `$0`; an ordinary spawned process must not be mislabeled as monetary work.
 - [ ] Hold the usage-ledger cross-process lock only for budget check, validated append, and fsync. Never hold it over network I/O. Preserve a paid response if settlement persistence fails and leave an honest dispatched/unresolved bound.
 - [ ] **Tree-spend visibility.** Under a root cap, pacing and stop text use root-subtree ledger spend including in-flight holds; own cost is diagnostic, and unavailable remains unknown rather than `$0`. Reuse `usage_accounting.last_root_accounting` and refresh only at rare cache-breaking/explicitly stale decision surfaces, never by an unconditional per-round ledger scan or inside a stable cached prefix. `task_pacing.resolve_cost_ceiling` returns `disabled|active|exhausted_soft_land|unknown` from the independent global-percentage and root-cap-minus-absolute-margin axes; graceful finalization precedes, but cannot bypass, the ledger fence. `resolve_deciding_spend` is the sole fallback seam and must label own-cost-under-root-cap as a lower bound.
@@ -1683,7 +1716,16 @@ Default local pytest excludes costly or environment-dependent lanes:
 
 - `integration` runs real provider checks, including Cloud.ru when
   `CLOUDRU_FOUNDATION_MODELS_API_KEY` is configured and GigaChat when
-  `GIGACHAT_CREDENTIALS` is configured.
+  `GIGACHAT_CREDENTIALS` is configured. Its trusted target-push/manual/tag
+  direct-OpenAI row derives unique shipped models from
+  `OPENAI_DIRECT_DEFAULTS`, uses only public `LLMClient.chat`, and requires
+  custom+`medium` plus a real registry-tool call. The shipped Main model also
+  consumes a nonce-bearing tool result in a second turn. Missing credentials
+  are red in the official repository job; explicit quota/429/5xx/timeout may
+  be typed inconclusive, while contract/auth/model/reasoning/tool 4xx stay red.
+  Secretless deterministic request-wire and Anthropic-custody contracts remain
+  in ordinary pull-request tests; do not move provider secrets into PR jobs or
+  edit the workflow merely to duplicate this existing trusted lane.
 - `browser` launches real Playwright Chromium/WebKit for agent browser tools.
 - `ui_browser` launches the host-side web UI under Playwright.
 - `ui_browser_docker` talks to an `ouroboros-web:test` container and must

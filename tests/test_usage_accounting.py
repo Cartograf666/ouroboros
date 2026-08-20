@@ -1112,30 +1112,36 @@ def test_actor_limit_blocks_third_retry_before_provider_send(data_root, monkeypa
     client = LLMClient(api_key="unused")
     sends = 0
 
+    class ParameterRejection(RuntimeError):
+        status_code = 400
+
+        def __init__(self, message):
+            super().__init__(message)
+            self.body = {"error": {"message": message}}
+
     def create(**kwargs):
         nonlocal sends
         sends += 1
-        raise RuntimeError(f"provider failure {sends}")
-
-    monkeypatch.setattr(
-        client,
-        "_retry_without_optional_sampling",
-        lambda kwargs, model, exc: {**kwargs, "temperature": None},
-    )
-    monkeypatch.setattr(
-        client,
-        "_openrouter_signature_retry_kwargs",
-        lambda target, kwargs, exc: {**kwargs, "messages": []},
-    )
+        message = (
+            "reasoning_effort value 'high' is not supported"
+            if sends == 1 else "temperature unsupported"
+        )
+        raise ParameterRejection(message)
     target = {
         "provider": "openai",
         "usage_model": "openai/gpt-5.2",
         "resolved_model": "gpt-5.2",
+        "base_url": "https://api.openai.example/v1",
     }
     with ua.physical_attempt_limit(2), pytest.raises(ua.PhysicalAttemptLimitExceeded):
         client._create_chat_completion_with_retries(
             create,
-            {"model": "gpt-5.2", "messages": [{"role": "user", "content": "x"}]},
+            {
+                "model": "gpt-5.2",
+                "messages": [{"role": "user", "content": "x"}],
+                "reasoning_effort": "high",
+                "temperature": 0.2,
+            },
             target,
         )
 
