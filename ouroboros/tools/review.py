@@ -11,7 +11,7 @@ from ouroboros.llm import LLMClient
 from ouroboros.utils import (
     run_cmd,
     append_jsonl,
-    estimate_tokens,
+    estimate_tokens,  # noqa: F401 — patchable seam: fit_triad_prompt resolves it through THIS namespace
     truncate_review_artifact,
     utc_now_iso,
 )
@@ -74,8 +74,11 @@ def _review_model_timeout_sec() -> float:
     return DEFAULT_REVIEW_MODEL_TIMEOUT_SEC
 
 
-from ouroboros.reviewer_window import reviewer_context_window, window_scaled_reserves
-from ouroboros.tools.review_synthesis import quorum_input_token_limit as _quorum_input_token_limit
+# The window/limit names below stay importable and MONKEYPATCHABLE on this
+# module: ``review_admission.fit_triad_prompt`` resolves them through this
+# namespace at call time (tests pin that seam).
+from ouroboros.reviewer_window import reviewer_context_window, window_scaled_reserves  # noqa: F401
+from ouroboros.tools.review_synthesis import quorum_input_token_limit as _quorum_input_token_limit  # noqa: F401
 from ouroboros.tools.review_helpers import (
     REPO_ROOT as _REPO_ROOT,
     load_checklist_section as _load_checklist_section_precise,
@@ -90,11 +93,11 @@ from ouroboros.tools.review_helpers import (
     REVIEW_PREAMBLE,
     build_self_verification_template,
     build_review_history_section as _build_review_history_section,
-    calibrated_input_token_limit,
+    calibrated_input_token_limit,  # noqa: F401 — patchable seam (see note above)
     emit_review_usage,
     format_name_status_for_preflight,
     format_review_history_entry as _format_review_entry,
-    REVIEW_PROMPT_TOKEN_BUDGET,
+    REVIEW_PROMPT_TOKEN_BUDGET,  # noqa: F401 — patchable seam (see note above)
     single_line as _single_line,
 )
 
@@ -1105,7 +1108,10 @@ def _collect_review_findings(ctx: ToolContext, model_results: list) -> tuple[lis
 
     ctx._last_review_critical_findings = structured_critical
     ctx._last_review_advisory_findings = structured_advisory
-    ctx._last_triad_raw_results = triad_raw_results
+    # Withheld seats (Q28-A oversize drop) keep their typed $0 records beside
+    # the dispatched panel's, so durable evidence names every configured seat.
+    ctx._last_triad_raw_results = triad_raw_results + list(
+        getattr(ctx, "_triad_withheld_seat_records", []) or [])
     if parsed.degraded_reasons:
         if not hasattr(ctx, "_review_degraded_reasons"):
             ctx._review_degraded_reasons = []
@@ -1167,130 +1173,44 @@ def _build_preflight_staged(target_repo: str, fallback: str = "") -> str:
         return fallback  # check 4 may not fire, but checks 1-3 still work
 
 
-def _fit_triad_prompt(api_models: list, assemble, current_files_section: str,
-                      diff_text: str, changed: str, target_repo) -> tuple:
-    """The api pack's guaranteed-fit ladder (P3 one-pass): drop only evidence
-    duplicated by the complete staged diff — full snapshots first, then unchanged
-    diff context. Each api slot's limit uses its REAL window from Capability
-    Evidence (a hardcoded 1M treated a 200K reviewer as 1M-capable and lost its
-    whole review to a deterministic prompt-too-long 400), with sub-1M windows
-    scaling their reserves so a small-window slot gets a fit-sized pack, not a
-    zero limit; the shared prompt is sized to the review QUORUM — the same SSOT
-    plan review uses — so one small slot degrades its OWN seat rather than
-    blocking the gate for the whole panel. Session rows are not constrained by
-    this pack at all (5.2/5.7): they retrieve with their own tools. Returns
-    ``(prompt, stable_prefix_len, block_message_or_empty)``."""
-    def _slot_input_limit(slot_model: str) -> int:
-        window = reviewer_context_window(slot_model)
-        output_reserve, tokenizer_margin = window_scaled_reserves(
-            window,
-            output_reserve=_review_output_budget(),
-            tokenizer_margin=50_000,
-        )
-        return max(0, calibrated_input_token_limit(
-            slot_model,
-            context_window=window,
-            output_reserve=output_reserve,
-            tokenizer_margin=tokenizer_margin,
-            budget_cap=REVIEW_PROMPT_TOKEN_BUDGET,
-        ))
-
-    input_limit = _quorum_input_token_limit(
-        api_models, {m: _slot_input_limit(m) for m in api_models})
-    prompt, stable_prefix_len = assemble(current_files_section, diff_text)
-    if input_limit and estimate_tokens(prompt) > input_limit:
-        touched_paths = [line.strip() for line in changed.splitlines() if line.strip()]
-        fit_note = (
-            "TRIAD FIT NOTE: Full post-change snapshots were omitted because they "
-            "duplicate the complete staged diff and would exceed the strictest "
-            "configured reviewer's input limit. Every touched path is listed below; "
-            "all added/deleted lines remain in the staged diff.\n\n"
-            + ("\n".join(f"- {path}" for path in touched_paths) or "(no paths reported)")
-        )
-        prompt, stable_prefix_len = assemble(fit_note, diff_text)
-        if input_limit and estimate_tokens(prompt) > input_limit:
-            from ouroboros.tools.review_binary_context import (
-                StagedDiffUnavailable, capture_staged_diff)
-            try:  # the SAME hardened capture as the primary diff, at zero context
-                compact_diff = capture_staged_diff(target_repo, unified=0)
-            except StagedDiffUnavailable:
-                compact_diff = ""  # keep the hardened full diff; the gate below blocks if it still overflows
-            if compact_diff.strip():
-                prompt, stable_prefix_len = assemble(fit_note, compact_diff)
-    prompt_tokens = estimate_tokens(prompt)
-    if not input_limit or prompt_tokens > input_limit:
-        return prompt, stable_prefix_len, (
-            "⚠️ REVIEW_BLOCKED: The irreducible one-pass triad prompt does not "
-            f"fit every configured reviewer ({prompt_tokens:,} estimated input "
-            f"tokens; limit {input_limit:,}). Split or shrink the staged change; "
-            "reviewer models and evidence authority were not degraded."
-        )
-    return prompt, stable_prefix_len, ""
+# The api pack's guaranteed-fit ladder lives with the rest of the pre-dispatch
+# assembly machinery; the module-level name stays importable and patchable here.
+from ouroboros.tools.review_admission import fit_triad_prompt as _fit_triad_prompt
 
 
-def _triad_session_task(ctx: ToolContext, *, goal_section: str, scope_section: str,
-                        checklist_section: str, rebuttal_section: str,
-                        review_history_section: str, dev_guide_text: str,
-                        architecture_text: str) -> str:
-    """The commit-triad task in SESSION delivery (5.2/5.3): the SAME preamble,
-    calibration, checklist and goal/scope/history the api pack carries — but no
-    assembled evidence. The subject is a pointer (the session takes the staged
-    diff itself) and the governance docs arrive as navigation maps (5.7)."""
-    from ouroboros.context_layout import generate_doc_nav_map
+def _triad_session_task(ctx: ToolContext, **sections) -> str:
+    """Compat shim over ``review_subject.build_triad_session_task`` (5.2/5.3):
+    same session task text; a managed subject inlines its authoritative delta."""
+    from ouroboros.tools.review_subject import build_triad_session_task
 
-    nav_maps = [
-        generate_doc_nav_map(text, title=title, rel_path=rel)
-        for title, rel, text in (
-            ("DEVELOPMENT.md", "docs/DEVELOPMENT.md", dev_guide_text),
-            ("ARCHITECTURE.md", "docs/ARCHITECTURE.md", architecture_text),
-        )
-        if str(text or "").strip()
-    ]
-    return "\n\n".join(part for part in [
-        REVIEW_PREAMBLE,
-        CRITICAL_FINDING_CALIBRATION,
-        REPO_ANTI_PATTERN_LOCK_GUARD,
-        checklist_section,
-        goal_section,
-        scope_section,
-        rebuttal_section,
-        review_history_section,
-        "## Subject (session delivery)\n"
-        "The review subject is the STAGED diff of the repository you are running "
-        "in. Retrieve it yourself with whatever your read-only tools allow: if you "
-        "can run commands, `git diff --cached` (and `git diff --cached --name-only` "
-        "for the file list); if your read-only mode withholds command execution — it "
-        "commonly does — read the touched files directly and compare them against "
-        "`.git`. Read the touched files as needed either way.",
-        "## Governance context (navigation maps)\n"
-        "Read BIBLE.md in full from the repository root. The maps below index "
-        "the other governance docs by line range; the paths are relative to the "
-        "repository root — read the sections you need with your own tools.",
-        *nav_maps,
-    ] if str(part or "").strip())
+    return build_triad_session_task(**sections)
 
 
 def _capture_triad_staged_diff(
     ctx: ToolContext, target_repo, blocking_review: bool
-) -> tuple[Optional[str], Optional[str]]:
-    """Capture the triad's staged-diff evidence, or route a capture failure.
+) -> tuple[Optional[str], Optional[Any], Optional[str]]:
+    """Capture the triad's review-diff evidence, or route a capture failure.
 
-    Returns ``(diff_text, None)`` on success and ``(None, block_result)`` on
-    failure — the fail-closed message in blocking mode, ``None`` (advisory skip)
-    otherwise. The diff is the triad's primary change evidence, so it is taken
-    byte-exact and hardened against operator diff config (the same
-    ``capture_staged_diff`` the scope reviewer uses); a genuine failure fails
+    Returns ``(diff_text, subject, None)`` on success — ``subject`` is the
+    managed resolution-delta artifact, ``None`` for an ordinary commit whose
+    evidence stays the byte-exact hardened staged diff — and
+    ``(None, None, block_result)`` on failure: the fail-closed message in
+    blocking mode, ``None`` (advisory skip) otherwise. A genuine failure fails
     closed rather than reviewing a placeholder that would yield authoritative
     findings about a diff nobody has.
     """
     from ouroboros.tools.review_binary_context import (
         StagedDiffUnavailable, capture_staged_diff)
+    from ouroboros.tools.review_subject import managed_review_subject
 
     try:
-        return capture_staged_diff(target_repo), None
+        subject = managed_review_subject(ctx, target_repo)
+        if subject is not None:
+            return subject.render_prompt_diff(), subject, None
+        return capture_staged_diff(target_repo), None, None
     except StagedDiffUnavailable as exc:
         ctx._last_review_block_reason = "infra_failure"
-        return None, _handle_review_block_or_warning(
+        return None, None, _handle_review_block_or_warning(
             ctx, blocking_review,
             "⚠️ REVIEW_BLOCKED: Cannot capture the staged diff — commit cannot "
             f"proceed.\nError: {exc}\n"
@@ -1300,32 +1220,43 @@ def _capture_triad_staged_diff(
         )
 
 
-def _run_unified_review(ctx: ToolContext, commit_message: str,
-                        review_rebuttal: str = "",
-                        repo_dir=None,
-                        goal: str = "",
-                        scope: str = "") -> Optional[str]:
-    """Run triad pre-commit review; return a block message or ``None``."""
+def _prepare_unified_review(ctx: ToolContext, commit_message: str,
+                            review_rebuttal: str = "",
+                            repo_dir=None,
+                            goal: str = "",
+                            scope: str = "") -> tuple:
+    """Assemble the triad packet WITHOUT dispatching any reviewer (Q25=A).
+
+    Returns ``(prepared, early_result, exited)``: ``exited=True`` means the
+    triad terminated during assembly and ``early_result`` (a block message, or
+    ``None`` for an advisory skip / empty diff) is its final answer — nothing
+    may be dispatched for it; otherwise ``prepared`` carries everything
+    ``_dispatch_unified_review`` needs."""
     target_repo = repo_dir or ctx.repo_dir
     ctx._review_iteration_count += 1
     ctx._last_review_block_reason = ""  # reset per attempt
     ctx._last_triad_models = []  # reset forensic field so stale values never persist on early exit
     ctx._last_review_critical_findings = []  # reset to avoid stale findings from previous attempts
     ctx._last_triad_raw_results = []  # reset per-model actor records
+    ctx._triad_withheld_seat_records = []  # reset Q28-dropped seat records
     ctx._review_degraded_reasons = []  # reset degraded participation markers
     review_enforcement = _cfg.get_review_enforcement()
     blocking_review = review_enforcement == "blocking"
 
-    diff_text, capture_block = _capture_triad_staged_diff(ctx, target_repo, blocking_review)
+    diff_text, subject, capture_block = _capture_triad_staged_diff(ctx, target_repo, blocking_review)
     if diff_text is None:  # capture failed: block (blocking) or advisory-skip (None)
-        return capture_block
+        return None, capture_block, True
     if not diff_text.strip():
-        return None
+        return None, None, True
 
     try:
         changed = run_cmd(["git", "diff", "--cached", "--name-only"], cwd=target_repo)
     except Exception:
         changed = ""
+    # Reviewers of a managed resolution read the RESOLUTION path set (delta ∪
+    # conflict anchors); the preflight staged list below stays on the FULL
+    # candidate (I2 — full-tree invariants are never narrowed).
+    review_changed = "\n".join(subject.touched_paths()) if subject is not None else changed
 
     preflight_staged = _build_preflight_staged(target_repo, fallback=changed)
 
@@ -1337,7 +1268,7 @@ def _run_unified_review(ctx: ToolContext, commit_message: str,
             "Review enforcement=Advisory: preflight warning did not block commit. ",
         )
         if result is not None:
-            return result
+            return None, result, True
 
     rebuttal_section = build_rebuttal_section(review_rebuttal)
 
@@ -1351,10 +1282,10 @@ def _run_unified_review(ctx: ToolContext, commit_message: str,
             f"Error: {e}\n"
             "Ensure docs/CHECKLISTS.md exists and contains the expected section headers."
         )
-        return _handle_review_block_or_warning(
+        return None, _handle_review_block_or_warning(
             ctx, blocking_review, blocked_msg,
             "Review enforcement=Advisory: review checklist failed to load; commit proceeding anyway. ",
-        )
+        ), True
 
     dev_guide_text = load_governance_doc(pathlib.Path(ctx.repo_dir), "docs/DEVELOPMENT.md", on_missing="explicit")
     architecture_text = load_governance_doc(pathlib.Path(ctx.repo_dir), "docs/ARCHITECTURE.md", on_missing="explicit")
@@ -1372,15 +1303,16 @@ def _run_unified_review(ctx: ToolContext, commit_message: str,
         ctx._review_history, open_obligations=_open_obs_for_review,
     )
 
-    # Build touched-file pack for full current context.
+    # Build touched-file pack for full current context (managed: the reviewed
+    # resolution set; binary rows carry the M0 baseline identity).
     try:
-        touched_paths = [f.strip() for f in changed.strip().splitlines() if f.strip()]
-        from ouroboros.tools.registry import _authorized_managed_update_resolver
-
+        touched_paths = [f.strip() for f in review_changed.strip().splitlines() if f.strip()]
         current_files_section, _omitted = build_touched_file_pack(
             pathlib.Path(target_repo),
             touched_paths,
-            represent_binary=_authorized_managed_update_resolver(ctx),
+            represent_binary=subject is not None,
+            m0_tree=getattr(subject, "m0_tree", "") or "",
+            staged_tree=getattr(subject, "staged_tree", "") or "",
         )
         if _omitted:
             current_files_section += (
@@ -1403,11 +1335,11 @@ def _run_unified_review(ctx: ToolContext, commit_message: str,
         row_plan = commit_triad_delivery()
     except ValueError as exc:
         ctx._last_review_block_reason = "infra_failure"
-        return _handle_review_block_or_warning(
+        return None, _handle_review_block_or_warning(
             ctx, blocking_review,
             f"⚠️ REVIEW_BLOCKED: invalid reviewer-slot configuration — {exc}",
             "Review enforcement=Advisory: invalid reviewer-slot configuration did not block commit. ",
-        )
+        ), True
     models, row_routes = row_plan["models"], row_plan["routes"]
     ctx._last_triad_models = list(models)  # forensic: actual resolved model IDs
     api_models = [m for m, r in zip(models, row_routes) if r is ReviewRouteKind.API_CHAT]
@@ -1434,7 +1366,7 @@ def _run_unified_review(ctx: ToolContext, commit_message: str,
             rebuttal_section=rebuttal_section,
             review_history_section=review_history_section,
             diff_text=staged_diff,
-            changed_files=changed,
+            changed_files=review_changed,
         )
         return stable + "\n" + dynamic, len(stable) + 1
 
@@ -1446,11 +1378,46 @@ def _run_unified_review(ctx: ToolContext, commit_message: str,
     if api_models:
         prompt, stable_prefix_len, fit_error = _fit_triad_prompt(
             api_models, _assemble_prompt, current_files_section, diff_text,
-            changed, target_repo,
+            review_changed, target_repo, ctx=ctx, subject=subject,
         )
         if fit_error:
-            ctx._last_review_block_reason = "fixed_overflow"
-            return fit_error
+            session_count = len(models) - len(api_models)
+            if session_count >= _cfg.adaptive_quorum(len(models)):
+                # Q28-A: packet limits gate only the api subset. Enough
+                # agent-session rows remain for the quorum, so the api rows are
+                # DROPPED (recorded loudly, never silent) and the panel proceeds
+                # on session delivery alone.
+                from ouroboros.tools.review_admission import (
+                    drop_api_rows,
+                    triad_not_dispatched_records,
+                )
+                # Seat identity survives the drop: each yielded api seat leaves
+                # a typed $0 not_dispatched actor record, merged into the
+                # durable raw results after the dispatched panel reports.
+                ctx._triad_withheld_seat_records = triad_not_dispatched_records(
+                    row_plan,
+                    "Q28-A oversize drop: this api seat could not receive the "
+                    "irreducible packet; the panel's agent-session rows "
+                    "satisfied the quorum without it ($0 spent).", only_api=True)
+                row_plan = drop_api_rows(row_plan)
+                models, row_routes = row_plan["models"], row_plan["routes"]
+                ctx._last_triad_models = list(models)
+                note = (
+                    f"triad_api_rows_dropped_oversize_pack: {len(api_models)} api row(s) "
+                    f"({', '.join(api_models)}) could not receive the irreducible packet; "
+                    f"{session_count} agent-session row(s) satisfy the quorum and proceed"
+                )
+                ctx._review_degraded_reasons.append(note)
+                log.warning("%s", note)
+                api_models, prompt, stable_prefix_len = [], "", 0
+            else:
+                # Typed ZERO-SPEND terminal (Q28-A): quorum is unreachable
+                # without the api rows, so nothing is dispatched at all. The
+                # managed wording (split impossible + settings guidance) is
+                # already IN the fit terminal — fit_triad_prompt replaces the
+                # split clause for a managed subject, never appends below it.
+                ctx._last_review_block_reason = "fixed_overflow"
+                return None, fit_error, True
 
     session_task = ""
     if len(api_models) < len(models):
@@ -1463,19 +1430,31 @@ def _run_unified_review(ctx: ToolContext, commit_message: str,
             review_history_section=review_history_section,
             dev_guide_text=dev_guide_text,
             architecture_text=architecture_text,
+            subject=subject,
         )
 
+    return {
+        "prompt": prompt, "stable_prefix_len": stable_prefix_len,
+        "models": models, "routes": row_routes, "row_plan": row_plan,
+        "session_task": session_task, "target_repo": target_repo,
+        "blocking_review": blocking_review,
+    }, None, False
+
+
+def _dispatch_unified_review(ctx: ToolContext, commit_message: str, prepared: dict) -> Optional[str]:
+    """Dispatch an assembled triad packet and post-process the panel verdict."""
+    blocking_review = prepared["blocking_review"]
     try:
         result_json = _handle_multi_model_review(
             ctx,
             content="Review the staged diff and context provided in the instructions above.",
-            prompt=prompt,
-            models=models,
-            stable_prefix_len=stable_prefix_len,
-            routes=row_routes,
-            session_task=session_task,
-            session_root=str(target_repo),
-            row_plan=row_plan,
+            prompt=prepared["prompt"],
+            models=prepared["models"],
+            stable_prefix_len=prepared["stable_prefix_len"],
+            routes=prepared["routes"],
+            session_task=prepared["session_task"],
+            session_root=str(prepared["target_repo"]),
+            row_plan=prepared["row_plan"],
         )
         result = json.loads(result_json)
     except Exception as e:
@@ -1524,10 +1503,11 @@ def _run_unified_review(ctx: ToolContext, commit_message: str,
     # Quorum counts only parseable responded actors, not errors/parse failures.
     triad_raw = getattr(ctx, "_last_triad_raw_results", []) or []
     successful_reviewers = sum(1 for r in triad_raw if r.get("status") == "responded")
-    # Non-successful actors are shown for transport/parse diagnostics.
+    # Non-successful actors are shown for transport/parse diagnostics; a
+    # not_dispatched seat (Q28-A drop) never ran, so it is not a FAILED actor.
     failed_actors = [
-        r["model_id"] for r in triad_raw if r.get("status") != "responded"
-    ]
+        r["model_id"] for r in triad_raw
+        if r.get("status") not in ("responded", "not_dispatched")]
     required_quorum = _cfg.adaptive_quorum(models_total)
     if successful_reviewers < required_quorum:
         ctx._last_review_block_reason = "review_quorum"
@@ -1598,3 +1578,22 @@ def _run_unified_review(ctx: ToolContext, commit_message: str,
         if errored_note:
             ctx._review_advisory.append(errored_note.strip())
     return None
+
+
+def _run_unified_review(ctx: ToolContext, commit_message: str,
+                        review_rebuttal: str = "",
+                        repo_dir=None,
+                        goal: str = "",
+                        scope: str = "") -> Optional[str]:
+    """Run triad pre-commit review; return a block message or ``None``.
+
+    Assembly and dispatch are two phases (Q25=A): callers that need admission
+    (``run_parallel_review``) prepare BOTH gate packets before dispatching
+    either; this wrapper keeps the single-call contract for everyone else."""
+    prepared, early_result, exited = _prepare_unified_review(
+        ctx, commit_message, review_rebuttal=review_rebuttal,
+        repo_dir=repo_dir, goal=goal, scope=scope,
+    )
+    if exited:
+        return early_result
+    return _dispatch_unified_review(ctx, commit_message, prepared)

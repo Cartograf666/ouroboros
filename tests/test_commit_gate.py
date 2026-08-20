@@ -600,9 +600,11 @@ def test_advisory_gate_in_repo_commit_push():
     assert gate_pos < review_pos, "Advisory gate must precede parallel review"
     gate_source = inspect.getsource(git_mod._advisory_and_tests_gate)
     assert "_check_advisory_freshness" in gate_source
-    # Verify _run_parallel_review contains _run_unified_review
+    # Verify _run_parallel_review contains the triad phases (Q25-A: assembly
+    # before dispatch superseded the single _run_unified_review call).
     parallel_source = inspect.getsource(git_mod._run_parallel_review)
-    assert "_run_unified_review" in parallel_source
+    assert "_prepare_unified_review" in parallel_source
+    assert "_dispatch_unified_review" in parallel_source
 
 
 def test_advisory_freshness_blocks_without_fresh_run(tmp_path):

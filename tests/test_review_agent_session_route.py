@@ -1855,7 +1855,10 @@ def test_scope_quorum_refuses_a_session_advisory_row_as_authoritative(tmp_path, 
                         effort="", session_target="", session_profile=""),
     ])
     monkeypatch.setattr(parallel_review, "run_cmd", lambda *_a, **_k: "staged diff")
-    monkeypatch.setattr(review, "_run_unified_review", lambda *_a, **_k: None)
+    monkeypatch.setattr(review, "_prepare_unified_review", lambda *_a, **_k: (None, None, True))
+    from ouroboros.tools import review_admission
+    monkeypatch.setattr(review_admission, "prepare_scope_review",
+                        lambda *_a, **_k: ({"packet": 1}, None))
 
     ctx = SimpleNamespace(
         repo_dir=tmp_path, drive_root=tmp_path, task_id="scope-quorum",
@@ -1999,7 +2002,7 @@ def _all_session_scope_panel(tmp_path, monkeypatch, *, window, provenance):
                    route=ReviewRouteKind.AGENT_SESSION, session_target="claude=fable-5"),
     ])
     monkeypatch.setattr(parallel_review, "run_cmd", lambda *_a, **_k: "staged diff")
-    monkeypatch.setattr(review, "_run_unified_review", lambda *_a, **_k: None)
+    monkeypatch.setattr(review, "_prepare_unified_review", lambda *_a, **_k: (None, None, True))
 
     ctx = _scope_ctx(tmp_path)
     ctx._review_history = []

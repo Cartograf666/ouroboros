@@ -561,7 +561,13 @@ and the typed `review_cycles_exhausted` event fires (every dispatched wave
 counts; undispatched refusals and replays do not) — finalize honestly or ask
 the owner to raise the cap. In both states, under blocking enforcement the
 commit is refused for free; under advisory the commit proceeds with a loud
-durable disclosure and no new review spend.
+durable disclosure and no new review spend. For a managed-update resolution
+commit, when the pinned M0 baseline is available the review packet inlines the
+authoritative resolution-delta artifact (final candidate vs the pinned
+mechanical merge M0); reviewers judge that inlined artifact and must not
+substitute their own `git diff --cached`. When M0 is unavailable the packet
+discloses the fallback loudly and session reviewers retrieve the full staged
+candidate diff themselves.
 
 ## Git Attribution
 

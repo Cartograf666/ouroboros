@@ -34,6 +34,7 @@ from ouroboros.review_state import (
     update_state,
     _utc_now,
 )
+from ouroboros.config import get_review_enforcement as _get_review_enforcement
 from ouroboros.tools.review_helpers import (
     build_advisory_changed_context,
     build_skill_host_context,
@@ -69,6 +70,12 @@ from ouroboros.review_evidence import build_review_projection, build_review_stat
 log = logging.getLogger(__name__)
 
 _MAX_DIFF_CHARS_ERROR = 500_000  # Fail loudly above this — split the commit
+# Stable markers of the MANAGED oversize skips: both managed skip messages
+# (the 500k delta gate and the prompt-size gate) carry _MANAGED_SKIP_NOTE, and
+# _next_step_guidance matches it so the skipped branch never advises the
+# impossible "split the commit" for a managed merge.
+_MANAGED_SKIP_MARKER = "managed resolution review diff too large"
+_MANAGED_SKIP_NOTE = "cannot be split into smaller commits"
 
 
 ADVISORY_REVIEW_CHOICE_GUIDANCE = (
@@ -77,9 +84,10 @@ ADVISORY_REVIEW_CHOICE_GUIDANCE = (
     "low-value, the LLM may deliberately choose skip_advisory_review=True; the "
     "choice is durably audited. This skip bypasses only the requirements for "
     "advisory freshness, advisory obligations, and advisory debt; unresolved "
-    "obligation and debt records remain visible, while tests, triad review, "
-    "applicable scope review, snapshot/fingerprint revalidation, and final "
-    "commit/tag/SHA binding still apply."
+    "obligation and debt records remain visible, while tests, triad review and "
+    "applicable scope review still run (blocking where enforcement makes them "
+    "binding), and snapshot/fingerprint revalidation and final commit/tag/SHA "
+    "binding still apply."
 )
 
 
@@ -291,7 +299,12 @@ def _build_advisory_prompt(
     drive_root: Optional[pathlib.Path] = None,
     prompt_context: Optional[dict] = None,
 ) -> str:
-    """Build the read-only advisory prompt."""
+    """Build the read-only advisory prompt.
+
+    Managed-resolution routing does NOT live here: ``_advisory_review_diff``
+    (the only production diff source) resolves the subject before this builder
+    runs and passes the finished diff in ``prompt_context``. The ``diff is
+    None`` branch below exists for direct callers (tests) only."""
     prompt_context = dict(prompt_context or {})
     diff: Optional[str] = prompt_context.get("diff")
     changed_files: Optional[str] = prompt_context.get("changed_files")
@@ -847,6 +860,79 @@ def _advisory_sdk_budget(ctx: ToolContext, active_scope, drive_root, repo_dir) -
     return min(caps) if caps else None
 
 
+def _advisory_review_diff(
+    repo_dir: pathlib.Path, ctx: ToolContext, paths: Optional[List[str]]
+) -> tuple:
+    """The advisory review diff and its context path scope, managed-aware (Δ4).
+
+    Returns ``(diff_text, context_paths, early, managed)``. Non-managed callers
+    get the byte-identical staged+unstaged capture with their own ``paths``
+    scope. The authorized managed resolver gets the disclosed resolution-delta
+    artifact (surface="advisory": the worktree candidate — advisory reviews
+    work-in-progress by contract) scoped to delta ∪ conflict anchors — and its
+    oversize outcome is an honest AUDITED non-blocking skip
+    (``early=("skipped", message, chars)``), never the split-the-commit hard
+    error: a managed merge stages the whole two-parent tree by contract and
+    CANNOT be split into smaller commits. A failed managed capture is
+    ``early=("error", message, 0)`` — no placeholder review."""
+    from ouroboros.tools.review_subject import managed_review_subject
+
+    try:
+        subject = managed_review_subject(ctx, repo_dir, surface="advisory")
+    except Exception as exc:  # incl. StagedDiffUnavailable
+        return "", None, (
+            "error", f"⚠️ ADVISORY_ERROR: managed resolution delta unavailable: {exc}", 0
+        ), False
+    try:
+        # Thread the disclosed counters out of THIS subject: the pre-review
+        # handler's snapshot summary reads them instead of recomputing a second
+        # subject (a full delta recomputation and a display-only TOCTOU).
+        ctx._last_advisory_subject_counters = (
+            subject.counters_line() if subject is not None else ""
+        )
+    except Exception:
+        pass
+    if subject is not None and len(subject.diff) > _MAX_DIFF_CHARS_ERROR:
+        # Honest downstream expectation: triad + scope always run, but they
+        # gate the commit only under blocking enforcement.
+        if _get_review_enforcement() == "blocking":
+            gate_note = "Triad and scope review still gate the commit."
+        else:
+            gate_note = (
+                "Triad and scope review still run; enforcement is advisory, so "
+                "their findings are recorded rather than blocking."
+            )
+        warning = (
+            f"⚠️ ADVISORY_SKIPPED: {_MANAGED_SKIP_MARKER} "
+            f"({len(subject.diff):,} chars > {_MAX_DIFF_CHARS_ERROR:,}). "
+            "Advisory review skipped — non-blocking and audited; a managed "
+            f"update merge {_MANAGED_SKIP_NOTE}. {gate_note}"
+        )
+        return "", None, ("skipped", warning, len(subject.diff)), True
+    if subject is not None:
+        return subject.render_prompt_diff(), subject.touched_paths(), None, True
+    return _get_staged_diff(repo_dir, paths=paths), paths, None, False
+
+
+def _prompt_oversize_skip_warning(prompt_chars: int, managed: bool) -> str:
+    """The 1.6M prompt gate's non-blocking skip text. ``managed=True`` (the
+    diff under review is a managed resolution delta) drops the split advice —
+    a managed merge stages the whole two-parent tree by contract — and states
+    what is actually possible instead."""
+    tokens_approx = max(1, prompt_chars // 4)
+    remedy = (
+        f"A managed update merge {_MANAGED_SKIP_NOTE}; the "
+        "skip is audited and non-blocking."
+        if managed else "Consider splitting the commit."
+    )
+    return (
+        f"⚠️ ADVISORY_SKIPPED: advisory prompt too large "
+        f"({prompt_chars:,} chars, ~{tokens_approx:,} tokens > "
+        f"{_ADVISORY_PROMPT_MAX_CHARS:,} char limit). "
+        f"Advisory review skipped — non-blocking. {remedy}"
+    )
+
+
 def _note_meta_error(ctx: ToolContext, meta: dict, err_msg: str) -> None:
     """Record an advisory failure on the ctx meta snapshot (best-effort)."""
     try:
@@ -901,16 +987,21 @@ def _run_claude_advisory(
 
     try:
         if include_repo_diff:
-            diff_text = _get_staged_diff(repo_dir, paths=paths)
+            diff_text, context_paths, early, managed_subject_diff = _advisory_review_diff(
+                repo_dir, ctx, paths
+            )
+            if early is not None:
+                kind, message, early_chars = early
+                return [], message, model if kind == "skipped" else "", early_chars
             if diff_text.startswith("⚠️ ADVISORY_ERROR:"):
                 return [], diff_text, "", 0
-            changed_files_text = _get_changed_file_list(repo_dir, paths=paths)
+            changed_files_text = _get_changed_file_list(repo_dir, paths=context_paths)
             if changed_files_text.startswith("⚠️ ADVISORY_ERROR:"):
                 return [], changed_files_text, "", 0
             resolved_paths, touched_pack, omitted_paths = build_advisory_changed_context(
                 repo_dir,
                 changed_files_text=changed_files_text,
-                paths=paths,
+                paths=context_paths,
                 exclude_paths={"docs/ARCHITECTURE.md"},
             )
             preflight_err = _syntax_preflight_staged_py_files(repo_dir, resolved_paths)
@@ -921,6 +1012,7 @@ def _run_claude_advisory(
             diff_text = "(not included; this advisory review is scoped to the supplied payload pack)"
             changed_files_text = "(not included; this advisory review is scoped to the supplied payload pack)"
             resolved_paths, touched_pack, omitted_paths = [], "", []
+            managed_subject_diff = False
 
         prompt = _build_advisory_prompt(
             repo_dir,
@@ -947,15 +1039,8 @@ def _run_claude_advisory(
     diag = _get_runtime_diagnostics(model, prompt_chars, resolved_paths)
 
     if prompt_chars > _ADVISORY_PROMPT_MAX_CHARS:
-        tokens_approx = max(1, prompt_chars // 4)
-        warning = (
-            f"⚠️ ADVISORY_SKIPPED: advisory prompt too large "
-            f"({prompt_chars:,} chars, ~{tokens_approx:,} tokens > "
-            f"{_ADVISORY_PROMPT_MAX_CHARS:,} char limit). "
-            f"Advisory review skipped — non-blocking. Consider splitting the commit."
-        )
         log.warning("Advisory skipped — prompt too large: %d chars", prompt_chars)
-        return [], warning, model, prompt_chars
+        return [], _prompt_oversize_skip_warning(prompt_chars, managed_subject_diff), model, prompt_chars
 
     log.info(
         "Advisory SDK call: model=%s prompt_chars=%d touched=%s sdk=%s cli=%s",
@@ -1416,8 +1501,15 @@ def _resolve_matching_obligations(
 
 def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryReviewState",
                         stale_from_edit: bool, stale_from_edit_ts: Optional[str],
-                        open_obs: list, open_debts: list, effective_is_fresh: bool = False) -> str:
+                        open_obs: list, open_debts: list, effective_is_fresh: bool = False,
+                        enforcement: str = "blocking") -> str:
     """Return a concrete next-step string based on current advisory state.
+
+    ``enforcement`` keeps the guidance HONEST (O1): under blocking the
+    historical wording stands; under advisory the findings are recorded
+    durably, the agent decides which to apply, and ``commit_reviewed`` is
+    available — the text must never assert a block that will not happen or a
+    fix-all-criticals dichotomy that does not exist.
 
     Snapshot binding of record-derived claims (the v6.74.5 "SyntaxError" stale
     template that cost a release ~25 min) is enforced UPSTREAM by the
@@ -1475,11 +1567,25 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
 
     # Advisory is effectively fresh — check obligations and findings
     if open_obs or open_debts:
+        if enforcement == "blocking":
+            return _with_choices(
+                f"Advisory is current but unresolved review debt remains. {_debt_hint()}commit_reviewed will be blocked until that debt is cleared. Re-read the full diff, group obligations by root cause, and rewrite the plan. Fix the issues, re-run advisory_review so it marks them PASS, or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
+            )
         return _with_choices(
-            f"Advisory is current but unresolved review debt remains. {_debt_hint()}commit_reviewed will be blocked until that debt is cleared. Re-read the full diff, group obligations by root cause, and rewrite the plan. Fix the issues, re-run advisory_review so it marks them PASS, or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
+            f"Advisory is current and unresolved review debt remains recorded durably. {_debt_hint()}Enforcement is advisory: you decide which findings to apply — commit_reviewed is available. Re-read the full diff, group obligations by root cause, and rewrite the plan; re-run advisory_review so addressed items are marked PASS."
         )
 
     if latest and latest.status == "skipped":
+        if _MANAGED_SKIP_NOTE in str(getattr(latest, "raw_result", "") or ""):
+            # Managed resolution skip: split advice is structurally impossible
+            # (the merge stages the whole two-parent tree by contract).
+            return (
+                "Advisory was skipped — the managed resolution exceeded the "
+                "advisory size gate. commit_reviewed may proceed. A managed "
+                f"update merge {_MANAGED_SKIP_NOTE}; switch the advisory row "
+                "to an agent route or a larger-window model if advisory "
+                "coverage is wanted."
+            )
         return "Advisory was skipped — prompt exceeded the budget gate (prompt too large for advisory). commit_reviewed may proceed. Consider splitting the commit into smaller chunks so advisory can run on the next change."
 
     if latest and latest.status == "bypassed":
@@ -1491,8 +1597,18 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
         and str(i.get("severity", "")).lower() == "critical"
     ]
     if fresh_critical:
+        if enforcement == "blocking":
+            # Honest blocking-branch wording (no false dichotomy): a FRESH
+            # advisory with critical findings already satisfies the commit
+            # gate's advisory-freshness requirement, and zero advisory FAILs is
+            # not a hard gate — the blocking triad and scope reviews are what
+            # can still block. The audited skip bypasses only the advisory
+            # freshness/debt checks, never these findings.
+            return _with_choices(
+                f"Advisory found {len(fresh_critical)} critical issue(s). This fresh advisory already satisfies the commit gate's advisory-freshness requirement; the findings are recorded durably as review debt the commit gate acknowledges, and commit_reviewed is available — the blocking triad and scope reviews are the gate that can still block. Fix the critical findings and re-run advisory_review so they are marked PASS; skip_advisory_review=True (audited) bypasses only the freshness/debt checks, not these findings."
+            )
         return _with_choices(
-            f"Advisory found {len(fresh_critical)} critical issue(s). Fix ALL critical findings, then re-run advisory_review, or deliberately choose the audited advisory skip."
+            f"Advisory found {len(fresh_critical)} critical issue(s). Findings are recorded durably; enforcement is advisory — you decide which to apply, and commit_reviewed is available. Re-run advisory_review after fixes, or deliberately choose the audited advisory skip."
         )
     return "Advisory is fresh with no critical findings. Proceed with: commit_reviewed(commit_message='...'). ⚠️ Do NOT make any further edits — any edit will make advisory stale."
 
@@ -1757,6 +1873,24 @@ def _handle_advisory_pre_review(
     if early_exit is not None:
         return early_exit
 
+    # Managed resolutions display the DISCLOSED dual counters instead of one
+    # whole-candidate file count (display only — snapshot hashing above stays
+    # on the full path set, I2). The counters ride out of the ONE subject
+    # _advisory_review_diff builds inside the run below — never a second
+    # subject recomputed here (full delta recomputation + display TOCTOU).
+    try:
+        ctx._last_advisory_subject_counters = ""  # reset: never a stale carry-over
+    except Exception:
+        pass
+
+    def _snapshot_summary() -> str:
+        # counters_line is fallback-aware: with M0 missing it reports the
+        # resolution count as n/a instead of masquerading the full list.
+        counters = str(getattr(ctx, "_last_advisory_subject_counters", "") or "")
+        if counters:
+            return counters
+        return f"{changed_files.count(chr(10)) + 1} file(s) changed"
+
     import time as _time
     _advisory_start = _time.monotonic()
     items, raw_result, model_used, prompt_chars = _run_claude_advisory(
@@ -1828,7 +1962,7 @@ def _handle_advisory_pre_review(
 
     # Prompt too large: persist non-blocking skipped run as fresh for this snapshot.
     if raw_result.startswith("⚠️ ADVISORY_SKIPPED:"):
-        snapshot_summary = f"{changed_files.count(chr(10)) + 1} file(s) changed"
+        snapshot_summary = _snapshot_summary()
         def _mutate_skip(skip_state: AdvisoryReviewState) -> None:
             skip_state.add_run(_advisory_run_record(
                 snapshot_hash, commit_message, "skipped",
@@ -1856,7 +1990,7 @@ def _handle_advisory_pre_review(
                       and str(i.get("verdict", "")).upper() == "FAIL"
                       and str(i.get("severity", "")).lower() != "critical"]
 
-    snapshot_summary = f"{changed_files.count(chr(10)) + 1} file(s) changed"
+    snapshot_summary = _snapshot_summary()
 
     # An empty array counts as a real "no findings" verdict only when the model
     # emitted the NO_FINDINGS sentinel the prompt asks for (REVIEW_JSON_ARRAY_CONTRACT),
@@ -1921,7 +2055,12 @@ def _handle_advisory_pre_review(
             if verified_clean else
             f"Advisory review complete. {len(critical_fails)} critical, "
             f"{len(advisory_fails)} advisory findings. "
-            "Fix issues and run commit_reviewed when ready."
+            + (
+                "Fix issues and run commit_reviewed when ready."
+                if _get_review_enforcement() == "blocking" else
+                "Findings are recorded durably; enforcement is advisory — you "
+                "decide which to apply. commit_reviewed is available when ready."
+            )
         ),
     }
     if findings_summary:
@@ -1956,6 +2095,7 @@ def _handle_review_status(
         projection["open_obligations"],
         projection["open_debts"],
         effective_is_fresh=projection["effective_is_fresh"],
+        enforcement=_get_review_enforcement(),
     )
     return json.dumps(
         build_review_status_payload(projection, next_step=next_step, include_raw=include_raw),

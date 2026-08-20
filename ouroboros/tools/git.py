@@ -667,6 +667,57 @@ def _managed_candidate_needs_proof(ctx: ToolContext) -> bool:
         return True
 
 
+def _subject_binding_mismatch_outcome(
+    ctx: ToolContext,
+    commit_message: str,
+    commit_start: float,
+    pre_fingerprint: Dict[str, Any],
+    post_fingerprint: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Defense-in-depth for the managed review subject: every gate subject
+    built during this attempt recorded its S tree (review_subject,
+    surface="gate"). Assert the reviewed subject is EXACTLY the tree the
+    binding fingerprints — i.e. the tree this commit writes. Empty set =
+    non-managed attempt (or a managed one that never built a subject): nothing
+    to assert, returns None. A mismatch returns the typed blocked outcome."""
+    subject_trees = {
+        str(t) for t in (getattr(ctx, "_last_review_subject_trees", None) or ())
+        if str(t or "").strip()
+    }
+    if not subject_trees:
+        return None
+    binding_tree = str((pre_fingerprint.get("binding") or {}).get("tree_sha") or "")
+    if subject_trees == {binding_tree}:
+        return None
+    mismatch_msg = (
+        "⚠️ REVIEW_BLOCKED: the managed review subject is not bound to "
+        "the staged candidate — reviewed subject tree(s) "
+        f"{', '.join(sorted(subject_trees))} do not equal the "
+        f"review-binding index tree {binding_tree or '(unavailable)'}. "
+        "The reviewers judged material that is not the tree this commit "
+        "would write; nothing was committed. Re-stage the intended "
+        "candidate and retry."
+    )
+    _record_commit_attempt(
+        ctx,
+        commit_message,
+        "blocked",
+        block_reason="review_subject_binding_mismatch",
+        block_details=mismatch_msg,
+        duration_sec=time.time() - commit_start,
+        phase="revalidation",
+        pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
+        fingerprint_status="invalid",
+    )
+    return {
+        "status": "blocked",
+        "message": mismatch_msg,
+        "block_reason": "review_subject_binding_mismatch",
+        "pre_fingerprint": pre_fingerprint,
+        "post_fingerprint": post_fingerprint,
+    }
+
+
 def _advisory_and_tests_gate(
     ctx: ToolContext,
     commit_message: str,
@@ -1014,6 +1065,11 @@ def _run_reviewed_stage_cycle(
             "pre_fingerprint": pre_fingerprint,
             "post_fingerprint": post_fingerprint,
         }
+    _subject_mismatch = _subject_binding_mismatch_outcome(
+        ctx, commit_message, commit_start, pre_fingerprint, post_fingerprint
+    )
+    if _subject_mismatch is not None:
+        return _subject_mismatch
     if blocked:
         # Typed block-row classification (Q16/Δ5): a reviewer VERDICT builds
         # the identical-diff refusal streak; an INFRA fact (fit/quorum/

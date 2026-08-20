@@ -116,21 +116,43 @@ def _object_size(repo_dir: pathlib.Path, blob_oid: str) -> str:
     return value.decode("ascii") if value.isdigit() else ""
 
 
-def staged_path_is_binary(repo_dir: pathlib.Path, rel: str) -> bool:
-    """Detect staged binary content from Git numstat, independent of filename."""
+def staged_path_is_binary(
+    repo_dir: pathlib.Path, rel: str, *, m0_tree: str = "", staged_tree: str = ""
+) -> bool:
+    """Detect staged binary content from Git numstat, independent of filename.
+
+    For a managed resolution (both baseline trees given) the detection ALSO
+    consults the M0 -> S numstat: the reviewed delta is what the managed packet
+    renders, and a path binary IN THAT DELTA must be represented as metadata
+    even when the stage-vs-HEAD numstat alone would not call it binary."""
     expected_path = os.fsencode(rel)
-    raw = _git_bytes(
-        repo_dir, ["diff", "--cached", "--numstat", "-z", "--", rel]
-    )
-    for record in raw.split(b"\0"):
-        fields = record.split(b"\t", 2)
-        if len(fields) == 3 and fields[2] == expected_path:
-            return fields[0] == b"-" and fields[1] == b"-"
+    probes = [["diff", "--cached", "--numstat", "-z", "--", rel]]
+    if m0_tree and staged_tree:
+        probes.append(["diff", "--numstat", "-z", m0_tree, staged_tree, "--", rel])
+    for probe in probes:
+        for record in _git_bytes(repo_dir, probe).split(b"\0"):
+            fields = record.split(b"\t", 2)
+            if len(fields) == 3 and fields[2] == expected_path:
+                if fields[0] == b"-" and fields[1] == b"-":
+                    return True
     return False
 
 
-def render_staged_binary_metadata(repo_dir: pathlib.Path, rel: str) -> str | None:
-    """Render stage-0 identity, or fail closed when the index object is unbound."""
+def render_staged_binary_metadata(
+    repo_dir: pathlib.Path, rel: str, *, m0_tree: str = ""
+) -> str | None:
+    """Render stage-0 identity, or fail closed when the index object is unbound.
+
+    ``m0_tree`` (managed resolutions only) adds the mechanical-merge baseline
+    identity: managed rows compare M0 vs the final candidate, and both real
+    merge parents (pre-update HEAD, official MERGE_HEAD) are already rendered."""
+
+    def _m0_row() -> str:
+        if not m0_tree:
+            return ""
+        mode, blob, ok = _tree_entry(repo_dir, m0_tree, rel)
+        identity = f"{mode} {blob}" if blob else ("unreadable" if not ok else "absent")
+        return f"- mechanical merge M0 blob: `{identity}`\n"
     raw = _git_bytes(repo_dir, ["ls-files", "--stage", "-z", "--", rel])
     expected_path = os.fsencode(rel)
     for record in raw.split(b"\0"):
@@ -152,19 +174,31 @@ def render_staged_binary_metadata(repo_dir: pathlib.Path, rel: str) -> str | Non
                 f"- staged blob: `{blob_oid}`\n"
                 f"- staged mode: `{mode}`\n"
                 f"- staged object size: `{object_size}` bytes\n"
-                f"- pre-merge HEAD blob: `{head_blob or 'absent'}`\n"
+                + _m0_row()
+                + f"- pre-merge HEAD blob: `{head_blob or 'absent'}`\n"
                 f"- official MERGE_HEAD blob: `{merge_blob or 'absent'}`\n"
             )
     deleted = _git_bytes(
         repo_dir, ["diff", "--cached", "--name-only", "--diff-filter=D", "-z", "--", rel]
     ).split(b"\0")
+    m0_blob = ""
     if expected_path not in deleted:
-        return None
+        # Managed resolutions delete against M0, not only against HEAD: a path
+        # the official target ADDED (absent from HEAD, so absent from the
+        # HEAD→index deletion set above) that the resolver deletes exists in M0
+        # but has no stage-0 entry — that IS the reviewed M0→S deletion, and it
+        # must be represented, never silently dropped. Any remaining index
+        # entry (an unmerged stage-1..3 path) is NOT a deletion and stays out.
+        if not m0_tree or raw.strip():
+            return None
+        _m0_mode, m0_blob, m0_ok = _tree_entry(repo_dir, m0_tree, rel)
+        if not m0_ok or not m0_blob:
+            return None
     head_mode, head_blob, head_ok = _tree_entry(repo_dir, "HEAD", rel)
     merge_mode, merge_blob, merge_ok = _tree_entry(repo_dir, "MERGE_HEAD", rel)
     if not head_ok or not merge_ok:
         return None
-    parent_blob = head_blob or merge_blob
+    parent_blob = head_blob or merge_blob or m0_blob
     object_size = _object_size(repo_dir, parent_blob) if parent_blob else ""
     if not parent_blob or not object_size:
         return None
@@ -174,6 +208,7 @@ def render_staged_binary_metadata(repo_dir: pathlib.Path, rel: str) -> str | Non
         "- staged blob: `absent (deletion)`\n"
         "- staged mode: `absent`\n"
         f"- deleted object size: `{object_size}` bytes\n"
-        f"- pre-merge HEAD: `{head_mode or 'absent'} {head_blob or 'absent'}`\n"
+        + _m0_row()
+        + f"- pre-merge HEAD: `{head_mode or 'absent'} {head_blob or 'absent'}`\n"
         f"- official MERGE_HEAD: `{merge_mode or 'absent'} {merge_blob or 'absent'}`\n"
     )

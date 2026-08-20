@@ -775,7 +775,10 @@ candidate-bound authority.
    exact-candidate authority and requires the applicable final gate again.
 
 Triad slots review the staged diff against `docs/CHECKLISTS.md`; duplicate model
-ids remain independent slots and `config.adaptive_quorum` owns quorum. Scope
+ids remain independent slots and `config.adaptive_quorum` owns quorum. Managed
+exception: a managed-update resolution commit reviews the declared M0→S
+resolution delta (`tools/review_subject.py`), and the commit gate binds S to the
+index write-tree the review-binding fingerprint pins. Scope
 slots inspect touched context plus the repository Atlas. Required artifacts may
 never disappear silently: the assembler reduces optional context and unchanged
 diff context, records every degradation, and fails closed if its irreducible

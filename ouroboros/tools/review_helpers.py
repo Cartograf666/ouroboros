@@ -910,6 +910,8 @@ def build_touched_file_pack(
     paths: list[str] | None = None,
     *,
     represent_binary: bool = False,
+    m0_tree: str = "",  # managed resolutions: binary rows carry the M0 baseline identity
+    staged_tree: str = "",
 ) -> tuple[str, list[str]]:
     """Read changed files into a prompt code pack plus omission list."""
     if paths is None:
@@ -938,10 +940,11 @@ def build_touched_file_pack(
         if not fp.is_file():
             from ouroboros.tools import review_binary_context as binary_context
             deleted_binary = represent_binary and (
-                binary_extension or binary_context.staged_path_is_binary(repo_dir, rel)
+                binary_extension or binary_context.staged_path_is_binary(
+                    repo_dir, rel, m0_tree=m0_tree, staged_tree=staged_tree)
             )
             if deleted_binary:
-                metadata = binary_context.render_staged_binary_metadata(repo_dir, rel)
+                metadata = binary_context.render_staged_binary_metadata(repo_dir, rel, m0_tree=m0_tree)
                 if metadata is not None:
                     parts.append(f"### {rel}\n\n{metadata}")
                     continue
@@ -957,7 +960,7 @@ def build_touched_file_pack(
         if binary_extension or _is_probably_binary(fp):
             if represent_binary:
                 from ouroboros.tools.review_binary_context import render_staged_binary_metadata
-                metadata = render_staged_binary_metadata(repo_dir, rel)
+                metadata = render_staged_binary_metadata(repo_dir, rel, m0_tree=m0_tree)
                 if metadata is None:
                     omitted.append(rel)
                     parts.append(
