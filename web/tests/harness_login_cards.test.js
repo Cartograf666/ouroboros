@@ -1080,6 +1080,40 @@ test('the pre-job external action creates client_pty and immediately exposes a l
     store.dispose();
 });
 
+test('Retry preserves the exact active client_pty transport in the next create body', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, statusPayload(false)),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    const host = interactiveHost();
+    const bodies = [];
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                bodies.push(JSON.parse(init.body));
+                if (bodies.length === 1) return json(400, {
+                    error: 'temporary refusal', code: 'profile_temporarily_unavailable',
+                });
+                return json(200, { job_id: 'retry-external', job: { state: 'running' } });
+            }
+            if (init.method === 'DELETE') return json(200, { job: { state: 'cancelled' } });
+            return json(200, { job: { state: 'running' } });
+        },
+    });
+
+    await ctl.start('one', 'work', 'client_pty');
+    assert.ok(host.innerHTML.includes('data-login-retry'), host.innerHTML);
+    host.click('[data-login-retry]');
+    await flush();
+    assert.equal(bodies.length, 2);
+    assert.equal(bodies[0].transport, 'client_pty');
+    assert.equal(bodies[1].transport, 'client_pty');
+    assert.equal(bodies[1].profile_id, 'work');
+    await ctl.dispose();
+    store.dispose();
+});
+
 test('a durable native-command terminal receipt exposes the external action after polling', async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
     const store = createClaudexorStatusStore({
@@ -1188,6 +1222,40 @@ test('create-400 on an EMPTY family becomes the name-the-account face, and its s
     assert.equal(posts[1].profile_id, 'work-laptop');
     assert.ok(host.innerHTML.includes('(work-laptop)'), `the card now runs the named login: ${host.innerHTML}`);
     assert.ok(!host.innerHTML.includes('data-profile-name-input'), 'the name face was replaced');
+    await ctl.dispose();
+    store.dispose();
+});
+
+test('the name-the-account continuation preserves an explicit client_pty transport', async () => {
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, nameFaceStatusPayload([])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await store.refresh();
+    const host = fakeHost();
+    const posts = [];
+    const ctl = createLoginCardController({
+        host, store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                const body = JSON.parse(init.body);
+                posts.push(body);
+                if (!body.profile_id) return json(400, REQUIRED_PROFILE);
+                return json(200, { job_id: 'named-external', job: { state: 'running' } });
+            }
+            if (init.method === 'DELETE') return json(200, { job: { state: 'cancelled' } });
+            return json(200, { job: { state: 'running' } });
+        },
+    });
+
+    await ctl.start('zephyr', '', 'client_pty');
+    ctl.active.profileNameValue = 'work';
+    ctl.submitProfileName();
+    await flush();
+    assert.equal(posts.length, 2);
+    assert.equal(posts[0].transport, 'client_pty');
+    assert.equal(posts[1].transport, 'client_pty');
+    assert.equal(posts[1].profile_id, 'work');
     await ctl.dispose();
     store.dispose();
 });

@@ -1,12 +1,12 @@
 {
  "schema_version": 1,
  "release": {
-  "version": "3.6.0",
-  "build_sha": "31aa51c9e545eb061d9335b600a372f484d3f7a9",
+  "version": "3.8.0",
+  "build_sha": "678990ece73851f7f1899d2686f4dd2af587fc70",
   "protocol_major": 3,
-  "archive_url": "https://github.com/razzant/claudexor/releases/download/v3.6.0/claudexor-runtime-3.6.0.tar.gz",
-  "sha256": "72b0936eb8825ee1da6adae0dfd8720a8c31c875dce4fb7cb0e36534f279918a",
-  "size_bytes": 20887532,
+  "archive_url": "https://github.com/razzant/claudexor/releases/download/v3.8.0/claudexor-runtime-3.8.0.tar.gz",
+  "sha256": "bf54753e1420ed0ed64e75a0f14395ef18acd06192b667e7506dd6ca24577a48",
+  "size_bytes": 21908984,
   "node_version": "24.16.0",
   "node_artifacts": {
    "darwin-arm64": {
@@ -40,6 +40,7 @@
     "executable": "node-v24.16.0-win-x64/node.exe"
    }
   },
-  "entrypoint": "claudexord.bundle.cjs"
+  "entrypoint": "claudexord.bundle.cjs",
+  "cli_entrypoint": "claudexor.bundle.cjs"
  }
 }

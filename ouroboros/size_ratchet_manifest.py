@@ -129,7 +129,6 @@ BAND_PATHS = {
     "devtools/benchmarks/terminal_bench/run_tb.py": None,
     "ouroboros/agent.py": "Shrank into the band from 1589 lines: the dispatch-time executor note pair (dispatch_executor_note/executor_blocked_outcome) moved whole to subagent_dispatch_notes.py with same-name re-exports kept (delegation-substrate sprint, B1/F7).",
     "ouroboros/agent_startup_checks.py": None,
-    "ouroboros/claudexor_runtime.py": None,
     "ouroboros/extension_process_runner.py": None,
     "ouroboros/gateway/contracts.py": None,
     "ouroboros/gateway/extensions.py": None,

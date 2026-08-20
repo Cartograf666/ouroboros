@@ -253,6 +253,7 @@ class ClaudexorGateway:
     def __init__(self, endpoint: Optional[DaemonEndpoint] = None, *, home: Optional[pathlib.Path] = None):
         self._endpoint = endpoint if endpoint is not None else discover_daemon(home)
         self._engine_version = ""
+        self._engine_build_sha = ""
         # trust_env=False: a shell HTTP(S)_PROXY must never be able to intercept the
         # loopback control plane (the bearer token rides these requests).
         self._client = httpx.Client(
@@ -283,6 +284,10 @@ class ClaudexorGateway:
     @property
     def engine_version(self) -> str:
         return self._engine_version
+
+    @property
+    def engine_build_sha(self) -> str:
+        return self._engine_build_sha
 
     # -- transport -------------------------------------------------------------
 
@@ -392,6 +397,7 @@ class ClaudexorGateway:
                 f"Claudexor {version or 'unknown'} is older than the required {CLAUDEXOR_MIN_VERSION}",
             )
         self._engine_version = version
+        self._engine_build_sha = str(engine.get("sha") or "")
         return body
 
     def agent_capabilities(self) -> Dict[str, Any]:

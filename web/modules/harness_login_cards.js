@@ -812,7 +812,7 @@ export function createLoginCardController({
             // transient note and settles the real verdict. _startLocked stops
             // polling itself once the previous job is terminal or provably
             // cancelled.
-            start(active.harness, active.profile);
+            start(active.harness, active.profile, active.transport);
         });
         hostEl.querySelector('[data-login-external-terminal]')?.addEventListener('click', () => {
             // This is a NEW job through the same serialized release/custody
@@ -1069,7 +1069,7 @@ export function createLoginCardController({
             render();
             return;
         }
-        start(active.harness, answer.profile);
+        start(active.harness, answer.profile, active.transport);
     }
 
     async function submitCodeFromCard(active) {
