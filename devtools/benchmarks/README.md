@@ -58,8 +58,9 @@ CALL) — NEVER STAY SILENT.**
 - Run manifests record non-secret provenance: requested task ids where the
   benchmark runner exposes them before execution, requested counts/selection
   slots for deterministic first-N runs such as Terminal-Bench, exact argv,
-  official command shape, output paths, model slots, source commit, dirty-state
-  counts, and hashes. Defaults are adapter-specific (`run_manifest.json`,
+  official command shape, output paths, model slots, the canonical Available-subagents
+  projection where the launcher owns it, source commit, dirty-state counts, and hashes.
+  Defaults are adapter-specific (`run_manifest.json`,
   `<predictions>.run_manifest.json`, or `osworld_preflight.run_manifest.json`).
 - Result ledgers are denominator-preserving Ouroboros JSONL files. They record
   every requested instance, including setup failures, timeouts, and empty
@@ -81,7 +82,9 @@ All committed bench settings templates share these disclosed defaults:
 
 - `OUROBOROS_MAX_WORKERS=4` — same-model subagent slots for decomposition
   WITHIN one task (the root agent takes one lane). Never independent attempts
-  with selection, so pass@1 claims hold. The core default (10) is untouched.
+  with selection, so pass@1 claims hold. Fixed-model profiles serialize exactly
+  one `api_model` row in `OUROBOROS_SUBAGENTS`; they cannot inherit a default
+  Light scout, second family, or agent-session route. The core default (10) is untouched.
 - `OUROBOROS_SAFETY_MODE=light` — bench containers/rendered data roots are
   disposable jails; deterministic guards stay, the LLM safety pass is kept for
   integration tools only. User defaults are untouched.
@@ -90,7 +93,7 @@ All committed bench settings templates share these disclosed defaults:
   without workspace isolation against a live repo, so pro would grant benchmark
   prompts write authority over the system body.
 - `claude_code_edit` disabled in every bench solve task — benches measure the
-  single-model Ouroboros harness; external coding delegates are a separate
+  single-model Ouroboros harness; external agent-session delegates are a separate
   experiment. (D10 retired the tool itself; the legacy name in these configs
   stays meaningful because `disabled_tools=["claude_code_edit"]` also withholds
   the successor `delegate_start`.)

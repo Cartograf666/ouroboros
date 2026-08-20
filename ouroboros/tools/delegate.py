@@ -38,7 +38,17 @@ from ouroboros import delegate_progress as progress
 from ouroboros.delegate_custody import RunCustody as _RunCustody
 from ouroboros.tool_capabilities import tool_result_limit
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.utils import truncate_within_limit
+from ouroboros.subagent_work_order import (  # noqa: F401 - compatibility re-export
+    _FIELD_CHARS as _ASSIGNMENT_FIELD_CHARS,
+    assignment_instructions as _assignment_instructions,
+)
+from ouroboros.subagent_work_order import start_binding_fingerprints
+from ouroboros.delegate_supervision import delegate_wait_entry as _delegate_wait_entry
+from ouroboros.subagent_runtime import (  # noqa: F401 - shared primitive re-export
+    delegate_start_entry as _delegate_start_entry,
+    exact_start,
+)
+from ouroboros.subagent_runtime import prepare_delegate_start_actor
 # The staged-output + read-receipt cluster lives in its own module (size gate);
 # re-exported here because sibling code, the tests and the convergence census all
 # name it on THIS surface, and `_READ_COVERAGE` must stay the same object.
@@ -129,8 +139,6 @@ _CLAUDEXOR_MAX_SECONDS = 604_800
 # above); re-bound here because sibling code and tests name it on this surface.
 _CUSTODY = custody._CUSTODY
 
-
-
 # Layered onto every lane by Claudexor (native system-prompt channel per harness). The
 # SAME prohibitions an ordinary subagent carries; a statement, not the enforcement —
 # that is the access profile plus the nanny's own workspace-patch capture.
@@ -164,49 +172,6 @@ _UNPROVEN_BOUNDARY_INSTRUCTION = (
     "answer as sandboxed or confined. If your own environment shows you whether a boundary "
     "was in force, say so plainly."
 )
-
-
-# Per-field bound on the contract text that rides the host instructions: the
-# objective/expected_output of a task contract are prose, and an unbounded field
-# would let one verbose contract dominate the run's system-prompt channel.
-_ASSIGNMENT_FIELD_CHARS = 4_000
-
-
-def _assignment_instructions(ctx: ToolContext) -> str:
-    """The nanny's own objective/expected_output, riding STRUCTURALLY with the run.
-
-    From the IMMUTABLE task contract (delegation-first economics, poltergeist phase
-    B): the child's goal reaches the delegated run in the host-authored
-    ``instructions``, so the nanny does not have to copy its contract into every
-    ``prompt`` it writes — the prompt states the specific assignment, and this block
-    states the task it serves. Host-authored and host-read: the model cannot widen
-    or forge it, and a missing contract simply contributes nothing.
-    """
-    contract = getattr(ctx, "task_contract", None)
-    if not isinstance(contract, dict) or not contract:
-        meta = getattr(ctx, "task_metadata", {})
-        meta = meta if isinstance(meta, dict) else {}
-        raw = meta.get("task_contract")
-        contract = raw if isinstance(raw, dict) else {}
-    objective = str(contract.get("objective") or "").strip()
-    expected = str(contract.get("expected_output") or "").strip()
-    parts: List[str] = []
-    # STRICT bound with the marker INSIDE the budget (F11/sol #9): the generic
-    # preview helper's anti-waste floor let a 4050-char field through whole
-    # against a 4000 budget, and its marker landed BEYOND the limit — right for
-    # display previews, wrong for a bounded prompt-channel field.
-    if objective:
-        parts.append(
-            "HOST TASK OBJECTIVE (the immutable contract of the task hosting this "
-            "run — your prompt below is one assignment inside it): "
-            + truncate_within_limit(objective, _ASSIGNMENT_FIELD_CHARS)
-        )
-    if expected:
-        parts.append(
-            "HOST EXPECTED OUTPUT: "
-            + truncate_within_limit(expected, _ASSIGNMENT_FIELD_CHARS)
-        )
-    return "\n\n".join(parts)
 
 
 def _host_instructions(authority: "DelegatedRunShape", assignment: str = "",
@@ -674,16 +639,11 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     from ouroboros.claudexor_daemon import ensure_owned_gateway
     from ouroboros.delegate_evidence import record_start_blocked
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
-    from ouroboros.subagents import (
-        get_subagent_harness, resolve_subagent_executor, route_health,
-    )
+    from ouroboros.subagents import resolve_subagent_executor, route_health
 
     text = str(prompt or "").strip()
     if not text:
         return _fail("delegate_start", "empty_prompt", "prompt is required")
-    # The EXACT-RESOURCE selector (R1 item 1): the ONLY allowed root is
-    # skill_payload — the selector chooses authority the task already holds
-    # (the existing top-level skill_payload.write cell), it grants nothing.
     selector_root = str(root or "").strip()
     selector_refusal = _payload_selector_refusal(selector_root, retry_of, bucket, skill_name)
     if selector_refusal:
@@ -700,22 +660,27 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     drive = custody.custody_root(ctx)
     owned_project_id = ""
     invocation_id = ""
-    # C1 isolation binding facts — empty for read-only runs and until resolved.
     snapshot_id = ""
     baseline_sha = ""
     target_root = ""
     authority_source = ""
     resource_ref: Dict[str, Any] = {}
-    # ONE logical invocation id per INTENDED invocation; reuse ONLY by explicit
-    # token, never by content-matching (an intended new start is a NEW id). A
-    # retry replays the STORED body byte-identically under the SAME wire
-    # Idempotency-Key, so the engine returns the run it already accepted.
+    selected_subagent_id = ""
+    config_fingerprint = ""
+    work_order_fingerprint, authority_fingerprint = start_binding_fingerprints(ctx, text)
     retry_token = str(retry_of or "").strip()
     recovering = bool(retry_token)
+    actor, actor_refusal = prepare_delegate_start_actor(
+        ctx, drive, recovering=recovering, invocation_id=retry_token,
+        work_order_fingerprint=work_order_fingerprint, authority_fingerprint=authority_fingerprint,
+    )
+    if actor_refusal:
+        return actor_refusal
+    selected_subagent_id = str(actor.get("selected_subagent_id") or "")
+    config_fingerprint = str(actor.get("config_fingerprint") or "")
+    work_order_fingerprint = str(actor.get("work_order_fingerprint") or "")
+    authority_fingerprint = str(actor.get("authority_fingerprint") or "")
     if recovering:
-        # The stored invocation is the SINGLE SOURCE of every retry fact
-        # (route, shape, root, project, key, C1 binding); validated BEFORE any
-        # daemon call, so a refused token registers nothing.
         binding, refusal = _resolve_retry_invocation(ctx, drive, retry_token, text)
         if refusal:
             return refusal
@@ -725,19 +690,8 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         invocation_id = retry_token
         payload_auth = None
     else:
-        route = get_subagent_harness()
-        if route is None:
-            resolution = resolve_subagent_executor("harness", route=None)
-            return _fail(
-                "delegate_start", resolution.reason,
-                "No delegated route is configured (OUROBOROS_SUBAGENT_HARNESS is empty). "
-                "Think natively instead — do not wait for a harness that does not exist.",
-                executor=resolution.executor,
-            )
+        route = actor["route"]
         if selector_root:
-            # The exact-resource lane (R1 item 1): authority is a FRESH
-            # ResolvedResourceBinding for skill_payload.write — never a widening
-            # of the generic derivation, which stays byte-identical below.
             authority, payload_auth, payload_error = _payload_mutation_authority(
                 ctx, drive, bucket, skill_name, _resolved_binding)
             if payload_error:
@@ -813,7 +767,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             # is the LOOKUP identity only; the wire key stays the invocation id,
             # and a retry replays the STORED body byte-identically regardless.
             instructions = _host_instructions(
-                authority, _assignment_instructions(ctx),
+                authority, "" if bool(actor.get("compiled_work_order")) else _assignment_instructions(ctx),
                 payload_skill=(str((record_auth.get("resource_ref") or {})
                                    .get("skill_name") or "")
                                if payload_auth is not None else ""))
@@ -841,7 +795,13 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             # exact binding and the startup GC can see the pending snapshot.
             snapshot_id=snapshot_id, execution_root=(root if snapshot_id else ""),
             baseline_sha=baseline_sha, target_root=target_root,
-            authority_source=authority_source, resource_ref=resource_ref)
+            authority_source=authority_source, resource_ref=resource_ref,
+            # Same pre-POST row as the request: crash recovery can prove the
+            # exact configured actor and exact compiled brief before adopting.
+            selected_subagent_id=selected_subagent_id,
+            config_fingerprint=config_fingerprint,
+            work_order_fingerprint=work_order_fingerprint,
+            authority_fingerprint=authority_fingerprint)
         if claim_holder:
             return _fail(
                 "delegate_start", "payload_delegation_busy",
@@ -942,6 +902,10 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         ledger_root=str(drive),
         idempotency_key=key,
         invocation_id=invocation_id,
+        selected_subagent_id=selected_subagent_id,
+        config_fingerprint=config_fingerprint,
+        work_order_fingerprint=work_order_fingerprint,
+        authority_fingerprint=authority_fingerprint,
         snapshot_id=snapshot_id,
         execution_root=(root if snapshot_id else ""),
         baseline_sha=baseline_sha,
@@ -965,13 +929,14 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     })
     return _started_payload(handle, run_id, route, access, authority, root,
                             durable=durable, recovering=recovering,
+                            invocation_id=invocation_id,
                             snapshot_id=snapshot_id, target_root=target_root,
                             baseline_sha=baseline_sha)
 
 
 def _started_payload(handle: Dict[str, Any], run_id: str, route: Any, access: str,
                      authority: "DelegatedRunShape", root: str, *, durable: bool,
-                     recovering: bool, snapshot_id: str, target_root: str,
+                     recovering: bool, invocation_id: str, snapshot_id: str, target_root: str,
                      baseline_sha: str) -> str:
     """The one author of delegate_start's started result (note + payload).
 
@@ -1018,8 +983,11 @@ def _started_payload(handle: Dict[str, Any], run_id: str, route: Any, access: st
         "scoped_home_requested": authority.delegated,
         "root": root,
         "custody_durable": durable,
+        "invocation_id": str(invocation_id or ""),
         "note": note,
     }
+    if not durable:
+        payload["pending_invocation_id"] = str(invocation_id or "")
     if snapshot_id:
         # The C1 binding, stated where the nanny can read it: the run's scope.root is
         # the EXECUTION snapshot; the authority target receives nothing until the
@@ -1303,6 +1271,7 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                     record_last_delegation(
                         route=entry.route_id, requested_model=entry.model,
                         applied_model=str(payload.get("model") or ""), run_id=rid,
+                        selected_subagent_id=entry.selected_subagent_id,
                         # Applied = the settlement receipt's authRoute fact (never invented); requested replays off STARTED.
                         requested_profile=entry.profile_id,
                         applied_profile=str((summary.get("authRoute") or {}).get("profileId") or ""))
@@ -1439,6 +1408,8 @@ def _delegate_cancel(ctx: ToolContext, run_id: str, reason: str = "") -> str:
 
 
 def get_tools() -> List[ToolEntry]:
+    from ouroboros.config import get_task_abs_ceiling_sec
+
     return [
         ToolEntry("delegate_start", {
             "name": "delegate_start",
@@ -1472,11 +1443,18 @@ def get_tools() -> List[ToolEntry]:
                 "Returns a run_id: watch it with delegate_wait, stop it with "
                 "delegate_cancel. The run's output is a CLAIM you must check — you are the "
                 "host, so verification receipts are still yours to write. If no route is "
-                "configured or it is unavailable you get a typed refusal: think natively "
-                "instead of waiting."
+                "configured or it is unavailable you get a typed refusal: choose an "
+                "explicit configured alternative, wait, narrow, or report blocked."
             ),
-            "parameters": {"type": "object", "required": ["prompt"], "properties": {
+            "parameters": {
+                "type": "object",
+                "required": ["prompt"],
+                "anyOf": [{"required": ["subagent_id"]}, {"required": ["retry_of"]}],
+                "properties": {
                 "prompt": {"type": "string", "description": "The complete task for the delegated session."},
+                "subagent_id": {"type": "string", "description":
+                    "Exact agent_session actor id from Available subagents. API actor ids are "
+                    "refused here and must be scheduled as recursive children."},
                 "root": {"type": "string", "enum": ["skill_payload"], "description":
                     "Optional exact-resource selector: 'skill_payload' delegates ONE "
                     "installed non-native skill payload you can already write. Omit "
@@ -1499,25 +1477,18 @@ def get_tools() -> List[ToolEntry]:
                     "returns the run it already accepted instead of starting a second one. "
                     "Never set it for an intended new run — a plain call always starts a "
                     "NEW invocation, even with an identical prompt."},
-            }},
-        }, lambda ctx, prompt, max_seconds=None, retry_of=None, root=None, bucket=None,
-           skill_name=None, _resolved_binding=None: _delegate_start(
-               ctx, prompt, max_seconds, retry_of, root=root, bucket=bucket,
-               skill_name=skill_name, _resolved_binding=_resolved_binding),
+                },
+            },
+        }, _delegate_start_entry,
            timeout_sec=120),
         ToolEntry("delegate_wait", {
             "name": "delegate_wait",
             "description": (
-                "Wait for a delegated run, bounded in time. Returns IMMEDIATELY only when "
-                "the run is TERMINAL or hit a containment fault; otherwise it HOLDS the "
-                "window you asked for — the run's narration streams to your human live "
-                "while you wait, so you are not the transport for it — and comes back at "
-                "expiry with `advances`, every journal-cursor movement seen during the "
-                "window, plus elapsed/max seconds and `quiet_for_sec`. A silent window "
-                "returns a typed no-progress reason. Keepalives are not progress. Calling "
-                "again with a tiny wait_sec to 'check' is a busy-poll: it costs a "
-                "full-context round per call and buys nothing, because this call already "
-                "waited. Pass since_seq=last_seq to keep following. A run that asks its "
+                "Sleep on a delegated run until a meaningful event. Quiet transport windows "
+                "are renewed by the host with zero model calls; journal progress still streams "
+                "to the human but does not wake you. Terminal settlement, a new interaction, "
+                "fault, addressed owner/task message, cancel/deadline control, or an explicit "
+                "one-shot checkpoint wakes exactly once. A run that asks its "
                 "user a question returns IMMEDIATELY as status='waiting_on_user' with "
                 "the full question set (interaction/question ids ride WHOLE, never "
                 "truncated): answer it with delegate_answer, or escalate to your "
@@ -1529,14 +1500,14 @@ def get_tools() -> List[ToolEntry]:
             ),
             "parameters": {"type": "object", "required": ["run_id"], "properties": {
                 "run_id": {"type": "string", "description": "Run id from delegate_start."},
-                "wait_sec": {"type": "integer", "description":
-                    "How long THIS call holds before handing control back to you (clamped "
-                    "to the configured ceiling and to your own remaining deadline). It is a "
-                    "WINDOW, not a quiet cutoff: a run that is streaming keeps streaming to "
-                    "your human for the whole of it, and you get the whole batch at the end."},
                 "since_seq": {"type": "integer", "description": "Event cursor: advances past it are recorded as progress."},
+                "checkpoint_after_sec": {"type": "integer", "description":
+                    "Optional one-shot future inspection time. Requires checkpoint_reason; "
+                    "a real earlier wake consumes it."},
+                "checkpoint_reason": {"type": "string", "description":
+                    "Why one proactive inspection is worth a model call. No repeating cadence."},
             }},
-        }, lambda ctx, run_id, wait_sec=None, since_seq=None: _delegate_wait(ctx, run_id, wait_sec, since_seq), timeout_sec=2100),
+        }, _delegate_wait_entry, timeout_sec=get_task_abs_ceiling_sec() + 120),
         ToolEntry("delegate_cancel", {
             "name": "delegate_cancel",
             "description": (

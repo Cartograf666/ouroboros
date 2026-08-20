@@ -194,7 +194,9 @@ def execute_panic_stop(
         pass
 
     try:
-        kill_workers_fn(force=True, archive_service_logs=False)
+        kill_workers_fn(
+            force=True, archive_service_logs=False, reconcile_delegate_custody=False,
+        )
     except Exception:
         pass
 

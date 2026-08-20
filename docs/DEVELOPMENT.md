@@ -303,6 +303,14 @@ evidence; owner-selected Low records the declared skip rather than pretending a
 partial review occurred. Current model ids and defaults belong in code/config,
 not in this handbook.
 
+Use `provider_models.ACTIVE_MODEL_SETTING_KEYS` for any new active consumer such
+as provider detection, model catalog/provenance, credential planning, or Provider
+Test. `LEGACY_MODEL_SETTING_KEYS` exists only for migration/history. In particular,
+`OUROBOROS_MODEL_HEAVY` and `USE_LOCAL_HEAVY` may seed an explicit configured API
+actor while the canonical list is absent, but must never become an active slot,
+startup-readiness signal, test probe, or fallback. Do not patch each consumer with
+its own Heavy exclusion; preserve the shared split.
+
 The `-pro` suffix is an OpenRouter routing slug, not an official OpenAI model id.
 A direct OpenAI Chat slot uses the plain Sol id; projecting the slug into Chat
 Completions would turn an owner route choice into a guaranteed 404. This is a
@@ -892,7 +900,7 @@ Before every commit, verify the following:
 - Project-room promotion with no working folder and no `workspace="none"` opt-out idempotently provisions a standalone git repo through `ensure_project_workspace`, then runs the ordinary workspace admission checks. Never provision over a non-empty broken binding or an unreadable registry; those cases fail loudly. Binding affects tool profile, memory, lease, and preflight, not the Max-mode Architecture projection.
 - Keep policy denials separate from execution failures: `user_files_path_blocked`, `cwd_blocked`, and `artifact_output_undeclared` are non-failure outcomes, while failure to register an explicitly declared output remains `artifact_output_error`.
 - The DEFAULT (non-workspace) shell lane carries the SAME target-aware git policy in every runtime mode including light (Q4=A sandbox unwind): mutating git is blocked only when it targets the Ouroboros runtime (system repo / any data drive — bidirectional, casefold, symlink-resolved containment; `commit_reviewed` is the remedy for self-repo changes), read-only git works everywhere including at the system repo, `allowed_resources.network=false` still fences network git subcommands, and acting `self_worktree` children keep the strict no-commit policy. `git init`/`commit`/`push` in `~/projects`, `/tmp`, an attached project folder, or a host-minted coop tree is legitimate task work, not a violation.
-- `claude_code_edit` is RETIRED (D10, owner-approved migration, phase 6.4): the SDK edit gateway's job moved to the delegated coding path — a mutating subagent (`schedule_subagent`) whose nanny drives the session with `delegate_start`/`delegate_wait`/`delegate_answer`/`delegate_cancel`, on the owner's subscription when a harness route is configured. The D10 migration shipped INCOMPLETE for one supported target class — the old gateway could edit an exact non-Git skill payload directly, while the successor knew only Git workspaces — and that class was RESTORED (owner option A, 2026-08-14): a top-level task selects the exact payload with `delegate_start(root="skill_payload", bucket=..., skill_name=...)`, the harness edits a private standalone Git snapshot, and the parent applies the captured diff explicitly under a whole-payload content-hash CAS, after which the existing skill review is stale. Compatibility is one-way and permanent: a saved task contract carrying `disabled_tools=["claude_code_edit"]` also withholds the successor `delegate_start` (registry `_disabled_tools`), and the frozen `GET /api/claude-code/status` + `POST /api/claude-code/install` endpoints stay — the Claude runtime still powers the api-route advisory review. Do not resurrect the tool name.
+- `claude_code_edit` is RETIRED (D10, owner-approved migration, phase 6.4): the SDK edit gateway's job moved to the configured session-actor path — `schedule_subagent(subagent_id=...)` freezes a mutating nanny's selected row and atomic bootstrap starts that exact subscription leaf before its first LLM turn; `delegate_wait`/`delegate_answer`/`delegate_cancel` supervise it, and explicit `delegate_start(subagent_id=...)` handles bounded direct or replacement starts. The D10 migration shipped INCOMPLETE for one supported target class — the old gateway could edit an exact non-Git skill payload directly, while the successor knew only Git workspaces — and that class was RESTORED (owner option A, 2026-08-14): a top-level task selects the session transport and exact payload with `delegate_start(subagent_id=..., root="skill_payload", bucket=..., skill_name=...)`, the harness edits a private standalone Git snapshot, and the parent applies the captured diff explicitly under a whole-payload content-hash CAS, after which the existing skill review is stale. The resource fields select authority and never select transport. Compatibility is one-way and permanent: a saved task contract carrying `disabled_tools=["claude_code_edit"]` also withholds the successor `delegate_start` (registry `_disabled_tools`), and the frozen `GET /api/claude-code/status` + `POST /api/claude-code/install` endpoints stay — the Claude runtime still powers the api-route advisory review. Do not resurrect the tool name.
 - Successor parity rule (from the D10 postmortem): a tool may be called replaced, retired with a successor, or fully migrated only after a persistent golden test proves every previously supported user-visible target class through the successor to the final outcome. Deleted-test tombstones and disclosure prove intentional code removal, not successor parity. Dropping a target class requires an explicit owner decision naming the lost user outcome; approval to remove the old tool name or implementation is not that approval.
 - Do not recommend `runtime_data/uploads`, skill payloads, or owner state directories as generic artifact transport.
 
@@ -928,15 +936,15 @@ Before every commit, verify the following:
 
 #### Live Subagent Task Constraints
 - Live subagents are scheduled only through the existing `schedule_subagent` tool.
-  Its public schema is strict: `objective` and `expected_output` are required;
+  Its public schema is strict: `subagent_id`, `objective`, and `expected_output` are required;
   optional public fields are `role`, `context`, `constraints`, `memory_mode`,
-  `model_lane`, `executor`, `deadline_at`, `acceptance_claims`, `write_surface`,
+  `deadline_at`, `acceptance_claims`, `write_surface`,
   `write_root`, `protected_paths_grant`, `external_tool_grants`,
   `delegation_intent`, `may_mutate`, `may_fan_out`, `max_children`, and
   `required_capabilities`. `schedule_subagent_properties()` owns both this schema
   and the handler's closed keyword set. `effort`, `parent_task_id`, and
-  `description` are not public inputs: effort is dispatch-derived, lineage comes
-  from `ToolContext`, and capability requirements are admission data rather than a
+  `description` are not public inputs: effort belongs to the selected configured
+  row, lineage comes from `ToolContext`, and capability requirements are admission data rather than a
   frozen contract field. Claims must be plain strings; malformed shapes fail with
   a typed argument error, blanks normalize away, and omission means none rather
   than parent inheritance. Child builders re-state claims and the emptied
@@ -944,6 +952,39 @@ Before every commit, verify the following:
   strict parsing, deadlines can only narrow, and `_narrow_child_delegation_budget`
   can only reduce a subagent parent's authority; a root's explicit mutation grant
   still passes through the ordinary runtime checks.
+- `subagent_id` selects one complete row from the canonical enabled
+  `OUROBOROS_SUBAGENTS` list. At schedule time, freeze the normalized row and list
+  fingerprint into the task; dispatch/restart must use that snapshot rather than
+  mutable Settings. An `api_model` row is the recursive API child. An
+  `agent_session` row is the recursive nanny plus one exact external leaf, whose
+  model/account facts come from requested→effective custody evidence. Do not add a
+  second model/lane/executor selector to the public schema, parse `recommended_use`,
+  rank rows in host code, or substitute another actor after a typed refusal.
+- Legacy `model_lane`/`executor` parameters are handler-side compatibility only,
+  hidden from schemas. Accept them only when they deterministically map to exactly
+  one migrated configured row; new+legacy is a conflict and omitted/ambiguous
+  `auto`, zero matches, or multiple matches returns `subagent_selection_required`.
+  Historical task/result fields remain readable; do not make them active defaults.
+- A configured session child must start or recover its exact external leaf before
+  its first LLM call. Compile one complete work order from the immutable child brief
+  and authority, reuse `subagent_runtime.exact_start`, and inject the custody-durable
+  startup/fault receipt. `started_uncustodied` is a fault with a possibly live run:
+  do not enter quiet sleep or start a replacement until verified settlement, and
+  replay the original pending invocation/idempotency key after worker loss.
+- `delegate_wait` is an event-only model sleep. Renew bounded transport windows in
+  `delegate_supervision` with zero LLM calls; journal progress may stream to the
+  owner but is not a wake. Wake only for terminal/interaction/fault, an addressed
+  owner/task message, cancellation/deadline control, recovery judgment, or one
+  explicitly requested `checkpoint_after_sec` + `checkpoint_reason`. A real event
+  consumes the one-shot checkpoint. Keep durable pending/ack/replay semantics for
+  wakes and message/interaction ids. On wake the nanny retains its full ordinary
+  tool surface and inherited parent cognitive route; no-co-building is a
+  prompt/review/receipt role contract, not a host allowlist.
+- Recovery is cause-specific. A proven non-signal worker crash and an explicit
+  planned-self-restart transaction may adopt the same exact run before orphan
+  cleanup/LLM/start. Owner restart, signals, panic, timeout/deadline, explicit
+  cancellation and abrupt whole-app loss are no-resume causes. Never generalize this
+  into arbitrary `RUNNING` resurrection or a public parked-task state.
 - Live `memory_mode=shared` is disabled. Keep `forked` and `empty` as the only
   live subagent modes unless a later design adds sanitized shared-context v2.
 - External `/api/tasks` and CLI requests must reject forged
@@ -1235,28 +1276,33 @@ Before every commit, verify the following:
   "Off" false claims. The v6.22.1-era rule that the empty runtime-default must
   not become a third owner-facing button was valid only while the unset default
   was binary per mode; the v6.91 surface-aware light default obsoleted it.
-- One capability, one section. The whole subagent story lives in Agents →
-  Delegation (`web/modules/subagents_settings.js`), beside Review lanes: the
-  route (`OUROBOROS_SUBAGENT_HARNESS`), the optional account pin
-  (`OUROBOROS_SUBAGENT_PROFILE`), the write permission
-  (`OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS`), and the two counts that bound it
-  (`OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT`, `OUROBOROS_MAX_SUBAGENT_DEPTH`),
-  with the two path roots behind a collapsed Advanced disclosure. They all answer
-  "where and how far do subagents run"; `OUROBOROS_MAX_WORKERS` stays in Advanced
-  because it sizes the process pool, not the agents. Never render a second control
-  over the same settings key — two controls carry two drafts, and the last one
-  collected wins, and a MOVE that leaves the old markup behind is exactly how a
-  duplicate appears (`tests/test_agents_tab_static.py` pins each moved id to one
-  occurrence).
-  The delegated-run MODEL is the owner's default, authored here as the `=model`
-  tail of the same key from engine discovery ("Engine default model" = empty
-  tail); reasoning effort stays derived per call, and a hand-written `:effort`
-  remainder rides through verbatim with no control over it.
-  The ACCOUNT pin is a sibling settings key, never a fourth grammar position:
-  its selector reuses the reviewer rows' `profileOptionsFor` ('' = automatic
-  rotation first; an undiscovered saved pin keeps its option so a daemon-down
-  save cannot erase it), a harness switch visibly drops the pin, and turning
-  delegation off authors the pin away with the route.
+- One capability, one section. The whole task-actor story lives in Agents →
+  **Available subagents** (`web/modules/subagents_settings.js`), beside but not
+  inside Review lanes. It edits one canonical `OUROBOROS_SUBAGENTS` object with a
+  list-level Enabled flag and at most ten stable rows. The UI numbers rows and asks
+  the owner for one prose field, Description (`recommended_use`); id and compatibility
+  name stay automatic and hidden, while API-model or Agent-session route, optional
+  effort and optional session account pin remain structured controls. Never derive
+  durable identity from the visual ordinal: removing a preceding row must not change
+  task snapshots or receipts. The write permission, active/depth counts and path roots
+  remain orthogonal controls in that section; `OUROBOROS_MAX_WORKERS` stays in Advanced
+  because it sizes the process pool. Never render a second control over the same
+  settings key.
+  Share only neutral route/model/account/effort/status primitives with reviewer
+  rows (`route_editor_primitives.js`). Preserve the two public schemas: task API
+  routes serialize `api_model`, reviewer routes `api_chat`; task pins serialize
+  `credential_profile_id`, reviewer pins `profile_id`. Empty session pin means the
+  engine's compatible-account rotation. Saved choices absent from discovery remain
+  visible and editable, marked unavailable/not checked according to the exact
+  catalog/accounts facet. A Cursor/Agy compound effort slug plus a conflicting
+  separate effort is a validation error, never two applied efforts.
+- Saved intent, generated drafts and live status are different axes. A status or
+  catalog failure annotates a loaded row and must never erase it. GET may return an
+  unsaved migration/default candidate; only explicit Settings Save or onboarding
+  completion materializes it. A late preview/status result may update a clean
+  generated baseline, not absorb owner edits or drop focus/caret. Generic Settings
+  validates/canonicalizes the draft before the existing serialized off-loop owner
+  transaction and reports that active tasks keep their starting snapshot.
 - Onboarding completes in ONE transaction, and install-time defaults belong in
   it. `POST /api/onboarding/complete` persists settings, the next-boot runtime
   mode, the fresh-install safety default and the agent-subscription preset in a
@@ -1323,6 +1369,18 @@ Before every commit, verify the following:
   `verification=not_run` is neutral unknown while `failed` is an error. Mirror
   additive response fields in Python TypedDicts and `web/modules/api_types.js`,
   and extend the field-parity plus focused Python/Node fixtures together.
+- Keep install compilation linear and split by semantic owner. Available
+  subagents include every supported connected task harness (Claude, Codex,
+  Cursor, Agy) plus truthful API/local Main/Light actors. Agy's generated row is
+  unpinned `gemini-3.7-flash-high`. Reviewer defaults independently consume only
+  ratified Claude/Codex/Cursor policies; Agy-only emits no structured reviewer
+  override, and mixed reviewer bytes must equal the core subset alone. API-only
+  and local-only actor compilation performs zero Claudexor reads. With one session
+  and credentials, emit the Light-derived Fast scout and a distinct Main
+  Independent perspective when real; never fabricate diversity or build a
+  harness/account/model powerset. `POST /api/onboarding/subagents/preview` is the
+  read-only compiler surface for the open wizard draft, while completion commits
+  its visible owner-edited value and independent reviewer disposition together.
 - Owner settings writes go through `gateway/owner_settings.py`. The settings
   lock is a PRECONDITION of the write, not a hint: `_acquire_settings_lock`
   answers `None` on timeout and a writer that proceeds anyway is unlocked while
@@ -1340,10 +1398,11 @@ Before every commit, verify the following:
   exported back to it; the generic save's merge skip-list reads the same set.
   Blocking only the request body is not enough — an install-time fact that the
   environment can supply closes its own window before the endpoint runs.
-- A control the owner cannot use is worse than none. With no agent subscription
-  connected the Delegation section says so and points at Accounts in the same tab
-  instead of rendering a delegation toggle whose every dispatch would silently
-  fall back to an API child. Harness lists come from the accounts panel's own
+- A control the owner cannot use is worse than none. With no agent subscription,
+  Available subagents still shows truthful configured/generated API or local actors
+  and the session chooser points at Accounts instead of inventing a route. A saved
+  unavailable session remains visible; dispatch returns its typed refusal and never
+  falls back to an API child. Harness lists come from the accounts panel's own
   source (`accountRows` over `/api/claudexor/status`) — one catalog path, one
   login-capable discriminator — and `accountRows` is dual-shape: a unified
   payload (server-stamped `unified_accounts`) serves every account as a named
@@ -1408,15 +1467,15 @@ Before every commit, verify the following:
   still use the normal retry path.
 
 #### Timeout & Wait Control
-- [ ] For cognitive/long-horizon work (subagent waits and review),
-  prefer **progress-aware / re-decidable waits** over a single fixed cutoff that
-  discards in-flight work. A passive wait that does not kill should stay in its
-  window while the observed task is non-terminal **and** progressing, up to a
-  generous ceiling, then fail closed with a precise structured reason. Progress
-  ADMITS the wait to keep waiting; it does not hand control back per event —
-  returning on each advance woke a full-context nanny round every poll interval
-  (measured: 18 rounds, 861k prompt tokens, for a run that was doing fine), so
-  the observations are carried back once, at the window's expiry.
+- [ ] For a session nanny, `delegate_wait` is **event-only** at the model surface.
+  Host supervision renews bounded transport windows while the run is non-terminal;
+  ordinary journal progress streams to the owner and advances the cursor but neither
+  returns to the model nor ends sleep. Only terminal/interaction/fault, addressed
+  task/owner message, control/recovery judgment, or a model-requested one-shot
+  checkpoint wakes it. A quiet transport-window expiry is an internal renewal with
+  zero LLM calls. Do not reintroduce caller-visible `wait_sec`, repeating timers,
+  progress wakes, or a host semantic stall detector. Reviews and ordinary task waits
+  keep their own existing progress-aware/re-decidable contracts.
 - [ ] The wait/continue/stop decision must be a **structured fact** — terminal
   status plus heartbeat freshness from `queue_snapshot.json` — not a keyword or
   regex over content (Bible P5). Use `task_status.py` terminal-status helpers and

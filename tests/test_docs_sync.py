@@ -163,7 +163,7 @@ def test_architecture_mirror_matches_the_split_axes_contracts():
     assert "compact_task_group" not in arch
     # schedule_subagent reports the request only; the axes resolve at dispatch.
     assert "schedule_subagent surfaces effective_lane(s)" not in arch_flat
-    assert "schedule_subagent reports the requested lane only" in arch_flat
+    assert "`schedule_subagent` reports the requested lane only" in arch_flat
     # swarm_fanout carries the requested lane; a wave event written before any
     # child starts cannot know what the children ran on.
     assert "requested/effective lanes" not in arch

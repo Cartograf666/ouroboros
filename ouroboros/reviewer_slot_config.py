@@ -44,11 +44,17 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from ouroboros.route_spec import (
+    ROUTE_KIND_AGENT_SESSION as SHARED_ROUTE_KIND_SESSION,
+    ROUTE_KIND_API_MODEL as SHARED_ROUTE_KIND_API,
+    parse_route_spec,
+    validate_compound_session_effort,
+)
+
 REVIEWER_SLOTS_ENV = "OUROBOROS_REVIEWER_SLOTS"
 
 ROUTE_KIND_API = "api_chat"
 ROUTE_KIND_SESSION = "agent_session"
-_ROUTE_KINDS = (ROUTE_KIND_API, ROUTE_KIND_SESSION)
 
 # Real limits, shown in the UI instead of promising an arbitrary number (D14).
 # Pinned against their owners by tests: the triad ceiling is
@@ -147,34 +153,24 @@ def _parse_slot(row: Any, where: str, seen_ids: set) -> ConfiguredReviewerSlot:
             "receipts can only line up with ONE history"
         )
     seen_ids.add(slot_id)
-    route = row.get("route")
-    if not isinstance(route, dict):
-        raise ValueError(f"{REVIEWER_SLOTS_ENV}: {where} route must be an object "
-                         "{kind, target_id}")
-    kind = str(route.get("kind") or "").strip().lower()
-    if kind not in _ROUTE_KINDS:
-        raise ValueError(
-            f"{REVIEWER_SLOTS_ENV}: {where} names an unknown route kind {kind!r}; "
-            f"valid: {', '.join(_ROUTE_KINDS)}"
-        )
-    target = str(route.get("target_id") or "").strip()
-    if not target:
-        raise ValueError(f"{REVIEWER_SLOTS_ENV}: {where} route.target_id is empty")
-    if kind == ROUTE_KIND_SESSION and "::" in target:
-        # api_chat targets keep the EXISTING `provider::model` direct-routing
-        # spelling; the owner's "no ::" directive bans it for HARNESS routes —
-        # the provider there is the harness name itself, never a string prefix.
-        raise ValueError(
-            f"{REVIEWER_SLOTS_ENV}: {where} session target {target!r} uses '::' — "
-            "a delegated row is spelled harness[=model] (owner directive: no "
-            "'::' syntax on agent routes)"
-        )
-    profile = str(route.get("profile_id") or "").strip()
+    route = parse_route_spec(
+        row.get("route"), setting=REVIEWER_SLOTS_ENV, where=where,
+        kind_aliases={
+            ROUTE_KIND_API: SHARED_ROUTE_KIND_API,
+            ROUTE_KIND_SESSION: SHARED_ROUTE_KIND_SESSION,
+        },
+        pin_key="profile_id",
+    )
+    kind = ROUTE_KIND_SESSION if route.is_session else ROUTE_KIND_API
+    effort = _valid_effort(row.get("effort"), where)
+    validate_compound_session_effort(
+        route, effort, setting=REVIEWER_SLOTS_ENV, where=where,
+    )
     return ConfiguredReviewerSlot(
-        slot_id=slot_id, kind=kind, target_id=target,
-        effort=_valid_effort(row.get("effort"), where),
-        session_target=target if kind == ROUTE_KIND_SESSION else "",
-        profile_id=profile if kind == ROUTE_KIND_SESSION else "",
+        slot_id=slot_id, kind=kind, target_id=route.target_id,
+        effort=effort,
+        session_target=route.target_id if kind == ROUTE_KIND_SESSION else "",
+        profile_id=route.credential_profile_id if kind == ROUTE_KIND_SESSION else "",
     )
 
 
@@ -201,15 +197,31 @@ def _parse_advisory(raw: Any) -> AdvisorySlotConfig:
             f"{REVIEWER_SLOTS_ENV}: advisory names an unknown route kind {kind!r}; "
             "valid: api, agent_session"
         )
-    target = str(route.get("target_id") or raw.get("target_id") or "").strip()
-    if kind == ROUTE_KIND_SESSION and "::" in target:
-        raise ValueError(f"{REVIEWER_SLOTS_ENV}: advisory session target {target!r} uses '::'")
+    shared_route = parse_route_spec(
+        {
+            "kind": kind,
+            "target_id": route.get("target_id") or raw.get("target_id") or "",
+            "profile_id": route.get("profile_id") or "",
+        },
+        setting=REVIEWER_SLOTS_ENV,
+        where="advisory",
+        kind_aliases={
+            "api": SHARED_ROUTE_KIND_API,
+            ROUTE_KIND_SESSION: SHARED_ROUTE_KIND_SESSION,
+        },
+        pin_key="profile_id",
+        allow_empty_target=True,
+    )
+    effort = _valid_effort(raw.get("effort"), "advisory") or "low"
+    validate_compound_session_effort(
+        shared_route, effort, setting=REVIEWER_SLOTS_ENV, where="advisory",
+    )
     return AdvisorySlotConfig(
         enabled=bool(raw.get("enabled", True)),
         kind=kind,
-        target_id=target,
-        effort=_valid_effort(raw.get("effort"), "advisory") or "low",
-        profile_id=str(route.get("profile_id") or "").strip(),
+        target_id=shared_route.target_id,
+        effort=effort,
+        profile_id=shared_route.credential_profile_id,
     )
 
 

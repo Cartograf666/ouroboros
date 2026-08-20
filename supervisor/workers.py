@@ -1532,6 +1532,7 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
                 out_q.put(e2)
         except Exception as _e:
             _log_worker_crash(wid, _drive, "handle_task", _e, _tb.format_exc())
+            return
 
 
 def _write_failure_result(
@@ -1954,6 +1955,8 @@ def kill_workers(
     archive_service_logs: bool = True,
     disable_reason: str = "",
     preserve_pending: bool = False,
+    preserve_running_task_ids: Optional[set[str]] = None,
+    reconcile_delegate_custody: bool = True,
 ) -> None:
     global _WORKER_POOL_DISABLED_REASON
     from supervisor import queue
@@ -1979,16 +1982,43 @@ def kill_workers(
         drained_ids = []
         try:
             done_status = terminal_status or "failed"
-            running_task_ids = set(RUNNING)
+            preserve_running = set(preserve_running_task_ids or ())
+            running_task_ids = set(RUNNING) - preserve_running
             interrupted_roots = {
                 str((meta.get("task") or {}).get("root_task_id") or task_id)
                 for task_id, meta in RUNNING.items()
-                if isinstance(meta, dict)
+                if isinstance(meta, dict) and task_id not in preserve_running
             }
+
+            def _audit_delegate_terminal(task_id: str, trigger: str) -> None:
+                if not reconcile_delegate_custody:
+                    return
+                try:
+                    from ouroboros import delegate_terminal
+
+                    audit = delegate_terminal.terminal_reconcile_task(
+                        DRIVE_ROOT, task_id, trigger=trigger,
+                    )
+                    delegate_terminal.record_terminal_reconciliation(
+                        DRIVE_ROOT, task_id, audit,
+                    )
+                except Exception:
+                    log.warning(
+                        "Terminal delegate reconciliation failed for %s", task_id,
+                        exc_info=True,
+                    )
+
             for task_id in list(RUNNING):
                 meta = RUNNING.get(task_id) or {}
                 task = meta.get("task") if isinstance(meta, dict) and isinstance(meta.get("task"), dict) else {}
+                if task_id in preserve_running:
+                    successor = dict(task)
+                    successor["_attempt"] = int(meta.get("attempt") or task.get("_attempt") or 1) + 1
+                    PENDING.insert(0, successor)
+                    RUNNING.pop(str(task_id), None)
+                    continue
                 try:
+                    _audit_delegate_terminal(str(task_id), "worker_pool_kill")
                     persisted = _write_failure_result(task_id, reason=result_reason, status=terminal_status)
                     if archive_service_logs:
                         try:
@@ -2004,11 +2034,15 @@ def kill_workers(
             if preserve_pending:
                 kept = []
                 for task in PENDING:
+                    if str(task.get("id") or "") in preserve_running:
+                        kept.append(task)
+                        continue
                     parent_id = str(task.get("parent_task_id") or "")
                     root_id = str(task.get("root_task_id") or "")
                     if parent_id and (parent_id in running_task_ids or root_id in interrupted_roots):
                         tid = str(task.get("id") or "")
                         if tid:
+                            _audit_delegate_terminal(tid, "pending_parent_interrupted")
                             persisted = _write_failure_result(
                                 tid,
                                 reason="Parent task was interrupted before this child started.",
@@ -2025,6 +2059,7 @@ def kill_workers(
                     tid = task.get("id")
                     if tid:
                         try:
+                            _audit_delegate_terminal(str(tid), "pending_pool_kill")
                             persisted = _write_failure_result(tid, reason=result_reason, status=terminal_status)
                         except Exception:
                             log.warning("Failed to write failure result for pending task %s", tid, exc_info=True)
@@ -2604,6 +2639,8 @@ def assign_tasks() -> None:
                             task_group_id=task.get("task_group_id"),
                             task_group=task.get("task_group"),
                             subagent_envelope=task.get("subagent_envelope"),
+                            configured_subagent=task.get("configured_subagent"),
+                            parent_cognitive_route=task.get("parent_cognitive_route"),
                             metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
                             result="Subagent assigned to a worker.",
                         )
@@ -2668,15 +2705,11 @@ def _ensure_workers_healthy_locked(queue: Any) -> tuple[List[int], bool]:
     crashed_tasks = []
     respawn_ids: List[int] = []
     for wid, w in list(WORKERS.items()):
-        # Variant A: a slot marked `reaping` is owned end-to-end by the background reaper
-        # (kill -> join -> archive -> respawn). Its proc is expected to die mid-reap, so the
-        # crash detector must NOT also respawn it — that double-respawn would orphan a live
-        # worker process. The reaper installs a fresh Worker (reaping=False) when done.
+        # The reaper owns marked slots through replacement; never double-respawn them.
         if getattr(w, "reaping", False):
             continue
         if not w.proc.is_alive():
-            # Reserve the dead slot before the main loop releases the queue lock
-            # to start its replacement. assign_tasks skips reaping slots.
+            # Reserve the dead slot before the queue lock is released.
             w.reaping = True
             dead_detections += 1
             if w.busy_task_id is not None:
@@ -2724,11 +2757,7 @@ def _ensure_workers_healthy_locked(queue: Any) -> tuple[List[int], bool]:
                 task = meta.get("task") if isinstance(meta, dict) else None
                 if isinstance(task, dict):
                     task_type = str(task.get("type") or "")
-                    # A negative exitcode means the worker died from a signal
-                    # (SIGSEGV/SIGBUS/SIGABRT/SIGKILL). These are deterministic
-                    # infrastructure crashes: retrying the same runtime path
-                    # reproduces them and only burns budget, so they are terminal
-                    # for EVERY task type (not just deep_self_review).
+                    # Signal crashes are terminal infrastructure failures for every task type.
                     is_crash_signal = isinstance(exitcode, int) and exitcode < 0
                     crash_signal = -exitcode if is_crash_signal else None
                     chat_id = coerce_chat_identity(task.get("chat_id"), 0)
@@ -2837,6 +2866,8 @@ def _ensure_workers_healthy_locked(queue: Any) -> tuple[List[int], bool]:
                             task, str(w.busy_task_id), "failed",
                             reason_code=reason_code, cost_fields=r_cost_fields,
                         )
+                        from ouroboros.delegate_recovery import reconcile_unrecoverable_task
+                        reconcile_unrecoverable_task(DRIVE_ROOT, str(w.busy_task_id))
                     elif task_type == "evolution" and not bool(load_state().get("evolution_mode_enabled")):
                         # Evolution was stopped: do not resurrect a dead evolution
                         # worker into another cycle (mirrors the hard-timeout gate
@@ -2856,9 +2887,17 @@ def _ensure_workers_healthy_locked(queue: Any) -> tuple[List[int], bool]:
                             task, str(w.busy_task_id), "cancelled",
                             cost_fields=r_cost_fields,
                         )
+                        from ouroboros.delegate_recovery import reconcile_unrecoverable_task
+                        reconcile_unrecoverable_task(DRIVE_ROOT, str(w.busy_task_id))
                     else:
                         task = dict(task)
                         task["_attempt"] = attempt + 1
+                        from ouroboros.delegate_recovery import prepare_worker_crash_handoff
+                        recovery_handoff = prepare_worker_crash_handoff(
+                            DRIVE_ROOT, task, old_attempt=attempt, new_attempt=attempt + 1,
+                            worker_id=wid,
+                            exitcode=exitcode if isinstance(exitcode, int) else None,
+                        )
                         try:
                             from ouroboros.task_results import STATUS_INTERRUPTED, write_task_result
                             write_task_result(
@@ -2869,10 +2908,6 @@ def _ensure_workers_healthy_locked(queue: Any) -> tuple[List[int], bool]:
                         except Exception:
                             log.debug("Failed to write interrupted status for %s", w.busy_task_id, exc_info=True)
                         try:
-                            # The ONE shared same-id requeue reset (§19.7.2 item 11):
-                            # the crash-requeue used to clean nothing, so the retried
-                            # attempt inherited the dead attempt's mailbox controls
-                            # and executable owner_hurry latch. Fail-soft inside.
                             from ouroboros.owner_hurry import retry_reset
 
                             retry_reset(
@@ -2888,6 +2923,10 @@ def _ensure_workers_healthy_locked(queue: Any) -> tuple[List[int], bool]:
                             if isinstance(admitted, dict) else ""
                         )
                         if admission_block:
+                            from ouroboros.delegate_recovery import veto_worker_retry_handoff
+                            veto_worker_retry_handoff(
+                                DRIVE_ROOT, str(w.busy_task_id), recovery_handoff, admission_block,
+                            )
                             reason_code = "worker_crash_retry_admission_blocked"
                             try:
                                 from ouroboros.task_results import STATUS_FAILED, write_task_result

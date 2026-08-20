@@ -14,8 +14,18 @@ from pathlib import Path
 
 import pytest
 
+from devtools.benchmarks.common.model_slots import pin_single_model
 from devtools.benchmarks.osworld import run_cu_bridge_agent as rcb
 from ouroboros.extension_loader import extension_surface_name
+
+
+_CU_ACTOR_MODEL = "openai/gpt-5.5"
+
+
+def _cu_actor_settings():
+    settings = {}
+    pin_single_model(_CU_ACTOR_MODEL, target=settings)
+    return settings
 
 
 def test_infeasible_checks_final_answer_fields_only():
@@ -364,9 +374,12 @@ def test_cu_bridge_claim_is_acquired_inside_the_try_that_releases_it():
     # of the RUN FLOW. Anchored on `body` (the flow, from the claim declaration on), not the
     # whole file: module-level helpers defined above the flow (`_gate_round`) legitimately
     # contain the same POST literal but are only ever CALLED from inside the flow.
-    assert src.index("runtime_attestation(args.ouroboros_url, repo_dir)") < src.index("acquire_task_claim(\n")
+    attestation = src.index("runtime_attestation(args.ouroboros_url, repo_dir)")
+    actor_match = src.index("actor_preflight = _cu_actor_preflight(settings_path, args.ouroboros_url)")
+    claim = src.index("acquire_task_claim(\n")
+    assert attestation < actor_match < claim
     first_paid_post_in_flow = src.index("claim_fd: int | None = None") + body.index('"POST", "/api/tasks"')
-    assert src.index("runtime_attestation(args.ouroboros_url, repo_dir)") < first_paid_post_in_flow
+    assert attestation < actor_match < first_paid_post_in_flow
 
 
 def test_cu_bridge_refuses_before_the_claim_when_attestation_fails(tmp_path, monkeypatch, capsys):
@@ -950,13 +963,14 @@ def _cu_bridge_stubs(monkeypatch, tmp_path, *, reward=1.0):
     monkeypatch.setattr(rcb, "_enable_skill", lambda repo, data: {"skill": "seeded"})
     monkeypatch.setattr(rcb, "_publish_target", lambda data, target: tmp_path / "state_target.txt")
     monkeypatch.setattr(rcb, "_collect_budget_counters", lambda *a, **k: {})
-    monkeypatch.setattr(
-        rcb, "_api",
-        lambda url, method, path, body=None, timeout=60: (
-            {"task_id": "t1"} if method == "POST" and path == "/api/tasks"
-            else {"status": "completed", "final_answer": "done"}
-        ),
-    )
+    def _api(url, method, path, body=None, timeout=60):
+        if method == "GET" and path == "/api/settings":
+            return _cu_actor_settings()
+        if method == "POST" and path == "/api/tasks":
+            return {"task_id": "t1"}
+        return {"status": "completed", "final_answer": "done"}
+
+    monkeypatch.setattr(rcb, "_api", _api)
     return rcb, env
 
 
@@ -970,7 +984,7 @@ def _cu_bridge_argv(tmp_path, claims):
     (repo_dir / "VERSION").write_text("6.76.0\n", encoding="utf-8")
     results = tmp_path / "results"
     settings = tmp_path / "settings.json"
-    settings.write_text("{}", encoding="utf-8")
+    settings.write_text(json.dumps(_cu_actor_settings()), encoding="utf-8")
     return [
         "run_cu_bridge_agent.py", "--osworld-root", str(osworld), "--provider_name", "docker",
         "--path_to_vm", "/vm/Ubuntu.qcow2", "--task", str(task), "--result_dir", str(results),
@@ -991,6 +1005,36 @@ def _attempt_dirs(run_dir):
 def _attempt_manifests(run_dir):
     return [json.loads((d / "task_run_manifest.json").read_text(encoding="utf-8"))
             for d in _attempt_dirs(run_dir)]
+
+
+def test_target_actor_is_durable_before_claim_and_survives_claim_crash(
+        tmp_path, monkeypatch):
+    from devtools.benchmarks.osworld import run_step_agent
+
+    claims = tmp_path / "claims"
+    rcb, _env = _cu_bridge_stubs(monkeypatch, tmp_path)
+    argv, results = _cu_bridge_argv(tmp_path, claims)
+    monkeypatch.setattr(sys, "argv", argv)
+    observed = {"claim": False}
+
+    def crash_at_first_external_boundary(*_args, **_kwargs):
+        manifests = _attempt_manifests(results / "chrome" / "abc")
+        assert len(manifests) == 1
+        actor = manifests[0]["harness"]["target_runtime_actor"]
+        assert actor["mismatches"] == []
+        assert not any(actor["local_routes"].values())
+        assert actor["reviewer_slots"]["advisory"]["enabled"] is False
+        assert manifests[0]["available_subagents"] == actor["available_subagents"]
+        observed["claim"] = True
+        raise RuntimeError("synthetic claim-boundary crash")
+
+    monkeypatch.setattr(run_step_agent, "acquire_task_claim", crash_at_first_external_boundary)
+    assert rcb.main() == 1
+
+    assert observed["claim"] is True
+    final = _attempt_manifests(results / "chrome" / "abc")[0]
+    assert final["extra"]["outcome"] == "adapter_error"
+    assert final["harness"]["target_runtime_actor"]["reviewer_slots"]
 
 
 def test_two_overlapping_attempts_never_share_one_canonical_record(tmp_path, monkeypatch, capsys):

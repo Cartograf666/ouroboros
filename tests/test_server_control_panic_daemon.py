@@ -69,7 +69,10 @@ def test_panic_stop_stops_owned_claudexor_daemon(monkeypatch, tmp_path):
         monkeypatch, tmp_path, daemon_stop=lambda: stops.append(True) or True
     )
     assert stops == [True]
-    assert worker_calls == [{"force": True, "archive_service_logs": False}]
+    assert worker_calls == [{
+        "force": True, "archive_service_logs": False,
+        "reconcile_delegate_custody": False,
+    }]
 
 
 def test_panic_stop_survives_daemon_stop_failure(monkeypatch, tmp_path):
@@ -80,4 +83,7 @@ def test_panic_stop_survives_daemon_stop_failure(monkeypatch, tmp_path):
         raise RuntimeError("daemon stop failed")
 
     worker_calls = _run_panic(monkeypatch, tmp_path, daemon_stop=_boom)
-    assert worker_calls == [{"force": True, "archive_service_logs": False}]
+    assert worker_calls == [{
+        "force": True, "archive_service_logs": False,
+        "reconcile_delegate_custody": False,
+    }]

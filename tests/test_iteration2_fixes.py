@@ -6,6 +6,7 @@
 #3 vision.view_image — bring a LOCAL image natively into the active model's context (local-only, not
    web-gated, reuses vlm_query's exact trust checks; blind-model + fail-closed paths covered).
 """
+import json
 import os
 import pathlib
 import shutil
@@ -69,6 +70,8 @@ def test_apply_all_model_one_low_reviewer_by_default(monkeypatch):
     assert os.environ["OUROBOROS_REVIEW_MODELS"] == "google/gemini-3.5-flash"  # one reviewer, no commas
     assert os.environ["OUROBOROS_EFFORT_REVIEW"] == "low"
     assert os.environ["OUROBOROS_EFFORT_SCOPE_REVIEW"] == "low"
+    actors = json.loads(os.environ["OUROBOROS_SUBAGENTS"])
+    assert [row["route"]["target_id"] for row in actors["items"]] == ["google/gemini-3.5-flash"]
 
 
 def test_apply_all_model_configurable_slots_and_effort(monkeypatch):

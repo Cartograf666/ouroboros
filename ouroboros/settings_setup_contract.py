@@ -32,18 +32,17 @@ def _rows(keys: tuple[str, ...], specs: tuple[tuple[Any, ...], ...]) -> list[dic
 _MODEL_DEFAULTS = {
     "openrouter": {
         "main": str(SETTINGS_DEFAULTS["OUROBOROS_MODEL"]),
-        "heavy": str(SETTINGS_DEFAULTS["OUROBOROS_MODEL_HEAVY"]),
         "light": str(SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"]),
         "vision": str(SETTINGS_DEFAULTS["OUROBOROS_MODEL_VISION"]),
         "consciousness": str(SETTINGS_DEFAULTS["OUROBOROS_MODEL_CONSCIOUSNESS"]),
         "fallback": str(SETTINGS_DEFAULTS["OUROBOROS_MODEL_FALLBACKS"]),
     },
-    "openai": dict(OPENAI_DIRECT_DEFAULTS),
-    "cloudru": dict(CLOUDRU_DIRECT_DEFAULTS),
-    "minimax": dict(MINIMAX_DIRECT_DEFAULTS),
-    "anthropic": dict(ANTHROPIC_DIRECT_DEFAULTS),
+    "openai": {key: value for key, value in OPENAI_DIRECT_DEFAULTS.items() if key != "heavy"},
+    "cloudru": {key: value for key, value in CLOUDRU_DIRECT_DEFAULTS.items() if key != "heavy"},
+    "minimax": {key: value for key, value in MINIMAX_DIRECT_DEFAULTS.items() if key != "heavy"},
+    "anthropic": {key: value for key, value in ANTHROPIC_DIRECT_DEFAULTS.items() if key != "heavy"},
     # No defaults: model names are server-specific; user must fill all slots.
-    "openai-compatible": {"main": "", "heavy": "", "light": "", "vision": "", "fallback": ""},
+    "openai-compatible": {"main": "", "light": "", "vision": "", "fallback": ""},
 }
 _MODEL_DEFAULTS["local"] = dict(_MODEL_DEFAULTS["openrouter"])
 for _profile_defaults in _MODEL_DEFAULTS.values():
@@ -95,8 +94,7 @@ _PROFILE_SPECS = {
 
 _MODEL_SLOTS = _rows(("slot", "stateKey", "settingKey", "inputId", "label", "note", "settingsInputId", "settingsToggleId"), (
     ("main", "mainModel", "OUROBOROS_MODEL", "main-model", "Main Model", "Primary reasoning and long-form work.", "s-model", "s-local-main"),
-    ("heavy", "heavyModel", "OUROBOROS_MODEL_HEAVY", "heavy-model", "Heavy Model", "Strong acting/coding lane for mutative first-level subagents. Empty uses Main.", "s-model-heavy", "s-local-heavy"),
-    ("light", "lightModel", "OUROBOROS_MODEL_LIGHT", "light-model", "Light Model", "Fast summaries, lightweight tasks, and all deep subagents. Empty uses Main.", "s-model-light", "s-local-light"),
+    ("light", "lightModel", "OUROBOROS_MODEL_LIGHT", "light-model", "Light Model", "Fast summaries, lightweight internal work, reflections, and the default Fast scout. Empty uses Main.", "s-model-light", "s-local-light"),
     ("vision", "visionModel", "OUROBOROS_MODEL_VISION", "vision-model", "Vision Model", "Caption and VLM lane. Empty uses Main.", "s-model-vision", ""),
     ("consciousness", "consciousnessModel", "OUROBOROS_MODEL_CONSCIOUSNESS", "consciousness-model", "Consciousness Model", "High-horizon background consciousness. Empty uses Main.", "s-model-consciousness", "s-local-consciousness"),
     ("fallback", "fallbackModel", "OUROBOROS_MODEL_FALLBACKS", "fallback-model", "Fallback Model", "Fallback and resilience path.", "s-model-fallback", "s-local-fallback"),
@@ -114,10 +112,14 @@ _RUNTIME_MODES = _rows(("value", "label", "tone", "className", "copy"), (
 ))
 
 _LOCAL_ROUTING_MODES = _rows(("value", "buttonLabel", "label", "flags"), (
-    ("cloud", "Cloud only", "Cloud models only", (False, False, False, False, False)),
-    ("fallback", "Fallback local", "Fallback model local", (False, False, False, False, True)),
-    ("all", "All models local", "All models local", (True, True, True, True, True)),
+    ("cloud", "Cloud only", "Cloud models only", (False, False, False, False)),
+    ("fallback", "Fallback local", "Fallback model local", (False, False, False, True)),
+    ("all", "All models local", "All active models local", (True, True, True, True)),
 ))
+
+_ACTIVE_LOCAL_KEYS = (
+    "USE_LOCAL_MAIN", "USE_LOCAL_LIGHT", "USE_LOCAL_CONSCIOUSNESS", "USE_LOCAL_FALLBACK",
+)
 
 _BUDGET_FIELDS = [
     {
@@ -269,19 +271,19 @@ def derive_provider_profile(settings: dict) -> str:
 
 
 def derive_local_routing_mode(settings: dict) -> str:
-    flags = tuple(_truthy(settings.get(key)) for key in ("USE_LOCAL_MAIN", "USE_LOCAL_HEAVY", "USE_LOCAL_LIGHT", "USE_LOCAL_CONSCIOUSNESS", "USE_LOCAL_FALLBACK"))
-    if flags == (True, True, True, True, True):
+    flags = tuple(_truthy(settings.get(key)) for key in _ACTIVE_LOCAL_KEYS)
+    if flags == (True, True, True, True):
         return "all"
-    return "fallback" if flags == (False, False, False, False, True) else "cloud"
+    return "fallback" if flags == (False, False, False, True) else "cloud"
 
 
-def local_routing_flags(mode: str, has_local: bool = True) -> tuple[bool, bool, bool, bool, bool]:
+def local_routing_flags(mode: str, has_local: bool = True) -> tuple[bool, bool, bool, bool]:
     if not has_local:
-        return (False, False, False, False, False)
+        return (False, False, False, False)
     for item in _LOCAL_ROUTING_MODES:
         if item["value"] == mode:
             return tuple(bool(flag) for flag in item["flags"])  # type: ignore[return-value]
-    return (False, False, False, False, False)
+    return (False, False, False, False)
 
 
 def model_defaults_for_profile(profile: str) -> dict:
@@ -470,7 +472,7 @@ def validate_setup_payload(data: dict, current_settings: dict) -> Tuple[dict, st
         return {}, f"Choose a runtime mode from {sorted(VALID_RUNTIME_MODES)}."
 
     models = {slot["settingKey"]: _string(data.get(slot["settingKey"])) for slot in _MODEL_SLOTS}
-    # Role-model (v6.39): only Main is required. Heavy/Light/Consciousness fall back to
+    # Role-model (v6.39): only Main is required. Light/Consciousness fall back to
     # Main when empty, and Fallbacks carries a resilience default (empty = no cross-model
     # fallback) — so the owner is not forced to fill every slot. Mirrors the relaxed
     # onboarding-wizard validateModelsStep.
@@ -509,9 +511,8 @@ def validate_setup_payload(data: dict, current_settings: dict) -> Tuple[dict, st
         "LOCAL_MODEL_N_GPU_LAYERS": local_gpu_layers,
         "LOCAL_MODEL_CHAT_FORMAT": local_chat_format if has_local else "",
         "USE_LOCAL_MAIN": use_local[0],
-        "USE_LOCAL_HEAVY": use_local[1],
-        "USE_LOCAL_LIGHT": use_local[2],
-        "USE_LOCAL_CONSCIOUSNESS": use_local[3],
-        "USE_LOCAL_FALLBACK": use_local[4],
+        "USE_LOCAL_LIGHT": use_local[1],
+        "USE_LOCAL_CONSCIOUSNESS": use_local[2],
+        "USE_LOCAL_FALLBACK": use_local[3],
     })
     return prepared, None

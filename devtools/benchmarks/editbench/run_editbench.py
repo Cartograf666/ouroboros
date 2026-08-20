@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -47,6 +48,11 @@ sys.path.insert(0, str(HERE))
 from devtools.benchmarks.common.manifests import (  # noqa: E402
     admit_benchmark_run,
     finalize_run_manifest,
+    model_slot_snapshot,
+)
+from devtools.benchmarks.common.model_slots import (  # noqa: E402
+    configured_subagents_snapshot,
+    disabled_subagents_setting,
 )
 from devtools.benchmarks.common.run_roots import assert_outside_repo, timestamp_run_id  # noqa: E402
 from devtools.benchmarks.common.server_runner import (  # noqa: E402
@@ -55,6 +61,7 @@ from devtools.benchmarks.common.server_runner import (  # noqa: E402
     build_isolated_settings,
     seed_owner_state,
 )
+from ouroboros.config import SETTINGS_DEFAULTS  # noqa: E402
 from checker import grade_generic  # noqa: E402
 from make_fixtures_v2 import T3_NEW_CMDSTR, T3_NEW_STRIP, T3_NEW_SUDO  # noqa: E402
 
@@ -272,9 +279,19 @@ def _seed_settings(data_root: pathlib.Path, model: str = "") -> pathlib.Path:
             live_cfg = json.loads(live.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             live_cfg = {}
+    effective_model = (
+        str(model or "").strip()
+        or str(live_cfg.get("OUROBOROS_MODEL") or "").strip()
+        or str(os.environ.get("OUROBOROS_MODEL") or "").strip()
+        or str(SETTINGS_DEFAULTS["OUROBOROS_MODEL"])
+    )
     overrides = {
         "OUROBOROS_RUNTIME_MODE": "advanced",
         "OUROBOROS_POST_TASK_EVOLUTION": "false",
+        # Delegation is outside the measured editing surface.  Make that explicit
+        # instead of relying on disabled tool names or an empty legacy Heavy slot.
+        "OUROBOROS_MODEL": effective_model,
+        "OUROBOROS_SUBAGENTS": disabled_subagents_setting(effective_model),
         # Keep the measurement about EDITING: no end-of-task review passes, no
         # LLM safety calls (deterministic guards stay), no consciousness lane.
         "OUROBOROS_TASK_REVIEW_MODE": "off",
@@ -284,9 +301,7 @@ def _seed_settings(data_root: pathlib.Path, model: str = "") -> pathlib.Path:
         # Pin the WHOLE main lane, fallbacks included — otherwise a transient
         # failure silently retries on the live fallback model and contaminates
         # the per-model comparison.
-        overrides["OUROBOROS_MODEL"] = model
         overrides["OUROBOROS_MODEL_FALLBACKS"] = model
-        overrides["OUROBOROS_MODEL_HEAVY"] = ""
     cfg = build_isolated_settings(live_cfg, **overrides)
     cfg.setdefault("TOTAL_BUDGET", 50.0)
     settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -575,6 +590,11 @@ def main() -> int:
         data_root.mkdir(parents=True)
         clone = _clone_working_tree(run_root)
         settings_path = _seed_settings(data_root, model=args.model)
+        manifest["model_slots"] = model_slot_snapshot(settings_path, env_overrides=False)
+        manifest["available_subagents"] = configured_subagents_snapshot(
+            settings_path,
+            env_overrides=False,
+        )
         if args.model:
             _log(f"main model lane pinned to {args.model}")
         seed_owner_state(data_root)
