@@ -57,14 +57,16 @@ from devtools.benchmarks.common.manifests import (
     runtime_attestation,
     write_json,
 )
+from devtools.benchmarks.common.model_slots import (
+    runtime_actor_snapshot,
+    single_model_subagents_setting,
+)
 from devtools.benchmarks.common.result_index import append_result_index, task_result_row
 from devtools.benchmarks.common.run_roots import (
     assert_outside_repo,
     ensure_outside_repo,
     repo_root_from_devtools,
 )
-
-
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _WORKSPACE_ROOT = _REPO_ROOT.parent
 
@@ -720,6 +722,7 @@ def release_task_claim(claims_dir: Path, claim_key: str, lock_fd: int | None, *,
 def _preflight(config: PreflightConfig) -> dict[str, Any]:
     failures: list[str] = []
     details: dict[str, Any] = {}
+    selected_model = str(config.model or "")
     checkout = osworld_checkout_info(config.osworld_root)
     details["osworld_checkout"] = checkout
     if not checkout["exists"]:
@@ -748,6 +751,26 @@ def _preflight(config: PreflightConfig) -> dict[str, Any]:
             settings = json.loads(config.settings_path.read_text(encoding="utf-8"))
             selected_model = str(config.model or settings.get("OUROBOROS_MODEL") or "")
             details["model"] = selected_model
+            if not selected_model:
+                failures.append(
+                    "a measured model must be declared through --model or settings "
+                    "OUROBOROS_MODEL"
+                )
+            else:
+                try:
+                    declared_actor = runtime_actor_snapshot(
+                        settings,
+                        expected_model=selected_model,
+                    )
+                except ValueError as exc:
+                    failures.append(f"declared actor invalid in settings: {exc}")
+                else:
+                    details["declared_runtime_actor"] = declared_actor
+                    details["available_subagents"] = declared_actor["available_subagents"]
+                    failures.extend(
+                        f"declared settings {mismatch}"
+                        for mismatch in declared_actor["mismatches"]
+                    )
             from ouroboros.provider_models import PROVIDER_ENV_KEYS, provider_for_model
 
             provider = provider_for_model(selected_model)
@@ -805,13 +828,22 @@ def _preflight(config: PreflightConfig) -> dict[str, Any]:
             got = server_settings.get(key)
             if str(got).strip().lower() != str(want).strip().lower():
                 mismatches.append(f"{key}: server={got!r} expected={want!r}")
-        if config.model:
-            server_model = str(server_settings.get("OUROBOROS_MODEL") or "")
-            if server_model != config.model:
-                mismatches.append(f"OUROBOROS_MODEL: server={server_model!r} expected={config.model!r}")
+        if selected_model:
+            target_actor = runtime_actor_snapshot(
+                server_settings,
+                expected_model=selected_model,
+            )
+            details["target_runtime_actor"] = target_actor
+            mismatches.extend(target_actor["mismatches"])
         details["server_scaffold_settings"] = {
             k: server_settings.get(k)
-            for k in ("OUROBOROS_RUNTIME_MODE", "OUROBOROS_SAFETY_MODE", "OUROBOROS_MAX_WORKERS", "OUROBOROS_MODEL")
+            for k in (
+                "OUROBOROS_RUNTIME_MODE",
+                "OUROBOROS_SAFETY_MODE",
+                "OUROBOROS_MAX_WORKERS",
+                "OUROBOROS_MODEL",
+                "OUROBOROS_SUBAGENTS",
+            )
         }
         if mismatches:
             message = (
@@ -850,6 +882,20 @@ def _preflight(config: PreflightConfig) -> dict[str, Any]:
     except Exception as exc:
         failures.append(str(exc))
     return {"ok": not failures, "failures": failures, "details": details}
+
+
+def _bind_target_actor(manifest: dict[str, Any], preflight: dict[str, Any]) -> None:
+    """Record the actor exposed by the target, including allowed scaffold drift."""
+    target_actor = (preflight.get("details") or {}).get("target_runtime_actor") or {}
+    manifest["available_subagents"] = (
+        dict(target_actor.get("available_subagents") or {})
+        if isinstance(target_actor, dict)
+        else {}
+    )
+    manifest["harness"] = {
+        **(manifest.get("harness") or {}),
+        "target_runtime_actor": target_actor,
+    }
 
 
 def _json_from_text(raw: str) -> dict[str, Any]:
@@ -1219,6 +1265,8 @@ Accessibility tree (may be empty/truncated):
         prompt_path.write_text(prompt, encoding="utf-8")
 
         env = os.environ.copy()
+        env.pop("OUROBOROS_MODEL_HEAVY", None)
+        env.pop("USE_LOCAL_HEAVY", None)
         # NB: `ouroboros run --url` submits over the gateway, so these env vars
         # configure only the CLI subprocess, NOT the executing server — the
         # disclosed scaffold defaults are ENFORCED by the preflight check of the
@@ -1237,9 +1285,9 @@ Accessibility tree (may be empty/truncated):
         if self.model:
             env.update({
                 "OUROBOROS_MODEL": self.model,
-                "OUROBOROS_MODEL_HEAVY": self.model,
                 "OUROBOROS_MODEL_LIGHT": self.model,
                 "OUROBOROS_MODEL_FALLBACKS": self.model,
+                "OUROBOROS_SUBAGENTS": single_model_subagents_setting(self.model),
             })
 
         cmd = [
@@ -1609,6 +1657,10 @@ def _run_step_loop(args: argparse.Namespace, final: dict[str, Any],
         allow_scaffold_mismatch=bool(args.allow_scaffold_mismatch),
     ))
     write_json(run_dir / "preflight.json", preflight)
+    # Bind the run to the actor the TARGET server actually exposed. This remains
+    # true for an explicit --allow-scaffold-mismatch ablation: the manifest records
+    # the drifted actor, never the nicer local declaration.
+    _bind_target_actor(base_manifest, preflight)
     # The attestation record travels with the manifest, not just the preflight file, so a
     # scored row can always be attributed to a runtime version + commit.
     base_manifest["extra"]["runtime_attestation"] = (

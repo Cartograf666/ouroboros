@@ -3211,13 +3211,7 @@ def _drain_incoming_messages(
     _owner_msg_seen: set,
     owner_ctx: Any = None,
 ) -> Dict[str, Any]:
-    """Inject owner messages received during task execution.
-
-    Returns typed control signals drained from the mailbox (currently
-    ``{"finalize_now": reason}`` when the supervisor opened a finalization
-    grace window); control entries are routed structurally, never injected
-    as owner prose.
-    """
+    """Injects dialogue; returns typed controls."""
     controls: Dict[str, Any] = {}
     while not incoming_messages.empty():
         try:
@@ -3244,7 +3238,10 @@ def _drain_incoming_messages(
             break
 
     if drive_root is not None and task_id:
-        from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_TEXT, drain_owner_entries
+        from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_TEXT, KIND_TASK_MESSAGE, acknowledge_transcript_entry, deliver_task_message, drain_owner_entries
+
+        if owner_ctx:
+            owner_ctx._loop_mailbox_seen_ids = _owner_msg_seen
         for entry in drain_owner_entries(drive_root, task_id=task_id, seen_ids=_owner_msg_seen):
             kind = entry.get("kind") or KIND_OWNER_TEXT
             if kind == KIND_FINALIZE_NOW:
@@ -3267,6 +3264,10 @@ def _drain_incoming_messages(
                 controls["hurry"] = str(entry.get("msg_id") or "hurry")
                 continue
             dmsg = entry.get("text") or ""
+            if kind == KIND_TASK_MESSAGE:
+                deliver_task_message(entry, task_id, event_queue, lambda text: _append_or_merge_user_message(messages, text))
+                acknowledge_transcript_entry(drive_root, task_id, entry)
+                continue
             _record_owner_directive(
                 owner_ctx,
                 source="owner_mailbox",
@@ -3276,6 +3277,7 @@ def _drain_incoming_messages(
             from ouroboros.client_surface import noted_owner_text
 
             _append_or_merge_user_message(messages, _owner_marked_content(noted_owner_text(owner_ctx, entry, dmsg)))
+            acknowledge_transcript_entry(drive_root, task_id, entry)
             if event_queue is not None:
                 try:
                     event_queue.put_nowait({
@@ -5446,10 +5448,11 @@ def _forced_delegation_note(tools_ctx: Any, llm_trace: Dict[str, Any]) -> str:
             f"\nNOTE: this task's delegated run(s) settled WITHOUT success ({settled} "
             "run(s)). State that failure and its impact honestly in your answer."
         )
-    if any(str(c.get("tool") or "") == "delegate_start"
-           for c in (llm_trace.get("tool_calls") or []) if isinstance(c, dict)):
-        # The trace shows a dispatch the durable rows have not recorded — never
-        # accuse over evidence that is behind the task's own actions.
+    if evidence.get("delegate_start_attempted") or any(
+        str(c.get("tool") or "") == "delegate_start"
+        for c in (llm_trace.get("tool_calls") or []) if isinstance(c, dict)
+    ):
+        # A durable or current-trace start attempt is not a refusal to delegate.
         return ""
     return (
         "\nNOTE: this task was dispatched onto the delegated substrate "
@@ -5795,10 +5798,8 @@ def _nanny_finalization_message(
         # evidence: an unreadable custody log (or a failed read above) proves
         # nothing (scope finding on a5e59bdf).
         return ""
-    if not started and trace_attempted:
-        # A start this trace saw but custody has no row for: pending settlement
-        # or an uncustodied start — an attempt either way; neither accusation
-        # fits, and the wait/cancel path owns its own disclosure.
+    if not started and (trace_attempted or evidence.get("delegate_start_attempted")):
+        # Pending, refused or uncustodied starts are still real attempts.
         return ""
     settled = int(evidence.get("delegated_runs_settled") or 0)
     failure_states = [str(s) for s in (evidence.get("delegated_run_failure_states") or [])]
@@ -6798,10 +6799,7 @@ def run_llm_loop(
         active_context_mode = _preferred_context_mode
     llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
     accumulated_usage: Dict[str, Any] = {}
-    # Published as a live reference so blocking tools (wait_task/wait_tasks/
-    # delegate_wait) can read RECORDED per-send facts — e.g. the APPLIED
-    # prompt-cache TTL (`_last_prompt_cache_ttl`) behind the cache-horizon
-    # disclosure — without a second, route-derived predictor.
+    # Shared live reference to recorded per-send facts for blocking tools.
     tools._ctx._accumulated_usage = accumulated_usage
     max_retries = 3
     cost_ceiling = _resolve_task_cost_ceiling(ctx, budget_remaining_usd)
@@ -6851,8 +6849,10 @@ def run_llm_loop(
                 _sanitized = LLMClient.sanitize_reasoning_on_model_switch(messages, _prev_active_model, active_model)
                 if _sanitized is not messages:
                     messages[:] = _sanitized
-            ctx.active_context_mode = active_context_mode  # switch_model re-binds the fit plan from this round's mode
-            ctx.active_model = active_model  # publish the round's REAL model (incl. switch_model / per-task override) so tools (native screenshot vision-routing) don't read the stale global OUROBOROS_MODEL env
+            ctx.active_context_mode = active_context_mode
+            ctx.active_model = active_model
+            ctx.active_effort = active_effort
+            ctx.active_use_local = active_use_local
 
             # One forced-wrap-up context per round: consumed by the round-limit
             # path and the supervisor finalize_now control path below.
@@ -6942,7 +6942,7 @@ def run_llm_loop(
             )
             tools._ctx._current_llm_call_meta = dict(accumulated_usage.get("_last_llm_call_meta") or {})
 
-            if msg is None:
+            if msg is None and not bool(getattr(ctx, "exact_model_route", False)):
                 (
                     msg,
                     active_model,
@@ -6956,11 +6956,11 @@ def run_llm_loop(
                     event_queue=event_queue, accumulated_usage=accumulated_usage, task_type=task_type,
                     emit_progress=emit_progress, context_fit_plan=context_fit_plan,
                     active_context_mode=active_context_mode)
-                if msg is None:
-                    # Provider death: terminal stop.
-                    text, accumulated_usage, forced_trace = _handle_provider_unavailable(limit_ctx)
-                    _merge_finalization_trace(llm_trace, forced_trace)
-                    return text, accumulated_usage, llm_trace
+            if msg is None:
+                # Exact actor routes skip generic substitution and fail as infrastructure.
+                text, accumulated_usage, forced_trace = _handle_provider_unavailable(limit_ctx)
+                _merge_finalization_trace(llm_trace, forced_trace)
+                return text, accumulated_usage, llm_trace
 
             from ouroboros.openai_chat_dispatch import CUSTOM_RECEIPTS_USAGE_KEY
 

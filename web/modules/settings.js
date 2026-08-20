@@ -5,9 +5,12 @@ import { applyMcpSettings, collectMcpSettings, initMcpSettings } from './mcp_set
 import { collectReviewerSlots, initReviewerSlots, reloadReviewerSlots } from './reviewer_slots.js';
 import {
     applySubagentsSettings,
+    availableSubagentsPreviewPayload,
     collectSubagentsSettings,
     initSubagentsSection,
     reloadSubagentsSection,
+    subagentSettingsFingerprint,
+    validateSubagentsDraft,
 } from './subagents_settings.js';
 import { initHarnessAccounts } from './harness_accounts.js';
 import { openConfirmDialog } from './confirm_dialog.js';
@@ -81,17 +84,6 @@ function applyInputValue(id, value) {
 
 function applyCheckboxValue(id, value) {
     byId(id).checked = isTruthySetting(value);
-}
-
-function syncHeavyModelPlaceholder() {
-    // Owner decision: an empty Heavy slot legally inherits Main, so the empty
-    // field names the model it actually resolves to instead of looking unset.
-    // Display-only — nothing here writes settings.
-    const heavy = byId('s-model-heavy');
-    const main = byId('s-model');
-    if (!heavy || !main) return;
-    const mainValue = String(main.value || '').trim();
-    heavy.placeholder = mainValue ? `inherits Main (${mainValue})` : 'inherits Main';
 }
 
 function isTruthySetting(value) {
@@ -401,7 +393,16 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     const providerTestsInFlight = new Set();
     initMcpSettings({ onChange: updateSettingsDirtyState });
     initReviewerSlots({ onChange: () => updateSettingsDirtyState() });
-    initSubagentsSection({ onChange: () => updateSettingsDirtyState() });
+    initSubagentsSection({
+        onChange: () => updateSettingsDirtyState(),
+        isOuterDraftClean: () => !settingsDirty,
+        onGeneratedApply: () => {
+            if (settingsLoaded && !settingsDirty) setSettingsCleanBaseline();
+        },
+        previewGenerated: ({ subscriptionsConnected }) => apiClient.previewOnboardingSubagents(
+            availableSubagentsPreviewPayload(collectBody(), subscriptionsConnected),
+        ),
+    });
     initHarnessAccounts();
 
     function anthropicKeyConfigured() {
@@ -511,10 +512,10 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         // own surfaces fetch, never arm the polling chain itself.
         baselineSettleDisposer?.();
         baselineSettleDisposer = claudexorStatus.subscribe(() => {
-            // CLEAN drafts only. Folding store-gated keys into a DIRTY baseline
-            // was tried and reverted: collectSubagentsSettings overlays the
-            // owner's unsaved Delegation edits onto the store facts, so the
-            // fold silently erased exactly those edits from the diff.
+            // CLEAN drafts only. A late availability repaint may change status
+            // copy but never the canonical actor draft; re-baselining a DIRTY
+            // page would still absorb the owner's real row edit into the clean
+            // baseline, so it remains forbidden.
             // Disclosed residual: a cold-daemon settle landing AFTER an owner
             // edit stays inside the unsaved-changes diff until the next save —
             // rare (the reloads wait a bounded beat for the probe first) and
@@ -611,7 +612,6 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             applyInputValue(slot.settingsInputId, s[slot.settingKey]);
             if (slot.settingsToggleId) applyCheckboxValue(slot.settingsToggleId, s[`USE_LOCAL_${slot.slot.toUpperCase()}`]);
         });
-        syncHeavyModelPlaceholder();
         applyCheckboxValue('s-auto-grant-reviewed-skills', s.OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS);
         // Owner-facing mutative-subagents control shows the EFFECTIVE state when it
         // is binary-representable: an explicit value, or unset in advanced/pro
@@ -628,7 +628,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         delete mutativeInput.dataset.effortTouched;
         mutativeInput.value =
             ({ true: 'on', false: 'off' }[rawMutative] || (runtimeMode === 'light' ? 'auto' : 'on'));
-        // The delegation route lives next to it in Agents → Delegation.
+        // The actor list lives next to it in Agents → Available subagents.
         applySubagentsSettings(s);
         // Post-task evolution: one owner-facing selector maps to enable + cadence.
         const evoEnabled =
@@ -728,18 +728,22 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         renderExtensionSettingsSections(page, sections);
         renderRequestedSkillSecrets(page, extData.skills || [], data);
         renderCustomSecrets(page, data);
-        // Await the reviewer rows and the Subagents accounts BEFORE the clean
+        // Await reviewer config and the Available-subagents bounded status beat BEFORE the clean
         // baseline: their async arrival must not read as an unsaved owner edit.
         // (The Claudexor status probe inside them is fire-and-forget — a cold
         // daemon must not hold the Save button — so its LATER settlement is
         // re-baselined below.)
         await Promise.all([reloadReviewerSlots(), reloadSubagentsSection()]);
+        // Mark the document loaded before taking the baseline. A generated
+        // preview may settle in the microtask between these statements; its
+        // clean-gated callback must be allowed to fold that exact draft into
+        // the baseline rather than leave a false unsaved change behind.
+        settingsLoaded = true;
         setSettingsCleanBaseline();
         armCleanBaselineOnStatusSettle();
         closeSettingsModelPickers();
         _renderNetworkHint(data._meta);
         renderClaudeCodeUi();
-        settingsLoaded = true;
         markSettingsDirty = updateSettingsDirtyState;
         syncSettingsLoadState();
         startClaudeCodePolling();
@@ -801,9 +805,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             // 6.1: the ONE structured reviewer-slot setting; {} until the rows
             // view has loaded, so an unrelated save cannot blank it.
             ...collectReviewerSlots(),
-            // Same rule for the delegated-subagent route: {} until the accounts
-            // read succeeded, so an unrelated save cannot turn delegation off
-            // because this page could not reach the daemon.
+            // Saved config and live availability are independent: a loaded
+            // actor list is collected even when status is down; only an
+            // unloaded/unparseable editor omits the key on an unrelated save.
             ...collectSubagentsSettings(),
         };
         setupModelSlots().forEach((slot) => {
@@ -1145,16 +1149,6 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         renderSettingsModelPicker(input);
     });
 
-    // Keep the Heavy inherits-Main hint live while Main is edited (typed
-    // 'input') or picked from the catalog dropdown (dispatched 'change').
-    for (const eventType of ['input', 'change']) {
-        page.addEventListener(eventType, (event) => {
-            if (event.target instanceof Element && event.target.id === 's-model') {
-                syncHeavyModelPlaceholder();
-            }
-        });
-    }
-
     page.addEventListener('mousedown', (event) => {
         const item = event.target instanceof Element
             ? event.target.closest('.model-picker-item')
@@ -1317,7 +1311,14 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             setStatus('Every-N cadence needs a whole number ≥ 1.', 'warn');
             return;
         }
+        const subagentErrors = validateSubagentsDraft();
+        if (subagentErrors.length) {
+            setStatus(`Available subagents: ${subagentErrors[0]}`, 'warn');
+            return;
+        }
         const body = collectBody();
+        const subagentsChanged = subagentSettingsFingerprint(body.OUROBOROS_SUBAGENTS)
+            !== subagentSettingsFingerprint(currentSettings?.OUROBOROS_SUBAGENTS);
 
         try {
             const data = await apiClient.saveSettings(body);
@@ -1371,6 +1372,10 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 statusMsg = 'Settings saved. Changes took effect immediately';
             } else {
                 statusMsg = 'Settings saved. Changes take effect on the next task';
+            }
+            if (subagentsChanged && data.agent_task_running) {
+                statusMsg += '. Available subagents take effect for new child tasks; '
+                    + 'the current task keeps its existing routes';
             }
             if (data.warnings && data.warnings.length) {
                 statusMsg += ' ⚠️ ' + data.warnings.join(' | ');

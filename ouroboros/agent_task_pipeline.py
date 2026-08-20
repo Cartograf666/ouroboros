@@ -13,7 +13,6 @@ from typing import Any, Callable, Dict, List
 
 from ouroboros.cost_projection import cost_projection
 from ouroboros.task_results import (
-    TASK_COST_META_FIELDS,
     STATUS_COMPLETED,
     STATUS_FAILED,
     load_task_result,
@@ -29,6 +28,7 @@ from ouroboros.outcomes import (
     artifact_bundle_from_result,
     build_verification_ledger,
     derive_loop_outcome,
+    infra_failed_axes,
     maybe_write_verification_artifact,
     normalize_outcome_axes,
 )
@@ -276,11 +276,12 @@ def _pre_synthesis_usage_snapshot(
     return snapshot
 
 
-# The synthesis cost/snapshot renderers live in `ouroboros/synthesis_cost_text.py`
+# The synthesis cost/snapshot projections live in `ouroboros/synthesis_cost_text.py`
 # (extracted at this module's size ceiling); re-exported here because the
 # synthesis prompts, the tests and monkeypatch targets name them on THIS surface.
 from ouroboros.synthesis_cost_text import (  # noqa: F401,E402
     _SYNTHESIS_USAGE_PROMPT_FIELDS,
+    _summary_row_cost_fields,
     _synthesis_cost_text,
     _synthesis_cost_usd,
     _synthesis_usage_snapshot_text,
@@ -595,7 +596,28 @@ def _derive_host_bound_loop_outcome(
 ) -> Dict[str, Any]:
     """Derive once from the current durable mutation-evidence binding."""
     _attach_host_mutation_projection(env, task, llm_trace)
-    return derive_loop_outcome(text or "", usage, llm_trace)
+    return _apply_terminal_custody_outcome(
+        env, task, derive_loop_outcome(text or "", usage, llm_trace),
+    )
+
+
+def _apply_terminal_custody_outcome(
+    env: Any, task: Dict[str, Any], loop_outcome: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Make the terminal custody audit authoritative for result and event axes."""
+
+    existing = load_task_result(task.get("budget_drive_root") or env.drive_root, str(task.get("id") or "")) or {}
+    unreconciled = existing.get("delegated_runs_unreconciled")
+    if not isinstance(unreconciled, list) or not unreconciled:
+        return loop_outcome
+    return {
+        **loop_outcome,
+        "reason_code": "delegated_custody_unreconciled",
+        "outcome_axes": infra_failed_axes(
+            "delegated_custody_unreconciled",
+            review_trigger="delegate_terminal_reconciliation",
+        ),
+    }
 
 
 def emit_task_results(
@@ -991,6 +1013,11 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
                 expected_output=str(task.get("expected_output") or ""),
             )
         outcome_axes = normalize_outcome_axes({"outcome_axes": loop_outcome.get("outcome_axes")})
+        loop_outcome = _apply_terminal_custody_outcome(env, task, loop_outcome)
+        if str(loop_outcome.get("reason_code") or "") == "delegated_custody_unreconciled":
+            outcome_axes = normalize_outcome_axes(
+                {"outcome_axes": loop_outcome["outcome_axes"]}
+            )
         execution_status = str((outcome_axes.get("execution") or {}).get("status") or "")
         reason_code = str(loop_outcome.get("reason_code") or "")
         status = (
@@ -1127,6 +1154,9 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
             task_group_id=task.get("task_group_id"),
             task_group=task.get("task_group"),
             subagent_envelope=subagent_envelope,
+            configured_subagent=task.get("configured_subagent"),
+            parent_cognitive_route=task.get("parent_cognitive_route"),
+            subagent_availability=task.get("subagent_availability"),
             metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
             result=text or "",
             final_answer=str(loop_outcome.get("final_answer") or ""),
@@ -1173,20 +1203,6 @@ Rounds: {rounds}, Cost: {cost_text}
 ## Structured review evidence
 {review_evidence}
 """
-
-
-def _summary_row_cost_fields(usage: Dict[str, Any]) -> Dict[str, Any]:
-    """Flat task-scope cost fields for the task_summary chat row (v6.82 P1).
-
-    Mapped explicitly from the pre-synthesis usage snapshot
-    (``_pre_synthesis_usage_snapshot``): only the snapshot's own honest keys are
-    copied. Its schema deliberately differs from the full nine-field browser set
-    — it carries no ``cost_usd``/``cost_accounting_error`` — and a non-root
-    snapshot without accounting keys yields nothing. Never fabricates values;
-    the terminal ``task_results`` checkpoint stays the final authority (history
-    replay overrides these row values with it when the result file survives).
-    """
-    return {key: usage[key] for key in TASK_COST_META_FIELDS if key in usage}
 
 
 def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evidence=None,

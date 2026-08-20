@@ -11,7 +11,6 @@ from ouroboros.reviewer_slot_config import parse_reviewer_slots
 from ouroboros.subscription_install_presets import (
     PRESET_MARKER_KEY,
     REVIEWER_SLOTS_KEY,
-    SUBAGENT_HARNESS_KEY,
     SUBSCRIPTION_PRESET_VERSION,
     HarnessDiscovery,
     compile_install_preset,
@@ -104,7 +103,9 @@ def test_every_combination_follows_the_declarative_policy(connected):
     assert preset.ok, preset.refusal
     primary = next(harness for harness in HARNESSES if harness in connected)
     subagent_target, subagent_effort = _target(primary, "subagent")
-    assert preset.subagent_harness == f"{subagent_target}:{subagent_effort}"
+    first_actor = json.loads(preset.available_subagents)["items"][0]
+    assert first_actor["route"]["target_id"] == subagent_target
+    assert first_actor["effort"] == subagent_effort
 
     config = parse_reviewer_slots(preset.reviewer_slots)
     assert [(row.target_id, row.effort) for row in config.triad] == [
@@ -131,7 +132,11 @@ def test_only_exact_discovery_ids_are_ever_written(connected):
 
     targets = [row.target_id for row in config.triad + config.scope]
     targets.append(config.advisory.target_id)
-    targets.append(preset.subagent_harness.split(":")[0])
+    targets.extend(
+        row["route"]["target_id"]
+        for row in json.loads(preset.available_subagents)["items"]
+        if row["route"]["kind"] == "agent_session"
+    )
     for target in targets:
         harness, _, model = target.partition("=")
         assert model in LIVE_MODELS[harness], f"{model!r} is not in {harness} discovery"
@@ -159,12 +164,15 @@ def test_single_core_harness_runs_three_independent_same_model_slots(harness):
     assert len({row.slot_id for row in config.triad}) == 3
 
 
-def test_settings_keys_are_exactly_the_three_install_keys():
+def test_settings_keys_write_new_actor_ssot_and_receipt_not_legacy_singleton():
+    from ouroboros.configured_subagents import SUBAGENTS_RECEIPT_KEY, SUBAGENTS_SETTING
+
     preset = compile_install_preset(_discoveries("claude"))
 
     assert set(preset.settings_keys()) == {
-        REVIEWER_SLOTS_KEY, SUBAGENT_HARNESS_KEY, PRESET_MARKER_KEY}
+        REVIEWER_SLOTS_KEY, SUBAGENTS_SETTING, SUBAGENTS_RECEIPT_KEY, PRESET_MARKER_KEY}
     assert preset.settings_keys()[PRESET_MARKER_KEY] == SUBSCRIPTION_PRESET_VERSION
+    assert "OUROBOROS_SUBAGENT_HARNESS" not in preset.settings_keys()
     # The API model slots are NOT among them (owner decision D-2).
     assert "OUROBOROS_MODEL" not in preset.settings_keys()
 
@@ -184,7 +192,6 @@ def test_unresolvable_model_refuses_typed_and_emits_nothing():
     assert "claude-opus-5" in preset.refusal.candidates
     # Nothing partial: no slots, no subagent value, no settings keys at all.
     assert preset.reviewer_slots == ""
-    assert preset.subagent_harness == ""
     assert preset.settings_keys() == {}
 
 
@@ -212,18 +219,24 @@ def test_cursor_effort_rides_the_slug_and_the_row_field_together():
     assert config.scope[0].target_id == "cursor=cursor-grok-4.6-high"
     assert config.scope[0].effort == "high"
     assert preset.receipt["surfaces"]["scope"][0]["effort_in_model_id"] is True
-    assert preset.receipt["surfaces"]["subagent"]["effort_in_model_id"] is True
+    assert preset.receipt["surfaces"]["subagent"][0]["effort_in_model_id"] is True
 
 
 @pytest.mark.parametrize("connected", AGY_COMBINATIONS)
-def test_antigravity_combinations_refuse_until_owner_dictates_their_seats(connected):
+def test_antigravity_compiles_task_actor_without_changing_core_reviewer_bytes(connected):
     preset = compile_install_preset(_discoveries(*connected))
 
-    assert not preset.ok
-    assert preset.refusal is not None
-    assert preset.refusal.code == "matrix_row_absent"
-    assert "owner decision" in preset.refusal.message
-    assert preset.settings_keys() == {}
+    assert preset.ok, preset.refusal
+    actor_routes = [
+        row["route"]["target_id"]
+        for row in json.loads(preset.available_subagents)["items"]
+    ]
+    assert "agy=gemini-3.7-flash-high" in actor_routes
+    core = tuple(harness for harness in connected if harness in CORE_HARNESSES)
+    if not core:
+        assert preset.reviewer_slots == ""
+    else:
+        assert preset.reviewer_slots == compile_install_preset(_discoveries(*core)).reviewer_slots
 
 
 def test_claude_and_codex_rows_carry_effort_only_in_the_field():
@@ -241,7 +254,7 @@ def test_no_connected_preset_harness_refuses():
     preset = compile_install_preset([HarnessDiscovery("opencode", ("whatever",))])
 
     assert not preset.ok
-    assert preset.refusal.code == "no_preset_harness_connected"
+    assert preset.refusal.code == "no_available_subagents"
     assert preset.settings_keys() == {}
 
 
@@ -269,6 +282,35 @@ def test_receipt_records_what_was_resolved_and_from_where():
     assert len(receipt["surfaces"]["triad"]) == 2
     # The receipt must be JSON-serializable — it rides an API response.
     json.dumps(receipt)
+
+
+def test_owner_pinned_session_is_reported_truthfully_in_the_receipt():
+    from ouroboros.configured_subagents import parse_configured_subagents
+
+    owner = parse_configured_subagents({
+        "enabled": True,
+        "items": [{
+            "subagent_id": "owner-session",
+            "name": "Owner session",
+            "recommended_use": "Use the explicitly pinned owner account.",
+            "route": {
+                "kind": "agent_session",
+                "target_id": "claude=claude-opus-5",
+                "credential_profile_id": "owner-account",
+            },
+            "effort": "high",
+        }],
+    })
+    preset = compile_install_preset(
+        _discoveries("claude"),
+        configured_subagents=owner,
+        source="configured",
+    )
+
+    assert preset.ok, preset.refusal
+    assert preset.receipt["profile_pinned"] is True
+    saved_route = preset.receipt["available_subagents"]["items"][0]["route"]
+    assert saved_route["credential_profile_id"] == "owner-account"
 
 
 def test_compiler_reads_no_settings_and_carries_no_transport(monkeypatch):
@@ -309,12 +351,10 @@ def _catalog_with_agy():
     return {**LIVE_MODELS, "agy": AGY_LIVE_MODELS}
 
 
-def test_matrix_row_absent_wins_over_empty_discovery():
-    # An unratified combination refuses as unratified whatever its discovery
-    # holds — the guard runs before discovery validation on purpose.
+def test_agy_missing_required_flash_is_typed_discovery_failure():
     preset = compile_install_preset([HarnessDiscovery(harness_id="agy", model_ids=())])
     assert preset.refusal is not None
-    assert preset.refusal.code == "matrix_row_absent"
+    assert preset.refusal.code == "discovery_empty"
 
 
 def test_no_recognized_combination_can_raise():
@@ -341,9 +381,120 @@ def test_agy_alias_table_spells_effort_inside_the_id():
     assert HARNESS_AGY in _EFFORT_IN_MODEL_ID
     aliases = _MODEL_ALIASES[HARNESS_AGY]
     # Every alias candidate formats to an id the pinned vendor CLI really
-    # publishes, so a future matrix row resolves exact discovery ids.
+    # publishes, so automatic and manually selected rows resolve exact ids.
     assert aliases["gemini-3.7-flash"][0].format(effort="high") in AGY_LIVE_MODELS
     assert aliases["gemini-3.1-pro"][0].format(effort="high") in AGY_LIVE_MODELS
     assert aliases["gemini-3.1-pro"][0].format(effort="low") in AGY_LIVE_MODELS
     # Documented trap for the future dictation: pro has no -medium slug.
     assert aliases["gemini-3.1-pro"][0].format(effort="medium") not in AGY_LIVE_MODELS
+
+
+def test_api_only_compiles_main_and_distinct_light_without_daemon_inputs():
+    preset = compile_install_preset((), settings={
+        "OPENAI_API_KEY": "configured",
+        "OUROBOROS_MODEL": "openai::gpt-5.6-sol",
+        "OUROBOROS_MODEL_LIGHT": "openai::gpt-5.6-luna",
+    })
+
+    assert preset.ok, preset.refusal
+    items = json.loads(preset.available_subagents)["items"]
+    assert [(row["name"], row["route"]["target_id"]) for row in items] == [
+        ("Primary builder", "openai::gpt-5.6-sol"),
+        ("Fast scout", "openai::gpt-5.6-luna"),
+    ]
+    assert preset.reviewer_slots == ""
+
+
+def test_api_only_identical_main_and_light_deduplicate_without_fake_diversity():
+    preset = compile_install_preset((), settings={
+        "OPENROUTER_API_KEY": "configured",
+        "OUROBOROS_MODEL": "openai/gpt-5.6-luna",
+        "OUROBOROS_MODEL_LIGHT": "openai/gpt-5.6-luna",
+    })
+
+    assert len(json.loads(preset.available_subagents)["items"]) == 1
+    assert [row["code"] for row in preset.diagnostics] == [
+        "duplicate_api_routes_omitted",
+    ]
+
+
+def test_legacy_heavy_is_not_an_active_default_actor_source():
+    preset = compile_install_preset((), settings={
+        "OPENROUTER_API_KEY": "configured",
+        "OUROBOROS_MODEL_HEAVY": "anthropic/claude-opus-5",
+    })
+
+    assert not preset.ok
+    assert preset.refusal is not None
+    assert preset.refusal.code == "no_available_subagents"
+
+
+def test_local_only_materializes_existing_local_suffix_and_no_router_actor():
+    preset = compile_install_preset((), settings={
+        "LOCAL_MODEL_SOURCE": "owner/model.gguf",
+        "USE_LOCAL_MAIN": True,
+        "USE_LOCAL_LIGHT": True,
+        "OUROBOROS_MODEL": "owner-main",
+        "OUROBOROS_MODEL_LIGHT": "owner-light",
+    })
+
+    assert preset.ok, preset.refusal
+    targets = [
+        row["route"]["target_id"]
+        for row in json.loads(preset.available_subagents)["items"]
+    ]
+    assert targets == ["owner-main (local)", "owner-light (local)"]
+
+
+def test_one_harness_plus_distinct_main_and_light_normally_yields_three_real_actors():
+    preset = compile_install_preset(_discoveries("claude"), settings={
+        "OPENROUTER_API_KEY": "configured",
+        "OUROBOROS_MODEL": "openai/gpt-5.6-sol",
+        "OUROBOROS_MODEL_LIGHT": "openai/gpt-5.6-luna",
+    })
+
+    items = json.loads(preset.available_subagents)["items"]
+    assert [row["name"] for row in items] == [
+        "Primary builder", "Fast scout", "Independent perspective",
+    ]
+    assert [row["route"]["target_id"] for row in items] == [
+        "claude=claude-opus-5", "openai/gpt-5.6-luna", "openai/gpt-5.6-sol",
+    ]
+
+
+def test_missing_exact_agy_flash_refuses_without_partial_actor_or_reviewer_output():
+    preset = compile_install_preset([
+        HarnessDiscovery("agy", ("gemini-3.7-flash-medium", "gemini-3.1-pro-high")),
+    ], settings={"OPENROUTER_API_KEY": "configured",
+                 "OUROBOROS_MODEL": "openai/gpt-5.6-luna"})
+
+    assert not preset.ok
+    assert preset.refusal is not None
+    assert preset.refusal.code == "model_not_in_discovery"
+    assert preset.available_subagents == ""
+    assert preset.reviewer_slots == ""
+
+
+def test_valid_owner_draft_is_validated_not_recompiled_from_missing_agy_default():
+    from ouroboros.configured_subagents import parse_configured_subagents
+
+    owner = parse_configured_subagents({
+        "enabled": True,
+        "items": [{
+            "subagent_id": "owner",
+            "name": "Owner",
+            "recommended_use": "Use when the owner selects it.",
+            "route": {"kind": "api_model", "target_id": "openai::gpt-5.6-sol"},
+        }],
+    })
+    preset = compile_install_preset(
+        [HarnessDiscovery("agy", ())],
+        configured_subagents=owner,
+        source="configured",
+    )
+
+    assert preset.ok, preset.refusal
+    assert json.loads(preset.available_subagents)["items"][0]["subagent_id"] == "owner"
+    assert preset.source == "configured"
+    assert preset.receipt["source"] == "configured"
+    assert preset.reviewer_slots == ""

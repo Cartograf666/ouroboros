@@ -1,9 +1,9 @@
-"""Synthesis-prompt renderers for the pre-synthesis cost/outcome snapshot.
+"""Render and project the pre-synthesis cost/outcome snapshot.
 
 Extracted from ``ouroboros/agent_task_pipeline.py`` at its module-size ceiling:
-one coherent concern — how the shared root usage snapshot is worded for the
-summary/reflection prompts. The pipeline re-exports every name here (same
-objects), so sibling code and the tests keep the historical surface.
+one coherent concern — wording the shared root usage snapshot for synthesis
+prompts and projecting it into the summary row. The pipeline re-exports every
+name here (same objects), so sibling code and tests keep the historical surface.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import json
 from typing import Any, Dict
 
 from ouroboros.cost_projection import cost_display
+from ouroboros.task_results import TASK_COST_META_FIELDS
 
 
 def _synthesis_cost_usd(usage: Dict[str, Any]) -> float | None:
@@ -34,6 +35,17 @@ def _synthesis_cost_text(usage: Dict[str, Any]) -> str:
     # Rendered by the cost SSOT so a known amount is spelled the same way here as
     # on every other surface (and a null never reaches this line as $0.00).
     return cost_display({"accounted_upper_bound_usd": cost, "cost_final": True})
+
+
+def _summary_row_cost_fields(usage: Dict[str, Any]) -> Dict[str, Any]:
+    """Flat task-scope cost fields for the task_summary chat row (v6.82 P1).
+
+    Mapped explicitly from the pre-synthesis usage snapshot: only that snapshot's
+    honest keys are copied. Its schema deliberately differs from the full browser
+    set and a non-root snapshot without accounting keys yields nothing. Never
+    fabricates values; the terminal task_results checkpoint stays authoritative.
+    """
+    return {key: usage[key] for key in TASK_COST_META_FIELDS if key in usage}
 
 
 _SYNTHESIS_USAGE_PROMPT_FIELDS = (
@@ -79,6 +91,7 @@ def _synthesis_usage_snapshot_text(usage: Dict[str, Any]) -> str:
 
 __all__ = [
     "_SYNTHESIS_USAGE_PROMPT_FIELDS",
+    "_summary_row_cost_fields",
     "_synthesis_cost_text",
     "_synthesis_cost_usd",
     "_synthesis_usage_snapshot_text",

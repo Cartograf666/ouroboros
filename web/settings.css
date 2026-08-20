@@ -261,6 +261,9 @@
 .settings-shell .form-field input,
 .settings-shell .form-field select,
 .settings-shell .form-field textarea,
+.settings-shell .available-subagent-row input,
+.settings-shell .available-subagent-row select,
+.settings-shell .available-subagent-row textarea,
 .model-picker input {
     width: 100%;
     min-width: 0;
@@ -277,6 +280,8 @@
 
 .settings-shell .form-field input::placeholder,
 .settings-shell .form-field textarea::placeholder,
+.settings-shell .available-subagent-row input::placeholder,
+.settings-shell .available-subagent-row textarea::placeholder,
 .secret-input::placeholder,
 .model-picker input::placeholder {
     color: rgba(255, 255, 255, 0.24);
@@ -285,6 +290,9 @@
 .settings-shell .form-field input:focus,
 .settings-shell .form-field select:focus,
 .settings-shell .form-field textarea:focus,
+.settings-shell .available-subagent-row input:focus,
+.settings-shell .available-subagent-row select:focus,
+.settings-shell .available-subagent-row textarea:focus,
 .model-picker input:focus {
     border-color: var(--focus-accent-border);
     box-shadow: 0 0 0 3px var(--focus-accent-ring);
@@ -295,7 +303,8 @@
     resize: vertical;
 }
 
-.settings-shell .form-field select {
+.settings-shell .form-field select,
+.settings-shell .available-subagent-row select {
     appearance: none;
     padding-right: 36px;
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 14 14'%3E%3Cpath d='M3 5l4 4 4-4' fill='none' stroke='%23e2e8f0' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
@@ -497,6 +506,95 @@
 .settings-ghost-btn:hover {
     color: var(--text-primary);
     border-color: rgba(232, 93, 111, 0.35);
+}
+
+.available-subagents-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 12px;
+}
+
+.available-subagents-toolbar,
+.available-subagent-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+}
+
+.available-subagents-toolbar .settings-ghost-btn {
+    margin-left: auto;
+}
+
+.available-subagents-count,
+.available-subagents-source,
+.available-subagents-diagnostics,
+.available-subagents-empty,
+.available-subagent-meta {
+    color: var(--text-secondary);
+    font-size: var(--type-meta);
+    line-height: var(--line-body);
+}
+
+.available-subagents-diagnostics[data-tone="error"] {
+    color: var(--status-error-fg);
+}
+
+.available-subagents-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.available-subagent-row {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 14px;
+    border: 1px solid var(--surface-border);
+    border-radius: 14px;
+    background: var(--surface-card-soft);
+}
+
+.available-subagent-route {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+}
+
+.available-subagent-route {
+    grid-template-columns: repeat(4, minmax(130px, 1fr));
+}
+
+.available-subagent-heading {
+    margin: 0;
+    color: var(--text-primary);
+    font-size: var(--type-body);
+    font-weight: 600;
+}
+
+.available-subagent-purpose {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    color: var(--text-secondary);
+    font-size: var(--type-meta);
+}
+
+.available-subagent-purpose textarea {
+    width: 100%;
+    min-height: 64px;
+    resize: vertical;
+}
+
+.available-subagent-actions {
+    justify-content: flex-end;
+}
+
+.available-subagent-actions .settings-ghost-btn {
+    min-height: 34px;
+    padding: 0 11px;
 }
 
 .settings-secret-list {
@@ -778,6 +876,14 @@
     .settings-custom-secret-row {
         grid-template-columns: 1fr;
         align-items: stretch;
+    }
+
+    .available-subagent-route {
+        grid-template-columns: 1fr;
+    }
+
+    .available-subagents-toolbar .settings-ghost-btn {
+        margin-left: 0;
     }
 
     .settings-effort-group {

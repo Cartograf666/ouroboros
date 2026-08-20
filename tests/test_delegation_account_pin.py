@@ -85,7 +85,7 @@ def test_a_pinned_route_is_judged_by_its_own_subject_exactly():
 
 
 def _waited_run(tmp_path, monkeypatch, summary, requested_model="m",
-                requested_profile=""):
+                requested_profile="", selected_subagent_id=""):
     """Drive one terminal `delegate_wait` for `summary`; return the agent payload.
 
     Profile-aware sibling of the transport module's `_waited_run`: the custody
@@ -106,7 +106,7 @@ def _waited_run(tmp_path, monkeypatch, summary, requested_model="m",
     delegate._CUSTODY.clear()
     delegate._CUSTODY["run-1"] = delegate._RunCustody(
         task_id="t-a", route_id="r", model=requested_model,
-        profile_id=requested_profile,
+        profile_id=requested_profile, selected_subagent_id=selected_subagent_id,
         project_id="p", project_owned=False)
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "t-a"
@@ -129,10 +129,18 @@ def test_the_receipt_carries_the_requested_and_applied_account(tmp_path, monkeyp
     _waited_run(tmp_path / "acct", monkeypatch,
                 {"state": "succeeded", "spendUsd": 0.0, "model": "m",
                  "authRoute": {"profileId": "codex-default"}},
-                requested_profile="koshak")
+                requested_profile="koshak", selected_subagent_id="session-builder")
     record = subagent_last_delegation()
     assert record["requested_profile"] == "koshak"
     assert record["applied_profile"] == "codex-default"
+    assert record["selected_subagent_id"] == "session-builder"
+
+    from ouroboros.subagents import record_last_delegation
+    record_last_delegation(
+        route="r", requested_model="m", applied_model="m", run_id="run-1",
+        selected_subagent_id="different-row",
+    )
+    assert subagent_last_delegation() == record
 
     # No receipt, no invention: an engine whose telemetry predates authRoute
     # leaves the applied account empty beside the recorded request.

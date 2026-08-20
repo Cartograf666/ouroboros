@@ -302,6 +302,7 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     # subagent-terminal class as subagent_executor_unavailable, never a trial's code.
     "delegate_tools_invisible": (False, "agent.py executor_blocked_outcome / preflight_delegate_visibility; a subagent terminal, never a trial's"),
     "delegate_visibility_unverified": (False, "agent.py preflight_delegate_visibility broken-introspection path; a subagent terminal, never a trial's"),
+    "delegated_custody_unreconciled": (False, "agent_task_pipeline.py terminal custody audit; a delegated-child infrastructure terminal, never a root benchmark capability result"),
     "task_exception": (False, "agent.py:777 the attempt ran and crashed; an honest failure"),
     "capability_profile_mismatch": (False, "control_delegation.py:81 rejected delegate call"),
     "delegation_constraint_block_surface": (False, "control_delegation.py:116 rejected call"),

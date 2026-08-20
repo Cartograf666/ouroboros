@@ -45,6 +45,7 @@ from ouroboros.task_results import STATUS_RUNNING, write_task_result
 from ouroboros.contracts.task_constraint import normalize_task_constraint
 from ouroboros.contracts.task_contract import attach_task_contract
 from ouroboros.outcomes import infra_failed_axes
+from ouroboros import subagent_bootstrap, subagent_runtime
 from ouroboros.subagents import (
     CapabilityDelta,
     SubagentExecutorResolution,
@@ -120,7 +121,7 @@ def _record_executor_resolution(
                 log.debug("Failed to append subscription-window beacon", exc_info=True)
 
 
-def _blocked_executor_terminal(cap_info: Dict[str, Any]) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+def _blocked_executor_terminal(cap_info: Dict[str, Any], task: Optional[Dict[str, Any]] = None) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """p34's typed terminal for a blocked executor pin, rebuilt from the facts
     cap_info carried across the (ctx, messages, cap_info) seam. The placeholder
     method p2 kept for exactly this synthesis is deleted; this is the one body."""
@@ -129,7 +130,8 @@ def _blocked_executor_terminal(cap_info: Dict[str, Any]) -> Tuple[str, Dict[str,
         executor="blocked",
         reason=str(cap_info.get("executor_blocked_reason") or ""),
         reset_at=str(cap_info.get("executor_blocked_reset_at") or ""),
-    ))
+    ), availability=(task or {}).get("subagent_availability")
+        if isinstance((task or {}).get("subagent_availability"), dict) else {})
     return text, usage, {"reasoning_notes": ["subagent_executor_unavailable"], "tool_calls": []}
 
 
@@ -316,7 +318,7 @@ def preflight_delegate_visibility(
             reason=derive_capability_reason(reasons, delta.substrate_disclosures),
             **changes)
 
-    pinned = str(task.get("requested_executor") or "auto").strip().lower() == "harness"
+    pinned = isinstance(task.get("configured_subagent"), dict) or str(task.get("requested_executor") or "auto").strip().lower() == "harness"
     reason = "delegate_tools_invisible"
     try:
         available = set(tools.available_tools())
@@ -354,7 +356,7 @@ def preflight_delegate_visibility(
     ))
 
 
-def reset_nanny_economics_marks(ctx: Any, *, route_dispatched: bool) -> None:
+def reset_nanny_economics_marks(ctx: Any, *, route_dispatched: bool, delegate_activity_seed: bool = False) -> None:
     """Reset EVERY nanny-economics mark for a fresh dispatch (F4).
 
     DEFENSIVE, not load-bearing: ``_prepare_task_context`` builds a FRESH
@@ -364,7 +366,7 @@ def reset_nanny_economics_marks(ctx: Any, *, route_dispatched: bool) -> None:
     ctx._nanny_route_dispatched = bool(route_dispatched)
     ctx._nanny_finalization_injected = False
     ctx._nanny_metered_progress = None
-    ctx._nanny_delegate_baseline = None
+    ctx._nanny_delegate_baseline = ({"round": 0, "cost": 0.0} if delegate_activity_seed else None)
     ctx._nanny_reminder_mark = None
 
 
@@ -688,7 +690,7 @@ class OuroborosAgent:
                 reasoning_effort=task.get("reasoning_effort"),
                 task_group_id=task.get("task_group_id"),
                 task_group=task.get("task_group"),
-                subagent_envelope=task.get("subagent_envelope"),
+                subagent_envelope=task.get("subagent_envelope"), configured_subagent=task.get("configured_subagent"), parent_cognitive_route=task.get("parent_cognitive_route"), subagent_availability=task.get("subagent_availability"),
                 metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
                 # Ingress-captured owner-message identity (v6.73.0): persisted on the
                 # durable record so a post-hoc "Turn into project" binds the start
@@ -824,7 +826,7 @@ class OuroborosAgent:
             "reasoning_effort",
             "task_group_id",
             "task_group",
-            "subagent_envelope",
+            "subagent_envelope", "configured_subagent", "parent_cognitive_route", "subagent_availability",
             "executor_ref",
             "original_task_id",
             "timeout_retry_from",
@@ -947,6 +949,7 @@ class OuroborosAgent:
                 ctx.task_model_override = str(task_metadata.get("model") or "").strip()
                 if "use_local_model" in task_metadata:
                     ctx.task_use_local_override = bool(task_metadata.get("use_local_model"))
+        startup_wake = subagent_bootstrap.bootstrap_before_context(ctx, task, dispatch)
         self._capture_mutation_baseline(task, task_metadata)
 
         self._emit_typing_start()
@@ -975,6 +978,7 @@ class OuroborosAgent:
         )
         if _exec_note:
             messages.append({"role": "user", "content": _exec_note})
+        subagent_bootstrap.append_startup_receipt(ctx, messages, startup_wake)
         # The nanny postcondition's input fact for the loop's finalization seam:
         # THIS task was dispatched onto the delegated substrate. ALL economics
         # marks reset together per dispatch (F4) — defensive, since the
@@ -983,7 +987,7 @@ class OuroborosAgent:
             dispatch is not None
             and dispatch.executor_resolution is not None
             and dispatch.executor_resolution.executor == "harness"
-        ))
+        ), delegate_activity_seed=bool(startup_wake))
 
         budget_remaining = None
         budget_accounting_status = "available"
@@ -1009,7 +1013,7 @@ class OuroborosAgent:
         # rather than a new return value or module-level helper, so synthesis can
         # adopt p34's `SubagentExecutorResolution`/`executor_blocked_outcome` without
         # a same-named twin to dedup here.
-        if dispatch is not None and dispatch.blocked:
+        if dispatch is not None and dispatch.blocked and not startup_wake:
             _res = dispatch.executor_resolution
             cap_info["executor_blocked_reason"] = str(
                 (_res.reason if _res is not None else "")
@@ -1031,8 +1035,7 @@ class OuroborosAgent:
         """Run one task under the root/subtree monetary attribution scope."""
         # Hot-reload settings so UI changes affect the next task without restart.
         try:
-            from ouroboros.config import load_settings, apply_settings_to_env
-            apply_settings_to_env(load_settings())
+            subagent_runtime.apply_task_start_settings()
         except Exception:
             pass
 
@@ -1122,7 +1125,7 @@ class OuroborosAgent:
             self._record_executor_facts(task)
 
             if str(cap_info.get("executor_blocked_reason") or ""):
-                text, usage, llm_trace = _blocked_executor_terminal(cap_info)
+                text, usage, llm_trace = _blocked_executor_terminal(cap_info, task)
             elif task_type_str == "deep_self_review":
                 # Deep self-review bypasses the tool loop.
                 try:

@@ -77,18 +77,24 @@ PROVIDER_CREDENTIAL_GROUPS: dict[str, tuple[str, ...]] = {
     "local": (),
 }
 
-# Settings keys that hold a ROUTED model identity (prefix -> provider via provider_for_model).
+# Active settings keys that hold a ROUTED model identity (prefix -> provider via
+# provider_for_model). Heavy is a bounded migration/history input, not a live
+# route selector; keeping the split here prevents new consumers (including
+# Provider Test) from accidentally resurrecting it.
 # Superset of the live slots; a key absent from settings still declares whatever
 # ``config.SETTINGS_DEFAULTS`` will hand the runtime, which is why declared_model_settings()
 # fills the defaults in rather than treating "unset" as "unused".
-MODEL_SETTING_KEYS: tuple[str, ...] = (
-    "OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY", "OUROBOROS_MODEL_LIGHT",
+ACTIVE_MODEL_SETTING_KEYS: tuple[str, ...] = (
+    "OUROBOROS_MODEL", "OUROBOROS_MODEL_LIGHT",
     "OUROBOROS_MODEL_VISION", "OUROBOROS_MODEL_CONSCIOUSNESS",
     "OUROBOROS_MODEL_FALLBACKS", "OUROBOROS_MODEL_FALLBACK",
     "OUROBOROS_MODEL_DEEP_SELF_REVIEW", "OUROBOROS_WEBSEARCH_MODEL",
     "OUROBOROS_REVIEW_MODELS", "OUROBOROS_SCOPE_REVIEW_MODELS",
     "OUROBOROS_SCOPE_REVIEW_MODEL",
 )
+LEGACY_MODEL_SETTING_KEYS: tuple[str, ...] = ("OUROBOROS_MODEL_HEAVY",)
+# Compatibility import name. Its meaning is now explicitly the active set.
+MODEL_SETTING_KEYS = ACTIVE_MODEL_SETTING_KEYS
 
 # Settings keys whose value is a Claude Agent SDK / Claude Code model NAME (``opus[1m]``),
 # NOT a routed model identity: they carry no provider prefix, so provider_for_model would
@@ -127,6 +133,31 @@ def provider_has_credentials(provider: str) -> bool:
     return bool(str(os.environ.get(env_key, "") or "").strip())
 
 
+def provider_has_credentials_in_settings(provider: str, settings: dict) -> bool:
+    """Mapping-based twin used by pure config/default compilers (no ambient env)."""
+    def get(key: str) -> str:
+        return str((settings or {}).get(key, "") or "").strip()
+
+    if provider == "local":
+        return bool(get("LOCAL_MODEL_SOURCE"))
+    if provider == "openai-compatible":
+        return bool(
+            get("OPENAI_COMPATIBLE_BASE_URL")
+            or (get("OPENAI_API_KEY") and get("OPENAI_BASE_URL"))
+        )
+    if provider == "gigachat":
+        return bool(
+            get("GIGACHAT_CREDENTIALS")
+            or (get("GIGACHAT_USER") and get("GIGACHAT_PASSWORD"))
+        )
+    env_key = PROVIDER_ENV_KEYS.get(provider, "OPENROUTER_API_KEY")
+    return bool(get(env_key))
+
+
+def model_has_credentials_in_settings(model: str, settings: dict) -> bool:
+    return provider_has_credentials_in_settings(provider_for_model(model), settings)
+
+
 def model_has_credentials(model: str) -> bool:
     """Return True when the model's provider has usable credentials configured."""
     return provider_has_credentials(provider_for_model(model))
@@ -154,14 +185,14 @@ def review_model_uses_local(model: str) -> bool:
 def resolve_credentialed_model(default_model: str) -> str:
     """Return ``default_model`` if its provider is credentialed, else the first
     configured model slot whose provider has credentials (light → fallback →
-    main → heavy). Falls back to ``default_model`` when nothing is credentialed
+    main). Falls back to ``default_model`` when nothing is credentialed
     so callers surface the original provider error rather than a silent swap."""
     if model_has_credentials(default_model):
         return default_model
-    # LIGHT/MAIN/HEAVY are single-model slots; FALLBACKS is a comma chain expanded via the
+    # LIGHT/MAIN are single-model slots; FALLBACKS is a comma chain expanded via the
     # shared SSOT parser (which also honors the legacy singular OUROBOROS_MODEL_FALLBACK)
-    # instead of testing the whole comma-string as one broken model id. Empty Heavy/Light
-    # (default -> Main) simply contribute nothing here. Lazy import: config imports this
+    # instead of testing the whole comma-string as one broken model id. Empty Light
+    # (default -> Main) simply contributes nothing here. Lazy import: config imports this
     # module, so importing config at module load would be circular.
     from ouroboros.config import parse_fallback_chain
     candidates: list[str] = []
@@ -169,7 +200,7 @@ def resolve_credentialed_model(default_model: str) -> str:
     if light:
         candidates.append(light)
     candidates.extend(parse_fallback_chain())
-    for env_name in ("OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY"):
+    for env_name in ("OUROBOROS_MODEL",):
         raw = str(os.environ.get(env_name, "") or "").strip()
         if raw:
             candidates.append(raw)

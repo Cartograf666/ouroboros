@@ -138,6 +138,11 @@ export const apiClient = {
      * @returns {Promise<import('./api_types.js').OnboardingCompleteResponse>}
      */
     completeOnboarding: (payload) => jsonPost('/api/onboarding/complete', payload),
+    /**
+     * @param {import('./api_types.js').OnboardingSubagentsPreviewRequest} payload
+     * @returns {Promise<import('./api_types.js').OnboardingSubagentsPreviewResponse>}
+     */
+    previewOnboardingSubagents: (payload) => jsonPost('/api/onboarding/subagents/preview', payload),
     ownerRuntimeMode: (mode) => jsonPost('/api/owner/runtime-mode', { mode }),
     ownerAutoGrant: (enabled) => jsonPost('/api/owner/auto-grant', { enabled: Boolean(enabled) }),
     ownerContextMode: (mode) => jsonPost('/api/owner/context-mode', { mode }),

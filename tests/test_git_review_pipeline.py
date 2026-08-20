@@ -1280,6 +1280,24 @@ class TestAdvisorySkipTests:
     """Verify that advisory_pre_review runs tests before the SDK call and
     that skip_tests=True bypasses the test gate."""
 
+    @pytest.fixture(autouse=True)
+    def _explicit_enabled_advisory(self, monkeypatch):
+        """Keep these unit tests independent of benchmark-authored process env."""
+        monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", json.dumps({
+            "triad": [{
+                "slot_id": "triad-test",
+                "route": {"kind": "api_chat", "target_id": "openai/test"},
+            }],
+            "scope": [{
+                "slot_id": "scope-test",
+                "route": {"kind": "api_chat", "target_id": "openai/test"},
+            }],
+            "advisory": {
+                "enabled": True,
+                "route": {"kind": "api_chat", "target_id": "anthropic/test"},
+            },
+        }))
+
     def _make_advisory_ctx(self, tmp_path):
         """Minimal ToolContext-like mock for advisory handler tests."""
         from tests._shared import make_safe_mock_ctx

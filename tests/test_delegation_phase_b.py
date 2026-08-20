@@ -65,6 +65,25 @@ def test_dispatch_note_override_rides_only_the_harness_branch():
     assert dispatch_executor_note(_resolution("blocked", "delegate_tools_invisible")) == ""
 
 
+def test_configured_nanny_note_defers_start_truth_to_receipt_and_keeps_full_supervision():
+    from ouroboros.subagent_dispatch_notes import dispatch_executor_note
+
+    lane = SubagentLaneResolution(
+        requested_lane="auto", effective_lane="main", model="openai/parent",
+        resolved_from="main", provenance="configured_subagent",
+    )
+    note = dispatch_executor_note(_resolution(), lane)
+    assert "typed startup/wake receipt alone" in note
+    assert "live, recovered, or refused" in note
+    assert "already started the exact external leaf" not in note
+    assert "full ordinary tool surface" in note
+    assert "answer authorized leaf questions" in note
+    assert "verify cancellation and terminal settlement" in note
+    assert "explicit separate child" in note
+    assert "delegate everything you can" not in note
+    assert "WORK ORDER" not in note
+
+
 def test_agent_reexports_the_moved_note_pair():
     # F7: the pair moved whole to the new module; the byte-pinned transport
     # suite imports both from ouroboros.agent, so the re-export must be the
@@ -413,11 +432,10 @@ def test_schedule_subagent_descriptions_carry_the_delegation_guidance():
     assert "OUTCOME" in objective and "script" in objective
     context = props["context"]["description"]
     assert "not instructions" in context and "WORK ORDER" in context
-    lane = props["model_lane"]["description"]
-    assert "Leave auto" in lane and "OVERRIDES dispatch policy" in lane
-    # Description-only change: the schema SHAPE is untouched.
-    assert props["model_lane"]["enum"] == ["auto", "main", "heavy", "light"]
-    assert props["model_lane"]["default"] == "auto"
+    selector = props["subagent_id"]["description"]
+    assert "Available subagent" in selector and "exact" in selector.lower()
+    assert "model_lane" not in props
+    assert "executor" not in props
     assert all("type" in spec for spec in props.values())
 
 

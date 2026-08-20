@@ -169,7 +169,9 @@ export const FACET_SUBJECT = {
 // Product names for the families a first run can bootstrap. They are used ONLY
 // until discovery answers with the engine's own `display_name`, and they are
 // trademarks rather than the generic label the Agents tab renamed away from.
-export const BOOTSTRAP_LABELS = { codex: 'Codex', claude: 'Claude Code', cursor: 'Cursor' };
+export const BOOTSTRAP_LABELS = {
+    codex: 'Codex', claude: 'Claude Code', cursor: 'Cursor', agy: 'Antigravity',
+};
 
 // THE family display name, for every surface that shows one. It lives with the
 // store because the store owns the payload this reads, and because two

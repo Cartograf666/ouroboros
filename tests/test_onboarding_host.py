@@ -466,6 +466,7 @@ def test_onboarding_page_route_is_declared_on_the_gateway_boundary():
 
     assert "GET /onboarding" in HTTP_ENDPOINTS
     assert "GET /api/onboarding" in HTTP_ENDPOINTS
+    assert "POST /api/onboarding/subagents/preview" in HTTP_ENDPOINTS
     # The page and the atomic completion it posts to are both on the boundary:
     # every host now finishes through the same one transaction.
     assert "POST /api/onboarding/complete" in HTTP_ENDPOINTS

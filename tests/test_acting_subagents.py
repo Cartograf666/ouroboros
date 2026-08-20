@@ -1143,15 +1143,21 @@ def test_integrate_counts_as_reviewable_effect():
     assert turn_has_reviewable_effects(trace) is True
 
 
-def test_readonly_subagent_cannot_spawn_acting_child(tmp_path):
+def test_readonly_subagent_cannot_spawn_acting_child(tmp_path, monkeypatch):
     from ouroboros.tools.control import _schedule_task
+    from tests._shared import configure_test_subagent
+
+    subagent_id = configure_test_subagent(monkeypatch)
     repo = tmp_path / "repo"; repo.mkdir()
     drive = tmp_path / "data"; drive.mkdir()
     ctx = ToolContext(
         repo_dir=repo, drive_root=drive,
         task_constraint=TaskConstraint(mode="local_readonly_subagent"),
     )
-    out = _schedule_task(ctx, objective="do X", expected_output="Y", write_surface="self_worktree")
+    out = _schedule_task(
+        ctx, subagent_id=subagent_id, objective="do X", expected_output="Y",
+        write_surface="self_worktree",
+    )
     assert "MUTATIVE_SUBAGENTS_DISABLED" in out
 
 

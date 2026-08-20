@@ -85,8 +85,18 @@ a `FAIL` on any feasible task scores 0.
   live system body.
 - `claude_code_edit` disabled per step (`--disable-tools claude_code_edit`) —
   benches measure the single-model Ouroboros harness.
-- Single-model: solver/review slots all point at the same model
-  (`settings_base.json`, secrets blank; fill keys at run time, never commit).
+- Single-model: solver/review slots all point at the same model, local routing is
+  explicitly off, and `settings_base.json` carries exactly one canonical
+  Available-subagent API row plus an authoritative API-only triad/scope panel on
+  it. The Claude-SDK advisory is explicitly disabled rather than populated with
+  a provider-routed model id. No default scout, second provider family, or session substrate can enter
+  the run. Because the step CLI submits to an already-running server, preflight
+  verifies that server exposes the same normalized one-row value; client env is
+  not accepted as proof. The top-level manifest records the actor returned by the
+  target server even for an explicit `--allow-scaffold-mismatch` ablation, rather
+  than repeating the local declaration. The CU-bridge runner applies the same
+  target `/api/settings` comparison and refuses drift before claiming/booting the
+  VM. `settings_base.json` keeps secrets blank; fill keys at run time, never commit.
 - Step loop is memory-stateless per Ouroboros call (`--memory-mode empty`);
   cross-step continuity is only the action history + agent `notes` carried by
   the runner prompt.
