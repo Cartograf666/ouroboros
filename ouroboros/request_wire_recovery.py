@@ -340,57 +340,39 @@ def _direct_openai_tool_source(
     )
 
 
-def _prepare_direct_openai_candidate(
+def _prepare_direct_rung_candidate(
     target: Mapping[str, Any],
     payload: Mapping[str, Any],
     api_surface: str,
+    *,
+    dialect: str,
+    reason_code: str,
+    ordinal: int,
 ) -> WireCandidateManifest:
     requested = payload_effort(payload)
     source = copy.deepcopy(dict(payload))
     applications: list[WireAppliedAction] = []
+    spec = WireCandidateSpec(dialect, requested, reason_code)
     for _ in range(_MAX_COMPOSED_ACTIONS):
-        function_candidate = _bind_with_applications(
+        candidate = _bind_with_applications(
             target=target,
             api_surface=api_surface,
             source_payload=source,
             requested_effort=requested,
             applications=applications,
-            fixed_spec=WireCandidateSpec("function", requested, "requested_wire_form"),
-            fixed_ordinal=1,
+            fixed_spec=spec,
+            fixed_ordinal=ordinal,
         )
         addition = _first_durable_action(
             target,
-            function_candidate.physical_payload(),
+            candidate.physical_payload(),
             api_surface,
             requested,
             applications,
             allow_dialect=False,
         )
         if addition is None:
-            break
-        applications.append(addition)
-
-    custom_spec = WireCandidateSpec("openai_chat_custom", requested, "requested_wire_form")
-    for _ in range(_MAX_COMPOSED_ACTIONS - len(applications)):
-        custom_candidate = _bind_with_applications(
-            target=target,
-            api_surface=api_surface,
-            source_payload=source,
-            requested_effort=requested,
-            applications=applications,
-            fixed_spec=custom_spec,
-            fixed_ordinal=1,
-        )
-        addition = _first_durable_action(
-            target,
-            custom_candidate.physical_payload(),
-            api_surface,
-            requested,
-            applications,
-            allow_dialect=False,
-        )
-        if addition is None:
-            return custom_candidate
+            return candidate
         applications.append(addition)
     return _bind_with_applications(
         target=target,
@@ -398,8 +380,17 @@ def _prepare_direct_openai_candidate(
         source_payload=source,
         requested_effort=requested,
         applications=applications,
-        fixed_spec=custom_spec,
-        fixed_ordinal=1,
+        fixed_spec=spec,
+        fixed_ordinal=ordinal,
+    )
+
+def _prepare_direct_openai_candidate(
+    target: Mapping[str, Any], payload: Mapping[str, Any], api_surface: str,
+) -> WireCandidateManifest:
+    return _prepare_direct_rung_candidate(
+        target, payload, api_surface,
+        dialect="openai_chat_custom",
+        reason_code="requested_wire_form", ordinal=1,
     )
 
 
@@ -804,6 +795,15 @@ def _plan_direct_dialect_retry(
         )
         if candidate is None:
             return None
+        if registered.candidate.accepted_profile.tool_dialect == "openai_chat_custom":
+            candidate = _prepare_direct_rung_candidate(
+                registered.target,
+                registered.source_payload,
+                registered.candidate.source_profile.api_surface,
+                dialect="function",
+                reason_code="provider_rejected_tool_dialect",
+                ordinal=2,
+            )
         register_wire_candidate(
             candidate,
             source_payload=registered.source_payload,

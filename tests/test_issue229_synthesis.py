@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 from types import SimpleNamespace
 
+import pytest
+
 import ouroboros.context_compaction as context_compaction
 import ouroboros.llm as llm_module
 import ouroboros.llm_observability as llm_observability
@@ -95,6 +97,17 @@ def _text_success():
         "id": "response-text",
         "choices": [{"message": {"role": "assistant", "content": "done"}}],
         "usage": {"prompt_tokens": 30, "completion_tokens": 3},
+    })
+
+
+def _body_rejection(message, *, param):
+    return _Response({
+        "error": {
+            "status_code": 400,
+            "code": "unsupported_parameter",
+            "param": param,
+            "message": message,
+        },
     })
 
 
@@ -229,6 +242,78 @@ def test_custom_reject_function_same_rung_param_repair_never_reaches_none(
         and "temperature" in set(record.action.get("fields") or ())
         for record in read_wire_action_records(rejected_profile)
     )
+
+
+def test_function_value_evidence_never_changes_next_custom_first_candidate(
+    tmp_path, monkeypatch,
+):
+    evidence_root = tmp_path / "wire-evidence"
+    monkeypatch.setattr(
+        wire_contract, "canonical_wire_evidence_root", lambda: evidence_root,
+    )
+    client, sent = _install_transport(monkeypatch, [
+        _Rejected("custom tools are not supported", param="tools[0].type"),
+        _Rejected(
+            "reasoning_effort value 'high' is not supported; use medium",
+            param="reasoning_effort",
+        ),
+        _text_success(),
+        _Rejected("custom tools are not supported", param="tools[0].type"),
+        _text_success(),
+    ])
+    kwargs = {
+        "messages": [{"role": "user", "content": "Use the probe."}],
+        "model": "openai::future-reasoning-model",
+        "tools": _tools(),
+        "reasoning_effort": "high",
+    }
+
+    client.chat(**kwargs)
+    client.chat(**kwargs)
+
+    assert [
+        (item["tools"][0]["type"], item.get("reasoning_effort"))
+        for item in sent
+    ] == [
+        ("custom", "high"),
+        ("function", "high"),
+        ("function", "medium"),
+        ("custom", "high"),
+        ("function", "medium"),
+    ]
+
+
+@pytest.mark.parametrize("body_error", [False, True])
+def test_custom_pending_repair_is_discarded_before_fresh_function(
+    tmp_path, monkeypatch, body_error,
+):
+    evidence_root = tmp_path / "wire-evidence"
+    monkeypatch.setattr(
+        wire_contract, "canonical_wire_evidence_root", lambda: evidence_root,
+    )
+    reject = _body_rejection if body_error else _Rejected
+    client, sent = _install_transport(monkeypatch, [
+        reject("temperature is not supported", param="temperature"),
+        reject("custom tools are not supported", param="tools[0].type"),
+        _text_success(),
+    ])
+
+    _message, usage = client.chat(
+        [{"role": "user", "content": "Use the probe."}],
+        "openai::future-reasoning-model",
+        tools=_tools(),
+        reasoning_effort="medium",
+        temperature=0.2,
+    )
+
+    assert [item["tools"][0]["type"] for item in sent] == [
+        "custom", "custom", "function",
+    ]
+    assert "temperature" in sent[0]
+    assert "temperature" not in sent[1]
+    assert "temperature" in sent[2]
+    assert usage["request_wire"]["ladder_ordinal"] == 2
+    assert usage["request_wire"]["applied_actions"] == []
 
 
 def test_ordered_request_wire_history_survives_main_and_structured_compaction(

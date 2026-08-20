@@ -202,6 +202,17 @@ def native_content_for_replay(
     return copy.deepcopy(content)
 
 
+def is_replayed_native_content(content: Any) -> bool:
+    """Whether this exact physical block list came from a replay receipt."""
+    if not isinstance(content, list):
+        return False
+    try:
+        digest = _sha256_bytes(_content_json(content))
+    except (TypeError, ValueError):
+        return False
+    return digest in _REPLAYED_RECEIPTS.get()
+
+
 def mark_replayed_receipts_consumed(message: Mapping[str, Any]) -> Dict[str, Any]:
     """Bind successful continuation custody to its new assistant response."""
     out = copy.deepcopy(dict(message))

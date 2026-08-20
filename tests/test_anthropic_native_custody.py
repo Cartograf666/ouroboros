@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import ouroboros.config as config
 import ouroboros.request_wire_contract as wire
 from ouroboros import context_compaction as compaction
 from ouroboros.anthropic_native_custody import (
@@ -139,12 +140,28 @@ def test_interleaved_raw_blocks_replay_exactly_and_tamper_or_route_drift_scrubs(
     changed_call = copy.deepcopy(message)
     changed_call["tool_calls"][0]["function"]["name"] = "other_tool"
     assert native_content_for_replay(changed_call, target, ("tool-A", "tool-B")) is None
-
     switched = LLMClient.sanitize_reasoning_on_model_switch(
         [message], "anthropic/claude-future", "anthropic/claude-other"
     )
     assert ANTHROPIC_NATIVE_RECEIPT_KEY not in switched[0]
     assert ANTHROPIC_NATIVE_RECEIPT_KEY not in scrub_native_custody([message])[0]
+
+
+def test_cache_finalizer_never_mutates_exact_native_replay(monkeypatch):
+    target = _target()
+    raw = _raw_content()
+    raw[1]["cache_control"] = {"type": "ephemeral"}
+    message = retain_native_assistant_content(_canonical_message(target), raw, target)
+    client = LLMClient(api_key="test")
+    monkeypatch.setattr(config, "resolve_prompt_cache_ttl", lambda: "1h")
+
+    with anthropic_replay_scope():
+        _system, messages = client._build_anthropic_messages(
+            [message, *_tool_results()], target,
+        )
+        assert messages[0]["content"] == raw
+        client._normalize_payload_cache_ttl(target, {"messages": messages})
+        assert messages[0]["content"] == raw
 
 
 def test_builder_places_exact_content_immediately_before_matching_results():

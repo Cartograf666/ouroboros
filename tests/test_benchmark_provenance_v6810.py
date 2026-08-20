@@ -23,18 +23,19 @@ from devtools.benchmarks.common.result_index import (
     runtime_terminal_disclosure,
     task_result_row,
 )
-from ouroboros.outcomes import BEST_EFFORT_REASON_CODES
 from devtools.benchmarks.common.secrets import (
     credential_disclosure,
     isolated_credential_grants,
 )
 from devtools.benchmarks.common.server_runner import build_isolated_settings
+from ouroboros.outcomes import BEST_EFFORT_REASON_CODES
 from ouroboros.provider_models import (
     PROVIDER_CREDENTIAL_GROUPS,
     PROVIDER_PREFIXES,
     credential_keys_for_providers,
     provider_credential_plan,
 )
+from ouroboros.request_wire_contract import WIRE_REASON_CODES
 
 # A live settings file carrying EVERY provider credential the owner has configured. This is
 # the realistic shape: the owner's file accumulates keys over time, and which of them a
@@ -330,8 +331,11 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     # terminal reason_code, so none changes benchmark truncation provenance.
     "provider_metadata_constraint": (False, "request-wire candidate adjustment; never a task terminal"),
     "provider_prescribed_value": (False, "request-wire exact-value repair; never a task terminal"),
+    "provider_recovery_succeeded": (False, "request-wire successful repair; never a task terminal"),
+    "provider_rejected_tool_dialect": (False, "request-wire dialect fallback; never a task terminal"),
     "provider_required_reasoning": (False, "request-wire mandatory-reasoning floor; never a task terminal"),
     "provider_unsupported_field": (False, "request-wire unsupported-field repair; never a task terminal"),
+    "requested_wire_form": (False, "request-wire initial physical form; never a task terminal"),
     "task_local_availability_fallback": (False, "request-wire task-local candidate; never a task terminal"),
 }
 
@@ -348,6 +352,8 @@ def _runtime_reason_code_literals() -> dict[str, str]:
         for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             for match in _REASON_CODE_LITERAL.finditer(line):
                 found.setdefault(match.group(1), f"{path.relative_to(root.parent)}:{lineno}")
+    for code in WIRE_REASON_CODES:
+        found.setdefault(code, "ouroboros/request_wire_contract.py:WIRE_REASON_CODES")
     return found
 
 

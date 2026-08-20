@@ -246,8 +246,6 @@ def plan_direct_openai_dialect_candidate(
     )
     api_surface = current.source_profile.api_surface
     if current.accepted_profile.tool_dialect == "openai_chat_custom":
-        if any(item.source == "pending" for item in current.applied_actions):
-            return None
         return bind_wire_candidate(
             target=target,
             api_surface=api_surface,

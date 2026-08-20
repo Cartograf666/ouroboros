@@ -18,6 +18,7 @@ from ouroboros.provider_models import OPENROUTER_DEFAULTS, PROVIDER_PREFIXES, no
 from ouroboros.anthropic_native_custody import (
     anthropic_replay_scoped,
     custody_private_key,
+    is_replayed_native_content,
     mark_replayed_receipts_consumed,
     native_content_for_replay,
     retain_native_assistant_content,
@@ -2089,6 +2090,8 @@ class LLMClient:
                     holders.append(item)
                 content = item.get("content")
                 if isinstance(content, list):
+                    if is_replayed_native_content(content):
+                        continue
                     for block in content:
                         if not isinstance(block, dict):
                             continue
