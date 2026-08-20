@@ -25,25 +25,21 @@
 //   * `full`    — exactly what Settings renders today: link/device code,
 //                 the optional paste-code entry, the live state line, the
 //                 verdict + the engine's own sentence, the collapsed Advanced
-//                 terminal fallback, and Close.
-//   * `compact` — Connect + progress + verified state + retry only, for a
-//                 wizard step. Disclosed residual: the paste-code entry and
-//                 the Advanced terminal fallback are NOT rendered in compact,
-//                 so a claude login whose localhost callback cannot complete
-//                 (browser on another device) has no finishing path in that
-//                 mode; the onboarding phase decides whether to keep it that
-//                 way or opt into `full`.
+//                 terminal fallback (or an explicit external continuation),
+//                 and Close.
+//   * `compact` — Connect + progress + verified state + retry, for a wizard
+//                 step. The optional paste-code entry and the delayed Advanced
+//                 fallback stay full-only. Any available attach command is
+//                 rendered directly in compact, while an explicitly selected
+//                 external-terminal continuation is direct in BOTH modes, so
+//                 neither mode strands the completion path.
 //
 // Pure helpers up top are node-tested without a DOM.
 
 import { apiFetch } from './api_client.js';
 import {
-    FACET_ACCOUNTS,
-    READ_OK,
     accountLoginConfirmed,
-    accountRows,
     claudexorStatus,
-    facetReadState,
     familyLabel,
 } from './claudexor_status_store.js';
 import { escapeHtmlAttr as escapeHtml, safeExternalHrefAttr } from './utils.js';
@@ -54,6 +50,14 @@ export const JOB_POLL_GIVE_UP_FAILURES = 10;
 
 export const LOGIN_CARD_FULL = 'full';
 export const LOGIN_CARD_COMPACT = 'compact';
+
+export const TERMINAL_TRANSPORT_ERROR_CODES = Object.freeze([
+    'terminal_transport_unavailable',
+    'terminal_transport_unsupported',
+    'terminal_transport_probe_failed',
+    'terminal_transport_failed',
+]);
+const TERMINAL_TRANSPORT_ERRORS = new Set(TERMINAL_TRANSPORT_ERROR_CODES);
 
 // ---------------------------------------------------------------------------
 // Pure helpers.
@@ -106,34 +110,10 @@ export function profileNameSubmission(raw) {
     return { profile: normalized, normalized, note: '' };
 }
 
-export function familyHasNoAccounts(payload, harness) {
-    // Zero DETECTED accounts for this family, through the SAME projection the
-    // account rows render (`accountRows`). The daemon emits a native
-    // pseudo-row for EVERY login-capable harness — presence alone is not an
-    // account. What counts: a NAMED profile row, or a native row whose login
-    // was actually detected (the projection spells that detection as
-    // `status.verification === 'passed'` with `local_store` provenance; an
-    // undetected pseudo-row carries an empty verification). An engine without
-    // a default credential store therefore reads honestly empty until a named
-    // account exists, while a family whose default CLI login is real keeps its
-    // row — still structural, still no harness-name branch.
-    return !accountRows(payload).some((row) => {
-        if (String(row.harness) !== String(harness || '')) return false;
-        if (row.kind === 'profile') return true;
-        return String(row.status?.verification || '') === 'passed';
-    });
-}
-
-export function familyEmptinessVerified(payload, harness) {
-    // Whether the "no detected account" claim above is AUTHORITATIVE: only an
-    // accounts facet that was actually READ licenses an absence claim (the
-    // store's own rule — facetKnown/facetReadState exist so a blip is not
-    // read as emptiness). The name-the-account face is NOT withheld on an
-    // unread facet — on a fresh install the first Connect is itself what
-    // provisions the daemon, so no successful read can exist yet — but its
-    // absence claim is then disclosed as unverified instead of asserted.
-    return facetReadState(payload, FACET_ACCOUNTS) === READ_OK
-        && familyHasNoAccounts(payload, harness);
+export function attachShellLabel(shell) {
+    if (shell === 'powershell') return 'PowerShell';
+    if (shell === 'posix') return 'POSIX shell';
+    return 'your terminal shell';
 }
 
 export function deviceCodeDisclosure(envelope) {
@@ -166,6 +146,29 @@ export function loginCardFace(active) {
     if (active.verdict?.kind === 'unavailable') return 'unavailable';
     if (deviceCodeDisclosure(active.envelope || {})) return 'device';
     return 'progress';
+}
+
+function durableTerminalTransportError(active) {
+    const code = active?.envelope?.job?.nativeCommand?.errorCode;
+    return typeof code === 'string' && TERMINAL_TRANSPORT_ERRORS.has(code) ? code : '';
+}
+
+export function externalTerminalActionAvailable(active) {
+    if (!active || active.transport === 'client_pty' || active.attachCommand) return false;
+    const problemCode = String(active.problemCode || '');
+    const actions = Array.isArray(active.requiredActions) ? active.requiredActions : [];
+    if (TERMINAL_TRANSPORT_ERRORS.has(problemCode)) {
+        return actions.includes('use_external_terminal');
+    }
+    return Boolean(durableTerminalTransportError(active));
+}
+
+export function loginRetryAvailable(active) {
+    const code = String(active?.problemCode || '') || durableTerminalTransportError(active);
+    if (code !== 'terminal_transport_unavailable'
+        && code !== 'terminal_transport_unsupported') return true;
+    const actions = Array.isArray(active?.requiredActions) ? active.requiredActions : [];
+    return actions.includes('retry_setup_login');
 }
 
 // How long the card waits for the engine to disclose a sign-in link before
@@ -484,7 +487,9 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
         `<h4>Connect ${escapeHtml(active.harness)}${active.profile ? ` (${escapeHtml(active.profile)})` : ''}</h4>`];
     if (face === 'error') {
         bits.push(`<div class="settings-inline-note" data-tone="error">${escapeHtml(active.error)}</div>`);
-        bits.push('<button type="button" class="btn btn-primary" data-login-retry>Try again</button>');
+        if (loginRetryAvailable(active)) {
+            bits.push('<button type="button" class="btn btn-primary" data-login-retry>Try again</button>');
+        }
     } else if (face === 'name') {
         // The engine refused to CREATE the default login and said why — its
         // sentence is the honest source of the reason and is shown verbatim.
@@ -492,15 +497,6 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
         // name an account (same validation the Add-account dialog runs) and
         // start the NAMED login through the same standard flow.
         bits.push(`<div class="settings-inline-note" data-tone="error" data-login-engine-said>${escapeHtml(active.needsProfile.message)}</div>`);
-        if (active.needsProfile.emptinessVerified === false) {
-            // The account list was NOT successfully read (fresh install, or a
-            // degraded accounts facet): the "no account in this family" half of
-            // the discriminator is disclosed as unverified rather than
-            // asserted — the engine's sentence above stays the primary truth.
-            bits.push('<div class="settings-inline-status" data-tone="muted" data-login-accounts-unread>'
-                + 'The account list could not be read, so "no account yet" is unverified — '
-                + 'if this family already has accounts, refresh and retry instead.</div>');
-        }
         bits.push(`
             <div class="harness-code-entry" data-profile-name-entry>
                 <label for="harness-profile-name-input">Name for the ${escapeHtml(active.needsProfile.familyLabel || active.harness)} account (e.g. work, backup). Lowercase letters, digits, "-" and "_" — anything else becomes "-".</label>
@@ -612,7 +608,8 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
     // A settled non-success verdict in COMPACT mode still offers the retry the
     // mode promises; in full mode the account row's own Connect button is the
     // retry, exactly as today.
-    if (compact && (active.verdict?.kind === 'failure' || active.verdict?.kind === 'unconfirmed')) {
+    if (compact && loginRetryAvailable(active)
+        && (active.verdict?.kind === 'failure' || active.verdict?.kind === 'unconfirmed')) {
         bits.push('<button type="button" class="btn btn-primary" data-login-retry>Try again</button>');
     }
     // …and beside that verdict, the engine's own explanation. The two verdict
@@ -630,16 +627,45 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
             bits.push(`<div class="settings-inline-note" data-login-detail>${escapeHtml(detail)}</div>`);
         }
     }
+    if (externalTerminalActionAvailable(active)) {
+        bits.push(`
+            <div class="settings-inline-note" data-login-external-action>
+                This sign-in cannot use the in-app terminal transport on this host.
+            </div>
+            <button type="button" class="btn btn-primary" data-login-external-terminal>Continue in external terminal</button>
+        `);
+    }
+    // An explicit external-terminal continuation exposes its usable command
+    // immediately in both render modes; compact also exposes any attach-capable
+    // job directly because it has no Advanced wrapper. This is inert copy-paste
+    // text for the labelled shell, never an embedded terminal.
+    const directExternal = !!active.attachCommand && !summary.terminal
+        && (active.transport === 'client_pty' || compact);
+    if (directExternal) {
+        const commandLabel = attachShellLabel(active.attachShell);
+        bits.push(`
+            <div class="harness-external-terminal" data-login-external-command>
+                <p>Continue this sign-in in your own terminal (outside Ouroboros).</p>
+                <p><strong>Command for ${escapeHtml(commandLabel)}:</strong></p>
+                <pre class="harness-attach-command" data-attach-command>${escapeHtml(active.attachCommand)}</pre>
+                <button type="button" class="settings-ghost-btn" data-copy-attach>Copy command</button>
+            </div>
+        `);
+    }
     // The demoted attach fallback: a collapsed Advanced affordance, only when
     // due (engine predates the disclosure modes, or no link within the
     // window) and only while the job can still be attached.
-    if (!compact && !summary.terminal && attachFallbackDue(active, nowMs)) {
+    if (!compact && !directExternal && !summary.terminal && attachFallbackDue(active, nowMs)) {
+        const commandLabel = attachShellLabel(active.attachShell);
         bits.push(`
             <details class="harness-advanced" data-login-advanced${active.advancedOpen ? ' open' : ''}>
                 <summary>Advanced: sign in from your own terminal</summary>
                 <p>${active.engineDegraded
-        ? 'This engine cannot host the sign-in in the app yet. Run this in your own terminal (outside Ouroboros); the card follows the progress automatically:'
+        ? (active.setupLoginSource === 'legacy_global_operation'
+            ? 'This older agent service exposes only a global sign-in capability, not a per-agent host guarantee. Run this in your own terminal (outside Ouroboros); the card follows the progress automatically:'
+            : 'This agent uses an external terminal for sign-in on this host. Run this outside Ouroboros; the card follows the progress automatically:')
         : 'No sign-in link arrived yet. You can run this in your own terminal (outside Ouroboros) instead; the card follows the progress automatically:'}</p>
+                <p><strong>Command for ${escapeHtml(commandLabel)}:</strong></p>
                 <pre class="harness-attach-command" data-attach-command>${escapeHtml(active.attachCommand)}</pre>
                 <button type="button" class="settings-ghost-btn" data-copy-attach>Copy command</button>
             </details>
@@ -787,6 +813,12 @@ export function createLoginCardController({
             // polling itself once the previous job is terminal or provably
             // cancelled.
             start(active.harness, active.profile);
+        });
+        hostEl.querySelector('[data-login-external-terminal]')?.addEventListener('click', () => {
+            // This is a NEW job through the same serialized release/custody
+            // guard as every other start. Never mutate the active job into a
+            // different transport and never auto-fallback.
+            start(active.harness, active.profile, 'client_pty');
         });
         hostEl.querySelector('[data-copy-signin-link]')?.addEventListener('click', () => {
             const disclosure = deviceCodeDisclosure(active.envelope || {});
@@ -958,11 +990,10 @@ export function createLoginCardController({
         if ((active?.error || active?.needsProfile) && !active.jobId
             && (expected === undefined || expected === active)) {
             // A create that produced no usable identity has nothing this card
-            // can address with DELETE. Preserve the unknown status, but keep
-            // the existing Close affordance usable through honest local detach.
-            // The name-the-account face closes the same way: its create was
-            // REFUSED, so there is provably no job (it carries absent=true and
-            // detaches as released).
+            // can address with DELETE. A typed refusal carries absent=true and
+            // detaches as released; an untyped discovery/transport failure
+            // preserves unknown. Either way the existing Close affordance is
+            // usable through honest local detach.
             const result = detach();
             onSettled();
             return Promise.resolve(result);
@@ -1084,7 +1115,7 @@ export function createLoginCardController({
         render();
     }
 
-    function start(harness, profile) {
+    function start(harness, profile, transport = '') {
         if (!harness || ctl.disposed) return Promise.resolve();
         // Duplicate starts are COALESCED, not merely serialized. The queue
         // guaranteed order, and order made an ordinary double-click into
@@ -1098,9 +1129,9 @@ export function createLoginCardController({
         // classify this 53 KB module as binary, and `grep` then answers with
         // SILENCE instead of "no match", so a reviewer looking for a symbol
         // in here concludes it does not exist. Same key, same collisions.
-        const key = `${harness}\u0000${profile || ''}`;
+        const key = `${harness}\u0000${profile || ''}\u0000${transport || ''}`;
         if (ctl.pendingStart && ctl.pendingStart.key === key) return ctl.pendingStart.promise;
-        const promise = withLoginTransition(() => _startLocked(harness, profile));
+        const promise = withLoginTransition(() => _startLocked(harness, profile, transport));
         const clear = () => {
             if (ctl.pendingStart && ctl.pendingStart.promise === promise) ctl.pendingStart = null;
         };
@@ -1111,7 +1142,7 @@ export function createLoginCardController({
         return promise;
     }
 
-    async function _startLocked(harness, profile) {
+    async function _startLocked(harness, profile, transport = '') {
         // Re-read after the queue wait: a shutdown may have been queued ahead of
         // this start, and a disposed controller must not create a job nobody
         // will ever poll or cancel.
@@ -1156,9 +1187,11 @@ export function createLoginCardController({
         // server/engine decide the hosting (loginFlow rides only for codex).
         const body = { harness, login_flow: 'device_auth' };
         if (profile) body.profile_id = profile;
+        if (transport === 'client_pty') body.transport = transport;
         ctl.active = {
-            harness, profile, jobId: '', envelope: null, absent: false, custodyStatus: '',
-            attachCommand: '', error: '',
+            harness, profile, transport, jobId: '', envelope: null, absent: false, custodyStatus: '',
+            attachCommand: '', attachShell: '', setupLoginSource: '', error: '',
+            problemCode: '', requiredActions: [],
             startedAtMs: now(), engineDegraded: false,
             inputValue: '', inputBusy: false, inputSent: false, inputError: '', inputNote: '',
             needsProfile: null, profileNameValue: '', profileNameNote: '',
@@ -1175,33 +1208,31 @@ export function createLoginCardController({
             const data = await resp.json().catch(() => null);
             if (ctl.active !== active) return;
             if (!resp.ok) {
+                const actions = Array.isArray(data?.required_actions)
+                    ? data.required_actions.map(String) : [];
+                const problemCode = typeof data?.code === 'string' ? data.code : '';
+                active.problemCode = problemCode;
+                active.requiredActions = actions;
+                if (problemCode) {
+                    // A typed daemon refusal before a durable job was returned
+                    // proves this client owns no setup custody. Generic
+                    // discovery/transport failures carry no code and remain
+                    // honestly unknown.
+                    active.absent = true;
+                    active.custodyStatus = LOGIN_CUSTODY_RELEASED;
+                }
                 if (resp.status === 400 && !profile
-                    && familyHasNoAccounts(store?.snapshot, harness)) {
-                    // The engine refused to CREATE a DEFAULT login for a family
-                    // with ZERO accounts. That structural pair — create-time 400
-                    // plus an empty family — is the discriminator, deliberately
-                    // NOT the harness name (the set of engines without a default
-                    // credential store is the ENGINE's fact, it changes under us,
-                    // and no harness-name branch may select a capability) and NOT
-                    // the error text (prose is not a contract; this refusal
-                    // carries no machine code). A 400 at create is the daemon's
-                    // verdict on the requested login SHAPE, and with no account
-                    // in the family the only path the engine leaves open is the
-                    // named one — so the card asks for a name instead of showing
-                    // a dead end. A named create's 400, or one for a family that
-                    // HAS accounts, stays an ordinary error. The refusal also
+                    && problemCode === 'credential_profile_required'
+                    && actions.includes('add_named_account')) {
+                    // The engine's typed verdict, not harness identity, family
+                    // emptiness, status alone or prose, selects the name face.
+                    // A named create and every unrelated 400/409 stay ordinary
+                    // errors. The refusal also
                     // proves no job exists (the daemon answered the create with
                     // a refusal), so custody is honestly absent/released.
                     active.preparingRuntime = false;
-                    active.absent = true;
-                    active.custodyStatus = LOGIN_CUSTODY_RELEASED;
                     active.needsProfile = {
                         message: String(data?.error || `HTTP ${resp.status}`),
-                        // An absence claim is authoritative only off a READ
-                        // accounts facet; a fresh install has none yet, so the
-                        // face still shows — with the claim disclosed as
-                        // unverified instead of asserted.
-                        emptinessVerified: familyEmptinessVerified(store?.snapshot, harness),
                         // The engine's display name ("Antigravity"), resolved
                         // at detection where the store is at hand — the pure
                         // renderer must not reach for a global (raw id is the
@@ -1226,6 +1257,8 @@ export function createLoginCardController({
             active.jobId = jobId;
             active.envelope = data;
             active.attachCommand = String(data.attach_command || '');
+            active.attachShell = String(data.attach_shell || '');
+            active.setupLoginSource = String(data.setup_login_source || '');
             // An engine that predates the disclosure modes never sends a link;
             // the demoted Advanced fallback may show right away (still collapsed).
             active.engineDegraded = data.disclosure_native === false

@@ -687,6 +687,108 @@ class ClaudexorRuntimeManager:
         rows.sort(key=lambda item: item[:3], reverse=True)
         return rows[0][3]
 
+    def resolve_serving_role_command(
+        self,
+        *,
+        engine_version: str,
+        engine_build_sha: str,
+        engine_entry: str,
+        role: str,
+    ) -> list[str]:
+        """Resolve one role on the exact immutable tree serving the daemon.
+
+        The reviewed pin selects the *next* daemon spawn.  A live daemon may
+        keep serving an older preserved tree while that pin is already staged,
+        so a recovery command binds instead to all three handshake identity
+        fields.  Schema-v1 metadata locates the preserved Node and entry; a
+        fresh side-effect-free probe establishes the additive role without
+        rewriting metadata underneath the live process.
+        """
+        version = str(engine_version or "").strip()
+        build_sha = str(engine_build_sha or "").strip()
+        entry_text = str(engine_entry or "").strip()
+        required_role = str(role or "").strip()
+        if (
+            not _SEMVER.fullmatch(version)
+            or not _GIT_SHA.fullmatch(build_sha)
+            or not entry_text
+            or not required_role
+        ):
+            raise ClaudexorRuntimeError(
+                "runtime_serving_identity_invalid",
+                "the serving daemon did not disclose a complete version/build/entry identity",
+            )
+        try:
+            disclosed_entry = pathlib.Path(entry_text).resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ClaudexorRuntimeError(
+                "runtime_serving_entry_unavailable",
+                f"the serving daemon entry is unavailable: {type(exc).__name__}",
+            ) from exc
+        if not disclosed_entry.is_file():
+            raise ClaudexorRuntimeError(
+                "runtime_serving_entry_unavailable",
+                "the serving daemon entry is not a regular file",
+            )
+
+        metadata: dict[str, Any] = {}
+        try:
+            candidates = sorted(managed_runtime_root().iterdir(), key=lambda path: path.name)
+        except OSError:
+            candidates = []
+        for candidate in candidates:
+            current = self._read_metadata(candidate)
+            if (
+                current.get("version") != version
+                or current.get("build_sha") != build_sha
+            ):
+                continue
+            candidate_entry = candidate / pathlib.PurePosixPath(
+                str(current.get("entrypoint") or "")
+            )
+            try:
+                if candidate_entry.resolve(strict=True) != disclosed_entry:
+                    continue
+            except (OSError, RuntimeError):
+                continue
+            metadata = current
+            break
+        if not metadata:
+            raise ClaudexorRuntimeError(
+                "runtime_serving_tree_unavailable",
+                "the exact runtime tree reported by the serving daemon is not preserved",
+            )
+
+        node_version = str(metadata.get("node_version") or "")
+        node = self._resolve_preserved_node(node_version)
+        if not node:
+            raise ClaudexorRuntimeError(
+                "runtime_serving_node_unavailable",
+                f"the preserved Node {node_version or 'unknown'} for the serving daemon is unavailable",
+            )
+        command = [node, str(disclosed_entry)]
+        probe, _ = self._probe_payload(command, expected_node_version=node_version)
+        if (
+            str(probe.get("version") or "") != version
+            or str(probe.get("buildSha") or "") != build_sha
+        ):
+            raise ClaudexorRuntimeError(
+                "runtime_probe_identity_mismatch",
+                "serving runtime probe identity does not match the daemon handshake",
+            )
+        roles = probe.get("roles")
+        advertised = (
+            {str(value) for value in roles if isinstance(value, str) and value}
+            if isinstance(roles, list)
+            else set()
+        )
+        if required_role not in advertised:
+            raise ClaudexorRuntimeError(
+                "runtime_role_unavailable",
+                f"the serving runtime does not advertise the {required_role} role",
+            )
+        return command
+
     @staticmethod
     def _read_metadata(root: pathlib.Path) -> dict[str, Any]:
         try:
@@ -741,6 +843,49 @@ class ClaudexorRuntimeManager:
         except OSError:
             return {}
         return raw
+
+    @staticmethod
+    def _resolve_preserved_node(node_version: str) -> str:
+        """Find an already-admitted Node without consulting the next pin."""
+        from ouroboros.platform_layer import (
+            bundled_resource_bases,
+            embedded_node_candidates,
+            node_distribution_platform,
+            probe_node_version,
+        )
+
+        version = str(node_version or "").strip()
+        if not _SEMVER.fullmatch(version):
+            return ""
+        for base in bundled_resource_bases():
+            for candidate in embedded_node_candidates(base):
+                try:
+                    if candidate.is_file() and probe_node_version(str(candidate)) == version:
+                        return str(candidate.resolve())
+                except (OSError, RuntimeError):
+                    continue
+        platform_key = node_distribution_platform()
+        if not platform_key:
+            return ""
+        root = managed_runtime_root() / "node" / f"{version}-{platform_key}"
+        try:
+            raw = json.loads((root / _NODE_META_FILENAME).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return ""
+        if (
+            not isinstance(raw, dict)
+            or raw.get("schema_version") != 1
+            or raw.get("version") != version
+            or raw.get("platform") != platform_key
+        ):
+            return ""
+        candidate = embedded_node_candidates(root)[0]
+        try:
+            if candidate.is_file() and probe_node_version(str(candidate)) == version:
+                return str(candidate.resolve())
+        except (OSError, RuntimeError):
+            pass
+        return ""
 
     def _resolve_node(self, pin: ClaudexorRuntimePin) -> str:
         """Select an exact packaged/source Node, then an exact managed copy."""
@@ -1051,14 +1196,18 @@ class ClaudexorRuntimeManager:
             if displaced.exists() and root.exists():
                 shutil.rmtree(displaced, ignore_errors=True)
 
-    def _probe(self, command: list[str], pin: ClaudexorRuntimePin) -> str:
+    def _probe_payload(
+        self, command: list[str], *, expected_node_version: str
+    ) -> tuple[dict[str, Any], str]:
         from ouroboros.platform_layer import probe_node_version, subprocess_hidden_kwargs
 
         node_version = probe_node_version(command[0])
-        if node_version != pin.node_version:
+        if node_version != expected_node_version:
             raise ClaudexorRuntimeError(
                 "runtime_node_version_mismatch",
-                f"packaged Node {node_version or 'unknown'} does not match the reviewed {pin.node_version}",
+                "packaged Node "
+                f"{node_version or 'unknown'} does not match the reviewed "
+                f"{expected_node_version}",
             )
         env = dict(os.environ)
         # The probe must report the identity stamped into the bundle. An
@@ -1096,6 +1245,12 @@ class ClaudexorRuntimeManager:
                 break
         if not isinstance(probe, dict):
             raise ClaudexorRuntimeError("runtime_probe_failed", "runtime probe returned no JSON object")
+        return probe, node_version
+
+    def _probe(self, command: list[str], pin: ClaudexorRuntimePin) -> str:
+        probe, node_version = self._probe_payload(
+            command, expected_node_version=pin.node_version
+        )
         if str(probe.get("version") or "") != pin.version or str(probe.get("buildSha") or "") != pin.build_sha:
             raise ClaudexorRuntimeError(
                 "runtime_probe_identity_mismatch",

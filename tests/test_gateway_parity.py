@@ -11,10 +11,12 @@ from ouroboros.gateway.contracts import (
     ActiveDirectTurn,
     ChatInbound,
     ChatOutbound,
+    ClaudexorCredentialProfileDeleteResponse,
     ClaudexorLoginJobProblem,
     ClaudexorLoginJobResponse,
     ClaudexorStatusReads,
     ClaudexorStatusResponse,
+    ClaudexorVendorCredentialDisposition,
     OnboardingCompleteRequest,
     OnboardingCompleteResponse,
     OnboardingPresetFailureResponse,
@@ -188,6 +190,8 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "SettingsPostCommitFailureResponse",
         "ClaudexorLoginJobResponse",
         "ClaudexorLoginJobProblem",
+        "ClaudexorCredentialProfileDeleteResponse",
+        "ClaudexorVendorCredentialDisposition",
     ):
         assert re.search(rf"@typedef \{{Object\}} {name}\b", text), f"api_types.js missing {name}"
     api_client = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "api_client.js").read_text(
@@ -212,6 +216,8 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
                 SettingsPostCommitFailureResponse,
                 ProviderTestRequest, ProviderTestResponse,
                 ClaudexorLoginJobResponse, ClaudexorLoginJobProblem,
+                ClaudexorCredentialProfileDeleteResponse,
+                ClaudexorVendorCredentialDisposition,
                 ClaudexorStatusReads, ClaudexorStatusResponse):
         expected = set(get_type_hints(cls, include_extras=True))
         actual = _js_typedef_fields(text, cls.__name__)
@@ -224,6 +230,33 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         r"@typedef \{Object\} ClaudexorLoginJobProblem\b([\s\S]*?)\*/", text)
     assert success_decl and "@property {Object} job" in success_decl.group(1)
     assert problem_decl and "@property {string} error" in problem_decl.group(1)
+    delete_decl = re.search(
+        r"@typedef \{Object\} ClaudexorCredentialProfileDeleteResponse\b([\s\S]*?)\*/",
+        text,
+    )
+    assert delete_decl
+    for declaration in (
+        "@property {Object} profile",
+        "@property {boolean} removed",
+        "@property {('config_dir_removed'|'secret_deleted'|'none')} credentialCleanup",
+    ):
+        assert declaration in delete_decl.group(1)
+    delete_optional = {
+        name for name, annotation
+        in ClaudexorCredentialProfileDeleteResponse.__annotations__.items()
+        if (getattr(annotation, "__forward_arg__", None) or str(annotation)).startswith(
+            "NotRequired["
+        )
+    }
+    assert delete_optional == {"cleanupWarning", "vendorCredentialDisposition"}
+    assert set(ClaudexorCredentialProfileDeleteResponse.__annotations__) - delete_optional == {
+        "profile", "removed", "credentialCleanup",
+    }
+    delete_hints = get_type_hints(
+        ClaudexorCredentialProfileDeleteResponse, include_extras=True)
+    assert set(get_args(delete_hints["credentialCleanup"])) == {
+        "config_dir_removed", "secret_deleted", "none",
+    }
     # The client's own list of facets. The shared status store is the ONE reader
     # of the `reads` block (`facetReadState`), and STATUS_FACETS is the list its
     # per-facet map and every "did the daemon answer anything at all?" predicate

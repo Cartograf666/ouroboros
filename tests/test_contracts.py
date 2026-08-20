@@ -1394,12 +1394,14 @@ def test_login_job_browser_envelopes_keep_their_required_discriminators():
     assert get_origin(problem["error"]) is Required
     assert set(success) - {"job"} == {
         "attach_command",
+        "attach_shell",
         "cursor",
         "deviceCode",
         "disclosure_native",
         "job_id",
         "ok",
         "sequence",
+        "setup_login_source",
     }
     assert set(problem) - {"error"} == {
         "code",

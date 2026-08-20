@@ -6,6 +6,7 @@ phase acceptance run, not by unit tests.
 """
 import json
 import pathlib
+import shlex
 
 import pytest
 
@@ -33,9 +34,110 @@ def test_owned_config_dir_is_data_plane():
 def test_attach_login_command_targets_the_owned_home():
     """The fallback card's copy-paste command (D30): the user's own terminal,
     the OWNED config dir — never a terminal surface inside the UI."""
-    command = owned.attach_login_command("job-123")
-    assert command.startswith(f"CLAUDEXOR_CONFIG_DIR={owned.owned_config_dir()} ")
-    assert command.endswith("claudexor setup attach job-123")
+    # Pin the syntax this exact assertion describes; the host default is
+    # PowerShell on Windows and is tested independently below.
+    argv = [
+        "/managed/node",
+        "/managed/runtime/claudexord.bundle.cjs",
+        "setup",
+        "attach",
+    ]
+    command = owned.attach_login_command("job-123", argv=argv, shell="posix")
+    config_root = str(owned.owned_config_dir())
+    assert command == (
+        f"CLAUDEXOR_CONFIG_DIR={shlex.quote(config_root)} "
+        "CLAUDEXOR_DAEMON_SOCK='' "
+        "/managed/node /managed/runtime/claudexord.bundle.cjs setup attach job-123"
+    )
+
+
+def test_attach_login_shell_selects_the_host_default(monkeypatch):
+    from ouroboros import platform_layer
+
+    monkeypatch.setattr(platform_layer, "IS_WINDOWS", False)
+    assert owned.attach_login_shell() == "posix"
+    monkeypatch.setattr(platform_layer, "IS_WINDOWS", True)
+    assert owned.attach_login_shell() == "powershell"
+
+
+def test_attach_login_command_quotes_posix_and_powershell(monkeypatch):
+    """The fallback is inert text for an explicitly labelled shell, including
+    the path/argument characters that break ad-hoc interpolation."""
+    monkeypatch.setattr(owned, "owned_config_dir",
+                        lambda: pathlib.Path("/tmp/Ouroboros profile's data"))
+    posix_argv = [
+        "/tmp/Ouroboros runtime's/node",
+        "/tmp/Ouroboros runtime's/claudexord.bundle.cjs",
+        "setup",
+        "attach",
+    ]
+    posix = owned.attach_login_command("job '7", argv=posix_argv, shell="posix")
+    assert posix == ("CLAUDEXOR_CONFIG_DIR='/tmp/Ouroboros profile'\"'\"'s data' "
+                     "CLAUDEXOR_DAEMON_SOCK='' "
+                     "'/tmp/Ouroboros runtime'\"'\"'s/node' "
+                     "'/tmp/Ouroboros runtime'\"'\"'s/claudexord.bundle.cjs' "
+                     "setup attach 'job '\"'\"'7'")
+
+    monkeypatch.setattr(owned, "owned_config_dir",
+                        lambda: pathlib.Path(r"C:\Users\O'Brien\Ouroboros data"))
+    powershell_argv = [
+        r"C:\Program Files\O'Brien\Node\node.exe",
+        r"C:\Program Files\O'Brien\Claudexor\claudexord.bundle.cjs",
+        "setup",
+        "attach",
+    ]
+    powershell = owned.attach_login_command(
+        "job '7", argv=powershell_argv, shell="powershell")
+    assert powershell == ("$env:CLAUDEXOR_CONFIG_DIR='C:\\Users\\O''Brien\\Ouroboros data'; "
+                          "$env:CLAUDEXOR_DAEMON_SOCK=''; "
+                          "& 'C:\\Program Files\\O''Brien\\Node\\node.exe' "
+                          "'C:\\Program Files\\O''Brien\\Claudexor\\claudexord.bundle.cjs' "
+                          "'setup' 'attach' 'job ''7'")
+
+
+def test_resolve_attach_login_argv_binds_serving_identity_and_maps_failures(monkeypatch):
+    from ouroboros import claudexor_runtime as runtime
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    engine = {
+        "version": "3.7.0",
+        "sha": "a" * 40,
+        "entry": "/managed/runtime/claudexord.bundle.cjs",
+    }
+
+    class Manager:
+        error = None
+
+        def resolve_serving_role_command(self, **kwargs):
+            assert kwargs == {
+                "engine_version": engine["version"],
+                "engine_build_sha": engine["sha"],
+                "engine_entry": engine["entry"],
+                "role": "setup_attach",
+            }
+            if self.error is not None:
+                raise self.error
+            return ["/managed/node", engine["entry"]]
+
+    manager = Manager()
+    monkeypatch.setattr(runtime, "get_runtime_manager", lambda: manager)
+    assert owned.resolve_attach_login_argv(engine) == [
+        "/managed/node", engine["entry"], "setup", "attach",
+    ]
+
+    cases = (
+        ("runtime_role_unavailable", "terminal_transport_unsupported", 409, ()),
+        ("runtime_serving_tree_unavailable", "terminal_transport_unavailable", 409, ()),
+        ("runtime_serving_node_unavailable", "terminal_transport_unavailable", 409, ()),
+        ("runtime_probe_identity_mismatch", "terminal_transport_probe_failed", 503,
+         ("retry_setup_login",)),
+    )
+    for runtime_code, browser_code, status, actions in cases:
+        manager.error = runtime.ClaudexorRuntimeError(runtime_code, "fixture")
+        with pytest.raises(ClaudexorUnavailable) as excinfo:
+            owned.resolve_attach_login_argv(engine)
+        assert (excinfo.value.code, excinfo.value.status_code) == (browser_code, status)
+        assert excinfo.value.required_actions == actions
 
 
 def test_resolve_claudexord_explicit_setting_must_exist(monkeypatch, tmp_path):
@@ -336,6 +438,24 @@ def test_account_removal_is_the_engine_contract_and_refuses_out_loud(monkeypatch
     import ouroboros.claudexor_daemon as owned
 
     deleted: list = []
+    receipt = {
+        "profile": {
+            "profile_id": "work",
+            "harness_id": "codex",
+            "display_name": "Work",
+            "credential_kind": "config_dir_login",
+            "isolation_locator": "/data/claudexor/profiles/codex-work",
+            "secret_ref": None,
+            "enabled": True,
+            "created_at": None,
+        },
+        "removed": True,
+        "credentialCleanup": "config_dir_removed",
+        "cleanupWarning": "owned profile storage cleanup needs manual inspection",
+        "vendorCredentialDisposition": {
+            "owner": "vendor", "state": "left_unchanged", "scope": "os_user",
+        },
+    }
 
     class FakeGateway:
         def __init__(self, endpoint):
@@ -354,7 +474,7 @@ def test_account_removal_is_the_engine_contract_and_refuses_out_loud(monkeypatch
             if refuse:
                 raise gw.ClaudexorUnavailable("profile_in_use", "still running work")
             deleted.append((harness_id, profile_id))
-            return {"ok": True}
+            return receipt
 
     monkeypatch.setattr(owned, "owned_config_dir", lambda: tmp_path / "cfg")
     monkeypatch.setattr(gw, "ClaudexorGateway", FakeGateway)
@@ -376,6 +496,7 @@ def test_account_removal_is_the_engine_contract_and_refuses_out_loud(monkeypatch
     ok = _call("codex", "work")
     assert ok.status_code == 200
     assert deleted == [("codex", "work")], "the handler forwards and does nothing else"
+    assert json.loads(ok.body) == receipt, "the complete engine receipt survives verbatim"
 
     refuse = True
     denied = _call("codex", "work")
@@ -672,16 +793,96 @@ def test_login_endpoint_validates_before_any_daemon_work():
     assert bad_transport.status_code == 400 and b"transport" in bad_transport.body
 
 
-def test_login_create_passes_the_daemon_400_verdict_through(monkeypatch):
-    """A create-time daemon 400 is a typed VERDICT about the requested login
-    shape (e.g. a harness with no default credential store refusing a default
-    login and telling the owner to sign in from a named account), not daemon
-    unavailability. It must reach the browser with its original status, the
-    stable code and the engine's own sentence VERBATIM, in the frozen
-    ``ClaudexorLoginJobProblem`` envelope — the card keys its
-    name-the-account face on the structural pair (create-time, 400), which a
-    blanket 503 collapse made unreachable. Anything the daemon did not answer
-    with a 400 stays the proxy's honest 503."""
+def test_external_recovery_preflights_before_profile_or_job_mutation(monkeypatch):
+    """An old or unprobeable serving tree cannot strand a client_pty job."""
+    import asyncio
+
+    from starlette.requests import Request
+
+    from ouroboros.gateway.claudexor_accounts import api_claudexor_login
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    calls = {"profile": 0, "setup": 0}
+    failure = {"exc": ClaudexorUnavailable(
+        "terminal_transport_unsupported",
+        "old serving runtime has no setup_attach role",
+        status_code=409,
+    )}
+
+    class Gateway:
+        def handshake(self):
+            return {"engine": {
+                "version": "3.6.0",
+                "sha": "a" * 40,
+                "entry": "/managed/runtime/claudexord.bundle.cjs",
+            }}
+
+        def agent_capabilities(self):
+            return {"harnesses": [{
+                "id": "one", "setupLogin": {"mode": "external_terminal"},
+            }]}
+
+        def create_credential_profile(self, *_args):
+            calls["profile"] += 1
+
+        def setup_job_create(self, _body):
+            calls["setup"] += 1
+            return {"id": "stranded"}
+
+    class GatewayCtx:
+        def __enter__(self):
+            return Gateway()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        "ouroboros.claudexor_daemon.ensure_owned_gateway", lambda: GatewayCtx())
+
+    def fail_attach_preflight(_engine):
+        raise failure["exc"]
+
+    monkeypatch.setattr(owned, "resolve_attach_login_argv", fail_attach_preflight)
+
+    async def call():
+        payload = json.dumps({"harness": "one", "profile_id": "named"}).encode()
+
+        async def receive():
+            return {"type": "http.request", "body": payload, "more_body": False}
+
+        request = Request({
+            "type": "http", "method": "POST", "path": "/api/claudexor/login",
+            "headers": [(b"content-type", b"application/json")], "query_string": b"",
+        }, receive)
+        return await api_claudexor_login(request)
+
+    unsupported = asyncio.run(call())
+    assert unsupported.status_code == 409
+    assert json.loads(unsupported.body) == {
+        "error": "old serving runtime has no setup_attach role",
+        "code": "terminal_transport_unsupported",
+    }
+    assert calls == {"profile": 0, "setup": 0}
+
+    failure["exc"] = ClaudexorUnavailable(
+        "terminal_transport_probe_failed",
+        "serving runtime probe failed",
+        status_code=503,
+        required_actions=("retry_setup_login",),
+    )
+    probe_failed = asyncio.run(call())
+    assert probe_failed.status_code == 503
+    assert json.loads(probe_failed.body) == {
+        "error": "serving runtime probe failed",
+        "code": "terminal_transport_probe_failed",
+        "required_actions": ["retry_setup_login"],
+    }
+    assert calls == {"profile": 0, "setup": 0}
+
+
+def test_login_create_passes_only_marked_daemon_create_verdicts_through(monkeypatch):
+    """Frozen setup-create 400/409/retryable-503 problems keep their typed
+    browser envelope; the same status before setup creation stays generic."""
     import asyncio
 
     from starlette.requests import Request
@@ -695,6 +896,11 @@ def test_login_create_passes_the_daemon_400_verdict_through(monkeypatch):
                "stage": "create"}
 
     class _Gateway:
+        def agent_capabilities(self):
+            if refusal["stage"] == "capabilities":
+                raise refusal["exc"]
+            return {"harnesses": [{"id": "zephyr", "setupLogin": {"mode": "in_app"}}]}
+
         def operations(self):
             return {}
 
@@ -747,14 +953,65 @@ def test_login_create_passes_the_daemon_400_verdict_through(monkeypatch):
     with_actions = json.loads(asyncio.run(_call()).body)
     assert with_actions["required_actions"] == ["add_named_account"]
 
+    # All frozen pre-job terminal verdict classes keep the same problem
+    # envelope: unsupported/unavailable is a 409 with an external-terminal
+    # continuation; a failed bounded helper probe is retryable 503 with both
+    # retry and external-terminal continuations.
+    for code in ("terminal_transport_unavailable", "terminal_transport_unsupported"):
+        refusal["exc"] = ClaudexorUnavailable(
+            code, f"{code} detail", status_code=409,
+            required_actions=("use_external_terminal",))
+        unavailable = asyncio.run(_call())
+        assert unavailable.status_code == 409
+        assert json.loads(unavailable.body) == {
+            "error": f"{code} detail",
+            "code": code,
+            "required_actions": ["use_external_terminal"],
+        }
+
+    refusal["exc"] = ClaudexorUnavailable(
+        "terminal_transport_probe_failed", "terminal helper probe timed out",
+        status_code=503,
+        required_actions=("retry_setup_login", "use_external_terminal"))
+    probe_failed = asyncio.run(_call())
+    assert probe_failed.status_code == 503
+    assert json.loads(probe_failed.body) == {
+        "error": "terminal helper probe timed out",
+        "code": "terminal_transport_probe_failed",
+        "required_actions": ["retry_setup_login", "use_external_terminal"],
+    }
+
+    # The same typed-looking 503 before setup_job_create is not a setup-create
+    # verdict. Handshake/transport and capability-discovery failures retain the
+    # generic gateway 503 and must not leak code/actions into this contract.
+    for stage in ("handshake", "capabilities"):
+        refusal["stage"] = stage
+        refusal["exc"] = ClaudexorUnavailable(
+            "terminal_transport_probe_failed", "terminal helper probe timed out",
+            status_code=503,
+            required_actions=("retry_setup_login", "use_external_terminal"))
+        before_create = asyncio.run(_call())
+        assert before_create.status_code == 503
+        before_body = json.loads(before_create.body)
+        assert before_body == {
+            "error": "terminal_transport_probe_failed: terminal helper probe timed out",
+        }
+
     # No 400 verdict — an unreachable daemon (status 0) and a daemon 5xx — is
     # never promoted to one: both stay the proxy's honest 503.
-    for exc in (ClaudexorUnavailable("daemon_unreachable", "connect refused"),
-                ClaudexorUnavailable("http_500", "boom", status_code=500)):
+    refusal["stage"] = "create"
+    for exc in (
+        ClaudexorUnavailable("daemon_unreachable", "connect refused"),
+        ClaudexorUnavailable("http_500", "boom", status_code=500),
+        ClaudexorUnavailable(
+            "http_503", "untyped setup refusal", status_code=503,
+            required_actions=("retry",)),
+    ):
         refusal["exc"] = exc
         answer = asyncio.run(_call())
         assert answer.status_code == 503
         assert exc.code.encode() in answer.body
+        assert set(json.loads(answer.body)) == {"error"}
 
     # A 400 from the HANDSHAKE stage is engine/protocol trouble, not a verdict
     # about the requested login shape: the pass-through is scoped to the job
@@ -764,6 +1021,78 @@ def test_login_create_passes_the_daemon_400_verdict_through(monkeypatch):
     answer = asyncio.run(_call())
     assert answer.status_code == 503
     assert b"http_400" in answer.body
+
+
+def test_profile_create_problem_surfaces_typed_and_starts_no_setup(monkeypatch):
+    """A non-duplicate profile-registration verdict keeps status, code and
+    action at the browser boundary; it never falls through to setup create."""
+    import asyncio
+
+    from starlette.requests import Request
+
+    from ouroboros.gateway.claudexor_accounts import api_claudexor_login
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    setups = []
+    refusal = {"exc": ClaudexorUnavailable(
+        "credential_profile_required", "name this account", status_code=400,
+        required_actions=("add_named_account",))}
+
+    class Gateway:
+        def agent_capabilities(self):
+            return {"harnesses": [{"id": "one", "setupLogin": {"mode": "in_app"}}]}
+
+        def create_credential_profile(self, *_args):
+            raise refusal["exc"]
+
+        def setup_job_create(self, body):
+            setups.append(body)
+            return {"id": "impossible"}
+
+    class GatewayCtx:
+        def __enter__(self):
+            return Gateway()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        "ouroboros.claudexor_daemon.ensure_owned_gateway", lambda: GatewayCtx())
+
+    async def _call():
+        payload = json.dumps({"harness": "one", "profile_id": "named"}).encode()
+
+        async def receive():
+            return {"type": "http.request", "body": payload, "more_body": False}
+
+        request = Request({
+            "type": "http", "method": "POST", "path": "/api/claudexor/login",
+            "headers": [(b"content-type", b"application/json")], "query_string": b"",
+        }, receive)
+        return await api_claudexor_login(request)
+
+    answer = asyncio.run(_call())
+    assert answer.status_code == 400
+    assert json.loads(answer.body) == {
+        "error": "name this account",
+        "code": "credential_profile_required",
+        "required_actions": ["add_named_account"],
+    }
+    refusal["exc"] = ClaudexorUnavailable(
+        "profile_name_invalid", "bad profile name", status_code=422)
+    invalid = asyncio.run(_call())
+    assert invalid.status_code == 422
+    assert json.loads(invalid.body) == {
+        "error": "bad profile name", "code": "profile_name_invalid",
+    }
+    refusal["exc"] = ClaudexorUnavailable(
+        "profile_storage_failed", "disk write failed", status_code=500)
+    failed = asyncio.run(_call())
+    assert failed.status_code == 503
+    assert json.loads(failed.body) == {
+        "error": "disk write failed", "code": "profile_storage_failed",
+    }
+    assert setups == []
 
 
 # ---------------------------------------------------------------------------
@@ -798,6 +1127,35 @@ def test_login_disclosure_capability_reads_the_operations_catalog():
     assert _login_disclosure_native([]) is False
 
 
+def test_setup_login_projection_preserves_all_four_wire_states():
+    """Optional and nullable are different protocol facts; malformed current
+    evidence must never collapse onto the one legacy state."""
+    from ouroboros.gateway.claudexor_accounts import _harness_setup_login
+
+    assert _harness_setup_login(
+        {"harnesses": [{"id": "one"}]}, "one") == ("absent", "")
+    assert _harness_setup_login(
+        {"harnesses": [{"id": "one", "setupLogin": None}]}, "one") == ("null", "")
+    assert _harness_setup_login(
+        {"harnesses": [{"id": "one", "setupLogin": {
+            "mode": "in_app", "futureField": True,
+        }}]}, "one") == ("object", "in_app")
+    assert _harness_setup_login(
+        {"harnesses": [{"id": "one", "setupLogin": {
+            "mode": "external_terminal",
+        }}]}, "one") == ("object", "external_terminal")
+    for malformed in (
+        {},
+        {"harnesses": []},
+        {"harnesses": [{"id": "other"}]},
+        {"harnesses": [{"id": "one"}, {"id": "one"}]},
+        {"harnesses": [{"id": "one", "setupLogin": {}}]},
+        {"harnesses": [{"id": "one", "setupLogin": {"mode": "future"}}]},
+        {"harnesses": [{"id": "one", "setupLogin": "in_app"}]},
+    ):
+        assert _harness_setup_login(malformed, "one") == ("malformed", "")
+
+
 def test_login_request_transport_default_is_capability_gated():
     """On a disclosure-native engine a non-codex login OMITS the transport so
     the engine hosts the flow itself (oauth_url in the snapshot overlay, no
@@ -812,6 +1170,18 @@ def test_login_request_transport_default_is_capability_gated():
     # An EXPLICIT client_pty ask survives on any engine (the card's fallback).
     explicit = _build_login_request("cursor", "", "client_pty", "", disclosure_native=True)
     assert explicit["transport"] == "client_pty"
+    # Codex client_pty has one legal flow. A caller-provided device flow cannot
+    # override the transport invariant, while non-codex never receives the
+    # codex-only field.
+    codex_external = _build_login_request(
+        "codex", "", "client_pty", "device_auth", disclosure_native=True)
+    assert codex_external == {
+        "harness": "codex", "action": "login", "authRequest": "subscription",
+        "transport": "client_pty", "loginFlow": "browser_redirect",
+    }
+    non_codex = _build_login_request(
+        "claude", "", "client_pty", "device_auth", disclosure_native=True)
+    assert "loginFlow" not in non_codex
     # Codex is untouched by the capability: its device flow was already
     # daemon-hosted, transport stays absent either way.
     for flag in (True, False):
@@ -819,7 +1189,67 @@ def test_login_request_transport_default_is_capability_gated():
         assert "transport" not in codex and codex["loginFlow"] == "device_auth"
 
 
-def _create_login(monkeypatch, tmp_path, body: dict, *, operations, raises=False):
+def _claudexor_3_6_capabilities(harness: str) -> dict:
+    """Schema-shaped 3.6.0 catalog fixture: the new key is truly absent."""
+    row = {
+        "id": harness,
+        "enabled": True,
+        "displayName": harness,
+        "status": "ok",
+        "providerFamily": "unknown",
+        "enabledIntents": ["coding"],
+        "disabledIntents": [],
+        "reasons": [],
+        "configuredModel": None,
+        "configuredModelValid": None,
+        "models": {"source": "none", "count": 0, "verifiedAgainst": None},
+        "webPolicy": "none",
+        "attachmentInputs": [],
+        "effortLevels": [],
+        "accessProfilesSupported": [],
+        "readonlyMechanism": "none",
+        "delegation": {
+            "available": False,
+            "reason": "manifest_unsupported",
+            "remediation": "Choose a harness with Delegate support.",
+            "requiresFullAccess": False,
+        },
+    }
+    return {
+        "ok": True,
+        "version": "3.6.0",
+        "generatedAt": "2026-08-19T00:00:00.000Z",
+        "git": {
+            "status": "ready", "version": "2.50.1", "detail": "git version 2.50.1",
+            "remediation": None,
+        },
+        "harnesses": [row],
+        "availableHarnesses": [harness],
+        "modes": ["ask", "plan", "agent"],
+        "runControlKeys": ["prompt"],
+        "outputSchemaDialects": [{
+            "dialect": "draft-07",
+            "uri": "http://json-schema.org/draft-07/schema#",
+            "defaultWhenOmitted": True,
+        }],
+        "mutability": {
+            "readOnlyModes": ["ask", "plan"],
+            "writeModes": ["agent"],
+            "isolationKinds": ["envelope", "live"],
+            "workspaceModes": ["in_place", "isolated"],
+            "accessProfiles": ["readonly", "workspace_write", "full"],
+            "applyModes": ["apply", "commit", "branch", "pr"],
+        },
+        "cliCommands": [{
+            "id": "ask", "mutability": "read", "stability": "stable", "recovery": False,
+        }],
+        "mcpTools": ["claudexor_ask"],
+        "runApplyStates": ["not_applied", "applied", "applied_review_blocked", "reverted"],
+    }
+
+
+def _create_login(monkeypatch, tmp_path, body: dict, *, operations,
+                  capabilities=None, raises=False):
     """Run the REAL create path against a fake daemon, answering the probe with
     ``operations`` (or raising for the catalog-unreadable case). Returns
     ``(answer, request_body_actually_sent)``."""
@@ -828,6 +1258,17 @@ def _create_login(monkeypatch, tmp_path, body: dict, *, operations, raises=False
     from ouroboros.gateways import claudexor as gw
 
     sent: dict = {}
+    engine = {
+        "version": "3.7.0",
+        "sha": "a" * 40,
+        "entry": str(tmp_path / "runtime" / "claudexord.bundle.cjs"),
+    }
+    attach_argv = [
+        str(tmp_path / "node" / "node"),
+        engine["entry"],
+        "setup",
+        "attach",
+    ]
 
     class FakeDaemon:
         def ensure_running(self):
@@ -847,7 +1288,12 @@ def _create_login(monkeypatch, tmp_path, body: dict, *, operations, raises=False
             return False
 
         def handshake(self, **_kw):
-            return {}
+            return {"engine": engine}
+
+        def agent_capabilities(self):
+            if capabilities is not None:
+                return capabilities
+            return _claudexor_3_6_capabilities(str(body.get("harness") or ""))
 
         def operations(self):
             if raises:
@@ -861,6 +1307,12 @@ def _create_login(monkeypatch, tmp_path, body: dict, *, operations, raises=False
 
     monkeypatch.setattr(owned, "get_owned_daemon", lambda: FakeDaemon())
     monkeypatch.setattr(owned, "owned_config_dir", lambda: tmp_path / "cfg")
+    monkeypatch.setattr(
+        owned,
+        "resolve_attach_login_argv",
+        lambda actual: attach_argv if actual == engine else pytest.fail(
+            "attach recovery must bind to the handshaken serving engine"),
+    )
     monkeypatch.setattr(gw, "ClaudexorGateway", FakeGateway)
     return _login_create(body), sent
 
@@ -884,6 +1336,7 @@ def test_login_create_transport_is_gated_by_the_executed_probe(monkeypatch, tmp_
     assert native["job"] == {"id": "job-1", "state": "queued"}
     assert "job" not in native["job"], "create must not emit the old job.job envelope"
     assert native["disclosure_native"] is True
+    assert native["setup_login_source"] == "legacy_global_operation"
     assert "transport" not in sent
     # No client_pty job ⇒ no attach command to demote into Advanced.
     assert "attach_command" not in native
@@ -893,8 +1346,226 @@ def test_login_create_transport_is_gated_by_the_executed_probe(monkeypatch, tmp_
         operations=[{"id": "post:setup.jobs.input", "method": "POST",
                      "path": "/v2/setup/jobs/:id/input"}])
     assert wrong_id["disclosure_native"] is False
+    assert wrong_id["setup_login_source"] == "legacy_global_operation"
     assert sent["transport"] == "client_pty"
-    assert wrong_id["attach_command"].endswith("claudexor setup attach job-1")
+    assert wrong_id["attach_command"] == owned.attach_login_command(
+        wrong_id["job_id"],
+        argv=[
+            str(tmp_path / "node" / "node"),
+            str(tmp_path / "runtime" / "claudexord.bundle.cjs"),
+            "setup",
+            "attach",
+        ],
+        shell=wrong_id["attach_shell"],
+    )
+
+
+def test_login_create_prefers_each_harness_setup_mode_over_global_operations(monkeypatch, tmp_path):
+    """Two rows can publish different host-effective modes. The exact target
+    row selects an omitted request and a global operation cannot override it;
+    an explicit client_pty recovery request remains explicit."""
+    capabilities = {"harnesses": [
+        {"id": "one", "setupLogin": {"mode": "in_app"}},
+        {"id": "two", "setupLogin": {"mode": "external_terminal"}},
+    ]}
+    in_app, sent = _create_login(
+        monkeypatch, tmp_path, {"harness": "one"},
+        operations=[], capabilities=capabilities, raises=True)
+    assert "transport" not in sent
+    assert in_app["disclosure_native"] is True
+    assert in_app["setup_login_source"] == "per_harness"
+    assert "attach_command" not in in_app
+
+    explicit, sent = _create_login(
+        monkeypatch, tmp_path, {"harness": "one", "transport": "client_pty"},
+        operations=[], capabilities=capabilities, raises=True)
+    assert sent["transport"] == "client_pty"
+    assert explicit["disclosure_native"] is False
+    assert explicit["setup_login_source"] == "per_harness"
+    assert "attach_command" in explicit
+
+    external, sent = _create_login(
+        monkeypatch, tmp_path, {"harness": "two"},
+        operations=[_INPUT_OP], capabilities=capabilities, raises=True)
+    assert sent["transport"] == "client_pty"
+    assert external["disclosure_native"] is False
+    assert external["setup_login_source"] == "per_harness"
+    assert external["attach_shell"] in {"posix", "powershell"}
+    assert "attach_command" in external
+
+
+@pytest.mark.parametrize("setup_login,expected_code", [
+    (None, "unsupported"),
+    ({"mode": "future"}, "setup_login_capability_malformed"),
+])
+def test_null_or_malformed_setup_login_never_mutates_or_falls_back(
+        monkeypatch, setup_login, expected_code):
+    """A current null/malformed field stops before profile create, operations
+    fallback and setup-job create. Only own-property absence is legacy."""
+    from ouroboros.gateway.claudexor_accounts import _login_create
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    calls = {"operations": 0, "profile": 0, "setup": 0}
+
+    class Gateway:
+        def agent_capabilities(self):
+            return {"harnesses": [{"id": "one", "setupLogin": setup_login}]}
+
+        def operations(self):
+            calls["operations"] += 1
+            return [_INPUT_OP]
+
+        def create_credential_profile(self, *_args):
+            calls["profile"] += 1
+
+        def setup_job_create(self, *_args):
+            calls["setup"] += 1
+            return {"id": "impossible"}
+
+    class GatewayCtx:
+        def __enter__(self):
+            return Gateway()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        "ouroboros.claudexor_daemon.ensure_owned_gateway", lambda: GatewayCtx())
+    if expected_code == "unsupported":
+        with pytest.raises(ValueError, match="does not support subscription sign-in"):
+            _login_create({"harness": "one", "profile_id": "named"})
+    else:
+        with pytest.raises(ClaudexorUnavailable) as malformed:
+            _login_create({"harness": "one", "profile_id": "named"})
+        assert malformed.value.code == expected_code
+    assert calls == {"operations": 0, "profile": 0, "setup": 0}
+
+
+def test_profile_create_suppresses_only_typed_or_exactly_read_back_duplicate(monkeypatch):
+    """Current typed duplicate is sufficient. The old generic 409 needs an
+    exact canonical row; every other conflict/failure stops before setup."""
+    from ouroboros.gateway.claudexor_accounts import _login_create
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    state = {"error": None, "profiles": {}, "reads": 0, "setups": 0}
+
+    class Gateway:
+        def agent_capabilities(self):
+            return {"harnesses": [{"id": "one", "setupLogin": {"mode": "in_app"}}]}
+
+        def create_credential_profile(self, *_args):
+            if state["error"]:
+                raise state["error"]
+
+        def credential_profiles(self):
+            state["reads"] += 1
+            return state["profiles"]
+
+        def setup_job_create(self, _body):
+            state["setups"] += 1
+            return {"id": f"job-{state['setups']}", "state": "queued"}
+
+    class GatewayCtx:
+        def __enter__(self):
+            return Gateway()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        "ouroboros.claudexor_daemon.ensure_owned_gateway", lambda: GatewayCtx())
+
+    state["error"] = ClaudexorUnavailable(
+        "credential_profile_exists", "already exists", status_code=409)
+    assert _login_create({"harness": "one", "profile_id": "named"})["job_id"] == "job-1"
+    assert state["reads"] == 0
+
+    state["error"] = ClaudexorUnavailable("http_409", "conflict", status_code=409)
+    state["profiles"] = {"profiles": [{"profile": {
+        "harness_id": "one", "profile_id": "named",
+    }}]}
+    assert _login_create({"harness": "one", "profile_id": "named"})["job_id"] == "job-2"
+    assert state["reads"] == 1
+
+    # Same id under another harness does not prove this registration.
+    state["profiles"] = {"profiles": [{"profile": {
+        "harness_id": "other", "profile_id": "named",
+    }}]}
+    with pytest.raises(ClaudexorUnavailable) as generic:
+        _login_create({"harness": "one", "profile_id": "named"})
+    assert generic.value is state["error"]
+    assert state["setups"] == 2
+
+    # A typed non-duplicate 409 remains a refusal even if a coincidental row
+    # exists; exact read-back is reserved for old generic 409 shapes.
+    state["error"] = ClaudexorUnavailable(
+        "credential_profile_ambiguous", "choose one", status_code=409,
+        required_actions=("disable_extra_profiles",))
+    state["profiles"] = {"profiles": [{"profile": {
+        "harness_id": "one", "profile_id": "named",
+    }}]}
+    with pytest.raises(ClaudexorUnavailable) as typed:
+        _login_create({"harness": "one", "profile_id": "named"})
+    assert typed.value.code == "credential_profile_ambiguous"
+    assert state["reads"] == 2, "typed conflicts must not trigger another read-back"
+    assert state["setups"] == 2
+
+
+def test_legacy_360_internal_error_duplicate_requires_exact_profile_reread(monkeypatch):
+    """The real 3.6.0 409 code is generic ``internal_error``. It is safe only
+    after one canonical read finds the exact legacy profile row."""
+    from ouroboros.gateway.claudexor_accounts import _login_create
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    legacy_profiles = json.loads((
+        pathlib.Path(__file__).resolve().parent.parent
+        / "web/tests/fixtures/credential_profiles_response.json"
+    ).read_text(encoding="utf-8"))
+    state = {"profiles": legacy_profiles, "reads": 0, "setups": 0}
+    conflict = ClaudexorUnavailable(
+        "internal_error",
+        "could not register the profile: duplicate credential profile koshak for harness codex",
+        status_code=409,
+    )
+
+    class Gateway:
+        def agent_capabilities(self):
+            return _claudexor_3_6_capabilities("codex")
+
+        def operations(self):
+            return [_INPUT_OP]
+
+        def create_credential_profile(self, *_args):
+            raise conflict
+
+        def credential_profiles(self):
+            state["reads"] += 1
+            return state["profiles"]
+
+        def setup_job_create(self, _body):
+            state["setups"] += 1
+            return {"id": "legacy-job", "state": "queued"}
+
+    class GatewayCtx:
+        def __enter__(self):
+            return Gateway()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        "ouroboros.claudexor_daemon.ensure_owned_gateway", lambda: GatewayCtx())
+
+    answer = _login_create({"harness": "codex", "profile_id": "koshak"})
+    assert answer["job_id"] == "legacy-job"
+    assert state == {"profiles": legacy_profiles, "reads": 1, "setups": 1}
+
+    state.update({"profiles": {"profiles": []}, "reads": 0, "setups": 0})
+    with pytest.raises(ClaudexorUnavailable) as unknown:
+        _login_create({"harness": "codex", "profile_id": "koshak"})
+    assert unknown.value is conflict
+    assert state["reads"] == 1
+    assert state["setups"] == 0
 
 
 def test_login_create_fails_closed_when_the_catalog_cannot_be_read(monkeypatch, tmp_path):
@@ -921,6 +1592,28 @@ def test_login_create_keeps_the_codex_invariant_on_both_engines(monkeypatch, tmp
         assert sent["loginFlow"] == "device_auth"
         assert "attach_command" not in answer
         assert answer["disclosure_native"] is bool(operations)
+
+    capabilities = {"harnesses": [{
+        "id": "codex", "setupLogin": {"mode": "in_app"},
+    }]}
+    external, sent = _create_login(
+        monkeypatch, tmp_path,
+        {"harness": "codex", "transport": "client_pty", "login_flow": "device_auth"},
+        operations=[], capabilities=capabilities, raises=True,
+    )
+    assert sent["transport"] == "client_pty"
+    assert sent["loginFlow"] == "browser_redirect"
+    assert external["disclosure_native"] is False
+    assert external["attach_command"] == owned.attach_login_command(
+        external["job_id"],
+        argv=[
+            str(tmp_path / "node" / "node"),
+            str(tmp_path / "runtime" / "claudexord.bundle.cjs"),
+            "setup",
+            "attach",
+        ],
+        shell=external["attach_shell"],
+    )
 
 
 def _input_request(job_id: str, body: dict):

@@ -153,6 +153,8 @@ test('both verification statuses are honest: vendor is trusted, local is neutral
     assert.equal(local.label, 'Signed in — not verified live');
 
     assert.equal(verificationBadge({ status: {} }).label, 'Not signed in');
+    assert.deepEqual(verificationBadge({ status: { verification: 'not_run' } }),
+        { tone: 'muted', label: 'Not verified' });
     assert.equal(verificationBadge({ status: { verification: 'failed', verification_source: 'vendor' } }).tone, 'error');
 });
 
