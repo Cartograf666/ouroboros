@@ -5,6 +5,55 @@ import {
     computeDerivedChatStatus,
     computeHydratedDirectActivities,
 } from '../modules/chat.js';
+import { createStateSnapshotSequencer } from '../modules/chat_activity.js';
+
+test('state snapshots and failure authority stay monotonic across reversed completion', () => {
+    const applied = [];
+    const requestTimes = [100, 200];
+    const snapshots = createStateSnapshotSequencer(
+        (data, requestedAt) => applied.push({ data, requestedAt }),
+        () => requestTimes.shift(),
+    );
+    const older = snapshots.begin();
+    const newer = snapshots.begin();
+
+    assert.deepEqual(older, { generation: 1, requestedAt: 100 });
+    assert.deepEqual(newer, { generation: 2, requestedAt: 200 });
+    assert.equal(snapshots.isCurrent(older), true);
+    assert.equal(snapshots.apply(newer, { activities: [] }), true);
+    // An older non-OK/catch path can no longer regress the newer header.
+    assert.equal(snapshots.isCurrent(older), false);
+    assert.equal(snapshots.apply(older, { activities: ['stale-root'] }), false);
+    assert.deepEqual(applied, [{ data: { activities: [] }, requestedAt: 200 }]);
+});
+
+test('snapshot provenance beats apply time while equal-time live frames keep the request barrier', () => {
+    let activities = new Map();
+    const snapshots = createStateSnapshotSequencer((data, requestedAt, generation) => {
+        activities = computeHydratedDirectActivities(
+            activities, data.activities, 1, requestedAt, null, generation,
+        );
+    }, () => 100);
+    const older = snapshots.begin();
+    const newer = snapshots.begin();
+    const originalNow = Date.now;
+    Date.now = () => 300;
+    try {
+        assert.equal(snapshots.apply(older, { activities: [
+            { activity_id: 'snapshot-root', chat_id: 1, kind: 'managed_task' },
+        ] }), true);
+        assert.equal(activities.get('snapshot-root').snapshotGeneration, older.generation);
+        // A genuinely later live frame can share the request's millisecond.
+        activities.set('live-root', {
+            activityId: 'live-root', kind: 'managed_task', startedAt: newer.requestedAt,
+        });
+        assert.equal(snapshots.apply(newer, { activities: [] }), true);
+        assert.equal(activities.has('snapshot-root'), false);
+        assert.equal(activities.has('live-root'), true);
+    } finally {
+        Date.now = originalNow;
+    }
+});
 
 test('computeDerivedChatStatus: offline state when ws is disconnected', () => {
     const status = computeDerivedChatStatus({

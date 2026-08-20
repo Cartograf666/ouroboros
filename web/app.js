@@ -4,6 +4,7 @@ import { createWS } from './modules/ws.js';
 import { apiFetch, fetchJson } from './modules/api_client.js';
 import { loadVersion, initMatrixRain } from './modules/utils.js';
 import { initChat, createChatInstance } from './modules/chat.js';
+import { createStateSnapshotSequencer } from './modules/chat_activity.js';
 import { initFiles } from './modules/files.js';
 import { apiClient } from './modules/api_client.js';
 import { openNewProjectDialog, openProjectRowMenu } from './modules/project_create.js';
@@ -192,10 +193,14 @@ document.addEventListener('click', (event) => {
 navDrawerBackdrop?.addEventListener('click', () => setMobileDrawerOpen(false));
 hydrateNavIcons();
 
-// perf2 P4.2: non-zero while openProjectPanel is building/painting a panel —
-// Main's chat instance defers its first hydration to it (bounded upper limit
-// lives in chat.js), so a fast project open never competes with Main replay.
+// While a Project panel paints, Main defers first hydration (bounded in chat.js).
 let projectPanelOpeningSince = 0;
+let mainChat;
+const stateSnapshots = createStateSnapshotSequencer((data, requestedAt, generation) => {
+    renderProjectsNav(data.projects || [], data.project_chat_ids);
+    applyTaskBindings(data.task_bindings || {});
+    hydrateOpenChatsFromState(data, requestedAt, generation);
+});
 
 const ctx = {
     ws,
@@ -205,6 +210,7 @@ const ctx = {
     openSettingsTab,
     openDashboardTab,
     isProjectOpening: () => projectPanelOpeningSince > 0,
+    stateSnapshots,
     setBeforePageLeave: (handler) => {
         if (typeof handler !== 'function') return () => {};
         beforePageLeaveHandlers.push(handler);
@@ -215,8 +221,15 @@ const ctx = {
     },
 };
 
-initChat(ctx);
+mainChat = initChat(ctx);
 initFiles(ctx);
+
+function hydrateOpenChatsFromState(data, snapshotRequestedAt, snapshotGeneration) {
+    mainChat?.hydrateStateSnapshot?.(data, snapshotRequestedAt, snapshotGeneration);
+    for (const instance of projectInstances.values()) {
+        instance.hydrateStateSnapshot?.(data, snapshotRequestedAt, snapshotGeneration);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Multi-project navigation + right thread panel (v6.32.0). Projects come from
@@ -529,12 +542,12 @@ document.getElementById('nav-projects-add')?.addEventListener('click', async (ev
 });
 
 async function refreshProjectsNav() {
+    const request = stateSnapshots.begin();
     try {
         const resp = await apiFetch('/api/state', { cache: 'no-store' });
         if (!resp.ok) return;
         const data = await resp.json();
-        renderProjectsNav(data.projects || [], data.project_chat_ids);
-        applyTaskBindings(data.task_bindings || {});
+        stateSnapshots.apply(request, data);
     } catch {}
 }
 

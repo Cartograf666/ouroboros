@@ -5,10 +5,12 @@ from __future__ import annotations
 import logging
 import pathlib
 import threading
+from datetime import datetime, timezone
 from typing import Any, Dict
 
 from ouroboros.cost_projection import with_cost_aliases
 from ouroboros.task_results import (
+    TASK_COST_META_FIELDS,
     STATUS_COMPLETED,
     load_task_result,
     resolve_task_lineage,
@@ -20,6 +22,124 @@ log = logging.getLogger(__name__)
 
 POST_TASK_SYNTHESIS_LOCK = threading.Lock()
 POST_TASK_SYNTHESIS_INFLIGHT: set[tuple[str, str]] = set()
+POST_TASK_SYNTHESIS_OPEN_STATUSES = frozenset({"pending_once", "running"})
+POST_TASK_SYNTHESIS_TERMINAL_STATUSES = frozenset({"completed", "degraded"})
+_TERMINAL_ACCOUNTING_FIELDS = (
+    *TASK_COST_META_FIELDS,
+    "total_rounds",
+    "prompt_tokens",
+    "completion_tokens",
+)
+
+
+def post_task_synthesis_is_open(value: Any) -> bool:
+    """Return whether a root still owes post-task synthesis."""
+    return str(value or "") in POST_TASK_SYNTHESIS_OPEN_STATUSES
+
+
+def post_task_synthesis_is_terminal(value: Any) -> bool:
+    """Return whether canonical post-task synthesis has settled."""
+    return str(value or "") in POST_TASK_SYNTHESIS_TERMINAL_STATUSES
+
+
+def _parse_updated_at(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def project_replica_task_result_fields(
+    canonical_fields: Dict[str, Any],
+    replica_fields: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return the replica overlay permitted over a canonical task result.
+
+    A terminal canonical post-task checkpoint owns only its synthesis fields
+    and the accounting snapshot written with that checkpoint. The replica
+    continues to own acceptance, result, review, and trace fields. ``updated_at``
+    is monotonic projection metadata only; it never selects field authority.
+    """
+    overlay = dict(replica_fields)
+    canonical_checkpoint = canonical_fields.get("root_phase_checkpoint")
+    canonical_post_task = (
+        str(canonical_checkpoint.get("post_task_synthesis") or "")
+        if isinstance(canonical_checkpoint, dict)
+        else ""
+    )
+    if post_task_synthesis_is_terminal(canonical_post_task):
+        replica_checkpoint = overlay.get("root_phase_checkpoint")
+        merged_checkpoint = dict(canonical_checkpoint)
+        if isinstance(replica_checkpoint, dict):
+            merged_checkpoint.update(replica_checkpoint)
+        merged_checkpoint["post_task_synthesis"] = canonical_post_task
+        if "post_task_stop_reason" in canonical_checkpoint:
+            merged_checkpoint["post_task_stop_reason"] = canonical_checkpoint[
+                "post_task_stop_reason"
+            ]
+        overlay["root_phase_checkpoint"] = merged_checkpoint
+        for field in _TERMINAL_ACCOUNTING_FIELDS:
+            overlay.pop(field, None)
+
+    canonical_updated_at = _parse_updated_at(canonical_fields.get("updated_at"))
+    replica_updated_at = _parse_updated_at(overlay.get("updated_at"))
+    if canonical_updated_at is not None and (
+        replica_updated_at is None or canonical_updated_at > replica_updated_at
+    ):
+        overlay["updated_at"] = canonical_fields["updated_at"]
+    return overlay
+
+
+def project_root_post_task_checkpoint_fields(
+    canonical_fields: Dict[str, Any],
+    patch_fields: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Merge a root post-task patch against the CURRENT canonical checkpoint.
+
+    The root writer owns only post-task synthesis and its accounting snapshot;
+    acceptance remains whatever the current record says. Once post-task state
+    is terminal, an open or different-terminal stale patch cannot replace that
+    state or its accounting. A same-terminal patch remains valid so the
+    proactive namer's explicit ``refresh`` can update the final cost snapshot.
+    """
+    overlay = dict(patch_fields)
+    if canonical_fields.get("status"):
+        # This writer enriches the current lifecycle record; it never owns a
+        # possibly stale pre-lock lifecycle transition.
+        overlay["status"] = canonical_fields["status"]
+    canonical_checkpoint = canonical_fields.get("root_phase_checkpoint")
+    patch_checkpoint = overlay.get("root_phase_checkpoint")
+    current = (
+        dict(canonical_checkpoint)
+        if isinstance(canonical_checkpoint, dict)
+        else {"phase": "task_acceptance", "status": "not_required", "pass_index": 0}
+    )
+    patch = dict(patch_checkpoint) if isinstance(patch_checkpoint, dict) else {}
+    canonical_post_task = str(current.get("post_task_synthesis") or "")
+    patch_post_task = str(patch.get("post_task_synthesis") or "")
+
+    if post_task_synthesis_is_terminal(canonical_post_task):
+        current["post_task_synthesis"] = canonical_post_task
+        if isinstance(canonical_checkpoint, dict) and "post_task_stop_reason" in canonical_checkpoint:
+            current["post_task_stop_reason"] = canonical_checkpoint[
+                "post_task_stop_reason"
+            ]
+        if patch_post_task != canonical_post_task:
+            for field in _TERMINAL_ACCOUNTING_FIELDS:
+                overlay.pop(field, None)
+    else:
+        if "post_task_stop_reason" in patch:
+            current["post_task_stop_reason"] = patch["post_task_stop_reason"]
+        if patch_post_task:
+            current["post_task_synthesis"] = patch_post_task
+    overlay["root_phase_checkpoint"] = current
+    return overlay
 
 
 def is_root_post_task(task: Dict[str, Any]) -> bool:
@@ -48,8 +168,14 @@ def root_checkpoint_roots(env: Any, task: Dict[str, Any]) -> list[pathlib.Path]:
         return []
 
 
-def set_root_post_task_checkpoint(env: Any, task: Dict[str, Any], status: str) -> None:
-    """Merge the phase marker in the canonical budget-drive task result."""
+def set_root_post_task_checkpoint(
+    env: Any,
+    task: Dict[str, Any],
+    status: str,
+    *,
+    stop_reason: str = "",
+) -> Dict[str, Any] | None:
+    """Merge the phase marker and return the record actually stored, if any."""
     if not is_root_post_task(task):
         return
     task_id = str(task.get("id") or task.get("task_id") or "")
@@ -69,7 +195,7 @@ def set_root_post_task_checkpoint(env: Any, task: Dict[str, Any], status: str) -
         saved = str(checkpoint.get("post_task_synthesis") or "") if isinstance(checkpoint, dict) else ""
         effective_status = saved if requested_status == "refresh" and saved else requested_status
         cost_fields: Dict[str, Any] = {"cost_final": False, "cost_with_children_partial": True}
-        if effective_status in {"completed", "degraded"}:
+        if post_task_synthesis_is_terminal(effective_status):
             try:
                 from ouroboros.usage_accounting import usage_breakdown
                 from supervisor.state import reconstruct_task_cost
@@ -109,33 +235,46 @@ def set_root_post_task_checkpoint(env: Any, task: Dict[str, Any], status: str) -
         # otherwise this producer persists a DIVERGED pair: an honest name still
         # carrying the pre-refresh amount beside a corrected alias.
         cost_fields = with_cost_aliases(cost_fields)
+        checkpoint_patch = {"post_task_synthesis": effective_status}
+        if stop_reason:
+            checkpoint_patch["post_task_stop_reason"] = str(stop_reason)
+        stored: Dict[str, Any] | None = None
         try:
-            checkpoint = dict(checkpoint) if isinstance(checkpoint, dict) else {
-                "phase": "task_acceptance", "status": "not_required", "pass_index": 0,
-            }
-            checkpoint["post_task_synthesis"] = effective_status
-            write_task_result(
+            stored = write_task_result(
                 authority_root,
                 task_id,
                 str(existing.get("status") or task.get("status") or STATUS_COMPLETED),
+                _field_projector=project_root_post_task_checkpoint_fields,
                 root_task_id=str(task.get("root_task_id") or task_id),
                 parent_task_id=task.get("parent_task_id"),
                 budget_drive_root=str(authority_root),
                 child_drive_root=task.get("child_drive_root") or task.get("drive_root"),
                 project_id=str(task.get("project_id") or ""),
-                root_phase_checkpoint=checkpoint,
+                root_phase_checkpoint=checkpoint_patch,
                 **cost_fields,
             )
         except Exception:
             log.debug("Failed to update root post-task checkpoint", exc_info=True)
-        if effective_status in {"completed", "degraded"}:
+        stored_checkpoint = (
+            stored.get("root_phase_checkpoint") if isinstance(stored, dict) else None
+        )
+        stored_post_task = (
+            str(stored_checkpoint.get("post_task_synthesis") or "")
+            if isinstance(stored_checkpoint, dict)
+            else ""
+        )
+        if post_task_synthesis_is_terminal(stored_post_task):
             finalized_event = {
                 "type": "task_cost_finalized",
                 "ts": utc_now_iso(),
                 "task_id": task_id,
-                "root_task_id": str(task.get("root_task_id") or task_id),
-                "post_task_status": effective_status,
-                **cost_fields,
+                "root_task_id": str(stored.get("root_task_id") or task.get("root_task_id") or task_id),
+                "post_task_status": stored_post_task,
+                **{
+                    field: stored[field]
+                    for field in _TERMINAL_ACCOUNTING_FIELDS
+                    if field in stored
+                },
             }
     if finalized_event is not None:
         try:
@@ -156,6 +295,7 @@ def set_root_post_task_checkpoint(env: Any, task: Dict[str, Any], status: str) -
                     bridge.push_log(finalized_event)
             except Exception:
                 log.debug("Live push of finalized task cost skipped for %s", task_id, exc_info=True)
+    return stored
 
 
 def root_post_task_already_completed(env: Any, task: Dict[str, Any]) -> bool:
@@ -167,5 +307,5 @@ def root_post_task_already_completed(env: Any, task: Dict[str, Any]) -> bool:
     checkpoint = existing.get("root_phase_checkpoint") if isinstance(existing, dict) else None
     return bool(
         isinstance(checkpoint, dict)
-        and checkpoint.get("post_task_synthesis") in {"completed", "degraded"}
+        and post_task_synthesis_is_terminal(checkpoint.get("post_task_synthesis"))
     )

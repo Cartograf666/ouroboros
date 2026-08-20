@@ -390,6 +390,13 @@
  */
 
 /**
+ * Additive /api/chat/history fact for a project-owned row mirrored into Main.
+ * It cannot grant Main-local cancel authority.
+ * @typedef {Object} ProjectMirrorHistoryFields
+ * @property {boolean=} project_mirror
+ */
+
+/**
  * Additive /api/chat/history row fields on `system_type: "skill_review"` rows:
  * the exact-job reference the producer already writes into chat.jsonl. A row
  * carrying a non-empty `job_id` lets the Chat card lazily fetch the rendered

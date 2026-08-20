@@ -32,6 +32,7 @@ from ouroboros.task_results import (
 )
 from ouroboros.cost_projection import carry_cost_meta, with_cost_aliases
 from ouroboros.outcomes import infra_failed_axes, normalize_outcome_axes
+from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
 from ouroboros.subagents import intended_lane as intended_subagent_lane
 from ouroboros.contracts.task_contract import build_task_contract, normalize_allowed_resources
 
@@ -1365,7 +1366,7 @@ def _authoritative_terminal_cost(
         )
     checkpoint = result.get("root_phase_checkpoint")
     post_status = str(checkpoint.get("post_task_synthesis") or "") if isinstance(checkpoint, dict) else ""
-    if is_root and post_status in {"pending_once", "running"}:
+    if is_root and post_task_synthesis_is_open(post_status):
         projection["cost_final"] = False
         projection["cost_with_children_partial"] = True
     # SSOT cost naming (C2): re-converge the additive/deprecated alias pairs at

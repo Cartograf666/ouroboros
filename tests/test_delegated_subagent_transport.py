@@ -5455,7 +5455,17 @@ def test_the_last_poll_of_a_spent_window_is_bounded_not_skipped(tmp_path, monkey
     answers and there is no second poll to bound, which is its own correct behaviour and
     a different case from this one.
     """
+    import ouroboros.delegate_progress as dp
     import ouroboros.gateways.claudexor as gw
+
+    calls = []
+    actual = dp.expiring_poll
+
+    def record(gateway, run_id):
+        calls.append(run_id)
+        return actual(gateway, run_id)
+
+    monkeypatch.setattr(dp, "expiring_poll", record)
 
     stub = _SlowPollStub(read_sec=1.2)
 
@@ -5464,12 +5474,8 @@ def test_the_last_poll_of_a_spent_window_is_bounded_not_skipped(tmp_path, monkey
         _nanny_ctx(tmp_path), tmp_path, monkeypatch, wait_sec=window, stub=stub)
 
     assert out["status"] == "progress" and out["waited_sec"] == window, out
-    # The wait's own deadline: the window starts BEFORE the opening read, so it expires
-    # `window` seconds after that read began. Exactly ONE read may start at or after it.
-    assert stub.reads, "the wait never polled at all"
-    deadline = stub.reads[0] + window
-    assert len([at for at in stub.reads if at >= deadline]) == 1, \
-        f"the window paid for more than one last poll: {stub.reads}, deadline {deadline}"
+    # The window starts before handshake; observe the spent-window branch directly, as designed.
+    assert calls == ["run-1"], calls
     assert len(stub.reads) == 2, stub.reads
     # ...and the wall clock the TASK pays stays within the BOUND of that deadline, rather
     # than within a 60s read of it.
@@ -5483,6 +5489,7 @@ def test_the_last_poll_of_a_spent_window_is_bounded_not_skipped(tmp_path, monkey
         _nanny_ctx(tmp_path), tmp_path, monkeypatch, wait_sec=window, stub=slower)
 
     assert out["status"] == "progress" and out["waited_sec"] == window, out
+    assert calls == ["run-1", "run-1"], calls
     assert len(slower.reads) == 2, slower.reads
     assert elapsed < window + 0.4 + 0.6, elapsed
     # The BOUND is what ended that read, not the daemon: it cost the bound, not the 1.2s
