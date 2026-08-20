@@ -623,8 +623,8 @@ def _make_thread_filter(
 ):
     """Build the per-request thread-filter closure (perf2 P3 decomposition).
 
-    Returns the ``row_matches_thread`` predicate shared by both stream readers
-    and both transform loops."""
+    Returns the thread predicate plus the producer-owned Main-mirror classifier
+    shared by both stream readers and both transform loops."""
 
     def _bound_project_chat(task_id: str, parent_task_id: str = "", root_task_id: str = "") -> int:
         # Resolve by LINEAGE (own binding -> parent -> root) so a subagent's rows
@@ -663,7 +663,19 @@ def _make_thread_filter(
             return bool(entry.get("is_progress")) or str(entry.get("type") or "") == "task_summary"
         return entry_chat not in project_chat_ids
 
-    return _row_matches_thread
+    def _row_is_project_mirror(entry_chat: int, entry: Optional[dict] = None) -> bool:
+        if thread_id in project_chat_ids or not isinstance(entry, dict):
+            return False
+        return bool(
+            entry_chat in project_chat_ids
+            or _bound_project_chat(
+                str(entry.get("task_id") or ""),
+                str(entry.get("parent_task_id") or ""),
+                str(entry.get("root_task_id") or ""),
+            )
+        )
+
+    return _row_matches_thread, _row_is_project_mirror
 
 
 def _collect_chat_rows(
@@ -672,6 +684,7 @@ def _collect_chat_rows(
     n_human: int,
     row_matches_thread,
     chat_annotations: Dict[str, Any],
+    row_is_project_mirror=None,
 ) -> tuple[list, int]:
     """Read + transform the chat stream.
 
@@ -745,6 +758,8 @@ def _collect_chat_rows(
                 rec["download_url"] = str(entry.get("download_url") or "")
                 rec["caption"] = str(entry.get("caption") or "")
             _copy_task_summary_metadata(rec, entry)
+            if callable(row_is_project_mirror) and row_is_project_mirror(entry_chat, entry):
+                rec["project_mirror"] = True
             combined.append(rec)
     except Exception as exc:
         log.warning("Failed to read chat history: %s", exc)
@@ -756,6 +771,7 @@ def _collect_progress_rows(
     archive_dir: pathlib.Path,
     n_progress: int,
     row_matches_thread,
+    row_is_project_mirror=None,
 ) -> tuple[list, int]:
     """Read + transform the progress stream.
 
@@ -821,6 +837,8 @@ def _collect_progress_rows(
             for field in _PROGRESS_META_FIELDS:
                 if field in entry:
                     rec[field] = entry[field]
+            if callable(row_is_project_mirror) and row_is_project_mirror(entry_chat, entry):
+                rec["project_mirror"] = True
             combined.append(rec)
     except Exception as exc:
         log.warning("Failed to read progress log: %s", exc)
@@ -1009,17 +1027,19 @@ def _assemble_history_response(
     project_chat_ids, project_source_refs, chat_annotations, bindings_by_task = (
         _project_history_context(data_dir, thread_id)
     )
-    row_matches_thread = _make_thread_filter(
+    row_matches_thread, row_is_project_mirror = _make_thread_filter(
         thread_id, project_chat_ids, project_source_refs, bindings_by_task
     )
     chat_path = data_dir / "logs" / "chat.jsonl"
     progress_path = data_dir / "logs" / "progress.jsonl"
     archive_dir = data_dir / "archive"
     combined, chat_quota_rows = _collect_chat_rows(
-        chat_path, archive_dir, n_human, row_matches_thread, chat_annotations
+        chat_path, archive_dir, n_human, row_matches_thread, chat_annotations,
+        row_is_project_mirror,
     )
     progress_rows, progress_quota_rows = _collect_progress_rows(
-        progress_path, archive_dir, n_progress, row_matches_thread
+        progress_path, archive_dir, n_progress, row_matches_thread,
+        row_is_project_mirror,
     )
     combined.extend(progress_rows)
     lifecycle_row = _active_lifecycle_row()

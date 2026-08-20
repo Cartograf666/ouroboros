@@ -477,7 +477,6 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                     }
 
                 state = {"activities": [_activity("truth-root")]}
-
                 def _inject(route):
                     response = route.fetch()
                     payload = response.json()
@@ -485,11 +484,12 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                     payload["project_chat_ids"] = [9] if any(a.get("chat_id") == 9 for a in state["activities"]) else []
                     route.fulfill(content_type="application/json", body=json.dumps(payload))
 
+                history = {"messages": []}
                 page.route("**/api/state*", _inject)
+                page.route("**/api/chat/history*", lambda route: route.fulfill(content_type="application/json", body=json.dumps(history)))
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
                 _wait_status(page, "Working...", timeout=30_000)
 
-                # Visible root card plus host-attested Stop authority.
                 page.evaluate(
                     """() => window.__ouroWs.emit('chat', {
                         type: 'chat', role: 'assistant', is_progress: true,
@@ -499,7 +499,6 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 )
                 page.wait_for_selector(f"{card} [data-cancel-run]", timeout=10_000)
 
-                # Final prose arrives while post-task work is still live.
                 page.evaluate(
                     """() => window.__ouroWs.emit('chat', {
                         type: 'chat', role: 'assistant', chat_id: 1,
@@ -531,8 +530,7 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                     card,
                 )
 
-                # Two existing state refresh wakeups overlap. Queue loss revokes
-                # Stop synchronously, and only one detail read may be in flight.
+                # Overlapping refreshes revoke Stop and share one detail read.
                 state["activities"] = []
                 page.evaluate(
                     """() => {
@@ -544,8 +542,7 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 assert page.locator(f"{card} [data-cancel-run]").count() == 0
                 assert page.locator(card).get_attribute("data-finished") == "0"
 
-                # Unreachable and then completed-but-open detail prove nothing;
-                # each is retried only on the next existing state snapshot.
+                # Unreachable and completed-but-open detail prove nothing.
                 assert page.evaluate("() => window.__settleTaskDetail({}, 404)")
                 page.wait_for_timeout(100)
                 page.evaluate("() => window.__ouroWs.emit('projects_changed', {})")
@@ -559,7 +556,6 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 page.wait_for_timeout(100)
                 assert page.locator(card).get_attribute("data-finished") == "0"
 
-                # Another overlapping pair remains single-flight.
                 page.evaluate(
                     """() => {
                         window.__ouroWs.emit('projects_changed', {});
@@ -584,7 +580,6 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 _wait_status(page, "Online")
                 assert page.evaluate("() => window.__finishTransitions") == 1
 
-                # Old snapshot and late typing cannot resurrect a concluded id.
                 state["activities"] = [_activity("truth-root")]
                 page.evaluate("() => window.__ouroWs.emit('projects_changed', {})")
                 page.wait_for_timeout(150)
@@ -623,9 +618,14 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 assert page.locator(rehome_card).get_attribute("data-finished") == "0"
                 page.evaluate("() => window.__ouroWs.emit('chat', {type: 'chat', role: 'assistant', is_progress: true, chat_id: 9, task_id: 'rehome-root', cancelable: true, content: 'Project work continues.'})")
                 assert page.locator(f"{rehome_card} [data-cancel-run]").count() == 0
+                history["messages"] = [{"text": "Historical project progress.", "role": "assistant", "is_progress": True, "task_id": "rehome-root", "cancelable": True, "project_mirror": True}]
+                with page.expect_response("**/api/chat/history*", timeout=10_000):
+                    page.evaluate("() => window.__ouroWs.emit('open', {previouslyConnected: true})")
+                page.wait_for_selector(rehome_card)
+                assert page.get_by_text("Historical project progress.").count() >= 1
+                assert page.locator(f"{rehome_card} [data-cancel-run]").count() == 0
 
-                # If an earlier absent snapshot already started a read, a later
-                # rehome snapshot clears that candidate and its terminal response
+                # A later rehome snapshot clears an earlier candidate and response.
                 # cannot finish the still-running card.
                 state["activities"] = [_activity("rehome-root")]
                 page.evaluate("() => window.__ouroWs.emit('projects_changed', {})")

@@ -1238,7 +1238,7 @@ def test_bound_project_history_backfills_task_progress(tmp_path):
         fh.write(json.dumps({"ts": "2026-01-01T00:00:00Z", "direction": "out", "text": "final answer", "chat_id": 1, "task_id": "task-1"}) + "\n")
         fh.write(json.dumps({"ts": "2026-01-01T00:00:01Z", "direction": "in", "text": "raw project chat", "chat_id": project_chat}) + "\n")
     with open(logs / "progress.jsonl", "w", encoding="utf-8") as fh:
-        fh.write(json.dumps({"ts": "2026-01-01T00:00:02Z", "type": "send_message", "content": "working", "text": "working", "is_progress": True, "chat_id": 1, "task_id": "task-1", "format": "markdown"}) + "\n")
+        fh.write(json.dumps({"ts": "2026-01-01T00:00:02Z", "type": "send_message", "content": "working", "text": "working", "is_progress": True, "chat_id": 1, "task_id": "task-1", "format": "markdown", "cancelable": True}) + "\n")
 
     api = make_chat_history_endpoint(tmp_path)
 
@@ -1251,10 +1251,15 @@ def test_bound_project_history_backfills_task_progress(tmp_path):
     assert "final answer" in project_texts
     assert "working" in project_texts
     assert "raw project chat" in project_texts
+    project_progress = next(m for m in project_resp["messages"] if m["text"] == "working")
+    assert "project_mirror" not in project_progress
 
     main_resp = json.loads(asyncio.run(api(_Req({}))).body)
     main_texts = [m["text"] for m in main_resp["messages"]]
     assert "working" in main_texts  # main mirrors sanitized progress
+    main_progress = next(m for m in main_resp["messages"] if m["text"] == "working")
+    assert main_progress["cancelable"] is True
+    assert main_progress["project_mirror"] is True
     assert "raw project chat" not in main_texts
     # The bound task's RAW final-answer row (still stored with main chat_id 1) is
     # project-owned via the binding and must NOT leak into the штаб's main history.

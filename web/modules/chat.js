@@ -3127,16 +3127,14 @@ export function createChatInstance({
                     }
                 }
 
-                // Two passes ensure cards exist before finishLiveCard() marks them done.
-
-                // Pass 1 builds timelines with DOM insertion suppressed.
+                // First pass builds card state without DOM insertion.
                 _syncPass1Active = true;
                 try { for (const msg of messages) {
                     const taskId = msg.task_id || '';
                     if (!taskId) continue;
                     if (retiredTaskIds.has(taskId)) continue;
                     if (msg.is_progress) {
-                        updateLiveCardFromProgressMessage(msg);
+                        updateLiveCardFromProgressMessage(msg, { grantCancelAuthority: msg.project_mirror !== true });
                         continue;
                     }
                     if (msg.system_type === 'task_summary') {
