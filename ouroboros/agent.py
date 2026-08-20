@@ -32,6 +32,7 @@ from ouroboros.tools.registry import ToolContext
 from ouroboros.memory import Memory
 from ouroboros.context import build_llm_messages
 from ouroboros.loop import run_llm_loop
+from ouroboros import task_activity
 from ouroboros.config import EFFORT_SCALE, resolve_effort
 from ouroboros.agent_startup_checks import (
     inject_crash_report,
@@ -1575,6 +1576,8 @@ class OuroborosAgent:
                 self._last_activity_ts = time.time()
                 if emit:
                     self._emit_task_heartbeat(task_id, "running")
+                    task_activity.emit_tick(task_id, emit=self._emit_progress, quiet_since=self._last_progress_ts,
+                                            metadata=self._current_task_metadata, drive_root=self.env.drive_root)
 
         threading.Thread(target=_loop, daemon=True).start()
         return stop

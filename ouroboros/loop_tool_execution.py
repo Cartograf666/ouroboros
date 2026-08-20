@@ -1010,6 +1010,26 @@ def tool_calls_can_run_parallel(tool_calls: List[Dict[str, Any]]) -> bool:
     )
 
 
+def _stamp_tool_activity(task_id: str, tool_calls: List[Dict[str, Any]]) -> None:
+    """Publish the running tool names for the owner-facing progress ticker."""
+    try:
+        from ouroboros import task_activity
+
+        names = []
+        for tc in tool_calls or []:
+            name = str(((tc or {}).get("function") or {}).get("name") or "").strip()
+            if name and name not in names:
+                names.append(name)
+        if not names:
+            return
+        detail = ", ".join(names[:3])
+        if len(names) > 3:
+            detail += f" (+{len(names) - 3} more)"
+        task_activity.mark(task_id, task_activity.PHASE_TOOL, detail=detail)
+    except Exception:
+        log.debug("Failed to stamp tool activity for the progress ticker", exc_info=True)
+
+
 def handle_tool_calls(
     tool_calls: List[Dict[str, Any]],
     tools: ToolRegistry,
@@ -1021,6 +1041,10 @@ def handle_tool_calls(
     emit_progress: Callable[[str], None],
 ) -> int:
     """Execute tool calls, append results, and return error count."""
+    # Ticker fact: name the batch, not each call. Parallel calls run together, and
+    # a serial batch re-stamps per tool below is not worth the bookkeeping — the
+    # owner wants to know the task is inside tools, and which ones.
+    _stamp_tool_activity(task_id, tool_calls)
     can_parallel = tool_calls_can_run_parallel(tool_calls)
 
     if not can_parallel:

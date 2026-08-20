@@ -473,3 +473,21 @@ def build_context_fit_plan(
         max_projection=max_projection,
         low_projection=low_projection,
     )
+
+
+# The `_context_*` telemetry a fallback attempt must not leak between
+# candidates: snapshot before, restore after. Pure dict work over this
+# module's own key prefix, so it belongs here rather than in the loop that
+# happens to call it (moved from `loop.py` under the size ratchet).
+def _snapshot_context_fit_usage(usage: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: value for key, value in usage.items() if key.startswith("_context_")}
+
+
+def _restore_context_fit_usage(
+    usage: Dict[str, Any],
+    snapshot: Dict[str, Any],
+) -> None:
+    for key in tuple(usage):
+        if key.startswith("_context_"):
+            usage.pop(key, None)
+    usage.update(snapshot)

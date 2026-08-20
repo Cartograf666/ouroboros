@@ -19,6 +19,7 @@ from ouroboros.config import adaptive_quorum, get_context_mode, get_light_model,
 from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_BYPASS_REASONS, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, REASON_DELIVERY_CONTROL_DEGRADED, REASON_OWNER_REQUESTED_FINALIZATION, RESULT_INFRA_FAILED, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
 from ouroboros.observability import new_execution_id
 from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools, swarm_router_turn
+from ouroboros import task_activity
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.context import build_user_content
 from ouroboros.context_budget import ContextReclaimRequest
@@ -74,7 +75,11 @@ class _CompactionRoundContext:
     emit_progress: Callable[[str], None]
 
 
-from ouroboros.provider_hints import _provider_failure_hint, _provider_recovery_hint  # noqa: E402
+from ouroboros.agent_notices import (  # noqa: E402
+    _nanny_burn_phrase, _nanny_finalization_message, _nanny_metered_since_delegate_activity,
+    _provider_failure_hint, _provider_recovery_hint,
+)
+from ouroboros.context_fit import _restore_context_fit_usage, _snapshot_context_fit_usage  # noqa: E402
 
 
 def _handle_text_response(
@@ -2257,6 +2262,13 @@ def _run_task_acceptance_review_once(
             ), workspace=task_pacing._workspace_delivery(tools._ctx),
         ),
     )
+    # Ticker fact: the panel is the longest non-model block a finalizing task has,
+    # and until now it was silent — the owner saw the task stop narrating right at
+    # the moment it looked finished.
+    task_activity.mark(
+        task_id, task_activity.PHASE_REVIEW,
+        detail=f"acceptance panel, pass {passes_done + 1}",
+    )
     try:
         from types import SimpleNamespace
 
@@ -2410,20 +2422,6 @@ def _adopt_fallback_route(
         # _call_round_model already recorded the accepted candidate's complete
         # same-basis fit facts. Do not replace them with a raw char estimate.
     return fallback_model, fallback_use_local, context_fit_plan, active_context_mode
-
-
-def _snapshot_context_fit_usage(usage: Dict[str, Any]) -> Dict[str, Any]:
-    return {key: value for key, value in usage.items() if key.startswith("_context_")}
-
-
-def _restore_context_fit_usage(
-    usage: Dict[str, Any],
-    snapshot: Dict[str, Any],
-) -> None:
-    for key in tuple(usage):
-        if key.startswith("_context_"):
-            usage.pop(key, None)
-    usage.update(snapshot)
 
 
 def _run_cross_model_fallback_chain(
@@ -2847,24 +2845,6 @@ def _note_nanny_delegate_activity(
     ctx._nanny_reminder_mark = None
 
 
-def _nanny_metered_since_delegate_activity(ctx: Any) -> Tuple[int, float]:
-    """(rounds, dollars) this task's OWN metered loop has spent since the last
-    delegate-verb call — zero before the first round is marked."""
-    progress = getattr(ctx, "_nanny_metered_progress", None)
-    progress = progress if isinstance(progress, dict) else {}
-    baseline = getattr(ctx, "_nanny_delegate_baseline", None)
-    baseline = baseline if isinstance(baseline, dict) else {}
-    try:
-        rounds = max(0, int(progress.get("round") or 0) - int(baseline.get("round") or 0))
-    except (TypeError, ValueError):
-        rounds = 0
-    try:
-        cost = max(0.0, float(progress.get("cost") or 0.0) - float(baseline.get("cost") or 0.0))
-    except (TypeError, ValueError):
-        cost = 0.0
-    return rounds, cost
-
-
 def _nanny_reminder_due(ctx: Any, round_idx: int) -> Tuple[int, float, bool]:
     """The measured burn plus whether the proportional reminder is due THIS round.
 
@@ -2908,11 +2888,6 @@ def _nanny_reminder_due(ctx: Any, round_idx: int) -> Tuple[int, float, bool]:
     if rounds_since_fire >= NANNY_REMINDER_ROUNDS or cost_since_fire >= NANNY_REMINDER_USD:
         return rounds, cost, True
     return rounds, cost, False
-
-
-def _nanny_burn_phrase(rounds: int, cost: float) -> str:
-    return (f"{rounds} of your own metered LLM rounds (~${cost:.2f})" if cost > 0
-            else f"{rounds} of your own metered LLM rounds")
 
 
 def _maybe_inject_nanny_economics_reminder(
@@ -4719,6 +4694,43 @@ def _run_forced_children_acceptance(
         tools_ctx._forced_undispositioned_children = None
 
 
+# How many times a Swarm routing turn may be told to route before the host stops
+# asking. The routing turn's entire job is ONE tool call, so a model that has
+# ignored the intent this many times is not going to emit it on the next round.
+_SWARM_ROUTING_NUDGE_BUDGET = 3
+
+
+def _swarm_routing_nudges(ctx: Any) -> int:
+    return int(getattr(ctx, "_swarm_routing_nudge_count", 0) or 0)
+
+
+def _swarm_routing_exhausted_rail(
+    limit_ctx: "_RoundLimitContext",
+    tools: ToolRegistry,
+    llm_trace: Dict[str, Any],
+) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
+    """End a routing turn that keeps answering inline instead of routing.
+
+    ``_enforce_swarm_actions`` holds finalization for another model round, and
+    nothing bounded that hold: a model that never emits the routing tool call
+    re-earned the reminder every round until MAX_ROUNDS (200). Each round also
+    re-sends a transcript that the reminder just grew, so a slow route degrades
+    rather than converges — on a local GGUF at minutes per round that is hours of
+    nudging, and the owner sees only a repeating progress line. Past the budget
+    the honest outcome is the typed ``not_attempted`` routing rail, which already
+    says no inline work was published, not one more reminder."""
+    ctx = tools._ctx
+    if not swarm_router_turn(ctx) or _swarm_handoff_attempt(ctx):
+        return None
+    if _swarm_routing_nudges(ctx) < _SWARM_ROUTING_NUDGE_BUDGET:
+        return None
+    llm_trace["reasoning_notes"].append(
+        f"Swarm routing turn ended after {_SWARM_ROUTING_NUDGE_BUDGET} unfulfilled "
+        "routing reminders; no managed root was admitted."
+    )
+    return _forced_swarm_router_result(limit_ctx, llm_trace, "swarm_routing_unfulfilled")
+
+
 def _enforce_swarm_actions(
     content: str,
     messages: List[Dict[str, Any]],
@@ -4738,6 +4750,7 @@ def _enforce_swarm_actions(
         )
         _append_or_merge_user_message(messages, reminder)
         llm_trace["reasoning_notes"].append(reminder)
+        tools._ctx._swarm_routing_nudge_count = _swarm_routing_nudges(tools._ctx) + 1
         emit_progress("Swarm routing action required before final response.")
         return True
 
@@ -4790,6 +4803,9 @@ def _no_tool_final_answer(
         if isinstance(candidate, DeliveryCandidate):
             content = candidate.full_text
 
+    routing_rail = _swarm_routing_exhausted_rail(limit_ctx, tools, llm_trace)
+    if routing_rail is not None:
+        return routing_rail
     if _enforce_swarm_actions(
         str(content or ""), messages, tools, llm_trace, emit_progress,
     ):
@@ -5774,116 +5790,6 @@ def _emit_round_progress(content: Any, msg: Dict[str, Any], emit_progress, llm_t
         display_reasoning = LLMClient.extract_display_reasoning(msg)
         if display_reasoning:
             emit_progress(display_reasoning)
-
-
-def _nanny_finalization_message(
-    tools: ToolRegistry, drive_root: pathlib.Path, task_id: str,
-    trace_attempted: bool = False,
-) -> str:
-    """The honest nanny reminder for a harness-dispatched child at finalization —
-    or '' when no reminder is deserved.
-
-    F4 (2026-08-10 saga): the old reminder accused children whose delegated runs
-    CRASHED of "choosing" not to delegate, and fired even when the delegate verbs
-    were policy-hidden. Two structural facts fix both: the task's own visible
-    toolset, and durable custody evidence (delegate_custody.
-    task_execution_evidence), which spans the WHOLE task — per-execution
-    llm_trace resets on continuation. `trace_attempted` is the third fact: a
-    delegate_start in THIS execution's trace. It must not suppress the failure
-    message (triad finding on e84475f2: delegate, run dies, finish by hand,
-    finalize — all inside ONE execution), only the accusation when custody has
-    no rows yet (a pending/uncustodied start is an attempt, not a choice)."""
-    try:
-        if "delegate_start" not in set(tools.available_tools()):
-            return ""  # the verbs are invisible here; "you chose not to" would be false
-    except Exception:
-        log.debug("nanny nudge: toolset visibility check failed", exc_info=True)
-    evidence: Dict[str, Any] = {}
-    try:
-        from ouroboros.delegate_custody import custody_root, task_execution_evidence
-
-        # Split-root fix (2026-08-10 amendments): custody WRITES land on the
-        # CANONICAL (budget) root, but this read used the loop's drive_root —
-        # a split-root subagent's child drive has no custody rows, leaving
-        # the nanny blind. Resolve the SAME root the writers use; the passed
-        # drive_root stays the fallback (e.g. unit-test stubs).
-        try:
-            evidence_root = custody_root(tools._ctx)
-        except Exception:
-            evidence_root = drive_root
-        evidence = task_execution_evidence(evidence_root, str(task_id or ""))
-    except Exception:
-        log.debug("nanny nudge: custody evidence read failed", exc_info=True)
-    if evidence.get("delegated_runs_succeeded"):
-        # The route WAS used and worked — but "used once" is not a permanent
-        # license: the poltergeist children each ran ONE successful $0 run,
-        # then co-built for tens of opus rounds while this early return kept
-        # the nudge silent. Silence is now proportional to the measured burn
-        # since the last delegated-run activity.
-        rounds, cost = _nanny_metered_since_delegate_activity(tools._ctx)
-        from ouroboros.task_pacing import NANNY_REMINDER_ROUNDS, NANNY_REMINDER_USD
-
-        if rounds < NANNY_REMINDER_ROUNDS and cost < NANNY_REMINDER_USD:
-            return ""
-        return (
-            "⚠️ NANNY_METERED_OVERRUN: your delegated run(s) succeeded, but you have "
-            f"since spent {_nanny_burn_phrase(rounds, cost)} with no delegated-run "
-            "activity. A successful run is verified and integrated, not rebuilt. If "
-            "the remaining work is substantive, delegate it (a new delegate_start); "
-            "if you are wrapping up, keep the wrap-up short and account for the "
-            "metered spend honestly in your result."
-        )
-    started = int(evidence.get("delegated_runs_started") or 0)
-    if not started and (evidence.get("evidence_read_failed") or not evidence):
-        # Zero attempts is an ACCUSATION and needs positively-established
-        # evidence: an unreadable custody log (or a failed read above) proves
-        # nothing (scope finding on a5e59bdf).
-        return ""
-    if not started and trace_attempted:
-        # A start this execution's trace saw but custody has no row for: pending
-        # settlement or an uncustodied start. An attempt either way — neither
-        # accusation fits, and the wait/cancel path owns its own disclosure.
-        return ""
-    settled = int(evidence.get("delegated_runs_settled") or 0)
-    failure_states = [str(s) for s in (evidence.get("delegated_run_failure_states") or [])]
-    pending = max(0, started - settled)
-    if pending:
-        # PENDING ≠ FAILED (sol review on b49f8192): a STARTED row with no
-        # settlement may still be executing — calling it failed invites a
-        # duplicate run, and finalizing over it orphans the result. Takes
-        # precedence over the failed message: with a run in flight, "retry"
-        # is wrong even when an earlier sibling died (still a fact below).
-        failed_note = (
-            f" {len(failure_states)} earlier run(s) already ended: {', '.join(failure_states)}."
-            if failure_states else ""
-        )
-        return (
-            "⚠️ NANNY_DELEGATED_RUN_PENDING: you routed work onto the delegated "
-            f"substrate and {pending} delegated run(s) have started but not "
-            "settled — they may still be executing. Do not finalize over an "
-            "in-flight delegated run (its result would be orphaned) and do not "
-            "start a duplicate: wait for or check it (delegate_wait) before "
-            "finalizing, or cancel it (delegate_cancel) and say so." + failed_note
-        )
-    if started:
-        states = ", ".join(failure_states) or "settled without a recorded terminal state"
-        return (
-            "⚠️ NANNY_DELEGATED_RUN_FAILED: you DID route work onto the delegated "
-            f"substrate ({started} run(s) started), but none succeeded — your "
-            f"delegated run(s) ended: {states}. Do not finalize as if delegation "
-            "was never attempted: either retry it (delegate_start / delegate_wait) "
-            "or state in your final answer that the delegated run failed and why "
-            "the remaining work ran on metered API tokens."
-        )
-    return (
-        "⚠️ NANNY_DID_NOT_DELEGATE: this task was dispatched onto the delegated "
-        "substrate (executor=harness), but you are finalizing with ZERO "
-        "delegate_start calls — the work would end up billed to metered API "
-        "tokens the parent asked to avoid. Either delegate the remaining work "
-        "now (delegate_start / delegate_wait), or finalize with an explicit "
-        "statement of WHY delegation was not used (route refused, work shape "
-        "unsuited, deadline) so your parent sees the substrate decision."
-    )
 
 
 def _maybe_inject_finalization_nudges(
@@ -6943,6 +6849,7 @@ def run_llm_loop(
                 emit_progress=emit_progress, tools=tools, event_queue=event_queue, task_id=task_id,
                 drive_logs=drive_logs, budget_remaining_usd=budget_remaining_usd, cost_ceiling=cost_ceiling)
 
+            task_activity.mark(task_id, task_activity.PHASE_COMPACTION, round_idx=round_idx, max_rounds=MAX_ROUNDS)
             messages, _compaction_usage = _run_round_compaction(
                 messages,
                 _CompactionRoundContext(
@@ -6963,6 +6870,13 @@ def run_llm_loop(
 
             seal_task_transcript(messages)
 
+            # The owner-facing ticker's fact source: this is where the round goes
+            # quiet, and on a slow route it stays quiet for minutes.
+            task_activity.mark(
+                task_id, task_activity.PHASE_MODEL,
+                round_idx=round_idx, max_rounds=MAX_ROUNDS,
+                model=f"{active_model}{' (local)' if active_use_local else ''}",
+            )
             msg, cost, active_context_mode = _call_round_model(
                 _RoundModelCallContext(
                     llm=llm,
@@ -7059,4 +6973,5 @@ def run_llm_loop(
     except BudgetExceeded as exc:
         return _handle_budget_exceeded(exc, exit_ctx, limit_ctx=limit_ctx)
     finally:
+        task_activity.clear(task_id)
         _cleanup_loop_resources(stateful_executor, exit_ctx)

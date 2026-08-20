@@ -140,6 +140,7 @@ BAND_PATHS = {
     "ouroboros/gateway/settings.py": "Retiring persistent auto-Low removed the former giant debt; the remaining owner and reviewer settings endpoints stay centralized while tracked in the shrinking band.",
     "ouroboros/gateway/tasks.py": None,
     "ouroboros/launcher_bootstrap.py": None,
+    "ouroboros/local_model.py": "Crossed 1000 lines by taking `get_local_request_timeout_sec` from config.py. The local lane is the slowest route the loop can take and the only one whose per-request deadline is a property of the lane itself; llm.py, its one caller, is at its own byte ceiling and is not the module that owns local inference.",
     "ouroboros/loop_llm_call.py": None,
     "ouroboros/loop_tool_execution.py": None,
     "ouroboros/outcomes.py": None,
@@ -148,6 +149,7 @@ BAND_PATHS = {
     "ouroboros/protected_artifacts.py": None,
     "ouroboros/skill_loader.py": None,
     "ouroboros/skill_review_runner.py": None,
+    "ouroboros/subagent_worktrees.py": "Crossed 1000 lines by taking `get_subagent_worktree_root` from config.py, whose only caller this file always was. The getter reads the root this module then provisions, prunes and registers; keeping it a module away was the accident, and the line count is the price of putting it back beside its use.",
     "ouroboros/subagents.py": None,
     "ouroboros/task_results.py": None,
     "ouroboros/task_status.py": None,
@@ -204,7 +206,7 @@ BYTE_BASELINE_DEBT = {
 }
 
 BYTE_DEBT = {
-    "ouroboros/loop.py": 318517,
+    "ouroboros/loop.py": 313812,
     "tests/test_delegated_subagent_transport.py": 320623,
     "tests/test_devtools_benchmarks.py": 328786,
     "web/modules/chat.js": 224733,

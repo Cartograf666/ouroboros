@@ -280,6 +280,18 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # pinning a worker on a dead socket.
     "OUROBOROS_WEBSEARCH_TIMEOUT_SEC": 480,
     "OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC": 2700,
+    # Per-request timeout for the LOCAL llama.cpp lane. Was a hardcoded 180s, which
+    # inverted the transport SSOT above: the SLOWEST route carried the SHORTEST
+    # deadline by 15x. A quantized 20B+ GGUF that prefills ~10k tokens and then
+    # reasons does not finish in three minutes on consumer hardware, so a main-loop
+    # round on a large local model timed out structurally, not because anything
+    # was actually wrong with the request.
+    "OUROBOROS_LOCAL_REQUEST_TIMEOUT_SEC": 1800,
+    # Owner-facing progress ticker: how long a running task may stay SILENT before
+    # the heartbeat thread renders its current phase into the chat. A silence
+    # filler, not a metronome — a task emitting real progress lines never trips
+    # it. 0 disables the ticker entirely.
+    "OUROBOROS_PROGRESS_TICKER_SEC": 60,
     # v6.54.3 (1.5): plan_task deadline scaling. With a task deadline the planning swarm's
     # wait ceiling is min(configured ceiling, remaining/4); below this floor plan_task SKIPS
     # with a typed reason + telemetry rather than eat the tail of the budget.
@@ -848,22 +860,6 @@ def get_allow_mutative_subagents(write_surface: str = "") -> bool:
     return not surface or surface in {"external_workspace", "genesis"}
 
 
-def get_subagent_worktree_root() -> str:
-    """Filesystem root for acting self_worktree checkouts (outside repo/ and data/)."""
-    raw = str(
-        os.environ.get("OUROBOROS_SUBAGENT_WORKTREE_ROOT", "")
-        or SETTINGS_DEFAULTS.get("OUROBOROS_SUBAGENT_WORKTREE_ROOT", "")
-    ).strip()
-    return raw or os.path.expanduser(os.path.join("~", "Ouroboros", "subagent_worktrees"))
-
-
-# delegate_wait's ToolEntry per-call timeout (above it a configured ceiling buys a
-# KILLED call, not a longer wait; pinned by test) and the hard max WINDOW per call
-# (F5): 1800 < 2100 (kill) < 2400 (lease) — decoupled, a raised timeout never widens it.
-DELEGATE_WAIT_CEILING_SEC = 2100
-DELEGATE_WAIT_WINDOW_MAX_SEC = 1800
-
-
 def get_delegate_wait_max_sec() -> int:
     """delegate_wait window ceiling: the setting NARROWS, never widens past 1800."""
     return _clamped_number_setting(
@@ -887,18 +883,6 @@ def get_subagent_projects_root() -> str:
         or SETTINGS_DEFAULTS.get("OUROBOROS_SUBAGENT_PROJECTS_ROOT", "")
     ).strip()
     return raw or os.path.expanduser(os.path.join("~", "Ouroboros", "projects"))
-
-
-def get_search_code_wall_sec() -> float:
-    """Total wall-clock budget (seconds) for ONE search_code call — bounds both the rg
-    directory walk and the batched rg loop so a scan over a very large root cannot run
-    unbounded. Env/setting: ``OUROBOROS_SEARCH_CODE_WALL_SEC`` (floored at 5s)."""
-    raw = (os.environ.get("OUROBOROS_SEARCH_CODE_WALL_SEC", "")
-           or str(SETTINGS_DEFAULTS.get("OUROBOROS_SEARCH_CODE_WALL_SEC", "45")))
-    try:
-        return max(5.0, float(raw))
-    except (TypeError, ValueError):
-        return 45.0
 
 
 def get_deliverables_root() -> str:
@@ -1015,6 +999,7 @@ def get_llm_transport_read_timeout_sec() -> float:
 
     The DEAD-SOCKET bound, not a latency target; explicit per-call timeouts win."""
     return _clamped_number_setting("OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC", low=60.0, high=7200.0)
+
 
 
 def get_acceptance_review_est_sec() -> float:
@@ -1524,6 +1509,13 @@ def get_pacing_interval_sec(settings: Optional[dict] = None) -> int:
     return max(0, parsed)
 
 
+
+# delegate_wait's ToolEntry per-call timeout (above it a configured ceiling buys a
+# KILLED call, not a longer wait; pinned by test) and the hard max WINDOW per call
+# (F5): 1800 < 2100 (kill) < 2400 (lease) — decoupled, a raised timeout never widens it.
+DELEGATE_WAIT_CEILING_SEC = 2100
+DELEGATE_WAIT_WINDOW_MAX_SEC = 1800
+
 def get_supervisor_liveness_deadline_sec(settings: Optional[dict] = None) -> int:
     """Supervisor-loop stall deadline in seconds (0 disables the watchdog)."""
     raw = os.environ.get("OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC")
@@ -1534,7 +1526,6 @@ def get_supervisor_liveness_deadline_sec(settings: Optional[dict] = None) -> int
     except (TypeError, ValueError):
         parsed = int(SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC)
     return max(0, parsed)
-
 
 # Settings keys deliberately NOT projected into the environment. Everything else in SETTINGS_DEFAULTS IS
 # exported, by derivation rather than a parallel hand-kept list: such a list drifts silently and the failure
