@@ -1597,10 +1597,21 @@ Before every commit, verify the following:
 - Write the update transaction before mutation. Reopen writers only after a
   verified abort/rollback or a healthy restart. An unverified rollback keeps
   its retryable phase plus the full failure evidence; a legacy `gate_blocked`
-  marker retries rollback on boot. Delayed evolution cleanup also acquires the
+  marker retries rollback on boot, while the `marker_cleanup_retry` phase only
+  retries the tx-marker unlink of an already-final repository — never a
+  rollback. Delayed evolution cleanup also acquires the
   same update lock and honors this admission owner; it must not stash/reset
-  behind the fence. Managed merge tests pass before restart; the ordinary
-  self-modification commit/tag/test/push ordering remains unchanged.
+  behind the fence. A managed merge commits only with proof that the full
+  suite ran green on the exact candidate tree: the resolver's single
+  pre-commit hermetic run is recorded as `tests_evidence` and reused by the
+  commit gate instead of a duplicate post-commit run; the ordinary
+  self-modification commit/tag/test/push ordering remains unchanged. Any
+  non-commit terminal of the assisted resolver rolls the live tree back and
+  best-effort preserves the attempt — committed or as a synthetic commit of
+  the uncommitted resolution — on the deterministic `failed-update-<target12>`
+  branch (a retry of the same target through the ordinary apply supersedes
+  it); the fresh rescue snapshot, not the branch, is the carrier rollback
+  itself depends on.
 - Take a fresh rescue before every destructive rollback and before boot-resume
   re-materialization: the pre-update snapshot predates the merge and holds none
   of the resolution. The hook is fail-open — never block a rollback on it — but
@@ -1991,7 +2002,11 @@ not.
 A red post-commit gate preserves the local commit for forensics but blocks push.
 Inside a managed update it also blocks boot promotion and routes through
 rollback; an incomplete rollback leaves `gate_blocked` so boot retries recovery
-instead of promoting the rejected merge. Review-binding and tag-binding
+instead of promoting the rejected merge. The managed gate's mandate is "the
+full suite provably ran green on the exact committed tree", not "run it
+twice": recorded `tests_evidence` from the resolver's green pre-commit
+hermetic run is reused when it covers that exact tree, and the post-commit run
+happens only when no such proof exists. Review-binding and tag-binding
 mismatches use the same failure route.
 
 Process containment is unconditional, including a green pass. Windows uses a
