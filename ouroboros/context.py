@@ -543,6 +543,8 @@ def _delegation_capability_fact() -> Optional[Dict[str, Any]]:
                 last_fact["requested_profile"] = str(last["requested_profile"])
             if last.get("applied_profile"):
                 last_fact["applied_profile"] = str(last["applied_profile"])
+            if last.get("selected_subagent_id"):
+                last_fact["selected_subagent_id"] = str(last["selected_subagent_id"])
             delegation["subagent_last_delegation"] = last_fact
         if len(delegation) == 1:
             return None

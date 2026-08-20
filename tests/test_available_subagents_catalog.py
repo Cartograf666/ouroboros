@@ -183,6 +183,7 @@ def test_catalog_is_semi_stable_while_dated_history_stays_dynamic(tmp_path, monk
         "applied_model": "gpt-5.6-sol",
         "requested_profile": "delegate-requested",
         "applied_profile": "delegate-applied",
+        "selected_subagent_id": "builder",
         "run_id": "run-1",
     }), encoding="utf-8")
 
@@ -207,6 +208,7 @@ def test_catalog_is_semi_stable_while_dated_history_stays_dynamic(tmp_path, monk
     assert "2026-08-18T01:02:03+00:00" in core.dynamic_text
     assert "reviewer_slots_last" in core.dynamic_text
     assert "subagent_last_delegation" in core.dynamic_text
+    assert '"selected_subagent_id": "builder"' in core.dynamic_text
     for profile in (
         "review-requested", "review-applied", "delegate-requested", "delegate-applied",
     ):
