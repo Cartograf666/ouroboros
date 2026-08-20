@@ -325,6 +325,14 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     "unexpected_fields": (False, "gateway/task_hurry.py hurry ingress refusal (400, text-free contract); never a task terminal"),
     "task_not_live": (False, "gateway/task_hurry.py hurry ingress refusal (404); never a task terminal"),
     "mailbox_write_failed": (False, "gateway/task_hurry.py fail-closed hurry ingress refusal (503); never a task terminal"),
+    # Request-wire reasons describe a physical candidate adjustment inside one
+    # LLM call. They are emitted in usage.request_wire, not as the root task's
+    # terminal reason_code, so none changes benchmark truncation provenance.
+    "provider_metadata_constraint": (False, "request-wire candidate adjustment; never a task terminal"),
+    "provider_prescribed_value": (False, "request-wire exact-value repair; never a task terminal"),
+    "provider_required_reasoning": (False, "request-wire mandatory-reasoning floor; never a task terminal"),
+    "provider_unsupported_field": (False, "request-wire unsupported-field repair; never a task terminal"),
+    "task_local_availability_fallback": (False, "request-wire task-local candidate; never a task terminal"),
 }
 
 _REASON_CODE_LITERAL = re.compile(
