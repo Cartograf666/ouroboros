@@ -337,6 +337,7 @@ def _truncate_tool_result(
     result: Any,
     tool_name: str = "",
     tool_args: Optional[Dict[str, Any]] = None,
+    source_ref: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Cap tool result unless it is an untruncated artifact."""
     limit = _tool_result_limit(tool_name)
@@ -345,7 +346,56 @@ def _truncate_tool_result(
         return s
     if len(s) <= limit:
         return s
-    return s[:limit] + f"\n... (truncated from {len(s)} chars, limit={limit})"
+    marker = f"\n... (truncated from {len(s)} chars, limit={limit})"
+    if isinstance(source_ref, dict) and source_ref:
+        marker += (
+            "\nFULL_RESULT_SOURCE_JSON="
+            + json.dumps(source_ref, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            + "\nDo not rerun this tool to recover omitted output. Read the exact source above."
+        )
+    else:
+        marker += (
+            "\nFULL_RESULT_SOURCE_UNAVAILABLE=true"
+            "\nDo not treat this partial result as complete; exact source persistence failed."
+        )
+    return s[:limit] + marker
+
+
+_SELF_PAGEABLE_TOOL_RESULTS = frozenset({
+    "read_file", "chat_history", "journal_read", "tree_read", "recent_tasks", "query_code",
+})
+
+
+def _persist_truncated_tool_source(
+    ctx: Any,
+    tool_name: str,
+    tool_call_id: str,
+    result: Any,
+    tool_args: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Write a generic over-limit result to this actor's existing artifact root."""
+
+    text = str(result)
+    if (
+        tool_name in _SELF_PAGEABLE_TOOL_RESULTS
+        or _should_skip_tool_result_truncation(tool_name, tool_args)
+        or len(text) <= _tool_result_limit(tool_name)
+    ):
+        return {}
+    try:
+        from ouroboros.artifacts import store_actor_source_bytes, task_id_for_artifacts
+
+        return store_actor_source_bytes(
+            pathlib.Path(ctx.drive_root),
+            task_id_for_artifacts(ctx),
+            category="tool_results",
+            source_id=str(tool_call_id or new_call_id("tool_result")),
+            data=text.encode("utf-8"),
+            extension="txt",
+        )
+    except Exception:
+        log.warning("Failed to persist actor-readable tool result source", exc_info=True)
+        return {}
 
 
 def _structured_tool_failure(result: Any) -> bool:
@@ -1206,10 +1256,23 @@ def process_tool_results(
         if is_error:
             error_count += 1
 
+        ctx = getattr(tools, "_ctx", None) if tools is not None else None
+        result_source_ref = (
+            _persist_truncated_tool_source(
+                ctx, fn_name, str(exec_result["tool_call_id"]), exec_result["result"],
+                exec_result.get("tool_args"),
+            )
+            if ctx is not None else {}
+        )
+        result_partial = (
+            not _should_skip_tool_result_truncation(fn_name, exec_result.get("tool_args"))
+            and len(str(exec_result["result"])) > _tool_result_limit(fn_name)
+        )
         truncated_result = _truncate_tool_result(
             exec_result["result"],
             tool_name=fn_name,
             tool_args=exec_result.get("tool_args"),
+            source_ref=result_source_ref,
         )
 
         messages.append({
@@ -1217,7 +1280,6 @@ def process_tool_results(
             "tool_call_id": exec_result["tool_call_id"],
             "content": truncated_result
         })
-        ctx = getattr(tools, "_ctx", None) if tools is not None else None
         if fn_name == "delegate_wait" and ctx is not None:
             try:
                 from ouroboros.delegate_supervision import acknowledge_pending_wake
@@ -1249,6 +1311,13 @@ def process_tool_results(
             "result": truncated_result,
             "is_error": is_error,
             "trace_ref": exec_result.get("trace_ref"),
+            **({
+                "result_partial": True,
+                "result_source_ref": result_source_ref,
+                "result_source_status": (
+                    "ready" if result_source_ref else "source_unavailable"
+                ),
+            } if result_partial else {}),
             **(exec_result.get("result_meta") or {}),
         })
         if fn_name == "task_acceptance_review" and not is_error:

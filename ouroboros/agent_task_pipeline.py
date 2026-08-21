@@ -345,6 +345,9 @@ def _run_post_task_processing_async(
 
     post_task_key: tuple[str, str] | None = None
     if _is_root_post_task(task_snapshot):
+        # The durable checkpoint owns paid idempotency; terminal roots never pay again.
+        if _root_post_task_already_completed(env, task_snapshot):
+            return None
         task_id = str(task_snapshot.get("id") or task_snapshot.get("task_id") or "")
         roots = _root_checkpoint_roots(env, task_snapshot)
         root_key = str(pathlib.Path(
@@ -1190,7 +1193,6 @@ If the task was non-trivial, end with a short meta-reflection section:
 - What should Ouroboros change in its own process or prompts to avoid repeating that class of mistake?
 Keep the meta-reflection concrete and operational, not narrative.
 End with: "Details: progress.jsonl + tools.jsonl for task_id={task_id}"
-
 ## Task
 Goal: {goal}
 Type: {task_type}
@@ -1203,18 +1205,20 @@ Rounds: {rounds}, Cost: {cost_text}
 {review_evidence}
 """
 
-
 def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evidence=None,
                       sealed_final=None):
     """Generate a detailed task summary and inject it into chat.jsonl."""
     try:
+        from ouroboros.project_dialogue import append_canonical_task_summary, completion_status_label
         from ouroboros.projects_registry import project_thread_note_for_task
 
         from ouroboros.consolidator import (
             CONSOLIDATION_REASONING_EFFORT,
             _consolidation_route,
         )
-        task_id = task.get("id", "unknown")
+        task_id = str(task.get("id") or "unknown")
+        canonical_root = pathlib.Path(task.get("budget_drive_root") or drive_logs.parent)
+        summary_id = f"task-narrative:{task_id}"
         n_tool_calls = len(llm_trace.get("tool_calls", []) or [])
         rounds = int(usage.get("rounds") or 0)
         cost_text = _synthesis_cost_text(usage)
@@ -1222,7 +1226,21 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
         reason_code = str(usage.get("reason_code") or "")
         review_projection = _compact_review_projection(llm_trace)
         presence_fields = presence_provenance_fields(task)
-
+        result_root = pathlib.Path(getattr(env, "drive_root", canonical_root))
+        stored_result = load_task_result(result_root, task_id) or {}
+        result_ref = {"kind": "task_result", "task_id": task_id, "reader": "get_task_result"}
+        def _append_summary(value: str) -> None:
+            append_canonical_task_summary(canonical_root, {
+                "ts": utc_now_iso(), "direction": "system", "type": "task_summary",
+                "summary_kind": "authored_root_summary", "summary_id": summary_id,
+                "task_id": task_id, "parent_task_id": str(task.get("parent_task_id") or ""), "root_task_id": str(task.get("root_task_id") or task_id),
+                "project_id": str(task.get("project_id") or ""), "chat_id": int(task.get("chat_id") or 0), "delegation_role": str(task.get("delegation_role") or ""), "role": str(task.get("role") or ""),
+                "status": str(stored_result.get("status") or "completed"), "outcome": completion_status_label(stored_result, usage),
+                "outcome_final": False, "outcome_authority": "pre_finalization_narrative_context",
+                "text": value, "tool_calls": n_tool_calls, "rounds": rounds, "outcome_axes": outcome_axes, "reason_code": reason_code,
+                "result_ref": result_ref, "source_coverage": {"task_result": result_ref}, **_summary_row_cost_fields(usage), **presence_fields,
+                **({"review_projection": review_projection} if review_projection.get("panels") else {}),
+            })
         # Skip LLM summary for trivial tasks.
         if n_tool_calls == 0 and rounds <= 1:
             goal = _truncate_with_notice(task.get("text", ""), 200)
@@ -1230,16 +1248,7 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
                 f"Task {task_id} ({task.get('type', 'user')}): "
                 f"{goal}. {rounds}r, {cost_text}." + project_thread_note_for_task(task)
             )
-            append_jsonl(drive_logs / "chat.jsonl", {
-                "ts": utc_now_iso(), "direction": "system",
-                "type": "task_summary", "task_id": task_id, "text": summary_text,
-                "chat_id": int(task.get("chat_id") or 0),
-                "tool_calls": n_tool_calls, "rounds": rounds,
-                "outcome_axes": outcome_axes, "reason_code": reason_code,
-                **_summary_row_cost_fields(usage),
-                **presence_fields,
-                **({"review_projection": review_projection} if review_projection.get("panels") else {}),
-            })
+            _append_summary(summary_text)
             return
 
         summary_model, summary_use_local = _consolidation_route()
@@ -1280,16 +1289,7 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
             )
         if summary_text:
             summary_text += project_thread_note_for_task(task)
-            append_jsonl(drive_logs / "chat.jsonl", {
-                "ts": utc_now_iso(), "direction": "system",
-                "type": "task_summary", "task_id": task_id, "text": summary_text,
-                "chat_id": int(task.get("chat_id") or 0),
-                "tool_calls": n_tool_calls, "rounds": rounds,
-                "outcome_axes": outcome_axes, "reason_code": reason_code,
-                **_summary_row_cost_fields(usage),
-                **presence_fields,
-                **({"review_projection": review_projection} if review_projection.get("panels") else {}),
-            })
+            _append_summary(summary_text)
     except Exception:
         log.debug("Task summary generation failed (non-critical)", exc_info=True)
 

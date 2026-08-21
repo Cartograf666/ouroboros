@@ -343,6 +343,14 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     "deep_self_review_error": (False, "agent.py:743 review-stage error on a review task"),
     "worker_pool_unavailable": (False, "gateway/tasks.py managed-task admission refusal"),
     "worker_pool_state_unavailable": (False, "gateway/tasks.py fail-closed admission inspection"),
+    "attachment_admission_rejected": (
+        False,
+        "gateway/_helpers.py pre-task attachment admission refusal; never a task terminal",
+    ),
+    "authority_source_unavailable": (
+        False,
+        "agent.py pre-context canonical-authority refusal; no substantive task attempt",
+    ),
     # Phase-A AR2-1: the HTTP cancel ingress refuses (503) when the durable
     # cancel-intent write fails — an ingress refusal about a CANCEL request; the
     # task itself keeps running untouched, so no trial ever terminalizes with it.

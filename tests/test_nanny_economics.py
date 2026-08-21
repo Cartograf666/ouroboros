@@ -112,6 +112,38 @@ def test_the_contract_objective_rides_the_run_instructions_structurally(tmp_path
     assert instructions.index("git commit") < instructions.index("HOST TASK OBJECTIVE")
 
 
+def test_direct_start_request_carries_complete_normalized_contract_authority(tmp_path, monkeypatch):
+    context = " \nAPI_CONTEXT_EXACT\n "
+    contract = {
+        "objective": "delegate the Cat build",
+        "context": context,
+        "constraints": "Claudexor only; no native edits",
+        "acceptance_claims": [{"id": "nested", "claim": "L1 asks L2 to spawn L3"}],
+        "delegation_budget": {"may_delegate": True, "depth_remaining": 3,
+                              "intent_note": "L1\nL2\nL3"},
+        "allowed_resources": {"network": False},
+        "predecessor_authority": {
+            "source": {"kind": "task_result", "task_id": "cat-old"},
+            "task_contract": {
+                "objective": "CLAUDEXOR_ONLY; L1 MUST ASK L2 TO SPAWN L3",
+                "context": "never use native/API fallback",
+            },
+        },
+    }
+
+    request = _start_with_contract(tmp_path, monkeypatch, contract)
+    marker = "HOST TASK CONTRACT AUTHORITY (complete normalized JSON; exact strings are authority):\n"
+    payload = request["instructions"].split(marker, 1)[1]
+    normalized = json.loads(payload)
+
+    assert normalized["context"] == context
+    assert normalized["constraints"] == contract["constraints"]
+    assert normalized["acceptance_claims"][0]["claim"] == "L1 asks L2 to spawn L3"
+    assert normalized["delegation_budget"]["intent_note"] == "L1\nL2\nL3"
+    assert normalized["allowed_resources"]["network"] is False
+    assert normalized["predecessor_authority"] == contract["predecessor_authority"]
+
+
 def test_a_missing_contract_contributes_nothing(tmp_path, monkeypatch):
     request = _start_with_contract(tmp_path, monkeypatch, {})
     assert "HOST TASK OBJECTIVE" not in request["instructions"]
@@ -729,3 +761,81 @@ def test_atomic_compiled_work_order_sends_dynamic_brief_once(tmp_path, monkeypat
     assert request["prompt"].count(objective) == 1
     assert objective not in request["instructions"]
     assert "git commit" in request["instructions"]
+
+
+def test_compiled_work_order_carries_exact_context_and_contract_tail():
+    from ouroboros.subagent_work_order import compile_external_work_order
+
+    context_tail = "API_CONTEXT_DECISIVE_TAIL"
+    intent_tail = "NEST_L1_L2_L3"
+    task = {
+        "id": "t-authority",
+        "objective": "research",
+        "context": "c" * 700 + context_tail,
+        "task_contract": {
+            "objective": "research",
+            "context": "c" * 700 + context_tail,
+            "delegation_budget": {"intent_note": "i" * 700 + intent_tail},
+        },
+    }
+
+    rendered = compile_external_work_order(task)
+
+    assert context_tail in rendered
+    assert intent_tail in rendered
+    assert "TASK CONTRACT AUTHORITY" in rendered
+    assert "chars omitted" not in rendered
+
+
+def test_compiled_work_order_preserves_context_boundary_whitespace():
+    from ouroboros.subagent_work_order import compile_external_work_order
+
+    context = " \nEXACT_CONTEXT_WITH_BOUNDARIES\n "
+    rendered = compile_external_work_order({
+        "id": "t-boundaries",
+        "objective": "research",
+        "context": context,
+        "task_contract": {"objective": "research", "context": context},
+    })
+
+    assert context in rendered
+
+
+def test_authority_fingerprint_binds_every_normalized_contract_field(tmp_path):
+    from ouroboros.delegate_recovery import authority_fingerprint_from_task
+
+    base = {
+        "id": "t-fingerprint",
+        "drive_root": str(tmp_path),
+        "task_contract": {
+            "objective": "build",
+            "context": "context-A",
+            "constraints": "constraint-A",
+            "delegation_budget": {"intent_note": "intent-A"},
+        },
+    }
+    original = authority_fingerprint_from_task(base)
+    for field, value in (
+        ("context", "context-B"),
+        ("constraints", "constraint-B"),
+        ("delegation_budget", {"intent_note": "intent-B"}),
+        ("predecessor_authority", {"source": {"task_id": "different"}}),
+    ):
+        changed = json.loads(json.dumps(base))
+        changed["task_contract"][field] = value
+        assert authority_fingerprint_from_task(changed) != original
+
+
+def test_normalized_contract_rebuild_keeps_workspace_lineage_and_predecessor():
+    from ouroboros.contracts.task_contract import build_task_contract
+
+    normalized = build_task_contract({
+        "id": "child", "workspace_root": "/tmp/project", "workspace_mode": "external",
+        "parent_task_id": "parent", "root_task_id": "root", "session_id": "session",
+        "delegation_role": "subagent", "predecessor_authority": {
+            "source": {"task_id": "previous"},
+            "task_contract": {"objective": "exact predecessor"},
+        },
+    })
+
+    assert build_task_contract({"task_contract": normalized}) == normalized

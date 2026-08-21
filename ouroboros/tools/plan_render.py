@@ -8,6 +8,7 @@ import json
 from typing import List, Optional
 
 from ouroboros.loop_tool_execution import PLAN_REVIEW_CONTROL_PREFIX
+from ouroboros.tools.plan_spec import MAX_FINDINGS_PER_SLOT
 
 
 # B2 (honest DEGRADED): every aggregate reaches the control line as itself — the
@@ -158,7 +159,15 @@ def _render_wave(
         + (", ".join(f"{o.get('locator')}: {o.get('reason')}" for o in manifest.get("omissions") or []) or "none"),
     ]
     if wave.get("compact"):
-        lines += ["", "(bounded history: this wave is kept as a compact summary; its full findings are no longer recorded)"]
+        ref = wave.get("wave_artifact") if isinstance(wave.get("wave_artifact"), dict) else {}
+        artifact_path = str(ref.get("path") or "")
+        detail = (
+            "its exact findings remain in the immutable task artifact. "
+            f"Exact wave: read_file({artifact_path})."
+            if artifact_path else
+            "legacy exact bytes are unavailable; this summary is not disposition authority."
+        )
+        lines += ["", f"(bounded hot history: this wave is a compact summary; {detail})"]
     if reminder:
         lines += ["", "⚠️ " + reminder]
     if aggregate == "DEGRADED":
@@ -172,11 +181,22 @@ def _render_wave(
         + (f" · disclosures: {', '.join(a['disclosures'])}" if a.get("disclosures") else "")
         for a in wave.get("actors") or []
     ] or ["(no actor records)"]
+    findings = list(wave.get("findings") or [])
+    findings_total = int(wave.get("findings_total") or len(findings))
+    finding_page = findings[:MAX_FINDINGS_PER_SLOT]
     lines += [
         "", "### Reviewer slots", "", *actor_lines,
         "", "### Findings (per slot; finding_id = slot:id)", "", "```json",
-        json.dumps(wave.get("findings") or [], ensure_ascii=False, indent=2, default=str), "```",
+        json.dumps(finding_page, ensure_ascii=False, indent=2, default=str), "```",
     ]
+    if findings_total > len(finding_page):
+        ref = wave.get("wave_artifact") if isinstance(wave.get("wave_artifact"), dict) else {}
+        lines += [
+            "",
+            f"Rendered finding page: 1-{len(finding_page)} of {findings_total}. "
+            f"Exact immutable wave: read_file(root='{ref.get('root') or 'artifact_store'}', "
+            f"path='{ref.get('path') or ''}').",
+        ]
     previews = [a for a in wave.get("actors") or [] if a.get("raw_text_preview")]
     if previews:
         lines += ["", "### Unparseable reviewer output (bounded preview)", ""]

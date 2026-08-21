@@ -10,7 +10,7 @@ import threading
 import time
 import traceback
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 log = logging.getLogger(__name__)
@@ -35,6 +35,8 @@ from ouroboros.loop import run_llm_loop
 from ouroboros.config import EFFORT_SCALE, resolve_effort
 from ouroboros.agent_startup_checks import (
     inject_crash_report,
+    persist_early_origin_stub as _persist_early_origin_stub_impl,
+    validate_task_authority_sources,
     verify_restart,
     verify_system_state,
 )
@@ -137,46 +139,25 @@ def _blocked_executor_terminal(cap_info: Dict[str, Any], task: Optional[Dict[str
 
 
 def _persist_early_origin_stub(drive_root: Any, task: Dict[str, Any]) -> None:
-    """Durably persist the ingress-captured origin BEFORE the convertible card
-    exists (v6.73.0). Merge-write only; the full RUNNING write follows and
-    overlays it. Ephemeral decision turns write no durable record by design
-    (they are never convertible), and tasks without an origin write nothing.
+    _persist_early_origin_stub_impl(drive_root, task, write_result=write_task_result)
 
-    A persistence failure is LOUD (warning + typed events.jsonl anomaly) but
-    deliberately non-fatal: the owner's task is worth more than its start
-    message, and the same storage fault would fail the full RUNNING write
-    moments later anyway — the residual convert-in-window exposure requires a
-    disk fault racing an instant owner click."""
-    if bool(task.get("_ephemeral_turn")):
-        return
-    ref = task.get("origin_message_ref")
-    if not (isinstance(ref, dict) and ref):
-        return
-    for _attempt in range(2):
-        try:
-            write_task_result(
-                drive_root,
-                str(task.get("id") or ""),
-                STATUS_RUNNING,
-                chat_id=task.get("chat_id"),
-                origin_message_ref=dict(ref),
-                origin_message_text=task.get("origin_message_text"),
-                result="Task is starting.",
-            )
-            return
-        except Exception:
-            if _attempt:
-                log.warning("Early origin stub persistence failed", exc_info=True)
-    try:
-        from ouroboros.utils import append_jsonl
 
-        append_jsonl(pathlib.Path(drive_root) / "logs" / "events.jsonl", {
-            "ts": utc_now_iso(),
-            "type": "origin_stub_persist_failed",
-            "task_id": str(task.get("id") or ""),
-        })
-    except Exception:
-        log.debug("origin_stub_persist_failed event write failed", exc_info=True)
+def _authority_source_terminal(refusal: Dict[str, Any]):
+    text = (
+        "AUTHORITY_SOURCE_UNAVAILABLE: cannot begin substantive work for "
+        f"{refusal.get('human_label') or 'this task'}. {refusal.get('detail') or ''}"
+    ).strip()
+    usage = {
+        "execution_status": "infra_failed", "reason_code": "authority_source_unavailable",
+        "authority_source_unavailable": refusal,
+    }
+    return text, usage, {"reasoning_notes": ["authority_source_unavailable"], "tool_calls": []}
+
+
+def _sync_task_project_scope(task: Dict[str, Any], ctx: Any) -> None:
+    project_id = str(getattr(ctx, "project_id", "") or "").strip()
+    if project_id and not str(task.get("project_id") or "").strip():
+        task["project_id"] = project_id
 
 
 def _budget_exhausted_message() -> str:
@@ -750,8 +731,14 @@ class OuroborosAgent:
             except Exception:
                 log.warning("mutation baseline capture failed for %s", task.get("id"), exc_info=True)
 
-    def _prepare_task_context(self, task: Dict[str, Any]) -> Tuple[ToolContext, List[Dict[str, Any]], Dict[str, Any]]:
+    def _prepare_task_context(
+        self, task: Dict[str, Any], authority_refusal: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[ToolContext, List[Dict[str, Any]], Dict[str, Any]]:
         """Set up ToolContext, build messages, return (ctx, messages, cap_info)."""
+        if authority_refusal is None:
+            authority_refusal = validate_task_authority_sources(self.env, task)
+        if authority_refusal:
+            return None, [], {"authority_source_unavailable": authority_refusal}
         drive_logs = self.env.drive_path("logs")
         task = attach_task_contract(task)
         # THE resolution, before anything durable is written about this run: the
@@ -945,14 +932,14 @@ class OuroborosAgent:
                     ctx.task_use_local_override = bool(task_metadata.get("use_local_model"))
         startup_wake = subagent_bootstrap.bootstrap_before_context(ctx, task, dispatch)
         self._capture_mutation_baseline(task, task_metadata)
-
         self._emit_typing_start()
-
+        canonical_drive = pathlib.Path(task.get("budget_drive_root") or self.env.budget_drive_root or self.env.drive_root)
+        review_env = self.env if canonical_drive.resolve(strict=False) == self.env.drive_root.resolve(strict=False) else replace(self.env, drive_root=canonical_drive)
         messages, cap_info = build_llm_messages(
             env=self.env,
             memory=self.memory,
             task=task,
-            review_context_builder=lambda: build_review_context(self.env),
+            review_context_builder=lambda: build_review_context(review_env),
             ctx=ctx,
         )
         # The second of the three places a reduction must reach (the durable record
@@ -1085,7 +1072,9 @@ class OuroborosAgent:
             self._accepting_owner_messages = bool(
                 task.get("_is_direct_chat") and not task.get("_ephemeral_turn")
             )
-        _persist_early_origin_stub(self.env.drive_root, task)  # origin durable BEFORE the card exists
+        authority_refusal = validate_task_authority_sources(self.env, task)
+        if not authority_refusal:
+            _persist_early_origin_stub(self.env.drive_root, task)
         self._emit_live_log(
             "task_started",
             task_id=self._current_task_id or "",
@@ -1097,20 +1086,16 @@ class OuroborosAgent:
             # card before tool activity can reveal it.
             ephemeral_decision=bool(task.get("_ephemeral_turn")),
         )
-
         drive_logs = self.env.drive_path("logs")
         heartbeat_stop = self._start_task_heartbeat_loop(str(task.get("id") or ""))
-
         try:
-            ctx, messages, cap_info = self._prepare_task_context(task)
+            ctx, messages, cap_info = self._prepare_task_context(task, authority_refusal)
             budget_remaining = cap_info.get("budget_remaining")
 
             usage: Dict[str, Any] = {}
             llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
-
             task_type_str = str(task.get("type") or "").lower()
             initial_effort = _initial_effort_for(task, task_type_str)
-
             # The owner's first phase-6 UI directive: the LEDE must show that THIS
             # bubble / subagent runs on codex (a chip, not a badge). The fact is
             # recorded onto the live task metadata that `_subagent_progress_meta`
@@ -1118,7 +1103,11 @@ class OuroborosAgent:
             # stamped onto the task, never re-derived per surface.
             self._record_executor_facts(task)
 
-            if str(cap_info.get("executor_blocked_reason") or ""):
+            authority_refusal = cap_info.get("authority_source_unavailable")
+            if isinstance(authority_refusal, dict) and authority_refusal:
+                task["_skip_post_task_synthesis"] = True
+                text, usage, llm_trace = _authority_source_terminal(authority_refusal)
+            elif str(cap_info.get("executor_blocked_reason") or ""):
                 text, usage, llm_trace = _blocked_executor_terminal(cap_info, task)
             elif task_type_str == "deep_self_review":
                 # Deep self-review bypasses the tool loop.
@@ -1244,9 +1233,7 @@ class OuroborosAgent:
             # ctx, but persistence/finalization read the task dict — sync it back so the
             # stored result and project-task reflection see the project (C4.1 gap). Fill
             # only, never overwrite, to preserve the "no re-scope" invariant.
-            _scope_pid = str(getattr(ctx, "project_id", "") or "").strip()
-            if _scope_pid and not str(task.get("project_id") or "").strip():
-                task["project_id"] = _scope_pid
+            _sync_task_project_scope(task, ctx)
 
             emit_task_results(
                 self.env, self.memory, self.llm,

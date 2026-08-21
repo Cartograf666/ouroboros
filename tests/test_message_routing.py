@@ -124,6 +124,71 @@ class TestOwnerInjectPerTask(unittest.TestCase):
         self.assertTrue(path.exists())
         self.assertIn("persistent", path.read_text())
 
+    def test_retry_keeps_task_message_global_ack_semantics(self):
+        """Phase 1C changes owner-text retry replay, not ancestor task messages."""
+        from ouroboros.owner_hurry import retry_reset
+        from ouroboros.owner_mailbox import (
+            acknowledge_transcript_entry,
+            drain_owner_entries,
+            write_task_message,
+        )
+
+        self.assertTrue(write_task_message(
+            self.drive_root,
+            "child instruction",
+            "child-task",
+            source_task_id="parent-task",
+            msg_id="task-msg-1",
+        ))
+        entry = drain_owner_entries(
+            self.drive_root, "child-task", attempt_key=1,
+        )[0]
+        acknowledge_transcript_entry(self.drive_root, "child-task", entry)
+        retry_reset(
+            self.drive_root, self.drive_root, "child-task", reason="worker_crash_requeue",
+        )
+
+        self.assertEqual(
+            drain_owner_entries(self.drive_root, "child-task", attempt_key=2),
+            [],
+        )
+
+    def test_legacy_ack_is_attempt_local_for_owner_but_global_for_task_message(self):
+        from ouroboros.owner_mailbox import (
+            acknowledge_task_messages,
+            acknowledged_task_message_ids,
+            drain_owner_entries,
+            write_owner_message,
+            write_task_message,
+        )
+
+        self.assertTrue(write_owner_message(
+            self.drive_root, "exact legacy owner bytes", "legacy-mixed",
+            msg_id="owner-legacy",
+        ))
+        self.assertTrue(write_task_message(
+            self.drive_root, "ancestor bytes", "legacy-mixed",
+            source_task_id="parent", msg_id="task-legacy",
+        ))
+        self.assertTrue(acknowledge_task_messages(
+            self.drive_root, "legacy-mixed", ["owner-legacy", "task-legacy"],
+            wake_id="legacy-consumer",
+        ))
+
+        self.assertEqual(
+            acknowledged_task_message_ids(
+                self.drive_root, "legacy-mixed", attempt_key=2,
+            ),
+            {"task-legacy"},
+        )
+        replay = drain_owner_entries(
+            self.drive_root, "legacy-mixed", attempt_key=2,
+        )
+        self.assertEqual(
+            [(row["msg_id"], row["kind"], row["text"]) for row in replay],
+            [("owner-legacy", "owner_text", "exact legacy owner bytes")],
+        )
+
     def test_mailbox_rejects_unsafe_task_id(self):
         from ouroboros.owner_mailbox import _mailbox_path
 

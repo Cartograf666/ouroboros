@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import types
 
 from ouroboros.projects_registry import create_project
@@ -53,6 +54,40 @@ def test_route_to_existing_project_emits_event_and_receipt(tmp_path):
     assert evt["source_ref"] == origin_ref
     assert evt["source_text"] == "continue the engine tuning"
     assert ctx._typed_routing_action_emitted == "route_to_project"
+
+
+def test_main_route_to_existing_project_explicitly_selects_predecessor_or_stays_fresh(tmp_path):
+    import server
+
+    create_project(tmp_path, "racer", name="Racer")
+    predecessor = {
+        "task_id": "racer-old", "status": "completed", "project_id": "racer",
+        "title": "Racer prototype", "objective": "Build the racer prototype",
+        "task_contract": {"objective": "Build the racer prototype", "context": "exact old context"},
+    }
+    result_dir = tmp_path / "task_results"
+    result_dir.mkdir()
+    (result_dir / "racer-old.json").write_text(json.dumps(predecessor), encoding="utf-8")
+    preview = server._task_result_ground_truth(predecessor)
+    metadata = {"main_routing_manifest": {"final_results": [preview]}}
+    events = []
+    route_tool = next(entry for entry in get_tools() if entry.name == "route_to_project")
+
+    out = route_tool.handler(
+        _ctx(tmp_path, events, task_metadata=metadata),
+        "racer", "Continue the racer", predecessor_task_id="racer-old",
+    )
+
+    assert out.startswith("⚠️ ROUTE_UNCONFIRMED")
+    assert events[0]["predecessor_authority_source"] == preview["authority_source"]
+
+    fresh_events = []
+    route_tool.handler(
+        _ctx(tmp_path, fresh_events, task_metadata=metadata),
+        "racer", "Start a separate racer experiment",
+    )
+    assert "predecessor_authority_source" not in fresh_events[0]
+    assert "predecessor_task_id" in route_tool.schema["parameters"]["properties"]
 
 
 def test_main_swarm_route_carries_intent_and_emits_only_once(tmp_path, monkeypatch):

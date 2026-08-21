@@ -32,6 +32,7 @@ from ouroboros.utils import append_jsonl, utc_now_iso
 from ouroboros.workspace_executor import executor_ref_from_ctx
 from ouroboros.workspace_executor import kill_all_services as executor_kill_all_services
 from ouroboros.workspace_executor import map_host_path as executor_map_host_path
+from ouroboros.workspace_executor import _read_local_service_marker
 from ouroboros.workspace_executor import service_logs as executor_service_logs
 from ouroboros.workspace_executor import service_status as executor_service_status
 from ouroboros.workspace_executor import start_service as executor_start_service
@@ -52,6 +53,10 @@ class ServiceRecord:
     started_at: float = field(default_factory=time.time)
     readiness: Dict[str, Any] = field(default_factory=dict)
     ready: bool = False
+    ready_observed_at: str = ""
+    readiness_log_offset: int = 0
+    readiness_log_carry: bytes = b""
+    readiness_log_identity: tuple[int, int] | None = None
     outputs: List[str] = field(default_factory=list)
     cwd_root: str = ""
     cwd_base: str = ""
@@ -350,16 +355,28 @@ def archive_task_service_logs(
 
 
 def _refresh_ready(record: ServiceRecord) -> bool:
-    if record.proc.poll() is not None:
-        record.ready = False
-        return False
-    readiness = record.readiness or {}
-    contains = str(readiness.get("stdout_contains") or readiness.get("log_contains") or "").strip()
-    if not contains:
-        record.ready = True
-        return True
-    record.ready = contains in _tail(record.log_path, 20_000)
-    return record.ready
+    with _LOCK:
+        if record.proc.poll() is not None:
+            record.ready = False
+            return False
+        if record.ready:
+            return True
+        readiness = record.readiness or {}
+        contains = str(readiness.get("stdout_contains") or readiness.get("log_contains") or "").strip()
+        if not contains:
+            record.ready = True
+            record.ready_observed_at = record.ready_observed_at or utc_now_iso()
+            return True
+        record.ready = _readiness_marker_observed(record, contains)
+        if record.ready:
+            record.ready_observed_at = record.ready_observed_at or utc_now_iso()
+        return record.ready
+
+
+def _readiness_marker_observed(record: ServiceRecord, marker: str) -> bool:
+    """Scan only unseen service-log bytes without turning the display tail into truth."""
+
+    return _read_local_service_marker(record, record.log_path, marker)
 
 
 def _start_service(
@@ -529,6 +546,11 @@ def _start_service(
 def _status_payload(record: ServiceRecord) -> Dict[str, Any]:
     _refresh_ready(record)
     rc = record.proc.poll()
+    # The process can settle in the small window between the readiness poll
+    # above and this state read.  Terminal state is never currently ready,
+    # while the observation timestamp remains useful historical evidence.
+    if rc is not None:
+        record.ready = False
     state = "running" if rc is None else "exited"
     return {
         "service_id": record.service_id,
@@ -538,6 +560,7 @@ def _status_payload(record: ServiceRecord) -> Dict[str, Any]:
         "pgid": record.pgid,
         "state": state,
         "ready": bool(record.ready),
+        "ready_observed_at": record.ready_observed_at or None,
         "returncode": rc,
         "uptime_sec": round(max(0.0, time.time() - record.started_at), 3),
         "cwd": record.cwd,
