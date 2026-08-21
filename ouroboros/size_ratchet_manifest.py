@@ -130,6 +130,7 @@ BAND_PATHS = {
     "ouroboros/agent.py": "Subagent message identity now lives in a shared helper; keep agent.py below the giant-file threshold rather than re-expanding it.",
     "ouroboros/agent_startup_checks.py": None,
     "ouroboros/artifacts.py": "Exact task-source persistence and repository-diff materialization now share the actor-readable artifact seam for acceptance evidence.",
+    "ouroboros/consciousness.py": "Durable Background Consciousness observation inbox and bounded truthful replay",
     "ouroboros/extension_process_runner.py": None,
     "ouroboros/gateway/control.py": "Entered the band from 966 lines: the update-flow redesign added the shared stash-first prologue (_stash_local_work_fenced/_unwind_stashed_update) and the review-wave affordability floor to the update apply orchestration (update-flow-redesign sprint, Q9/Q10 owner decisions).",
     "ouroboros/gateway/extensions.py": None,

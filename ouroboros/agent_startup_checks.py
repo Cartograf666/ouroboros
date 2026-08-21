@@ -653,6 +653,7 @@ def check_stray_server_processes(env: Any) -> Tuple[Dict[str, Any], int]:
 def _hot_store_thresholds() -> Tuple[Tuple[str, int, str], ...]:
     from ouroboros.context_budget import (
         EVENTS_LOG_WARN_BYTES,
+        BG_OBSERVATIONS_WARN_BYTES,
         PROGRESS_LOG_WARN_BYTES,
         SCHEDULED_TASKS_WARN_BYTES,
         TOOLS_LOG_WARN_BYTES,
@@ -664,6 +665,13 @@ def _hot_store_thresholds() -> Tuple[Tuple[str, int, str], ...]:
         "Rotation/archival is the remediation (tracked as a GitHub issue)."
     )
     return (
+        (
+            "state/consciousness_observations.jsonl",
+            BG_OBSERVATIONS_WARN_BYTES,
+            "Background consciousness replays this append-only inbox on wake; "
+            "archive only through an owner-preserving retention change that keeps "
+            "every unacknowledged row readable.",
+        ),
         (
             "state/usage_attempts.jsonl",
             USAGE_LEDGER_WARN_BYTES,
