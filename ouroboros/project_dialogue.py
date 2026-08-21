@@ -18,7 +18,7 @@ import uuid
 from typing import Any, Dict, Iterable, List, Optional
 
 from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
-from ouroboros.utils import iter_jsonl_objects, jsonl_append_lock_path, replace_atomic, utc_now_iso
+from ouroboros.utils import append_jsonl, iter_jsonl_objects, jsonl_append_lock_path, replace_atomic, utc_now_iso
 
 _ANNOTATIONS_NAME = "chat_annotations.jsonl"
 _COMPACT_AT_BYTES = 800_000
@@ -397,6 +397,8 @@ def completion_status_label(result: Dict[str, Any], event: Dict[str, Any]) -> st
         or axis_status.get("objective") == "fail"
         or axis_status.get("review") == "fail"
         or axis_status.get("artifacts") in {"failed", "missing"}
+        or str(result.get("artifact_status") or event.get("artifact_status") or "").lower()
+        in {"failed", "missing"}
     )
     degraded = any(value in {"degraded", "partial", "best_effort"}
                    for value in axis_status.values())
@@ -414,48 +416,12 @@ def completion_status_label(result: Dict[str, Any], event: Dict[str, Any]) -> st
     return status.replace("_", " ").title() or "Finished"
 
 
-def task_summary_exists(drive_root: Any, summary_id: str) -> bool:
-    """Whether one canonical summary identity already exists in live/archive chat."""
-    sid = str(summary_id or "").strip()
-    if not sid:
-        return False
-    root = pathlib.Path(drive_root)
-    paths = [*sorted((root / "archive").glob("chat_*.jsonl")), root / "logs" / "chat.jsonl"]
-    legacy_task_id = sid.removeprefix("task-summary:") if sid.startswith("task-summary:") else ""
-    return any(
-        str(row.get("summary_id") or "") == sid
-        or bool(legacy_task_id and row.get("type") == "task_summary"
-                and str(row.get("task_id") or "") == legacy_task_id)
-        for path in paths for row in iter_jsonl_objects(path)
-    )
-
-
 def append_canonical_task_summary(drive_root: Any, row: Dict[str, Any]) -> bool:
-    """Append one idempotent task-summary row to the canonical biography."""
-    summary_id = str(row.get("summary_id") or "").strip()
-    if not summary_id:
+    """Append one task-summary row through the existing concurrent JSONL owner."""
+    if not str(row.get("summary_id") or "").strip():
         return False
     path = pathlib.Path(drive_root) / "logs" / "chat.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = jsonl_append_lock_path(path)
-    lock_fd = acquire_exclusive_file_lock(lock_path, timeout_sec=2.0, stale_sec=10.0)
-    if lock_fd is None:
-        return False
-    try:
-        if task_summary_exists(drive_root, summary_id):
-            return False
-        data = (json.dumps(dict(row), ensure_ascii=False) + "\n").encode("utf-8")
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-        try:
-            view = memoryview(data)
-            while view:
-                view = view[os.write(fd, view):]
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        return True
-    finally:
-        release_exclusive_file_lock(lock_path, lock_fd)
+    return append_jsonl(path, dict(row))
 
 
 def _append_terminal_task_projection(
@@ -463,7 +429,7 @@ def _append_terminal_task_projection(
     task_done_event: Dict[str, Any],
 ) -> bool:
     """Project one terminal child result into canonical cognition, without an LLM."""
-    from ouroboros.task_results import resolve_task_lineage
+    from ouroboros.task_results import resolve_task_lineage, write_task_result
     from ouroboros.task_status import SETTLED_STATUSES
 
     tid = str(task_id or "").strip()
@@ -486,52 +452,65 @@ def _append_terminal_task_projection(
     if status not in SETTLED_STATUSES:
         return False
     is_root = bool(lineage["is_root_task"])
-    if is_root:
-        from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
-
-        checkpoint = result.get("root_phase_checkpoint")
-        phase = str(checkpoint.get("post_task_synthesis") or "") if isinstance(checkpoint, dict) else ""
-        summary_id = f"task-summary:{tid}"
-        # A normal root's existing authored summary owns this identity. While
-        # its async synthesis is pending/running, do not pre-empt the LLM call.
-        if task_summary_exists(drive_root, summary_id) or post_task_synthesis_is_open(phase):
-            return False
-        summary_kind = "terminal_root_projection"
-    else:
-        summary_id = f"task-terminal:{tid}"
-        summary_kind = "terminal_result_projection"
+    summary_id = f"task-terminal:{tid}"
+    summary_kind = "terminal_root_projection" if is_root else "terminal_result_projection"
     parent_id = str(lineage.get("parent_task_id") or "")
     root_id = str(lineage.get("root_task_id") or tid)
     from ouroboros.project_facts import resolve_project_id
 
-    project_id = resolve_project_id({**task, **result})
-    role = str(result.get("role") or task.get("role") or "child")
-    reason = str(result.get("reason_code") or event.get("reason_code") or "")
-    outcome = completion_status_label(result, event)
-    excerpt = _completion_excerpt(result)
-    details = f'Details: get_task_result(task_id="{tid}")'
-    text = (
-        f"{outcome}. role={role}; parent={parent_id or 'unknown'}; "
-        f"root={root_id}; project={project_id or 'none'}."
+    appended = False
+
+    def _append_once(current: Dict[str, Any], _patch: Dict[str, Any]) -> Dict[str, Any]:
+        nonlocal appended
+        existing_marker = current.get("canonical_terminal_projection")
+        if isinstance(existing_marker, dict) and str(existing_marker.get("summary_id") or "") == summary_id:
+            return {"status": str(current.get("status") or status)}
+        effective = {**result, **current}
+        project_id = resolve_project_id({**task, **effective})
+        role = str(effective.get("role") or task.get("role") or ("root" if is_root else "child"))
+        reason = str(effective.get("reason_code") or event.get("reason_code") or "")
+        outcome = completion_status_label(effective, event)
+        excerpt = _completion_excerpt(effective)
+        details = f'Details: get_task_result(task_id="{tid}")'
+        text = (
+            f"{outcome}. role={role}; parent={parent_id or 'unknown'}; "
+            f"root={root_id}; project={project_id or 'none'}."
+        )
+        if excerpt:
+            text += f" {excerpt}"
+        if reason:
+            text += f" Reason: {reason}."
+        result_ref = {"kind": "task_result", "task_id": tid, "reader": "get_task_result"}
+        row = {
+            "ts": str(event.get("ts") or effective.get("ts") or utc_now_iso()),
+            "direction": "system", "type": "task_summary", "summary_kind": summary_kind,
+            "summary_id": summary_id, "task_id": tid,
+            "parent_task_id": parent_id, "root_task_id": root_id,
+            "project_id": project_id,
+            "chat_id": int(event.get("chat_id") or task.get("chat_id") or 0),
+            "delegation_role": str(effective.get("delegation_role") or task.get("delegation_role") or ""),
+            "role": role, "status": str(effective.get("status") or status),
+            "outcome": outcome, "outcome_final": True,
+            "outcome_authority": "canonical_task_result_after_finalization",
+            "outcome_axes": effective.get("outcome_axes") or event.get("outcome_axes") or {},
+            "reason_code": reason, "result_ref": result_ref,
+            "text": f"{text} {details}",
+        }
+        appended = append_canonical_task_summary(drive_root, row)
+        if not appended:
+            return {"status": str(current.get("status") or status)}
+        return {
+            "status": str(current.get("status") or status),
+            "canonical_terminal_projection": {
+                "summary_id": summary_id, "summary_kind": summary_kind,
+                "written_at": row["ts"],
+            },
+        }
+
+    write_task_result(
+        drive_root, tid, status, _field_projector=_append_once,
     )
-    if excerpt:
-        text += f" {excerpt}"
-    if reason:
-        text += f" Reason: {reason}."
-    text += f" {details}"
-    result_ref = {"kind": "task_result", "task_id": tid, "reader": "get_task_result"}
-    return append_canonical_task_summary(drive_root, {
-        "ts": str(event.get("ts") or result.get("ts") or utc_now_iso()),
-        "direction": "system", "type": "task_summary",
-        "summary_kind": summary_kind,
-        "summary_id": summary_id, "task_id": tid,
-        "parent_task_id": parent_id, "root_task_id": root_id,
-        "project_id": project_id, "chat_id": int(event.get("chat_id") or task.get("chat_id") or 0),
-        "delegation_role": str(result.get("delegation_role") or task.get("delegation_role") or ""),
-        "role": role, "status": status, "outcome": outcome,
-        "outcome_axes": result.get("outcome_axes") or event.get("outcome_axes") or {},
-        "reason_code": reason, "result_ref": result_ref, "text": text,
-    })
+    return appended
 
 
 def append_terminal_task_projection(
@@ -630,5 +609,4 @@ __all__ = [
     "routing_target_label",
     "resolve_owner_message_source",
     "source_refs_for_project",
-    "task_summary_exists",
 ]

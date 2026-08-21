@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 from types import SimpleNamespace
 
 
@@ -29,11 +30,10 @@ def test_split_project_root_summary_lands_canonically_once_before_child_gc(tmp_p
         "budget_drive_root": str(canonical),
     }
 
-    for _ in range(2):
-        pipeline._run_task_summary(
-            env, object(), task, {"rounds": 1, "cost": 0},
-            {"tool_calls": []}, child / "logs",
-        )
+    pipeline._run_task_summary(
+        env, object(), task, {"rounds": 1, "cost": 0},
+        {"tool_calls": []}, child / "logs",
+    )
 
     rows = [row for row in _chat_rows(canonical) if row.get("type") == "task_summary"]
     assert len(rows) == 1
@@ -50,8 +50,9 @@ def test_split_project_root_summary_lands_canonically_once_before_child_gc(tmp_p
     assert len([row for row in _chat_rows(canonical) if row.get("task_id") == "project-root"]) == 1
 
 
-def test_existing_authored_root_summary_prevents_a_second_llm_call(tmp_path):
+def test_root_checkpoint_prevents_a_second_paid_authored_summary(tmp_path, monkeypatch):
     from ouroboros import agent_task_pipeline as pipeline
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
 
     class Llm:
         def __init__(self):
@@ -61,35 +62,102 @@ def test_existing_authored_root_summary_prevents_a_second_llm_call(tmp_path):
             self.calls += 1
             return {"content": "Authored once"}, {"cost": 0}
 
-    env = SimpleNamespace(repo_dir=tmp_path / "repo", drive_root=tmp_path)
+    import ouroboros.llm as llm_mod
+    import ouroboros.memory as memory_mod
+    import ouroboros.post_task_evolution as evolution
+
+    llm = Llm()
+    monkeypatch.setattr(llm_mod, "LLMClient", lambda: llm)
+    monkeypatch.setattr(memory_mod, "Memory", lambda **_kwargs: object())
+    monkeypatch.setattr(pipeline, "_run_chat_consolidation", lambda *_a, **_k: None)
+    monkeypatch.setattr(pipeline, "_run_scratchpad_consolidation", lambda *_a, **_k: None)
+    monkeypatch.setattr(pipeline, "_run_reflection", lambda *_a, **_k: None)
+    monkeypatch.setattr(pipeline, "_update_improvement_backlog", lambda *_a, **_k: 0)
+    monkeypatch.setattr(pipeline, "_apply_reflection_memory_actions", lambda *_a, **_k: 0)
+    monkeypatch.setattr(evolution, "maybe_promote", lambda *_a, **_k: None)
+    env = SimpleNamespace(
+        repo_dir=tmp_path / "repo", drive_root=tmp_path,
+        drive_path=lambda rel: tmp_path / rel,
+    )
     task = {"id": "root-llm", "root_task_id": "root-llm", "chat_id": 1,
             "type": "task", "text": "Nontrivial task"}
-    llm = Llm()
-    for _ in range(2):
-        pipeline._run_task_summary(
-            env, llm, task, {"rounds": 2, "cost": 0},
-            {"tool_calls": [{"tool": "read_file"}]}, tmp_path / "logs",
-        )
+    write_task_result(
+        tmp_path, "root-llm", STATUS_COMPLETED,
+        root_task_id="root-llm",
+        root_phase_checkpoint={"post_task_synthesis": "pending_once"},
+    )
+    args = (
+        env, task, {"rounds": 2, "cost": 0},
+        {"tool_calls": [{"tool": "read_file"}]}, {}, tmp_path / "logs",
+    )
+    pipeline._run_post_task_processing_async(*args, blocking=True)
+    # Raw dialogue may rotate/compact after the checkpoint settles. Its absence
+    # must not authorize another paid synthesis.
+    archive = tmp_path / "archive"
+    archive.mkdir(exist_ok=True)
+    (tmp_path / "logs" / "chat.jsonl").replace(archive / "chat_rotated.jsonl")
+    pipeline._run_post_task_processing_async(*args, blocking=True)
 
     assert llm.calls == 1
-    assert len([row for row in _chat_rows(tmp_path) if row.get("task_id") == "root-llm"]) == 1
+    assert not (tmp_path / "logs" / "chat.jsonl").exists()
+    assert "root-llm" in (archive / "chat_rotated.jsonl").read_text(encoding="utf-8")
 
 
-def test_legacy_root_summary_without_identity_still_prevents_retry_duplicate(tmp_path):
-    from ouroboros.project_dialogue import append_terminal_task_projection
+def test_authored_summary_hot_path_never_scans_rotated_biography(tmp_path, monkeypatch):
+    from ouroboros import agent_task_pipeline as pipeline
+    import ouroboros.project_dialogue as dialogue
 
-    logs = tmp_path / "logs"
-    logs.mkdir(parents=True)
-    (logs / "chat.jsonl").write_text(
-        json.dumps({"type": "task_summary", "task_id": "legacy-root", "text": "Legacy"}) + "\n",
-        encoding="utf-8",
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    for index in range(206):
+        (archive / f"chat_{index:04d}.jsonl").write_text(
+            json.dumps({"type": "task_summary", "task_id": f"old-{index}"}) + "\n",
+            encoding="utf-8",
+        )
+    scans = 0
+
+    def forbidden_scan(*_args, **_kwargs):
+        nonlocal scans
+        scans += 1
+        return iter(())
+
+    monkeypatch.setattr(dialogue, "iter_jsonl_objects", forbidden_scan)
+
+    class Llm:
+        calls = 0
+
+        def chat(self, **_kwargs):
+            self.calls += 1
+            return {"content": "One paid narrative"}, {"cost": 0}
+
+    llm = Llm()
+    pipeline._run_task_summary(
+        SimpleNamespace(drive_root=tmp_path), llm,
+        {"id": "new-root", "root_task_id": "new-root", "type": "task", "text": "work"},
+        {"rounds": 2, "cost": 0}, {"tool_calls": [{"tool": "read_file"}]},
+        tmp_path / "logs",
     )
-    assert not append_terminal_task_projection(
-        tmp_path, "legacy-root", {},
-        {"task_id": "legacy-root", "root_task_id": "legacy-root", "status": "failed"},
+
+    assert llm.calls == 1
+    assert scans == 0
+
+
+def test_missing_role_terminal_root_is_never_labeled_child(tmp_path):
+    from ouroboros.project_dialogue import append_terminal_task_projection
+    from ouroboros.task_results import STATUS_FAILED, write_task_result
+
+    result = write_task_result(
+        tmp_path, "roleless-root", STATUS_FAILED,
+        root_task_id="roleless-root", result="failed",
+    )
+    assert append_terminal_task_projection(
+        tmp_path, "roleless-root", {}, result,
         {"status": "failed", "chat_id": 1},
     )
-    assert len(_chat_rows(tmp_path)) == 1
+    row = next(row for row in _chat_rows(tmp_path) if row.get("task_id") == "roleless-root")
+    assert row["summary_kind"] == "terminal_root_projection"
+    assert row["role"] == "root"
+    assert "role=root" in row["text"]
 
 
 def test_terminal_child_projection_is_idempotent_and_honest_for_all_outcomes(tmp_path):
@@ -135,13 +203,54 @@ def test_terminal_child_projection_is_idempotent_and_honest_for_all_outcomes(tmp
         assert f'get_task_result(task_id="{task_id}")' in row["text"]
 
 
+def test_terminal_projection_dedup_does_not_lose_concurrent_chat_append(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from ouroboros.project_dialogue import append_terminal_task_projection
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.utils import append_jsonl
+
+    result = write_task_result(
+        tmp_path, "concurrent-child", STATUS_COMPLETED,
+        parent_task_id="root", root_task_id="root", delegation_role="subagent",
+        result="done", outcome_axes={"execution": {"status": "ok"}},
+    )
+    task = {
+        "id": "concurrent-child", "parent_task_id": "root", "root_task_id": "root",
+        "delegation_role": "subagent", "chat_id": 1,
+    }
+
+    def project(_index):
+        return append_terminal_task_projection(
+            tmp_path, "concurrent-child", task, result,
+            {"chat_id": 1, "status": "completed"},
+        )
+
+    def noise(index):
+        return append_jsonl(
+            tmp_path / "logs" / "chat.jsonl",
+            {"type": "concurrent_noise", "index": index},
+        )
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        projection_results = list(pool.map(project, range(12)))
+        noise_results = list(pool.map(noise, range(24)))
+
+    rows = _chat_rows(tmp_path)
+    assert projection_results.count(True) == 1
+    assert all(noise_results)
+    assert len([row for row in rows if row.get("summary_id") == "task-terminal:concurrent-child"]) == 1
+    assert {row["index"] for row in rows if row.get("type") == "concurrent_noise"} == set(range(24))
+
+
 def test_terminal_root_fallback_covers_cancel_without_preempting_open_synthesis(tmp_path):
     from ouroboros.project_dialogue import append_terminal_task_projection
+    from ouroboros.task_results import STATUS_CANCELLED, STATUS_COMPLETED, write_task_result
 
-    cancelled = {
-        "task_id": "cancelled-root", "root_task_id": "cancelled-root",
-        "project_id": "launch", "status": "cancelled", "result": "Stopped by owner",
-    }
+    cancelled = write_task_result(
+        tmp_path, "cancelled-root", STATUS_CANCELLED,
+        root_task_id="cancelled-root", project_id="launch", result="Stopped by owner",
+    )
     assert append_terminal_task_projection(
         tmp_path, "cancelled-root", {}, cancelled,
         {"chat_id": 41, "status": "cancelled"},
@@ -150,18 +259,125 @@ def test_terminal_root_fallback_covers_cancel_without_preempting_open_synthesis(
     assert row["summary_kind"] == "terminal_root_projection"
     assert row["outcome"] == "Cancelled"
 
-    pending = {
-        "task_id": "normal-root", "root_task_id": "normal-root", "status": "completed",
-        "root_phase_checkpoint": {"post_task_synthesis": "pending_once"},
-    }
-    assert not append_terminal_task_projection(
+    pending = write_task_result(
+        tmp_path, "normal-root", STATUS_COMPLETED,
+        root_task_id="normal-root",
+        root_phase_checkpoint={"post_task_synthesis": "running"},
+    )
+    assert append_terminal_task_projection(
         tmp_path, "normal-root", {}, pending,
         {"chat_id": 1, "status": "completed"},
     )
+    normal = next(row for row in _chat_rows(tmp_path) if row.get("task_id") == "normal-root")
+    assert normal["summary_kind"] == "terminal_root_projection"
+
+
+def test_running_async_root_truth_survives_restart_degradation_once(tmp_path):
+    from ouroboros.agent_task_pipeline import recover_pending_root_post_task_synthesis
+    from ouroboros.project_dialogue import append_terminal_task_projection
+    from ouroboros.task_results import STATUS_COMPLETED, load_task_result, write_task_result
+
+    running = write_task_result(
+        tmp_path, "restart-root", STATUS_COMPLETED,
+        root_task_id="restart-root", result="Owner already received the answer",
+        root_phase_checkpoint={"post_task_synthesis": "running"},
+    )
+    assert append_terminal_task_projection(
+        tmp_path, "restart-root", {}, running,
+        {"chat_id": 1, "status": "completed"},
+    )
+    assert recover_pending_root_post_task_synthesis(tmp_path, repo_dir=tmp_path / "repo") == 1
+
+    stored = load_task_result(tmp_path, "restart-root")
+    assert stored["root_phase_checkpoint"]["post_task_synthesis"] == "degraded"
+    rows = [row for row in _chat_rows(tmp_path) if row.get("task_id") == "restart-root"]
+    assert len(rows) == 1
+    assert rows[0]["outcome_final"] is True
+
+
+def test_authored_narrative_never_suppresses_final_artifact_failure_truth(tmp_path):
+    from ouroboros import agent_task_pipeline as pipeline
+    from ouroboros.project_dialogue import append_terminal_task_projection
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+
+    initial = write_task_result(
+        tmp_path, "artifact-root", STATUS_COMPLETED,
+        root_task_id="artifact-root", result="Built output",
+        outcome_axes={"execution": {"status": "ok"}, "artifacts": {"status": "ready"}},
+    )
+    pipeline._run_task_summary(
+        SimpleNamespace(drive_root=tmp_path), object(),
+        {"id": "artifact-root", "root_task_id": "artifact-root", "text": "build",
+         "type": "task", "chat_id": 1},
+        {"rounds": 1, "cost": 0, "outcome_axes": initial["outcome_axes"]},
+        {"tool_calls": []}, tmp_path / "logs",
+    )
+    final = write_task_result(
+        tmp_path, "artifact-root", STATUS_COMPLETED,
+        artifact_status="failed", artifact_error="manifest copy failed",
+        outcome_axes={"execution": {"status": "ok"}, "artifacts": {"status": "failed"}},
+    )
+    assert append_terminal_task_projection(
+        tmp_path, "artifact-root", {}, final,
+        {"chat_id": 1, "status": "completed", "artifact_status": "failed",
+         "outcome_axes": initial["outcome_axes"]},
+    )
+
+    rows = [row for row in _chat_rows(tmp_path) if row.get("task_id") == "artifact-root"]
+    assert [row["summary_kind"] for row in rows] == [
+        "authored_root_summary", "terminal_root_projection",
+    ]
+    assert rows[-1]["outcome"] == "Failed"
+    assert rows[-1]["outcome_axes"]["artifacts"]["status"] == "failed"
+    assert rows[-1]["outcome_final"] is True
+
+
+def test_split_authored_narrative_keeps_only_canonical_result_ref_after_child_gc(tmp_path):
+    import shutil
+
+    from ouroboros import agent_task_pipeline as pipeline
+    from ouroboros.headless import copy_child_task_result
+    from ouroboros.task_results import STATUS_COMPLETED, load_task_result, write_task_result
+
+    canonical = tmp_path / "canonical"
+    child = tmp_path / "child"
+    dangling = child / "task_results" / "artifacts" / "split-root" / "bundle.txt"
+    dangling.parent.mkdir(parents=True)
+    dangling.write_text("artifact", encoding="utf-8")
+    stored = write_task_result(
+        child, "split-root", STATUS_COMPLETED,
+        root_task_id="split-root", project_id="launch", result="done",
+        artifacts=[{"path": str(dangling), "name": "bundle.txt"}],
+        artifact_bundle={"status": "ready", "artifacts": [{"path": str(dangling)}]},
+    )
+    task = {
+        "id": "split-root", "root_task_id": "split-root", "project_id": "launch",
+        "chat_id": 41, "type": "task", "text": "build",
+        "budget_drive_root": str(canonical),
+        "drive_root": str(child),
+    }
+    pipeline._run_task_summary(
+        SimpleNamespace(drive_root=child), object(), task,
+        {"rounds": 1, "cost": 0}, {"tool_calls": []}, child / "logs",
+    )
+    copied = copy_child_task_result(canonical, task)
+    assert copied and load_task_result(canonical, "split-root")
+    shutil.rmtree(child)
+
+    row = next(row for row in _chat_rows(canonical) if row.get("task_id") == "split-root")
+    assert row["result_ref"] == {
+        "kind": "task_result", "task_id": "split-root", "reader": "get_task_result",
+    }
+    assert "artifact_bundle" not in row
+    assert str(dangling) not in json.dumps(row, ensure_ascii=False)
+    assert stored["artifact_bundle"]["artifacts"][0]["path"] == str(dangling)
+    canonical_result = load_task_result(canonical, "split-root")
+    assert canonical_result["artifacts"][0]["path"] != str(dangling)
+    assert pathlib.Path(canonical_result["artifacts"][0]["path"]).is_file()
 
 
 def test_duplicate_task_done_after_child_copyback_appends_one_canonical_projection(tmp_path):
-    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.task_results import STATUS_COMPLETED, load_task_result, write_task_result
     from supervisor import events
 
     child_drive = tmp_path / "state" / "headless_tasks" / "child-copy" / "data"
@@ -195,6 +411,7 @@ def test_duplicate_task_done_after_child_copyback_appends_one_canonical_projecti
     rows = [row for row in _chat_rows(tmp_path) if row.get("task_id") == "child-copy"]
     assert len(rows) == 1
     assert rows[0]["result_ref"]["reader"] == "get_task_result"
+    assert load_task_result(tmp_path, "child-copy")["canonical_terminal_projection"]["summary_id"] == "task-terminal:child-copy"
     assert not child_drive.joinpath("task_results", "child-copy.json").samefile(
         tmp_path / "task_results" / "child-copy.json"
     )

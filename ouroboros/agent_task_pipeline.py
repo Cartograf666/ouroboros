@@ -345,6 +345,9 @@ def _run_post_task_processing_async(
 
     post_task_key: tuple[str, str] | None = None
     if _is_root_post_task(task_snapshot):
+        # The durable checkpoint owns paid idempotency; terminal roots never pay again.
+        if _root_post_task_already_completed(env, task_snapshot):
+            return None
         task_id = str(task_snapshot.get("id") or task_snapshot.get("task_id") or "")
         roots = _root_checkpoint_roots(env, task_snapshot)
         root_key = str(pathlib.Path(
@@ -1206,7 +1209,7 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
                       sealed_final=None):
     """Generate a detailed task summary and inject it into chat.jsonl."""
     try:
-        from ouroboros.project_dialogue import append_canonical_task_summary, completion_status_label, task_summary_exists
+        from ouroboros.project_dialogue import append_canonical_task_summary, completion_status_label
         from ouroboros.projects_registry import project_thread_note_for_task
 
         from ouroboros.consolidator import (
@@ -1214,10 +1217,7 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
             _consolidation_route,
         )
         task_id = str(task.get("id") or "unknown")
-        canonical_root = pathlib.Path(task.get("budget_drive_root") or drive_logs.parent); summary_id = f"task-summary:{task_id}"
-        # Retry/recovery must not pay for a second summary.
-        if task_summary_exists(canonical_root, summary_id):
-            return
+        canonical_root = pathlib.Path(task.get("budget_drive_root") or drive_logs.parent); summary_id = f"task-narrative:{task_id}"
         n_tool_calls = len(llm_trace.get("tool_calls", []) or [])
         rounds = int(usage.get("rounds") or 0)
         cost_text = _synthesis_cost_text(usage)
@@ -1236,10 +1236,10 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
                 "project_id": str(task.get("project_id") or ""), "chat_id": int(task.get("chat_id") or 0),
                 "delegation_role": str(task.get("delegation_role") or ""), "role": str(task.get("role") or ""),
                 "status": str(stored_result.get("status") or "completed"), "outcome": completion_status_label(stored_result, usage),
+                "outcome_final": False, "outcome_authority": "pre_finalization_narrative_context",
                 "text": value, "tool_calls": n_tool_calls, "rounds": rounds,
                 "outcome_axes": outcome_axes, "reason_code": reason_code,
                 "result_ref": result_ref, "source_coverage": {"task_result": result_ref},
-                "artifact_bundle": stored_result.get("artifact_bundle") or {},
                 **_summary_row_cost_fields(usage), **presence_fields,
                 **({"review_projection": review_projection} if review_projection.get("panels") else {}),
             })
