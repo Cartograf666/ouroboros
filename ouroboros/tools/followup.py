@@ -77,10 +77,6 @@ def get_tools() -> List[ToolEntry]:
                         },
                     },
                     "required": ["objective"],
-                    "oneOf": [
-                        {"required": ["run_at"]},
-                        {"required": ["cron"]},
-                    ],
                 },
             },
             handler=_handle_schedule_followup,

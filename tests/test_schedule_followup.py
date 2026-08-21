@@ -523,10 +523,8 @@ def test_schedule_followup_registration_surfaces():
     assert [e.name for e in entries] == ["schedule_followup"]
     schema = entries[0].schema["parameters"]
     assert set(schema["required"]) == {"objective"}
-    assert schema["oneOf"] == [
-        {"required": ["run_at"]},
-        {"required": ["cron"]},
-    ]
+    assert {"run_at", "cron"} <= set(schema["properties"])
+    assert not ({"anyOf", "oneOf", "allOf"} & set(schema))
     from ouroboros.safety import POLICY_SKIP, TOOL_POLICY
 
     assert TOOL_POLICY["schedule_followup"] == POLICY_SKIP
