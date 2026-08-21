@@ -978,7 +978,7 @@ def test_api_row_is_refused_by_root_direct_exact_start_before_daemon(monkeypatch
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "root1"
     schema = next(e.schema for e in delegate.get_tools() if e.name == "delegate_start")["parameters"]
-    assert schema["anyOf"] == [{"required": ["subagent_id"]}, {"required": ["retry_of"]}]
+    assert schema["required"] == ["prompt"] and not ({"anyOf", "oneOf", "allOf"} & schema.keys())
     missing = json.loads(delegate.exact_start(ctx, "bounded leaf"))
     assert missing["reason"] == "subagent_selection_required"
     out = json.loads(delegate.exact_start(

@@ -294,6 +294,12 @@ One configured provider must be sufficient for the agent loop, commit review,
 scope policy, safety, and context/memory flows. Core capability must not acquire
 a hidden OpenRouter or second-provider dependency.
 
+Tool-schema changes are provider-contract changes. Every shipped built-in schema
+must pass general JSON Schema and the known cross-provider subset over the
+complete registry; trusted integration CI sends that same registry in one bounded
+tool canary per supported provider family/API surface, while pull-request CI
+remains secretless.
+
 When adding or changing a provider, update one coherent route contract:
 
 1. credential/readiness detection and exact model-id migration;

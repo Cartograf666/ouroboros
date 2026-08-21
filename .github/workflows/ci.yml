@@ -6,10 +6,10 @@
 # Tier 2.6 (Skill smoke): Push to ouroboros-stable / manual / tag                     → LIVE OuroborosHub official-skill install smoke (3-OS, ~5 min) + review→grant→enable-persistence flow on one cheap reviewer slot (ubuntu-only step, OPENROUTER_API_KEY, ~$1.2/run)
 # Tier 3 (Build+Release): Tag v*                                                       → PyInstaller + GitHub Release (~15 min)
 #
-# Tier 2.5 requires OPENROUTER_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY /
-# CLOUDRU_FOUNDATION_MODELS_API_KEY in
-# repository secrets and runs the `integration` pytest marker; locally these
-# tests are excluded by `addopts = -m 'not integration'` in pyproject.toml.
+# Tier 2.5 requires OPENROUTER_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY.
+# Optional MiniMax / Cloud.ru / GigaChat rows run when their repository secrets
+# exist. The job runs the `integration` pytest marker; locally these tests are
+# excluded by `addopts = -m 'not integration'` in pyproject.toml.
 
 name: CI
 
@@ -184,13 +184,12 @@ jobs:
   # ──────────────────────────────────────────────────────────────────
   # Tier 2.5: Integration tests against real provider APIs
   # Triggered on push to main / ouroboros / ouroboros-stable, manual,
-  # or tag v*. Requires OPENROUTER_API_KEY / OPENAI_API_KEY /
-  # ANTHROPIC_API_KEY / CLOUDRU_FOUNDATION_MODELS_API_KEY in repository secrets. The `integration` pytest
-  # marker (in pyproject.toml) controls inclusion via `-m integration`;
-  # within an included test file, missing-key skipping is done by per-
-  # test `@pytest.mark.skipif(not os.environ.get(KEY))` decorators (see
-  # tests/test_provider_integration.py). NOT a `needs:` of build/
-  # release: a provider outage must not block a tagged release.
+  # or tag v*. OPENROUTER_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY
+  # are required in the official trusted job; MiniMax / Cloud.ru / GigaChat
+  # credentials are optional and their absent rows remain visible as skips.
+  # The `integration` pytest marker controls inclusion via `-m integration`.
+  # Confirmed provider-contract failures block release-preflight; the test
+  # classifier keeps quota/rate-limit/5xx/timeout outcomes inconclusive.
   # ──────────────────────────────────────────────────────────────────
   integration-test:
     if: |
@@ -208,9 +207,11 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
           CLOUDRU_FOUNDATION_MODELS_API_KEY: ${{ secrets.CLOUDRU_FOUNDATION_MODELS_API_KEY }}
           CLOUDRU_FOUNDATION_MODELS_BASE_URL: ${{ secrets.CLOUDRU_FOUNDATION_MODELS_BASE_URL }}
-        run: python -m pytest tests/test_provider_integration.py -m integration -q --tb=short
+          GIGACHAT_CREDENTIALS: ${{ secrets.GIGACHAT_CREDENTIALS }}
+        run: python -m pytest tests/test_provider_integration.py -m integration -q -rs --tb=short
 
   # ──────────────────────────────────────────────────────────────────
   # Tier 2.6: Official-skill install smoke against the LIVE OuroborosHub
@@ -222,8 +223,9 @@ jobs:
   # broken official skill); there is deliberately NO fallback-skip on
   # network failure, and gating the release on live external services
   # (GitHub raw, PyPI, DuckDuckGo, wttr.in, OpenRouter) is a deliberate
-  # owner decision — the opposite trade-off from integration-test, which is
-  # deliberately NOT a release need. Runs the `skill_smoke` pytest marker
+  # owner decision. Provider integration is now a separate release-preflight
+  # dependency with typed inconclusive outcomes for transient outages. Runs
+  # the `skill_smoke` pytest marker
   # (pyproject.toml) as serial pytest invocations: real network installs +
   # real pip installs into per-skill isolated envs are not xdist-safe —
   # never add -n here (the lane's tests are also kept out of the quick/full
@@ -399,7 +401,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────
   release-preflight:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: full-test
+    needs: [full-test, integration-test]
     runs-on: ubuntu-latest
     outputs:
       is_prerelease: ${{ steps.release_meta.outputs.is_prerelease }}

@@ -70,13 +70,54 @@ def test_pull_request_ci_is_fork_safe_and_does_not_enable_provider_jobs():
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
         encoding="utf-8"
     )
+    quick_job = workflow.partition("\n  quick-test:\n")[2].partition(
+        "\n  # ──────────────────────────────────────────────────────────────────"
+    )[0]
 
     assert "pull_request:\n    branches: [ouroboros]" in workflow
     assert "\n  pull_request_target:" not in workflow
+    assert "\n  schedule:" not in workflow
     assert "permissions:\n  contents: read" in workflow
     assert "github.event_name == 'pull_request' && github.base_ref == 'ouroboros'" in workflow
+    assert "secrets." not in quick_job
     assert "release:\n" in workflow
     assert "      contents: write" in workflow
+
+
+def test_trusted_provider_ci_wires_full_secret_policy_and_release_dependency():
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    integration_job = workflow.partition("\n  integration-test:\n")[2].partition(
+        "\n  # ──────────────────────────────────────────────────────────────────"
+    )[0]
+    release_preflight = workflow.partition("\n  release-preflight:\n")[2].partition(
+        "\n  build:\n"
+    )[0]
+
+    assert integration_job
+    assert "github.event_name == 'pull_request'" not in integration_job
+    assert "github.event_name == 'workflow_dispatch'" in integration_job
+    for ref in (
+        "refs/heads/main",
+        "refs/heads/ouroboros",
+        "refs/heads/ouroboros-stable",
+        "refs/tags/v",
+    ):
+        assert ref in integration_job
+
+    for secret in (
+        "OPENROUTER_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
+        "CLOUDRU_FOUNDATION_MODELS_API_KEY",
+        "GIGACHAT_CREDENTIALS",
+    ):
+        assert f"{secret}: ${{{{ secrets.{secret} }}}}" in integration_job
+
+    assert " -rs " in integration_job
+    assert "needs: [full-test, integration-test]" in release_preflight
 
 
 def test_repository_has_explicit_mit_license_holder():

@@ -385,9 +385,11 @@ def test_delegate_start_recipes_match_the_fresh_start_schema():
         entry.schema for entry in delegate.get_tools() if entry.name == "delegate_start"
     )["parameters"]
     assert schema["required"] == ["prompt"]
-    assert {tuple(row["required"]) for row in schema["anyOf"]} == {
-        ("subagent_id",), ("retry_of",),
-    }
+    assert not ({"anyOf", "oneOf", "allOf"} & schema.keys())
+    assert "Required for a fresh start" in schema["properties"]["subagent_id"]["description"]
+    assert "supplying both selectors is a typed conflict" in (
+        schema["properties"]["retry_of"]["description"]
+    )
 
     repo = pathlib.Path(__file__).parents[1]
     recipe_paths = (
