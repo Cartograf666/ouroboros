@@ -180,7 +180,6 @@ BAND_PATHS = {
     "tests/test_swe_pro_e1v2.py": None,
     "tests/test_telegram_miniapp_lifecycle.py": None,
     "tests/test_tool_api_v2_public_surface.py": None,
-    "tests/test_ui_smoke_project_continuity.py": "Terminal Project completion pointer, human routing label, Main/Project history isolation, and panel lifecycle are verified together in the production-shaped browser suite.",
     "tests/test_usage_accounting.py": None,
     "tests/test_v647_megacommit.py": None,
     "tests/test_v6730_origin_invariant.py": None,
