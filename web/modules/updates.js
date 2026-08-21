@@ -263,7 +263,8 @@ export function initUpdates({ mount, state }) {
         } catch (err) {
             const restartRequired = Boolean(err?.body?.restart_required);
             const suffix = restartRequired ? ' Runtime shutdown was incomplete; restart Ouroboros before retrying.' : '';
-            showToast('Update failed: ' + (err.message || err) + suffix, 'error');
+            const stashNote = err?.body?.stash_note ? ` (${err.body.stash_note})` : '';
+            showToast('Update failed: ' + (err.message || err) + stashNote + suffix, 'error');
             applyBtn.disabled = restartRequired;
             applyBtn.textContent = restartRequired ? 'Restart Required' : 'Update Now';
         }

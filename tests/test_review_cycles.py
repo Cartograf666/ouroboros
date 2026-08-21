@@ -95,9 +95,14 @@ def test_getter_env_or_default_and_fail_closed_logged_once(monkeypatch, caplog):
 
 
 def test_settings_file_roundtrip_projects_unlimited_into_env(monkeypatch, tmp_path):
-    # apply_settings_to_env writes os.environ directly; register the key with monkeypatch
-    # first so the projected value is restored after the test (no cross-test leak).
-    monkeypatch.delenv(KEY, raising=False)
+    # apply_settings_to_env writes os.environ directly. SETENV-then-DELENV is
+    # what registers the key's original (absent) state with monkeypatch:
+    # pytest's delenv on an ABSENT key records NOTHING, so the previous
+    # delenv-only registration silently LEAKED the projected "3" into sibling
+    # tests on the same xdist worker (observed: improvement-pass caps reading
+    # cycles=3 in test_review_verification_v6544).
+    monkeypatch.setenv(KEY, "registered-for-restore")
+    monkeypatch.delenv(KEY)
     settings_path = tmp_path / "settings.json"
     settings_path.write_text(json.dumps({KEY: "unlimited"}), encoding="utf-8")
     monkeypatch.setattr(cfg, "SETTINGS_PATH", settings_path)
@@ -183,10 +188,13 @@ def test_improvement_pass_gate_and_rails_follow_shared_cap(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Commit gate reads the live value
+# Commit gate reads the live value: the shared knob bounds PAID triad+scope
+# cycles per ROOT task (Q16/Q23); the identical-diff refusal is knob-independent
+# and covered in tests/test_commit_gate.py + tests/test_review_cycles_gates.py.
 
 
-def _seed_blocks(tmp_path, count, fingerprint="fp-same"):
+def _seed_paid_attempts(tmp_path, count, *, start=1, root="root-1", status="succeeded",
+                        block_reason="", block_class="", phase="commit", paid=True):
     from ouroboros.review_state import CommitAttemptRecord, make_repo_key, update_state, _utc_now
 
     repo_key = make_repo_key(pathlib.Path(tmp_path))
@@ -194,55 +202,109 @@ def _seed_blocks(tmp_path, count, fingerprint="fp-same"):
     def _mutate(state):
         for i in range(count):
             state.attempts.append(CommitAttemptRecord(
-                ts=_utc_now(), commit_message="msg", status="blocked",
-                block_reason="critical_findings", repo_key=repo_key,
-                tool_name="commit_reviewed", task_id="t-cap", attempt=i + 1,
-                phase="blocking_review", pre_review_fingerprint=fingerprint,
+                ts=_utc_now(), commit_message="msg", status=status,
+                block_reason=block_reason, block_class=block_class,
+                repo_key=repo_key, tool_name="commit_reviewed", task_id=root,
+                attempt=start + i, phase=phase, paid=paid,
+                pre_review_fingerprint=f"fp-{start + i}",
+                root_task_id=root,
             ))
     update_state(pathlib.Path(tmp_path), _mutate)
 
 
-def test_commit_gate_cap_reads_live_setting(monkeypatch, tmp_path):
-    from ouroboros.tools.commit_gate import blocked_attempt_fingerprint_cap, check_blocked_attempt_cap
+def test_commit_gate_ceiling_reads_live_setting(monkeypatch, tmp_path):
+    from ouroboros.tools.commit_gate import (
+        check_review_cycles_ceiling,
+        count_paid_review_cycles,
+    )
 
-    ctx = types.SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, task_id="t-cap")
-    assert blocked_attempt_fingerprint_cap() == 2  # default moved 3 -> 2 (D20, disclosed)
-    _seed_blocks(tmp_path, 1)
-    assert check_blocked_attempt_cap(ctx, "fp-same") == ""
-    _seed_blocks(tmp_path, 1)  # streak 2 == cap: refused
-    msg = check_blocked_attempt_cap(ctx, "fp-same")
-    assert "REVIEW_ATTEMPT_CAP" in msg and "2 times in a row" in msg
+    ctx = types.SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, task_id="root-1")
+    assert rc.review_max_cycles() == 2  # default moved 3 -> 2 (D20, disclosed)
+    _seed_paid_attempts(tmp_path, 1)
+    assert count_paid_review_cycles(ctx, root_task_id="root-1") == 1
+    assert check_review_cycles_ceiling(ctx, root_task_id="root-1") is None
+    _seed_paid_attempts(tmp_path, 1, start=2)  # 2 paid == cap: refused
+    exhausted = check_review_cycles_ceiling(ctx, root_task_id="root-1")
+    assert exhausted is not None and "REVIEW_CYCLES_EXHAUSTED" in exhausted["message"]
+    assert exhausted["cycles_paid"] == 2 and exhausted["cap"] == 2
+    # Another root task has its own ceiling.
+    assert check_review_cycles_ceiling(ctx, root_task_id="root-2") is None
+    # An unknown root never gates (fail-open, disclosed).
+    assert check_review_cycles_ceiling(ctx, root_task_id="") is None
     # Raise the shared cap: the SAME ledger is below it again.
     monkeypatch.setenv(KEY, "4")
-    assert blocked_attempt_fingerprint_cap() == 4
-    assert check_blocked_attempt_cap(ctx, "fp-same") == ""
-    _seed_blocks(tmp_path, 2)  # streak 4
-    assert "REVIEW_ATTEMPT_CAP" in check_blocked_attempt_cap(ctx, "fp-same")
-    # Unlimited: never cap, however long the identical-diff streak.
+    assert check_review_cycles_ceiling(ctx, root_task_id="root-1") is None
+    _seed_paid_attempts(tmp_path, 2, start=3)
+    assert check_review_cycles_ceiling(ctx, root_task_id="root-1") is not None
+    # Unlimited: never a ceiling, however many paid cycles.
     monkeypatch.setenv(KEY, "unlimited")
-    assert blocked_attempt_fingerprint_cap() is None
-    _seed_blocks(tmp_path, 10)
-    assert check_blocked_attempt_cap(ctx, "fp-same") == ""
+    _seed_paid_attempts(tmp_path, 10, start=5)
+    assert check_review_cycles_ceiling(ctx, root_task_id="root-1") is None
     # Garbage fails closed to the bounded default (2), never to "no cap".
     monkeypatch.setenv(KEY, "lots")
-    assert blocked_attempt_fingerprint_cap() == 2
-    assert "REVIEW_ATTEMPT_CAP" in check_blocked_attempt_cap(ctx, "fp-same")
+    assert check_review_cycles_ceiling(ctx, root_task_id="root-1") is not None
+
+
+def test_paid_cycle_count_counts_dispatched_money_only(tmp_path, monkeypatch):
+    """machine-5 contract: the ceiling counts MONEY. Every row that physically
+    dispatched a wave (paid=True) counts whatever its terminal — verdict-block,
+    pass, success, quorum-failed infra-block, crashed/expired failure alike.
+    Only undispatched rows (paid=False: legacy history, free replays,
+    preflight refusals) stay outside the count."""
+    from ouroboros.tools.commit_gate import count_paid_review_cycles
+
+    monkeypatch.delenv(KEY, raising=False)
+    ctx = types.SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, task_id="root-1")
+    _seed_paid_attempts(tmp_path, 1, status="blocked", block_reason="critical_findings",
+                        block_class="verdict", phase="blocking_review")
+    _seed_paid_attempts(tmp_path, 1, start=2, status="reviewed", phase="review_only")
+    _seed_paid_attempts(tmp_path, 1, start=3)  # succeeded
+    assert count_paid_review_cycles(ctx, root_task_id="root-1") == 3
+    # Dispatched-then-degraded waves spent reviewer money: they count.
+    _seed_paid_attempts(tmp_path, 1, start=4, status="blocked", block_reason="review_quorum",
+                        block_class="infra", phase="blocking_review")
+    _seed_paid_attempts(tmp_path, 1, start=5, status="failed", block_reason="infra_failure",
+                        phase="expired")
+    _seed_paid_attempts(tmp_path, 1, start=6, status="failed",
+                        block_reason="post_commit_tests_failed", phase="post_commit_tests")
+    assert count_paid_review_cycles(ctx, root_task_id="root-1") == 6
+    # Undispatched rows (legacy / free replay / refusals) never count.
+    _seed_paid_attempts(tmp_path, 1, start=7, paid=False)
+    _seed_paid_attempts(tmp_path, 1, start=8, status="blocked", paid=False,
+                        block_reason="identical_diff_refused", phase="preflight")
+    assert count_paid_review_cycles(ctx, root_task_id="root-1") == 6
 
 
 def test_commit_gate_has_no_import_time_cap_constant():
     import ouroboros.tools.commit_gate as commit_gate
 
     assert not hasattr(commit_gate, "BLOCKED_ATTEMPT_FINGERPRINT_CAP")
+    # The pre-Q16 paid-identical-re-review API is retired: identical bytes are
+    # refused free from the first verdict-block, not re-reviewed up to a cap.
+    assert not hasattr(commit_gate, "check_blocked_attempt_cap")
+    assert not hasattr(commit_gate, "blocked_attempt_fingerprint_cap")
 
 
-def test_advisory_review_schema_note_derives_from_shared_cap(monkeypatch):
+def test_advisory_review_schema_note_states_paid_cycle_semantics(monkeypatch):
     from ouroboros.tools.claude_advisory_review import _identical_diff_cap_note
 
-    assert "after 2 genuine review-verdict block(s)" in _identical_diff_cap_note()
+    note = _identical_diff_cap_note()
+    assert "identical bytes are never re-reviewed for pay" in note
+    assert "identical_diff_refused" in note
+    assert "after 2 paid cycle(s)" in note
+    assert "per ROOT task" in note  # wording-5: the tree shares one ceiling
+    # Honesty caveat (synthesis F6): the identical-diff refusal replays only
+    # recorded VERDICT blocks, which a pure advisory line never mints — there
+    # the no-new-spend guarantee is the exhaustion free replay.
+    assert "Under blocking enforcement an identical resubmission after a recorded" in note
+    assert "a pure advisory line never mints verdict blocks" in note
+    assert "exhaustion free replay" in note
     monkeypatch.setenv(KEY, "5")
-    assert "after 5 genuine" in _identical_diff_cap_note()
+    assert "after 5 paid cycle(s)" in _identical_diff_cap_note()
     monkeypatch.setenv(KEY, "unlimited")
-    assert "no identical-diff cap is configured" in _identical_diff_cap_note()
+    note = _identical_diff_cap_note()
+    assert "no per-root-task ceiling" in note
+    assert "identical bytes are never re-reviewed for pay" in note  # knob-independent
     source = (REPO / "ouroboros" / "tools" / "claude_advisory_review.py").read_text(encoding="utf-8")
     assert "after 3 genuine" not in source
 

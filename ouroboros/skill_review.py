@@ -56,7 +56,6 @@ from ouroboros.tools.review_helpers import (
 from ouroboros.triad_review import emit_review_model_error_events, extract_json_array, parse_model_review_results
 from ouroboros.utils import (
     append_jsonl,
-    atomic_write_json,
     estimate_tokens,
     sanitize_tool_result_for_log,
     utc_now_iso,
@@ -183,6 +182,18 @@ class SkillReviewOutcome:
     requested_permissions: List[str] = field(default_factory=list)
     auto_granted_permissions: List[str] = field(default_factory=list)
     review_profile: str = ""
+    # Max-Review-Cycles facts (Q17/Q23): ``paid`` = a reviewer panel was
+    # physically dispatched for this outcome (recorded WRITE-AHEAD at dispatch
+    # via the durable dispatch marker; one chunked wave = ONE cycle) with
+    # ``wave_id`` naming that dispatch; the contract fingerprint the panel ran
+    # under; the content hash of the rebuttal supplied; and, for a $0 free
+    # replay, the ts of the recorded verdict it quotes. All land on the
+    # terminal history row.
+    paid: bool = False
+    wave_id: str = ""
+    review_contract_fingerprint: str = ""
+    rebuttal_sha256: str = ""
+    replayed_from_ts: str = ""
 
 
 def _apply_auto_grant_outcome(outcome: SkillReviewOutcome, skill: Any, auto_grant: Any) -> None:
@@ -284,122 +295,18 @@ def _review_history_path(drive_root: pathlib.Path, skill_name: str) -> pathlib.P
     return review_history_path(drive_root, skill_name)
 
 
-def _accepted_rebuttals_path(drive_root: pathlib.Path, skill_name: str) -> pathlib.Path:
-    """Path to persisted accepted rebuttals for one skill."""
-    return drive_root / "state" / "skills" / skill_name / "accepted_rebuttals.json"
-
-
-def _load_accepted_rebuttals(drive_root: pathlib.Path, skill_name: str) -> List[Dict[str, Any]]:
-    """Return persisted accepted rebuttals (empty list when none / unreadable)."""
-    path = _accepted_rebuttals_path(drive_root, skill_name)
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError:
-        return []
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(data, dict):
-        return []
-    items = data.get("items")
-    if not isinstance(items, list):
-        return []
-    out: List[Dict[str, Any]] = []
-    for entry in items:
-        if isinstance(entry, dict):
-            out.append(entry)
-    return out
-
-
-def _persist_rebuttal_flips(
-    drive_root: pathlib.Path,
-    skill_name: str,
-    *,
-    history: List[Dict[str, Any]],
-    findings: List[Dict[str, Any]],
-    review_rebuttal: str,
-    content_hash: str,
-    responded_models: List[str],
-) -> None:
-    """Record rebuttals for items that flipped FAIL -> PASS on this attempt."""
-    if not review_rebuttal or not history:
-        return
-    last_fail_items = _fail_items_from_history_entry(history[-1])
-    current_fail_items = {
-        str(f.get("item") or "")
-        for f in findings
-        if isinstance(f, dict)
-        and str(f.get("verdict") or "").upper() == "FAIL"
-        and str(f.get("item") or "")
-    }
-    for item in sorted(last_fail_items - current_fail_items):
-        _record_accepted_rebuttal(
-            drive_root,
-            skill_name,
-            item=item,
-            rebuttal_text=review_rebuttal,
-            content_hash=content_hash,
-            passed_models=list(responded_models),
-        )
-
-
-def _fail_items_from_history_entry(entry: Dict[str, Any]) -> set[str]:
-    """Return FAIL item names from both v5.18 and legacy history entries."""
-    out = {
-        str(f.get("item") or "")
-        for f in (entry.get("fail_findings") or [])
-        if isinstance(f, dict) and str(f.get("item") or "")
-    }
-    if out:
-        return out
-    for signature in entry.get("failure_signature") or []:
-        parts = str(signature or "").split(":")
-        if len(parts) >= 2 and parts[1].upper() == "FAIL" and parts[0]:
-            out.add(parts[0])
-    return out
-
-
-def _record_accepted_rebuttal(
-    drive_root: pathlib.Path,
-    skill_name: str,
-    *,
-    item: str,
-    rebuttal_text: str,
-    content_hash: str,
-    passed_models: Optional[List[str]] = None,
-) -> None:
-    """Persist (or refresh) an accepted rebuttal for ``item``."""
-    path = _accepted_rebuttals_path(drive_root, skill_name)
-    existing = _load_accepted_rebuttals(drive_root, skill_name)
-    target: Optional[Dict[str, Any]] = None
-    for entry in existing:
-        if str(entry.get("item") or "") == item:
-            target = entry
-            break
-    if target is None:
-        target = {
-            "item": item,
-            "rebuttal_text": rebuttal_text,
-            "accepted_at": utc_now_iso(),
-            "content_hash_seen": [content_hash] if content_hash else [],
-            "models_that_passed_after": list(passed_models or []),
-        }
-        existing.append(target)
-    else:
-        target["rebuttal_text"] = rebuttal_text
-        target["accepted_at"] = utc_now_iso()
-        seen = list(target.get("content_hash_seen") or [])
-        if content_hash and content_hash not in seen:
-            seen.append(content_hash)
-        target["content_hash_seen"] = seen
-        if passed_models:
-            target["models_that_passed_after"] = list(passed_models)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(path, {"items": existing}, trailing_newline=True)
-    except OSError:
-        log.debug("accepted rebuttal write failed", exc_info=True)
+# The accepted-rebuttal ledger and the Max-Review-Cycles machinery moved whole
+# to ouroboros/skill_review_cycles.py (module-size gate; same split shape as
+# phase 0's update_candidate.py). Historical names stay importable from here.
+from ouroboros.skill_review_cycles import (  # noqa: E402
+    accepted_rebuttals_path as _accepted_rebuttals_path,  # noqa: F401 — re-export
+    load_accepted_rebuttals as _load_accepted_rebuttals,
+    fail_items_from_history_entry as _fail_items_from_history_entry,  # noqa: F401 — re-export
+    install_skill_dispatch_stamp as _install_skill_dispatch_stamp,
+    persist_rebuttal_flips as _persist_rebuttal_flips,
+    record_accepted_rebuttal as _record_accepted_rebuttal,  # noqa: F401 — re-export
+    review_wave_budget_block as _review_wave_budget_block,
+)
 
 
 def _build_skill_review_history_section(
@@ -1036,53 +943,6 @@ def _run_skill_advisory_pre_review(ctx: Any, *, skill_name: str, file_pack: str)
     return {"status": "empty", "prompt_section": ""}
 
 
-def _review_wave_budget_block(
-    ctx: Any,
-    skill_name: str,
-    file_packs: List[str],
-    models: List[str],
-) -> Optional[str]:
-    """Return a human-readable refusal when the review wave cannot fit the
-    remaining root budget, else None. Read-only; emits one typed event."""
-    from ouroboros.tools.review_helpers import review_wave_budget_gate
-
-    # Estimate the WHOLE wave: a chunked oversized skill runs one full
-    # reviewer pass PER pack (run_skill_review_passes), and every pass re-sends
-    # the stable governance/checklist/host-contract files the prompt builder
-    # inlines — so both the payload chars and the governance chars multiply by
-    # the pack count. A single-pack estimate would under-admit exactly the
-    # multi-chunk waves most likely to die mid-review.
-    governance_chars = 0
-    for rel in (
-        "docs/ARCHITECTURE.md", "docs/DEVELOPMENT.md", "BIBLE.md",
-        "docs/CHECKLISTS.md", "docs/CREATING_SKILLS.md",
-    ):
-        try:
-            governance_chars += int((_REPO_ROOT / rel).stat().st_size)
-        except OSError:
-            pass
-    packs = max(1, len(file_packs))
-    total_chars = sum(len(pack) + governance_chars for pack in file_packs)
-    # One admission slot per PHYSICAL reviewer call (models x packs), each
-    # sized at the average per-pack prompt: the input estimate sums to the
-    # exact wave total while the per-call output reservation also multiplies
-    # by the pack count (a models-only wave under-reserved chunked output).
-    admission = review_wave_budget_gate(
-        ctx, surface="skill_review", models=list(models) * packs,
-        prompt_chars=total_chars // packs,
-        extra={"skill_name": skill_name, "packs": packs},
-    )
-    if admission is None:
-        return None
-    return (
-        "review wave declined before dispatch: estimated reviewer-wave cost "
-        f"~${admission.get('estimated_wave_usd')} exceeds the remaining root budget "
-        f"${admission.get('remaining_usd')} (limit ${admission.get('limit_usd')}). "
-        "No reviewer was called; the skill stays pending. Raise the per-task "
-        "budget or re-run the review in a fresh task."
-    )
-
-
 def _build_review_prompt_for_attempt(
     ctx: Any,
     drive_root: pathlib.Path,
@@ -1247,6 +1107,68 @@ def is_official_hub_payload_verified(skill: Any) -> bool:
 # Public entry point
 
 
+def _skill_cycles_gate(
+    ctx: Any,
+    skill: Any,
+    drive_root: pathlib.Path,
+    models: List[str],
+    review_rebuttal: str,
+    content_hash: str,
+) -> tuple[Optional["SkillReviewOutcome"], str, str, str]:
+    """Max Review Cycles on the skill gate (Q17/Q23), run BEFORE any paid
+    panel: a byte-identical snapshot with a recorded substantive verdict under
+    the same panel contract replays for FREE, and the shared knob bounds PAID
+    panel cycles per ceiling key (root task for task-driven groups; the manual
+    lane per content_hash). Returns ``(early_outcome_or_None,
+    contract_fingerprint, rebuttal_sha256, review_profile)`` — the resolved
+    profile is part of the panel-contract identity and is computed ONCE here
+    for the whole review."""
+    from ouroboros.skill_review_cycles import (
+        free_replay_outcome,
+        skill_review_contract_fingerprint,
+        skill_review_cycles_refusal,
+    )
+    from ouroboros.tools.commit_gate import compute_rebuttal_sha256
+
+    review_profile = _official_hub_review_profile(skill)
+    contract_fp = skill_review_contract_fingerprint(
+        models, required_items=_SKILL_REVIEW_ITEMS, review_profile=review_profile,
+    )
+    rebuttal_sha = compute_rebuttal_sha256(review_rebuttal)
+    group_id = str(getattr(ctx, "_skill_review_group_id", "") or "") or f"manual:{skill.name}"
+    replayed = free_replay_outcome(
+        skill, drive_root=drive_root, group_id=group_id, content_hash=content_hash,
+        contract_fingerprint=contract_fp, rebuttal_sha256=rebuttal_sha,
+    )
+    if replayed is not None:
+        return replayed, contract_fp, rebuttal_sha, review_profile
+    refusal = skill_review_cycles_refusal(
+        ctx, skill.name, drive_root=drive_root, group_id=group_id, models=models,
+        content_hash=content_hash, contract_fingerprint=contract_fp,
+    )
+    return refusal, contract_fp, rebuttal_sha, review_profile
+
+
+def _stamp_paid_facts(
+    outcome: "SkillReviewOutcome",
+    contract_fp: str,
+    rebuttal_sha: str,
+    stamp: Any = None,
+) -> "SkillReviewOutcome":
+    """Max-Review-Cycles facts for a post-panel outcome: the contract and
+    rebuttal identities always ride it; ``paid`` (and the wave id) only when
+    the wave PHYSICALLY dispatched — ``stamp.fired`` mirrors the durable
+    write-ahead dispatch marker recorded before the first transport call
+    (plan-review precedent), so a crash cannot launder the spend and an
+    assembly-refused $0 wave never counts."""
+    outcome.paid = bool(stamp is not None and getattr(stamp, "fired", False))
+    outcome.review_contract_fingerprint = contract_fp
+    outcome.rebuttal_sha256 = rebuttal_sha
+    if outcome.paid:
+        outcome.wave_id = str(getattr(stamp, "wave_id", "") or "")
+    return outcome
+
+
 def _skill_quorum_failure_outcome(
     skill: Any,
     *,
@@ -1261,10 +1183,18 @@ def _skill_quorum_failure_outcome(
     drive_root: pathlib.Path,
     persist: bool,
     lifecycle_owns_history: bool = False,
+    paid: bool = False,
+    review_contract_fingerprint: str = "",
+    rebuttal_sha256: str = "",
+    wave_id: str = "",
 ) -> SkillReviewOutcome:
     """PENDING outcome for a skill review that missed the adaptive reviewer quorum,
     preserving the single-reviewer degraded marker on the outcome AND the durable
-    history (extracted to keep ``review_skill`` under the function-size gate)."""
+    history (extracted to keep ``review_skill`` under the function-size gate).
+    The caller passes the Max-Review-Cycles paid facts (F3): the internal
+    history append must carry them — a dispatched quorum failure spent
+    reviewer money, and an unpaid row here would let the direct
+    ``review_skill(persist=True)`` path (marketplace install) launder it."""
     outcome = SkillReviewOutcome(
         skill_name=skill.name,
         status=STATUS_PENDING,
@@ -1289,6 +1219,10 @@ def _skill_quorum_failure_outcome(
             findings=findings,
             raw_actor_records=[record.to_dict() for record in parsed_review.actor_records],
             single_reviewer_no_diversity=single_reviewer_no_diversity,
+            paid=paid,
+            review_contract_fingerprint=review_contract_fingerprint,
+            rebuttal_sha256=rebuttal_sha256,
+            wave_id=wave_id,
         )
     return outcome
 
@@ -1417,6 +1351,12 @@ def review_skill(
             skill_name=skill.name, status=STATUS_PENDING, content_hash=content_hash,
             error=f"invalid reviewer-slot configuration blocks skill review: {slot_err}")
     models = list(get_review_models())
+    early_outcome, contract_fp, rebuttal_sha, review_profile = _skill_cycles_gate(
+        ctx, skill, drive_root, models, review_rebuttal, content_hash,
+    )
+    if early_outcome is not None:
+        return early_outcome
+
     if len(file_packs) > 1:
         log.warning(
             "Skill %s exceeds the reviewer token budget; reviewing in %d chunked passes.",
@@ -1433,52 +1373,68 @@ def review_skill(
                                   error=budget_block)
     from ouroboros.skill_review_passes import run_skill_review_passes
 
-    prompt, advisory_evidence, result_json_text, infra_error = run_skill_review_passes(
-        ctx,
-        drive_root,
-        skill,
-        evidence={
-            "manifest_dump": manifest_dump,
-            "content_hash": content_hash,
-            "history": history,
-            "review_rebuttal": review_rebuttal,
-            "required_items": _SKILL_REVIEW_ITEMS,
-        },
-        file_packs=file_packs,
-        models=models,
-        build_prompt=_build_review_prompt_for_attempt,
-        run_review=_handle_multi_model_review,
+    # F3 write-ahead seam: the durable dispatch marker lands immediately
+    # before the panel's first transport call (assembly failures inside the
+    # pass runner stay $0); every post-panel outcome below derives its paid
+    # fact from whether the stamp actually fired.
+    stamp, _prior_stamp = _install_skill_dispatch_stamp(
+        ctx, drive_root, skill.name,
+        group_id=str(getattr(ctx, "_skill_review_group_id", "") or "") or f"manual:{skill.name}",
+        content_hash=content_hash, contract_fp=contract_fp, rebuttal_sha=rebuttal_sha,
     )
+
+    def _paid_facts(outcome: SkillReviewOutcome) -> SkillReviewOutcome:
+        return _stamp_paid_facts(outcome, contract_fp, rebuttal_sha, stamp)
+
+    try:
+        prompt, advisory_evidence, result_json_text, infra_error = run_skill_review_passes(
+            ctx,
+            drive_root,
+            skill,
+            evidence={
+                "manifest_dump": manifest_dump,
+                "content_hash": content_hash,
+                "history": history,
+                "review_rebuttal": review_rebuttal,
+                "required_items": _SKILL_REVIEW_ITEMS,
+            },
+            file_packs=file_packs,
+            models=models,
+            build_prompt=_build_review_prompt_for_attempt,
+            run_review=_handle_multi_model_review,
+        )
+    finally:
+        ctx._review_paid_stamp = _prior_stamp
     if infra_error:
         log.warning("Skill review infrastructure failure for %s: %s", skill.name, infra_error)
-        return SkillReviewOutcome(
+        return _paid_facts(SkillReviewOutcome(
             skill_name=skill.name,
             status=STATUS_PENDING,
             reviewer_models=models,
             content_hash=content_hash,
             error=f"infrastructure failure: {sanitize_tool_result_for_log(infra_error)}",
-        )
+        ))
 
     try:
         result_json = json.loads(result_json_text)
     except json.JSONDecodeError:
-        return SkillReviewOutcome(
+        return _paid_facts(SkillReviewOutcome(
             skill_name=skill.name,
             status=STATUS_PENDING,
             reviewer_models=models,
             content_hash=content_hash,
             error="review returned non-JSON top-level response",
             raw_result=_truncate_raw_result(result_json_text),
-        )
+        ))
 
     if "error" in result_json:
-        return SkillReviewOutcome(
+        return _paid_facts(SkillReviewOutcome(
             skill_name=skill.name,
             status=STATUS_PENDING,
             reviewer_models=models,
             content_hash=content_hash,
             error=f"review service error: {result_json['error']}",
-        )
+        ))
 
     parsed_review = parse_model_review_results(result_json, required_items=_SKILL_REVIEW_ITEMS)
     emit_review_model_error_events(ctx, parsed_review, source="skill_review", skill_name=skill.name)
@@ -1491,7 +1447,7 @@ def review_skill(
         # P3) — in the outcome + review history below, not just this log line.
         log.warning("Skill review (trust gate) ran with a single reviewer (single_reviewer_no_diversity).")
     if len(responded_models) < required_quorum:
-        return _skill_quorum_failure_outcome(
+        return _paid_facts(_skill_quorum_failure_outcome(
             skill,
             findings=findings,
             models=models,
@@ -1504,16 +1460,23 @@ def review_skill(
             drive_root=drive_root,
             persist=persist,
             lifecycle_owns_history=bool(getattr(ctx, "_skill_review_lifecycle_guard", False)),
-        )
+            # F3(a): the internal history append must carry the paid facts —
+            # a dispatched quorum failure spent reviewer money.
+            paid=bool(getattr(stamp, "fired", False)),
+            review_contract_fingerprint=contract_fp,
+            rebuttal_sha256=rebuttal_sha,
+            wave_id=str(getattr(stamp, "wave_id", "") or "") if getattr(stamp, "fired", False) else "",
+        ))
 
-    review_profile = _official_hub_review_profile(skill)
+    # review_profile was resolved ONCE in _skill_cycles_gate (it is part of
+    # the panel-contract fingerprint) and rides down to aggregation here.
     status = _aggregate_status(
         findings,
         skill_type=skill.manifest.type,
         is_module_widget=_is_module_widget_skill(skill),
         review_profile=review_profile,
     )
-    outcome = SkillReviewOutcome(
+    outcome = _paid_facts(SkillReviewOutcome(
         skill_name=skill.name,
         status=status,
         findings=findings,
@@ -1526,69 +1489,77 @@ def review_skill(
         advisory_result=advisory_evidence,
         convergence_hint=_convergence_hint(history, findings, current_status=status),
         review_profile=review_profile,
-    )
+    ))
 
     if persist:
-        if getattr(ctx, "_skill_review_lifecycle_guard", False):
-            from ouroboros.skill_review_runner import _can_persist_review_outcome
+        return _persist_reviewed_outcome(
+            ctx, skill, drive_root, outcome,
+            history=history, review_rebuttal=review_rebuttal,
+            contract_fp=contract_fp, rebuttal_sha=rebuttal_sha,
+        )
+    return outcome
 
-            if not _can_persist_review_outcome(
-                drive_root,
-                skill.name,
-                content_hash,
-                expected_job_id=str(getattr(ctx, "_skill_review_lifecycle_job_id", "") or ""),
-            ):
-                outcome.status = STATUS_PENDING
-                outcome.error = (
-                    "review outcome was not persisted because the lifecycle job "
-                    "is already terminal or no longer matches this content hash"
-                )
-                return outcome
-        save_review_state(
+
+def _persist_reviewed_outcome(
+    ctx: Any,
+    skill: Any,
+    drive_root: pathlib.Path,
+    outcome: SkillReviewOutcome,
+    *,
+    history: List[Dict[str, Any]],
+    review_rebuttal: str,
+    contract_fp: str,
+    rebuttal_sha: str,
+) -> SkillReviewOutcome:
+    """Persist one reviewed verdict (state, history, rebuttal flips, auto-grant)
+    — extracted whole from ``review_skill`` at the function-size gate."""
+    content_hash = outcome.content_hash
+    if getattr(ctx, "_skill_review_lifecycle_guard", False):
+        from ouroboros.skill_review_runner import _can_persist_review_outcome
+
+        if not _can_persist_review_outcome(
             drive_root,
             skill.name,
-            SkillReviewState(
-                status=outcome.status,
-                content_hash=content_hash,
-                findings=findings,
-                reviewer_models=responded_models,
-                timestamp=utc_now_iso(),
-                prompt_chars=outcome.prompt_chars,
-                cost_usd=outcome.cost_usd,
-                raw_result=outcome.raw_result,
-                raw_actor_records=[record.to_dict() for record in parsed_review.actor_records],
-                advisory_result=dict(advisory_evidence or {}),
-                review_profile=review_profile,
-            ),
-        )
-        if not getattr(ctx, "_skill_review_lifecycle_guard", False):
-            _append_skill_review_history(
-                drive_root, skill.name,
-                status=outcome.status, content_hash=content_hash, findings=findings,
-                single_reviewer_no_diversity=single_reviewer_no_diversity,
+            content_hash,
+            expected_job_id=str(getattr(ctx, "_skill_review_lifecycle_job_id", "") or ""),
+        ):
+            outcome.status = STATUS_PENDING
+            outcome.error = (
+                "review outcome was not persisted because the lifecycle job "
+                "is already terminal or no longer matches this content hash"
             )
-        _persist_rebuttal_flips(
+            return outcome
+    persisted_state = SkillReviewState(
+        status=outcome.status,
+        content_hash=content_hash,
+        findings=outcome.findings,
+        reviewer_models=outcome.reviewer_models,
+        timestamp=utc_now_iso(),
+        prompt_chars=outcome.prompt_chars,
+        cost_usd=outcome.cost_usd,
+        raw_result=outcome.raw_result,
+        raw_actor_records=list(outcome.raw_actor_records or []),
+        advisory_result=dict(outcome.advisory_result or {}),
+        review_profile=outcome.review_profile,
+    )
+    save_review_state(drive_root, skill.name, persisted_state)
+    if not getattr(ctx, "_skill_review_lifecycle_guard", False):
+        _append_skill_review_history(
             drive_root, skill.name,
-            history=history, findings=findings,
-            review_rebuttal=review_rebuttal, content_hash=content_hash,
-            responded_models=list(responded_models),
+            status=outcome.status, content_hash=content_hash, findings=outcome.findings,
+            single_reviewer_no_diversity=outcome.single_reviewer_no_diversity,
+            paid=outcome.paid, review_contract_fingerprint=contract_fp,
+            rebuttal_sha256=rebuttal_sha, wave_id=outcome.wave_id,
         )
-        skill.review = SkillReviewState(
-            status=outcome.status,
-            content_hash=content_hash,
-            findings=findings,
-            reviewer_models=responded_models,
-            timestamp=utc_now_iso(),
-            prompt_chars=outcome.prompt_chars,
-            cost_usd=outcome.cost_usd,
-            raw_result=outcome.raw_result,
-            raw_actor_records=[record.to_dict() for record in parsed_review.actor_records],
-            advisory_result=dict(advisory_evidence or {}),
-            review_profile=review_profile,
-        )
-        auto_grant = auto_grant_if_enabled(drive_root, skill)
-        _apply_auto_grant_outcome(outcome, skill, auto_grant)
-
+    _persist_rebuttal_flips(
+        drive_root, skill.name,
+        history=history, findings=outcome.findings,
+        review_rebuttal=review_rebuttal, content_hash=content_hash,
+        responded_models=list(outcome.reviewer_models),
+    )
+    skill.review = persisted_state
+    auto_grant = auto_grant_if_enabled(drive_root, skill)
+    _apply_auto_grant_outcome(outcome, skill, auto_grant)
     return outcome
 
 

@@ -149,7 +149,12 @@ _SUBAGENT_SHELL_SECRET_MARKERS = (
     # from a workspace cwd) needs the slash-less marker too.
     "/data/settings.json", "data/settings.json", "ouroboros/data/settings", "file1.txt",
     # Universal credential/secret/control files (relative or absolute).
-    ".env", ".git/config", ".git/credentials", "credentials.json", "tokens.json",
+    # ouroboros-update-tx.json is the managed-update tx marker (.git/…): owner
+    # control state, mirrored on .git/config. Subagent shell only — the
+    # authorized resolver is the MAIN agent and the supervisor/host writers go
+    # through supervisor.update_merge, so neither is affected (synthesis F3).
+    ".env", ".git/config", ".git/credentials", "ouroboros-update-tx.json",
+    "credentials.json", "tokens.json",
     "/.ssh/", ".ssh/", "id_rsa", "id_ed25519", ".netrc", ".npmrc", ".pgpass", ".aws/",
 )
 
@@ -245,15 +250,44 @@ def _managed_update_code_tool_block(ctx: Any, name: str) -> str:
 
 
 def _authorized_managed_update_resolver(ctx: Any) -> bool:
-    """Whether this task is the durable tx-authorized assisted resolver."""
-    try:
-        from supervisor.update_merge import authorized_assisted_task
+    """Whether this task is the durable tx-authorized assisted resolver.
 
-        return bool(authorized_assisted_task(
+    Fail-closed bool for every authority consumer (False = no extra powers).
+    The AUTHORITY-READ failure is additionally distinguished from an honest
+    "not the resolver" via a typed ctx marker (``_managed_authority_read_error``:
+    set on an unreadable read AND on a corrupt tx marker, cleared on every
+    healthy evaluation), so the review-subject builder can fail LOUDLY instead
+    of silently reviewing a possibly-managed candidate as an ordinary full
+    staged capture."""
+    try:
+        from supervisor.update_merge import authorized_assisted_task_strict
+
+        marker_status, tx = authorized_assisted_task_strict(
             getattr(ctx, "task_id", ""),
             getattr(ctx, "task_metadata", None),
-        ))
-    except Exception:
+        )
+        try:
+            if marker_status == "corrupt":
+                # A tx marker EXISTS but cannot be parsed: authority stays
+                # False (fail-closed) for every bool consumer, but the loud
+                # A4 channel must fire — clearing the marker here would let
+                # the review subject silently treat a possibly-managed
+                # candidate as an ordinary full staged diff.
+                setattr(
+                    ctx, "_managed_authority_read_error",
+                    "update_tx_corrupt: the managed update transaction marker "
+                    "exists but could not be parsed",
+                )
+            else:
+                setattr(ctx, "_managed_authority_read_error", "")
+        except Exception:
+            pass
+        return bool(tx)
+    except Exception as exc:
+        try:
+            setattr(ctx, "_managed_authority_read_error", repr(exc))
+        except Exception:
+            pass
         return False
 
 

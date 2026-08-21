@@ -238,10 +238,10 @@ def _iter_lexical_functions(tree: ast.AST, path: str) -> Iterator[GatedFunction]
 
 
 # (path, sha1 of the module text) -> its exact function inventory. Parsing is a
-# pure function of that key, and the first-parent history audit re-parses the
-# same unchanged blobs once per commit (~900 modules x every commit since the
-# baseline), which is what pushed the CI ratchet test past its per-test timeout
-# on the slowest runners. Bounded: cleared when it outgrows the working set.
+# pure function of that key, and one validation run inventories several trees
+# (live tree, staged index, HEAD/parent refs for the pairwise transition) that
+# share almost every module blob unchanged: each distinct text is parsed once,
+# not once per tree. Bounded: cleared when it outgrows the working set.
 _MODULE_FUNCTIONS_CACHE: dict[tuple[str, str], tuple[GatedFunction, ...]] = {}
 _MODULE_FUNCTIONS_CACHE_LIMIT = 8192
 
@@ -542,8 +542,17 @@ GRANDFATHERED_OVERSIZED_FUNCTIONS = FUNCTION_DEBT
 def validate_manifest_transition(
     current: SizeRatchetManifest,
     previous: SizeRatchetManifest,
+    *,
+    adjacent: bool = True,
 ) -> list[str]:
-    """Validate shrink-only debt and rationale authority against the parent tree."""
+    """Validate shrink-only debt and rationale authority against the parent tree.
+
+    ``adjacent=False`` is the PAIRWISE (interval) form: byte-equality of a
+    surviving band rationale is only sound between adjacent manifests — across
+    an interval a path may legally retire and re-enter with a fresh rationale
+    (every intermediate step green) — so the interval form requires a nonblank
+    tip rationale instead of equality (Q18-A: interval archaeology is out of
+    scope; interval FALSE POSITIVES are not)."""
     errors: list[str] = []
     if current.baseline_source_sha != previous.baseline_source_sha:
         errors.append("BASELINE_SOURCE_SHA is immutable")
@@ -565,8 +574,14 @@ def validate_manifest_transition(
     for path in sorted(set(current.band_paths) & previous_band):
         old = previous.band_paths[path]
         new = current.band_paths[path]
-        if new != old:
-            errors.append(f"surviving band rationale is immutable: {path}")
+        if adjacent:
+            if new != old:
+                errors.append(f"surviving band rationale is immutable: {path}")
+        elif old is not None and (new is None or not new.strip()):
+            # Interval form: a rewrite is legal (retire+re-enter), but DROPPING
+            # a recorded rationale — to None or to a blank string — across the
+            # interval launders the justification away.
+            errors.append(f"band rationale dropped across the interval: {path}")
 
     for path in sorted(set(current.byte_debt) - set(previous.byte_debt)):
         errors.append(f"new or re-entered module debt above {MAX_MODULE_BYTES} UTF-8 bytes: {path}")
@@ -600,15 +615,16 @@ def _manifest_inventory_errors(
     return errors
 
 
-def _bootstrap_inventory_errors(
+def _bootstrap_baseline_errors(
     manifest: SizeRatchetManifest,
     inventory: SizeRatchetInventory,
 ) -> list[str]:
-    errors = _manifest_inventory_errors(manifest, inventory)
+    """A fresh bootstrap seeds its immutable baselines from its own candidate tree."""
+    errors: list[str] = []
     if manifest.band_baseline_paths != inventory.band_paths:
-        errors.append("BAND_BASELINE_PATHS differs from exact BASELINE_SOURCE_SHA inventory")
+        errors.append("BAND_BASELINE_PATHS differs from the bootstrap candidate inventory")
     if dict(manifest.byte_baseline_debt) != dict(inventory.byte_debt):
-        errors.append("BYTE_BASELINE_DEBT differs from exact BASELINE_SOURCE_SHA inventory")
+        errors.append("BYTE_BASELINE_DEBT differs from the bootstrap candidate inventory")
     return errors
 
 
@@ -640,87 +656,45 @@ def _staged_manifest_inventory(
     return staged_text, staged, inventory
 
 
-def _audit_committed_manifest_history(
-    repo_dir: pathlib.Path,
-    head: str,
-    manifest_path: str,
-) -> tuple[list[str], SizeRatchetManifest | None, str | None]:
-    errors: list[str] = []
-    head_text = _git_show_manifest(repo_dir, head, manifest_path)
-    if head_text is None:
-        return ["size-ratchet transition authority unavailable: HEAD manifest is inaccessible"], None, None
-    head_manifest = parse_size_ratchet_manifest(head_text)
-    baseline = head_manifest.baseline_source_sha
-    ancestor = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", baseline, head],
-        cwd=repo_dir,
-        check=False,
-        capture_output=True,
-    )
-    if ancestor.returncode != 0:
-        return (
-            ["size-ratchet transition authority unavailable: BASELINE_SOURCE_SHA ancestry is inaccessible"],
-            None,
-            None,
-        )
-    if _git_show_manifest(repo_dir, baseline, manifest_path) is not None:
-        return (
-            ["size-ratchet transition authority invalid: BASELINE_SOURCE_SHA already contains the manifest"],
-            None,
-            None,
-        )
-    try:
-        baseline_inventory = collect_size_ratchet_inventory_at_ref(repo_dir, baseline)
-    except (OSError, ValueError, subprocess.CalledProcessError):
-        errors.append("size-ratchet transition authority unavailable: BASELINE_SOURCE_SHA tree is not accessible")
-        return errors, None, None
-
-    commits = subprocess.run(
-        ["git", "rev-list", "--first-parent", "--reverse", f"{baseline}..{head}"],
+def _commit_parents(repo_dir: pathlib.Path, commit: str) -> list[str]:
+    """Exact parent SHAs of ``commit`` in parent order (empty for a root commit)."""
+    listed = subprocess.run(
+        ["git", "rev-list", "--parents", "-n", "1", commit],
         cwd=repo_dir,
         check=True,
         capture_output=True,
         text=True,
-    ).stdout.splitlines()
-    if not commits:
-        errors.append("size-ratchet transition authority unavailable: incomplete first-parent manifest history")
-        return errors, None, None
+    ).stdout.split()
+    return listed[1:]
 
-    bootstrap_commit: str | None = None
-    previous: SizeRatchetManifest | None = None
-    latest_text: str | None = None
-    for commit in commits:
-        text = _git_show_manifest(repo_dir, commit, manifest_path)
-        if text is None:
-            if bootstrap_commit is not None:
-                errors.append(f"{commit[:12]}: size-ratchet manifest was removed from first-parent history")
-            continue
-        manifest = parse_size_ratchet_manifest(text)
-        if bootstrap_commit is None:
-            bootstrap_commit = commit
-            parent = subprocess.run(
-                ["git", "rev-parse", f"{commit}^1"],
-                cwd=repo_dir,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if parent.returncode != 0 or parent.stdout.strip() != baseline:
-                errors.append("committed manifest bootstrap must name its exact first parent SHA")
-            errors.extend(f"bootstrap: {error}" for error in _bootstrap_inventory_errors(manifest, baseline_inventory))
-        elif previous is not None:
-            errors.extend(f"{commit[:12]}: {error}" for error in validate_manifest_transition(manifest, previous))
-        try:
-            inventory = collect_size_ratchet_inventory_at_ref(repo_dir, commit)
-        except (OSError, ValueError, subprocess.CalledProcessError):
-            errors.append(f"{commit[:12]}: committed source tree is not accessible")
-        else:
-            errors.extend(f"{commit[:12]}: {error}" for error in _manifest_inventory_errors(manifest, inventory))
-        previous = manifest
-        latest_text = text
-    if bootstrap_commit is None:
-        errors.append("size-ratchet transition authority unavailable: manifest bootstrap commit is not accessible")
-    return errors, previous, latest_text
+
+def resolve_committed_manifest_text(
+    repo_dir: pathlib.Path,
+    *,
+    manifest_path: str = SIZE_RATCHET_MANIFEST_PATH,
+) -> str | None:
+    """Merge-aware committed manifest authority for the checkout's ``HEAD``.
+
+    The committed manifest from ``HEAD``'s tree; when that tree lacks it, the
+    first parent (in parent order) whose tree carries it — a merge that landed
+    the manifest through EITHER parent line keeps its authority, with no
+    first-parent history replay. ``None`` means no committed manifest exists on
+    ``HEAD`` or any of its parents: a bootstrap, accepted from the current tree
+    (interval archaeology is an owner-accepted tradeoff — the official
+    repository CI enforces the pairwise base-vs-tip transition instead).
+    """
+    root = pathlib.Path(repo_dir).resolve()
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    text = _git_show_manifest(root, head, manifest_path)
+    if text is not None:
+        return text
+    for parent in _commit_parents(root, head):
+        text = _git_show_manifest(root, parent, manifest_path)
+        if text is not None:
+            return text
+    return None
 
 
 def _staged_tree_without_index_lock(root: pathlib.Path) -> str:
@@ -757,95 +731,170 @@ def _staged_tree_without_index_lock(root: pathlib.Path) -> str:
         ).stdout.strip()
 
 
+def _validate_manifest_candidate(
+    root: pathlib.Path,
+    current_text: str,
+    *,
+    manifest_path: str,
+    include_staged: bool,
+) -> list[str]:
+    """Shared exactness + merge-aware transition core for live and in-memory candidates."""
+    current = parse_size_ratchet_manifest(current_text)
+    inventory = collect_size_ratchet_inventory(root)
+    errors = _manifest_inventory_errors(current, inventory)
+
+    previous_text = resolve_committed_manifest_text(root, manifest_path=manifest_path)
+    previous = parse_size_ratchet_manifest(previous_text) if previous_text is not None else None
+    if previous is None:
+        errors.extend(f"bootstrap: {error}" for error in _bootstrap_baseline_errors(current, inventory))
+    elif current_text != previous_text:
+        errors.extend(validate_manifest_transition(current, previous))
+
+    if not include_staged:
+        return errors
+
+    head_tree = subprocess.run(
+        ["git", "rev-parse", "HEAD^{tree}"], cwd=root, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    index_tree = _staged_tree_without_index_lock(root)
+    if index_tree == head_tree:
+        return errors
+    staged_text, staged, staged_inventory = _staged_manifest_inventory(root, index_tree, manifest_path)
+    if staged_text is None:
+        if previous is None:
+            errors.append("staged: size-ratchet bootstrap manifest is missing from the changed index")
+        else:
+            errors.append("staged: size-ratchet manifest was removed after bootstrap")
+        return errors
+    assert staged is not None and staged_inventory is not None
+    errors.extend(f"staged: {error}" for error in _manifest_inventory_errors(staged, staged_inventory))
+    if previous is None:
+        errors.extend(
+            f"staged bootstrap: {error}" for error in _bootstrap_baseline_errors(staged, staged_inventory)
+        )
+    elif staged_text != previous_text:
+        errors.extend(f"staged: {error}" for error in validate_manifest_transition(staged, previous))
+    return errors
+
+
 def validate_size_ratchet(
     repo_dir: pathlib.Path,
     *,
     manifest_path: str = SIZE_RATCHET_MANIFEST_PATH,
 ) -> list[str]:
-    """Validate live and staged candidates against immutable Git authority."""
+    """Validate live and staged candidates against the merge-aware committed authority.
+
+    Enforcement contract: the OFFICIAL repository's CI ``size_ratchet`` lane
+    BLOCKS on these findings (tip exactness plus the pairwise base-vs-tip
+    transition); every local surface (default pytest lanes exclude the marker;
+    ``check_worktree_readiness`` and ``codebase_health`` report the findings)
+    only WARNS. There is no committed-history replay: the previous manifest
+    resolves from ``HEAD`` or any of its parents, and a checkout with no
+    committed manifest anywhere bootstraps from its own tree — a locally
+    evolved fork is never trapped by structural debt it inherited.
+    """
     root = pathlib.Path(repo_dir).resolve()
     current_path = root.joinpath(*pathlib.PurePosixPath(manifest_path).parts)
     current_text = current_path.read_text(encoding="utf-8")
-    current = parse_size_ratchet_manifest(current_text)
-    errors = _manifest_inventory_errors(current, collect_size_ratchet_inventory(root))
+    return _validate_manifest_candidate(root, current_text, manifest_path=manifest_path, include_staged=True)
 
-    head = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
-    ).stdout.strip()
-    head_tree = subprocess.run(
-        ["git", "rev-parse", "HEAD^{tree}"], cwd=root, check=True, capture_output=True, text=True
-    ).stdout.strip()
-    index_tree = _staged_tree_without_index_lock(root)
-    head_text = _git_show_manifest(root, head, manifest_path)
-    if head_text is None:
-        if current.baseline_source_sha != head:
-            errors.append("manifest bootstrap is allowed only when BASELINE_SOURCE_SHA equals the current HEAD")
-        try:
-            baseline_inventory = collect_size_ratchet_inventory_at_ref(root, current.baseline_source_sha)
-        except (OSError, ValueError, subprocess.CalledProcessError):
-            errors.append("size-ratchet transition authority unavailable: BASELINE_SOURCE_SHA tree is not accessible")
-        else:
-            errors.extend(f"bootstrap: {error}" for error in _bootstrap_inventory_errors(current, baseline_inventory))
-        if index_tree != head_tree:
-            staged_text, staged, staged_inventory = _staged_manifest_inventory(
-                root, index_tree, manifest_path
-            )
-            if staged_text is None:
-                errors.append("staged: size-ratchet bootstrap manifest is missing from the changed index")
-            else:
-                assert staged is not None and staged_inventory is not None
-                errors.extend(
-                    f"staged: {error}" for error in _manifest_inventory_errors(staged, staged_inventory)
-                )
-                if staged.baseline_source_sha != head:
-                    errors.append(
-                        "staged: manifest bootstrap is allowed only when BASELINE_SOURCE_SHA "
-                        "equals the current HEAD"
-                    )
-                try:
-                    baseline_inventory = collect_size_ratchet_inventory_at_ref(
-                        root, staged.baseline_source_sha
-                    )
-                except (OSError, ValueError, subprocess.CalledProcessError):
-                    errors.append(
-                        "staged: size-ratchet transition authority unavailable: "
-                        "BASELINE_SOURCE_SHA tree is not accessible"
-                    )
-                else:
-                    errors.extend(
-                        f"staged bootstrap: {error}"
-                        for error in _bootstrap_inventory_errors(staged, baseline_inventory)
-                    )
-        return errors
 
-    history_errors, head_authority, latest_text = _audit_committed_manifest_history(root, head, manifest_path)
-    errors.extend(history_errors)
-    if head_authority is None or latest_text != head_text:
-        if not history_errors:
-            errors.append("size-ratchet transition authority unavailable: HEAD manifest is not in first-parent history")
-    elif current_text != head_text:
-        errors.extend(validate_manifest_transition(current, head_authority))
+def validate_size_ratchet_candidate(
+    repo_dir: pathlib.Path,
+    candidate_text: str,
+    *,
+    manifest_path: str = SIZE_RATCHET_MANIFEST_PATH,
+) -> list[str]:
+    """Validate one rendered in-memory manifest BEFORE it is written to disk.
 
-    if index_tree != head_tree:
-        staged_text, staged, staged_inventory = _staged_manifest_inventory(
-            root, index_tree, manifest_path
+    Pure candidate mode for ``scripts/regenerate_size_ratchet.py``: the same
+    live-tree exactness, bootstrap, and shrink-only transition checks as
+    ``validate_size_ratchet``, with no staged-index checks and no filesystem
+    write first. The manifest module's own metrics sit far below every debt
+    threshold today (an observation, not a structural guarantee), which keeps
+    them out of the debt sets and makes validation against the current live
+    inventory exact even while the old manifest bytes are still on disk.
+    """
+    root = pathlib.Path(repo_dir).resolve()
+    return _validate_manifest_candidate(root, candidate_text, manifest_path=manifest_path, include_staged=False)
+
+
+def validate_size_ratchet_transition_against_base(
+    repo_dir: pathlib.Path,
+    base_ref: str | None,
+    *,
+    manifest_path: str = SIZE_RATCHET_MANIFEST_PATH,
+) -> list[str]:
+    """Pairwise (interval-form) shrink-only check of HEAD's manifest vs a base.
+
+    CI passes the event base (PR base.sha / push event.before) via
+    ``OURO_SIZE_RATCHET_BASE_REF``. Base semantics — every hole here is a
+    laundering vector, so degradations are deliberate and narrow: all-zeros
+    (new-branch/tag push) degrades to HEAD's parent, never skips; a resolvable
+    base WITHOUT the manifest FAILS (delete-then-rebootstrap laundering; true
+    first adoption re-runs with a post-adoption base); empty/unresolvable
+    (force-push loss) degrades to HEAD's parent whose manifest is first
+    validated against the parent's own tree (fabricated bases are refused);
+    no parent manifest at all = bootstrap, transition skipped."""
+    root = pathlib.Path(repo_dir).resolve()
+    tip_text = _git_show_manifest(root, "HEAD", manifest_path)
+    if tip_text is None:
+        return ["pairwise: HEAD does not carry the size-ratchet manifest"]
+
+    ref = (base_ref or "").strip()
+    if ref and not ref.strip("0"):
+        ref = ""  # all-zeros: no event base — fall through to the parent degradation
+    base_text: str | None = None
+    validate_parent_tree = False
+    if ref:
+        resolved = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
         )
-        if staged_text is None:
-            errors.append("staged: size-ratchet manifest was removed after bootstrap")
-        else:
-            assert staged is not None and staged_inventory is not None
-            errors.extend(f"staged: {error}" for error in _manifest_inventory_errors(staged, staged_inventory))
-            if head_authority is None or latest_text != head_text:
-                if not history_errors:
-                    errors.append(
-                        "staged: size-ratchet transition authority unavailable: "
-                        "HEAD manifest is not in first-parent history"
-                    )
-            elif staged_text != head_text:
-                errors.extend(
-                    f"staged: {error}" for error in validate_manifest_transition(staged, head_authority)
-                )
-    return errors
+        if resolved.returncode == 0:
+            base_text = _git_show_manifest(root, resolved.stdout.strip(), manifest_path)
+            if base_text is None:
+                return [
+                    f"pairwise: base {resolved.stdout.strip()[:12]} does not carry the "
+                    "size-ratchet manifest — a deletion inside the interval retires the "
+                    "ratchet's memory; for genuine first adoption re-run with a "
+                    "post-adoption base"
+                ]
+    if base_text is None:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        for parent in _commit_parents(root, head):
+            base_text = _git_show_manifest(root, parent, manifest_path)
+            if base_text is not None:
+                validate_parent_tree = True  # the degraded parent base is always tree-verified
+                parent_ref = parent
+                break
+    if base_text is None:
+        return []
+    previous = parse_size_ratchet_manifest(base_text)
+    if validate_parent_tree:
+        # BEFORE the identical-text shortcut: a fabricated parent manifest that
+        # pre-declares the tip's debt is byte-identical to the tip's manifest —
+        # equality is exactly what the laundering constructs.
+        try:
+            parent_inventory = collect_size_ratchet_inventory_at_ref(root, parent_ref)
+            parent_errors = _manifest_inventory_errors(previous, parent_inventory)
+        except Exception as exc:
+            parent_errors = [f"pairwise-parent: inventory failed: {type(exc).__name__}: {exc}"]
+        if parent_errors:
+            return [
+                "pairwise: the degraded parent-base manifest does not match the parent's own tree "
+                "(a fabricated base cannot authorize a transition): " + "; ".join(parent_errors[:3])
+            ]
+    if base_text == tip_text:
+        return []
+    return validate_manifest_transition(
+        parse_size_ratchet_manifest(tip_text), previous, adjacent=False
+    )
 
 
 def _metrics_from_inventory(inventory: SizeRatchetInventory) -> Dict[str, Any]:

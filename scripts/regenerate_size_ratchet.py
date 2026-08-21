@@ -20,8 +20,10 @@ from ouroboros.review import (  # noqa: E402
     collect_size_ratchet_inventory,
     collect_size_ratchet_inventory_at_ref,
     parse_size_ratchet_manifest,
+    resolve_committed_manifest_text,
     validate_manifest_transition,
     validate_size_ratchet,
+    validate_size_ratchet_candidate,
 )
 
 
@@ -99,9 +101,11 @@ def _next_manifest(
     *,
     checked_candidate: SizeRatchetManifest | None = None,
 ) -> SizeRatchetManifest:
+    if _git("ls-files", "-u").stdout.strip():
+        raise ValueError("merge in progress: resolve conflicts first")
     head = _git("rev-parse", "HEAD").stdout.strip()
-    prior_result = _git("show", f"HEAD:{SIZE_RATCHET_MANIFEST_PATH}", check=False)
-    previous = parse_size_ratchet_manifest(prior_result.stdout) if prior_result.returncode == 0 else None
+    prior_text = resolve_committed_manifest_text(REPO_ROOT)
+    previous = parse_size_ratchet_manifest(prior_text) if prior_text is not None else None
 
     unused = set(rationales)
     if previous is None:
@@ -163,8 +167,18 @@ def main(argv: list[str] | None = None) -> int:
             parse_size_ratchet_manifest(path.read_text(encoding="utf-8")) if args.check and path.exists() else None
         )
         rendered = _render(_next_manifest(rationales, checked_candidate=checked_candidate))
+        # Candidate mode: prove the rendered manifest against the live tree
+        # BEFORE overwriting the checked-in one, so a red regeneration never
+        # clobbers the on-disk manifest with an invalid candidate.
+        candidate_errors = [] if args.check else validate_size_ratchet_candidate(REPO_ROOT, rendered)
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"size-ratchet regeneration failed: {exc}", file=sys.stderr)
+        return 2
+    if candidate_errors:
+        print(
+            "size-ratchet candidate validation failed (manifest not written):\n" + "\n".join(candidate_errors),
+            file=sys.stderr,
+        )
         return 2
 
     if args.check:
@@ -173,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{SIZE_RATCHET_MANIFEST_PATH} is stale; run {pathlib.Path(__file__).name}", file=sys.stderr)
             return 1
     else:
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(rendered, encoding="utf-8")
     try:
         validation_errors = validate_size_ratchet(REPO_ROOT)
@@ -181,6 +196,14 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if validation_errors:
         print("size-ratchet validation failed:\n" + "\n".join(validation_errors), file=sys.stderr)
+        if not args.check and all(e.startswith("staged: ") for e in validation_errors):
+            # Mid-merge resolver case: the regenerated manifest WAS written and
+            # is correct — only the merge-staged copy is stale. One command fixes it.
+            print(
+                f"note: {SIZE_RATCHET_MANIFEST_PATH} WAS regenerated on disk; run "
+                f"`git add {SIZE_RATCHET_MANIFEST_PATH}` and re-run to finish",
+                file=sys.stderr,
+            )
         return 2
     return 0
 

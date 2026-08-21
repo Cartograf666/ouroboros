@@ -1396,6 +1396,14 @@ def _review_status_attempt_payload(ca: Any) -> Dict[str, Any] | None:
         "pre_review_fingerprint": ca.pre_review_fingerprint[:12] or None,
         "post_review_fingerprint": ca.post_review_fingerprint[:12] or None,
         "degraded_reasons": list(ca.degraded_reasons or []),
+        # Max-Review-Cycles accounting facts (Q16 auditability): the typed
+        # block class, the dispatch-paid fact, and the identities the free
+        # refusal/replay decisions key on.
+        "block_class": str(getattr(ca, "block_class", "") or "") or None,
+        "paid": bool(getattr(ca, "paid", False)),
+        "rebuttal_sha256": str(getattr(ca, "rebuttal_sha256", "") or "")[:12] or None,
+        "review_contract_fingerprint": str(getattr(ca, "review_contract_fingerprint", "") or "")[:12] or None,
+        "root_task_id": str(getattr(ca, "root_task_id", "") or "") or None,
         **_review_status_actor_summary(ca),
     })
     return data
@@ -1464,6 +1472,9 @@ def _review_status_message(projection: Dict[str, Any]) -> str:
             "fingerprint_unavailable": "The staged diff could not be fingerprinted. Fix git diff and retry.",
             "overlap_guard": "Another reviewed attempt is still active. Wait or expire it before retrying.",
             "attempt_cap_reached": "The same staged diff was review-blocked repeatedly. Change the diff or rebut via review_rebuttal.",
+            "identical_diff_refused": "This exact staged diff was already review-blocked. Change the diff or supply a NEW review_rebuttal (identical bytes are never re-reviewed for pay).",
+            "review_cycles_exhausted": "This task tree spent its paid review cycles (OUROBOROS_REVIEW_MAX_CYCLES). Finalize honestly or ask the owner to raise the cap.",
+            "review_subject_binding_mismatch": "The reviewed managed subject is not the tree this commit would write. Re-stage the intended candidate and retry so review and commit describe the same tree.",
         }
         label = "BLOCKED" if ca.status == "blocked" else "FAILED"
         current = (
@@ -1479,9 +1490,16 @@ def _review_status_message(projection: Dict[str, Any]) -> str:
 def _attempt_to_dict(item: Any) -> Dict[str, Any]:
     data = {
         key: str(getattr(item, key, "") or "")
-        for key in ("ts", "tool_name", "status", "phase", "block_reason", "scope_model")
+        for key in (
+            "ts", "tool_name", "status", "phase", "block_reason", "scope_model",
+            # Max-Review-Cycles accounting facts (Q16 auditability).
+            "block_class", "rebuttal_sha256", "review_contract_fingerprint",
+            "root_task_id",
+        )
     }
     data.update({
+        "paid": bool(getattr(item, "paid", False)),
+        "raw_stripped": bool(getattr(item, "raw_stripped", False)),
         "attempt": int(getattr(item, "attempt", 0) or 0),
         "late_result_pending": bool(getattr(item, "late_result_pending", False)),
         "duration_sec": float(getattr(item, "duration_sec", 0.0) or 0.0),

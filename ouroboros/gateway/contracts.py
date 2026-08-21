@@ -392,6 +392,11 @@ class UpdateApplyErrorResponse(TypedDict):
     restart_required: NotRequired[bool]
     merge_plan: NotRequired[UpdateMergePlan]
     smoke: NotRequired[Dict[str, Any]]
+    # Stash-first prologue disclosures (additive): how the owner's stashed work
+    # was unwound on an aborted update, and the wave-floor admission numbers.
+    stash_note: NotRequired[str]
+    estimated_wave_usd: NotRequired[Optional[float]]
+    remaining_usd: NotRequired[Optional[float]]
 
 
 class UpdateStatusReadyOutbound(TypedDict):

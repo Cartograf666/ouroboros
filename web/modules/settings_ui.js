@@ -462,7 +462,7 @@ export function renderSettingsPage() {
 
                     <div class="form-section">
                         <h3>Max Review Cycles</h3>
-                        <div class="settings-section-copy">One shared cap on paid review cycles per task for plan review, task acceptance (improvement passes = cycles &minus; 1) and the commit gate (review blocks of the same unchanged diff before it refuses another run). <code>&infin;</code> removes the cap; the task's own deadline, budget and lifecycle rails still bind.</div>
+                        <div class="settings-section-copy">One shared cap on paid review cycles per task for plan review, task acceptance (improvement passes = cycles &minus; 1), the commit gate (paid triad+scope cycles per root task, shared across the whole task tree; an unchanged diff never buys a new review after a recorded verdict block regardless of this number &mdash; blocking enforcement refuses it for free, while a pure advisory line records no verdict blocks and its no-new-spend guarantee is the free replay after exhaustion, with a loud durable disclosure) and skill review (paid panel runs per root task or per manual snapshot; identical snapshots replay free). <code>&infin;</code> removes the cap; the task's own deadline, budget and lifecycle rails still bind.</div>
                         <div class="settings-effort-card">
                             <label>Max Review Cycles</label>
                             <input id="s-review-max-cycles" type="hidden" value="2">

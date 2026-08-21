@@ -393,6 +393,25 @@ P7 makes context fit a maintenance constraint, not a line-count aesthetic.
   reviewer checklist 2(c), not a deterministic size-test gate. Existing
   baseline debt is not retroactively a failing tree. Any advisory ratchet must
   publish its AST counting scope and bind its baseline to the final SHA.
+- Enforcement surfaces: the OFFICIAL repository's CI runs the dedicated
+  `size_ratchet` pytest lane as a blocking third step in quick-test and
+  full-test — manifest exactness against the tip tree plus the pairwise
+  shrink-only transition against the event base
+  (`OURO_SIZE_RATCHET_BASE_REF`). Local surfaces never block on size: the
+  default pytest lanes exclude the marker, and `check_worktree_readiness`
+  (advisory preflight) and `codebase_health` report the same
+  `validate_size_ratchet` findings as "official CI will enforce" warnings.
+  The lane blocks only in post-push/PR CI, so its authority presupposes
+  branch protection / required status checks on the official `ouroboros`
+  branch (a repository-settings prerequisite outside this codebase).
+  There is no committed-history replay: the previous manifest resolves
+  merge-aware from `HEAD` or any of its parents, and a checkout with no
+  committed manifest anywhere bootstraps from its own tree — so a locally
+  evolved fork can always take an official update without being trapped by
+  structural debt it inherited, while the official line keeps ratcheting.
+  `scripts/regenerate_size_ratchet.py` validates its rendered candidate
+  BEFORE writing it and refuses an unmerged index with a typed
+  "merge in progress" error.
 - Prefer deleting dead/duplicate authority before raising a cap. Add an
   abstraction only when it removes concrete coupling or preserves a stable
   extension seam.
@@ -756,7 +775,10 @@ candidate-bound authority.
    exact-candidate authority and requires the applicable final gate again.
 
 Triad slots review the staged diff against `docs/CHECKLISTS.md`; duplicate model
-ids remain independent slots and `config.adaptive_quorum` owns quorum. Scope
+ids remain independent slots and `config.adaptive_quorum` owns quorum. Managed
+exception: a managed-update resolution commit reviews the declared M0→S
+resolution delta (`tools/review_subject.py`), and the commit gate binds S to the
+index write-tree the review-binding fingerprint pins. Scope
 slots inspect touched context plus the repository Atlas. Required artifacts may
 never disappear silently: the assembler reduces optional context and unchanged
 diff context, records every degradation, and fails closed if its irreducible
@@ -783,12 +805,53 @@ Review Cycles" 1 / 2 / 3 / 5 / ∞). Its per-gate meaning is documented in that
 module and is literally: plan review — paid reviewer-panel cycles per task;
 task acceptance — paid panel runs per task, `improvement passes = cycles − 1`
 (the retired `OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES` is migrated into the shared key at
-settings load — cycles = passes + 1 — and never binds at runtime); commit gate — consecutive review-blocks of a
-BYTE-IDENTICAL staged diff before the identical-diff attempt cap refuses another
-triad+scope run (changing the diff starts a fresh streak; a rebuttal lifts the
-cap for that attempt only; the default moved from a hardcoded 3 to the shared 2). `unlimited` removes the
-local count everywhere; deadline, budget and lifecycle rails still bind. A
-malformed value fails closed to the bounded default and is logged once.
+settings load — cycles = passes + 1 — and never binds at runtime); commit gate
+— paid triad+scope cycles per ROOT task (the whole task tree shares one
+ceiling; a manual session is its own task; a follow-up task is a fresh root;
+the paid fact is recorded on the attempt row at dispatch and the count is
+derived from the attempt ledger); skill review — paid reviewer-panel
+dispatches per ceiling key (the root task for task-driven groups; the manual
+lane is scoped per content snapshot, so revised content restarts its count;
+one chunked wave = ONE cycle). `unlimited` removes the local count
+everywhere; deadline, budget and lifecycle rails still bind. A malformed
+value fails closed to the bounded default and is logged once.
+
+Anti-pattern: paying for byte-identical review material. Never dispatch a paid
+reviewer wave for material a gate has already reviewed under the same review
+contract — the commit gate refuses a byte-identical staged diff for free from
+the FIRST verdict-block (`identical_diff_refused`, quoting the recorded
+verdict), and skill review replays a recorded substantive verdict for an
+identical snapshot at $0 (only while the persisted review state still covers
+it). A rebuttal is identified by CONTENT (sha256): a hash new to the streak
+buys exactly ONE paid re-review; a repeated hash is refused free. The exact
+rule keeps two axes distinct. Refusal-streak eligibility is about VERDICTS:
+only substantive reviewer verdicts build (or end) the identical-bytes refusal
+streak, and a rebuttal is "spent" only by the substantive verdict it bought —
+never when it was refused undispatched or when its wave died on infra. Money
+accounting is about DISPATCH: the limit counts PAID cycles, and every
+physically dispatched wave counts whatever its terminal — so a dispatched
+infra terminal (quorum failure, transport death, timeout) consumes money but
+not the rebuttal, while infra facts refused at assembly (fit overflow,
+sub-floor window) never dispatched and stay outside the count; the paid fact
+is recorded write-ahead at first dispatch. Byte-identical resubmissions are
+refused before any spend. Exhaustion is always the typed
+`review_cycles_exhausted` event with honest exits, never a silent grind or
+another paid dispatch. The paid-cycle ceiling counts dispatched waves under
+BOTH enforcement modes; under advisory enforcement a commit after exhaustion
+proceeds as a free replay with a loud typed disclosure (no new review spend),
+while blocking enforcement refuses it. Note the honest scope of each
+guarantee: the identical-diff refusal replays only recorded VERDICT blocks,
+and a pure advisory line never mints one (advisory criticals disclose, they
+do not block) — under advisory the no-new-spend guarantee therefore comes
+from the exhaustion free replay, not from the refusal streak.
+
+Scope of the review-contract fingerprint (deliberate): it covers the reviewer
+roster, routes, enforcement, resolved efforts, and the prompt constants —
+governance-document CONTENTS (BIBLE.md, CHECKLISTS.md, ARCHITECTURE.md) are
+deliberately outside it, so editing those documents neither lapses recorded
+verdicts nor frees replays. The accepted trade-off is that an old verdict can
+replay under amended governance text; this keeps routine documentation
+maintenance from repricing every recorded review.
 
 `docs/CHECKLISTS.md` is the only reviewer-question, severity, and output SSOT.
 Architecture owns the dataflow; this section owns operator sequence. Finish all
@@ -863,9 +926,9 @@ Before every commit, verify the following:
 - [ ] **Tool** (`{verb}_{noun}`): thin LLM-callable wrapper. Validates input, formats output.
 
 #### Module Size & Complexity
-- [ ] Module stays near one context window (~1000 lines target; exact-path 1600 hard-gate debt is checked in, stale entries fail, and new/re-entered 1001-1500 paths carry a rationale)
+- [ ] Module stays near one context window (~1000 lines target; exact-path 1600 hard-gate debt is checked in, stale entries fail the official-CI `size_ratchet` lane and warn locally, and new/re-entered 1001-1500 paths carry a rationale)
 - [ ] No non-grandfathered Python function or method exceeds the 300-line hard gate (`FUNCTION_DEBT` exact `(path, qualname)` keys are the exception SSOT); methods above 150 lines trigger decomposition review
-- [ ] Total Python function count stays under the current smoke hard gate (consult `ouroboros/review.py::MAX_TOTAL_FUNCTIONS` for the active value; bump with a comment if a feature requires more headroom)
+- [ ] Total Python function count stays under `ouroboros/review.py::MAX_TOTAL_FUNCTIONS` (enforced by the official-CI `size_ratchet` lane, warned locally like the other size gates; bump with a comment if a feature requires more headroom)
 - [ ] More than eight parameters is a decomposition signal; consider a typed context object, but do not claim a hard gate or mark existing baseline debt noncompliant
 - [ ] No gratuitous abstract layers (Bible P7)
 
@@ -1549,10 +1612,21 @@ Before every commit, verify the following:
 - Write the update transaction before mutation. Reopen writers only after a
   verified abort/rollback or a healthy restart. An unverified rollback keeps
   its retryable phase plus the full failure evidence; a legacy `gate_blocked`
-  marker retries rollback on boot. Delayed evolution cleanup also acquires the
+  marker retries rollback on boot, while the `marker_cleanup_retry` phase only
+  retries the tx-marker unlink of an already-final repository — never a
+  rollback. Delayed evolution cleanup also acquires the
   same update lock and honors this admission owner; it must not stash/reset
-  behind the fence. Managed merge tests pass before restart; the ordinary
-  self-modification commit/tag/test/push ordering remains unchanged.
+  behind the fence. A managed merge commits only with proof that the full
+  suite ran green on the exact candidate tree: the resolver's single
+  pre-commit hermetic run is recorded as `tests_evidence` and reused by the
+  commit gate instead of a duplicate post-commit run; the ordinary
+  self-modification commit/tag/test/push ordering remains unchanged. Any
+  non-commit terminal of the assisted resolver rolls the live tree back and
+  best-effort preserves the attempt — committed or as a synthetic commit of
+  the uncommitted resolution — on the deterministic `failed-update-<target12>`
+  branch (a retry of the same target through the ordinary apply supersedes
+  it); the fresh rescue snapshot, not the branch, is the carrier rollback
+  itself depends on.
 - Take a fresh rescue before every destructive rollback and before boot-resume
   re-materialization: the pre-update snapshot predates the merge and holds none
   of the resolution. The hook is fail-open — never block a rollback on it — but
@@ -1817,7 +1891,8 @@ it as a release-artifact install or contributor development environment.
 
 Default local pytest excludes costly or environment-dependent lanes:
 `integration`, `browser`, `ui_browser`, `ui_browser_docker`,
-`portable_detail`, and `skill_smoke`. CI opts into them explicitly:
+`portable_detail`, `skill_smoke`, and `size_ratchet`. CI opts into them
+explicitly:
 
 - `integration` runs real provider checks, including Cloud.ru when
   `CLOUDRU_FOUNDATION_MODELS_API_KEY` is configured and GigaChat when
@@ -1868,6 +1943,23 @@ Default local pytest excludes costly or environment-dependent lanes:
   ubuntu shard (an LLM verdict is OS-independent). Paid step (~$1.2/run,
   ~$2.4 with the single fresh verdict retry); a missing key is a hard red,
   not a skip.
+
+- `size_ratchet` carries the live-repo size gates: exact-manifest smoke and
+  the module/function hard gates (`tests/test_smoke.py`), the generator
+  `--check` exactness half (`tests/test_repo_health_smoke.py`), and the
+  pairwise base-vs-tip transition check. It is the ONLY blocking surface for
+  repository size: official-repository CI runs `python -m pytest tests/ -m
+  size_ratchet` as a dedicated third step in quick-test AND full-test, with
+  `OURO_SIZE_RATCHET_BASE_REF` naming the event base (PR base SHA / push
+  `event.before`; an all-zeros or unresolvable base degrades to the tip's
+  parent manifest, verified against the parent's own tree — never a skip —
+  while a resolvable base without the manifest fails closed).
+  Default local runs exclude the marker and surface the same
+  `validate_size_ratchet` findings as warnings through
+  `check_worktree_readiness` and `codebase_health`; fixture-based ratchet
+  unit tests stay in the default lanes — only checks against the live repo
+  carry the marker. Its tests must not carry the `serial` marker (same
+  single-lane rule as `skill_smoke`).
 
 When adding a new opt-in lane, register the marker in `pyproject.toml`, add
 a collect-only zero-test guard in CI, and keep the default local addopts
@@ -1925,7 +2017,11 @@ not.
 A red post-commit gate preserves the local commit for forensics but blocks push.
 Inside a managed update it also blocks boot promotion and routes through
 rollback; an incomplete rollback leaves `gate_blocked` so boot retries recovery
-instead of promoting the rejected merge. Review-binding and tag-binding
+instead of promoting the rejected merge. The managed gate's mandate is "the
+full suite provably ran green on the exact committed tree", not "run it
+twice": recorded `tests_evidence` from the resolver's green pre-commit
+hermetic run is reused when it covers that exact tree, and the post-commit run
+happens only when no such proof exists. Review-binding and tag-binding
 mismatches use the same failure route.
 
 Process containment is unconditional, including a green pass. Windows uses a

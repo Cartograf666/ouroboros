@@ -227,6 +227,15 @@ may not weaken it.
    is blocking under `blocking` enforcement; under owner-chosen
    `advisory` enforcement it still runs in full and every decision that
    blocking would have stopped is loudly and durably recorded.
+   For a managed-update resolution commit — the merge that lands an
+   already-released official target into the local line — the diff the
+   reviewers score is the declared resolution delta: the difference
+   between the mechanical merge of the two parents and the staged
+   candidate tree. Binding, freshness, and final Git identity still
+   cover the exact full candidate; the packet names its base openly, so
+   this is a declared review subject, not partial coverage (amendment
+   proposed in the update-flow redesign contribution; effective through
+   the standard reviewed release that lands it).
 2. **Advisory pre-review**: a cheap, staleness-aware preflight on the
    staged snapshot. It catches omissions before authoritative review, but
    Ouroboros may skip it by LLM judgment when it is slow, unhealthy,
@@ -246,7 +255,14 @@ may not weaken it.
 5. **Deterministic pre-commit gates** and **health invariants**: cheap
    deterministic checks (version sync, data-boundary, changelog cap,
    advisory freshness or audited-skip evidence, codebase size) that run before or
-   instead of the expensive LLM review.
+   instead of the expensive LLM review. The codebase-size ratchet is
+   anchored to the official line: the official repository's CI blocks
+   size regressions pairwise (base versus tip), while every local
+   checkout surfaces the same validator's findings as loud, durable
+   warnings instead of commit blocks — an update of a locally-evolved
+   fork is never trapped by structural debt it inherited (amendment
+   proposed in the update-flow redesign contribution; effective through
+   the standard reviewed release that lands it).
 
 ### Modification bounds
 
@@ -669,6 +685,16 @@ the original commit already passed review, and the revert is its
 deterministic inverse. Review gates on rollbacks would create a
 paradox: reviewers block the undo for "no tests" or "no VERSION bump,"
 trapping Ouroboros with broken code it cannot revert.
+
+External contribution commits proposed to the official repository are
+version-neutral: they leave every release carrier byte-identical, and
+the maintainer's integration commit performs the single version
+increment for the landed change. Forensic recovery snapshots — commits
+that exist only to preserve an interrupted work state on a dedicated
+recovery ref — are rescue artifacts, not releases: no version bump, no
+tag, never a published line (amendment proposed in the update-flow
+redesign contribution; effective through the standard reviewed release
+that lands it).
 
 ## Principle 10: Evolution Through Iterations (absorbed)
 

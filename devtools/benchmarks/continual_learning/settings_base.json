@@ -10,6 +10,7 @@
   "OUROBOROS_SCOPE_REVIEW_MODEL": "anthropic/claude-sonnet-4.6",
   "OUROBOROS_SCOPE_REVIEW_MODELS": "anthropic/claude-sonnet-4.6",
   "OUROBOROS_REVIEW_ENFORCEMENT": "blocking",
+  "OUROBOROS_REVIEW_MAX_CYCLES": "unlimited",
   "OUROBOROS_RUNTIME_MODE": "advanced",
   "OUROBOROS_SAFETY_MODE": "light",
   "OUROBOROS_MAX_WORKERS": 4,

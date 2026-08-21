@@ -19,7 +19,9 @@ from dataclasses import dataclass, field, replace
 from typing import Any, List, Optional
 
 from ouroboros.llm import LLMClient
-from ouroboros.review_substrate import review_repo_dirs_for, scope_reviewer_slots
+# review_repo_dirs_for stays importable and MONKEYPATCHABLE on this module:
+# review_admission.prepare_scope_review resolves it through this namespace.
+from ouroboros.review_substrate import review_repo_dirs_for, scope_reviewer_slots  # noqa: F401
 from ouroboros.tools.registry import ToolContext
 from ouroboros.tools.review_context_atlas import (
     ReviewContextAtlasRequest,
@@ -362,8 +364,15 @@ def _parse_staged_name_status(repo_dir: pathlib.Path) -> list:
     return entries
 
 
-def _classify_deleted_for_inline(path: str, repo_dir: pathlib.Path) -> Optional[str]:
-    """Return a suppression reason for deleted HEAD content, or None to inline."""
+def _classify_deleted_for_inline(
+    path: str, repo_dir: pathlib.Path, *, m0_tree: str = "", staged_tree: str = ""
+) -> Optional[str]:
+    """Return a suppression reason for deleted HEAD content, or None to inline.
+
+    The trees (managed resolutions only) extend the binary probe to the
+    reviewed M0→S delta — a binary the official target added and the resolver
+    deleted is invisible to the HEAD-only ``--cached`` numstat but must still
+    classify as binary. Non-managed callers pass nothing, byte-identical."""
     fp = pathlib.Path(path)
     fname_lower = fp.name.lower()
     suffix_lower = fp.suffix.lower()
@@ -371,12 +380,14 @@ def _classify_deleted_for_inline(path: str, repo_dir: pathlib.Path) -> Optional[
         return "sensitive (env/credential/key)"
     if suffix_lower in BINARY_EXTENSIONS:
         return "binary extension"
-    return "binary content" if staged_path_is_binary(repo_dir, path) else None
+    return "binary content" if staged_path_is_binary(
+        repo_dir, path, m0_tree=m0_tree, staged_tree=staged_tree) else None
 
 
 def _degradable_diff_only_paths(repo_dir: pathlib.Path, current: list,
                                 skipped: list, deleted: list,
-                                renamed: frozenset = frozenset()) -> list:
+                                renamed: frozenset = frozenset(), *,
+                                m0_tree: str = "", staged_tree: str = "") -> list:
     """Touched paths the ladder may hand to the diff-only tier. Current paths join
     freely, exactly as before (atlas-required ones degrade only after -U0). Touched
     TESTS — skipped-by-design current ones and deleted ones — join the free tier too,
@@ -387,7 +398,8 @@ def _degradable_diff_only_paths(repo_dir: pathlib.Path, current: list,
     def _degradable_test(p: str, is_deleted: bool) -> bool:
         if atlas_required_beyond_diff(p.replace("\\", "/").lstrip("./")):
             return False
-        if p in renamed or staged_path_is_binary(repo_dir, p):
+        if p in renamed or staged_path_is_binary(
+                repo_dir, p, m0_tree=m0_tree, staged_tree=staged_tree):
             return False
         if is_deleted:
             try:
@@ -397,7 +409,8 @@ def _degradable_diff_only_paths(repo_dir: pathlib.Path, current: list,
             return (
                 head_bytes <= _DELETED_INLINE_MAX_BYTES
                 and _should_skip_current_touched_context(p)
-                and _classify_deleted_for_inline(p, repo_dir) is None
+                and _classify_deleted_for_inline(
+                    p, repo_dir, m0_tree=m0_tree, staged_tree=staged_tree) is None
             )
         return True
 
@@ -415,6 +428,8 @@ def _inline_deleted_file_pack(
     *,
     represent_binary: bool = False,
     diff_only_paths: Optional[list] = None,
+    m0_tree: str = "",
+    staged_tree: str = "",
 ) -> str:
     """Append deleted-file HEAD content or explicit suppression markers;
     ``diff_only_paths`` members skip the HEAD inline (ladder-degraded): a text
@@ -432,12 +447,13 @@ def _inline_deleted_file_pack(
                 "staged diff below)*\n"
             )
             continue
-        suppress_reason = _classify_deleted_for_inline(dp, repo_dir)
+        suppress_reason = _classify_deleted_for_inline(
+            dp, repo_dir, m0_tree=m0_tree, staged_tree=staged_tree)
         if suppress_reason is not None:
             if represent_binary and suppress_reason.startswith("binary"):
                 from ouroboros.tools.review_binary_context import render_staged_binary_metadata
 
-                metadata = render_staged_binary_metadata(repo_dir, dp)
+                metadata = render_staged_binary_metadata(repo_dir, dp, m0_tree=m0_tree)
                 if metadata is None:
                     raise RuntimeError(f"deleted binary {dp} has no exact staged Git metadata")
                 notes.append(f"### {dp}\n\n{metadata}\n")
@@ -545,6 +561,8 @@ def _render_touched_section(
     diff_only_paths: list,
     *,
     represent_binary: bool = False,
+    m0_tree: str = "",
+    staged_tree: str = "",
 ) -> tuple:
     """Build the touched-files prompt section.
 
@@ -555,11 +573,13 @@ def _render_touched_section(
     no coverage row can claim content the pack does not hold (BIBLE P1)."""
     kept = [path for path in current_context_paths if path not in diff_only_paths]
     section, pack_omitted = build_touched_file_pack(
-        repo_dir, kept, represent_binary=represent_binary
+        repo_dir, kept, represent_binary=represent_binary,
+        m0_tree=m0_tree, staged_tree=staged_tree,
     )
     section = _inline_deleted_file_pack(
         section, deleted_paths, repo_dir,
         represent_binary=represent_binary, diff_only_paths=diff_only_paths,
+        m0_tree=m0_tree, staged_tree=staged_tree,
     )
     # A ladder-degraded touched test moves to the degradation note below; listing
     # it HERE too would claim an atlas snapshot the pack no longer holds.
@@ -640,6 +660,9 @@ class _ScopePromptContext:
     scope_model: str = ""
     governance_repo_dir: Optional[pathlib.Path] = None
     represent_binary: bool = False
+    # The managed resolution-delta artifact (review_subject.ManagedReviewSubject);
+    # None for every ordinary commit — the pack then reads the staged diff.
+    managed_subject: Optional[Any] = None
 
 
 def _build_scope_prompt(
@@ -700,10 +723,23 @@ def _build_scope_prompt(
             else ""
         ) + f"**IMPORTANT: {_CONVERGENCE_RULE_TEXT}**\n"
 
+    subject = context.managed_subject
     # Hardened, byte-exact, fail-closed: it raises rather than yield a placeholder.
-    diff_text = capture_staged_diff(repo_dir)
+    # A managed resolution reviews its disclosed resolution-delta artifact (Δ4).
+    diff_text = (
+        subject.render_prompt_diff() if subject is not None
+        else capture_staged_diff(repo_dir)
+    )
 
-    touched_entries = _parse_staged_name_status(repo_dir)
+    if subject is not None:
+        # Touched set = resolution delta ∪ conflict anchors: an anchor stays a
+        # reviewed path even when the resolver left it byte-identical to M0.
+        delta_paths = {p for _s, p in subject.name_status}
+        touched_entries = [(s, p, p) for s, p in subject.name_status] + [
+            ("M", p, p) for p in sorted(set(subject.conflict_paths) - delta_paths)
+        ]
+    else:
+        touched_entries = _parse_staged_name_status(repo_dir)
     current_paths = [ep[1] for ep in touched_entries if ep[0] != "D"]
     deleted_paths = [ep[1] for ep in touched_entries if ep[0] == "D"]
     all_touched_paths = [ep[1] for ep in touched_entries]
@@ -721,6 +757,8 @@ def _build_scope_prompt(
         return _render_touched_section(
             repo_dir, current_context_paths, deleted_paths,
             current_skipped_by_design, diff_only_paths, represent_binary=represent_binary,
+            m0_tree=getattr(subject, "m0_tree", "") or "",
+            staged_tree=getattr(subject, "staged_tree", "") or "",
         )
 
     current_files_section, omitted, snapshot_included = _render_current_section([])
@@ -786,7 +824,9 @@ def _build_scope_prompt(
     degradable = sorted(
         _degradable_diff_only_paths(
             repo_dir, current_context_paths, current_skipped_by_design, deleted_paths,
-            renamed_paths),
+            renamed_paths,
+            m0_tree=getattr(subject, "m0_tree", "") or "",
+            staged_tree=getattr(subject, "staged_tree", "") or ""),
         key=lambda path: (atlas_required_beyond_diff(path), -_touched_token_estimate(path)),
     )
     compact = False
@@ -866,7 +906,10 @@ def _build_scope_prompt(
             if not compact_diff_attempted:  # every +/- line, no unchanged context
                 compact_diff_attempted = True
                 try:
-                    compact_diff = capture_staged_diff(repo_dir, unified=0)
+                    compact_diff = (
+                        subject.render_prompt_diff(unified=0) if subject is not None
+                        else capture_staged_diff(repo_dir, unified=0)
+                    )
                 except StagedDiffUnavailable:
                     compact_diff = ""  # the full capture above stays the evidence
                 if compact_diff.strip() and compact_diff != diff_text:
@@ -1144,8 +1187,12 @@ def _handle_prompt_signals(
     context_status: Optional["_TouchedContextStatus"],
     input_limit: int = _SCOPE_INPUT_TOKEN_LIMIT,
     scope_model: str = "",
+    managed: bool = False,
 ) -> Optional[ScopeReviewResult]:
-    """Translate touched-context status into an early ScopeReviewResult."""
+    """Translate touched-context status into an early ScopeReviewResult.
+
+    ``managed=True`` (the authorized managed resolver) makes the terminal
+    remedies honest: a two-parent resolution cannot split its staged diff."""
     if context_status is None:
         return None  # proceed with LLM call
 
@@ -1160,7 +1207,8 @@ def _handle_prompt_signals(
         _output_reserve, _ = _window_scaled_reserves(_window)
         _budget = (f"input budget ({input_limit} tokens, reserving {_output_reserve} for "
                    f"output within its {_window_provenance_phrase(_window, _provenance, _resolved.observed_at)})")
-        _cause, _remedy = _ladder_terminal_cause(context_status, input_limit, budget_phrase=_budget)
+        _cause, _remedy = _ladder_terminal_cause(
+            context_status, input_limit, budget_phrase=_budget, managed=managed)
         log.warning(
             "Scope review pack did not assemble: %s; window=%d provenance=%s (fail-closed).",
             _cause, _window, _provenance,
@@ -1194,7 +1242,7 @@ def _handle_prompt_signals(
         # assembled — and they can COINCIDE, so the cause(s) are READ from the
         # status and every one that applies is rendered. Fails CLOSED either way.
         token_count = context_status.token_count
-        cause, remedy = _ladder_terminal_cause(context_status, input_limit)
+        cause, remedy = _ladder_terminal_cause(context_status, input_limit, managed=managed)
         return ScopeReviewResult(
             blocked=True,
             status="fixed_overflow",
@@ -1334,83 +1382,36 @@ def run_scope_review(
     slot_effort: str = "",  # the row's own effort (6.1); "" = global scope_review effort
     session_target: str = "",  # the row's own harness[=model] target; "" = shared route
     session_profile: str = "",  # optional credential pin (Q2-в); "" = rotation
+    prepared: Optional[dict] = None,  # pre-assembled packet (review_admission.prepare_scope_review)
 ) -> ScopeReviewResult:
-    """Run the blocking scope review, or record the owner-declared low-mode skip."""
-    if _scope_review_skipped_in_low_context():
-        return _low_context_skip_result(scope_model or _get_scope_model())
-    try:
-        governance_repo, repo_dir = review_repo_dirs_for(ctx)
-    except (TypeError, ValueError) as exc:
-        return ScopeReviewResult(
-            blocked=True,
-            status="error",
-            block_message=f"⚠️ SCOPE_REVIEW_BLOCKED: invalid review roots: {exc}.",
+    """Run the blocking scope review, or record the owner-declared low-mode skip.
+
+    Assembly and dispatch are two phases (Q25=A): ``run_parallel_review``
+    assembles every packet through ``review_admission.prepare_scope_review``
+    BEFORE dispatching anything and hands the packet back here as ``prepared``;
+    a direct call without ``prepared`` keeps the single-call contract."""
+    if prepared is None:
+        from ouroboros.tools.review_admission import prepare_scope_review
+
+        prepared, final = prepare_scope_review(
+            ctx, commit_message, goal=goal, scope=scope,
+            review_rebuttal=review_rebuttal, review_history=review_history,
+            scope_review_history=scope_review_history, scope_model=scope_model,
+            slot_id=slot_id, route=route, slot_effort=slot_effort,
+            session_target=session_target, session_profile=session_profile,
         )
-    scope_model_id = scope_model or _get_scope_model()
-    delegated = str(getattr(route, "value", route) or "") == "agent_session"
-
-    from ouroboros.tools.registry import _authorized_managed_update_resolver
-
-    try:
-        if delegated:
-            # Session delivery (5.2): same task/checklist/contract, no assembled
-            # pack — the session retrieves with its own tools in the repo root.
-            from ouroboros.tools.scope_review_session import ScopeIntentContext as _Intent
-            from ouroboros.tools.scope_review_session import build_scope_session_task
-
-            session_task, session_manifest = build_scope_session_task(
-                repo_dir, commit_message,
-                _Intent(goal=goal, scope=scope, review_rebuttal=review_rebuttal,
-                        review_history=review_history,
-                        scope_review_history=scope_review_history),
-                drive_root=pathlib.Path(ctx.drive_root) if getattr(ctx, "drive_root", None) else None,
-                governance_repo_dir=governance_repo,
-            )
-            _SCOPE_CONTEXT_MANIFEST.set(session_manifest)
-            prompt, context_status = session_task, None
-        else:
-            session_task = ""
-            prompt, context_status = _build_scope_prompt(
-                repo_dir, commit_message,
-                goal=goal, scope=scope,
-                review_rebuttal=review_rebuttal,
-                review_history=review_history,
-                scope_review_history=scope_review_history,
-                context=_ScopePromptContext(
-                    drive_root=(
-                        pathlib.Path(ctx.drive_root)
-                        if getattr(ctx, "drive_root", None)
-                        else None
-                    ),
-                    scope_model=scope_model_id,
-                    governance_repo_dir=governance_repo,
-                    represent_binary=_authorized_managed_update_resolver(ctx),
-                ),
-            )
-    except RuntimeError as exc:
-        return ScopeReviewResult(
-            blocked=True,
-            block_message=(
-                "⚠️ SCOPE_REVIEW_BLOCKED: Failed to build review context — commit blocked.\n"
-                f"Error: {exc}\n"
-                "Ensure git is available and the repository is in a valid state."
-            ),
-            model_id=scope_model_id,
-            status="error",
-            context_manifest=_current_scope_context_manifest(),
-        )
-
-    # Pack-budget signals belong to an ASSEMBLED pack: a session assembles none, so its
-    # context_status is None and this returns None by construction — no route branch.
-    signal_result = _handle_prompt_signals(
-        prompt, context_status, scope_model=scope_model_id,
-        input_limit=_effective_scope_input_limit(scope_model=scope_model_id),
-    )
-    if signal_result is not None:
-        # Keep _handle_prompt_signals as the status SSOT for early exits.
-        signal_result.model_id = scope_model_id
-        signal_result.context_manifest = _current_scope_context_manifest()
-        return signal_result
+        if final is not None:
+            return final
+    # ContextVars never cross threads: re-seed this thread from the packet.
+    _SCOPE_CONTEXT_MANIFEST.set(dict(prepared["context_manifest"] or {}))
+    _SCOPE_STABLE_PREFIX_LEN.set(int(prepared["stable_prefix_len"] or 0))
+    prompt, session_task = prepared["prompt"], prepared["session_task"]
+    repo_dir, scope_model_id = prepared["repo_dir"], prepared["scope_model_id"]
+    slot_id, route = prepared["slot_id"], prepared["route"]
+    slot_effort = prepared["slot_effort"]
+    session_target = prepared["session_target"]
+    session_profile = prepared["session_profile"]
+    delegated = bool(prepared["delegated"])
 
     _prompt_chars = len(prompt)  # type: ignore[arg-type]
     _prompt_tokens_est = estimate_tokens(prompt)  # type: ignore[arg-type]

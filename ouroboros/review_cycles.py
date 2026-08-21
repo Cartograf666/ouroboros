@@ -9,17 +9,37 @@ shipped default with one loud log line. It is a string on purpose:
 default would silently swallow ``"unlimited"``. ``review_max_cycles()`` returns
 ``Optional[int]`` — ``None`` means unlimited.
 
-Per-gate meaning of the ONE number:
+Per-gate meaning of the ONE number — on every gate it counts PAID cycles, and
+identical material is never re-reviewed for pay:
 
 * plan review — paid reviewer-panel cycles per task (the engine consumes the
   getter; this module only exposes it);
 * task acceptance — paid panel runs per task, ``passes = cycles - 1``
   (``acceptance_max_improvement_passes_from_cycles``), so the default 2 equals
   the historical default of 1 improvement pass; unlimited → None;
-* commit gate — consecutive review-blocks on a BYTE-IDENTICAL staged diff before
-  the identical-diff attempt cap refuses another triad+scope run. Semantics
-  unchanged (a changed diff starts a fresh streak); only the number's source
-  changed, and the default moved 3 → 2 (owner-approved, disclosed).
+* commit gate — paid triad+scope cycles per ROOT task (the whole task tree
+  shares one ceiling; a manual session is its own task; a follow-up task is a
+  fresh root). The paid fact is recorded on the attempt row AT DISPATCH and
+  the count is derived from the attempt ledger; the ceiling counts MONEY —
+  every dispatched wave counts whatever its terminal, and only UNDISPATCHED
+  attempts (free refusals/replays, preflight and assembly failures) stay
+  outside the count, which is also the only sense in which "infra retries
+  freely" applies to the ceiling. Independently of the number, a
+  byte-identical staged diff whose last terminal is a review-VERDICT block is
+  refused for FREE from the FIRST block (``identical_diff_refused``, quoting
+  the recorded verdict); a rebuttal is content-hashed and a hash new to the
+  streak buys exactly ONE paid re-review (a rebuttal is "spent" only when it
+  bought a dispatched, verdict-answered wave). Exhaustion under blocking is a
+  free typed refusal; under advisory the commit proceeds with a loud typed
+  disclosure and no further paid dispatch;
+* skill review — paid reviewer-panel dispatches per ceiling key (the root task
+  for task-driven review groups — shared across every skill that task reviews,
+  follow-ups start fresh — or, for the manual lane, the CURRENT content
+  snapshot: revised content restarts the manual count; a chunked oversized
+  wave is ONE cycle, not one per pack). A byte-identical skill snapshot with a
+  recorded substantive verdict under the same panel contract replays free
+  (``skill_review_cycles.py``) when the persisted review state still covers
+  it; exhaustion is the same typed event with ``surface="skill_review"``.
 
 Values are read from ``os.environ`` (``config.apply_settings_to_env`` projects
 saved settings there) falling back to ``SETTINGS_DEFAULTS`` — no second

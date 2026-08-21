@@ -204,8 +204,13 @@ def _clear_update_intent() -> bool:
 def _run_git_process_bounded(
     cmd: List[str], *, timeout: float, cwd: Optional[pathlib.Path] = None,
     env: Optional[Dict[str, str]] = None, text: bool = True,
+    input_data: Optional[Any] = None,
 ) -> Tuple[int, Any, Any]:
-    """Run one short-lived Git process and terminate its tree on timeout."""
+    """Run one short-lived Git process and terminate its tree on timeout.
+
+    ``input_data`` (str when ``text=True``, bytes otherwise) is fed to the
+    process's stdin and the pipe is closed — the batch-stdin git plumbing
+    (e.g. ``git cat-file --batch``) rides the same timeout/kill semantics."""
     from ouroboros.platform_layer import kill_process_tree, subprocess_new_group_kwargs
     from ouroboros.tools.shell import _active_subprocesses, _subprocess_lock
 
@@ -215,6 +220,7 @@ def _run_git_process_bounded(
         proc = subprocess.Popen(
             cmd,
             cwd=str(cwd or REPO_DIR),
+            stdin=subprocess.PIPE if input_data is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=text,
@@ -229,7 +235,7 @@ def _run_git_process_bounded(
         _active_subprocesses.add(proc)
     try:
         try:
-            stdout, stderr = proc.communicate(timeout=limit)
+            stdout, stderr = proc.communicate(input=input_data, timeout=limit)
         except subprocess.TimeoutExpired as exc:
             partial_error = getattr(exc, "stderr", None)
             kill_process_tree(proc)

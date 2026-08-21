@@ -578,8 +578,11 @@ def review_wave_admission(
     models: Sequence[str],
     prompt_chars: int,
     max_completion_tokens: int = 65536,
+    remaining_usd_override: float | None = None,
 ) -> Dict[str, Any]:
-    """Read-only all-slot admission using the normal reservation math; fail open."""
+    """Read-only all-slot admission using the normal reservation math; fail open.
+    ``remaining_usd_override`` serves callers outside any task usage scope (the
+    managed-update admission gate): compared against instead of the projection."""
     result: Dict[str, Any] = {
         "fits": True,
         "estimated_wave_usd": None,
@@ -594,12 +597,15 @@ def review_wave_admission(
     try:
         from ouroboros.pricing import infer_provider_from_model
 
-        projection = usage_projection(drive_root, root_task_id=root_task_id)
-        limit = _number(projection.get("limit_usd"))
-        remaining = _number(projection.get("remaining_known_usd"))
-        if limit is None or remaining is None:
-            return result
-        result["limit_usd"] = limit
+        if remaining_usd_override is not None:
+            remaining = float(remaining_usd_override)
+        else:
+            projection = usage_projection(drive_root, root_task_id=root_task_id)
+            limit = _number(projection.get("limit_usd"))
+            remaining = _number(projection.get("remaining_known_usd"))
+            if limit is None or remaining is None:
+                return result
+            result["limit_usd"] = limit
         result["remaining_usd"] = remaining
         prompt_tokens = max(0, int(prompt_chars or 0)) // 4
         total = 0.0

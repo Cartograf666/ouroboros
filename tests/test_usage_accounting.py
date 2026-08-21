@@ -1427,3 +1427,35 @@ def test_a_non_final_projection_names_its_cause(data_root):
         root_task_id="root", spend_usd=0.0)
     free = ua.usage_projection(data_root / "free")
     assert free["non_final_rows"] == 0 and free["cost_final"] is True
+
+
+def test_review_wave_admission_override_compares_against_the_given_remaining(monkeypatch):
+    """The managed-update admission gate runs OUTSIDE any task usage scope: the
+    override branch must estimate with the normal reservation math and compare
+    against the caller's remaining USD, never a task projection."""
+    import ouroboros.usage_accounting as ua
+
+    monkeypatch.setattr(ua, "_reservation_cost", lambda _request: 1.25)
+    monkeypatch.setattr(
+        ua, "usage_projection",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("override must not read a projection")),
+    )
+
+    tight = ua.review_wave_admission(
+        root_task_id="managed-update-admission",
+        models=["prov/a", "prov/b"],
+        prompt_chars=400_000,
+        remaining_usd_override=2.0,
+    )
+    assert tight["fits"] is False
+    assert tight["estimated_wave_usd"] == 2.5
+    assert tight["remaining_usd"] == 2.0
+    assert tight["limit_usd"] is None
+
+    roomy = ua.review_wave_admission(
+        root_task_id="managed-update-admission",
+        models=["prov/a", "prov/b"],
+        prompt_chars=400_000,
+        remaining_usd_override=3.0,
+    )
+    assert roomy["fits"] is True and roomy["estimated_wave_usd"] == 2.5

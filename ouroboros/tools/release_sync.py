@@ -302,6 +302,43 @@ def version_carrier_desyncs(
     return desync
 
 
+def check_worktree_version_sync(repo_dir) -> str:
+    """Return a non-fatal warning when release version carriers disagree.
+
+    Worktree-readiness form of ``version_carrier_desyncs``: reads the live
+    carrier files itself and never raises (moved here from
+    ``review_helpers.py`` — version-sync logic lives with its authority).
+    """
+    repo_dir = Path(repo_dir)
+    try:
+        version_path = repo_dir / "VERSION"
+        if not version_path.exists():
+            return ""
+        version_str = version_path.read_text(encoding="utf-8").strip()
+        if not is_release_version(version_str):
+            return ""
+
+        def _read(rel_path: str) -> str:
+            return path.read_text(encoding="utf-8") if (path := repo_dir / rel_path).exists() else ""
+        desync = version_carrier_desyncs(
+            version_str,
+            pyproject_text=_read("pyproject.toml"),
+            uv_lock_text=_read("uv.lock"),
+            web_package_text=_read("web/package.json"),
+            readme_text=_read("README.md"),
+            arch_text=_read("docs/ARCHITECTURE.md"),
+            api_types_text=_read("web/modules/api_types.js"),
+            download_readme_text=_read("README.md"),
+            site_install_text=_read("site/install/index.html"),
+            docs_install_text=_read("docs/install/index.html"),
+        )
+        if desync:
+            return f"VERSION={version_str} but {', '.join(desync)} differ. Sync version carriers before committing."
+    except Exception:
+        pass
+    return ""
+
+
 def sync_release_metadata(repo_dir: str) -> List[str]:
     """Sync VERSION into generated and author-facing release carriers."""
     root = Path(repo_dir)
