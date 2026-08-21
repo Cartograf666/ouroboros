@@ -442,10 +442,11 @@ def test_reasoning_integrity_canary_rejects_explicit_none_and_clamp():
 def test_normalized_calls_require_unique_schema_valid_delegate_start():
     tools = full_registry_canary_tools()
     expected = delegate_start_canary_arguments("normalized-call")
+    required = {"prompt": expected["prompt"]}
     assert assert_normalized_canary_call(
         {"tool_calls": [_canonical_canary_call("call-ok", expected)]},
         tools,
-        expected,
+        required,
     )[0]["id"] == "call-ok"
 
     provider_defaults = {
@@ -459,22 +460,34 @@ def test_normalized_calls_require_unique_schema_valid_delegate_start():
     assert assert_normalized_canary_call(
         {"tool_calls": [_canonical_canary_call("call-defaults", provider_defaults)]},
         tools,
-        expected,
+        required,
     )[0]["id"] == "call-defaults"
 
-    wrong = dict(expected, subagent_id="other")
+    provider_selector = {
+        "prompt": expected["prompt"],
+        "retry_of": "provider-contract-canary",
+        "root": "skill_payload",
+        "bucket": "external",
+    }
+    assert assert_normalized_canary_call(
+        {"tool_calls": [_canonical_canary_call("call-selector", provider_selector)]},
+        tools,
+        required,
+    )[0]["id"] == "call-selector"
+
+    wrong = dict(expected, prompt="different nonce-bearing prompt")
     with pytest.raises(AssertionError):
         assert_normalized_canary_call(
             {"tool_calls": [_canonical_canary_call("call-wrong", wrong)]},
             tools,
-            expected,
+            required,
         )
     duplicate = _canonical_canary_call("call-duplicate", expected)
     with pytest.raises(AssertionError):
         assert_normalized_canary_call(
             {"tool_calls": [duplicate, copy.deepcopy(duplicate)]},
             tools,
-            expected,
+            required,
         )
 
 
@@ -622,6 +635,8 @@ def test_public_chat_builds_full_registry_request_for_every_matrix_row():
         else:
             assert first["tool_choice"] == "auto"
         if canary.continue_to_final:
+            assert "After its tool result" in first["messages"][0]["content"]
+            assert "expected_final_marker" in first["messages"][0]["content"]
             second = client.calls[1]
             assert second["tool_choice"] == "none"
             assert second["max_tokens"] == CANARY_CONTINUATION_MAX_TOKENS
@@ -636,3 +651,5 @@ def test_public_chat_builds_full_registry_request_for_every_matrix_row():
                 f"call-{canary.canary_id}-2",
             ]
             assert all(nonce in message["content"] for message in second["messages"][2:])
+        else:
+            assert "After its tool result" not in first["messages"][0]["content"]
