@@ -61,6 +61,32 @@ def _as_amount(value: Any) -> Optional[float]:
         return None
 
 
+def honest_accounted_amount(source: Optional[Mapping[str, Any]]) -> Optional[float]:
+    """Return a known accounted subtotal without fabricating unknown zero.
+
+    The physical ledger uses ``accounted_usd`` as the settled plus reserved /
+    unresolved upper bound. An external or unknown-price row can therefore
+    leave that subtotal at ``0.0`` while ``unknown_unmetered`` is positive.
+    That zero is not a measured free result unless a bound exists, so terminal
+    and live producers must carry ``None`` instead. A non-zero known subtotal,
+    including a mixed known+unknown tree, remains useful and is disclosed by
+    the openness fields beside it.
+    """
+    src = source if isinstance(source, Mapping) else {}
+    amount = _as_amount(src.get("accounted_usd"))
+    if amount is None:
+        return None
+    try:
+        unknown = int(src.get("unknown_unmetered") or 0)
+        reserved = float(src.get("reserved_usd") or 0)
+        unresolved = float(src.get("unresolved_upper_bound_usd") or 0)
+    except (TypeError, ValueError):
+        return amount
+    if amount == 0 and unknown > 0 and reserved == 0 and unresolved == 0:
+        return None
+    return amount
+
+
 def resolve_cost_pair(source: Optional[Mapping[str, Any]], new: str, old: str) -> tuple[bool, Any]:
     """``(present, raw_value)`` for one alias pair under the ONE precedence rule.
 
@@ -161,15 +187,7 @@ def live_root_cost_projection(
         unknown = int(usage.get("unknown_unmetered") or 0)
         reserved = float(usage.get("reserved_usd") or 0)
         unresolved = float(usage.get("unresolved_upper_bound_usd") or 0)
-        accounted = _as_amount(usage.get("accounted_usd"))
-        # An entirely unknown zero-dollar summary is not a free task: external
-        # unmetered work and unknown-price rows deliberately carry no amount.
-        # Keep a numeric known subtotal when a bound exists, and keep measured
-        # zero for a genuinely priced/free row.
-        if accounted is None or (
-            accounted == 0 and unknown > 0 and reserved == 0 and unresolved == 0
-        ):
-            accounted = None
+        accounted = honest_accounted_amount(usage)
         projection = {
             "cost_accounting_status": "available",
             "cost_usd_with_children": (
@@ -243,6 +261,7 @@ __all__ = [
     "carry_cost_meta",
     "cost_display",
     "cost_projection",
+    "honest_accounted_amount",
     "live_root_cost_projection",
     "resolve_cost_pair",
     "with_cost_aliases",

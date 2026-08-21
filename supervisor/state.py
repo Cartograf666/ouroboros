@@ -715,6 +715,7 @@ def reconstruct_task_cost(
         }
     else:
         try:
+            from ouroboros.cost_projection import honest_accounted_amount
             from ouroboros.usage_accounting import ensure_legacy_imported, usage_breakdown
 
             authority_root = pathlib.Path(drive_root) if drive_root is not None else DRIVE_ROOT
@@ -722,7 +723,11 @@ def reconstruct_task_cost(
             bucket = usage_breakdown(authority_root, task_id=want)
             projection = {
                 "cost_accounting_status": "available",
-                "cost_usd": round(float(bucket.get("accounted_usd") or 0.0), 6),
+                "cost_usd": (
+                    round(amount, 6)
+                    if (amount := honest_accounted_amount(bucket)) is not None
+                    else None
+                ),
                 "total_rounds": int(bucket.get("physical_calls") or 0),
                 "prompt_tokens": int(bucket.get("prompt_tokens") or 0),
                 "completion_tokens": int(bucket.get("completion_tokens") or 0),

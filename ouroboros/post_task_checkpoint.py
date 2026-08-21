@@ -8,7 +8,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Dict
 
-from ouroboros.cost_projection import with_cost_aliases
+from ouroboros.cost_projection import honest_accounted_amount, with_cost_aliases
 from ouroboros.task_results import (
     TASK_COST_META_FIELDS,
     STATUS_COMPLETED,
@@ -215,8 +215,11 @@ def set_root_post_task_checkpoint(
                     authority_root, root_task_id=logical_root_id
                 )
                 subtree_final = bool(subtree.get("cost_final"))
+                subtree_amount = honest_accounted_amount(subtree)
                 cost_fields.update({
-                    "cost_usd_with_children": round(float(subtree.get("accounted_usd") or 0.0), 6),
+                    "cost_usd_with_children": (
+                        round(subtree_amount, 6) if subtree_amount is not None else None
+                    ),
                     "cost_with_children_partial": not subtree_final,
                     "cost_final": bool(cost_fields.get("cost_final") and subtree_final),
                 })

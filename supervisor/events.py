@@ -1331,6 +1331,7 @@ def _authoritative_terminal_cost(
     task_id: str, task: Dict[str, Any], result: Dict[str, Any], evt: Dict[str, Any], drive_root: pathlib.Path,
 ) -> Dict[str, Any]:
     """Project one terminal task/root from the physical-attempt authority."""
+    from ouroboros.cost_projection import honest_accounted_amount
     from supervisor.state import reconstruct_task_cost
 
     authority_root = pathlib.Path(task.get("budget_drive_root") or drive_root)
@@ -1371,8 +1372,11 @@ def _authoritative_terminal_cost(
                 root_task_id=str(lineage["root_task_id"] or task_id),
             )
             subtree_final = bool(subtree.get("cost_final"))
+            subtree_amount = honest_accounted_amount(subtree)
             projection.update({
-                "cost_usd_with_children": round(float(subtree.get("accounted_usd") or 0.0), 6),
+                "cost_usd_with_children": (
+                    round(subtree_amount, 6) if subtree_amount is not None else None
+                ),
                 "cost_with_children_partial": not subtree_final,
                 "cost_final": bool(projection.get("cost_final") and subtree_final),
                 # THIRD site of the same class: `non_final_rows` is `cost_final`'s

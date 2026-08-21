@@ -10,6 +10,7 @@ from __future__ import annotations
 from ouroboros.cost_projection import (
     cost_display,
     cost_projection,
+    honest_accounted_amount,
     with_cost_aliases,
 )
 
@@ -37,6 +38,18 @@ class TestAliases:
 
 
 class TestProjection:
+    def test_unknown_zero_accounted_subtotal_is_null_but_measured_zero_survives(self):
+        assert honest_accounted_amount({
+            "accounted_usd": 0.0, "unknown_unmetered": 1,
+            "reserved_usd": 0.0, "unresolved_upper_bound_usd": 0.0,
+        }) is None
+        assert honest_accounted_amount({
+            "accounted_usd": 0.0, "unknown_unmetered": 0,
+        }) == 0.0
+        assert honest_accounted_amount({
+            "accounted_usd": 1.25, "unknown_unmetered": 1,
+        }) == 1.25
+
     def test_unknown_cost_is_null_on_both_names_and_never_final(self):
         out = cost_projection({"status": "completed"})
         assert out["cost_usd"] is None
