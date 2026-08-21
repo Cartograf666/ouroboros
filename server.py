@@ -1031,9 +1031,9 @@ _LAST_CANCEL_INTENT_SWEEP = [0.0]
 
 def _periodic_supervisor_maintenance(last_custody_reap: list, last_review_reconcile: list) -> None:
     """Throttled periodic upkeep extracted from the supervisor loop: cancel-intent
-    watchdog (every 20s), custody reap of orphaned task-scoped processes (every
-    600s) + review-job zombie reconcile (every 300s). Each cadence gates itself
-    via its own last-run marker."""
+    watchdog and pending child-ref promotion replay (every 20s), custody reap of
+    orphaned task-scoped processes (every 600s) + review-job zombie reconcile
+    (every 300s). Each cadence gates itself via its own last-run marker."""
     if time.time() - _LAST_CANCEL_INTENT_SWEEP[0] > 20:
         _LAST_CANCEL_INTENT_SWEEP[0] = time.time()
         try:
@@ -1056,6 +1056,12 @@ def _periodic_supervisor_maintenance(last_custody_reap: list, last_review_reconc
             replay_pending_deliveries(DATA_DIR)
         except Exception:
             log.debug("Pending terminal-delivery replay failed", exc_info=True)
+        try:
+            from ouroboros.observability import retry_pending_child_ref_promotions
+
+            retry_pending_child_ref_promotions(DATA_DIR)
+        except Exception:
+            log.debug("Pending child-ref promotion retry failed", exc_info=True)
     if time.time() - last_custody_reap[0] > 600:
         last_custody_reap[0] = time.time()
         try:

@@ -19,7 +19,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from ouroboros.utils import atomic_write_json, replace_atomic, utc_now_iso, write_bytes_atomic
+from ouroboros.utils import atomic_write_json, replace_atomic, utc_now_iso
 
 
 OBSERVABILITY_DIR = "observability"
@@ -481,6 +481,7 @@ def promote_call_manifest_ref(
 _PUBLISHED_CHILD_REF_FIELDS = frozenset(
     {
         "trace_refs",
+        "loop_outcome",
         "review_evidence",
         "review_projection",
         "verification_ledger",
@@ -491,7 +492,7 @@ _PUBLISHED_CHILD_REF_FIELDS = frozenset(
     }
 )
 _SOURCE_HANDLES_SUBDIR = "source_handles"
-_SOURCE_HANDLE_DIGEST_RE = re.compile(r"-([0-9a-f]{64})\.[A-Za-z0-9]+$")
+_TASK_SOURCE_MARKER = "FULL_RESULT_SOURCE_JSON="
 _SERVICE_REF_TOOLS = frozenset({"service_logs", "stop_service"})
 
 
@@ -548,13 +549,109 @@ def _is_manifest_ref(value: Any) -> bool:
 
 
 def _is_task_source_ref(value: Any) -> bool:
-    return bool(
-        isinstance(value, dict)
-        and value.get("kind") == "task_source"
-        and value.get("root") == "artifact_store"
-        and pathlib.PurePosixPath(str(value.get("path") or "")).parts[:1]
-        == (_SOURCE_HANDLES_SUBDIR,)
+    return bool(isinstance(value, dict) and value.get("kind") == "task_source")
+
+
+def _task_source_contract_valid(ref: Dict[str, Any]) -> bool:
+    read = ref.get("read") if isinstance(ref.get("read"), dict) else {}
+    arguments = (
+        read.get("arguments") if isinstance(read.get("arguments"), dict) else {}
     )
+    path = str(ref.get("path") or "")
+    return bool(
+        ref.get("root") == "artifact_store"
+        and read.get("tool") == "read_file"
+        and arguments.get("root") == ref.get("root")
+        and str(arguments.get("path") or "") == path
+    )
+
+
+def _task_source_failure_reason(exc: Exception) -> str:
+    message = str(exc)
+    if isinstance(exc, FileNotFoundError):
+        return "source_missing"
+    if "size verification" in message or "sha256 verification" in message:
+        return "digest_mismatch"
+    if "escapes" in message or "symlink" in message:
+        return "invalid_scope"
+    if isinstance(exc, (TypeError, ValueError)):
+        return "invalid_ref"
+    return "source_unreadable"
+
+
+def _promote_task_source_ref(
+    parent_root: pathlib.Path,
+    child_root: pathlib.Path,
+    task_id: str,
+    ref: Dict[str, Any],
+    state: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Promote one exact Phase3B actor ref through its own read/write seams."""
+
+    if not _task_source_contract_valid(ref):
+        _append_promotion_fact(
+            state["unavailable_refs"], _promotion_fact(ref, "invalid_ref")
+        )
+        return _typed_unavailable_ref(ref, "invalid_ref")
+    try:
+        from ouroboros.artifacts import (
+            read_actor_source_bytes,
+            store_actor_source_bytes,
+        )
+
+        read_actor_source_bytes(parent_root, task_id, ref)
+        return dict(ref)
+    except Exception:
+        pass
+
+    try:
+        raw = read_actor_source_bytes(child_root, task_id, ref)
+    except Exception as exc:
+        reason = _task_source_failure_reason(exc)
+        _append_promotion_fact(
+            state["unavailable_refs"], _promotion_fact(ref, reason)
+        )
+        return _typed_unavailable_ref(ref, reason)
+
+    rel = pathlib.PurePosixPath(str(ref.get("path") or ""))
+    expected_sha = str(ref.get("sha256") or "")
+    name_match = re.fullmatch(
+        rf"(.+)-{re.escape(expected_sha)}\.([A-Za-z0-9]+)",
+        rel.name,
+    )
+    if len(rel.parts) != 3 or rel.parts[0] != _SOURCE_HANDLES_SUBDIR or not name_match:
+        _append_promotion_fact(
+            state["unavailable_refs"], _promotion_fact(ref, "invalid_ref")
+        )
+        return _typed_unavailable_ref(ref, "invalid_ref")
+
+    source = _task_artifact_dir(child_root, task_id, create=False).joinpath(
+        *rel.parts
+    )
+    try:
+        promoted = store_actor_source_bytes(
+            parent_root,
+            task_id,
+            category=rel.parts[1],
+            source_id=name_match.group(1),
+            data=raw,
+            extension=name_match.group(2),
+        )
+        if str(promoted.get("path") or "") != rel.as_posix():
+            raise OSError("canonical task source path changed during promotion")
+        read_actor_source_bytes(parent_root, task_id, ref)
+        state["promoted_source_handle_count"] += 1
+        return dict(ref)
+    except Exception as exc:
+        _append_promotion_fact(
+            state["pending_refs"],
+            _promotion_fact(
+                {**ref, "path": str(source)},
+                f"{type(exc).__name__}: {exc}",
+            ),
+        )
+        state["status"] = "incomplete"
+        return dict(ref)
 
 
 def _promote_known_observability_ref(
@@ -571,12 +668,25 @@ def _promote_known_observability_ref(
             raise OSError("embedded child observability ref promotion is pending")
         return rewritten
 
+    source_root = child_root
+    try:
+        ref_path = pathlib.Path(str(ref.get("path") or "")).resolve(strict=False)
+        ref_path.relative_to(_observability_root(parent_root).resolve(strict=False))
+        source_root = parent_root
+    except (OSError, ValueError):
+        pass
+
     try:
         promoted = (
-            promote_blob_ref(child_root, parent_root, ref, transform_json=transform_json)
+            promote_blob_ref(
+                source_root,
+                parent_root,
+                ref,
+                transform_json=transform_json,
+            )
             if _is_blob_ref(ref)
             else promote_call_manifest_ref(
-                child_root, parent_root, ref, task_id=task_id,
+                source_root, parent_root, ref, task_id=task_id,
                 transform_json=transform_json,
             )
         )
@@ -611,6 +721,46 @@ def _rewrite_service_result(
         return text
     rewritten = _rewrite_child_ref_tree(parsed, parent_root, child_root, task_id, state)
     return prefix + json.dumps(rewritten, ensure_ascii=False, indent=2)
+
+
+def _rewrite_task_source_markers(
+    text: str,
+    parent_root: pathlib.Path,
+    child_root: pathlib.Path,
+    task_id: str,
+    state: Dict[str, Any],
+) -> str:
+    """Rewrite only Phase3B's explicit actor-source envelope inside tool text."""
+
+    rewritten_lines: List[str] = []
+    for line in str(text).splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        newline = line[len(body):]
+        if not body.startswith(_TASK_SOURCE_MARKER):
+            rewritten_lines.append(line)
+            continue
+        try:
+            ref = json.loads(body[len(_TASK_SOURCE_MARKER):])
+        except (TypeError, ValueError):
+            rewritten_lines.append(line)
+            continue
+        if not _is_task_source_ref(ref):
+            rewritten_lines.append(line)
+            continue
+        promoted = _promote_task_source_ref(
+            parent_root, child_root, task_id, ref, state
+        )
+        rewritten_lines.append(
+            _TASK_SOURCE_MARKER
+            + json.dumps(
+                promoted,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + newline
+        )
+    return "".join(rewritten_lines)
 
 
 def _rewrite_service_payload(
@@ -648,71 +798,9 @@ def _rewrite_child_ref_tree(
     if _is_blob_ref(value) or _is_manifest_ref(value):
         return _promote_known_observability_ref(parent_root, child_root, task_id, value, state)
     if _is_task_source_ref(value):
-        rel = pathlib.PurePosixPath(str(value.get("path") or ""))
-        try:
-            expected_size = int(value["size"])
-        except (KeyError, TypeError, ValueError):
-            expected_size = -1
-        expected_sha = str(value.get("sha256") or "")
-        if expected_size < 0 or not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
-            _append_promotion_fact(
-                state["unavailable_refs"], _promotion_fact(value, "invalid_ref")
-            )
-            return _typed_unavailable_ref(value, "invalid_ref")
-        source = _task_artifact_dir(child_root, task_id, create=False).joinpath(*rel.parts)
-        target = _task_artifact_dir(parent_root, task_id, create=False).joinpath(*rel.parts)
-        if target.is_file():
-            raw = target.read_bytes()
-            if (
-                len(raw) == expected_size
-                and hashlib.sha256(raw).hexdigest() == expected_sha
-            ):
-                return dict(value)
-        if source.is_file():
-            try:
-                raw = source.read_bytes()
-            except OSError as exc:
-                reason = f"source_unreadable:{type(exc).__name__}"
-                _append_promotion_fact(
-                    state["unavailable_refs"], _promotion_fact(value, reason)
-                )
-                return _typed_unavailable_ref(value, reason)
-            match = _SOURCE_HANDLE_DIGEST_RE.search(source.name)
-            if (
-                len(raw) != expected_size
-                or hashlib.sha256(raw).hexdigest() != expected_sha
-                or match is None
-                or match.group(1) != expected_sha
-            ):
-                _append_promotion_fact(
-                    state["unavailable_refs"],
-                    _promotion_fact(value, "digest_mismatch"),
-                )
-                return _typed_unavailable_ref(value, "digest_mismatch")
-            try:
-                write_bytes_atomic(target, raw)
-                copied = target.read_bytes()
-                if (
-                    len(copied) != expected_size
-                    or hashlib.sha256(copied).hexdigest() != expected_sha
-                ):
-                    raise OSError("canonical task source verification failed")
-                state["promoted_source_handle_count"] += 1
-                return dict(value)
-            except Exception as exc:
-                _append_promotion_fact(
-                    state["pending_refs"],
-                    _promotion_fact(
-                        {**value, "path": str(source)},
-                        f"{type(exc).__name__}: {exc}",
-                    ),
-                )
-                state["status"] = "incomplete"
-                return dict(value)
-        _append_promotion_fact(
-            state["unavailable_refs"], _promotion_fact(value, "source_missing")
+        return _promote_task_source_ref(
+            parent_root, child_root, task_id, value, state
         )
-        return _typed_unavailable_ref(value, "source_missing")
     if isinstance(value, dict):
         return {
             key: _rewrite_child_ref_tree(
@@ -725,6 +813,10 @@ def _rewrite_child_ref_tree(
             _rewrite_child_ref_tree(item, parent_root, child_root, task_id, state)
             for item in value
         ]
+    if isinstance(value, str) and _TASK_SOURCE_MARKER in value:
+        return _rewrite_task_source_markers(
+            value, parent_root, child_root, task_id, state
+        )
     return value
 
 
@@ -754,6 +846,121 @@ def promote_child_task_refs(
     if state["pending_refs"]:
         state["status"] = "incomplete"
     return rewritten, state
+
+
+def promote_child_task_ref_patch(
+    parent_drive_root: pathlib.Path,
+    child_drive_root: pathlib.Path,
+    task_id: str,
+    canonical_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return only ref-bearing canonical fields for a pending retry write."""
+
+    rewritten, state = promote_child_task_refs(
+        parent_drive_root,
+        child_drive_root,
+        task_id,
+        canonical_result,
+    )
+    patch = {
+        key: rewritten[key]
+        for key in _PUBLISHED_CHILD_REF_FIELDS
+        if key in rewritten
+    }
+    patch["child_ref_promotion"] = state
+    return patch
+
+
+def _has_pending_ref_promotion(promotion: Any) -> bool:
+    if not isinstance(promotion, dict):
+        return False
+    try:
+        version = int(promotion.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        version == 1
+        and str(promotion.get("status") or "") != "complete"
+        and isinstance(promotion.get("pending_refs"), list)
+        and promotion.get("pending_refs")
+    )
+
+
+def _retry_pending_child_ref_promotion(
+    parent: pathlib.Path,
+    child: pathlib.Path,
+    task_id: str,
+    loaded_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Retry ref fields from CURRENT canonical authority under its result lock."""
+
+    from ouroboros.task_results import write_task_result
+
+    def _project(current: Dict[str, Any], _incoming: Dict[str, Any]) -> Dict[str, Any]:
+        current_status = str(current.get("status") or loaded_result.get("status") or "")
+        if not _has_pending_ref_promotion(current.get("child_ref_promotion")):
+            return {"status": current_status}
+        patch = promote_child_task_ref_patch(parent, child, task_id, current)
+        patch["status"] = current_status
+        return patch
+
+    return write_task_result(
+        parent,
+        task_id,
+        str(loaded_result.get("status") or ""),
+        _field_projector=_project,
+    )
+
+
+def retry_pending_child_ref_promotions(
+    parent_drive_root: pathlib.Path,
+) -> Dict[str, Any]:
+    """Retry only newly ledgered pending refs, never the stale child result."""
+
+    from ouroboros.headless import HEADLESS_TASKS_DIR
+    from ouroboros.task_status import SETTLED_STATUSES
+    from ouroboros.task_results import load_task_result, validate_task_id
+
+    parent = pathlib.Path(parent_drive_root)
+    base = parent / HEADLESS_TASKS_DIR
+    report: Dict[str, Any] = {
+        "scanned": 0,
+        "retried": [],
+        "completed": [],
+        "pending": [],
+        "errors": [],
+    }
+    if not base.is_dir():
+        return report
+    for task_dir in sorted(base.iterdir()):
+        if not task_dir.is_dir():
+            continue
+        task_id = task_dir.name
+        report["scanned"] += 1
+        try:
+            validate_task_id(task_id)
+            result = load_task_result(parent, task_id) or {}
+            if str(result.get("status") or "").lower() not in SETTLED_STATUSES:
+                continue
+            if not _has_pending_ref_promotion(result.get("child_ref_promotion")):
+                continue
+            settled = _retry_pending_child_ref_promotion(
+                parent, task_dir / "data", task_id, result
+            )
+            report["retried"].append(task_id)
+            promotion = settled.get("child_ref_promotion") or {}
+            destination = (
+                "completed"
+                if str(promotion.get("status") or "") == "complete"
+                else "pending"
+            )
+            report[destination].append(task_id)
+        except Exception as exc:
+            report["errors"].append({
+                "task_id": task_id,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+    return report
 
 
 def write_call_manifest(

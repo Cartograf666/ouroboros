@@ -233,9 +233,19 @@ def prune_headless_task_drives(
     base = parent / HEADLESS_TASKS_DIR
     days = _resolve_retention_days(retention_days)
     cutoff = age_cutoff(days, now)
-    report: Dict[str, Any] = {"retention_days": days, "scanned": 0, "pruned": [], "skipped": [], "errors": []}
+    report: Dict[str, Any] = {
+        "retention_days": days,
+        "scanned": 0,
+        "pruned": [],
+        "skipped": [],
+        "errors": [],
+        "promotion_retry": {},
+    }
     if not base.is_dir():
         return report
+    from ouroboros.observability import retry_pending_child_ref_promotions
+
+    report["promotion_retry"] = retry_pending_child_ref_promotions(parent)
     for task_dir in sorted(base.iterdir()):
         if not task_dir.is_dir():
             continue

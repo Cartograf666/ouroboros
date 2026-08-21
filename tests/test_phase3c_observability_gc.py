@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import gzip
-import hashlib
 import json
 import pathlib
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+
+import pytest
 
 from ouroboros.headless import (
     copy_child_task_result,
@@ -15,7 +17,7 @@ from ouroboros.headless import (
     remove_subagent_task_drive,
 )
 from ouroboros.observability import persist_call, read_blob_ref, write_blob
-from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+from ouroboros.task_results import STATUS_COMPLETED, load_task_result, write_task_result
 
 
 def _child(tmp_path: pathlib.Path, task_id: str) -> tuple[pathlib.Path, pathlib.Path]:
@@ -32,6 +34,12 @@ def _future_now() -> float:
 
 def _manifest(ref: dict) -> dict:
     return json.loads(pathlib.Path(ref["path"]).read_text(encoding="utf-8"))
+
+
+def _source_ref_from_visible_result(text: str) -> dict:
+    prefix = "FULL_RESULT_SOURCE_JSON="
+    line = next(line for line in text.splitlines() if line.startswith(prefix))
+    return json.loads(line[len(prefix):])
 
 
 def test_copyback_promotes_trace_manifest_and_blobs_before_headless_gc(tmp_path):
@@ -106,6 +114,204 @@ def test_copyback_promotes_trace_manifest_and_blobs_before_headless_gc(tmp_path)
     assert read_blob_ref(parent, _manifest(promoted_tool_ref)["full_payload_ref"])[
         "tool"
     ] == "read_file"
+
+
+def test_pipeline_loop_outcome_trace_refs_are_rebased_and_readable_after_gc(tmp_path):
+    from ouroboros.agent_task_pipeline import _store_task_result
+    from ouroboros.outcomes import derive_loop_outcome
+
+    task_id = "phase3c-loop-outcome"
+    parent, child = _child(tmp_path, task_id)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    request = persist_call(
+        child,
+        task_id=task_id,
+        call_id="pipeline-request",
+        call_type="llm_request",
+        payload={"messages": [{"role": "user", "content": "exact pipeline prompt"}]},
+    )
+    response = persist_call(
+        child,
+        task_id=task_id,
+        call_id="pipeline-response",
+        call_type="llm_response",
+        payload={"message": {"role": "assistant", "content": "exact answer"}},
+    )
+    tool = persist_call(
+        child,
+        task_id=task_id,
+        call_id="pipeline-tool",
+        call_type="tool_call",
+        payload={"tool": "read_file", "result": "pipeline tool result"},
+    )
+    usage = {
+        "execution_id": "phase3c-execution",
+        "rounds": 1,
+        "llm_call_refs": [{
+            "llm_call_id": "phase3c-llm",
+            "request_ref": request["manifest_ref"],
+            "response_ref": response["manifest_ref"],
+        }],
+    }
+    trace = {
+        "tool_calls": [{
+            "tool": "read_file",
+            "tool_call_id": "pipeline-tool-call",
+            "result": "pipeline tool result",
+            "is_error": False,
+            "trace_ref": tool,
+        }],
+        "reasoning_notes": [],
+    }
+    outcome = derive_loop_outcome("FINAL ANSWER: exact answer", usage, trace)
+    _store_task_result(
+        SimpleNamespace(drive_root=child, repo_dir=repo),
+        {"id": task_id, "type": "task", "text": "pipeline task"},
+        "FINAL ANSWER: exact answer",
+        usage,
+        trace,
+        review_evidence={},
+        loop_outcome=outcome,
+    )
+
+    copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+
+    assert copied is not None
+    nested_refs = copied["loop_outcome"]["trace_refs"]
+    nested_request = nested_refs["llm_call_refs"][0]["request_ref"]
+    nested_tool = nested_refs["tool_call_refs"][0]["manifest_ref"]
+    assert pathlib.Path(nested_request["path"]).is_relative_to(parent / "observability")
+    assert pathlib.Path(nested_tool["path"]).is_relative_to(parent / "observability")
+    prune_headless_task_drives(parent, retention_days=0, now=_future_now())
+    assert not child.exists()
+    assert read_blob_ref(parent, _manifest(nested_request)["full_payload_ref"])[
+        "messages"
+    ][0]["content"] == "exact pipeline prompt"
+    assert read_blob_ref(parent, _manifest(nested_tool)["full_payload_ref"])[
+        "result"
+    ] == "pipeline tool result"
+
+
+def test_real_truncated_tool_source_envelope_remains_actor_readable_after_gc(tmp_path):
+    from ouroboros.agent_task_pipeline import _store_task_result
+    from ouroboros.loop_tool_execution import process_tool_results
+    from ouroboros.outcomes import derive_loop_outcome
+    from ouroboros.tools.core import _read_file
+    from ouroboros.tools.registry import ToolContext
+
+    task_id = "phase3c-real-source"
+    parent, child = _child(tmp_path, task_id)
+    repo = tmp_path / "repo-real-source"
+    repo.mkdir()
+    ctx = ToolContext(repo_dir=repo, drive_root=child, task_id=task_id)
+    messages: list[dict] = []
+    trace = {"tool_calls": [], "reasoning_notes": []}
+    exact_tail = "\nDECISIVE_SUFFIX=FAILED_AFTER_ONE_SHOT"
+    full_result = "one-shot output\n" + ("x" * 100_000) + exact_tail
+    process_tool_results(
+        [{
+            "fn_name": "run_command",
+            "tool_call_id": "one-shot-call",
+            "result": full_result,
+            "is_error": False,
+            "tool_args": {"cmd": "non-idempotent-operation"},
+            "args_for_log": {"cmd": "non-idempotent-operation"},
+            "trace_ref": {},
+            "result_meta": {"status": "ok"},
+        }],
+        messages,
+        trace,
+        emit_progress=lambda _message: None,
+        tools=SimpleNamespace(_ctx=ctx),
+    )
+    produced_ref = _source_ref_from_visible_result(messages[0]["content"])
+    request = persist_call(
+        child,
+        task_id=task_id,
+        call_id="source-envelope-request",
+        call_type="llm_request",
+        payload={"messages": messages},
+    )
+    usage = {
+        "execution_id": "source-envelope-execution",
+        "rounds": 1,
+        "llm_call_refs": [{
+            "llm_call_id": "source-envelope-llm",
+            "request_ref": request["manifest_ref"],
+        }],
+    }
+    outcome = derive_loop_outcome("FINAL ANSWER: inspected", usage, trace)
+    _store_task_result(
+        SimpleNamespace(drive_root=child, repo_dir=repo),
+        {"id": task_id, "type": "task", "text": "one-shot"},
+        "FINAL ANSWER: inspected",
+        usage,
+        trace,
+        review_evidence={},
+        loop_outcome=outcome,
+    )
+
+    copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+
+    assert copied is not None
+    request_ref = copied["loop_outcome"]["trace_refs"]["llm_call_refs"][0][
+        "request_ref"
+    ]
+    prune_headless_task_drives(parent, retention_days=0, now=_future_now())
+    payload = read_blob_ref(parent, _manifest(request_ref)["full_payload_ref"])
+    promoted_ref = _source_ref_from_visible_result(payload["messages"][0]["content"])
+    assert promoted_ref == produced_ref
+    read_args = dict(promoted_ref["read"]["arguments"])
+    read_args["start_char"] = 95_000
+    canonical_ctx = ToolContext(repo_dir=repo, drive_root=parent, task_id=task_id)
+    assert exact_tail in _read_file(canonical_ctx, **read_args)
+
+
+@pytest.mark.parametrize("mismatch", ["tool", "root", "path"])
+def test_task_source_read_contract_mismatch_is_typed_unavailable(tmp_path, mismatch):
+    from ouroboros.artifacts import store_actor_source_bytes
+
+    task_id = f"phase3c-source-contract-{mismatch}"
+    parent, child = _child(tmp_path, task_id)
+    ref = store_actor_source_bytes(
+        child,
+        task_id,
+        category="tool_results",
+        source_id="contract",
+        data=b"exact source",
+        extension="txt",
+    )
+    malformed = json.loads(json.dumps(ref))
+    if mismatch == "tool":
+        malformed["read"]["tool"] = "run_command"
+    elif mismatch == "root":
+        malformed["read"]["arguments"]["root"] = "runtime_data"
+    else:
+        malformed["read"]["arguments"]["path"] = (
+            "source_handles/tool_results/other.txt"
+        )
+    write_task_result(
+        child,
+        task_id,
+        STATUS_COMPLETED,
+        result="done",
+        artifact_status="ready",
+        review_evidence={"exact_source_ref": malformed},
+    )
+
+    copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+
+    assert copied is not None
+    gap = copied["review_evidence"]["exact_source_ref"]
+    assert gap["availability"] == "unavailable"
+    assert gap["reason"] == "invalid_ref"
+    assert not (
+        parent / "task_results" / "artifacts" / task_id / pathlib.Path(ref["path"])
+    ).exists()
+    assert prune_headless_task_drives(
+        parent, retention_days=0, now=_future_now()
+    )["pruned"]
 
 
 def test_copyback_promotes_service_full_log_refs_in_durable_evidence_and_tool_payload(tmp_path):
@@ -233,19 +439,36 @@ def test_digest_mismatch_becomes_typed_unavailable_and_does_not_pin_drive(tmp_pa
 def test_concurrent_copyback_is_idempotent_and_copies_only_referenced_source_handle(
     tmp_path,
 ):
+    from ouroboros.artifacts import store_actor_source_bytes
+
     task_id = "phase3c-source-handles"
     parent, child = _child(tmp_path, task_id)
-    source_dir = child / "task_results" / "artifacts" / task_id / "source_handles" / "tool_results"
-    source_dir.mkdir(parents=True)
     source_bytes = b"actor promised source"
-    source_digest = hashlib.sha256(source_bytes).hexdigest()
-    source = source_dir / ("tool-" + source_digest + ".txt")
-    source.write_bytes(source_bytes)
-    unreferenced_source_bytes = b"unreferenced source handle"
-    unreferenced_source = source_dir / (
-        "unused-" + hashlib.sha256(unreferenced_source_bytes).hexdigest() + ".txt"
+    source_ref = store_actor_source_bytes(
+        child,
+        task_id,
+        category="tool_results",
+        source_id="tool",
+        data=source_bytes,
+        extension="txt",
     )
-    unreferenced_source.write_bytes(unreferenced_source_bytes)
+    source = child / "task_results" / "artifacts" / task_id / source_ref["path"]
+    unreferenced_source_bytes = b"unreferenced source handle"
+    unreferenced_source_ref = store_actor_source_bytes(
+        child,
+        task_id,
+        category="tool_results",
+        source_id="unused",
+        data=unreferenced_source_bytes,
+        extension="txt",
+    )
+    unreferenced_source = (
+        child
+        / "task_results"
+        / "artifacts"
+        / task_id
+        / unreferenced_source_ref["path"]
+    )
     unrelated = child / "task_results" / "artifacts" / task_id / "unrelated.txt"
     unrelated.write_text("must not copy", encoding="utf-8")
     unreferenced_blob = write_blob(child, {"unreferenced": True})
@@ -256,18 +479,6 @@ def test_concurrent_copyback_is_idempotent_and_copies_only_referenced_source_han
         call_type="tool_call",
         payload={"result": "copy once by content identity"},
     )
-    source_ref = {
-        "kind": "task_source",
-        "root": "artifact_store",
-        "path": f"source_handles/tool_results/{source.name}",
-        "size": len(source_bytes),
-        "sha256": source_digest,
-        "read": {
-            "tool": "read_file",
-            "root": "artifact_store",
-            "path": f"source_handles/tool_results/{source.name}",
-        },
-    }
     write_task_result(
         child,
         task_id,
@@ -337,3 +548,178 @@ def test_legacy_missing_child_ref_is_typed_gap_without_permanent_retention(tmp_p
     assert gap["reason"] == "source_missing"
     assert copied["child_ref_promotion"]["status"] == "complete"
     assert prune_headless_task_drives(parent, retention_days=0, now=_future_now())["pruned"]
+
+
+def test_startup_sweep_retries_only_pending_refs_then_prunes_without_manual_copyback(
+    tmp_path, monkeypatch,
+):
+    import ouroboros.observability as observability
+    import server
+
+    task_id = "phase3c-startup-retry"
+    parent, child = _child(tmp_path, task_id)
+    first_trace = persist_call(
+        child,
+        task_id=task_id,
+        call_id="startup-retry-first",
+        call_type="tool_call",
+        payload={"result": "already promoted before interruption"},
+    )
+    pending_trace = persist_call(
+        child,
+        task_id=task_id,
+        call_id="startup-retry-pending",
+        call_type="tool_call",
+        payload={"result": "survive startup retry"},
+    )
+    write_task_result(
+        child,
+        task_id,
+        STATUS_COMPLETED,
+        result="stale child result",
+        artifact_status="ready",
+        artifacts=[{"kind": "stale_child_artifact", "path": "child-only"}],
+        root_phase_checkpoint={"post_task_synthesis": "pending_once"},
+        trace_refs={
+            "tool_call_refs": [
+                {"manifest_ref": first_trace["manifest_ref"]},
+                {"manifest_ref": pending_trace["manifest_ref"]},
+            ]
+        },
+    )
+    real = observability.promote_call_manifest_ref
+
+    def _interrupt_pending(*args, **kwargs):
+        ref = args[2] if len(args) > 2 else kwargs.get("ref") or {}
+        if ref.get("call_id") == "startup-retry-pending":
+            raise OSError("first copy interrupted")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(
+        observability,
+        "promote_call_manifest_ref",
+        _interrupt_pending,
+    )
+    copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    assert copied is not None
+    assert copied["child_ref_promotion"]["status"] == "incomplete"
+
+    canonical_artifact = {
+        "kind": "canonical_newer_artifact",
+        "path": str(parent / "canonical-newer.txt"),
+    }
+    write_task_result(
+        parent,
+        task_id,
+        STATUS_COMPLETED,
+        result="canonical newer result",
+        artifact_status="ready_with_changes",
+        artifact_bundle={"status": "ready_with_changes", "artifacts": [canonical_artifact]},
+        artifacts=[canonical_artifact],
+        artifact_finalized_at="2000-01-01T00:00:00+00:00",
+        root_phase_checkpoint={
+            "post_task_synthesis": "completed",
+            "canonical_newer": True,
+        },
+    )
+    monkeypatch.setattr(observability, "promote_call_manifest_ref", real)
+    monkeypatch.setattr(server, "DATA_DIR", parent)
+    monkeypatch.setenv("OUROBOROS_GC_RETENTION_DAYS", "1")
+
+    server._startup_prune_sweeps()
+
+    settled = load_task_result(parent, task_id) or {}
+    assert settled["child_ref_promotion"]["status"] == "complete"
+    assert settled["result"] == "canonical newer result"
+    assert settled["artifact_status"] == "ready_with_changes"
+    assert settled["artifacts"] == [canonical_artifact]
+    assert settled["artifact_bundle"] == {
+        "status": "ready_with_changes",
+        "artifacts": [canonical_artifact],
+    }
+    assert settled["root_phase_checkpoint"] == {
+        "post_task_synthesis": "completed",
+        "canonical_newer": True,
+    }
+    assert not child.exists()
+    promoted_first = settled["trace_refs"]["tool_call_refs"][0]["manifest_ref"]
+    promoted_pending = settled["trace_refs"]["tool_call_refs"][1]["manifest_ref"]
+    assert read_blob_ref(parent, _manifest(promoted_first)["full_payload_ref"])[
+        "result"
+    ] == "already promoted before interruption"
+    assert read_blob_ref(parent, _manifest(promoted_pending)["full_payload_ref"])[
+        "result"
+    ] == "survive startup retry"
+
+
+def test_startup_prune_retries_missing_pending_source_into_typed_gap(
+    tmp_path, monkeypatch,
+):
+    import ouroboros.observability as observability
+
+    task_id = "phase3c-startup-missing"
+    parent, child = _child(tmp_path, task_id)
+    trace = persist_call(
+        child,
+        task_id=task_id,
+        call_id="startup-missing",
+        call_type="tool_call",
+        payload={"result": "lost before retry"},
+    )
+    write_task_result(
+        child,
+        task_id,
+        STATUS_COMPLETED,
+        result="done",
+        artifact_status="ready",
+        trace_refs={"tool_call_refs": [{"manifest_ref": trace["manifest_ref"]}]},
+    )
+    real = observability.promote_call_manifest_ref
+    monkeypatch.setattr(
+        observability,
+        "promote_call_manifest_ref",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("interrupted")),
+    )
+    copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    assert copied is not None
+    assert copied["child_ref_promotion"]["status"] == "incomplete"
+    pathlib.Path(trace["manifest_ref"]["path"]).unlink()
+    monkeypatch.setattr(observability, "promote_call_manifest_ref", real)
+
+    report = prune_headless_task_drives(
+        parent, retention_days=0, now=_future_now()
+    )
+
+    assert report["promotion_retry"]["completed"] == [task_id]
+    assert report["pruned"][0]["task_id"] == task_id
+    settled = load_task_result(parent, task_id) or {}
+    gap = settled["trace_refs"]["tool_call_refs"][0]["manifest_ref"]
+    assert gap["availability"] == "unavailable"
+    assert gap["reason"] == "source_missing"
+    assert settled["child_ref_promotion"]["status"] == "complete"
+
+
+def test_periodic_maintenance_invokes_pending_ref_promotion_sweep(
+    tmp_path, monkeypatch,
+):
+    import ouroboros.observability as observability
+    import server
+    import supervisor.task_lifecycle as task_lifecycle
+    import supervisor.terminal_delivery as terminal_delivery
+
+    calls: list[pathlib.Path] = []
+    monkeypatch.setattr(server, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(server.time, "time", lambda: 10_000.0)
+    monkeypatch.setattr(server, "_LAST_CANCEL_INTENT_SWEEP", [0.0])
+    monkeypatch.setattr(task_lifecycle, "sweep_cancel_intents", lambda: {})
+    monkeypatch.setattr(terminal_delivery, "replay_pending_deliveries", lambda _root: None)
+    monkeypatch.setattr(
+        observability,
+        "retry_pending_child_ref_promotions",
+        lambda root: calls.append(pathlib.Path(root)) or {},
+        raising=False,
+    )
+
+    server._periodic_supervisor_maintenance([10_000.0], [10_000.0])
+
+    assert calls == [tmp_path]
