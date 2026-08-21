@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import pathlib
 import types
+
+import pytest
 
 
 class _ImmediateThread:
@@ -94,6 +97,43 @@ def test_project_single_pending_root_gets_zero_call_mailbox_delivery(tmp_path, m
     assert annotation["action"] == "mailbox_delivery"
     assert annotation["target"] == "pending-root"
     assert annotation["status"] == "delivered"
+
+
+def test_project_fast_route_stages_attachment_in_actor_child_drive(tmp_path):
+    import server
+    from ouroboros.projects_registry import create_project
+    from ouroboros.tools.core import _read_file
+    from ouroboros.tools.registry import ToolContext
+
+    project = create_project(tmp_path, "attachment-room")
+    chat_id = int(project["chat_id"])
+    child_drive = tmp_path / "task_drives" / "forked-root" / "data"
+    child_drive.mkdir(parents=True)
+    source = tmp_path / "owner-input.txt"
+    source.write_text("child-drive-readable", encoding="utf-8")
+    task = {
+        "id": "forked-root", "chat_id": chat_id, "root_task_id": "forked-root",
+        "delegation_role": "root", "drive_root": str(child_drive),
+        "child_drive_root": str(child_drive),
+    }
+    ctx = _ctx(tmp_path, running={"forked-root": {"task": task}})
+    notices = []
+    ctx.send_with_budget = lambda _chat, text, **_kwargs: notices.append(text)
+    metadata = {
+        "chat_attachment_uploads": [{"path": str(source), "label": "owner input"}],
+    }
+
+    assert server._route_project_chat_to_running_task(
+        ctx, chat_id, "use this", "owner-attachment", task_metadata=metadata,
+    ) == "forked-root"
+
+    manifest = metadata["_attachment_manifest"]
+    assert pathlib.Path(manifest[0]["abs_path"]).is_relative_to(child_drive)
+    tool_ctx = ToolContext(repo_dir=tmp_path, drive_root=child_drive, task_id="forked-root")
+    assert "child-drive-readable" in _read_file(
+        tool_ctx, manifest[0]["relpath"], root="artifact_store",
+    )
+    assert notices and "status=staged" in notices[-1]
 
 
 def test_project_swarm_bypasses_single_root_mailbox_for_new_managed_root(tmp_path, monkeypatch):
@@ -648,6 +688,282 @@ def test_routing_ack_is_typed_and_never_broadcast_as_chat_bubble(monkeypatch):
     assert all(payload.get("type") != "chat" for payload in ws_payloads)
 
 
+def test_routing_ack_carries_event_time_human_label_without_replacing_target(monkeypatch):
+    from supervisor import message_bus
+    ws_payloads = []
+    bridge = message_bus.LocalChatBridge()
+    bridge._broadcast_fn = ws_payloads.append
+    monkeypatch.setattr(message_bus, "publish_event", lambda *_a, **_k: None)
+    bridge.send_routing_ack(
+        7,
+        client_message_id="m-labelled",
+        action="steer_task",
+        target="opaque-task-id",
+        target_label="Проект 🚀 › Исправить тесты",
+        status="delivered",
+    )
+    assert ws_payloads[-1]["target"] == "opaque-task-id"
+    assert ws_payloads[-1]["target_label"] == "Проект 🚀 › Исправить тесты"
+
+
+def test_task_presentation_snapshot_prefers_human_names_and_keeps_machine_ids(tmp_path):
+    from ouroboros.projects_registry import (
+        bind_task_to_project,
+        create_project,
+        task_presentation_snapshot,
+    )
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+    project = create_project(tmp_path, "opaque-project-id", name="Космос 🌌")
+    bind_task_to_project(
+        tmp_path,
+        "opaque-task-id",
+        project["id"],
+        project["chat_id"],
+        origin={"absent": "system"},
+    )
+    write_task_result(
+        tmp_path,
+        "opaque-task-id",
+        STATUS_RUNNING,
+        title="Явный заголовок",
+        suggested_name="Позднее имя",
+        objective="Очень длинная цель",
+    )
+    snapshot = task_presentation_snapshot(tmp_path, "opaque-task-id")
+    assert snapshot == {
+        "project_id": "opaque-project-id",
+        "project_name": "Космос 🌌",
+        "task_id": "opaque-task-id",
+        "task_name": "Явный заголовок",
+        "target_label": "Космос 🌌 › Явный заголовок",
+    }
+
+
+def test_task_presentation_snapshot_rejects_id_only_project_name_and_is_neutral(tmp_path):
+    from ouroboros.projects_registry import (
+        bind_task_to_project,
+        create_project,
+        task_presentation_snapshot,
+    )
+
+    project = create_project(tmp_path, "opaque-project-id", name="opaque-project-id")
+    bind_task_to_project(
+        tmp_path,
+        "opaque-task-id",
+        project["id"],
+        project["chat_id"],
+        origin={"absent": "system"},
+    )
+
+    snapshot = task_presentation_snapshot(tmp_path, "opaque-task-id")
+
+    assert snapshot["project_name"] == "Project"
+    assert snapshot["task_name"] == "Task"
+    assert snapshot["target_label"] == "Project › Task"
+
+
+def test_task_presentation_snapshot_reads_existing_title_from_durable_live_queue(tmp_path):
+    import json
+    from ouroboros.projects_registry import bind_task_to_project, create_project, task_presentation_snapshot
+
+    project = create_project(tmp_path, "human-project", name="Human Project")
+    bind_task_to_project(tmp_path, "live-task", project["id"], project["chat_id"],
+                         origin={"absent": "system"})
+    (tmp_path / "state" / "queue_snapshot.json").write_text(json.dumps({
+        "running": [{"id": "live-task", "task": {
+            "id": "live-task", "title": "Human Task",
+        }}],
+        "pending": [],
+    }), encoding="utf-8")
+    assert task_presentation_snapshot(tmp_path, "live-task")["target_label"] == (
+        "Human Project › Human Task")
+
+
+def test_task_presentation_snapshot_bounds_existing_objective_and_does_not_make_ids_unique(
+    tmp_path,
+):
+    from ouroboros.projects_registry import task_presentation_snapshot
+
+    objective = "Describe the existing work " + ("carefully " * 20)
+    first = task_presentation_snapshot(
+        tmp_path, "machine-key-one", task={"objective": objective},
+    )
+    second = task_presentation_snapshot(
+        tmp_path, "machine-key-two", task={"objective": objective},
+    )
+
+    assert first["task_name"] == second["task_name"]
+    assert first["target_label"] == second["target_label"]
+    assert first["task_id"] != second["task_id"]
+    assert len(first["task_name"]) <= 80
+    assert first["task_name"].endswith("…")
+
+
+def test_project_completion_enqueues_once_for_root_and_never_for_child_or_ephemeral(
+    tmp_path, monkeypatch,
+):
+    from ouroboros.projects_registry import bind_task_to_project, create_project, update_project
+    from ouroboros.project_dialogue import enqueue_project_completion_summary
+
+    project = create_project(tmp_path, "launch", name="Launch 🚀")
+    bind_task_to_project(
+        tmp_path,
+        "root-project",
+        project["id"],
+        project["chat_id"],
+        origin={"absent": "system"},
+    )
+    queued = []
+    seen = set()
+
+    def _enqueue(_root, event, **_kwargs):
+        delivery_id = event["delivery_id"]
+        if delivery_id in seen:
+            return False
+        seen.add(delivery_id)
+        queued.append(dict(event))
+        return True
+
+    monkeypatch.setattr(
+        "supervisor.terminal_delivery.enqueue_terminal_delivery",
+        _enqueue,
+    )
+    ctx = types.SimpleNamespace(DRIVE_ROOT=tmp_path)
+    root = {
+        "id": "root-project",
+        "project_id": "launch",
+        "title": "Ship release",
+        "chat_id": project["chat_id"],
+    }
+    result = {
+        "task_id": "root-project",
+        "status": "completed",
+        "project_id": "launch",
+        "title": "Ship release",
+        "result": "Release shipped.",
+    }
+    event = {"status": "completed"}
+    done = {"status": "completed", "outcome_axes": {"execution": {"status": "ok"}}}
+
+    assert enqueue_project_completion_summary(
+        ctx.DRIVE_ROOT, event, "root-project", root, result, done
+    ) is True
+    update_project(tmp_path, project["id"], name="Renamed after completion")
+    assert enqueue_project_completion_summary(
+        ctx.DRIVE_ROOT, event, "root-project", root, result, done
+    ) is False
+    assert queued == [{
+        "type": "send_message",
+        "chat_id": 1,
+        "task_id": "root-project",
+        "text": "Launch 🚀 › Ship release · Completed\nRelease shipped.",
+        "role": "system",
+        "system_type": "project_completion_summary",
+        "delivery_id": "project-completion:root-project",
+        "progress_meta": {
+            "project_id": "launch",
+            "project_name": "Launch 🚀",
+            "target_label": "Launch 🚀 › Ship release",
+            "status": "completed",
+        },
+    }]
+
+    child = {**root, "id": "child-project", "parent_task_id": "root-project",
+             "root_task_id": "root-project", "delegation_role": "subagent"}
+    assert enqueue_project_completion_summary(
+        ctx.DRIVE_ROOT, event, "child-project", child,
+        {**result, "task_id": "child-project"}, done
+    ) is False
+    assert enqueue_project_completion_summary(
+        ctx.DRIVE_ROOT, {"_ephemeral": True}, "root-project", root, result, done
+    ) is False
+    assert enqueue_project_completion_summary(
+        ctx.DRIVE_ROOT, event, "root-project", root, result,
+        {**done, "ephemeral_decision": True},
+    ) is False
+    assert len(queued) == 1
+    assert queued[0]["progress_meta"]["target_label"] == "Launch 🚀 › Ship release"
+
+
+@pytest.mark.parametrize(
+    ("result", "event", "expected"),
+    [
+        ({"status": "failed"}, {}, "Failed"),
+        ({"status": "cancelled"}, {}, "Cancelled"),
+        (
+            {"status": "completed"},
+            {"outcome_axes": {"execution": {"status": "degraded"}}},
+            "Completed with limitations",
+        ),
+        (
+            {"status": "completed", "outcome_axes": {"execution": {"status": "degraded"}}},
+            {},
+            "Completed with limitations",
+        ),
+        (
+            {"status": "completed", "outcome_axes": {"objective": {"status": "fail"}}},
+            {},
+            "Failed",
+        ),
+        (
+            {"status": "completed", "outcome_axes": {"execution": {"status": "failed"}}},
+            {},
+            "Failed",
+        ),
+        (
+            {"status": "completed", "outcome_axes": {"review": {"status": "fail"}}},
+            {},
+            "Failed",
+        ),
+    ],
+)
+def test_project_completion_summary_labels_every_terminal_outcome(result, event, expected):
+    from ouroboros.project_dialogue import completion_status_label
+
+    assert completion_status_label(result, event) == expected
+
+
+def test_project_completion_duplicate_outbox_events_deliver_one_main_row(tmp_path, monkeypatch):
+    from ouroboros.project_dialogue import enqueue_project_completion_summary
+    from ouroboros.projects_registry import bind_task_to_project, create_project
+    from supervisor import events, workers
+
+    project = create_project(tmp_path, "stable-project", name="Stable Project")
+    bind_task_to_project(
+        tmp_path, "stable-root", project["id"], project["chat_id"],
+        origin={"absent": "system"},
+    )
+    queued = []
+    monkeypatch.setattr(
+        workers, "get_event_q", lambda: types.SimpleNamespace(put=queued.append),
+    )
+    events._DELIVERED_MESSAGE_IDS.clear()
+    task = {"id": "stable-root", "project_id": project["id"], "title": "Finish"}
+    result = {**task, "task_id": "stable-root", "status": "completed"}
+    done = {"status": "completed", "outcome_axes": {"execution": {"status": "ok"}}}
+
+    assert enqueue_project_completion_summary(
+        tmp_path, {}, "stable-root", task, result, done,
+    ) is True
+    assert enqueue_project_completion_summary(
+        tmp_path, {}, "stable-root", task, result, done,
+    ) is True
+    assert len(queued) == 2  # duplicate live copies share one durable delivery id
+
+    sent = []
+    ctx = types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path, RUNNING={}, send_with_budget=lambda *a, **k: sent.append((a, k)),
+        append_jsonl=lambda *_a, **_k: None,
+    )
+    events._handle_send_message(queued[0], ctx)
+    events._handle_send_message(queued[1], ctx)
+
+    assert len(sent) == 1
+    assert sent[0][0][0] == 1
+    assert sent[0][1]["system_type"] == "project_completion_summary"
+    assert sent[0][1]["progress_meta"]["target_label"] == "Stable Project › Finish"
+
+
 def test_manual_target_event_persists_concrete_options_in_latest_annotation(
     tmp_path, monkeypatch,
 ):
@@ -675,8 +991,9 @@ def test_manual_target_event_persists_concrete_options_in_latest_annotation(
     payload = ws_payloads[-1]
     assert payload["type"] == "message_annotation"
     assert payload["status"] == "needs_manual_target"
-    assert payload["options"] == event["options"]
+    assert payload["options"][0]["label"] == "Fix tests"
+    assert payload["options"][1] == event["options"][1]
     assert payload["suppress_bubble"] is True
     sidecar = latest_chat_annotations(tmp_path)["owner-choice-1"]
     assert set(sidecar) >= {"client_message_id", "action", "target", "status"}
-    assert sidecar["options"] == event["options"]
+    assert sidecar["options"] == payload["options"]

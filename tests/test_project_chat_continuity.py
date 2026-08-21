@@ -537,5 +537,8 @@ def test_owner_project_message_survives_into_history_with_annotation(tmp_path, m
     assert row["chat_annotation"] == {
         "action": "mailbox_delivery",
         "target": "pending-root",
+        "target_label": "Task",
         "status": "delivered",
+        "attachment_manifest": [],
     }
+    assert acks[-1][1]["target_label"] == row["chat_annotation"]["target_label"]

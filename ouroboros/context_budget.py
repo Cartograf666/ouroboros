@@ -233,3 +233,12 @@ PROGRESS_LOG_WARN_BYTES = 8_000_000
 # fired follow-up. 2MB ≈ thousands of ~1KB records: the point where a
 # per-tick full parse + atomic rewrite under the lock stops being free.
 SCHEDULED_TASKS_WARN_BYTES = 2_000_000
+# Background observations are append-only and replayed by the consciousness
+# owner on each wake.  This is a warning, not a retention gate: acknowledged
+# and unacknowledged rows remain durable until a future owner-approved archive.
+BG_OBSERVATIONS_WARN_BYTES = 20_000_000
+# ``chat_history`` can deliberately replay the archive chain, while ordinary
+# context reads only the unconsolidated generation suffix.  Warn before an
+# explicit full-history read becomes seconds-scale; this is observability, not
+# a retention gate and never shortens the memory horizon.
+CHAT_ARCHIVE_SCAN_WARN_BYTES = 100_000_000

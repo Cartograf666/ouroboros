@@ -36,8 +36,9 @@ def _canonical_hash(value: Any) -> str:
 
 def authority_fingerprint_from_task(task: Mapping[str, Any]) -> str:
     from ouroboros.contracts.task_constraint import normalize_task_constraint
+    from ouroboros.contracts.task_contract import build_task_contract
 
-    contract = task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {}
+    contract = build_task_contract(task)
     normalized_constraint = normalize_task_constraint(task.get("task_constraint"))
     constraint = asdict(normalized_constraint) if normalized_constraint is not None else {}
 
@@ -51,7 +52,7 @@ def authority_fingerprint_from_task(task: Mapping[str, Any]) -> str:
         "workspace_mode": str(task.get("workspace_mode") or ""),
         "drive_root": _root(task.get("drive_root")),
         "task_constraint": constraint,
-        "allowed_resources": contract.get("allowed_resources") if isinstance(contract.get("allowed_resources"), dict) else {},
+        "task_contract": contract,
         "executor_ref": task.get("executor_ref") if isinstance(task.get("executor_ref"), dict) else {},
     })
 

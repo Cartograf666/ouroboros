@@ -466,6 +466,61 @@ def get_reserved_project(drive_root: Any, project_id: str) -> Optional[Dict[str,
     return None
 
 
+def _bounded_presentation_name(value: Any, *, fallback: str = "") -> str:
+    name = " ".join(str(value or "").split()) or str(fallback or "")
+    return name if len(name) <= PROJECT_NAME_MAX else name[: PROJECT_NAME_MAX - 1].rstrip() + "…"
+
+
+def task_presentation_snapshot(drive_root: Any, task_id: str, *, task: Any = None,
+                               result: Any = None, project_id: str = "") -> Dict[str, str]:
+    tid = str(task_id or "").strip()
+    sources = [row for row in (task, result) if isinstance(row, dict)]
+    if tid:
+        try:
+            from ouroboros.task_status import load_effective_task_result
+            stored = load_effective_task_result(
+                pathlib.Path(drive_root), tid, materialize_artifacts=False)
+            if isinstance(stored, dict):
+                sources.append(stored)
+        except Exception:
+            log.debug("task presentation result lookup failed for %s", tid, exc_info=True)
+        snapshot = read_json_dict(pathlib.Path(drive_root) / "state" / "queue_snapshot.json") or {}
+        for row in [*list(snapshot.get("running") or []), *list(snapshot.get("pending") or [])]:
+            queued = row.get("task") if isinstance(row, dict) else None
+            if isinstance(queued, dict) and str(queued.get("id") or row.get("id") or "") == tid:
+                sources.append(queued)
+                break
+    pid = str(project_id or "").strip()
+    if not pid:
+        for source in sources:
+            pid = str(source.get("project_id") or "").strip()
+            if pid:
+                break
+    if not pid and tid:
+        binding = project_binding_for_task(drive_root, tid) or {}
+        pid = str(binding.get("project_id") or "").strip()
+    pname = ""
+    if pid:
+        project = get_reserved_project(drive_root, pid) or {}
+        pname = _bounded_presentation_name(project.get("name"))
+    if pname == pid:
+        pname = ""
+    if pid and not pname:
+        pname = "Project"
+    task_name = ""
+    for field in ("title", "suggested_name", "objective", "description"):
+        for source in sources:
+            task_name = _bounded_presentation_name(source.get(field))
+            if task_name:
+                break
+        if task_name:
+            break
+    task_name = task_name or "Task"
+    return {"project_id": pid, "project_name": pname, "task_id": tid,
+            "task_name": task_name,
+            "target_label": f"{pname} › {task_name}" if pname else task_name}
+
+
 def create_project(
     drive_root: Any,
     project_id: str,
@@ -901,6 +956,7 @@ __all__ = [
     "project_thread_note_for_task",
     "project_chat_for_task_tree",
     "project_task_bindings",
+    "task_presentation_snapshot",
     "registered_project_chat_ids",
     "reserved_project_chat_ids",
     "projects_summary",

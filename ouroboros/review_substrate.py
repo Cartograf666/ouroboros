@@ -110,6 +110,7 @@ class ReviewRequest:
     policy: Dict[str, Any] = field(default_factory=dict)
     task_id: str = ""
     messages: List[Dict[str, Any]] = field(default_factory=list)
+    slot_messages: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
     call_type: str = ""
     max_tokens: int | None = None
     temperature: float | None = None
@@ -121,6 +122,7 @@ class ReviewRequest:
     # because a delegated reviewer retrieves context with its own tools (D12).
     session_root: str = ""
     session_task: str = ""
+    session_threads: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -1377,11 +1379,16 @@ class ReviewCoordinator:
             )
         except Exception:
             prompt_ref = {}
-        if request.surface == "task_acceptance" and request.evidence.get("__immutable_core_overflow__"):
+        incomplete_partial = request.evidence.get("__unresolved_partial_artifacts__")
+        if request.surface == "task_acceptance" and (
+            request.evidence.get("__immutable_core_overflow__") or incomplete_partial):
             raw_text = json.dumps({
                 "verdict": "DEGRADED",
                 "findings": [],
                 "summary": (
+                    "A decision-bearing tool result remains partial or its exact source "
+                    "is unavailable; acceptance cannot treat that projection as complete."
+                    if incomplete_partial else
                     "Immutable owner requirements do not fit the acceptance evidence "
                     "budget; no requirement was silently truncated."
                 ),
@@ -1395,7 +1402,8 @@ class ReviewCoordinator:
                     payload={"message": {"content": raw_text}, "usage": {}},
                     manifest={
                         "surface": request.surface, "slot_id": slot.slot_id,
-                        "model": slot.model, "status": "degraded_core_overflow",
+                        "model": slot.model, "status": "degraded_partial_source"
+                        if incomplete_partial else "degraded_core_overflow",
                         "physical_attempts": 0,
                     },
                 )

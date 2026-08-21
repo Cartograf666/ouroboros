@@ -57,6 +57,23 @@ _PENDING_MAX_REPLAYS = 5
 RUN_STATE_UNKNOWN_PREFIX = "delegated_run_state_unknown"
 
 
+def cleanup_settled_owner_mailbox(
+    drive_root: Any, task_id: str, task: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Remove attempt mail only after the canonical task result is settled."""
+
+    from ouroboros.owner_mailbox import cleanup_task_mailbox
+    from ouroboros.task_results import load_task_result
+    from ouroboros.task_status import SETTLED_STATUSES
+    from supervisor.queue import _task_drive_for_task
+
+    durable = load_task_result(pathlib.Path(drive_root), str(task_id)) or {}
+    if str(durable.get("status") or "") in SETTLED_STATUSES:
+        cleanup_task_mailbox(
+            _task_drive_for_task(task or durable, str(task_id)), str(task_id),
+        )
+
+
 def _registry_path(drive_root: Any) -> pathlib.Path:
     root = pathlib.Path(drive_root) / "state"
     root.mkdir(parents=True, exist_ok=True)
