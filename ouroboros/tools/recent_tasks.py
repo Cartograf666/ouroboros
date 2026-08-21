@@ -211,8 +211,11 @@ def _handle_recent_tasks(
         "remaining": remaining,
         "snapshot": current_snapshot,
         "next": ({
+            "limit": task_limit,
             "offset": skip + returned,
             "snapshot": current_snapshot,
+            "include_results": bool(include_results),
+            "include_traces": bool(include_traces),
         } if remaining else None),
     }
     if not stable:

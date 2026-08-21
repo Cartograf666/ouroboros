@@ -27,7 +27,6 @@ from ouroboros.project_facts import (
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.utils import (
     append_jsonl,
-    iter_jsonl_objects,
     jsonl_generation_signature,
     utc_now_iso,
 )
@@ -284,18 +283,41 @@ def _journal_snapshot(source: Dict[str, Any], project_id: str) -> str:
 def _journal_snapshot_rows(
     path: pathlib.Path,
     project_id: str,
-) -> tuple[List[Dict[str, Any]], str, bool]:
+) -> tuple[List[Dict[str, Any]], str, bool, int]:
     """Capture one stateless journal generation, retrying one concurrent append."""
     rows: List[Dict[str, Any]] = []
     snapshot = ""
+    unreadable = 0
     for _attempt in range(2):
         before = jsonl_generation_signature(path)
-        rows = [r for r in iter_jsonl_objects(path) if isinstance(r, dict)]
+        rows = []
+        unreadable = 0
+        try:
+            with path.open("rb") as handle:
+                for raw in handle:
+                    try:
+                        line = raw.decode("utf-8").strip()
+                    except UnicodeDecodeError:
+                        unreadable += 1
+                        continue
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        unreadable += 1
+                        continue
+                    if not isinstance(entry, dict):
+                        unreadable += 1
+                        continue
+                    rows.append(entry)
+        except OSError:
+            unreadable += 1
         after = jsonl_generation_signature(path)
         snapshot = _journal_snapshot(after, project_id)
         if before and before == after:
-            return rows, snapshot, True
-    return rows, snapshot, False
+            return rows, snapshot, True, unreadable
+    return rows, snapshot, False, unreadable
 
 
 def _journal_read(
@@ -325,7 +347,7 @@ def _journal_read(
         skip = max(0, int(offset or 0))
     except (TypeError, ValueError):
         skip = 0
-    rows, current_snapshot, stable = _journal_snapshot_rows(path, pid)
+    rows, current_snapshot, stable, unreadable = _journal_snapshot_rows(path, pid)
     requested_snapshot = str(snapshot or "").strip().lower()
     if not stable:
         return (
@@ -338,15 +360,23 @@ def _journal_read(
             "JOURNAL_READ_SNAPSHOT_CHANGED: the journal changed after the prior page; "
             "no mixed page was returned; restart with offset=0 and no snapshot."
         )
-    total = len(rows)
-    end = max(0, total - skip)
+    valid_total = len(rows)
+    total = valid_total + unreadable
+    end = max(0, valid_total - skip)
     start = max(0, end - take)
     page = rows[start:end]
     remaining = start
     lines = [
-        f"Page: total={total} returned={len(page)} offset={skip} "
-        f"remaining={remaining} snapshot={current_snapshot}"
+        f"Page: total={total} valid_total={valid_total} unreadable={unreadable} "
+        f"returned={len(page)} offset={skip} remaining={remaining} "
+        f"remaining_scope=valid_rows coverage={'partial' if unreadable else 'complete'} "
+        f"snapshot={current_snapshot}"
     ]
+    if unreadable:
+        lines.append(
+            f"JOURNAL_READ_GAP: coverage is partial; {unreadable} non-empty physical "
+            "row(s) were malformed or non-object JSON. Valid rows remain pageable."
+        )
     if remaining:
         lines.append(
             "Next older page: "
@@ -404,8 +434,8 @@ def journal_tail_digest(project_id: str, *, limit: int = 40) -> str:
     path = project_journal_path(pid)
     if not path.is_file():
         return ""
-    rows, snapshot, stable = _journal_snapshot_rows(path, pid)
-    if not rows:
+    rows, snapshot, stable, unreadable = _journal_snapshot_rows(path, pid)
+    if not rows and not unreadable:
         return ""
     page_size = max(1, int(limit))
     take = rows[-page_size:]
@@ -414,6 +444,11 @@ def journal_tail_digest(project_id: str, *, limit: int = 40) -> str:
         f"- [{str(r.get('ts') or '')[:16]}] {str(r.get('kind') or 'note')}: {str(r.get('text') or '')}"
         for r in take
     ]
+    if unreadable:
+        lines.insert(0, (
+            f"- ⚠ coverage partial: {unreadable} unreadable journal row(s); "
+            f"inspect valid rows with journal_read(project_id='{pid}')"
+        ))
     if omitted:
         if stable:
             lines.insert(0, (

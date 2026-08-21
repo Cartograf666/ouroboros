@@ -388,23 +388,46 @@ def _tree_ledger_snapshot_rows(
     root_id: str,
     *,
     data_root: pathlib.Path | None = None,
-) -> tuple[List[Dict[str, Any]], str, bool]:
+) -> tuple[List[Dict[str, Any]], str, bool, int]:
     try:
         path = tree_ledger_path(root_id, data_root=data_root)
     except ValueError:
-        return [], "", True
+        return [], "", True, 0
     if not path.is_file():
-        return [], "", True
+        return [], "", True, 0
     rows: List[Dict[str, Any]] = []
     snapshot = ""
+    unreadable = 0
     for _attempt in range(2):
         before = jsonl_generation_signature(path)
-        rows = [r for r in iter_jsonl_objects(path) if isinstance(r, dict)]
+        rows = []
+        unreadable = 0
+        try:
+            with path.open("rb") as handle:
+                for raw in handle:
+                    try:
+                        line = raw.decode("utf-8").strip()
+                    except UnicodeDecodeError:
+                        unreadable += 1
+                        continue
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        unreadable += 1
+                        continue
+                    if not isinstance(entry, dict):
+                        unreadable += 1
+                        continue
+                    rows.append(entry)
+        except OSError:
+            unreadable += 1
         after = jsonl_generation_signature(path)
         snapshot = _tree_ledger_snapshot(after, root_id)
         if before and before == after:
-            return rows, snapshot, True
-    return rows, snapshot, False
+            return rows, snapshot, True, unreadable
+    return rows, snapshot, False, unreadable
 
 
 def _format_tree_ledger_row(row: Dict[str, Any]) -> str:
@@ -436,7 +459,7 @@ def tree_ledger_page(
     snapshot: str = "",
     data_root: pathlib.Path | None = None,
 ) -> str:
-    rows, current_snapshot, stable = _tree_ledger_snapshot_rows(
+    rows, current_snapshot, stable, unreadable = _tree_ledger_snapshot_rows(
         root_id, data_root=data_root,
     )
     if not rows and not current_snapshot:
@@ -466,15 +489,23 @@ def tree_ledger_page(
         skip = max(0, int(offset or 0))
     except (TypeError, ValueError):
         skip = 0
-    total = len(rows)
-    end = max(0, total - skip)
+    valid_total = len(rows)
+    total = valid_total + unreadable
+    end = max(0, valid_total - skip)
     start = max(0, end - take)
     page = rows[start:end]
     remaining = start
     lines = [
-        f"Page: total={total} returned={len(page)} offset={skip} "
-        f"remaining={remaining} snapshot={current_snapshot}"
+        f"Page: total={total} valid_total={valid_total} unreadable={unreadable} "
+        f"returned={len(page)} offset={skip} remaining={remaining} "
+        f"remaining_scope=valid_rows coverage={'partial' if unreadable else 'complete'} "
+        f"snapshot={current_snapshot}"
     ]
+    if unreadable:
+        lines.append(
+            f"TREE_READ_GAP: coverage is partial; {unreadable} non-empty physical "
+            "row(s) were malformed or non-object JSON. Valid rows remain pageable."
+        )
     if remaining:
         lines.append(
             f"Next older page: tree_read(limit={take}, offset={skip + len(page)}, "
@@ -492,15 +523,20 @@ def tree_ledger_tail_digest(
 ) -> str:
     """Recent ledger entries for context injection (no ctx needed). Each entry shown in
     full; older entries beyond the tail represented by a visible pointer to tree_read."""
-    rows, snapshot, stable = _tree_ledger_snapshot_rows(
+    rows, snapshot, stable, unreadable = _tree_ledger_snapshot_rows(
         root_id, data_root=data_root,
     )
-    if not rows:
+    if not rows and not unreadable:
         return ""
     page_size = max(1, int(limit))
     take = rows[-page_size:]
     omitted = len(rows) - len(take)
     lines: List[str] = []
+    if unreadable:
+        lines.append(
+            f"- ⚠ coverage partial: {unreadable} unreadable task-tree row(s); "
+            "inspect valid rows with tree_read"
+        )
     if omitted:
         if stable:
             lines.append(

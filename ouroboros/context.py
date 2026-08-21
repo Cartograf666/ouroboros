@@ -867,9 +867,14 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
     out = "## Runtime context\n\n" + runtime_ctx
     try:
         from ouroboros.task_tree_ledger import tree_ledger_tail_digest
-
         _root_id = str(task.get("root_task_id") or task.get("id") or "")
-        _tree_digest = tree_ledger_tail_digest(_root_id, limit=40) if _root_id else ""
+        from ouroboros.tool_access import canonical_data_root
+        _tree_root = (canonical_data_root(ctx) if ctx is not None else pathlib.Path(
+            task.get("budget_drive_root") or getattr(env, "budget_drive_root", None) or env.drive_root
+        ).resolve(strict=False))
+        _tree_digest = tree_ledger_tail_digest(
+            _root_id, limit=40, data_root=_tree_root,
+        ) if _root_id else ""
         if _tree_digest:
             out += (
                 "\n\n## Task-tree coordination ledger (shared swarm blackboard)\n\n"
