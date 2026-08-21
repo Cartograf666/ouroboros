@@ -25,21 +25,19 @@ def _repo(tmp_path):
     return tmp_path
 
 
-def _rev_parse(repo, rev):
-    return subprocess.run(
-        ["git", "rev-parse", rev], cwd=repo, check=True, capture_output=True, text=True,
-    ).stdout.strip()
+def _fail_tree_read(monkeypatch, *, ref):
+    """Fail one exact tree read while real Git still proves the ref exists."""
+    real_git_run = review_binary_context._git_run
+    failed_calls = []
 
+    def fail_selected_tree(repo_dir, args):
+        if args == ["ls-tree", "-z", ref, "--", "bin.dat"]:
+            failed_calls.append(args)
+            return subprocess.CompletedProcess(args, 128, stdout=b"")
+        return real_git_run(repo_dir, args)
 
-def _corrupt_root_tree(repo):
-    """Delete HEAD's root tree object: HEAD still resolves, but any
-    ``ls-tree HEAD -- <path>`` now fails with a real git error rather than
-    the path simply not being present."""
-    tree_oid = _rev_parse(repo, "HEAD^{tree}")
-    obj_path = repo / ".git" / "objects" / tree_oid[:2] / tree_oid[2:]
-    assert obj_path.exists(), "fixture assumption: a fresh repo keeps its tree loose"
-    obj_path.chmod(0o644)
-    obj_path.unlink()
+    monkeypatch.setattr(review_binary_context, "_git_run", fail_selected_tree)
+    return failed_calls
 
 
 def test_capture_returns_the_staged_diff(tmp_path):
@@ -130,7 +128,9 @@ def test_render_staged_binary_metadata_returns_none_when_git_cannot_even_run(tmp
     assert metadata is None
 
 
-def test_render_staged_binary_metadata_hard_blocks_on_head_tree_read_error(tmp_path):
+def test_render_staged_binary_metadata_hard_blocks_on_head_tree_read_error(
+    tmp_path, monkeypatch,
+):
     """A staged binary whose HEAD tree object is unreadable (corrupt object,
     IO error) must fail closed, not render the unread HEAD blob as `absent`:
     a git read failure is not proof the object was never there."""
@@ -141,11 +141,13 @@ def test_render_staged_binary_metadata_hard_blocks_on_head_tree_read_error(tmp_p
                     capture_output=True)
     (repo / "bin.dat").write_bytes(b"\x00\x01new")
     subprocess.run(["git", "add", "bin.dat"], cwd=repo, check=True, capture_output=True)
-    _corrupt_root_tree(repo)
+    assert render_staged_binary_metadata(repo, "bin.dat") is not None
+    failed_calls = _fail_tree_read(monkeypatch, ref="HEAD")
 
     metadata = render_staged_binary_metadata(repo, "bin.dat")
 
     assert metadata is None
+    assert len(failed_calls) == 1
 
 
 @pytest.mark.parametrize("probe_result", [None, 128])
@@ -179,7 +181,7 @@ def test_render_staged_binary_metadata_hard_blocks_when_the_ref_probe_itself_fai
 
 
 def test_render_staged_binary_metadata_deletion_hard_blocks_on_merge_head_tree_read_error(
-    tmp_path,
+    tmp_path, monkeypatch,
 ):
     """Same fail-closed contract on the deleted-binary rendering path, and
     specifically for a MERGE_HEAD read failure during a real in-progress
@@ -203,12 +205,10 @@ def test_render_staged_binary_metadata_deletion_hard_blocks_on_merge_head_tree_r
         "fixture assumption: conflict left a merge in progress"
     )
     subprocess.run(["git", "rm", "-q", "bin.dat"], cwd=repo, check=True, capture_output=True)
-    merge_tree = _rev_parse(repo, "MERGE_HEAD^{tree}")
-    obj_path = repo / ".git" / "objects" / merge_tree[:2] / merge_tree[2:]
-    assert obj_path.exists(), "fixture assumption: the merge-side tree is loose"
-    obj_path.chmod(0o644)
-    obj_path.unlink()
+    assert render_staged_binary_metadata(repo, "bin.dat") is not None
+    failed_calls = _fail_tree_read(monkeypatch, ref="MERGE_HEAD")
 
     metadata = render_staged_binary_metadata(repo, "bin.dat")
 
     assert metadata is None
+    assert len(failed_calls) == 1
