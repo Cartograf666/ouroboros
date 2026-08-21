@@ -116,6 +116,13 @@ def _chat_history_snapshot_id(
         "schema_version": 1,
         "query": _normalized_chat_history_query(filters, search),
         "generations": generations,
+        # Existing consolidator gap blocks are the durable truth that an older
+        # span is unknowable after its cursor is rebased.  Their small stable IDs
+        # participate in the stateless token; no block-content/full-file hashing
+        # or new continuation state is introduced.
+        "durable_gap_ids": [
+            str(value) for value in (coverage.get("durable_gap_ids") or [])
+        ],
     }
     encoded = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -337,6 +344,31 @@ class Memory:
     def load_dialogue_blocks(self) -> List[Dict[str, Any]]:
         path = self.drive_root / "memory" / "dialogue_blocks.json"
         return self._load_json_blocks(path)
+
+    def _durable_dialogue_gaps(self) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Project consolidator-owned durable discontinuities into raw coverage."""
+
+        gaps: List[Dict[str, Any]] = []
+        identities: List[str] = []
+        for index, block in enumerate(self.load_dialogue_blocks()):
+            if not isinstance(block, dict):
+                continue
+            gap_id = str(block.get("gap_id") or "").strip()
+            content = str(block.get("content") or "")
+            if not gap_id and "[MEMORY GAP]" not in content:
+                continue
+            identity = gap_id or (
+                "legacy-memory-gap:"
+                f"{index}:{str(block.get('ts') or '')}:{str(block.get('range') or '')}"
+            )
+            identities.append(identity)
+            gaps.append({
+                "kind": "durable_consolidation_gap",
+                "gap_id": gap_id,
+                "block_index": index,
+                "detail": "A durable dialogue block records a known history discontinuity.",
+            })
+        return gaps, identities
 
     def load_dialogue_meta(self) -> Dict[str, Any]:
         path = self.drive_root / "memory" / "dialogue_meta.json"
@@ -568,6 +600,9 @@ class Memory:
                     "kind": "consolidation_cursor_state_unreadable",
                     "error": type(exc).__name__,
                 })
+            durable_gaps, durable_gap_ids = self._durable_dialogue_gaps()
+            coverage["gaps"].extend(durable_gaps)
+            coverage["durable_gap_ids"] = durable_gap_ids
             last_entries, last_coverage = entries, coverage
             if stable_generations:
                 return entries, coverage
