@@ -170,6 +170,89 @@ def test_wave_9_and_65_remain_exactly_readable_after_hot_trimming(tmp_path) -> N
     assert read_plan_review_wave_artifact(tmp_path, task_id, refs[65])["reviewer_outputs"][0]["text"] == "exact-wave-65"
 
 
+def test_compacted_wave_keeps_the_full_blocking_count() -> None:
+    from ouroboros.task_results import _compact_plan_review_wave
+
+    wave = {
+        "cycle_index": 1,
+        "request_fingerprint": "a" * 64,
+        "aggregate": "REVISE_PLAN",
+        "findings": [_finding(index) for index in range(1, 33)],
+        "findings_total": 33,
+        "counts": {"blocking": 1, "note": 32, "need_evidence": 0},
+        "closed": False,
+        "paid": True,
+    }
+
+    assert _compact_plan_review_wave(wave)["counts"]["blocking"] == 1
+
+
+@pytest.mark.parametrize("current_ids", [("s1", "s2"), ("s1", "s2", "s3", "s4")])
+def test_continuation_refuses_a_changed_reviewer_assignment_set(tmp_path, current_ids) -> None:
+    from ouroboros.review_substrate import ReviewSlot
+    from ouroboros.tools.plan_review_artifacts import continuation_inputs, persist_wave
+
+    prior_slots = [ReviewSlot(slot_id=sid, model=f"model-{sid}") for sid in ("s1", "s2", "s3")]
+    exact = {
+        "schema_version": 1,
+        "cycle_index": 1,
+        "request_fingerprint": "b" * 64,
+        "slots": [
+            {
+                "slot_id": slot.slot_id, "model": slot.model, "effort": slot.effort,
+                "route": "api_chat", "session_target": "", "session_profile": "",
+            }
+            for slot in prior_slots
+        ],
+        "reviewer_outputs": [
+            {
+                "slot_id": slot.slot_id,
+                "request_messages": [{"role": "user", "content": "prior"}],
+                "text": "[]",
+            }
+            for slot in prior_slots
+        ],
+    }
+    ref = persist_wave(tmp_path, "task-1", exact)
+    current = [ReviewSlot(slot_id=sid, model=f"model-{sid}") for sid in current_ids]
+
+    _slots, messages, threads, error = continuation_inputs(
+        tmp_path, "task-1", {"wave_artifact": ref}, current, user_content="continue",
+    )
+
+    assert error == "prior_reviewer_assignment_set_changed"
+    assert messages == {} and threads == {}
+
+
+def test_continuation_repins_the_prior_applied_session_profile(tmp_path) -> None:
+    from ouroboros.review_substrate import ReviewSlot
+    from ouroboros.tools.plan_review_artifacts import continuation_inputs, persist_wave, slot_row
+
+    prior = ReviewSlot(
+        slot_id="s1", model="claude=fable", route="agent_session",
+        session_target="claude=fable", session_profile="profile-a",
+    )
+    exact = {
+        "schema_version": 1,
+        "cycle_index": 1,
+        "request_fingerprint": "c" * 64,
+        "slots": [slot_row(prior)],
+        "reviewer_outputs": [{
+            "slot_id": "s1", "review_thread_id": "thread-1",
+            "applied_profile": "profile-b", "text": "need evidence",
+        }],
+    }
+    ref = persist_wave(tmp_path, "task-1", exact)
+
+    rebound, _messages, threads, error = continuation_inputs(
+        tmp_path, "task-1", {"wave_artifact": ref}, [prior], user_content="continue",
+    )
+
+    assert error is None
+    assert threads == {"s1": "thread-1"}
+    assert rebound[0].session_profile == "profile-b"
+
+
 def test_api_chat_continuation_uses_exact_slot_transcript() -> None:
     from ouroboros.review_execution import ApiChatReviewExecutor, ReviewAssignment
     from ouroboros.review_substrate import ReviewRequest, ReviewSlot
@@ -253,7 +336,7 @@ def test_claudexor_gateway_thread_turn_contract(monkeypatch) -> None:
     assert seen[0][3] == "thread-key" and seen[1][3] == "turn-key"
 
 
-def test_continued_thread_does_not_repin_the_exhausted_profile() -> None:
+def test_continued_thread_explicitly_repins_the_expected_profile() -> None:
     from ouroboros.review_thread_continuity import start_review_thread_turn
 
     captured = {}
@@ -274,7 +357,32 @@ def test_continued_thread_does_not_repin_the_exhausted_profile() -> None:
 
     assert captured["request"]["model"] == "fable"
     assert captured["request"]["harnesses"] == ["claude"]
-    assert "credentialProfileId" not in captured["request"]
+    assert captured["request"]["credentialProfileId"] == "profile-a"
+
+
+def test_profile_rotation_receipt_is_read_from_the_settled_run_events() -> None:
+    from ouroboros.review_thread_continuity import profile_rotation_receipts
+
+    class Gateway:
+        def get_run_artifact(self, run_id, path):
+            assert (run_id, path) == ("run-2", "events.jsonl")
+            return (json.dumps({
+                "seq": 7,
+                "type": "route.profile.rotated",
+                "payload": {
+                    "from_profile_id": "profile-a", "to_profile_id": "profile-b",
+                    "reason": "profile_headroom_preflight", "resets_at": "later",
+                },
+            }) + "\n").encode()
+
+    assert profile_rotation_receipts(Gateway(), "run-2") == [{
+        "type": "route.profile.rotated",
+        "from_profile_id": "profile-a",
+        "to_profile_id": "profile-b",
+        "reason": "profile_headroom_preflight",
+        "attempt_id": "",
+        "resets_at": "later",
+    }]
 
 
 def test_agent_session_continuation_passes_the_real_thread_id(monkeypatch, tmp_path) -> None:
@@ -318,6 +426,112 @@ def test_agent_session_continuation_passes_the_real_thread_id(monkeypatch, tmp_p
     assert result.usage["review_thread_id"] == "thread-1"
     assert result.usage["review_thread_receipt"]["continuity"]["kind"] == "native_resume"
     assert result.usage["auth_route_receipt"]["reason"] == "quota_exhausted"
+
+
+def test_agent_session_rejects_unexplained_applied_profile_drift(monkeypatch, tmp_path) -> None:
+    from ouroboros.review_execution import AgentSessionReviewExecutor, ReviewAssignment
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot
+
+    def fake_run(*, prompt, root, custody_drive, invocation):
+        return {
+            "run_id": "run-2", "thread_id": "thread-1", "turn_id": "turn-2",
+            "thread_receipt": {"continuity": {"kind": "native_resume"}},
+            "profile_continuity_receipt": {
+                "expected_profile": "profile-a", "applied_profile": "profile-b",
+                "status": "cannot_verify", "rotation_receipt": {},
+            },
+            "text": "[]\nNO_FINDINGS", "conformance": "passed", "schema_asked": True,
+            "custody_durable": True, "settlement": "settled", "route_id": "claude",
+            "effective_route_ids": ["claude"], "model": "fable", "spend": 0.0,
+            "spend_estimated": False, "applied_profile": "profile-b", "applied_access": "readonly",
+            "auth_route_receipt": {
+                "requested": "subscription", "effective": "subscription",
+                "reason": "subscription_preferred", "profileId": "profile-b",
+            },
+        }
+
+    monkeypatch.setattr("ouroboros.review_execution.run_delegated_review_session", fake_run)
+    request = ReviewRequest(
+        surface="plan_review", goal="review", task_id="task-1",
+        session_root=str(tmp_path), session_task="review exact evidence",
+        session_threads={"slot_a": "thread-1"},
+        policy={"output_contract": "return findings"},
+    )
+    slot = ReviewSlot(
+        slot_id="slot_a", model="fable", route="agent_session",
+        session_target="claude=fable", session_profile="profile-a",
+    )
+
+    result = AgentSessionReviewExecutor(
+        ReviewAssignment(request=request, slot=slot, custody_root=tmp_path)
+    ).execute()
+
+    assert result.raw_text == ""
+    assert result.usage["profile_continuity_receipt"] == {
+        "expected_profile": "profile-a",
+        "applied_profile": "profile-b",
+        "status": "cannot_verify",
+        "rotation_receipt": {},
+    }
+
+
+def test_agent_session_accepts_only_a_typed_profile_rotation_receipt(monkeypatch, tmp_path) -> None:
+    from ouroboros.review_execution import AgentSessionReviewExecutor, ReviewAssignment
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot
+
+    rotation = {
+        "type": "route.profile.rotated", "from_profile_id": "profile-a",
+        "to_profile_id": "profile-b", "reason": "vendor_limit_rejected",
+        "attempt_id": "a01", "resets_at": "2026-08-22T00:00:00Z",
+    }
+
+    def fake_run(*, prompt, root, custody_drive, invocation):
+        return {
+            "run_id": "run-2", "thread_id": "thread-1", "turn_id": "turn-2",
+            "thread_receipt": {
+                "continuity": {
+                    "kind": "packet", "laneSwitchedFrom": {
+                        "harness": "claude", "profileId": "profile-a",
+                    },
+                },
+            },
+            "profile_continuity_receipt": {
+                "expected_profile": "profile-a", "applied_profile": "profile-b",
+                "status": "typed_rotation", "rotation_receipt": rotation,
+            },
+            "text": "[]\nNO_FINDINGS", "conformance": "passed", "schema_asked": True,
+            "custody_durable": True, "settlement": "settled", "route_id": "claude",
+            "effective_route_ids": ["claude"], "model": "fable", "spend": 0.0,
+            "spend_estimated": False, "applied_profile": "profile-b", "applied_access": "readonly",
+            "auth_route_receipt": {
+                "requested": "subscription", "effective": "subscription",
+                "reason": "subscription_preferred", "profileId": "profile-b",
+            },
+        }
+
+    monkeypatch.setattr("ouroboros.review_execution.run_delegated_review_session", fake_run)
+    request = ReviewRequest(
+        surface="plan_review", goal="review", task_id="task-1",
+        session_root=str(tmp_path), session_task="review exact evidence",
+        session_threads={"slot_a": "thread-1"},
+        policy={"output_contract": "return findings"},
+    )
+    slot = ReviewSlot(
+        slot_id="slot_a", model="fable", route="agent_session",
+        session_target="claude=fable", session_profile="profile-a",
+    )
+
+    result = AgentSessionReviewExecutor(
+        ReviewAssignment(request=request, slot=slot, custody_root=tmp_path)
+    ).execute()
+
+    assert result.raw_text == "[]\nNO_FINDINGS"
+    assert result.usage["profile_continuity_receipt"] == {
+        "expected_profile": "profile-a",
+        "applied_profile": "profile-b",
+        "status": "typed_rotation",
+        "rotation_receipt": rotation,
+    }
 
 
 def test_disposition_supersedes_the_exact_wave_before_hot_state(_harness) -> None:

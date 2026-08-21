@@ -335,6 +335,7 @@ def _plan_row_from_actor(actor: Dict[str, Any], slot: Any) -> dict:
         "review_turn_id": str(usage.get("review_turn_id") or ""),
         "review_thread_receipt": usage.get("review_thread_receipt") or {},
         "auth_route_receipt": usage.get("auth_route_receipt") or {},
+        "profile_continuity_receipt": usage.get("profile_continuity_receipt") or {},
         "applied_profile": str(usage.get("applied_profile") or ""),
     }
 

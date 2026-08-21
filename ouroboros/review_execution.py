@@ -973,9 +973,8 @@ def run_delegated_review_session(
                 run_request["model"] = route.model
             if route.effort:
                 run_request["effort"] = route.effort
-            if getattr(route, "profile_id", ""):
-                # Manual profile pin is optional; the daemon owns unpinned rotation (D28).
-                run_request["credentialProfileId"] = route.profile_id
+            if use_thread or getattr(route, "profile_id", ""):
+                run_request["credentialProfileId"] = getattr(route, "profile_id", "") or None
             if schema_asked:
                 run_request["outputSchema"] = output_schema
         if not run_id:
@@ -1076,14 +1075,16 @@ def run_delegated_review_session(
         thread_receipt: Dict[str, Any] = {}
         if use_thread:
             from ouroboros.review_thread_continuity import review_thread_receipt as receipt_for
-
-            thread_receipt = receipt_for(gateway, thread_id, run_id, turn_id)
+            thread_receipt = receipt_for(gateway, thread_id, run_id, turn_id,
+                expected_profile=str(getattr(route, "profile_id", "") or ""),
+                applied_profile=str((summary.get("authRoute") or {}).get("profileId") or ""))
             turn_id = str(thread_receipt.get("turn_id") or turn_id)
         return {
             "run_id": run_id,
             "thread_id": thread_id,
             "turn_id": turn_id,
             "thread_receipt": thread_receipt,
+            "profile_continuity_receipt": thread_receipt.get("profile_continuity") or {},
             "text": text,
             "conformance": str(summary.get("outputConformance") or "").strip().lower(),
             "schema_asked": schema_asked,
@@ -1436,6 +1437,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             "review_turn_id": str(facts.get("turn_id") or ""),
             "review_thread_receipt": facts.get("thread_receipt") or {},
             "auth_route_receipt": facts.get("auth_route_receipt") or {},
+            "profile_continuity_receipt": facts.get("profile_continuity_receipt") or {},
             # APPLIED account/access (D29): what the engine's receipt disclosed,
             # '' when telemetry predates it — shown as absent, never as the
             # requested value dressed up as applied.
@@ -1478,12 +1480,14 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 "effective": f"model {facts['model']}",
                 "reason": "session_route_resolves_its_own_model",
             })
-        self._transcript = facts["text"]
+        self._raw_transcript = facts["text"]
+        self._transcript = "" if (facts.get("profile_continuity_receipt") or {}).get(
+            "status") == "cannot_verify" else self._raw_transcript
 
     def _verdict_result(self, force_extraction: bool = False) -> ReviewAttemptResult:
-        text = self._transcript or ""
+        text = self._raw_transcript
         canonical, method, extraction_usage = canonicalize_session_verdict(
-            text,
+            self._transcript or "",
             conformance_passed=self._conformance_passed and not force_extraction,
             contract=self._output_contract(),
             llm=self.llm,

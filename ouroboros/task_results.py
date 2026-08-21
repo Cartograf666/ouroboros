@@ -734,7 +734,7 @@ def _compact_plan_review_wave(wave: Dict[str, Any]) -> Dict[str, Any]:
         "counts": {
             "findings": int(wave.get("findings_total") or len(findings)),
             "dispositions": len(wave.get("dispositions") or []),
-            "blocking": sum(1 for f in findings if isinstance(f, dict) and f.get("class") == "blocking"),
+            "blocking": int(wave["counts"].get("blocking") or 0) if isinstance(wave.get("counts"), dict) and "blocking" in wave["counts"] else sum(1 for f in findings if isinstance(f, dict) and f.get("class") == "blocking"),
         },
         "closed": bool(wave.get("closed")),
         "paid": bool(wave.get("paid")),

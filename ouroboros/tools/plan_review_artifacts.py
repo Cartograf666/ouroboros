@@ -188,7 +188,10 @@ def continuation_inputs(
         exact = read_wave(state_root, task_id, ref)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         return slots, {}, {}, f"prior_exact_wave_unreadable:{type(exc).__name__}"
-    configs = {str(r.get("slot_id") or ""): r for r in exact.get("slots") or [] if isinstance(r, dict)}
+    prior_slots = [r for r in exact.get("slots") or [] if isinstance(r, dict)]
+    if [slot_row(slot) for slot in slots] != prior_slots:
+        return slots, {}, {}, "prior_reviewer_assignment_set_changed"
+    configs = {str(r.get("slot_id") or ""): r for r in prior_slots}
     outputs = {str(r.get("slot_id") or ""): r for r in exact.get("reviewer_outputs") or [] if isinstance(r, dict)}
     rebound, slot_messages, session_threads = [], {}, {}
     from ouroboros.review_execution import ReviewRouteKind
@@ -209,6 +212,9 @@ def continuation_inputs(
             if not thread_id:
                 return slots, {}, {}, f"prior_review_thread_missing:{sid}"
             session_threads[sid] = thread_id
+            rebound[-1] = dataclasses.replace(
+                rebound[-1], session_profile=str(output.get("applied_profile") or ""),
+            )
         else:
             prior_messages = output.get("request_messages")
             if not isinstance(prior_messages, list):
@@ -243,6 +249,7 @@ def exact_wave(
             "review_turn_id": str(row.get("review_turn_id") or ""),
             "review_thread_receipt": row.get("review_thread_receipt") or {},
             "auth_route_receipt": row.get("auth_route_receipt") or {},
+            "profile_continuity_receipt": row.get("profile_continuity_receipt") or {},
             "applied_profile": str(row.get("applied_profile") or ""),
             "prompt_ref": row.get("prompt_ref") or {}, "response_ref": row.get("response_ref") or {},
         })

@@ -554,7 +554,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         return _plan_unavailable(
             ctx, "ERROR: No review models configured. Set OUROBOROS_REVIEW_MODELS in settings.",
             "review_models_unconfigured")
-
+    configured_slots = list(slots)
     previous = previous_override if previous_override is not None else _last_paid_wave(state)
     if previous is not None:
         try:
@@ -664,6 +664,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
             "review_turn_id": str(row.get("review_turn_id") or ""),
             "review_thread_receipt": row.get("review_thread_receipt") or {},
             "auth_route_receipt": row.get("auth_route_receipt") or {},
+            "profile_continuity_receipt": row.get("profile_continuity_receipt") or {},
             "applied_profile": str(row.get("applied_profile") or ""),
         })
     agg = plan_spec.aggregate(slot_results, quorum=quorum)
@@ -704,12 +705,12 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         "paid": bool(callable_slots),
         # Material health epoch, roster identity, and structural unreachability (B2b).
         "health_epoch": _plan_health_epoch(health_evidence),
-        "reviewer_config_fingerprint": _plan_reviewer_config_fingerprint(slots),
+        "reviewer_config_fingerprint": _plan_reviewer_config_fingerprint(configured_slots),
         **_plan_quorum_unreachable_facts(slot_records, quorum=quorum),
         "reviewed_at": utc_now_iso(),
     }
     exact_wave = _exact_wave(
-        wave, plan_prose=request.plan, manifest=manifest, slots=slots, rows=rows,
+        wave, plan_prose=request.plan, manifest=manifest, slots=configured_slots, rows=rows,
         system_prompt=system_prompt, user_content=user_content,
         session_task=session_task, slot_messages=slot_messages,
     )
