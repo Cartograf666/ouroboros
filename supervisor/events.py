@@ -3995,7 +3995,10 @@ def _handle_send_photo(evt: Dict[str, Any], ctx: Any) -> None:
         if not chat_id or not image_b64:
             return
         photo_bytes = b64mod.b64decode(image_b64)
-        ok, err = ctx.bridge.send_photo(chat_id, photo_bytes, caption=caption, mime=mime)
+        ok, err = ctx.bridge.send_photo(
+            chat_id, photo_bytes, caption=caption, mime=mime,
+            task_id=str(evt.get("task_id") or ""),
+        )
         if not ok:
             ctx.append_jsonl(
                 ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
@@ -4034,7 +4037,10 @@ def _handle_send_video(evt: Dict[str, Any], ctx: Any) -> None:
         if not video_b64:
             return
         video_bytes = b64mod.b64decode(video_b64)
-        ok, err = ctx.bridge.send_video(chat_id, video_bytes, caption=caption, mime=mime)
+        ok, err = ctx.bridge.send_video(
+            chat_id, video_bytes, caption=caption, mime=mime,
+            task_id=str(evt.get("task_id") or ""),
+        )
         if not ok:
             ctx.append_jsonl(
                 ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",

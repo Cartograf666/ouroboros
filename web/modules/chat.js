@@ -97,6 +97,19 @@ const MAX_PENDING_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 // mirrored into Main, but must still produce exactly one toast.
 const shownIncidentToastKeys = new Set();
 
+export function durableChatMediaUrl(value) {
+    const url = String(value || '');
+    return /^\/api\/tasks\/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\/artifacts\/chat-media-[0-9a-f]{64}\.(png|jpg|gif|webp|mp4|webm)$/.test(url) ? url : '';
+}
+
+export function chatMediaMessageKey(msg) {
+    return [msg.msg_type || msg.type, String(msg.ts || ''), String(msg.caption || ''), String(msg.mime || '')].join('|');
+}
+
+export function isNonTerminalMediaHistoryRow(msg) {
+    return msg.system_type === 'photo' || msg.system_type === 'video';
+}
+
 /**
  * /panic gate (v6.90.3, CRITICAL CONTROL): pure decision helper between the
  * confirm dialog's resolution and sending the panic command. Panic fires on an
@@ -3186,15 +3199,16 @@ export function createChatInstance({
                         continue;
                     }
                     if (msg.system_type === 'task_summary') continue;
-                    // A delivered document is a media bubble, not a task-final
+                    // Delivered media is a bubble, not a task-final
                     // message — render it BEFORE the taskId/finishLiveCard block so
-                    // a mid-task file delivery replayed while its task is still
+                    // a mid-task delivery replayed while its task is still
                     // running does not falsely finalize that task's live card.
-                    if (msg.msg_type === 'document') {
-                        appendDocumentBubble(msg);
+                    if (msg.msg_type === 'document' || msg.msg_type === 'photo' || msg.msg_type === 'video') {
+                        if (msg.msg_type === 'document') appendDocumentBubble(msg);
+                        else appendMediaBubble(msg);
                         continue;
                     }
-                    if (taskId && (msg.role === 'assistant' || msg.role === 'system')) {
+                    if (taskId && (msg.role === 'assistant' || msg.role === 'system') && !isNonTerminalMediaHistoryRow(msg)) {
                         if (subagentChildParents.has(taskId)) {
                             insertCardIfNeeded(taskId);
                             routeSubagentFinalMessageToCard(taskId, msg);
@@ -4371,13 +4385,9 @@ export function createChatInstance({
         }
     });
 
-    onWs('photo', (msg) => {
-        if (!isMyThread(msg)) return;
-        // Media frames carry no activity identity: hide the dots row for the
-        // incoming bubble but leave the authoritative active set intact (4A) —
-        // syncChatStatus re-derives the header from live state.
-        hideTypingIndicatorOnly();
-        syncChatStatus();
+    function buildMediaBubble(msg) {
+        const type = msg.msg_type || msg.type;
+        if (type !== 'photo' && type !== 'video') return null;
         const role = msg.role === 'user' ? 'user' : 'assistant';
         const sender = role === 'user'
             ? getSenderLabel('user', false, '', {
@@ -4392,58 +4402,50 @@ export function createChatInstance({
         const timeFmt = formatMsgTime(rawTs);
         const timeHtml = timeFmt ? `<div class="msg-time" title="${escapeHtmlAttr(timeFmt.full)}">${escapeHtml(timeFmt.short)}</div>` : '';
         const captionHtml = msg.caption ? `<div class="message">${escapeHtml(msg.caption)}</div>` : '';
-        const mime = /^image\/[a-z0-9.+-]+$/i.test(String(msg.mime || '')) ? String(msg.mime) : 'image/png';
-        const imageBase64 = /^[A-Za-z0-9+/=\s]+$/.test(String(msg.image_base64 || ''))
-            ? String(msg.image_base64 || '').replace(/\s+/g, '')
+        const fallbackMime = type === 'photo' ? 'image/png' : 'video/mp4';
+        const mimePattern = type === 'photo' ? /^image\/[a-z0-9.+-]+$/i : /^video\/[a-z0-9.+-]+$/i;
+        const mime = mimePattern.test(String(msg.mime || '')) ? String(msg.mime) : fallbackMime;
+        const base64Value = type === 'photo' ? msg.image_base64 : msg.video_base64;
+        const mediaBase64 = /^[A-Za-z0-9+/=\s]+$/.test(String(base64Value || ''))
+            ? String(base64Value || '').replace(/\s+/g, '')
             : '';
-        const imageUrl = imageBase64 ? `data:${mime};base64,${imageBase64}` : '';
+        const durableUrl = durableChatMediaUrl(msg.download_url);
+        const mediaUrl = mediaBase64 ? `data:${mime};base64,${mediaBase64}` : durableUrl;
+        if (!mediaUrl) return null;
+        const mediaHtml = type === 'photo'
+            ? `<img class="chat-photo" src="${escapeHtmlAttr(mediaUrl)}" alt="Photo attachment">`
+            : `<video class="chat-video" src="${escapeHtmlAttr(mediaUrl)}" controls></video>`;
         bubble.innerHTML = `
             <div class="sender">${escapeHtml(sender)}</div>
             ${captionHtml}
-            <div class="message"><img class="chat-photo" src="${escapeHtmlAttr(imageUrl)}" alt="Photo attachment"></div>
+            <div class="message">${mediaHtml}</div>
             ${timeHtml}
         `;
         const img = bubble.querySelector('.chat-photo');
-        if (img && imageUrl) {
-            img.addEventListener('click', () => window.open(imageUrl, '_blank'));
+        if (img) {
+            img.addEventListener('click', () => window.open(mediaUrl, '_blank'));
         }
         stampNodeTimestamp(bubble, rawTs);
-        insertMessageNode(bubble);
-        incrementUnreadIfNeeded(msg);
-    });
+        return bubble;
+    }
 
-    onWs('video', (msg) => {
+    function appendMediaBubble(msg) {
+        const key = chatMediaMessageKey(msg);
+        if (key && seenMessageKeys.has(key)) return false;
+        const bubble = buildMediaBubble(msg);
+        if (!bubble) return false;
+        rememberMessageKey(key);
+        insertMessageNode(bubble);
+        return true;
+    }
+
+    for (const type of ['photo', 'video']) onWs(type, (msg) => {
         if (!isMyThread(msg)) return;
+        // Media frames carry no activity identity: hide the dots row but leave
+        // the authoritative active set intact; sync derives the header from it.
         hideTypingIndicatorOnly();
         syncChatStatus();
-        const role = msg.role === 'user' ? 'user' : 'assistant';
-        const sender = role === 'user'
-            ? getSenderLabel('user', false, '', {
-                source: msg.source || '',
-                senderLabel: msg.sender_label || '',
-                senderSessionId: msg.sender_session_id || '',
-            })
-            : 'Ouroboros';
-        const bubble = document.createElement('div');
-        bubble.className = `chat-bubble ${role}`;
-        const rawTs = msg.ts || new Date().toISOString();
-        const timeFmt = formatMsgTime(rawTs);
-        const timeHtml = timeFmt ? `<div class="msg-time" title="${escapeHtmlAttr(timeFmt.full)}">${escapeHtml(timeFmt.short)}</div>` : '';
-        const captionHtml = msg.caption ? `<div class="message">${escapeHtml(msg.caption)}</div>` : '';
-        const mime = /^video\/[a-z0-9.+-]+$/i.test(String(msg.mime || '')) ? String(msg.mime) : 'video/mp4';
-        const videoBase64 = /^[A-Za-z0-9+/=\s]+$/.test(String(msg.video_base64 || ''))
-            ? String(msg.video_base64 || '').replace(/\s+/g, '')
-            : '';
-        const videoUrl = videoBase64 ? `data:${mime};base64,${videoBase64}` : '';
-        bubble.innerHTML = `
-            <div class="sender">${escapeHtml(sender)}</div>
-            ${captionHtml}
-            <div class="message"><video class="chat-video" src="${escapeHtmlAttr(videoUrl)}" controls></video></div>
-            ${timeHtml}
-        `;
-        stampNodeTimestamp(bubble, rawTs);
-        insertMessageNode(bubble);
-        incrementUnreadIfNeeded(msg);
+        if (appendMediaBubble(msg)) incrementUnreadIfNeeded(msg);
     });
 
     // Shared document-bubble builder for both live WS frames and history replay.

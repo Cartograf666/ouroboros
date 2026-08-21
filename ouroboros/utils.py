@@ -152,19 +152,14 @@ def replace_atomic(src: pathlib.Path | str, dst: pathlib.Path | str) -> None:
             delay = min(delay * 2, _REPLACE_RETRY_MAX_DELAY_SEC)
 
 
-def write_text_atomic(
-    path: pathlib.Path,
-    content: str,
-    *,
-    fsync: bool = False,
-) -> None:
-    """Atomically overwrite ``path`` with ``content`` via a sibling temp file + os.replace.
+def _atomic_overwrite(path: pathlib.Path, write_temp: Callable[[pathlib.Path], None]) -> None:
+    """Run ``write_temp`` against a sibling file, then atomically replace ``path``.
 
     A crash (SIGKILL / power loss) between the temp create and the replace leaves the
     EXISTING file fully intact — never a half-written/truncated file (G, v6.39). The temp
     name carries the ``.tmp.<pid>.<tid>.<uuid>`` atomic signature so the stale-temp sweep
     (`sweep_stale_temp_files`) reclaims an orphaned temp. Shared SSOT for every full-file
-    overwrite (atomic_write_json layers JSON serialization on top).
+    overwrite.
 
     The existing file's permission bits are PRESERVED across the replace (os.replace
     creates a new inode, so without this a tracked executable script would lose its +x);
@@ -186,15 +181,7 @@ def write_text_atomic(
     )
     tmp = path.with_name(tmp_name)
     try:
-        if fsync:
-            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-            try:
-                os.write(fd, content.encode("utf-8"))
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-        else:
-            tmp.write_text(content, encoding="utf-8")
+        write_temp(tmp)
         if existing_mode is not None:
             try:
                 os.chmod(tmp, existing_mode)
@@ -207,6 +194,56 @@ def write_text_atomic(
         except OSError:
             pass
         raise
+
+
+def write_bytes_atomic(
+    path: pathlib.Path,
+    content: bytes,
+    *,
+    fsync: bool = False,
+) -> None:
+    """Atomically overwrite ``path`` with exact bytes."""
+
+    def _write(tmp: pathlib.Path) -> None:
+        if not fsync:
+            tmp.write_bytes(content)
+            return
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
+        fd = os.open(str(tmp), flags, 0o644)
+        try:
+            view = memoryview(content)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError(f"short write to {tmp}")
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    _atomic_overwrite(path, _write)
+
+
+def write_text_atomic(
+    path: pathlib.Path,
+    content: str,
+    *,
+    fsync: bool = False,
+) -> None:
+    """Atomically overwrite UTF-8 text with platform newline semantics."""
+
+    def _write(tmp: pathlib.Path) -> None:
+        if fsync:
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            try:
+                os.write(fd, content.encode("utf-8"))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        else:
+            tmp.write_text(content, encoding="utf-8")
+
+    _atomic_overwrite(path, _write)
 
 
 def atomic_write_json(

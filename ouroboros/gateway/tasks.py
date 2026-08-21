@@ -50,6 +50,7 @@ from ouroboros.contracts.task_contract import (
     normalize_resource_policy,
 )
 from ouroboros.outcomes import public_task_result
+from ouroboros.artifacts import resolve_chat_media_path
 from ouroboros.task_results import (
     STATUS_FAILED,
     STATUS_SCHEDULED,
@@ -908,6 +909,9 @@ async def api_task_artifact(request: Request):
     if not name or "/" in name or "\\" in name or name in {".", ".."} or ".." in pathlib.PurePosixPath(name).parts:
         return json_error("artifact name must be a simple filename", 400)
     drive_root = request_drive_root(request)
+    chat_media = resolve_chat_media_path(drive_root, task_id, name)
+    if chat_media is not None:
+        return FileResponse(chat_media)
     result = load_effective_task_result(drive_root, task_id)
     if not result:
         return json_error("task not found", 404)
