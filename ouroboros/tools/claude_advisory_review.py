@@ -877,6 +877,14 @@ def _advisory_review_diff(
     ``early=("error", message, 0)`` — no placeholder review."""
     from ouroboros.tools.review_subject import managed_review_subject
 
+    # Every advisory pre-review reviews the LIVE worktree afresh: drop any
+    # advisory-surface memo entries so a subject built for an earlier
+    # pre-review of this attempt can never be served for a changed worktree
+    # (gate-surface entries stay — the staged candidate is frozen per attempt).
+    memo = getattr(ctx, "_managed_review_subject_memo", None)
+    if isinstance(memo, dict):
+        for key in [k for k in memo if isinstance(k, tuple) and len(k) >= 4 and k[3] == "advisory"]:
+            memo.pop(key, None)
     try:
         subject = managed_review_subject(ctx, repo_dir, surface="advisory")
     except Exception as exc:  # incl. StagedDiffUnavailable

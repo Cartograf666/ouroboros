@@ -401,6 +401,8 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
     # THIS attempt records its S tree here; the commit gate then asserts the
     # set equals the binding fingerprint's tree_sha (typed failure otherwise).
     ctx._last_review_subject_trees = set()
+    # The per-attempt managed-subject memo resets with the same boundary (C5).
+    ctx._managed_review_subject_memo = {}
 
     try:
         diff_bytes = run_cmd(["git", "diff", "--cached"], cwd=ctx.repo_dir).encode()

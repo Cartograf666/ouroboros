@@ -141,7 +141,7 @@ def _paid_row(row: Any) -> bool:
     return isinstance(row, dict) and bool(row.get("paid"))
 
 
-def _unmerged_marker_paid(
+def _unmerged_markers_paid(
     drive_root: pathlib.Path,
     skill_name: str,
     rows: List[Dict[str, Any]],
@@ -150,30 +150,33 @@ def _unmerged_marker_paid(
     content_hash: str = "",
     root: str = "",
 ) -> int:
-    """1 when this skill's write-ahead dispatch marker records a paid wave on
-    the given ceiling key whose terminal row has NOT landed yet (crashed wave,
-    or a direct-call infra outcome without a history row) — the money was
-    spent before the first transport call and must count. 0 otherwise: a
-    landed terminal row already carries the merged facts (the marker is
-    cleared on merge; the wave-key check below also guards a failed clear)."""
-    from ouroboros.skill_review_history import load_dispatch_marker
+    """How many of this skill's write-ahead dispatch markers record a paid wave
+    on the given ceiling key whose terminal row has NOT landed yet (crashed
+    wave, or a direct-call infra outcome without a history row) — the money
+    was spent before the first transport call and must count. Markers are
+    per-wave files, so EVERY concurrent unmerged wave counts; a landed
+    terminal row already carries the merged facts (its marker is cleared on
+    merge; the wave-key check below also guards a failed clear)."""
+    from ouroboros.skill_review_history import load_dispatch_markers
 
-    marker = load_dispatch_marker(pathlib.Path(drive_root), skill_name)
-    wave = str(marker.get("wave_id") or "")
-    if not wave or not marker.get("paid"):
-        return 0
-    if root:
-        if str(marker.get("root_task_id") or "") != root:
-            return 0
-    elif (
-        str(marker.get("group_id") or "") != str(group_id or "")
-        or str(marker.get("content_hash") or "") != str(content_hash or "")
-    ):
-        return 0
-    for row in rows:
-        if str(row.get("wave_id") or row.get("job_id") or "") == wave:
-            return 0
-    return 1
+    landed_waves = {
+        str(row.get("wave_id") or row.get("job_id") or "") for row in rows
+    }
+    count = 0
+    for marker in load_dispatch_markers(pathlib.Path(drive_root), skill_name):
+        wave = str(marker.get("wave_id") or "")
+        if not wave or not marker.get("paid") or wave in landed_waves:
+            continue
+        if root:
+            if str(marker.get("root_task_id") or "") != root:
+                continue
+        elif (
+            str(marker.get("group_id") or "") != str(group_id or "")
+            or str(marker.get("content_hash") or "") != str(content_hash or "")
+        ):
+            continue
+        count += 1
+    return count
 
 
 def count_paid_skill_review_cycles(
@@ -201,7 +204,7 @@ def count_paid_skill_review_cycles(
             and _paid_row(row)
             and str(row.get("content_hash") or "") == str(content_hash or "")
         )
-        return paid + _unmerged_marker_paid(
+        return paid + _unmerged_markers_paid(
             drive_root, skill_name, rows,
             group_id=group_id, content_hash=content_hash,
         )
@@ -226,7 +229,7 @@ def count_paid_skill_review_cycles(
             for row in rows
             if str(row.get("root_task_id") or "") == root and _paid_row(row)
         )
-        count += _unmerged_marker_paid(drive_root, skill_dir.name, rows, root=root)
+        count += _unmerged_markers_paid(drive_root, skill_dir.name, rows, root=root)
     return count
 
 

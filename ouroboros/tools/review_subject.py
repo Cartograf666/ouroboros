@@ -191,6 +191,12 @@ class ManagedReviewSubject:
     # the candidate must stay surface-correct: on the advisory surface the
     # full candidate is the WORKTREE, not the staged index.
     surface: str = "gate"
+    # Per-subject cache of re-rendered bodies keyed by width (C5 tail): the
+    # -U0 fit rung re-renders per consumer, and both trees are pinned on this
+    # subject, so a width's body is immutable for its lifetime. The subject
+    # itself is ctx-memoized per attempt — the cache inherits that
+    # invalidation. Excluded from comparison/repr: it is not identity.
+    _render_cache: dict = dataclasses.field(default_factory=dict, repr=False, compare=False)
 
     def _candidate_noun(self) -> str:
         return "staged candidate" if self.surface != "advisory" else "worktree candidate"
@@ -304,9 +310,12 @@ class ManagedReviewSubject:
         width = self.unified if unified is None else int(unified)
         if width == self.unified:
             body = self.diff
+        elif width in self._render_cache:
+            body = self._render_cache[width]
         else:
             base = "HEAD" if self.fallback_full_diff else self.m0_tree
             body = _tree_delta_diff(self.repo_dir, base, self.staged_tree, width)
+            self._render_cache[width] = body
         return f"{self.header()}\n\n{body}"
 
 
@@ -336,9 +345,28 @@ def managed_review_subject(
 
         authorized = _authorized_managed_update_resolver(ctx)
     except Exception:
-        # Only the AUTHORITY question may resolve to "not managed": a failed
-        # predicate means this caller was never proven to be the resolver.
+        # An exception ESCAPING the predicate (programming/import error — its
+        # internal evidence handling normally resolves to False + a typed
+        # marker) must not silently downgrade a genuinely managed task to an
+        # ordinary staged-diff review. Cheap existence probe (no parse): a
+        # present managed-update tx marker says this repo APPEARS mid-update,
+        # so fail loudly on the staged-capture channel; absent marker — log
+        # loudly and stay non-managed (an ordinary commit must never be
+        # blocked by a managed-code bug).
         log.warning("managed review subject: authority predicate failed", exc_info=True)
+        marker_present = False
+        try:
+            from supervisor.update_merge import _update_tx_marker_path
+
+            marker_present = _update_tx_marker_path().is_file()
+        except Exception:
+            marker_present = False
+        if marker_present:
+            raise StagedDiffUnavailable(
+                "managed-update authority predicate crashed while a managed "
+                "update tx marker is present — the review subject cannot be "
+                "determined (not proven managed, not proven ordinary)"
+            )
         return None
     if not authorized:
         # "Not the resolver" is only trustworthy when the authority EVIDENCE was
@@ -402,12 +430,27 @@ def managed_review_subject(
             raise StagedDiffUnavailable(
                 f"managed candidate tree S could not be serialized: {tree_error}"
             )
+    m0_tree = "" if tx_error else str(tx.get("m0_tree") or "")
+    m0_missing_reason = tx_error or str(tx.get("m0_missing_reason") or "")
+    # Per-attempt memo (C5): the gate S serialization is cheap, but the M0→S
+    # diff/name-status/counting below rebuild identically for every consumer
+    # of one attempt (triad + each scope row + advisory). Key = the exact
+    # subject identity; invalidated wherever the attempt resets
+    # ``_last_review_subject_trees`` (and per advisory pre-review). A memo hit
+    # returns the SAME built subject — no consumer-visible content changes.
+    # The M0-MISSING fallback is deliberately NOT memoized: its identity
+    # includes the volatile failure reason (tx_unreadable vs tx_missing vs a
+    # recorded m0_missing_reason), which the tree-based key cannot see.
+    memo_key = (str(repo_dir), m0_tree, staged_tree, surface, 3)
+    memo = getattr(ctx, "_managed_review_subject_memo", None)
+    if m0_tree and isinstance(memo, dict):
+        cached = memo.get(memo_key)
+        if cached is not None:
+            return cached
     anchors = {str(p) for p in (tx.get("conflict_paths") or []) if str(p).strip()}
     live = _live_unmerged_paths(repo_dir)
     if live is not None:
         anchors.update(live)
-    m0_tree = "" if tx_error else str(tx.get("m0_tree") or "")
-    m0_missing_reason = tx_error or str(tx.get("m0_missing_reason") or "")
     if m0_tree:
         diff = _tree_delta_diff(repo_dir, m0_tree, staged_tree, 3)
         name_status = _tree_delta_name_status(repo_dir, m0_tree, staged_tree)
@@ -424,7 +467,7 @@ def managed_review_subject(
         diff = _tree_delta_diff(repo_dir, "HEAD", staged_tree, 3)
         name_status = _tree_delta_name_status(repo_dir, "HEAD", staged_tree)
         fallback = True
-    return ManagedReviewSubject(
+    subject = ManagedReviewSubject(
         repo_dir=str(repo_dir),
         m0_tree=m0_tree,
         staged_tree=staged_tree,
@@ -439,6 +482,16 @@ def managed_review_subject(
         fallback_full_diff=fallback,
         surface=surface,
     )
+    if not m0_tree:
+        return subject  # fallback subjects are never cached (see above)
+    if not isinstance(memo, dict):
+        memo = {}
+        try:
+            ctx._managed_review_subject_memo = memo
+        except Exception:
+            return subject  # a ctx that cannot carry the memo simply rebuilds
+    memo[memo_key] = subject
+    return subject
 
 
 def capture_review_diff(ctx: Any, repo_dir, *, unified: int = 3) -> str:

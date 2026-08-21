@@ -226,7 +226,7 @@ def test_bounded_git_process_kills_tree_and_is_panic_tracked(monkeypatch):
             self.pid = 12345
             self.calls = 0
 
-        def communicate(self, timeout=None):
+        def communicate(self, input=None, timeout=None):
             assert self in shell._active_subprocesses
             self.calls += 1
             if self.calls == 1:
@@ -1208,7 +1208,7 @@ def test_official_fetch_timeout_kills_the_process_tree(monkeypatch):
         def __init__(self):
             self.communicates = 0
 
-        def communicate(self, timeout=None):
+        def communicate(self, input=None, timeout=None):
             assert self in shell._active_subprocesses
             self.communicates += 1
             if self.communicates == 1:

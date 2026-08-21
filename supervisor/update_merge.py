@@ -25,7 +25,8 @@ from supervisor import git_ops as _g
 from supervisor.update_candidate import (  # noqa: F401
     _MERGE_NEUTRAL_FLAGS, _git_run, _merge_head_sha, _preserve_failed_update_attempt,
     _rev_parse, existing_failed_update_ref, live_unmerged_paths,
-    UpdateTxCorrupt, managed_tests_evidence_covers, record_managed_tests_evidence,
+    UpdateTxCorrupt, managed_assisted_marker_check, managed_tests_evidence_covers,
+    record_managed_tests_evidence,
     record_managed_tests_proof, update_tx_phase, update_tx_phase_or_keep,
     worktree_snapshot_tree,
     find_update_stash_sha, restore_stash_with_marker, restore_update_stash,
@@ -1321,49 +1322,6 @@ def restore_assisted_resolution_after_commit_error(tx: Dict[str, Any]) -> bool:
     current["phase"] = "assisted_resolution"
     write_update_tx(current)
     return True
-
-
-def managed_assisted_marker_check() -> Tuple[bool, str]:
-    """Reject leftover conflict markers in the STAGED tree — the PRIMARY leakage gate: once the
-    agent `git add`-s a marked file it is a 'resolved' (stage-0) entry, so `--diff-filter=U`
-    no longer catches it. Scan the raw staged blob (no diff '+' prefix); flag a file only when
-    BOTH a `<<<<<<<` and a `>>>>>>>` marker line are present (avoids false-positives on a lone
-    markdown `=======` underline)."""
-    import re
-
-    start_re = re.compile(br"^<{7}", re.MULTILINE)
-    end_re = re.compile(br"^>{7}", re.MULTILINE)
-    names_result = subprocess.run(
-        ["git", "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRTUXB"],
-        cwd=str(_g.REPO_DIR),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    bad: List[str] = []
-    if names_result.returncode != 0:
-        return False, "⚠️ MANAGED_UPDATE_ERROR: could not inspect staged files for conflict markers."
-    for raw_path in [value for value in names_result.stdout.split(b"\0") if value]:
-        path = os.fsdecode(raw_path)
-        blob_result = subprocess.run(
-            ["git", "show", f":{path}"],
-            cwd=str(_g.REPO_DIR),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if blob_result.returncode != 0:
-            return False, f"⚠️ MANAGED_UPDATE_ERROR: could not inspect staged file {path}."
-        blob = blob_result.stdout
-        if b"\0" in blob:
-            continue
-        if start_re.search(blob) and end_re.search(blob):
-            bad.append(path)
-    if bad:
-        return False, (
-            "⚠️ MANAGED_UPDATE_ERROR: unresolved conflict markers remain in: "
-            + ", ".join(bad[:20])
-            + " — remove every <<<<<<< / ======= / >>>>>>> before committing."
-        )
-    return True, ""
 
 
 def reestablish_merge_head(target_sha: str) -> None:

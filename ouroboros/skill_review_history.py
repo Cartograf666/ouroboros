@@ -26,8 +26,28 @@ def review_history_path(drive_root: pathlib.Path, skill_name: str) -> pathlib.Pa
     return drive_root / "state" / "skills" / skill_name / "review_history.jsonl"
 
 
-def dispatch_marker_path(drive_root: pathlib.Path, skill_name: str) -> pathlib.Path:
+def legacy_dispatch_marker_path(drive_root: pathlib.Path, skill_name: str) -> pathlib.Path:
+    """The retired SINGLE-file marker (pre per-wave storage). Tolerated read-only:
+    ``write_dispatch_marker`` flushes it into the history and removes it."""
     return drive_root / "state" / "skills" / skill_name / "review_dispatch.json"
+
+
+def dispatch_marker_dir(drive_root: pathlib.Path, skill_name: str) -> pathlib.Path:
+    """APPEND-ONLY per-wave dispatch markers: one file per dispatched wave, so
+    two concurrent waves on one skill can never overwrite each other's paid
+    fact (a lost marker silently undercounts the cycle ceiling). Each wave's
+    terminal-row merge clears exactly its own file."""
+    return drive_root / "state" / "skills" / skill_name / "review_dispatch"
+
+
+def _wave_marker_path(drive_root: pathlib.Path, skill_name: str, wave_id: str) -> pathlib.Path:
+    import hashlib
+    import re
+
+    wave = str(wave_id or "")
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", wave)[:48]
+    digest = hashlib.sha256(wave.encode("utf-8")).hexdigest()[:10]
+    return dispatch_marker_dir(drive_root, skill_name) / f"{safe}-{digest}.json"
 
 
 def _emit_history_event(drive_root: pathlib.Path, event: Dict[str, Any]) -> None:
@@ -41,26 +61,68 @@ def _emit_history_event(drive_root: pathlib.Path, event: Dict[str, Any]) -> None
         log.debug("skill review history event emission failed", exc_info=True)
 
 
-def load_dispatch_marker(drive_root: pathlib.Path, skill_name: str) -> Dict[str, Any]:
-    """The current write-ahead dispatch marker, ``{}`` when none/unreadable."""
+def _read_marker_file(path: pathlib.Path) -> Dict[str, Any]:
     try:
-        data = json.loads(dispatch_marker_path(drive_root, skill_name).read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
 
 
+def load_dispatch_markers(drive_root: pathlib.Path, skill_name: str) -> List[Dict[str, Any]]:
+    """EVERY unmerged write-ahead dispatch marker for this skill (per-wave files
+    plus a tolerated legacy single-file marker), sorted by wave id. Unreadable
+    files are skipped (fail-open cost accounting)."""
+    markers: Dict[str, Dict[str, Any]] = {}
+    try:
+        files = sorted(dispatch_marker_dir(drive_root, skill_name).glob("*.json"))
+    except OSError:
+        files = []
+    for path in files:
+        marker = _read_marker_file(path)
+        wave = str(marker.get("wave_id") or "")
+        if wave:
+            markers[wave] = marker
+    legacy = _read_marker_file(legacy_dispatch_marker_path(drive_root, skill_name))
+    legacy_wave = str(legacy.get("wave_id") or "")
+    if legacy_wave and legacy_wave not in markers:
+        markers[legacy_wave] = legacy
+    return [markers[wave] for wave in sorted(markers)]
+
+
+def load_dispatch_marker_for_wave(
+    drive_root: pathlib.Path, skill_name: str, wave_id: str
+) -> Dict[str, Any]:
+    """The marker recorded for exactly this wave, ``{}`` when none/unreadable."""
+    if not wave_id:
+        return {}
+    marker = _read_marker_file(_wave_marker_path(drive_root, skill_name, wave_id))
+    if str(marker.get("wave_id") or "") == str(wave_id):
+        return marker
+    legacy = _read_marker_file(legacy_dispatch_marker_path(drive_root, skill_name))
+    if str(legacy.get("wave_id") or "") == str(wave_id):
+        return legacy
+    return {}
+
+
 def clear_dispatch_marker(drive_root: pathlib.Path, skill_name: str, *, wave_id: str) -> None:
-    """Remove the marker once its wave's terminal row landed (merge complete)."""
+    """Remove ONE wave's marker once its terminal row landed (merge complete).
+    Only the named wave's own file (or a legacy single-file marker recording
+    that wave) is touched — concurrent waves' markers stay in place."""
     if not wave_id:
         return
-    marker = load_dispatch_marker(drive_root, skill_name)
-    if str(marker.get("wave_id") or "") != str(wave_id):
-        return
-    try:
-        dispatch_marker_path(drive_root, skill_name).unlink()
-    except OSError:
-        log.debug("skill review dispatch marker unlink failed", exc_info=True)
+    path = _wave_marker_path(drive_root, skill_name, wave_id)
+    if str(_read_marker_file(path).get("wave_id") or "") == str(wave_id):
+        try:
+            path.unlink()
+        except OSError:
+            log.debug("skill review dispatch marker unlink failed", exc_info=True)
+    legacy_path = legacy_dispatch_marker_path(drive_root, skill_name)
+    if str(_read_marker_file(legacy_path).get("wave_id") or "") == str(wave_id):
+        try:
+            legacy_path.unlink()
+        except OSError:
+            log.debug("legacy skill review dispatch marker unlink failed", exc_info=True)
 
 
 def write_dispatch_marker(
@@ -77,17 +139,25 @@ def write_dispatch_marker(
     """Durable WRITE-AHEAD dispatch marker (Q17; same principle as the commit
     gate's paid stamp): written immediately before the first physical reviewer
     transport call of ONE skill-review wave, shared by the lifecycle runner and
-    direct ``review_skill`` callers. Terminal history rows merge it (facts ride
-    the row, marker cleared); a wave that never lands a terminal row keeps the
-    marker, so the derived paid-cycle count never forgets spent money. An
-    unmerged predecessor from a crashed wave is first flushed into the history
-    as an infra terminal carrying its paid facts. A failing write surfaces as a
-    loud typed event — this is fail-open cost accounting, not a safety gate."""
+    direct ``review_skill`` callers. APPEND-ONLY per-wave storage: each wave
+    writes ITS OWN marker file, so two concurrent waves on one skill can never
+    overwrite each other's paid fact; each terminal-row merge clears exactly
+    its own marker, and every still-unmerged marker keeps counting toward the
+    ceiling (a crashed or swallowed wave spent the money). A sibling per-wave
+    marker is NEVER flushed here — a concurrent wave is live by design, and
+    flushing it as an infra terminal would let the idempotent merge (keyed by
+    its wave id) refuse its REAL verdict row later. A LEGACY single-file
+    marker from a pre-upgrade wave is read + flushed into the history as an
+    infra terminal and removed. A failing write surfaces as a loud typed
+    event — this is fail-open cost accounting, not a safety gate."""
     from ouroboros.utils import atomic_write_json
 
-    predecessor = load_dispatch_marker(drive_root, skill_name)
-    if predecessor.get("wave_id") and str(predecessor["wave_id"]) != str(wave_id):
-        _flush_orphan_dispatch_marker(drive_root, skill_name, predecessor)
+    legacy = _read_marker_file(legacy_dispatch_marker_path(drive_root, skill_name))
+    if legacy.get("wave_id") and str(legacy["wave_id"]) != str(wave_id):
+        # On success the idempotent append clears the legacy file itself (its
+        # merge path recognises the legacy marker); on failure the file stays
+        # so the paid fact keeps counting and a later write retries the flush.
+        _flush_orphan_dispatch_marker(drive_root, skill_name, legacy)
     payload = {
         "ts": utc_now_iso(),
         "wave_id": str(wave_id),
@@ -99,7 +169,7 @@ def write_dispatch_marker(
         "rebuttal_sha256": str(rebuttal_sha256 or ""),
     }
     try:
-        path = dispatch_marker_path(drive_root, skill_name)
+        path = _wave_marker_path(drive_root, skill_name, str(wave_id))
         path.parent.mkdir(parents=True, exist_ok=True)
         # Same redaction invariant as the history rows: marker fields are all
         # hashes/ids today, so this is a no-op class guard, not a data change.
@@ -145,10 +215,12 @@ def _merge_dispatch_marker_facts(
     The producer can lose the facts legitimately — a lifecycle timeout
     finalizes with no result object — but the marker recorded the dispatch
     before the first transport call, so the terminal row still carries
-    ``paid``/contract/rebuttal. Rows of other waves pass through untouched."""
-    marker = load_dispatch_marker(drive_root, skill_name)
-    wave = str(marker.get("wave_id") or "")
+    ``paid``/contract/rebuttal. Rows of other waves pass through untouched:
+    the merge reads exactly ITS wave's per-wave marker (or a legacy
+    single-file marker recording that wave)."""
     row_wave = str(payload.get("wave_id") or payload.get("job_id") or "")
+    marker = load_dispatch_marker_for_wave(drive_root, skill_name, row_wave)
+    wave = str(marker.get("wave_id") or "")
     if not wave or wave != row_wave:
         return payload
     merged = dict(payload)

@@ -875,6 +875,9 @@ def _run_reviewed_stage_cycle(
     # the CURRENT binding tree and permanently block the free-replay commit
     # (typed review_subject_binding_mismatch on every retry).
     ctx._last_review_subject_trees = set()
+    # The per-attempt subject memo shares the attempt boundary (C5): a new
+    # attempt must rebuild against the fresh candidate.
+    ctx._managed_review_subject_memo = {}
     classification_paths, advisory_paths, stage_error = _stage_candidate_for_review(
         ctx,
         commit_message,

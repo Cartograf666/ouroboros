@@ -13,7 +13,6 @@ Depends on ``git_ops`` via the module object (``_g.X``) so monkeypatched
 from __future__ import annotations
 
 import os
-import subprocess
 from typing import Any, Dict, List, Optional, Tuple
 
 from supervisor import git_ops as _g
@@ -28,17 +27,33 @@ deliberately NOT neutralized — they are part of the repository's own contract 
 apply identically to every invocation."""
 
 
+_GIT_RUN_TIMEOUT_SEC = 300.0
+"""Generous wall-clock bound for one update-plumbing git invocation. This plumbing
+runs WHILE THE UPDATE LOCK IS HELD: a git process hung on a clean filter, a merge
+driver, a stale repo lock or a blocked filesystem would otherwise wedge the whole
+update flow with no rollback path. A timeout surfaces through the normal nonzero-rc
+shape (``git_ops.FETCH_TIMEOUT_RC`` + a disclosed message) that every caller already
+routes into its typed update error, after the process TREE is killed
+(cross-platform: ``platform_layer.kill_process_tree``)."""
+
+
 def _git_run(
-    cmd: List[str], *, cwd: Optional[str] = None, extra_env: Optional[Dict[str, str]] = None
+    cmd: List[str], *, cwd: Optional[str] = None,
+    extra_env: Optional[Dict[str, str]] = None,
+    timeout: float = _GIT_RUN_TIMEOUT_SEC,
 ) -> Tuple[int, str, str]:
     """Run a git command with an optional cwd / extra env (e.g. GIT_INDEX_FILE), WITHOUT
     the REPO_DIR pin and index-repair retry of ``git_capture``. For merge-planning in a
-    temp index / temp worktree only — never the live-repo control path."""
+    temp index / temp worktree only — never the live-repo control path. BOUNDED: reuses
+    ``git_ops._run_git_process_bounded`` (timeout + process-group kill), so a hung git
+    can never wedge the update lock; a timeout returns ``(FETCH_TIMEOUT_RC, "", msg)``."""
     env = dict(os.environ)
     if extra_env:
         env.update(extra_env)
-    r = subprocess.run(cmd, cwd=str(cwd or _g.REPO_DIR), capture_output=True, text=True, env=env)
-    return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+    rc, out, err = _g._run_git_process_bounded(
+        cmd, timeout=timeout, cwd=cwd or _g.REPO_DIR, env=env, text=True,
+    )
+    return rc, str(out or "").strip(), str(err or "").strip()
 
 
 def _rev_parse(ref: str) -> str:
@@ -90,6 +105,104 @@ def live_unmerged_paths() -> Optional[List[str]]:
     if rc_u != 0:
         return None
     return [ln.strip() for ln in unmerged_out.splitlines() if ln.strip()]
+
+
+def _staged_blobs_batch(paths: List[bytes]) -> Tuple[Optional[Dict[bytes, bytes]], bytes]:
+    """Read the staged (stage-0) blob of every path in ONE bounded ``git cat-file
+    --batch`` process instead of one subprocess per path. Paths stay RAW BYTES
+    end-to-end (N1): git's ``:path`` batch requests are byte-safe, while a valid
+    POSIX filename with non-UTF-8 bytes fsdecodes to surrogates that a strict
+    UTF-8 re-encode cannot represent. Returns ``(blobs_by_path, b"")`` or
+    ``(None, failed_path)`` when any path's staged blob could not be read
+    (unmerged entries resolve to ``missing``)."""
+    if not paths:
+        return {}, b""
+    request = b"".join(b":" + path + b"\n" for path in paths)
+    rc, raw, _err = _g._run_git_process_bounded(
+        ["git", "cat-file", "--batch"], timeout=_GIT_RUN_TIMEOUT_SEC,
+        cwd=_g.REPO_DIR, text=False, input_data=request,
+    )
+    if rc != 0 or not isinstance(raw, bytes):
+        return None, paths[0]
+    blobs: Dict[bytes, bytes] = {}
+    cursor = 0
+    for path in paths:
+        header_end = raw.find(b"\n", cursor)
+        if header_end < 0:
+            return None, path
+        header = raw[cursor:header_end].split(b" ")
+        if len(header) == 2 and header[1] == b"missing":
+            return None, path
+        if len(header) != 3 or header[1] != b"blob":
+            return None, path
+        try:
+            size = int(header[2])
+        except ValueError:
+            return None, path
+        blob_start = header_end + 1
+        blob_end = blob_start + size
+        if blob_end >= len(raw) or raw[blob_end:blob_end + 1] != b"\n":
+            return None, path
+        blobs[path] = raw[blob_start:blob_end]
+        cursor = blob_end + 1
+    return blobs, b""
+
+
+def managed_assisted_marker_check() -> Tuple[bool, str]:
+    """Reject leftover conflict markers in the STAGED tree — the PRIMARY leakage gate: once the
+    agent `git add`-s a marked file it is a 'resolved' (stage-0) entry, so `--diff-filter=U`
+    no longer catches it. Scan the raw staged blob (no diff '+' prefix); flag a file only when
+    BOTH a `<<<<<<<` and a `>>>>>>>` marker line are present (avoids false-positives on a lone
+    markdown `=======` underline). Every git call is BOUNDED, and the blob scan is ONE
+    ``git cat-file --batch`` process for the whole staged set, not one process per path."""
+    import re
+
+    start_re = re.compile(br"^<{7}", re.MULTILINE)
+    end_re = re.compile(br"^>{7}", re.MULTILINE)
+    rc_n, names_raw, _ne = _g._run_git_process_bounded(
+        ["git", "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRTUXB"],
+        timeout=_GIT_RUN_TIMEOUT_SEC, cwd=_g.REPO_DIR, text=False,
+    )
+    if rc_n != 0 or not isinstance(names_raw, bytes):
+        return False, "⚠️ MANAGED_UPDATE_ERROR: could not inspect staged files for conflict markers."
+    # Paths stay RAW BYTES through the batch (N1); fsdecode is for DIAGNOSTICS
+    # and the fallback argv only (argv round-trips via the surrogateescape
+    # fsencode, so git receives the original bytes back).
+    paths = [value for value in names_raw.split(b"\0") if value]
+    # `cat-file --batch` requests are newline-delimited: a path containing a
+    # newline cannot ride the batch and falls back to a bounded per-path read.
+    batch_paths = [path for path in paths if b"\n" not in path]
+    blobs, failed_path = _staged_blobs_batch(batch_paths)
+    if blobs is None:
+        return False, (
+            "⚠️ MANAGED_UPDATE_ERROR: could not inspect staged file "
+            f"{os.fsdecode(failed_path)}."
+        )
+    for path in (path for path in paths if b"\n" in path):
+        rc_s, blob_raw, _se = _g._run_git_process_bounded(
+            ["git", "show", f":{os.fsdecode(path)}"], timeout=_GIT_RUN_TIMEOUT_SEC,
+            cwd=_g.REPO_DIR, text=False,
+        )
+        if rc_s != 0 or not isinstance(blob_raw, bytes):
+            return False, (
+                "⚠️ MANAGED_UPDATE_ERROR: could not inspect staged file "
+                f"{os.fsdecode(path)}."
+            )
+        blobs[path] = blob_raw
+    bad: List[str] = []
+    for path in paths:
+        blob = blobs.get(path, b"")
+        if b"\0" in blob:
+            continue
+        if start_re.search(blob) and end_re.search(blob):
+            bad.append(os.fsdecode(path))
+    if bad:
+        return False, (
+            "⚠️ MANAGED_UPDATE_ERROR: unresolved conflict markers remain in: "
+            + ", ".join(bad[:20])
+            + " — remove every <<<<<<< / ======= / >>>>>>> before committing."
+        )
+    return True, ""
 
 
 def existing_failed_update_ref(target_sha: str, *, not_at: str = "") -> str:
@@ -213,8 +326,14 @@ def record_managed_tests_evidence(
         return ""
     from ouroboros.utils import utc_now_iso
 
-    tx["tests_evidence"] = {"tree": tree, "at": utc_now_iso()}
-    _um.write_update_tx(tx)
+    # Merge-write ONLY the evidence key onto the FRESH durable tx (W2 class):
+    # a concurrent finalizer/watchdog/commit-transition write landing between
+    # this function's tx read and a wholesale write-back would be rolled back
+    # (phase, stash state, commit metadata) and strand recovery. On a CORRUPT
+    # marker the forensic write is SKIPPED loudly (F1 semantics inside the
+    # helper) — evidence is forensic-only post-F2, so the caller still gets
+    # the tree for the process-held proof.
+    update_tx_phase_or_keep(tx, {"tests_evidence": {"tree": tree, "at": utc_now_iso()}})
     return tree
 
 

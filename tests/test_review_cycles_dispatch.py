@@ -529,7 +529,7 @@ def test_skill_wave_outcomes_yield_exactly_one_paid_unit_each(tmp_path, monkeypa
     paid unit in the derived count — via the terminal row when one lands, via
     the unmerged write-ahead dispatch marker when none does."""
     from ouroboros import skill_review
-    from ouroboros.skill_review_history import load_dispatch_marker
+    from ouroboros.skill_review_history import load_dispatch_markers
 
     ctx = types.SimpleNamespace(task_id="", task_metadata={}, event_queue=None)
 
@@ -542,7 +542,7 @@ def test_skill_wave_outcomes_yield_exactly_one_paid_unit_each(tmp_path, monkeypa
     assert outcome.status in ("clean", "warnings", "blockers")
     assert outcome.paid is True and outcome.wave_id
     assert _paid_units(tmp_path, "h-verdict") == 1
-    assert load_dispatch_marker(pathlib.Path(tmp_path), "demo") == {}  # merged+cleared
+    assert load_dispatch_markers(pathlib.Path(tmp_path), "demo") == []  # merged+cleared
     row = _history_rows(tmp_path)[-1]
     assert row["paid"] is True and row["wave_id"] == outcome.wave_id
     assert row["review_contract_fingerprint"] == outcome.review_contract_fingerprint
@@ -555,7 +555,7 @@ def test_skill_wave_outcomes_yield_exactly_one_paid_unit_each(tmp_path, monkeypa
     outcome = skill_review.review_skill(ctx, "demo", persist=True)
     assert outcome.status == "pending" and outcome.paid is True
     assert _paid_units(tmp_path, "h-quorum") == 1
-    assert load_dispatch_marker(pathlib.Path(tmp_path), "demo") == {}
+    assert load_dispatch_markers(pathlib.Path(tmp_path), "demo") == []
     row = _history_rows(tmp_path)[-1]
     assert row["paid"] is True and row["content_hash"] == "h-quorum"
 
@@ -567,8 +567,9 @@ def test_skill_wave_outcomes_yield_exactly_one_paid_unit_each(tmp_path, monkeypa
     outcome = skill_review.review_skill(ctx, "demo", persist=True)
     assert outcome.status == "pending" and outcome.paid is True
     assert _paid_units(tmp_path, "h-transport") == 1
-    marker = load_dispatch_marker(pathlib.Path(tmp_path), "demo")
-    assert marker.get("content_hash") == "h-transport" and marker.get("paid") is True
+    markers = load_dispatch_markers(pathlib.Path(tmp_path), "demo")
+    assert len(markers) == 1
+    assert markers[0].get("content_hash") == "h-transport" and markers[0].get("paid") is True
 
     # (4) exception after dispatch: the write-ahead marker survives the crash.
     def _boom(ctx_arg):
@@ -580,12 +581,12 @@ def test_skill_wave_outcomes_yield_exactly_one_paid_unit_each(tmp_path, monkeypa
     with pytest.raises(RuntimeError):
         skill_review.review_skill(ctx, "demo", persist=True)
     assert _paid_units(tmp_path, "h-crash") == 1
-    # Writing marker (4) flushed the orphaned marker (3) into the history as an
-    # infra terminal — the spend of wave (3) is still exactly one unit.
+    # Per-wave markers are APPEND-ONLY: wave (4)'s write did NOT displace the
+    # orphaned marker (3) — both coexist and each spend is still exactly one
+    # unit derived from its own unmerged marker.
     assert _paid_units(tmp_path, "h-transport") == 1
-    flushed = [r for r in _history_rows(tmp_path)
-               if r.get("terminal_reason") == "dispatched_wave_never_finalized"]
-    assert flushed and flushed[-1]["content_hash"] == "h-transport"
+    unmerged = load_dispatch_markers(pathlib.Path(tmp_path), "demo")
+    assert {m.get("content_hash") for m in unmerged} == {"h-transport", "h-crash"}
     # The seam is restored after every wave.
     assert getattr(ctx, "_review_paid_stamp", None) is None
 
@@ -594,7 +595,7 @@ def test_lifecycle_timeout_terminal_merges_the_dispatch_marker(tmp_path, monkeyp
     """F3(b): a lifecycle timeout finalizes with NO result object — the
     terminal history row still carries the paid facts, merged from the
     write-ahead dispatch marker by job id."""
-    from ouroboros.skill_review_history import load_dispatch_marker, write_dispatch_marker
+    from ouroboros.skill_review_history import load_dispatch_markers, write_dispatch_marker
     from ouroboros.skill_review_runner import _mark_review_job_timeout, review_job_state_path
     from ouroboros.utils import atomic_write_json
 
@@ -617,7 +618,7 @@ def test_lifecycle_timeout_terminal_merges_the_dispatch_marker(tmp_path, monkeyp
     assert rows[-1]["paid"] is True  # merged from the marker, result was None
     assert rows[-1]["review_contract_fingerprint"] == "cf-9"
     assert rows[-1]["rebuttal_sha256"] == "reb-9"
-    assert load_dispatch_marker(drive, "demo") == {}  # merge cleared it
+    assert load_dispatch_markers(drive, "demo") == []  # merge cleared it
     from ouroboros.skill_review_cycles import count_paid_skill_review_cycles
 
     assert count_paid_skill_review_cycles(drive, "demo", "task:root-5:demo") == 1
@@ -681,3 +682,112 @@ def test_spent_rebuttal_memory_lapses_with_the_panel_contract(tmp_path):
         pathlib.Path(tmp_path), "demo", group_id="manual:demo", content_hash="h1",
         contract_fingerprint="cf-new", rebuttal_sha256="reb-1",
     ) is not None
+
+
+# ---------------------------------------------------------------------------
+# C4 — append-only per-wave dispatch markers (concurrency + legacy migration)
+
+
+def test_concurrent_wave_markers_are_append_only_and_each_merge_clears_its_own(tmp_path):
+    """Two interleaved waves on ONE skill both keep their write-ahead paid
+    fact (per-wave marker files — no single-file overwrite), both count
+    toward the ceiling, and each terminal-row merge clears exactly its own
+    marker without minting spurious infra rows for the live sibling."""
+    from ouroboros.skill_review_cycles import count_paid_skill_review_cycles
+    from ouroboros.skill_review_history import (
+        append_history_once,
+        load_dispatch_markers,
+        write_dispatch_marker,
+    )
+    from ouroboros.utils import utc_now_iso
+
+    drive = pathlib.Path(tmp_path)
+    (drive / "logs").mkdir(parents=True, exist_ok=True)
+    write_dispatch_marker(
+        drive, "demo", wave_id="wave-A", group_id="manual:demo", content_hash="h-1",
+    )
+    write_dispatch_marker(
+        drive, "demo", wave_id="wave-B", group_id="manual:demo", content_hash="h-1",
+    )
+
+    # Append-only: writing B neither displaced A's marker nor flushed the LIVE
+    # wave A into the history as a fake infra terminal.
+    markers = load_dispatch_markers(drive, "demo")
+    assert {m["wave_id"] for m in markers} == {"wave-A", "wave-B"}
+    assert _history_rows(tmp_path) == []
+    assert count_paid_skill_review_cycles(
+        drive, "demo", "manual:demo", content_hash="h-1",
+    ) == 2
+
+    # Wave A's REAL terminal row lands (idempotent merge by wave id): the paid
+    # fact merges from A's own marker and ONLY A's marker is cleared.
+    assert append_history_once(drive, "demo", {
+        "ts": utc_now_iso(), "status": "clean", "content_hash": "h-1",
+        "group_id": "manual:demo", "job_id": "wave-A", "wave_id": "wave-A",
+        "failure_signature": [], "fail_findings": [],
+    })
+    rows = _history_rows(tmp_path)
+    assert [row["status"] for row in rows] == ["clean"]  # the verdict, not "interrupted"
+    assert rows[-1]["paid"] is True
+    assert {m["wave_id"] for m in load_dispatch_markers(drive, "demo")} == {"wave-B"}
+    assert count_paid_skill_review_cycles(
+        drive, "demo", "manual:demo", content_hash="h-1",
+    ) == 2  # one landed row + one still-unmerged marker
+
+    # Wave B merges too: no markers left, the count is stable.
+    assert append_history_once(drive, "demo", {
+        "ts": utc_now_iso(), "status": "warnings", "content_hash": "h-1",
+        "group_id": "manual:demo", "job_id": "wave-B", "wave_id": "wave-B",
+        "failure_signature": [], "fail_findings": [],
+    })
+    assert load_dispatch_markers(drive, "demo") == []
+    assert count_paid_skill_review_cycles(
+        drive, "demo", "manual:demo", content_hash="h-1",
+    ) == 2
+
+
+def test_legacy_single_file_marker_is_read_and_flushed_on_the_next_write(tmp_path):
+    """Migration: a pre-upgrade SINGLE-file marker is tolerated read-side
+    (listed + counted) and the next wave's write flushes it into the history
+    as a paid infra terminal and removes the file — the spend is never
+    forgotten and never double-counted."""
+    from ouroboros.skill_review_cycles import count_paid_skill_review_cycles
+    from ouroboros.skill_review_history import (
+        legacy_dispatch_marker_path,
+        load_dispatch_markers,
+        write_dispatch_marker,
+    )
+
+    drive = pathlib.Path(tmp_path)
+    (drive / "logs").mkdir(parents=True, exist_ok=True)
+    legacy = legacy_dispatch_marker_path(drive, "demo")
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(json.dumps({
+        "ts": "2026-01-01T00:00:00Z", "wave_id": "wave-legacy",
+        "group_id": "manual:demo", "content_hash": "h-1",
+        "root_task_id": "", "paid": True,
+        "review_contract_fingerprint": "cf-old", "rebuttal_sha256": "",
+    }), encoding="utf-8")
+
+    assert any(
+        m["wave_id"] == "wave-legacy" for m in load_dispatch_markers(drive, "demo")
+    )
+    assert count_paid_skill_review_cycles(
+        drive, "demo", "manual:demo", content_hash="h-1",
+    ) == 1
+
+    write_dispatch_marker(
+        drive, "demo", wave_id="wave-new", group_id="manual:demo", content_hash="h-1",
+    )
+    assert not legacy.exists()
+    flushed = [
+        row for row in _history_rows(tmp_path)
+        if row.get("terminal_reason") == "dispatched_wave_never_finalized"
+    ]
+    assert flushed and flushed[-1]["wave_id"] == "wave-legacy"
+    assert flushed[-1]["paid"] is True
+    assert flushed[-1]["review_contract_fingerprint"] == "cf-old"
+    assert {m["wave_id"] for m in load_dispatch_markers(drive, "demo")} == {"wave-new"}
+    assert count_paid_skill_review_cycles(
+        drive, "demo", "manual:demo", content_hash="h-1",
+    ) == 2  # the flushed legacy row + the new unmerged marker

@@ -1352,3 +1352,84 @@ def test_advisory_pre_review_builds_exactly_one_subject(tmp_path, monkeypatch):
 
     skipped = [r for r in load_state(tmp_path / "data").advisory_runs if r.status == "skipped"]
     assert skipped and "reviewed resolution paths:" in skipped[-1].snapshot_summary
+
+
+# ---------------------------------------------------------------------------
+# Hardening round: C5 per-attempt subject memoization, C6 crashed-predicate
+# marker probe.
+# ---------------------------------------------------------------------------
+
+
+def test_subject_is_built_once_per_key_and_reset_invalidates(tmp_path, monkeypatch):
+    """C5: N consumers of one attempt (triad + scope rows + fit rungs) share
+    ONE built subject per (repo, M0, S, surface) key — the memo hit returns
+    the SAME object, the advisory surface is a separate key, and the
+    per-attempt reset (clearing ``_managed_review_subject_memo``) forces a
+    fresh build."""
+    import ouroboros.tools.review_subject as review_subject_mod
+
+    repo, ctx, tx = _managed_resolution_repo(tmp_path, monkeypatch)
+    builds = {"count": 0}
+    real_delta = review_subject_mod._tree_delta_diff
+
+    def _counting_delta(*args, **kwargs):
+        builds["count"] += 1
+        return real_delta(*args, **kwargs)
+
+    monkeypatch.setattr(review_subject_mod, "_tree_delta_diff", _counting_delta)
+
+    first = managed_review_subject(ctx, repo)
+    second = managed_review_subject(ctx, repo)
+    third = managed_review_subject(ctx, repo)
+    assert first is not None and first is second is third
+    assert builds["count"] == 1
+
+    advisory_first = managed_review_subject(ctx, repo, surface="advisory")
+    advisory_second = managed_review_subject(ctx, repo, surface="advisory")
+    assert advisory_first is advisory_second and advisory_first is not first
+    assert builds["count"] == 2  # the advisory surface is its own key
+
+    # The per-attempt reset boundary invalidates the memo.
+    ctx._managed_review_subject_memo = {}
+    fresh = managed_review_subject(ctx, repo)
+    assert fresh is not first
+    assert builds["count"] == 3
+    # Content is identical across the rebuild: memoization never changed
+    # anything a consumer sees.
+    assert fresh.render_prompt_diff() == first.render_prompt_diff()
+
+
+def test_crashed_predicate_with_present_tx_marker_fails_loud(tmp_path, monkeypatch):
+    """C6: an exception ESCAPING the authority predicate (programming/import
+    error) while the managed update tx MARKER exists must raise the typed
+    StagedDiffUnavailable — never silently review an apparently-managed
+    candidate as an ordinary staged diff."""
+    import ouroboros.tools.registry as registry_mod
+    from ouroboros.tools.review_binary_context import StagedDiffUnavailable
+
+    repo, ctx, tx = _managed_resolution_repo(tmp_path, monkeypatch)
+    assert update_merge._update_tx_marker_path().is_file()
+
+    def _boom(_ctx):
+        raise RuntimeError("predicate programming error")
+
+    monkeypatch.setattr(registry_mod, "_authorized_managed_update_resolver", _boom)
+    with pytest.raises(StagedDiffUnavailable):
+        managed_review_subject(ctx, repo)
+
+
+def test_crashed_predicate_without_marker_stays_non_managed(tmp_path, monkeypatch):
+    """C6, the other branch: no tx marker → the crash is logged loudly and the
+    caller stays on the ordinary staged-diff path (a non-managed commit must
+    never be blocked by a managed-code bug)."""
+    import ouroboros.tools.registry as registry_mod
+
+    repo, ctx, tx = _managed_resolution_repo(tmp_path, monkeypatch)
+    assert update_merge.clear_update_tx()
+    assert not update_merge._update_tx_marker_path().is_file()
+
+    def _boom(_ctx):
+        raise RuntimeError("predicate programming error")
+
+    monkeypatch.setattr(registry_mod, "_authorized_managed_update_resolver", _boom)
+    assert managed_review_subject(ctx, repo) is None
