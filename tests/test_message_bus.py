@@ -142,8 +142,8 @@ def test_send_photo_and_video_persist_compact_rows_before_unread_revision(monkey
     revisions = []
     monkeypatch.setattr(message_bus, "_advance_project_visible_revision", revisions.append)
 
-    bridge.send_photo(123, b"image", caption="shot", mime="image/png")
-    bridge.send_video(123, b"video", caption="clip", mime="video/mp4")
+    bridge.send_photo(123, b"image", caption="shot", mime="image/png", task_id="media-task")
+    bridge.send_video(123, b"video", caption="clip", mime="video/mp4", task_id="media-task")
 
     rows = [
         json.loads(line)
@@ -155,7 +155,31 @@ def test_send_photo_and_video_persist_compact_rows_before_unread_revision(monkey
         ("video", "clip", "video/mp4"),
     ]
     assert all("image_base64" not in row and "video_base64" not in row for row in rows)
+    assert all(row["task_id"] == "media-task" for row in rows)
+    assert all(row["download_url"].startswith("/api/tasks/media-task/artifacts/chat-media-") for row in rows)
+    stored = list((tmp_path / "task_results" / "artifacts" / "media-task" / "chat_media").iterdir())
+    assert {path.read_bytes() for path in stored} == {b"image", b"video"}
     assert revisions == [123, 123]
+
+
+def test_send_photo_keeps_live_delivery_when_media_persistence_fails(monkeypatch, tmp_path):
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    bridge._broadcast_fn = frames.append
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        message_bus, "store_chat_media_bytes",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    monkeypatch.setattr(message_bus, "load_state", lambda: {"session_id": "s", "owner_id": 7})
+
+    ok, _ = bridge.send_photo(123, b"image", caption="shot", task_id="media-task")
+
+    assert ok is True
+    assert next(frame for frame in frames if frame.get("type") == "photo")["image_base64"]
+    import json
+    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text().splitlines()[-1])
+    assert row.get("download_url", "") == ""
 
 
 def test_push_log_broadcast_surfaces_chat_id(monkeypatch):

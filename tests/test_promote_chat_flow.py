@@ -1390,15 +1390,15 @@ def test_bound_task_media_routes_to_project_panel(tmp_path):
         DRIVE_ROOT=tmp_path,
         append_jsonl=lambda *a, **k: None,
         bridge=types.SimpleNamespace(
-            send_photo=lambda cid, data, caption="", mime="": (photo_sent.append(cid) or (True, "")),
-            send_video=lambda cid, data, caption="", mime="": (video_sent.append(cid) or (True, "")),
+            send_photo=lambda cid, data, caption="", mime="", task_id="": (photo_sent.append((cid, task_id)) or (True, "")),
+            send_video=lambda cid, data, caption="", mime="", task_id="": (video_sent.append((cid, task_id)) or (True, "")),
         ),
     )
     blob = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"0" * 64).decode()
     _handle_send_photo({"task_id": "task-m", "chat_id": 1, "image_base64": blob, "mime": "image/png"}, ctx)
     _handle_send_video({"task_id": "task-m", "chat_id": 1, "video_base64": blob, "mime": "video/mp4"}, ctx)
-    assert photo_sent == [project_chat]  # binding precedence, not the original main 1
-    assert video_sent == [project_chat]
+    assert photo_sent == [(project_chat, "task-m")]  # binding precedence, not the original main 1
+    assert video_sent == [(project_chat, "task-m")]
 
 
 def test_bound_task_send_message_routes_future_events_to_project(tmp_path):

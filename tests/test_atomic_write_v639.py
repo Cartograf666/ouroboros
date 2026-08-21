@@ -5,13 +5,21 @@ from __future__ import annotations
 import pytest
 
 from ouroboros import utils
-from ouroboros.utils import atomic_write_json, write_text, write_text_atomic
+from ouroboros.utils import atomic_write_json, write_bytes_atomic, write_text, write_text_atomic
 
 
 def test_write_text_atomic_writes_content(tmp_path):
     target = tmp_path / "f.txt"
     write_text_atomic(target, "hello world")
     assert target.read_text(encoding="utf-8") == "hello world"
+
+
+@pytest.mark.parametrize("fsync", [False, True])
+def test_write_bytes_atomic_writes_exact_bytes(tmp_path, fsync):
+    target = tmp_path / "media.bin"
+    content = b"\x00\xff\x10media"
+    write_bytes_atomic(target, content, fsync=fsync)
+    assert target.read_bytes() == content
 
 
 def test_write_text_atomic_preserves_old_file_on_failure(tmp_path, monkeypatch):

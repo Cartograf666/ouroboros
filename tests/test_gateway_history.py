@@ -79,6 +79,46 @@ def test_chat_history_replays_delivered_document_row(tmp_path):
     assert rec["caption"] == "quarterly numbers"
 
 
+def test_chat_history_replays_durable_photo_and_keeps_legacy_row_as_text(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    rows = [
+        {
+            "ts": "2026-08-21T00:00:00Z", "direction": "out", "chat_id": 1,
+            "user_id": 7, "text": "durable shot", "type": "photo",
+            "mime": "image/png", "caption": "durable shot", "task_id": "media-task",
+            "download_url": "/api/tasks/media-task/artifacts/chat-media-" + "a" * 64 + ".png",
+        },
+        {
+            "ts": "2026-08-21T00:01:00Z", "direction": "out", "chat_id": 1,
+            "user_id": 7, "text": "durable clip", "type": "video",
+            "mime": "video/mp4", "caption": "durable clip", "task_id": "media-task",
+            "download_url": "/api/tasks/media-task/artifacts/chat-media-" + "b" * 64 + ".mp4",
+        },
+        {
+            "ts": "2026-08-21T00:02:00Z", "direction": "out", "chat_id": 1,
+            "user_id": 7, "text": "legacy shot", "type": "photo", "mime": "image/png",
+            "task_id": "still-running",
+        },
+    ]
+    (logs / "chat.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    (logs / "progress.jsonl").write_text("", encoding="utf-8")
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
+    payload = json.loads(response.body.decode("utf-8"))["messages"]
+
+    durable = next(item for item in payload if item["text"] == "durable shot")
+    video = next(item for item in payload if item["text"] == "durable clip")
+    legacy = next(item for item in payload if item["text"] == "legacy shot")
+    assert durable["msg_type"] == "photo"
+    assert durable["download_url"].endswith(".png")
+    assert video["msg_type"] == "video"
+    assert video["download_url"].endswith(".mp4")
+    assert "msg_type" not in legacy
+    assert legacy["task_id"] == "still-running"
+
+
 def test_chat_history_backfills_from_rotated_archive(tmp_path):
     """The live chat.jsonl is rotated to archive/chat_<ts>.jsonl at ~800KB. History
     replay must backfill from the most recent archive(s) so a rotation does not
