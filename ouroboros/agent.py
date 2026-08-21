@@ -920,12 +920,17 @@ class OuroborosAgent:
             ctx.begin_acceptance_fence = self._begin_acceptance_fence
             ctx.inspect_acceptance_fence = self._inspect_acceptance_fence
             ctx.end_acceptance_fence = self._end_acceptance_fence
-        if str(task_metadata.get("delegation_role") or "").lower() == "subagent":
+        if (
+            str(task_metadata.get("delegation_role") or "").lower() == "subagent"
+            or bool(task.get("_presence_turn"))
+        ):
             model_override = str(task_metadata.get("model") or "").strip()
             if model_override:
                 ctx.task_model_override = model_override
             if "use_local_model" in task_metadata:
                 ctx.task_use_local_override = bool(task_metadata.get("use_local_model"))
+        if bool(task.get("_presence_turn")):
+            ctx.inline_max_rounds = int(task_metadata.get("inline_max_rounds") or 10)
         # NOTE: the ephemeral decision turn is INTENTIONALLY kept on the SAME route as the
         # main chat (no light-lane override): a busy-chat ephemeral turn can produce the
         # owner-facing answer inline (WS10), so silently lowering its model would be a P1

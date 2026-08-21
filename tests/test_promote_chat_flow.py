@@ -49,6 +49,34 @@ def test_promote_tool_emits_event_with_chat_and_project(tmp_path, monkeypatch):
     assert ctx._typed_routing_action_emitted == "promote_chat_to_task"
 
 
+def test_presence_promotion_preserves_ceiling_and_cannot_choose_new_scope(tmp_path, monkeypatch):
+    from ouroboros.tools.control import _promote_chat_to_task
+
+    _confirm_promote(monkeypatch)
+    contract = {"capability_ceiling": {"digest": "a" * 64}}
+    ctx = types.SimpleNamespace(
+        pending_events=[],
+        event_queue=None,
+        current_chat_id=4242,
+        drive_root=tmp_path,
+        task_metadata={"presence": {"binding_id": "b" * 32}},
+        task_contract=contract,
+    )
+    out = _promote_chat_to_task(
+        ctx,
+        "Research the question",
+        project_name="Injected",
+        workspace_root="/tmp/foreign",
+        source="https://example.invalid/repo.git",
+    )
+    assert out.startswith("OK: task")
+    event = ctx.pending_events[0]
+    assert event["presence"] == {"binding_id": "b" * 32}
+    assert event["task_contract"] == contract
+    assert event["project_id"] == event["project_name"] == ""
+    assert event["workspace_root"] == event["workspace"] == event["source"] == ""
+
+
 def _swarm_ctx(tmp_path, **overrides):
     values = {
         "pending_events": [],
@@ -196,6 +224,60 @@ def test_promoted_named_project_from_projectless_chat_provisions_workspace(tmp_p
     assert workspace_root, "file-less named project must get an auto-provisioned workspace"
     assert (pathlib.Path(workspace_root) / ".git").exists()
     assert str(project.get("working_dir") or "") == workspace_root
+
+
+def test_worker_admits_promoted_presence_with_same_verified_ceiling(tmp_path, monkeypatch):
+    import supervisor.workers as workers
+    from ouroboros.presence_authority import (
+        build_presence_capability_ceiling,
+        presence_ceiling_payload,
+    )
+    from ouroboros.presence_capabilities import (
+        PresenceProfileResolution,
+        PresenceSelection,
+        PresenceToolTarget,
+    )
+    from ouroboros.presence_runtime import ResolvedPresenceRuntime
+
+    resolution = PresenceProfileResolution(
+        active=(PresenceSelection("1" * 64, PresenceToolTarget("builtin", "chat_history")),),
+        missing_required=(),
+        missing_optional=(),
+        orphaned=(),
+        runtime=ResolvedPresenceRuntime("main", 10, 10, False),
+        profile_fingerprint="a" * 64,
+        selection_fingerprint="b" * 64,
+        required_selections_present=True,
+    )
+    ceiling = build_presence_capability_ceiling(
+        skill_name="helper",
+        skill_content_hash="c" * 64,
+        state_fingerprint="d" * 64,
+        resolution=resolution,
+    )
+    contract = {"capability_ceiling": presence_ceiling_payload(ceiling)}
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    enqueued = []
+    ctx = types.SimpleNamespace(
+        enqueue_task=lambda task: enqueued.append(task),
+        persist_queue_snapshot=lambda **_kwargs: True,
+        load_state=lambda: {"owner_chat_id": 1},
+    )
+    outcome = workers.promote_chat_to_task(
+        {
+            "task_id": "presencechild1",
+            "objective": "Continue the research",
+            "chat_id": 4242,
+            "presence": {"binding_id": "e" * 32},
+            "task_contract": contract,
+        },
+        ctx,
+    )
+    assert outcome["status"] == "scheduled"
+    task = enqueued[0]
+    assert task["_presence_origin"] is True
+    assert task["metadata"]["presence"]["binding_id"] == "e" * 32
+    assert task["task_contract"]["capability_ceiling"]["digest"] == ceiling.digest
 
 
 def test_ephemeral_swarm_unconfirmed_promotion_reuses_one_task_id(tmp_path, monkeypatch):

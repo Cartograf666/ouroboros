@@ -415,12 +415,12 @@ def test_localized_109_tools_max_each_admission_metric_independently():
     ) == max(token_sizes)
 
 
-def test_current_109_tool_registry_exposes_and_measures_both_projections(tmp_path):
+def test_current_111_tool_registry_exposes_and_measures_both_projections(tmp_path):
     from ouroboros.tools.registry import ToolRegistry
 
     repo_dir = pathlib.Path(__file__).resolve().parents[1]
     tools = ToolRegistry(repo_dir=repo_dir, drive_root=tmp_path).schemas()
-    assert len(tools) == 109
+    assert len(tools) == 111
     messages = [{"role": "user", "content": "x"}]
     projections = dispatch.direct_openai_context_projections(
         messages,

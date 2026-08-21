@@ -213,7 +213,27 @@ def _derive_authority(ctx: ToolContext) -> "DelegatedRunShape":
     from ouroboros.tool_access import active_tool_profile
 
     profile = active_tool_profile(ctx)
-    return delegated_run_shape(profile in ("acting_subagent", "external_workspace_task"))
+    mutating = profile in ("acting_subagent", "external_workspace_task")
+    if mutating:
+        from ouroboros.presence_authority import presence_ceiling_allows_delegated_surface
+
+        constraint = getattr(ctx, "task_constraint", None)
+        surface = str(getattr(constraint, "surface", "") or "external_workspace")
+        mutating = presence_ceiling_allows_delegated_surface(ctx, surface)
+    return delegated_run_shape(mutating)
+
+
+def _presence_delegate_read_refusal(ctx: ToolContext) -> str:
+    from ouroboros.presence_authority import presence_ceiling_allows_delegated_read
+
+    if presence_ceiling_allows_delegated_read(ctx):
+        return ""
+    return _fail(
+        "delegate_start",
+        "presence_delegate_read_root_unselected",
+        "This Presence profile did not select whole-root read access for the active repository, "
+        "so a delegated harness cannot honestly be started inside that broader read surface.",
+    )
 
 
 def _containment_breach(detail: Dict[str, Any], authority: "DelegatedRunShape") -> Optional[_Breach]:
@@ -699,6 +719,8 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         else:
             authority = _derive_authority(ctx)
             payload_auth = None
+            if refusal := _presence_delegate_read_refusal(ctx):
+                return refusal
 
     access = authority.access
     try:

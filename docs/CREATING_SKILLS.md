@@ -396,6 +396,7 @@ calls and runtime behaviours:
 | `companion_process` | The skill may register a manifest-declared companion subprocess supervised by the host. |
 | `subscribe_event` | The skill may subscribe to manifest-declared host event topics such as `chat.outbound` or `skill.lifecycle`. Chat topics require owner permission grants; `skill.lifecycle` does not. |
 | `inject_chat` | The skill may request Host Service chat injection after an explicit owner permission grant. |
+| `presence` | A reviewed transport skill may submit authenticated non-owner conversation events to the Host Service Presence boundary and poll only their correlated late work. Requires an explicit content-hash-bound owner grant. |
 
 A missing permission causes the matching `register_*` call to raise
 `ExtensionRegistrationError`, surfaced as a skill load error in the
@@ -409,7 +410,7 @@ Some settings keys are protected: `OPENROUTER_API_KEY`,
 `GITHUB_TOKEN`, `OUROBOROS_NETWORK_PASSWORD`. These keys are NEVER
 forwarded to a skill by default, even when listed in
 `env_from_settings`. Custom secret keys stored in Settings → Secrets
-are treated the same way. Host permissions such as `inject_chat` and
+are treated the same way. Host permissions such as `inject_chat`, `presence`, and
 chat event subscriptions also require explicit, content-hash-bound owner
 consent. The desktop launcher's owner-grant bridge records these grants.
 
@@ -459,6 +460,80 @@ unrelated parties — never the breadth of control it exposes. The capability is
 gated by the host (token + fresh review + enablement + content-hash grants) and
 by core owner/chat binding, not by withholding control from the skill. See
 `docs/CHECKLISTS.md` → "Transport and control skills are first-class".
+
+### Presence behavior profiles and transport ingress
+
+Presence separates two ordinary reviewed skills: a **behavior skill** declares
+how an external conversation should be handled, while a **transport skill**
+authenticates provider events and relays them through the loopback Host Service.
+The behavior is portable; provider credentials, room ids, exact tool names, and
+installation-specific resource locations do not belong in its profile.
+
+A behavior skill may add a strict `presence:` block to its manifest:
+
+```yaml
+presence:
+  schema_version: 1
+  instructions_file: presence.md
+  context_topics:
+    - public-conversation-notes
+  runtime_defaults:
+    model_slot: main             # main | light
+    inline_max_rounds: 10
+  capability_requests:
+    - id: research
+      kind: tool                 # tool | script | resource
+      required: false
+      purpose: Look up current public information when a reply needs it.
+    - id: notes
+      kind: resource
+      required: true
+      operations: [read, write]
+      purpose: Maintain conversation notes in a selected confined resource.
+```
+
+Use either non-empty inline `instructions` or `instructions_file`, never both.
+An instructions file must be UTF-8 inside the reviewed payload surface.
+`context_topics` names full knowledge topics to inject for each turn.
+`runtime_defaults` is optional and resolves to a bounded `main` or `light` turn;
+the host clamps `inline_max_rounds` to its global limit. Capability request ids
+are stable portable concepts. After installation, `configure_presence` maps
+them to exact built-in, extension, MCP, script, or confined resource targets;
+required requests must all be selected before admission. These selections and
+runtime overrides are host-owned state. Changing a request's id, kind, or
+resource operations invalidates its selection instead of silently retargeting
+it.
+
+A transport extension declares `permissions: [presence]`, obtains its ordinary
+content-hash-bound skill token, and sends:
+
+- `POST /presence/turn` with exactly `binding_id`, `event`, and optional
+  `staged_files`. The event carries the provider/account/conversation/thread,
+  stable source-event and conversation ids, structured actor/conversation/message
+  facts, and text. Files must already be under that transport skill's state root.
+- `GET /presence/work/{work_ref}?binding_id=...` to poll only late work created
+  by the same owner binding.
+
+The owner-created binding fixes the authenticated transport skill, behavior
+skill, origin scope, and exact proactive destination. The origin is either one
+exact conversation/thread or the explicit account-wide conversation id `*`;
+the latter admits any conversation on that exact provider account while each
+event still receives its own canonical conversation key. For each turn the host
+rechecks install, enablement, executable review, binding identity, and required
+selections, then compiles an immutable positive capability ceiling. A fresh
+agent receives only that ceiling, reviewed instructions, exact event facts, and
+declared context topics. Completion is typed as `message`, `silent`,
+`tool_delivered`, or `deferred`; `deferred` includes a correlated `work_ref`
+only after successful promotion. Promotion and one-shot or recurring follow-up keep the same
+ceiling and reply context rather than widening authority.
+
+Transport custody preserves provider arrival order before Host admission; the
+host serializes one conversation and enforces the installation-wide active-turn
+limit across processes. A current Presence turn may cancel only its own
+binding-and-conversation-correlated `work_ref`. Owner chat or Background
+Consciousness may initiate an existing binding, but the resulting cycle must use
+an explicitly selected transport tool and finish `tool_delivered` to claim that
+an external message was sent.
 
 ## Notifying the owner when work completes
 

@@ -955,6 +955,15 @@ Before every commit, verify the following:
 - When a task contract declares `resource_policy.protected_artifacts`, enforce it as a typed affordance policy in every runtime mode: execute-only black-box references may be run, but byte reads, copy/hash/static introspection, tracing, and debugging against declared paths are blocked.
 - Observable Acceptance Claims are bounded, advisory, task-general criteria (`id`, `claim`, `surface`, `support`, `priority`). `success_criteria` is an input alias, not a second persisted carrier. `effective_acceptance_claims` is the only binder: ingress-contract claims win, otherwise the current closed plan wave's frozen claims apply at read time; neither path mutates the live contract. A child receives only claims explicitly passed to its own `schedule_subagent` call. Reviewer `evidence_refs` resolve by exact membership in the already-built host packet, without fuzzy matching, filesystem reads, or re-execution; a claim reference certifies clean only through a passing host-attested support row. Non-passing receipts, agent prose, expected-support text, and unattested references remain named but non-resolving. Resolution changes the clean bit and its disclosure, not actor parsing, quorum, or verdict. Do not turn claims into a hard acceptance gate or surface-specific taxonomy.
 
+#### Skill-defined Presence
+- Keep behavior portable and authority installation-local. A reviewed `presence:` profile may declare instructions, context topics, bounded `main`/`light` runtime defaults, and conceptual tool/script/resource requests. It must not name provider credentials, room ids, or assume one installed tool spelling. `presence_capabilities.py` stores the owner's exact selections outside the payload and fingerprints the request semantics that authorize each selection.
+- Presence authority is a positive immutable ceiling, not a denylist or a prompt promise. Admission requires the owner-created binding plus an installed, enabled, freshly executable behavior skill and every required selection; it then freezes skill/profile/state/selection fingerprints, exact tool and resource grants, argument bindings, runtime slot, and round limit into `task_contract.capability_ceiling`. Registry schema discovery and execution must enforce the same ceiling for built-ins, extensions, MCP tools, scripts, and resource roots.
+- `state/presence_bindings.json` is host-owned authority. A transport token may resolve only bindings naming that exact transport skill, and the submitted provider/account/conversation/thread must match the binding origin. Transport payloads carry structured actor, conversation, message, and source-event facts; never recover those identities from message text. Staged files stay inside the calling skill's state root before entering the ordinary attachment store.
+- Run each admitted event with a fresh agent, a deterministic binding-plus-source-event task id, a cross-process installation-wide concurrency gate, and per-conversation serialization. The transport's durable provider custody owns arrival FIFO before Host admission. Dialogue uses the ordinary history, memory, consolidation, and task-result owners with exact transport provenance; `chat_history` may narrow the live-plus-archive timeline by exact provider/account/conversation/thread/actor/date facts. Do not add a transport-specific task scheduler, memory silo, core terminal outbox, or resident cross-room agent.
+- Presence completion is exactly `message`, `silent`, `tool_delivered`, or `deferred`. A deferred result requires a successfully promoted `work_ref`; correlated lookup stays behind the same transport token and binding instead of exposing the general task API, and `presence_cancel_work` additionally requires the current binding and conversation to match. Owner chat and Background Consciousness may initiate only an existing reviewed binding, and an initiation is delivered only through a selected transport tool. Promotion must clear Project/workspace/source widening and copy the same Presence metadata and capability ceiling by value. `schedule_followup` does the same for one-shot and recurring work. Any new descendant producer must either preserve this ceiling or refuse the transition; reconstructing authority from mutable current state is forbidden.
+- Shared autobiography does not mean unlocked shared files. Knowledge topic mutation and index regeneration use one stable lock, and scratchpad block mutation and markdown regeneration use one stable lock, so concurrent owner and Presence turns cannot overwrite a newer projection with an older render. An exhausted companion persists its terminal failure in existing skill health before leaving the live process snapshot; a successful new start clears the matching failure.
+- Test the boundary at both layers: strict profile/state/ceiling parsing, stale/missing review admission, schema and direct-execution filtering, argument binding, binding/token/origin checks, event idempotency and conversation ordering, typed outcomes, late-work correlation, and promotion/follow-up inheritance. Provider adapter E2E is separate evidence and must not be inferred from core tests.
+
 #### Devtools isolation
 
 - `devtools/` is tracked operator code outside runtime package discovery and
@@ -1862,6 +1871,13 @@ owns route mounting; domain handlers remain thin. Frontend calls go through
 the contract. Outbound provider/harness adapters belong in
 `ouroboros/gateways/`. Do not require a class when established function owners
 already preserve the boundary.
+
+Reviewed skill callbacks use the separate loopback
+`gateway/host_service.py` boundary. Its Presence routes accept authenticated
+transport facts and return typed delivery receipts; they delegate binding,
+admission, authority compilation, and execution to the Presence domain modules.
+Do not copy that policy into an adapter or promote the callback surface into a
+general owner/task API.
 
 ## Build & CI
 

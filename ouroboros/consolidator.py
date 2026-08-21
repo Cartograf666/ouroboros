@@ -450,7 +450,9 @@ def _format_entries_for_block(entries: List[Dict[str, Any]]) -> str:
             author = "Ouroboros"
         else:
             direction_prefix = ""
-            author = e.get("username") or e.get("author") or "User"
+            from ouroboros.dialogue_provenance import dialogue_author
+
+            author = dialogue_author(e)
         text = str(e.get("text", ""))
         lines.append(f"[{ts}] {direction_prefix}{author}: {text}")
     return "\n\n".join(lines)
@@ -626,7 +628,13 @@ def _read_chat_entries(path: pathlib.Path) -> List[Dict[str, Any]]:
                 entries.append(entry)
     return entries
 
-def _rebuild_knowledge_index(knowledge_dir: pathlib.Path) -> None:
+def _rebuild_knowledge_index(knowledge_dir: pathlib.Path, *, _locked: bool = False) -> None:
+    if not _locked:
+        from ouroboros.tools.knowledge import _knowledge_write_lock
+
+        with _knowledge_write_lock(knowledge_dir):
+            _rebuild_knowledge_index(knowledge_dir, _locked=True)
+        return
     try:
         if not knowledge_dir.exists():
             return
@@ -741,8 +749,13 @@ Respond with JSON only (no fences):
             log.warning("Scratchpad block consolidation returned empty, skipping")
             return usage
 
-        _write_knowledge_entries(knowledge_dir, result.get("knowledge_entries", []))
-        _rebuild_knowledge_index(knowledge_dir)
+        from ouroboros.tools.knowledge import _knowledge_write_lock
+
+        with _knowledge_write_lock(knowledge_dir):
+            _write_knowledge_entries(
+                knowledge_dir, result.get("knowledge_entries", []), _locked=True,
+            )
+            _rebuild_knowledge_index(knowledge_dir, _locked=True)
 
         compressed_block = {
             "ts": utc_now_iso(),
@@ -765,8 +778,7 @@ Respond with JSON only (no fences):
             ]
             return [compressed_block] + survivors
 
-        new_blocks = _mutate_locked_json_list(memory.scratchpad_blocks_path(), _merge_survivors)
-        memory.regenerate_scratchpad_md()
+        new_blocks = memory.mutate_scratchpad_blocks(_merge_survivors)
 
         log.info("Scratchpad blocks consolidated: %d blocks (%d chars) -> %d blocks (%d chars)",
                  len(blocks), total_chars,
@@ -778,11 +790,24 @@ Respond with JSON only (no fences):
         return None
 
 
-def _write_knowledge_entries(knowledge_dir: pathlib.Path, entries: List[Dict[str, Any]]) -> None:
+def _write_knowledge_entries(
+    knowledge_dir: pathlib.Path,
+    entries: List[Dict[str, Any]],
+    *,
+    _locked: bool = False,
+) -> None:
     # Validate topics through the ONE knowledge-topic validator (P7/C9.4) instead of
     # a private char-filter that silently munged names into a different file than
     # the knowledge tool would. An invalid topic is skipped + logged, never coerced.
     from ouroboros.tools.knowledge import _sanitize_topic
+
+    if not _locked:
+        from ouroboros.tools.knowledge import _knowledge_write_lock
+
+        with _knowledge_write_lock(knowledge_dir):
+            _write_knowledge_entries(knowledge_dir, entries, _locked=True)
+            _rebuild_knowledge_index(knowledge_dir, _locked=True)
+        return
 
     knowledge_dir.mkdir(parents=True, exist_ok=True)
     for entry in entries:

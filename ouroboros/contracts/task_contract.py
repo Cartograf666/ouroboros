@@ -431,6 +431,16 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
         or ""
     ).strip()
     task_type = str(merged.get("task_type") or task.get("type") or "task").strip() or "task"
+    capability_ceiling = None
+    if merged.get("capability_ceiling") is not None:
+        from ouroboros.presence_authority import (
+            presence_ceiling_from_payload,
+            presence_ceiling_payload,
+        )
+
+        capability_ceiling = presence_ceiling_payload(
+            presence_ceiling_from_payload(merged.get("capability_ceiling"))
+        )
 
     acceptance_claims = normalize_acceptance_claims(
         merged.get("acceptance_claims")
@@ -502,6 +512,8 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
     for key in ("notes", "review_notes"):
         if merged.get(key):
             contract[key] = merged.get(key)
+    if capability_ceiling is not None:
+        contract["capability_ceiling"] = capability_ceiling
     return contract
 
 

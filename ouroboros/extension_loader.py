@@ -1411,6 +1411,14 @@ def _apply_deps_block(state: Dict[str, Any], drive_root: pathlib.Path, skill: Lo
     return state
 
 
+def _apply_durable_extension_health(
+    state: Dict[str, Any], drive_root: pathlib.Path, skill: LoadedSkill
+) -> Dict[str, Any]:
+    from ouroboros.extension_health import apply_companion_failure_to_runtime_state
+
+    return apply_companion_failure_to_runtime_state(state, drive_root, skill.name)
+
+
 def runtime_state_for_skill_name(
     skill_name: str,
     drive_root: pathlib.Path,
@@ -1443,7 +1451,7 @@ def runtime_state_for_skill_name(
             "loaded_matches_current": False,
             "reason": "missing",
         }
-    return _apply_deps_block(
+    state = _apply_deps_block(
         _extension_runtime_state(
             skill,
             drive_root=pathlib.Path(drive_root),
@@ -1453,6 +1461,7 @@ def runtime_state_for_skill_name(
         pathlib.Path(drive_root),
         skill,
     )
+    return _apply_durable_extension_health(state, pathlib.Path(drive_root), skill)
 
 
 def runtime_state_for_loaded_skill(
@@ -1467,7 +1476,10 @@ def runtime_state_for_loaded_skill(
         drive_root=pathlib.Path(drive_root) if drive_root is not None else None,
         skills=skills,
     )
-    return _apply_deps_block(state, pathlib.Path(drive_root), skill) if drive_root is not None else state
+    if drive_root is None:
+        return state
+    root = pathlib.Path(drive_root)
+    return _apply_durable_extension_health(_apply_deps_block(state, root, skill), root, skill)
 
 
 def is_extension_live(

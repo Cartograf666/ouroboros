@@ -3,12 +3,15 @@
 import json
 import hashlib
 import logging
+import os
 import re
+from contextlib import contextmanager
 from pathlib import Path
 from typing import List
 
 from ouroboros.tools.registry import ToolEntry, ToolContext
 from ouroboros.utils import utc_now_iso
+from ouroboros.platform_layer import file_lock_exclusive, file_unlock
 
 log = logging.getLogger(__name__)
 
@@ -82,6 +85,25 @@ def _ensure_dir(ctx: ToolContext):
     _knowledge_dir(ctx).mkdir(parents=True, exist_ok=True)
 
 
+@contextmanager
+def _knowledge_write_lock(knowledge_dir: Path):
+    """Serialize topic and index mutation on one stable directory sidecar."""
+    knowledge_dir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(knowledge_dir / f"{INDEX_FILE}.lock", os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        file_lock_exclusive(fd)
+    except Exception:
+        os.close(fd)
+        raise
+    try:
+        yield
+    finally:
+        try:
+            file_unlock(fd)
+        finally:
+            os.close(fd)
+
+
 def _extract_summary(text: str, max_chars: int = 150) -> str:
     """Extract up to three non-heading snippets for the index."""
     lines = text.strip().split("\n")
@@ -102,9 +124,13 @@ def _extract_summary(text: str, max_chars: int = 150) -> str:
     return summary
 
 
-def _rebuild_index(ctx: ToolContext):
+def _rebuild_index(ctx: ToolContext, *, _locked: bool = False):
     """Rebuild the knowledge index from all topic files."""
     kdir = _knowledge_dir(ctx)
+    if not _locked:
+        with _knowledge_write_lock(kdir):
+            _rebuild_index(ctx, _locked=True)
+        return
     if not kdir.exists():
         return
 
@@ -265,24 +291,26 @@ def _knowledge_write(ctx: ToolContext, topic: str, content: str, mode: str = "ov
         return f"⚠️ Invalid topic: {e}"
 
     _ensure_dir(ctx)
-    old_content = path.read_text(encoding="utf-8") if path.exists() else ""
+    with _knowledge_write_lock(_knowledge_dir(ctx)):
+        old_content = path.read_text(encoding="utf-8") if path.exists() else ""
 
-    if mode == "append":
-        needs_newline = False
-        if path.exists() and path.stat().st_size > 0:
-            with open(path, "rb") as rf:
-                rf.seek(-1, 2)
-                if rf.read(1) != b"\n":
-                    needs_newline = True
+        if mode == "append":
+            needs_newline = False
+            if path.exists() and path.stat().st_size > 0:
+                with open(path, "rb") as rf:
+                    rf.seek(-1, 2)
+                    if rf.read(1) != b"\n":
+                        needs_newline = True
 
-        with open(path, "a", encoding="utf-8") as f:
-            if needs_newline:
-                f.write("\n")
-            f.write(content)
-    else:
-        path.write_text(content, encoding="utf-8")
+            with open(path, "a", encoding="utf-8") as f:
+                if needs_newline:
+                    f.write("\n")
+                f.write(content)
+        else:
+            path.write_text(content, encoding="utf-8")
 
-    _update_index_entry(ctx, sanitized_topic)
+        _update_index_entry(ctx, sanitized_topic)
+        new_content = path.read_text(encoding="utf-8") if path.exists() else ""
 
     try:
         history_path = _knowledge_dir(ctx).parent / "knowledge_history.jsonl"
@@ -293,9 +321,9 @@ def _knowledge_write(ctx: ToolContext, topic: str, content: str, mode: str = "ov
                 "topic": sanitized_topic,
                 "mode": mode,
                 "old_sha256": hashlib.sha256(old_content.encode("utf-8")).hexdigest() if old_content else "",
-                "new_sha256": hashlib.sha256(path.read_text(encoding="utf-8").encode("utf-8")).hexdigest() if path.exists() else "",
+                "new_sha256": hashlib.sha256(new_content.encode("utf-8")).hexdigest() if new_content else "",
                 "old_content": old_content,
-                "new_content": path.read_text(encoding="utf-8") if path.exists() else "",
+                "new_content": new_content,
             }, ensure_ascii=False) + "\n")
     except Exception:
         pass

@@ -533,6 +533,13 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         "promotion_admission_token": admission_token,
         **_promoted_force_plan_metadata(evt),
     }
+    presence = evt.get("presence") if isinstance(evt.get("presence"), dict) else None
+    if presence:
+        task["_presence_origin"] = True
+        task["source"] = "presence_promote"
+        task.setdefault("metadata", {})["presence"] = dict(presence)
+        contract = evt.get("task_contract") if isinstance(evt.get("task_contract"), dict) else {}
+        task["task_contract"] = dict(contract)
     if repair_constraint is not None:
         # X3: bind the admission hash to the REAL task id, durably, before the
         # task exists anywhere else — every payload write CAS-checks this chain.

@@ -138,3 +138,25 @@ test('legacy review states keep selected preflight reachable', () => {
         assert.match(html, />Publish to OuroborosHub</);
     }
 });
+
+test('reviewed Presence skill renders compact local runtime controls', () => {
+    const html = renderInstalledSkillCard(skill({
+        presence_runtime: {
+            defaults: { model_slot: 'light', inline_max_rounds: 10 },
+            overrides: { model_slot: 'main', inline_max_rounds: 7 },
+            state_fingerprint: 'a'.repeat(64),
+        },
+    }));
+
+    assert.match(html, /data-presence-runtime-form/);
+    assert.match(html, /Presence runtime/);
+    assert.match(html, /Reviewed default \(light\)/);
+    assert.match(html, /name="inline_max_rounds"[^>]*value="7"/);
+    assert.match(html, /data-presence-runtime-reset/);
+    assert.match(html, /Applies to new Presence turns only/);
+});
+
+test('ordinary skill card does not render Presence runtime controls', () => {
+    const html = renderInstalledSkillCard(skill());
+    assert.doesNotMatch(html, /data-presence-runtime-form/);
+});

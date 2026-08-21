@@ -1,13 +1,13 @@
-"""``schedule_followup`` — one-shot deferred follow-up through the EXISTING scheduler.
+"""``schedule_followup`` — deferred follow-up through the EXISTING scheduler.
 
 The W=A wait affordance (rotation sprint, owner-approved): when waiting for an
 external instant (a subscription window reset, an embargo, a slow dependency) beats
-burning rounds, the agent registers ONE deferred follow-up in the supervisor's
-scheduled-task table (``state/scheduled_tasks.json``) with a ``{"type": "once",
-"run_at": <ISO>}`` trigger. The supervisor's ordinary scheduler tick fires it once
-at/after ``run_at`` as an ordinary queued ROOT task (normal admission, normal
-budget), then marks the record done. No second scheduler exists: this module only
-WRITES the table the supervisor already consumes.
+burning rounds, the agent registers a one-shot follow-up in the supervisor's
+scheduled-task table (``state/scheduled_tasks.json``). A task may also register a
+recurring 5-field cron follow-up through that same table. The supervisor's ordinary
+scheduler tick enqueues either form as an ordinary ROOT task (normal admission,
+normal budget). No second scheduler exists: this module only WRITES the table the
+supervisor already consumes.
 
 Authority is narrower than the parent's, not wider: a delegated subagent may not
 mint future root tasks (typed refusal), the objective is the agent's own plain
@@ -37,13 +37,12 @@ def get_tools() -> List[ToolEntry]:
             schema={
                 "name": "schedule_followup",
                 "description": (
-                    "Register ONE one-shot deferred follow-up task that the supervisor "
-                    "scheduler enqueues as an ordinary root task at/after run_at (ISO 8601; "
-                    "naive times read as UTC), instead of waiting in-task or re-polling. "
-                    "Use it when an external instant (e.g. a reviewer-lane quota reset) is "
-                    "the honest unblock time. Write the objective in your own words — it "
-                    "becomes the future task's text verbatim. The record is durable "
-                    "(state/scheduled_tasks.json), fires exactly once, and the owner can "
+                    "Register a deferred follow-up task that the supervisor scheduler "
+                    "enqueues as an ordinary root task. Supply exactly one trigger: run_at "
+                    "for a one-shot ISO 8601 instant (naive = UTC), or cron for a recurring "
+                    "5-field expression with an optional IANA timezone. Write the objective "
+                    "in your own words — it becomes each future task's text verbatim. The "
+                    "record is durable in state/scheduled_tasks.json, and the owner can "
                     "disable or delete it from the Schedules surface. A task may hold at "
                     f"most {_MAX_PENDING_FOLLOWUPS} pending follow-ups."
                 ),
@@ -52,7 +51,15 @@ def get_tools() -> List[ToolEntry]:
                     "properties": {
                         "run_at": {
                             "type": "string",
-                            "description": "ISO 8601 instant to fire at/after (naive = UTC).",
+                            "description": "One-shot ISO 8601 instant to fire at/after (naive = UTC).",
+                        },
+                        "cron": {
+                            "type": "string",
+                            "description": "Recurring 5-field cron expression; mutually exclusive with run_at.",
+                        },
+                        "timezone": {
+                            "type": "string",
+                            "description": "Optional IANA timezone for cron (blank = system local timezone).",
                         },
                         "objective": {
                             "type": "string",
@@ -69,7 +76,11 @@ def get_tools() -> List[ToolEntry]:
                             ),
                         },
                     },
-                    "required": ["run_at", "objective"],
+                    "required": ["objective"],
+                    "oneOf": [
+                        {"required": ["run_at"]},
+                        {"required": ["cron"]},
+                    ],
                 },
             },
             handler=_handle_schedule_followup,
@@ -111,12 +122,34 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
     if not task_id:
         return "ERROR: FOLLOWUP_TASK_ID_REQUIRED: a durable follow-up must belong to a real task."
     run_at_raw = str(params.get("run_at") or "").strip()
-    instant = parse_deadline_ts(run_at_raw)
-    if instant is None:
+    cron = str(params.get("cron") or "").strip()
+    if bool(run_at_raw) == bool(cron):
         return (
-            f"ERROR: FOLLOWUP_RUN_AT_INVALID: {run_at_raw!r} is not a parseable ISO 8601 "
-            "instant. Example: 2026-08-19T12:20:00+03:00 (naive times read as UTC)."
+            "ERROR: FOLLOWUP_TRIGGER_REQUIRED: supply exactly one of run_at (one-shot) "
+            "or cron (recurring)."
         )
+    timezone = str(params.get("timezone") or "").strip()
+    if run_at_raw:
+        if timezone:
+            return (
+                "ERROR: FOLLOWUP_TIMEZONE_WITH_RUN_AT: timezone applies only to recurring "
+                "cron follow-ups; run_at is an absolute instant."
+            )
+        instant = parse_deadline_ts(run_at_raw)
+        if instant is None:
+            return (
+                f"ERROR: FOLLOWUP_RUN_AT_INVALID: {run_at_raw!r} is not a parseable ISO 8601 "
+                "instant. Example: 2026-08-19T12:20:00+03:00 (naive times read as UTC)."
+            )
+        trigger = {"type": "once", "run_at": instant.isoformat()}
+    else:
+        from ouroboros.schedule_contract import cron_error, timezone_error
+
+        if error := cron_error(cron):
+            return f"ERROR: FOLLOWUP_CRON_INVALID: {error}"
+        if error := timezone_error(timezone):
+            return f"ERROR: FOLLOWUP_TIMEZONE_INVALID: {error}"
+        trigger = {"type": "cron", "expr": cron}
     objective = str(params.get("objective") or "").strip()
     if not objective:
         return "ERROR: FOLLOWUP_OBJECTIVE_REQUIRED: write the future task's objective in plain language."
@@ -143,15 +176,21 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
     records = [r for r in (list_scheduled_tasks(drive_root).get("tasks") or []) if isinstance(r, dict)]
     pending = _pending_followups(records, task_id)
     if len(pending) >= _MAX_PENDING_FOLLOWUPS:
+        def _trigger_label(record: Dict[str, Any]) -> str:
+            item = record.get("trigger") if isinstance(record.get("trigger"), dict) else {}
+            if str(item.get("type") or "") == "cron":
+                zone = str(record.get("timezone") or "").strip() or "system local time"
+                return f"cron {item.get('expr')} ({zone})"
+            return f"fires at/after {item.get('run_at')}"
+
         listing = "; ".join(
-            f"{r.get('id')} (fires at/after { (r.get('trigger') or {}).get('run_at') })" for r in pending
+            f"{record.get('id')} ({_trigger_label(record)})" for record in pending
         )
         return (
             f"ERROR: FOLLOWUP_CAP_REACHED: this task already holds {len(pending)} pending "
-            f"follow-up(s) of the {_MAX_PENDING_FOLLOWUPS} allowed: {listing}. Each fires once; "
-            "wait for one to fire, or the owner can disable/delete records from the Schedules surface."
+            f"follow-up(s) of the {_MAX_PENDING_FOLLOWUPS} allowed: {listing}. Wait for a "
+            "one-shot to fire, or the owner can disable/delete records from the Schedules surface."
         )
-    run_at_iso = instant.isoformat()
     metadata_src = getattr(ctx, "task_metadata", None)
     root_task_id = metadata_src.get("root_task_id") if isinstance(metadata_src, dict) else None
     record = {
@@ -160,9 +199,8 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
         "description": objective,
         "source": FOLLOWUP_SOURCE,
         "enabled": True,
-        # Blank timezone: run_at is stored normalized to UTC, so the local-zone
-        # fallback in `timezone_for_schedule` cannot move the instant.
-        "trigger": {"type": "once", "run_at": run_at_iso},
+        "timezone": timezone,
+        "trigger": trigger,
         "task": {
             "type": "task",
             "text": objective,
@@ -177,15 +215,26 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
             },
         },
     }
+    presence = metadata_src.get("presence") if isinstance(metadata_src, dict) else None
+    contract = getattr(ctx, "task_contract", None)
+    if isinstance(presence, dict) and presence and isinstance(contract, dict):
+        record["task"]["metadata"]["presence"] = dict(presence)
+        record["task"]["task_contract"] = dict(contract)
     try:
         stored = upsert_scheduled_task(record, drive_root=drive_root)
     except Exception as exc:
         return f"ERROR: FOLLOWUP_PERSIST_FAILED: {type(exc).__name__}: {exc}"
+    if trigger["type"] == "once":
+        timing = f"once at/after {trigger['run_at']}"
+        lifecycle = "fires exactly once"
+    else:
+        zone = timezone or "system local time"
+        timing = f"recurring cron {cron} ({zone})"
+        lifecycle = "remains active after each run"
     return (
-        f"FOLLOWUP_SCHEDULED: one-shot follow-up {stored.get('id')} registered to fire at/after "
-        f"{run_at_iso} (next scheduler tick at/after that instant). It will enqueue an ordinary "
-        f"root task through the supervisor scheduler under normal admission; pending follow-ups "
-        f"for this task: {len(pending) + 1}/{_MAX_PENDING_FOLLOWUPS}. The record is durable in "
-        "state/scheduled_tasks.json and fires exactly once; the owner can disable or delete it "
-        "from the Schedules surface."
+        f"FOLLOWUP_SCHEDULED: follow-up {stored.get('id')} registered as {timing}. It will "
+        "enqueue ordinary root tasks through the supervisor scheduler under normal admission; "
+        f"pending follow-ups for this task: {len(pending) + 1}/{_MAX_PENDING_FOLLOWUPS}. The "
+        f"record is durable in state/scheduled_tasks.json and {lifecycle}; the owner can "
+        "disable or delete it from the Schedules surface."
     )

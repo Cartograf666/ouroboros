@@ -53,6 +53,8 @@ from ouroboros.task_finalization import (
     register_final_answer_owed,
     sealed_final_prompt_section,
 )
+from ouroboros.dialogue_provenance import is_presence_task, presence_provenance_fields
+from ouroboros.presence_runner import build_presence_result_event
 
 log = logging.getLogger(__name__)
 
@@ -391,24 +393,21 @@ def _run_post_task_processing_async(
                 sealed_final=sealed_snapshot,
             )
             result["reflection_entry"] = reflection_entry
-            from ouroboros.project_facts import resolve_project_id
+            if not is_presence_task(task_snapshot):
+                from ouroboros.project_facts import resolve_project_id
 
-            _pid = resolve_project_id(task_snapshot)
-            # Project facts stay project-scoped, but the improvement backlog is
-            # Ouroboros's GLOBAL queue of lessons about its own tooling. A
-            # workspace task can reveal generic friction (bad tools, poor
-            # prompts, broken lifecycle) that should feed post-task evolution
-            # without leaking project facts into canonical memory.
-            _update_improvement_backlog(env, reflection_entry)
-            _apply_reflection_memory_actions(env, reflection_entry, project_id=_pid)
-            try:
-                from ouroboros.post_task_evolution import maybe_promote
+                _pid = resolve_project_id(task_snapshot)
+                # Project facts stay scoped; generic process lessons remain global.
+                _update_improvement_backlog(env, reflection_entry)
+                _apply_reflection_memory_actions(env, reflection_entry, project_id=_pid)
+                try:
+                    from ouroboros.post_task_evolution import maybe_promote
 
-                maybe_promote(env, task_snapshot, reflection_entry, llm_client)
-            except Exception:
-                log.debug("Post-task evolution promotion failed", exc_info=True)
-            if on_reflection is not None:
-                on_reflection(reflection_entry, llm_client)
+                    maybe_promote(env, task_snapshot, reflection_entry, llm_client)
+                except Exception:
+                    log.debug("Post-task evolution promotion failed", exc_info=True)
+                if on_reflection is not None:
+                    on_reflection(reflection_entry, llm_client)
             checkpoint_status = "completed"
         except Exception:
             log.warning("Async post-task processing failed", exc_info=True)
@@ -629,8 +628,7 @@ def emit_task_results(
     task: Dict[str, Any], text: str,
     usage: Dict[str, Any], llm_trace: Dict[str, Any],
     start_time: float, drive_logs: pathlib.Path,
-    ctx: Any = None,
-    event_queue: Any = None,
+    ctx: Any = None, event_queue: Any = None,
 ) -> None:
     """Emit all end-of-task events to supervisor and run post-task processing."""
     loop_outcome = _derive_host_bound_loop_outcome(env, task, text, usage, llm_trace)
@@ -650,12 +648,9 @@ def emit_task_results(
     # RECORD \u2014 no task_result file, no task_eval ledger row. The cognitive-memory writes
     # (reflection/consolidation/letters-home) are already gated further below; this
     # closes the remaining durable task-record writes. An inline answer + card
-    # resolution (send_message/task_done) and budget metrics still flow so the reply
-    # is visible. A typed routing receipt is presentation metadata attached to the
-    # owner's message, not a replacement for the agent's conversational answer.
-    # Agent.run_task normalizes blank model output before this boundary, so every
-    # finalized response follows the same durable send_message path.
+    # resolution and budget metrics still flow so the reply is visible.
     _ephemeral = bool(task.get("_ephemeral_turn"))
+    _presence = is_presence_task(task)
     _typed_routing_action = (
         str(getattr(ctx, "_typed_routing_action_emitted", "") or "").strip()
         if ctx is not None else ""
@@ -673,8 +668,7 @@ def emit_task_results(
         # frames.  The Web client uses this only to suppress the transient
         # task card; the inline conversational answer itself remains visible.
         send_event["progress_meta"] = dict(_decision_meta)
-    pending_events.append(send_event)
-
+    pending_events.append(build_presence_result_event(task, text, ctx) if _presence else send_event)
     duration_sec = round(time.time() - start_time, 3)
     n_tool_calls = len(llm_trace.get("tool_calls", []))
     n_tool_errors = sum(1 for tc in llm_trace.get("tool_calls", [])
@@ -759,7 +753,7 @@ def emit_task_results(
         # a terminal result nobody would ever deliver. The nonblocking lane
         # used to buffer the send with no delivery_id and no owed registration
         # at all. Seam + dedup: ouroboros/task_finalization.py.
-        if _is_root_post_task(task):
+        if _is_root_post_task(task) and not _presence:
             if not _root_post_task_already_completed(env, task):
                 # The owner's answer leaves BEFORE post-task synthesis: the
                 # typed phase marker rides the frame (progress_meta merges
@@ -1225,6 +1219,7 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
         outcome_axes = normalize_outcome_axes(usage)
         reason_code = str(usage.get("reason_code") or "")
         review_projection = _compact_review_projection(llm_trace)
+        presence_fields = presence_provenance_fields(task)
 
         # Skip LLM summary for trivial tasks.
         if n_tool_calls == 0 and rounds <= 1:
@@ -1240,6 +1235,7 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
                 "tool_calls": n_tool_calls, "rounds": rounds,
                 "outcome_axes": outcome_axes, "reason_code": reason_code,
                 **_summary_row_cost_fields(usage),
+                **presence_fields,
                 **({"review_projection": review_projection} if review_projection.get("panels") else {}),
             })
             return
@@ -1289,6 +1285,7 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
                 "tool_calls": n_tool_calls, "rounds": rounds,
                 "outcome_axes": outcome_axes, "reason_code": reason_code,
                 **_summary_row_cost_fields(usage),
+                **presence_fields,
                 **({"review_projection": review_projection} if review_projection.get("panels") else {}),
             })
     except Exception:
@@ -1403,6 +1400,7 @@ def _run_reflection(env: Any, llm: Any, task: Dict[str, Any],
                     usage_snapshot_text=_synthesis_usage_snapshot_text(usage),
                     sealed_final_text=sealed_final_prompt_section(sealed_final),
                 )
+                entry = {**entry, **presence_provenance_fields(task)}
                 append_reflection_routed(env, task, entry)
                 return entry
             except Exception:

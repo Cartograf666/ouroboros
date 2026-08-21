@@ -1,6 +1,6 @@
-"""One-shot deferred follow-ups (B2b, W=A): the ``once`` trigger's pure selection
+"""Deferred follow-ups (B2b, W=A): the ``once`` trigger's pure selection
 logic, the supervisor queue firing/mark-done semantics, and the agent-facing
-``schedule_followup`` tool (registration surfaces, authority guard, typed cap).
+``schedule_followup`` tool (one-shot or existing cron, authority guard, typed cap).
 
 The scheduler is the EXISTING one (``supervisor/queue.py`` scheduled-tasks table);
 these tests pin that no second scheduler was built: the tool only writes the table
@@ -159,6 +159,8 @@ def _followup(ctx, **kw):
 
     params = {"run_at": "2030-01-01T00:00:00+00:00",
               "objective": "Re-run the plan panel once the reviewer window resets."}
+    if "cron" in kw and "run_at" not in kw:
+        params.pop("run_at")
     params.update(kw)
     return _handle_schedule_followup(ctx, **params)
 
@@ -178,7 +180,77 @@ def test_schedule_followup_registers_a_one_shot_entry(tmp_path):
     # the agent's own words ride verbatim — no host template
     assert record["task"]["text"] == "Re-run the plan panel once the reviewer window resets."
     assert record["task"]["context"] == "plan review for root-1 was quorum-unreachable"
+
+
+def test_presence_followup_preserves_ceiling_and_return_context(tmp_path):
+    ctx = _ctx(tmp_path)
+    ctx.task_metadata["presence"] = {"binding_id": "b" * 32}
+    ctx.task_contract = {"capability_ceiling": {"digest": "a" * 64}}
+    assert _followup(ctx).startswith("FOLLOWUP_SCHEDULED")
+    from supervisor import queue
+
+    record = queue.list_scheduled_tasks(tmp_path / "data")["tasks"][0]
+    assert record["task"]["metadata"]["presence"] == {"binding_id": "b" * 32}
+    assert record["task"]["task_contract"] == ctx.task_contract
     assert record["task"]["metadata"]["origin_task_id"] == "root-1"
+
+
+def test_presence_recurring_followup_uses_existing_cron_and_preserves_authority(tmp_path):
+    from ouroboros.presence_authority import (
+        PresenceCapabilityCeiling,
+        PresenceToolGrant,
+        presence_ceiling_payload,
+    )
+
+    ctx = _ctx(tmp_path)
+    ctx.task_metadata["presence"] = {
+        "binding_id": "b" * 32,
+        "conversation_key": "telegram:account:chat:0",
+    }
+    ceiling = PresenceCapabilityCeiling(
+        skill_name="community-helper",
+        skill_content_hash="a" * 64,
+        profile_fingerprint="b" * 64,
+        state_fingerprint="c" * 64,
+        selection_fingerprint="d" * 64,
+        model_slot="main",
+        inline_max_rounds=10,
+        tool_grants=(PresenceToolGrant("telegram_send"),),
+        resource_grants=(),
+        digest="0" * 64,
+    )
+    payload = presence_ceiling_payload(ceiling)
+    ctx.task_contract = {"objective": "presence turn", "capability_ceiling": payload}
+
+    out = _followup(ctx, cron="15 9 * * 1-5", timezone="Europe/Moscow")
+    assert out.startswith("FOLLOWUP_SCHEDULED")
+    assert "recurring cron 15 9 * * 1-5 (Europe/Moscow)" in out
+    from supervisor import queue
+
+    record = queue.list_scheduled_tasks(tmp_path / "data")["tasks"][0]
+    assert record["trigger"] == {"type": "cron", "expr": "15 9 * * 1-5"}
+    assert record["timezone"] == "Europe/Moscow"
+    assert record["next_run_at"]
+    assert record["task"]["metadata"]["presence"] == ctx.task_metadata["presence"]
+    assert record["task"]["task_contract"] == ctx.task_contract
+    scheduled = queue._task_from_schedule(record)
+    assert scheduled["metadata"]["presence"] == ctx.task_metadata["presence"]
+    assert scheduled["task_contract"]["capability_ceiling"] == ctx.task_contract["capability_ceiling"]
+
+
+def test_schedule_followup_requires_exactly_one_valid_trigger(tmp_path):
+    ctx = _ctx(tmp_path)
+    assert _followup(ctx, run_at="", cron="").startswith("ERROR: FOLLOWUP_TRIGGER_REQUIRED")
+    both = _followup(ctx, cron="0 9 * * *", run_at="2030-01-01T00:00:00+00:00")
+    assert both.startswith("ERROR: FOLLOWUP_TRIGGER_REQUIRED")
+    assert _followup(ctx, cron="hourly").startswith("ERROR: FOLLOWUP_CRON_INVALID")
+    bad_zone = _followup(ctx, cron="0 9 * * *", timezone="Mars/Olympus")
+    assert bad_zone.startswith("ERROR: FOLLOWUP_TIMEZONE_INVALID")
+    run_at_zone = _followup(ctx, timezone="Europe/Moscow")
+    assert run_at_zone.startswith("ERROR: FOLLOWUP_TIMEZONE_WITH_RUN_AT")
+    from supervisor.queue import list_scheduled_tasks
+
+    assert list_scheduled_tasks(tmp_path / "data")["tasks"] == []
 
 
 def test_schedule_followup_cap_refusal_is_typed_and_disclosed(tmp_path):
@@ -450,7 +522,11 @@ def test_schedule_followup_registration_surfaces():
     entries = get_tools()
     assert [e.name for e in entries] == ["schedule_followup"]
     schema = entries[0].schema["parameters"]
-    assert set(schema["required"]) == {"run_at", "objective"}
+    assert set(schema["required"]) == {"objective"}
+    assert schema["oneOf"] == [
+        {"required": ["run_at"]},
+        {"required": ["cron"]},
+    ]
     from ouroboros.safety import POLICY_SKIP, TOOL_POLICY
 
     assert TOOL_POLICY["schedule_followup"] == POLICY_SKIP

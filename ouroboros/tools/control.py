@@ -774,7 +774,11 @@ def _finish_swarm_handoff(
 ) -> str:
     """Latch one immutable admission attempt; repeated calls emit nothing."""
 
-    if swarm_router_turn(ctx) and not isinstance(getattr(ctx, "_swarm_handoff_attempt", None), dict):
+    metadata = getattr(ctx, "task_metadata", {})
+    presence_turn = isinstance(metadata, dict) and bool(metadata.get("presence"))
+    if (swarm_router_turn(ctx) or presence_turn) and not isinstance(
+        getattr(ctx, "_swarm_handoff_attempt", None), dict
+    ):
         ctx._swarm_handoff_attempt = {
             "task_id": str(evt.get("task_id") or ""),
             "routing_token": str(evt.get("routing_token") or ""),
@@ -917,6 +921,21 @@ def _promote_chat_to_task(
         ),
         "ts": utc_now_iso(),
     }
+    metadata = getattr(ctx, "task_metadata", {})
+    presence = metadata.get("presence") if isinstance(metadata, dict) else None
+    if isinstance(presence, dict) and presence:
+        # A public conversation may promote long work, but it cannot choose a
+        # new Project/workspace/source authority. The immutable positive ceiling
+        # and exact return destination follow the promoted root by value.
+        evt.update({
+            "project_id": "",
+            "project_name": "",
+            "workspace_root": "",
+            "workspace": "",
+            "source": "",
+            "presence": dict(presence),
+            "task_contract": dict(getattr(ctx, "task_contract", {}) or {}),
+        })
     _attach_origin_from_metadata(ctx, evt)
     _attach_swarm_intent(ctx, evt)
     _attach_client_surface(ctx, evt)
@@ -1709,6 +1728,14 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
     # constraint selection, mutating detection, and the event all treat it as read-only (P5).
     if requested_surface == "read_only":
         requested_surface = ""
+    if requested_surface:
+        from ouroboros.presence_authority import presence_ceiling_allows_delegated_surface
+
+        if not presence_ceiling_allows_delegated_surface(ctx, requested_surface):
+            return (
+                "⚠️ PRESENCE_DELEGATION_BLOCKED: mutative delegation requires an exact "
+                "selected write root for this surface in the inherited capability ceiling."
+            )
     # FR2: a flat parent requesting external_workspace with no write_root builds
     # cooperatively in ONE host-minted shared tree (helper extracted to keep this
     # method under the size gate).
@@ -1907,13 +1934,15 @@ def _request_deep_self_review(ctx: ToolContext, reason: str) -> str:
     return f"Deep self-review requested (model: {model}). It will be queued and executed asynchronously."
 
 
-def _chat_history(ctx: ToolContext, count: int = 100, offset: int = 0, search: str = "") -> str:
+def _chat_history(
+    ctx: ToolContext, count: int = 100, offset: int = 0, search: str = "", **filters: str,
+) -> str:
     from ouroboros.memory import Memory
     mem = Memory(drive_root=ctx.drive_root)
     # Full project awareness (v6.32.0): the one mind's active recall spans every
     # thread (main + projects). The project-task working FOCUS is applied to the
     # passive default context only, never to this deliberate recall tool.
-    return mem.chat_history(count=count, offset=offset, search=search)
+    return mem.chat_history(count=count, offset=offset, search=search, **filters)
 
 
 def _update_scratchpad(ctx: ToolContext, content: str) -> str:
@@ -2793,12 +2822,19 @@ def get_tools() -> List[ToolEntry]:
         }, _request_deep_self_review),
         ToolEntry("chat_history", {
             "name": "chat_history",
-            "description": "Retrieve messages from chat history. Supports search.",
+            "description": "Retrieve live and recent archived chat messages. Supports exact provenance/date filters, substring search, and pagination.",
             "parameters": {"type": "object", "properties": {
                 "count": {"type": "integer", "default": 100, "description": "Number of messages (from latest)"},
                 "offset": {"type": "integer", "default": 0, "description": "Skip N from end (pagination)"},
                 "search": {"type": "string", "default": "", "description": "Text filter"},
-            }, "required": []},
+                "provider": {"type": "string", "default": "", "description": "Exact transport provider"},
+                "account_id": {"type": "string", "default": "", "description": "Exact transport account ID"},
+                "conversation_id": {"type": "string", "default": "", "description": "Exact transport conversation ID"},
+                "thread_id": {"type": "string", "default": "", "description": "Exact transport thread ID"},
+                "actor_id": {"type": "string", "default": "", "description": "Exact platform actor ID"},
+                "date_from": {"type": "string", "default": "", "description": "Inclusive ISO-8601 lower timestamp bound"},
+                "date_to": {"type": "string", "default": "", "description": "Inclusive ISO-8601 upper timestamp bound"},
+            }, "required": [], "additionalProperties": False},
         }, _chat_history),
         ToolEntry("update_scratchpad", {
             "name": "update_scratchpad",

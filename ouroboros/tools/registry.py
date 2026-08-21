@@ -905,6 +905,48 @@ def _disabled_tools(ctx: Any) -> frozenset:
     return frozenset(names)
 
 
+def _presence_tool_allowed(ctx: Any, name: str) -> bool:
+    """Positive ceiling for host-admitted presence work; absent is byte-compatible."""
+
+    from ouroboros.presence_authority import (
+        presence_ceiling_allows_tool,
+        presence_ceiling_from_context,
+    )
+
+    ceiling = presence_ceiling_from_context(ctx)
+    if name in {"presence_finish", "presence_cancel_work"}:
+        return ceiling is not None
+    return ceiling is None or presence_ceiling_allows_tool(ceiling, name)
+
+
+def _presence_binding_allowed(ctx: Any, binding: Any) -> bool:
+    from ouroboros.presence_authority import (
+        presence_ceiling_allows_binding,
+        presence_ceiling_from_context,
+    )
+
+    ceiling = presence_ceiling_from_context(ctx)
+    if ceiling is None or binding is None:
+        return True
+    items = binding if isinstance(binding, tuple) else (binding,)
+    return bool(items) and all(presence_ceiling_allows_binding(ceiling, item) for item in items)
+
+
+def _presence_bound_args(ctx: Any, name: str, args: Any) -> tuple[dict[str, Any], str]:
+    try:
+        from ouroboros.presence_authority import apply_presence_argument_bindings
+
+        bound = apply_presence_argument_bindings(ctx, name, dict(args or {}))
+        if not _presence_tool_allowed(ctx, name):
+            return {}, (
+                "⚠️ PRESENCE_CAPABILITY_BLOCKED: "
+                f"{name!r} is outside this presence task's positive capability ceiling."
+            )
+        return bound, ""
+    except Exception as exc:
+        return {}, f"⚠️ PRESENCE_ARGUMENT_BINDING_BLOCKED: {exc}"
+
+
 _GITHUB_TOKEN_TOOLS = frozenset({
     "list_github_prs",
     "get_github_pr",
@@ -1548,7 +1590,7 @@ class ToolRegistry:
     _FROZEN_TOOL_MODULES = [
         "browser", "ci", "claude_advisory_review", "compact_context", "control",
         "core", "delegate", "edit_ops", "evolution_stats", "followup", "git", "git_pr", "git_rollback", "github",
-        "health", "join_ledger", "knowledge", "media", "memory_tools", "plan_review", "project_journal",
+        "health", "join_ledger", "knowledge", "media", "memory_tools", "plan_review", "project_journal", "presence",
         "recent_tasks",
         "query_code", "review", "search", "services", "shell", "skill_exec", "skill_publish",
         "skill_preflight", "subagent_integration", "task_tree", "tool_discovery", "verify", "vision",
@@ -1642,6 +1684,7 @@ class ToolRegistry:
             e.name
             for e in self._entries.values()
             if e.name not in disabled  # declarative tool policy (task_contract.disabled_tools)
+            if _presence_tool_allowed(self._ctx, e.name)
             if _builtin_tool_availability(e.name, self._ctx)[0]
             if not local_readonly_subagent or e.name in LOCAL_READONLY_SUBAGENT_TOOL_NAMES
             if not acting_subagent or e.name in ACTING_SUBAGENT_TOOL_NAMES
@@ -1724,6 +1767,7 @@ class ToolRegistry:
             schema
             for entry in self._entries.values()
             if entry.name not in disabled_tools  # declarative tool policy (task_contract.disabled_tools)
+            if _presence_tool_allowed(self._ctx, entry.name)
             if entry.name not in unavailable_tools
             if not local_readonly_subagent or entry.name in LOCAL_READONLY_SUBAGENT_TOOL_NAMES
             if not acting_subagent or entry.name in ACTING_SUBAGENT_TOOL_NAMES
@@ -1768,6 +1812,7 @@ class ToolRegistry:
                         }
                         for tool in _ext_tools.values()
                         if _ext_is_live(str(tool.get("skill") or ""), capability_root, repo_path=str(tool.get("skills_repo_path") or "") or None)
+                        and _presence_tool_allowed(self._ctx, tool["name"])
                         and (not acting_subagent or tool["name"] in acting_grants)
                     ]
             except Exception as exc:
@@ -1791,6 +1836,7 @@ class ToolRegistry:
                             "function": {"name": tool["name"], "description": tool.get("description", ""), "parameters": tool.get("schema", {"type": "object", "properties": {}})},
                         }
                         for tool in _mgr.list_tools_for_registry()
+                        if _presence_tool_allowed(self._ctx, tool["name"])
                         if not acting_subagent or tool["name"] in acting_grants
                     ]
                     # D1: an enabled+configured server returning zero tools WITHOUT
@@ -1817,6 +1863,8 @@ class ToolRegistry:
         result = []
         for e in self._entries.values():
             if e.name in disabled_tools:  # declarative tool policy (task_contract.disabled_tools)
+                continue
+            if not _presence_tool_allowed(self._ctx, e.name):
                 continue
             if e.name in unavailable_tools:
                 continue
@@ -1861,6 +1909,8 @@ class ToolRegistry:
         # residual, not built.
         if requested in _disabled_tools(self._ctx):
             return "disabled by this task's contract (disabled_tools)"
+        if not _presence_tool_allowed(self._ctx, requested):
+            return "outside this presence task's positive capability ceiling"
         if requested not in self._entries:
             return None
         available, reason, _detail = _builtin_tool_availability(requested, self._ctx)
@@ -1884,6 +1934,8 @@ class ToolRegistry:
         # Declarative tool policy applies across ALL discovery sources (built-in, extension, MCP),
         # so enable_tools/discovery can never surface a disabled name — consistent with schemas()/execute().
         if requested in _disabled_tools(self._ctx):
+            return None
+        if not _presence_tool_allowed(self._ctx, requested):
             return None
         entry = self._entries.get(requested)
         if entry:
@@ -3143,7 +3195,9 @@ class ToolRegistry:
 
     def execute(self, name: str, args: Dict[str, Any]) -> str:
         name = str(name or "").strip()
-        args = dict(args or {})
+        args, presence_arg_error = _presence_bound_args(self._ctx, name, args)
+        if presence_arg_error:
+            return presence_arg_error
         _route_note = ""
         task_constraint = normalize_task_constraint(getattr(self._ctx, "task_constraint", None))
         local_readonly_subagent = self._is_local_readonly_subagent()
@@ -3166,7 +3220,6 @@ class ToolRegistry:
                     ext_tool = None
             except Exception:
                 ext_tool = None
-
         _mcp_is_name = None
         if entry is None and ext_tool is None:
             try:
@@ -3258,6 +3311,11 @@ class ToolRegistry:
                     str(args.get("root") or "active_workspace"),
                     exc,
                 )
+        if not _presence_binding_allowed(self._ctx, resolved_binding):
+            return (
+                "⚠️ PRESENCE_RESOURCE_BLOCKED: the resolved target is outside "
+                "this presence task's positive resource ceiling."
+            )
         # Fail-closed: an acting child WITHOUT a resolved isolated workspace would
         # have active_workspace/system_repo fall back to the LIVE repo. Confine it
         # to data roots and block shell/coding/service (whose default target is the repo).
@@ -3282,7 +3340,6 @@ class ToolRegistry:
             _runtime_mode = _get_runtime_mode()
         except Exception:
             _runtime_mode = "advanced"
-
         if is_mcp:
             return self._dispatch_mcp_tool(name, args)
         if entry is None:
@@ -3336,7 +3393,6 @@ class ToolRegistry:
                 "(data/skills/<bucket>/<skill>/) or skill_repair constraints. "
                 "Switch to advanced/pro only for reviewed Ouroboros self-modification."
             )
-
         protected_write_paths = []
         if name in _ROOT_ARG_REPO_WRITE_TOOLS:
             root_name = str(args.get("root", "") or "active_workspace")
@@ -3420,9 +3476,7 @@ class ToolRegistry:
             if name in _PROCESS_COMMAND_TOOLS and workspace_mode and acting_self_worktree
             else None
         )
-        worktree_before = (
-            self._worktree_status_snapshot() if entry.mutates_worktree else None
-        )
+        worktree_before = self._worktree_status_snapshot() if entry.mutates_worktree else None
         early_error, result = self._invoke_builtin_handler(
             name, entry, args, resolved_binding, python_resolution, worktree_before,
         )

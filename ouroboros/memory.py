@@ -5,7 +5,8 @@ import logging
 import os
 import pathlib
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Mapping, Optional
 
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros.utils import append_jsonl, iter_jsonl_objects, read_json_dict, read_text, short, utc_now_iso, write_text
@@ -18,6 +19,65 @@ from ouroboros.platform_layer import (
 log = logging.getLogger(__name__)
 
 _SCRATCHPAD_MAX_BLOCKS = 10
+
+
+def _history_timestamp(value: Any, *, field: str = "ts") -> datetime:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field} must be an ISO-8601 timestamp")
+    try:
+        parsed = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _chat_history_filter(filters: Mapping[str, str], search: str):
+    exact_transport = {
+        key: str(filters.get(key) or "").strip()
+        for key in ("provider", "account_id", "conversation_id", "thread_id")
+    }
+    actor_id = str(filters.get("actor_id") or "").strip()
+    date_from = (
+        _history_timestamp(filters.get("date_from"), field="date_from")
+        if filters.get("date_from") else None
+    )
+    date_to = (
+        _history_timestamp(filters.get("date_to"), field="date_to")
+        if filters.get("date_to") else None
+    )
+    search_lower = str(search or "").lower()
+
+    def matches(entry: Mapping[str, Any]) -> bool:
+        if is_a2a_chat_id(entry.get("chat_id")):
+            return False
+        if search_lower and search_lower not in str(entry.get("text", "")).lower():
+            return False
+        transport = entry.get("transport") if isinstance(entry.get("transport"), Mapping) else {}
+        if any(value and str(transport.get(key) or "") != value for key, value in exact_transport.items()):
+            return False
+        actor = transport.get("actor") if isinstance(transport.get("actor"), Mapping) else {}
+        actor_values = {
+            str(value) for value in (
+                actor.get("platform_actor_id"), actor.get("id"), entry.get("sender_session_id")
+            ) if value not in (None, "")
+        }
+        if actor_id and actor_id not in actor_values:
+            return False
+        if date_from is not None or date_to is not None:
+            try:
+                row_ts = _history_timestamp(entry.get("ts"))
+            except ValueError:
+                return False
+            if date_from is not None and row_ts < date_from:
+                return False
+            if date_to is not None and row_ts > date_to:
+                return False
+        return True
+
+    return matches
 
 
 class Memory:
@@ -55,9 +115,7 @@ class Memory:
         try:
             fd = os.open(str(bp) + ".lock", os.O_RDONLY | os.O_CREAT, 0o644)
             _lock_sh(fd)
-            data = bp.read_text(encoding="utf-8")
-            blocks = json.loads(data) if data.strip() else []
-            return blocks if isinstance(blocks, list) else []
+            return self._read_scratchpad_blocks_unlocked(bp)
         except Exception:
             log.debug("Failed to load scratchpad blocks", exc_info=True)
             return []
@@ -106,24 +164,12 @@ class Memory:
         if metadata:
             new_block["metadata"] = dict(metadata)
 
-        # Same stable sidecar lock as load/consolidation; the data file itself
-        # is replaced atomically so a crash mid-append cannot truncate memory.
-        fd = None
         try:
-            fd = os.open(str(bp) + ".lock", os.O_RDWR | os.O_CREAT, 0o644)
-            _lock_ex(fd)
-
-            try:
-                text = bp.read_text(encoding="utf-8").strip() if bp.exists() else ""
-            except OSError:
-                text = ""
-            blocks = json.loads(text) if text else []
-            if not isinstance(blocks, list):
-                blocks = []
-
-            blocks.append(new_block)
-            if len(blocks) > _SCRATCHPAD_MAX_BLOCKS:
-                evicted = blocks[:-_SCRATCHPAD_MAX_BLOCKS]
+            def _append(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                updated = [*blocks, new_block]
+                if len(updated) <= _SCRATCHPAD_MAX_BLOCKS:
+                    return updated
+                evicted = updated[:-_SCRATCHPAD_MAX_BLOCKS]
                 for eb in evicted:
                     append_jsonl(self.journal_path(), {
                         "ts": utc_now_iso(),
@@ -132,11 +178,9 @@ class Memory:
                         "evicted_block_source": eb.get("source", ""),
                         "evicted_block_content": eb.get("content", ""),
                     })
-                blocks = blocks[-_SCRATCHPAD_MAX_BLOCKS:]
+                return updated[-_SCRATCHPAD_MAX_BLOCKS:]
 
-            from ouroboros.utils import atomic_write_json
-
-            atomic_write_json(bp, blocks)
+            self.mutate_scratchpad_blocks(_append)
         except Exception:
             # An honest journal (P1): a failed write must be journaled as a
             # failure and surfaced to the caller — the old path logged
@@ -152,16 +196,6 @@ class Memory:
             except Exception:
                 log.debug("Failed to journal block_append_failed", exc_info=True)
             raise
-        finally:
-            if fd is not None:
-                try:
-                    _unlock(fd)
-                    os.close(fd)
-                except OSError:
-                    pass
-
-        self.regenerate_scratchpad_md()
-
         try:
             total_chars = sum(len(b.get("content", "")) for b in self.load_scratchpad_blocks())
             append_jsonl(self.journal_path(), {
@@ -178,7 +212,60 @@ class Memory:
         return new_block
 
     def regenerate_scratchpad_md(self) -> None:
-        blocks = self.load_scratchpad_blocks()
+        bp = self.scratchpad_blocks_path()
+        bp.parent.mkdir(parents=True, exist_ok=True)
+        fd = None
+        try:
+            fd = os.open(str(bp) + ".lock", os.O_RDWR | os.O_CREAT, 0o644)
+            _lock_ex(fd)
+            try:
+                blocks = self._read_scratchpad_blocks_unlocked(bp)
+            except Exception:
+                log.debug("Failed to load scratchpad blocks for regeneration", exc_info=True)
+                blocks = []
+            self._write_scratchpad_markdown(blocks)
+        finally:
+            if fd is not None:
+                try:
+                    _unlock(fd)
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def mutate_scratchpad_blocks(self, mutator: Any) -> List[Dict[str, Any]]:
+        """Mutate block source and regenerate its markdown under one sidecar lock."""
+        from ouroboros.utils import atomic_write_json
+
+        bp = self.scratchpad_blocks_path()
+        bp.parent.mkdir(parents=True, exist_ok=True)
+        fd = None
+        try:
+            fd = os.open(str(bp) + ".lock", os.O_RDWR | os.O_CREAT, 0o644)
+            _lock_ex(fd)
+            blocks = self._read_scratchpad_blocks_unlocked(bp)
+            updated = mutator(blocks)
+            if not isinstance(updated, list):
+                raise ValueError("scratchpad block mutator must return a list")
+            atomic_write_json(bp, updated)
+            self._write_scratchpad_markdown(updated)
+            return updated
+        finally:
+            if fd is not None:
+                try:
+                    _unlock(fd)
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _read_scratchpad_blocks_unlocked(bp: pathlib.Path) -> List[Dict[str, Any]]:
+        if not bp.exists():
+            return []
+        data = bp.read_text(encoding="utf-8")
+        blocks = json.loads(data) if data.strip() else []
+        return blocks if isinstance(blocks, list) else []
+
+    def _write_scratchpad_markdown(self, blocks: List[Dict[str, Any]]) -> None:
         if not blocks:
             bp = self.scratchpad_blocks_path()
             if bp.exists() and bp.stat().st_size > 2:
@@ -252,9 +339,12 @@ class Memory:
             if not path.exists():
                 write_text(path, "")
 
-    def chat_history(self, count: int = 100, offset: int = 0, search: str = "") -> str:
+    def chat_history(
+        self, count: int = 100, offset: int = 0, search: str = "", **filters: str,
+    ) -> str:
         chat_path = self.logs_path("chat.jsonl")
-        if not chat_path.exists():
+        archive_dir = self.drive_root / "archive"
+        if not chat_path.exists() and not any(archive_dir.glob("chat_*.jsonl")):
             return "(chat history is empty)"
 
         try:
@@ -264,11 +354,14 @@ class Memory:
             # only A2A virtual transport is excluded. The project-task FOCUS lives
             # in the passive default context (build_recent_sections), NOT in this
             # explicit recall tool — the one mind can deliberately recall anything.
-            entries = self._read_jsonl_entries("chat.jsonl", exclude_a2a=True)
+            from ouroboros.gateway._helpers import read_rotated_jsonl_entries
 
-            if search:
-                search_lower = search.lower()
-                entries = [e for e in entries if search_lower in str(e.get("text", "")).lower()]
+            matches = _chat_history_filter(filters, search)
+            want = count + max(offset, 0) if count > 0 else 2**63 - 1
+            entries = read_rotated_jsonl_entries(
+                chat_path, archive_dir, "chat", want, matches,
+            )
+            entries = [entry for entry in entries if matches(entry)]
 
             if offset > 0:
                 entries = entries[:-offset] if offset < len(entries) else []
@@ -364,7 +457,9 @@ class Memory:
         if dir_raw == "system":
             entry_type = str(e.get("type", "")).strip() or "system"
             return f"📋 {ts} [{entry_type}] {raw_text}" if compact else f"📋 [{ts}] [{entry_type}] {raw_text}"
-        username = e.get("username") or e.get("author") or "User"
+        from ouroboros.dialogue_provenance import dialogue_author
+
+        username = dialogue_author(e)
         return f"← {ts} [{username}] {raw_text}" if compact else f"← [{ts}] [{username}] {raw_text}"
 
     def summarize_progress(self, entries: List[Dict[str, Any]], limit: int = 15) -> str:
