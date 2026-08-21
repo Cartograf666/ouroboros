@@ -464,9 +464,12 @@
     min-width: 0;
 }
 
+.settings-action-row > .settings-inline-status:empty {
+    display: none;
+}
+
 .settings-action-row > .btn-default {
     justify-self: end;
-    flex: 0 0 auto;
 }
 
 .settings-footer {
@@ -627,7 +630,6 @@
 }
 
 .settings-custom-secret-remove {
-    min-height: 40px;
     padding: 0 12px;
 }
 

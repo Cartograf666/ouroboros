@@ -7,6 +7,7 @@ const onboardingCss = await readFile(new URL('../onboarding.css', import.meta.ur
 const styleCss = await readFile(new URL('../style.css', import.meta.url), 'utf8');
 const settingsJs = await readFile(new URL('../modules/settings.js', import.meta.url), 'utf8');
 const catalogJs = await readFile(new URL('../modules/settings_catalog.js', import.meta.url), 'utf8');
+const uiHelpersJs = await readFile(new URL('../modules/ui_helpers.js', import.meta.url), 'utf8');
 
 test('neutral controls have one shared button role in both UI shells', () => {
     assert.match(styleCss, /\.btn-default\s*\{/);
@@ -20,6 +21,7 @@ test('neutral controls have one shared button role in both UI shells', () => {
 test('single-action settings rows reserve a flexible status and responsive action edge', () => {
     assert.match(settingsCss, /\.settings-action-row\s*\{[\s\S]*grid-template-columns:\s*minmax\(0, 1fr\) auto/);
     assert.match(settingsCss, /\.settings-action-row\s*>\s*\.btn-default\s*\{[\s\S]*justify-self:\s*end/);
+    assert.match(settingsCss, /\.settings-action-row\s*>\s*\.settings-inline-status:empty\s*\{[\s\S]*display:\s*none/);
     assert.match(settingsCss, /@media \(max-width: 760px\)[\s\S]*\.settings-action-row\s*\{[\s\S]*grid-template-columns:\s*1fr/);
 });
 
@@ -28,6 +30,9 @@ test('async actions expose the same busy and status semantics', () => {
     assert.match(settingsJs, /setAttribute\('aria-busy', 'true'\)/);
     assert.match(settingsJs, /setInlineStatus\(status, 'Testing…', 'muted'\)/);
     assert.match(settingsJs, /providerTestStatusText\(data\), data\?\.ok \? 'ok' : 'danger'/);
+    assert.match(settingsJs, /refreshModelCatalog\(\{ button: byId\('btn-refresh-model-catalog'\) \}\)/);
+    assert.match(settingsJs, /setInlineStatus\(el, '', 'muted'\)/);
+    assert.match(uiHelpersJs, /if \(el\.textContent !== next\) el\.textContent = next/);
     assert.match(catalogJs, /refreshModelCatalog\(\{ button \} = \{\}\)/);
     assert.match(catalogJs, /refreshSeq === catalogRefreshSeq/);
 });

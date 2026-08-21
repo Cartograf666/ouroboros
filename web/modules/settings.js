@@ -610,7 +610,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         Object.keys(PROVIDER_TEST_INPUTS).forEach((provider) => {
             providerTestGenerations.set(provider, (providerTestGenerations.get(provider) || 0) + 1);
         });
-        page.querySelectorAll('[data-provider-test-status]').forEach((el) => { el.textContent = ''; });
+        page.querySelectorAll('[data-provider-test-status]').forEach((el) => setInlineStatus(el, '', 'muted'));
         applySecretInputs(page, s);
         INPUT_FIELDS.forEach(([id, key, fallback = '']) => applyInputValue(id, fallback && !s[key] ? fallback : s[key]));
         VALUE_FIELDS.forEach(([id, key, fallback]) => { byId(id).value = s[key] || fallback; });
@@ -762,7 +762,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         try {
             await loadSettings();
             try {
-                await refreshModelCatalog();
+                await refreshModelCatalog({ button: byId('btn-refresh-model-catalog') });
                 setStatus('Settings loaded', 'ok');
             } catch (error) {
                 setStatus(

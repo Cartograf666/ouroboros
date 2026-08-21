@@ -108,7 +108,10 @@ export function formatRelativeAge(time, freshLabel = 'Just installed') {
 }
 
 export function setInlineStatus(el, text, tone = 'muted') {
-    if (el) { el.textContent = text || ''; el.dataset.tone = normalizeTone(tone); }
+    if (!el) return;
+    const next = text || '';
+    if (el.textContent !== next) el.textContent = next;
+    el.dataset.tone = normalizeTone(tone);
 }
 
 export async function openViaHostBridge(url, filename = 'file') {
