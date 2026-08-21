@@ -551,7 +551,11 @@ def record_token_density(
                 and _density_of(pair.get("prompt_chars"), pair.get("prompt_tokens")) > 0
             ]
             route_pairs = [pair for pair in pairs if str(pair.get("route_fp") or "") == route]
-            newest = max(route_pairs, key=_density_recency_key, default=None)
+            newest = max(
+                enumerate(route_pairs),
+                key=lambda item: (*_density_recency_key(item[1]), item[0]),
+                default=(0, None),
+            )[1]
             known = _density_of(
                 (newest or {}).get("prompt_chars"), (newest or {}).get("prompt_tokens"),
             )

@@ -396,6 +396,43 @@ def test_density_reducers_use_newest_route_or_model_but_densest_review_witness(
     assert resolve_main_token_density(tmp_path, "", "never/seen") == (1.0, "cold_estimate")
 
 
+def test_density_throttle_uses_legacy_list_order_for_equal_clock_ties(tmp_path):
+    from ouroboros.capability_evidence import _DENSITY_MEMO, record_token_density
+
+    observed_at = ce.utc_now_iso()
+    ce._save(tmp_path, {"token_density": {"m/one": {"pairs": [
+        {
+            "prompt_chars": 400_000,
+            "prompt_tokens": 100_000,
+            "observed_at": observed_at,
+            "route_fp": "route-a",
+        },
+        {
+            "prompt_chars": 400_000,
+            "prompt_tokens": 200_000,
+            "observed_at": observed_at,
+            "observation_seq": "invalid-legacy-value",
+            "route_fp": "route-a",
+        },
+    ]}}})
+
+    _DENSITY_MEMO.clear()
+    record_token_density(
+        tmp_path, "m/one", prompt_chars=400_000, prompt_tokens=200_000,
+        route_fp="route-a",
+    )
+    stored = json.loads((tmp_path / "state" / "capability_evidence.json").read_text())
+    assert len(stored["token_density"]["m/one"]["pairs"]) == 2
+
+    _DENSITY_MEMO.clear()
+    record_token_density(
+        tmp_path, "m/one", prompt_chars=400_000, prompt_tokens=100_000,
+        route_fp="route-a",
+    )
+    stored = json.loads((tmp_path / "state" / "capability_evidence.json").read_text())
+    assert len(stored["token_density"]["m/one"]["pairs"]) == 3
+
+
 def test_density_memo_does_not_claim_a_witness_when_persistence_failed(tmp_path, monkeypatch):
     from ouroboros.capability_evidence import _DENSITY_MEMO, record_token_density
 
