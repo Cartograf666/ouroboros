@@ -90,6 +90,17 @@ test('compact task cards show one complete cost and keep openness details', () =
     assert.equal(partialChild.final, false);
 });
 
+test('unknown zero-dollar accounting stays pending instead of becoming free', () => {
+    assert.deepEqual(taskCostMeta({
+        cost_usd: null,
+        cost_usd_with_children: null,
+        cost_accounting_status: 'available',
+        cost_final: false,
+        cost_with_children_partial: true,
+        unknown_unmetered: 1,
+    }), ['cost pending', 'unmetered=1']);
+});
+
 test('a bare per-round cost_usd delta is NOT task cost (v6.82 P1)', () => {
     // llm_round_finished carries only cost_usd — no task-scope accounting
     // evidence — so it must render nothing and produce no sticky projection.

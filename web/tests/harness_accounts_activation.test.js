@@ -59,9 +59,14 @@ test('Agents activation wakes only an already-provisioned idle daemon', async ()
     globalThis.window = win;
     const requests = [];
     let body = STALE;
+    let failNextRead = false;
     const store = createClaudexorStatusStore({
         fetchImpl: async (url, init = {}) => {
             requests.push(`${init.method || 'GET'} ${url}`);
+            if ((init.method || 'GET') === 'GET' && failNextRead) {
+                failNextRead = false;
+                return { ok: false, status: 503, json: async () => ({ error: 'temporary outage' }) };
+            }
             return response((init.method || 'GET') === 'POST' ? RUNNING : body);
         },
         doc,
@@ -71,6 +76,15 @@ test('Agents activation wakes only an already-provisioned idle daemon', async ()
         requests.length = 0;
         await win.fire('ouro:settings-subtab-shown');
         assert.ok(requests.includes('POST /api/claudexor/wake'));
+
+        // A failed refresh keeps the last snapshot for display. It must not
+        // make that retained `stale + ready` value look like fresh wake proof.
+        body = STALE;
+        await store.refresh();
+        requests.length = 0;
+        failNextRead = true;
+        await win.fire('ouro:settings-subtab-shown');
+        assert.deepEqual(requests, ['GET /api/claudexor/status']);
 
         body = payload('not_provisioned');
         await store.refresh();

@@ -1154,8 +1154,13 @@ export function refreshHarnessStatus() {
  * foreign ownership and repair remain behind Connect.
  */
 async function refreshHarnessStatusOnActivation() {
-    await state.store.refresh();
-    const daemon = state.store.snapshot?.daemon || {};
+    const snapshot = await state.store.refresh();
+    // The store deliberately retains the last answer after a failed GET so
+    // the panel can keep useful context.  That retained snapshot is not fresh
+    // evidence for an owner-triggered write: a transient outage must never
+    // turn yesterday's `stale + ready` into a wake request.
+    if (state.store.error) return null;
+    const daemon = snapshot?.daemon || state.store.snapshot?.daemon || {};
     if (String(daemon.state || '') === 'stale'
         && String(daemon.runtime?.state || '') === 'ready'
         && !daemon.ownership_problem) {

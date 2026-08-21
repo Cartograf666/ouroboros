@@ -144,12 +144,40 @@ def live_root_cost_projection(
             pathlib.Path(task.get("budget_drive_root") or drive_root),
             root_task_id=str(lineage["root_task_id"] or task_id),
         )
+        # A root-filtered summary with no attributable rows is an empty view,
+        # not measured zero.  The task-detail reader applies the same rule:
+        # legacy metadata alone and an empty subtree must not publish a money
+        # amount whose source never observed this root.
+        counts = usage.get("attempt_counts")
+        if isinstance(counts, Mapping):
+            attributable_rows = sum(
+                max(0, int(value or 0))
+                for key, value in counts.items()
+                if key != "metadata_only"
+            )
+            sessions = max(0, int(usage.get("subscription_sessions") or 0))
+            if attributable_rows == 0 and sessions == 0:
+                return {}
+        unknown = int(usage.get("unknown_unmetered") or 0)
+        reserved = float(usage.get("reserved_usd") or 0)
+        unresolved = float(usage.get("unresolved_upper_bound_usd") or 0)
+        accounted = _as_amount(usage.get("accounted_usd"))
+        # An entirely unknown zero-dollar summary is not a free task: external
+        # unmetered work and unknown-price rows deliberately carry no amount.
+        # Keep a numeric known subtotal when a bound exists, and keep measured
+        # zero for a genuinely priced/free row.
+        if accounted is None or (
+            accounted == 0 and unknown > 0 and reserved == 0 and unresolved == 0
+        ):
+            accounted = None
         projection = {
             "cost_accounting_status": "available",
-            "cost_usd_with_children": round(float(usage.get("accounted_usd") or 0), 6),
-            "reserved_usd": float(usage.get("reserved_usd") or 0),
-            "unresolved_upper_bound_usd": float(usage.get("unresolved_upper_bound_usd") or 0),
-            "unknown_unmetered": int(usage.get("unknown_unmetered") or 0),
+            "cost_usd_with_children": (
+                round(accounted, 6) if accounted is not None else None
+            ),
+            "reserved_usd": reserved,
+            "unresolved_upper_bound_usd": unresolved,
+            "unknown_unmetered": unknown,
             "non_final_rows": int(usage.get("non_final_rows") or 0),
             "ledger_integrity_degraded": bool(usage.get("integrity_degraded")),
         }

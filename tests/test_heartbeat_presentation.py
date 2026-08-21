@@ -106,6 +106,54 @@ def test_root_heartbeat_keeps_ledger_failure_honest(tmp_path, monkeypatch):
     assert frame["cost_final"] is False
 
 
+def test_root_heartbeat_omits_empty_or_legacy_only_cost(tmp_path, monkeypatch):
+    from ouroboros import usage_accounting
+    from supervisor.events import _handle_task_heartbeat
+
+    monkeypatch.setattr(usage_accounting, "usage_projection", lambda *_a, **_kw: {
+        "accounted_usd": 0.0, "attempt_counts": {"metadata_only": 4},
+        "subscription_sessions": 0, "unknown_unmetered": 0,
+        "non_final_rows": 0, "integrity_degraded": False,
+    })
+    ctx, pushed = _heartbeat_ctx(tmp_path, {
+        "id": "root-empty", "type": "task", "root_task_id": "root-empty",
+    })
+    _handle_task_heartbeat({"task_id": "root-empty", "phase": "running"}, ctx)
+
+    assert "cost_accounting_status" not in pushed[0]
+    assert "cost_usd_with_children" not in pushed[0]
+
+
+def test_root_heartbeat_keeps_unknown_zero_cost_nullable_and_measured_zero_numeric(
+    tmp_path, monkeypatch,
+):
+    from ouroboros import usage_accounting
+    from supervisor.events import _handle_task_heartbeat
+
+    usage = {
+        "accounted_usd": 0.0, "attempt_counts": {"settled": 1},
+        "subscription_sessions": 0, "unknown_unmetered": 1,
+        "non_final_rows": 1, "integrity_degraded": False,
+    }
+    monkeypatch.setattr(usage_accounting, "usage_projection", lambda *_a, **_kw: usage)
+    ctx, pushed = _heartbeat_ctx(tmp_path, {
+        "id": "root-unknown", "type": "task", "root_task_id": "root-unknown",
+    })
+    _handle_task_heartbeat({"task_id": "root-unknown", "phase": "running"}, ctx)
+    unknown = pushed[0]
+    assert unknown["cost_accounting_status"] == "available"
+    assert unknown["cost_usd_with_children"] is None
+    assert unknown["accounted_upper_bound_usd_with_children"] is None
+    assert unknown["unknown_unmetered"] == 1
+
+    usage = {**usage, "unknown_unmetered": 0, "non_final_rows": 0}
+    ctx, pushed = _heartbeat_ctx(tmp_path, {
+        "id": "root-free", "type": "task", "root_task_id": "root-free",
+    })
+    _handle_task_heartbeat({"task_id": "root-free", "phase": "running"}, ctx)
+    assert pushed[0]["cost_usd_with_children"] == 0.0
+
+
 def test_retired_timeout_defaults_are_quiet_but_custom_value_is_loud(tmp_path, monkeypatch) -> None:
     from supervisor import queue
 
