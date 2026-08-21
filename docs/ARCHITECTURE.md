@@ -538,6 +538,7 @@ A pre-existing cross-platform residual remains: shutdown admission is not atomic
 │   │   ├── review_continuations/ ← Per-task blocked-review continuation payloads (+ quarantined corrupt files under `corrupt/`)
 │   │   │   └── archived/ ← Durable, runtime-unread retirement for continuations whose task is settled, whose recorded obligations are no longer open, and which remained un-resumed for at least seven days. Retirement is a collision-safe move; fresh or still-actionable records and any move error stay live, while malformed files go to `corrupt/`. Archived records are never deleted.
 │   │   ├── workspace_executor_processes/ ← Durable local/docker executor foreground/service cleanup records for panic/shutdown recovery
+│   │   ├── consciousness_observations.jsonl ← Append-only Background Consciousness inbox: enqueue rows are retained until a settled successful cycle appends an ACK; malformed/unknown rows remain visible as source gaps
 │   │   ├── cx/ ← Managed Claudexor runtime store: immutable `<version>-<sha12>/` trees (each with its `managed-runtime.json`), `node/` exact managed Node copies, `cache/` verified archives, `install.lock`
 │   │   └── skills/              ← Phase 3 external-skill state plane (sibling of advisory_review.json, not shared)
 │   │       └── <skill_name>/
@@ -1025,6 +1026,22 @@ heuristic or parallel gateway-capability subsystem is introduced.
 #### Background consciousness and Evolution
 
 Background Consciousness is the high-horizon awareness loop. It can groom memory, identity candidates, knowledge, and the improvement backlog, message the owner, and initiate an already configured reviewed Presence binding; it does not directly acquire the binding's tools or transport authority itself. It does not directly run shell/code work, subagents, reviews, commits, or evolution toggles. Evolution Campaigns perform self-improvement as ordinary governed tasks, so awareness can propose work without bypassing task, budget, and review authority.
+
+Its observation inbox is the append-only `state/consciousness_observations.jsonl`
+store under the active runtime data root. Existing producers write a stable-ID
+`enqueue` row before the wake notification returns; `_snapshot_pending_observations`
+reads a cached, insertion-ordered projection, and `_ack_observations` appends
+ACK rows only after the thought receipt, tool receipts, budget settlement, and
+other durable state writes for that snapshot have succeeded. A provider error,
+overflow, cancellation, unreadable/malformed row, or unknown ACK leaves the
+snapshot pending and exposes the existing actor-readable source reference
+`read_file(root='runtime_data', path='state/consciousness_observations.jsonl')`.
+The status surface reports only pending count, oldest timestamp, source, and gap
+count; it never treats that bounded projection as the observation source itself.
+When the same cycle can call `update_identity`, an observation gap joins the
+existing identity-completeness envelope and blocks that destructive write until
+the actor resolves the named source. This preserves direct BGC autonomy for a
+complete source without adding an approval flow.
 
 An active campaign owns an explicit objective, campaign id, transaction, and task claim. `evolution_mode_enabled` is only its scheduling projection. Dispatch, review, commit, publication, and restart revalidate that exact authority; a restored row without a live uncommitted claim is cancelled. A reviewed commit binds to the claim by exact SHA before publication. If authority changes after commit, the commit is moved to a private inspection ref and any attempt-created tag is removed from the normal namespace; concurrent index/worktree edits are not reset and no restart occurs. Restart verification and boot reconciliation decide whether the cycle is absorbed, abandoned, or still pending, and exact terminal replay resumes only incomplete effects without double-counting a cycle.
 
@@ -2563,6 +2580,22 @@ Panic is a complete owner stop, not a restart. It stops consciousness, records t
 11. **UI resources carry a disposer.** Every subscription, listener, observer, timer, stream, and live page instance has explicit teardown; navigation does not leave hidden instances mutating visible or durable state.
 12. **Frozen contracts extend explicitly.** `ouroboros/contracts/` remains versioned, backward-compatible ABI. New capability extends the frozen shape or uses an explicitly versioned successor; convenience code does not smuggle policy into it.
 13. **Provider wire adaptation stays exact-route and success-confirmed.** Canonical history remains provider-neutral; typed physical projections may change values, fields, or a registered dialect on one provider/endpoint/API/model only. Failed candidates teach nothing durable, task-local cognition degradation never becomes future dispatch authority, and the physical-attempt ledger remains distinct from terminal request-wire history.
+
+### 10.1 Continuity data-flow map
+
+The table below is the canonical map for continuity changes. A bounded view is
+an interface projection, never a new authority. The actor that makes the
+decision must be able to resolve the named source through an existing reader;
+otherwise the view is partial and the consumer remains non-final or abstains.
+
+| Surface | Canonical source and owner | Bounded projection | Actor-readable source/ref | Decision and retention rule |
+|---|---|---|---|---|
+| Owner authority and biography | Canonical `logs/chat.jsonl`, archive generations, and `memory/dialogue_blocks.json` owned by the canonical drive | Main/Project context sections and archive-aware history windows | Existing `chat_history`/archive readers with generation and gap metadata | A known gap is disclosed; summaries/blocks never replace exact current owner directives. Raw generations and durable blocks follow their existing retention owner. |
+| Execution evidence | Task results, observability call manifests/blobs, service logs, and process-custody records | Status cards, terminal rows, bounded tails, and compact child summaries | Exact artifact/blob/service-log refs carried by the task result or canonical promotion | A projection cannot certify a missing child/source. Referenced canonical artifacts are promoted before child-drive GC; disposable execution scratch follows unified GC. |
+| Terminal task/project memory | Root terminal result plus existing task/project summary producers | Cognitive Main terminal summaries and one Project-root UI completion row | Task-result ID, project binding, and summary/source refs | Summary is a biography projection, not raw evidence. Terminal outcomes, including failed/cancelled/degraded, remain retained through their canonical result owner. |
+| Background Consciousness observations | `data/state/consciousness_observations.jsonl`, append-only enqueue/ACK rows owned by `BackgroundConsciousness` | Pending count/oldest metadata and a bounded recent observation rendering | `read_file(root='runtime_data', path='state/consciousness_observations.jsonl')` | Unacknowledged rows survive restart/overflow/error. Gaps block ACK and the existing direct identity rewrite; only a settled successful cycle appends ACK. |
+| Plan/review authority | Exact task-artifact/observability wave bodies, evidence selectors, reviewer route/thread receipts, and the bounded review hot index | Review status, latest wave, obligations, and compact findings | Exact artifact/source handle plus SHA/range/thread selectors | Missing or partial evidence is `DEGRADED`/`NOT_RUN`, never PASS. Exact artifacts remain bound to the reviewed candidate SHA; hot indexes may rotate only after the source is retained. |
+| Canonical versus execution roots | Canonical budget/data root owns identity, authority, biography, results, and promoted observability; execution drives own tools, workspace, and transient trajectory | Project/fork/task lenses and status projections | Existing canonical-root resolver, task-result pointers, and source handles | A fork is an execution lens, not a second mind. Copy-back/promotion precedes GC for anything referenced by a canonical result; missing legacy bytes become an explicit gap. |
 
 ---
 

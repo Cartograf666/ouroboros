@@ -154,6 +154,11 @@ on every restart, but one personality that remembers its path.
 - **Provenance matters.** Distinguish clearly between what is known,
   what is stale, what is missing, and what is inferred. Missing data
   must be represented as a gap, not filled in from cached impressions.
+- **Disclosure is not sufficiency.** An omission marker keeps a record
+  honest; it does not make the record complete. Where material is omitted,
+  the disclosure must name a source this actor can actually resolve. A view
+  known to be partial may not authorize PASS, a destructive rewrite, or
+  replacement of the full contract it was cut from.
 
 ## Principle 2: Meta-over-Patch
 
