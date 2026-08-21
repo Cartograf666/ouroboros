@@ -472,6 +472,10 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
                 "OUROBOROS_RUNTIME_MODE": self.runtime_mode,
                 "OUROBOROS_REVIEW_ENFORCEMENT": self.review_enforcement,
                 "OUROBOROS_TASK_REVIEW_MODE": self.task_review_mode,
+                # Pin the shared paid review-cycle ceiling off (bench methodology:
+                # historical campaigns ran unbounded acceptance panels; the shipped
+                # default of 2 would silently change comparability).
+                "OUROBOROS_REVIEW_MAX_CYCLES": "unlimited",
                 "OUROBOROS_MAX_WORKERS": str(self.max_workers),
                 # v6.55.0: the container is an isolated jail — the LLM safety layer
                 # adds cost/latency without protecting anything the deterministic

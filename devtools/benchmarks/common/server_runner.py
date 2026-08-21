@@ -92,6 +92,10 @@ _ISO_SETTINGS_ALLOW_EXACT = frozenset({
     # self-review config is honored by isolated benchmark servers (else it silently
     # falls back to the "auto" default and the end-of-task review never runs).
     "OUROBOROS_TASK_REVIEW_MODE", "OUROBOROS_REVIEW_ENFORCEMENT",
+    # Shared paid review-cycle ceiling (non-secret): bench templates pin it to
+    # "unlimited" for methodology comparability; a live-settings pin must forward
+    # into isolated bench servers the same way the other review knobs do.
+    "OUROBOROS_REVIEW_MAX_CYCLES",
     "CLAUDE_CODE_MODEL", "CLAUDE_AGENT_SDK_MODEL",
     # One-window false provenance tombstone: it travels with an explicit Low so
     # the isolated run keeps owner-Low/P3 semantics. Legacy true is normalized.

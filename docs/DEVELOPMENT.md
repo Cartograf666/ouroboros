@@ -845,6 +845,14 @@ and a pure advisory line never mints one (advisory criticals disclose, they
 do not block) — under advisory the no-new-spend guarantee therefore comes
 from the exhaustion free replay, not from the refusal streak.
 
+Scope of the review-contract fingerprint (deliberate): it covers the reviewer
+roster, routes, enforcement, resolved efforts, and the prompt constants —
+governance-document CONTENTS (BIBLE.md, CHECKLISTS.md, ARCHITECTURE.md) are
+deliberately outside it, so editing those documents neither lapses recorded
+verdicts nor frees replays. The accepted trade-off is that an old verdict can
+replay under amended governance text; this keeps routine documentation
+maintenance from repricing every recorded review.
+
 `docs/CHECKLISTS.md` is the only reviewer-question, severity, and output SSOT.
 Architecture owns the dataflow; this section owns operator sequence. Finish all
 edits, run focused tests, run the advisory when useful, then freeze and review
