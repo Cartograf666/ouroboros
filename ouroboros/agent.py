@@ -55,6 +55,7 @@ from ouroboros.subagents import (
     envelope_from_task,
     resolve_subagent_dispatch,
 )
+from ouroboros.subagent_messages import subagent_message_meta
 
 
 _worker_boot_logged = False
@@ -771,8 +772,6 @@ class OuroborosAgent:
             task_type=str(task.get("type") or ""),
         )
         if str(task.get("delegation_role") or "") == "subagent" and self._event_queue is not None and self._current_chat_id is not None:
-            _tc = task.get("task_constraint")
-            _surface = str((_tc.get("surface") if isinstance(_tc, dict) else "") or "")
             try:
                 self._event_queue.put({
                     "type": "send_message",
@@ -781,19 +780,9 @@ class OuroborosAgent:
                     "format": "markdown",
                     "is_progress": True,
                     "task_id": str(task.get("id") or ""),
-                    "progress_meta": {
-                        "subagent_event": "running",
-                        "subagent_task_id": str(task.get("id") or ""),
-                        "root_task_id": str(task.get("root_task_id") or ""),
-                        "parent_task_id": str(task.get("parent_task_id") or ""),
-                        "delegation_role": "subagent",
-                        "subagent_role": str(task.get("role") or ""),
-                        "write_surface": _surface,
-                        "task_group_id": str(task.get("task_group_id") or ""),
-                        "model_lane": str(task.get("requested_model_lane") or task.get("model_lane") or ""),
-                        "effective_model_lane": str(task.get("effective_model_lane") or ""),
-                        "model": str(task.get("model") or ""),
-                    },
+                    "progress_meta": subagent_message_meta(
+                        task, task_id=str(task.get("id") or ""), event="running",
+                    ),
                     "ts": utc_now_iso(),
                 })
             except Exception:
@@ -1445,27 +1434,8 @@ class OuroborosAgent:
 
     def _subagent_progress_meta(self, event: str) -> Dict[str, Any]:
         metadata = self._current_task_metadata if isinstance(self._current_task_metadata, dict) else {}
-        if str(metadata.get("delegation_role") or "").lower() != "subagent":
-            return {}
         task_id = str(self._current_task_id or metadata.get("subagent_task_id") or metadata.get("task_id") or "")
-        return {
-            "subagent_event": str(event or "progress"),
-            "subagent_task_id": task_id,
-            "root_task_id": str(metadata.get("root_task_id") or ""),
-            "parent_task_id": str(metadata.get("parent_task_id") or ""),
-            "delegation_role": "subagent",
-            "subagent_role": str(metadata.get("role") or ""),
-            "write_surface": str(metadata.get("write_surface") or ""),
-            "task_group_id": str(metadata.get("task_group_id") or ""),
-            "model_lane": str(metadata.get("requested_model_lane") or metadata.get("model_lane") or ""),
-            "effective_model_lane": str(metadata.get("effective_model_lane") or ""),
-            "model": str(metadata.get("model") or ""),
-            # Phase 6 (owner directive #1): WHERE this subagent really runs. Only
-            # a delegated route is a fact worth a chip — the native path is the
-            # ordinary case and prints nothing, so the lane never fills with
-            # "api" noise. Empty stays empty; the renderer draws no chip.
-            "executor_route": str(metadata.get("executor_route") or ""),
-        }
+        return subagent_message_meta(metadata, task_id=task_id, event=event or "progress")
 
     def _start_task_heartbeat_loop(self, task_id: str) -> Optional[threading.Event]:
         if not task_id.strip():

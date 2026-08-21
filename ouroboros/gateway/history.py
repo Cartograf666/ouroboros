@@ -16,6 +16,7 @@ from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros.gateway._helpers import _TAIL_WINDOW_START_BYTES, read_rotated_jsonl_entries
 from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
 from ouroboros.task_results import TASK_COST_META_FIELDS as _TASK_COST_META_FIELDS
+from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS, subagent_message_meta
 from ouroboros.outcomes import normalize_outcome_axes
 from ouroboros.utils import utc_now_iso
 
@@ -444,7 +445,7 @@ def _load_terminal_result(
 ) -> Dict[str, Any]:
     """Effective task result for history projection, cached per request.
 
-    Status/cost projection only — a history GET must never copy artifacts or
+    Status/cost and compact child-identity projection only — a history GET must never copy artifacts or
     claim disposition hashes (materialize contract). The cache is shared
     between the pre-floor lineage terminal-truth pass (perf2 P3 variant A) and
     ``_annotate_terminal_task_truth``, so each task_results file is read at
@@ -466,7 +467,7 @@ def _annotate_terminal_task_truth(
     data_dir: pathlib.Path,
     result_cache: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> None:
-    """Project bounded terminal truth onto the card rows that survive history replay.
+    """Project bounded terminal truth and legacy child identity onto replay rows.
 
     Runs AFTER quota slicing (v6.90.x P2) on exactly the rows the response emits,
     so the endpoint pays for the task ids of the WINDOW, not of the whole parsed
@@ -493,12 +494,25 @@ def _annotate_terminal_task_truth(
             if str(message.get("system_type") or "") == "task_summary"
             and message.get("task_id")
         }
+        legacy_final_task_ids = {
+            str(message.get("task_id") or "")
+            for message in combined
+            if message.get("task_id")
+            and not message.get("is_progress")
+            and str(message.get("role") or "") in {"assistant", "system"}
+            and str(message.get("delegation_role") or "").lower() != "subagent"
+            and str(message.get("task_id") or "") not in progress_task_ids
+        }
         terminal_status_by_task: Dict[str, str] = {}
         terminal_truth_by_task: Dict[str, Dict[str, Any]] = {}
+        legacy_child_meta_by_task: Dict[str, Dict[str, Any]] = {}
         suggested_name_by_task: Dict[str, str] = {}
         finalizing_tasks: set = set()
-        for task_id in progress_task_ids | summary_task_ids:
+        for task_id in progress_task_ids | summary_task_ids | legacy_final_task_ids:
             result = _load_terminal_result(data_dir, task_id, cache)
+            child_meta = subagent_message_meta(result, task_id=task_id)
+            if child_meta:
+                legacy_child_meta_by_task[task_id] = child_meta
             status = str(result.get("status") or "")
             checkpoint = result.get("root_phase_checkpoint")
             synthesis = (
@@ -550,6 +564,8 @@ def _annotate_terminal_task_truth(
             task_id = str(message.get("task_id") or "")
             if not task_id:
                 continue
+            for key, value in legacy_child_meta_by_task.get(task_id, {}).items():
+                message.setdefault(key, value)
             # Every row of a finalizing task carries the typed phase so replay
             # (progress cards AND the early final answer row) holds the card
             # on "Finalizing…" instead of resolving it as done.
@@ -763,6 +779,9 @@ def _collect_chat_rows(
                 rec["download_url"] = str(entry["download_url"])
                 rec["caption"] = str(entry.get("caption") or "")
             _copy_task_summary_metadata(rec, entry)
+            for field in SUBAGENT_MESSAGE_FIELDS:
+                if field in entry:
+                    rec[field] = entry[field]
             if callable(row_is_project_mirror) and row_is_project_mirror(entry_chat, entry):
                 rec["project_mirror"] = True
             combined.append(rec)

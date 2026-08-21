@@ -34,6 +34,7 @@ from ouroboros.cost_projection import carry_cost_meta, with_cost_aliases
 from ouroboros.outcomes import infra_failed_axes, normalize_outcome_axes
 from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
 from ouroboros.subagents import intended_lane as intended_subagent_lane
+from ouroboros.subagent_messages import subagent_message_meta
 from ouroboros.contracts.task_contract import build_task_contract, normalize_allowed_resources
 
 log = logging.getLogger(__name__)
@@ -1067,13 +1068,21 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
         # are narration ABOUT the task, never work BY it.
         progress_meta = evt.get("progress_meta") if isinstance(evt.get("progress_meta"), dict) else None
         _running = getattr(ctx, "RUNNING", None)
-        if is_progress and task_id and isinstance(_running, dict):
+        task_row: Dict[str, Any] = {}
+        if task_id and isinstance(_running, dict):
             _m = _running.get(task_id)
             # Mutate in place (see _handle_llm_usage): no write-back, so a cross-thread
             # cancel that popped this task is never resurrected.
             if isinstance(_m, dict):
-                if not evt.get(HOST_NARRATION):
+                if is_progress and not evt.get(HOST_NARRATION):
                     _m["last_progress_at"] = time.time()
+                task_row = _m.get("task") if isinstance(_m.get("task"), dict) else {}
+                child_meta = subagent_message_meta(task_row, task_id=task_id)
+                if child_meta:
+                    event_meta = dict(progress_meta or {})
+                    progress_meta = dict(child_meta)
+                    progress_meta.update(event_meta)
+            if is_progress and isinstance(_m, dict):
                 # v6.82 (P5): host-attested cancelable marker. RUNNING membership is
                 # the supervisor's own truth that this frame belongs to a queue task
                 # that /api/tasks/{id}/cancel can force-cancel. An in-process
@@ -1087,7 +1096,6 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
                 # re-deriving rootness from frame shape), and a subagent's
                 # narration never mints a root-shaped card with a live Cancel.
                 # Copy-on-write: the worker's own event dict is never mutated.
-                task_row = _m.get("task") if isinstance(_m.get("task"), dict) else {}
                 progress_meta = dict(progress_meta or {})
                 for lineage_key in ("root_task_id", "parent_task_id", "delegation_role"):
                     value = str(task_row.get(lineage_key) or "").strip()
@@ -1109,7 +1117,24 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
                         progress_meta["cancelable"] = True
                 except Exception:
                     log.debug("cancelable lineage resolution failed for %s", task_id, exc_info=True)
-        bound_chat = _bound_project_chat_id(ctx, task_id, evt.get("parent_task_id"), evt.get("root_task_id"))
+        if task_id and not is_progress and not task_row and not subagent_message_meta(progress_meta, task_id=task_id):
+            try:
+                from ouroboros.task_status import load_effective_task_result
+
+                result = load_effective_task_result(ctx.DRIVE_ROOT, task_id, materialize_artifacts=False)
+                child_meta = subagent_message_meta(result, task_id=task_id)
+                if child_meta:
+                    event_meta = dict(progress_meta or {})
+                    progress_meta = dict(child_meta)
+                    progress_meta.update(event_meta)
+            except Exception:
+                log.debug("final lineage recovery failed for %s", task_id, exc_info=True)
+        meta = progress_meta or {}
+        bound_chat = _bound_project_chat_id(
+            ctx, task_id,
+            meta.get("parent_task_id") or evt.get("parent_task_id"),
+            meta.get("root_task_id") or evt.get("root_task_id"),
+        )
         chat_id = bound_chat or int(evt["chat_id"])
         ctx.send_with_budget(
             chat_id,
