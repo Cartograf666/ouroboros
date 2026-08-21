@@ -519,7 +519,7 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
         bits.push(href ? `
             <div class="harness-signin-actions">
                 <a class="btn btn-primary" data-open-signin href="${href}" target="_blank" rel="noopener">Open sign-in link</a>
-                <button type="button" class="settings-ghost-btn" data-copy-signin-link>Copy link</button>
+                <button type="button" class="btn btn-default" data-copy-signin-link>Copy link</button>
             </div>
         ` : `
             <div class="settings-inline-note" data-tone="error" data-unsafe-signin-link>
@@ -533,7 +533,7 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
                 <div class="harness-device-code">
                     <p>Enter this one-time code on that page:</p>
                     <div class="harness-code" data-device-code>${escapeHtml(disclosure.code)}</div>
-                    <button type="button" class="settings-ghost-btn" data-copy-device-code>Copy code</button>
+                    <button type="button" class="btn btn-default" data-copy-device-code>Copy code</button>
                 </div>
             `);
         }
@@ -566,7 +566,7 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
                 <div class="harness-code-entry-row">
                     <input type="text" id="harness-code-input" data-login-code-input autocomplete="off" spellcheck="false"
                         placeholder="sign-in code" value="${escapeHtml(active.inputValue || '')}"${active.inputSent ? ' disabled' : ''}>
-                    <button type="button" class="settings-ghost-btn" data-login-code-submit${busy ? ' disabled' : ''}>${active.inputBusy ? 'Sending…' : (active.inputSent ? 'Code sent' : 'Submit code')}</button>
+                    <button type="button" class="btn btn-default" data-login-code-submit${busy ? ' disabled' : ''}>${active.inputBusy ? 'Sending…' : (active.inputSent ? 'Code sent' : 'Submit code')}</button>
                 </div>
                 ${active.inputError ? `<div class="settings-inline-note" data-tone="error">${escapeHtml(active.inputError)}</div>` : ''}
                 ${active.inputSent ? `<div class="settings-inline-status" data-tone="muted">${escapeHtml(active.inputNote || 'Code sent — finishing the sign-in…')}</div>` : ''}
@@ -648,7 +648,7 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
                 <p>Continue this sign-in in your own terminal (outside Ouroboros).</p>
                 <p><strong>Command for ${escapeHtml(commandLabel)}:</strong></p>
                 <pre class="harness-attach-command" data-attach-command>${escapeHtml(active.attachCommand)}</pre>
-                <button type="button" class="settings-ghost-btn" data-copy-attach>Copy command</button>
+                <button type="button" class="btn btn-default" data-copy-attach>Copy command</button>
             </div>
         `);
     }
@@ -667,12 +667,12 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
         : 'No sign-in link arrived yet. You can run this in your own terminal (outside Ouroboros) instead; the card follows the progress automatically:'}</p>
                 <p><strong>Command for ${escapeHtml(commandLabel)}:</strong></p>
                 <pre class="harness-attach-command" data-attach-command>${escapeHtml(active.attachCommand)}</pre>
-                <button type="button" class="settings-ghost-btn" data-copy-attach>Copy command</button>
+                <button type="button" class="btn btn-default" data-copy-attach>Copy command</button>
             </details>
         `);
     }
     if (!compact) {
-        bits.push('<button type="button" class="settings-ghost-btn" data-login-dismiss>Close</button>');
+        bits.push('<button type="button" class="btn btn-default" data-login-dismiss>Close</button>');
     }
     bits.push('</div>');
     return bits.join('');

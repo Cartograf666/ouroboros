@@ -325,7 +325,7 @@ export function renderReviewerSlotsSection() {
             <h4 class="reviewer-slots-heading">Triad slots <span class="muted" id="reviewer-triad-limit" title="The commit gate's real ceiling"></span></h4>
             <div id="reviewer-triad-rows" class="reviewer-slot-rows"></div>
             <div class="settings-toolbar">
-                <button type="button" class="settings-ghost-btn" id="btn-add-triad-slot">Add triad slot</button>
+                <button type="button" class="btn btn-default" id="btn-add-triad-slot">Add triad slot</button>
             </div>
             <h4 class="reviewer-slots-heading">Scope slots <span class="muted" id="reviewer-scope-limit" title="The scope pool's real width"></span></h4>
             <div class="settings-inline-note">An agent row reads the repository with its own read-only tools instead of
@@ -333,7 +333,7 @@ export function renderReviewerSlotsSection() {
                 confirmed at 200K or more; Ouroboros does not attest which files the agent opened.</div>
             <div id="reviewer-scope-rows" class="reviewer-slot-rows"></div>
             <div class="settings-toolbar">
-                <button type="button" class="settings-ghost-btn" id="btn-add-scope-slot">Add scope slot</button>
+                <button type="button" class="btn btn-default" id="btn-add-scope-slot">Add scope slot</button>
             </div>
             <h4 class="reviewer-slots-heading">Advisory pre-reviewer</h4>
             <div id="reviewer-advisory-row" class="reviewer-slot-rows"></div>
@@ -391,7 +391,7 @@ function rowHtml(row, group) {
                 ${session ? selectHtml('data-slot-model aria-label="Harness model"', [{ label: '', options: modelOptions }], split.model) : ''}
                 ${session && profileOptions.length > 1 ? selectHtml('data-slot-profile aria-label="Credential account"', [{ label: '', options: profileOptions }], row.route.profile_id || '') : ''}
                 ${effortSelectHtml('data-slot-effort aria-label="Reasoning effort"', row.effort, surfaceDefault)}
-                <button type="button" class="settings-ghost-btn" data-slot-remove title="Remove this slot">Remove</button>
+                <button type="button" class="btn btn-default" data-slot-remove title="Remove this slot">Remove</button>
             </div>
             <div class="reviewer-slot-meta muted"${last ? ` title="${escapeHtml(lastRunMetaTitle(last))}"` : ''}>${escapeHtml(metaParts.join(' · '))}</div>
         </div>

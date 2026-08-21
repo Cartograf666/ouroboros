@@ -28,10 +28,14 @@ function fillCatalogDatalist(items) {
     broadcastCatalog(items);
 }
 
-export async function refreshModelCatalog() {
+export async function refreshModelCatalog({ button } = {}) {
     const refreshSeq = ++catalogRefreshSeq;
     const statusEl = document.getElementById('settings-model-catalog-status');
     setCatalogStatus(statusEl, 'Refreshing model catalog...', 'muted');
+    if (button) {
+        button.disabled = true;
+        button.setAttribute('aria-busy', 'true');
+    }
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), MODEL_CATALOG_TIMEOUT_MS);
 
@@ -84,5 +88,9 @@ export async function refreshModelCatalog() {
         return { items: [], errors: [{ provider_id: 'catalog', error: String(message) }] };
     } finally {
         clearTimeout(timeoutId);
+        if (button && refreshSeq === catalogRefreshSeq) {
+            button.disabled = false;
+            button.removeAttribute('aria-busy');
+        }
     }
 }

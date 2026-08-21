@@ -382,8 +382,8 @@ export function availableSubagentRowMarkup(row, state, index = 0) {
             </div>
             <div class="available-subagent-meta">${escapeHtml(meta)}</div>
             <div class="available-subagent-actions">
-                <button type="button" class="settings-ghost-btn" data-subagent-duplicate aria-label="Duplicate Subagent ${ordinal}">Duplicate</button>
-                <button type="button" class="settings-ghost-btn" data-subagent-remove aria-label="Remove Subagent ${ordinal}">Remove</button>
+                <button type="button" class="btn btn-default" data-subagent-duplicate aria-label="Duplicate Subagent ${ordinal}">Duplicate</button>
+                <button type="button" class="btn btn-default" data-subagent-remove aria-label="Remove Subagent ${ordinal}">Remove</button>
             </div>
         </article>`;
 }
@@ -578,7 +578,7 @@ export function createAvailableSubagentsEditor({
                     Enabled
                 </label>
                 <span class="available-subagents-count">${state.setting.items.length}/${MAX_AVAILABLE_SUBAGENTS}</span>
-                <button type="button" class="settings-ghost-btn" data-subagent-add
+                <button type="button" class="btn btn-default" data-subagent-add
                     ${!state.loaded || state.setting.items.length >= MAX_AVAILABLE_SUBAGENTS ? 'disabled' : ''}>Add subagent</button>
             </div>
             <div class="available-subagents-source">${escapeHtml([source, readProblem].filter(Boolean).join(' '))}</div>

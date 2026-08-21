@@ -59,8 +59,8 @@ function secretField({ id, settingKey, label, placeholder }) {
             <label>${label}</label>
             <div class="secret-input-row">
                 <input id="${id}" data-secret-setting="${settingKey}" class="secret-input" type="password" placeholder="${placeholder}">
-                <button type="button" class="settings-ghost-btn secret-toggle" data-target="${id}">Show</button>
-                <button type="button" class="settings-ghost-btn secret-clear" data-target="${id}">Clear</button>
+                <button type="button" class="btn btn-default secret-toggle" data-target="${id}">Show</button>
+                <button type="button" class="btn btn-default secret-clear" data-target="${id}">Clear</button>
             </div>
         </div>
     `;
@@ -149,9 +149,9 @@ const PROVIDER_CARDS = [
         testProvider: 'anthropic', testInputs: { 's-anthropic': 'ANTHROPIC_API_KEY' },
         note: 'Use model values like <code>anthropic::claude-sonnet-5</code> in the Models tab to route models directly through Anthropic. Claude tooling still reuses this key.',
         extra: `
-            <div class="settings-toolbar" id="settings-claude-code-panel" hidden>
-                <button type="button" class="settings-ghost-btn" id="btn-claude-code-install">Repair Runtime</button>
-                <span id="settings-claude-code-status" class="settings-inline-status">Checking Claude runtime...</span>
+            <div class="settings-action-row" id="settings-claude-code-panel" hidden>
+                <span id="settings-claude-code-status" class="settings-inline-status" role="status" aria-live="polite" aria-atomic="true">Checking Claude runtime...</span>
+                <button type="button" class="btn btn-default" id="btn-claude-code-install">Repair Runtime</button>
             </div>
             <div class="settings-inline-note" id="settings-claude-code-copy" hidden>Claude runtime powers the advisory pre-review on the API route. It is managed automatically by the app.</div>
         `,
@@ -169,9 +169,9 @@ function providerSettingsCard(spec) {
         .map((field) => field.settingKey ? secretField(field) : plainField(field))
         .join('');
     const test = spec.testProvider ? `
-            <div class="settings-toolbar">
-                <button type="button" class="settings-ghost-btn" data-provider-test="${spec.testProvider}" title="Sends one short model request. Provider charges may apply.">Test</button>
-                <span class="settings-inline-status" data-provider-test-status="${spec.testProvider}"></span>
+            <div class="settings-action-row">
+                <span class="settings-inline-status" data-provider-test-status="${spec.testProvider}" role="status" aria-live="polite" aria-atomic="true"></span>
+                <button type="button" class="btn btn-default" data-provider-test="${spec.testProvider}" title="Sends one short model request. Provider charges may apply.">Test</button>
             </div>
         ` : '';
     return providerCard({
@@ -369,9 +369,9 @@ export function renderSettingsPage() {
                             These fields are cloud model IDs. Enable <code>Local</code> to route that model
                             through the GGUF server configured in Advanced.
                         </div>
-                        <div class="settings-toolbar">
-                            <button type="button" class="settings-ghost-btn" id="btn-refresh-model-catalog">Refresh Model Catalog</button>
-                            <span id="settings-model-catalog-status" class="settings-inline-status">Model catalog is optional and failure-tolerant.</span>
+                        <div class="settings-action-row">
+                            <span id="settings-model-catalog-status" class="settings-inline-status" role="status" aria-live="polite" aria-atomic="true">Model catalog is optional and failure-tolerant.</span>
+                            <button type="button" class="btn btn-default" id="btn-refresh-model-catalog">Refresh Model Catalog</button>
                         </div>
                         <div class="settings-model-grid">
                             ${MODEL_CARDS.map(([title, copy, inputId, toggleId, defaultValue]) => modelCard({ title, copy, inputId, toggleId, defaultValue })).join('')}
