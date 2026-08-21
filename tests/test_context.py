@@ -791,7 +791,7 @@ class TestAdvisoryReviewStatusInContext:
         assert "third evidence" in dynamic_text
 
 
-def test_runtime_section_includes_improvement_backlog_digest(tmp_path):
+def test_improvement_backlog_digest_is_actor_scoped(tmp_path):
     from ouroboros.context import build_llm_messages
     from ouroboros.memory import Memory
 
@@ -832,14 +832,24 @@ def test_runtime_section_includes_improvement_backlog_digest(tmp_path):
         encoding="utf-8",
     )
 
-    messages, _ = build_llm_messages(
-        env=FakeEnv(),
-        memory=Memory(drive_root=tmp_path),
-        task={"id": "task-a", "type": "task", "text": "hello"},
-    )
-    dynamic_text = messages[0]["content"][2]["text"]
-    assert "## Improvement Backlog" in dynamic_text
-    assert "Reduce recurring task friction around REVIEW_BLOCKED" in dynamic_text
+    ordinary = ({"id": "main", "type": "task", "_is_direct_chat": True},
+                {"id": "project", "type": "task", "project_id": "p1"},
+                {"id": "managed", "type": "task"},
+                {"id": "child", "type": "task", "delegation_role": "subagent"})
+    for task in ordinary:
+        task["text"] = "hello"
+        messages, _ = build_llm_messages(
+            env=FakeEnv(), memory=Memory(drive_root=tmp_path), task=task,
+        )
+        assert "## Improvement Backlog" not in messages[0]["content"][2]["text"]
+
+    for task_type in ("evolution", "deep_self_review"):
+        messages, _ = build_llm_messages(
+            env=FakeEnv(), memory=Memory(drive_root=tmp_path),
+            task={"id": task_type, "type": task_type, "text": "improve"})
+        dynamic_text = messages[0]["content"][2]["text"]
+        assert "## Improvement Backlog" in dynamic_text
+        assert "Reduce recurring task friction around REVIEW_BLOCKED" in dynamic_text
 
 
 class TestRuntimeEnvSection:

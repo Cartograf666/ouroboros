@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import logging
 import os
@@ -73,6 +74,8 @@ class BackgroundConsciousness:
         self._observations: queue.Queue = queue.Queue(maxsize=100)
         self._deferred_events: list = []
         self._tool_executor = StatefulToolExecutor()
+        self._identity_source_requirements: Dict[str, pathlib.Path] = {}
+        self._identity_source_reads: Dict[str, str] = {}
 
         self._bg_spent_usd: float = 0.0
         self._bg_budget_pct: float = float(
@@ -527,6 +530,10 @@ class BackgroundConsciousness:
         env = Env(repo_dir=self._repo_dir, drive_root=self._drive_root)
         memory = Memory(drive_root=self._drive_root, repo_dir=self._repo_dir)
         bg_task = {"id": "bg-consciousness", "type": "consciousness"}
+        # Per-cycle proof only.  A read from an older decision envelope cannot
+        # authorize a later identity rewrite after the source changed.
+        self._identity_source_requirements = {}
+        self._identity_source_reads = {}
 
         parts = [self._load_bg_prompt()]
 
@@ -547,12 +554,43 @@ class BackgroundConsciousness:
         )
 
         try:
-            from ouroboros.improvement_backlog import format_backlog_digest
+            from ouroboros.improvement_backlog import (
+                backlog_path, format_backlog_digest, load_backlog_items,
+            )
 
+            full_backlog_digest = format_backlog_digest(
+                self._drive_root, limit=8, max_chars=2_147_483_647,
+            )
             backlog_digest = format_backlog_digest(self._drive_root, limit=8, max_chars=4000)
             if backlog_digest:
+                open_items = [
+                    item for item in load_backlog_items(self._drive_root)
+                    if str(item.get("status") or "open").lower() == "open"
+                ]
+                if len(open_items) > 8 or backlog_digest != full_backlog_digest:
+                    self._identity_source_requirements["improvement-backlog"] = backlog_path(
+                        self._drive_root
+                    )
+                    backlog_digest += (
+                        "\n- complete_source: call knowledge_read(topic=\"improvement-backlog\") "
+                        "and receive the complete current record before update_identity; "
+                        "if unavailable, abstain from that rewrite"
+                    )
                 parts.append(backlog_digest)
         except Exception:
+            try:
+                from ouroboros.improvement_backlog import backlog_path
+
+                path = backlog_path(self._drive_root)
+                if path.exists():
+                    self._identity_source_requirements["improvement-backlog"] = path
+                    parts.append(
+                        "## Improvement Backlog — source unavailable\n\n"
+                        "The named current source could not be materialized. "
+                        "Abstain from update_identity in this cycle."
+                    )
+            except Exception:
+                pass
             log.debug("Failed to include improvement backlog in consciousness context", exc_info=True)
 
         health_section = build_health_invariants(env)
@@ -669,6 +707,23 @@ class BackgroundConsciousness:
         except (json.JSONDecodeError, ValueError):
             return "Failed to parse arguments."
 
+        if fn_name == "update_identity":
+            pending = []
+            for topic, path in self._identity_source_requirements.items():
+                try:
+                    current_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+                except Exception:
+                    current_sha = ""
+                if not current_sha or self._identity_source_reads.get(topic) != current_sha:
+                    pending.append(topic)
+            if pending:
+                return (
+                    "⚠️ IDENTITY_UPDATE_ABSTAINED: direct update_identity authority remains "
+                    "available, but this decision envelope omitted named source(s) that are "
+                    "not completely materialized in this cycle: " + ", ".join(sorted(pending))
+                    + ". Read each complete current source with its existing reader, or abstain."
+                )
+
         self._emit_live_log(
             "tool_call_started",
             tool=fn_name,
@@ -744,6 +799,24 @@ class BackgroundConsciousness:
             tool_name=fn_name,
             tool_args=args if isinstance(args, dict) else {},
         )
+
+        if (
+            fn_name == "knowledge_read"
+            and error is None
+            and not timed_out
+            and isinstance(args, dict)
+        ):
+            topic = str(args.get("topic") or "").strip()
+            path = self._identity_source_requirements.get(topic)
+            if path is not None:
+                try:
+                    current = path.read_text(encoding="utf-8")
+                    if str(result) == current and result_str == current:
+                        self._identity_source_reads[topic] = hashlib.sha256(
+                            current.encode("utf-8")
+                        ).hexdigest()
+                except Exception:
+                    pass
 
         args_for_log = sanitize_tool_args_for_log(fn_name, args)
         if error is None and result is not None and not timed_out:

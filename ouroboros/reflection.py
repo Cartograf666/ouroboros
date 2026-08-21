@@ -665,21 +665,11 @@ def _update_patterns(drive_root: pathlib.Path, entry: Dict[str, Any]) -> None:
     else:
         current = _PATTERNS_HEADER
 
-    # The register is bounded by the prompt contract (max 20 rows), which fits
-    # well under this cap — the old 3000-char cut fed the LLM a PARTIAL table
-    # and the full-replace write then dropped every unseen row (memory loss).
-    # The cap remains only as a backstop against a pathologically bloated file.
-    _register_cap = 16_000
-    current_truncated = _truncate_with_notice(current, _register_cap)
     prompt = _PATTERNS_PROMPT.format(
-        current_patterns=(
-            current_truncated
-            + (
-                "\n\n[IMPORTANT: The current register was compacted for prompt size. "
-                "Preserve existing rows unless you are intentionally merging or updating them.]"
-                if len(current) > _register_cap else ""
-            )
-        ),
+        # This call replaces the whole file, so its decision input must be the
+        # complete current register.  Provider overflow/error is handled by the
+        # caller as an abstention; a prefix can never authorize the rewrite.
+        current_patterns=current,
         goal=_truncate_with_notice(entry.get("goal", "?"), 200),
         markers=", ".join(entry.get("key_markers", [])),
         reflection=_truncate_with_notice(entry.get("reflection", ""), 500),
@@ -713,6 +703,17 @@ def _update_patterns(drive_root: pathlib.Path, entry: Dict[str, Any]) -> None:
 
     if not updated.startswith("#"):
         updated = "# Pattern Register\n\n" + updated
+
+    # The lock-free LLM call may race another reflection.  That makes the prompt
+    # source stale/incomplete, so preserve the newer register for the next pass.
+    try:
+        latest = patterns_path.read_text(encoding="utf-8") if patterns_path.exists() else _PATTERNS_HEADER
+    except Exception:
+        log.warning("Pattern register source became unavailable; preserving it")
+        return
+    if latest != current:
+        log.info("Pattern register changed during update; preserving the newer source")
+        return
 
     append_jsonl(drive_root / "memory" / "knowledge" / "patterns_history.jsonl", {
         "ts": utc_now_iso(),

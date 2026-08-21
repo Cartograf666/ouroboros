@@ -1468,7 +1468,7 @@ def _capture_context_core(
         from ouroboros.improvement_backlog import format_backlog_digest
 
         backlog_digest = format_backlog_digest(canonical_root)
-        if backlog_digest:
+        if backlog_digest and str(task.get("type") or "") in {"evolution", "deep_self_review"}:
             dynamic_parts.append(backlog_digest)
     except Exception:
         log.debug("Failed to build improvement backlog digest", exc_info=True)

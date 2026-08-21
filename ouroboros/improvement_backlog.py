@@ -235,13 +235,19 @@ def _semantic_redirect_fingerprints(
 
     out: List[Dict[str, Any]] = []
     for item in items:
-        summary = _sanitize(item.get("summary", ""), 260)
+        raw_summary = str(item.get("summary") or "")
+        raw_category = str(item.get("category") or "process")
+        raw_source = str(item.get("source") or "task")
+        summary = _sanitize(raw_summary, 260)
         if not summary:
             out.append(item)
             continue
-        category = _sanitize(item.get("category", "process"), 60) or "process"
-        source = _sanitize(item.get("source", "task"), 60) or "task"
-        fingerprint = str(item.get("fingerprint") or _stable_fingerprint(summary, category, source))
+        category = _sanitize(raw_category, 60) or "process"
+        source = _sanitize(raw_source, 60) or "task"
+        fingerprint = str(
+            item.get("fingerprint")
+            or _stable_fingerprint(raw_summary, raw_category, raw_source)
+        )
         if fingerprint in existing_fps:
             out.append(item)  # exact hit — the locked pass bumps it, no LLM needed
             continue
@@ -292,12 +298,18 @@ def append_backlog_items(drive_root: Any, items: List[Dict[str, Any]]) -> int:
         changed = 0
 
         for item in items:
-            summary = _sanitize(item.get("summary", ""), 260)
+            raw_summary = str(item.get("summary") or "")
+            raw_category = str(item.get("category") or "process")
+            raw_source = str(item.get("source") or "task")
+            summary = _sanitize(raw_summary, 260)
             if not summary:
                 continue
-            category = _sanitize(item.get("category", "process"), 60) or "process"
-            source = _sanitize(item.get("source", "task"), 60) or "task"
-            fingerprint = str(item.get("fingerprint") or _stable_fingerprint(summary, category, source))
+            category = _sanitize(raw_category, 60) or "process"
+            source = _sanitize(raw_source, 60) or "task"
+            fingerprint = str(
+                item.get("fingerprint")
+                or _stable_fingerprint(raw_summary, raw_category, raw_source)
+            )
             if fingerprint in fp_to_key:
                 ex = by_key[fp_to_key[fingerprint]]
                 ex["count"] = str(_count_of(ex) + 1)
@@ -379,10 +391,13 @@ def merge_backlog_text(drive_root: Any, text: str) -> int:
         existing_fps = set()
     fresh: List[Dict[str, Any]] = []
     for it in items:
-        summary = _sanitize(it.get("summary", ""), 260)
-        category = _sanitize(it.get("category", "process"), 60) or "process"
-        source = _sanitize(it.get("source", "task"), 60) or "task"
-        fingerprint = str(it.get("fingerprint") or _stable_fingerprint(summary, category, source))
+        raw_summary = str(it.get("summary") or "")
+        raw_category = str(it.get("category") or "process")
+        raw_source = str(it.get("source") or "task")
+        fingerprint = str(
+            it.get("fingerprint")
+            or _stable_fingerprint(raw_summary, raw_category, raw_source)
+        )
         if fingerprint in existing_fps:
             continue
         fresh.append(it)
@@ -497,8 +512,11 @@ def groom_backlog(drive_root: Any, *, cap: int = _GROOM_CAP) -> int:
     path = backlog_path(drive_root)
     if not path.exists():
         return 0
-    with _locked_text_file(path, mode="r", shared=True) as fh:
-        snapshot_text = fh.read()
+    try:
+        with _locked_text_file(path, mode="r", shared=True) as fh:
+            snapshot_text = fh.read()
+    except Exception:
+        return 0
     items = _parse_backlog_items(snapshot_text)
     if len(items) <= cap:
         return 0
@@ -514,16 +532,12 @@ def groom_backlog(drive_root: Any, *, cap: int = _GROOM_CAP) -> int:
         from ouroboros.llm import LLMClient
         from ouroboros.llm_observability import chat_observed
 
-        compact = [
-            {
-                k: it.get(k, "")
-                for k in ("id", "status", "priority", "kind", "summary", "category",
-                          "source", "task_id", "requires_plan_review", "count",
-                          "created_at", "fingerprint")
-            }
-            for it in fp_items
-        ]
-        prompt = _GROOM_PROMPT.format(cap=cap, items_json=_json.dumps(compact, ensure_ascii=False))
+        # One destructive grooming call sees every complete stored record,
+        # including evidence/context/custom fields and immutable manual items.
+        # If this full prompt cannot be served, the exception path preserves the
+        # file; there is no smaller second call or prefix-authorized rewrite.
+        complete = [dict(it) for it in items]
+        prompt = _GROOM_PROMPT.format(cap=cap, items_json=_json.dumps(complete, ensure_ascii=False))
         client = LLMClient()
         resp, usage = chat_observed(
             client,
