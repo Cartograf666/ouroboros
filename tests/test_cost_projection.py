@@ -28,6 +28,14 @@ class TestAliases:
         out = with_cost_aliases({"cost_usd": None, "accounted_upper_bound_usd": 9.0})
         assert out["accounted_upper_bound_usd"] is None and out["cost_usd"] is None
 
+    def test_unknown_zero_is_not_reintroduced_by_aliasing(self):
+        out = with_cost_aliases({
+            "cost_usd": 0.0, "unknown_unmetered": 1,
+            "cost_final": False,
+        })
+        assert out["cost_usd"] is None
+        assert out["accounted_upper_bound_usd"] is None
+
     def test_aliasing_never_invents_a_field(self):
         assert "cost_usd" not in with_cost_aliases({"total_rounds": 3})
         assert with_cost_aliases(None) == {}
@@ -56,6 +64,14 @@ class TestProjection:
         assert out["accounted_upper_bound_usd"] is None
         assert out["cost_known"] is False
         assert out["cost_final"] is False
+
+    def test_unknown_zero_source_cost_projects_as_null(self):
+        out = cost_projection({
+            "cost_usd": 0.0, "unknown_unmetered": 1,
+            "cost_final": False,
+        })
+        assert out["cost_usd"] is None
+        assert out["cost_known"] is False
 
     def test_missing_key_default_never_fabricates_zero(self):
         # The exact $0-fabrication class: data.get("cost_usd", 0) at five sites.

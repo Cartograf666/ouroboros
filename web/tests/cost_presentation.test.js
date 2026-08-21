@@ -8,7 +8,7 @@ import {
     taskCostMeta,
     taskCostProjection,
 } from '../modules/chat.js';
-import { costDashboardPresentation } from '../modules/costs.js';
+import { costBucketPresentation, costDashboardPresentation } from '../modules/costs.js';
 import { summarizeLogEvent } from '../modules/log_events.js';
 import {
     accountedUpperBound,
@@ -97,6 +97,12 @@ test('unknown zero-dollar accounting stays pending instead of becoming free', ()
         cost_accounting_status: 'available',
         cost_final: false,
         cost_with_children_partial: true,
+        unknown_unmetered: 1,
+    }), ['cost pending', 'unmetered=1']);
+    assert.deepEqual(taskCostMeta({
+        cost_usd: 0,
+        cost_accounting_status: 'available',
+        cost_final: false,
         unknown_unmetered: 1,
     }), ['cost pending', 'unmetered=1']);
 });
@@ -235,6 +241,21 @@ test('cost dashboard distinguishes loading, unavailable, pending, and final zero
         ...base,
         accounting: { ...base.accounting, accounted_usd: null },
     }).state, 'unavailable');
+});
+
+test('legacy breakdown buckets disclose unknown and pending zero amounts', () => {
+    assert.equal(costBucketPresentation({
+        cost: 0, calls: 1, unknown_unmetered: 1, non_final_rows: 1, cost_final: false,
+    }), 'cost pending (unmetered=1)');
+    assert.equal(costBucketPresentation({
+        cost: 0, calls: 1, unknown_unmetered: 0, non_final_rows: 1, cost_final: false,
+    }), 'cost pending');
+    assert.equal(costBucketPresentation({
+        cost: 0.25, calls: 2, unknown_unmetered: 1, non_final_rows: 1, cost_final: false,
+    }), '$0.25 (pending, unmetered=1)');
+    assert.equal(costBucketPresentation({
+        cost: 0, calls: 1, unknown_unmetered: 0, non_final_rows: 0, cost_final: true,
+    }), '$0.00');
 });
 
 test('an unavailable snapshot is sticky but never pins the card (v6.82 r2)', () => {

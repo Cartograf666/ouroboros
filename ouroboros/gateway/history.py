@@ -108,6 +108,11 @@ def _compat_cost_bucket(bucket: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "cost": round(float(bucket.get("settled_usd") or 0.0), 6),
         "calls": int(bucket.get("physical_calls") or 0),
+        # Keep the compatibility tables honest about rows whose settled dollar
+        # amount is zero but whose accounting is still open or undisclosed.
+        "unknown_unmetered": int(bucket.get("unknown_unmetered") or 0),
+        "non_final_rows": int(bucket.get("non_final_rows") or 0),
+        "cost_final": bool(bucket.get("cost_final")),
         "prompt_tokens": int(bucket.get("prompt_tokens") or 0),
         "completion_tokens": int(bucket.get("completion_tokens") or 0),
         "cached_tokens": int(bucket.get("cached_tokens") or 0),
@@ -137,10 +142,12 @@ def _compat_cost_groups(
             continue
         target = result[key]
         for field in (
-            "cost", "calls", "prompt_tokens", "completion_tokens",
+            "cost", "calls", "unknown_unmetered", "non_final_rows",
+            "prompt_tokens", "completion_tokens",
             "cached_tokens", "cache_write_tokens",
         ):
             target[field] += source[field]
+        target["cost_final"] = target["cost_final"] and source["cost_final"]
         for ttl, count in source["prompt_cache_ttls"].items():
             target["prompt_cache_ttls"][ttl] = int(target["prompt_cache_ttls"].get(ttl, 0)) + int(count)
     if (

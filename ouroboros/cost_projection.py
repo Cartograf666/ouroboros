@@ -107,6 +107,19 @@ def resolve_cost_pair(source: Optional[Mapping[str, Any]], new: str, old: str) -
     return False, None
 
 
+def honest_cost_pair_amount(
+    source: Optional[Mapping[str, Any]], new: str, old: str,
+) -> tuple[bool, Optional[float]]:
+    """Resolve one cost pair and apply the shared unknown-zero rule."""
+    src = source if isinstance(source, Mapping) else {}
+    present, raw = resolve_cost_pair(src, new, old)
+    if not present:
+        return False, None
+    probe = dict(src)
+    probe["accounted_usd"] = raw
+    return True, honest_accounted_amount(probe)
+
+
 def with_cost_aliases(fields: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     """A COPY of ``fields`` with each additive/deprecated cost name mirrored.
 
@@ -120,7 +133,7 @@ def with_cost_aliases(fields: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     """
     out = dict(fields or {})
     for new, old in COST_ALIAS_PAIRS:
-        present, value = resolve_cost_pair(out, new, old)
+        present, value = honest_cost_pair_amount(out, new, old)
         if present:
             out[new] = value
             out[old] = value
@@ -138,7 +151,7 @@ def carry_cost_meta(source: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     src = source if isinstance(source, Mapping) else {}
     out: Dict[str, Any] = {}
     for new, old in COST_ALIAS_PAIRS:
-        present, value = resolve_cost_pair(src, new, old)
+        present, value = honest_cost_pair_amount(src, new, old)
         if present:
             out[new] = value
             out[old] = value
@@ -220,16 +233,15 @@ def cost_projection(source: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     openness flag the source has.
     """
     src = source if isinstance(source, Mapping) else {}
-    amount = _as_amount(resolve_cost_pair(src, *COST_ALIAS_PAIRS[0])[1])
+    _, amount = honest_cost_pair_amount(src, *COST_ALIAS_PAIRS[0])
     out: Dict[str, Any] = {
         "accounted_upper_bound_usd": amount,
         "cost_usd": amount,
         "cost_known": amount is not None,
         "cost_final": bool(src.get("cost_final")) and amount is not None,
     }
-    present, raw_with_children = resolve_cost_pair(src, *COST_ALIAS_PAIRS[1])
+    present, with_children = honest_cost_pair_amount(src, *COST_ALIAS_PAIRS[1])
     if present:
-        with_children = _as_amount(raw_with_children)
         out["accounted_upper_bound_usd_with_children"] = with_children
         out["cost_usd_with_children"] = with_children
     for key in COST_OPENNESS_FIELDS:
@@ -261,6 +273,7 @@ __all__ = [
     "carry_cost_meta",
     "cost_display",
     "cost_projection",
+    "honest_cost_pair_amount",
     "honest_accounted_amount",
     "live_root_cost_projection",
     "resolve_cost_pair",

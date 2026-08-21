@@ -20,6 +20,20 @@ function optionalFiniteNumber(value) {
     return Number.isFinite(number) ? number : null;
 }
 
+/** Render one legacy breakdown bucket without turning an open zero into free. */
+export function costBucketPresentation(info) {
+    const cost = optionalFiniteNumber(info?.cost);
+    if (cost === null) return 'unknown';
+    const unknown = optionalFiniteNumber(info?.unknown_unmetered) || 0;
+    const nonFinalRows = optionalFiniteNumber(info?.non_final_rows) || 0;
+    const pending = info?.cost_final === false || nonFinalRows > 0 || unknown > 0;
+    if (!pending) return formatUsd2(cost);
+    const unknownLabel = unknown > 0 ? `unmetered=${Math.trunc(unknown)}` : '';
+    const details = [unknownLabel].filter(Boolean).join(', ');
+    if (cost === 0) return details ? `cost pending (${details})` : 'cost pending';
+    return details ? `${formatUsd2(cost)} (pending, ${details})` : `${formatUsd2(cost)} (pending)`;
+}
+
 /** Pure cost-dashboard projection: null/unavailable never renders as $0. */
 export function costDashboardPresentation(data) {
     if (!data) return { state: 'loading' };
@@ -137,7 +151,7 @@ export function initCosts({ state, mount }) {
             tr.append(
                 cell('cost-cell-name', name, { title: name }),
                 cell('cost-cell-right', info.calls),
-                cell('cost-cell-right', formatUsd2(info.cost)),
+                cell('cost-cell-right', costBucketPresentation(info)),
                 tdBar,
             );
             tbody.appendChild(tr);

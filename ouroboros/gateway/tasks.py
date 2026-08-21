@@ -837,13 +837,14 @@ def _task_cost_breakdown_view(drive_root: pathlib.Path, result: Dict[str, Any]) 
     if not task_id or root_id != task_id:
         return None
     try:
+        from ouroboros.cost_projection import honest_accounted_amount
         from ouroboros.usage_accounting import usage_breakdown
 
         breakdown = usage_breakdown(drive_root, root_task_id=root_id)
     except Exception:
         log.debug("cost breakdown view unavailable for %s", task_id, exc_info=True)
         return None
-    subtree = breakdown.get("accounted_usd")
+    subtree = honest_accounted_amount(breakdown)
     counts = breakdown.get("attempt_counts")
     counts = counts if isinstance(counts, dict) else {}
     # `metadata_only` is a count of AMBIGUOUS legacy calls carrying no money, so
