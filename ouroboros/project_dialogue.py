@@ -465,6 +465,23 @@ def _append_terminal_task_projection(
         existing_marker = current.get("canonical_terminal_projection")
         if isinstance(existing_marker, dict) and str(existing_marker.get("summary_id") or "") == summary_id:
             return {"status": str(current.get("status") or status)}
+        checkpoint = current.get("root_phase_checkpoint")
+        post_task_phase = (
+            str(checkpoint.get("post_task_synthesis") or "")
+            if isinstance(checkpoint, dict) else ""
+        )
+        if is_root and post_task_phase in {"pending_once", "running"}:
+            ready = current.get("canonical_terminal_projection_ready")
+            if isinstance(ready, dict) and str(ready.get("summary_id") or "") == summary_id:
+                return {"status": str(current.get("status") or status)}
+            return {
+                "status": str(current.get("status") or status),
+                "canonical_terminal_projection_ready": {
+                    "summary_id": summary_id,
+                    "task_done_ts": str(event.get("ts") or utc_now_iso()),
+                    "chat_id": int(event.get("chat_id") or task.get("chat_id") or 0),
+                },
+            }
         effective = {**result, **current}
         project_id = resolve_project_id({**task, **effective})
         role = str(effective.get("role") or task.get("role") or ("root" if is_root else "child"))
@@ -505,6 +522,7 @@ def _append_terminal_task_projection(
                 "summary_id": summary_id, "summary_kind": summary_kind,
                 "written_at": row["ts"],
             },
+            "canonical_terminal_projection_ready": None,
         }
 
     write_task_result(

@@ -244,8 +244,16 @@ def test_terminal_projection_dedup_does_not_lose_concurrent_chat_append(tmp_path
 
 
 def test_terminal_root_fallback_covers_cancel_without_preempting_open_synthesis(tmp_path):
+    from types import SimpleNamespace
+
+    from ouroboros.post_task_checkpoint import set_root_post_task_checkpoint
     from ouroboros.project_dialogue import append_terminal_task_projection
-    from ouroboros.task_results import STATUS_CANCELLED, STATUS_COMPLETED, write_task_result
+    from ouroboros.task_results import (
+        STATUS_CANCELLED,
+        STATUS_COMPLETED,
+        load_task_result,
+        write_task_result,
+    )
 
     cancelled = write_task_result(
         tmp_path, "cancelled-root", STATUS_CANCELLED,
@@ -264,17 +272,29 @@ def test_terminal_root_fallback_covers_cancel_without_preempting_open_synthesis(
         root_task_id="normal-root",
         root_phase_checkpoint={"post_task_synthesis": "running"},
     )
-    assert append_terminal_task_projection(
+    assert not append_terminal_task_projection(
         tmp_path, "normal-root", {}, pending,
         {"chat_id": 1, "status": "completed"},
     )
+    assert not any(row.get("task_id") == "normal-root" for row in _chat_rows(tmp_path))
+    assert load_task_result(tmp_path, "normal-root")["canonical_terminal_projection_ready"]["summary_id"] == "task-terminal:normal-root"
+    set_root_post_task_checkpoint(
+        SimpleNamespace(drive_root=tmp_path),
+        {"id": "normal-root", "root_task_id": "normal-root", "chat_id": 1},
+        "completed",
+    )
     normal = next(row for row in _chat_rows(tmp_path) if row.get("task_id") == "normal-root")
     assert normal["summary_kind"] == "terminal_root_projection"
+    assert normal["outcome"] == "Completed"
+    assert normal["outcome_final"] is True
 
 
 def test_running_async_root_truth_survives_restart_degradation_once(tmp_path):
     from ouroboros.agent_task_pipeline import recover_pending_root_post_task_synthesis
-    from ouroboros.project_dialogue import append_terminal_task_projection
+    from ouroboros.project_dialogue import (
+        append_terminal_task_projection,
+        completion_status_label,
+    )
     from ouroboros.task_results import STATUS_COMPLETED, load_task_result, write_task_result
 
     running = write_task_result(
@@ -282,17 +302,22 @@ def test_running_async_root_truth_survives_restart_degradation_once(tmp_path):
         root_task_id="restart-root", result="Owner already received the answer",
         root_phase_checkpoint={"post_task_synthesis": "running"},
     )
-    assert append_terminal_task_projection(
+    assert not append_terminal_task_projection(
         tmp_path, "restart-root", {}, running,
         {"chat_id": 1, "status": "completed"},
     )
+    assert not any(row.get("task_id") == "restart-root" for row in _chat_rows(tmp_path))
     assert recover_pending_root_post_task_synthesis(tmp_path, repo_dir=tmp_path / "repo") == 1
 
     stored = load_task_result(tmp_path, "restart-root")
     assert stored["root_phase_checkpoint"]["post_task_synthesis"] == "degraded"
     rows = [row for row in _chat_rows(tmp_path) if row.get("task_id") == "restart-root"]
     assert len(rows) == 1
+    assert rows[0]["outcome"] == "Completed with limitations"
+    assert rows[0]["outcome"] == completion_status_label(stored, {})
     assert rows[0]["outcome_final"] is True
+    assert recover_pending_root_post_task_synthesis(tmp_path, repo_dir=tmp_path / "repo") == 0
+    assert len([row for row in _chat_rows(tmp_path) if row.get("task_id") == "restart-root"]) == 1
 
 
 def test_authored_narrative_never_suppresses_final_artifact_failure_truth(tmp_path):
