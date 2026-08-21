@@ -299,10 +299,18 @@ def test_chat_scrolls_to_bottom_after_first_history_load():
     # keep JS unit tests green (they exercise the exported helper directly).
     assert "insertTimelineNode(messagesDiv, node, typing" in source, \
         "insertMessageNode must route through chronological insertTimelineNode"
-    # Media producers (photo, video, document) must each stamp sortable
-    # data-ts from the raw source timestamp; text bubbles stamp msg.ts.
-    assert source.count("stampNodeTimestamp(bubble, rawTs);") >= 3, \
-        "photo/video/document bubbles must carry raw-timestamp data-ts"
+    # The shared photo/video builder and the separate document builder must
+    # each stamp sortable data-ts from the raw source timestamp.
+    media_builder = source.split("function buildMediaBubble", 1)[1].split(
+        "function appendMediaBubble", 1
+    )[0]
+    document_builder = source.split("function buildDocumentBubble", 1)[1].split(
+        "function documentMessageKey", 1
+    )[0]
+    assert "stampNodeTimestamp(bubble, rawTs);" in media_builder, \
+        "shared photo/video bubbles must carry raw-timestamp data-ts"
+    assert "stampNodeTimestamp(bubble, rawTs);" in document_builder, \
+        "document bubbles must carry raw-timestamp data-ts"
     assert "stampNodeTimestamp(bubble, ts);" in source, \
         "chat text bubbles must carry raw-timestamp data-ts"
 

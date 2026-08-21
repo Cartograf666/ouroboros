@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import mimetypes
 import pathlib
+import re
 import shutil
 import uuid
 import zipfile
@@ -12,7 +13,7 @@ from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, Dict, Iterable, List, Optional, Union
 
-from ouroboros.utils import atomic_write_json, read_json_dict
+from ouroboros.utils import atomic_write_json, read_json_dict, write_bytes_atomic
 from ouroboros.headless import ARTIFACT_STATUS_READY, SCRATCH_MANIFEST_NAME, task_artifacts_dir
 from ouroboros.task_results import validate_task_id
 
@@ -35,6 +36,18 @@ _MAX_SCRATCH_PATHS = 1000
 # deliverables — collect_task_artifact_records excludes it). Bounds keep one task
 # from importing an unbounded amount of host data.
 _ATTACHMENTS_SUBDIR = "attachments"
+_CHAT_MEDIA_SUBDIR = "chat_media"
+_CHAT_MEDIA_EXTENSIONS = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "video/mp4": "mp4",
+    "video/webm": "webm",
+}
+_CHAT_MEDIA_NAME_RE = re.compile(
+    r"^chat-media-[0-9a-f]{64}\.(png|jpg|gif|webp|mp4|webm)$"
+)
 _MAX_STAGED_ATTACHMENTS = 25
 _MAX_STAGED_ATTACHMENT_BYTES = 50 * 1024 * 1024  # ~50 MB per file
 
@@ -230,6 +243,60 @@ def task_artifact_dir_path(drive_root: Union[pathlib.Path, str], task_id: str, *
     """Return the task artifact directory without creating it unless requested."""
 
     return task_artifacts_dir(pathlib.Path(drive_root), validate_task_id(task_id), create=create)
+
+
+def store_chat_media_bytes(
+    drive_root: Union[pathlib.Path, str], task_id: str, data: bytes, mime: str,
+) -> Optional[Dict[str, Any]]:
+    """Store reloadable outbound chat media outside the deliverable inventory."""
+
+    normalized_mime = str(mime or "").lower()
+    extension = _CHAT_MEDIA_EXTENSIONS.get(normalized_mime)
+    if not extension:
+        return None
+    try:
+        artifact_dir = task_artifact_dir_path(drive_root, task_id, create=True)
+    except ValueError:
+        return None
+    digest = sha256(data).hexdigest()
+    name = f"chat-media-{digest}.{extension}"
+    media_dir = artifact_dir / _CHAT_MEDIA_SUBDIR
+    media_dir.mkdir(parents=True, exist_ok=True)
+    if media_dir.is_symlink():
+        return None
+    try:
+        media_dir.resolve(strict=False).relative_to(artifact_dir.resolve(strict=False))
+    except (OSError, ValueError):
+        return None
+    path = media_dir / name
+    if path.is_symlink() or not path.is_file():
+        write_bytes_atomic(path, data)
+    return {"name": name, "mime": normalized_mime, "sha256": digest, "size": len(data)}
+
+
+def resolve_chat_media_path(
+    drive_root: Union[pathlib.Path, str], task_id: str, name: str,
+) -> Optional[pathlib.Path]:
+    """Resolve an exact content-addressed chat-media filename, or return ``None``."""
+
+    match = _CHAT_MEDIA_NAME_RE.fullmatch(str(name or ""))
+    if not match:
+        return None
+    try:
+        artifact_root = task_artifact_dir_path(drive_root, task_id, create=False).resolve(strict=False)
+        media_dir = artifact_root / _CHAT_MEDIA_SUBDIR
+        if media_dir.is_symlink():
+            return None
+        candidate = media_dir / name
+        if candidate.is_symlink():
+            return None
+        path = candidate.resolve(strict=False)
+        path.relative_to(artifact_root)
+    except (OSError, ValueError):
+        return None
+    if not path.is_file():
+        return None
+    return path
 
 
 # The artifact-store subdir delegated-run captures live in (the naming SSOT
@@ -535,7 +602,7 @@ def collect_task_artifact_records(drive_root: Union[pathlib.Path, str], task_id:
             continue
         # v6.52.0 (P1): staged INPUT attachments live under attachments/ and are NOT
         # task deliverables — never record them as produced artifacts.
-        if rel_parts and rel_parts[0] == _ATTACHMENTS_SUBDIR:
+        if rel_parts and rel_parts[0] in {_ATTACHMENTS_SUBDIR, _CHAT_MEDIA_SUBDIR}:
             continue
         try:
             record = artifact_record(path)

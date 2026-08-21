@@ -8,7 +8,9 @@ import queue
 import re
 import threading
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
+from ouroboros.artifacts import store_chat_media_bytes
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros.event_bus import CHAT_DOCUMENT, CHAT_OUTBOUND, CHAT_PHOTO, CHAT_TYPING, CHAT_VIDEO, publish_event
 from supervisor.state import append_jsonl, load_state
@@ -21,6 +23,19 @@ DATA_DIR = None  # pathlib.Path
 TOTAL_BUDGET_LIMIT: float = 0.0
 BUDGET_REPORT_EVERY_MESSAGES: int = 10
 _BRIDGE: Optional["LocalChatBridge"] = None
+
+
+def _chat_media_download_url(task_id: str, data: bytes, mime: str) -> str:
+    if not DATA_DIR:
+        return ""
+    try:
+        stored = store_chat_media_bytes(DATA_DIR, task_id, data, mime)
+    except Exception:
+        log.warning("Could not persist outbound chat media", exc_info=True)
+        return ""
+    if not stored:
+        return ""
+    return f"/api/tasks/{quote(task_id, safe='')}/artifacts/{quote(str(stored['name']), safe='')}"
 
 
 def coerce_chat_identity(value: Any, default: int = 1) -> int:
@@ -470,10 +485,12 @@ class LocalChatBridge:
         photo_bytes: bytes,
         caption: str = "",
         mime: str = "image/png",
+        task_id: str = "",
     ) -> Tuple[bool, str]:
         """Send photo to UI and host event subscribers."""
         if is_a2a_chat_id(chat_id):
             return True, "ok"
+        download_url = _chat_media_download_url(task_id, photo_bytes, mime)
         b64_str = base64.b64encode(photo_bytes).decode("ascii")
         msg = {
             "type": "photo",
@@ -505,8 +522,10 @@ class LocalChatBridge:
             owner_id,
             caption or "Photo attachment",
             ts=msg["ts"],
+            task_id=str(task_id or ""),
             record_type="photo",
             mime=str(mime or ""),
+            download_url=download_url,
             caption=str(caption or ""),
         )
         _advance_project_visible_revision(chat_id)
@@ -518,10 +537,12 @@ class LocalChatBridge:
         video_bytes: bytes,
         caption: str = "",
         mime: str = "video/mp4",
+        task_id: str = "",
     ) -> Tuple[bool, str]:
         """Send video to UI and host event subscribers."""
         if is_a2a_chat_id(chat_id):
             return True, "ok"
+        download_url = _chat_media_download_url(task_id, video_bytes, mime)
         b64_str = base64.b64encode(video_bytes).decode("ascii")
         msg = {
             "type": "video",
@@ -553,8 +574,10 @@ class LocalChatBridge:
             owner_id,
             caption or "Video attachment",
             ts=msg["ts"],
+            task_id=str(task_id or ""),
             record_type="video",
             mime=str(mime or ""),
+            download_url=download_url,
             caption=str(caption or ""),
         )
         _advance_project_visible_revision(chat_id)

@@ -1981,6 +1981,24 @@ def test_task_artifact_endpoint_serves_only_declared_artifacts(tmp_path):
     assert client.get("/api/tasks/task-artifact/artifacts/bad%5Cname").status_code == 400
 
 
+def test_task_artifact_endpoint_serves_exact_chat_media_without_task_result(tmp_path):
+    from ouroboros.artifacts import collect_task_artifact_records, store_chat_media_bytes
+
+    data = tmp_path / "data"
+    stored = store_chat_media_bytes(data, "ephemeral1", b"photo-bytes", "image/png")
+    assert stored is not None
+    app = Starlette(routes=[Route("/api/tasks/{task_id}/artifacts/{name}", endpoint=api_task_artifact, methods=["GET"])])
+    app.state.drive_root = data
+    client = TestClient(app)
+
+    response = client.get(f"/api/tasks/ephemeral1/artifacts/{stored['name']}")
+    assert response.status_code == 200
+    assert response.content == b"photo-bytes"
+    assert collect_task_artifact_records(data, "ephemeral1") == []
+
+    assert client.get("/api/tasks/ephemeral1/artifacts/chat-media-bad.png").status_code == 404
+
+
 def test_task_artifact_endpoint_serves_manifest_artifact_after_status_repair(tmp_path):
     from ouroboros.artifacts import copy_file_to_task_artifacts
 
