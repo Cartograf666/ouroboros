@@ -934,12 +934,53 @@ def enqueue_assisted_resolution_task(tx: Dict[str, Any]) -> str:
     from supervisor.update_merge_policy import assisted_objective
 
     task_id = str(tx.get("task_id") or "")
+    prior_terminal_status = ""
+    if task_id and task_id not in workers.RUNNING:
+        try:
+            from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
+
+            prior = load_task_result(_g.DRIVE_ROOT, task_id) or {}
+            if str(prior.get("status") or "") in _TRULY_TERMINAL_STATUSES:
+                prior_terminal_status = str(prior.get("status") or "")
+        except Exception:
+            # Fail-open to the historical behavior: an unreadable ledger must
+            # not block the resume that used to work without this check.
+            prior_terminal_status = ""
+    if prior_terminal_status:
+        # Boot-resume after a shutdown that already settled the recorded
+        # resolver terminally (e.g. SIGTERM wrote a durable "cancelled"):
+        # re-enqueueing the OLD id is silently dropped pre-assignment by
+        # ``_drop_cancelled_pending`` (its durable result is terminal), leaving
+        # the tx wedged in assisted_resolution with no resolver task and no
+        # orphan watchdog (which only arms on task_done). Mint a FRESH task id
+        # and move the tx's recorded id to it. Paid-review-cycle ceiling
+        # continuity: the ORIGINAL resolver id — the root the ledger already
+        # charged — is pinned once and threaded into the task metadata below.
+        import uuid
+
+        fresh_id = "update_assisted_merge_" + uuid.uuid4().hex[:8]
+        tx.setdefault("original_root_task_id", task_id)
+        tx["task_id"] = fresh_id
+        write_update_tx(tx)
+        _log_supervisor({
+            "type": "managed_update_assisted_reenqueued_fresh",
+            "task_old": task_id,
+            "task_new": fresh_id,
+            "prior_status": prior_terminal_status,
+        })
+        task_id = fresh_id
     task = {
         "id": task_id,
         "text": assisted_objective(tx),
         "type": "task",
         "chat_id": int(tx.get("owner_chat_id") or 0),
         "metadata": {
+            # Root continuity for the paid-review-cycle ceiling
+            # (``commit_gate.resolve_root_task_id`` honors this key first): the
+            # first enqueue pins the resolver's own id (same value the gate
+            # would derive), a fresh-id re-enqueue pins the ORIGINAL id so the
+            # money ceiling never resets across resume chains of one update.
+            "root_task_id": str(tx.get("original_root_task_id") or task_id),
             "managed_update": {
                 "target_sha": str(tx.get("target_sha") or ""),
                 "conflict_paths": list(tx.get("conflict_paths") or []),
