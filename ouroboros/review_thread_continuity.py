@@ -24,10 +24,9 @@ def ensure_review_thread(
         "primaryHarness": route.route_id, "eligibleHarnesses": [route.route_id],
         "access": "readonly",
     }
-    # A thread turn must never fall back to the daemon's sticky/pool precedence
-    # by omission. ``None`` is the engine's typed default-subject pin; a string
-    # is the exact expected profile.
-    request["credentialProfileId"] = getattr(route, "profile_id", "") or None
+    profile_id = str(getattr(route, "profile_id", "") or "")
+    if profile_id:
+        request["credentialProfileId"] = profile_id
     return str(gateway.create_thread(request, idempotency_key=key).get("id") or "")
 
 
@@ -62,6 +61,7 @@ def profile_rotation_receipts(gateway: Any, run_id: str) -> list[dict]:
             else row
         )
         receipts.append({
+            "seq": row.get("seq"),
             "type": "route.profile.rotated",
             "from_profile_id": payload.get("from_profile_id"),
             "to_profile_id": payload.get("to_profile_id"),
@@ -75,22 +75,44 @@ def profile_rotation_receipts(gateway: Any, run_id: str) -> list[dict]:
 def profile_continuity_receipt(
     expected_profile: str, applied_profile: str, rotations: list[dict],
 ) -> dict:
-    """Bind expected and applied profiles, accepting only an engine rotation receipt."""
+    """Bind profiles through one complete ordered engine-owned rotation chain."""
     expected, applied = str(expected_profile or ""), str(applied_profile or "")
-    matched = next((
-        dict(row) for row in rotations if isinstance(row, dict)
-        and row.get("type") == "route.profile.rotated"
-        and str(row.get("from_profile_id") or "") == expected
-        and str(row.get("to_profile_id") or "") == applied
-        and str(row.get("reason") or "")
-    ), None)
-    status = "matched" if expected == applied else ("typed_rotation" if matched else "cannot_verify")
-    return {
-        "expected_profile": expected,
-        "applied_profile": applied,
-        "status": status,
-        "rotation_receipt": matched or {},
-    }
+    chain = [dict(row) for row in rotations if isinstance(row, dict)]
+
+    def result(status: str, reason: str, receipt: dict | None = None) -> dict:
+        return {
+            "expected_profile": expected,
+            "applied_profile": applied,
+            "status": status,
+            "verification_reason": reason,
+            "rotation_receipt": dict(receipt or {}),
+            "rotation_receipts": chain,
+        }
+
+    if not rotations:
+        return result(
+            "matched" if expected == applied else "cannot_verify",
+            "profile_matched" if expected == applied else "unexplained_profile_drift",
+        )
+    if len(chain) != len(rotations):
+        return result("cannot_verify", "rotation_event_malformed")
+    current, previous_seq = expected, None
+    for row in chain:
+        seq = row.get("seq")
+        source = str(row.get("from_profile_id") or "")
+        target = str(row.get("to_profile_id") or "")
+        if (row.get("type") != "route.profile.rotated"
+                or not isinstance(seq, int) or isinstance(seq, bool)
+                or not target or target == source or not str(row.get("reason") or "")):
+            return result("cannot_verify", "rotation_event_malformed")
+        if previous_seq is not None and seq <= previous_seq:
+            return result("cannot_verify", "rotation_event_order_invalid")
+        if source != current:
+            return result("cannot_verify", "rotation_chain_gap")
+        current, previous_seq = target, seq
+    if current != applied:
+        return result("cannot_verify", "rotation_terminal_mismatch")
+    return result("typed_rotation", "typed_rotation_chain", chain[-1])
 
 
 def review_thread_receipt(

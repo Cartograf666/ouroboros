@@ -360,6 +360,58 @@ def test_continued_thread_explicitly_repins_the_expected_profile() -> None:
     assert captured["request"]["credentialProfileId"] == "profile-a"
 
 
+def test_initial_unpinned_thread_omits_profile_but_its_turn_sends_explicit_null() -> None:
+    from types import SimpleNamespace
+
+    from ouroboros.gateways.claudexor import ClaudexorGateway, DaemonEndpoint
+    from ouroboros.review_thread_continuity import ensure_review_thread, start_review_thread_turn
+
+    captured = {}
+
+    class Custody:
+        @staticmethod
+        def idempotency_key(*parts):
+            return ":".join(str(part) for part in parts)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if request.url.path == "/v2/threads":
+            # Installed ControlThreadCreateRequest: nonblank string or omission.
+            assert "credentialProfileId" not in body
+            captured["create"] = body
+            return httpx.Response(200, json={"id": "thread-1"})
+        if request.url.path == "/v2/threads/thread-1/turns":
+            # Installed ControlThreadTurnRequest: explicit null clears a sticky pin.
+            assert "credentialProfileId" in body and body["credentialProfileId"] is None
+            captured["turn"] = body
+            return httpx.Response(200, json={
+                "threadId": "thread-1", "turnId": "turn-1", "runId": "run-1",
+            })
+        return httpx.Response(404, json={"code": "not_found", "message": "no"})
+
+    gateway = ClaudexorGateway(DaemonEndpoint(host="127.0.0.1", port=1, token="token"))
+    gateway._client.close()
+    gateway._client = httpx.Client(
+        base_url="http://127.0.0.1:1", transport=httpx.MockTransport(handler),
+        headers={"Authorization": "Bearer token"},
+    )
+    try:
+        thread_id = ensure_review_thread(
+            gateway, Custody(), "", route=SimpleNamespace(route_id="claude", profile_id=""),
+            root="/repo", surface="plan_review", slot_id="s1", task_id="task-1",
+        )
+        start_review_thread_turn(
+            gateway, thread_id,
+            {"prompt": "review", "credentialProfileId": None, "_thread_id": thread_id},
+            idempotency_key="turn-key",
+        )
+    finally:
+        gateway.close()
+
+    assert thread_id == "thread-1"
+    assert captured["turn"]["credentialProfileId"] is None
+
+
 def test_profile_rotation_receipt_is_read_from_the_settled_run_events() -> None:
     from ouroboros.review_thread_continuity import profile_rotation_receipts
 
@@ -376,6 +428,7 @@ def test_profile_rotation_receipt_is_read_from_the_settled_run_events() -> None:
             }) + "\n").encode()
 
     assert profile_rotation_receipts(Gateway(), "run-2") == [{
+        "seq": 7,
         "type": "route.profile.rotated",
         "from_profile_id": "profile-a",
         "to_profile_id": "profile-b",
@@ -383,6 +436,64 @@ def test_profile_rotation_receipt_is_read_from_the_settled_run_events() -> None:
         "attempt_id": "",
         "resets_at": "later",
     }]
+
+
+def _rotation(seq, source, target, *, reason="vendor_limit_rejected"):
+    return {
+        "seq": seq, "type": "route.profile.rotated",
+        "from_profile_id": source, "to_profile_id": target,
+        "reason": reason, "attempt_id": f"attempt-{seq}", "resets_at": "later",
+    }
+
+
+@pytest.mark.parametrize(
+    ("applied", "rotations", "expected_status", "expected_reason"),
+    [
+        (
+            "profile-b", [_rotation(10, "profile-a", "profile-b")],
+            "typed_rotation", "typed_rotation_chain",
+        ),
+        (
+            "profile-c",
+            [_rotation(10, "profile-a", "profile-b"), _rotation(20, "profile-b", "profile-c")],
+            "typed_rotation", "typed_rotation_chain",
+        ),
+        (
+            "profile-c",
+            [_rotation(10, "profile-a", "profile-b"), _rotation(20, "profile-x", "profile-c")],
+            "cannot_verify", "rotation_chain_gap",
+        ),
+        (
+            "profile-c", [_rotation(10, "profile-a", "profile-b")],
+            "cannot_verify", "rotation_terminal_mismatch",
+        ),
+        (
+            "profile-c",
+            [_rotation(20, "profile-a", "profile-b"), _rotation(10, "profile-b", "profile-c")],
+            "cannot_verify", "rotation_event_order_invalid",
+        ),
+        (
+            "profile-b",
+            [{**_rotation(10, "profile-a", "profile-b"), "reason": ""}],
+            "cannot_verify", "rotation_event_malformed",
+        ),
+    ],
+    ids=("one-hop", "multi-hop", "broken-gap", "terminal-mismatch", "reordered", "malformed"),
+)
+def test_profile_continuity_folds_only_one_ordered_engine_rotation_chain(
+    applied, rotations, expected_status, expected_reason,
+) -> None:
+    from ouroboros.review_thread_continuity import profile_continuity_receipt
+
+    receipt = profile_continuity_receipt("profile-a", applied, rotations)
+
+    assert receipt["status"] == expected_status
+    assert receipt["verification_reason"] == expected_reason
+    if expected_status == "typed_rotation":
+        assert receipt["rotation_receipts"] == rotations
+        assert receipt["rotation_receipt"] == rotations[-1]
+    else:
+        assert receipt["rotation_receipt"] == {}
 
 
 def test_agent_session_continuation_passes_the_real_thread_id(monkeypatch, tmp_path) -> None:
