@@ -156,7 +156,10 @@ test('a timeout-retry root gains Cancel run: the host marker is the truth', () =
     const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
     assert.match(chat, /updateLiveCardFromProgressMessage\(msg, \{ grantCancelAuthority = true \} = \{\}\)/);
     assert.match(chat, /grantCancelAuthority && msg\?\.cancelable === true && msg\?\.task_id/);
-    assert.match(chat, /grantCancelAuthority: !isMirror/);
+    // Project-owned progress is now panel-local; Main only accepts its typed
+    // terminal completion projection, so the old `!isMirror` branch is gone.
+    assert.match(chat, /const isMyThread = \(msg\) => \{[\s\S]{0,260}return !isKnownProjectFrame\(msg\);/);
+    assert.match(chat, /updateLiveCardFromProgressMessage\(msg, \{ grantCancelAuthority: true \}\)/);
     assert.doesNotMatch(chat, /frameRoot === taskId\) *&&[\s\S]{0,80}markTaskCancelable/);
     // ...and the eligibility reducer still refuses subagent/finished/reusable cards,
     // so trusting the marker does not widen the button beyond live pooled roots.
