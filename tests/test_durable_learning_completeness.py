@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import pathlib
+import threading
 
 
 def test_pattern_register_rewrite_receives_complete_tail(tmp_path, monkeypatch):
@@ -48,6 +50,89 @@ def test_backlog_fingerprint_uses_unsanitized_canonical_fields(tmp_path, monkeyp
     assert len({item["fingerprint"] for item in items}) == 2
 
 
+def test_generate_reflection_carries_raw_backlog_identity_through_append(tmp_path, monkeypatch):
+    from ouroboros import reflection
+    from ouroboros.improvement_backlog import append_backlog_items, load_backlog_items
+
+    prefix = "decisive-prefix-" + ("x" * 300)
+    summaries = [prefix + (tail * 80) for tail in ("A", "B")]
+    replies = []
+    for summary in summaries:
+        candidate = {
+            "summary": summary,
+            "category": "process",
+            "source": "execution_reflection",
+            "evidence": "production reflection evidence",
+        }
+        replies.append({
+            "content": (
+                "Reflection body\n"
+                "MEMORY_ACTIONS_JSON: []\n"
+                "BACKLOG_CANDIDATES_JSON: " + json.dumps([candidate])
+            )
+        })
+
+    monkeypatch.setattr("ouroboros.config.get_light_model", lambda: "light")
+    monkeypatch.setattr(
+        "ouroboros.semantic_dedup.find_semantic_duplicate_id", lambda *a, **k: None,
+    )
+
+    def fake_chat(*args, **kwargs):
+        return replies.pop(0), {}
+
+    monkeypatch.setattr("ouroboros.llm_observability.chat_observed", fake_chat)
+    generated = [
+        reflection.generate_reflection(
+            {"id": f"task-{idx}", "text": "reflect", "drive_root": str(tmp_path)},
+            {}, "trace", object(), {"rounds": 1, "cost": 0.0},
+        )
+        for idx in range(2)
+    ]
+    assert generated[0]["backlog_candidates"][0]["summary"] == generated[1]["backlog_candidates"][0]["summary"]
+    for entry in generated:
+        assert append_backlog_items(tmp_path, entry["backlog_candidates"]) == 1
+
+    items = load_backlog_items(tmp_path)
+    assert len(items) == 2
+    assert len({item["fingerprint"] for item in items}) == 2
+
+
+def test_backlog_semantic_redirect_skips_known_partial_query_and_candidate(tmp_path, monkeypatch):
+    from ouroboros.improvement_backlog import append_backlog_items, load_backlog_items
+
+    semantic_calls = []
+
+    def redirect_to_first(query, candidates, **kwargs):
+        semantic_calls.append((query, candidates))
+        return candidates[0]["id"]
+
+    monkeypatch.setattr(
+        "ouroboros.semantic_dedup.find_semantic_duplicate_id", redirect_to_first,
+    )
+
+    query_root = tmp_path / "partial-query"
+    assert append_backlog_items(query_root, [{
+        "summary": "complete existing item", "category": "process", "source": "reflection",
+    }]) == 1
+    assert append_backlog_items(query_root, [{
+        "summary": "partial query " + ("q" * 400),
+        "category": "process", "source": "reflection",
+    }]) == 1
+
+    candidate_root = tmp_path / "partial-candidate"
+    assert append_backlog_items(candidate_root, [{
+        "summary": "partial candidate " + ("c" * 400),
+        "category": "process", "source": "reflection",
+    }]) == 1
+    assert append_backlog_items(candidate_root, [{
+        "summary": "complete new item", "category": "process", "source": "reflection",
+    }]) == 1
+
+    assert semantic_calls == []
+    assert len(load_backlog_items(query_root)) == 2
+    assert len(load_backlog_items(candidate_root)) == 2
+
+
 def test_groom_receives_complete_records_and_preserves_on_unavailable(tmp_path, monkeypatch):
     from ouroboros import improvement_backlog as ib
 
@@ -86,6 +171,93 @@ def test_groom_receives_complete_records_and_preserves_on_unavailable(tmp_path, 
     monkeypatch.setattr(ib, "_locked_text_file", unavailable)
     assert ib.groom_backlog(tmp_path, cap=10) == 0
     assert ib.backlog_path(tmp_path).read_text(encoding="utf-8") == before
+
+
+def test_groom_preserves_annotated_fingerprinted_survivor_verbatim(tmp_path, monkeypatch):
+    from ouroboros import improvement_backlog as ib
+
+    monkeypatch.setattr(
+        "ouroboros.semantic_dedup.find_semantic_duplicate_id", lambda *a, **k: None,
+    )
+    assert ib.append_backlog_items(tmp_path, [{
+        "id": f"ibl-{idx}", "fingerprint": f"fp-{idx}", "summary": f"item {idx}",
+        "category": "process", "source": "reflection",
+    } for idx in range(35)]) == 35
+    path = ib.backlog_path(tmp_path)
+    text = path.read_text(encoding="utf-8")
+    text = text.replace(
+        "- summary: item 0\n",
+        "- summary: item 0\n- owner_note: keep this exact owner byte\n"
+        "freeform decisive survivor tail\n",
+        1,
+    )
+    path.write_text(text, encoding="utf-8")
+    before_items = ib.load_backlog_items(tmp_path)
+    annotated_before = next(item for item in before_items if item["id"] == "ibl-0")["_raw"]
+    keep = [{
+        "id": item["id"], "fingerprint": item["fingerprint"], "summary": item["summary"],
+    } for item in before_items[:20]]
+
+    monkeypatch.setattr("ouroboros.config.get_light_model", lambda: "light")
+    monkeypatch.setattr("ouroboros.llm.LLMClient", lambda: object())
+
+    def fake_chat(*args, **kwargs):
+        prompt = kwargs["messages"][0]["content"]
+        assert "owner_note" in prompt and "freeform decisive survivor tail" in prompt
+        return ({"content": json.dumps(keep)}, {})
+
+    monkeypatch.setattr("ouroboros.llm_observability.chat_observed", fake_chat)
+    assert ib.groom_backlog(tmp_path, cap=30) == 20
+    annotated_after = next(
+        item for item in ib.load_backlog_items(tmp_path) if item["id"] == "ibl-0"
+    )
+    assert annotated_after["_raw"] == annotated_before
+
+
+def test_concurrent_pattern_updates_commit_one_cas_winner(tmp_path, monkeypatch):
+    from ouroboros import reflection
+
+    knowledge = tmp_path / "memory" / "knowledge"
+    knowledge.mkdir(parents=True)
+    path = knowledge / "patterns.md"
+    initial = reflection._PATTERNS_HEADER
+    path.write_text(initial, encoding="utf-8")
+    llm_gate = threading.Barrier(2)
+    legacy_write_gate = threading.Barrier(2)
+    monkeypatch.setattr("ouroboros.config.get_light_model", lambda: "light")
+    monkeypatch.setattr("ouroboros.llm.LLMClient", lambda: object())
+
+    def fake_chat(*args, **kwargs):
+        llm_gate.wait(timeout=10)
+        task_id = kwargs["task_id"]
+        return ({
+            "content": initial + f"| {task_id} | 1 | cause | fix | open |\n",
+        }, {})
+
+    monkeypatch.setattr("ouroboros.llm_observability.chat_observed", fake_chat)
+    real_write_text = pathlib.Path.write_text
+
+    def synchronize_legacy_replace(self, data, *args, **kwargs):
+        if self == path:
+            legacy_write_gate.wait(timeout=10)
+        return real_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "write_text", synchronize_legacy_replace)
+    entries = [{
+        "task_id": f"writer-{idx}", "goal": "concurrent pattern update",
+        "key_markers": ["TOOL_ERROR"], "reflection": f"writer {idx}",
+    } for idx in range(2)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(reflection._update_patterns, tmp_path, entry) for entry in entries]
+        for future in futures:
+            future.result(timeout=15)
+
+    final = path.read_text(encoding="utf-8")
+    history_path = knowledge / "patterns_history.jsonl"
+    history = [json.loads(line) for line in history_path.read_text(encoding="utf-8").splitlines()]
+    assert sum(f"writer-{idx}" in final for idx in range(2)) == 1
+    assert len(history) == 1
+    assert history[0]["new_content"] == final
 
 
 def test_closed_objective_before_old_horizon_reaches_chooser(tmp_path, monkeypatch):
@@ -142,15 +314,19 @@ def test_closed_objective_unavailable_abstains_before_chooser(tmp_path, monkeypa
     assert called == []
 
 
-def _bg_fixture(tmp_path):
+def _bg_fixture(tmp_path, *, backlog_count=10):
     from ouroboros.consciousness import BackgroundConsciousness
     from ouroboros.improvement_backlog import append_backlog_items
 
     repo_dir = pathlib.Path(__file__).parents[1]
     (tmp_path / "logs").mkdir(parents=True)
+    (tmp_path / "logs" / "chat.jsonl").write_text(
+        json.dumps({"chat_id": 1, "direction": "in", "text": "complete recent chat"}) + "\n",
+        encoding="utf-8",
+    )
     (tmp_path / "state").mkdir(parents=True)
     (tmp_path / "state" / "state.json").write_text("{}", encoding="utf-8")
-    for idx in range(10):
+    for idx in range(backlog_count):
         append_backlog_items(tmp_path, [{
             "id": f"ibl-bg-{idx}", "fingerprint": f"fp-bg-{idx}",
             "summary": f"background item {idx}", "category": "identity", "source": "reflection",
@@ -190,5 +366,35 @@ def test_bgc_unavailable_named_omission_abstains_without_approval_flow(tmp_path)
         assert "IDENTITY_UPDATE_ABSTAINED" in result
         assert "approval" not in result.lower()
         assert not (tmp_path / "memory" / "identity_journal.jsonl").exists()
+    finally:
+        bc._tool_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_bgc_malformed_recent_chat_gap_blocks_direct_identity_update(tmp_path):
+    bc = _bg_fixture(tmp_path, backlog_count=0)
+    try:
+        chat = tmp_path / "logs" / "chat.jsonl"
+        chat.write_text(
+            chat.read_text(encoding="utf-8") + '{"direction":"in","text":"broken"\n',
+            encoding="utf-8",
+        )
+        context = bc._build_context()
+        assert "jsonl_malformed" in context
+        content = "I must not rewrite identity from a context with a known chat gap."
+        result = bc._execute_tool(_tool_call("update_identity", {"content": content}, "u1"), [])
+        assert "IDENTITY_UPDATE_ABSTAINED" in result
+        assert not (tmp_path / "memory" / "identity_journal.jsonl").exists()
+    finally:
+        bc._tool_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_bgc_complete_recent_chat_keeps_direct_identity_update_available(tmp_path):
+    bc = _bg_fixture(tmp_path, backlog_count=0)
+    try:
+        bc._build_context()
+        content = "I retain direct identity authority with complete ordinary context."
+        result = bc._execute_tool(_tool_call("update_identity", {"content": content}, "u1"), [])
+        assert result.startswith("OK: identity updated")
+        assert content in (tmp_path / "memory" / "identity_journal.jsonl").read_text(encoding="utf-8")
     finally:
         bc._tool_executor.shutdown(wait=False, cancel_futures=True)

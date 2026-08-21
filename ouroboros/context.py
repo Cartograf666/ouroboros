@@ -1071,7 +1071,7 @@ def _format_recent_reflections(entries: List[Dict[str, Any]], limit: int = 10) -
 
 def build_recent_sections(
     memory: Memory, env: Any, task_id: str = "", thread_chat_id: int = 0,
-    project_id: str = "",
+    project_id: str = "", chat_coverage_out: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     sections = []
 
@@ -1101,12 +1101,12 @@ def build_recent_sections(
         )
     else:
         dialogue_meta = memory.load_dialogue_meta()
-        # The Memory owner reuses the consolidation cursor and returns one bounded,
-        # truthfully-gapped raw suffix; older dialogue is represented by blocks/eras
-        # and remains explicitly retrievable through chat_history.
+        # The Memory owner returns one bounded, truthfully-gapped raw suffix.
         chat_entries, chat_coverage = memory.read_unconsolidated_chat(
             dialogue_meta, _chat_tail,
         )
+    if chat_coverage_out is not None:
+        chat_coverage_out.update(chat_coverage)
     chat_summary = memory.summarize_chat(chat_entries, limit=_chat_tail)
     if chat_summary:
         sections.append("## Recent chat\n\n" + chat_summary)

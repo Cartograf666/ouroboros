@@ -76,6 +76,7 @@ class BackgroundConsciousness:
         self._tool_executor = StatefulToolExecutor()
         self._identity_source_requirements: Dict[str, pathlib.Path] = {}
         self._identity_source_reads: Dict[str, str] = {}
+        self._identity_unresolved_sources: set[str] = set()
 
         self._bg_spent_usd: float = 0.0
         self._bg_budget_pct: float = float(
@@ -534,6 +535,7 @@ class BackgroundConsciousness:
         # authorize a later identity rewrite after the source changed.
         self._identity_source_requirements = {}
         self._identity_source_reads = {}
+        self._identity_unresolved_sources = set()
 
         parts = [self._load_bg_prompt()]
 
@@ -607,8 +609,24 @@ class BackgroundConsciousness:
 
         parts.append(build_runtime_section(env, bg_task))
 
-        # Empty task_id includes recent sections across tasks.
-        parts.extend(build_recent_sections(memory, env, task_id=""))
+        # Empty task_id includes recent sections across tasks.  The typed facts
+        # below are the exact same facts rendered into the decision envelope.
+        recent_chat_coverage: Dict[str, Any] = {}
+        parts.extend(build_recent_sections(
+            memory, env, task_id="", chat_coverage_out=recent_chat_coverage,
+        ))
+        if (
+            recent_chat_coverage.get("gaps")
+            or int(recent_chat_coverage.get("omitted_matching_rows") or 0) > 0
+            or bool(recent_chat_coverage.get("omitted_matching_rows_unknown"))
+        ):
+            self._identity_unresolved_sources.add("recent-chat")
+            parts.append(
+                "## Identity update completeness\n\n"
+                "Recent chat has unresolved typed coverage. Existing chat_history may "
+                "inspect surviving pages, but this cycle cannot prove a complete unchanged "
+                "source; direct update_identity must abstain for this cycle."
+            )
 
         observations = []
         while not self._observations.empty():
@@ -708,7 +726,7 @@ class BackgroundConsciousness:
             return "Failed to parse arguments."
 
         if fn_name == "update_identity":
-            pending = []
+            pending = list(self._identity_unresolved_sources)
             for topic, path in self._identity_source_requirements.items():
                 try:
                     current_sha = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -721,7 +739,8 @@ class BackgroundConsciousness:
                     "⚠️ IDENTITY_UPDATE_ABSTAINED: direct update_identity authority remains "
                     "available, but this decision envelope omitted named source(s) that are "
                     "not completely materialized in this cycle: " + ", ".join(sorted(pending))
-                    + ". Read each complete current source with its existing reader, or abstain."
+                    + ". Materialize each resolvable source with its existing reader; "
+                    "unresolved typed gaps require abstention."
                 )
 
         self._emit_live_log(

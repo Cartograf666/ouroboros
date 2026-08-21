@@ -136,6 +136,15 @@ def _sanitize(value: Any, limit: int = 300) -> str:
     return text[:limit] + f" ⚠️ OMISSION NOTE: +{len(text) - limit} chars omitted"
 
 
+def _identity_is_known_partial(summary: Any, category: Any, source: Any) -> bool:
+    """Whether semantic comparison would see less than a canonical identity field."""
+    for value, limit in ((summary, 260), (category, 60), (source, 60)):
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if "⚠️ OMISSION NOTE:" in text or len(text) > limit:
+            return True
+    return False
+
+
 def _priority(value: Any) -> str:
     raw = str(value or "med").strip().lower()
     raw = {"medium": "med"}.get(raw, raw)
@@ -203,7 +212,9 @@ def _dedup_candidates(open_items: List[Dict[str, Any]], category: str, source: s
     return [
         {"id": str(it.get("id") or ""), "text": str(it.get("summary") or "")}
         for it in same[:_DEDUP_CANDIDATE_CAP]
-        if it.get("id") and it.get("summary")
+        if it.get("id") and it.get("summary") and not _identity_is_known_partial(
+            it.get("summary"), it.get("category"), it.get("source")
+        )
     ]
 
 
@@ -250,6 +261,9 @@ def _semantic_redirect_fingerprints(
         )
         if fingerprint in existing_fps:
             out.append(item)  # exact hit — the locked pass bumps it, no LLM needed
+            continue
+        if _identity_is_known_partial(raw_summary, raw_category, raw_source):
+            out.append(item)
             continue
         candidates = _dedup_candidates(open_items, category, source)
         if not candidates:
@@ -499,14 +513,27 @@ Current backlog items (JSON):
 Return ONLY a JSON array of the items to KEEP. Each object: {{"id","status","priority","kind","summary","category","source","task_id","requires_plan_review","count","created_at","fingerprint","evidence","context","proposed_next_step"}}. Preserve the id/fingerprint/created_at of every kept item. Do NOT invent new work. Do NOT drop a high-priority or high-count item just to hit the cap."""
 
 
+def _needs_verbatim_grooming(item: Dict[str, Any]) -> bool:
+    """True when a modelled overlay cannot preserve the stored block losslessly."""
+    if any(key not in {"id", "_raw", *_ENTRY_KEYS} for key in item):
+        return True
+    seen = set()
+    for line in str(item.get("_raw") or "").splitlines()[1:]:
+        if not line or not line.startswith("- ") or ": " not in line:
+            return True
+        key = line[2:].split(": ", 1)[0].strip()
+        if key not in _ENTRY_KEYS or key in seen:
+            return True
+        seen.add(key)
+    return False
+
+
 def groom_backlog(drive_root: Any, *, cap: int = _GROOM_CAP) -> int:
     """D: best-effort LLM grooming of AUTO-generated (fingerprinted) backlog items —
-    merge near-dupes, mark resolved, re-rank, cap to <=cap. Hand-added
-    (no-fingerprint) items are passed through UNCHANGED (never dropped). Runs on a
-    size-triggered (NOT error-gated) schedule and re-serializes through the locked
-    parser-safe writer. Returns the number of items written, or 0 when nothing was
-    groomed. Fails closed (no write) on a bad/empty/oversized model reply OR if the
-    backlog changed concurrently during the lock-free LLM call (no lost updates)."""
+    merge near-dupes, mark resolved, re-rank, cap to <=cap. Hand-added items and
+    fingerprinted blocks with unmodelled bytes pass through UNCHANGED. Runs on a
+    size trigger and re-serializes through the locked parser-safe writer. Returns
+    the number written, or 0 on a bad/empty/oversized reply or concurrent change."""
     import json as _json
 
     path = backlog_path(drive_root)
@@ -520,10 +547,14 @@ def groom_backlog(drive_root: Any, *, cap: int = _GROOM_CAP) -> int:
     items = _parse_backlog_items(snapshot_text)
     if len(items) <= cap:
         return 0
-    # Only AUTO-generated (fingerprinted) items are groomable; hand-added items
-    # (no fingerprint) are user-curated and pass through untouched.
-    fp_items = [it for it in items if str(it.get("fingerprint") or "").strip()]
-    nofp_items = [it for it in items if not str(it.get("fingerprint") or "").strip()]
+    # Fingerprinted blocks with unknown fields/freeform bytes cannot be safely
+    # overlaid from the model schema, so preserve them like hand-authored items.
+    fingerprinted = [it for it in items if str(it.get("fingerprint") or "").strip()]
+    fp_items = [it for it in fingerprinted if not _needs_verbatim_grooming(it)]
+    passthrough_items = [
+        it for it in items
+        if not str(it.get("fingerprint") or "").strip() or _needs_verbatim_grooming(it)
+    ]
     if not fp_items:
         return 0
 
@@ -612,7 +643,7 @@ def groom_backlog(drive_root: Any, *, cap: int = _GROOM_CAP) -> int:
     if not kept_fp or len(kept_fp) > cap or len(kept_fp) < max(1, min(len(fp_items), cap) // 2):
         return 0
 
-    final = kept_fp + nofp_items  # hand-added items always survive, unchanged
+    final = kept_fp + passthrough_items  # unmodelled bytes always survive unchanged
     with _locked_text_file(path, mode="r+") as fh:
         # Abort if the backlog changed during the lock-free LLM call (a concurrent
         # append/close/recurrence) — never overwrite a concurrent update. The next

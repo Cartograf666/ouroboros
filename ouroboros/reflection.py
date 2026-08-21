@@ -7,7 +7,7 @@ import logging
 import pathlib
 from typing import Any, Dict, List, Optional
 
-from ouroboros.utils import utc_now_iso, append_jsonl
+from ouroboros.utils import utc_now_iso, append_jsonl, write_text_atomic
 
 
 def _truncate_with_notice(text: Any, limit: int) -> str:
@@ -435,16 +435,22 @@ def generate_reflection(
 
         backlog_candidates: List[Dict[str, Any]] = []
         if isinstance(raw_candidates, list):
+            from ouroboros.improvement_backlog import _stable_fingerprint
+
             for raw in raw_candidates[:3]:
                 if not isinstance(raw, dict):
                     continue
-                summary = _truncate_with_notice(raw.get("summary", ""), 260).strip()
-                category = _truncate_with_notice(raw.get("category", "process"), 80).strip() or "process"
-                source = _truncate_with_notice(raw.get("source", "execution_reflection"), 80).strip() or "execution_reflection"
+                raw_summary = str(raw.get("summary") or "")
+                raw_category = str(raw.get("category") or "process")
+                raw_source = str(raw.get("source") or "execution_reflection")
+                summary = _truncate_with_notice(raw_summary, 260).strip()
+                category = _truncate_with_notice(raw_category, 80).strip() or "process"
+                source = _truncate_with_notice(raw_source, 80).strip() or "execution_reflection"
                 evidence = _truncate_with_notice(raw.get("evidence", ""), 220).strip()
                 if not summary or not evidence:
                     continue
                 backlog_candidates.append({
+                    "fingerprint": _stable_fingerprint(raw_summary, raw_category, raw_source),
                     "summary": summary,
                     "category": category,
                     "source": source,
@@ -704,29 +710,33 @@ def _update_patterns(drive_root: pathlib.Path, entry: Dict[str, Any]) -> None:
     if not updated.startswith("#"):
         updated = "# Pattern Register\n\n" + updated
 
-    # The lock-free LLM call may race another reflection.  That makes the prompt
-    # source stale/incomplete, so preserve the newer register for the next pass.
-    try:
-        latest = patterns_path.read_text(encoding="utf-8") if patterns_path.exists() else _PATTERNS_HEADER
-    except Exception:
-        log.warning("Pattern register source became unavailable; preserving it")
-        return
-    if latest != current:
-        log.info("Pattern register changed during update; preserving the newer source")
-        return
+    # The LLM stays outside the stable knowledge lock.  Final source reread,
+    # compare-and-swap, history decision, and atomic replacement are one critical
+    # section, so two normal writers cannot both authorize from the same snapshot.
+    from ouroboros.tools.knowledge import _knowledge_write_lock
 
-    append_jsonl(drive_root / "memory" / "knowledge" / "patterns_history.jsonl", {
-        "ts": utc_now_iso(),
-        "task_id": str(entry.get("task_id") or ""),
-        "markers": list(entry.get("key_markers") or []),
-        "old_content": current,
-        "new_content": updated + "\n",
-    })
-    patterns_path.write_text(updated + "\n", encoding="utf-8")
+    with _knowledge_write_lock(patterns_path.parent):
+        try:
+            latest = patterns_path.read_text(encoding="utf-8") if patterns_path.exists() else _PATTERNS_HEADER
+        except Exception:
+            log.warning("Pattern register source became unavailable; preserving it")
+            return
+        if latest != current:
+            log.info("Pattern register changed during update; preserving the newer source")
+            return
+        if not append_jsonl(drive_root / "memory" / "knowledge" / "patterns_history.jsonl", {
+            "ts": utc_now_iso(),
+            "task_id": str(entry.get("task_id") or ""),
+            "markers": list(entry.get("key_markers") or []),
+            "old_content": current,
+            "new_content": updated + "\n",
+        }):
+            log.warning("Pattern register history unavailable; preserving the register")
+            return
+        write_text_atomic(patterns_path, updated + "\n")
+        try:
+            from ouroboros.consolidator import _rebuild_knowledge_index
+            _rebuild_knowledge_index(patterns_path.parent, _locked=True)
+        except Exception:
+            log.debug("Failed to rebuild knowledge index after patterns update", exc_info=True)
     log.info("Pattern register updated (%d chars)", len(updated))
-
-    try:
-        from ouroboros.consolidator import _rebuild_knowledge_index
-        _rebuild_knowledge_index(patterns_path.parent)
-    except Exception:
-        log.debug("Failed to rebuild knowledge index after patterns update", exc_info=True)
