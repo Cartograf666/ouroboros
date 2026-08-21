@@ -344,7 +344,7 @@ def assert_canary_usage(usage, canary: ProviderCanary):
     return usage.get("request_wire")
 
 
-def assert_normalized_canary_call(message, tools, expected_arguments):
+def assert_normalized_canary_call(message, tools, required_arguments):
     from jsonschema import validators
 
     calls = message.get("tool_calls") if isinstance(message, dict) else None
@@ -368,7 +368,7 @@ def assert_normalized_canary_call(message, tools, expected_arguments):
         arguments = json.loads(raw_arguments)
         assert not list(validator_class(schema).iter_errors(arguments))
         assert set(arguments) <= set((schema.get("properties") or {}).keys()), arguments
-        for key, expected in expected_arguments.items():
+        for key, expected in required_arguments.items():
             assert arguments.get(key) == expected, arguments
     return calls
 
@@ -381,13 +381,22 @@ def run_provider_contract_canary(
     nonce: str,
 ):
     """Exercise the public chat seam without executing the returned tool call."""
-    expected_arguments = delegate_start_canary_arguments(nonce)
-    arguments_json = json.dumps(expected_arguments, ensure_ascii=False, sort_keys=True)
+    requested_arguments = delegate_start_canary_arguments(nonce)
+    required_arguments = {"prompt": requested_arguments["prompt"]}
+    arguments_json = json.dumps(requested_arguments, ensure_ascii=False, sort_keys=True)
+    final_marker = f"FULL_REGISTRY_CONTINUED_{nonce}"
+    continuation_instruction = (
+        "After its tool result, read the expected_final_marker field and reply "
+        "with exactly that value. "
+        if canary.continue_to_final
+        else ""
+    )
     conversation = [{
         "role": "user",
         "content": (
             f"Call {CANARY_TOOL_NAME} exactly once with exactly this JSON object "
             f"as its arguments: {arguments_json}. Do not add, omit, or change a field. "
+            f"{continuation_instruction}"
             "Return the tool call now and no prose."
         ),
     }]
@@ -402,12 +411,15 @@ def run_provider_contract_canary(
         no_proxy=True,
         timeout=CANARY_TIMEOUT_SEC,
     )
-    calls = assert_normalized_canary_call(message, tools, expected_arguments)
+    # This is a provider schema-admission canary, not a duplicate of the
+    # runtime selector gate.  The provider must preserve the nonce-bearing
+    # prompt and return only declared, schema-valid fields; subagent_id versus
+    # retry_of is enforced by the existing typed runtime refusal tests.
+    calls = assert_normalized_canary_call(message, tools, required_arguments)
     first_disclosure = assert_canary_usage(usage, canary)
     if not canary.continue_to_final:
         return message, usage, None, None
 
-    final_marker = f"FULL_REGISTRY_CONTINUED_{nonce}"
     continuation = [
         *conversation,
         message,
