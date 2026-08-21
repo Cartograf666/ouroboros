@@ -18,6 +18,36 @@ _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
 _TAIL_WINDOW_START_BYTES = 512 * 1024
 
 
+def _read_jsonl_segment_with_gaps(
+    path: pathlib.Path,
+    *,
+    tail_bytes: int | None = None,
+) -> tuple[list, set[str]]:
+    """Read one JSONL segment while retaining truthful parse/read-gap facts.
+
+    ``iter_jsonl_objects`` intentionally skips malformed rows because most
+    callers are best-effort telemetry readers.  Gateway history is different:
+    it publishes a completeness claim, so a skipped row must remain visible as
+    a bounded read-gap fact even when the valid rows can still be rendered.
+    """
+    path = pathlib.Path(path)
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return [], set()
+    except OSError:
+        return [], {"unreadable_source"}
+
+    gaps: set[str] = set()
+    try:
+        entries = list(
+            iter_jsonl_objects(path, tail_bytes=tail_bytes, gap_reasons=gaps)
+        )
+    except OSError:
+        gaps.add("unreadable_source")
+    return entries, gaps
+
+
 def read_rotated_jsonl_entries(
     live: pathlib.Path,
     archive_dir: pathlib.Path,
@@ -25,7 +55,9 @@ def read_rotated_jsonl_entries(
     want: int,
     counts_toward_quota,
     max_archives: int = 3,
-) -> list:
+    *,
+    include_gaps: bool = False,
+) -> list | tuple[list, set[str]]:
     """Bounded, rotation-aware read of one JSONL log (v6.90.x P2, built on the
     ``iter_jsonl_objects(tail_bytes=...)`` bounded-read SSOT).
 
@@ -42,14 +74,25 @@ def read_rotated_jsonl_entries(
     live = pathlib.Path(live)
     try:
         size = live.stat().st_size
+    except FileNotFoundError:
+        size = 0
     except OSError:
         size = 0
     window = _TAIL_WINDOW_START_BYTES
+    gaps: set[str] = set()
     while True:
         if window >= size:
-            live_entries = list(iter_jsonl_objects(live))
+            if include_gaps:
+                live_entries, live_gaps = _read_jsonl_segment_with_gaps(live)
+                gaps.update(live_gaps)
+            else:
+                live_entries = list(iter_jsonl_objects(live))
             break
-        live_entries = list(iter_jsonl_objects(live, tail_bytes=window))
+        if include_gaps:
+            live_entries, live_gaps = _read_jsonl_segment_with_gaps(live, tail_bytes=window)
+            gaps.update(live_gaps)
+        else:
+            live_entries = list(iter_jsonl_objects(live, tail_bytes=window))
         if sum(1 for entry in live_entries if counts_toward_quota(entry)) >= want:
             break
         window *= 2
@@ -65,8 +108,13 @@ def read_rotated_jsonl_entries(
         if collected >= want or len(chosen) >= max_archives:
             break
         try:
-            archive_entries = list(iter_jsonl_objects(archive_path))
+            if include_gaps:
+                archive_entries, archive_gaps = _read_jsonl_segment_with_gaps(archive_path)
+                gaps.update(archive_gaps)
+            else:
+                archive_entries = list(iter_jsonl_objects(archive_path))
         except Exception:
+            gaps.add("unreadable_source")
             continue
         chosen.append(archive_entries)
         collected += sum(1 for entry in archive_entries if counts_toward_quota(entry))
@@ -74,7 +122,7 @@ def read_rotated_jsonl_entries(
     for archive_entries in reversed(chosen):  # oldest chosen archive first
         ordered.extend(archive_entries)
     ordered.extend(live_entries)
-    return ordered
+    return (ordered, gaps) if include_gaps else ordered
 
 
 def request_drive_root(request: Request) -> pathlib.Path:

@@ -482,6 +482,7 @@ def iter_jsonl_objects(
     max_entries: Optional[int] = None,
     tail_bytes: Optional[int] = None,
     dict_only: bool = True,
+    gap_reasons: Optional[set[str]] = None,
 ) -> Iterator[Any]:
     """Yield parseable JSONL entries; max_entries applies to raw tail lines."""
     path = pathlib.Path(path)
@@ -498,15 +499,25 @@ def iter_jsonl_objects(
                         handle.readline()
             lines = deque(handle, maxlen=max_entries) if max_entries else handle
             for raw in lines:
-                line = raw.decode("utf-8", errors="replace").strip()
+                try:
+                    line = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    if gap_reasons is not None:
+                        gap_reasons.add("unreadable_bytes")
+                    line = raw.decode("utf-8", errors="replace")
+                line = line.strip()
                 if not line:
                     continue
                 try:
                     entry = json.loads(line)
                 except (json.JSONDecodeError, ValueError):
+                    if gap_reasons is not None:
+                        gap_reasons.add("malformed_jsonl")
                     continue
                 if not dict_only or isinstance(entry, dict):
                     yield entry
+                elif gap_reasons is not None:
+                    gap_reasons.add("invalid_jsonl_row")
     except FileNotFoundError:
         return
 

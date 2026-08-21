@@ -191,6 +191,105 @@ def test_chat_history_backfills_from_rotated_archive(tmp_path):
     assert texts.index("older message before the rotation") < texts.index("newest live message")
 
 
+def test_chat_history_marks_malformed_rows_incomplete(tmp_path):
+    """A skipped JSONL row must not make the bounded window claim completeness."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "chat.jsonl").write_bytes(
+        json.dumps({
+            "ts": "2026-08-21T18:00:00Z",
+            "direction": "in",
+            "chat_id": 1,
+            "text": "surviving row",
+        }).encode("utf-8")
+        + b"\n{malformed row\n"
+    )
+    (logs / "progress.jsonl").write_text("", encoding="utf-8")
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
+    payload = json.loads(response.body.decode("utf-8"))
+
+    assert any(item.get("text") == "surviving row" for item in payload["messages"])
+    assert payload["window"]["complete"] is False
+    assert "chat_malformed_jsonl" in payload["window"]["truncated_by"]
+
+
+def test_history_gap_metadata_keeps_reader_failures_fail_soft(tmp_path, monkeypatch):
+    """Adding gap metadata must not turn the existing best-effort reader into a 500."""
+    from ouroboros.gateway import history
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("synthetic reader failure")
+
+    monkeypatch.setattr(history, "_read_chat_history_entries", fail)
+    rows, quota, gaps = history._collect_chat_rows(
+        tmp_path / "chat.jsonl",
+        tmp_path / "archive",
+        10,
+        lambda *_args: True,
+        {},
+        include_gaps=True,
+    )
+
+    assert rows == []
+    assert quota == 0
+    assert gaps == set()
+
+
+def test_history_gap_metadata_keeps_legacy_reader_call_shape(tmp_path, monkeypatch):
+    """The opt-in metadata path must not change existing private helper callers."""
+    from ouroboros.gateway import history
+
+    row = {
+        "direction": "in",
+        "chat_id": 1,
+        "text": "legacy helper row",
+        "ts": "2026-08-21T18:01:00Z",
+    }
+
+    def legacy(_live, _archive, _want, _predicate):
+        return [row]
+
+    monkeypatch.setattr(history, "_read_chat_history_entries", legacy)
+    rows, quota = history._collect_chat_rows(
+        tmp_path / "chat.jsonl",
+        tmp_path / "archive",
+        10,
+        lambda *_args: True,
+        {},
+    )
+
+    assert rows[0]["text"] == "legacy helper row"
+    assert quota == 1
+
+
+def test_rotated_reader_legacy_mode_keeps_parser_call_shape(tmp_path, monkeypatch):
+    """Non-metadata callers retain the old iterator signature and cost path."""
+    from ouroboros.gateway import _helpers
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    live = logs / "chat.jsonl"
+    live.write_text("{}\n", encoding="utf-8")
+
+    def legacy(path, *, tail_bytes=None):
+        assert tail_bytes is None or isinstance(tail_bytes, int)
+        return iter([{"text": str(path), "direction": "in"}])
+
+    monkeypatch.setattr(_helpers, "iter_jsonl_objects", legacy)
+    entries = _helpers.read_rotated_jsonl_entries(
+        live,
+        tmp_path / "archive",
+        "chat",
+        10,
+        lambda _entry: True,
+    )
+
+    assert isinstance(entries, list)
+    assert entries[0]["direction"] == "in"
+
+
 def test_progress_history_backfills_from_rotated_archive(tmp_path):
     """progress.jsonl now rotates to archive/progress_<ts>.jsonl like chat. History
     replay must backfill rotated progress rows (newest-first, until the n_progress

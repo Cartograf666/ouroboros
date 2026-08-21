@@ -365,7 +365,7 @@ def _origin_fallback_rows(data_dir, thread_id: int, human_tail: list) -> list:
     return synthesized
 
 
-def _read_chat_history_entries(live, adir, want, row_matches_thread):
+def _read_chat_history_entries(live, adir, want, row_matches_thread, *, include_gaps=False):
     """Read a bounded live chat.jsonl tail plus a newest-first archive backfill.
 
     The live chat.jsonl is rotated to ``archive/chat_<ts>.jsonl`` once it crosses
@@ -383,7 +383,12 @@ def _read_chat_history_entries(live, adir, want, row_matches_thread):
     is O(window), not O(whole live file).
     """
     return read_rotated_jsonl_entries(
-        live, adir, "chat", want, _chat_quota_predicate(row_matches_thread)
+        live,
+        adir,
+        "chat",
+        want,
+        _chat_quota_predicate(row_matches_thread),
+        include_gaps=include_gaps,
     )
 
 
@@ -407,7 +412,7 @@ def _chat_quota_predicate(row_matches_thread):
     return _counts_toward_thread
 
 
-def _read_progress_history_entries(live, adir, want, counts_toward_quota):
+def _read_progress_history_entries(live, adir, want, counts_toward_quota, *, include_gaps=False):
     """Bounded, rotation-aware read of logs/progress.jsonl (mirror of
     ``_read_chat_history_entries``): a window-doubled live byte tail plus a
     newest-first ``archive/progress_*.jsonl`` backfill (capped like chat's 3).
@@ -421,7 +426,9 @@ def _read_progress_history_entries(live, adir, want, counts_toward_quota):
     in-window. That guarantee assumes progress rows are appended with
     non-decreasing ts (the writers share one host clock); a backdated
     out-of-order row older than the floor can fall outside the lineage window."""
-    return read_rotated_jsonl_entries(live, adir, "progress", want, counts_toward_quota)
+    return read_rotated_jsonl_entries(
+        live, adir, "progress", want, counts_toward_quota, include_gaps=include_gaps
+    )
 
 
 def _copy_task_summary_metadata(rec: Dict[str, Any], entry: Dict[str, Any]) -> None:
@@ -708,7 +715,9 @@ def _collect_chat_rows(
     n_human: int,
     row_matches_thread,
     chat_annotations: Dict[str, Any],
-) -> tuple[list, int]:
+    *,
+    include_gaps: bool = False,
+) -> tuple[list, int] | tuple[list, int, set[str]]:
     """Read + transform the chat stream.
 
     Returns ``(rows, quota_row_count)`` — the transformed history records and
@@ -716,13 +725,24 @@ def _collect_chat_rows(
     window-truncation metadata)."""
     combined: list = []
     chat_quota_rows = 0
+    stream_gaps: set[str] = set()
     _chat_counts_toward_quota = _chat_quota_predicate(row_matches_thread)
     try:
         # Rotation-aware archive backfill lives in the module-level
         # _read_chat_history_entries helper (endpoint's thread filter threaded in).
-        _chat_entries = _read_chat_history_entries(
-            chat_path, archive_dir, n_human, row_matches_thread
-        )
+        if include_gaps:
+            _chat_entries = _read_chat_history_entries(
+                chat_path,
+                archive_dir,
+                n_human,
+                row_matches_thread,
+                include_gaps=True,
+            )
+            _chat_entries, stream_gaps = _chat_entries
+        else:
+            _chat_entries = _read_chat_history_entries(
+                chat_path, archive_dir, n_human, row_matches_thread
+            )
         # Window accounting for the response's truncation metadata: how many
         # read rows satisfy the SAME quota predicate the reader stopped on.
         chat_quota_rows = sum(
@@ -796,7 +816,7 @@ def _collect_chat_rows(
             combined.append(rec)
     except Exception as exc:
         log.warning("Failed to read chat history: %s", exc)
-    return combined, chat_quota_rows
+    return (combined, chat_quota_rows, stream_gaps) if include_gaps else (combined, chat_quota_rows)
 
 
 def _collect_progress_rows(
@@ -804,7 +824,9 @@ def _collect_progress_rows(
     archive_dir: pathlib.Path,
     n_progress: int,
     row_matches_thread,
-) -> tuple[list, int]:
+    *,
+    include_gaps: bool = False,
+) -> tuple[list, int] | tuple[list, int, set[str]]:
     """Read + transform the progress stream.
 
     Returns ``(rows, quota_row_count)`` (mirror of ``_collect_chat_rows``)."""
@@ -833,13 +855,24 @@ def _collect_progress_rows(
 
     combined: list = []
     progress_quota_rows = 0
+    stream_gaps: set[str] = set()
     try:
-        _progress_entries = _read_progress_history_entries(
-            progress_path,
-            archive_dir,
-            n_progress,
-            _progress_counts_toward_quota,
-        )
+        if include_gaps:
+            _progress_entries = _read_progress_history_entries(
+                progress_path,
+                archive_dir,
+                n_progress,
+                _progress_counts_toward_quota,
+                include_gaps=True,
+            )
+            _progress_entries, stream_gaps = _progress_entries
+        else:
+            _progress_entries = _read_progress_history_entries(
+                progress_path,
+                archive_dir,
+                n_progress,
+                _progress_counts_toward_quota,
+            )
         progress_quota_rows = sum(
             1 for entry in _progress_entries if _progress_counts_toward_quota(entry)
         )
@@ -872,7 +905,11 @@ def _collect_progress_rows(
             combined.append(rec)
     except Exception as exc:
         log.warning("Failed to read progress log: %s", exc)
-    return combined, progress_quota_rows
+    return (
+        (combined, progress_quota_rows, stream_gaps)
+        if include_gaps
+        else (combined, progress_quota_rows)
+    )
 
 
 def _active_lifecycle_row() -> Optional[Dict[str, Any]]:
@@ -1013,6 +1050,7 @@ def _window_metadata(
     archive_dir: pathlib.Path,
     human_rows_dropped: bool,
     lineage_truncated: bool,
+    stream_gaps: Optional[Dict[str, set[str]]] = None,
 ) -> Dict[str, Any]:
     """Additive window metadata (perf2 P3; frozen contract extended explicitly).
 
@@ -1036,6 +1074,11 @@ def _window_metadata(
     ):
         if cause and cause not in truncated_by:
             truncated_by.append(cause)
+    for stream in ("chat", "progress"):
+        for gap in sorted((stream_gaps or {}).get(stream, set())):
+            cause = f"{stream}_{gap}"
+            if cause not in truncated_by:
+                truncated_by.append(cause)
     return {"complete": not truncated_by, "truncated_by": truncated_by}
 
 
@@ -1063,11 +1106,13 @@ def _assemble_history_response(
     chat_path = data_dir / "logs" / "chat.jsonl"
     progress_path = data_dir / "logs" / "progress.jsonl"
     archive_dir = data_dir / "archive"
-    combined, chat_quota_rows = _collect_chat_rows(
+    combined, chat_quota_rows, chat_gaps = _collect_chat_rows(
         chat_path, archive_dir, n_human, row_matches_thread, chat_annotations,
+        include_gaps=True,
     )
-    progress_rows, progress_quota_rows = _collect_progress_rows(
+    progress_rows, progress_quota_rows, progress_gaps = _collect_progress_rows(
         progress_path, archive_dir, n_progress, row_matches_thread,
+        include_gaps=True,
     )
     combined.extend(progress_rows)
     lifecycle_row = _active_lifecycle_row()
@@ -1111,6 +1156,7 @@ def _assemble_history_response(
             chat_quota_rows, progress_quota_rows, n_human, n_progress,
             chat_path, progress_path, archive_dir,
             human_rows_dropped, lineage_truncated,
+            {"chat": chat_gaps, "progress": progress_gaps},
         ),
     }
     # Same rendering options as starlette's JSONResponse — serialized here so
