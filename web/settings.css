@@ -464,10 +464,6 @@
     min-width: 0;
 }
 
-.settings-action-row > .settings-inline-status:empty {
-    display: none;
-}
-
 .settings-action-row > .btn-default {
     justify-self: end;
 }
@@ -902,6 +898,10 @@
     .settings-action-row {
         grid-template-columns: 1fr;
         align-items: start;
+    }
+
+    .settings-action-row > .settings-inline-status:empty {
+        display: none;
     }
 
     .settings-action-row > .btn-default {

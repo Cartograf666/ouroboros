@@ -1,11 +1,10 @@
 import { apiFetch } from './api_client.js';
+import { setInlineStatus } from './ui_helpers.js';
 const MODEL_CATALOG_TIMEOUT_MS = 25000;
 let catalogRefreshSeq = 0;
 
 function setCatalogStatus(statusEl, text, tone = 'muted') {
-    if (!statusEl) return;
-    statusEl.textContent = text;
-    statusEl.dataset.tone = tone;
+    setInlineStatus(statusEl, text, tone);
 }
 
 function broadcastCatalog(items) {

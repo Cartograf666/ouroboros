@@ -21,7 +21,7 @@ test('neutral controls have one shared button role in both UI shells', () => {
 test('single-action settings rows reserve a flexible status and responsive action edge', () => {
     assert.match(settingsCss, /\.settings-action-row\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto/);
     assert.match(settingsCss, /\.settings-action-row\s*>\s*\.btn-default\s*\{[^}]*justify-self:\s*end/);
-    assert.match(settingsCss, /\.settings-action-row\s*>\s*\.settings-inline-status:empty\s*\{[^}]*display:\s*none/);
+    assert.match(settingsCss, /@media \(max-width: 760px\)[\s\S]*?\.settings-action-row\s*>\s*\.settings-inline-status:empty\s*\{[^}]*display:\s*none/);
     assert.match(settingsCss, /@media \(max-width: 760px\)[\s\S]*?\.settings-action-row\s*\{[^}]*grid-template-columns:\s*1fr/);
 });
 
@@ -33,6 +33,8 @@ test('async actions expose the same busy and status semantics', () => {
     assert.match(settingsJs, /refreshModelCatalog\(\{ button: byId\('btn-refresh-model-catalog'\) \}\)/);
     assert.match(settingsJs, /setInlineStatus\(el, '', 'muted'\)/);
     assert.match(uiHelpersJs, /if \(el\.textContent !== next\) el\.textContent = next/);
+    assert.match(catalogJs, /import \{ setInlineStatus \} from '\.\/ui_helpers\.js'/);
+    assert.match(catalogJs, /setInlineStatus\(statusEl, text, tone\)/);
     assert.match(catalogJs, /refreshModelCatalog\(\{ button \} = \{\}\)/);
     assert.match(catalogJs, /refreshSeq === catalogRefreshSeq/);
 });
