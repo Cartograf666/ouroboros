@@ -6756,20 +6756,12 @@ def test_run_tb_classifies_a_harbor_job_by_its_trials_not_its_exit_code():
 
 
 def test_run_tb_manifest_records_the_model_the_run_actually_resolved(tmp_path, monkeypatch):
-    """TB's manifest must name the model that RAN, in the SAME field GAIA records it in.
+    """Record the model that ran, not decoy env/settings templates.
 
-    Presence is deliberately not the property under test. The sibling failure this guards
-    against is SWE-Pro's manifest naming a model that did not run because it snapshotted the
-    settings TEMPLATE instead of the derived settings, so a decoy model is planted in BOTH the
-    host env and the host settings file: an implementation that copies either one still writes a
-    perfectly non-empty `model_slots`, and still fails every equality assertion below. The
-    `--all-model` leg additionally pins the post-override value, the one `--model` alone never
-    sees.
-
-    Hermetic by construction — purpose-built seed repo, tmp settings file, tmp run root, cwd
-    redirected into tmp_path and the harbor probe stubbed — so nothing here depends on this
-    machine's workspace layout or on a harbor binary being installed.
+    The ``--all-model`` leg also pins post-parse override truth. The seed repo, settings,
+    run roots, cwd and harbor probe are isolated from the operator workspace.
     """
+    from devtools.benchmarks.common import model_slots
     from devtools.benchmarks.common.manifests import MODEL_SLOT_KEYS
     from devtools.benchmarks.terminal_bench import run_tb
 
@@ -6778,8 +6770,11 @@ def test_run_tb_manifest_records_the_model_the_run_actually_resolved(tmp_path, m
     monkeypatch.setattr(run_tb, "repo_root_from_devtools", lambda: seed)
     monkeypatch.setattr(run_tb, "harbor_version", lambda _harbor_bin: "")
     monkeypatch.chdir(tmp_path)
-    for key in MODEL_SLOT_KEYS:
-        monkeypatch.delenv(key, raising=False)
+    for key in (
+        *MODEL_SLOT_KEYS, *model_slots._ACTIVE_LOCAL_ROUTE_KEYS,
+        model_slots.SUBAGENTS_SETTING, model_slots.REVIEWER_SLOTS_ENV, "USE_LOCAL_HEAVY",
+    ):
+        monkeypatch.setenv(key, "")
     settings = tmp_path / "settings.json"
     settings.write_text(
         json.dumps({"OUROBOROS_MODEL": "decoy/template-main",

@@ -159,7 +159,9 @@ def test_uncredentialed_api_actor_stops_before_the_llm_loop(monkeypatch, tmp_pat
     })
 
     assert calls == []
-    result = json.loads((drive / "task_results" / "api-child.json").read_text())
+    result = json.loads(
+        (drive / "task_results" / "api-child.json").read_text(encoding="utf-8")
+    )
     assert result["outcome_axes"]["execution"]["status"] == "infra_failed"
     assert result["reason_code"] == "subagent_executor_unavailable"
     assert result["subagent_availability"]["host_fallback"] is False
