@@ -1442,17 +1442,19 @@ def get_tools() -> List[ToolEntry]:
                 "delegate_cancel. The run's output is a CLAIM you must check — you are the "
                 "host, so verification receipts are still yours to write. If no route is "
                 "configured or it is unavailable you get a typed refusal: choose an "
-                "explicit configured alternative, wait, narrow, or report blocked."
+                "explicit configured alternative, wait, narrow, or report blocked. Fresh "
+                "starts require subagent_id; recovery retries use retry_of without a new "
+                "subagent selector."
             ),
             "parameters": {
                 "type": "object",
                 "required": ["prompt"],
-                "anyOf": [{"required": ["subagent_id"]}, {"required": ["retry_of"]}],
                 "properties": {
                 "prompt": {"type": "string", "description": "The complete task for the delegated session."},
                 "subagent_id": {"type": "string", "description":
-                    "Exact agent_session actor id from Available subagents. API actor ids are "
-                    "refused here and must be scheduled as recursive children."},
+                    "Required for a fresh start: exact agent_session actor id from Available "
+                    "subagents. Omit when replaying retry_of. API actor ids are refused here "
+                    "and must be scheduled as recursive children."},
                 "root": {"type": "string", "enum": ["skill_payload"], "description":
                     "Optional exact-resource selector: 'skill_payload' delegates ONE "
                     "installed non-native skill payload you can already write. Omit "
@@ -1473,6 +1475,8 @@ def get_tools() -> List[ToolEntry]:
                     "outcome was unknown (transport failure, lost response). Replays THAT "
                     "invocation byte-identically under its original key, so the engine "
                     "returns the run it already accepted instead of starting a second one. "
+                    "Omit subagent_id on this recovery path; supplying both selectors is a "
+                    "typed conflict. "
                     "Never set it for an intended new run — a plain call always starts a "
                     "NEW invocation, even with an identical prompt."},
                 },

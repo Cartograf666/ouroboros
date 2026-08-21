@@ -2389,11 +2389,37 @@ Claude Runtime Status appears when an Anthropic key exists or when backend/runti
 
 The local `ouroboros-stable` ref also remains a recovery fallback maintained by explicit promotion; that local role does not select the official QA feed. Colab seeds it from the already validated shared Stable release when possible and otherwise from the selected validated channel, then leaves it pinned until promotion. Launcher metadata describes bootstrap provenance only. Runtime status, preflight, Colab bootstrap, and apply resolve the selected channel and exact fetched SHA themselves, so an older frozen launcher cannot silently redirect updates. Stable additionally requires the shared plain release tag; QA and Development do not use version comparison as an admission gate.
 
-The main CI workflow has five roles: fork-safe quick checks with no provider secrets; the full cross-platform matrix; provider integration when secrets exist; official-skill install, preflight, review, dependency, and keyless execution smoke; and tag-triggered build/release. Quick and full checkouts fetch complete history because the size ratchet fails closed unless its immutable bootstrap and every first-parent transition are locally provable. Secret-bearing skill review runs before any step that imports downloaded plugin code, and a missing required key is red rather than skipped. Release jobs build three platform archives, an AppImage, and three native Linux package assets, verify each final asset, produce checksums, SBOMs and source-bound attestations, and recheck the remote annotated tag against the event SHA before draft creation and publication.
+The main CI workflow has five roles: fork-safe quick checks with no provider secrets; the full cross-platform matrix; trusted provider integration; official-skill install, preflight, review, dependency, and keyless execution smoke; and tag-triggered build/release. Quick and full checkouts fetch complete history because the size ratchet fails closed unless its immutable bootstrap and every first-parent transition are locally provable. Secret-bearing skill review runs before any step that imports downloaded plugin code, and a missing required key is red rather than skipped. Release jobs build three platform archives, an AppImage, and three native Linux package assets, verify each final asset, produce checksums, SBOMs and source-bound attestations, and recheck the remote annotated tag against the event SHA before draft creation and publication.
 
-Request-wire compatibility has two CI layers without changing the workflow. Fork-safe pull-request tests deterministically pin the custom codec, exact-route typed recovery, success-only/TTL evidence, ordered terminal-call history, all tool-bearing consumers, and direct-Anthropic custody/scrubbing. The existing trusted `integration` lane on target-branch pushes, manual runs, and tags derives unique direct OpenAI models from `OPENAI_DIRECT_DEFAULTS` and exercises public `LLMClient.chat`: custom+`medium`, a real registry tool schema, normalized/schema-valid calls, and a nonce-bearing tool-result continuation on the shipped Main model. Missing OpenAI credentials are red only in the official repository job; explicit quota/429/5xx/timeout outcomes are typed inconclusive, while auth/model/reasoning/tool contract 4xx remain red. An applied `none` can restore availability but cannot satisfy this reasoning-integrity canary.
+Tool-schema compatibility has two CI layers. Fork-safe pull-request tests build the
+complete shipped built-in catalog without loading MCP or extensions, validate every
+schema as general JSON Schema plus the known cross-provider subset (including no empty
+enum and no root `anyOf` / `oneOf` / `allOf`), and require OpenRouter/function, direct
+Anthropic, GigaChat, and direct OpenAI projections to preserve the complete tool-name
+set. The trusted `integration` lane runs only on `main` / `ouroboros` /
+`ouroboros-stable` pushes, manual runs, and tags. It sends that same full registry in
+one bounded `delegate_start` canary per physical route without executing the returned
+call: OpenRouter Gemini (`google/gemini-3.7-flash`), Opus
+(`anthropic/claude-opus-5`), GPT (`openai/gpt-5.6-luna`), Grok
+(`x-ai/grok-4.6`), and DeepSeek (`deepseek/deepseek-v4-pro-0813`); the three shipped
+direct OpenAI defaults; direct Anthropic (`anthropic::claude-sonnet-5`); and optional
+MiniMax (`minimax::MiniMax-M3`), Cloud.ru (`cloudru::zai-org/GLM-4.7`), and GigaChat
+(`gigachat::GigaChat-2-Max`). The shipped direct-OpenAI Main route alone keeps its
+second-turn nonce-bearing continuation. Each canary requires positive usage, exact
+provider/model identity, and a normalized schema-valid tool call; supported reasoning
+routes request `medium`, while GigaChat uses its supported automatic tool choice.
+Missing core credentials are red only in the official trusted job; absent optional
+credentials are loud skips. Quota/billing, 429, 5xx, and timeout outcomes remain typed
+inconclusive, while contract/auth/model/tool/reasoning 4xx are red.
 
-Quick pull-request jobs are read-only and never use `pull_request_target`. The live catalog skill lane is intentionally a release dependency: it proves that the published payloads still install on this runtime, while keeping provider credentials out of every process that imports payload code. This external-service dependency is an explicit owner trade-off rather than an accidental source of flaky authority.
+Quick pull-request jobs are read-only, receive no provider secrets, and never use
+`pull_request_target`; there is no scheduled paid run. `release-preflight` depends on
+the trusted integration job as well as the full test matrix, so a reproducible
+provider-contract failure blocks tag builds while an inconclusive provider outage does not. The
+live catalog skill lane remains an independent release dependency: it proves that the
+published payloads still install on this runtime, while keeping provider credentials
+out of every process that imports payload code. These external-service dependencies are
+explicit owner trade-offs rather than accidental sources of flaky authority.
 
 The separate Scorecard workflow runs on `main` pushes and weekly. It pins every action by full commit SHA, defaults permissions to read-only, and adds only `security-events: write` and `id-token: write` for SARIF upload and OpenSSF publication. `CODE_OF_CONDUCT.md` owns community rules and reporting; `CITATION.cff` owns the software citation and preferred technical-report citation; `site/paper/index.html` owns the canonical human- and machine-readable paper landing page; `docs/benchmarks/evidence.json` is a historical, release-bound non-GAIA projection of public benchmark claims and immutable evidence links. README remains the claim SSOT.
 

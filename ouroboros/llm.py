@@ -2898,18 +2898,19 @@ class LLMClient:
     def _build_anthropic_tool_choice(tool_choice: Any) -> Optional[Dict[str, Any]]:
         if not tool_choice or tool_choice == "auto":
             return None
-        if tool_choice in {"required", "any"}:
-            return {"type": "any"}
-        if tool_choice == "none":
-            return {"type": "none"}
         if isinstance(tool_choice, dict):
             function = tool_choice.get("function") or {}
             name = str(function.get("name") or "").strip()
             if name:
                 return {"type": "tool", "name": name}
-        if isinstance(tool_choice, str):
-            return {"type": "tool", "name": tool_choice}
-        return None
+            return None
+        if not isinstance(tool_choice, str):
+            return None
+        if tool_choice in {"required", "any"}:
+            return {"type": "any"}
+        if tool_choice == "none":
+            return {"type": "none"}
+        return {"type": "tool", "name": tool_choice}
 
     @staticmethod
     def _cache_write_split(raw_usage: Dict[str, Any]) -> Dict[str, int]:
