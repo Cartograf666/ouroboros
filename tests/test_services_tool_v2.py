@@ -280,6 +280,98 @@ def test_executor_local_status_refreshes_late_readiness_after_timeout(tmp_path):
     assert payload["ready"] is True
 
 
+def test_executor_payload_repolls_local_terminal_after_readiness_refresh(tmp_path):
+    import ouroboros.workspace_executor as workspace_executor
+
+    class RacingProcess:
+        def __init__(self):
+            self.calls = 0
+
+        def poll(self):
+            self.calls += 1
+            return None if self.calls == 1 else 0
+
+    log_path = tmp_path / "race.log"
+    log_path.write_bytes(b"READY\n")
+    record = SimpleNamespace(
+        service_id="task:race",
+        name="race",
+        task_id="task",
+        executor=SimpleNamespace(executor_id="local", kind="local", network="host"),
+        backend_pid="1234",
+        backend_cwd="/workspace",
+        host_cwd=tmp_path,
+        cwd_root="active_workspace",
+        cwd_base=str(tmp_path),
+        cwd_source="active_workspace",
+        skill_name="",
+        cmd=["service"],
+        outputs=[],
+        keep_alive=False,
+        backend_log_path=str(log_path),
+        readiness={"log_contains": "READY"},
+        started_at=time.time(),
+        ready=False,
+        ready_observed_at="",
+        local_proc=RacingProcess(),
+        readiness_log_offset=0,
+        readiness_log_carry=b"",
+        readiness_log_identity=None,
+    )
+
+    payload = workspace_executor._service_payload(record)
+
+    assert payload["state"] == "exited"
+    assert payload["ready"] is False
+    assert payload["ready_observed_at"]
+
+
+def test_executor_payload_repolls_docker_terminal_after_readiness_refresh(monkeypatch, tmp_path):
+    import ouroboros.workspace_executor as workspace_executor
+
+    record = SimpleNamespace(
+        service_id="task:docker-race",
+        name="docker-race",
+        task_id="task",
+        executor=SimpleNamespace(executor_id="docker", kind="docker_exec", network="none", container_name="svc"),
+        backend_pid="1234",
+        backend_cwd="/workspace",
+        host_cwd=tmp_path,
+        cwd_root="active_workspace",
+        cwd_base=str(tmp_path),
+        cwd_source="active_workspace",
+        skill_name="",
+        cmd=["service"],
+        outputs=[],
+        keep_alive=False,
+        backend_log_path="/tmp/service.log",
+        readiness={"log_contains": "READY"},
+        started_at=time.time(),
+        ready=False,
+        ready_observed_at="",
+        readiness_log_offset=0,
+        readiness_log_carry=b"",
+        readiness_log_identity=(7, 42),
+    )
+    state_calls = 0
+
+    def fake_run(cmd, **kwargs):
+        nonlocal state_calls
+        shell = str(cmd[-1])
+        if "stat -c" in shell:
+            return subprocess.CompletedProcess(cmd, 0, stdout=b"7:42:5\nREADY", stderr=b"")
+        state_calls += 1
+        result = "running\n" if state_calls == 1 else "exited\n"
+        return subprocess.CompletedProcess(cmd, 0, stdout=result, stderr="")
+
+    monkeypatch.setattr(workspace_executor.subprocess, "run", fake_run)
+    payload = workspace_executor._service_payload(record)
+
+    assert payload["state"] == "exited"
+    assert payload["ready"] is False
+    assert state_calls == 2
+
+
 def test_executor_docker_readiness_uses_incremental_cursor_and_carry(monkeypatch):
     import ouroboros.workspace_executor as workspace_executor
 

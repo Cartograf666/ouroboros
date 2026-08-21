@@ -387,6 +387,7 @@ def _docker_exec_pidfile_stop_shell(pidfile: str) -> str:
         "kill -TERM -$pid 2>/dev/null || kill -TERM $pid 2>/dev/null || true; "
         "sleep 0.5; "
         "kill -KILL -$pid 2>/dev/null || kill -KILL $pid 2>/dev/null || true; "
+        "if kill -0 -$pid 2>/dev/null || kill -0 $pid 2>/dev/null; then exit 1; fi; "
         f"rm -f {quoted_pidfile}"
     )
 
@@ -412,7 +413,15 @@ def _dispatch_docker_record_cleanup(record: dict[str, Any]) -> bool:
             errors="replace",
             timeout=5,
         )
-        return proc.returncode == 0
+        if proc.returncode != 0:
+            return False
+        # The bounded shell dispatch is only an attempt.  Service records carry
+        # a backend PID, so panic/``wait=False`` cleanup performs the same
+        # explicit terminal probe before allowing the durable record to go.
+        backend_pid = str(record.get("backend_pid") or "").strip()
+        if backend_pid:
+            return _docker_pid_state(container, backend_pid) == "exited"
+        return True
     except Exception:
         return False
 
@@ -491,7 +500,6 @@ def _register_service_process(drive_root: pathlib.Path | None, record: _Executor
             "container_name": record.executor.container_name,
             "backend_pid": record.backend_pid,
             "backend_log_path": record.backend_log_path,
-            "readiness": dict(record.readiness),
             "backend_cwd": record.backend_cwd,
             "host_cwd": str(record.host_cwd),
             "cwd_root": record.cwd_root,
@@ -651,17 +659,17 @@ def _kill_docker_record(record: dict[str, Any], *, wait: bool = True) -> bool:
             return False
         if proc.returncode != 0:
             return False
-        if _docker_pid_is_running(container, backend_pid):
+        if _docker_pid_state(container, backend_pid) != "exited":
             return False
     return True
 
 
-def _docker_pid_is_running(container_name: str, backend_pid: str) -> bool:
-    """Return true only when Docker's kill-0 probe confirms a live backend."""
+def _docker_pid_state(container_name: str, backend_pid: str) -> str:
+    """Probe Docker and preserve ``unknown`` when the probe is inconclusive."""
 
     pid = str(backend_pid or "").strip()
     if not pid:
-        return False
+        return "unknown"
     try:
         bootstrap_process_path()
         proc = subprocess.run(
@@ -679,8 +687,18 @@ def _docker_pid_is_running(container_name: str, backend_pid: str) -> bool:
             timeout=5,
         )
     except Exception:
-        return True
-    return proc.returncode == 0 and "running" in (proc.stdout or "")
+        return "unknown"
+    if proc.returncode != 0:
+        return "unknown"
+    raw_output = proc.stdout or ""
+    if isinstance(raw_output, bytes):
+        raw_output = raw_output.decode("utf-8", errors="replace")
+    output = str(raw_output).strip()
+    if output == "running":
+        return "running"
+    if output == "exited":
+        return "exited"
+    return "unknown"
 
 
 def kill_all_foreground(drive_root: pathlib.Path | None = None, *, wait: bool = True) -> list[dict[str, Any]]:
@@ -884,6 +902,8 @@ def stop_service(ctx: Any, name: str) -> dict[str, Any] | None:
             )
         except Exception as exc:
             payload = _service_payload(record)
+            if record.executor.kind == "docker_exec":
+                payload["cleanup_dispatched"] = False
             payload["stop_failed"] = True
             payload["stop_error"] = f"{type(exc).__name__}: {exc}"
             return payload
@@ -895,10 +915,14 @@ def stop_service(ctx: Any, name: str) -> dict[str, Any] | None:
         # A successful shell dispatch is not custody settlement by itself.
         # Confirm the backend PID is no longer observable before dropping the
         # in-memory handle and durable process record.
-        if _service_state(record) == "running":
+        probe_state = _safe_service_state(record)
+        if probe_state != "exited":
             payload = _service_payload(record)
             payload["stop_failed"] = True
-            payload["stop_error"] = "docker service stop returned success but kill-0 still reports the service running"
+            payload["stop_error"] = (
+                "docker service stop returned success but kill-0 confirmation is "
+                f"{probe_state}"
+            )
             return payload
     with _STATE_LOCK:
         _SERVICES.pop(key, None)
@@ -911,7 +935,7 @@ def stop_service(ctx: Any, name: str) -> dict[str, Any] | None:
 def stop_task_services(ctx: Any) -> list[dict[str, Any]]:
     task_id = str(getattr(ctx, "task_id", "") or "manual")
     kept = [
-        _service_payload(record, state=_service_state(record), note="keep_alive")
+        _service_payload(record, state=_safe_service_state(record), note="keep_alive")
         for record in _services_snapshot()
         if record.task_id == task_id
         and bool(getattr(record, "keep_alive", False))
@@ -965,8 +989,9 @@ def kill_all_services(
                     text=True,
                     timeout=10 if wait else 5,
                 )
-                terminal = proc.returncode == 0 and _service_state(record) != "running"
-                payload = _service_payload(record, state="stopped" if terminal else _service_state(record))
+                probe_state = _safe_service_state(record) if proc.returncode == 0 else "unknown"
+                terminal = proc.returncode == 0 and probe_state == "exited"
+                payload = _service_payload(record, state="stopped" if terminal else probe_state)
                 payload["cleanup_dispatched"] = terminal
                 if terminal:
                     with _STATE_LOCK:
@@ -974,10 +999,16 @@ def kill_all_services(
                     _forget_process(record.durable_record_path)
                 else:
                     payload["stop_failed"] = True
-                    payload["stop_error"] = proc.stderr.strip() or proc.stdout.strip() or "docker service stop failed"
+                    payload["stop_error"] = (
+                        proc.stderr.strip()
+                        or proc.stdout.strip()
+                        or f"docker service stop confirmation is {probe_state}"
+                    )
                 stopped.append(payload)
         except Exception as exc:
             payload = _service_payload(record)
+            if record.executor.kind == "docker_exec":
+                payload["cleanup_dispatched"] = False
             payload["stop_failed"] = True
             payload["stop_error"] = f"{type(exc).__name__}: {exc}"
             stopped.append(payload)
@@ -1100,10 +1131,16 @@ def _docker_service_stop_shell(backend_pid: str) -> str:
 
 
 def _service_payload(record: _ExecutorService, *, state: str | None = None, note: str = "") -> dict[str, Any]:
-    actual_state = state or _service_state(record)
+    actual_state = state if state is not None else _safe_service_state(record)
     if actual_state == "running":
         _refresh_executor_service_readiness(record)
+        # Readiness scanning and the state probe are separate operations.  A
+        # process can settle during the scan, so re-poll before serializing a
+        # running+ready claim (for both local and Docker backends).
+        actual_state = _safe_service_state(record)
     else:
+        record.ready = False
+    if actual_state != "running":
         record.ready = False
     payload = {
         "service_id": record.service_id,
@@ -1139,15 +1176,43 @@ def _service_payload(record: _ExecutorService, *, state: str | None = None, note
 def _service_state(record: _ExecutorService) -> str:
     if record.executor.kind == "local":
         proc = record.local_proc
-        return "running" if proc is not None and proc.poll() is None else "exited"
-    proc = subprocess.run(
-        ["docker", "exec", record.executor.container_name, "sh", "-lc", f"kill -0 {shlex.quote(record.backend_pid)} 2>/dev/null && echo running || echo exited"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=10,
-    )
-    return "running" if "running" in (proc.stdout or "") else "exited"
+        if proc is None:
+            return "exited"
+        try:
+            return "running" if proc.poll() is None else "exited"
+        except Exception:
+            return "unknown"
+    try:
+        proc = subprocess.run(
+            ["docker", "exec", record.executor.container_name, "sh", "-lc", f"kill -0 {shlex.quote(record.backend_pid)} 2>/dev/null && echo running || echo exited"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return "unknown"
+    if proc.returncode != 0:
+        return "unknown"
+    raw_output = proc.stdout or ""
+    if isinstance(raw_output, bytes):
+        raw_output = raw_output.decode("utf-8", errors="replace")
+    output = str(raw_output).strip()
+    if output == "running":
+        return "running"
+    if output == "exited":
+        return "exited"
+    return "unknown"
+
+
+def _safe_service_state(record: _ExecutorService) -> str:
+    """Never let an inconclusive state probe discard cleanup custody."""
+
+    try:
+        state = _service_state(record)
+    except Exception:
+        return "unknown"
+    return state if state in {"running", "exited", "unknown"} else "unknown"
 
 
 def _read_service_tail(record: _ExecutorService, chars: int) -> str:

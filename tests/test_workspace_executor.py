@@ -775,6 +775,7 @@ def test_executor_service_status_and_durable_record_redact_secret_like_args(tmp_
 
     assert secret not in status_raw
     assert secret not in durable_text
+    assert '"readiness"' not in durable_text
     assert "***REDACTED***" in status_raw
     assert "***REDACTED***" in durable_text
 
@@ -1082,6 +1083,170 @@ def test_docker_executor_stop_success_without_terminal_kill_preserves_handle(tmp
     assert workspace_executor.service_status(ctx, "svc") is not None
 
 
+def test_docker_executor_stop_unknown_probe_preserves_handle(tmp_path, monkeypatch):
+    import ouroboros.workspace_executor as workspace_executor
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data = tmp_path / "data"
+    data.mkdir()
+    ctx = ToolContext(
+        repo_dir=tmp_path / "repo",
+        drive_root=data,
+        workspace_root=workspace,
+        workspace_mode="external",
+        task_id="docker-stop-unknown",
+        executor_ref={
+            "type": "docker_exec",
+            "id": "pb-container",
+            "container_name": "pb-container",
+            "network": "none",
+            "workspace_host_path": str(workspace),
+            "workspace_backend_path": "/workspace",
+        },
+    )
+    workspace_executor._SERVICES.clear()
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["docker", "inspect", "-f"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="none\n", stderr="")
+        if cmd[:2] == ["docker", "exec"] and "nohup" in str(cmd[-1]):
+            return subprocess.CompletedProcess(cmd, 0, stdout="12345\n", stderr="")
+        if cmd[:2] == ["docker", "exec"] and "kill -TERM" in str(cmd[-1]):
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[:2] == ["docker", "exec"] and "kill -0" in str(cmd[-1]):
+            return subprocess.CompletedProcess(cmd, 7, stdout="", stderr="daemon unavailable")
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(workspace_executor.subprocess, "run", fake_run)
+    workspace_executor.start_service(
+        ctx,
+        name="svc",
+        cmd=["sleep", "30"],
+        host_cwd=workspace,
+        cwd_root="active_workspace",
+        readiness={},
+        outputs=[],
+        before_outputs={},
+    )
+
+    failed = workspace_executor.stop_service(ctx, "svc")
+
+    assert failed and failed["stop_failed"] is True
+    assert "unknown" in failed["stop_error"]
+    assert failed["state"] == "unknown"
+    assert workspace_executor.service_status(ctx, "svc") is not None
+
+
+def test_docker_executor_stop_state_exception_preserves_handle(tmp_path, monkeypatch):
+    import ouroboros.workspace_executor as workspace_executor
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data = tmp_path / "data"
+    data.mkdir()
+    ctx = ToolContext(
+        repo_dir=tmp_path / "repo",
+        drive_root=data,
+        workspace_root=workspace,
+        workspace_mode="external",
+        task_id="docker-stop-exception",
+        executor_ref={
+            "type": "docker_exec",
+            "id": "pb-container",
+            "container_name": "pb-container",
+            "network": "none",
+            "workspace_host_path": str(workspace),
+            "workspace_backend_path": "/workspace",
+        },
+    )
+    workspace_executor._SERVICES.clear()
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["docker", "inspect", "-f"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="none\n", stderr="")
+        if cmd[:2] == ["docker", "exec"] and "nohup" in str(cmd[-1]):
+            return subprocess.CompletedProcess(cmd, 0, stdout="12345\n", stderr="")
+        if cmd[:2] == ["docker", "exec"] and "kill -TERM" in str(cmd[-1]):
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(workspace_executor.subprocess, "run", fake_run)
+    monkeypatch.setattr(workspace_executor, "_service_state", lambda _record: (_ for _ in ()).throw(RuntimeError("probe boom")))
+    workspace_executor.start_service(
+        ctx,
+        name="svc",
+        cmd=["sleep", "30"],
+        host_cwd=workspace,
+        cwd_root="active_workspace",
+        readiness={},
+        outputs=[],
+        before_outputs={},
+    )
+
+    failed = workspace_executor.stop_service(ctx, "svc")
+
+    assert failed and failed["stop_failed"] is True
+    assert failed["state"] == "unknown"
+    assert workspace_executor.service_status(ctx, "svc") is not None
+
+
+def test_docker_executor_global_cleanup_unknown_state_keeps_handle(tmp_path, monkeypatch):
+    import ouroboros.workspace_executor as workspace_executor
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data = tmp_path / "data"
+    data.mkdir()
+    ctx = ToolContext(
+        repo_dir=tmp_path / "repo",
+        drive_root=data,
+        workspace_root=workspace,
+        workspace_mode="external",
+        task_id="docker-cleanup-unknown",
+        executor_ref={
+            "type": "docker_exec",
+            "id": "pb-container",
+            "container_name": "pb-container",
+            "network": "none",
+            "workspace_host_path": str(workspace),
+            "workspace_backend_path": "/workspace",
+        },
+    )
+    workspace_executor._SERVICES.clear()
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["docker", "inspect", "-f"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="none\n", stderr="")
+        if cmd[:2] == ["docker", "exec"] and "nohup" in str(cmd[-1]):
+            return subprocess.CompletedProcess(cmd, 0, stdout="12345\n", stderr="")
+        if cmd[:2] == ["docker", "exec"] and "kill -TERM" in str(cmd[-1]):
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[:2] == ["docker", "exec"] and "kill -0" in str(cmd[-1]):
+            return subprocess.CompletedProcess(cmd, 7, stdout="", stderr="daemon unavailable")
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(workspace_executor.subprocess, "run", fake_run)
+    workspace_executor.start_service(
+        ctx,
+        name="svc",
+        cmd=["sleep", "30"],
+        host_cwd=workspace,
+        cwd_root="active_workspace",
+        readiness={},
+        outputs=[],
+        before_outputs={},
+    )
+
+    result = workspace_executor.kill_all_services(data)
+
+    current = next(item for item in result if item.get("name") == "svc")
+    assert current["cleanup_dispatched"] is False
+    assert current["stop_failed"] is True
+    assert current["state"] == "unknown"
+    assert workspace_executor.service_status(ctx, "svc") is not None
+
+
 def test_docker_durable_cleanup_keeps_record_until_kill_zero_terminal(tmp_path, monkeypatch):
     import ouroboros.workspace_executor as workspace_executor
 
@@ -1108,6 +1273,42 @@ def test_docker_durable_cleanup_keeps_record_until_kill_zero_terminal(tmp_path, 
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         if cmd[:2] == ["docker", "exec"] and "kill -0" in str(cmd[-1]):
             return subprocess.CompletedProcess(cmd, 0, stdout="running\n", stderr="")
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(workspace_executor.subprocess, "run", fake_run)
+    result = workspace_executor._kill_durable_service_records(data)
+
+    assert result[0]["state"] == "cleanup_pending"
+    assert result[0]["cleanup_dispatched"] is False
+    assert path.exists()
+
+
+def test_docker_durable_cleanup_keeps_record_on_unknown_kill_zero(tmp_path, monkeypatch):
+    import ouroboros.workspace_executor as workspace_executor
+
+    data = tmp_path / "data"
+    data.mkdir()
+    workspace_executor._SERVICES.clear()
+    path = workspace_executor._register_process(
+        data,
+        {
+            "record_type": "service",
+            "executor_type": "docker_exec",
+            "executor_id": "pb-container",
+            "container_name": "pb-container",
+            "backend_pid": "12345",
+            "service_id": "task:durable-unknown",
+            "task_id": "task",
+            "name": "durable-unknown",
+        },
+    )
+    assert path is not None
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:2] == ["docker", "exec"] and "kill -TERM" in str(cmd[-1]):
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[:2] == ["docker", "exec"] and "kill -0" in str(cmd[-1]):
+            return subprocess.CompletedProcess(cmd, 7, stdout="", stderr="daemon unavailable")
         raise AssertionError(cmd)
 
     monkeypatch.setattr(workspace_executor.subprocess, "run", fake_run)
