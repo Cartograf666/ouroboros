@@ -861,12 +861,14 @@ export const SURFACE_ACTIVATION_EVENTS = ['ouro:page-shown', 'ouro:settings-subt
  * @param {Function} options.listener called with the store view on every settle
  * @param {string} options.elementId id of the element that IS this surface
  * @param {boolean} [options.includeModels] the activation read needs discovery
+ * @param {Function} [options.onActivate] optional owner-action override
  * @returns {Function} one disposer releasing the subscription and the listeners
  */
 export function bindStatusSurface(store, {
     listener = () => {},
     elementId = '',
     includeModels = false,
+    onActivate = null,
     doc = () => (typeof document === 'undefined' ? null : document),
     win = () => (typeof window === 'undefined' ? null : window),
     activationEvents = SURFACE_ACTIVATION_EVENTS,
@@ -883,7 +885,10 @@ export function bindStatusSurface(store, {
     if (target && typeof target.addEventListener === 'function') {
         // Activation is judged by the SAME predicate, so a tab that is not this
         // surface's tab costs nothing and this surface needs no name for its own.
-        const onActivated = () => { if (visible()) store.refresh({ includeModels }); };
+        const activationAction = typeof onActivate === 'function'
+            ? onActivate
+            : () => store.refresh({ includeModels });
+        const onActivated = () => { if (visible()) return activationAction(); };
         for (const name of activationEvents) {
             target.addEventListener(name, onActivated);
             disposers.push(() => target.removeEventListener(name, onActivated));

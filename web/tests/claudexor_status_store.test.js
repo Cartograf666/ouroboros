@@ -616,6 +616,37 @@ test('any bound surface can keep the poll armed — not only the accounts panel'
     t.mock.timers.reset();
 });
 
+test('surface binding delegates a visible activation to its owner action', async () => {
+    const elements = { accounts: { offsetParent: {} }, hidden: { offsetParent: null } };
+    const doc = fakeDoc();
+    doc.getElementById = (id) => elements[id] || null;
+    const listeners = {};
+    const win = {
+        addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
+        removeEventListener(type, fn) {
+            listeners[type] = (listeners[type] || []).filter((item) => item !== fn);
+        },
+        fire(type) { return Promise.all((listeners[type] || []).map((fn) => fn())); },
+    };
+    const store = createClaudexorStatusStore({ fetchImpl: async () => okResponse(RUNNING), doc });
+    let activations = 0;
+    const releaseVisible = bindStatusSurface(store, {
+        elementId: 'accounts', listener: () => {}, doc, win,
+        onActivate: () => { activations += 1; },
+    });
+    const releaseHidden = bindStatusSurface(store, {
+        elementId: 'hidden', listener: () => {}, doc, win,
+        onActivate: () => { activations += 100; },
+    });
+
+    await win.fire('ouro:settings-subtab-shown');
+    assert.equal(activations, 1, 'only the visible surface ran its owner action');
+
+    releaseHidden();
+    releaseVisible();
+    store.dispose();
+});
+
 test('a hidden page pauses polling, and a login hold keeps it awake off-surface', () => {
     const doc = fakeDoc();
     const store = createClaudexorStatusStore({
