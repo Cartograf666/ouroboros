@@ -1,10 +1,9 @@
-"""SSOT predicate for skill→hub publish eligibility (FR1).
+"""Passive skill→hub visibility and managed-task admission facts.
 
-One rule, consumed by the backend publish gate (``tools/skill_publish.py``), the
-gateway serializer (``gateway/extensions.py`` emits a ``submit_hub`` object), and —
-through that serialized object — the frontend Skills card. This ends the desync
-where the backend accepted advisory-only ``warnings`` but the card still disabled
-Submit unless the status was exactly ``clean``.
+The passive skill index deliberately does not run Betterleaks, so it cannot claim
+that the current bytes are publication-ready.  It does know whether the action is
+visible and whether an ordinary managed task may start to repair/review/publish the
+skill.  The selected-skill preflight owns the later scanner-backed readiness fact.
 
 Imports ONLY the config-level review-status constants — no skill loading, no gateway
 code — so it stays a thin, dependency-light predicate.
@@ -32,26 +31,51 @@ def submit_hub_eligibility(
     review_stale: bool = False,
     github_token_configured: bool = False,
 ) -> Dict[str, Any]:
-    """Return ``{visible, disabled, reason}`` for the Submit-to-Hub affordance.
+    """Return passive publication visibility and task-admission facts.
 
-    ``visible`` is whether the action belongs on the card at all (publishable
-    source); ``disabled`` + ``reason`` explain why a visible action can't proceed
-    yet. A skill with an advisory-only ``warnings`` review IS publishable — matching
-    the backend gate — so the card no longer falsely requires exactly ``clean``."""
+    ``disabled`` is only the compatibility projection of
+    ``not task_start_allowed``.  Repairable review states keep the ordinary task
+    available; the authoritative tool still enforces a fresh publishable review
+    before any outbound effect.
+    """
     src = str(source or "native").lower()
     # Normalize the verdict the SAME way the backend publish gate does, so a raw verdict
     # (e.g. 'pass'/'advisory_pass') and the normalized form ('clean'/'warnings') agree.
     review_status = normalize_skill_review_status(review_status)
     if src not in PUBLISHABLE_SOURCES:
-        return {"visible": False, "disabled": True, "reason": ""}
+        return {
+            "visible": False,
+            "publication_ready": False,
+            "task_start_allowed": False,
+            "disabled": True,
+            "state": "hard_block",
+            "reason": "",
+        }
     if not github_token_configured:
-        return {"visible": True, "disabled": True, "reason": "Configure GITHUB_TOKEN in Settings → Secrets"}
+        return {
+            "visible": True,
+            "publication_ready": False,
+            "task_start_allowed": False,
+            "disabled": True,
+            "state": "hard_block",
+            "reason": "Configure GITHUB_TOKEN in Settings → Secrets",
+        }
     if str(review_profile or "") == "owner_attested":
         # Owner-attested skills SKIPPED the LLM review; a public submission needs the
         # full tri-model review, so the hub refuses them.
-        return {"visible": True, "disabled": True, "reason": "Owner-attested skills can't be published — run a full LLM review first"}
-    if review_stale:
-        return {"visible": True, "disabled": True, "reason": "Skill needs a fresh review before submission"}
-    if str(review_status or "") not in PUBLISHABLE_STATUSES:
-        return {"visible": True, "disabled": True, "reason": "Skill needs a clean (or advisory-only warnings) review before submission"}
-    return {"visible": True, "disabled": False, "reason": "Open a PR to OuroborosHub from your GitHub fork"}
+        reason = "Owner-attested skills need a full LLM review before publication"
+    elif review_stale:
+        reason = "Skill needs a fresh review before publication"
+    elif str(review_status or "") not in PUBLISHABLE_STATUSES:
+        reason = "Skill needs review work before publication"
+    else:
+        # A passive inventory read has not scanned the selected immutable bytes.
+        reason = "Open Publish to check the current bytes before publication"
+    return {
+        "visible": True,
+        "publication_ready": False,
+        "task_start_allowed": True,
+        "disabled": False,
+        "state": "needs_attention",
+        "reason": reason,
+    }

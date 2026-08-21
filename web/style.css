@@ -4748,6 +4748,38 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     white-space: pre-line;
 }
 
+.confirm-dialog-details {
+    border-top: 1px solid var(--surface-border);
+    padding-top: 10px;
+}
+
+.confirm-dialog-details > summary {
+    cursor: pointer;
+    user-select: none;
+}
+
+.confirm-dialog-detail-list {
+    display: grid;
+    gap: 8px;
+    margin: 10px 0 0;
+}
+
+.confirm-dialog-detail-row {
+    display: grid;
+    grid-template-columns: minmax(110px, 0.35fr) minmax(0, 1fr);
+    gap: 10px;
+}
+
+.confirm-dialog-detail-row dt {
+    font-weight: 600;
+}
+
+.confirm-dialog-detail-row dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+}
+
 .marketplace-modal-head {
     display: flex;
     align-items: center;

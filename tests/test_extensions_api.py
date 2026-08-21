@@ -198,6 +198,12 @@ def client_env(tmp_path, monkeypatch):
 
 
 def test_api_extensions_index_lists_extension_skills(tmp_path, monkeypatch):
+    import ouroboros.gateway.skill_publish as skill_publish_preflight
+
+    def unexpected_scan(*_args, **_kwargs):
+        raise AssertionError("passive extension listing ran Betterleaks")
+
+    monkeypatch.setattr(skill_publish_preflight, "scan_named_bytes", unexpected_scan)
     skills_root = tmp_path / "skills"
     plugin = (
         "def register(api):\n"
@@ -219,8 +225,67 @@ def test_api_extensions_index_lists_extension_skills(tmp_path, monkeypatch):
         assert ext_meta["live_reason"] == "disabled"
         assert ext_meta["executable_review"] is False
         assert ext_meta["review_gate"]["blocking_reason"] == "review_pending"
+        assert ext_meta["submit_hub"]["publication_ready"] is False
+        assert ext_meta["submit_hub"]["disabled"] is (
+            not ext_meta["submit_hub"]["task_start_allowed"]
+        )
     finally:
         _stop_patches(patches)
+
+
+def test_api_extensions_index_uses_one_request_local_repo_identity(
+    tmp_path,
+    monkeypatch,
+):
+    import ouroboros.gateway.extensions as extensions_api
+    import ouroboros.skill_review_runner as review_runner
+
+    drive_root = tmp_path / "drive"
+    request_repo = str(tmp_path / "request-skills")
+    later_repo = str(tmp_path / "later-skills")
+    config_reads: list[str] = []
+    reconcile_calls: list[tuple[pathlib.Path, str]] = []
+    build_calls: list[tuple[pathlib.Path, str]] = []
+
+    def changing_repo_path() -> str:
+        value = request_repo if not config_reads else later_repo
+        config_reads.append(value)
+        return value
+
+    def reconcile_stale_review_jobs(root, *, repo_path=None, **_kwargs):
+        effective_repo_path = changing_repo_path() if repo_path is None else repo_path
+        reconcile_calls.append((pathlib.Path(root), effective_repo_path))
+
+    def build_extensions_index(root, repo_path):
+        build_calls.append((pathlib.Path(root), repo_path))
+        return {"skills": [], "live": {}}
+
+    monkeypatch.setattr(
+        "ouroboros.config.get_skills_repo_path",
+        changing_repo_path,
+    )
+    monkeypatch.setattr(
+        review_runner,
+        "reconcile_stale_review_jobs",
+        reconcile_stale_review_jobs,
+    )
+    monkeypatch.setattr(
+        extensions_api,
+        "_build_extensions_index",
+        build_extensions_index,
+    )
+    monkeypatch.setattr(
+        extensions_api,
+        "_request_drive_root",
+        lambda _request: drive_root,
+    )
+
+    response = asyncio.run(extensions_api.api_extensions_index(object()))
+
+    assert response.status_code == 200
+    assert config_reads == [request_repo]
+    assert reconcile_calls == [(drive_root, request_repo)]
+    assert build_calls == [(drive_root, request_repo)]
 
 
 def test_extensions_index_collision_row_skips_lifecycle_projections(
@@ -288,6 +353,14 @@ def test_extensions_index_collision_row_skips_lifecycle_projections(
     assert row["conflict"] is None
     assert row["skill_review"] == {}
     assert row["grants"] == {}
+    assert row["submit_hub"] == {
+        "visible": False,
+        "publication_ready": False,
+        "task_start_allowed": False,
+        "disabled": True,
+        "state": "hard_block",
+        "reason": "",
+    }
     assert schedule_inputs == [[collision]]
     assert not (drive_root / "state").exists()
 

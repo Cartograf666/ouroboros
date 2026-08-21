@@ -36,6 +36,26 @@ export function jsonPost(url, payload = {}, options = {}) {
 }
 
 /**
+ * Run the read-only publication preflight for one selected skill. Domain
+ * states, including repairable findings, remain successful JSON responses;
+ * only transport/admission refusals reject through fetchJson.
+ * @param {string} skill
+ * @returns {Promise<import('./api_types.js').SkillPublishPreflightResponse>}
+ */
+export function skillPublishPreflight(skill) {
+    return jsonPost(`/api/skills/${encodeURIComponent(skill)}/publish-preflight`, {});
+}
+
+/**
+ * Create one ordinary managed task through the shared task gateway.
+ * @param {import('./api_types.js').TaskCreateRequest} payload
+ * @returns {Promise<import('./api_types.js').TaskCreateResponse>}
+ */
+export function createTask(payload) {
+    return jsonPost('/api/tasks', payload);
+}
+
+/**
  * Cancel a task. With {cascade:true} the server also cancels the task's live
  * subtree and answers only once that teardown has finished; without it the
  * request stays the synchronous single-task cancel (no body — headless compat).
@@ -163,6 +183,8 @@ export const apiClient = {
      */
     providerTest: (payload) => jsonPost('/api/providers/test', payload),
     extensions: () => fetchJson('/api/extensions', { cache: 'no-store' }),
+    skillPublishPreflight,
+    createTask,
     skillLifecycleQueue: () => fetchJson('/api/skills/lifecycle-queue', { cache: 'no-store' }),
     /** @returns {Promise<import('./api_types.js').SkillDeleteResponse>} */
     deleteSkill: (skill, payloadRoot) => jsonPost(`/api/skills/${encodeURIComponent(skill)}/delete`, {

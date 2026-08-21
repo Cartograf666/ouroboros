@@ -6,6 +6,7 @@ import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
 import { apiClient, apiFetch } from './api_client.js';
 import { renderInstalledSkillCard } from './skill_card_renderer.js';
+import { runSkillPublishFlow } from './skill_publish_flow.js';
 import { installedTime } from './ui_helpers.js';
 import {
     boundedText,
@@ -282,6 +283,21 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
             document.querySelector('[data-nav-page="widgets"]')?.click();
             return;
         }
+        if (action === 'submit_hub') {
+            // The clicked card is the selected-skill identity. It may disappear
+            // from the passive inventory after a manifest edit, while the
+            // selected preflight can still return an agent-repairable state.
+            const outcome = await runSkillPublishFlow(name);
+            if (!outcome.started) return;
+            showToast(`${name}: publication task ${outcome.task?.task_id || ''} created`, 'ok');
+            emitSkillLifecycle('submit_hub', name);
+            if (typeof ctx.showPage === 'function') {
+                ctx.showPage('chat');
+            } else {
+                document.querySelector('[data-nav-page="chat"]')?.click();
+            }
+            return;
+        }
         const { skills } = await fetchSkills();
         const skill = (skills || []).find((item) => item.name === name);
         if (!skill) throw new Error('Skill not found in current catalogue.');
@@ -376,31 +392,6 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
             return;
         }
 
-        if (action === 'submit_hub') {
-            const ok = await openConfirmDialog({
-                title: `Submit ${name} to OuroborosHub`,
-                body: `Open a public GitHub pull request submitting ${name} to OuroborosHub? The PR will contain the reviewed skill payload and an updated catalog entry.`,
-                confirmLabel: 'Submit to OuroborosHub',
-                danger: true,
-            });
-            if (!ok) return;
-            // A real managed task (v6.70.0): the old path sent a chat command and
-            // printed "task queued" before any task existed — the ephemeral decision
-            // turn cannot even call submit_skill_to_hub, so the placebo could resolve
-            // to nothing. /api/tasks enqueues a supervised folder-less task whose full
-            // tool envelope includes submit_skill_to_hub.
-            const submitTask = await postWithFeedback('/api/tasks', {
-                description: `Submit the local skill "${name}" to OuroborosHub using the submit_skill_to_hub tool. `
-                    + 'Validate the fresh no-blocker review first; if submission is refused, report the exact reason.',
-            });
-            showToast(`${name}: submission task ${submitTask.task_id || ''} created`, 'ok');
-            emitSkillLifecycle('submit_hub', name);
-            if (typeof ctx.showPage === 'function') {
-                ctx.showPage('chat');
-            } else {
-                document.querySelector('[data-nav-page="chat"]')?.click();
-            }
-        }
     }
 
     async function toggleSkillEnabled(name, wantsEnabled) {

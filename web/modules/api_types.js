@@ -589,13 +589,45 @@
  * @property {string=} review_profile
  * @property {boolean=} official_hub_verified
  * @property {boolean=} owner_attestable
- * @property {{visible: boolean, disabled: boolean, reason: string}=} submit_hub
+ * @property {{visible: boolean, publication_ready: boolean, task_start_allowed: boolean, disabled: boolean, state: "ready"|"warnings"|"needs_attention"|"repairable"|"hard_block", reason: string}=} submit_hub
  * @property {{current: Object, history: Object[]}=} skill_review
  * @property {boolean=} is_self_authored
  * @property {Object=} grants
  * @property {string[]=} permissions
  * @property {string[]=} conflicts
  * @property {{code: "skill_conflict", skills: string[], omitted: number}=} conflict
+ */
+
+/**
+ * @typedef {Object} SkillPublishFinding
+ * @property {string} path
+ * @property {number} line
+ * @property {string} detector
+ * @property {"low"|"medium"|"high"|"unknown"} confidence
+ * @property {string} reason
+ * @property {"not_attempted"} verification
+ * @property {"blocker"|"warning"|"audited_false_positive"} disposition
+ */
+
+/**
+ * @typedef {Object} SkillPublishPreflightResponse
+ * @property {boolean} ok
+ * @property {string} skill Canonical selected-skill name.
+ * @property {string} repository Canonical case-preserving owner/repo from the configured catalog.
+ * @property {"ready"|"warnings"|"needs_attention"|"repairable"|"hard_block"} state
+ * @property {boolean} publication_ready
+ * @property {boolean} task_start_allowed
+ * @property {string} snapshot_hash
+ * @property {{status?: string, stale?: boolean, profile?: string}} review
+ * @property {{status?: string, engine?: string, version?: string, ruleset_sha256?: string}} scanner
+ * @property {SkillPublishFinding[]} findings
+ * @property {number} omitted_count
+ * @property {number} blocker_count
+ * @property {number} warning_count
+ * @property {number} audited_false_positive_count
+ * @property {string} reason_code
+ * @property {string} summary
+ * @property {string} repair_hint
  */
 
 /**

@@ -3,9 +3,33 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
 let activeDialog = null;
 let activeClose = null;
 
+/**
+ * Render one caller-supplied typed detail disclosure. Values are always text;
+ * callers cannot inject markup into the shared dialog.
+ * @param {{summary?: string, rows?: Array<{label?: string, value?: string}>}|null} details
+ */
+export function renderConfirmDialogDetails(details) {
+    if (!details || typeof details !== 'object') return '';
+    const rows = Array.isArray(details.rows)
+        ? details.rows.filter((row) => row && typeof row === 'object')
+        : [];
+    if (!rows.length) return '';
+    const renderedRows = rows.map((row) => `
+        <div class="confirm-dialog-detail-row">
+            <dt>${escapeHtml(String(row.label ?? 'Detail'))}</dt>
+            <dd>${escapeHtml(String(row.value ?? ''))}</dd>
+        </div>`).join('');
+    return `<details class="confirm-dialog-details ui-rich-content">
+        <summary>${escapeHtml(String(details.summary ?? 'Show details'))}</summary>
+        <dl class="confirm-dialog-detail-list">${renderedRows}
+        </dl>
+    </details>`;
+}
+
 export function openConfirmDialog({
     title,
     body,
+    details = null,
     input = false,
     initialValue = '',
     // Alert mode (v6.90.3): one OK-style button, no cancel button. Escape,
@@ -28,6 +52,7 @@ export function openConfirmDialog({
                 </div>
                 <div class="marketplace-modal-body">
                     <p>${escapeHtml(body || 'Continue?')}</p>
+                    ${renderConfirmDialogDetails(details)}
                     ${input ? `<input class="files-modal-input confirm-dialog-input" data-confirm-input type="text" value="${escapeHtml(initialValue)}">` : ''}
                 </div>
                 <div class="marketplace-modal-actions">

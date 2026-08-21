@@ -1988,7 +1988,7 @@ class ToolRegistry:
         return f"{safety_msg}\n\n---\n{result}" if safety_msg else result
 
     def _protected_shell_block(
-        self, raw_cmd, cmd_path_lower, binding, acting_self_worktree,
+        self, raw_cmd, cmd_path_lower, binding, acting_self_worktree, writeish,
     ) -> Optional[str]:
         """Apply payload/core write guards to the selected physical target."""
         items = _binding_items(binding)
@@ -2003,7 +2003,7 @@ class ToolRegistry:
                 *SKILL_PAYLOAD_CONTROL_FILENAMES,
                 *(SKILL_PAYLOAD_CONTROL_DIRNAMES - {"__pycache__"}),
             )
-        ) and shell_has_write_indicator(raw_cmd):
+        ) and writeish:
             return (
                 "⚠️ SAFETY_VIOLATION: Shell command would modify a skill "
                 "provenance / launcher seed / dependency marker (.clawhub.json, "
@@ -2613,7 +2613,7 @@ class ToolRegistry:
                     )
 
         if protected_shell := self._protected_shell_block(
-            raw_cmd, cmd_path_lower, binding, acting_self_worktree,
+            raw_cmd, cmd_path_lower, binding, acting_self_worktree, writeish,
         ):
             return protected_shell
 

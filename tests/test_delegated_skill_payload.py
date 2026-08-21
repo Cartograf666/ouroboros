@@ -230,7 +230,8 @@ def test_native_missing_and_child_targets_refuse_before_any_gateway(tmp_path, mo
     from ouroboros.tools.registry import ToolContext
 
     ctx = _payload_ctx(tmp_path, monkeypatch)
-    _seed_skill(tmp_path / "data", name="native-ish", bucket="native")
+    native = _seed_skill(tmp_path / "data", name="native-ish", bucket="native")
+    (native / ".seed-origin").write_text("seeded\n", encoding="utf-8")
 
     def _no_gateway():
         raise AssertionError("the refusal must land BEFORE any gateway work")
@@ -254,6 +255,62 @@ def test_native_missing_and_child_targets_refuse_before_any_gateway(tmp_path, mo
         child, "x", root="skill_payload", bucket="external", skill_name="alpha"))
     assert out["reason"] == "payload_delegation_forbidden", out
     assert "AUTHORITY denial" in out["detail"], out
+
+
+@pytest.mark.parametrize("runtime_mode", ["light", "advanced", "pro"])
+def test_markerless_native_delegates_as_external_and_rebinds_by_marker(
+    runtime_mode,
+    tmp_path,
+    monkeypatch,
+):
+    import ouroboros.safety as safety
+    from ouroboros.gateways import claudexor as gw
+    from ouroboros.tools.delegate_integration import _rebind_payload_reference
+    from ouroboros.tools.registry import ToolRegistry
+
+    ctx = _payload_ctx(tmp_path, monkeypatch)
+    payload = _seed_skill(
+        tmp_path / "data",
+        name="user-native",
+        bucket="native",
+    )
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", runtime_mode)
+    monkeypatch.setattr(safety, "check_safety", lambda *a, **k: (True, ""))
+    seen: dict = {}
+    monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _StartStub(seen))
+    custody._CUSTODY.clear()
+    registry = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
+    registry.set_context(ctx)
+
+    started = json.loads(
+        registry.execute(
+            "delegate_start",
+            {
+                "subagent_id": "payload-session",
+                "prompt": "edit notes.txt",
+                "root": "skill_payload",
+                "bucket": "external",
+                "skill_name": "user-native",
+            },
+        )
+    )
+    assert started["status"] == "started", started
+    assert pathlib.Path(started["authority_target_root"]).resolve() == payload.resolve()
+    entry = custody.replay(tmp_path / "data")["run-p1"]
+    assert entry.resource_ref["source"] == "external"
+    assert entry.resource_ref["target_root"] == str(payload.resolve())
+
+    (payload / ".seed-origin").write_text("launcher-seed\n", encoding="utf-8")
+    rebound, _binding, refusal = _rebind_payload_reference(
+        ctx,
+        entry.resource_ref,
+        entry.target_root,
+        tool="integrate_delegated_patch",
+        context="test",
+    )
+    assert rebound is None
+    assert "payload_target_unresolved" in refusal
+    custody._CUSTODY.clear()
 
 
 def test_second_delegation_on_same_payload_is_refused_cheaply(tmp_path, monkeypatch):

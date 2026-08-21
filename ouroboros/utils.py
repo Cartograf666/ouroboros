@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import pathlib
+import re as _re
 import subprocess
 import threading
 import time
@@ -640,7 +641,6 @@ _SECRET_KEYS = frozenset([
     "token", "api_key", "apikey", "authorization", "secret", "password", "passwd", "passphrase",
 ])
 
-import re as _re
 _SECRET_PATTERNS = _re.compile(
     r'ghp_[A-Za-z0-9]{30,}'       # GitHub personal access token
     r'|gh[ousr]_[A-Za-z0-9]{30,}' # GitHub OAuth/user/server/refresh tokens
@@ -657,7 +657,6 @@ _SECRET_PATTERNS = _re.compile(
     r'|sk-[A-Za-z0-9]{40,}'       # OpenAI API key
     r'|(?:(?<=bot)|\b)[0-9]{8,}:[A-Za-z0-9_\-]{20,}\b'  # Telegram bot token (digits:secret; matches the /bot<id>:<secret>/ URL form — no \b exists between 'bot' and a digit)
 )
-_SECRET_BEARER_RE = _re.compile(r'(?i)\bBearer\s+([A-Za-z0-9_\-./+=]{24,})')
 _SECRET_URL_CREDENTIAL_RE = _re.compile(
     r'(?i)\b(?:postgres|postgresql|mysql|mariadb|mongodb(?:\+srv)?|redis)://[^/\s:@]+:[^/\s@]+@'
 )
@@ -764,47 +763,23 @@ def _secret_placeholder_value(value: str) -> bool:
 
 
 def sanitize_tool_result_for_log(result: str) -> str:
-    """Redact potential secrets from tool result before logging."""
+    """Redact potential secrets before a public or durable projection."""
     if not isinstance(result, str) or len(result) < 20:
         return result
     redacted = _SECRET_PATTERNS.sub("***REDACTED***", result)
-    return _SECRET_URL_CREDENTIAL_RE.sub(
+    redacted = _SECRET_URL_CREDENTIAL_RE.sub(
         lambda match: match.group(0).split("://", 1)[0] + "://***REDACTED***@",
         redacted,
     )
+    try:
+        from ouroboros.observability import redact_projection
 
-
-def contains_real_secret_value(text: str) -> tuple[bool, List[str]]:
-    """Detect concrete secret values by format and simple literal assignments."""
-    if not isinstance(text, str) or not text:
-        return False, []
-    matches = [
-        *_SECRET_PATTERNS.findall(text),
-        *_SECRET_BEARER_RE.findall(text),
-        *_SECRET_URL_CREDENTIAL_RE.findall(text),
-    ]
-    matches.extend(
-        literal
-        for env_key, env_literal, api_key, api_literal, js_key, js_literal in _SECRET_FALLBACK_LITERAL_RE.findall(text)
-        for key, literal in ((env_key, env_literal), (api_key, api_literal), (js_key, js_literal))
-        if key and literal and _secret_key_name(key) and not _secret_placeholder_value(literal)
-    )
-    matches.extend(
-        value.strip()
-        for key, value in _SECRET_LITERAL_FIELDS_RE.findall(text)
-        if _secret_key_name(key) and not _secret_placeholder_value(value)
-    )
-    matches.extend(
-        value.strip()
-        for key, value in _SECRET_BRACKET_LITERAL_RE.findall(text)
-        if _secret_key_name(key) and not _secret_placeholder_value(value)
-    )
-    matches.extend(
-        value.strip()
-        for key, value in _SECRET_UNQUOTED_ASSIGNMENT_RE.findall(text)
-        if _secret_key_name(key) and not _secret_placeholder_value(value)
-    )
-    return bool(matches), list(matches)
+        projected = redact_projection(redacted).value
+        if isinstance(projected, str):
+            return projected
+    except Exception:
+        log.debug("Failed to run observability redactor for tool result", exc_info=True)
+    return redacted
 
 
 def sanitize_tool_args_for_log(

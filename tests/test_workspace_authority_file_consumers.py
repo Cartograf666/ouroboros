@@ -265,6 +265,18 @@ def test_native_installed_copy_is_reviewable_but_seed_mutation_stays_system_repo
     seed = system_repo / "skills" / "native_alpha"
     seed.mkdir(parents=True)
     (seed / "tool.py").write_text("SEED = 1\n", encoding="utf-8")
+    markerless_edit = build_resolved_resource_binding(
+        ctx,
+        root="skill_payload",
+        operation="edit",
+        path="tool.py",
+        bucket="native",
+        skill_name="native_alpha",
+    )
+    assert markerless_edit.source == "external"
+    assert markerless_edit.target_path == (installed / "tool.py").resolve()
+
+    (installed / ".seed-origin").write_text("launcher-seed\n", encoding="utf-8")
     binding = build_resolved_resource_binding(
         ctx, root="skill_payload", operation="review", path=".",
         skill_name="native_alpha",

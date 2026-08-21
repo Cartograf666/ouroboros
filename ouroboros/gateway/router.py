@@ -112,6 +112,7 @@ def collect_routes(
         api_projects_list,
     )
     from ouroboros.gateway.state import api_health, api_state
+    from ouroboros.gateway.skill_publish import skill_publish_routes
     from ouroboros.gateway.tasks import (
         api_task_artifact,
         api_task_cancel,
@@ -170,6 +171,7 @@ def collect_routes(
         Route("/api/skills/daemons", endpoint=api_skill_daemons, methods=["GET"]),
         Route("/api/skills/lifecycle-queue", endpoint=api_skill_lifecycle_queue, methods=["GET"]),
         Route("/api/skills/{skill}/review", endpoint=api_skill_review, methods=["POST"]),
+        *skill_publish_routes(),
         Route(
             "/api/skills/{skill}/review-history/{job_id}",
             endpoint=api_skill_review_history_detail,

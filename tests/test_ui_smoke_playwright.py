@@ -2904,12 +2904,10 @@ def test_ui_smoke_v639_skip_review_button(direct_server_with_data):
                 # owner-attested skill -> distinct 'owner-attested' badge (review_profile surfaced).
                 page.wait_for_selector('.skills-card[data-skill="attestedtool"]', timeout=30_000)
                 att_card = page.locator('.skills-card[data-skill="attestedtool"]').first
-                assert att_card.locator(".skills-badge").filter(
-                    has_text="owner-attested").count() >= 1
-                # submitHubReady guard: an owner-attested skill must NOT offer an enabled
-                # publish (the hub refuses to publish owner-attested skills). Render the card
-                # WITH a github token configured (in-page module import — node exec is blocked)
-                # and assert Submit-to-OuroborosHub is disabled for the owner-attested reason.
+                assert att_card.locator(".skills-badge").filter(has_text="owner-attested").count() >= 1
+                # The backend is the sole publication classifier. Owner-attested review is
+                # not publication-ready, but the selected flow may start an ordinary task
+                # that repairs/reviews the bytes before opening a PR.
                 submit_html = page.evaluate(
                     """async () => {
                         const m = await import('/static/modules/skill_card_renderer.js');
@@ -2918,11 +2916,16 @@ def test_ui_smoke_v639_skip_review_button(direct_server_with_data):
                               is_self_authored: true, review_status: 'clean',
                               review_gate: { executable_review: true }, review_stale: false,
                               review_profile: 'owner_attested', grants: {}, permissions: [],
-                              payload_root: 'skills/external/att', enabled: true },
+                              payload_root: 'skills/external/att', enabled: true,
+                              submit_hub: { visible: true, publication_ready: false,
+                                task_start_allowed: true, state: 'needs_attention',
+                                reason: 'Owner-attested review needs attention' } },
                             new Set(), new Set(), {}, { githubTokenConfigured: true });
                     }"""
                 )
-                assert 'data-submit-disabled="true"' in submit_html
+                assert 'data-submit-disabled="false"' in submit_html
+                assert 'data-publication-ready="false"' in submit_html
+                assert 'data-submit-state="needs_attention"' in submit_html
                 assert "owner-attested" in submit_html.lower()
                 # Defense-in-depth (mirrors the backend source gate): a marketplace skill
                 # mislabeled self-authored must STILL NOT offer Skip review.

@@ -542,7 +542,7 @@ def capture_terminal_patch_for_drive(drive: Any, entry: _RunCustody) -> Optional
 # -- exact skill-payload delegation (R1) ---------------------------------------
 #
 # The restored delegated coding target class: an ordinary top-level task selects
-# ONE exact non-native skill payload through the existing ResolvedResourceBinding
+# ONE exact user-managed skill payload through the existing ResolvedResourceBinding
 # vocabulary (root=skill_payload, bucket, skill_name), Claudexor edits a PRIVATE
 # standalone Git snapshot of it, and the parent explicitly applies the captured
 # harness-authored diff under a whole-payload content-hash CAS. No fourth write
@@ -614,7 +614,7 @@ def _payload_selector_refusal(selector_root: str, retry_of: Any, bucket: Any,
     """Argument-shape validation for delegate_start's exact-resource selector."""
     if selector_root and selector_root != "skill_payload":
         return _fail("delegate_start", "unsupported_root",
-                     "root supports only 'skill_payload' (an installed non-native "
+                     "root supports only 'skill_payload' (an installed user-managed "
                      "skill payload). Ordinary workspace delegation takes no root.")
     if selector_root and str(retry_of or "").strip():
         return _fail("delegate_start", "selector_on_retry",
@@ -730,7 +730,7 @@ def _payload_mutation_authority(
             return None, None, _fail(
                 "delegate_start", "payload_target_unresolved",
                 f"The selected skill payload could not be bound: {exc}. Delegation "
-                "targets one EXISTING exact non-native payload. For a NEW skill, "
+                "targets one EXISTING exact user-managed payload. For a NEW skill, "
                 "create its manifest first (write_file root='skill_payload', "
                 "bucket='external', path='SKILL.md'), then delegate the "
                 "now-existing payload.",

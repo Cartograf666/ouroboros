@@ -397,13 +397,15 @@ def mark_stale_review_job_interrupted(
 def reconcile_stale_review_jobs(
     drive_root: pathlib.Path,
     *,
+    repo_path: str | None = None,
     stale_after_sec: int = _STALE_REVIEW_JOB_SEC,
 ) -> int:
     root = pathlib.Path(drive_root) / "state" / "skills"
     if not root.exists():
         return 0
     collision_names = skill_identity_collision_names(
-        pathlib.Path(drive_root), repo_path=get_skills_repo_path(),
+        pathlib.Path(drive_root),
+        repo_path=get_skills_repo_path() if repo_path is None else repo_path,
     )
     count = 0
     for path in root.glob("*/review_job.json"):

@@ -1263,12 +1263,8 @@ def test_light_data_write_with_bucket_skill_name_resolves_under_payload(tmp_path
     assert landed.is_file(), f"expected file at {landed}; got result={result[:200]}"
 
 
-def test_light_bucket_native_rejected_at_gate(tmp_path, monkeypatch):
-    """bucket=native MUST not be honoured — launcher seed update lane stays
-    authoritative. With the post-triad partial-args check in place, the gate
-    surfaces the specific SKILL_PAYLOAD_ARG_ERROR (which lists `native excluded`)
-    BEFORE the generic LIGHT_MODE_BLOCKED would fire — giving the agent a
-    clearer signal."""
+def test_light_missing_native_payload_creation_rejected_at_gate(tmp_path, monkeypatch):
+    """A missing native payload is not a user-managed package to create in place."""
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     reg = _registry(tmp_path)
     result = reg.execute(

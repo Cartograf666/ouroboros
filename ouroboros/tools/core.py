@@ -163,12 +163,26 @@ def _skill_payload_parts(target: pathlib.Path, data_root: pathlib.Path) -> tuple
     return None
 
 
-def _native_payload_without_seed(target: pathlib.Path, data_root: pathlib.Path) -> bool:
+def _native_payload_mutation_block_reason(
+    target: pathlib.Path, data_root: pathlib.Path,
+) -> str:
     payload = _skill_payload_parts(target, data_root)
     if payload is None:
-        return False
+        return ""
     bucket, _skill_name, payload_root = payload
-    return bucket == "native" and not (payload_root / ".seed-origin").is_file()
+    if bucket != "native":
+        return ""
+    if (payload_root / ".seed-origin").is_file():
+        return (
+            "launcher-seeded data/skills/native/<skill>/ payloads are "
+            "read/review only; edit their seed via root=system_repo"
+        )
+    if not payload_root.is_dir():
+        return (
+            "data/skills/native/<skill>/ is not a user-managed payload yet; "
+            "create new skills under data/skills/external/<skill>/"
+        )
+    return ""
 
 
 def _data_skill_target(path: str, drive_root: pathlib.Path) -> SkillPayloadTarget | None:
@@ -792,13 +806,12 @@ def _data_write(
             "object (for example {'content': ...}) rather than file text. "
             "Extract the actual file body before calling write_file."
         )
-    if _native_payload_without_seed(lexical_target, data_root) or _native_payload_without_seed(target_path, data_root):
-        return (
-            "⚠️ DATA_WRITE_BLOCKED: data/skills/native/<skill>/ is reserved "
-            "for launcher-seeded skills that carry a .seed-origin marker. "
-            "Write user- or agent-authored skill payloads under "
-            "data/skills/external/<skill>/ instead."
-        )
+    native_block = (
+        _native_payload_mutation_block_reason(lexical_target, data_root)
+        or _native_payload_mutation_block_reason(target_path, data_root)
+    )
+    if native_block:
+        return f"⚠️ DATA_WRITE_BLOCKED: {native_block}."
     skill_owner_state_path = (
         _is_skill_owner_state_target(lexical_target, data_root)
         or _is_skill_owner_state_target(target_path, data_root)
@@ -1467,6 +1480,10 @@ def _edit_text(
         binding.skill_name
         and binding.source in {"external", "clawhub", "ouroboroshub", "native", "user_repo"}
     )
+    if native_block := _native_payload_mutation_block_reason(
+        binding.target_path, binding.state_drive_root,
+    ):
+        return f"⚠️ EDIT_TEXT_BLOCKED: {native_block}."
     if normalized in {"active_workspace", "system_repo"} and not bound_skill_payload:
         from ouroboros.tools.git import _str_replace_editor
 
@@ -1528,6 +1545,12 @@ def _edit_text(
     try:
         target = binding.target_path
         if normalized == "runtime_data":
+            if is_skill_control_plane_path(target, binding.state_drive_root):
+                return (
+                    "⚠️ EDIT_TEXT_BLOCKED: skill provenance, launcher seed, "
+                    "marketplace, dependency, and self-authored markers are "
+                    "control-plane state. Edit user-authored payload files instead."
+                )
             if (b := _project_store_access_block(_normalize_data_read_path(ctx, path))):
                 return b
             if (

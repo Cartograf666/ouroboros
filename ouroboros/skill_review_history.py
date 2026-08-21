@@ -15,6 +15,13 @@ from ouroboros.utils import append_jsonl, iter_jsonl_objects, jsonl_append_lock_
 log = logging.getLogger(__name__)
 
 
+def _redact_history_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    from ouroboros.observability import redact_projection
+
+    redacted = redact_projection(payload).value
+    return redacted if isinstance(redacted, dict) else {}
+
+
 def review_history_path(drive_root: pathlib.Path, skill_name: str) -> pathlib.Path:
     return drive_root / "state" / "skills" / skill_name / "review_history.jsonl"
 
@@ -158,7 +165,10 @@ def append_history(
             payload["single_reviewer_no_diversity"] = True
         if raw_actor_records:
             payload["raw_actor_records"] = list(raw_actor_records)
-        append_jsonl(review_history_path(drive_root, skill_name), payload)
+        append_jsonl(
+            review_history_path(drive_root, skill_name),
+            _redact_history_payload(payload),
+        )
     except Exception:
         log.debug("skill review history append failed", exc_info=True)
 
@@ -182,7 +192,8 @@ def append_history_once(
         try:
             if any(str(row.get("job_id") or "") == job_id for row in iter_jsonl_objects(path)):
                 return True
-            data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+            safe_payload = _redact_history_payload(payload)
+            data = (json.dumps(safe_payload, ensure_ascii=False) + "\n").encode("utf-8")
             fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
             try:
                 view = memoryview(data)
