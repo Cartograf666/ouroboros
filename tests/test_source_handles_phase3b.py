@@ -393,3 +393,76 @@ def test_task_acceptance_abstains_before_review_on_unresolved_partial_source(tmp
     assert result.degraded is True
     assert result.actors[0]["status"] == "ok"
     assert result.actors[0]["signal"] == "DEGRADED"
+
+
+def test_marker_only_repo_diff_abstains_before_review(monkeypatch, tmp_path):
+    """A legacy diff producer must not turn its visible slice into PASS."""
+    import ouroboros.review_evidence as evidence_mod
+
+    monkeypatch.setattr(
+        evidence_mod,
+        "collect_turn_diff",
+        lambda _ctx, **_kwargs: (
+            "diff --git a/visible.py b/visible.py\n"
+            "⚠️ OMISSION NOTE: truncated at 20000 chars; original length 80000"
+        ),
+    )
+    ctx = _tool_ctx(tmp_path, task_id="marker-only-diff")
+    evidence = build_task_acceptance_evidence(
+        ctx, llm_trace={"tool_calls": []}, drive_root=tmp_path, task_id="marker-only-diff",
+    )
+    assert evidence["__unresolved_partial_artifacts__"][0]["tool"] == "repo_diff"
+
+    llm = _MustNotReviewPartial()
+    result = run_review_request(
+        ReviewRequest(
+            surface="task_acceptance", goal="decide from evidence", subject="candidate",
+            evidence=evidence, policy={"min_successful_slots": 1}, task_id="marker-only-diff",
+        ),
+        slots=[ReviewSlot(slot_id="slot", model="review-model")],
+        drive_root=tmp_path,
+        llm=llm,
+    )
+    assert llm.calls == 0
+    assert result.aggregate_signal == "DEGRADED"
+
+
+def test_large_repo_diff_materializes_exact_source_and_keeps_pass_path(tmp_path):
+    """The normal over-limit path is exact-source backed, not silently degraded."""
+    import subprocess as sp
+
+    ctx = _tool_ctx(tmp_path, task_id="exact-repo-diff")
+    repo = ctx.repo_dir
+    sp.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    (repo / "large.py").write_text("x = 0\n", encoding="utf-8")
+    sp.run(["git", "add", "large.py"], cwd=repo, check=True, capture_output=True)
+    sp.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "base"],
+        cwd=repo, check=True, capture_output=True,
+    )
+    (repo / "large.py").write_text(
+        "\n".join(f"value_{i} = {i}" for i in range(5000)) + "\nDECISIVE_DIFF_TAIL=present\n",
+        encoding="utf-8",
+    )
+    evidence = build_task_acceptance_evidence(
+        ctx, llm_trace={"tool_calls": []}, drive_root=tmp_path, task_id="exact-repo-diff",
+    )
+    assert "__unresolved_partial_artifacts__" not in evidence
+    assert evidence["repo_diff_source_ref"]["kind"] == "task_source"
+    assert "DECISIVE_DIFF_TAIL=present" in evidence["repo_diff"]
+    assert collect_task_artifact_records(tmp_path, "exact-repo-diff") == []
+
+    class _PassLLM:
+        def chat(self, **_kwargs):
+            return {"content": json.dumps({"verdict": "PASS", "findings": [], "summary": "ok"})}, {}
+
+    result = run_review_request(
+        ReviewRequest(
+            surface="task_acceptance", goal="decide from evidence", subject="candidate",
+            evidence=evidence, policy={"min_successful_slots": 1}, task_id="exact-repo-diff",
+        ),
+        slots=[ReviewSlot(slot_id="slot", model="review-model")],
+        drive_root=tmp_path,
+        llm=_PassLLM(),
+    )
+    assert result.aggregate_signal == "PASS"

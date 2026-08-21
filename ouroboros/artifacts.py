@@ -9,6 +9,7 @@ import mimetypes
 import pathlib
 import re
 import shutil
+import subprocess
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -558,6 +559,86 @@ def read_actor_source_bytes(
     if sha256(raw).hexdigest() != str(ref.get("sha256") or ""):
         raise ValueError("actor source ref failed sha256 verification")
     return raw
+
+
+def persist_exact_text_source(
+    drive_root: Union[pathlib.Path, str], task_id: str, *,
+    source_id: str, text: str,
+) -> tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """Persist and immediately verify one exact redacted text source."""
+    ref: Dict[str, Any] = {}
+    try:
+        ref = store_actor_source_bytes(
+            drive_root, task_id, category="tool_results", source_id=source_id,
+            data=str(text).encode("utf-8"), extension="txt",
+        )
+        exact = read_actor_source_bytes(drive_root, task_id, ref).decode("utf-8")
+        return exact, ref, {}
+    except Exception as exc:
+        return "", ref, {
+            "status": "source_unavailable",
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def collect_exact_repo_diff(repo: Any, *, include_recent_commit: bool = False) -> str:
+    """Collect the unbounded, hook-disabled repository diff for one review."""
+    if not repo:
+        return ""
+
+    def _git(args: list[str]) -> str:
+        try:
+            return subprocess.run(
+                ["git", *args], cwd=str(repo), capture_output=True, text=True, timeout=20,
+            ).stdout or ""
+        except (subprocess.SubprocessError, OSError):
+            return ""
+
+    diff = _git(["diff", "--no-ext-diff", "--no-textconv", "--no-color", "HEAD"])
+    untracked = _git(["ls-files", "--others", "--exclude-standard"]).strip()
+    if untracked:
+        diff += "\n# Untracked working-tree files (new, not yet committed; may include pre-existing untracked files):\n" + untracked + "\n"
+    if include_recent_commit:
+        commit = _git(["show", "--no-ext-diff", "--no-textconv", "--no-color", "--stat", "-p", "HEAD"]).strip()
+        if commit:
+            diff += "\n# Most recent commit (committed this turn):\n" + commit + "\n"
+    return diff
+
+
+def materialize_repo_diff_evidence(
+    repo: Any, drive_root: Any, task_id: str, *, limit: int = 20000,
+    include_recent_commit: bool = False,
+) -> tuple[str, Dict[str, Any]]:
+    """Return a redacted exact diff or a typed cannot-verify projection."""
+    from ouroboros.observability import redact_projection
+    from ouroboros.utils import truncate_review_artifact
+
+    raw = collect_exact_repo_diff(repo, include_recent_commit=include_recent_commit)
+    if not raw:
+        return "", {"complete": False, "issue": {
+            "tool": "repo_diff", "status": "source_unavailable",
+            "reason": "partial_repo_diff_without_exact_source", "source_ref": {},
+        }}
+    redacted = str(redact_projection(raw).value)
+    if len(redacted) <= limit:
+        return redacted, {"complete": True}
+    if drive_root is not None and str(task_id or ""):
+        exact, source_ref, issue = persist_exact_text_source(
+            drive_root, str(task_id), source_id="acceptance_repo_diff", text=redacted,
+        )
+        if exact:
+            return exact, {"complete": True, "source_ref": source_ref}
+        return truncate_review_artifact(redacted, limit=limit), {
+            "complete": False, "source_ref": source_ref, "issue": {
+                "tool": "repo_diff", **issue, "source_ref": source_ref,
+            },
+        }
+    return truncate_review_artifact(redacted, limit=limit), {
+        "complete": False, "issue": {
+            "tool": "repo_diff", "status": "source_unavailable",
+            "reason": "partial_repo_diff_without_task_source_ref", "source_ref": {},
+        },
+    }
 
 
 def materialize_tool_result_source(

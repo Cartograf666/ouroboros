@@ -48,37 +48,17 @@ def collect_turn_diff(ctx: Any, *, limit: int = 20000, include_recent_commit: bo
         except (subprocess.SubprocessError, OSError):
             return ""
 
-    # Truncate the tracked diff and the untracked-file list INDEPENDENTLY, so a
-    # large tracked diff never clips away the untracked new-file names (a
-    # self-authored test the agent just wrote is the most important signal here).
-    # --no-ext-diff AND --no-textconv: the active workspace may be an UNTRUSTED
-    # repo (external-workspace tasks). A repo-configured external-diff or textconv
-    # driver would otherwise execute an arbitrary command ON THE HOST while
-    # collecting review evidence — disable both rendering hooks (Bible P3).
     tracked = _git(["diff", "--no-ext-diff", "--no-textconv", "--no-color", "HEAD"])
     diff = truncate_review_artifact(tracked, limit=limit)
     untracked = _git(["ls-files", "--others", "--exclude-standard"]).strip()
     if untracked:
         untracked = truncate_review_artifact(untracked, limit=4000)
-        # Honest label: these are ALL untracked working-tree files, not a proven
-        # this-turn set — the host has no baseline, so it must not assert
-        # authorship the reviewer is the one to judge.
         diff = f"{diff}\n# Untracked working-tree files (new, not yet committed; may include pre-existing untracked files):\n{untracked}\n"
-    # If THIS turn committed its work (commit_reviewed status=ok), the changes
-    # live IN HEAD. Surface that commit so the reviewer can judge evidence
-    # independence on committed files/tests too. Gated on a real current-turn
-    # commit signal (so a clean repo never sends an UNRELATED prior commit), but
-    # NOT on an empty tracked diff: an agent can commit AND leave further dirty
-    # tracked changes, and both are this-turn evidence.
     if include_recent_commit:
         commit = _git(["show", "--no-ext-diff", "--no-textconv", "--no-color", "--stat", "-p", "HEAD"]).strip()
         if commit:
             commit = truncate_review_artifact(commit, limit=limit)
             diff = f"{diff}\n# Most recent commit (committed this turn):\n{commit}\n"
-    # Redact secrets before this diff reaches reviewer LLM slots: a tracked edit
-    # to a credential file (or a literal token/key in a hunk) must not be sent
-    # raw. Reuses the observability redactor (URL creds, token patterns, secret
-    # KEY=value assignments) — evidence-independence facts survive, secrets don't.
     from ouroboros.observability import redact_projection
 
     return redact_projection(diff).value
@@ -954,8 +934,23 @@ def build_task_acceptance_evidence(
         if delta_aggregate:
             ev["capability_deltas"] = redact_projection(delta_aggregate).value
             prov["capability_deltas"] = "host_attested"
-    ev["repo_diff"] = collect_turn_diff(ctx, include_recent_commit=include_recent_commit)
+    repo_diff = collect_turn_diff(ctx, include_recent_commit=include_recent_commit)
+    diff_meta: Dict[str, Any] = {}
+    if "OMISSION NOTE: truncated at " in str(repo_diff or "") or "... (truncated from " in str(repo_diff or ""):
+        from ouroboros.artifacts import materialize_repo_diff_evidence
+        repo_getter = getattr(ctx, "active_repo_dir", None)
+        repo_dir = repo_getter() if callable(repo_getter) else repo_getter or getattr(ctx, "repo_dir", None)
+        exact, diff_meta = materialize_repo_diff_evidence(
+            repo_dir, drive_root, task_id, include_recent_commit=include_recent_commit,
+        )
+        if diff_meta.get("complete"):
+            repo_diff = exact
+    ev["repo_diff"] = repo_diff
     prov["repo_diff"] = "host_attested"
+    if diff_meta.get("source_ref"):
+        ev["repo_diff_source_ref"] = redact_projection(diff_meta["source_ref"]).value
+        prov["repo_diff_source_ref"] = "host_attested"
+    partial_sources: List[Dict[str, Any]] = [dict(diff_meta["issue"])] if diff_meta.get("issue") else []
     if subtree_statuses is not None:
         ev["terminal_subtree_statuses"] = [dict(row) for row in subtree_statuses if isinstance(row, dict)]
         prov["terminal_subtree_statuses"] = "host_attested"
@@ -969,7 +964,7 @@ def build_task_acceptance_evidence(
             if omitted:
                 ev["tool_trajectory_omitted_leading"] = omitted
         if unresolved:
-            ev["__unresolved_partial_artifacts__"] = unresolved
+            partial_sources.extend(unresolved)
         notes = llm_trace.get("reasoning_notes") or []
         if notes:
             ev["reasoning_notes"] = truncate_review_artifact("\n".join(str(n) for n in notes), limit=_ACCEPT_NOTES_CAP)
@@ -1047,6 +1042,10 @@ def build_task_acceptance_evidence(
         if arts:
             ev["artifacts"] = arts
             prov["artifacts"] = "artifact"
+            if any(isinstance(row, dict) and row.get("name") == "…" for row in arts):
+                partial_sources.append({"tool": "artifact_manifest", "status": "source_unavailable", "reason": "artifact_manifest_truncated_without_exact_range", "source_ref": {}})
+    if partial_sources:
+        ev["__unresolved_partial_artifacts__"] = partial_sources
     # Set task_type BEFORE budget enforcement so the whole packet stays deterministically
     # bounded — callers must NOT mutate the packet after the builder returns (review round-4).
     if str(task_type).strip():
