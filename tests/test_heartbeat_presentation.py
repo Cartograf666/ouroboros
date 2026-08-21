@@ -5,6 +5,17 @@ from __future__ import annotations
 import inspect
 import json
 import pathlib
+import time
+import types
+
+
+def _heartbeat_ctx(tmp_path, task):
+    pushed = []
+    return types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path,
+        RUNNING={task["id"]: {"task": task, "started_at": time.time()}},
+        bridge=types.SimpleNamespace(push_log=pushed.append),
+    ), pushed
 
 
 def test_routine_heartbeat_is_not_rendered_as_chat_message() -> None:
@@ -34,6 +45,65 @@ def test_liveness_and_incident_controls_remain_active() -> None:
         '"is_progress": True',
     ):
         assert invariant in source
+
+
+def test_root_heartbeat_carries_one_live_subtree_projection(tmp_path, monkeypatch):
+    from ouroboros import usage_accounting
+    from supervisor.events import _handle_task_heartbeat
+
+    monkeypatch.setattr(usage_accounting, "usage_projection", lambda *_a, **_kw: {
+        "accounted_usd": 76.82, "reserved_usd": 1.25,
+        "unresolved_upper_bound_usd": 0.5, "unknown_unmetered": 2,
+        "non_final_rows": 3, "integrity_degraded": False, "cost_final": True,
+    })
+    ctx, pushed = _heartbeat_ctx(tmp_path, {
+        "id": "root-hb", "type": "task", "root_task_id": "root-hb",
+    })
+    _handle_task_heartbeat({"task_id": "root-hb", "phase": "running"}, ctx)
+
+    frame = pushed[0]
+    assert frame["cost_usd_with_children"] == 76.82
+    assert frame["accounted_upper_bound_usd_with_children"] == 76.82
+    assert frame["cost_final"] is False
+    assert frame["cost_with_children_partial"] is True
+    assert (frame["reserved_usd"], frame["unresolved_upper_bound_usd"]) == (1.25, 0.5)
+    assert frame["unknown_unmetered"] == 2
+
+
+def test_child_heartbeat_does_not_read_or_publish_live_cost(tmp_path, monkeypatch):
+    from ouroboros import usage_accounting
+    from supervisor.events import _handle_task_heartbeat
+
+    monkeypatch.setattr(usage_accounting, "usage_projection", lambda *_a, **_kw: (
+        _ for _ in ()
+    ).throw(AssertionError("child heartbeat must not read the ledger")))
+    ctx, pushed = _heartbeat_ctx(tmp_path, {
+        "id": "child-hb", "type": "task", "root_task_id": "root-hb",
+        "parent_task_id": "root-hb", "delegation_role": "subagent",
+    })
+    _handle_task_heartbeat({"task_id": "child-hb", "phase": "running"}, ctx)
+
+    assert "cost_accounting_status" not in pushed[0]
+    assert "cost_usd_with_children" not in pushed[0]
+
+
+def test_root_heartbeat_keeps_ledger_failure_honest(tmp_path, monkeypatch):
+    from ouroboros import usage_accounting
+    from supervisor.events import _handle_task_heartbeat
+
+    monkeypatch.setattr(usage_accounting, "usage_projection", lambda *_a, **_kw: (
+        _ for _ in ()
+    ).throw(OSError("ledger unavailable")))
+    ctx, pushed = _heartbeat_ctx(tmp_path, {
+        "id": "root-hb", "type": "task", "root_task_id": "root-hb",
+    })
+    _handle_task_heartbeat({"task_id": "root-hb", "phase": "running"}, ctx)
+
+    frame = pushed[0]
+    assert frame["cost_accounting_status"] == "unavailable"
+    assert frame["cost_usd_with_children"] is None
+    assert frame["accounted_upper_bound_usd_with_children"] is None
+    assert frame["cost_final"] is False
 
 
 def test_retired_timeout_defaults_are_quiet_but_custom_value_is_loud(tmp_path, monkeypatch) -> None:

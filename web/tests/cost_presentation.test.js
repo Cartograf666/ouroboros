@@ -57,6 +57,39 @@ test('task cards distinguish unavailable, pending zero, and final zero', () => {
     }), ['cost=$0.00']);
 });
 
+test('compact task cards show one complete cost and keep openness details', () => {
+    assert.deepEqual(taskCostMeta({
+        cost_usd: 55.86,
+        cost_usd_with_children: 76.82,
+        cost_accounting_status: 'available',
+        cost_final: false,
+        cost_with_children_partial: true,
+        reserved_usd: 1.25,
+        unresolved_upper_bound_usd: 0.5,
+        unknown_unmetered: 2,
+    }), [
+        'cost=$76.82 (pending)',
+        'reserved=$1.25',
+        'unresolved≤$0.50',
+        'unmetered=2',
+    ]);
+    assert.deepEqual(taskCostMeta({
+        cost_usd: 4.25,
+        cost_accounting_status: 'available',
+        cost_final: true,
+    }), ['cost=$4.25']);
+
+    const partialChild = taskCostProjection({
+        cost_usd: 4.25,
+        cost_usd_with_children: 6.5,
+        cost_accounting_status: 'available',
+        cost_final: true,
+        cost_with_children_partial: true,
+    }, '2026-07-29T00:00:00Z');
+    assert.deepEqual(partialChild.meta, ['cost=$6.50 (pending)']);
+    assert.equal(partialChild.final, false);
+});
+
 test('a bare per-round cost_usd delta is NOT task cost (v6.82 P1)', () => {
     // llm_round_finished carries only cost_usd — no task-scope accounting
     // evidence — so it must render nothing and produce no sticky projection.

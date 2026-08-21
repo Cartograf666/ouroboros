@@ -30,7 +30,7 @@ from ouroboros.task_results import (
     load_task_result,
     write_task_result,
 )
-from ouroboros.cost_projection import carry_cost_meta, with_cost_aliases
+from ouroboros.cost_projection import carry_cost_meta, live_root_cost_projection, with_cost_aliases
 from ouroboros.outcomes import infra_failed_axes, normalize_outcome_axes
 from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
 from ouroboros.subagents import intended_lane as intended_subagent_lane
@@ -895,6 +895,7 @@ def _handle_task_heartbeat(evt: Dict[str, Any], ctx: Any) -> None:
             _hb_chat_id = _bound_project_chat_id(ctx, task_id, task.get("parent_task_id"), task.get("root_task_id")) or int(task.get("chat_id") or 0)
         except (TypeError, ValueError):
             _hb_chat_id = 0
+        cost_fields = live_root_cost_projection(task_id, task, evt, ctx.DRIVE_ROOT)
         try:
             ctx.bridge.push_log({
                 "ts": evt.get("ts", utc_now_iso()),
@@ -910,6 +911,7 @@ def _handle_task_heartbeat(evt: Dict[str, Any], ctx: Any) -> None:
                 "parent_task_id": evt.get("parent_task_id", ""),
                 "delegation_role": evt.get("delegation_role", ""),
                 "subagent_role": evt.get("subagent_role", ""),
+                **cost_fields,
             })
         except Exception:
             log.debug("Failed to forward task heartbeat to live logs", exc_info=True)

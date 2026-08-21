@@ -19,7 +19,11 @@ meta set) so every surface tells the same story with the same names.
 
 from __future__ import annotations
 
+import logging
+import pathlib
 from typing import Any, Dict, Mapping, Optional
+
+log = logging.getLogger(__name__)
 
 # (additive honest name, deprecated alias) — same value on both, forever.
 COST_ALIAS_PAIRS = (
@@ -118,6 +122,48 @@ def carry_cost_meta(source: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     return out
 
 
+def live_root_cost_projection(
+    task_id: str, task: Mapping[str, Any], event: Mapping[str, Any], drive_root: pathlib.Path,
+) -> Dict[str, Any]:
+    """Return a non-final root-subtree projection for the existing heartbeat."""
+    from ouroboros.task_results import resolve_task_lineage
+
+    lineage = resolve_task_lineage(
+        task_id, metadata=task.get("metadata"),
+        **{key: task.get(key, event.get(key)) for key in (
+            "root_task_id", "parent_task_id", "delegation_role",
+            "original_task_id", "timeout_retry_from",
+        )},
+    )
+    if not lineage["is_root_task"]:
+        return {}
+    try:
+        from ouroboros.usage_accounting import usage_projection
+
+        usage = usage_projection(
+            pathlib.Path(task.get("budget_drive_root") or drive_root),
+            root_task_id=str(lineage["root_task_id"] or task_id),
+        )
+        projection = {
+            "cost_accounting_status": "available",
+            "cost_usd_with_children": round(float(usage.get("accounted_usd") or 0), 6),
+            "reserved_usd": float(usage.get("reserved_usd") or 0),
+            "unresolved_upper_bound_usd": float(usage.get("unresolved_upper_bound_usd") or 0),
+            "unknown_unmetered": int(usage.get("unknown_unmetered") or 0),
+            "non_final_rows": int(usage.get("non_final_rows") or 0),
+            "ledger_integrity_degraded": bool(usage.get("integrity_degraded")),
+        }
+    except Exception:
+        log.debug("Root heartbeat cost unavailable for %s", task_id, exc_info=True)
+        projection = {
+            "cost_accounting_status": "unavailable",
+            "cost_accounting_error": "ledger_unavailable",
+            "cost_usd_with_children": None,
+        }
+    projection.update(cost_final=False, cost_with_children_partial=True)
+    return with_cost_aliases(projection)
+
+
 def cost_projection(source: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     """Read-side projection of a task-result-like mapping into the SSOT shape.
 
@@ -169,6 +215,7 @@ __all__ = [
     "carry_cost_meta",
     "cost_display",
     "cost_projection",
+    "live_root_cost_projection",
     "resolve_cost_pair",
     "with_cost_aliases",
 ]
