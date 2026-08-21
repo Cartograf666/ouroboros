@@ -83,23 +83,19 @@ export function taskCostMeta(payload = {}) {
     // log_events — the deprecated alias wins a diverged pair, so the read side
     // and the write side never pick opposite winners for the same record.
     const own = accountedUpperBound(payload);
-    const finalKnown = payload.cost_final === true;
+    // Compact cards show one complete amount. Prefer the subtree projection
+    // when the producer has one; leaf/legacy frames still fall back to own.
+    const total = accountedUpperBoundWithChildren(payload) ?? own;
+    const finalKnown = payload.cost_final === true
+        && payload.cost_with_children_partial !== true;
     const pendingKnown = payload.cost_final === false
         || payload.cost_with_children_partial === true
         || payload.cost_accounting_status === 'available' && !has('cost_final');
     const meta = [];
-    if (own === null) {
+    if (total === null) {
         meta.push('cost pending');
-    } else if (finalKnown || pendingKnown || own !== 0) {
-        meta.push(`cost=$${own.toFixed(2)}${pendingKnown && !finalKnown ? ' (pending)' : ''}`);
-    }
-
-    const subtree = accountedUpperBoundWithChildren(payload);
-    if (subtree !== null && (
-        own === null || subtree !== own || payload.cost_with_children_partial === true
-    )) {
-        const partial = payload.cost_with_children_partial === true || !finalKnown;
-        meta.push(`subtree=$${subtree.toFixed(2)}${partial ? ' (pending)' : ''}`);
+    } else if (finalKnown || pendingKnown || total !== 0) {
+        meta.push(`cost=$${total.toFixed(2)}${pendingKnown && !finalKnown ? ' (pending)' : ''}`);
     }
     const reserved = optionalFiniteNumber(payload.reserved_usd);
     if (reserved !== null && reserved > 0) meta.push(`reserved=$${reserved.toFixed(2)}`);
@@ -126,7 +122,8 @@ export function taskCostProjection(payload = {}, rawTs = '') {
         // Only a SETTLED ledger value is final. "unavailable" is an honest
         // unknown, not a settled truth: marking it final let one transient
         // ledger-read failure outrank every later real reading.
-        final: payload.cost_final === true,
+        final: payload.cost_final === true
+            && payload.cost_with_children_partial !== true,
         unavailable,
     };
 }
