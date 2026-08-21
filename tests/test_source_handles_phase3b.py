@@ -9,7 +9,7 @@ from ouroboros import context_compaction as compaction
 from ouroboros.artifacts import collect_task_artifact_records
 from ouroboros.context_budget import ContextReclaimRequest
 from ouroboros.consolidator import consolidate_scratchpad
-from ouroboros.loop_tool_execution import process_tool_results
+from ouroboros.loop_tool_execution import _truncate_tool_result, process_tool_results
 from ouroboros.memory import Memory
 from ouroboros.review_evidence import build_task_acceptance_evidence
 from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
@@ -258,6 +258,55 @@ class _MustNotReviewPartial:
     def chat(self, **_kwargs):
         self.calls += 1
         raise AssertionError("an unresolved partial source must not reach a clean reviewer")
+
+
+def test_metadata_less_actor_truncation_envelope_abstains_before_review(tmp_path):
+    actor_view = _truncate_tool_result("legacy" * 100_000, "run_command")
+    assert "truncated from 600000" in actor_view
+    ctx = _tool_ctx(tmp_path, task_id="legacy-partial")
+    evidence = build_task_acceptance_evidence(
+        ctx,
+        llm_trace={"tool_calls": [{
+            "tool": "run_command", "status": "ok", "result": actor_view,
+        }]},
+        drive_root=tmp_path,
+        task_id="legacy-partial",
+    )
+    row = evidence["tool_trajectory"][0]
+    assert "truncated from 600000" in row["result"]
+    assert row["result_complete"] is False
+    assert evidence["__unresolved_partial_artifacts__"][0]["status"] == "source_unavailable"
+
+    llm = _MustNotReviewPartial()
+    result = run_review_request(
+        ReviewRequest(
+            surface="task_acceptance", goal="decide from legacy evidence",
+            subject="candidate", evidence=evidence,
+            policy={"min_successful_slots": 1}, task_id="legacy-partial",
+        ),
+        slots=[ReviewSlot(slot_id="slot", model="review-model")],
+        drive_root=tmp_path,
+        llm=llm,
+    )
+    assert llm.calls == 0
+    assert result.aggregate_signal == "DEGRADED"
+    assert result.degraded is True
+
+
+def test_explicit_complete_row_is_not_reclassified_from_envelope_text(tmp_path):
+    result_text = "0123456789\n... (truncated from 20 chars, limit=10)"
+    ctx = _tool_ctx(tmp_path, task_id="explicit-complete")
+    evidence = build_task_acceptance_evidence(
+        ctx,
+        llm_trace={"tool_calls": [{
+            "tool": "run_command", "status": "ok", "result": result_text,
+            "result_partial": False,
+        }]},
+        drive_root=tmp_path,
+        task_id="explicit-complete",
+    )
+    assert "__unresolved_partial_artifacts__" not in evidence
+    assert "result_complete" not in evidence["tool_trajectory"][0]
 
 
 def test_task_acceptance_abstains_before_review_on_unresolved_partial_source(tmp_path):

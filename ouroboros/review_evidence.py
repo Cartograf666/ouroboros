@@ -553,7 +553,7 @@ def _accept_trajectory(tool_calls: list, drive_root: Any = None, task_id: str = 
             unresolved.append(issue)
         result_cap = TOOL_RESULT_LIMITS.get(tool, _ACCEPT_RESULT_CAP)
         source_ref = c.get("result_source_ref") if isinstance(c.get("result_source_ref"), dict) else {}
-        if result_complete and c.get("result_partial"):
+        if c.get("result_partial") or not result_complete:
             result_cap = max(result_cap, len(str(result_value)))
         row = {
             "tool": tool,
@@ -562,7 +562,7 @@ def _accept_trajectory(tool_calls: list, drive_root: Any = None, task_id: str = 
             "args": _accept_redact_cap(c.get("args"), _ACCEPT_ARGS_CAP) if c.get("args") not in (None, "", {}) else "",
             "result": _accept_redact_cap(result_value, result_cap) if result_value not in (None, "") else "",
         }
-        if c.get("result_partial"):
+        if c.get("result_partial") or not result_complete:
             row.update(result_complete=result_complete, result_source_ref=source_ref)
         out.append(row)
     return out, omitted, unresolved

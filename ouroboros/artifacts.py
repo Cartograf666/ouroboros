@@ -41,6 +41,12 @@ _ATTACHMENTS_SUBDIR = "attachments"
 _CHAT_MEDIA_SUBDIR = "chat_media"
 _SOURCE_HANDLES_SUBDIR = "source_handles"
 _SOURCE_HANDLE_CATEGORIES = frozenset({"tool_results", "context_checkpoints"})
+_LEGACY_TOOL_RESULT_TRUNCATION_RE = re.compile(
+    r"\n\.\.\. \(truncated from (?P<original>[1-9][0-9]*) chars, "
+    r"limit=(?P<limit>[1-9][0-9]*)\)"
+    r"(?:\nFULL_RESULT_SOURCE_UNAVAILABLE=true"
+    r"\nDo not treat this partial result as complete; exact source persistence failed\.)?\Z"
+)
 _CHAT_MEDIA_EXTENSIONS = {
     "image/png": "png",
     "image/jpeg": "jpg",
@@ -560,9 +566,24 @@ def materialize_tool_result_source(
     """Return the exact result behind a partial task trace, or a typed gap."""
 
     result = call.get("result")
-    if not call.get("result_partial"):
+    legacy_match = (
+        _LEGACY_TOOL_RESULT_TRUNCATION_RE.search(result)
+        if "result_partial" not in call and isinstance(result, str) else None
+    )
+    legacy_partial = bool(
+        legacy_match
+        and int(legacy_match.group("limit")) == legacy_match.start()
+        and int(legacy_match.group("original")) > int(legacy_match.group("limit"))
+    )
+    if not call.get("result_partial") and not legacy_partial:
         return result, True, {}
     ref = call.get("result_source_ref") if isinstance(call.get("result_source_ref"), dict) else {}
+    if legacy_partial:
+        return result, False, {
+            "tool_call_id": str(call.get("tool_call_id") or ""),
+            "tool": str(call.get("tool") or ""), "status": "source_unavailable",
+            "reason": "legacy_actor_truncation_without_source_ref", "source_ref": {},
+        }
     try:
         return read_actor_source_bytes(drive_root, task_id, ref).decode("utf-8"), True, {}
     except (OSError, UnicodeError, TypeError, ValueError) as exc:
