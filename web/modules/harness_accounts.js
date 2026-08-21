@@ -880,7 +880,7 @@ export function renderAgentAccountsSection() {
             <div id="harness-accounts-groups" class="agent-family-list"></div>
             <div id="harness-login-card"></div>
             <div class="settings-toolbar">
-                <button type="button" class="settings-ghost-btn" id="btn-harness-refresh">Refresh</button>
+                <button type="button" class="btn btn-default" id="btn-harness-refresh">Refresh</button>
             </div>
         </div>
     `;
@@ -918,8 +918,8 @@ function rowHtml(row, payload, facets = {}) {
     // native pseudo-row has neither, because that engine has no route for
     // either and a dead button would claim an effect this app cannot have.
     const rowActions = row.kind === 'native' ? '' : `
-                <button type="button" class="settings-ghost-btn" data-harness-toggle data-enabled="${row.enabled === false ? '0' : '1'}" title="${row.enabled === false ? 'Let rotation use this account again' : 'Keep the login, take this account out of rotation'}">${row.enabled === false ? 'Enable' : 'Disable'}</button>
-                <button type="button" class="settings-ghost-btn" data-harness-remove title="Ask the agent service to forget this account">Remove</button>`;
+                <button type="button" class="btn btn-default" data-harness-toggle data-enabled="${row.enabled === false ? '0' : '1'}" title="${row.enabled === false ? 'Let rotation use this account again' : 'Keep the login, take this account out of rotation'}">${row.enabled === false ? 'Enable' : 'Disable'}</button>
+                <button type="button" class="btn btn-default" data-harness-remove title="Ask the agent service to forget this account">Remove</button>`;
     return `
         <div class="harness-account-row${quota.exhausted ? ' harness-exhausted' : ''}" data-harness="${escapeHtml(row.harness)}" data-profile="${escapeHtml(row.profile_id)}" data-kind="${escapeHtml(row.kind)}">
             <div class="harness-account-main">
@@ -928,7 +928,7 @@ function rowHtml(row, payload, facets = {}) {
             </div>
             <div class="harness-account-meta muted">${escapeHtml(meta)}</div>
             <div class="harness-account-actions">
-                <button type="button" class="settings-ghost-btn" data-harness-login>${escapeHtml(rowActionLabel(row, payload))}</button>${rowActions}
+                <button type="button" class="btn btn-default" data-harness-login>${escapeHtml(rowActionLabel(row, payload))}</button>${rowActions}
             </div>
         </div>
     `;
@@ -949,7 +949,7 @@ function groupHtml(group, payload, facets) {
                     <span class="ui-status" data-tone="${group.status.tone}">${escapeHtml(group.status.label)}</span>
                     ${nextUp ? `<span class="ui-status" data-tone="muted" data-next-up>${escapeHtml(nextUp)}</span>` : ''}
                 </div>
-                <button type="button" class="settings-ghost-btn" data-family-add>${escapeHtml(familyActionLabel(group, payload))}</button>
+                <button type="button" class="btn btn-default" data-family-add>${escapeHtml(familyActionLabel(group, payload))}</button>
             </div>
             <div class="agent-family-rows">${body}</div>
         </section>

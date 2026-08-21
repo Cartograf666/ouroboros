@@ -97,6 +97,13 @@ function setStatus(text, tone = 'ok') {
     status.dataset.tone = tone;
 }
 
+function setButtonBusy(button, busy) {
+    if (!button) return;
+    button.disabled = busy;
+    if (busy) button.setAttribute('aria-busy', 'true');
+    else button.removeAttribute('aria-busy');
+}
+
 function readInt(id, fallback) {
     const value = parseInt(byId(id).value, 10);
     return Number.isNaN(value) ? fallback : value;
@@ -144,10 +151,10 @@ function customSecretRow(key = '', value = '') {
         <div class="form-field settings-custom-secret-key"><label>Key</label><input data-custom-secret-key value="${escapeHtml(key)}" placeholder="SLACK_WEBHOOK_URL" spellcheck="false"></div>
         <div class="form-field settings-custom-secret-value"><label>Value</label><div class="secret-input-row">
             <input id="${id}" data-custom-secret-value class="secret-input" type="password" value="${escapeHtml(value || '')}" placeholder="Secret value">
-            <button type="button" class="settings-ghost-btn" data-row-secret-toggle>Show</button>
-            <button type="button" class="settings-ghost-btn" data-row-secret-clear>Clear</button>
+            <button type="button" class="btn btn-default" data-row-secret-toggle>Show</button>
+            <button type="button" class="btn btn-default" data-row-secret-clear>Clear</button>
         </div><div class="settings-inline-note" data-custom-secret-error hidden></div></div>
-        <button type="button" class="settings-ghost-btn settings-custom-secret-remove" data-custom-secret-remove>Remove</button>`;
+        <button type="button" class="btn btn-default settings-custom-secret-remove" data-custom-secret-remove>Remove</button>`;
     wireSecretRow(row);
     row.querySelector('[data-custom-secret-remove]')?.addEventListener('click', () => { row.dataset.removeCustomSecret = '1'; row.hidden = true; markSettingsDirty(); });
     return row;
@@ -181,8 +188,8 @@ function renderRequestedSkillSecrets(root, skills, settings) {
         el.className = 'settings-requested-secret-row';
         el.innerHTML = `<div class="form-field"><label>${escapeHtml(key)}</label><div class="secret-input-row">
             <input id="${id}" data-secret-setting="${escapeHtml(key)}" class="secret-input" type="password" value="${escapeHtml(settings[key] || '')}" placeholder="Secret value">
-            <button type="button" class="settings-ghost-btn" data-row-secret-toggle>Show</button>
-            <button type="button" class="settings-ghost-btn" data-row-secret-clear>Clear</button>
+            <button type="button" class="btn btn-default" data-row-secret-toggle>Show</button>
+            <button type="button" class="btn btn-default" data-row-secret-clear>Clear</button>
         </div></div>`;
         wireSecretRow(el); host.appendChild(el);
     });
@@ -544,14 +551,13 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             || (ready ? 'Claude runtime ready.' : (installed ? 'Claude runtime available but not ready.' : 'Claude runtime not available.'));
         const tone = ready ? 'ok' : (error ? 'error' : (installed ? 'muted' : 'error'));
         if (status) {
-            status.textContent = message;
-            status.dataset.tone = tone;
+            setInlineStatus(status, message, tone);
         }
         if (button) {
             button.dataset.busy = busy ? '1' : '0';
             button.dataset.ready = ready ? '1' : '0';
             button.dataset.installed = installed ? '1' : '0';
-            button.disabled = busy;
+            setButtonBusy(button, busy);
             button.textContent = busy ? 'Repairing...' : (ready ? 'Runtime OK' : 'Repair Runtime');
         }
         renderClaudeCodeUi();
@@ -604,7 +610,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         Object.keys(PROVIDER_TEST_INPUTS).forEach((provider) => {
             providerTestGenerations.set(provider, (providerTestGenerations.get(provider) || 0) + 1);
         });
-        page.querySelectorAll('[data-provider-test-status]').forEach((el) => { el.textContent = ''; });
+        page.querySelectorAll('[data-provider-test-status]').forEach((el) => setInlineStatus(el, '', 'muted'));
         applySecretInputs(page, s);
         INPUT_FIELDS.forEach(([id, key, fallback = '']) => applyInputValue(id, fallback && !s[key] ? fallback : s[key]));
         VALUE_FIELDS.forEach(([id, key, fallback]) => { byId(id).value = s[key] || fallback; });
@@ -756,7 +762,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         try {
             await loadSettings();
             try {
-                await refreshModelCatalog();
+                await refreshModelCatalog({ button: byId('btn-refresh-model-catalog') });
                 setStatus('Settings loaded', 'ok');
             } catch (error) {
                 setStatus(
@@ -1224,8 +1230,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         const sentFingerprint = JSON.stringify(overrides);
         const sentGeneration = providerTestGenerations.get(provider) || 0;
         providerTestsInFlight.add(provider);
-        button.disabled = true;
-        if (status) status.textContent = 'Testing…';
+        setButtonBusy(button, true);
+        if (status) setInlineStatus(status, 'Testing…', 'muted');
         const resultIsCurrent = () => providerTestResultIsCurrent({
             sentGeneration,
             currentGeneration: providerTestGenerations.get(provider) || 0,
@@ -1234,14 +1240,16 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         });
         try {
             const data = await apiClient.providerTest({ provider_id: provider, overrides });
-            if (status && resultIsCurrent()) status.textContent = providerTestStatusText(data);
+            if (status && resultIsCurrent()) {
+                setInlineStatus(status, providerTestStatusText(data), data?.ok ? 'ok' : 'danger');
+            }
         } catch (_error) {
             if (status && resultIsCurrent()) {
-                status.textContent = providerTestNetworkErrorStatus();
+                setInlineStatus(status, providerTestNetworkErrorStatus(), 'danger');
             }
         } finally {
             providerTestsInFlight.delete(provider);
-            button.disabled = false;
+            setButtonBusy(button, false);
         }
     });
 
@@ -1258,7 +1266,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                     (providerTestGenerations.get(provider) || 0) + 1,
                 );
                 const status = page.querySelector(`[data-provider-test-status="${provider}"]`);
-                if (status) status.textContent = '';
+                if (status) setInlineStatus(status, '', 'muted');
                 break;
             }
         }
@@ -1291,8 +1299,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         }
     });
 
-    byId('btn-refresh-model-catalog').addEventListener('click', async () => {
-        await refreshModelCatalog();
+    byId('btn-refresh-model-catalog').addEventListener('click', async (event) => {
+        await refreshModelCatalog({ button: event.currentTarget });
     });
 
     byId('btn-reload-settings')?.addEventListener('click', async () => {

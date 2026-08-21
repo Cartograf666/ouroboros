@@ -53,3 +53,18 @@ test('every provider test button warns that one charged request is sent', () => 
         );
     }
 });
+
+test('provider actions use the shared status-first action row contract', () => {
+    const html = renderSettingsPage();
+    const rows = [...html.matchAll(/<div class="settings-action-row(?:"|\s)[\s\S]*?<\/div>/g)]
+        .map(([row]) => row);
+    assert.equal(rows.length, 9, 'seven provider probes plus Claude and catalog actions');
+    assert.doesNotMatch(html, /settings-ghost-btn/);
+    for (const row of rows) {
+        const statusAt = row.indexOf('role="status"');
+        const actionAt = row.indexOf('class="btn btn-default"');
+        assert.ok(statusAt >= 0, 'each action row exposes a live status');
+        assert.ok(actionAt > statusAt, 'the action is docked after the status in source order');
+        assert.match(row, /aria-live="polite"/);
+    }
+});

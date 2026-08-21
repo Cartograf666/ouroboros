@@ -1804,7 +1804,11 @@ commit.
   `style=""` markup and `.style.<property>` assignments are review debt.
   Dynamic measured values may update a narrowly named CSS custom property when
   that is the actual runtime data flow.
-- One semantic button variant expresses one action role. Notifications use the
+- One semantic button variant expresses one action role. Neutral Settings and
+  onboarding controls use the existing `.btn.btn-default` role; do not add a
+  parallel `settings-ghost-btn` variant. A one-action result row uses the
+  named `.settings-action-row` contract (status first, action docked right),
+  while multi-action toolbars retain their own grouping. Notifications use the
   shared toast host unless status belongs to a permanently reserved control
   row. Working, warning, error, and destructive states keep consistent meaning
   across Chat, Logs, Settings, and Skills.

@@ -123,6 +123,9 @@
 }
 
 .settings-provider-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
     padding: 0 18px 18px;
 }
 
@@ -447,6 +450,24 @@
     gap: 10px;
 }
 
+/* A single action with a durable result belongs to one row: the result stays
+   readable on the left while the action keeps a stable right edge. */
+.settings-action-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: var(--space-3);
+    min-width: 0;
+}
+
+.settings-action-row > .settings-inline-status {
+    min-width: 0;
+}
+
+.settings-action-row > .btn-default {
+    justify-self: end;
+}
+
 .settings-footer {
     flex-shrink: 0;
     display: flex;
@@ -492,20 +513,9 @@
     min-width: 0;
 }
 
-.settings-ghost-btn {
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    background: rgba(255, 255, 255, 0.04);
-    color: var(--text-primary);
-    border-radius: 12px;
-    padding: 0 14px;
+.secret-input-row .btn-default,
+.settings-custom-secret-remove {
     min-height: 42px;
-    cursor: pointer;
-    font-size: var(--button-font-size);
-}
-
-.settings-ghost-btn:hover {
-    color: var(--text-primary);
-    border-color: rgba(232, 93, 111, 0.35);
 }
 
 .available-subagents-editor {
@@ -523,7 +533,7 @@
     gap: 8px;
 }
 
-.available-subagents-toolbar .settings-ghost-btn {
+.available-subagents-toolbar .btn-default {
     margin-left: auto;
 }
 
@@ -592,7 +602,7 @@
     justify-content: flex-end;
 }
 
-.available-subagent-actions .settings-ghost-btn {
+.available-subagent-actions .btn-default {
     min-height: 34px;
     padding: 0 11px;
 }
@@ -616,7 +626,6 @@
 }
 
 .settings-custom-secret-remove {
-    min-height: 40px;
     padding: 0 12px;
 }
 
@@ -882,8 +891,21 @@
         grid-template-columns: 1fr;
     }
 
-    .available-subagents-toolbar .settings-ghost-btn {
+    .available-subagents-toolbar .btn-default {
         margin-left: 0;
+    }
+
+    .settings-action-row {
+        grid-template-columns: 1fr;
+        align-items: start;
+    }
+
+    .settings-action-row > .settings-inline-status:empty {
+        display: none;
+    }
+
+    .settings-action-row > .btn-default {
+        justify-self: end;
     }
 
     .settings-effort-group {
