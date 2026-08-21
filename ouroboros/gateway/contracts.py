@@ -678,6 +678,17 @@ class OwnerSafetyModeResponse(TypedDict):
     safety_mode: str  # full | light | off (v6.54.3)
 
 
+class OwnerSkillPresenceRuntimeRequest(TypedDict):
+    expected_state_fingerprint: str
+    runtime_overrides: Dict[str, Any]
+
+
+class OwnerSkillPresenceRuntimeResponse(TypedDict):
+    ok: bool
+    skill: str
+    presence_runtime: Dict[str, Any]
+
+
 class SkillGrantResponse(TypedDict, total=False):
     ok: bool
     skill: str
@@ -1259,6 +1270,7 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "POST /api/owner/safety-mode",
     "POST /api/owner/capability-ack",
     "POST /api/owner/skills/{skill}/attest-review",
+    "POST /api/owner/skills/{skill}/presence-runtime",
     "POST /api/skills/{skill}/publish-preflight",
     "GET /api/model-catalog",
     "POST /api/tasks",
@@ -1421,6 +1433,8 @@ __all__ = [
     "OwnerContextModeResponse",
     "OwnerScopeReviewFloorResponse",
     "OwnerSafetyModeResponse",
+    "OwnerSkillPresenceRuntimeRequest",
+    "OwnerSkillPresenceRuntimeResponse",
     "OnboardingCompleteRequest",
     "OnboardingCompleteResponse",
     "OnboardingSubagentsPreviewResponse",

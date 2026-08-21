@@ -27,6 +27,7 @@ _SCHEMA = 1
 LIVE = "live"        # desired_live and loaded successfully
 BROKEN = "broken"    # desired_live but failed to load
 INACTIVE = "inactive"  # disabled, deps pending, review-gated, or not an extension
+COMPANION_RESTART_EXHAUSTED = "companion_restart_exhausted"
 
 
 def health_path(drive_root: pathlib.Path, skill_name: str) -> pathlib.Path:
@@ -100,6 +101,81 @@ def record_extension_health(
     return result
 
 
+def _companion_failure_reason(companion_name: str) -> str:
+    return f"{COMPANION_RESTART_EXHAUSTED}:{str(companion_name or '').strip()}"
+
+
+def record_companion_restart_exhausted(
+    drive_root: pathlib.Path,
+    skill_name: str,
+    companion_name: str,
+    *,
+    returncode: int,
+) -> Dict[str, Any]:
+    """Persist terminal companion failure in the extension's existing health row."""
+    prior = read_extension_health(drive_root, skill_name) or {}
+    observed = prior.get("last_observed") or {}
+    name = str(companion_name or "").strip()
+    return record_extension_health(
+        drive_root,
+        skill_name,
+        status=BROKEN,
+        version=str(observed.get("version") or ""),
+        sha=str(observed.get("sha") or ""),
+        reason=_companion_failure_reason(name),
+        load_error=(
+            f"companion {name!r} exited with code {int(returncode)} "
+            "after exhausting its restart budget"
+        ),
+    )
+
+
+def clear_companion_restart_exhausted(
+    drive_root: pathlib.Path,
+    skill_name: str,
+    companion_name: str,
+) -> None:
+    """Clear this companion's terminal failure after a successful fresh start."""
+    prior = read_extension_health(drive_root, skill_name) or {}
+    observed = prior.get("last_observed") or {}
+    if (
+        observed.get("status") != BROKEN
+        or observed.get("reason") != _companion_failure_reason(companion_name)
+    ):
+        return
+    record_extension_health(
+        drive_root,
+        skill_name,
+        status=LIVE,
+        version=str(observed.get("version") or ""),
+        sha=str(observed.get("sha") or ""),
+        reason="companion_restarted",
+    )
+
+
+def apply_companion_failure_to_runtime_state(
+    state: Dict[str, Any],
+    drive_root: pathlib.Path,
+    skill_name: str,
+) -> Dict[str, Any]:
+    """Project a durable exhausted companion into the normal runtime state."""
+    if not state.get("desired_live"):
+        return state
+    health = read_extension_health(drive_root, skill_name) or {}
+    observed = health.get("last_observed") or {}
+    reason = str(observed.get("reason") or "")
+    if observed.get("status") != BROKEN or not reason.startswith(
+        f"{COMPANION_RESTART_EXHAUSTED}:"
+    ):
+        return state
+    state.update(
+        companion_failed=True,
+        reason=reason,
+        load_error=str(observed.get("load_error") or "companion restart budget exhausted"),
+    )
+    return state
+
+
 def regressed_extensions(drive_root: pathlib.Path) -> List[Dict[str, Any]]:
     """Return health records for extensions currently flagged as regressed."""
     root = pathlib.Path(drive_root) / "state" / "skills"
@@ -137,6 +213,8 @@ def regressed_extensions(drive_root: pathlib.Path) -> List[Dict[str, Any]]:
 
 def status_for_runtime_state(state: Dict[str, Any]) -> str:
     """Map an extension runtime-state dict to a health status."""
+    if state.get("desired_live") and state.get("companion_failed"):
+        return BROKEN
     if state.get("live_loaded"):
         return LIVE
     if state.get("desired_live") and (
@@ -150,9 +228,13 @@ __all__ = [
     "HEALTH_FILENAME",
     "LIVE",
     "BROKEN",
+    "COMPANION_RESTART_EXHAUSTED",
     "INACTIVE",
+    "apply_companion_failure_to_runtime_state",
+    "clear_companion_restart_exhausted",
     "health_path",
     "read_extension_health",
+    "record_companion_restart_exhausted",
     "record_extension_health",
     "regressed_extensions",
     "status_for_runtime_state",

@@ -141,8 +141,8 @@ def collect_routes(
         api_settings_get,
         api_settings_post,
     )
+    from ouroboros.gateway.presence_settings import api_owner_skill_presence_runtime
     from ouroboros.gateway.ws import ws_endpoint
-
     settings_handlers = settings_handlers or {}
     settings_get = settings_handlers.get("api_settings_get", api_settings_get)
     settings_post = settings_handlers.get("api_settings_post", api_settings_post)
@@ -178,6 +178,7 @@ def collect_routes(
             methods=["GET"],
         ),
         Route("/api/owner/skills/{skill}/attest-review", endpoint=api_owner_skill_attest_review, methods=["POST"]),
+        Route("/api/owner/skills/{skill}/presence-runtime", endpoint=api_owner_skill_presence_runtime, methods=["POST"]),
         Route("/api/skills/{skill}/grants", endpoint=api_skill_grants, methods=["POST"]),
         Route("/api/skills/{skill}/reconcile", endpoint=api_skill_reconcile, methods=["POST"]),
         Route("/api/marketplace/clawhub/search", endpoint=api_marketplace_search, methods=["GET"]),

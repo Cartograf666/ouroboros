@@ -127,7 +127,6 @@ BAND_PATHS = {
     "devtools/benchmarks/swe_bench_pro/e1v2/run_pro.py": None,
     "devtools/benchmarks/terminal_bench/harbor_installed_agent.py": None,
     "devtools/benchmarks/terminal_bench/run_tb.py": None,
-    "ouroboros/agent.py": "Shrank into the band from 1589 lines: the dispatch-time executor note pair (dispatch_executor_note/executor_blocked_outcome) moved whole to subagent_dispatch_notes.py with same-name re-exports kept (delegation-substrate sprint, B1/F7).",
     "ouroboros/agent_startup_checks.py": None,
     "ouroboros/extension_process_runner.py": None,
     "ouroboros/gateway/contracts.py": None,
@@ -144,7 +143,6 @@ BAND_PATHS = {
     "ouroboros/preflight_runner.py": None,
     "ouroboros/protected_artifacts.py": None,
     "ouroboros/review.py": "Entered the band from 952 lines: re-anchoring the size ratchet on the official line added the candidate and pairwise base-vs-tip transition validators (validate_size_ratchet_candidate/validate_size_ratchet_transition_against_base) with merge-aware previous-manifest resolution, replacing the retired first-parent history audit (update-flow-redesign sprint, Q7-C/Q18-A/Q19-A owner decisions).",
-    "ouroboros/skill_loader.py": None,
     "ouroboros/skill_review_runner.py": None,
     "ouroboros/task_status.py": None,
     "ouroboros/tools/browser.py": None,
@@ -203,7 +201,7 @@ BYTE_BASELINE_DEBT = {
 }
 
 BYTE_DEBT = {
-    "ouroboros/loop.py": 317202,
+    "ouroboros/loop.py": 317162,
     "tests/test_delegated_subagent_transport.py": 320571,
     "tests/test_devtools_benchmarks.py": 328282,
     "web/modules/chat.js": 229208,

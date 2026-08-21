@@ -191,6 +191,15 @@ export const apiClient = {
         payload_root: payloadRoot,
     }),
     skillGrants: (skill, items) => jsonPost(`/api/skills/${encodeURIComponent(skill)}/grants`, { items }),
+    /**
+     * @param {string} skill
+     * @param {import('./api_types.js').OwnerSkillPresenceRuntimeRequest} payload
+     * @returns {Promise<import('./api_types.js').OwnerSkillPresenceRuntimeResponse>}
+     */
+    savePresenceRuntime: (skill, payload) => jsonPost(
+        `/api/owner/skills/${encodeURIComponent(skill)}/presence-runtime`,
+        payload,
+    ),
     chatHistory: (limit = 1000) => fetchJson(`/api/chat/history?limit=${encodeURIComponent(limit)}`, { cache: 'no-store' }),
     projectFromTask: (taskId, id, name, objectiveHint = '') => jsonPost('/api/projects/from-task', { task_id: taskId, id, name, objective_hint: objectiveHint }),
     /** @param {import('./api_types.js').ProjectCreateRequest} payload */

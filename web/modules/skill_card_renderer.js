@@ -188,6 +188,37 @@ function provenanceBlock(prov) {
         + (warnings ? `<details class="skills-card-warnings"><summary class="muted">adapter warnings</summary><ul>${warnings}</ul></details>` : '');
 }
 
+function presenceRuntimeBlock(skill) {
+    const runtime = skill.presence_runtime;
+    if (!runtime || typeof runtime !== 'object') return '';
+    if (runtime.error) {
+        return `<div class="skills-load-error">Presence runtime unavailable: ${escapeHtml(runtime.error)}</div>`;
+    }
+    const defaults = runtime.defaults || {};
+    const overrides = runtime.overrides || {};
+    const modelOverride = ['main', 'light'].includes(overrides.model_slot) ? overrides.model_slot : '';
+    const roundsOverride = Number.isInteger(overrides.inline_max_rounds) ? overrides.inline_max_rounds : '';
+    const fingerprint = String(runtime.state_fingerprint || '');
+    return `<form class="skills-presence-runtime" data-presence-runtime-form data-skill-name="${escapeHtml(skill.name)}" data-state-fingerprint="${escapeHtml(fingerprint)}">
+        <div class="skills-presence-runtime-title">Presence runtime</div>
+        <label>Model
+            <select name="model_slot">
+                <option value="" ${modelOverride ? '' : 'selected'}>Reviewed default (${escapeHtml(defaults.model_slot || 'main')})</option>
+                <option value="main" ${modelOverride === 'main' ? 'selected' : ''}>Main</option>
+                <option value="light" ${modelOverride === 'light' ? 'selected' : ''}>Light</option>
+            </select>
+        </label>
+        <label>Inline rounds
+            <input name="inline_max_rounds" type="number" min="1" step="1" value="${escapeHtml(roundsOverride)}" placeholder="${escapeHtml(defaults.inline_max_rounds || 10)}">
+        </label>
+        <div class="skills-presence-runtime-actions">
+            <button type="submit" class="btn btn-default btn-sm">Save</button>
+            <button type="button" class="btn btn-ghost btn-sm" data-presence-runtime-reset>Use reviewed defaults</button>
+        </div>
+        <div class="muted">Applies to new Presence turns only.</div>
+    </form>`;
+}
+
 export function renderInstalledSkillCard(skill, reviewingSkills = new Set(), repairingSkills = new Set(), live = {}, options = {}) {
     const safeName = escapeHtml(skill.name);
     const reviewInProgress = reviewingSkills.has(skill.name);
@@ -254,6 +285,7 @@ export function renderInstalledSkillCard(skill, reviewingSkills = new Set(), rep
         <div class="skills-detail-row"><span class="skills-detail-label">Type</span><code>${escapeHtml(skill.type || 'skill')}</code> · version ${escapeHtml(skill.version || '—')} · source ${escapeHtml(source)}</div>
         <div class="skills-detail-row"><span class="skills-detail-label">Review</span>${statusBadge(skill.review_status, skill.review_gate, skill.review_profile)}${skill.review_stale ? ' <span class="skills-badge skills-badge-warn">stale</span>' : ''}</div>
         <div class="skills-detail-row"><span class="skills-detail-label">Permissions</span>${(skill.permissions || []).map((p) => `<code>${escapeHtml(p)}</code>`).join(' ') || '<i class="muted">none</i>'}</div>
+        ${presenceRuntimeBlock(skill)}
         ${provenanceBlock(prov)}
     </details>`;
     return `<article class="skills-card" data-skill="${safeName}" ${reviewInProgress ? 'data-reviewing="1"' : ''} ${repairInProgress ? 'data-repairing="1"' : ''}>

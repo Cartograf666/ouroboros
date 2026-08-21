@@ -328,6 +328,7 @@ def _build_extensions_index(drive_root, repo_path):
         return datetime.fromtimestamp(min(stamps), tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
     from ouroboros.extension_health import read_extension_health
+    from ouroboros.gateway.presence_settings import presence_runtime_card_projection
     from ouroboros.skill_review_runner import skill_review_ui_projection
     from ouroboros.tools.github import github_token_from_env_or_settings
 
@@ -412,6 +413,9 @@ def _build_extensions_index(drive_root, repo_path):
             "skill_review": skill_review_ui_projection(drive_root, s.name),
             "grants": grant_status_for_skill(drive_root, s),
         })
+        presence_runtime = presence_runtime_card_projection(drive_root, s)
+        if presence_runtime is not None:
+            entry["presence_runtime"] = presence_runtime
         if s.source == "clawhub":
             try:
                 prov = read_provenance(drive_root, s.name) or {}

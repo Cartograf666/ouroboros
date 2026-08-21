@@ -1456,6 +1456,18 @@ def _capture_context_core(
         memory, env, task_id=task.get("id", ""), thread_chat_id=int(task.get("chat_id") or 0),
         project_id=_reflections_pid,
     ))
+    task_metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    try:
+        from ouroboros.presence_context import build_presence_context_section
+
+        presence_section = build_presence_context_section(
+            pathlib.Path(env.drive_root),
+            task_metadata.get("presence"),
+        )
+        if presence_section:
+            dynamic_parts.append(presence_section)
+    except Exception:
+        log.debug("Failed to inject presence context", exc_info=True)
 
     return _ContextCore(
         base_prompt=base_prompt,

@@ -643,6 +643,19 @@
  */
 
 /**
+ * @typedef {Object} OwnerSkillPresenceRuntimeRequest
+ * @property {string} expected_state_fingerprint
+ * @property {{model_slot: ("main"|"light"|null), inline_max_rounds: (number|null)}} runtime_overrides
+ */
+
+/**
+ * @typedef {Object} OwnerSkillPresenceRuntimeResponse
+ * @property {boolean} ok
+ * @property {string} skill
+ * @property {Object} presence_runtime
+ */
+
+/**
  * @typedef {Object} ExecutorRef
  * @property {"local"|"docker_exec"} type
  * @property {string=} id

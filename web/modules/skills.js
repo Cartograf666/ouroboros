@@ -277,6 +277,26 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
         return result;
     }
 
+    async function savePresenceRuntime(form, reset = false) {
+        const name = String(form?.dataset?.skillName || '');
+        const expected = String(form?.dataset?.stateFingerprint || '');
+        if (!name || !expected) throw new Error('Presence runtime state is unavailable. Refresh and retry.');
+        const modelValue = reset ? '' : String(form.elements.model_slot?.value || '').trim();
+        const roundsValue = reset ? '' : String(form.elements.inline_max_rounds?.value || '').trim();
+        const rounds = roundsValue === '' ? null : Number(roundsValue);
+        if (rounds !== null && (!Number.isInteger(rounds) || rounds < 1)) {
+            throw new Error('Inline rounds must be a positive whole number.');
+        }
+        await apiClient.savePresenceRuntime(name, {
+            expected_state_fingerprint: expected,
+            runtime_overrides: {
+                model_slot: modelValue || null,
+                inline_max_rounds: rounds,
+            },
+        });
+        showToast(`${name}: Presence runtime ${reset ? 'reset' : 'saved'} for new turns`, 'ok');
+    }
+
     async function triggerSkillAction(name, action, options = {}) {
         if (!name || !action) return;
         if (action === 'open_widgets') {
@@ -506,7 +526,36 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
         event.preventDefault();
         actionTarget.click();
     });
+    container.addEventListener('submit', async (event) => {
+        const form = event.target.closest?.('[data-presence-runtime-form]');
+        if (!form) return;
+        event.preventDefault();
+        const submit = form.querySelector('button[type="submit"]');
+        if (submit) submit.disabled = true;
+        try {
+            await savePresenceRuntime(form);
+        } catch (err) {
+            showToast(`${form.dataset.skillName || 'Skill'}: ${err.message || err}`, 'danger');
+        } finally {
+            if (submit) submit.disabled = false;
+            renderFn();
+        }
+    });
     container.addEventListener('click', async (event) => {
+        const resetRuntime = event.target.closest('[data-presence-runtime-reset]');
+        if (resetRuntime) {
+            const form = resetRuntime.closest('[data-presence-runtime-form]');
+            resetRuntime.disabled = true;
+            try {
+                await savePresenceRuntime(form, true);
+            } catch (err) {
+                showToast(`${form?.dataset?.skillName || 'Skill'}: ${err.message || err}`, 'danger');
+            } finally {
+                resetRuntime.disabled = false;
+                renderFn();
+            }
+            return;
+        }
         const menuTrigger = event.target.closest('[data-skill-menu-trigger]');
         if (menuTrigger) {
             const menu = menuTrigger.closest('.skills-card-menu');

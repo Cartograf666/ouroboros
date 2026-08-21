@@ -833,6 +833,10 @@ export function renderSettingsPage() {
                                 <input id="s-workers" type="number" min="1" max="50" value="10">
                             </div>
                             <div class="form-field">
+                                <label>Concurrent Presence Conversations</label>
+                                <input id="s-presence-max-active" type="number" min="1" max="20" value="2">
+                            </div>
+                            <div class="form-field">
                                 <label>Tool Timeout (s)</label>
                                 <input id="s-tool-timeout" type="number" value="600">
                             </div>

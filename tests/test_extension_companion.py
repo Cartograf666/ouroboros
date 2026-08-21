@@ -1,6 +1,7 @@
 import pathlib
 import subprocess
 import sys
+import time
 
 from ouroboros.extension_companion import (
     CompanionDescriptor,
@@ -9,6 +10,8 @@ from ouroboros.extension_companion import (
 )
 from ouroboros.extension_loader import PluginAPIImpl, _PluginAPIConfig
 import ouroboros.extension_loader as extension_loader
+from ouroboros import extension_health
+from ouroboros.skill_loader import SkillReviewState, find_skill, save_enabled, save_review_state
 
 
 def test_companion_supervisor_starts_and_stops_process(tmp_path: pathlib.Path) -> None:
@@ -47,6 +50,63 @@ def test_panic_kill_all_clears_runtime_table(tmp_path: pathlib.Path) -> None:
     assert supervisor.snapshot()
     supervisor.panic_kill_all()
     assert supervisor.snapshot() == {}
+
+
+def test_exhausted_companion_remains_in_durable_runtime_health(tmp_path: pathlib.Path) -> None:
+    init_server_process_pid()
+    drive_root = tmp_path / "drive"
+    repo_root = tmp_path / "skills"
+    skill_dir = repo_root / "connector"
+    drive_root.mkdir()
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: connector\ndescription: connector\nversion: 0.1.0\n"
+        "type: extension\nentry: plugin.py\npermissions: []\n---\nbody\n",
+        encoding="utf-8",
+    )
+    (skill_dir / "plugin.py").write_text("def register(api):\n    pass\n", encoding="utf-8")
+    loaded = find_skill(drive_root, "connector", repo_path=str(repo_root))
+    assert loaded is not None
+    save_enabled(drive_root, loaded.name, True)
+    save_review_state(
+        drive_root,
+        loaded.name,
+        SkillReviewState(status="pass", content_hash=loaded.content_hash),
+    )
+    loaded = find_skill(drive_root, loaded.name, repo_path=str(repo_root))
+    assert loaded is not None
+    try:
+        assert extension_loader.load_extension(loaded, lambda: {}, drive_root=drive_root) is None
+        supervisor = CompanionSupervisor(drive_root)
+        descriptor = CompanionDescriptor(
+            skill_name=loaded.name,
+            name="bridge",
+            command=[sys.executable, "-c", "raise SystemExit(7)"],
+            cwd=tmp_path,
+            env={},
+            max_restarts=0,
+        )
+
+        assert supervisor.start(descriptor)
+        deadline = time.monotonic() + 3
+        while supervisor.snapshot() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert supervisor.snapshot() == {}
+        health = extension_health.read_extension_health(drive_root, loaded.name) or {}
+        observed = health.get("last_observed") or {}
+        assert observed["status"] == extension_health.BROKEN
+        assert observed["reason"] == "companion_restart_exhausted:bridge"
+        state = extension_loader.runtime_state_for_loaded_skill(
+            loaded, drive_root, skills=[loaded],
+        )
+        assert state["live_loaded"] is True
+        assert state["companion_failed"] is True
+        assert state["reason"] == "companion_restart_exhausted:bridge"
+        assert "exhausting its restart budget" in state["load_error"]
+        assert extension_health.status_for_runtime_state(state) == extension_health.BROKEN
+    finally:
+        extension_loader.unload_extension(loaded.name)
 
 
 def test_plugin_api_companion_registration_uses_reviewed_manifest_descriptor(tmp_path: pathlib.Path) -> None:

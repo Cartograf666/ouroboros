@@ -35,6 +35,7 @@ def _write_ext(
     plugin: str,
     env_from_settings: list[str] | None = None,
     conflicts: list[str] | None = None,
+    presence: str = "",
 ) -> pathlib.Path:
     skill_dir = repo_root / name
     skill_dir.mkdir(parents=True, exist_ok=True)
@@ -52,6 +53,7 @@ def _write_ext(
             f"permissions: {perms_yaml}\n"
             f"env_from_settings: {env_yaml}\n"
             f"conflicts: {conflicts_yaml}\n"
+            f"{presence}"
             "---\n"
             "body\n"
         ),
@@ -229,6 +231,117 @@ def test_api_extensions_index_lists_extension_skills(tmp_path, monkeypatch):
         assert ext_meta["submit_hub"]["disabled"] is (
             not ext_meta["submit_hub"]["task_start_allowed"]
         )
+    finally:
+        _stop_patches(patches)
+
+
+def test_reviewed_presence_runtime_card_projection_and_owner_cas(tmp_path, monkeypatch):
+    from ouroboros.presence_capabilities import load_presence_state
+    from ouroboros.skill_loader import SkillReviewState, compute_content_hash, save_review_state
+
+    skills_root = tmp_path / "skills"
+    skill_dir = _write_ext(
+        skills_root,
+        "presence_ext",
+        permissions=[],
+        plugin="def register(api):\n    pass\n",
+        presence=(
+            "presence:\n"
+            "  instructions: Participate when useful.\n"
+            "  runtime_defaults:\n"
+            "    model_slot: light\n"
+            "    inline_max_rounds: 10\n"
+        ),
+    )
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    client, drive_root, patches = _make_client(tmp_path, monkeypatch)
+    try:
+        content_hash = compute_content_hash(skill_dir, manifest_entry="plugin.py")
+        save_review_state(
+            drive_root,
+            "presence_ext",
+            SkillReviewState(status="pass", content_hash=content_hash),
+        )
+        review_path = drive_root / "state" / "skills" / "presence_ext" / "review.json"
+        review_before = review_path.read_bytes()
+
+        row = next(
+            item for item in client.get("/api/extensions").json()["skills"]
+            if item["name"] == "presence_ext"
+        )
+        runtime = row["presence_runtime"]
+        assert runtime["defaults"] == {"model_slot": "light", "inline_max_rounds": 10}
+        assert runtime["overrides"] == {"model_slot": None, "inline_max_rounds": None}
+
+        update = client.post(
+            "/api/owner/skills/presence_ext/presence-runtime",
+            json={
+                "expected_state_fingerprint": runtime["state_fingerprint"],
+                "runtime_overrides": {"model_slot": "main", "inline_max_rounds": 7},
+            },
+        )
+        assert update.status_code == 200, update.text
+        updated_runtime = update.json()["presence_runtime"]
+        assert updated_runtime["overrides"] == {"model_slot": "main", "inline_max_rounds": 7}
+        assert review_path.read_bytes() == review_before
+        assert load_presence_state(drive_root, "presence_ext").runtime_overrides.model_slot == "main"
+
+        conflict = client.post(
+            "/api/owner/skills/presence_ext/presence-runtime",
+            json={
+                "expected_state_fingerprint": runtime["state_fingerprint"],
+                "runtime_overrides": {"model_slot": "light", "inline_max_rounds": 5},
+            },
+        )
+        assert conflict.status_code == 409
+        assert conflict.json()["code"] == "presence_state_conflict"
+
+        reset = client.post(
+            "/api/owner/skills/presence_ext/presence-runtime",
+            json={
+                "expected_state_fingerprint": updated_runtime["state_fingerprint"],
+                "runtime_overrides": {"model_slot": None, "inline_max_rounds": None},
+            },
+        )
+        assert reset.status_code == 200, reset.text
+        assert reset.json()["presence_runtime"]["overrides"] == {
+            "model_slot": None,
+            "inline_max_rounds": None,
+        }
+        refreshed = next(
+            item for item in client.get("/api/extensions").json()["skills"]
+            if item["name"] == "presence_ext"
+        )
+        assert refreshed["review_stale"] is False
+    finally:
+        _stop_patches(patches)
+
+
+def test_presence_runtime_controls_require_fresh_executable_review(tmp_path, monkeypatch):
+    skills_root = tmp_path / "skills"
+    _write_ext(
+        skills_root,
+        "presence_pending",
+        permissions=[],
+        plugin="def register(api):\n    pass\n",
+        presence="presence:\n  instructions: Participate when useful.\n",
+    )
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    client, _drive_root, patches = _make_client(tmp_path, monkeypatch)
+    try:
+        row = next(
+            item for item in client.get("/api/extensions").json()["skills"]
+            if item["name"] == "presence_pending"
+        )
+        assert "presence_runtime" not in row
+        response = client.post(
+            "/api/owner/skills/presence_pending/presence-runtime",
+            json={
+                "expected_state_fingerprint": "0" * 64,
+                "runtime_overrides": {"model_slot": None, "inline_max_rounds": None},
+            },
+        )
+        assert response.status_code == 409
     finally:
         _stop_patches(patches)
 

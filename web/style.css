@@ -4269,6 +4269,56 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     font-size: 11.5px;
 }
 
+.skills-presence-runtime {
+    width: min(100%, 620px);
+    margin-top: 8px;
+    padding: 10px 12px;
+    border: 1px solid rgba(250, 250, 250, 0.08);
+    border-radius: var(--radius-md);
+    background: rgba(255, 255, 255, 0.025);
+    display: flex;
+    flex-wrap: wrap;
+    align-items: end;
+    gap: 8px 12px;
+}
+
+.skills-presence-runtime-title {
+    flex-basis: 100%;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.skills-presence-runtime label {
+    display: grid;
+    gap: 4px;
+    color: rgba(250, 250, 250, 0.6);
+    font-size: 11.5px;
+}
+
+.skills-presence-runtime select,
+.skills-presence-runtime input {
+    min-height: 32px;
+    border: 1px solid rgba(250, 250, 250, 0.12);
+    border-radius: var(--radius-sm);
+    background: rgba(12, 14, 18, 0.8);
+    color: var(--text-primary);
+    padding: 5px 8px;
+}
+
+.skills-presence-runtime input {
+    width: 110px;
+}
+
+.skills-presence-runtime-actions {
+    display: flex;
+    gap: 6px;
+}
+
+.skills-presence-runtime > .muted {
+    flex-basis: 100%;
+    font-size: 11.5px;
+}
+
 .skills-card-actions {
     display: flex;
     gap: 8px;

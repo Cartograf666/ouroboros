@@ -617,6 +617,7 @@ class BackgroundConsciousness:
         "knowledge_read", "knowledge_write", "knowledge_list",
         "web_search", "read_file", "list_files", "query_code",
         "chat_history", "recent_tasks",
+        "initiate_presence",
         "list_github_issues", "get_github_issue",
     })
 
