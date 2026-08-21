@@ -529,6 +529,11 @@ def _start_service(
 def _status_payload(record: ServiceRecord) -> Dict[str, Any]:
     _refresh_ready(record)
     rc = record.proc.poll()
+    # The process can settle in the small window between the readiness poll
+    # above and this state read.  Terminal state is never currently ready,
+    # while the observation timestamp remains useful historical evidence.
+    if rc is not None:
+        record.ready = False
     state = "running" if rc is None else "exited"
     return {
         "service_id": record.service_id,
