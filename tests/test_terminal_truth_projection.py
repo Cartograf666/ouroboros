@@ -913,35 +913,6 @@ def test_failed_checkpoint_write_emits_no_finalized_event(tmp_path, monkeypatch)
     assert appended == []
 
 
-def test_post_task_checkpoint_keeps_unknown_zero_cost_nullable(tmp_path):
-    import ouroboros.post_task_checkpoint as checkpoint
-    from ouroboros import usage_accounting
-
-    data = tmp_path / "data"
-    data.mkdir()
-    task_id = "post-task-opaque"
-    write_task_result(
-        data, task_id, STATUS_COMPLETED, root_task_id=task_id,
-        root_phase_checkpoint={"post_task_synthesis": "running"},
-    )
-    usage_accounting.record_unmetered_external_dispatch(
-        "post-opaque", drive_root=data, provider="external-skill",
-        task_id=task_id, root_task_id=task_id,
-    )
-
-    checkpoint.set_root_post_task_checkpoint(
-        SimpleNamespace(drive_root=data),
-        {"id": task_id, "root_task_id": task_id, "status": STATUS_COMPLETED},
-        "completed",
-    )
-    stored = load_task_result(data, task_id)
-    assert stored["cost_usd"] is None
-    assert stored["accounted_upper_bound_usd"] is None
-    assert stored["cost_usd_with_children"] is None
-    assert stored["accounted_upper_bound_usd_with_children"] is None
-    assert stored["unknown_unmetered"] == 1
-
-
 def test_startup_recovery_surfaces_failed_running_checkpoint_persistence(tmp_path, monkeypatch):
     import ouroboros.agent_task_pipeline as pipeline
     import ouroboros.post_task_checkpoint as checkpoint

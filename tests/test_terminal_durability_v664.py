@@ -705,6 +705,36 @@ def test_terminal_unknown_zero_cost_stays_nullable(tmp_path):
     assert terminal["unknown_unmetered"] == 1
 
 
+def test_post_task_checkpoint_keeps_unknown_zero_cost_nullable(tmp_path):
+    import ouroboros.post_task_checkpoint as checkpoint
+    from ouroboros import usage_accounting
+    from ouroboros.task_results import STATUS_COMPLETED, load_task_result, write_task_result
+
+    data = tmp_path / "data"
+    data.mkdir()
+    task_id = "post-task-opaque"
+    write_task_result(
+        data, task_id, STATUS_COMPLETED, root_task_id=task_id,
+        root_phase_checkpoint={"post_task_synthesis": "running"},
+    )
+    usage_accounting.record_unmetered_external_dispatch(
+        "post-opaque", drive_root=data, provider="external-skill",
+        task_id=task_id, root_task_id=task_id,
+    )
+
+    checkpoint.set_root_post_task_checkpoint(
+        SimpleNamespace(drive_root=data),
+        {"id": task_id, "root_task_id": task_id, "status": STATUS_COMPLETED},
+        "completed",
+    )
+    stored = load_task_result(data, task_id)
+    assert stored["cost_usd"] is None
+    assert stored["accounted_upper_bound_usd"] is None
+    assert stored["cost_usd_with_children"] is None
+    assert stored["accounted_upper_bound_usd_with_children"] is None
+    assert stored["unknown_unmetered"] == 1
+
+
 def _install_supervisor(tmp_path, monkeypatch):
     from supervisor import queue, state, workers
 
