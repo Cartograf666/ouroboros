@@ -17,6 +17,7 @@ from ouroboros.request_wire_receipts import (
 from ouroboros.usage_accounting import PhysicalAttemptCapture
 from tests.provider_contract_ci import (
     CANARY_CONTINUATION_MAX_TOKENS,
+    CANARY_EMPTY_RESPONSE_MAX_ATTEMPTS,
     CANARY_MAX_TOKENS,
     CANARY_TIMEOUT_SEC,
     CANARY_TOOL_NAME,
@@ -160,7 +161,7 @@ def test_provider_alarm_output_sanitizes_token_shaped_evidence(capsys):
     assert "***REDACTED***" in str(caught_message.value)
 
 
-def test_exact_provider_canary_matrix_and_physical_call_count():
+def test_exact_provider_canary_matrix_logical_turns_and_attempt_bound():
     matrix = provider_canary_matrix()
     assert [(row.canary_id, row.model) for row in matrix] == [
         ("openrouter_gemini", "google/gemini-3.7-flash"),
@@ -194,7 +195,9 @@ def test_exact_provider_canary_matrix_and_physical_call_count():
     assert [row.canary_id for row in matrix if not row.named_tool_choice] == [
         "gigachat_direct"
     ]
-    assert sum(1 + int(row.continue_to_final) for row in matrix) == 13
+    logical_turns = sum(1 + int(row.continue_to_final) for row in matrix)
+    assert logical_turns == 13
+    assert logical_turns * CANARY_EMPTY_RESPONSE_MAX_ATTEMPTS == 26
     assert sum(
         1 + int(row.continue_to_final)
         for row in matrix
@@ -626,6 +629,7 @@ def test_public_chat_builds_full_registry_request_for_every_matrix_row():
         assert first["reasoning_effort"] == canary.reasoning_effort
         assert first["max_tokens"] == CANARY_MAX_TOKENS
         assert first["no_proxy"] is True
+        assert first["bypass_response_cache"] is False
         assert first["timeout"] == CANARY_TIMEOUT_SEC
         assert [tool["function"]["name"] for tool in first["tools"]] == names
         if canary.named_tool_choice:
@@ -639,6 +643,7 @@ def test_public_chat_builds_full_registry_request_for_every_matrix_row():
             assert "expected_final_marker" in first["messages"][0]["content"]
             second = client.calls[1]
             assert second["tool_choice"] == "none"
+            assert second["bypass_response_cache"] is False
             assert second["max_tokens"] == CANARY_CONTINUATION_MAX_TOKENS
             assert [tool["function"]["name"] for tool in second["tools"]] == [
                 CANARY_TOOL_NAME,
@@ -653,3 +658,148 @@ def test_public_chat_builds_full_registry_request_for_every_matrix_row():
             assert all(nonce in message["content"] for message in second["messages"][2:])
         else:
             assert "After its tool result" not in first["messages"][0]["content"]
+
+
+def test_canary_retries_one_semantic_empty_first_turn(monkeypatch):
+    import tests.provider_contract_ci as contract
+
+    monkeypatch.setattr(contract.time, "sleep", lambda _seconds: None)
+    canary = next(row for row in provider_canary_matrix() if row.canary_id == "openrouter_grok")
+    nonce = "empty-first-turn"
+    expected = delegate_start_canary_arguments(nonce)
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, **kwargs):
+            self.calls.append(copy.deepcopy(kwargs))
+            if len(self.calls) == 1:
+                return {}, {**_fake_usage(canary, 1), "completion_tokens": 0}
+            return (
+                {"tool_calls": [_canonical_canary_call("call-recovered", expected)]},
+                _fake_usage(canary, 2),
+            )
+
+    client = FakeClient()
+    run_provider_contract_canary(
+        client, canary=canary, tools=full_registry_canary_tools(), nonce=nonce,
+    )
+    assert [call["bypass_response_cache"] for call in client.calls] == [False, True]
+    assert {
+        key: value for key, value in client.calls[0].items() if key != "bypass_response_cache"
+    } == {
+        key: value for key, value in client.calls[1].items() if key != "bypass_response_cache"
+    }
+
+
+def test_canary_retries_one_semantic_empty_continuation(monkeypatch):
+    import tests.provider_contract_ci as contract
+
+    monkeypatch.setattr(contract.time, "sleep", lambda _seconds: None)
+    canary = next(row for row in provider_canary_matrix() if row.continue_to_final)
+    nonce = "empty-continuation"
+    expected = delegate_start_canary_arguments(nonce)
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, **kwargs):
+            self.calls.append(copy.deepcopy(kwargs))
+            if len(self.calls) == 1:
+                return (
+                    {"tool_calls": [_canonical_canary_call("call-first", expected)]},
+                    _fake_usage(canary, 1),
+                )
+            if len(self.calls) == 2:
+                return {}, {**_fake_usage(canary, 2), "completion_tokens": 0}
+            return (
+                {"content": f"FULL_REGISTRY_CONTINUED_{nonce}"},
+                _fake_usage(canary, 3),
+            )
+
+    client = FakeClient()
+    run_provider_contract_canary(
+        client, canary=canary, tools=full_registry_canary_tools(), nonce=nonce,
+    )
+    assert [call["bypass_response_cache"] for call in client.calls] == [
+        False, False, True,
+    ]
+    assert {
+        key: value for key, value in client.calls[1].items() if key != "bypass_response_cache"
+    } == {
+        key: value for key, value in client.calls[2].items() if key != "bypass_response_cache"
+    }
+
+
+def test_canary_repeated_semantic_empty_stays_red(monkeypatch):
+    import tests.provider_contract_ci as contract
+
+    monkeypatch.setattr(contract.time, "sleep", lambda _seconds: None)
+    canary = next(row for row in provider_canary_matrix() if row.canary_id == "openrouter_grok")
+
+    class EmptyClient:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, **kwargs):
+            self.calls.append(copy.deepcopy(kwargs))
+            return {}, {**_fake_usage(canary, len(self.calls)), "completion_tokens": 0}
+
+    client = EmptyClient()
+    with pytest.raises(AssertionError) as caught:
+        run_provider_contract_canary(
+            client, canary=canary, tools=full_registry_canary_tools(), nonce="twice-empty",
+        )
+    diagnostic = caught.value.args[0]["semantic_empty_provider_response"]
+    assert diagnostic["attempts"] == 2
+    assert diagnostic["message_keys"] == []
+    assert [call["bypass_response_cache"] for call in client.calls] == [False, True]
+
+
+def test_canary_permanent_empty_and_nonempty_malformed_do_not_retry(monkeypatch):
+    import tests.provider_contract_ci as contract
+
+    monkeypatch.setattr(contract.time, "sleep", lambda _seconds: None)
+    canary = next(row for row in provider_canary_matrix() if row.canary_id == "openrouter_grok")
+
+    class PermanentClient:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, **kwargs):
+            self.calls.append(copy.deepcopy(kwargs))
+            secret = "sk-or-v1-" + "A" * 40
+            usage = {
+                **_fake_usage(canary, 1),
+                "completion_tokens": 0,
+                "provider_error": {
+                    "kind": "bad_request", "code": "400", "message": secret,
+                },
+            }
+            return {}, usage
+
+    permanent = PermanentClient()
+    with pytest.raises(AssertionError) as caught:
+        run_provider_contract_canary(
+            permanent, canary=canary, tools=full_registry_canary_tools(), nonce="permanent",
+        )
+    assert len(permanent.calls) == 1
+    assert "sk-or-v1-" not in str(caught.value)
+    assert "***REDACTED***" in str(caught.value)
+
+    class MalformedClient:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, **kwargs):
+            self.calls.append(copy.deepcopy(kwargs))
+            return {"content": "not a tool call"}, _fake_usage(canary, 1)
+
+    malformed = MalformedClient()
+    with pytest.raises(AssertionError):
+        run_provider_contract_canary(
+            malformed, canary=canary, tools=full_registry_canary_tools(), nonce="malformed",
+        )
+    assert len(malformed.calls) == 1

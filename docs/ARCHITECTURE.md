@@ -1,4 +1,4 @@
-# Ouroboros v6.108.0 — Architecture & Reference
+# Ouroboros v6.108.1 — Architecture & Reference
 
 This file is NOT a changelog. Version history lives in README.md, git tags, and commit log.
 
@@ -1969,7 +1969,10 @@ exact-model witness (otherwise a cross-model witness), applies the existing safe
 factor and never drops below the conservative 1.65 cold floor. Retention keeps the
 densest witnessed pair plus the newest bounded remainder, so ordinary lighter traffic
 cannot evict its support; when that witness reaches TTL its unsupported value genuinely
-disappears. There is no independently refreshed running-maximum scalar.
+disappears. Equal clock ticks use a persisted per-witness observation sequence only as
+a recency tie-breaker; freshness and TTL still depend exclusively on the original
+`observed_at`, so ordering cannot extend evidence authority. There is no independently
+refreshed running-maximum scalar.
 `review_helpers.calibrated_input_token_limit` still returns the STRICTEST of the 920K
 budget cap, density form `(window − output_reserve) / density`, and historical
 absolute-margin form, so expiry may loosen only within those existing conservative
@@ -2474,7 +2477,11 @@ provider/model identity, and a normalized schema-valid tool call; supported reas
 routes request `medium`, while GigaChat uses its supported automatic tool choice.
 Missing core credentials are red only in the official trusted job; absent optional
 credentials are loud skips. Quota/billing, 429, 5xx, and timeout outcomes remain typed
-inconclusive, while contract/auth/model/tool/reasoning 4xx are red.
+inconclusive, while contract/auth/model/tool/reasoning 4xx are red. One logical canary
+turn may make one same-route second physical send only when the normalized response is
+runtime-classified semantic-empty; the second send bypasses response caches where the
+route supports that control. A repeated empty response, a permanent body/context error,
+or any non-empty malformed/schema response remains red.
 
 Quick pull-request jobs are read-only, receive no provider secrets, and never use
 `pull_request_target`; there is no scheduled paid run. `release-preflight` depends on

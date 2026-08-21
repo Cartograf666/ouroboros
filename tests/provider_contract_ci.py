@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import time
 from dataclasses import dataclass
 from enum import Enum
 
@@ -16,6 +17,8 @@ from ouroboros.utils import sanitize_tool_result_for_log
 CANARY_TIMEOUT_SEC = 120.0
 CANARY_MAX_TOKENS = 1024
 CANARY_CONTINUATION_MAX_TOKENS = 2048
+CANARY_EMPTY_RESPONSE_MAX_ATTEMPTS = 2
+CANARY_EMPTY_RESPONSE_BACKOFF_SEC = 1.0
 CANARY_TOOL_NAME = "delegate_start"
 CANARY_SUBAGENT_ID = "provider-contract-canary"
 
@@ -344,6 +347,73 @@ def assert_canary_usage(usage, canary: ProviderCanary):
     return usage.get("request_wire")
 
 
+def _semantic_empty_canary_message(message) -> bool:
+    return (
+        isinstance(message, dict)
+        and not (message.get("tool_calls") or [])
+        and not str(message.get("content") or "").strip()
+    )
+
+
+def _safe_empty_canary_diagnostic(canary: ProviderCanary, message, usage, attempts: int):
+    provider_error = usage.get("provider_error") if isinstance(usage, dict) else None
+    safe_provider_error = ""
+    if provider_error:
+        try:
+            raw_provider_error = json.dumps(
+                provider_error, ensure_ascii=False, sort_keys=True,
+            )
+        except (TypeError, ValueError):
+            raw_provider_error = str(provider_error)
+        safe_provider_error = sanitize_tool_result_for_log(
+            raw_provider_error,
+        )[:500]
+    return {
+        "canary_id": canary.canary_id,
+        "model": canary.model,
+        "attempts": attempts,
+        "message_keys": sorted(str(key) for key in message) if isinstance(message, dict) else [],
+        "finish_reason": message.get("finish_reason") if isinstance(message, dict) else None,
+        "stop_reason": message.get("stop_reason") if isinstance(message, dict) else None,
+        "provider": usage.get("provider") if isinstance(usage, dict) else None,
+        "resolved_model": usage.get("resolved_model") if isinstance(usage, dict) else None,
+        "prompt_tokens": int(usage.get("prompt_tokens") or 0) if isinstance(usage, dict) else 0,
+        "completion_tokens": int(usage.get("completion_tokens") or 0) if isinstance(usage, dict) else 0,
+        "provider_error": safe_provider_error,
+        "ledger_attempts": len(usage.get("ledger_attempt_ids") or []) if isinstance(usage, dict) else 0,
+    }
+
+
+def _chat_canary_turn(client, *, canary: ProviderCanary, chat_kwargs):
+    """Retry one runtime-classified semantic-empty turn on the exact same route."""
+    message = None
+    usage = {}
+    attempts = 0
+    for attempt in range(CANARY_EMPTY_RESPONSE_MAX_ATTEMPTS):
+        attempts = attempt + 1
+        attempt_kwargs = copy.deepcopy(chat_kwargs)
+        attempt_kwargs["bypass_response_cache"] = attempt > 0
+        message, usage = client.chat(**attempt_kwargs)
+        if not _semantic_empty_canary_message(message):
+            return message, usage
+
+        from ouroboros.loop_llm_call import _classify_empty_response
+
+        event_type, _is_provider_glitch, permanent_body_error = _classify_empty_response(
+            usage, message,
+        )
+        if permanent_body_error or event_type == "remote_context_overflow":
+            break
+        if attempts < CANARY_EMPTY_RESPONSE_MAX_ATTEMPTS:
+            time.sleep(CANARY_EMPTY_RESPONSE_BACKOFF_SEC)
+
+    raise AssertionError({
+        "semantic_empty_provider_response": _safe_empty_canary_diagnostic(
+            canary, message, usage, attempts,
+        ),
+    })
+
+
 def assert_normalized_canary_call(message, tools, required_arguments):
     from jsonschema import validators
 
@@ -401,15 +471,19 @@ def run_provider_contract_canary(
         ),
     }]
     tool_choice = _named_tool_choice() if canary.named_tool_choice else "auto"
-    message, usage = client.chat(
-        messages=conversation,
-        model=canary.model,
-        tools=copy.deepcopy(tools),
-        tool_choice=tool_choice,
-        reasoning_effort=canary.reasoning_effort,
-        max_tokens=CANARY_MAX_TOKENS,
-        no_proxy=True,
-        timeout=CANARY_TIMEOUT_SEC,
+    message, usage = _chat_canary_turn(
+        client,
+        canary=canary,
+        chat_kwargs={
+            "messages": conversation,
+            "model": canary.model,
+            "tools": copy.deepcopy(tools),
+            "tool_choice": tool_choice,
+            "reasoning_effort": canary.reasoning_effort,
+            "max_tokens": CANARY_MAX_TOKENS,
+            "no_proxy": True,
+            "timeout": CANARY_TIMEOUT_SEC,
+        },
     )
     # This is a provider schema-admission canary, not a duplicate of the
     # runtime selector gate.  The provider must preserve the nonce-bearing
@@ -436,15 +510,19 @@ def run_provider_contract_canary(
             for call in calls
         ],
     ]
-    final_message, final_usage = client.chat(
-        messages=continuation,
-        model=canary.model,
-        tools=[copy.deepcopy(_delegate_start_tool(tools))],
-        tool_choice="none",
-        reasoning_effort=canary.reasoning_effort,
-        max_tokens=CANARY_CONTINUATION_MAX_TOKENS,
-        no_proxy=True,
-        timeout=CANARY_TIMEOUT_SEC,
+    final_message, final_usage = _chat_canary_turn(
+        client,
+        canary=canary,
+        chat_kwargs={
+            "messages": continuation,
+            "model": canary.model,
+            "tools": [copy.deepcopy(_delegate_start_tool(tools))],
+            "tool_choice": "none",
+            "reasoning_effort": canary.reasoning_effort,
+            "max_tokens": CANARY_CONTINUATION_MAX_TOKENS,
+            "no_proxy": True,
+            "timeout": CANARY_TIMEOUT_SEC,
+        },
     )
     final_disclosure = assert_canary_usage(final_usage, canary)
     if isinstance(first_disclosure, dict) and isinstance(final_disclosure, dict):

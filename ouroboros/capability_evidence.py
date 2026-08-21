@@ -488,6 +488,21 @@ MEASURED_DENSITY_SAFETY_FACTOR = 1.05
 _DENSITY_MEMO: Dict[str, Tuple[float, str]] = {}
 
 
+def _density_observation_seq(pair: Dict[str, Any]) -> int:
+    """Persisted insertion order for witnesses that share one clock tick."""
+    try:
+        return max(0, int(pair.get("observation_seq") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _density_recency_key(pair: Dict[str, Any]) -> Tuple[float, int]:
+    """Chronological key without letting the tie-breaker refresh witness TTL."""
+    observed = parse_deadline_ts(pair.get("observed_at"))
+    epoch = observed.timestamp() if observed is not None else float("-inf")
+    return epoch, _density_observation_seq(pair)
+
+
 def _density_of(prompt_chars: Any, prompt_tokens: Any) -> float:
     """Real tokens per chars/4 estimated token, or 0.0 when not measurable."""
     try:
@@ -536,7 +551,7 @@ def record_token_density(
                 and _density_of(pair.get("prompt_chars"), pair.get("prompt_tokens")) > 0
             ]
             route_pairs = [pair for pair in pairs if str(pair.get("route_fp") or "") == route]
-            newest = min(route_pairs, key=lambda pair: _age_seconds(str(pair.get("observed_at") or "")), default=None)
+            newest = max(route_pairs, key=_density_recency_key, default=None)
             known = _density_of(
                 (newest or {}).get("prompt_chars"), (newest or {}).get("prompt_tokens"),
             )
@@ -548,24 +563,35 @@ def record_token_density(
                 _DENSITY_MEMO[memo_key] = (known, str(newest.get("observed_at") or ""))
                 return
             observed_at = utc_now_iso()
+            observation_seq = max(
+                (_density_observation_seq(pair) for pair in pairs), default=0,
+            ) + 1
             pairs.append({
                 "prompt_chars": int(prompt_chars or 0),
                 "prompt_tokens": int(prompt_tokens or 0),
                 "observed_at": observed_at,
+                "observation_seq": observation_seq,
                 "source": str(source or "dispatch_usage"),
                 "route_fp": route,
             })
-            densest = max(
-                pairs,
-                key=lambda pair: (
-                    _density_of(pair.get("prompt_chars"), pair.get("prompt_tokens")),
-                    str(pair.get("observed_at") or ""),
+            indexed_pairs = list(enumerate(pairs))
+            densest_index, densest = max(
+                indexed_pairs,
+                key=lambda item: (
+                    _density_of(item[1].get("prompt_chars"), item[1].get("prompt_tokens")),
+                    *_density_recency_key(item[1]),
+                    item[0],
                 ),
             )
-            newest_rest = sorted(
-                (pair for pair in pairs if pair is not densest),
-                key=lambda pair: str(pair.get("observed_at") or ""), reverse=True,
-            )[:_TOKEN_DENSITY_MAX_PAIRS - 1]
+            newest_rest = [
+                pair
+                for index, pair in sorted(
+                    indexed_pairs,
+                    key=lambda item: (*_density_recency_key(item[1]), item[0]),
+                    reverse=True,
+                )
+                if index != densest_index
+            ][:_TOKEN_DENSITY_MAX_PAIRS - 1]
             store[fp] = {"pairs": [densest, *newest_rest]}
             if _save(drive_root, data):
                 _DENSITY_MEMO[memo_key] = (density, observed_at)
@@ -620,10 +646,16 @@ def resolve_main_token_density(drive_root: Any, route_fp: str, model_id: str) ->
             if route and str(item[0].get("route_fp") or "") == route
         ]
         if route_pairs:
-            return min(route_pairs, key=lambda item: _age_seconds(str(item[0].get("observed_at") or "")))[1], "fresh_route_usage"
+            return max(
+                enumerate(route_pairs),
+                key=lambda item: (*_density_recency_key(item[1][0]), item[0]),
+            )[1][1], "fresh_route_usage"
         model_pairs = _fresh_density_pairs(store, _normalized_density_model(model_id))
         if model_pairs:
-            return min(model_pairs, key=lambda item: _age_seconds(str(item[0].get("observed_at") or "")))[1], "fresh_model_usage"
+            return max(
+                enumerate(model_pairs),
+                key=lambda item: (*_density_recency_key(item[1][0]), item[0]),
+            )[1][1], "fresh_model_usage"
     except Exception:
         pass
     return 1.0, "cold_estimate"
