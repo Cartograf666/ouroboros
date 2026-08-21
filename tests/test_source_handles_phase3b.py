@@ -309,6 +309,50 @@ def test_explicit_complete_row_is_not_reclassified_from_envelope_text(tmp_path):
     assert "result_complete" not in evidence["tool_trajectory"][0]
 
 
+def test_budget_recap_preserves_every_legacy_actor_envelope(tmp_path):
+    calls = []
+    for index in range(3):
+        actor_view = _truncate_tool_result(str(index) * 500_000, "run_command")
+        assert "truncated from 500000" in actor_view
+        calls.append({"tool": "run_command", "status": "ok", "result": actor_view})
+
+    evidence = build_task_acceptance_evidence(
+        _tool_ctx(tmp_path, task_id="legacy-budget"),
+        llm_trace={"tool_calls": calls},
+        drive_root=tmp_path,
+        task_id="legacy-budget",
+    )
+    rows = evidence["tool_trajectory"]
+    assert len(rows) == 3
+    assert all("truncated from 500000" in row["result"] for row in rows)
+    assert all(row["result_complete"] is False for row in rows)
+    assert all("_legacy_projection_envelope" not in row for row in rows)
+    assert len(evidence["__unresolved_partial_artifacts__"]) >= 3
+
+
+def test_redaction_expansion_preserves_legacy_actor_envelope(tmp_path):
+    credential_url = "https://alice:phase3b-secret@example.invalid/private?"
+    full = (credential_url * 3_000) + ("Z" * 400_000)
+    actor_view = _truncate_tool_result(full, "run_command")
+    marker = f"truncated from {len(full)}"
+    assert marker in actor_view
+
+    evidence = build_task_acceptance_evidence(
+        _tool_ctx(tmp_path, task_id="legacy-redaction"),
+        llm_trace={"tool_calls": [{
+            "tool": "run_command", "status": "ok", "result": actor_view,
+        }]},
+        drive_root=tmp_path,
+        task_id="legacy-redaction",
+    )
+    row = evidence["tool_trajectory"][0]
+    assert "phase3b-secret" not in row["result"]
+    assert "***REDACTED***" in row["result"]
+    assert marker in row["result"]
+    assert row["result_complete"] is False
+    assert "_legacy_projection_envelope" not in row
+
+
 def test_task_acceptance_abstains_before_review_on_unresolved_partial_source(tmp_path):
     full = "decision-input\n" + ("p" * 20_000) + "\nDECISIVE_ACCEPTANCE_SUFFIX=FAIL"
     ctx, _visible, trace_row = _project_large_result(

@@ -10,7 +10,7 @@ import subprocess
 from typing import Any, Dict, List
 
 from ouroboros.tool_capabilities import DEFAULT_TOOL_RESULT_LIMIT
-from ouroboros.utils import truncate_review_artifact
+from ouroboros.utils import truncate_review_artifact, truncate_within_limit
 
 log = logging.getLogger(__name__)
 
@@ -164,26 +164,24 @@ def task_acceptance_evidence_revision(evidence: Dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _accept_redact_cap(value: Any, limit: int) -> str:
+def _accept_redact_cap(value: Any, limit: int, suffix: str = "") -> str:
     from ouroboros.observability import redact_projection
 
     if isinstance(value, str):
         red = redact_projection(value).value
     else:
-        # Redact the STRUCTURE first (key-name-aware masking for dict/list — catches a
-        # non-token secret under a secret-named key), THEN serialize and apply the
-        # string-level token redaction as defense-in-depth (review #1, MEDIUM-1).
+        # Structural masking first, then token redaction after serialization.
         red = redact_projection(json.dumps(redact_projection(value).value, ensure_ascii=False, default=str)).value
-    return truncate_review_artifact(red, limit=limit)
+    if not suffix:
+        return truncate_review_artifact(red, limit=limit)
+    prefix = red[:-len(suffix)] if red.endswith(suffix) else red
+    return truncate_within_limit(prefix, max(0, limit - len(suffix))) + suffix
 
 
 def _accept_task_contract(ctx: Any) -> Dict[str, Any]:
-    """The FULL normalized task contract (NOT a hand-maintained key allowlist — review round-2):
-    so the reviewer judges BOTH 'every requirement met' (the narrative spec) AND process/
-    constraint adherence (constraints, resource policy, deadline, delegation budget, status,
-    source, …, plus any future additive contract fields). Reads the whole ctx.task_contract,
-    merges a nested task_metadata.task_contract (explicit contract wins), and falls back to
-    task_metadata for spec-narrative fields. Structurally REDACTED at the call site."""
+    """Return the full normalized task contract, never a hand-maintained allowlist.
+
+    Explicit contract fields win over nested metadata; redaction happens at the call site."""
     contract = getattr(ctx, "task_contract", {})
     meta = getattr(ctx, "task_metadata", {})
     out: Dict[str, Any] = {}
@@ -549,6 +547,10 @@ def _accept_trajectory(tool_calls: list, drive_root: Any = None, task_id: str = 
         result_value, result_complete, issue = materialize_tool_result_source(
             drive_root, task_id, c,
         )
+        legacy_envelope = ""
+        if issue.get("reason") == "legacy_actor_truncation_without_source_ref":
+            result_text = str(result_value)
+            legacy_envelope = result_text[result_text.rfind("\n... (truncated from "):]
         if issue:
             unresolved.append(issue)
         result_cap = TOOL_RESULT_LIMITS.get(tool, _ACCEPT_RESULT_CAP)
@@ -560,33 +562,31 @@ def _accept_trajectory(tool_calls: list, drive_root: Any = None, task_id: str = 
             "status": str(c.get("status") or ("error" if c.get("is_error") else "ok")),
             "is_error": bool(c.get("is_error")),
             "args": _accept_redact_cap(c.get("args"), _ACCEPT_ARGS_CAP) if c.get("args") not in (None, "", {}) else "",
-            "result": _accept_redact_cap(result_value, result_cap) if result_value not in (None, "") else "",
+            "result": _accept_redact_cap(result_value, result_cap, legacy_envelope) if result_value not in (None, "") else "",
         }
         if c.get("result_partial") or not result_complete:
             row.update(result_complete=result_complete, result_source_ref=source_ref)
+        if legacy_envelope:
+            row["_legacy_projection_envelope"] = legacy_envelope
         out.append(row)
     return out, omitted, unresolved
 
 
 def _accept_artifact_manifest(drive_root: Any, task_id: str, protected: set) -> list:
-    """Leak-safe artifact projection: a manifest (name/size/sha12) for every task artifact,
-    with a small REDACTED text preview ONLY for small non-protected text artifacts.
-    `protected_artifacts` are manifest-only (codex #3); large/binary get no bytes."""
+    """Return a leak-safe manifest; protected, large and binary artifacts stay manifest-only."""
     import hashlib
 
     from ouroboros.task_results import validate_task_id
 
     out: list = []
     try:
-        # validate_task_id guards against a malformed task_id escaping the artifact dir
-        # (matches outcomes.verification_receipts_path; review round-2 CRITICAL).
+        # validate_task_id prevents escaping the artifact root.
         base = pathlib.Path(drive_root) / "task_results" / "artifacts" / validate_task_id(task_id)
         if not base.exists():
             return out
         base_resolved = base.resolve()
         for p in sorted(base.rglob("*")):
-            # Skip symlinks and anything that resolves OUTSIDE the artifact dir — rglob follows
-            # symlinked dirs, so a symlink could otherwise read host files (review #1, MEDIUM-2).
+            # rglob follows symlinked dirs, so reject symlinks and escaped paths.
             try:
                 if p.is_symlink() or not p.is_file():
                     continue
@@ -597,10 +597,7 @@ def _accept_artifact_manifest(drive_root: Any, task_id: str, protected: set) -> 
                 continue
             rel = str(p.relative_to(base))
             entry: Dict[str, Any] = {"name": rel, "size": size, "provenance": "artifact"}
-            # Match the declared protected path artifact-relative, by prefix, OR by basename —
-            # erring toward MORE protection (manifest-only never leaks) since a declared path may
-            # be absolute/workspace-relative and not prefix-match the artifact-relative form
-            # (review round-3 defense-in-depth).
+            # Match protected paths by artifact path, prefix, or basename.
             rel_base = rel.rsplit("/", 1)[-1]
             if any(
                 rel == str(pp).lstrip("/")
@@ -632,6 +629,17 @@ def _accept_artifact_manifest(drive_root: Any, task_id: str, protected: set) -> 
 
 
 def _accept_enforce_budget(ev: Dict[str, Any]) -> Dict[str, Any]:
+    def _finish() -> Dict[str, Any]:
+        for row in ev.get("tool_trajectory") or []:
+            if isinstance(row, dict):
+                row.pop("_legacy_projection_envelope", None)
+        return ev
+
+    def _cap_result(row: Dict[str, Any], limit: int) -> None:
+        row["result"] = _accept_redact_cap(row.get("result"), limit, str(
+            row.get("_legacy_projection_envelope") or "",
+        ))
+
     def _size() -> int:
         try:
             return len(json.dumps(ev, ensure_ascii=False, default=str))
@@ -641,10 +649,8 @@ def _accept_enforce_budget(ev: Dict[str, Any]) -> Dict[str, Any]:
     omissions: List[Dict[str, Any]] = list(ev.get("omissions_manifest") or [])
     ev["omissions_manifest"] = omissions
     if _size() <= _ACCEPT_TOTAL_BUDGET:
-        return ev
-    # Disclosed-truncation ladder (Bible P1): degrade the lowest-value sections first — the
-    # trajectory TAIL, then artifact PREVIEWS — each with an explicit note (review #1, MEDIUM-3 /
-    # correctness MEDIUM-LOW: artifacts/repo_diff could previously blow the ceiling silently).
+        return _finish()
+    # Disclosed ladder: trajectory tail, then artifact previews, always with a note.
     notes: List[str] = []
     traj = ev.get("tool_trajectory")
     if isinstance(traj, list) and len(traj) > 20:
@@ -657,14 +663,12 @@ def _accept_enforce_budget(ev: Dict[str, Any]) -> Dict[str, Any]:
     traj = ev.get("tool_trajectory")
     if _size() > _ACCEPT_TOTAL_BUDGET and isinstance(traj, list) and traj:
         non_traj = _size() - sum(len(str(c.get("result") or "")) for c in traj if isinstance(c, dict))
-        # Haircut per retained call: each re-cap appends a ~64-75 char omission
-        # marker; -400 is deliberately conservative headroom for JSON escaping of
-        # newline/quote-heavy shell output so the split cannot land just OVER budget.
+        # Keep conservative headroom for markers and JSON escaping.
         share = max(700, (_ACCEPT_TOTAL_BUDGET - non_traj) // max(1, len(traj)) - 400)
         recapped = 0
         for c in traj:
             if isinstance(c, dict) and len(str(c.get("result") or "")) > share:
-                c["result"] = truncate_review_artifact(str(c.get("result")), limit=share)
+                _cap_result(c, share)
                 if "result_complete" in c:
                     c["result_complete"] = False
                 recapped += 1
@@ -676,7 +680,7 @@ def _accept_enforce_budget(ev: Dict[str, Any]) -> Dict[str, Any]:
             floored = 0
             for c in traj:
                 if isinstance(c, dict) and len(str(c.get("result") or "")) > 700:
-                    c["result"] = truncate_review_artifact(str(c.get("result")), limit=700)
+                    _cap_result(c, 700)
                     if "result_complete" in c:
                         c["result_complete"] = False
                     floored += 1
@@ -692,17 +696,13 @@ def _accept_enforce_budget(ev: Dict[str, Any]) -> Dict[str, Any]:
         if stripped:
             notes.append(f"stripped {stripped} artifact previews to manifest-only")
             omissions.append({"section": "artifact_previews", "omitted": stripped, "reason": "evidence_budget"})
-    # The agent-controlled `agent_supplied` block is otherwise uncapped — collapse it to a
-    # disclosed-truncated projection if it's keeping the packet over budget (review #2, MED-LOW).
+    # Collapse oversized agent-supplied evidence only after trajectory/artifact reductions.
     if _size() > _ACCEPT_TOTAL_BUDGET and isinstance(ev.get("agent_supplied"), dict) and ev["agent_supplied"]:
         ev["agent_supplied"] = {"__truncated__": truncate_review_artifact(
             json.dumps(ev["agent_supplied"], ensure_ascii=False, default=str), limit=20000)}
         notes.append("collapsed oversized agent-supplied evidence to a truncated projection")
         omissions.append({"section": "agent_supplied", "reason": "evidence_budget"})
-    # The owner contract/requirements are immutable core.  Never silently collapse
-    # them to a projection.  If the residual core itself cannot fit, mark the
-    # packet so each reviewer abstains as DEGRADED instead of reviewing a partial
-    # contract.
+    # Immutable owner requirements overflow only into a typed DEGRADED abstention.
     if _size() > _ACCEPT_TOTAL_BUDGET:
         ev["__immutable_core_overflow__"] = {
             "packet_chars": _size(),
@@ -727,7 +727,7 @@ def _accept_enforce_budget(ev: Dict[str, Any]) -> Dict[str, Any]:
             f"⚠️ OMISSION NOTE: evidence exceeded {_ACCEPT_TOTAL_BUDGET} chars; "
             + "; ".join(notes) + ". Full content is durable off-axis."
         )
-    return ev
+    return _finish()
 
 
 def _owner_content_projection(content: Any) -> str:
