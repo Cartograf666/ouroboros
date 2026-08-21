@@ -338,6 +338,16 @@ def _tool_call(name, args, call_id):
     return {"id": call_id, "function": {"name": name, "arguments": json.dumps(args)}}
 
 
+def _write_schedules(tmp_path, count):
+    tasks = [{
+        "id": f"schedule-{idx}", "name": f"schedule {idx}", "enabled": True,
+        "trigger": {"type": "cron", "expr": "0 * * * *"},
+    } for idx in range(count)]
+    (tmp_path / "state" / "scheduled_tasks.json").write_text(
+        json.dumps({"tasks": tasks}), encoding="utf-8",
+    )
+
+
 def test_bgc_direct_identity_update_requires_complete_named_omission(tmp_path):
     bc = _bg_fixture(tmp_path)
     try:
@@ -391,10 +401,53 @@ def test_bgc_malformed_recent_chat_gap_blocks_direct_identity_update(tmp_path):
 def test_bgc_complete_recent_chat_keeps_direct_identity_update_available(tmp_path):
     bc = _bg_fixture(tmp_path, backlog_count=0)
     try:
+        memory_dir = tmp_path / "memory"
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        (memory_dir / "dialogue_blocks.json").write_text(json.dumps([{
+            "ts": "2026-08-21T00:00:00Z", "source": "consolidator",
+            "content": "Complete consolidated biography block.",
+        }]), encoding="utf-8")
+        _write_schedules(tmp_path, 8)
         bc._build_context()
         content = "I retain direct identity authority with complete ordinary context."
         result = bc._execute_tool(_tool_call("update_identity", {"content": content}, "u1"), [])
         assert result.startswith("OK: identity updated")
         assert content in (tmp_path / "memory" / "identity_journal.jsonl").read_text(encoding="utf-8")
+    finally:
+        bc._tool_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_bgc_durable_dialogue_gap_blocks_direct_identity_update(tmp_path):
+    bc = _bg_fixture(tmp_path, backlog_count=0)
+    try:
+        memory_dir = tmp_path / "memory"
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        (memory_dir / "dialogue_blocks.json").write_text(json.dumps([{
+            "ts": "2026-08-21T00:00:00Z", "source": "consolidator",
+            "gap_id": "dialogue-gap-123",
+            "content": "[MEMORY GAP] A durable biography interval is unavailable.",
+        }]), encoding="utf-8")
+        context = bc._build_context()
+        assert "## Dialogue History" in context and "[MEMORY GAP]" in context
+        content = "I must not rewrite identity across a known durable biography gap."
+        result = bc._execute_tool(_tool_call("update_identity", {"content": content}, "u1"), [])
+        assert "IDENTITY_UPDATE_ABSTAINED" in result
+        assert "dialogue-gap-123" in result
+        assert not (memory_dir / "identity_journal.jsonl").exists()
+    finally:
+        bc._tool_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_bgc_scheduled_tasks_omission_blocks_direct_identity_update(tmp_path):
+    bc = _bg_fixture(tmp_path, backlog_count=0)
+    try:
+        _write_schedules(tmp_path, 9)
+        context = bc._build_context()
+        assert '"omitted_count": 1' in context
+        content = "I must not rewrite identity from an incomplete standing-schedule digest."
+        result = bc._execute_tool(_tool_call("update_identity", {"content": content}, "u1"), [])
+        assert "IDENTITY_UPDATE_ABSTAINED" in result
+        assert "scheduled-tasks" in result
+        assert not (tmp_path / "memory" / "identity_journal.jsonl").exists()
     finally:
         bc._tool_executor.shutdown(wait=False, cancel_futures=True)

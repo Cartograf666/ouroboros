@@ -545,7 +545,13 @@ class BackgroundConsciousness:
             )
         parts.extend(build_governance_sections(env, warn_large=True, warn_label="consciousness"))
 
-        parts.extend(build_memory_sections(memory))
+        durable_dialogue_gaps: List[Dict[str, Any]] = []
+        parts.extend(build_memory_sections(
+            memory, durable_dialogue_gaps_out=durable_dialogue_gaps,
+        ))
+        for gap in durable_dialogue_gaps:
+            gap_id = str(gap.get("gap_id") or f"block-{gap.get('block_index', '?')}")
+            self._identity_unresolved_sources.add(f"dialogue-gap:{gap_id}")
 
         parts.extend(
             build_knowledge_sections(
@@ -607,7 +613,12 @@ class BackgroundConsciousness:
             )
         parts.append("## Drive state\n\n" + state_json)
 
-        parts.append(build_runtime_section(env, bg_task))
+        scheduled_tasks_digest: Dict[str, Any] = {}
+        parts.append(build_runtime_section(
+            env, bg_task, scheduled_tasks_digest_out=scheduled_tasks_digest,
+        ))
+        if int(scheduled_tasks_digest.get("omitted_count") or 0) > 0:
+            self._identity_unresolved_sources.add("scheduled-tasks")
 
         # Empty task_id includes recent sections across tasks.  The typed facts
         # below are the exact same facts rendered into the decision envelope.
@@ -621,11 +632,13 @@ class BackgroundConsciousness:
             or bool(recent_chat_coverage.get("omitted_matching_rows_unknown"))
         ):
             self._identity_unresolved_sources.add("recent-chat")
+        if self._identity_unresolved_sources:
             parts.append(
                 "## Identity update completeness\n\n"
-                "Recent chat has unresolved typed coverage. Existing chat_history may "
-                "inspect surviving pages, but this cycle cannot prove a complete unchanged "
-                "source; direct update_identity must abstain for this cycle."
+                "Named unresolved source(s): "
+                + ", ".join(sorted(self._identity_unresolved_sources))
+                + ". Existing readers may inspect surviving data, but this cycle cannot "
+                "prove complete unchanged sources; direct update_identity must abstain."
             )
 
         observations = []

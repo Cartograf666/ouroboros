@@ -591,7 +591,7 @@ def _task_authority_projection(env: Any, task: Dict[str, Any]) -> Dict[str, Any]
     return projection
 
 
-def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) -> str:
+def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, scheduled_tasks_digest_out: Optional[Dict[str, Any]] = None) -> str:
     try:
         git_branch, git_sha = get_git_info(env.repo_dir)
     except Exception:
@@ -761,9 +761,9 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
     schedule_digest = _scheduled_tasks_digest(env)
     if schedule_digest:
         runtime_data["scheduled_tasks"] = schedule_digest
-    # Surface RUNNING tasks so a busy-chat turn can steer the right one instead of
-    # duplicating it. This is a structural fact; the model still chooses (BIBLE P5).
-    # It also gives project-room messages their default project scene.
+        if scheduled_tasks_digest_out is not None:
+            scheduled_tasks_digest_out.update(schedule_digest)
+    # Surface running tasks so a busy-chat turn can steer instead of duplicating it.
     _meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
     # Owner Surface Fact: the surface that SENT the message this task/turn came
     # from. A web message carries raw observables (pywebview/ua/viewport/...);
@@ -970,7 +970,7 @@ def _warn_if_over_budget(name: str, content: str) -> None:
         log.warning("Context section '%s' exceeds budget: %d chars > %d", name, len(content), budget)
 
 
-def build_memory_sections(memory: Memory, partition: str = "all") -> List[str]:
+def build_memory_sections(memory: Memory, partition: str = "all", durable_dialogue_gaps_out: Optional[List[Dict[str, Any]]] = None) -> List[str]:
     sections = []
 
     include_stable = partition in {"all", "stable"}
@@ -987,9 +987,7 @@ def build_memory_sections(memory: Memory, partition: str = "all") -> List[str]:
         sections.append("## Identity (from `memory/identity.md` — already loaded; do not re-read via read_file(root='runtime_data', path='memory/identity.md'))\n\n" + identity_raw)
         world_raw = memory.load_world_profile().strip()
         if world_raw:
-            # Generated environment profile: include in FULL and warn rather than
-            # silently prefix-slicing (BIBLE P1 no-silent-truncation). An oversized
-            # WORLD.md is a generation-discipline bug, not a context-budget excuse.
+            # Generated profile is full; oversize is a generation-discipline bug.
             _warn_if_over_budget("world", world_raw)
             sections.append("## Environment Profile (from `memory/WORLD.md` — already loaded; delete WORLD.md and restart to regenerate if the host environment changes)\n\n" + world_raw)
 
@@ -998,6 +996,8 @@ def build_memory_sections(memory: Memory, partition: str = "all") -> List[str]:
         if dialogue_blocks:
             blocks_md = memory.format_blocks_as_markdown(dialogue_blocks)
             if blocks_md.strip():
+                if durable_dialogue_gaps_out is not None:
+                    durable_dialogue_gaps_out.extend(memory._durable_dialogue_gaps(dialogue_blocks)[0])
                 sections.append("## Dialogue History\n\n" + blocks_md)
         legacy_summary = safe_read(memory.drive_root / "memory" / "dialogue_summary.md").strip()
         if legacy_summary:

@@ -379,12 +379,14 @@ class Memory:
         path = self.drive_root / "memory" / "dialogue_blocks.json"
         return self._load_json_blocks(path)
 
-    def _durable_dialogue_gaps(self) -> Tuple[List[Dict[str, Any]], List[str]]:
+    def _durable_dialogue_gaps(
+        self, blocks: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
         """Project consolidator-owned durable discontinuities into raw coverage."""
 
         gaps: List[Dict[str, Any]] = []
         identities: List[str] = []
-        for index, block in enumerate(self.load_dialogue_blocks()):
+        for index, block in enumerate(self.load_dialogue_blocks() if blocks is None else blocks):
             if not isinstance(block, dict):
                 continue
             gap_id = str(block.get("gap_id") or "").strip()
