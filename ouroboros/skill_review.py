@@ -651,7 +651,7 @@ def render_skill_review_block(
         )
         if retry_coaching:
             lines.append(retry_coaching.lstrip())
-    return "\n".join(lines)
+    return sanitize_tool_result_for_log("\n".join(lines))
 
 
 def _is_module_widget_skill(skill: Any) -> bool:

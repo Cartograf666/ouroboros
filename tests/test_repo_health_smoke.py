@@ -357,9 +357,15 @@ def test_total_function_cap_checks_staged_and_live_projections(tmp_path: Path) -
     _write_manifest(repo, _manifest(sha=baseline))
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "bootstrap ratchet")
-    paths = [f"batch_{index}.py" for index in range(7)]
-    source = "".join(f"def f{index}(): pass\n" for index in range(929))
-    total = len(paths) * 929
+    functions_per_path = MAX_MODULE_LINES
+    paths = [
+        f"batch_{index}.py"
+        for index in range((MAX_TOTAL_FUNCTIONS // functions_per_path) + 1)
+    ]
+    source = "".join(
+        f"def f{index}(): pass\n" for index in range(functions_per_path)
+    )
+    total = len(paths) * functions_per_path
     assert total > MAX_TOTAL_FUNCTIONS
 
     for rel in paths:

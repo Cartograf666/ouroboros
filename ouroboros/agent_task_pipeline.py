@@ -45,6 +45,7 @@ from ouroboros.post_task_checkpoint import (
     root_post_task_already_completed as _root_post_task_already_completed,
     set_root_post_task_checkpoint as _set_root_post_task_checkpoint,
 )
+from ouroboros.skill_publish_result import apply_skill_publish_receipt_veto
 from ouroboros.task_finalization import (
     build_sealed_final_package,
     build_swarm_efficiency as _build_swarm_efficiency,  # moved (module ceiling); tests import it here
@@ -596,9 +597,8 @@ def _derive_host_bound_loop_outcome(
 ) -> Dict[str, Any]:
     """Derive once from the current durable mutation-evidence binding."""
     _attach_host_mutation_projection(env, task, llm_trace)
-    return _apply_terminal_custody_outcome(
-        env, task, derive_loop_outcome(text or "", usage, llm_trace),
-    )
+    loop_outcome = apply_skill_publish_receipt_veto(derive_loop_outcome(text or "", usage, llm_trace), task, llm_trace)
+    return _apply_terminal_custody_outcome(env, task, loop_outcome)
 
 
 def _apply_terminal_custody_outcome(
@@ -606,7 +606,10 @@ def _apply_terminal_custody_outcome(
 ) -> Dict[str, Any]:
     """Make the terminal custody audit authoritative for result and event axes."""
 
-    existing = load_task_result(task.get("budget_drive_root") or env.drive_root, str(task.get("id") or "")) or {}
+    drive_root = task.get("budget_drive_root") or getattr(env, "drive_root", None)
+    if drive_root is None:
+        return loop_outcome
+    existing = load_task_result(drive_root, str(task.get("id") or "")) or {}
     unreconciled = existing.get("delegated_runs_unreconciled")
     if not isinstance(unreconciled, list) or not unreconciled:
         return loop_outcome

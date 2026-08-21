@@ -21,8 +21,9 @@ BAND_MODULE_MAX_LINES = 1500
 MAX_MODULE_BYTES = 200_000
 TARGET_FUNCTION_LINES = 150
 MAX_FUNCTION_LINES = 300
-# v7 campaign: 6000 -> 6500 gives four extraction streams one helper/facade budget; local ratchets force paydown.
-MAX_TOTAL_FUNCTIONS = 6500
+# Owner decision 2026-08-21: keep this only as a high-water alarm with ample
+# product headroom; module and per-function ratchets remain the primary gates.
+MAX_TOTAL_FUNCTIONS = 9500
 
 SIZE_RATCHET_MANIFEST_PATH = "ouroboros/size_ratchet_manifest.py"
 

@@ -480,10 +480,20 @@ Payload data access is scoped to the selected non-native skill under
 `data/skills/ouroboroshub/<skill>/`. Marketplace/official provenance
 sidecars inside those payload roots (`.clawhub.json`, `.ouroboroshub.json`)
 remain control-plane state and are not writable from Repair mode. User-managed
-payloads accidentally left under `data/skills/native/` are blocked with an
-actionable manual-upgrade error; move them to `data/skills/external/` or
-reinstall them. The Repair guard still does not grant write access to true
-native launcher-seeded skills.
+payloads physically left under `data/skills/native/` without `.seed-origin` are
+classified as logical `external` in place for ordinary top-level
+read/write/edit/shell/delegation in every runtime mode; no migration is needed.
+The constrained Repair contract itself remains non-native and does not gain
+that alias. A marker-present launcher seed stays read/review-only, and generic
+tools still cannot mutate `.seed-origin`, review/grant state, marketplace
+provenance, dependency sidecars, or other control state.
+
+A selected `skill_publish` task may recover one exact known manifestless
+`user_repo` leaf through the existing selected-candidate binding: omitted
+`bucket` permits inspect operations and creation only of root `SKILL.md` or
+`skill.json`, after which ordinary discovery and fresh review resume. Reviewers
+must verify that grouping roots, unknown/colliding identities, explicit wrong
+buckets, nested manifests, and path escapes remain refused.
 
 ### Output contract
 

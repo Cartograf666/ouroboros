@@ -232,7 +232,7 @@ export function renderInstalledSkillCard(skill, reviewingSkills = new Set(), rep
             ${makeRunnable ? `<button type="button" role="menuitem" class="skills-menu-item skills-make-runnable" data-skill="${safeName}" data-skill-action="repair" title="Author a runnable script for this instruction skill via the repair agent">Make runnable</button>` : ''}
             ${!reviewInProgress ? `<button type="button" role="menuitem" class="skills-menu-item skills-review" data-skill="${safeName}">${skill.review_status === 'pending' ? 'Review' : (skill.review_stale ? 'Re-review' : 'Review again')}</button>` : ''}
             ${ownerAttestable ? `<button type="button" role="menuitem" class="skills-menu-item skills-attest-review skills-attest-warn" data-skill="${safeName}" title="Skip the expensive LLM review for your own or verified official-hub skill. The deterministic safety preflight still runs, and this is logged for audit.">⚠️ Skip review</button>` : ''}
-            ${submit.visible ? `<button type="button" role="menuitem" class="skills-menu-item skills-submit-hub ${submit.disabled ? 'is-disabled' : ''}" data-skill="${safeName}" title="${escapeHtml(submit.reason)}" data-submit-disabled="${submit.disabled ? 'true' : 'false'}" data-submit-reason="${escapeHtml(submit.reason)}" aria-disabled="${submit.disabled ? 'true' : 'false'}">Submit to OuroborosHub</button>` : ''}
+            ${submit.visible ? `<button type="button" role="menuitem" class="skills-menu-item skills-submit-hub ${submit.disabled ? 'is-disabled' : ''}" data-skill="${safeName}" title="${escapeHtml(submit.reason)}" data-submit-disabled="${submit.disabled ? 'true' : 'false'}" data-submit-reason="${escapeHtml(submit.reason)}" data-submit-state="${escapeHtml(submit.state || '')}" data-publication-ready="${submit.publication_ready === true ? 'true' : 'false'}" aria-disabled="${submit.disabled ? 'true' : 'false'}">Publish to OuroborosHub</button>` : ''}
             ${market ? `<button type="button" role="menuitem" class="skills-menu-item skills-update" data-skill="${safeName}" data-source="${escapeHtml(source)}">Update</button><button type="button" role="menuitem" class="skills-menu-item skills-uninstall" data-skill="${safeName}" data-source="${escapeHtml(source)}">Uninstall</button>` : ''}
             ${localDelete ? `<button type="button" role="menuitem" class="skills-menu-item skills-delete-local" data-skill="${safeName}" data-payload-root="${escapeHtml(payloadRoot)}">Delete</button>` : ''}
         </dialog></div>` : '';
@@ -275,16 +275,28 @@ export function renderInstalledSkillCard(skill, reviewingSkills = new Set(), rep
 }
 
 function submitHubReady(skill, githubTokenConfigured = false) {
-    // FR1: prefer the host's SSOT verdict (the gateway serializes `submit_hub`) so the
-    // card and the backend publish gate never diverge. The backend accepts a no-blocker
-    // review — clean OR advisory-only warnings — and this is now the single rule.
-    if (skill.submit_hub && typeof skill.submit_hub === 'object') return skill.submit_hub;
-    // Fallback for older payloads without submit_hub (kept in sync with the SSOT).
+    // Prefer the host's SSOT verdict. The additive task_start_allowed fact owns
+    // admission when present; disabled remains only a compatibility projection.
+    if (skill.submit_hub && typeof skill.submit_hub === 'object') {
+        const submit = skill.submit_hub;
+        return {
+            ...submit,
+            disabled: typeof submit.task_start_allowed === 'boolean'
+                ? !submit.task_start_allowed
+                : (typeof submit.disabled === 'boolean' ? submit.disabled : true),
+        };
+    }
+    // Older payloads cannot know publication readiness. Keep the selected preflight
+    // reachable for every otherwise supported source; it owns review/repair truth.
     const source = (skill.source || 'native').toLowerCase();
     const visible = ['external', 'self_authored', 'user_repo', 'ouroboroshub', 'clawhub'].includes(source);
     if (!visible) return { visible: false, disabled: true, reason: '' };
     if (!githubTokenConfigured) return { visible: true, disabled: true, reason: 'Configure GITHUB_TOKEN in Settings -> Secrets' };
-    if (skill.review_profile === 'owner_attested') return { visible: true, disabled: true, reason: 'Owner-attested skills can\'t be published — run a full LLM review first' };
-    if ((skill.review_status !== 'clean' && skill.review_status !== 'warnings') || skill.review_stale) return { visible: true, disabled: true, reason: 'Skill needs a fresh clean (or advisory-only warnings) review before submission' };
-    return { visible: true, disabled: false, reason: 'Open a PR to OuroborosHub from your GitHub fork' };
+    return {
+        visible: true,
+        publication_ready: false,
+        task_start_allowed: true,
+        disabled: false,
+        reason: 'Run the selected publish preflight',
+    };
 }

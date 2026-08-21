@@ -25,7 +25,7 @@ from ouroboros.context import build_user_content
 from ouroboros.context_budget import ContextReclaimRequest
 from ouroboros.context_compaction import compact_tool_history_llm, context_reclaim_transcript_sha256
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
-from ouroboros.utils import estimate_tokens, truncate_review_artifact
+from ouroboros.utils import estimate_tokens, sanitize_tool_result_for_log, truncate_review_artifact
 from ouroboros.usage_accounting import (
     BudgetExceeded,
     PhysicalAttemptContext,
@@ -122,9 +122,10 @@ def _handle_text_response(
     accumulated_usage: Dict[str, Any],
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Handle LLM response without tool calls (final response)."""
-    if content and content.strip():
-        llm_trace["reasoning_notes"].append(content.strip())
-    return (content or ""), accumulated_usage, llm_trace
+    safe_content = sanitize_tool_result_for_log(content or "")
+    if safe_content.strip():
+        llm_trace["reasoning_notes"].append(safe_content.strip())
+    return safe_content, accumulated_usage, llm_trace
 
 
 def _skill_names_touched_by_trace(llm_trace: Dict[str, Any]) -> List[str]:
@@ -3900,6 +3901,7 @@ def _replace_delivery_candidate(
     *,
     control: str,
 ) -> DeliveryCandidate:
+    full_text = sanitize_tool_result_for_log(full_text)
     previous_candidate = getattr(tools._ctx, "_delivery_candidate", None)
     if isinstance(previous_candidate, DeliveryCandidate):
         _supersede_delivery_acceptance_binding(
@@ -5215,7 +5217,9 @@ def _forced_fallback_result(
     )
     candidate = _current_delivery_candidate(ctx, llm_trace)
     if candidate is not None:
-        composed = _compose_delivery_suffix(candidate.full_text, suffix)
+        composed = sanitize_tool_result_for_log(
+            _compose_delivery_suffix(candidate.full_text, suffix)
+        )
         if composed != candidate.full_text:
             candidate = _publish_model_forced_candidate(
                 ctx, llm_trace, composed, reason_code,
@@ -5269,7 +5273,7 @@ def _forced_fallback_result(
             )
             return candidate.full_text, ctx.accumulated_usage, llm_trace
 
-    composed = _compose_delivery_suffix(fallback_text, suffix)
+    composed = sanitize_tool_result_for_log(_compose_delivery_suffix(fallback_text, suffix))
     candidate = _publish_model_forced_candidate(
         ctx, llm_trace, composed, reason_code,
     )
@@ -5721,19 +5725,20 @@ def _visible_round_text(content: Any) -> str:
 
 
 def _emit_round_progress(content: Any, msg: Dict[str, Any], emit_progress, llm_trace: Dict[str, Any]) -> None:
-    """Emit the round's progress bubble: the visible assistant text, or — for a pure tool-call round
-    with no visible text — readable reasoning the provider already returned. The reasoning fallback
-    is DISPLAY-ONLY: emitted to the UI bubble but NOT recorded in ``reasoning_notes`` (which feeds
-    build_trace_summary / task summaries) and never appended to the transcript, so it cannot leak out
-    of the display path into the durable trace or back to a provider. Gated by OUROBOROS_REASONING_SUMMARY."""
+    """Emit redacted progress safely to users.
+
+    Visible text is retained in ``reasoning_notes``. Provider reasoning stays
+    display-only; the native message and transcript remain unchanged.
+    """
     visible_text = _visible_round_text(content)
     if visible_text:
-        emit_progress(visible_text)
-        llm_trace["reasoning_notes"].append(visible_text)
+        safe_text = sanitize_tool_result_for_log(visible_text)
+        emit_progress(safe_text)
+        llm_trace["reasoning_notes"].append(safe_text)
     elif str(os.environ.get("OUROBOROS_REASONING_SUMMARY", "auto")).strip().lower() != "off":
         display_reasoning = LLMClient.extract_display_reasoning(msg)
         if display_reasoning:
-            emit_progress(display_reasoning)
+            emit_progress(sanitize_tool_result_for_log(display_reasoning))
 
 
 def _nanny_finalization_message(

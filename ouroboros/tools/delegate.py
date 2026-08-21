@@ -1429,15 +1429,15 @@ def get_tools() -> List[ToolEntry]:
                 "decision='apply'|'reject'); read the captured diff before applying, and "
                 "never let the run commit inside its snapshot. If you are read-only it "
                 "can only read and answer. "
-                "A TOP-LEVEL task may instead select ONE exact installed non-native "
+                "A TOP-LEVEL task may instead select ONE exact installed user-managed "
                 "skill payload with root='skill_payload' + bucket + skill_name: the "
                 "selector chooses authority you already hold (it grants nothing), the "
                 "run edits a private standalone snapshot of that payload, the LIVE "
                 "payload stays byte-identical until you explicitly "
                 "integrate_delegated_patch, and after an apply the skill's prior "
                 "review is stale — run skill_preflight and skill_review as usual. "
-                "The payload must already exist (for a NEW skill write its manifest "
-                "first), and native skills stay system-repo territory. "
+                "The payload must already exist (create a NEW skill's manifest first). "
+                "Seeded native stays system-repo territory; markerless native is logical external. "
                 "Returns a run_id: watch it with delegate_wait, stop it with "
                 "delegate_cancel. The run's output is a CLAIM you must check — you are the "
                 "host, so verification receipts are still yours to write. If no route is "
@@ -1455,7 +1455,7 @@ def get_tools() -> List[ToolEntry]:
                     "refused here and must be scheduled as recursive children."},
                 "root": {"type": "string", "enum": ["skill_payload"], "description":
                     "Optional exact-resource selector: 'skill_payload' delegates ONE "
-                    "installed non-native skill payload you can already write. Omit "
+                    "installed user-managed skill payload you can already write. Omit "
                     "for ordinary workspace delegation."},
                 "bucket": {"type": "string", "description":
                     "With root='skill_payload': the payload location "

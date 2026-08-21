@@ -751,6 +751,28 @@ class ExtensionsIndexResponse(TypedDict, total=False):
     error: str
 
 
+class SkillPublishPreflightResponse(TypedDict):
+    """Safe selected-skill publication facts; never raw scanner output."""
+
+    ok: bool
+    skill: str
+    repository: str
+    state: Literal["ready", "warnings", "needs_attention", "repairable", "hard_block"]
+    publication_ready: bool
+    task_start_allowed: bool
+    snapshot_hash: str
+    review: Dict[str, Any]
+    scanner: Dict[str, Any]
+    findings: list[Dict[str, Any]]
+    omitted_count: int
+    blocker_count: int
+    warning_count: int
+    audited_false_positive_count: int
+    reason_code: str
+    summary: str
+    repair_hint: str
+
+
 class SkillLifecycleQueueResponse(TypedDict, total=False):
     active: Dict[str, Any]
     events: list[Dict[str, Any]]
@@ -1232,6 +1254,7 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "POST /api/owner/safety-mode",
     "POST /api/owner/capability-ack",
     "POST /api/owner/skills/{skill}/attest-review",
+    "POST /api/skills/{skill}/publish-preflight",
     "GET /api/model-catalog",
     "POST /api/tasks",
     "GET /api/tasks",
@@ -1409,6 +1432,7 @@ __all__ = [
     "ScheduleDeleteResponse",
     "UploadResponse",
     "ExtensionsIndexResponse",
+    "SkillPublishPreflightResponse",
     "SkillLifecycleQueueResponse",
     "MarketplaceSearchResponse",
     "MarketplaceInstalledResponse",

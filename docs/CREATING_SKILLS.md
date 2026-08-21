@@ -34,10 +34,12 @@ OuroborosHub payload, the OWNER may skip the expensive LLM review via the
 manifest-validation floor STILL runs (an invalid or unsafe payload is refused),
 and official-hub payloads are freshly rechecked against the live catalog before
 attestation is persisted. Only the tri-model LLM phase is skipped; the verdict
-is marked `owner-attested` (distinct from an LLM-clean badge) and an
-owner-attested skill cannot be published to a public hub — run the full review
-first. Native, ClawHub, and unverified OuroborosHub payloads are never
-attestable. The agent cannot self-attest (the marker is owner-state).
+is marked `owner-attested` (distinct from an LLM-clean badge) and does not
+confer publication readiness. Choosing Publish may still start the ordinary
+managed publication task, but Ouroboros must complete a fresh full skill review
+before any outbound GitHub effect. Native, ClawHub, and unverified
+OuroborosHub payloads are never attestable. The agent cannot self-attest (the
+marker is owner-state).
 
 There are three skill types:
 
@@ -59,11 +61,12 @@ The **runtime ownership** of an installed skill is also tagged:
 
 User-authored or manually copied skills belong under
 `data/skills/external/<name>/`. The `native` bucket is reserved for
-launcher-seeded skills that carry a `.seed-origin` marker. If a user
-payload is accidentally left under `native/`, Ouroboros no longer migrates it
-automatically; move it to `external/` or reinstall it so the Repair workflow can
-edit and re-review it. Generic file tools also refuse new writes under unseeded
-`native/` payloads and tell the agent to use `external/` instead.
+launcher-seeded skills that carry a `.seed-origin` marker. That marker, not the
+directory name alone, is the ownership fact: an existing payload under
+`native/` without the marker is treated in place as user-managed `external`
+content. Ordinary top-level tasks can inspect, edit, run commands in, or
+delegate that payload without a migration. A marker-present launcher seed stays
+read/review-only, and new skills are still created under `external/`.
 
 ## Manifest schema (`SKILL.md` frontmatter or `skill.json`)
 
@@ -319,17 +322,22 @@ repo commits, extension tools, key grants, and enable/disable flows. Finish
 with `skill_preflight` and `skill_review`; the owner enables or grants access
 after a fresh executable review.
 
-### Light-mode short-form authoring (no repair constraint)
+### Top-level short-form authoring (including light mode)
 
-Under `runtime_mode=light` without a `skill_repair` task constraint,
-`write_file` and `edit_text` can target skill payloads with
-`root=skill_payload`, `bucket` (one of `external` / `clawhub` /
-`ouroboroshub`; `native` is excluded), and `skill_name`. A short relative
+An ordinary top-level task in every runtime mode can target user-managed skill
+payloads with `root=skill_payload`, `bucket` (`external` / `clawhub` /
+`ouroboroshub` / `user_repo`), and `skill_name`. A markerless payload physically
+under `native/` is selected through the logical `external` bucket; a true
+marker-present native seed remains read/review-only. A short relative
 `path` such as `plugin.py` or `lib/utils.py` resolves under
-`data/skills/<bucket>/<skill_name>/`, the same payload root the repair flow
-would pick. Supply both args together — passing only one returns a clear
+the selected physical payload root. Supply both args together — passing only
+one returns a clear
 `bucket and skill_name must be supplied together` error instead of silently
 writing into the drive root.
+
+The constrained Skills UI Repair lane is intentionally narrower and unchanged:
+it still selects only its declared non-native payload and has no shell or
+delegation capability.
 
 To **create a new skill** the payload directory need not pre-exist: writing the
 manifest at the payload root (`path="SKILL.md"` or `path="skill.json"`) is the
@@ -687,23 +695,59 @@ You can read their full source under
 
 ### OuroborosHub (official, curated)
 
-`razzant/OuroborosHub` is the official catalog Ouroboros installs
-from. The normal publishing path is agent-driven:
+`razzant/OuroborosHub` is the official catalog. Finish the local payload and
+configure `GITHUB_TOKEN` in Settings → Secrets, then choose **Publish to
+OuroborosHub** on the skill card or ask Ouroboros in chat. This is one
+agent-driven flow; a separate manual Preflight or Review action is not required
+merely to start it. The browser first runs a read-only preflight for the
+selected skill and asks for explicit public-action confirmation. Cancelling
+creates no task.
 
-1. Finish the local skill under `data/skills/<bucket>/<slug>/`.
-2. Run `skill_preflight` and `skill_review`; submission requires a
-   fresh `clean` review whose stored `content_hash` matches the current
-   payload.
-3. Configure `GITHUB_TOKEN` in Settings → Secrets.
-4. Use the Skills card menu → **Submit to OuroborosHub**, or ask in
-   chat: `Submit skill <slug> to OuroborosHub`.
+The preflight returns one of five states:
 
-The agent calls `submit_skill_to_hub`, infers the upstream destination
-from `OUROBOROS_HUB_CATALOG_URL`, creates or reuses the user's GitHub
-fork, commits `skills/<slug>/...` plus an updated `catalog.json` on a
-`submit/<slug>-v<version>` branch, and opens a PR. If the same version
-already exists in the catalog, bump the skill version and re-review
-before submitting again.
+- `ready` — the current snapshot is locally publication-ready; the managed task
+  repeats the authoritative checks before any public effect.
+- `warnings` — only non-blocking redacted findings remain, and continuing
+  requires explicit confirmation.
+- `needs_attention` — the content, version, or full review still needs work, but
+  the ordinary managed publication task may start so Ouroboros can repair and
+  re-review it.
+- `repairable` — Betterleaks is missing or unhealthy; the ordinary task may
+  start with the exact repair hint.
+- `hard_block` — authority, identity, source, or managed-task admission prevents
+  the task from starting.
+
+If the selected `user_repo` leaf lost its manifest after the card was opened,
+that exact `skill_publish` task may omit `bucket` while it lists/searches/reads
+the leaf and while it creates only the root `SKILL.md` or `skill.json`. Once the
+manifest exists, ordinary discovery, preflight, and fresh review resume.
+Grouping directories, unknown or colliding identities, nested manifests, and
+path escapes are still refused; no parallel `external` payload is created.
+
+Only literal Betterleaks `high` confidence blocks an outbound publication call.
+`medium`, `low`, missing, and unknown confidence remain redacted warnings. For
+an intentional provider-shaped fixture, Ouroboros may add Betterleaks's
+exact-line `betterleaks:allow` annotation. That byte edit makes the hash-bound
+skill review stale, so a fresh full `skill_review` is mandatory before retrying.
+The audit pass records the suppressed exact line as an audited false positive.
+Remove or rotate a real credential instead of allowing it.
+
+Packaged installs include Betterleaks 1.8.1. A source checkout installs the
+exact pinned runtime explicitly with:
+
+`python -m ouroboros.betterleaks_runtime install`
+
+Publish never downloads the scanner automatically. Typed failures return the
+completed stage, external effects, and a repair hint; Ouroboros decides whether
+to inspect, repair, re-review, retry, clean up, or stop.
+
+Publication succeeds only when the task records a validated pull-request
+receipt in the configured Hub repository for this exact skill. A branch,
+commit, refusal report, or unfinished attempt is partial progress, not
+successful publication. The pull request includes only a redacted scanner
+attestation: engine and version, ruleset digest, `blockers=0`, and
+warning/audited counts. It never includes candidate values, snippets, or raw
+scanner output.
 
 ### ClawHub (third-party, registry-driven)
 
