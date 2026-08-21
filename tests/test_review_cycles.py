@@ -293,10 +293,12 @@ def test_advisory_review_schema_note_states_paid_cycle_semantics(monkeypatch):
     assert "identical_diff_refused" in note
     assert "after 2 paid cycle(s)" in note
     assert "per ROOT task" in note  # wording-5: the tree shares one ceiling
-    # F5 honesty caveat: "refused" is enforcement-dependent — advisory commits
-    # proceed with a loud disclosure and no new spend.
-    assert "under blocking enforcement the commit is refused for free" in note
-    assert "under advisory the commit proceeds with a loud durable disclosure" in note
+    # Honesty caveat (synthesis F6): the identical-diff refusal replays only
+    # recorded VERDICT blocks, which a pure advisory line never mints — there
+    # the no-new-spend guarantee is the exhaustion free replay.
+    assert "Under blocking enforcement an identical resubmission after a recorded" in note
+    assert "a pure advisory line never mints verdict blocks" in note
+    assert "exhaustion free replay" in note
     monkeypatch.setenv(KEY, "5")
     assert "after 5 paid cycle(s)" in _identical_diff_cap_note()
     monkeypatch.setenv(KEY, "unlimited")

@@ -107,12 +107,19 @@ def skill_review_contract_fingerprint(
     prompt_contract = _skill_prompt_contract_hash()
     if not prompt_contract:
         return ""  # unknown contract never matches (fail-open toward paying)
+    # The RESOLVED review effort is contract identity too (synthesis F4): the
+    # skill panel dispatches every slot at resolve_effort("review") (see
+    # tools/review.py::_query_model), and a reviewer at a different effort is
+    # a different contract — changing the effort lapses free replay.
+    from ouroboros.config import resolve_effort
+
     payload = json.dumps(
         {
             "models": [str(model) for model in (models or [])],
             "required_items": [str(item) for item in (required_items or ())],
             "prompt_contract": prompt_contract,
             "review_profile": str(review_profile or ""),
+            "effort": str(resolve_effort("review") or ""),
         },
         sort_keys=True,
         ensure_ascii=False,

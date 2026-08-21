@@ -1204,7 +1204,9 @@ def test_tests_evidence_records_only_for_authorized_resolver_and_live_suite(tmp_
 def test_managed_post_commit_gate_reuses_exact_tree_proof(tmp_path, monkeypatch):
     """The managed gate's mandate is 'the suite provably ran green on the exact
     committed tree' — proof-by-identity skips the duplicate run; any mismatch
-    still pays a fresh mandatory run."""
+    still pays a fresh mandatory run. Synthesis F2: the AUTHORITY is the
+    process-held ctx record — FORGED durable ``tests_evidence`` (the tx marker
+    is a plain resolver-writable file) never suppresses the mandatory run."""
     from ouroboros.tools import git as git_tool
 
     repo, head = _init_repo(tmp_path)
@@ -1212,10 +1214,8 @@ def test_managed_post_commit_gate_reuses_exact_tree_proof(tmp_path, monkeypatch)
     committed_tree = _git(repo, "rev-parse", "HEAD^{tree}").stdout.strip()
     ctx = SimpleNamespace(repo_dir=str(repo), emit_progress_fn=lambda *_a, **_k: None)
 
-    update_merge.write_update_tx({
-        "phase": "assisted_resolution", "task_id": "resolver",
-        "tests_evidence": {"tree": committed_tree},
-    })
+    # Process-held proof for the exact committed tree -> no duplicate run.
+    ctx._managed_tests_proof_trees = {committed_tree}
     monkeypatch.setattr(
         git_tool, "_post_commit_result",
         lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("duplicate suite run")),
@@ -1224,16 +1224,26 @@ def test_managed_post_commit_gate_reuses_exact_tree_proof(tmp_path, monkeypatch)
         ctx, "msg", 0.0, True, [""], {"target_sha": "x" * 40},
     ) is None
 
-    # Mismatched (or absent) proof -> the mandatory run still happens.
+    # F2(a): a FORGED durable evidence file (tree matches the committed tree)
+    # WITHOUT a ctx record -> the gate still runs the mandatory suite.
     update_merge.write_update_tx({
         "phase": "assisted_resolution", "task_id": "resolver",
-        "tests_evidence": {"tree": "0" * 40},
+        "tests_evidence": {"tree": committed_tree},
     })
+    forged_ctx = SimpleNamespace(repo_dir=str(repo), emit_progress_fn=lambda *_a, **_k: None)
     ran = []
     monkeypatch.setattr(
         git_tool, "_post_commit_result",
         lambda *_a, **_k: ran.append("suite") and None,
     )
+    assert git_tool._managed_post_commit_tests_gate(
+        forged_ctx, "msg", 0.0, True, [""], {"target_sha": "x" * 40},
+    ) is None
+    assert ran == ["suite"], "forged durable tests_evidence suppressed the mandatory run"
+
+    # Mismatched ctx proof -> the mandatory run still happens too.
+    ctx._managed_tests_proof_trees = {"0" * 40}
+    ran.clear()
     assert git_tool._managed_post_commit_tests_gate(
         ctx, "msg", 0.0, True, [""], {"target_sha": "x" * 40},
     ) is None

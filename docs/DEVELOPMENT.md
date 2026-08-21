@@ -839,7 +839,11 @@ refused before any spend. Exhaustion is always the typed
 another paid dispatch. The paid-cycle ceiling counts dispatched waves under
 BOTH enforcement modes; under advisory enforcement a commit after exhaustion
 proceeds as a free replay with a loud typed disclosure (no new review spend),
-while blocking enforcement refuses it.
+while blocking enforcement refuses it. Note the honest scope of each
+guarantee: the identical-diff refusal replays only recorded VERDICT blocks,
+and a pure advisory line never mints one (advisory criticals disclose, they
+do not block) — under advisory the no-new-spend guarantee therefore comes
+from the exhaustion free replay, not from the refusal streak.
 
 `docs/CHECKLISTS.md` is the only reviewer-question, severity, and output SSOT.
 Architecture owns the dataflow; this section owns operator sequence. Finish all

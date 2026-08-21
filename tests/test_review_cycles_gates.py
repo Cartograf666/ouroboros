@@ -380,9 +380,10 @@ def test_free_cycle_gate_infra_streak_never_gates_advisory_or_blocking(tmp_path,
 # Skill review (Δ6, Q17/Q23)
 
 
-def test_skill_review_contract_fingerprint_tracks_roster_items_and_profile():
+def test_skill_review_contract_fingerprint_tracks_roster_items_and_profile(monkeypatch):
     from ouroboros.skill_review_cycles import skill_review_contract_fingerprint
 
+    monkeypatch.setenv("OUROBOROS_EFFORT_REVIEW", "high")
     base = skill_review_contract_fingerprint(["m1", "m2"], required_items=("a", "b"))
     assert base and len(base) == 64
     assert base == skill_review_contract_fingerprint(["m1", "m2"], required_items=("a", "b"))
@@ -392,6 +393,29 @@ def test_skill_review_contract_fingerprint_tracks_roster_items_and_profile():
     # aggregates blockers differently, so a profile change lapses replay.
     assert base != skill_review_contract_fingerprint(
         ["m1", "m2"], required_items=("a", "b"), review_profile="official_hub")
+    # Synthesis F4: the RESOLVED review effort is contract identity — the panel
+    # dispatches every slot at resolve_effort("review"), so an effort change is
+    # a different reviewer contract and must lapse free replay.
+    monkeypatch.setenv("OUROBOROS_EFFORT_REVIEW", "low")
+    assert base != skill_review_contract_fingerprint(["m1", "m2"], required_items=("a", "b"))
+
+
+def test_commit_contract_fingerprint_tracks_resolved_review_efforts(monkeypatch):
+    """Synthesis F4 (commit side): the commit fingerprint's triad/scope rows
+    carry RESOLVED efforts (surface defaults fill empty per-row efforts), so a
+    global review or scope-review effort change lapses refusal/replay."""
+    from ouroboros.tools.commit_gate import commit_review_contract_fingerprint
+
+    monkeypatch.setenv("OUROBOROS_EFFORT_REVIEW", "high")
+    monkeypatch.setenv("OUROBOROS_EFFORT_SCOPE_REVIEW", "high")
+    base = commit_review_contract_fingerprint()
+    assert base and len(base) == 64
+    monkeypatch.setenv("OUROBOROS_EFFORT_REVIEW", "low")
+    assert base != commit_review_contract_fingerprint()
+    monkeypatch.setenv("OUROBOROS_EFFORT_REVIEW", "high")
+    assert base == commit_review_contract_fingerprint()
+    monkeypatch.setenv("OUROBOROS_EFFORT_SCOPE_REVIEW", "low")
+    assert base != commit_review_contract_fingerprint()
 
 
 def _write_history(drive_root, skill, rows):

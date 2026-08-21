@@ -559,9 +559,11 @@ PAID triad+scope cycles per ROOT task — the whole task tree shares one ceiling
 (a follow-up task starts its own); on exhaustion no further review is bought
 and the typed `review_cycles_exhausted` event fires (every dispatched wave
 counts; undispatched refusals and replays do not) — finalize honestly or ask
-the owner to raise the cap. In both states, under blocking enforcement the
-commit is refused for free; under advisory the commit proceeds with a loud
-durable disclosure and no new review spend. For a managed-update resolution
+the owner to raise the cap. Byte-identical resubmits are refused/replayed for
+free off a recorded verdict block; a pure advisory line never mints verdict
+blocks — there the no-new-spend guarantee is the exhaustion free replay, and
+the commit proceeds with a loud durable disclosure (blocking enforcement
+refuses it for free). For a managed-update resolution
 commit, when the pinned M0 baseline is available the review packet inlines the
 authoritative resolution-delta artifact (final candidate vs the pinned
 mechanical merge M0); reviewers judge that inlined artifact and must not

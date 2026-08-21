@@ -440,6 +440,9 @@ def test_managed_flow_runs_the_hermetic_suite_exactly_once(tmp_path, monkeypatch
     assert gate is None
     assert runs == [str(repo)], "the managed flow paid for the hermetic suite twice"
     assert any("no duplicate suite run" in note for note in progress)
+    # Synthesis F2: the authority the gate consulted is the PROCESS-HELD ctx
+    # record pinned by the recording site — not the durable (forensic) tx copy.
+    assert committed_tree in getattr(ctx, "_managed_tests_proof_trees", set())
 
 
 def test_managed_phase_writes_merge_onto_fresh_tx_not_stale_snapshot(
@@ -846,3 +849,142 @@ def test_carrier_projection_is_token_exact_and_desync_free(tmp_path, monkeypatch
     assert version_carrier_desyncs("2.0.0", web_package_text=package_text) == []
     # Contrast: the pre-projection fork token WOULD have been a desync.
     assert version_carrier_desyncs("2.0.0", web_package_text='{"version": "1.5.0"}') != []
+
+
+# ---------------------------------------------------------------------------
+# Synthesis panel fixes (commit #9): F1 corrupt-tx fail-closed at both
+# converted phase-write sites; F2 process-held test-proof authority surviving
+# the advisory→commit tool-call boundary.
+# ---------------------------------------------------------------------------
+
+
+def _corrupt_marker():
+    path = update_merge._update_tx_marker_path()
+    path.write_text("{ this is not json", encoding="utf-8")
+    return path
+
+
+def test_update_tx_phase_refuses_to_overwrite_a_corrupt_marker(tmp_path, monkeypatch):
+    """F1 core contract: an ABSENT marker keeps the snapshot fallback (creation
+    semantics), a CORRUPT marker raises the typed failure WITHOUT writing —
+    the corruption evidence read_update_tx_strict preserves stays byte-intact."""
+    import pytest
+
+    repo, head, plan, tx = tua._materialized_conflict_tx(tmp_path, monkeypatch)
+    marker = _corrupt_marker()
+    corrupt_bytes = marker.read_bytes()
+    with pytest.raises(update_merge.UpdateTxCorrupt):
+        update_merge.update_tx_phase(dict(tx), {"phase": "committing_assisted"})
+    assert marker.read_bytes() == corrupt_bytes, "corrupt marker was overwritten"
+    # Absent marker -> snapshot fallback still creates the record.
+    marker.unlink()
+    merged = update_merge.update_tx_phase(dict(tx), {"phase": "rolling_back"})
+    assert merged["phase"] == "rolling_back"
+    assert update_merge.read_update_tx().get("phase") == "rolling_back"
+
+
+def test_committing_site_fails_typed_on_a_corrupt_marker(tmp_path, monkeypatch):
+    """F1 site 1 (git.py commit flow): the committing_assisted transition on a
+    corrupt marker returns the typed MANAGED_UPDATE_ERROR and leaves the marker
+    bytes untouched — consistent with the corrupt-preflight block."""
+    import inspect
+
+    import ouroboros.tools.git as git_mod
+
+    repo, head, plan, tx = tua._materialized_conflict_tx(tmp_path, monkeypatch)
+    marker = _corrupt_marker()
+    corrupt_bytes = marker.read_bytes()
+    error = git_mod._managed_committing_phase_error(dict(tx))
+    assert error and "MANAGED_UPDATE_ERROR" in error and "corrupt" in error
+    assert marker.read_bytes() == corrupt_bytes, "corrupt marker was overwritten"
+    # The real commit flow is bound to this helper (fail-closed return path).
+    src = inspect.getsource(git_mod._repo_commit_push)
+    assert "_managed_committing_phase_error(_managed_tx)" in src
+    assert "return _fail(_phase_error)" in src
+    # Valid marker -> the transition proceeds and merge-writes onto the fresh tx.
+    marker.unlink()
+    update_merge.write_update_tx(dict(tx))
+    assert git_mod._managed_committing_phase_error(dict(tx)) is None
+    assert update_merge.read_update_tx().get("phase") == "committing_assisted"
+
+
+def test_postcommit_site_skips_phase_write_loudly_on_a_corrupt_marker(tmp_path, monkeypatch):
+    """F1 site 2 (managed_assisted_postcommit): a corrupt marker skips BOTH
+    phase writes with a loud supervisor row; the commit already landed, so the
+    flow keeps going and the marker bytes stay untouched for the owner."""
+    repo, head, plan, tx = tua._materialized_conflict_tx(tmp_path, monkeypatch)
+    marker = _corrupt_marker()
+    corrupt_bytes = marker.read_bytes()
+    rows = []
+    monkeypatch.setattr(update_merge, "_log_supervisor", rows.append)
+    monkeypatch.setattr(update_merge, "update_restart_smoke", lambda: {"ok": True})
+    ok, msg = update_merge.managed_assisted_postcommit(dict(tx), "f" * 40)
+    assert ok, msg
+    assert marker.read_bytes() == corrupt_bytes, "corrupt marker was overwritten"
+    skipped = [r for r in rows if r.get("type") == "managed_update_tx_phase_write_skipped_corrupt"]
+    assert len(skipped) == 2, rows
+    assert "phase" in skipped[0]["patch_keys"]
+
+
+def test_ctx_proof_survives_the_advisory_to_commit_boundary(tmp_path, monkeypatch):
+    """F2(c): the proof pinned by the ADVISORY recording site is consulted by
+    the COMMIT-side gates through the same task ctx (one ctx spans every tool
+    call of a task); both recording sites are bound to the shared helper."""
+    import inspect
+
+    import ouroboros.tools.claude_advisory_review as adv_mod
+    import ouroboros.tools.git as git_mod
+
+    repo, head, plan, tx = tua._materialized_conflict_tx(tmp_path, monkeypatch)
+    meta = tua._authority_metadata(tx)
+    monkeypatch.setenv("OUROBOROS_PRE_PUSH_TESTS", "1")
+    ctx = SimpleNamespace(task_id="resolver", task_metadata=meta, repo_dir=str(repo),
+                          emit_progress_fn=lambda *_a, **_k: None)
+
+    # The advisory-side site records through the shared process-held helper...
+    tree = update_merge.record_managed_tests_proof(ctx)
+    assert tree and tree in ctx._managed_tests_proof_trees
+    for site_src in (
+        inspect.getsource(adv_mod._advisory_pre_sdk_gate),
+        inspect.getsource(git_mod._advisory_and_tests_gate),
+    ):
+        assert "record_managed_tests_proof(ctx)" in site_src
+
+    # ...and the commit-side consumers see it on the SAME ctx.
+    assert git_mod._managed_candidate_needs_proof(ctx) is False
+    tua._git(repo, "add", "-A")
+    tua._git(repo, "commit", "-q", "-m", "managed resolution")
+    committed_tree = tua._git(repo, "rev-parse", "HEAD^{tree}").stdout.strip()
+    assert committed_tree == tree
+    monkeypatch.setattr(
+        git_mod, "_post_commit_result",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("duplicate suite run")),
+    )
+    assert git_mod._managed_post_commit_tests_gate(
+        ctx, "msg", 0.0, True, [""], update_merge.read_update_tx(),
+    ) is None
+    # A FRESH ctx (restart analogue) holds no proof -> the mandate re-runs once.
+    fresh = SimpleNamespace(task_id="resolver", task_metadata=meta, repo_dir=str(repo),
+                            emit_progress_fn=lambda *_a, **_k: None)
+    assert git_mod._managed_candidate_needs_proof(fresh) is True
+
+
+def test_forged_durable_evidence_never_satisfies_needs_proof(tmp_path, monkeypatch):
+    """F2(a), pre-commit side: durable tests_evidence forged to the candidate
+    tree (the tx marker is resolver-writable) without a ctx record leaves the
+    compensating preflight MANDATORY."""
+    repo, head, plan, tx = tua._materialized_conflict_tx(tmp_path, monkeypatch)
+    meta = tua._authority_metadata(tx)
+    import ouroboros.tools.git as git_mod
+
+    cand_tree, err = update_merge.worktree_snapshot_tree("HEAD")
+    assert cand_tree, err
+    forged = dict(update_merge.read_update_tx())
+    forged["tests_evidence"] = {"tree": cand_tree, "at": "forged"}
+    update_merge.write_update_tx(forged)
+    ctx = SimpleNamespace(task_id="resolver", task_metadata=meta, repo_dir=str(repo),
+                          emit_progress_fn=lambda *_a, **_k: None)
+    assert update_merge.managed_tests_evidence_covers(cand_tree)  # forensic view
+    assert git_mod._managed_candidate_needs_proof(ctx) is True, (
+        "forged durable tests_evidence suppressed the mandatory pre-commit suite"
+    )

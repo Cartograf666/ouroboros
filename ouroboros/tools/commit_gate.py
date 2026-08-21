@@ -202,7 +202,11 @@ def commit_review_contract_fingerprint() -> str:
     routes, scope rows, enforcement, and the shipped prompt-contract text. A
     changed fingerprint lapses free-refusal/replay authority (a new paid
     review is allowed and refusals never quote across the change). Fail-open
-    "" — an unknown contract never matches, so nothing is refused on it."""
+    "" — an unknown contract never matches, so nothing is refused on it.
+    The per-row efforts below are the RESOLVED efforts (``row_effort`` /
+    ``scope_reviewer_slots`` fill empty rows from the configured surface
+    default), so changing the global review or scope-review effort changes
+    this fingerprint and lapses replay (synthesis F4 — pinned by test)."""
     try:
         from ouroboros.config import get_review_enforcement
         from ouroboros.review_substrate import scope_reviewer_slots

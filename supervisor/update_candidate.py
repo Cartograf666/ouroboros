@@ -159,16 +159,29 @@ def _preserve_failed_update_attempt(tx: Dict[str, Any]) -> str:
     return name
 
 
+class UpdateTxCorrupt(RuntimeError):
+    """The durable update-tx marker exists but is unreadable/invalid. Raised by
+    ``update_tx_phase`` instead of silently REPLACING the corruption evidence
+    with a caller's stale snapshot: ``read_update_tx_strict``'s contract is that
+    corruption fails closed and loudly, and a merge-write that papers over it
+    would launder a corrupt marker back into a "valid" one."""
+
+
 def record_managed_tests_evidence(
     task_id: str, task_metadata: Optional[Dict[str, Any]] = None
 ) -> str:
     """After a GREEN full hermetic pytest run inside the authorized resolver's flow,
     pin the exact candidate tree the suite ran against (the live worktree projection —
     what ``run_hermetic_pytest`` actually tests) into the tx as ``tests_evidence``.
-    The managed commit gate then reuses this proof instead of paying a second full
-    run when the committed tree is byte-identical (single-run contract, Q10). Skips
-    recording when the suite was env-disabled (no run happened — recording would
-    forge a proof). Returns the recorded tree sha, '' when not applicable."""
+    Skips recording when the suite was env-disabled (no run happened — recording
+    would forge a proof). Returns the recorded tree sha, '' when not applicable.
+
+    AUTHORITY NOTE (synthesis F2): the durable ``tests_evidence`` copy written
+    here is FORENSIC/telemetry only. The tx marker is a plain writable file the
+    authorized resolver's shell can reach, so the single-run gates
+    (``_managed_candidate_needs_proof`` / ``_managed_post_commit_tests_gate``)
+    consult ONLY the process-held record on the task ctx (see
+    ``record_managed_tests_proof``), never this file."""
     if os.environ.get("OUROBOROS_PRE_PUSH_TESTS", "1") != "1":
         return ""
     from supervisor import update_merge as _um
@@ -205,6 +218,36 @@ def record_managed_tests_evidence(
     return tree
 
 
+def record_managed_tests_proof(ctx: Any) -> str:
+    """PROCESS-HELD authority for the managed single-run contract (Q10).
+
+    Called by BOTH host recording sites — the compensating commit preflight
+    (``tools/git.py``) and the advisory pre-review preflight
+    (``tools/claude_advisory_review.py``) — immediately after the host itself
+    ran the full hermetic suite green. Pins the exact candidate tree on the
+    task ctx (host-written, in-process, out of the resolver's shell reach);
+    the durable tx copy stays as forensic telemetry via
+    ``record_managed_tests_evidence``. One ctx spans every tool call of one
+    task, so the proof survives the advisory→commit boundary; a server
+    restart between the proof run and the commit loses the ctx record and
+    re-runs the suite once (the safe direction). Returns the pinned tree."""
+    tree = record_managed_tests_evidence(
+        str(getattr(ctx, "task_id", "") or ""), getattr(ctx, "task_metadata", None)
+    )
+    if tree:
+        proofs = getattr(ctx, "_managed_tests_proof_trees", None)
+        if not isinstance(proofs, set):
+            proofs = set()
+            try:
+                ctx._managed_tests_proof_trees = proofs
+            except Exception:
+                # A ctx that cannot carry the record simply keeps the mandatory
+                # gate run — never a durable-file fallback.
+                return tree
+        proofs.add(tree)
+    return tree
+
+
 def update_tx_phase(base_tx: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
     """Merge-write a managed phase transition onto the FRESH durable tx.
 
@@ -215,21 +258,55 @@ def update_tx_phase(base_tx: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str,
     gate would then re-buy the full hermetic suite it already holds proof for
     (and a flaky red there rolls back a green-proven candidate). This helper
     re-reads the durable tx and applies ONLY the caller's intended key changes
-    on top, refusing to drop keys the durable record carries. When the durable
-    marker is absent or corrupt, the caller's snapshot is the only substrate
-    left — fall back to it (downstream strict readers still fail closed on a
-    corrupt marker). Returns the tx dict actually written."""
+    on top, refusing to drop keys the durable record carries.
+
+    Marker statuses are DISTINGUISHED (synthesis F1): an ABSENT marker falls
+    back to the caller's snapshot (creation semantics — the snapshot is the
+    only substrate left); a CORRUPT marker raises the typed
+    ``UpdateTxCorrupt`` WITHOUT writing — replacing an unreadable marker with
+    stale data would silently destroy the corruption evidence that
+    ``read_update_tx_strict``'s fail-closed contract preserves for the owner.
+    Returns the tx dict actually written."""
     from supervisor import update_merge as _um
 
     status, current = _um.read_update_tx_strict()
+    if status == "corrupt":
+        raise UpdateTxCorrupt(
+            "update tx marker exists but is unreadable/invalid — refusing to "
+            "overwrite the corruption evidence with a stale snapshot"
+        )
     merged = dict(current) if status == "valid" else dict(base_tx)
     merged.update(patch)
     _um.write_update_tx(merged)
     return merged
 
 
+def update_tx_phase_or_keep(base_tx: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
+    """``update_tx_phase`` for post-commit callers that must keep going: on a
+    CORRUPT marker the phase write is SKIPPED with a loud supervisor row (the
+    marker bytes stay untouched for the owner; boot recovery fails closed on
+    them) and the merged dict is returned in-memory only."""
+    try:
+        return update_tx_phase(base_tx, patch)
+    except UpdateTxCorrupt as exc:
+        from supervisor.update_merge import _log_supervisor
+
+        _g.log.error("managed update tx phase write skipped: %s", exc)
+        _log_supervisor({
+            "type": "managed_update_tx_phase_write_skipped_corrupt",
+            "patch_keys": sorted(str(key) for key in patch),
+            "error": str(exc),
+        })
+        merged = dict(base_tx)
+        merged.update(patch)
+        return merged
+
+
 def managed_tests_evidence_covers(committed_tree: str) -> bool:
-    """True when the durable tx carries a green-suite proof for EXACTLY this tree."""
+    """True when the durable tx carries a green-suite record for EXACTLY this
+    tree. FORENSIC surface only (synthesis F2): the tx marker is
+    resolver-writable, so the single-run gates never consult this — they read
+    the process-held ctx record pinned by ``record_managed_tests_proof``."""
     if not committed_tree:
         return False
     from supervisor import update_merge as _um

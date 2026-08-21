@@ -25,7 +25,8 @@ from supervisor import git_ops as _g
 from supervisor.update_candidate import (  # noqa: F401
     _MERGE_NEUTRAL_FLAGS, _git_run, _merge_head_sha, _preserve_failed_update_attempt,
     _rev_parse, existing_failed_update_ref, live_unmerged_paths,
-    managed_tests_evidence_covers, record_managed_tests_evidence, update_tx_phase,
+    UpdateTxCorrupt, managed_tests_evidence_covers, record_managed_tests_evidence,
+    record_managed_tests_proof, update_tx_phase, update_tx_phase_or_keep,
     worktree_snapshot_tree,
     find_update_stash_sha, restore_stash_with_marker, restore_update_stash,
     stash_local_changes_for_update, lookup_update_stash,
@@ -1385,15 +1386,16 @@ def managed_assisted_postcommit(tx: Dict[str, Any], commit_sha: str) -> Tuple[bo
     ``request_restart`` and boot finalize verifies the healthy boot. Returns (ok, message)."""
     # Merge-write onto the FRESH durable tx (never the caller's pre-stage-cycle
     # snapshot): in-attempt keys like ``tests_evidence`` must survive this
-    # phase transition — see ``update_tx_phase``.
-    tx = update_tx_phase(tx, {
+    # phase transition — see ``update_tx_phase``. The commit already landed, so
+    # a CORRUPT marker here skips the write loudly (F1) instead of aborting.
+    tx = update_tx_phase_or_keep(tx, {
         "phase": "pending_boot_smoke",
         "merge_commit": commit_sha,
         "pre_restart_smoke": _PRE_RESTART_SMOKE_PENDING,
     })
     smoke = update_restart_smoke()
     if smoke.get("ok"):
-        tx = update_tx_phase(tx, {"pre_restart_smoke": _PRE_RESTART_SMOKE_PASSED})
+        tx = update_tx_phase_or_keep(tx, {"pre_restart_smoke": _PRE_RESTART_SMOKE_PASSED})
         return True, (
             "✅ Managed update committed as a reviewed 2-parent merge and passed the pre-restart "
             "smoke. Call `request_restart` now to finish landing the update."

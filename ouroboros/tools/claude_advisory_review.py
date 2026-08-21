@@ -1327,9 +1327,10 @@ def _identical_diff_cap_note() -> str:
         "one paid re-review; a repeated one buys none)."
     )
     caveat = (
-        " In both states, under blocking enforcement the commit is refused for free; "
-        "under advisory the commit proceeds with a loud durable disclosure and no new "
-        "review spend."
+        " Under blocking enforcement an identical resubmission after a recorded "
+        "verdict block is refused for free; a pure advisory line never mints verdict "
+        "blocks, so its no-new-spend guarantee is the exhaustion free replay — the "
+        "commit proceeds with a loud durable disclosure and no new review spend."
     )
     if cap is None:
         return (
@@ -1776,14 +1777,14 @@ def _advisory_pre_sdk_gate(
             })
         ctx.emit_progress_fn("Tests passed ✓ — proceeding with advisory SDK call.")
         # Single-run contract for managed-update resolutions (Q10): a green full
-        # hermetic run here is durable proof for the exact candidate tree; the
+        # hermetic run here is the proof for the exact candidate tree; the
         # managed commit gate reuses it instead of paying a second full run.
+        # The gates' authority is the PROCESS-HELD ctx record (F2); the durable
+        # tx copy written alongside is forensic telemetry only.
         try:
-            from supervisor.update_merge import record_managed_tests_evidence
+            from supervisor.update_merge import record_managed_tests_proof
 
-            record_managed_tests_evidence(
-                getattr(ctx, "task_id", ""), getattr(ctx, "task_metadata", None)
-            )
+            record_managed_tests_proof(ctx)
         except Exception:
             log.debug("managed tests evidence recording failed", exc_info=True)
 

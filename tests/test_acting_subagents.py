@@ -1110,6 +1110,13 @@ def test_subagent_shell_secret_markers_cover_relative_paths():
     assert _subagent_shell_targets_secret("cat .git/config")
     assert _subagent_shell_targets_secret("cat .git/credentials")
     assert _subagent_shell_targets_secret("cat ~/.ssh/id_rsa")
+    # Synthesis F3: the managed-update tx marker is owner-control state —
+    # subagent shell may not touch it (main-agent resolver and supervisor
+    # writers are unaffected; this guard is subagent-only by construction).
+    assert _subagent_shell_targets_secret("cat .git/ouroboros-update-tx.json")
+    assert _subagent_shell_targets_secret(
+        'python -c "open(\'.git/ouroboros-update-tx.json\',\'w\')"'.lower()
+    )
     assert not _subagent_shell_targets_secret("cat src/main.py")
 
 

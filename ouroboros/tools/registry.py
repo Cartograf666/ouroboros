@@ -149,7 +149,12 @@ _SUBAGENT_SHELL_SECRET_MARKERS = (
     # from a workspace cwd) needs the slash-less marker too.
     "/data/settings.json", "data/settings.json", "ouroboros/data/settings", "file1.txt",
     # Universal credential/secret/control files (relative or absolute).
-    ".env", ".git/config", ".git/credentials", "credentials.json", "tokens.json",
+    # ouroboros-update-tx.json is the managed-update tx marker (.git/…): owner
+    # control state, mirrored on .git/config. Subagent shell only — the
+    # authorized resolver is the MAIN agent and the supervisor/host writers go
+    # through supervisor.update_merge, so neither is affected (synthesis F3).
+    ".env", ".git/config", ".git/credentials", "ouroboros-update-tx.json",
+    "credentials.json", "tokens.json",
     "/.ssh/", ".ssh/", "id_rsa", "id_ed25519", ".netrc", ".npmrc", ".pgpass", ".aws/",
 )
 

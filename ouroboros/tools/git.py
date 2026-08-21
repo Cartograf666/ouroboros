@@ -652,17 +652,22 @@ def _managed_candidate_needs_proof(ctx: ToolContext) -> bool:
     with skip_tests, or the tree changed since) — the compensating preflight
     must then run PRE-commit, before paid review and before any commit exists,
     regardless of skip_tests/doc-only, so a red candidate is fixed in place
-    instead of committed and rolled back."""
+    instead of committed and rolled back.
+
+    AUTHORITY (synthesis F2): the proof consulted here is the PROCESS-HELD ctx
+    record pinned by ``record_managed_tests_proof`` when the host itself ran
+    the suite — never the durable ``tests_evidence`` tx copy, which is a plain
+    resolver-writable file (forensic only; a forged tree there must not
+    suppress the mandatory run). A restart between the proof run and the
+    commit therefore re-runs the suite once."""
     if not _authorized_managed_update_resolver(ctx):
         return False
     try:
-        from supervisor.update_merge import (
-            managed_tests_evidence_covers,
-            worktree_snapshot_tree,
-        )
+        from supervisor.update_merge import worktree_snapshot_tree
 
         cand_tree, _cand_err = worktree_snapshot_tree("HEAD")
-        return not (cand_tree and managed_tests_evidence_covers(cand_tree))
+        proofs = getattr(ctx, "_managed_tests_proof_trees", None) or ()
+        return not (cand_tree and cand_tree in proofs)
     except Exception:
         log.debug("managed proof check failed; running the preflight", exc_info=True)
         return True
@@ -822,10 +827,12 @@ def _advisory_and_tests_gate(
                 "block_reason": "tests_preflight_blocked",
             }
         # Q10 single-run: this green preflight IS the managed pre-commit proof.
+        # Process-held on ctx (the gates' authority, F2); the durable tx copy
+        # written alongside is forensic telemetry only.
         try:
-            from supervisor.update_merge import record_managed_tests_evidence
+            from supervisor.update_merge import record_managed_tests_proof
 
-            record_managed_tests_evidence(getattr(ctx, "task_id", ""), getattr(ctx, "task_metadata", None))
+            record_managed_tests_proof(ctx)
         except Exception:
             log.debug("managed tests evidence recording failed", exc_info=True)
     elif _advisory_bypassed:
@@ -1443,6 +1450,29 @@ def _managed_commit_gate_failure(reason: str, message: str) -> str:
     )
 
 
+def _managed_committing_phase_error(managed_tx: Dict[str, Any]) -> Optional[str]:
+    """Enter ``committing_assisted`` via a merge-write on the FRESH durable tx.
+
+    Returns ``None`` on success. A CORRUPT marker returns the typed failure
+    message WITHOUT writing (synthesis F1): silently replacing an unreadable
+    marker with the caller's stale snapshot would destroy the corruption
+    evidence ``read_update_tx_strict`` fails closed to preserve — the refusal
+    here is consistent with the corrupt-marker block ``managed_assisted_tx_for``
+    already applies at the commit preflight."""
+    from supervisor.update_merge import UpdateTxCorrupt, update_tx_phase
+
+    try:
+        update_tx_phase(managed_tx, {"phase": "committing_assisted"})
+        return None
+    except UpdateTxCorrupt as exc:
+        return (
+            "⚠️ MANAGED_UPDATE_ERROR: the durable update tx marker is corrupt "
+            f"({exc}). Refusing the commit-phase transition: the marker bytes are "
+            "preserved for recovery, nothing was committed, and restart/recovery "
+            "is required."
+        )
+
+
 def _managed_post_commit_tests_gate(
     ctx, commit_message: str, commit_start: float, skip_tests: bool,
     test_warning_ref, managed_tx: Dict[str, Any],
@@ -1455,11 +1485,14 @@ def _managed_post_commit_tests_gate(
     can wave a managed merge through untested — but the mandate is "the full
     suite provably ran green on the exact committed tree", not "run it twice":
     when the resolver's pre-commit run (advisory preflight or the compensating
-    bypass preflight) recorded tests_evidence for a tree byte-identical to the
-    committed one, that proof is reused and the duplicate run is skipped (Q10).
-    The terminal record carries the same review metadata/fingerprints as every
-    sibling failure record, so an operator can reconstruct WHICH reviewed
-    revision the gate rejected."""
+    bypass preflight) pinned a PROCESS-HELD proof for a tree byte-identical to
+    the committed one, that proof is reused and the duplicate run is skipped
+    (Q10). The authority is the host-written ctx record (synthesis F2) — the
+    durable ``tests_evidence`` tx copy is resolver-writable forensics and a
+    forged tree there never suppresses this run; a restart between the proof
+    and the commit re-runs the suite once. The terminal record carries the
+    same review metadata/fingerprints as every sibling failure record, so an
+    operator can reconstruct WHICH reviewed revision the gate rejected."""
     if not managed_tx:
         return None
     del skip_tests  # deliberately ignored for managed merges
@@ -1469,20 +1502,16 @@ def _managed_post_commit_tests_gate(
         ).strip()
     except Exception:
         committed_tree = ""
-    try:
-        from supervisor.update_merge import managed_tests_evidence_covers
-
-        if managed_tests_evidence_covers(committed_tree):
-            try:
-                ctx.emit_progress_fn(
-                    "Managed post-commit tests: reusing the green pre-commit hermetic "
-                    "run (exact tree match) — no duplicate suite run."
-                )
-            except Exception:
-                pass
-            return None
-    except Exception:
-        log.debug("managed tests evidence check failed; running the suite", exc_info=True)
+    proofs = getattr(ctx, "_managed_tests_proof_trees", None) or ()
+    if committed_tree and committed_tree in proofs:
+        try:
+            ctx.emit_progress_fn(
+                "Managed post-commit tests: reusing the green pre-commit hermetic "
+                "run (exact tree match) — no duplicate suite run."
+            )
+        except Exception:
+            pass
+        return None
     post_test_error = _post_commit_result(
         ctx, commit_message, False, test_warning_ref, force=True,
     )
@@ -2613,7 +2642,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             # entry that --diff-filter=U misses), then mark the crash-window phase before the
             # native 2-parent commit (MERGE_HEAD is still set, so `git commit` records both
             # parents — reviewed pre_update_sha + target).
-            from supervisor.update_merge import managed_assisted_marker_check, update_tx_phase
+            from supervisor.update_merge import managed_assisted_marker_check
 
             _mok, _merr = managed_assisted_marker_check()
             if not _mok:
@@ -2622,8 +2651,11 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             # snapshotted BEFORE the stage cycle, and the compensating tests
             # preflight records ``tests_evidence`` into the durable marker
             # mid-attempt — a wholesale snapshot write here would drop that
-            # proof and force the post-commit gate to pay a duplicate run.
-            update_tx_phase(_managed_tx, {"phase": "committing_assisted"})
+            # record. A CORRUPT marker refuses the transition (F1): nothing
+            # has been committed yet, so fail closed like the preflight does.
+            _phase_error = _managed_committing_phase_error(_managed_tx)
+            if _phase_error:
+                return _fail(_phase_error)
 
         try:
             run_cmd(["git", "commit", "-m", commit_message], cwd=ctx.repo_dir)
