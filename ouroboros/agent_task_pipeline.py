@@ -34,6 +34,7 @@ from ouroboros.outcomes import (
 )
 from ouroboros.contracts.task_contract import build_task_contract
 from ouroboros.subagents import envelope_from_task, substrate_result_fields
+from ouroboros.subagent_messages import subagent_message_meta
 from ouroboros.utils import utc_now_iso, append_jsonl, truncate_review_artifact as _truncate_with_notice
 from ouroboros.post_task_checkpoint import (
     POST_TASK_SYNTHESIS_INFLIGHT as _POST_TASK_SYNTHESIS_INFLIGHT,
@@ -656,18 +657,19 @@ def emit_task_results(
         if ctx is not None else ""
     )
     _has_typed_routing_action = bool(_ephemeral and _typed_routing_action)
-    _decision_meta = {"ephemeral_decision": True} if _ephemeral else {}
+    _message_meta = subagent_message_meta(task, task_id=str(task.get("id") or ""))
+    if _ephemeral:
+        _message_meta["ephemeral_decision"] = True
     send_event = {
         "type": "send_message", "chat_id": task["chat_id"],
         "text": text or "\u200b", "log_text": text or "",
         "format": "markdown",
         "task_id": task.get("id"), "ts": utc_now_iso(),
     }
-    if _decision_meta:
-        # MessageBus already carries progress_meta on both progress and final
-        # frames.  The Web client uses this only to suppress the transient
-        # task card; the inline conversational answer itself remains visible.
-        send_event["progress_meta"] = dict(_decision_meta)
+    if _message_meta:
+        # Final frames carry their own durable identity; replay must not depend
+        # on a nearby progress row that may age out independently.
+        send_event["progress_meta"] = dict(_message_meta)
     pending_events.append(build_presence_result_event(task, text, ctx) if _presence else send_event)
     duration_sec = round(time.time() - start_time, 3)
     n_tool_calls = len(llm_trace.get("tool_calls", []))

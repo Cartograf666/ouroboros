@@ -2470,6 +2470,21 @@ export function createChatInstance({
         });
     }
 
+    function learnSubagentLineage(msg) {
+        if (String(msg?.delegation_role || '').toLowerCase() !== 'subagent') return '';
+        const parentId = String(msg.parent_task_id || '').trim();
+        const childId = String(msg.subagent_task_id || msg.task_id || '').trim();
+        if (!parentId || !childId || parentId === childId) return '';
+        setSubagentParent(childId, {
+            parentId, role: String(msg.subagent_role || '').trim(), model: msg.model,
+        });
+        const event = String(msg.subagent_event || '').toLowerCase();
+        if (msg.task_terminal_status || ['completed', 'completed_warn', 'failed', 'cancelled', 'rejected'].includes(event)) {
+            subagentTerminalChildren.add(childId);
+        }
+        return childId;
+    }
+
     function summarizeSubagentCardFrame(evt, overrides = {}, rawTs = '') {
         const summary = summarizeChatLiveEvent({
             ...evt,
@@ -2652,6 +2667,7 @@ export function createChatInstance({
         const text = String(msg?.content || msg?.text || '').trim();
         const rawTs = msg?.ts || new Date().toISOString();
         forceTaskCard(parentId, rawTs);
+        forceTaskCard(childId, rawTs);
         const record = getSubagentCardRecord(childId, parentId, role);
         const priorTerminalPhase = record?.finished ? String(record.phaseEl?.dataset?.phase || '') : '';
         const summary = summarizeSubagentCardFrame(msg, {
@@ -3117,27 +3133,9 @@ export function createChatInstance({
                     }
                     seenMessageKeys.clear();
                     messageKeyOrder.length = 0;
-                    // Subagent lineage + terminal state live only in memory. Clear and
-                    // rebuild them from durable history BEFORE the card passes, so a
-                    // finished child card finalizes regardless of replay order or which
-                    // event carried the terminal signal (a subagent 'completed' event OR
-                    // a server task_terminal_status). Otherwise finished children stick
-                    // on "working" and get revived by parent heartbeats on reload.
                     subagentChildParents.clear();
                     subagentTerminalChildren.clear();
-                    for (const msg of messages) {
-                        if (String(msg.delegation_role || '').toLowerCase() !== 'subagent') continue;
-                        const parentId = String(msg.parent_task_id || '').trim();
-                        const childId = String(msg.subagent_task_id || msg.task_id || '').trim();
-                        if (!parentId || !childId || parentId === childId) continue;
-                        if (!subagentChildParents.has(childId)) {
-                            setSubagentParent(childId, { parentId, role: String(msg.subagent_role || '').trim(), model: msg.model });
-                        }
-                        const ev = String(msg.subagent_event || '').toLowerCase();
-                        if (msg.task_terminal_status || ['completed', 'completed_warn', 'failed', 'cancelled', 'rejected'].includes(ev)) {
-                            subagentTerminalChildren.add(childId);
-                        }
-                    }
+                    for (const msg of messages) learnSubagentLineage(msg);
                 }
 
                 // First pass builds card state without DOM insertion.
@@ -4249,6 +4247,7 @@ export function createChatInstance({
 
         if (msg.role === 'assistant' || msg.role === 'system') {
             const explicitTaskId = msg.task_id || '';
+            learnSubagentLineage(msg);
             const ephemeralDecision = registerEphemeralDecisionFrame(msg);
             // 3A: Main mirrors Project frames as штаб presentation only — a
             // mirrored ephemeral turn never enters THIS instance's active set.

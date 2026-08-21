@@ -221,7 +221,11 @@ def test_emit_task_results_queues_restart_after_final_events(tmp_path, monkeypat
         memory=object(),
         llm=object(),
         pending_events=pending_events,
-        task={"id": "child-1", "type": "task", "chat_id": 1, "text": "inspect", "delegation_role": "subagent", "memory_mode": "shared"},
+        task={
+            "id": "child-1", "type": "task", "chat_id": 1, "text": "inspect",
+            "delegation_role": "subagent", "memory_mode": "shared",
+            "parent_task_id": "parent-1", "root_task_id": "root-1", "role": "critic",
+        },
         text="summary",
         usage={"rounds": 2, "cost": 0.2},
         llm_trace={"tool_calls": [], "reasoning_notes": []},
@@ -230,6 +234,19 @@ def test_emit_task_results_queues_restart_after_final_events(tmp_path, monkeypat
         ctx=SimpleNamespace(pending_restart_reason=""),
     )
     assert [evt["type"] for evt in pending_events] == ["send_message", "task_metrics", "task_done"]
+    assert pending_events[0]["progress_meta"] == {
+        "subagent_task_id": "child-1",
+        "root_task_id": "root-1",
+        "parent_task_id": "parent-1",
+        "delegation_role": "subagent",
+        "subagent_role": "critic",
+        "write_surface": "",
+        "task_group_id": "",
+        "model_lane": "",
+        "effective_model_lane": "",
+        "model": "",
+        "executor_route": "",
+    }
     assert memory_calls == []
 
 

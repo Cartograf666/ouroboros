@@ -15,6 +15,7 @@ from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros.event_bus import CHAT_DOCUMENT, CHAT_OUTBOUND, CHAT_PHOTO, CHAT_TYPING, CHAT_VIDEO, publish_event
 from supervisor.state import append_jsonl, load_state
 from ouroboros.utils import utc_now_iso
+from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS
 
 log = logging.getLogger(__name__)
 
@@ -855,6 +856,7 @@ def log_chat(
     download_url: str = "",
     caption: str = "",
     client_surface: Optional[Dict[str, Any]] = None,
+    message_meta: Optional[Dict[str, Any]] = None,
 ) -> None:
     if DATA_DIR:
         record = {
@@ -883,6 +885,12 @@ def log_chat(
             # Per-message sending-surface provenance (Owner Surface Fact);
             # optional column, never a "type":"chat" literal (AST-scan hygiene).
             record["client_surface"] = dict(client_surface)
+        # Speech rows persist only the compact identity required to route a
+        # child final after progress retention/rotation has removed its cards.
+        meta = dict(message_meta or {})
+        for key in SUBAGENT_MESSAGE_FIELDS:
+            if key in meta:
+                record[key] = meta[key]
         if filename:
             record["filename"] = filename
         if mime:
@@ -932,6 +940,7 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
             fmt=fmt,
             task_id=task_id,
             record_type=system_type,
+            message_meta=progress_meta,
         )
 
     if _text.strip() in ("", "\u200b"):

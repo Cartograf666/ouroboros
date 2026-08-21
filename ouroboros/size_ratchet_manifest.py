@@ -127,6 +127,7 @@ BAND_PATHS = {
     "devtools/benchmarks/swe_bench_pro/e1v2/run_pro.py": None,
     "devtools/benchmarks/terminal_bench/harbor_installed_agent.py": None,
     "devtools/benchmarks/terminal_bench/run_tb.py": None,
+    "ouroboros/agent.py": "Subagent message identity now lives in a shared helper; keep agent.py below the giant-file threshold rather than re-expanding it.",
     "ouroboros/agent_startup_checks.py": None,
     "ouroboros/extension_process_runner.py": None,
     "ouroboros/gateway/contracts.py": None,
@@ -204,5 +205,5 @@ BYTE_DEBT = {
     "ouroboros/loop.py": 317162,
     "tests/test_delegated_subagent_transport.py": 320571,
     "tests/test_devtools_benchmarks.py": 328282,
-    "web/modules/chat.js": 229208,
+    "web/modules/chat.js": 228625,
 }

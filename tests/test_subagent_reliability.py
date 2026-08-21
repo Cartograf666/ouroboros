@@ -54,12 +54,14 @@ def test_replay_clears_and_rebuilds_subagent_lineage():
     # Cleared on rebuild so stale cross-session lineage cannot persist.
     assert "subagentChildParents.clear();" in src
     assert "subagentTerminalChildren.clear();" in src
-    # Pre-pass reconstructs lineage + terminal set from durable history.
-    assert "if (String(msg.delegation_role || '').toLowerCase() !== 'subagent') continue;" in src
-    assert "setSubagentParent(childId, { parentId, role:" in src
+    # One helper learns lineage from both replay rows and live final frames.
+    assert "function learnSubagentLineage(msg)" in src
+    assert "for (const msg of messages) learnSubagentLineage(msg);" in src
+    assert "learnSubagentLineage(msg);\n            const ephemeralDecision" in src
+    assert "forceTaskCard(childId, rawTs);" in src
     # A child is locked terminal from EITHER a terminal subagent event OR the
     # server task_terminal_status, so it cannot be revived by parent heartbeats.
-    assert "if (msg.task_terminal_status || ['completed', 'completed_warn', 'failed', 'cancelled', 'rejected'].includes(ev)) {" in src
+    assert "if (msg.task_terminal_status || ['completed', 'completed_warn', 'failed', 'cancelled', 'rejected'].includes(event)) {" in src
     assert "subagentTerminalChildren.add(childId);" in src
 
 
