@@ -30,26 +30,21 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 from hashlib import sha256
-import inspect
 import json
 import logging
 import pathlib
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, List, Optional
 
 from ouroboros.config import adaptive_quorum, get_review_enforcement
 from ouroboros.review_cycles import emit_review_cycles_exhausted, review_max_cycles
 from ouroboros.task_results import (
     load_plan_review_state, load_task_result, mark_current_plan_review_unavailable,
     mark_plan_review_cycles_exhausted, plan_review_wave, current_plan_review_wave,
-    record_plan_review_attempt, record_plan_review_dispositions, record_plan_review_wave,
+    record_plan_review_attempt, record_plan_review_dispositions,
 )
 from ouroboros.tools import plan_evidence, plan_spec
 from ouroboros.tools.plan_render import _next_step, _quote_control_lines, _render_wave  # noqa: F401 — engine renderers
-from ouroboros.tools.plan_packet import (
-    build_plan_review_system_prompt,
-    build_plan_review_user_content,
-)
 from ouroboros.tools.plan_review_runtime import (
     PLAN_NO_SNAPSHOT as _PLAN_NO_SNAPSHOT,
     PLAN_REVIEW_MAX_TOKENS as _PLAN_REVIEW_MAX_TOKENS,
@@ -66,15 +61,21 @@ from ouroboros.tools.plan_review_runtime import (
     plan_slot_fit as _plan_slot_fit,
     plan_wave_replay_decision as _plan_wave_replay_decision,
     record_raw_plan_request_attempt as _record_raw_plan_request_attempt,
-    root_exploration_log as _root_exploration_log,
+    root_exploration_log as _root_exploration_log,  # noqa: F401 - compatibility seam
     run_plan_review_slots as _run_plan_review_slots,
+    build_plan_review_packet as _build_packet,
+)
+from ouroboros.tools.plan_review_artifacts import (
+    authority_wave as _authority_wave,
+    continuation_state as _continuation_state,
+    exact_wave as _exact_wave,
+    persist_wave as _persist_plan_review_wave_artifact,
+    record_cannot_verify_attempt as _record_cannot_verify_attempt,
+    record_exact_wave as _record_exact_wave,
+    read_wave as _read_plan_review_wave_artifact,
 )
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.tools.review_helpers import (
-    load_checklist_section,
-    load_governance_doc,
-    review_wave_budget_gate,
-)
+from ouroboros.tools.review_helpers import review_wave_budget_gate
 from ouroboros.tools.review_synthesis import (
     PLAN_REVIEW_CONTROL_PREFIX,
 )
@@ -337,15 +338,6 @@ def _plan_fingerprint(goal: str, plan: str, spec: dict, manifest_hash: str, cons
     return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
-def _task_objective(ctx: ToolContext) -> str:
-    contract = getattr(ctx, "task_contract", {})
-    if not isinstance(contract, dict) or not contract:
-        meta = getattr(ctx, "task_metadata", {})
-        contract = meta.get("task_contract") if isinstance(meta, dict) else {}
-    contract = contract if isinstance(contract, dict) else {}
-    return str(contract.get("objective") or contract.get("description") or "")
-
-
 def _task_evidence_reader(root: pathlib.Path) -> Callable[[str], Optional[str]]:
     """``task:<id>`` locators → a bounded JSON summary of that task's durable result."""
     def _read(task_id: str) -> Optional[str]:
@@ -363,31 +355,6 @@ def _task_evidence_reader(root: pathlib.Path) -> Callable[[str], Optional[str]]:
             "result": truncate_review_artifact(str(record.get("result") or ""), limit=_TASK_EVIDENCE_RESULT_CHARS),
         }, ensure_ascii=False, indent=2, default=str)
     return _read
-
-
-def _packet_kwargs(fn: Callable, **candidates: Any) -> Dict[str, Any]:
-    """Pass only the kwargs the packet builder accepts — the Phase B builders gain
-    additive kwargs (``bible_locator``/``bible_nav_map``/``cycle_index``) that land by
-    merge; the engine must run before and after that merge."""
-    try:
-        accepted = set(inspect.signature(fn).parameters)
-    except (TypeError, ValueError):
-        return {}
-    return {key: value for key, value in candidates.items() if key in accepted}
-
-
-def _session_task_text(system_prompt: str, user_content: str, session_root: str) -> str:
-    return (
-        "RETRIEVING REVIEWER (agent session): you run read-only inside "
-        f"{session_root or 'the active workspace'}. The evidence below is the host's REDACTED "
-        "snapshot — the same bytes every reviewer sees — so do NOT re-read the raw evidence "
-        "locators (a session reading originals would leak what the api route redacts, 4e133c8a); "
-        "the ONE exception is the governance pack — BIBLE.md and docs/ARCHITECTURE.md are public "
-        "repository documents you MAY read raw, and MUST read in full when the pack marks them "
-        "MANDATORY FULL READS (a self-modification plan), even if the agent also declared them as "
-        "evidence. Retrieve any OTHER repository context with your own tools.\n\n"
-        + system_prompt + "\n\n" + user_content
-    )
 
 
 # W3 host attachment is bounded like the agent's own evidence list (MAX_LIST_ITEMS honoured
@@ -457,8 +424,12 @@ def _prepare_plan_inputs(ctx: ToolContext, request: "_PlanRequest", state_root: 
     host_locators = [loc for loc in reviewer_requested if loc not in declared_evidence]
     # B-08/C-06: allowed roots are the active workspace and the system repo only; the runtime
     # data plane is denied outright (the sensitive-name policy is a residual, not a boundary).
+    # A continuation range is the evidence the prior panel explicitly said it
+    # still needed. Resolve those host-carried selectors first so a repeated
+    # 120K declared pack cannot starve the decisive line/tail with the same
+    # ``budget_exhausted`` state that prompted the continuation.
     manifest = plan_evidence.resolve_evidence(
-        declared_evidence + host_locators, active_root=active_root,
+        host_locators + declared_evidence, active_root=active_root,
         allowed_roots=[active_root, system_root],
         resolve_task=_task_evidence_reader(state_root), deny_paths=_evidence_deny_paths(ctx),
     )
@@ -523,11 +494,16 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
     if existing is not None and not isinstance(existing.get("spec"), dict):
         existing = None  # C-09: a COMPACTED row (no frozen spec) is never authority
     if existing is not None:
-        # Fb3/B2: identical request ⇒ idempotent replay — no panel, no cycle — unless
-        # the recorded replay authority lapsed (`plan_wave_replay_decision`: changed
-        # roster; DEGRADED without a structural epoch, or whose epoch moved). ONE
-        # exception (4e133c8a; R9-5): an open wave whose BLOCKING findings all carry
-        # recorded REJECT dispositions (C-08) has earned the promised delta cycle.
+        try:
+            existing = _authority_wave(state_root, task_id, existing)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return _plan_unavailable(
+                ctx,
+                "ERROR: Exact plan-review authority is unreadable; replay and disposition are refused.",
+                "plan_review_exact_artifact_unavailable",
+            )
+        # Identical requests replay free unless authority lapsed; fully rejected
+        # blocking findings are the one earned-delta exception (4e133c8a).
         earned_delta = (
             str(existing.get("aggregate")) in {"REVISE_PLAN", "REVIEW_REQUIRED"}
             and not existing.get("closed")
@@ -540,11 +516,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
             # the rejected wave IS the previous cycle for the delta panel
             previous_override = existing
         elif bool(existing.get("closed")):
-            # CLOSED waves replay with NO roster check (accepted 3a): a settled
-            # verdict is EARNED authority — its panel really reviewed this envelope
-            # — and the commit gates re-review the implementation anyway. A roster
-            # change is configuration hygiene for FUTURE panels, never a
-            # retroactive void of already-settled review authority.
+            # A closed verdict is earned authority; later roster changes govern
+            # future panels and do not retroactively void it (accepted 3a).
             return _render_wave(existing, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement,
                                 cached=True, reminder=reminder)
         else:  # stale ⇒ replay authority lapsed: the identical envelope re-dispatches fresh
@@ -583,21 +556,49 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
             "review_models_unconfigured")
 
     previous = previous_override if previous_override is not None else _last_paid_wave(state)
+    if previous is not None:
+        try:
+            previous = _authority_wave(state_root, task_id, previous)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return _plan_unavailable(
+                ctx,
+                "ERROR: Prior exact plan-review authority is unreadable; a delta review is refused.",
+                "plan_review_exact_artifact_unavailable",
+            )
     cycle_index = cycles_paid + 1
     system_prompt, user_content, session_task = _build_packet(
         ctx, spec=spec, request=request, manifest=manifest, constitutional=constitutional,
         system_root=system_root, active_root=active_root, cycle_index=cycle_index,
         enforcement=enforcement, previous=previous,
     )
+    slots, slot_messages, session_threads, cannot_verify = _continuation_state(
+        state_root, task_id, previous, slots, manifest, user_content=user_content,
+    )
+    if cannot_verify:
+        try:
+            stored = _record_cannot_verify_attempt(
+                state_root, task_id, cycle_index=cycle_index, fingerprint=fingerprint,
+                previous=previous, spec=spec, plan_prose=request.plan, manifest=manifest,
+                manifest_hash=manifest_hash, constitutional=bool(constitutional),
+                constitutional_note=constitutional_note, slots=slots, enforcement=enforcement,
+                cap=cap, reason=cannot_verify,
+                reviewer_config_fingerprint=_plan_reviewer_config_fingerprint(slots),
+                reviewed_at=utc_now_iso(), system_prompt=system_prompt,
+                user_content=user_content, session_task=session_task,
+                need_evidence_seen=list(state.get("need_evidence_seen") or []),
+                page_size=plan_spec.MAX_FINDINGS_PER_SLOT,
+            )
+        except (OSError, ValueError) as exc:
+            return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
+        return _render_wave(
+            stored, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement,
+            reminder=reminder,
+        )
     quorum = adaptive_quorum(len(slots))
-    # B2b: ONE panel health snapshot before fan-out — positive structural evidence
-    # becomes $0 typed skip rows (still in the quorum denominator); unknown dispatches.
-    # The replay seam's fresh snapshot (epoch-changed re-dispatch) is reused, not re-probed.
+    # One health snapshot: typed unavailability skips at $0; unknown dispatches (B2b).
     health_evidence = _plan_panel_health_snapshot(slots) if replay_snapshot is _PLAN_NO_SNAPSHOT else replay_snapshot
     live_slots, health_skip_rows = _plan_health_skip_rows(slots, health_evidence)
-    # Per-slot input fit (P3): oversize = FREE typed row; below quorum = typed refusal —
-    # unless health skips already hold the quorum hostage: then the remaining live slots
-    # still dispatch and the wave records DEGRADED with full typed facts (B2b).
+    # Oversize is a free typed row; live slots still dispatch when health already blocks quorum.
     callable_slots, oversize_rows, fit_error = _plan_slot_fit(
         live_slots, prompt_chars=len(system_prompt) + len(user_content), quorum=quorum)
     if fit_error and not health_skip_rows:
@@ -624,6 +625,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         ctx, callable_slots, system_prompt=system_prompt, user_content=user_content,
         session_task=session_task, session_root=str(active_root),
         output_contract=plan_spec.PLAN_FINDINGS_ARRAY_CONTRACT,
+        slot_messages=slot_messages,
+        session_threads=session_threads,
     ) if callable_slots else []
     # excluded slots stay configured rows: they count in the quorum denominator
     rows = list(rows) + oversize_rows + health_skip_rows
@@ -657,6 +660,11 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
                 truncate_review_artifact(str(row.get("text") or ""), limit=_RAW_TEXT_PREVIEW_CHARS)
                 if not ok else ""
             ),
+            "review_thread_id": str(row.get("review_thread_id") or ""),
+            "review_turn_id": str(row.get("review_turn_id") or ""),
+            "review_thread_receipt": row.get("review_thread_receipt") or {},
+            "auth_route_receipt": row.get("auth_route_receipt") or {},
+            "applied_profile": str(row.get("applied_profile") or ""),
         })
     agg = plan_spec.aggregate(slot_results, quorum=quorum)
     aggregate = str(agg["aggregate"])
@@ -694,17 +702,23 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest) -> str
         # B2: paid = at least one slot physically dispatched this wave (oversize/skip
         # rows are $0 and never charge; a dispatched DEGRADED panel pays like any other).
         "paid": bool(callable_slots),
-        # B2b: the material health epoch (snapshot-derived structural evidence only),
-        # the roster identity this wave dispatched under (a changed roster lapses
-        # replay authority) and, when the typed rows prove the quorum cannot be met
-        # by any re-dispatch, the structural-unreachability facts.
+        # Material health epoch, roster identity, and structural unreachability (B2b).
         "health_epoch": _plan_health_epoch(health_evidence),
         "reviewer_config_fingerprint": _plan_reviewer_config_fingerprint(slots),
         **_plan_quorum_unreachable_facts(slot_records, quorum=quorum),
         "reviewed_at": utc_now_iso(),
     }
+    exact_wave = _exact_wave(
+        wave, plan_prose=request.plan, manifest=manifest, slots=slots, rows=rows,
+        system_prompt=system_prompt, user_content=user_content,
+        session_task=session_task, slot_messages=slot_messages,
+    )
     try:
-        stored = record_plan_review_wave(state_root, task_id, wave, need_evidence_seen=sorted(seen_after))
+        stored = _record_exact_wave(
+            state_root, task_id, wave, exact_wave,
+            need_evidence_seen=sorted(seen_after),
+            page_size=plan_spec.MAX_FINDINGS_PER_SLOT,
+        )
         if stored.get("paid") and not wave.get("paid"):
             # D2/B2: the durable authority stayed the paid predecessor (this attempt
             # dispatched nothing); the tool answer still describes the attempt that ran.
@@ -770,75 +784,6 @@ def build_plan_review_packet_for_dry_run(ctx: ToolContext, request: "_PlanReques
         "manifest": prepared["manifest"], "system_prompt": system_prompt,
         "user_content": user_content, "fingerprint": prepared["fingerprint"],
     }
-
-
-def _governance_text(system_root: pathlib.Path, rel_path: str) -> str:
-    """A governance document's text, or "" when it is missing: `explicit` returns a truthy
-    omission NOTE, which would ship AS the constitution/architecture; a constitutional packet
-    without the real document must be an assembly failure (D26/W3), not a note."""
-    text = load_governance_doc(system_root, rel_path, on_missing="explicit")
-    return "" if text.startswith("[⚠️ OMISSION") else text
-
-
-def _build_packet(
-    ctx: ToolContext, *, spec: dict, request: _PlanRequest, manifest: dict, constitutional: bool,
-    system_root: pathlib.Path, active_root: pathlib.Path, cycle_index: int, enforcement: str,
-    previous: Optional[dict],
-) -> tuple[str, str, str]:
-    """(system_prompt, user_content, session_task) — the lean packet (plan §7.2 C)."""
-    try:
-        checklist = load_checklist_section("Plan Review Checklist")
-    except Exception as exc:
-        log.warning("Could not load Plan Review Checklist: %s", exc)
-        checklist = ""
-    bible_text = _governance_text(system_root, "BIBLE.md")
-    architecture_text = _governance_text(system_root, "docs/ARCHITECTURE.md")
-    bible_nav_map = architecture_nav_map = ""
-    if not constitutional:
-        from ouroboros.context_layout import generate_doc_nav_map
-
-        if bible_text.strip():
-            bible_nav_map = generate_doc_nav_map(bible_text, title="BIBLE.md", rel_path="BIBLE.md")
-        if architecture_text.strip():
-            architecture_nav_map = generate_doc_nav_map(
-                architecture_text, title="ARCHITECTURE.md", rel_path="docs/ARCHITECTURE.md"
-            )
-    def _system(by_retrieval: bool) -> str:
-        return build_plan_review_system_prompt(
-            checklist_section=checklist, constitutional=constitutional,
-            bible_text=bible_text if constitutional else None, cycle_index=cycle_index,
-            enforcement=enforcement,
-            **_packet_kwargs(build_plan_review_system_prompt,
-                             bible_locator=str(system_root / "BIBLE.md"), bible_nav_map=bible_nav_map or None,
-                             architecture_text=architecture_text if constitutional else None,
-                             architecture_locator=str(system_root / "docs" / "ARCHITECTURE.md"),
-                             architecture_nav_map=architecture_nav_map or None,
-                             governance_by_retrieval=by_retrieval),
-        )
-
-    system_prompt = _system(False)
-    # plan_packet renders CYCLE records; the previous paid wave is exactly one (B-03).
-    prior_cycles = ([{
-        "cycle_index": (previous or {}).get("cycle_index"),
-        "aggregate": (previous or {}).get("aggregate"),
-        "findings": list((previous or {}).get("findings") or []),
-    }] if previous else [])
-    dispositions = list((previous or {}).get("dispositions") or [])
-    delta = (  # a truncated frozen body (durable-state fit) is never diffed element-wise
-        {"unavailable": "previous frozen spec body truncated to fit the durable state; hashes name the original"}
-        if previous and previous.get("spec_body_truncated")
-        else plan_spec.spec_delta(previous.get("spec"), spec) if previous else None
-    )
-    common = dict(
-        objective=_task_objective(ctx), goal=spec["goal"], plan_prose=request.plan, spec=spec,
-        prior_cycles=prior_cycles, dispositions=dispositions, spec_delta=delta,
-        root_exploration_log=_root_exploration_log(ctx),
-        **_packet_kwargs(build_plan_review_user_content, cycle_index=cycle_index),
-    )
-    user_content = build_plan_review_user_content(manifest=manifest, **common)
-    # session task = the executor's COMPACT form: governance by mandatory retrieval, not inline
-    session_task = _session_task_text(_system(True), user_content, str(active_root))
-    return system_prompt, user_content, session_task
 
 
 def _cycles_exhausted(
@@ -942,6 +887,10 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
             "ERROR: PLAN_REVIEW_DISPOSITION_UNBINDABLE: no recorded plan-review wave holds "
             f"fingerprint {fingerprint} (compact history is not dispositionable). No plan attempt was recorded."
         )
+    try:
+        wave = _authority_wave(root, task_id, wave) or wave
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return "ERROR: PLAN_REVIEW_DISPOSITION_UNBINDABLE: exact wave is unreadable: " + str(exc)
     # I-01: a disposition closes ONLY the CURRENT attempt's wave (never a superseded one).
     attempt = state.get("current_attempt") if isinstance(state.get("current_attempt"), dict) else {}
     current_fp = str(attempt.get("fingerprint") or "")
@@ -979,10 +928,21 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
     closure = plan_spec.closure_after_disposition(
         str(wave.get("aggregate") or ""), wave.get("findings") or [], items, enforcement,
     )
+    disposition_recorded_at = utc_now_iso()
     try:
+        prior_ref = wave.get("wave_artifact") if isinstance(wave.get("wave_artifact"), dict) else {}
+        exact = _read_plan_review_wave_artifact(root, task_id, prior_ref)
+        exact.update({
+            "dispositions": list(items), "closed": bool(closure["closed"]),
+            "closure_notes": list(closure["notes"]),
+            "disposition_recorded_at": disposition_recorded_at,
+            "supersedes_wave_artifact": prior_ref,
+        })
+        disposition_ref = _persist_plan_review_wave_artifact(root, task_id, exact)
         stored = record_plan_review_dispositions(
             root, task_id, fingerprint=fingerprint, dispositions=items,
             closed=bool(closure["closed"]), closure_notes=list(closure["notes"]),
+            wave_artifact=disposition_ref, recorded_at=disposition_recorded_at,
         )
     except (OSError, TimeoutError, ValueError) as exc:
         return "ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: " + str(exc)
@@ -995,5 +955,3 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
 
 
 # ------------------------------------------------------------------------ rendering
-
-

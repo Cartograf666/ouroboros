@@ -110,6 +110,7 @@ class ReviewRequest:
     policy: Dict[str, Any] = field(default_factory=dict)
     task_id: str = ""
     messages: List[Dict[str, Any]] = field(default_factory=list)
+    slot_messages: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
     call_type: str = ""
     max_tokens: int | None = None
     temperature: float | None = None
@@ -121,6 +122,7 @@ class ReviewRequest:
     # because a delegated reviewer retrieves context with its own tools (D12).
     session_root: str = ""
     session_task: str = ""
+    session_threads: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

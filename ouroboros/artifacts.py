@@ -770,6 +770,52 @@ def artifact_record(path: pathlib.Path, *, kind: str = "task_artifact", source_p
     return record
 
 
+def store_task_artifact_bytes(
+    drive_root: Union[pathlib.Path, str],
+    task_id: str,
+    name: str,
+    data: bytes,
+    *,
+    kind: str = "task_artifact",
+) -> Dict[str, Any]:
+    """Persist immutable task-owned bytes and register the actor-readable file.
+
+    This is the byte-oriented twin of ``copy_file_to_task_artifacts`` for
+    producers that already own canonical bytes. Existing-valid-content wins;
+    a name collision with different bytes is refused instead of rewriting a
+    durable authority ref.
+    """
+    safe_name = pathlib.Path(str(name or "")).name
+    if not safe_name or safe_name in {".", ".."} or safe_name != str(name):
+        raise ValueError("task artifact name must be one plain filename")
+    if artifact_store_path_block_reason(pathlib.Path(safe_name)):
+        raise ValueError("task artifact name is reserved")
+    artifact_dir = task_artifact_dir_path(drive_root, task_id, create=True)
+    path = artifact_dir / safe_name
+    if path.exists():
+        existing = path.read_bytes()
+        if existing != data:
+            raise ValueError(f"task artifact collision: {safe_name}")
+    else:
+        write_bytes_atomic(path, data)
+    record = artifact_record(path, kind=kind)
+    manifest_path = artifact_dir / _ARTIFACT_MANIFEST
+    manifest_doc = read_json_dict(manifest_path) or {}
+    manifest = manifest_doc.get("artifacts") if isinstance(manifest_doc.get("artifacts"), dict) else {}
+    manifest = {str(key): dict(value) for key, value in manifest.items() if isinstance(value, dict)}
+    manifest[safe_name] = dict(record)
+    atomic_write_json(
+        manifest_path, {"schema_version": 1, "artifacts": manifest}, trailing_newline=True,
+    )
+    return {
+        "root": "artifact_store",
+        "path": safe_name,
+        "sha256": record["sha256"],
+        "bytes": record["size"],
+        "kind": kind,
+    }
+
+
 def _artifact_versions_dir(drive_root: pathlib.Path, task_id: str, artifact_name: str) -> pathlib.Path:
     safe_name = pathlib.Path(artifact_name).name.replace("/", "_").replace("\\", "_")
     if not safe_name or safe_name in {".", ".."}:

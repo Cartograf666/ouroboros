@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from hashlib import sha256
+import inspect
 import json
 import logging
 import pathlib
@@ -26,6 +27,10 @@ from ouroboros.utils import utc_now_iso
 
 
 PLAN_REVIEW_MAX_TOKENS = 65536
+from ouroboros.tools.plan_review_artifacts import (  # noqa: E402, F401 - compatibility imports
+    persist_wave as persist_plan_review_wave_artifact,
+    read_wave as read_plan_review_wave_artifact,
+)
 PLAN_REVIEW_EFFORT = "high"
 PLAN_REVIEW_SLOT_TIMEOUT_SEC = 560
 # Per-slot provenance of what the reviewer read (BIBLE P3, retrieving reviewers):
@@ -35,6 +40,102 @@ HOST_FILE_READ_ASSEMBLED = "host_assembled_packet"
 HOST_FILE_READ_UNOBSERVED = "unobserved"
 
 log = logging.getLogger(__name__)
+
+
+def _packet_kwargs(fn: Any, **candidates: Any) -> Dict[str, Any]:
+    parameters = inspect.signature(fn).parameters
+    return {key: value for key, value in candidates.items() if key in parameters}
+
+
+def _task_objective(ctx: ToolContext) -> str:
+    contract = getattr(ctx, "task_contract", {})
+    metadata = getattr(ctx, "task_metadata", {})
+    if not isinstance(contract, dict) or not contract:
+        contract = metadata.get("task_contract") if isinstance(metadata, dict) else {}
+    contract = contract if isinstance(contract, dict) else {}
+    return str(contract.get("objective") or contract.get("description") or "")
+
+
+def _governance_text(system_root: pathlib.Path, rel_path: str) -> str:
+    from ouroboros.tools.review_helpers import load_governance_doc
+
+    text = load_governance_doc(system_root, rel_path, on_missing="explicit")
+    return "" if text.startswith("[⚠️ OMISSION") else text
+
+
+def _session_task_text(system_prompt: str, user_content: str, session_root: str) -> str:
+    return (
+        "RETRIEVING REVIEWER (agent session): you run read-only inside "
+        f"{session_root or 'the active workspace'}. The evidence below is the host's REDACTED "
+        "snapshot — the same bytes every reviewer sees — so do NOT re-read the raw evidence "
+        "locators (a session reading originals would leak what the api route redacts, 4e133c8a); "
+        "the ONE exception is the governance pack — BIBLE.md and docs/ARCHITECTURE.md are public "
+        "repository documents you MAY read raw, and MUST read in full when the pack marks them "
+        "MANDATORY FULL READS (a self-modification plan), even if the agent also declared them as "
+        "evidence. Retrieve any OTHER repository context with your own tools.\n\n"
+        + system_prompt + "\n\n" + user_content
+    )
+
+
+def build_plan_review_packet(
+    ctx: ToolContext, *, spec: dict, request: Any, manifest: dict, constitutional: bool,
+    system_root: pathlib.Path, active_root: pathlib.Path, cycle_index: int,
+    enforcement: str, previous: Optional[dict],
+) -> tuple[str, str, str]:
+    """Build the api packet and route-owned retrieving-session task."""
+    from ouroboros.context_layout import generate_doc_nav_map
+    from ouroboros.tools import plan_spec
+    from ouroboros.tools.plan_packet import (
+        build_plan_review_system_prompt, build_plan_review_user_content,
+    )
+    from ouroboros.tools.review_helpers import load_checklist_section
+
+    try:
+        checklist = load_checklist_section("Plan Review Checklist")
+    except Exception as exc:
+        log.warning("Could not load Plan Review Checklist: %s", exc)
+        checklist = ""
+    bible_text = _governance_text(system_root, "BIBLE.md")
+    architecture_text = _governance_text(system_root, "docs/ARCHITECTURE.md")
+    bible_nav_map = architecture_nav_map = ""
+    if not constitutional:
+        if bible_text.strip():
+            bible_nav_map = generate_doc_nav_map(bible_text, title="BIBLE.md", rel_path="BIBLE.md")
+        if architecture_text.strip():
+            architecture_nav_map = generate_doc_nav_map(
+                architecture_text, title="ARCHITECTURE.md", rel_path="docs/ARCHITECTURE.md")
+
+    def system(by_retrieval: bool) -> str:
+        return build_plan_review_system_prompt(
+            checklist_section=checklist, constitutional=constitutional,
+            bible_text=bible_text if constitutional else None, cycle_index=cycle_index,
+            enforcement=enforcement,
+            **_packet_kwargs(
+                build_plan_review_system_prompt,
+                bible_locator=str(system_root / "BIBLE.md"), bible_nav_map=bible_nav_map or None,
+                architecture_text=architecture_text if constitutional else None,
+                architecture_locator=str(system_root / "docs" / "ARCHITECTURE.md"),
+                architecture_nav_map=architecture_nav_map or None,
+                governance_by_retrieval=by_retrieval,
+            ),
+        )
+
+    system_prompt = system(False)
+    prior = ([{"cycle_index": previous.get("cycle_index"), "aggregate": previous.get("aggregate"),
+               "findings": list(previous.get("findings") or [])}] if previous else [])
+    delta = (
+        {"unavailable": "previous frozen spec body truncated to fit the durable state; hashes name the original"}
+        if previous and previous.get("spec_body_truncated")
+        else plan_spec.spec_delta(previous.get("spec"), spec) if previous else None
+    )
+    user_content = build_plan_review_user_content(
+        manifest=manifest, objective=_task_objective(ctx), goal=spec["goal"],
+        plan_prose=request.plan, spec=spec, prior_cycles=prior,
+        dispositions=list((previous or {}).get("dispositions") or []), spec_delta=delta,
+        root_exploration_log=root_exploration_log(ctx),
+        **_packet_kwargs(build_plan_review_user_content, cycle_index=cycle_index),
+    )
+    return system_prompt, user_content, _session_task_text(system(True), user_content, str(active_root))
 
 
 def plan_deadline_skip(ctx: ToolContext, *, emit: bool = False) -> str:
@@ -140,6 +241,8 @@ async def run_plan_review_slots(
     session_task: str = "",
     session_root: str = "",
     output_contract: str = "",
+    slot_messages: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    session_threads: Optional[Dict[str, str]] = None,
 ) -> list[dict]:
     """ONE ``ReviewRequest`` fanned across the configured rows through the substrate.
 
@@ -158,6 +261,7 @@ async def run_plan_review_slots(
         messages=build_plan_review_messages(
             system_prompt, user_content, plan_user_stable_len(user_content),
         ),
+        slot_messages=dict(slot_messages or {}),
         task_id=str(getattr(ctx, "task_id", "") or "plan_review"),
         call_type="plan_review",
         max_tokens=PLAN_REVIEW_MAX_TOKENS,
@@ -165,6 +269,7 @@ async def run_plan_review_slots(
         no_proxy=True,
         session_task=session_task,
         session_root=session_root,
+        session_threads=dict(session_threads or {}),
         policy={"output_contract": output_contract} if output_contract else {},
     )
     loop = asyncio.get_running_loop()
@@ -226,6 +331,11 @@ def _plan_row_from_actor(actor: Dict[str, Any], slot: Any) -> dict:
         # the error prose for the code or the reset instant.
         **_typed_facts_from(actor, lambda source, key: source.get(key)),
         "capability_delta": usage.get("capability_delta") or [],
+        "review_thread_id": str(usage.get("review_thread_id") or ""),
+        "review_turn_id": str(usage.get("review_turn_id") or ""),
+        "review_thread_receipt": usage.get("review_thread_receipt") or {},
+        "auth_route_receipt": usage.get("auth_route_receipt") or {},
+        "applied_profile": str(usage.get("applied_profile") or ""),
     }
 
 

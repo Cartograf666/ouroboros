@@ -732,12 +732,13 @@ def _compact_plan_review_wave(wave: Dict[str, Any]) -> Dict[str, Any]:
         "request_fingerprint": str(wave.get("request_fingerprint") or ""),
         "aggregate": str(wave.get("aggregate") or ""),
         "counts": {
-            "findings": len(findings),
+            "findings": int(wave.get("findings_total") or len(findings)),
             "dispositions": len(wave.get("dispositions") or []),
             "blocking": sum(1 for f in findings if isinstance(f, dict) and f.get("class") == "blocking"),
         },
         "closed": bool(wave.get("closed")),
         "paid": bool(wave.get("paid")),
+        "wave_artifact": copy.deepcopy(wave.get("wave_artifact") or {}),
     }
 
 
@@ -855,7 +856,6 @@ def record_plan_review_wave(
     state = _update_plan_review_state(results_drive_root, task_id, _record)
     return plan_review_wave(state, fingerprint) or {}
 
-
 def record_plan_review_dispositions(
     results_drive_root: Any,
     task_id: str,
@@ -864,9 +864,10 @@ def record_plan_review_dispositions(
     dispositions: List[Dict[str, Any]],
     closed: bool,
     closure_notes: Optional[List[str]] = None,
+    wave_artifact: Optional[Dict[str, Any]] = None,
+    recorded_at: str = "",
 ) -> Dict[str, Any]:
     """Store the agent's dispositions on one FULL wave and its resulting closure.
-
     A wave that is already closed is immutable (``PLAN_REVIEW_DISPOSITION_IMMUTABLE``);
     a GREEN/REVISE_PLAN/DEGRADED wave never becomes closed here (the closure table in
     ``plan_spec.closure_after_disposition`` is the caller's authority)."""
@@ -878,9 +879,11 @@ def record_plan_review_dispositions(
         if wave.get("closed"):
             raise ValueError("PLAN_REVIEW_DISPOSITION_IMMUTABLE: a closed wave cannot be changed")
         wave["dispositions"] = copy.deepcopy(list(dispositions))
-        wave["disposition_recorded_at"] = utc_now_iso()
+        wave["disposition_recorded_at"] = recorded_at or utc_now_iso()
         if closure_notes is not None:
             wave["closure_notes"] = list(closure_notes)
+        if wave_artifact is not None:
+            wave["wave_artifact"] = copy.deepcopy(wave_artifact)
         if closed and str(wave.get("aggregate") or "") == "REVIEW_REQUIRED":
             wave["closed"] = True
         state["current_attempt"] = {"fingerprint": fingerprint, "status": "open", "reason": ""}
@@ -888,7 +891,6 @@ def record_plan_review_dispositions(
 
     state = _update_plan_review_state(results_drive_root, task_id, _record)
     return plan_review_wave(state, fingerprint) or {}
-
 
 def mark_plan_review_cycles_exhausted(
     results_drive_root: Any, task_id: str, *, fingerprint: str,
@@ -903,8 +905,6 @@ def mark_plan_review_cycles_exhausted(
 
     state = _update_plan_review_state(results_drive_root, task_id, _mark)
     return plan_review_wave(state, fingerprint) or {}
-
-
 
 def fail_tasks(results_drive_root: Any, tasks: Any, *, reason_code: str, result: str) -> int:
     """Terminally FAIL a batch of queued tasks (e.g. on budget exhaustion) so their
