@@ -355,21 +355,22 @@ def archive_task_service_logs(
 
 
 def _refresh_ready(record: ServiceRecord) -> bool:
-    if record.proc.poll() is not None:
-        record.ready = False
-        return False
-    if record.ready:
-        return True
-    readiness = record.readiness or {}
-    contains = str(readiness.get("stdout_contains") or readiness.get("log_contains") or "").strip()
-    if not contains:
-        record.ready = True
-        record.ready_observed_at = record.ready_observed_at or utc_now_iso()
-        return True
-    record.ready = _readiness_marker_observed(record, contains)
-    if record.ready:
-        record.ready_observed_at = record.ready_observed_at or utc_now_iso()
-    return record.ready
+    with _LOCK:
+        if record.proc.poll() is not None:
+            record.ready = False
+            return False
+        if record.ready:
+            return True
+        readiness = record.readiness or {}
+        contains = str(readiness.get("stdout_contains") or readiness.get("log_contains") or "").strip()
+        if not contains:
+            record.ready = True
+            record.ready_observed_at = record.ready_observed_at or utc_now_iso()
+            return True
+        record.ready = _readiness_marker_observed(record, contains)
+        if record.ready:
+            record.ready_observed_at = record.ready_observed_at or utc_now_iso()
+        return record.ready
 
 
 def _readiness_marker_observed(record: ServiceRecord, marker: str) -> bool:
