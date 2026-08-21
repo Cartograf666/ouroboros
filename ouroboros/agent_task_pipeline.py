@@ -1217,7 +1217,8 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
             _consolidation_route,
         )
         task_id = str(task.get("id") or "unknown")
-        canonical_root = pathlib.Path(task.get("budget_drive_root") or drive_logs.parent); summary_id = f"task-narrative:{task_id}"
+        canonical_root = pathlib.Path(task.get("budget_drive_root") or drive_logs.parent)
+        summary_id = f"task-narrative:{task_id}"
         n_tool_calls = len(llm_trace.get("tool_calls", []) or [])
         rounds = int(usage.get("rounds") or 0)
         cost_text = _synthesis_cost_text(usage)
@@ -1225,22 +1226,19 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
         reason_code = str(usage.get("reason_code") or "")
         review_projection = _compact_review_projection(llm_trace)
         presence_fields = presence_provenance_fields(task)
-        result_root = pathlib.Path(getattr(env, "drive_root", canonical_root)); stored_result = load_task_result(result_root, task_id) or {}
+        result_root = pathlib.Path(getattr(env, "drive_root", canonical_root))
+        stored_result = load_task_result(result_root, task_id) or {}
         result_ref = {"kind": "task_result", "task_id": task_id, "reader": "get_task_result"}
         def _append_summary(value: str) -> None:
             append_canonical_task_summary(canonical_root, {
                 "ts": utc_now_iso(), "direction": "system", "type": "task_summary",
                 "summary_kind": "authored_root_summary", "summary_id": summary_id,
-                "task_id": task_id, "parent_task_id": str(task.get("parent_task_id") or ""),
-                "root_task_id": str(task.get("root_task_id") or task_id),
-                "project_id": str(task.get("project_id") or ""), "chat_id": int(task.get("chat_id") or 0),
-                "delegation_role": str(task.get("delegation_role") or ""), "role": str(task.get("role") or ""),
+                "task_id": task_id, "parent_task_id": str(task.get("parent_task_id") or ""), "root_task_id": str(task.get("root_task_id") or task_id),
+                "project_id": str(task.get("project_id") or ""), "chat_id": int(task.get("chat_id") or 0), "delegation_role": str(task.get("delegation_role") or ""), "role": str(task.get("role") or ""),
                 "status": str(stored_result.get("status") or "completed"), "outcome": completion_status_label(stored_result, usage),
                 "outcome_final": False, "outcome_authority": "pre_finalization_narrative_context",
-                "text": value, "tool_calls": n_tool_calls, "rounds": rounds,
-                "outcome_axes": outcome_axes, "reason_code": reason_code,
-                "result_ref": result_ref, "source_coverage": {"task_result": result_ref},
-                **_summary_row_cost_fields(usage), **presence_fields,
+                "text": value, "tool_calls": n_tool_calls, "rounds": rounds, "outcome_axes": outcome_axes, "reason_code": reason_code,
+                "result_ref": result_ref, "source_coverage": {"task_result": result_ref}, **_summary_row_cost_fields(usage), **presence_fields,
                 **({"review_projection": review_projection} if review_projection.get("panels") else {}),
             })
         # Skip LLM summary for trivial tasks.

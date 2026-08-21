@@ -83,16 +83,25 @@ def test_reflection_marker_uses_canonical_format():
     assert "OMISSION NOTE" in out and "[+" not in out
 
 
-def test_task_contract_marker_uses_canonical_format():
+def test_task_contract_preserves_complete_authority_fields():
     import inspect
 
     from ouroboros.contracts import task_contract
 
     source = inspect.getsource(task_contract)
     assert "chars omitted)" not in source  # legacy marker retired
-    # Both bounded fields delegate to the shared primitive (marker + floor SSOT).
-    assert source.count("truncate_review_artifact") >= 2
     assert "OMISSION NOTE" not in source  # no hand-rolled marker copies remain
+
+    intent = "intent-" + ("i" * 900) + "-tail"
+    claim = "claim-" + ("c" * 700) + "-tail"
+    support = "support-" + ("s" * 800) + "-tail"
+    contract = task_contract.build_task_contract({
+        "delegation_budget": {"intent_note": intent},
+        "acceptance_claims": [{"claim": claim, "support": support}],
+    })
+    assert contract["delegation_budget"]["intent_note"] == intent
+    assert contract["acceptance_claims"][0]["claim"] == claim
+    assert contract["acceptance_claims"][0]["support"] == support
 
 
 # ---------------------------------------------------------------------------
