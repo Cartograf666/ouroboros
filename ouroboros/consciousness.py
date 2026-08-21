@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import concurrent.futures
-import hashlib
 import contextlib
+import hashlib
 import inspect
 import json
 import logging
@@ -1033,7 +1033,9 @@ class BackgroundConsciousness:
 
         try:
             from ouroboros.improvement_backlog import (
-                backlog_path, format_backlog_digest, load_backlog_items,
+                backlog_path,
+                format_backlog_digest,
+                load_backlog_items,
             )
 
             full_backlog_digest = format_backlog_digest(
@@ -1102,6 +1104,17 @@ class BackgroundConsciousness:
             or bool(recent_chat_coverage.get("omitted_matching_rows_unknown"))
         ):
             self._identity_unresolved_sources.add("recent-chat")
+        if observations is None:
+            observations = self._snapshot_pending_observations()
+        with self._observation_lock_for_instance():
+            observation_state = self._read_observation_state()
+        observation_gaps = list(observation_state.get("gap_reasons") or ())
+        if observation_gaps:
+            # The bounded observation view is still useful, but a malformed or
+            # otherwise unreadable row means the actor has only a partial source.
+            # Reuse the existing identity completeness envelope rather than
+            # adding a second approval or policy gate.
+            self._identity_unresolved_sources.add("background-observations")
         if self._identity_unresolved_sources:
             parts.append(
                 "## Identity update completeness\n\n"
@@ -1111,9 +1124,7 @@ class BackgroundConsciousness:
                 "prove complete unchanged sources; direct update_identity must abstain."
             )
 
-        if observations is None:
-            observations = self._snapshot_pending_observations()
-        if observations:
+        if observations or observation_gaps:
             parts.append(self._render_observations(observations))
 
         bg_info_lines = [

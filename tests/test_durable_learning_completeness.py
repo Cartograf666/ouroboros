@@ -451,3 +451,46 @@ def test_bgc_scheduled_tasks_omission_blocks_direct_identity_update(tmp_path):
         assert not (tmp_path / "memory" / "identity_journal.jsonl").exists()
     finally:
         bc._tool_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_bgc_observation_gap_blocks_direct_identity_update(tmp_path):
+    bc = _bg_fixture(tmp_path, backlog_count=0)
+    try:
+        store = tmp_path / "state" / "consciousness_observations.jsonl"
+        store.write_text(
+            '{"op":"enqueue","id":"valid","source":"runtime",'
+            '"kind":"text","time":"2026-08-21T00:00:00Z",'
+            '"payload":"known row","ref":null}\n'
+            '{"op":"enqueue","id":"broken"\n',
+            encoding="utf-8",
+        )
+        context = bc._build_context()
+        assert "source_complete=False" in context
+        assert "state/consciousness_observations.jsonl" in context
+        assert "background-observations" in context
+        content = "I must not rewrite identity across a known observation-source gap."
+        result = bc._execute_tool(_tool_call("update_identity", {"content": content}, "u1"), [])
+        assert "IDENTITY_UPDATE_ABSTAINED" in result
+        assert "background-observations" in result
+        assert not (tmp_path / "memory" / "identity_journal.jsonl").exists()
+    finally:
+        bc._tool_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_bgc_complete_observation_source_keeps_direct_identity_update_available(tmp_path):
+    bc = _bg_fixture(tmp_path, backlog_count=0)
+    try:
+        assert bc.inject_observation(
+            "complete observation", observation_id="complete-observation"
+        )
+        context = bc._build_context()
+        assert "source_complete=True" in context
+        assert "complete-observation" in context
+        content = "I retain direct identity authority with a complete observation source."
+        result = bc._execute_tool(_tool_call("update_identity", {"content": content}, "u1"), [])
+        assert result.startswith("OK: identity updated")
+        assert content in (tmp_path / "memory" / "identity_journal.jsonl").read_text(
+            encoding="utf-8"
+        )
+    finally:
+        bc._tool_executor.shutdown(wait=False, cancel_futures=True)
