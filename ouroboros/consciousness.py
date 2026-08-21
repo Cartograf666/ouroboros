@@ -375,6 +375,15 @@ class BackgroundConsciousness:
                         continue
                     if not self._validate_observation_row(item, line_no, gap_reasons):
                         continue
+                    if item.get("op") == "ack":
+                        identifier = item.get("id", item.get("observation_id"))
+                        if identifier not in rows:
+                            gap_reasons.append(
+                                f"ack row references unknown observation "
+                                f"{identifier!r} at line {line_no}"
+                            )
+                            # Do not pre-ack an enqueue that may appear later.
+                            continue
                     self._index_observation_row(item, rows, acked)
 
         self._observation_state_cache = {
@@ -505,7 +514,10 @@ class BackgroundConsciousness:
                     return False
                 state = self._read_observation_state(force=True)
                 if state.get("gap_reasons"):
-                    log.error("Cannot acknowledge observations with unreadable inbox rows: %s", state["gap_reasons"][:3])
+                    log.error(
+                        "Cannot acknowledge observations with unreadable inbox rows: %s",
+                        state["gap_reasons"][:3],
+                    )
                     return False
                 for observation in observations:
                     identifier = str(observation.get("id") or "")
@@ -895,7 +907,11 @@ class BackgroundConsciousness:
             if not final_content.strip():
                 self._cycle_ack_allowed = False
             if not self.is_paused and not self._stop_requested():
-                if not thought_written or not self._cycle_ack_allowed or not self._ack_observations(observation_snapshot):
+                if (
+                    not thought_written
+                    or not self._cycle_ack_allowed
+                    or not self._ack_observations(observation_snapshot)
+                ):
                     self._last_idle_reason = "observation_ack_pending"
                     return False
             elif observation_snapshot:

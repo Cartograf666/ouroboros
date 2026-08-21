@@ -231,6 +231,32 @@ def test_unknown_and_malformed_rows_create_gaps_and_block_ack(tmp_path):
     assert restarted._ack_observations(restarted._snapshot_pending_observations()) is False
 
 
+def test_ghost_ack_is_a_gap_and_does_not_preack_later_enqueue(tmp_path):
+    _, drive = _make(tmp_path)
+    store = drive / "state" / "consciousness_observations.jsonl"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    ghost_ack = {"op": "ack", "id": "future-id", "time": "2026-08-22T00:00:00Z"}
+    later_enqueue = {
+        "op": "enqueue",
+        "id": "future-id",
+        "source": "test",
+        "kind": "trace",
+        "time": "2026-08-22T00:00:01Z",
+        "payload": "must remain pending",
+        "ref": None,
+    }
+    store.write_text(
+        json.dumps(ghost_ack) + "\n" + json.dumps(later_enqueue) + "\n",
+        encoding="utf-8",
+    )
+    restarted, _ = _make(tmp_path)
+    status = restarted.status_snapshot()
+    assert status["observation_source_complete"] is False
+    assert status["observation_gap_count"] == 1
+    assert [row["id"] for row in restarted._snapshot_pending_observations()] == ["future-id"]
+    assert restarted._ack_observations(restarted._snapshot_pending_observations()) is False
+
+
 def test_success_acks_only_cycle_snapshot_and_later_rows_stay_pending(tmp_path, monkeypatch):
     bc, _ = _make(tmp_path)
     bc.inject_observation("first", observation_id="first")
