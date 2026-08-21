@@ -2251,7 +2251,7 @@ def _get_task_result(ctx: ToolContext, task_id: str, include_authority: bool = F
     if bool(include_authority):
         from ouroboros.agent_startup_checks import task_result_authority_projection
 
-        authority = task_result_authority_projection(data)
+        authority = task_result_authority_projection(data, drive_root=status_drive_root)
         return json.dumps({
             "status": "available", "authority": authority,
             "source": {"tool": "get_task_result", "task_id": str(task_id)},

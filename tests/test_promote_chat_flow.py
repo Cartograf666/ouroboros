@@ -62,6 +62,7 @@ def test_cat_router_preview_promote_first_request_and_direct_harness_keep_full_a
     from ouroboros.contracts.task_contract import attach_task_contract
     from ouroboros.context import build_llm_messages
     from ouroboros.memory import Memory
+    from ouroboros.outcomes import append_verification_receipt
     from ouroboros.projects_registry import create_project
     from ouroboros.subagent_work_order import assignment_instructions, compile_external_work_order
     from ouroboros.tools.control import (
@@ -77,12 +78,34 @@ def test_cat_router_preview_promote_first_request_and_direct_harness_keep_full_a
     predecessor_id = "cat-old-root"
     tail = "CLAUDEXOR_ONLY; L1 MUST ASK L2 TO SPAWN L3"
     result_tail = "KEEP_EXISTING_TOWER_ASSET; DO_NOT_REBUILD_FROM_SCRATCH"
+    artifact_error = "ARTIFACT_CAPTURE_FAILED_AFTER_PARTIAL_COPY"
+    artifact_finalized_at = "2026-08-21T00:00:00Z"
+    capability_delta = "HARNESS_ROUTE_REDUCED_TO_NATIVE_ONLY"
+    delegated_custody = "DELEGATED_RUN_STILL_OPEN"
+    verification_ledger = "VERIFICATION_LEDGER_BLOCKER"
+    verification_receipt = "CANONICAL_RECEIPT_FAILED"
+    future_terminal_fact = "FUTURE_TERMINAL_AUTHORITY_FIELD"
+    process_evidence = (
+        "RAW_LOOP_TRANSCRIPT_MUST_NOT_BE_INHERITED",
+        "UNRELATED_ROUTING_METADATA_MUST_NOT_BE_INHERITED",
+        "RAW_LLM_TRACE_MUST_NOT_BE_INHERITED",
+    )
     predecessor = {
         "task_id": predecessor_id,
         "status": "cancelled",
         "title": "Cat Tower Builder",
         "objective": "o" * 700 + tail,
         "result": "completed implementation evidence\n" + "r" * 700 + result_tail,
+        "artifact_status": "failed",
+        "artifact_error": artifact_error,
+        "artifact_finalized_at": artifact_finalized_at,
+        "capability_delta": {"reduced": True, "detail": capability_delta},
+        "delegated_runs_unreconciled": [delegated_custody],
+        "verification_ledger": {"entries": [{"evidence": verification_ledger}]},
+        "future_terminal_fact": {"detail": future_terminal_fact},
+        "loop_outcome": {"final_text": process_evidence[0] * 500},
+        "metadata": {"main_routing_manifest": {"raw": process_evidence[1]}},
+        "llm_trace": {"reasoning_notes": [process_evidence[2]]},
         "project_id": "cat-tower",
         "task_contract": {
             "objective": "o" * 700 + tail,
@@ -96,6 +119,10 @@ def test_cat_router_preview_promote_first_request_and_direct_harness_keep_full_a
     (result_dir / f"{predecessor_id}.json").write_text(
         json.dumps(predecessor), encoding="utf-8",
     )
+    append_verification_receipt(tmp_path, predecessor_id, {
+        "criterion_id": "canonical-receipt", "status": "fail",
+        "evidence": verification_receipt,
+    })
     preview = server._task_result_ground_truth(predecessor)
     assert preview["objective"].endswith("chars omitted]")
     assert preview["authority_source"]["arguments"] == {
@@ -169,15 +196,18 @@ def test_cat_router_preview_promote_first_request_and_direct_harness_keep_full_a
     })
     assert child_contract["predecessor_authority"] == task["predecessor_authority"]
 
-    assert tail in rendered
-    assert result_tail in rendered
+    surfaces = (rendered, retrieved, direct_harness, nested_work_order)
+    for surface in surfaces:
+        for marker in (
+            tail, result_tail, artifact_error, artifact_finalized_at, capability_delta,
+            delegated_custody, verification_ledger, verification_receipt,
+            future_terminal_fact,
+        ):
+            assert marker in surface
+        for marker in process_evidence:
+            assert marker not in surface
     assert "never use native/API fallback" in rendered
-    assert result_tail in retrieved
-    assert tail in direct_harness
-    assert result_tail in direct_harness
     assert "L1 asks L2 to spawn L3" in direct_harness
-    assert tail in nested_work_order
-    assert result_tail in nested_work_order
     assert "never use native/API fallback" in nested_work_order
 
 

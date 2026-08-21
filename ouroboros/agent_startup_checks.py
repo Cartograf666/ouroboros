@@ -15,23 +15,70 @@ from ouroboros.utils import atomic_write_json, utc_now_iso, read_text, append_js
 
 log = logging.getLogger(__name__)
 
-_TASK_RESULT_AUTHORITY_FIELDS = (
-    "task_id", "status", "title", "objective", "description", "expected_output",
-    "context", "result", "trace_summary", "reason_code", "outcome_axes",
-    "project_id", "workspace_root", "workspace_mode", "artifact_status",
-    "artifact_bundle", "artifacts", "trace_refs", "verification_receipts",
-    "origin_message_ref", "origin_message_text", "predecessor_authority_source",
-    "plan_review_state",
-)
+_TASK_RESULT_PROCESS_EVIDENCE_FIELDS = frozenset({
+    # These are raw reasoning/transport records, not terminal task authority.
+    # Exact immutable refs and compact terminal facts remain top-level and are
+    # therefore inherited automatically; the transcripts themselves stay in
+    # observability/checkpoint storage for explicit reads.
+    "loop_outcome",
+    "metadata",
+    "llm_trace",
+    "reasoning_notes",
+    "tool_calls",
+    "candidate_answers",
+    "messages",
+    "transcript",
+    "model_transcript",
+    "tool_transcript",
+    "review_runs",
+    "raw_request",
+    "raw_response",
+    "request_wire",
+    "request_wire_history",
+})
 
 
-def task_result_authority_projection(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Exact decision-bearing result/contract bytes named by a router pointer."""
+def _authority_verification_receipts(
+    row: Dict[str, Any], drive_root: Any,
+) -> list[Dict[str, Any]]:
+    """Read the canonical receipt store, including the pre-copy-back child window."""
+
+    if drive_root is None:
+        return []
+    task_id = str(row.get("task_id") or row.get("id") or "").strip()
+    if not task_id:
+        return []
+    from ouroboros.outcomes import read_verification_receipts
+
+    receipts = read_verification_receipts(drive_root, task_id)
+    if receipts:
+        return receipts
+    from ouroboros.task_status import _child_drive_candidates
+
+    for child_drive in _child_drive_candidates(row):
+        if pathlib.Path(child_drive) == pathlib.Path(drive_root):
+            continue
+        receipts = read_verification_receipts(child_drive, task_id)
+        if receipts:
+            return receipts
+    return []
+
+
+def task_result_authority_projection(
+    row: Dict[str, Any], *, drive_root: Any = None,
+) -> Dict[str, Any]:
+    """Exact terminal authority, excluding raw model/tool/loop process evidence.
+
+    Task-result writers are intentionally additive.  Copying every top-level
+    terminal field except the explicit process-evidence carriers means a future
+    artifact, custody, verification, or capability fact cannot silently vanish
+    merely because this reader predates its field name.
+    """
 
     authority = {
-        key: copy.deepcopy(row[key])
-        for key in _TASK_RESULT_AUTHORITY_FIELDS
-        if key in row
+        key: copy.deepcopy(value)
+        for key, value in row.items()
+        if key not in _TASK_RESULT_PROCESS_EVIDENCE_FIELDS
     }
     contract = row.get("task_contract")
     if isinstance(contract, dict):
@@ -40,6 +87,9 @@ def task_result_authority_projection(row: Dict[str, Any]) -> Dict[str, Any]:
         from ouroboros.contracts.task_contract import build_task_contract
 
         authority["task_contract"] = build_task_contract(row)
+    receipts = _authority_verification_receipts(row, drive_root)
+    if receipts:
+        authority["verification_receipts"] = copy.deepcopy(receipts)
     return authority
 
 
@@ -132,7 +182,7 @@ def validate_task_authority_sources(env: Any, task: Dict[str, Any]) -> Dict[str,
             return _unavailable(predecessor, "named predecessor task result is missing or unreadable")
         task["predecessor_authority"] = {
             "source": dict(predecessor),
-            **task_result_authority_projection(predecessor_row),
+            **task_result_authority_projection(predecessor_row, drive_root=root),
         }
     else:
         metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
