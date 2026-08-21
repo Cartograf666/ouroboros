@@ -13,6 +13,8 @@ project (e.g. when curating from the штаб).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import pathlib
 from typing import Any, Dict, List
@@ -23,7 +25,12 @@ from ouroboros.project_facts import (
     sanitize_project_id,
 )
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.utils import append_jsonl, iter_jsonl_objects, utc_now_iso
+from ouroboros.utils import (
+    append_jsonl,
+    iter_jsonl_objects,
+    jsonl_generation_signature,
+    utc_now_iso,
+)
 
 log = logging.getLogger(__name__)
 
@@ -264,21 +271,89 @@ def mirror_tree_coordination_to_journal(project_id: str, root_id: str, task_id: 
         append_journal_milestone(pid, journal_kind, f"[swarm {kind}] ({who}): {text}", task_id=task_id)
 
 
-def _journal_read(ctx: ToolContext, project_id: str = "", limit: int = 30) -> str:
+def _journal_snapshot(source: Dict[str, Any], project_id: str) -> str:
+    payload = {
+        "schema_version": 1,
+        "project_id": project_id,
+        "source": source,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _journal_snapshot_rows(
+    path: pathlib.Path,
+    project_id: str,
+) -> tuple[List[Dict[str, Any]], str, bool]:
+    """Capture one stateless journal generation, retrying one concurrent append."""
+    rows: List[Dict[str, Any]] = []
+    snapshot = ""
+    for _attempt in range(2):
+        before = jsonl_generation_signature(path)
+        rows = [r for r in iter_jsonl_objects(path) if isinstance(r, dict)]
+        after = jsonl_generation_signature(path)
+        snapshot = _journal_snapshot(after, project_id)
+        if before and before == after:
+            return rows, snapshot, True
+    return rows, snapshot, False
+
+
+def _journal_read(
+    ctx: ToolContext,
+    project_id: str = "",
+    limit: int = 30,
+    offset: int = 0,
+    snapshot: str = "",
+) -> str:
     pid = _authorized_project_id(ctx, project_id)
     if not pid:
         return ("⚠️ TOOL_ARG_ERROR (journal_read): no project scope — this task is not "
                 "project-scoped and no explicit project_id was given.")
     path = project_journal_path(pid)
     if not path.is_file():
+        if str(snapshot or "").strip():
+            return (
+                "JOURNAL_READ_SNAPSHOT_CHANGED: the journal source is no longer "
+                "available; no mixed page was returned; restart with offset=0 and no snapshot."
+            )
         return f"(journal for project {pid} is empty)"
-    rows: List[Dict[str, Any]] = [r for r in iter_jsonl_objects(path) if isinstance(r, dict)]
-    take = max(1, min(int(limit or 30), 200))
-    omitted = max(0, len(rows) - take)
-    lines = []
-    if omitted:
-        lines.append(f"…[{omitted} earlier entries omitted — raise limit to see more]")
-    for row in rows[-take:]:
+    try:
+        take = max(1, min(int(limit or 30), 200))
+    except (TypeError, ValueError):
+        take = 30
+    try:
+        skip = max(0, int(offset or 0))
+    except (TypeError, ValueError):
+        skip = 0
+    rows, current_snapshot, stable = _journal_snapshot_rows(path, pid)
+    requested_snapshot = str(snapshot or "").strip().lower()
+    if not stable:
+        return (
+            "JOURNAL_READ_SNAPSHOT_CHANGED_DURING_READ: the journal changed while "
+            "the page was captured; no mixed page was returned; retry with offset=0 "
+            "and no snapshot."
+        )
+    if requested_snapshot and requested_snapshot != current_snapshot:
+        return (
+            "JOURNAL_READ_SNAPSHOT_CHANGED: the journal changed after the prior page; "
+            "no mixed page was returned; restart with offset=0 and no snapshot."
+        )
+    total = len(rows)
+    end = max(0, total - skip)
+    start = max(0, end - take)
+    page = rows[start:end]
+    remaining = start
+    lines = [
+        f"Page: total={total} returned={len(page)} offset={skip} "
+        f"remaining={remaining} snapshot={current_snapshot}"
+    ]
+    if remaining:
+        lines.append(
+            "Next older page: "
+            f"journal_read(project_id='{pid}', limit={take}, "
+            f"offset={skip + len(page)}, snapshot='{current_snapshot}')"
+        )
+    for row in page:
         lines.append(
             f"[{str(row.get('ts') or '')[:19]}] {str(row.get('kind') or 'note').upper()}: "
             f"{str(row.get('text') or '')}"
@@ -329,17 +404,29 @@ def journal_tail_digest(project_id: str, *, limit: int = 40) -> str:
     path = project_journal_path(pid)
     if not path.is_file():
         return ""
-    rows = [r for r in iter_jsonl_objects(path) if isinstance(r, dict)]
+    rows, snapshot, stable = _journal_snapshot_rows(path, pid)
     if not rows:
         return ""
-    take = rows[-max(1, int(limit)):]
+    page_size = max(1, int(limit))
+    take = rows[-page_size:]
     omitted = len(rows) - len(take)
     lines = [
         f"- [{str(r.get('ts') or '')[:16]}] {str(r.get('kind') or 'note')}: {str(r.get('text') or '')}"
         for r in take
     ]
     if omitted:
-        lines.insert(0, f"- …[{omitted} earlier milestones via journal_read]")
+        if stable:
+            lines.insert(0, (
+                f"- …[{omitted} earlier milestones; source="
+                f"journal_read(project_id='{pid}'); next="
+                f"journal_read(project_id='{pid}', limit={page_size}, "
+                f"offset={len(take)}, snapshot='{snapshot}') ]"
+            ))
+        else:
+            lines.insert(0, (
+                f"- …[{omitted} observed earlier milestones; journal changed during "
+                f"capture; restart with journal_read(project_id='{pid}', limit={page_size})]"
+            ))
     return "\n".join(lines)
 
 
@@ -384,11 +471,23 @@ def get_tools() -> List[ToolEntry]:
                     "type": "object",
                     "properties": {
                         "limit": {"type": "integer", "default": 30, "description": "Max entries (<=200)."},
+                        "offset": {
+                            "type": "integer",
+                            "default": 0,
+                            "description": "Number of newer entries already consumed.",
+                        },
+                        "snapshot": {
+                            "type": "string",
+                            "default": "",
+                            "description": "Stable cursor returned by the preceding page.",
+                        },
                         **common,
                     },
                 },
             },
-            lambda ctx, limit=30, project_id="": _journal_read(ctx, project_id, limit),
+            lambda ctx, limit=30, offset=0, snapshot="", project_id="": _journal_read(
+                ctx, project_id, limit, offset, snapshot,
+            ),
             timeout_sec=15,
         ),
         ToolEntry(

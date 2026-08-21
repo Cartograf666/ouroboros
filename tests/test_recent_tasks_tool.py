@@ -28,7 +28,12 @@ def _write_task(root, name, *, result="done", ts="2026-01-01T00:00:00Z", **extra
 
 def test_recent_tasks_empty_drive(tmp_path):
     data = json.loads(_handle_recent_tasks(_ctx(tmp_path)))
-    assert data == {"running": [], "tasks": [], "unreadable_tasks": []}
+    assert data["running"] == []
+    assert data["tasks"] == []
+    assert data["unreadable_tasks"] == []
+    assert data["total"] == 0
+    assert data["remaining"] == 0
+    assert data["next"] is None
 
 
 def test_recent_tasks_uses_canonical_budget_root_from_fork(tmp_path):
