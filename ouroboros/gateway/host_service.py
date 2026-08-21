@@ -366,18 +366,20 @@ def _presence_staged_files(
 ) -> tuple[pathlib.Path, ...]:
     if value in (None, []):
         return ()
-    if not isinstance(value, list) or len(value) > 25:
-        raise ValueError("staged_files must be a list of at most 25 paths")
+    if not isinstance(value, list):
+        raise ValueError("staged_files must be a list of paths")
     state_root = (ctx.skills_state_dir / skill_name).resolve(strict=False)
     files = []
     for index, raw in enumerate(value):
-        path = pathlib.Path(str(raw or "")).expanduser().resolve(strict=True)
+        # Keep the host boundary responsible only for request shape and source
+        # confinement.  Missing/non-file inputs and the staging limit belong to
+        # the existing canonical staging owner, which emits the complete typed
+        # ordinal manifest before Presence can call the model.
+        path = pathlib.Path(str(raw or "")).expanduser().resolve(strict=False)
         try:
             path.relative_to(state_root)
         except ValueError as exc:
             raise ValueError(f"staged_files[{index}] is outside this skill's state") from exc
-        if not path.is_file():
-            raise ValueError(f"staged_files[{index}] is not a file")
         files.append(path)
     return tuple(files)
 
