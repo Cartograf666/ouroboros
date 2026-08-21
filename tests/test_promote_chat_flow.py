@@ -1807,6 +1807,43 @@ def test_project_from_task_auto_names_from_objective(tmp_path):
     assert get_project(tmp_path, "task-obj01")["name"] == name
 
 
+def test_project_from_task_reuses_explicit_title_without_inline_light_call(tmp_path, monkeypatch):
+    """An already-authored title is the Project name; conversion must not buy a
+    second naming request while a complete human title already exists."""
+    import asyncio
+    import json
+
+    from ouroboros.gateway.projects import api_project_from_task
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+
+    write_task_result(
+        tmp_path,
+        "named01",
+        STATUS_RUNNING,
+        title="Ракетный стенд 🚀",
+        suggested_name="Ненужный запасной вариант",
+        objective="Длинное описание задачи",
+    )
+
+    async def _forbidden(*_args, **_kwargs):
+        raise AssertionError("LIGHT naming must not run for an explicit task title")
+
+    import ouroboros.project_naming as naming
+    monkeypatch.setattr(naming, "llm_project_name_async", _forbidden)
+
+    class _Req:
+        def __init__(self):
+            self.app = types.SimpleNamespace(
+                state=types.SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path)
+            )
+
+        async def json(self):
+            return {"task_id": "named01", "id": "task-named01"}
+
+    payload = json.loads(asyncio.run(api_project_from_task(_Req())).body)
+    assert payload["project"]["name"] == "Ракетный стенд 🚀"
+
+
 def test_project_from_task_uses_neutral_name_when_nothing_derivable(tmp_path):
     """Nothing derivable (no title/objective/description) → a NEUTRAL 'New project'
     name, never the bare task id (the owner explicitly rejects task-… names)."""
@@ -1963,10 +2000,7 @@ def test_bound_project_history_backfills_task_progress(tmp_path):
 
     main_resp = json.loads(asyncio.run(api(_Req({}))).body)
     main_texts = [m["text"] for m in main_resp["messages"]]
-    assert "working" in main_texts  # main mirrors sanitized progress
-    main_progress = next(m for m in main_resp["messages"] if m["text"] == "working")
-    assert main_progress["cancelable"] is True
-    assert main_progress["project_mirror"] is True
+    assert "working" not in main_texts
     assert "raw project chat" not in main_texts
     # The bound task's RAW final-answer row (still stored with main chat_id 1) is
     # project-owned via the binding and must NOT leak into the штаб's main history.
@@ -2092,7 +2126,7 @@ def test_chat_history_filters_by_thread(tmp_path):
     assert "legacy row (no chat_id)" in main_texts  # legacy rows are main-chat
     assert "transport mirror" in main_texts  # non-project transport stays visible
     assert "project hello" not in main_texts  # registered project partitions out
-    assert "project summary" in main_texts  # штаб mirrors project summaries/progress
+    assert "project summary" not in main_texts
     assert "a2a noise" not in main_texts
 
     proj_resp = json.loads(asyncio.run(api(_Req({"chat_id": str(project_chat)}))).body)

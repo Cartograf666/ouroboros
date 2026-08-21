@@ -1264,6 +1264,7 @@ def _record_routing_receipt(
     client_message_id: str,
     action: str,
     target: str = "",
+    target_label: str = "",
     status: str,
     persist: bool = True,
     options: Optional[list] = None,
@@ -1271,6 +1272,10 @@ def _record_routing_receipt(
     attachment_manifest: Optional[list] = None,
 ) -> None:
     """Emit a typed bubble-free ack and optionally persist its presentation state."""
+    if target and not str(target_label or "").strip():
+        from ouroboros.project_dialogue import routing_target_label
+
+        target_label = routing_target_label(ctx.DRIVE_ROOT, action, target)
     if persist:
         try:
             from ouroboros.project_dialogue import append_chat_annotation
@@ -1280,6 +1285,7 @@ def _record_routing_receipt(
                 client_message_id,
                 action=action,
                 target=target,
+                target_label=target_label,
                 status=status,
                 detail=detail,
                 attachment_manifest=attachment_manifest,
@@ -1293,6 +1299,7 @@ def _record_routing_receipt(
                 "client_message_id": client_message_id,
                 "action": action,
                 "target": target,
+                "target_label": target_label,
                 "status": status,
             }
             if options is not None:
@@ -1313,6 +1320,7 @@ def _record_routing_receipt(
                     "client_message_id": str(client_message_id or ""),
                     "action": action,
                     "target": target,
+                    "target_label": target_label,
                     "status": status,
                     "suppress_bubble": True,
                 }

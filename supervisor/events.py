@@ -66,6 +66,7 @@ def _emit_routing_receipt(
     *,
     action: str,
     target: str = "",
+    target_label: str = "",
     status: str,
     reason: str = "",
     detail: str = "",
@@ -74,6 +75,13 @@ def _emit_routing_receipt(
     publish: bool = True,
 ) -> Dict[str, Any]:
     """Persist and publish one token-bound routing annotation receipt."""
+    if target and not str(target_label or "").strip():
+        from ouroboros.project_dialogue import routing_target_label
+
+        target_label = routing_target_label(
+            ctx.DRIVE_ROOT, action, target, task=evt,
+            project_id=str(evt.get("project_id") or ""),
+        )
     client_message_id = str(evt.get("client_message_id") or "").strip()
     routing_token = str(evt.get("routing_token") or "").strip()
     annotation_status = "not_applicable"
@@ -88,6 +96,7 @@ def _emit_routing_receipt(
                     client_message_id,
                     action=action,
                     target=target,
+                    target_label=target_label,
                     status=status,
                     routing_token=routing_token,
                     reason=reason,
@@ -114,6 +123,7 @@ def _emit_routing_receipt(
         "detail": str(detail or ""),
         "annotation_status": annotation_status,
         "routing_token": routing_token,
+        "target_label": str(target_label or ""),
     }
     if attachment_manifest is not None:
         receipt["attachment_manifest"] = _routing_attachments(attachment_manifest) or []
@@ -125,6 +135,7 @@ def _emit_routing_receipt(
             evt,
             action=action,
             target=target,
+            target_label=target_label,
             status=effective_status,
             options=options,
             attachment_manifest=attachment_manifest,
@@ -138,12 +149,20 @@ def _publish_routing_ack(
     *,
     action: str,
     target: str,
+    target_label: str = "",
     status: str,
     options: Optional[list] = None,
     attachment_manifest: Optional[list] = None,
 ) -> None:
     """Publish a live non-bubble acknowledgement after durable authority exists."""
     try:
+        if target and not str(target_label or "").strip():
+            from ouroboros.project_dialogue import routing_target_label
+
+            target_label = routing_target_label(
+                ctx.DRIVE_ROOT, action, target, task=evt,
+                project_id=str(evt.get("project_id") or ""),
+            )
         client_message_id = str(evt.get("client_message_id") or "").strip()
         try:
             chat_id = int(evt.get("chat_id") or 0)
@@ -156,6 +175,7 @@ def _publish_routing_ack(
                 "client_message_id": client_message_id,
                 "action": action,
                 "target": target,
+                "target_label": target_label,
                 "status": status,
             }
             if options is not None:
@@ -1017,25 +1037,13 @@ def _handle_typing_start(evt: Dict[str, Any], ctx: Any) -> None:
         pass
 
 
-# Delivered final-answer dedupe (mirror of the already_done terminal dedupe, for
-# this one event kind): the worker sends the final send_message BOTH over the
-# live queue (before blocking post-task) AND in the buffered return — queue.put
-# is not a delivery receipt, so neither copy is dropped worker-side; instead
-# both carry the same delivery_id and the second one is suppressed here. The
-# in-memory deque is a fast-path cache; the durable registry
-# (``supervisor.terminal_delivery``, phase A2) is the LOGICAL dedupe shared by
-# the natural, cancel, and reap delivery paths and survives a restart.
+# Fast-path terminal-delivery cache. The durable registry is the logical
+# cross-restart dedupe; registration happens only after a successful send.
 _DELIVERED_MESSAGE_IDS: "deque[str]" = deque(maxlen=256)
 
 
 def _register_delivered(ctx: Any, delivery_id: str) -> None:
-    """Durably mark one delivery id as delivered — and clear what it owed.
-
-    Both halves of the same fact: the id joins the restart-surviving registry AND
-    leaves the pending outbox in one write, so a replay can never re-send an
-    answer that landed (phase A2/F7). Fail-soft: a registry write must never cost
-    a delivery that already happened.
-    """
+    """Atomically mark one id delivered and clear its pending-outbox row."""
     try:
         from supervisor.terminal_delivery import register_delivery
 
@@ -1095,19 +1103,9 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
                     progress_meta = dict(child_meta)
                     progress_meta.update(event_meta)
             if is_progress and isinstance(_m, dict):
-                # v6.82 (P5): host-attested cancelable marker. RUNNING membership is
-                # the supervisor's own truth that this frame belongs to a queue task
-                # that /api/tasks/{id}/cancel can force-cancel. An in-process
-                # direct-chat turn is never in RUNNING, so its card never shows a
-                # dead "Cancel run" button. Covers pooled roots that skip the
-                # scheduled notice (e.g. promote_chat_to_task). The marker is
-                # LINEAGE-GATED here and carries the RUNNING row's authoritative
-                # lineage: only a resolved ROOT is stamped (a timeout-retry root
-                # counts — its root_task_id names the original, which is exactly
-                # why the frontend must trust this attestation rather than
-                # re-deriving rootness from frame shape), and a subagent's
-                # narration never mints a root-shaped card with a live Cancel.
-                # Copy-on-write: the worker's own event dict is never mutated.
+                # RUNNING is the host authority for a cancelable queue root.
+                # Lineage-gating prevents a subagent from minting that action;
+                # copy-on-write preserves the worker event.
                 progress_meta = dict(progress_meta or {})
                 for lineage_key in ("root_task_id", "parent_task_id", "delegation_role"):
                     value = str(task_row.get(lineage_key) or "").strip()
@@ -1147,7 +1145,15 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             meta.get("parent_task_id") or evt.get("parent_task_id"),
             meta.get("root_task_id") or evt.get("root_task_id"),
         )
-        chat_id = bound_chat or int(evt["chat_id"])
+        system_type = str(evt.get("system_type") or "")
+        # This host-stamped terminal projection deliberately targets cognitive
+        # Main while its raw task id remains Project-bound. Every other task
+        # message keeps lineage routing through the owning Project thread.
+        chat_id = (
+            int(evt["chat_id"])
+            if system_type == "project_completion_summary"
+            else bound_chat or int(evt["chat_id"])
+        )
         ctx.send_with_budget(
             chat_id,
             str(evt.get("text") or ""),
@@ -1159,12 +1165,9 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             ts=(str(raw_ts) if raw_ts else None),
             # S3 (Q4): a typed system receipt keeps its role/type end to end.
             role=str(evt.get("role") or ""),
-            system_type=str(evt.get("system_type") or ""),
+            system_type=system_type,
         )
-        # Registered only AFTER a successful send: if the live copy's send
-        # raises, the buffered copy must NOT be suppressed later — "never
-        # lost" outranks "never doubled". The durable registration is the
-        # restart-surviving half of the same rule.
+        # Register only after send; a failed first copy must not suppress retry.
         if delivery_id:
             _DELIVERED_MESSAGE_IDS.append(delivery_id)
             _register_delivered(ctx, delivery_id)
@@ -1686,6 +1689,12 @@ def _finish_task_done_dispatch(
     task_done_event: Dict[str, Any],
 ) -> None:
     """Notify lineage, release queue state, and preserve terminal compatibility."""
+
+    from ouroboros.project_dialogue import enqueue_project_completion_summary
+
+    enqueue_project_completion_summary(
+        ctx.DRIVE_ROOT, evt, str(task_id or ""), task, final_task_result, task_done_event,
+    )
 
     if task_id and str(task.get("delegation_role") or "") == "subagent":
         try:
@@ -3234,6 +3243,7 @@ def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> Dict[str, Any
                 evt,
                 action=receipt_action,
                 target=str(outcome.get("task_id") or task_id),
+                target_label=str(receipt.get("target_label") or ""),
                 status="scheduled",
                 attachment_manifest=_routing_attachments(outcome.get("attachment_manifest")),
             )
@@ -3343,10 +3353,9 @@ def _handle_ensure_project_scope(evt: Dict[str, Any], ctx: Any) -> None:
 
 def _handle_routing_manual_target(evt: Dict[str, Any], ctx: Any) -> None:
     """Publish the decision actor's typed abstention without routing work."""
-    options = [
-        dict(row) for row in list(evt.get("options") or [])[:100]
-        if isinstance(row, dict)
-    ]
+    from ouroboros.project_dialogue import routing_options_with_labels
+
+    options = routing_options_with_labels(ctx.DRIVE_ROOT, evt.get("options"))
     _emit_routing_receipt(
         ctx,
         evt,

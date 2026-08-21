@@ -652,3 +652,80 @@ def test_chat_history_preserves_cancelable_marker(tmp_path):
 
     rec = next(item for item in payload if item.get("task_id") == "root1")
     assert rec["cancelable"] is True
+
+
+def test_main_history_keeps_only_host_project_root_completion_while_project_keeps_detail(
+    tmp_path,
+):
+    from ouroboros.projects_registry import create_project
+
+    project = create_project(tmp_path, "launch", name="Launch 🚀")
+    project_chat = int(project["chat_id"])
+    logs = tmp_path / "logs"
+    logs.mkdir(exist_ok=True)
+    (logs / "chat.jsonl").write_text(
+        "\n".join(
+            json.dumps(row, ensure_ascii=False)
+            for row in (
+                {
+                    "ts": "2026-08-21T00:00:02Z",
+                    "direction": "system",
+                    "chat_id": project_chat,
+                    "type": "task_summary",
+                    "task_id": "root-project",
+                    "text": "Detailed Project summary",
+                    "tool_calls": 3,
+                    "rounds": 4,
+                },
+                {
+                    "ts": "2026-08-21T00:00:03Z",
+                    "direction": "system",
+                    "chat_id": 1,
+                    "type": "project_completion_summary",
+                    "task_id": "root-project",
+                    "project_id": "launch",
+                    "project_name": "Launch 🚀",
+                    "target_label": "Launch 🚀 › Ship release",
+                    "status": "completed",
+                    "text": "Launch 🚀 › Ship release · Completed",
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (logs / "progress.jsonl").write_text(
+        json.dumps(
+            {
+                "ts": "2026-08-21T00:00:01Z",
+                "chat_id": project_chat,
+                "content": "Project-only progress",
+                "task_id": "root-project",
+                "is_progress": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    main = json.loads(
+        asyncio.run(endpoint(SimpleNamespace(query_params={"chat_id": "1"}))).body
+    )["messages"]
+    project_rows = json.loads(
+        asyncio.run(
+            endpoint(SimpleNamespace(query_params={"chat_id": str(project_chat)}))
+        ).body
+    )["messages"]
+
+    assert [row["system_type"] for row in main if row.get("system_type")] == [
+        "project_completion_summary"
+    ]
+    completion = main[0]
+    assert completion["task_id"] == "root-project"
+    assert completion["project_id"] == "launch"
+    assert completion["project_name"] == "Launch 🚀"
+    assert completion["target_label"] == "Launch 🚀 › Ship release"
+    assert completion["status"] == "completed"
+    assert any(row.get("is_progress") for row in project_rows)
+    assert any(row.get("system_type") == "task_summary" for row in project_rows)

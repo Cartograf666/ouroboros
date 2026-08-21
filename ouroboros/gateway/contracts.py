@@ -210,6 +210,10 @@ class ChatOutbound(TypedDict):
     telegram_chat_id: NotRequired[int]
     # UI-only system annotation emitted by skill-repair visible commands.
     system_type: NotRequired[str]
+    # Event-time human presentation; raw task/project ids remain machine keys.
+    target_label: NotRequired[str]
+    project_id: NotRequired[str]
+    project_name: NotRequired[str]
     # Present on some transport re-broadcast paths.
     chat_id: NotRequired[int]
 
@@ -346,6 +350,7 @@ class MessageAnnotationOutbound(TypedDict):
     suppress_bubble: bool
     chat_id: NotRequired[int]
     target: NotRequired[str]
+    target_label: NotRequired[str]
     options: NotRequired[List[Dict[str, Any]]]
     attachment_manifest: NotRequired[List[AttachmentManifestEntry]]
     ts: NotRequired[str]

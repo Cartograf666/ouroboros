@@ -385,6 +385,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "client_message_id",
         "action",
         "target",
+        "target_label",
         "status",
         "options",
         "attachment_manifest",

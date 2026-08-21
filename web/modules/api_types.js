@@ -325,6 +325,9 @@
  * @property {Object=} transport
  * @property {number=} telegram_chat_id
  * @property {string=} system_type
+ * @property {string=} target_label
+ * @property {string=} project_id
+ * @property {string=} project_name
  * @property {number=} chat_id
  */
 
@@ -418,6 +421,7 @@
  * @property {string} client_message_id
  * @property {string} action
  * @property {string=} target
+ * @property {string=} target_label
  * @property {string} status
  * @property {Array<Object>=} options
  * @property {AttachmentManifestEntry[]=} attachment_manifest

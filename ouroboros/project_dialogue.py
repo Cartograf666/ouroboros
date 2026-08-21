@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import pathlib
 import uuid
@@ -21,6 +22,7 @@ from ouroboros.utils import iter_jsonl_objects, jsonl_append_lock_path, replace_
 _ANNOTATIONS_NAME = "chat_annotations.jsonl"
 _COMPACT_AT_BYTES = 800_000
 _RETAINED_ARCHIVES = 3
+log = logging.getLogger(__name__)
 
 
 def _row_chat_id(row: Dict[str, Any]) -> int:
@@ -279,6 +281,7 @@ def append_chat_annotation(
     *,
     action: str,
     target: str = "",
+    target_label: str = "",
     status: str,
     routing_token: str = "",
     reason: str = "",
@@ -298,6 +301,8 @@ def append_chat_annotation(
         "target": str(target or "")[:200],
         "status": str(status or "")[:80],
     }
+    if str(target_label or ""):
+        row["target_label"] = str(target_label)[:200]
     if str(routing_token or ""):
         row["routing_token"] = str(routing_token)[:128]
     if str(reason or ""):
@@ -332,15 +337,160 @@ def append_chat_annotation(
         release_exclusive_file_lock(lock_path, lock_fd)
 
 
+def routing_target_label(
+    drive_root: Any, action: str, target: str, *, task: Any = None,
+    project_id: str = "",
+) -> str:
+    """Resolve one deterministic event-time label for an existing raw target."""
+    target = str(target or "").strip()
+    if not target:
+        return ""
+    try:
+        from ouroboros.projects_registry import get_reserved_project, task_presentation_snapshot
+
+        if action == "project_route":
+            project = get_reserved_project(drive_root, target) or {}
+            name = str(project.get("name") or "").strip()
+            return name if name and name != target else "Project"
+        return task_presentation_snapshot(
+            drive_root, target, task=task, project_id=project_id,
+        )["target_label"]
+    except Exception:
+        log.debug("Routing target label resolution failed for %s", target, exc_info=True)
+        return "Task"
+
+
+def routing_options_with_labels(drive_root: Any, options: Any) -> List[Dict[str, Any]]:
+    """Stamp human labels on manual task choices while retaining their raw ids."""
+    rows: List[Dict[str, Any]] = []
+    for raw in list(options or [])[:100]:
+        if not isinstance(raw, dict):
+            continue
+        row = dict(raw)
+        task_id = str(row.get("task_id") or "").strip()
+        if task_id and not str(row.get("label") or "").strip():
+            row["label"] = routing_target_label(
+                drive_root, str(row.get("action") or "steer_task"), task_id,
+                task=row, project_id=str(row.get("project_id") or ""),
+            )
+        rows.append(row)
+    return rows
+
+
+def completion_status_label(result: Dict[str, Any], event: Dict[str, Any]) -> str:
+    from ouroboros.task_results import (
+        STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_REJECTED_DUPLICATE,
+    )
+
+    status = str(result.get("status") or event.get("status") or "").strip().lower()
+    axes = {}
+    for source in (event, result):
+        value = source.get("outcome_axes")
+        if isinstance(value, dict):
+            axes.update({key: axis for key, axis in value.items() if isinstance(axis, dict)})
+    axis_status = {key: str(axis.get("status") or "").lower() for key, axis in axes.items()}
+    failed = (
+        status == STATUS_FAILED
+        or axis_status.get("lifecycle") == STATUS_FAILED
+        or axis_status.get("execution") in {"failed", "infra_failed"}
+        or axis_status.get("objective") == "fail"
+        or axis_status.get("review") == "fail"
+        or axis_status.get("artifacts") in {"failed", "missing"}
+    )
+    degraded = any(value in {"degraded", "partial", "best_effort"}
+                   for value in axis_status.values())
+    checkpoint = result.get("root_phase_checkpoint")
+    degraded |= bool(isinstance(checkpoint, dict)
+                     and str(checkpoint.get("post_task_synthesis") or "").lower() == "degraded")
+    if status == STATUS_CANCELLED:
+        return "Cancelled"
+    if failed:
+        return "Failed"
+    if status == STATUS_COMPLETED:
+        return "Completed with limitations" if degraded else "Completed"
+    if status == STATUS_REJECTED_DUPLICATE:
+        return "Not started"
+    return status.replace("_", " ").title() or "Finished"
+
+
+def _completion_excerpt(result: Dict[str, Any]) -> str:
+    for key in ("summary", "result", "error"):
+        text = " ".join(str(result.get(key) or "").split())
+        if text:
+            return text if len(text) <= 240 else text[:239].rstrip() + "…"
+    return ""
+
+
+def enqueue_project_completion_summary(
+    drive_root: Any, evt: Dict[str, Any], task_id: str, task: Dict[str, Any],
+    result: Dict[str, Any], task_done_event: Dict[str, Any],
+) -> bool:
+    """Owe Main's one compact row for a terminal non-ephemeral Project root."""
+    tid = str(task_id or "").strip()
+    task = task if isinstance(task, dict) else {}
+    result = result if isinstance(result, dict) else {}
+    if not tid or any(
+        bool(row.get("_ephemeral") or row.get("ephemeral_decision"))
+        for row in (evt, task, result, task_done_event) if isinstance(row, dict)
+    ):
+        return False
+    try:
+        from ouroboros.projects_registry import task_presentation_snapshot
+        from ouroboros.task_results import resolve_task_lineage
+        from ouroboros.task_status import SETTLED_STATUSES
+        from supervisor.terminal_delivery import enqueue_terminal_delivery
+
+        metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+        lineage = resolve_task_lineage(
+            tid, metadata=metadata,
+            root_task_id=result.get("root_task_id") or task.get("root_task_id"),
+            parent_task_id=result.get("parent_task_id") or task.get("parent_task_id"),
+            delegation_role=result.get("delegation_role") or task.get("delegation_role"),
+            original_task_id=result.get("original_task_id") or task.get("original_task_id"),
+            timeout_retry_from=result.get("timeout_retry_from") or task.get("timeout_retry_from"),
+        )
+        status = str(result.get("status") or task_done_event.get("status") or "").lower()
+        if not lineage["is_root_task"] or status not in SETTLED_STATUSES:
+            return False
+        snapshot = task_presentation_snapshot(
+            drive_root, tid, task=task, result=result,
+            project_id=str(result.get("project_id") or task.get("project_id") or ""),
+        )
+        if not snapshot["project_id"]:
+            return False
+        excerpt = _completion_excerpt(result)
+        event = {
+            "type": "send_message", "chat_id": 1, "task_id": tid,
+            "text": (f"{snapshot['target_label']} · "
+                     f"{completion_status_label(result, task_done_event)}\n"
+                     f"{excerpt or 'Open the Project for details.'}"),
+            "role": "system", "system_type": "project_completion_summary",
+            "delivery_id": f"project-completion:{tid}",
+            "progress_meta": {
+                "project_id": snapshot["project_id"],
+                "project_name": snapshot["project_name"],
+                "target_label": snapshot["target_label"], "status": status,
+            },
+        }
+        return bool(enqueue_terminal_delivery(drive_root, event))
+    except Exception:
+        log.warning("Failed to enqueue Project completion summary for %s", tid, exc_info=True)
+        return False
+
+
 __all__ = [
     "append_chat_annotation",
     "build_owner_message_ref",
     "chat_annotation_receipt",
     "entry_matches_source_ref",
     "latest_chat_annotations",
+    "enqueue_project_completion_summary",
+    "completion_status_label",
     "owner_message_ref_is_valid",
     "project_origin_rows",
     "project_recent_dialogue",
+    "routing_options_with_labels",
+    "routing_target_label",
     "resolve_owner_message_source",
     "source_refs_for_project",
 ]
