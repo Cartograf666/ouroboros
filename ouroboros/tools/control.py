@@ -735,6 +735,47 @@ def _attach_origin_from_metadata(ctx: ToolContext, evt: Dict[str, Any]) -> None:
         evt["origin_suppressed"] = True
 
 
+def _attach_predecessor_authority_from_metadata(
+    ctx: ToolContext, evt: Dict[str, Any], predecessor_task_id: str = "",
+) -> str:
+    metadata = getattr(ctx, "task_metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    selected_id = str(predecessor_task_id or "").strip()
+    if not selected_id:
+        return ""
+    previous = metadata.get("project_last_task_result")
+    manifest = metadata.get("main_routing_manifest")
+    candidates = (
+        manifest.get("final_results")
+        if isinstance(manifest, dict) and isinstance(manifest.get("final_results"), list)
+        else [previous] if isinstance(previous, dict) else []
+    )
+    previous = next((
+        row for row in candidates
+        if isinstance(row, dict) and str(row.get("task_id") or "") == selected_id
+    ), None)
+    if not isinstance(previous, dict):
+        return (
+            "predecessor_task_id is not an addressable result in the host "
+            "routing manifest"
+        )
+    status_root = Path(str(
+        metadata.get("budget_drive_root")
+        or getattr(ctx, "budget_drive_root", "")
+        or ctx.drive_root
+    ))
+    if not load_effective_task_result(status_root, selected_id, materialize_artifacts=False):
+        return "the selected predecessor task result is missing or unreadable"
+    source = previous.get("authority_source") if isinstance(previous, dict) else None
+    from ouroboros.agent_startup_checks import valid_task_result_authority_source
+
+    if valid_task_result_authority_source(source, selected_id):
+        evt["predecessor_authority_source"] = dict(source)
+    else:
+        return "the selected predecessor has no readable authority source"
+    return ""
+
+
 def _attach_client_surface(ctx: ToolContext, evt: Dict[str, Any]) -> None:
     """Copy the routing turn's per-message client-surface fact onto a
     promote/route/steer event BY VALUE (the origin_message_ref rail's sibling:
@@ -799,6 +840,7 @@ def _promote_chat_to_task(
     project_name: str = "",
     workspace: str = "",
     source: str = "",
+    predecessor_task_id: str = "",
 ) -> str:
     """Route real work out of the conversation lane into a supervised pooled task.
 
@@ -937,6 +979,14 @@ def _promote_chat_to_task(
             "task_contract": dict(getattr(ctx, "task_contract", {}) or {}),
         })
     _attach_origin_from_metadata(ctx, evt)
+    predecessor_error = _attach_predecessor_authority_from_metadata(
+        ctx, evt, predecessor_task_id,
+    )
+    if predecessor_error:
+        return (
+            "⚠️ AUTHORITY_SOURCE_UNAVAILABLE (promote_chat_to_task): "
+            + predecessor_error
+        )
     _attach_swarm_intent(ctx, evt)
     _attach_client_surface(ctx, evt)
     mode, confirmation = _emit_and_wait_for_routing(ctx, evt)
@@ -1025,6 +1075,7 @@ def _list_projects(ctx: ToolContext, limit: int = 50) -> str:
 
 def _route_to_project(
     ctx: ToolContext, project_id: str = "", message: str = "", reason: str = "",
+    predecessor_task_id: str = "",
 ) -> str:
     """Route a main-chat message to an EXISTING project so the work continues in
     that project's context (its memory/journal/thread), keeping the main chat free.
@@ -1037,8 +1088,8 @@ def _route_to_project(
     from ouroboros.project_facts import explicit_project_id_ok, sanitize_project_id
     from ouroboros.projects_registry import get_project
 
-    msg = str(message or "").strip()
-    if not msg:
+    msg = str(message or "")
+    if not msg.strip():
         return "⚠️ TOOL_ARG_ERROR (route_to_project): message is required"
     cached = _cached_swarm_handoff(ctx)
     if cached:
@@ -1119,6 +1170,11 @@ def _route_to_project(
         "ts": utc_now_iso(),
     }
     _attach_origin_from_metadata(ctx, evt)
+    predecessor_error = _attach_predecessor_authority_from_metadata(
+        ctx, evt, predecessor_task_id,
+    )
+    if predecessor_error:
+        return "⚠️ AUTHORITY_SOURCE_UNAVAILABLE (route_to_project): " + predecessor_error
     _attach_swarm_intent(ctx, evt)
     _attach_client_surface(ctx, evt)
     mode, receipt = _emit_and_wait_for_routing(ctx, evt)
@@ -1176,13 +1232,21 @@ def _steer_task(ctx: ToolContext, task_id: str, message: str) -> str:
             "⚠️ TOOL_ARG_ERROR (steer_task): task_id is required — pick one from "
             "current_chat.running_tasks (or promote_chat_to_task to start new work)."
         )
-    if not msg:
+    if not msg.strip():
         return "⚠️ TOOL_ARG_ERROR (steer_task): message is required."
     try:
         current_chat_id = int(getattr(ctx, "current_chat_id", None) or 0)
     except (TypeError, ValueError):
         current_chat_id = 0
     _md = getattr(ctx, "task_metadata", None)
+    # The model chooses the target, but the host transports the exact owner
+    # bytes captured at ingress.  A model-authored paraphrase must not replace
+    # the owner's steering text.  Non-owner/internal calls have no origin text
+    # and retain the explicit tool argument.
+    if isinstance(_md, dict) and isinstance(_md.get("origin_message_text"), str):
+        exact_owner_text = str(_md.get("origin_message_text") or "")
+        if exact_owner_text.strip():
+            msg = exact_owner_text
     client_message_id = str((_md.get("client_message_id") if isinstance(_md, dict) else "") or "").strip()
     routing_contract = (
         _md.get("routing_contract")
@@ -1208,10 +1272,14 @@ def _steer_task(ctx: ToolContext, task_id: str, message: str) -> str:
     mode, receipt = _emit_and_wait_for_routing(ctx, evt)
     status = str(receipt.get("status") or "unconfirmed")
     if status == "delivered":
-        return (
+        confirmation = (
             f"✉️ Steering task {target}: mailbox delivery is durably confirmed ({mode}). "
             "The task receives it at its next checkpoint."
         )
+        detail = str(receipt.get("detail") or "")
+        if detail:
+            confirmation += f"\n\n[ATTACHMENTS]\n{detail}\n[END_ATTACHMENTS]"
+        return confirmation
     if status in {"rejected", "needs_manual_target"}:
         return (
             f"⚠️ STEER_REJECTED: task {target} was not steered "
@@ -1409,6 +1477,7 @@ def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
                 # requested child deadline whenever the parent carried one of its own.
                 "deadline_at": narrowed_deadline_at,
                 "delegation_budget": delegation_budget,
+                "attachment_manifest": spec.get("attachment_manifest") or [],
                 # Same lesson for the criteria carriers, re-stated even when EMPTY:
                 # without these, the parent's claims/criteria leak into every child and
                 # child verify receipts would "support" claims the child never owned.
@@ -1417,6 +1486,7 @@ def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
             } if isinstance(parent_contract, dict) else {
                 "delegation_budget": delegation_budget,
                 "acceptance_claims": child_claims,
+                "attachment_manifest": spec.get("attachment_manifest") or [],
             },
         },
     })
@@ -1449,6 +1519,19 @@ def _inherited_workspace_from_active_repo(
     except Exception:
         pass
     return workspace_root, workspace_mode
+
+
+def _materialize_child_attachment_manifest(
+    parent_contract: Dict[str, Any], target_root: Path, task_id: str,
+) -> tuple[list[dict], str]:
+    """Copy inherited task inputs into the child's own artifact store."""
+
+    inherited = parent_contract.get("attachment_manifest") if parent_contract else []
+    if not isinstance(inherited, list) or not inherited:
+        return [], ""
+    from ouroboros.artifacts import materialize_inherited_attachment_manifest
+
+    return materialize_inherited_attachment_manifest(inherited, target_root, task_id)
 
 
 def schedule_subagent_properties() -> Dict[str, Any]:
@@ -1784,6 +1867,12 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         tid, status_drive_root, memory_mode, parent_project_id)
     if _drive_err:
         return _drive_err
+    child_attachment_manifest, attachment_error = _materialize_child_attachment_manifest(
+        parent_contract, child_drive or status_drive_root, tid,
+    )
+    if attachment_error:
+        shutil.rmtree(task_state_dir(status_drive_root, tid), ignore_errors=True)
+        return f"⚠️ SUBTASK_ATTACHMENT_ERROR: {attachment_error}"
 
     # C3.1: propagate and narrow the parent's typed delegation intent.
     child_delegation_budget = child_budget_for_schedule(
@@ -1801,6 +1890,7 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         "parent_task_id": parent_task_id, "root_task_id": root_task_id, "session_id": session_id,
         "child_delegation_budget": child_delegation_budget, "deadline_at": str(deadline_at or ""),
         "acceptance_claims": fields["acceptance_claims"],
+        "attachment_manifest": child_attachment_manifest,
     })
     # The requested-status envelope carries the REQUEST. Its derived half stays
     # empty until dispatch fills it, so a queued child's public description never
@@ -1938,7 +2028,15 @@ def _chat_history(
     ctx: ToolContext, count: int = 100, offset: int = 0, search: str = "", **filters: str,
 ) -> str:
     from ouroboros.memory import Memory
-    mem = Memory(drive_root=ctx.drive_root)
+    metadata = getattr(ctx, "task_metadata", {}) if isinstance(
+        getattr(ctx, "task_metadata", {}), dict
+    ) else {}
+    canonical_root = Path(str(
+        metadata.get("budget_drive_root")
+        or getattr(ctx, "budget_drive_root", "")
+        or ctx.drive_root
+    ))
+    mem = Memory(drive_root=canonical_root)
     # Full project awareness (v6.32.0): the one mind's active recall spans every
     # thread (main + projects). The project-task working FOCUS is applied to the
     # passive default context only, never to this deliberate recall tool.
@@ -2136,13 +2234,27 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
     return f"OK: switching to {', '.join(changes)} on next round."
 
 
-def _get_task_result(ctx: ToolContext, task_id: str) -> str:
+def _get_task_result(ctx: ToolContext, task_id: str, include_authority: bool = False) -> str:
     """Read the effective result of a registered subtask."""
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
     status_drive_root = Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
     data = load_effective_task_result(status_drive_root, task_id)
     if not data:
         return f"Task {task_id}: unknown or not yet registered"
+    if bool(include_authority):
+        authority = {
+            key: data.get(key)
+            for key in (
+                "task_id", "title", "objective", "description", "context",
+                "task_contract", "origin_message_ref", "origin_message_text",
+                "predecessor_authority_source", "plan_review_state",
+            )
+            if data.get(key) not in (None, "")
+        }
+        return json.dumps({
+            "status": "available", "authority": authority,
+            "source": {"tool": "get_task_result", "task_id": str(task_id)},
+        }, ensure_ascii=False, sort_keys=True)
     status = data.get("status", "unknown")
     result = data.get("result", "")
     trace = data.get("trace_summary", "")
@@ -2652,7 +2764,9 @@ _PROMOTE_CHAT_DESCRIPTION = (
     "and this task runs inside it (my own judgment: the owner's phrasing is intent, "
     "not a keyword trigger — I name the project from what they actually want it "
     "called, and do not just answer or spawn a project-less task). `project_id` "
-    "scopes to an existing project; "
+    "scopes to an existing project. When this new task continues one specific "
+    "completed result shown by the host (the Main manifest or Project last-result "
+    "preview), pass its internal id as `predecessor_task_id`; omit it for fresh work. "
     "`workspace_root` points at a working folder. A project-scoped task inherits "
     "the project's working folder as its ACTIVE WORKSPACE by default (its file/"
     "shell/git tools operate there, not on the Ouroboros repo); pass "
@@ -2696,6 +2810,7 @@ def get_tools() -> List[ToolEntry]:
                     "workspace_root": {"type": "string", "description": "Optional absolute working-folder path (validated at admission: must be a git worktree root outside the Ouroboros repo/data). When omitted for a project-scoped task, the project's registered working_dir is used by default.", "default": ""},
                     "workspace": {"type": "string", "description": "Pass 'none' to opt OUT of the project room's default working folder (a folder-less task in a folder-ful project). Leave empty otherwise.", "default": ""},
                     "source": {"type": "string", "description": "Attach or clone the project's working folder in ONE move: a git URL (https://... or git@host:path — cloned server-side into the projects root; private repos fail typed auth_required) or an existing folder path (validated attach). The folder is registered on the project (provenance + trusted_at) and becomes this task's active workspace. Use for 'help me debug this GitHub repo / this folder' asks.", "default": ""},
+                    "predecessor_task_id": {"type": "string", "description": "Internal selector for one completed result already listed by the host routing manifest. Use only when the new task continues that result; omit for fresh work.", "default": ""},
                 },
                 "required": ["objective"],
             },
@@ -2742,12 +2857,15 @@ def get_tools() -> List[ToolEntry]:
                 "CALL THIS TOOL with project_id='' and the owner's message: it emits the typed "
                 "needs_manual_target acknowledgement with host-validated task options and New task "
                 "in Project; prose alone cannot emit that typed choice. For brand-new work that is not yet a project, "
-                "use promote_chat_to_task instead. Returns a visible routing receipt."
+                "use promote_chat_to_task instead. When continuing one completed result from the "
+                "Main host manifest, pass its internal `predecessor_task_id`; omit it for fresh work. "
+                "Returns a visible routing receipt."
             ),
             "parameters": {"type": "object", "properties": {
                 "project_id": {"type": "string", "default": "", "description": "Target project id (filesystem-clean; see list_projects), or empty to emit typed needs_manual_target."},
                 "message": {"type": "string", "description": "The owner message / work to route into the project."},
                 "reason": {"type": "string", "default": "", "description": "Optional short why-this-project note (provenance)."},
+                "predecessor_task_id": {"type": "string", "default": "", "description": "Internal selector for one completed result listed by the Main host manifest. Omit for fresh work."},
             }, "required": ["message"]},
         }, _route_to_project),
         ToolEntry("steer_task", {
@@ -2899,9 +3017,11 @@ def get_tools() -> List[ToolEntry]:
         }, _switch_model),
         ToolEntry("get_task_result", {
             "name": "get_task_result",
-            "description": "Read the effective result of a subtask, including child-drive output when available.",
+            "description": "Read the effective result or exact authority of a task, including child-drive output when available.",
             "parameters": {"type": "object", "required": ["task_id"], "properties": {
-                "task_id": {"type": "string", "description": "Task ID returned by schedule_subagent"},
+                "task_id": {"type": "string", "description": "Task ID returned by scheduling or exposed by the host routing manifest."},
+                "include_authority": {"type": "boolean", "default": False,
+                                      "description": "Return exact task contract/origin/current plan-review authority."},
             }},
         }, _get_task_result),
         ToolEntry("wait_task", {

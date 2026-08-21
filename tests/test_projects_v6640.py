@@ -121,6 +121,13 @@ def test_chat_annotations_are_compact_and_torn_tail_tolerant(tmp_path):
         action="routed",
         target="project:alpha",
         status="delivered",
+        detail="- missing: rejected (reason=source_missing, ordinal=0)",
+        attachment_manifest=[{
+            "ordinal": 0,
+            "status": "rejected",
+            "reason": "source_missing",
+            "label": "missing",
+        }],
     )
     path = tmp_path / "logs" / "chat_annotations.jsonl"
     with path.open("ab") as handle:
@@ -130,6 +137,7 @@ def test_chat_annotations_are_compact_and_torn_tail_tolerant(tmp_path):
     assert latest["owner-1"]["status"] == "delivered"
     assert set(latest["owner-1"]) == {
         "ts", "type", "client_message_id", "action", "target", "status",
+        "detail", "attachment_manifest",
     }
 
     from ouroboros.gateway.history import make_chat_history_endpoint
@@ -142,6 +150,13 @@ def test_chat_annotations_are_compact_and_torn_tail_tolerant(tmp_path):
         "action": "routed",
         "target": "project:alpha",
         "status": "delivered",
+        "detail": "- missing: rejected (reason=source_missing, ordinal=0)",
+        "attachment_manifest": [{
+            "ordinal": 0,
+            "status": "rejected",
+            "reason": "source_missing",
+            "label": "missing",
+        }],
     }
 
 

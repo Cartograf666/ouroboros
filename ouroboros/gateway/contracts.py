@@ -25,6 +25,20 @@ class ChatAttachmentInbound(TypedDict, total=False):
     mime: str
 
 
+class AttachmentManifestEntry(TypedDict, total=False):
+    """One declared task attachment after staging admission."""
+
+    ordinal: int
+    status: Literal["staged", "rejected"]
+    reason: str
+    label: str
+    root: str
+    relpath: str
+    abs_path: str
+    mime: str
+    is_image: bool
+
+
 class ChatInbound(TypedDict):
     """Inbound WS chat message. ``type`` and ``content`` are required."""
 
@@ -333,6 +347,7 @@ class MessageAnnotationOutbound(TypedDict):
     chat_id: NotRequired[int]
     target: NotRequired[str]
     options: NotRequired[List[Dict[str, Any]]]
+    attachment_manifest: NotRequired[List[AttachmentManifestEntry]]
     ts: NotRequired[str]
 
 
@@ -879,6 +894,8 @@ class TaskCreateRequest(_TaskCreateRequestRequired, total=False):
     memory_mode: str
     project_id: str
     attachments: list[Dict[str, Any]]
+    # Explicit raw-API opt-in. Browser/UI callers omit it and remain atomic.
+    allow_partial_attachments: bool
     acceptance_claims: list[Dict[str, Any]]
     # v6.60.0: "" | "final_answer_line" — adapter-declared machine-extractable answer
     # protocol; flows into task_contract.answer_protocol and inherits to subagents.
@@ -904,7 +921,9 @@ class TaskCreateResponse(TypedDict, total=False):
     ok: bool
     task_id: str
     status: str
+    reason_code: str
     error: str
+    attachment_manifest: list[AttachmentManifestEntry]
 
 
 class TaskListResponse(TypedDict, total=False):
@@ -1462,6 +1481,7 @@ __all__ = [
     "ProviderTestResponse",
     "FileBrowserListResponse",
     "ChatHistoryResponse",
+    "AttachmentManifestEntry",
     "ExecutorRef",
     "TaskCreateRequest",
     "TaskCreateResponse",

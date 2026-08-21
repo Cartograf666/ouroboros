@@ -215,7 +215,13 @@ def _user_annotation(
     annotation = annotations.get(client_message_id)
     if role != "user" or not isinstance(annotation, dict):
         return None
-    return {key: annotation.get(key) for key in ("action", "target", "status")}
+    return {
+        key: annotation.get(key)
+        for key in (
+            "action", "target", "status", "detail", "attachment_manifest",
+        )
+        if key in annotation
+    }
 
 
 def make_cost_breakdown_endpoint(data_dir: pathlib.Path):

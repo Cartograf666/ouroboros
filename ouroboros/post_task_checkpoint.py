@@ -144,6 +144,8 @@ def project_root_post_task_checkpoint_fields(
 
 def is_root_post_task(task: Dict[str, Any]) -> bool:
     """Structural root test for the single global post-task synthesis authority."""
+    if bool(task.get("_skip_post_task_synthesis")):
+        return False
     meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
     task_id = str(task.get("id") or task.get("task_id") or "")
     return bool(resolve_task_lineage(

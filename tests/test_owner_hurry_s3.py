@@ -31,7 +31,9 @@ from ouroboros import owner_hurry as oh
 from ouroboros.gateway.tasks import api_task_hurry
 from ouroboros.owner_mailbox import (
     KIND_HURRY,
+    _ack_path,
     _mailbox_path,
+    acknowledge_task_messages,
     drain_owner_entries,
     write_owner_message,
 )
@@ -626,8 +628,10 @@ def test_crash_requeue_runs_the_shared_retry_reset(tmp_path, monkeypatch):
 
     # Same-id front requeue with the bumped attempt.
     assert [(t["id"], t["_attempt"]) for t in workers.PENDING] == [("crash-1", 2)]
-    # NO executable latch survives: the mailbox (the control carrier) is gone.
-    assert not _mailbox_path(tmp_path, "crash-1").exists()
+    # NO executable latch survives, while the append-only mailbox remains as
+    # the durable owner-text carrier.
+    assert _mailbox_path(tmp_path, "crash-1").exists()
+    assert drain_owner_entries(tmp_path, "crash-1", attempt_key=2) == []
     # ...and the current block is archived into history, not silently dropped.
     stored = load_task_result(tmp_path, "crash-1")
     assert "owner_hurry" not in stored
@@ -644,16 +648,187 @@ def test_retry_reset_is_shared_by_reaper_and_evolution_retry(tmp_path):
     from supervisor import task_reaper
 
     assert "retry_reset" in inspect.getsource(task_reaper.reap_timed_out_task)
-    # Functional: mailbox removed, block archived, and a second call is a no-op.
+    # Functional: control revoked in-place, block archived, second call is a no-op.
     write_owner_message(tmp_path, "owner_hurry", "evo-1", msg_id="hurry:r1", kind=KIND_HURRY)
     oh.record_requested(tmp_path, "evo-1", request_id="r1", attempt=1)
     oh.retry_reset(tmp_path, tmp_path, "evo-1", reason="evolution_retry")
-    assert not _mailbox_path(tmp_path, "evo-1").exists()
+    assert _mailbox_path(tmp_path, "evo-1").exists()
+    assert drain_owner_entries(tmp_path, "evo-1", attempt_key=2) == []
     stored = load_task_result(tmp_path, "evo-1")
     assert "owner_hurry" not in stored
     assert stored["owner_hurry_history"][-1]["archived_reason"] == "evolution_retry"
     oh.retry_reset(tmp_path, tmp_path, "evo-1", reason="evolution_retry")   # idempotent
     assert len(load_task_result(tmp_path, "evo-1")["owner_hurry_history"]) == 1
+
+
+def test_retry_preserves_unacked_owner_text_and_revokes_attempt_controls(tmp_path):
+    import ouroboros.loop as loop
+
+    write_owner_message(tmp_path, "exact owner bytes  \n", "retry-owner", msg_id="owner-1")
+    write_owner_message(
+        tmp_path, "owner_hurry", "retry-owner", msg_id="hurry-1", kind=KIND_HURRY,
+    )
+    first_ctx = _drain_ctx(tmp_path, task_id="retry-owner", attempt=1)
+    first_messages: list = []
+    loop._drain_incoming_messages(
+        first_messages, _q.Queue(), tmp_path, "retry-owner", None, set(), owner_ctx=first_ctx,
+    )
+    assert "exact owner bytes" in json.dumps(first_messages)
+
+    oh.retry_reset(tmp_path, tmp_path, "retry-owner", reason="worker_crash_requeue")
+    replay = drain_owner_entries(tmp_path, "retry-owner", attempt_key=2)
+
+    assert [(row["msg_id"], row["kind"], row["text"]) for row in replay] == [
+        ("owner-1", "owner_text", "exact owner bytes  \n"),
+    ]
+
+
+@pytest.mark.parametrize("crash_boundary", ["after_drain", "after_tool_call", "after_tool_execution"])
+def test_fresh_attempt_replays_exact_owner_text_until_terminal(
+    tmp_path, monkeypatch, crash_boundary,
+):
+    import ouroboros.loop as loop
+
+    exact = "model must see these exact bytes  \n"
+    task_id = f"owner-{crash_boundary}"
+    write_owner_message(tmp_path, exact, task_id, msg_id="owner-model")
+    first_ctx = _drain_ctx(tmp_path, task_id=task_id, attempt=1)
+    first_messages = []
+    loop._drain_incoming_messages(
+        first_messages, _q.Queue(), tmp_path, task_id, None, set(), owner_ctx=first_ctx,
+    )
+    if crash_boundary in {"after_tool_call", "after_tool_execution"}:
+        tool_call = {
+            "id": "tc-1", "type": "function",
+            "function": {"name": "probe", "arguments": "{}"},
+        }
+        monkeypatch.setattr(
+            loop,
+            "call_llm_with_retry",
+            lambda *_args, **_kwargs: (
+                {"role": "assistant", "tool_calls": [tool_call]}, 0.01,
+            ),
+        )
+        monkeypatch.setattr(loop, "_server_web_allowed_by_task", lambda _ctx: False)
+        loop._dispatch_round_model(
+            SimpleNamespace(
+                llm=object(), messages=first_messages, active_model="test-model",
+                tool_schemas=[], active_effort="high", max_retries=0,
+                drive_logs=tmp_path / "logs", task_id=task_id, round_idx=1,
+                event_queue=None, accumulated_usage={}, task_type="task",
+                active_use_local=False, tools=SimpleNamespace(_ctx=first_ctx),
+                drive_root=tmp_path,
+            ),
+            None,
+            attempt_cap=1,
+        )
+    if crash_boundary == "after_tool_execution":
+        from ouroboros.loop_tool_execution import StatefulToolExecutor, handle_tool_calls
+
+        class _ProbeTools:
+            CODE_TOOLS = set()
+
+            def __init__(self):
+                self.calls = []
+                self._ctx = SimpleNamespace(
+                    task_metadata={}, _request_wire_custom_receipts=(),
+                )
+
+            def get_timeout(self, _name):
+                return 10
+
+            def execute(self, name, args):
+                self.calls.append((name, args))
+                return "durable tool effect"
+
+        probe_tools = _ProbeTools()
+        executor = StatefulToolExecutor()
+        first_messages.append({"role": "assistant", "tool_calls": [tool_call]})
+        try:
+            assert handle_tool_calls(
+                [tool_call], probe_tools, tmp_path / "logs", task_id, executor,
+                first_messages, {"tool_calls": []}, lambda _text: None,
+            ) == 0
+        finally:
+            executor.shutdown(wait=True)
+        assert probe_tools.calls == [("probe", {})]
+        assert first_messages[-1]["role"] == "tool"
+
+    oh.retry_reset(tmp_path, tmp_path, task_id, reason="worker_crash_requeue")
+    successor_ctx = _drain_ctx(tmp_path, task_id=task_id, attempt=2)
+    successor_messages = []
+    loop._drain_incoming_messages(
+        successor_messages, _q.Queue(), tmp_path, task_id, None, set(), owner_ctx=successor_ctx,
+    )
+    observed = []
+    monkeypatch.setattr(
+        loop,
+        "call_llm_with_retry",
+        lambda _llm, messages, *_args, **_kwargs: observed.append(messages) or (
+            {"role": "assistant", "content": "ok"}, 0.01,
+        ),
+    )
+    monkeypatch.setattr(loop, "_server_web_allowed_by_task", lambda _ctx: False)
+    loop._dispatch_round_model(
+        SimpleNamespace(
+            llm=object(), messages=successor_messages, active_model="test-model",
+            tool_schemas=[], active_effort="high", max_retries=0,
+            drive_logs=tmp_path / "logs", task_id=task_id, round_idx=1,
+            event_queue=None, accumulated_usage={}, task_type="task",
+            active_use_local=False, tools=SimpleNamespace(_ctx=successor_ctx),
+            drive_root=tmp_path,
+        ),
+        None,
+        attempt_cap=1,
+    )
+    wire = json.dumps(observed[0], ensure_ascii=False)
+    assert exact.rstrip("\n") in wire
+    assert wire.count("model must see these exact bytes") == 1
+
+
+def test_historical_settled_attempt_ack_does_not_suppress_fresh_attempt(tmp_path):
+    write_owner_message(tmp_path, "incorporated", "settled-owner", msg_id="owner-settled")
+    assert acknowledge_task_messages(
+        tmp_path, "settled-owner", ["owner-settled"],
+        wake_id="old-model-response", attempt_key=1,
+    )
+    ack = _ack_path(tmp_path, "settled-owner")
+    rows = [json.loads(line) for line in ack.read_text(encoding="utf-8").splitlines()]
+    rows[0]["settled"] = True
+    ack.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8",
+    )
+
+    replay = drain_owner_entries(tmp_path, "settled-owner", attempt_key=2)
+    assert [(row["msg_id"], row["text"]) for row in replay] == [
+        ("owner-settled", "incorporated"),
+    ]
+
+
+def test_nonterminal_loop_cleanup_preserves_owner_mailbox(tmp_path, monkeypatch):
+    import ouroboros.delegate_custody as delegated
+    import ouroboros.loop as loop
+
+    write_owner_message(tmp_path, "survive loop exit", "loop-exit", msg_id="owner-loop")
+    assert acknowledge_task_messages(
+        tmp_path, "loop-exit", ["owner-loop"], wake_id="attempt-1", attempt_key=1,
+    )
+    inner = SimpleNamespace(
+        _delivery_candidate=object(), _delivery_control_required=True,
+        task_metadata={},
+    )
+    monkeypatch.setattr(loop, "_finalize_task_services", lambda _ctx: False)
+    monkeypatch.setattr(delegated, "release_task_runs", lambda *_a, **_k: [])
+    loop._cleanup_loop_resources(None, loop._LoopExitContext(
+        tools=SimpleNamespace(_ctx=inner), drive_root=tmp_path, task_id="loop-exit",
+        event_queue=None, drive_logs=tmp_path / "logs",
+        accumulated_usage={}, llm_trace={},
+    ))
+
+    replay = drain_owner_entries(tmp_path, "loop-exit", attempt_key=2)
+    assert [(row["msg_id"], row["text"]) for row in replay] == [
+        ("owner-loop", "survive loop exit"),
+    ]
 
 
 # ---------------------------------------------------------------------------

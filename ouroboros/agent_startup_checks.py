@@ -15,6 +15,166 @@ from ouroboros.utils import atomic_write_json, utc_now_iso, read_text, append_js
 log = logging.getLogger(__name__)
 
 
+def valid_task_result_authority_source(source: Any, task_id: Any) -> bool:
+    """Whether a named predecessor is the exact host-issued actor pointer."""
+    if not isinstance(source, dict):
+        return False
+    selected_id = str(task_id or "").strip()
+    arguments = source.get("arguments")
+    return bool(
+        selected_id
+        and str(source.get("kind") or "") == "task_result"
+        and str(source.get("task_id") or "") == selected_id
+        and str(source.get("tool") or "") == "get_task_result"
+        and isinstance(arguments, dict)
+        and str(arguments.get("task_id") or "") == selected_id
+        and arguments.get("include_authority") is True
+    )
+
+
+def validate_task_authority_sources(env: Any, task: Dict[str, Any]) -> Dict[str, Any]:
+    """Materialize named authority sources or return one typed startup refusal."""
+    root = pathlib.Path(
+        task.get("budget_drive_root")
+        or getattr(env, "budget_drive_root", None)
+        or env.drive_root
+    )
+
+    def _unavailable(source: Dict[str, Any], detail: str) -> Dict[str, Any]:
+        return {
+            "reason_code": "authority_source_unavailable",
+            "human_label": str(source.get("human_label") or source.get("task_id") or "task authority"),
+            "source": dict(source),
+            "detail": detail,
+            "recovery_choices": ["retry_after_source_recovery", "start_explicit_fresh_task"],
+        }
+
+    origin_ref = task.get("origin_message_ref")
+    if origin_ref not in (None, {}) and not isinstance(origin_ref, dict):
+        return _unavailable(
+            {"kind": "owner_message", "human_label": "originating owner message", "ref": origin_ref},
+            "named owner source reference is not an object",
+        )
+    if isinstance(origin_ref, dict) and origin_ref:
+        from ouroboros.project_dialogue import (
+            _text_sha256,
+            owner_message_ref_is_valid,
+            resolve_owner_message_source,
+        )
+
+        if not owner_message_ref_is_valid(origin_ref):
+            return _unavailable(
+                {"kind": "owner_message", "human_label": "originating owner message", "ref": origin_ref},
+                "named owner source reference has an invalid host identity shape",
+            )
+
+        origin_text = task.get("origin_message_text")
+        if isinstance(origin_text, str) and origin_text:
+            if _text_sha256(origin_text) != str(origin_ref.get("text_sha256") or ""):
+                return _unavailable(
+                    {"kind": "owner_message", "human_label": "originating owner message", "ref": origin_ref},
+                    "retained origin text does not match its ingress checksum",
+                )
+        else:
+            matching = resolve_owner_message_source(root, origin_ref)
+            if matching is None:
+                return _unavailable(
+                    {"kind": "owner_message", "human_label": "originating owner message", "ref": origin_ref},
+                    "named canonical owner row is not readable and no retention-proof text is stored",
+                )
+            task["origin_message_text"] = str(matching.get("text") or "")
+
+    predecessor = task.get("predecessor_authority_source")
+    if predecessor not in (None, {}) and not isinstance(predecessor, dict):
+        return _unavailable(
+            {"kind": "task_result", "human_label": "predecessor task authority", "raw": predecessor},
+            "named predecessor authority source is not an object",
+        )
+    if isinstance(predecessor, dict) and predecessor:
+        predecessor_id = str(predecessor.get("task_id") or "").strip()
+        if not valid_task_result_authority_source(predecessor, predecessor_id):
+            return _unavailable(predecessor, "named predecessor authority source shape is invalid")
+        from ouroboros.task_status import load_effective_task_result
+
+        predecessor_row = (
+            load_effective_task_result(root, predecessor_id, materialize_artifacts=False)
+            if predecessor_id else None
+        )
+        if not isinstance(predecessor_row, dict):
+            return _unavailable(predecessor, "named predecessor task result is missing or unreadable")
+        from ouroboros.contracts.task_contract import build_task_contract
+
+        task["predecessor_authority"] = {
+            "source": dict(predecessor),
+            "task_contract": build_task_contract(predecessor_row),
+            "objective": predecessor_row.get("objective") or predecessor_row.get("description") or "",
+            "context": predecessor_row.get("context") or "",
+        }
+    else:
+        metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+        previous = metadata.get("project_last_task_result")
+        if isinstance(previous, dict) and previous and not previous.get("authority_source"):
+            task.setdefault("authority_historical_gaps", []).append({
+                "kind": "legacy_predecessor_without_source",
+                "task_id": str(previous.get("task_id") or ""),
+            })
+
+    current_id = str(task.get("id") or "").strip()
+    current_path = root / "task_results" / f"{current_id}.json"
+    if current_id and current_path.exists():
+        try:
+            from ouroboros.task_results import load_plan_review_state
+
+            load_plan_review_state(root, current_id)
+        except Exception as exc:
+            return _unavailable(
+                {"kind": "plan_review_state", "task_id": current_id,
+                 "human_label": str(task.get("title") or task.get("objective") or current_id)},
+                f"current plan/review authority is unreadable ({type(exc).__name__})",
+            )
+    return {}
+
+
+def persist_early_origin_stub(
+    drive_root: Any, task: Dict[str, Any], *, write_result: Any = None,
+) -> None:
+    """Merge-persist ingress authority before the convertible task card exists.
+
+    Ephemeral/origin-less turns write nothing. A storage failure is loud but
+    non-fatal: the owner's task outlives its start message, and the subsequent
+    full RUNNING write will encounter the same storage fault. ``write_result``
+    preserves the existing agent test seam while production uses the canonical
+    task-result writer.
+    """
+    if bool(task.get("_ephemeral_turn")):
+        return
+    ref = task.get("origin_message_ref")
+    if not (isinstance(ref, dict) and ref):
+        return
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+
+    writer = write_result or write_task_result
+
+    for attempt in range(2):
+        try:
+            writer(
+                drive_root, str(task.get("id") or ""), STATUS_RUNNING,
+                chat_id=task.get("chat_id"), origin_message_ref=dict(ref),
+                origin_message_text=task.get("origin_message_text"), result="Task is starting.",
+            )
+            return
+        except Exception:
+            if attempt:
+                log.warning("Early origin stub persistence failed", exc_info=True)
+    try:
+        append_jsonl(pathlib.Path(drive_root) / "logs" / "events.jsonl", {
+            "ts": utc_now_iso(), "type": "origin_stub_persist_failed",
+            "task_id": str(task.get("id") or ""),
+        })
+    except Exception:
+        log.debug("origin_stub_persist_failed event write failed", exc_info=True)
+
+
 def _is_release_tag(tag: str) -> bool:
     from ouroboros.tools.release_sync import normalize_release_tag
 
@@ -481,6 +641,22 @@ def hot_store_growth_notes(env: Any) -> list:
                 f"WARNING: HOT STORE GROWTH — {rel} is {size / 1_000_000:.1f} MB "
                 f"(threshold {threshold // 1_000_000} MB). {remediation}"
             )
+    try:
+        archive_size = sum(
+            path.stat().st_size for path in (drive_root / "archive").glob("chat_*.jsonl")
+            if path.is_file()
+        )
+    except OSError:
+        archive_size = 0
+    from ouroboros.context_budget import CHAT_ARCHIVE_SCAN_WARN_BYTES
+    if archive_size > CHAT_ARCHIVE_SCAN_WARN_BYTES:
+        notes.append(
+            "WARNING: HOT STORE GROWTH — archive/chat_*.jsonl totals "
+            f"{archive_size / 1_000_000:.1f} MB (threshold "
+            f"{CHAT_ARCHIVE_SCAN_WARN_BYTES // 1_000_000} MB). Ordinary context reads "
+            "the consolidation-owned suffix; explicit chat_history replay scans this chain. "
+            "Investigate archive indexing/compaction without shortening the memory horizon."
+        )
     return notes
 
 

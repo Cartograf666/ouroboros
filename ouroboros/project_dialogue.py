@@ -13,7 +13,7 @@ import json
 import os
 import pathlib
 import uuid
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
 from ouroboros.utils import iter_jsonl_objects, jsonl_append_lock_path, replace_atomic, utc_now_iso
@@ -21,6 +21,13 @@ from ouroboros.utils import iter_jsonl_objects, jsonl_append_lock_path, replace_
 _ANNOTATIONS_NAME = "chat_annotations.jsonl"
 _COMPACT_AT_BYTES = 800_000
 _RETAINED_ARCHIVES = 3
+
+
+def _row_chat_id(row: Dict[str, Any]) -> int:
+    try:
+        return int(row.get("chat_id", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _chat_paths(drive_root: Any) -> List[pathlib.Path]:
@@ -56,6 +63,23 @@ def build_owner_message_ref(
         "ts": str(ts or ""),
         "text_sha256": _text_sha256(text),
     }
+
+
+def owner_message_ref_is_valid(ref: Any) -> bool:
+    """Whether a source ref has the complete host-minted owner-row identity."""
+    if not isinstance(ref, dict) or not {
+        "chat_id", "client_message_id", "ts", "text_sha256",
+    }.issubset(ref):
+        return False
+    digest = ref.get("text_sha256")
+    return bool(
+        isinstance(ref.get("chat_id"), int)
+        and not isinstance(ref.get("chat_id"), bool)
+        and isinstance(ref.get("client_message_id"), str)
+        and isinstance(ref.get("ts"), str) and ref.get("ts")
+        and isinstance(digest, str) and len(digest) == 64
+        and all(char in "0123456789abcdef" for char in digest)
+    )
 
 
 def source_refs_for_project(drive_root: Any, project_chat_id: int) -> List[Dict[str, Any]]:
@@ -107,34 +131,94 @@ def project_origin_rows(drive_root: Any, project_chat_id: int) -> List[Dict[str,
     return rows
 
 
+def project_recent_dialogue(
+    memory: Any, project_chat_id: int, max_entries: int,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
+    """Focused recent rows plus retention-proof cross-thread owner origins."""
+    from ouroboros.projects_registry import all_task_bindings
+
+    try:
+        bound = all_task_bindings(memory.drive_root)
+    except Exception:
+        bound = {}
+    refs = source_refs_for_project(memory.drive_root, project_chat_id)
+    ref_keys = {key for ref in refs if (key := _source_ref_identity(ref)) is not None}
+    entries, coverage = memory.read_unconsolidated_chat(
+        memory.load_dialogue_meta(), max_entries,
+        predicate=lambda row: (
+            _row_chat_id(row) == project_chat_id
+            or bound.get(str(row.get("task_id") or "")) == project_chat_id
+            or bool(_entry_source_identities(row) & ref_keys)
+        ),
+    )
+    present_ref_keys = set()
+    for entry in entries:
+        present_ref_keys.update(_entry_source_identities(entry))
+    retained: List[Dict[str, Any]] = []
+    for origin in project_origin_rows(memory.drive_root, project_chat_id):
+        ref = origin.get("ref") if isinstance(origin.get("ref"), dict) else {}
+        if _source_ref_identity(ref) in present_ref_keys:
+            continue
+        retained.append({
+            "chat_id": ref.get("chat_id"), "client_message_id": ref.get("client_message_id"),
+            "ts": ref.get("ts"), "direction": "in", "text": origin.get("text"),
+            "project_origin_projection": True,
+        })
+    return entries, coverage, retained
+
+
+def _source_ref_identity(ref: Dict[str, Any]) -> Optional[tuple]:
+    try:
+        chat_id = int(ref.get("chat_id") or 0)
+    except (TypeError, ValueError):
+        return None
+    return (
+        chat_id, str(ref.get("client_message_id") or ""), str(ref.get("ts") or ""),
+        str(ref.get("text_sha256") or ""),
+    )
+
+
+def _entry_source_identities(entry: Dict[str, Any]) -> set:
+    if str(entry.get("direction") or "") != "in":
+        return set()
+    try:
+        chat_id = int(entry.get("chat_id", 1) or 1)
+    except (TypeError, ValueError):
+        chat_id = 1
+    client_id = str(entry.get("client_message_id") or "")
+    ts = str(entry.get("ts") or "")
+    text_hash = _text_sha256(entry.get("text"))
+    return {
+        (chat_id, client_id, ts, text_hash), (chat_id, "", ts, text_hash),
+        (chat_id, client_id, "", text_hash), (chat_id, "", "", text_hash),
+    }
+
+
 def entry_matches_source_ref(entry: Dict[str, Any], refs: Iterable[Dict[str, Any]]) -> bool:
     """Whether ``entry`` is the original row identified by one binding ref."""
-    if str(entry.get("direction") or "") != "in":
-        return False
-    try:
-        entry_chat_id = int(entry.get("chat_id", 1) or 1)
-    except (TypeError, ValueError):
-        entry_chat_id = 1
-    entry_client_id = str(entry.get("client_message_id") or "")
-    entry_ts = str(entry.get("ts") or "")
-    entry_hash = _text_sha256(entry.get("text"))
-    for ref in refs:
-        if not isinstance(ref, dict):
-            continue
+    ref_keys = {
+        key for ref in refs if isinstance(ref, dict)
+        if (key := _source_ref_identity(ref)) is not None
+    }
+    return bool(_entry_source_identities(entry) & ref_keys)
+
+
+def resolve_owner_message_source(drive_root: Any, ref: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Stream the exact named owner source across the durable generation chain."""
+    from ouroboros.consolidator import _ordered_chat_generation_paths
+
+    live = pathlib.Path(drive_root) / "logs" / "chat.jsonl"
+    ref_key = _source_ref_identity(ref)
+    if ref_key is None:
+        return None
+    for path in reversed(_ordered_chat_generation_paths(live)):
         try:
-            if int(ref.get("chat_id") or 0) != entry_chat_id:
-                continue
-        except (TypeError, ValueError):
+            for row in iter_jsonl_objects(path):
+                if ref_key in _entry_source_identities(row):
+                    return dict(row)
+        except OSError:
             continue
-        client_id = str(ref.get("client_message_id") or "")
-        if client_id and client_id != entry_client_id:
-            continue
-        if str(ref.get("ts") or "") and str(ref.get("ts")) != entry_ts:
-            continue
-        if str(ref.get("text_sha256") or "") != entry_hash:
-            continue
-        return True
-    return False
+    return None
 
 
 def _latest_annotations(path: pathlib.Path) -> Dict[str, Dict[str, Any]]:
@@ -200,6 +284,7 @@ def append_chat_annotation(
     reason: str = "",
     detail: str = "",
     options: Any = None,
+    attachment_manifest: Any = None,
 ) -> bool:
     """Append one compact UI annotation; no semantic routing state is stored."""
     message_id = str(client_message_id or "").strip()
@@ -221,6 +306,10 @@ def append_chat_annotation(
         row["detail"] = str(detail)[:1000]
     if isinstance(options, list):
         row["options"] = [dict(item) for item in options[:100] if isinstance(item, dict)]
+    if isinstance(attachment_manifest, list):
+        row["attachment_manifest"] = [
+            dict(item) for item in attachment_manifest if isinstance(item, dict)
+        ]
     path = pathlib.Path(drive_root) / "logs" / _ANNOTATIONS_NAME
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = jsonl_append_lock_path(path)
@@ -249,6 +338,9 @@ __all__ = [
     "chat_annotation_receipt",
     "entry_matches_source_ref",
     "latest_chat_annotations",
+    "owner_message_ref_is_valid",
     "project_origin_rows",
+    "project_recent_dialogue",
+    "resolve_owner_message_source",
     "source_refs_for_project",
 ]
