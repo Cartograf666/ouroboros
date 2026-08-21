@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -5,7 +6,15 @@ import pathlib
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
-from ouroboros.utils import atomic_write_json, read_json_dict, replace_atomic, utc_now_iso, read_text, write_text
+from ouroboros.utils import (
+    append_jsonl,
+    atomic_write_json,
+    read_json_dict,
+    replace_atomic,
+    utc_now_iso,
+    read_text,
+    write_text,
+)
 
 from ouroboros.platform_layer import (
     file_lock_exclusive as _lock_ex,
@@ -768,6 +777,22 @@ Respond with JSON only (no fences):
             "source": "consolidation",
             "content": compressed_text.strip(),
         }
+
+        source_bytes = json.dumps(
+            old_blocks, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        source_entry_id = "scratchpad-consolidation:" + hashlib.sha256(source_bytes).hexdigest()
+        source_ref = memory.scratchpad_journal_source_ref(source_entry_id)
+        if not append_jsonl(memory.journal_path(), {
+            "ts": utc_now_iso(),
+            "type": "blocks_consolidated",
+            "entry_id": source_entry_id,
+            "source_blocks": old_blocks,
+            "source_ref": source_ref,
+        }):
+            log.error("Scratchpad consolidation source journal write failed; preserving blocks")
+            return usage
+        compressed_block["metadata"] = {"source_ref": source_ref}
 
         # Merge-aware replace UNDER the write lock: blocks appended DURING the
         # slow LLM call live only on disk — building the new list from the

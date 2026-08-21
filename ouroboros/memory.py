@@ -146,6 +146,22 @@ class Memory:
     def identity_journal_path(self) -> pathlib.Path: return self._memory_path("identity_journal.jsonl")
     def logs_path(self, name: str) -> pathlib.Path: return (self.drive_root / "logs" / name).resolve()
 
+    @staticmethod
+    def scratchpad_journal_source_ref(entry_id: str = "") -> Dict[str, Any]:
+        ref: Dict[str, Any] = {
+            "read": {
+                "tool": "read_file",
+                "arguments": {
+                    "root": "runtime_data",
+                    "path": "memory/scratchpad_journal.jsonl",
+                    "start_line": 1,
+                },
+            },
+        }
+        if str(entry_id or "").strip():
+            ref["entry_id"] = str(entry_id).strip()
+        return ref
+
     def load_scratchpad(self) -> str:
         path = self.scratchpad_path()
         if path.exists():
@@ -221,13 +237,16 @@ class Memory:
                     return updated
                 evicted = updated[:-_SCRATCHPAD_MAX_BLOCKS]
                 for eb in evicted:
-                    append_jsonl(self.journal_path(), {
+                    written = append_jsonl(self.journal_path(), {
                         "ts": utc_now_iso(),
                         "type": "block_evicted",
                         "evicted_block_ts": eb.get("ts", ""),
                         "evicted_block_source": eb.get("source", ""),
                         "evicted_block_content": eb.get("content", ""),
+                        "source_ref": self.scratchpad_journal_source_ref(),
                     })
+                    if not written:
+                        raise RuntimeError("scratchpad eviction journal write failed")
                 return updated[-_SCRATCHPAD_MAX_BLOCKS:]
 
             self.mutate_scratchpad_blocks(_append)
@@ -333,11 +352,26 @@ class Memory:
 
         n = len(blocks)
         parts = [f"## Scratchpad (working memory — {n}/{_SCRATCHPAD_MAX_BLOCKS} blocks)\n"]
+        if self.journal_path().exists():
+            parts.append(
+                "Exact retired/replaced source blocks remain readable with "
+                "`read_file(root='runtime_data', "
+                "path='memory/scratchpad_journal.jsonl', start_line=1)`.\n\n"
+            )
         for block in reversed(blocks):
             ts = str(block.get("ts", ""))[:16]
             source = block.get("source", "?")
             content = block.get("content", "")
             parts.append(f"### [{ts} — {source}]\n{content}\n\n---\n")
+            metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+            source_ref = metadata.get("source_ref") if isinstance(metadata.get("source_ref"), dict) else {}
+            entry_id = str(source_ref.get("entry_id") or "")
+            if entry_id:
+                parts.append(
+                    "Exact replaced blocks: `read_file(root='runtime_data', "
+                    "path='memory/scratchpad_journal.jsonl', start_line=1)`; "
+                    f"locate `entry_id={entry_id}`.\n\n"
+                )
 
         write_text(self.scratchpad_path(), "\n".join(parts))
 

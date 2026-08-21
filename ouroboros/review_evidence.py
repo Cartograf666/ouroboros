@@ -536,40 +536,36 @@ def annotate_criteria_evidence_resolution(actors: Any, evidence: Any) -> None:
             actor["criteria_refs_unresolved"] = [dict(_RESOLUTION_UNAVAILABLE_ROW)]
 
 
-def _accept_trajectory(tool_calls: list) -> tuple:
-    """Redacted, per-result-capped projection of the tool-call trajectory (tail-kept) so the
-    reviewer can audit HOW the task was solved, not only the final diff. Returns
-    (projected_calls, omitted_leading_count); the omission is disclosed (Bible P1).
-
-    Evidence-parity (v6.71.1): each result is capped at the ACTOR's own per-tool
-    window (SSOT tool_capabilities.TOOL_RESULT_LIMITS / DEFAULT_TOOL_RESULT_LIMIT)
-    — the reviewer adjudicates the same view the agent saw, including the 80k
-    verification tools (run_command/read_file/…). Uncapped actor views
-    (UNTRUNCATED_TOOL_RESULTS) fall back to the default window with a disclosed
-    omission note; the whole-packet budget ladder may shrink further, disclosed."""
+def _accept_trajectory(tool_calls: list, drive_root: Any = None, task_id: str = "") -> tuple:
+    """Build the bounded acceptance trajectory and resolve partial source handles."""
+    from ouroboros.artifacts import materialize_tool_result_source
     from ouroboros.tool_capabilities import TOOL_RESULT_LIMITS
-
     calls = [c for c in (tool_calls or []) if isinstance(c, dict)]
     omitted = max(0, len(calls) - _ACCEPT_TRAJECTORY_MAX_CALLS)
     kept = calls[-_ACCEPT_TRAJECTORY_MAX_CALLS:] if omitted else calls
-    out = []
+    out, unresolved = [], []
     for c in kept:
         tool = str(c.get("tool") or "")
-        # The trace value is the actor's view: for an over-limit raw result it is
-        # already `cap chars + "... (truncated from N ...)"` (~47 chars over cap).
-        # truncate_review_artifact's anti-waste floor (a cut saving less than its
-        # own ~70-char marker passes WHOLE) keeps that actor marker intact here,
-        # so the reviewer retains the original raw-size provenance (P1) — pinned
-        # by test_actor_truncation_marker_survives_into_acceptance_packet.
+        result_value, result_complete, issue = materialize_tool_result_source(
+            drive_root, task_id, c,
+        )
+        if issue:
+            unresolved.append(issue)
         result_cap = TOOL_RESULT_LIMITS.get(tool, _ACCEPT_RESULT_CAP)
-        out.append({
+        source_ref = c.get("result_source_ref") if isinstance(c.get("result_source_ref"), dict) else {}
+        if result_complete and c.get("result_partial"):
+            result_cap = max(result_cap, len(str(result_value)))
+        row = {
             "tool": tool,
             "status": str(c.get("status") or ("error" if c.get("is_error") else "ok")),
             "is_error": bool(c.get("is_error")),
             "args": _accept_redact_cap(c.get("args"), _ACCEPT_ARGS_CAP) if c.get("args") not in (None, "", {}) else "",
-            "result": _accept_redact_cap(c.get("result"), result_cap) if c.get("result") not in (None, "") else "",
-        })
-    return out, omitted
+            "result": _accept_redact_cap(result_value, result_cap) if result_value not in (None, "") else "",
+        }
+        if c.get("result_partial"):
+            row.update(result_complete=result_complete, result_source_ref=source_ref)
+        out.append(row)
+    return out, omitted, unresolved
 
 
 def _accept_artifact_manifest(drive_root: Any, task_id: str, protected: set) -> list:
@@ -657,15 +653,7 @@ def _accept_enforce_budget(ev: Dict[str, Any]) -> Dict[str, Any]:
         ev["tool_trajectory_omitted_leading"] = int(ev.get("tool_trajectory_omitted_leading", 0) or 0) + dropped
         notes.append(f"kept the most-recent 20 tool calls (dropped {dropped} earlier)")
         omissions.append({"section": "tool_trajectory", "omitted": dropped, "reason": "evidence_budget"})
-    # Trajectory re-cap (v6.71.1): with evidence-parity the per-result caps track
-    # the actor's per-tool windows (up to 80k), so even 20 retained calls can exceed
-    # the whole-packet ceiling on tool-heavy tasks. This is a TRAJECTORY degradation,
-    # so it runs with the other trajectory steps, honoring the documented "degrade
-    # the trajectory first" ladder order — artifact previews and agent_supplied (the
-    # obligation-rebuttal channel) are true last resorts, not collateral of routine
-    # trajectory weight. Re-cap each retained result to an equal share of the
-    # remaining budget (disclosed, floor 700 = the pre-parity view) BEFORE ever
-    # declaring the packet unreviewable.
+    # Re-cap trajectory results before lower-priority evidence sections.
     traj = ev.get("tool_trajectory")
     if _size() > _ACCEPT_TOTAL_BUDGET and isinstance(traj, list) and traj:
         non_traj = _size() - sum(len(str(c.get("result") or "")) for c in traj if isinstance(c, dict))
@@ -677,20 +665,20 @@ def _accept_enforce_budget(ev: Dict[str, Any]) -> Dict[str, Any]:
         for c in traj:
             if isinstance(c, dict) and len(str(c.get("result") or "")) > share:
                 c["result"] = truncate_review_artifact(str(c.get("result")), limit=share)
+                if "result_complete" in c:
+                    c["result_complete"] = False
                 recapped += 1
         if recapped:
             notes.append(f"re-capped {recapped} trajectory results to ~{share} chars each for budget")
             omissions.append({"section": "tool_trajectory_results", "omitted": recapped, "reason": "evidence_budget"})
-        # Escape-proof backstop: the -400/call haircut covers JSON escaping of the
-        # retained prefixes analytically (prefix inflation ⊆ whole-result inflation,
-        # already inside non_traj), but if pathological serialization ever defeats
-        # that bound, shed to the 700-char floor instead of letting reducible
-        # trajectory weight masquerade as immutable-core overflow.
+        # Escape-proof backstop: shed to the 700-char floor if needed.
         if _size() > _ACCEPT_TOTAL_BUDGET and share > 700:
             floored = 0
             for c in traj:
                 if isinstance(c, dict) and len(str(c.get("result") or "")) > 700:
                     c["result"] = truncate_review_artifact(str(c.get("result")), limit=700)
+                    if "result_complete" in c:
+                        c["result_complete"] = False
                     floored += 1
             if floored:
                 notes.append(f"floored {floored} trajectory results to 700 chars for budget")
@@ -722,6 +710,18 @@ def _accept_enforce_budget(ev: Dict[str, Any]) -> Dict[str, Any]:
             "reason": "immutable owner requirements cannot be truncated",
         }
         notes.append(f"immutable core remains ~{_size() // 1000}k; reviewer must abstain as DEGRADED")
+    unresolved_partials = [{
+        "tool": str(row.get("tool") or ""),
+        "status": "not_materialized_for_reviewer",
+        "source_ref": row.get("result_source_ref") or {},
+    } for row in (ev.get("tool_trajectory") or [])
+        if isinstance(row, dict) and row.get("result_complete") is False]
+    if unresolved_partials:
+        existing = ev.get("__unresolved_partial_artifacts__")
+        ev["__unresolved_partial_artifacts__"] = [
+            *(existing if isinstance(existing, list) else []),
+            *unresolved_partials,
+        ]
     if notes:
         ev["__budget_note__"] = (
             f"⚠️ OMISSION NOTE: evidence exceeded {_ACCEPT_TOTAL_BUDGET} chars; "
@@ -960,12 +960,16 @@ def build_task_acceptance_evidence(
         ev["terminal_subtree_statuses"] = [dict(row) for row in subtree_statuses if isinstance(row, dict)]
         prov["terminal_subtree_statuses"] = "host_attested"
     if isinstance(llm_trace, dict):
-        traj, omitted = _accept_trajectory(llm_trace.get("tool_calls") or [])
+        traj, omitted, unresolved = _accept_trajectory(
+            llm_trace.get("tool_calls") or [], drive_root=drive_root, task_id=task_id,
+        )
         if traj or omitted:
             ev["tool_trajectory"] = traj
             prov["tool_trajectory"] = "tool_result"
             if omitted:
                 ev["tool_trajectory_omitted_leading"] = omitted
+        if unresolved:
+            ev["__unresolved_partial_artifacts__"] = unresolved
         notes = llm_trace.get("reasoning_notes") or []
         if notes:
             ev["reasoning_notes"] = truncate_review_artifact("\n".join(str(n) for n in notes), limit=_ACCEPT_NOTES_CAP)

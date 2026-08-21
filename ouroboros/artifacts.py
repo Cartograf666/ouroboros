@@ -39,6 +39,8 @@ _MAX_SCRATCH_PATHS = 1000
 # from importing an unbounded amount of host data.
 _ATTACHMENTS_SUBDIR = "attachments"
 _CHAT_MEDIA_SUBDIR = "chat_media"
+_SOURCE_HANDLES_SUBDIR = "source_handles"
+_SOURCE_HANDLE_CATEGORIES = frozenset({"tool_results", "context_checkpoints"})
 _CHAT_MEDIA_EXTENSIONS = {
     "image/png": "png",
     "image/jpeg": "jpg",
@@ -472,6 +474,108 @@ def task_artifact_dir_path(drive_root: Union[pathlib.Path, str], task_id: str, *
     return task_artifacts_dir(pathlib.Path(drive_root), validate_task_id(task_id), create=create)
 
 
+def store_actor_source_bytes(
+    drive_root: Union[pathlib.Path, str],
+    task_id: str,
+    *,
+    category: str,
+    source_id: str,
+    data: bytes,
+    extension: str,
+) -> Dict[str, Any]:
+    """Persist exact bytes inside this task's existing actor-readable artifact root."""
+
+    normalized_category = str(category or "").strip()
+    if normalized_category not in _SOURCE_HANDLE_CATEGORIES:
+        raise ValueError(f"unsupported source-handle category: {normalized_category}")
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(source_id or "source")).strip("._")
+    safe_id = safe_id[:160] or "source"
+    safe_extension = re.sub(r"[^A-Za-z0-9]+", "", str(extension or "bin"))[:12] or "bin"
+    digest = sha256(data).hexdigest()
+    artifact_dir = task_artifact_dir_path(drive_root, task_id, create=True)
+    relative = pathlib.PurePosixPath(
+        _SOURCE_HANDLES_SUBDIR,
+        normalized_category,
+        f"{safe_id}-{digest}.{safe_extension}",
+    )
+    target = artifact_dir.joinpath(*relative.parts)
+    write_bytes_atomic(target, bytes(data))
+    return {
+        "kind": "task_source",
+        "root": "artifact_store",
+        "path": relative.as_posix(),
+        "size": len(data),
+        "sha256": digest,
+        "read": {
+            "tool": "read_file",
+            "arguments": {
+                "root": "artifact_store",
+                "path": relative.as_posix(),
+                "start_line": 1,
+                "max_lines": 2000,
+                "start_char": 0,
+            },
+        },
+    }
+
+
+def read_actor_source_bytes(
+    drive_root: Union[pathlib.Path, str], task_id: str, ref: Any,
+) -> bytes:
+    """Resolve and verify one task-local actor source ref or raise explicitly."""
+
+    if not isinstance(ref, dict) or ref.get("kind") != "task_source":
+        raise ValueError("actor source ref has an unexpected kind")
+    if ref.get("root") != "artifact_store":
+        raise ValueError("actor source ref has an unexpected root")
+    rel = pathlib.PurePosixPath(str(ref.get("path") or ""))
+    if not rel.parts or rel.parts[0] != _SOURCE_HANDLES_SUBDIR or rel.is_absolute():
+        raise ValueError("actor source ref has an invalid path")
+    base = task_artifact_dir_path(drive_root, task_id, create=False).resolve(strict=False)
+    target = base.joinpath(*rel.parts)
+    if target.is_symlink():
+        raise ValueError("actor source ref may not be a symlink")
+    try:
+        target = target.resolve(strict=True)
+        target.relative_to(base)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"actor source unavailable: {rel.as_posix()}") from exc
+    except ValueError as exc:
+        raise ValueError("actor source ref escapes its task artifact root") from exc
+    raw = target.read_bytes()
+    try:
+        expected_size = int(ref["size"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("actor source ref has no valid size") from exc
+    if len(raw) != expected_size:
+        raise ValueError("actor source ref failed size verification")
+    if sha256(raw).hexdigest() != str(ref.get("sha256") or ""):
+        raise ValueError("actor source ref failed sha256 verification")
+    return raw
+
+
+def materialize_tool_result_source(
+    drive_root: Union[pathlib.Path, str], task_id: str, call: Dict[str, Any],
+) -> tuple[Any, bool, Dict[str, Any]]:
+    """Return the exact result behind a partial task trace, or a typed gap."""
+
+    result = call.get("result")
+    if not call.get("result_partial"):
+        return result, True, {}
+    ref = call.get("result_source_ref") if isinstance(call.get("result_source_ref"), dict) else {}
+    try:
+        return read_actor_source_bytes(drive_root, task_id, ref).decode("utf-8"), True, {}
+    except (OSError, UnicodeError, TypeError, ValueError) as exc:
+        return result, False, {
+            "tool_call_id": str(call.get("tool_call_id") or ""),
+            "tool": str(call.get("tool") or ""),
+            "status": "source_unavailable",
+            "declared_status": str(call.get("result_source_status") or ""),
+            "reason": f"{type(exc).__name__}: {exc}",
+            "source_ref": ref,
+        }
+
+
 def store_chat_media_bytes(
     drive_root: Union[pathlib.Path, str], task_id: str, data: bytes, mime: str,
 ) -> Optional[Dict[str, Any]]:
@@ -829,7 +933,9 @@ def collect_task_artifact_records(drive_root: Union[pathlib.Path, str], task_id:
             continue
         # v6.52.0 (P1): staged INPUT attachments live under attachments/ and are NOT
         # task deliverables — never record them as produced artifacts.
-        if rel_parts and rel_parts[0] in {_ATTACHMENTS_SUBDIR, _CHAT_MEDIA_SUBDIR}:
+        if rel_parts and rel_parts[0] in {
+            _ATTACHMENTS_SUBDIR, _CHAT_MEDIA_SUBDIR, _SOURCE_HANDLES_SUBDIR,
+        }:
             continue
         try:
             record = artifact_record(path)
