@@ -1380,18 +1380,11 @@ class ReviewCoordinator:
         except Exception:
             prompt_ref = {}
         incomplete_partial = request.evidence.get("__unresolved_partial_artifacts__")
-        if request.surface == "task_acceptance" and (
-            request.evidence.get("__immutable_core_overflow__") or incomplete_partial):
+        if request.surface == "task_acceptance" and (request.evidence.get("__immutable_core_overflow__") or incomplete_partial):
             raw_text = json.dumps({
                 "verdict": "DEGRADED",
                 "findings": [],
-                "summary": (
-                    "A decision-bearing tool result remains partial or its exact source "
-                    "is unavailable; acceptance cannot treat that projection as complete."
-                    if incomplete_partial else
-                    "Immutable owner requirements do not fit the acceptance evidence "
-                    "budget; no requirement was silently truncated."
-                ),
+                "summary": "A decision-bearing tool result remains partial or its exact source is unavailable; acceptance cannot treat that projection as complete." if incomplete_partial else "Immutable owner requirements do not fit the acceptance evidence budget; no requirement was silently truncated.",
             })
             try:
                 response_ref = persist_call(
@@ -1402,8 +1395,7 @@ class ReviewCoordinator:
                     payload={"message": {"content": raw_text}, "usage": {}},
                     manifest={
                         "surface": request.surface, "slot_id": slot.slot_id,
-                        "model": slot.model, "status": "degraded_partial_source"
-                        if incomplete_partial else "degraded_core_overflow",
+                        "model": slot.model, "status": "degraded_partial_source" if incomplete_partial else "degraded_core_overflow",
                         "physical_attempts": 0,
                     },
                 )

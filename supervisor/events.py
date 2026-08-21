@@ -78,10 +78,7 @@ def _emit_routing_receipt(
     if target and not str(target_label or "").strip():
         from ouroboros.project_dialogue import routing_target_label
 
-        target_label = routing_target_label(
-            ctx.DRIVE_ROOT, action, target, task=evt,
-            project_id=str(evt.get("project_id") or ""),
-        )
+        target_label = routing_target_label(ctx.DRIVE_ROOT, action, target, task=evt, project_id=str(evt.get("project_id") or ""))
     client_message_id = str(evt.get("client_message_id") or "").strip()
     routing_token = str(evt.get("routing_token") or "").strip()
     annotation_status = "not_applicable"
@@ -159,10 +156,7 @@ def _publish_routing_ack(
         if target and not str(target_label or "").strip():
             from ouroboros.project_dialogue import routing_target_label
 
-            target_label = routing_target_label(
-                ctx.DRIVE_ROOT, action, target, task=evt,
-                project_id=str(evt.get("project_id") or ""),
-            )
+            target_label = routing_target_label(ctx.DRIVE_ROOT, action, target, task=evt, project_id=str(evt.get("project_id") or ""))
         client_message_id = str(evt.get("client_message_id") or "").strip()
         try:
             chat_id = int(evt.get("chat_id") or 0)
@@ -1039,8 +1033,7 @@ def _handle_typing_start(evt: Dict[str, Any], ctx: Any) -> None:
         pass
 
 
-# Fast-path terminal-delivery cache. The durable registry is the logical
-# cross-restart dedupe; registration happens only after a successful send.
+# Durable terminal registry dedupes successful sends across restarts.
 _DELIVERED_MESSAGE_IDS: "deque[str]" = deque(maxlen=256)
 
 
@@ -1105,9 +1098,7 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
                     progress_meta = dict(child_meta)
                     progress_meta.update(event_meta)
             if is_progress and isinstance(_m, dict):
-                # RUNNING is the host authority for a cancelable queue root.
-                # Lineage-gating prevents a subagent from minting that action;
-                # copy-on-write preserves the worker event.
+                # Host-attested RUNNING lineage is the cancel authority.
                 progress_meta = dict(progress_meta or {})
                 for lineage_key in ("root_task_id", "parent_task_id", "delegation_role"):
                     value = str(task_row.get(lineage_key) or "").strip()
@@ -1148,14 +1139,8 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             meta.get("root_task_id") or evt.get("root_task_id"),
         )
         system_type = str(evt.get("system_type") or "")
-        # This host-stamped terminal projection deliberately targets cognitive
-        # Main while its raw task id remains Project-bound. Every other task
-        # message keeps lineage routing through the owning Project thread.
-        chat_id = (
-            int(evt["chat_id"])
-            if system_type == "project_completion_summary"
-            else bound_chat or int(evt["chat_id"])
-        )
+        # Project completion summaries target cognitive Main; other messages keep lineage routing.
+        chat_id = int(evt["chat_id"]) if system_type == "project_completion_summary" else bound_chat or int(evt["chat_id"])
         ctx.send_with_budget(
             chat_id,
             str(evt.get("text") or ""),
