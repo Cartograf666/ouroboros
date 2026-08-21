@@ -13,6 +13,7 @@ form (scope, kinds, append-only, size caps); the LLM interprets meaning (BIBLE P
 
 from __future__ import annotations
 
+import json
 import logging
 import pathlib
 from hashlib import sha256
@@ -20,7 +21,12 @@ from typing import Any, Dict, List
 
 from ouroboros.config import DATA_DIR
 from ouroboros.task_results import validate_task_id
-from ouroboros.utils import append_jsonl, iter_jsonl_objects, utc_now_iso
+from ouroboros.utils import (
+    append_jsonl,
+    iter_jsonl_objects,
+    jsonl_generation_signature,
+    utc_now_iso,
+)
 
 log = logging.getLogger(__name__)
 
@@ -368,36 +374,182 @@ def child_result_disposition_row(
     return current
 
 
-def tree_ledger_tail_digest(root_id: str, *, limit: int = 40) -> str:
+def _tree_ledger_snapshot(source: Dict[str, Any], root_id: str) -> str:
+    payload = {
+        "schema_version": 1,
+        "root_task_id": root_id,
+        "source": source,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _tree_ledger_snapshot_rows(
+    root_id: str,
+    *,
+    data_root: pathlib.Path | None = None,
+) -> tuple[List[Dict[str, Any]], str, bool, int]:
+    try:
+        path = tree_ledger_path(root_id, data_root=data_root)
+    except ValueError:
+        return [], "", True, 0
+    if not path.is_file():
+        return [], "", True, 0
+    rows: List[Dict[str, Any]] = []
+    snapshot = ""
+    unreadable = 0
+    for _attempt in range(2):
+        before = jsonl_generation_signature(path)
+        rows = []
+        unreadable = 0
+        try:
+            with path.open("rb") as handle:
+                for raw in handle:
+                    try:
+                        line = raw.decode("utf-8").strip()
+                    except UnicodeDecodeError:
+                        unreadable += 1
+                        continue
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        unreadable += 1
+                        continue
+                    if not isinstance(entry, dict):
+                        unreadable += 1
+                        continue
+                    rows.append(entry)
+        except OSError:
+            unreadable += 1
+        after = jsonl_generation_signature(path)
+        snapshot = _tree_ledger_snapshot(after, root_id)
+        if before and before == after:
+            return rows, snapshot, True, unreadable
+    return rows, snapshot, False, unreadable
+
+
+def _format_tree_ledger_row(row: Dict[str, Any]) -> str:
+    flag = " ⚠needs_parent_attention" if row.get("needs_parent_attention") else ""
+    who = str(row.get("role") or "") or str(row.get("task_id") or "")[:8]
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    payload_note = ""
+    if str(row.get("kind") or "") == DELEGATION_CONSTRAINT_KIND and payload:
+        payload_note = (
+            f" {{id={payload.get('constraint_id')}, directive={payload.get('directive')}, "
+            f"scope={payload.get('scope')}}}"
+        )
+    elif str(payload.get("type") or "") == "child_result_disposition":
+        payload_note = (
+            f" {{child={payload.get('child_task_id')}, disposition={payload.get('disposition')}, "
+            f"sha256={str(payload.get('child_result_sha256') or '')[:12]}}}"
+        )
+    return (
+        f"- [{str(row.get('ts') or '')[:16]}] {str(row.get('kind') or 'note')}{flag} "
+        f"({who}){payload_note}: {str(row.get('text') or '')}"
+    )
+
+
+def tree_ledger_page(
+    root_id: str,
+    *,
+    limit: int = 40,
+    offset: int = 0,
+    snapshot: str = "",
+    data_root: pathlib.Path | None = None,
+) -> str:
+    rows, current_snapshot, stable, unreadable = _tree_ledger_snapshot_rows(
+        root_id, data_root=data_root,
+    )
+    if not rows and not current_snapshot:
+        if str(snapshot or "").strip():
+            return (
+                "TREE_READ_SNAPSHOT_CHANGED: the task-tree ledger source is no longer "
+                "available; no mixed page was returned; restart with offset=0 and no snapshot."
+            )
+        return ""
+    if not stable:
+        return (
+            "TREE_READ_SNAPSHOT_CHANGED_DURING_READ: the task-tree ledger changed "
+            "while the page was captured; no mixed page was returned; retry with "
+            "offset=0 and no snapshot."
+        )
+    requested_snapshot = str(snapshot or "").strip().lower()
+    if requested_snapshot and requested_snapshot != current_snapshot:
+        return (
+            "TREE_READ_SNAPSHOT_CHANGED: the task-tree ledger changed after the prior "
+            "page; no mixed page was returned; restart with offset=0 and no snapshot."
+        )
+    try:
+        take = max(1, min(int(limit or 40), 200))
+    except (TypeError, ValueError):
+        take = 40
+    try:
+        skip = max(0, int(offset or 0))
+    except (TypeError, ValueError):
+        skip = 0
+    valid_total = len(rows)
+    total = valid_total + unreadable
+    end = max(0, valid_total - skip)
+    start = max(0, end - take)
+    page = rows[start:end]
+    remaining = start
+    lines = [
+        f"Page: total={total} valid_total={valid_total} unreadable={unreadable} "
+        f"returned={len(page)} offset={skip} remaining={remaining} "
+        f"remaining_scope=valid_rows coverage={'partial' if unreadable else 'complete'} "
+        f"snapshot={current_snapshot}"
+    ]
+    if unreadable:
+        lines.append(
+            f"TREE_READ_GAP: coverage is partial; {unreadable} non-empty physical "
+            "row(s) were malformed or non-object JSON. Valid rows remain pageable."
+        )
+    if remaining:
+        lines.append(
+            f"Next older page: tree_read(limit={take}, offset={skip + len(page)}, "
+            f"snapshot='{current_snapshot}')"
+        )
+    lines.extend(_format_tree_ledger_row(row) for row in page)
+    return "\n".join(lines)
+
+
+def tree_ledger_tail_digest(
+    root_id: str,
+    *,
+    limit: int = 40,
+    data_root: pathlib.Path | None = None,
+) -> str:
     """Recent ledger entries for context injection (no ctx needed). Each entry shown in
     full; older entries beyond the tail represented by a visible pointer to tree_read."""
-    rows = tree_ledger_rows(root_id)
-    if not rows:
+    rows, snapshot, stable, unreadable = _tree_ledger_snapshot_rows(
+        root_id, data_root=data_root,
+    )
+    if not rows and not unreadable:
         return ""
-    take = rows[-max(1, int(limit)):]
+    page_size = max(1, int(limit))
+    take = rows[-page_size:]
     omitted = len(rows) - len(take)
     lines: List[str] = []
-    if omitted:
-        lines.append(f"- …[{omitted} earlier ledger entries via tree_read]")
-    for r in take:
-        flag = " ⚠needs_parent_attention" if r.get("needs_parent_attention") else ""
-        who = str(r.get("role") or "") or str(r.get("task_id") or "")[:8]
-        payload = r.get("payload") if isinstance(r.get("payload"), dict) else {}
-        payload_note = ""
-        if str(r.get("kind") or "") == DELEGATION_CONSTRAINT_KIND and payload:
-            payload_note = (
-                f" {{id={payload.get('constraint_id')}, directive={payload.get('directive')}, "
-                f"scope={payload.get('scope')}}}"
-            )
-        elif str(payload.get("type") or "") == "child_result_disposition":
-            payload_note = (
-                f" {{child={payload.get('child_task_id')}, disposition={payload.get('disposition')}, "
-                f"sha256={str(payload.get('child_result_sha256') or '')[:12]}}}"
-            )
+    if unreadable:
         lines.append(
-            f"- [{str(r.get('ts') or '')[:16]}] {str(r.get('kind') or 'note')}{flag} "
-            f"({who}){payload_note}: {str(r.get('text') or '')}"
+            f"- ⚠ coverage partial: {unreadable} unreadable task-tree row(s); "
+            "inspect valid rows with tree_read"
         )
+    if omitted:
+        if stable:
+            lines.append(
+                f"- …[{omitted} earlier ledger entries; source=tree_read; next="
+                f"tree_read(limit={page_size}, offset={len(take)}, "
+                f"snapshot='{snapshot}') ]"
+            )
+        else:
+            lines.append(
+                f"- …[{omitted} observed earlier ledger entries; ledger changed during "
+                f"capture; restart with tree_read(limit={page_size})]"
+            )
+    lines.extend(_format_tree_ledger_row(row) for row in take)
     return "\n".join(lines)
 
 
@@ -458,6 +610,7 @@ __all__ = [
     "tree_ledger_path",
     "tree_ledger_append",
     "tree_ledger_rows",
+    "tree_ledger_page",
     "tree_ledger_tail_digest",
     "tree_ledger_attention_after",
     "open_delegation_constraints",

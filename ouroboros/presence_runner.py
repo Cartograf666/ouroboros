@@ -20,9 +20,18 @@ from ouroboros.utils import append_jsonl, read_json_dict, utc_now_iso
 
 
 class PresenceTurnError(ValueError):
-    def __init__(self, code: str, field: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        field: str,
+        *,
+        attachment_manifest: Sequence[Mapping[str, Any]] = (),
+    ) -> None:
         self.code = str(code or "presence_turn_failed")
         self.field = str(field or "presence_turn")
+        self.attachment_manifest = [
+            dict(row) for row in attachment_manifest if isinstance(row, Mapping)
+        ]
         super().__init__(f"{self.code}: {self.field}")
 
 
@@ -320,9 +329,34 @@ def _build_task(
         [{"path": str(path), "label": path.name} for path in staged_files],
     )
     if manifest:
+        from ouroboros.artifacts import (
+            attachment_manifest_has_rejections,
+            remove_staged_attachments,
+        )
+
+        if attachment_manifest_has_rejections(manifest):
+            # Presence is an initial-task ingress, so its default is the same
+            # atomic admission as gateway-created roots.  Keep the complete
+            # ordinal-preserving report, but remove every sibling copied by
+            # this failed admission before dialogue or model execution begins.
+            remove_staged_attachments(manifest)
+            raise PresenceTurnError(
+                "presence_attachment_admission_rejected",
+                "staged_files",
+                attachment_manifest=manifest,
+            )
+    if manifest:
         from ouroboros.gateway.tasks import _render_attachment_lines
 
-        task["attachment_images"] = [item for item in manifest if item.get("is_image")]
+        # The manifest is task authority, not merely presentation prose.  Keep
+        # every staged/rejected declaration on the canonical carrier before the
+        # task contract is normalized so a later promotion or child can inherit
+        # and materialize the exact inputs.
+        task["attachments"] = [dict(item) for item in manifest]
+        task["attachment_images"] = [
+            dict(item) for item in manifest
+            if str(item.get("status") or "staged") == "staged" and item.get("is_image")
+        ]
         rendered = _render_attachment_lines(manifest)
         if rendered:
             task["text"] = f"{task['text']}\n\n[ATTACHMENTS]\n{rendered}\n[END_ATTACHMENTS]".strip()

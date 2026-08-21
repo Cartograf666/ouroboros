@@ -9,12 +9,21 @@ import uuid
 from typing import Any, Callable, Optional
 
 from ouroboros import delegate_custody as custody
-from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, KIND_HURRY, drain_owner_entries
+from ouroboros.owner_mailbox import (
+    KIND_FINALIZE_NOW,
+    KIND_HURRY,
+    KIND_TASK_MESSAGE,
+    drain_owner_entries,
+)
 from ouroboros.utils import atomic_write_json, utc_now_iso
 
 _TICK_SEC = 3
 _QUIET_STATUSES = {"progress", "no_progress"}
 _LOOP_CONTROL_KINDS = {KIND_FINALIZE_NOW, KIND_HURRY}
+
+
+def _attempt_key(ctx: Any) -> str:
+    return str(getattr(ctx, "task_attempt", None) or 1)
 
 
 def _state_path(ctx: Any) -> pathlib.Path:
@@ -57,9 +66,13 @@ def _payload(raw: str) -> dict[str, Any]:
 
 
 def _addressed_wakes(ctx: Any, state: dict[str, Any]) -> list[dict[str, Any]]:
-    seen = {
-        str(item) for item in (state.get("mailbox_acknowledged_ids") or []) if str(item)
-    }
+    attempt = _attempt_key(ctx)
+    seen = set()
+    if str(state.get("mailbox_acknowledged_attempt_key") or "") == attempt:
+        seen.update(
+            str(item) for item in (state.get("mailbox_acknowledged_ids") or [])
+            if str(item)
+        )
     seen.update(
         str(item) for item in (getattr(ctx, "_loop_mailbox_seen_ids", set()) or set())
         if str(item)
@@ -68,6 +81,7 @@ def _addressed_wakes(ctx: Any, state: dict[str, Any]) -> list[dict[str, Any]]:
         pathlib.Path(getattr(ctx, "drive_root", custody.custody_root(ctx))),
         str(getattr(ctx, "task_id", "") or ""),
         seen_ids=seen,
+        attempt_key=attempt,
     )
     return [
         {
@@ -112,11 +126,30 @@ def _wake_ids(value: Any) -> set[str]:
     return found
 
 
-def _pending_payload(state: dict[str, Any]) -> dict[str, Any]:
+def _pending_payload(ctx: Any, state: dict[str, Any]) -> dict[str, Any]:
     pending = state.get("pending_wake") if isinstance(state.get("pending_wake"), dict) else {}
     payload = pending.get("payload") if isinstance(pending.get("payload"), dict) else {}
     if pending and not pending.get("acknowledged_at") and payload:
-        return dict(payload)
+        replay = dict(payload)
+        if str(pending.get("attempt_key") or "") != _attempt_key(ctx):
+            events = replay.get("wake_events")
+            if isinstance(events, list):
+                kept = [
+                    dict(item) for item in events if isinstance(item, dict)
+                    and str(item.get("kind") or "") not in _LOOP_CONTROL_KINDS
+                ]
+                if kept:
+                    replay["wake_events"] = kept
+                else:
+                    replay.pop("wake_events", None)
+            if str(replay.get("status") or "") in _QUIET_STATUSES and not replay.get("wake_events"):
+                pending["acknowledged_at"] = utc_now_iso()
+                state["last_acknowledged_wake"] = pending
+                state["pending_wake"] = {}
+                state["status"] = "awake"
+                _save_state(ctx, state)
+                return {}
+        return replay
     return {}
 
 
@@ -128,7 +161,9 @@ def acknowledge_pending_wake(ctx: Any, delivered: Any = None) -> bool:
     if not pending or pending.get("acknowledged_at"):
         return True
     expected = str(pending.get("wake_id") or "")
-    if delivered:
+    attempt = _attempt_key(ctx)
+    delivered_wake = False
+    if delivered is not None:
         try:
             payload = json.loads(delivered) if isinstance(delivered, str) else delivered
         except (TypeError, ValueError):
@@ -136,17 +171,55 @@ def acknowledge_pending_wake(ctx: Any, delivered: Any = None) -> bool:
         payload = payload if isinstance(payload, dict) else {}
         if expected and expected not in _wake_ids(payload):
             return False
+        delivered_wake = True
+    if str(pending.get("attempt_key") or "") != attempt and not delivered_wake:
+        # A fresh physical attempt has not seen the predecessor's returned wake.
+        # Leave it pending so supervised_wait replays the exact payload first.
+        return True
     from ouroboros.owner_mailbox import acknowledge_task_messages
 
     mailbox_ids = [str(item) for item in (pending.get("mailbox_ids") or []) if str(item)]
-    if mailbox_ids and not acknowledge_task_messages(
-        pathlib.Path(getattr(ctx, "drive_root", custody.custody_root(ctx))),
-        str(getattr(ctx, "task_id", "") or ""), mailbox_ids, wake_id=expected,
+    seen_mailbox_ids = [
+        str(item) for item in (pending.get("seen_mailbox_ids") or []) if str(item)
+    ] or [
+        str(item.get("msg_id") or "")
+        for item in (
+            pending.get("payload", {}).get("wake_events", [])
+            if isinstance(pending.get("payload"), dict) else []
+        )
+        if isinstance(item, dict) and str(item.get("msg_id") or "")
+    ]
+    wake_events = (
+        pending.get("payload", {}).get("wake_events", [])
+        if isinstance(pending.get("payload"), dict) else []
+    )
+    owner_ids = {
+        str(item.get("msg_id") or "")
+        for item in wake_events if isinstance(item, dict)
+        and str(item.get("kind") or "owner_text") not in {
+            *_LOOP_CONTROL_KINDS, KIND_TASK_MESSAGE,
+        }
+    }
+    global_ids = [item for item in mailbox_ids if item not in owner_ids]
+    mailbox_root = pathlib.Path(getattr(ctx, "drive_root", custody.custody_root(ctx)))
+    task_id = str(getattr(ctx, "task_id", "") or "")
+    if global_ids and not acknowledge_task_messages(
+        mailbox_root, task_id, global_ids, wake_id=expected,
+    ):
+        return False
+    if owner_ids and not acknowledge_task_messages(
+        mailbox_root, task_id, sorted(owner_ids), wake_id=expected,
+        attempt_key=attempt,
+    ):
+        return False
+    if mailbox_ids and not (global_ids or owner_ids) and not acknowledge_task_messages(
+        mailbox_root, task_id, mailbox_ids, wake_id=expected, attempt_key=attempt,
     ):
         return False
     if not _emit(ctx, "delegate_supervision_wake_acknowledged", {
         "run_id": str(state.get("run_id") or ""), "wake_id": expected,
         "mailbox_ids": mailbox_ids,
+        "attempt_key": attempt,
         "interaction_ids": list(pending.get("interaction_ids") or []),
     }):
         return False
@@ -160,10 +233,16 @@ def acknowledge_pending_wake(ctx: Any, delivered: Any = None) -> bool:
         _REPORTED_INTERACTIONS[run_id] = frozenset(
             set(_REPORTED_INTERACTIONS.get(run_id, frozenset())) | set(interaction_ids)
         )
+    prior_mailbox_ids = (
+        state.get("mailbox_acknowledged_ids") or []
+        if str(state.get("mailbox_acknowledged_attempt_key") or "") == attempt
+        else []
+    )
     state["mailbox_acknowledged_ids"] = sorted({
-        *(str(item) for item in (state.get("mailbox_acknowledged_ids") or []) if str(item)),
-        *mailbox_ids,
+        *(str(item) for item in prior_mailbox_ids if str(item)),
+        *seen_mailbox_ids,
     })
+    state["mailbox_acknowledged_attempt_key"] = attempt
     state["interaction_acknowledged_ids"] = sorted({
         *(str(item) for item in (state.get("interaction_acknowledged_ids") or []) if str(item)),
         *interaction_ids,
@@ -220,7 +299,7 @@ def supervised_wait(
 
         wait_once = _delegate_wait
     state = _load_state(ctx, run_id)
-    replay = _pending_payload(state)
+    replay = _pending_payload(ctx, state)
     if replay:
         _emit(ctx, "delegate_supervision_wake_replayed", {
             "run_id": str(run_id),
@@ -298,11 +377,16 @@ def supervised_wait(
             state["last_wake"] = payload
             state["pending_wake"] = {
                 "wake_id": wake_id,
+                "attempt_key": _attempt_key(ctx),
                 "payload": payload,
                 "mailbox_ids": [
                     str(item.get("msg_id") or "") for item in wakes
                     if str(item.get("msg_id") or "")
                     and str(item.get("kind") or "") not in _LOOP_CONTROL_KINDS
+                ],
+                "seen_mailbox_ids": [
+                    str(item.get("msg_id") or "") for item in wakes
+                    if str(item.get("msg_id") or "")
                 ],
                 "interaction_ids": sorted(_interaction_ids(payload)),
                 "created_at": utc_now_iso(),

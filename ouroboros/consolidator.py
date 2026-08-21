@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -5,7 +6,15 @@ import pathlib
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
-from ouroboros.utils import atomic_write_json, read_json_dict, replace_atomic, utc_now_iso, read_text, write_text
+from ouroboros.utils import (
+    append_jsonl,
+    atomic_write_json,
+    read_json_dict,
+    replace_atomic,
+    utc_now_iso,
+    read_text,
+    write_text,
+)
 
 from ouroboros.platform_layer import (
     file_lock_exclusive as _lock_ex,
@@ -40,6 +49,16 @@ def _consolidation_route() -> Tuple[str, bool]:
 CONSOLIDATION_REASONING_EFFORT = "medium"
 
 
+def _ordered_chat_generation_paths(source_path: pathlib.Path) -> List[pathlib.Path]:
+    """Return the consolidator-owned physical chat chain, oldest to live."""
+    archive_dir = source_path.parent.parent / "archive"
+    try:
+        archives = sorted(archive_dir.glob("chat_*.jsonl"), key=lambda p: p.name)
+    except OSError:
+        archives = []
+    return [*archives, source_path]
+
+
 def _resolve_generation_segments(
     meta: Dict[str, Any], source_path: pathlib.Path,
 ) -> Tuple[List[pathlib.Path], int, bool]:
@@ -58,11 +77,7 @@ def _resolve_generation_segments(
     stored_sig = meta.get("chat_log_signature") or {}
     stored_first = str(stored_sig.get("first_line_sha256") or "") if isinstance(stored_sig, dict) else ""
     live_sig = _chat_log_signature(source_path)
-    archive_dir = source_path.parent.parent / "archive"
-    try:
-        archives = sorted(archive_dir.glob("chat_*.jsonl"), key=lambda p: p.name)
-    except OSError:
-        archives = []
+    archives = _ordered_chat_generation_paths(source_path)[:-1]
     if not stored_first:
         # Uninitialized cursor. Any archives that already exist rotated BEFORE
         # the first consolidation ever ran — they are unconsolidated by
@@ -762,6 +777,22 @@ Respond with JSON only (no fences):
             "source": "consolidation",
             "content": compressed_text.strip(),
         }
+
+        source_bytes = json.dumps(
+            old_blocks, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        source_entry_id = "scratchpad-consolidation:" + hashlib.sha256(source_bytes).hexdigest()
+        source_ref = memory.scratchpad_journal_source_ref(source_entry_id)
+        if not append_jsonl(memory.journal_path(), {
+            "ts": utc_now_iso(),
+            "type": "blocks_consolidated",
+            "entry_id": source_entry_id,
+            "source_blocks": old_blocks,
+            "source_ref": source_ref,
+        }):
+            log.error("Scratchpad consolidation source journal write failed; preserving blocks")
+            return usage
+        compressed_block["metadata"] = {"source_ref": source_ref}
 
         # Merge-aware replace UNDER the write lock: blocks appended DURING the
         # slow LLM call live only on disk — building the new list from the

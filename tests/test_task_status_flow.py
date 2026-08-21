@@ -345,6 +345,69 @@ def test_schedule_task_memory_modes_prepare_declared_drive_shape(tmp_path, monke
     assert len(event_queue.events) == before_shared
 
 
+def test_configured_session_child_materializes_initial_and_steered_attachments(tmp_path, monkeypatch):
+    from ouroboros.artifacts import stage_task_attachments
+    from ouroboros.owner_mailbox import write_owner_message
+    from ouroboros.subagent_work_order import compile_external_work_order
+    from ouroboros.tools.control import _schedule_task
+    from ouroboros.tools.core import _read_file
+    from ouroboros.tools.registry import ToolContext
+
+    monkeypatch.setenv(
+        "OUROBOROS_SUBAGENTS",
+        '{"enabled":true,"items":[{"subagent_id":"session-scout","name":"Session scout",'
+        '"recommended_use":"Tests","route":{"kind":"agent_session",'
+        '"target_id":"codex=gpt-5.6-sol"},"effort":"high"}]}',
+    )
+    source = tmp_path / "parent-input.txt"
+    source.write_text("session-child-readable", encoding="utf-8")
+    parent_manifest = stage_task_attachments(
+        tmp_path, "parent-attachments", [{"path": str(source), "label": "parent input"}],
+    )
+    later = tmp_path / "steered-input.txt"
+    later.write_text("steered-child-readable", encoding="utf-8")
+    steered_manifest = stage_task_attachments(
+        tmp_path, "parent-attachments", [{"path": str(later), "label": "steered input"}],
+    )
+    assert write_owner_message(
+        tmp_path, "Use the later input", "parent-attachments", msg_id="steer-1",
+        attachment_manifest=steered_manifest,
+    )
+    event_queue = _FakeEventQueue()
+    ctx = SimpleNamespace(
+        task_depth=0, pending_events=[], event_queue=event_queue,
+        drive_root=tmp_path, task_id="parent-attachments",
+        task_contract={"attachment_manifest": [dict(row) for row in parent_manifest]},
+        task_metadata={}, is_direct_chat=False, is_workspace_mode=lambda: False,
+    )
+
+    result = _schedule_task(
+        ctx, subagent_id="session-scout", objective="Inspect inherited input",
+        expected_output="Report", memory_mode="forked",
+    )
+
+    assert "Subagent request queued" in result
+    event = event_queue.events[0]
+    child_manifest = event["task_contract"]["attachment_manifest"]
+    assert [row["label"] for row in child_manifest] == ["parent input", "steered input"]
+    assert str(parent_manifest[0]["abs_path"]) not in str(child_manifest)
+    assert str(steered_manifest[0]["abs_path"]) not in str(child_manifest)
+    child_ctx = ToolContext(
+        repo_dir=tmp_path, drive_root=pathlib.Path(event["drive_root"]),
+        task_id=event["task_id"],
+    )
+    assert "session-child-readable" in _read_file(
+        child_ctx, child_manifest[0]["relpath"], root="artifact_store",
+    )
+    assert "steered-child-readable" in _read_file(
+        child_ctx, child_manifest[1]["relpath"], root="artifact_store",
+    )
+    work_order = compile_external_work_order(event)
+    assert all(row["abs_path"] in work_order for row in child_manifest)
+    assert str(parent_manifest[0]["abs_path"]) not in work_order
+    assert str(steered_manifest[0]["abs_path"]) not in work_order
+
+
 def test_schedule_task_rejects_legacy_description_schema(tmp_path, monkeypatch):
     from ouroboros.tools.control import _schedule_task
 

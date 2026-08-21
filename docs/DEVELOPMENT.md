@@ -486,6 +486,38 @@ enroll that store in the `ouroboros/context_budget.py` threshold table (with a
 justified constant) in the same commit — an unenrolled hot store is invisible
 to the tripwire.
 
+### Invariant: Source-complete decision pipeline
+
+Every new or changed continuity surface is reviewed as one narrow chain:
+
+`producer → canonical full source → bounded projection → consumer → decision → retention/GC`.
+
+- The producer records the complete event or artifact before it publishes a
+  projection or wakeup. The canonical source owns identity, order, bytes, and
+  integrity state; a cache or hot index is never a second authority.
+- A bounded projection names what it omitted and carries a source reference
+  that the *same actor* can resolve through an existing reader. `source_complete`
+  is a coverage fact, not a permission to infer missing material.
+- A consumer that can authorize PASS, a destructive rewrite, or replacement of
+  a full contract must materialize the named source first. A known `partial`
+  marker and an unverified claim that some host might retrieve more are not
+  equivalent: the latter is not actor-attested coverage and cannot release the
+  decision.
+- Retention and GC are part of the chain. Anything referenced by a canonical
+  result, review, identity decision, or project summary is retained or promoted
+  before its execution root can be collected. Unreferenced scratch remains
+  disposable under the unified retention owner; an unavailable legacy source is
+  represented as an explicit gap, never silently treated as complete.
+
+#### Context and growth matrix
+
+| Store / surface | Complete producer and source | Interactive projection / consumer | Growth and retention proof |
+|---|---|---|---|
+| Background observations | `BackgroundConsciousness.inject_observation` → `state/consciousness_observations.jsonl` enqueue rows | Cached pending/oldest status and bounded `_render_observations` view; identity-update consumer reads the gap marker and source ref | `BG_OBSERVATIONS_WARN_BYTES` in `context_budget.py` / `agent_startup_checks.py`; append-only rows, including unacknowledged rows, are not GC-pruned by the hot-store warning |
+| Chat and biography | Canonical `logs/chat.jsonl`, rotated generations, and dialogue blocks | Main/Project context and archive-aware `chat_history` | Rotation/archive readers carry generation/gap coverage; blocks are the compression path, not a deletion of the horizon |
+| Plan/review evidence | Exact task-artifact/observability bodies and reviewer route/thread receipts | Bounded review hot index, obligations, and latest-wave status | Exact artifact refs and candidate SHA bind the decision; index rotation cannot certify a missing or partial wave |
+| Task/project execution | Canonical task result plus promoted child artifacts and summaries | Status cards, terminal rows, and Main/Project summary projections | Canonical promotion precedes child-drive GC; disposable task scratch follows the unified retention owner |
+
 ### Invariant: UI resources carry a disposer
 
 Every long-lived acquisition in `web/` returns or records a disposer, and a UI

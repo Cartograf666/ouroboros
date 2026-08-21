@@ -222,7 +222,14 @@ def _user_annotation(
     annotation = annotations.get(client_message_id)
     if role != "user" or not isinstance(annotation, dict):
         return None
-    return {key: annotation.get(key) for key in ("action", "target", "status")}
+    return {
+        key: annotation.get(key)
+        for key in (
+            "action", "target", "target_label", "status", "detail", "options",
+            "attachment_manifest",
+        )
+        if key in annotation
+    }
 
 
 def make_cost_breakdown_endpoint(data_dir: pathlib.Path):
@@ -365,7 +372,7 @@ def _origin_fallback_rows(data_dir, thread_id: int, human_tail: list) -> list:
     return synthesized
 
 
-def _read_chat_history_entries(live, adir, want, row_matches_thread):
+def _read_chat_history_entries(live, adir, want, row_matches_thread, *, include_gaps=False):
     """Read a bounded live chat.jsonl tail plus a newest-first archive backfill.
 
     The live chat.jsonl is rotated to ``archive/chat_<ts>.jsonl`` once it crosses
@@ -383,7 +390,12 @@ def _read_chat_history_entries(live, adir, want, row_matches_thread):
     is O(window), not O(whole live file).
     """
     return read_rotated_jsonl_entries(
-        live, adir, "chat", want, _chat_quota_predicate(row_matches_thread)
+        live,
+        adir,
+        "chat",
+        want,
+        _chat_quota_predicate(row_matches_thread),
+        include_gaps=include_gaps,
     )
 
 
@@ -407,7 +419,7 @@ def _chat_quota_predicate(row_matches_thread):
     return _counts_toward_thread
 
 
-def _read_progress_history_entries(live, adir, want, counts_toward_quota):
+def _read_progress_history_entries(live, adir, want, counts_toward_quota, *, include_gaps=False):
     """Bounded, rotation-aware read of logs/progress.jsonl (mirror of
     ``_read_chat_history_entries``): a window-doubled live byte tail plus a
     newest-first ``archive/progress_*.jsonl`` backfill (capped like chat's 3).
@@ -421,7 +433,9 @@ def _read_progress_history_entries(live, adir, want, counts_toward_quota):
     in-window. That guarantee assumes progress rows are appended with
     non-decreasing ts (the writers share one host clock); a backdated
     out-of-order row older than the floor can fall outside the lineage window."""
-    return read_rotated_jsonl_entries(live, adir, "progress", want, counts_toward_quota)
+    return read_rotated_jsonl_entries(
+        live, adir, "progress", want, counts_toward_quota, include_gaps=include_gaps
+    )
 
 
 def _copy_task_summary_metadata(rec: Dict[str, Any], entry: Dict[str, Any]) -> None:
@@ -646,8 +660,7 @@ def _make_thread_filter(
 ):
     """Build the per-request thread-filter closure (perf2 P3 decomposition).
 
-    Returns the thread predicate plus the producer-owned Main-mirror classifier
-    shared by both stream readers and both transform loops."""
+    Returns the one thread predicate shared by both durable stream readers."""
 
     def _bound_project_chat(task_id: str, parent_task_id: str = "", root_task_id: str = "") -> int:
         # Resolve by LINEAGE (own binding -> parent -> root) so a subagent's rows
@@ -670,35 +683,37 @@ def _make_thread_filter(
                 str(entry.get("root_task_id") or ""),
             ) if isinstance(entry, dict) else 0
         )
+        is_root_completion = bool(
+            isinstance(entry, dict)
+            and str(entry.get("type") or "") == "project_completion_summary"
+        )
+        is_cognitive_projection = bool(
+            isinstance(entry, dict)
+            and str(entry.get("summary_kind") or "")
+            in {"terminal_result_projection", "terminal_root_projection"}
+        )
         if thread_id in project_chat_ids:
+            # The compact host-stamped completion belongs only to Main; the
+            # Project thread already owns the complete task timeline/result.
+            if is_root_completion:
+                return False
             if bound_chat == thread_id:
                 return True
             if isinstance(entry, dict) and _matches_project_source(entry, project_source_refs):
                 return True
             return entry_chat == thread_id
-        # Main / non-project view: everything that is NOT another project. A
-        # bound task's rows are project-owned, so mirror only its sanitized
-        # progress/task_summary and exclude its raw chat (same as a native
-        # project row), never leak raw project chat into the штаб.
+        # Main / non-project view: exactly one host-stamped terminal Project-root
+        # row is admitted from the canonical Main chat. Project progress, logs,
+        # child traffic, ordinary summaries and raw dialogue stay in Project.
+        if is_root_completion:
+            return entry_chat not in project_chat_ids
+        if is_cognitive_projection:
+            return False
         if entry_chat in project_chat_ids or bound_chat > 0:
-            if not isinstance(entry, dict):
-                return False
-            return bool(entry.get("is_progress")) or str(entry.get("type") or "") == "task_summary"
+            return False
         return entry_chat not in project_chat_ids
 
-    def _row_is_project_mirror(entry_chat: int, entry: Optional[dict] = None) -> bool:
-        if thread_id in project_chat_ids or not isinstance(entry, dict):
-            return False
-        return bool(
-            entry_chat in project_chat_ids
-            or _bound_project_chat(
-                str(entry.get("task_id") or ""),
-                str(entry.get("parent_task_id") or ""),
-                str(entry.get("root_task_id") or ""),
-            )
-        )
-
-    return _row_matches_thread, _row_is_project_mirror
+    return _row_matches_thread
 
 
 def _collect_chat_rows(
@@ -707,8 +722,9 @@ def _collect_chat_rows(
     n_human: int,
     row_matches_thread,
     chat_annotations: Dict[str, Any],
-    row_is_project_mirror=None,
-) -> tuple[list, int]:
+    *,
+    include_gaps: bool = False,
+) -> tuple[list, int] | tuple[list, int, set[str]]:
     """Read + transform the chat stream.
 
     Returns ``(rows, quota_row_count)`` — the transformed history records and
@@ -716,13 +732,24 @@ def _collect_chat_rows(
     window-truncation metadata)."""
     combined: list = []
     chat_quota_rows = 0
+    stream_gaps: set[str] = set()
     _chat_counts_toward_quota = _chat_quota_predicate(row_matches_thread)
     try:
         # Rotation-aware archive backfill lives in the module-level
         # _read_chat_history_entries helper (endpoint's thread filter threaded in).
-        _chat_entries = _read_chat_history_entries(
-            chat_path, archive_dir, n_human, row_matches_thread
-        )
+        if include_gaps:
+            _chat_entries = _read_chat_history_entries(
+                chat_path,
+                archive_dir,
+                n_human,
+                row_matches_thread,
+                include_gaps=True,
+            )
+            _chat_entries, stream_gaps = _chat_entries
+        else:
+            _chat_entries = _read_chat_history_entries(
+                chat_path, archive_dir, n_human, row_matches_thread
+            )
         # Window accounting for the response's truncation metadata: how many
         # read rows satisfy the SAME quota predicate the reader stopped on.
         chat_quota_rows = sum(
@@ -756,6 +783,10 @@ def _collect_chat_rows(
                 "task_id": str(entry.get("task_id", "")),
                 "telegram_chat_id": int(entry.get("telegram_chat_id") or 0),
             }
+            if rec["system_type"] == "project_completion_summary":
+                for key in ("project_id", "project_name", "target_label", "status"):
+                    if key in entry:
+                        rec[key] = str(entry.get(key) or "")
             annotation = _user_annotation(role, rec["client_message_id"], chat_annotations)
             if annotation is not None:
                 rec["chat_annotation"] = annotation
@@ -789,12 +820,10 @@ def _collect_chat_rows(
             for field in SUBAGENT_MESSAGE_FIELDS:
                 if field in entry:
                     rec[field] = entry[field]
-            if callable(row_is_project_mirror) and row_is_project_mirror(entry_chat, entry):
-                rec["project_mirror"] = True
             combined.append(rec)
     except Exception as exc:
         log.warning("Failed to read chat history: %s", exc)
-    return combined, chat_quota_rows
+    return (combined, chat_quota_rows, stream_gaps) if include_gaps else (combined, chat_quota_rows)
 
 
 def _collect_progress_rows(
@@ -802,8 +831,9 @@ def _collect_progress_rows(
     archive_dir: pathlib.Path,
     n_progress: int,
     row_matches_thread,
-    row_is_project_mirror=None,
-) -> tuple[list, int]:
+    *,
+    include_gaps: bool = False,
+) -> tuple[list, int] | tuple[list, int, set[str]]:
     """Read + transform the progress stream.
 
     Returns ``(rows, quota_row_count)`` (mirror of ``_collect_chat_rows``)."""
@@ -832,13 +862,24 @@ def _collect_progress_rows(
 
     combined: list = []
     progress_quota_rows = 0
+    stream_gaps: set[str] = set()
     try:
-        _progress_entries = _read_progress_history_entries(
-            progress_path,
-            archive_dir,
-            n_progress,
-            _progress_counts_toward_quota,
-        )
+        if include_gaps:
+            _progress_entries = _read_progress_history_entries(
+                progress_path,
+                archive_dir,
+                n_progress,
+                _progress_counts_toward_quota,
+                include_gaps=True,
+            )
+            _progress_entries, stream_gaps = _progress_entries
+        else:
+            _progress_entries = _read_progress_history_entries(
+                progress_path,
+                archive_dir,
+                n_progress,
+                _progress_counts_toward_quota,
+            )
         progress_quota_rows = sum(
             1 for entry in _progress_entries if _progress_counts_toward_quota(entry)
         )
@@ -868,12 +909,14 @@ def _collect_progress_rows(
             for field in _PROGRESS_META_FIELDS:
                 if field in entry:
                     rec[field] = entry[field]
-            if callable(row_is_project_mirror) and row_is_project_mirror(entry_chat, entry):
-                rec["project_mirror"] = True
             combined.append(rec)
     except Exception as exc:
         log.warning("Failed to read progress log: %s", exc)
-    return combined, progress_quota_rows
+    return (
+        (combined, progress_quota_rows, stream_gaps)
+        if include_gaps
+        else (combined, progress_quota_rows)
+    )
 
 
 def _active_lifecycle_row() -> Optional[Dict[str, Any]]:
@@ -1014,6 +1057,7 @@ def _window_metadata(
     archive_dir: pathlib.Path,
     human_rows_dropped: bool,
     lineage_truncated: bool,
+    stream_gaps: Optional[Dict[str, set[str]]] = None,
 ) -> Dict[str, Any]:
     """Additive window metadata (perf2 P3; frozen contract extended explicitly).
 
@@ -1037,6 +1081,11 @@ def _window_metadata(
     ):
         if cause and cause not in truncated_by:
             truncated_by.append(cause)
+    for stream in ("chat", "progress"):
+        for gap in sorted((stream_gaps or {}).get(stream, set())):
+            cause = f"{stream}_{gap}"
+            if cause not in truncated_by:
+                truncated_by.append(cause)
     return {"complete": not truncated_by, "truncated_by": truncated_by}
 
 
@@ -1058,19 +1107,19 @@ def _assemble_history_response(
     project_chat_ids, project_source_refs, chat_annotations, bindings_by_task = (
         _project_history_context(data_dir, thread_id)
     )
-    row_matches_thread, row_is_project_mirror = _make_thread_filter(
+    row_matches_thread = _make_thread_filter(
         thread_id, project_chat_ids, project_source_refs, bindings_by_task
     )
     chat_path = data_dir / "logs" / "chat.jsonl"
     progress_path = data_dir / "logs" / "progress.jsonl"
     archive_dir = data_dir / "archive"
-    combined, chat_quota_rows = _collect_chat_rows(
+    combined, chat_quota_rows, chat_gaps = _collect_chat_rows(
         chat_path, archive_dir, n_human, row_matches_thread, chat_annotations,
-        row_is_project_mirror,
+        include_gaps=True,
     )
-    progress_rows, progress_quota_rows = _collect_progress_rows(
+    progress_rows, progress_quota_rows, progress_gaps = _collect_progress_rows(
         progress_path, archive_dir, n_progress, row_matches_thread,
-        row_is_project_mirror,
+        include_gaps=True,
     )
     combined.extend(progress_rows)
     lifecycle_row = _active_lifecycle_row()
@@ -1114,6 +1163,7 @@ def _assemble_history_response(
             chat_quota_rows, progress_quota_rows, n_human, n_progress,
             chat_path, progress_path, archive_dir,
             human_rows_dropped, lineage_truncated,
+            {"chat": chat_gaps, "progress": progress_gaps},
         ),
     }
     # Same rendering options as starlette's JSONResponse — serialized here so
