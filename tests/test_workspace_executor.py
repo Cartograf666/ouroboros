@@ -571,7 +571,11 @@ def test_executor_local_service_lifecycle_hides_private_snapshot(tmp_path, monke
             "start_service",
             {
                 "name": "svc",
-                "cmd": [sys.executable, "-c", "import time; print('READY', flush=True); time.sleep(30)"],
+                "cmd": [
+                    sys.executable,
+                    "-c",
+                    "import os,time; os.write(1, b'READY\\n' + b'x' * 25000); time.sleep(30)",
+                ],
                 "readiness": {"log_contains": "READY", "timeout_sec": 5},
             },
         )
@@ -582,11 +586,68 @@ def test_executor_local_service_lifecycle_hides_private_snapshot(tmp_path, monke
     stopped = json.loads(stopped_raw)
 
     assert started["ready"] is True
+    assert started["ready_observed_at"]
     assert status["state"] == "running"
-    assert "READY" in logs["tail"]
+    assert "READY" not in logs["tail"]
+    assert "x" in logs["tail"]
     assert stopped["state"] == "stopped"
     assert "_before_outputs" not in stopped_raw
     assert bootstrap_calls
+
+
+def test_executor_readiness_scans_before_large_log_suffix(tmp_path, monkeypatch):
+    import ouroboros.workspace_executor as workspace_executor
+
+    log_path = tmp_path / "executor-service.log"
+    log_path.write_bytes(b"READY\n" + (b"x" * 25_000))
+    record = SimpleNamespace(
+        executor=SimpleNamespace(kind="local"),
+        backend_log_path=str(log_path),
+        local_proc=SimpleNamespace(poll=lambda: None),
+        ready=False,
+    )
+    monkeypatch.setattr(workspace_executor.time, "sleep", lambda _seconds: None)
+
+    workspace_executor._wait_readiness(
+        record,
+        {"log_contains": "READY", "timeout_sec": 0.05},
+    )
+
+    assert record.ready is True
+
+
+def test_executor_terminal_payload_clears_readiness(tmp_path):
+    import ouroboros.workspace_executor as workspace_executor
+
+    record = SimpleNamespace(
+        service_id="task:svc",
+        name="svc",
+        task_id="task",
+        executor=SimpleNamespace(
+            executor_id="local-service",
+            kind="local",
+            network="host",
+        ),
+        backend_pid="4321",
+        backend_cwd="/workspace",
+        host_cwd=tmp_path,
+        cwd_root="active_workspace",
+        cwd_base=str(tmp_path),
+        cwd_source="active_workspace",
+        skill_name="",
+        cmd=["service"],
+        outputs=[],
+        keep_alive=False,
+        backend_log_path=str(tmp_path / "service.log"),
+        started_at=workspace_executor.time.time(),
+        ready=True,
+    )
+
+    payload = workspace_executor._service_payload(record, state="exited")
+
+    assert payload["state"] == "exited"
+    assert payload["ready"] is False
+    assert record.ready is False
 
 
 def test_start_service_with_executor_ref_uses_local_for_unmapped_task_drive_cwd(tmp_path, monkeypatch):
