@@ -64,7 +64,7 @@ def test_attach_login_command_quotes_posix_and_powershell(monkeypatch):
     """The fallback is inert text for an explicitly labelled shell, including
     the path/argument characters that break ad-hoc interpolation."""
     monkeypatch.setattr(owned, "owned_config_dir",
-                        lambda: pathlib.Path("/tmp/Ouroboros profile's data"))
+                        lambda: pathlib.PurePosixPath("/tmp/Ouroboros profile's data"))
     posix_argv = [
         "/tmp/Ouroboros runtime's/node",
         "/tmp/Ouroboros runtime's/claudexord.bundle.cjs",
@@ -79,7 +79,7 @@ def test_attach_login_command_quotes_posix_and_powershell(monkeypatch):
                      "setup attach 'job '\"'\"'7'")
 
     monkeypatch.setattr(owned, "owned_config_dir",
-                        lambda: pathlib.Path(r"C:\Users\O'Brien\Ouroboros data"))
+                        lambda: pathlib.PureWindowsPath(r"C:\Users\O'Brien\Ouroboros data"))
     powershell_argv = [
         r"C:\Program Files\O'Brien\Node\node.exe",
         r"C:\Program Files\O'Brien\Claudexor\claudexord.bundle.cjs",

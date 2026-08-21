@@ -15,9 +15,9 @@ import pytest
 from ouroboros import launcher_server_reaper as reaper
 from ouroboros import process_containment as containment
 
-REPO = "/opt/Ouroboros/repo"
-DATA = "/opt/Ouroboros/data"
-OURS = f"/opt/Ouroboros/python/bin/python3 {REPO}/server.py"
+REPO = os.path.normpath("/opt/Ouroboros/repo")
+DATA = os.path.normpath("/opt/Ouroboros/data")
+OURS = f"{os.path.normpath('/opt/Ouroboros/python/bin/python3')} {os.path.join(REPO, 'server.py')}"
 
 
 def _install_fakes(monkeypatch, pids, commands, env_states, groups=None):
@@ -162,9 +162,10 @@ def test_candidate_enumeration_uses_one_unbranded_full_width_ps_read(monkeypatch
             stdout="  777 python3 /x/server.py\nnot-a-pid oops\n", returncode=0,
         )
 
+    monkeypatch.setattr(reaper, "os", types.SimpleNamespace(getuid=lambda: 501))
     monkeypatch.setattr(reaper.subprocess, "run", fake_run)
     assert reaper._candidate_commands() == {777: "python3 /x/server.py"}
-    assert seen["cmd"] == ["ps", "-ww", "-u", str(os.getuid()), "-o", "pid=,command="]
+    assert seen["cmd"] == ["ps", "-ww", "-u", "501", "-o", "pid=,command="]
 
 
 def test_a_missing_ps_is_enumeration_failure_not_a_clean_answer(monkeypatch):

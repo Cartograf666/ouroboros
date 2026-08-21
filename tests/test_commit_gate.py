@@ -939,7 +939,6 @@ def test_advisory_auto_bypass_on_missing_key(tmp_path, monkeypatch):
     import subprocess
     adv_mod = _get_advisory_module()
     rs_mod = _get_review_state_module()
-
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
     drive_root = tmp_path / "drive"
@@ -948,8 +947,9 @@ def test_advisory_auto_bypass_on_missing_key(tmp_path, monkeypatch):
     (drive_root / "logs").mkdir()
     subprocess.run(["git", "init"], cwd=str(repo_dir), capture_output=True)
 
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
+    monkeypatch.delenv(adv_mod.ADVISORY_REVIEW_ROUTE_ENV, raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-
     progress_calls = []
 
     class FakeCtx:
