@@ -858,5 +858,4 @@ export function initSkills(ctx) {
             renderFn();
         }
     });
-    renderFn();
 }
