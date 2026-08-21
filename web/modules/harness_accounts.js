@@ -696,7 +696,10 @@ function faultOutranksReassurance(service, note) {
     return { tone: note.tone, text: note.text };
 }
 
-export function serviceBannerLine(store, { wakeError = '' } = {}) {
+export function serviceBannerLine(store, { wakeError = '', wakeBusy = false } = {}) {
+    if (wakeBusy) {
+        return { tone: 'muted', text: 'Starting the agent daemon…' };
+    }
     // THE service banner: one place on the tab that explains a daemon/runtime
     // problem, replacing the scattering of "(not in discovery)" the owner
     // reported. Provenance is PER FACET, so this line never collapses three
@@ -965,7 +968,10 @@ function renderRows() {
     const host = document.getElementById('harness-accounts-groups');
     const banner = document.getElementById('agents-service-banner');
     if (banner) {
-        const line = serviceBannerLine(state.store, { wakeError: state.wakeError });
+        const line = serviceBannerLine(state.store, {
+            wakeError: state.wakeError,
+            wakeBusy: state.wakeBusy,
+        });
         banner.textContent = line.text;
         banner.dataset.tone = line.tone;
     }
@@ -1142,6 +1148,23 @@ export function refreshHarnessStatus() {
 }
 
 /**
+ * Opening Agents is an explicit owner action. Refresh first so an old live
+ * snapshot cannot hide a daemon reaped by a server restart; only the exact
+ * already-provisioned idle state is then restarted. First-time installation,
+ * foreign ownership and repair remain behind Connect.
+ */
+async function refreshHarnessStatusOnActivation() {
+    await state.store.refresh();
+    const daemon = state.store.snapshot?.daemon || {};
+    if (String(daemon.state || '') === 'stale'
+        && String(daemon.runtime?.state || '') === 'ready'
+        && !daemon.ownership_problem) {
+        return wakeDaemon();
+    }
+    return null;
+}
+
+/**
  * Mount the section. The exported destroy seam is an honest local detach, so
  * remount never waits on or invents daemon release proof.
  */
@@ -1178,6 +1201,7 @@ async function _init(store) {
     state.disposers.push(bindStatusSurface(state.store, {
         listener: () => renderRows(),
         elementId: 'harness-accounts-groups',
+        onActivate: refreshHarnessStatusOnActivation,
     }));
     state.initialized = true;
     // The first read must not wait for the poll interval: init runs while the

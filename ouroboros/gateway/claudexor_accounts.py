@@ -5,7 +5,7 @@ fact — profiles, login jobs, device-code custody, the two honest verification
 statuses, quota windows. The browser cannot talk to the daemon directly (its
 control plane is loopback-Origin-guarded and bearer-token'd; the token must
 never reach a page), so these handlers translate: status aggregation, the
-owner-initiated daemon wake behind the panel's Refresh button, login job
+owner-initiated daemon wake behind Refresh or explicit Agents activation, login job
 create, login job read/cancel/input, login job termination reconcile, and
 the credential-profile row actions — removal and the Enabled toggle,
 DELETE/PATCH on one route. Nothing here interprets a credential and nothing
@@ -485,8 +485,8 @@ async def api_claudexor_wake(request: Request) -> JSONResponse:
     The status GET stays side-effect-free by contract (and by test), which is
     right for a 5s poll but leaves the panel's Refresh POWERLESS: the daemon is
     lazy, so an owner who just wants to SEE their accounts had to start a login
-    job or a delegated run to wake it. This is that missing owner action, and
-    nothing else calls it — no poll, no page load.
+    job or a delegated run to wake it. Refresh and explicit Agents activation
+    call this owner action; background polling and the status GET never do.
 
     Provisioning cost rides here honestly: a cold runtime install happens inside
     this request rather than behind a silent GET.
