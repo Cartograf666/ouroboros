@@ -96,6 +96,21 @@ def test_journal_read_preserves_valid_rows_but_marks_malformed_coverage(tmp_path
     assert "2 unreadable" in digest
 
 
+def test_journal_read_preserves_valid_rows_with_invalid_utf8(tmp_path, monkeypatch):
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
+    _journal_rows(tmp_path, "mine", 1)
+    path = tmp_path / "projects" / "mine" / "journal.jsonl"
+    with path.open("ab") as handle:
+        handle.write(b"\xfflegacy-row\n")
+    ctx = SimpleNamespace(drive_root=tmp_path / "fork", project_id="mine")
+
+    page = _journal_read(ctx, limit=2)
+
+    assert "journal-000" in page
+    assert "unreadable=1" in page
+    assert "coverage=partial" in page
+
+
 def _tree_rows(root, root_id: str, count: int) -> None:
     for index in range(count):
         result = tree_ledger_append(
@@ -191,6 +206,25 @@ def test_tree_read_preserves_valid_rows_but_marks_malformed_coverage(tmp_path):
     assert "remaining=0" in second and "coverage=partial" in second
 
 
+def test_tree_read_preserves_valid_rows_with_invalid_utf8(tmp_path):
+    _tree_rows(tmp_path, "root-task", 1)
+    path = tmp_path / "task_trees" / "root-task" / "blackboard.jsonl"
+    with path.open("ab") as handle:
+        handle.write(b"\xfflegacy-row\n")
+    ctx = SimpleNamespace(
+        task_id="child",
+        drive_root=tmp_path / "fork",
+        budget_drive_root=str(tmp_path),
+        task_metadata={"root_task_id": "root-task"},
+    )
+
+    page = _tree_read(ctx, limit=2)
+
+    assert "tree-000" in page
+    assert "unreadable=1" in page
+    assert "coverage=partial" in page
+
+
 def test_runtime_tree_digest_uses_same_canonical_root_as_tree_read(tmp_path):
     from ouroboros.context import build_runtime_section
 
@@ -201,6 +235,9 @@ def test_runtime_tree_digest_uses_same_canonical_root_as_tree_read(tmp_path):
         "root-task", "note", "canonical-passive-row", task_id="child",
         data_root=canonical,
     ).startswith("OK:")
+    path = canonical / "task_trees" / "root-task" / "blackboard.jsonl"
+    with path.open("ab") as handle:
+        handle.write(b"\xfflegacy-row\n")
     env = SimpleNamespace(
         repo_dir=pathlib.Path(__file__).parents[1],
         drive_root=fork,
@@ -220,6 +257,7 @@ def test_runtime_tree_digest_uses_same_canonical_root_as_tree_read(tmp_path):
     rendered = build_runtime_section(env, task, ctx=ctx)
 
     assert "canonical-passive-row" in rendered
+    assert "coverage partial: 1 unreadable task-tree row" in rendered
 
 
 def _write_task(root, index: int, *, project_id: str = "mine") -> None:

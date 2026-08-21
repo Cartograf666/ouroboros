@@ -82,7 +82,7 @@ def jsonl_generation_signature(path: pathlib.Path) -> dict:
         return {}
     try:
         stat = path.stat()
-        with path.open("r", encoding="utf-8") as handle:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
             first = next((line.strip() for line in handle if line.strip()), "")
         return {
             "first_line_sha256": hashlib.sha256(first.encode("utf-8", errors="replace")).hexdigest(),
