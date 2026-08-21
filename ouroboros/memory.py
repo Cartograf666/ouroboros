@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -81,6 +82,45 @@ def _chat_history_filter(filters: Mapping[str, str], search: str):
         return True
 
     return matches
+
+
+def _normalized_chat_history_query(filters: Mapping[str, str], search: str) -> Dict[str, str]:
+    """Canonical actor-query identity for one chat-history snapshot."""
+
+    normalized = {
+        key: str(filters.get(key) or "").strip()
+        for key in ("provider", "account_id", "conversation_id", "thread_id", "actor_id")
+    }
+    normalized["search"] = str(search or "").lower()
+    for key in ("date_from", "date_to"):
+        value = filters.get(key)
+        normalized[key] = _history_timestamp(value, field=key).isoformat() if value else ""
+    return normalized
+
+
+def _chat_history_snapshot_id(
+    coverage: Mapping[str, Any], filters: Mapping[str, str], search: str,
+) -> str:
+    """Hash one exact physical generation snapshot plus its normalized query."""
+
+    generations = []
+    for row in coverage.get("generations") or []:
+        if not isinstance(row, Mapping):
+            continue
+        generations.append({
+            "name": pathlib.Path(str(row.get("path") or "")).name,
+            "first_line_sha256": str(row.get("first_line_sha256") or ""),
+            "size": int(row.get("size") or 0),
+        })
+    payload = {
+        "schema_version": 1,
+        "query": _normalized_chat_history_query(filters, search),
+        "generations": generations,
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class Memory:
@@ -343,12 +383,16 @@ class Memory:
                 write_text(path, "")
 
     def chat_history(
-        self, count: int = 100, offset: int = 0, search: str = "", **filters: str,
+        self, count: int = 100, offset: int = 0, search: str = "",
+        snapshot: str = "", **filters: str,
     ) -> str:
         chat_path = self.logs_path("chat.jsonl")
         archive_dir = self.drive_root / "archive"
         if not chat_path.exists() and not any(archive_dir.glob("chat_*.jsonl")):
-            return "(chat history is empty)"
+            meta = self.load_dialogue_meta()
+            signature = meta.get("chat_log_signature") if isinstance(meta, dict) else {}
+            if not (isinstance(signature, dict) and signature.get("first_line_sha256")):
+                return "(chat history is empty)"
 
         try:
             # Full project awareness (v6.32.0): active recall spans the one
@@ -363,6 +407,17 @@ class Memory:
                 predicate=matches,
             )
 
+            current_snapshot = _chat_history_snapshot_id(coverage, filters, search)
+            requested_snapshot = str(snapshot or "").strip().lower()
+            snapshot_stable = bool(coverage.get("snapshot_stable"))
+            if requested_snapshot and (
+                not snapshot_stable or requested_snapshot != current_snapshot
+            ):
+                return (
+                    "CHAT_HISTORY_SNAPSHOT_CHANGED: the query or archive/live generations "
+                    "changed; no mixed page was returned; restart with offset=0 and no snapshot."
+                )
+
             total = len(entries)
             if offset > 0:
                 entries = entries[:-offset] if offset < len(entries) else []
@@ -372,17 +427,47 @@ class Memory:
             remaining = max(0, total - max(0, int(offset)) - len(entries))
             gaps = [str(gap.get("kind") or "unknown") for gap in coverage.get("gaps") or []]
             gap_note = f" Gaps: {', '.join(gaps)}." if gaps else ""
+            pagination_note = (
+                f" Continue with offset={max(0, int(offset)) + len(entries)}, "
+                f"snapshot={current_snapshot}."
+                if snapshot_stable else
+                " Snapshot unavailable because the generation capture did not stabilize."
+            )
+            if not requested_snapshot:
+                pagination_note += (
+                    " Pagination used a live offset; repeating an offset without the returned "
+                    "snapshot is shiftable if history changes."
+                )
             if not entries:
                 if total:
+                    if gaps:
+                        return (
+                            f"Showing 0 of {total} observed messages; no further observed matches "
+                            f"at offset={max(0, int(offset))}; completeness unknown."
+                            f"{pagination_note}{gap_note}"
+                        )
                     return (
                         f"Showing 0 of {total} messages; matching history is exhausted "
-                        f"at offset={max(0, int(offset))}.{gap_note}"
+                        f"at offset={max(0, int(offset))}.{pagination_note}{gap_note}"
                     )
-                return "(no messages matching query)." + gap_note
+                if gaps:
+                    return (
+                        "(no observed messages matching query; completeness unknown)."
+                        + pagination_note + gap_note
+                    )
+                return "(no messages matching query)." + pagination_note
             lines = [self._format_chat_line(e, compact=False) for e in entries]
+            if gaps:
+                header = (
+                    f"Showing {len(entries)} of {total} observed messages; "
+                    f"{remaining} observed older remain; completeness unknown."
+                )
+            else:
+                header = (
+                    f"Showing {len(entries)} of {total} messages; {remaining} older remain."
+                )
             return (
-                f"Showing {len(entries)} of {total} messages; {remaining} older remain."
-                f" Continue with offset={max(0, int(offset)) + len(entries)}.{gap_note}\n\n"
+                header + pagination_note + gap_note + "\n\n"
                 + "\n".join(lines)
             )
         except Exception as e:
@@ -453,7 +538,7 @@ class Memory:
             stable_generations = stable_paths and all(
                 str(left.get("first_line_sha256") or "")
                 == str(right.get("first_line_sha256") or "")
-                and int(right.get("size") or 0) >= int(left.get("size") or 0)
+                and int(right.get("size") or 0) == int(left.get("size") or 0)
                 for left, right in zip(before, after)
             )
             coverage = {
@@ -462,18 +547,32 @@ class Memory:
                 "gaps": gaps,
                 "capture_attempts": attempt + 1,
                 "snapshot_changed_during_read": bool(
-                    stable_generations
-                    and any(
-                        int(right.get("size") or 0) > int(left.get("size") or 0)
-                        for left, right in zip(before, after)
-                    )
+                    not stable_generations
                 ),
+                "snapshot_stable": stable_generations,
                 "reader": "chat_history(count, offset, search)",
             }
+            try:
+                from ouroboros.consolidator import _resolve_generation_segments
+
+                _segments, _offset, cursor_gap = _resolve_generation_segments(
+                    self.load_dialogue_meta(), self.logs_path("chat.jsonl"),
+                )
+                if cursor_gap:
+                    coverage["gaps"].append({
+                        "kind": "consolidation_cursor_generation_missing",
+                        "detail": "The consolidation cursor names a generation that is no longer readable.",
+                    })
+            except Exception as exc:
+                coverage["gaps"].append({
+                    "kind": "consolidation_cursor_state_unreadable",
+                    "error": type(exc).__name__,
+                })
             last_entries, last_coverage = entries, coverage
             if stable_generations:
                 return entries, coverage
         last_coverage = dict(last_coverage)
+        last_coverage["snapshot_stable"] = False
         last_coverage.setdefault("gaps", []).append({
             "kind": "generation_chain_changed_during_capture",
             "detail": "archive/live generation ordering did not stabilize after 3 attempts",

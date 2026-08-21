@@ -373,6 +373,153 @@ def test_presence_promotion_preserves_ceiling_and_cannot_choose_new_scope(tmp_pa
         assert child[key] == contract[key]
 
 
+def test_real_presence_promotion_rebases_root_and_materializes_all_attachments(
+    tmp_path, monkeypatch,
+):
+    import supervisor.workers as workers
+    from ouroboros.presence_runner import _build_task
+    from ouroboros.subagent_work_order import compile_external_work_order
+    from ouroboros.tools.control import (
+        _build_child_subagent_contract,
+        _materialize_child_attachment_manifest,
+        _promote_chat_to_task,
+    )
+    from tests.test_presence_runner import _admission, _event
+
+    inherited_source = tmp_path / "presence-input.txt"
+    inherited_source.write_text("presence authority bytes", encoding="utf-8")
+    upload_source = tmp_path / "promotion-input.txt"
+    upload_source.write_text("promotion authority bytes", encoding="utf-8")
+    presence_task = _build_task(
+        _admission(), _event(), drive_root=tmp_path, staged_files=(inherited_source,),
+    )
+    presence_task["task_contract"]["context"] = "preserve exact presence context"
+    presence_task["task_contract"]["predecessor_authority"] = {
+        "result": "preserve predecessor result",
+    }
+    assert presence_task["attachments"] == presence_task["task_contract"]["attachment_manifest"]
+
+    _confirm_promote(monkeypatch)
+    tool_ctx = types.SimpleNamespace(
+        pending_events=[], event_queue=None, current_chat_id=4242,
+        drive_root=tmp_path,
+        task_metadata={
+            **presence_task["metadata"],
+            "chat_attachment_uploads": [{"path": str(upload_source), "label": "promotion input"}],
+        },
+        task_contract=presence_task["task_contract"],
+    )
+    result = _promote_chat_to_task(
+        tool_ctx,
+        "Research the new question deeply",
+        expected_output="A grounded report",
+        project_name="forbidden scope",
+        workspace_root="/tmp/forbidden",
+    )
+    assert result.startswith("OK: task")
+    event = tool_ctx.pending_events[0]
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    enqueued = []
+    worker_ctx = types.SimpleNamespace(
+        enqueue_task=lambda task: enqueued.append(task) or task,
+        persist_queue_snapshot=lambda **_kwargs: True,
+        load_state=lambda: {"owner_chat_id": 1},
+    )
+    outcome = workers.promote_chat_to_task(event, worker_ctx)
+
+    assert outcome["status"] == "scheduled"
+    promoted = enqueued[0]
+    contract = promoted["task_contract"]
+    assert promoted["type"] == contract["task_type"] == "task"
+    assert promoted["objective"] == contract["objective"] == "Research the new question deeply"
+    assert promoted["expected_output"] == contract["expected_output"] == "A grounded report"
+    assert contract["lineage"]["root_task_id"] == promoted["id"]
+    assert contract["context"] == "preserve exact presence context"
+    assert contract["predecessor_authority"]["result"] == "preserve predecessor result"
+    assert contract["capability_ceiling"] == presence_task["task_contract"]["capability_ceiling"]
+    assert promoted["attachments"] == contract["attachment_manifest"]
+    assert len(promoted["attachments"]) == 2
+    assert all(pathlib.Path(row["abs_path"]).is_file() for row in promoted["attachments"])
+    assert all(
+        pathlib.Path(row["abs_path"]).is_relative_to(
+            tmp_path / "task_results" / "artifacts" / promoted["id"] / "attachments"
+        )
+        for row in promoted["attachments"]
+    )
+
+    child_root = tmp_path / "child-drive"
+    child_manifest, attachment_error = _materialize_child_attachment_manifest(
+        contract, child_root, "presence-child",
+    )
+    assert attachment_error == ""
+    child = _build_child_subagent_contract({
+        "tid": "presence-child", "objective": "Inspect both inputs",
+        "expected_output": "Report", "parent_contract": contract,
+        "root_task_id": promoted["id"], "parent_task_id": promoted["id"],
+        "attachment_manifest": child_manifest,
+    })
+    work_order = compile_external_work_order({
+        "id": "presence-child", "objective": "Inspect both inputs",
+        "expected_output": "Report", "task_contract": child,
+        "parent_task_id": promoted["id"], "root_task_id": promoted["id"],
+    })
+    assert child["capability_ceiling"] == contract["capability_ceiling"]
+    assert len(child["attachment_manifest"]) == 2
+    assert "presence authority bytes" not in work_order
+    assert "presence-input.txt" in work_order and "promotion-input.txt" in work_order
+
+
+def test_real_presence_promotion_rejection_cleans_promoted_attachment_copy(
+    tmp_path, monkeypatch,
+):
+    import supervisor.workers as workers
+    from ouroboros.presence_runner import _build_task
+    from ouroboros.tools.control import _promote_chat_to_task
+    from tests.test_presence_runner import _admission, _event
+
+    inherited_source = tmp_path / "presence-input.txt"
+    inherited_source.write_text("presence authority bytes", encoding="utf-8")
+    presence_task = _build_task(
+        _admission(), _event(), drive_root=tmp_path, staged_files=(inherited_source,),
+    )
+    original_path = pathlib.Path(presence_task["attachments"][0]["abs_path"])
+    assert original_path.is_file()
+
+    _confirm_promote(monkeypatch)
+    tool_ctx = types.SimpleNamespace(
+        pending_events=[], event_queue=None, current_chat_id=4242,
+        drive_root=tmp_path,
+        task_metadata={
+            **presence_task["metadata"],
+            "chat_attachment_uploads": [{
+                "path": str(tmp_path / "missing-upload.txt"), "label": "missing",
+            }],
+        },
+        task_contract=presence_task["task_contract"],
+    )
+    assert _promote_chat_to_task(tool_ctx, "Long work").startswith("OK: task")
+    event = tool_ctx.pending_events[0]
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    enqueued = []
+    worker_ctx = types.SimpleNamespace(
+        enqueue_task=lambda task: enqueued.append(task) or task,
+        persist_queue_snapshot=lambda **_kwargs: True,
+        load_state=lambda: {"owner_chat_id": 1},
+    )
+    outcome = workers.promote_chat_to_task(event, worker_ctx)
+
+    assert outcome["status"] == "needs_manual_target"
+    assert outcome["reason"] == "attachment_admission_rejected"
+    assert enqueued == []
+    promoted_dir = (
+        tmp_path / "task_results" / "artifacts" / event["task_id"] / "attachments"
+    )
+    assert not promoted_dir.exists()
+    assert original_path.is_file()
+
+
 def _swarm_ctx(tmp_path, **overrides):
     values = {
         "pending_events": [],

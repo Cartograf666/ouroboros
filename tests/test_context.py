@@ -1211,7 +1211,8 @@ def test_chat_history_surfaces_malformed_gap_even_when_search_matches_nothing(tm
 
     result = Memory(tmp_path).chat_history(count=20, search="absent-query")
 
-    assert "no messages matching query" in result
+    assert "no observed messages matching query" in result
+    assert "completeness unknown" in result
     assert "jsonl_malformed" in result
 
 

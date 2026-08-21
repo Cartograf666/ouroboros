@@ -468,23 +468,61 @@ def _promoted_force_plan_metadata(evt: dict) -> dict:
 
 
 def _stage_promoted_initial_attachments(
-    evt: dict, task: dict, tid: str,
+    evt: dict, task: dict, tid: str, *, inherited_manifest: Any = None,
 ) -> tuple[list[dict], Optional[dict]]:
     """Stage before any durable project/workspace/task admission side effect."""
 
     uploads = evt.get("attachment_uploads")
     uploads = uploads if isinstance(uploads, list) else []
-    if not uploads:
+    inherited = inherited_manifest if isinstance(inherited_manifest, list) else []
+    if not uploads and not inherited:
         return [], None
+    manifest: list[dict] = []
     try:
         from ouroboros.artifacts import (
             attachment_manifest_has_rejections,
+            materialize_inherited_attachment_manifest,
             remove_staged_attachments,
             stage_task_attachments,
         )
         from ouroboros.gateway.tasks import _render_attachment_lines
 
-        manifest = stage_task_attachments(DRIVE_ROOT, tid, uploads)
+        inherited_rows, inherited_error = materialize_inherited_attachment_manifest(
+            inherited, DRIVE_ROOT, tid,
+        )
+        if inherited_error:
+            failed_inherited = [
+                {
+                    **{
+                        key: row[key] for key in ("ordinal", "label")
+                        if isinstance(row, dict) and key in row
+                    },
+                    "status": "rejected",
+                    "reason": "inherited_source_unavailable",
+                }
+                for row in inherited
+            ]
+            return failed_inherited, {
+                "status": "needs_manual_target",
+                "reason": "attachment_admission_rejected",
+                "detail": f"Inherited attachment materialization failed: {inherited_error}",
+                "attachment_manifest": failed_inherited,
+                "task_id": tid,
+            }
+        upload_rows = stage_task_attachments(DRIVE_ROOT, tid, uploads) if uploads else []
+        # Preserve the private cleanup ownership carried by the staging helper so
+        # every later admission refusal remains atomic even after composing
+        # inherited and newly-uploaded inputs.
+        manifest = inherited_rows if inherited_rows else upload_rows
+        if inherited_rows and upload_rows:
+            inherited_rows.extend(upload_rows)
+            inherited_owned = getattr(inherited_rows, "_cleanup_owned_paths", None)
+            upload_owned = getattr(upload_rows, "_cleanup_owned_paths", None)
+            if isinstance(inherited_owned, set) and isinstance(upload_owned, set):
+                inherited_owned.update(upload_owned)
+        for ordinal, row in enumerate(manifest):
+            if isinstance(row, dict):
+                row["ordinal"] = ordinal
         rendered = _render_attachment_lines(manifest)
         if attachment_manifest_has_rejections(manifest):
             remove_staged_attachments(manifest)
@@ -507,6 +545,14 @@ def _stage_promoted_initial_attachments(
         return manifest, None
     except Exception:
         log.warning("promote: attachment staging failed for %s", tid, exc_info=True)
+        if manifest:
+            try:
+                from ouroboros.artifacts import remove_staged_attachments
+
+                remove_staged_attachments(manifest)
+            except Exception:
+                log.debug("promote: partial composed attachment cleanup failed", exc_info=True)
+        declared = [*inherited, *uploads]
         manifest = [
             {
                 "ordinal": index,
@@ -515,7 +561,7 @@ def _stage_promoted_initial_attachments(
                 "label": str(item.get("label") or item.get("display_name") or f"attachment {index + 1}")
                 if isinstance(item, dict) else f"attachment {index + 1}",
             }
-            for index, item in enumerate(uploads)
+            for index, item in enumerate(declared)
         ]
         return manifest, {
             "status": "needs_manual_target",
@@ -542,6 +588,34 @@ def _reject_promoted_after_attachment_stage(
         except Exception:
             log.debug("promote: staged attachment cleanup failed", exc_info=True)
     return outcome
+
+
+def _apply_presence_promotion_authority(
+    evt: dict, task: dict, *, objective: str, expected_output: str,
+) -> list[dict]:
+    """Preserve inherited Presence authority while rebinding the new root."""
+
+    presence = evt.get("presence") if isinstance(evt.get("presence"), dict) else None
+    if not presence:
+        return []
+    task["_presence_origin"] = True
+    task["source"] = "presence_promote"
+    task.setdefault("metadata", {})["presence"] = dict(presence)
+    contract = evt.get("task_contract") if isinstance(evt.get("task_contract"), dict) else {}
+    inherited_manifest = [
+        dict(row) for row in (contract.get("attachment_manifest") or [])
+        if isinstance(row, dict)
+    ]
+    promoted_contract = dict(contract)
+    promoted_contract.update({
+        "task_type": "task",
+        "objective": objective,
+        "expected_output": expected_output,
+        "attachment_manifest": [],
+    })
+    promoted_contract.pop("lineage", None)
+    task["task_contract"] = promoted_contract
+    return inherited_manifest
 
 
 def _relocate_promoted_attachments(task: dict, tid: str, manifest: list[dict]) -> bool:
@@ -636,15 +710,11 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         "promotion_admission_token": admission_token,
         **_promoted_force_plan_metadata(evt),
     }
-    presence = evt.get("presence") if isinstance(evt.get("presence"), dict) else None
-    if presence:
-        task["_presence_origin"] = True
-        task["source"] = "presence_promote"
-        task.setdefault("metadata", {})["presence"] = dict(presence)
-        contract = evt.get("task_contract") if isinstance(evt.get("task_contract"), dict) else {}
-        task["task_contract"] = dict(contract)
+    inherited_attachment_manifest = _apply_presence_promotion_authority(
+        evt, task, objective=objective, expected_output=expected_output,
+    )
     attachment_manifest, attachment_rejection = _stage_promoted_initial_attachments(
-        evt, task, tid,
+        evt, task, tid, inherited_manifest=inherited_attachment_manifest,
     )
     if attachment_rejection is not None:
         return attachment_rejection
@@ -810,6 +880,8 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         public_manifest = [dict(row) for row in attachment_manifest]
         task["attachments"] = public_manifest
         task["attachment_images"] = [row for row in public_manifest if row.get("is_image")]
+        if isinstance(task.get("task_contract"), dict):
+            task["task_contract"]["attachment_manifest"] = public_manifest
     attach_task_contract(task)
     admitted = ctx.enqueue_task(task)
     if isinstance(admitted, dict) and admitted.get("_admission_blocked"):

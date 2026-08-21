@@ -2032,7 +2032,8 @@ def _request_deep_self_review(ctx: ToolContext, reason: str) -> str:
 
 
 def _chat_history(
-    ctx: ToolContext, count: int = 100, offset: int = 0, search: str = "", **filters: str,
+    ctx: ToolContext, count: int = 100, offset: int = 0, search: str = "",
+    snapshot: str = "", **filters: str,
 ) -> str:
     from ouroboros.memory import Memory
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(
@@ -2047,7 +2048,9 @@ def _chat_history(
     # Full project awareness (v6.32.0): the one mind's active recall spans every
     # thread (main + projects). The project-task working FOCUS is applied to the
     # passive default context only, never to this deliberate recall tool.
-    return mem.chat_history(count=count, offset=offset, search=search, **filters)
+    return mem.chat_history(
+        count=count, offset=offset, search=search, snapshot=snapshot, **filters,
+    )
 
 
 def _update_scratchpad(ctx: ToolContext, content: str) -> str:
@@ -2953,6 +2956,7 @@ def get_tools() -> List[ToolEntry]:
                 "actor_id": {"type": "string", "default": "", "description": "Exact platform actor ID"},
                 "date_from": {"type": "string", "default": "", "description": "Inclusive ISO-8601 lower timestamp bound"},
                 "date_to": {"type": "string", "default": "", "description": "Inclusive ISO-8601 upper timestamp bound"},
+                "snapshot": {"type": "string", "default": "", "description": "Opaque snapshot returned by the first page; reuse it with offset to refuse shifted/mixed pages"},
             }, "required": [], "additionalProperties": False},
         }, _chat_history),
         ToolEntry("update_scratchpad", {
