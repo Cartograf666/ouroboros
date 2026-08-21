@@ -174,6 +174,22 @@ def _preset_suggested_name(drive_root: object, task_id: str) -> str:
     return ""
 
 
+def _explicit_task_title(drive_root: object, task_id: str) -> str:
+    """Existing model-authored task title, before any naming fallback/call."""
+    try:
+        from ouroboros.task_results import load_task_result
+
+        result = load_task_result(drive_root, task_id) or {}
+    except Exception:
+        log.debug("_explicit_task_title: load_task_result failed", exc_info=True)
+        result = {}
+    for source in (result, _task_from_live_queue(drive_root, task_id)):
+        value = str((source or {}).get("title") or "").strip()
+        if value:
+            return _cap_name(value)
+    return ""
+
+
 # Human labels for the skill-lifecycle job kinds that ``skill_lifecycle_queue.
 # _chat_task_id`` encodes into a synthetic task id (skill_lifecycle_<kind>_<target>_<job>).
 _SKILL_LIFECYCLE_KINDS = {
@@ -614,8 +630,8 @@ async def api_project_from_task(request: Request) -> JSONResponse:
             hint = hint[: _MAX_DERIVED_NAME - 1].rstrip() + "…"
         owner_text = _owner_request_text(drive_root, task_id, full_hint)
         # LLM-first project name (Cluster B): the owner wants a name the model coined,
-        # not the heuristic "task-…". Order: explicit caller name -> a title the proactive
-        # card namer already coined (reused with ZERO extra call) -> an inline bounded
+        # not the heuristic "task-…". Order: explicit caller name -> explicit task title
+        # -> a title the proactive card namer already coined (both reused with ZERO extra call) -> an inline bounded
         # light-model call -> the heuristic (title/objective/queue) -> the frontend hint
         # -> a neutral "New project". The async namer folds the heuristic/hint candidates
         # into its own fail-soft fallback, so a missing key / timeout never blocks convert.
@@ -625,8 +641,11 @@ async def api_project_from_task(request: Request) -> JSONResponse:
         else:
             from ouroboros.project_naming import llm_project_name_async
 
+            explicit_title = _explicit_task_title(drive_root, task_id)
             preset = _preset_suggested_name(drive_root, task_id)
-            if preset:
+            if explicit_title:
+                project_name, reason = explicit_title, "explicit_task_title"
+            elif preset:
                 project_name, reason = preset, "proactive_namer"
             else:
                 # A skill/system task carries no owner request text; give the namer an

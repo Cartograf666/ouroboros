@@ -121,6 +121,13 @@ def test_chat_annotations_are_compact_and_torn_tail_tolerant(tmp_path):
         action="routed",
         target="project:alpha",
         status="delivered",
+        detail="- missing: rejected (reason=source_missing, ordinal=0)",
+        attachment_manifest=[{
+            "ordinal": 0,
+            "status": "rejected",
+            "reason": "source_missing",
+            "label": "missing",
+        }],
     )
     path = tmp_path / "logs" / "chat_annotations.jsonl"
     with path.open("ab") as handle:
@@ -130,6 +137,7 @@ def test_chat_annotations_are_compact_and_torn_tail_tolerant(tmp_path):
     assert latest["owner-1"]["status"] == "delivered"
     assert set(latest["owner-1"]) == {
         "ts", "type", "client_message_id", "action", "target", "status",
+        "detail", "attachment_manifest",
     }
 
     from ouroboros.gateway.history import make_chat_history_endpoint
@@ -142,6 +150,13 @@ def test_chat_annotations_are_compact_and_torn_tail_tolerant(tmp_path):
         "action": "routed",
         "target": "project:alpha",
         "status": "delivered",
+        "detail": "- missing: rejected (reason=source_missing, ordinal=0)",
+        "attachment_manifest": [{
+            "ordinal": 0,
+            "status": "rejected",
+            "reason": "source_missing",
+            "label": "missing",
+        }],
     }
 
 
@@ -221,7 +236,7 @@ def test_project_sidebar_and_menu_static_contracts():
     assert 'maxlength="${maxNameLength}"' in menu
 
 
-def test_project_main_mirror_never_creates_second_unread_static_contract():
+def test_project_activity_stays_out_of_main_static_contract():
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1]
@@ -236,26 +251,31 @@ def test_project_main_mirror_never_creates_second_unread_static_contract():
     assert project_guard < increment
     assert "Project visible_revision is the sole unread authority" in unread_fn
 
-    # The useful Main штаб/live-card mirror remains, but every unread call keeps
-    # the original frame so the Project-origin guard can classify it.
+    # Main has its own compact host-stamped completion row. Project progress,
+    # logs and ordinary summaries never enter its live fan-out.
     fanout = chat[
-        chat.index("const isProjectMirrorFrame"):
+        chat.index("const isMyThread"):
         chat.index("onWs('message_annotation'")
     ]
-    assert "mirrorProject && isProjectMirrorFrame(msg)" in fanout
+    assert "mirrorProject" not in fanout
+    assert "return !isKnownProjectFrame(msg);" in fanout
+    assert "msg.system_type === 'project_completion_summary'" in fanout
     assert "appendTaskSummaryToLiveCard(msg);" in fanout
-    assert "updateLiveCardFromProgressMessage(msg, { grantCancelAuthority: !isMirror });" in fanout
+    assert "updateLiveCardFromProgressMessage(msg, { grantCancelAuthority: true });" in fanout
     assert "incrementUnreadIfNeeded(msg);" in fanout
     assert "incrementUnreadIfNeeded();" not in chat
 
-    # History replay reconstructs the mirror but is not a new-delivery signal;
-    # only live frames may advance Main's global unread counter.
+    # History replay renders the durable compact completion independently of
+    # task-card reconstruction.
     history = chat[
         chat.index("async function syncHistory"):
         chat.index("function cancelHistoryPaint")
     ]
     assert "appendTaskSummaryToLiveCard(msg" in history
+    assert "msg.system_type === 'project_completion_summary'" in history
     assert "incrementUnreadIfNeeded" not in history
+    assert "name: projectName || 'Project'" in chat
+    assert "name: projectName || projectId" not in chat
 
 
 def test_chat_ws_subscriptions_flow_through_disposer_helper():

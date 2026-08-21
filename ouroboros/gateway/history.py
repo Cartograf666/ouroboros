@@ -215,7 +215,14 @@ def _user_annotation(
     annotation = annotations.get(client_message_id)
     if role != "user" or not isinstance(annotation, dict):
         return None
-    return {key: annotation.get(key) for key in ("action", "target", "status")}
+    return {
+        key: annotation.get(key)
+        for key in (
+            "action", "target", "target_label", "status", "detail", "options",
+            "attachment_manifest",
+        )
+        if key in annotation
+    }
 
 
 def make_cost_breakdown_endpoint(data_dir: pathlib.Path):
@@ -639,8 +646,7 @@ def _make_thread_filter(
 ):
     """Build the per-request thread-filter closure (perf2 P3 decomposition).
 
-    Returns the thread predicate plus the producer-owned Main-mirror classifier
-    shared by both stream readers and both transform loops."""
+    Returns the one thread predicate shared by both durable stream readers."""
 
     def _bound_project_chat(task_id: str, parent_task_id: str = "", root_task_id: str = "") -> int:
         # Resolve by LINEAGE (own binding -> parent -> root) so a subagent's rows
@@ -663,35 +669,30 @@ def _make_thread_filter(
                 str(entry.get("root_task_id") or ""),
             ) if isinstance(entry, dict) else 0
         )
+        is_root_completion = bool(
+            isinstance(entry, dict)
+            and str(entry.get("type") or "") == "project_completion_summary"
+        )
         if thread_id in project_chat_ids:
+            # The compact host-stamped completion belongs only to Main; the
+            # Project thread already owns the complete task timeline/result.
+            if is_root_completion:
+                return False
             if bound_chat == thread_id:
                 return True
             if isinstance(entry, dict) and _matches_project_source(entry, project_source_refs):
                 return True
             return entry_chat == thread_id
-        # Main / non-project view: everything that is NOT another project. A
-        # bound task's rows are project-owned, so mirror only its sanitized
-        # progress/task_summary and exclude its raw chat (same as a native
-        # project row), never leak raw project chat into the штаб.
+        # Main / non-project view: exactly one host-stamped terminal Project-root
+        # row is admitted from the canonical Main chat. Project progress, logs,
+        # child traffic, ordinary summaries and raw dialogue stay in Project.
+        if is_root_completion:
+            return entry_chat not in project_chat_ids
         if entry_chat in project_chat_ids or bound_chat > 0:
-            if not isinstance(entry, dict):
-                return False
-            return bool(entry.get("is_progress")) or str(entry.get("type") or "") == "task_summary"
+            return False
         return entry_chat not in project_chat_ids
 
-    def _row_is_project_mirror(entry_chat: int, entry: Optional[dict] = None) -> bool:
-        if thread_id in project_chat_ids or not isinstance(entry, dict):
-            return False
-        return bool(
-            entry_chat in project_chat_ids
-            or _bound_project_chat(
-                str(entry.get("task_id") or ""),
-                str(entry.get("parent_task_id") or ""),
-                str(entry.get("root_task_id") or ""),
-            )
-        )
-
-    return _row_matches_thread, _row_is_project_mirror
+    return _row_matches_thread
 
 
 def _collect_chat_rows(
@@ -700,7 +701,6 @@ def _collect_chat_rows(
     n_human: int,
     row_matches_thread,
     chat_annotations: Dict[str, Any],
-    row_is_project_mirror=None,
 ) -> tuple[list, int]:
     """Read + transform the chat stream.
 
@@ -749,6 +749,10 @@ def _collect_chat_rows(
                 "task_id": str(entry.get("task_id", "")),
                 "telegram_chat_id": int(entry.get("telegram_chat_id") or 0),
             }
+            if rec["system_type"] == "project_completion_summary":
+                for key in ("project_id", "project_name", "target_label", "status"):
+                    if key in entry:
+                        rec[key] = str(entry.get(key) or "")
             annotation = _user_annotation(role, rec["client_message_id"], chat_annotations)
             if annotation is not None:
                 rec["chat_annotation"] = annotation
@@ -782,8 +786,6 @@ def _collect_chat_rows(
             for field in SUBAGENT_MESSAGE_FIELDS:
                 if field in entry:
                     rec[field] = entry[field]
-            if callable(row_is_project_mirror) and row_is_project_mirror(entry_chat, entry):
-                rec["project_mirror"] = True
             combined.append(rec)
     except Exception as exc:
         log.warning("Failed to read chat history: %s", exc)
@@ -795,7 +797,6 @@ def _collect_progress_rows(
     archive_dir: pathlib.Path,
     n_progress: int,
     row_matches_thread,
-    row_is_project_mirror=None,
 ) -> tuple[list, int]:
     """Read + transform the progress stream.
 
@@ -861,8 +862,6 @@ def _collect_progress_rows(
             for field in _PROGRESS_META_FIELDS:
                 if field in entry:
                     rec[field] = entry[field]
-            if callable(row_is_project_mirror) and row_is_project_mirror(entry_chat, entry):
-                rec["project_mirror"] = True
             combined.append(rec)
     except Exception as exc:
         log.warning("Failed to read progress log: %s", exc)
@@ -1051,7 +1050,7 @@ def _assemble_history_response(
     project_chat_ids, project_source_refs, chat_annotations, bindings_by_task = (
         _project_history_context(data_dir, thread_id)
     )
-    row_matches_thread, row_is_project_mirror = _make_thread_filter(
+    row_matches_thread = _make_thread_filter(
         thread_id, project_chat_ids, project_source_refs, bindings_by_task
     )
     chat_path = data_dir / "logs" / "chat.jsonl"
@@ -1059,11 +1058,9 @@ def _assemble_history_response(
     archive_dir = data_dir / "archive"
     combined, chat_quota_rows = _collect_chat_rows(
         chat_path, archive_dir, n_human, row_matches_thread, chat_annotations,
-        row_is_project_mirror,
     )
     progress_rows, progress_quota_rows = _collect_progress_rows(
         progress_path, archive_dir, n_progress, row_matches_thread,
-        row_is_project_mirror,
     )
     combined.extend(progress_rows)
     lifecycle_row = _active_lifecycle_row()

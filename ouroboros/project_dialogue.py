@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import pathlib
 import uuid
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
 from ouroboros.utils import iter_jsonl_objects, jsonl_append_lock_path, replace_atomic, utc_now_iso
@@ -21,6 +22,14 @@ from ouroboros.utils import iter_jsonl_objects, jsonl_append_lock_path, replace_
 _ANNOTATIONS_NAME = "chat_annotations.jsonl"
 _COMPACT_AT_BYTES = 800_000
 _RETAINED_ARCHIVES = 3
+log = logging.getLogger(__name__)
+
+
+def _row_chat_id(row: Dict[str, Any]) -> int:
+    try:
+        return int(row.get("chat_id", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _chat_paths(drive_root: Any) -> List[pathlib.Path]:
@@ -56,6 +65,23 @@ def build_owner_message_ref(
         "ts": str(ts or ""),
         "text_sha256": _text_sha256(text),
     }
+
+
+def owner_message_ref_is_valid(ref: Any) -> bool:
+    """Whether a source ref has the complete host-minted owner-row identity."""
+    if not isinstance(ref, dict) or not {
+        "chat_id", "client_message_id", "ts", "text_sha256",
+    }.issubset(ref):
+        return False
+    digest = ref.get("text_sha256")
+    return bool(
+        isinstance(ref.get("chat_id"), int)
+        and not isinstance(ref.get("chat_id"), bool)
+        and isinstance(ref.get("client_message_id"), str)
+        and isinstance(ref.get("ts"), str) and ref.get("ts")
+        and isinstance(digest, str) and len(digest) == 64
+        and all(char in "0123456789abcdef" for char in digest)
+    )
 
 
 def source_refs_for_project(drive_root: Any, project_chat_id: int) -> List[Dict[str, Any]]:
@@ -107,34 +133,94 @@ def project_origin_rows(drive_root: Any, project_chat_id: int) -> List[Dict[str,
     return rows
 
 
+def project_recent_dialogue(
+    memory: Any, project_chat_id: int, max_entries: int,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
+    """Focused recent rows plus retention-proof cross-thread owner origins."""
+    from ouroboros.projects_registry import all_task_bindings
+
+    try:
+        bound = all_task_bindings(memory.drive_root)
+    except Exception:
+        bound = {}
+    refs = source_refs_for_project(memory.drive_root, project_chat_id)
+    ref_keys = {key for ref in refs if (key := _source_ref_identity(ref)) is not None}
+    entries, coverage = memory.read_unconsolidated_chat(
+        memory.load_dialogue_meta(), max_entries,
+        predicate=lambda row: (
+            _row_chat_id(row) == project_chat_id
+            or bound.get(str(row.get("task_id") or "")) == project_chat_id
+            or bool(_entry_source_identities(row) & ref_keys)
+        ),
+    )
+    present_ref_keys = set()
+    for entry in entries:
+        present_ref_keys.update(_entry_source_identities(entry))
+    retained: List[Dict[str, Any]] = []
+    for origin in project_origin_rows(memory.drive_root, project_chat_id):
+        ref = origin.get("ref") if isinstance(origin.get("ref"), dict) else {}
+        if _source_ref_identity(ref) in present_ref_keys:
+            continue
+        retained.append({
+            "chat_id": ref.get("chat_id"), "client_message_id": ref.get("client_message_id"),
+            "ts": ref.get("ts"), "direction": "in", "text": origin.get("text"),
+            "project_origin_projection": True,
+        })
+    return entries, coverage, retained
+
+
+def _source_ref_identity(ref: Dict[str, Any]) -> Optional[tuple]:
+    try:
+        chat_id = int(ref.get("chat_id") or 0)
+    except (TypeError, ValueError):
+        return None
+    return (
+        chat_id, str(ref.get("client_message_id") or ""), str(ref.get("ts") or ""),
+        str(ref.get("text_sha256") or ""),
+    )
+
+
+def _entry_source_identities(entry: Dict[str, Any]) -> set:
+    if str(entry.get("direction") or "") != "in":
+        return set()
+    try:
+        chat_id = int(entry.get("chat_id", 1) or 1)
+    except (TypeError, ValueError):
+        chat_id = 1
+    client_id = str(entry.get("client_message_id") or "")
+    ts = str(entry.get("ts") or "")
+    text_hash = _text_sha256(entry.get("text"))
+    return {
+        (chat_id, client_id, ts, text_hash), (chat_id, "", ts, text_hash),
+        (chat_id, client_id, "", text_hash), (chat_id, "", "", text_hash),
+    }
+
+
 def entry_matches_source_ref(entry: Dict[str, Any], refs: Iterable[Dict[str, Any]]) -> bool:
     """Whether ``entry`` is the original row identified by one binding ref."""
-    if str(entry.get("direction") or "") != "in":
-        return False
-    try:
-        entry_chat_id = int(entry.get("chat_id", 1) or 1)
-    except (TypeError, ValueError):
-        entry_chat_id = 1
-    entry_client_id = str(entry.get("client_message_id") or "")
-    entry_ts = str(entry.get("ts") or "")
-    entry_hash = _text_sha256(entry.get("text"))
-    for ref in refs:
-        if not isinstance(ref, dict):
-            continue
+    ref_keys = {
+        key for ref in refs if isinstance(ref, dict)
+        if (key := _source_ref_identity(ref)) is not None
+    }
+    return bool(_entry_source_identities(entry) & ref_keys)
+
+
+def resolve_owner_message_source(drive_root: Any, ref: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Stream the exact named owner source across the durable generation chain."""
+    from ouroboros.consolidator import _ordered_chat_generation_paths
+
+    live = pathlib.Path(drive_root) / "logs" / "chat.jsonl"
+    ref_key = _source_ref_identity(ref)
+    if ref_key is None:
+        return None
+    for path in reversed(_ordered_chat_generation_paths(live)):
         try:
-            if int(ref.get("chat_id") or 0) != entry_chat_id:
-                continue
-        except (TypeError, ValueError):
+            for row in iter_jsonl_objects(path):
+                if ref_key in _entry_source_identities(row):
+                    return dict(row)
+        except OSError:
             continue
-        client_id = str(ref.get("client_message_id") or "")
-        if client_id and client_id != entry_client_id:
-            continue
-        if str(ref.get("ts") or "") and str(ref.get("ts")) != entry_ts:
-            continue
-        if str(ref.get("text_sha256") or "") != entry_hash:
-            continue
-        return True
-    return False
+    return None
 
 
 def _latest_annotations(path: pathlib.Path) -> Dict[str, Dict[str, Any]]:
@@ -195,11 +281,13 @@ def append_chat_annotation(
     *,
     action: str,
     target: str = "",
+    target_label: str = "",
     status: str,
     routing_token: str = "",
     reason: str = "",
     detail: str = "",
     options: Any = None,
+    attachment_manifest: Any = None,
 ) -> bool:
     """Append one compact UI annotation; no semantic routing state is stored."""
     message_id = str(client_message_id or "").strip()
@@ -213,6 +301,8 @@ def append_chat_annotation(
         "target": str(target or "")[:200],
         "status": str(status or "")[:80],
     }
+    if str(target_label or ""):
+        row["target_label"] = str(target_label)[:200]
     if str(routing_token or ""):
         row["routing_token"] = str(routing_token)[:128]
     if str(reason or ""):
@@ -221,6 +311,10 @@ def append_chat_annotation(
         row["detail"] = str(detail)[:1000]
     if isinstance(options, list):
         row["options"] = [dict(item) for item in options[:100] if isinstance(item, dict)]
+    if isinstance(attachment_manifest, list):
+        row["attachment_manifest"] = [
+            dict(item) for item in attachment_manifest if isinstance(item, dict)
+        ]
     path = pathlib.Path(drive_root) / "logs" / _ANNOTATIONS_NAME
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = jsonl_append_lock_path(path)
@@ -243,12 +337,160 @@ def append_chat_annotation(
         release_exclusive_file_lock(lock_path, lock_fd)
 
 
+def routing_target_label(
+    drive_root: Any, action: str, target: str, *, task: Any = None,
+    project_id: str = "",
+) -> str:
+    """Resolve one deterministic event-time label for an existing raw target."""
+    target = str(target or "").strip()
+    if not target:
+        return ""
+    try:
+        from ouroboros.projects_registry import get_reserved_project, task_presentation_snapshot
+
+        if action == "project_route":
+            project = get_reserved_project(drive_root, target) or {}
+            name = str(project.get("name") or "").strip()
+            return name if name and name != target else "Project"
+        return task_presentation_snapshot(
+            drive_root, target, task=task, project_id=project_id,
+        )["target_label"]
+    except Exception:
+        log.debug("Routing target label resolution failed for %s", target, exc_info=True)
+        return "Task"
+
+
+def routing_options_with_labels(drive_root: Any, options: Any) -> List[Dict[str, Any]]:
+    """Stamp human labels on manual task choices while retaining their raw ids."""
+    rows: List[Dict[str, Any]] = []
+    for raw in list(options or [])[:100]:
+        if not isinstance(raw, dict):
+            continue
+        row = dict(raw)
+        task_id = str(row.get("task_id") or "").strip()
+        if task_id and not str(row.get("label") or "").strip():
+            row["label"] = routing_target_label(
+                drive_root, str(row.get("action") or "steer_task"), task_id,
+                task=row, project_id=str(row.get("project_id") or ""),
+            )
+        rows.append(row)
+    return rows
+
+
+def completion_status_label(result: Dict[str, Any], event: Dict[str, Any]) -> str:
+    from ouroboros.task_results import (
+        STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_REJECTED_DUPLICATE,
+    )
+
+    status = str(result.get("status") or event.get("status") or "").strip().lower()
+    axes = {}
+    for source in (event, result):
+        value = source.get("outcome_axes")
+        if isinstance(value, dict):
+            axes.update({key: axis for key, axis in value.items() if isinstance(axis, dict)})
+    axis_status = {key: str(axis.get("status") or "").lower() for key, axis in axes.items()}
+    failed = (
+        status == STATUS_FAILED
+        or axis_status.get("lifecycle") == STATUS_FAILED
+        or axis_status.get("execution") in {"failed", "infra_failed"}
+        or axis_status.get("objective") == "fail"
+        or axis_status.get("review") == "fail"
+        or axis_status.get("artifacts") in {"failed", "missing"}
+    )
+    degraded = any(value in {"degraded", "partial", "best_effort"}
+                   for value in axis_status.values())
+    checkpoint = result.get("root_phase_checkpoint")
+    degraded |= bool(isinstance(checkpoint, dict)
+                     and str(checkpoint.get("post_task_synthesis") or "").lower() == "degraded")
+    if status == STATUS_CANCELLED:
+        return "Cancelled"
+    if failed:
+        return "Failed"
+    if status == STATUS_COMPLETED:
+        return "Completed with limitations" if degraded else "Completed"
+    if status == STATUS_REJECTED_DUPLICATE:
+        return "Not started"
+    return status.replace("_", " ").title() or "Finished"
+
+
+def _completion_excerpt(result: Dict[str, Any]) -> str:
+    for key in ("summary", "result", "error"):
+        text = " ".join(str(result.get(key) or "").split())
+        if text:
+            return text if len(text) <= 240 else text[:239].rstrip() + "…"
+    return ""
+
+
+def enqueue_project_completion_summary(
+    drive_root: Any, evt: Dict[str, Any], task_id: str, task: Dict[str, Any],
+    result: Dict[str, Any], task_done_event: Dict[str, Any],
+) -> bool:
+    """Owe Main's one compact row for a terminal non-ephemeral Project root."""
+    tid = str(task_id or "").strip()
+    task = task if isinstance(task, dict) else {}
+    result = result if isinstance(result, dict) else {}
+    if not tid or any(
+        bool(row.get("_ephemeral") or row.get("ephemeral_decision"))
+        for row in (evt, task, result, task_done_event) if isinstance(row, dict)
+    ):
+        return False
+    try:
+        from ouroboros.projects_registry import task_presentation_snapshot
+        from ouroboros.task_results import resolve_task_lineage
+        from ouroboros.task_status import SETTLED_STATUSES
+        from supervisor.terminal_delivery import enqueue_terminal_delivery
+
+        metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+        lineage = resolve_task_lineage(
+            tid, metadata=metadata,
+            root_task_id=result.get("root_task_id") or task.get("root_task_id"),
+            parent_task_id=result.get("parent_task_id") or task.get("parent_task_id"),
+            delegation_role=result.get("delegation_role") or task.get("delegation_role"),
+            original_task_id=result.get("original_task_id") or task.get("original_task_id"),
+            timeout_retry_from=result.get("timeout_retry_from") or task.get("timeout_retry_from"),
+        )
+        status = str(result.get("status") or task_done_event.get("status") or "").lower()
+        if not lineage["is_root_task"] or status not in SETTLED_STATUSES:
+            return False
+        snapshot = task_presentation_snapshot(
+            drive_root, tid, task=task, result=result,
+            project_id=str(result.get("project_id") or task.get("project_id") or ""),
+        )
+        if not snapshot["project_id"]:
+            return False
+        excerpt = _completion_excerpt(result)
+        event = {
+            "type": "send_message", "chat_id": 1, "task_id": tid,
+            "text": (f"{snapshot['target_label']} · "
+                     f"{completion_status_label(result, task_done_event)}\n"
+                     f"{excerpt or 'Open the Project for details.'}"),
+            "role": "system", "system_type": "project_completion_summary",
+            "delivery_id": f"project-completion:{tid}",
+            "progress_meta": {
+                "project_id": snapshot["project_id"],
+                "project_name": snapshot["project_name"],
+                "target_label": snapshot["target_label"], "status": status,
+            },
+        }
+        return bool(enqueue_terminal_delivery(drive_root, event))
+    except Exception:
+        log.warning("Failed to enqueue Project completion summary for %s", tid, exc_info=True)
+        return False
+
+
 __all__ = [
     "append_chat_annotation",
     "build_owner_message_ref",
     "chat_annotation_receipt",
     "entry_matches_source_ref",
     "latest_chat_annotations",
+    "enqueue_project_completion_summary",
+    "completion_status_label",
+    "owner_message_ref_is_valid",
     "project_origin_rows",
+    "project_recent_dialogue",
+    "routing_options_with_labels",
+    "routing_target_label",
+    "resolve_owner_message_source",
     "source_refs_for_project",
 ]

@@ -401,6 +401,8 @@ export function routingAnnotationText(annotation) {
     const action = String(annotation.action || '');
     const status = String(annotation.status || '');
     const target = String(annotation.target || '');
+    const targetLabel = String(annotation.target_label || '')
+        || (target ? (action === 'project_route' ? 'Project' : 'Task') : '');
     if (status === 'pending') return 'Choosing the right destination…';
     if (status === 'needs_manual_target') {
         const optionLabels = (Array.isArray(annotation.options) ? annotation.options : [])
@@ -410,11 +412,14 @@ export function routingAnnotationText(annotation) {
                 if (option.action === 'new_task_in_project') {
                     return `New task in ${String(option.project_name || 'Project')}`;
                 }
-                return String(option.title || option.task_id || option.project_name || option.project_id || '');
+                if (option.title || option.project_name) {
+                    return String(option.title || option.project_name);
+                }
+                return option.project_id && !option.task_id ? 'Project' : 'Task';
             })
             .filter(Boolean);
         if (optionLabels.length) return `Choose a target · ${optionLabels.join(' / ')}`;
-        return target ? `Choose a target · ${target}` : 'Choose a target';
+        return targetLabel ? `Choose a target · ${targetLabel}` : 'Choose a target';
     }
     if (status === 'project_unavailable') return 'Project is unavailable';
     const labels = {
@@ -425,7 +430,7 @@ export function routingAnnotationText(annotation) {
         project_route: 'Project routing',
     };
     const label = labels[action] || status.replaceAll('_', ' ') || action.replaceAll('_', ' ');
-    return target && label ? `${label} · ${target}` : label;
+    return targetLabel && label ? `${label} · ${targetLabel}` : label;
 }
 
 /**
