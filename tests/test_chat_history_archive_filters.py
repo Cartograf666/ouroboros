@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from ouroboros.memory import Memory
 from ouroboros.tools.control import get_tools
@@ -83,15 +84,187 @@ def test_chat_history_old_call_keeps_search_offset_count_result(tmp_path):
         {"ts": "2026-08-21T09:03:00Z", "direction": "in", "text": "match three"},
     ])
 
-    assert Memory(tmp_path).chat_history(count=1, offset=1, search="MATCH") == (
-        "Showing 1 messages:\n\n← [2026-08-21T09:02] [User] match two"
+    legacy = Memory(tmp_path).chat_history(count=1, offset=1, search="MATCH")
+    assert "Showing 1 of 3 messages; 1 older remain." in legacy
+    assert "live offset" in legacy and "shift" in legacy
+    assert "← [2026-08-21T09:02] [User] match two" in legacy
+    exhausted = Memory(tmp_path).chat_history(count=1, offset=99, search="MATCH")
+    assert exhausted.startswith("Showing 0 of 3 messages; matching history is exhausted at offset=99.")
+    assert "no messages matching query" not in exhausted
+
+
+def test_chat_history_snapshot_refuses_append_between_pages(tmp_path):
+    _write(tmp_path / "logs" / "chat.jsonl", [
+        _row(f"2026-08-21T09:0{index}:00Z", text)
+        for index, text in enumerate(("match a", "match b", "match c"))
+    ])
+    memory = Memory(tmp_path)
+
+    first = memory.chat_history(count=2, search="MATCH")
+    snapshot = re.search(r"snapshot=([0-9a-f]{64})", first)
+    assert snapshot is not None
+    assert "match b" in first and "match c" in first
+
+    with (tmp_path / "logs" / "chat.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_row("2026-08-21T09:03:00Z", "match d")) + "\n")
+
+    second = memory.chat_history(
+        count=2, offset=2, search="match", snapshot=snapshot.group(1),
     )
+    assert second.startswith("CHAT_HISTORY_SNAPSHOT_CHANGED:")
+    assert "restart with offset=0" in second
+    assert "match a" not in second and "match b" not in second
+
+
+def test_chat_history_snapshot_pages_when_source_is_unchanged(tmp_path):
+    _write(tmp_path / "logs" / "chat.jsonl", [
+        _row(f"2026-08-21T09:0{index}:00Z", text)
+        for index, text in enumerate(("match a", "match b", "match c"))
+    ])
+    memory = Memory(tmp_path)
+
+    first = memory.chat_history(count=2, search="match")
+    snapshot = re.search(r"snapshot=([0-9a-f]{64})", first)
+    assert snapshot is not None
+    second = memory.chat_history(
+        count=2, offset=2, search="MATCH", snapshot=snapshot.group(1),
+    )
+
+    assert "match a" in second
+    assert "match b" not in second and "match c" not in second
+    assert f"snapshot={snapshot.group(1)}" in second
+    mismatch = memory.chat_history(
+        count=2, offset=2, search="different query", snapshot=snapshot.group(1),
+    )
+    assert mismatch.startswith("CHAT_HISTORY_SNAPSHOT_CHANGED:")
+
+
+def test_chat_history_snapshot_retries_append_during_capture(tmp_path, monkeypatch):
+    _write(tmp_path / "logs" / "chat.jsonl", [_row("2026-08-21T09:00:00Z", "first")])
+    memory = Memory(tmp_path)
+    original = memory._read_chat_generation
+    appended = False
+
+    def read_then_append(path, **kwargs):
+        nonlocal appended
+        rows, gaps = original(path, **kwargs)
+        if not appended:
+            appended = True
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(_row("2026-08-21T09:01:00Z", "second")) + "\n")
+        return rows, gaps
+
+    monkeypatch.setattr(memory, "_read_chat_generation", read_then_append)
+    entries, coverage = memory.read_chat_generations()
+
+    assert [row["text"] for row in entries] == ["first", "second"]
+    assert coverage["capture_attempts"] == 2
+    assert coverage["snapshot_stable"] is True
+
+
+def test_chat_history_gap_never_claims_complete_or_exhausted(tmp_path):
+    path = tmp_path / "logs" / "chat.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(
+        b'{"ts":"2026-08-21T09:00:00Z","direction":"in","text":"match valid"}\n'
+        b'{"direction":"in","text":"match hidden"\n'
+    )
+
+    first = Memory(tmp_path).chat_history(count=1, search="match")
+    exhausted = Memory(tmp_path).chat_history(count=1, offset=99, search="match")
+
+    assert "1 observed messages" in first
+    assert "completeness unknown" in first
+    assert "0 older remain" not in first
+    assert "no further observed matches" in exhausted
+    assert "matching history is exhausted" not in exhausted
+    assert "jsonl_malformed" in exhausted
+
+
+def test_explicit_chat_history_surfaces_missing_consolidation_generation(tmp_path):
+    _write(tmp_path / "logs" / "chat.jsonl", [_row("2026-08-21T09:00:00Z", "survivor")])
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir(parents=True)
+    (memory_dir / "dialogue_meta.json").write_text(json.dumps({
+        "last_consolidated_offset": 50,
+        "chat_log_signature": {"first_line_sha256": "f" * 64, "size": 999},
+    }), encoding="utf-8")
+
+    result = Memory(tmp_path).chat_history(count=20)
+
+    assert "survivor" in result
+    assert "consolidation_cursor_generation_missing" in result
+    assert "completeness unknown" in result
+
+    (tmp_path / "logs" / "chat.jsonl").unlink()
+    no_survivors = Memory(tmp_path).chat_history(count=20)
+    assert "consolidation_cursor_generation_missing" in no_survivors
+    assert "completeness unknown" in no_survivors
+
+
+def test_chat_history_keeps_durable_gap_after_consolidator_rebases_cursor(tmp_path):
+    from ouroboros.consolidator import consolidate, should_consolidate
+
+    _write(tmp_path / "logs" / "chat.jsonl", [_row("2026-08-21T09:00:00Z", "survivor")])
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir(parents=True)
+    blocks_path = memory_dir / "dialogue_blocks.json"
+    meta_path = memory_dir / "dialogue_meta.json"
+    meta_path.write_text(json.dumps({
+        "last_consolidated_offset": 50,
+        "chat_log_signature": {"first_line_sha256": "f" * 64, "size": 999},
+    }), encoding="utf-8")
+    memory = Memory(tmp_path)
+
+    first = memory.chat_history(count=20)
+    old_snapshot = re.search(r"snapshot=([0-9a-f]{64})", first)
+    assert old_snapshot is not None
+    assert "consolidation_cursor_generation_missing" in first
+    assert should_consolidate(meta_path, tmp_path / "logs" / "chat.jsonl") is True
+
+    class NoLlmExpected:
+        def chat(self, **_kwargs):
+            raise AssertionError("gap rebasing below BLOCK_SIZE must not call the LLM")
+
+    assert consolidate(
+        chat_path=tmp_path / "logs" / "chat.jsonl",
+        blocks_path=blocks_path,
+        meta_path=meta_path,
+        llm_client=NoLlmExpected(),
+    ) is None
+    blocks = json.loads(blocks_path.read_text(encoding="utf-8"))
+    assert blocks[0]["gap_id"].startswith("gap:")
+    assert "[MEMORY GAP]" in blocks[0]["content"]
+
+    second = memory.chat_history(count=20)
+    stale_page = memory.chat_history(count=20, snapshot=old_snapshot.group(1))
+    assert "durable_consolidation_gap" in second
+    assert "completeness unknown" in second
+    assert stale_page.startswith("CHAT_HISTORY_SNAPSHOT_CHANGED:")
+
+
+def test_chat_history_recognizes_legacy_memory_gap_block_without_gap_id(tmp_path):
+    _write(tmp_path / "logs" / "chat.jsonl", [_row("2026-08-21T09:00:00Z", "survivor")])
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir(parents=True)
+    (memory_dir / "dialogue_blocks.json").write_text(json.dumps([{
+        "ts": "2026-08-21T10:00:00Z",
+        "type": "summary",
+        "range": "unknown",
+        "message_count": 0,
+        "content": "[MEMORY GAP] Legacy durable discontinuity.",
+    }]), encoding="utf-8")
+
+    result = Memory(tmp_path).chat_history(count=20)
+
+    assert "durable_consolidation_gap" in result
+    assert "completeness unknown" in result
 
 
 def test_chat_history_tool_exposes_only_exact_filter_fields():
     tool = next(entry for entry in get_tools() if entry.name == "chat_history")
     assert set(tool.schema["parameters"]["properties"]) == {
         "count", "offset", "search", "provider", "account_id", "conversation_id",
-        "thread_id", "actor_id", "date_from", "date_to",
+        "thread_id", "actor_id", "date_from", "date_to", "snapshot",
     }
     assert tool.schema["parameters"]["additionalProperties"] is False

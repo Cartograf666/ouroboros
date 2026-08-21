@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import filecmp
+import json
 import logging
 import mimetypes
 import pathlib
@@ -52,6 +54,14 @@ _MAX_STAGED_ATTACHMENTS = 25
 _MAX_STAGED_ATTACHMENT_BYTES = 50 * 1024 * 1024  # ~50 MB per file
 
 
+class _StagedAttachmentManifest(list):
+    """List-compatible manifest with call-private cleanup ownership."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._cleanup_owned_paths: set[pathlib.Path] = set()
+
+
 def _safe_attachment_name(raw_name: str) -> str:
     """Sanitize an attachment basename (mirrors gateway/files._sanitize_upload_filename)."""
 
@@ -82,28 +92,57 @@ def stage_task_attachments(
     through here so they land in ONE agent-readable root (``artifact_store``) and
     become reachable via ``read_file(root='artifact_store', path='attachments/...')``
     instead of a bare absolute host path. Secret SOURCES are skipped (SSOT: the
-    ``ouroboros.tool_access`` secret blocklist). Never raises — a per-file error
-    skips just that file.
+    ``ouroboros.tool_access`` secret blocklist). Never raises. Every declared
+    input produces exactly one ordinal-preserving ``staged`` or ``rejected``
+    row, so callers never confuse a partial staging result with the complete
+    attachment set.
 
     Returns a list of manifest entries::
 
-        {"label", "root": "artifact_store", "relpath": "attachments/<safe>",
+        {"ordinal", "status": "staged", "reason": "", "label",
+         "root": "artifact_store", "relpath": "attachments/<safe>",
          "mime", "is_image"}
+
+        {"ordinal", "status": "rejected", "reason": "source_missing",
+         "label"}
     """
 
-    items: List[Dict[str, Any]] = []
-    if isinstance(attachments, list):
-        for item in attachments:
-            if isinstance(item, dict):
-                path = str(item.get("path") or "").strip()
-                label = str(item.get("label") or item.get("display_name") or "").strip()
-            else:
-                path = str(item or "").strip()
-                label = ""
-            if path:
-                items.append({"path": path, "label": label})
-    if not items:
+    declared = list(attachments) if isinstance(attachments, list) else []
+    if not declared:
         return []
+
+    def _display_label(item: Any, raw_path: str, ordinal: int) -> str:
+        if isinstance(item, dict):
+            raw = item.get("label") or item.get("display_name") or ""
+        else:
+            raw = ""
+        if not str(raw or "").strip() and raw_path:
+            raw = pathlib.Path(raw_path).name
+        cleaned = " ".join(
+            "".join(c for c in str(raw or "") if c.isprintable()).split()
+        )[:120]
+        return cleaned or f"attachment {ordinal + 1}"
+
+    def _rejected(ordinal: int, label: str, reason: str) -> Dict[str, Any]:
+        return {
+            "ordinal": ordinal,
+            "status": "rejected",
+            "reason": str(reason),
+            "label": label,
+        }
+
+    def _same_bytes(left: pathlib.Path, right: pathlib.Path) -> bool:
+        try:
+            return filecmp.cmp(left, right, shallow=False)
+        except OSError:
+            return False
+
+    def _content_key(path: pathlib.Path) -> str:
+        digest = sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()[:12]
 
     # SSOT secret detection: reuse the user_files secret blocklist so a credential
     # SOURCE (e.g. ~/.ssh/id_rsa, credentials.json, *.pem) is never copied in.
@@ -134,29 +173,54 @@ def stage_task_attachments(
         )
 
     try:
-        attach_dir = task_artifact_dir_path(drive_root, task_id, create=True) / _ATTACHMENTS_SUBDIR
+        attach_dir = task_artifact_dir_path(drive_root, task_id, create=False) / _ATTACHMENTS_SUBDIR
     except Exception:
         log.debug("stage_task_attachments: could not resolve attachment dir", exc_info=True)
-        return []
+        return [
+            _rejected(
+                ordinal,
+                _display_label(
+                    item,
+                    str(item.get("path") or "") if isinstance(item, dict) else str(item or ""),
+                    ordinal,
+                ),
+                "staging_unavailable",
+            )
+            for ordinal, item in enumerate(declared)
+        ]
 
-    manifest: List[Dict[str, Any]] = []
-    staged = 0
-    for item in items:
-        if staged >= _MAX_STAGED_ATTACHMENTS:
-            log.info("stage_task_attachments: hit max staged attachments (%d); skipping rest", _MAX_STAGED_ATTACHMENTS)
-            break
+    manifest = _StagedAttachmentManifest()
+    for ordinal, raw_item in enumerate(declared):
+        if isinstance(raw_item, dict):
+            raw_path = str(raw_item.get("path") or "").strip()
+        else:
+            raw_path = str(raw_item or "").strip()
+        label = _display_label(raw_item, raw_path, ordinal)
+        if ordinal >= _MAX_STAGED_ATTACHMENTS:
+            manifest.append(_rejected(ordinal, label, "attachment_limit_exceeded"))
+            continue
+        if not raw_path:
+            manifest.append(_rejected(ordinal, label, "invalid_path"))
+            continue
         try:
-            source = pathlib.Path(item["path"]).expanduser().resolve(strict=False)
+            source = pathlib.Path(raw_path).expanduser().resolve(strict=False)
+            if not source.exists():
+                manifest.append(_rejected(ordinal, label, "source_missing"))
+                continue
             if not source.is_file():
+                manifest.append(_rejected(ordinal, label, "source_not_file"))
                 continue
             if _is_secret_source(source):
                 log.info("stage_task_attachments: skipped secret source %s", source.name)
+                manifest.append(_rejected(ordinal, label, "secret_source"))
                 continue
             try:
                 if source.stat().st_size > _MAX_STAGED_ATTACHMENT_BYTES:
                     log.info("stage_task_attachments: skipped oversized source %s", source.name)
+                    manifest.append(_rejected(ordinal, label, "file_too_large"))
                     continue
             except OSError:
+                manifest.append(_rejected(ordinal, label, "source_stat_failed"))
                 continue
             attach_dir.mkdir(parents=True, exist_ok=True)
             # The stored filename derives from the SOURCE basename (it carries the
@@ -166,18 +230,33 @@ def stage_task_attachments(
             dest = attach_dir / safe_name
             # Collision-safe destination: distinct sources never clobber each other.
             if dest.exists() and dest.resolve(strict=False) != source.resolve(strict=False):
-                suffix = pathlib.Path(safe_name).suffix
-                stem = safe_name[: -len(suffix)] if suffix else safe_name
-                dest = attach_dir / f"{stem}.{uuid.uuid4().hex[:8]}{suffix}"
+                same_bytes = _same_bytes(dest, source)
+                if not same_bytes:
+                    suffix = pathlib.Path(safe_name).suffix
+                    stem = safe_name[: -len(suffix)] if suffix else safe_name
+                    content_key = _content_key(source)
+                    dest = attach_dir / f"{stem}.{content_key}{suffix}"
+                    collision = 1
+                    while dest.exists() and not _same_bytes(dest, source):
+                        collision += 1
+                        dest = attach_dir / f"{stem}.{content_key}.{collision}{suffix}"
             if dest.resolve(strict=False) != source.resolve(strict=False):
-                shutil.copy2(source, dest)
+                existed = dest.exists()
+                try:
+                    if not existed or not _same_bytes(dest, source):
+                        shutil.copy2(source, dest)
+                        if not existed:
+                            manifest._cleanup_owned_paths.add(dest)
+                except OSError:
+                    if not existed:
+                        dest.unlink(missing_ok=True)
+                    manifest.append(_rejected(ordinal, label, "copy_failed"))
+                    continue
             mime = mimetypes.guess_type(str(dest))[0] or "application/octet-stream"
-            # Sanitize the label rendered verbatim into the [ATTACHMENTS] manifest line / image
-            # caption: drop control chars + collapse whitespace (incl. newlines) + bound, so a
-            # crafted filename cannot inject extra prompt lines or break the rendered read_file line.
-            _raw_label = str(item.get("label") or "").strip() or source.name
-            label = " ".join("".join(c for c in _raw_label if c.isprintable()).split())[:120] or "attachment"
             manifest.append({
+                "ordinal": ordinal,
+                "status": "staged",
+                "reason": "",
                 "label": label,
                 "root": "artifact_store",
                 "relpath": f"{_ATTACHMENTS_SUBDIR}/{dest.name}",
@@ -191,11 +270,22 @@ def stage_task_attachments(
                 "mime": mime,
                 "is_image": mime.startswith("image/"),
             })
-            staged += 1
         except Exception:
-            log.debug("stage_task_attachments: skipped a file on error", exc_info=True)
-            continue
+            log.debug("stage_task_attachments: rejected a file on error", exc_info=True)
+            manifest.append(_rejected(ordinal, label, "copy_failed"))
     return manifest
+
+
+def attachment_manifest_has_rejections(manifest: Any) -> bool:
+    """Whether a complete staging manifest contains any rejected declaration."""
+
+    return bool(
+        isinstance(manifest, list)
+        and any(
+            isinstance(item, dict) and str(item.get("status") or "staged") == "rejected"
+            for item in manifest
+        )
+    )
 
 
 def remove_staged_attachments(manifest: Any) -> int:
@@ -208,6 +298,11 @@ def remove_staged_attachments(manifest: Any) -> int:
     touched. Never raises; returns the number of files removed.
     """
     removed = 0
+    owned = {
+        pathlib.Path(path)
+        for path in getattr(manifest, "_cleanup_owned_paths", set())
+    }
+    attachment_dirs: set[pathlib.Path] = set()
     if not isinstance(manifest, list):
         return removed
     for entry in manifest:
@@ -218,12 +313,144 @@ def remove_staged_attachments(manifest: Any) -> int:
             continue
         try:
             path = pathlib.Path(staged)
-            if path.is_file() and _ATTACHMENTS_SUBDIR in path.parts:
+            if path in owned and path.is_file() and _ATTACHMENTS_SUBDIR in path.parts:
                 path.unlink(missing_ok=True)
                 removed += 1
+                attachment_dirs.add(path.parent)
         except Exception:
             log.debug("remove_staged_attachments: could not remove %s", staged, exc_info=True)
+    for directory in attachment_dirs:
+        try:
+            directory.rmdir()
+            directory.parent.rmdir()
+        except OSError:
+            # Another admitted attachment or artifact still owns the directory.
+            pass
     return removed
+
+
+def rebase_staged_attachment_manifest(
+    manifest: Any,
+    old_dir: Union[pathlib.Path, str],
+    new_dir: Union[pathlib.Path, str],
+) -> Any:
+    """Rebase generated absolute paths and private cleanup ownership in place."""
+
+    old, new = pathlib.Path(old_dir), pathlib.Path(new_dir)
+    if not isinstance(manifest, list):
+        return manifest
+    for row in manifest:
+        if not isinstance(row, dict) or not str(row.get("abs_path") or ""):
+            continue
+        path = pathlib.Path(str(row["abs_path"]))
+        try:
+            row["abs_path"] = str(new / path.relative_to(old))
+        except ValueError:
+            continue
+    owned = getattr(manifest, "_cleanup_owned_paths", None)
+    if isinstance(owned, set):
+        rebased: set[pathlib.Path] = set()
+        for path in owned:
+            try:
+                rebased.add(new / pathlib.Path(path).relative_to(old))
+            except ValueError:
+                rebased.add(pathlib.Path(path))
+        manifest._cleanup_owned_paths = rebased
+    return manifest
+
+
+def materialize_inherited_attachment_manifest(
+    manifest: Any,
+    target_drive: Union[pathlib.Path, str],
+    target_task_id: str,
+) -> tuple[List[Dict[str, Any]], str]:
+    """Copy inherited staged inputs into a child's own artifact store."""
+
+    if not isinstance(manifest, list) or not manifest:
+        return [], ""
+    copied = _StagedAttachmentManifest()
+    target_dir = task_artifact_dir_path(target_drive, target_task_id) / _ATTACHMENTS_SUBDIR
+    try:
+        for index, raw in enumerate(manifest):
+            if not isinstance(raw, dict):
+                continue
+            row = dict(raw)
+            if str(row.get("status") or "staged") == "rejected":
+                row.pop("abs_path", None)
+                copied.append(row)
+                continue
+            source = pathlib.Path(str(row.get("abs_path") or ""))
+            if not source.is_file():
+                raise FileNotFoundError(f"inherited attachment {index} is unavailable")
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / _safe_attachment_name(
+                pathlib.Path(str(row.get("relpath") or source.name)).name
+            )
+            if not target.exists():
+                shutil.copy2(source, target)
+                copied._cleanup_owned_paths.add(target)
+            elif not filecmp.cmp(source, target, shallow=False):
+                raise OSError(f"inherited attachment collision at {target.name}")
+            row.update({
+                "root": "artifact_store",
+                "relpath": f"{_ATTACHMENTS_SUBDIR}/{target.name}",
+                "abs_path": str(target),
+            })
+            copied.append(row)
+        return copied, ""
+    except Exception as exc:
+        remove_staged_attachments(copied)
+        return [], f"{type(exc).__name__}: {exc}"
+
+
+def handoff_task_attachments_for_retry(
+    drive_root: Union[pathlib.Path, str],
+    task_id: str,
+    retry_task_id: str,
+    task: Dict[str, Any],
+) -> tuple[Dict[str, str], str]:
+    """Copy the complete attachment store and rebase generated task paths."""
+
+    old_dir = task_artifact_dir_path(drive_root, task_id) / _ATTACHMENTS_SUBDIR
+    new_dir = task_artifact_dir_path(drive_root, retry_task_id) / _ATTACHMENTS_SUBDIR
+    old_text, new_text = str(old_dir), str(new_dir)
+    if not old_dir.is_dir():
+        serialized = json.dumps(task, ensure_ascii=False, default=str)
+        return ({}, "attachment store missing") if old_text in serialized else ({}, "")
+    created: list[pathlib.Path] = []
+    try:
+        for source in sorted(path for path in old_dir.rglob("*") if path.is_file()):
+            target = new_dir / source.relative_to(old_dir)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                if not filecmp.cmp(source, target, shallow=False):
+                    raise OSError(f"retry attachment collision at {target.name}")
+                continue
+            shutil.copy2(source, target)
+            created.append(target)
+
+        def _rebase(value: Any) -> Any:
+            if isinstance(value, str):
+                return value.replace(old_text, new_text)
+            if isinstance(value, list):
+                return [_rebase(item) for item in value]
+            if isinstance(value, dict):
+                return {key: _rebase(item) for key, item in value.items()}
+            return value
+
+        rebased = _rebase(task)
+        task.clear()
+        task.update(rebased)
+        return {old_text: new_text}, ""
+    except Exception as exc:
+        for path in reversed(created):
+            path.unlink(missing_ok=True)
+        try:
+            new_dir.rmdir()
+            new_dir.parent.rmdir()
+        except OSError:
+            pass
+        return {}, f"{type(exc).__name__}: {exc}"
 
 
 def artifact_store_path_block_reason(path: pathlib.Path) -> str:

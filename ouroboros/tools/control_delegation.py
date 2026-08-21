@@ -16,7 +16,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable
 
-from ouroboros.contracts.task_contract import _bounded_intent_note, normalize_bool
+from ouroboros.contracts.task_contract import _normalized_intent_note, normalize_bool
 from ouroboros.tools.registry import ToolContext
 from ouroboros.utils import utc_now_iso
 
@@ -329,7 +329,7 @@ def _narrow_child_delegation_budget(
         "may_fan_out": normalize_bool(may_fan_out) and parent_may_fan_out,
         "depth_remaining": child_depth_remaining,
         "max_children": child_max_children,
-        "intent_note": _bounded_intent_note(
+        "intent_note": _normalized_intent_note(
             str(intent_note or "").strip() or str(parent_budget.get("intent_note") or "")
         ),
     }

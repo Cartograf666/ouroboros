@@ -139,7 +139,44 @@ def json_exception(exc: BaseException, status: int = 500) -> JSONResponse:
     return json_error(str(exc), status)
 
 
+def stage_initial_task_attachments(
+    drive_root: pathlib.Path,
+    task_id: str,
+    attachments: list,
+    *,
+    allow_partial: bool,
+) -> tuple[list, JSONResponse | None]:
+    """Stage one API task's complete manifest or return its atomic refusal."""
+
+    from ouroboros.artifacts import (
+        attachment_manifest_has_rejections,
+        remove_staged_attachments,
+        stage_task_attachments,
+    )
+
+    try:
+        manifest = stage_task_attachments(drive_root, task_id, attachments)
+    except Exception as exc:
+        return [], json_exception(exc, 503)
+    if not attachment_manifest_has_rejections(manifest) or allow_partial:
+        return manifest, None
+    remove_staged_attachments(manifest)
+    return manifest, JSONResponse({
+        "ok": False,
+        "task_id": task_id,
+        "status": "rejected",
+        "reason_code": "attachment_admission_rejected",
+        "error": (
+            "Task was not scheduled because one or more declared attachments "
+            "could not be staged. Retry with corrected attachments, or set "
+            "allow_partial_attachments=true on the task API request."
+        ),
+        "attachment_manifest": manifest,
+    }, status_code=422)
+
+
 __all__ = (
     "coerce_bool", "coerce_int", "iter_jsonl_objects", "json_error", "json_exception",
     "read_rotated_jsonl_entries", "request_json_or", "request_drive_root", "request_repo_dir",
+    "stage_initial_task_attachments",
 )

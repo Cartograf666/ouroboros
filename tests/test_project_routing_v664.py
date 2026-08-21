@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pathlib
 import types
 
 
@@ -94,6 +95,43 @@ def test_project_single_pending_root_gets_zero_call_mailbox_delivery(tmp_path, m
     assert annotation["action"] == "mailbox_delivery"
     assert annotation["target"] == "pending-root"
     assert annotation["status"] == "delivered"
+
+
+def test_project_fast_route_stages_attachment_in_actor_child_drive(tmp_path):
+    import server
+    from ouroboros.projects_registry import create_project
+    from ouroboros.tools.core import _read_file
+    from ouroboros.tools.registry import ToolContext
+
+    project = create_project(tmp_path, "attachment-room")
+    chat_id = int(project["chat_id"])
+    child_drive = tmp_path / "task_drives" / "forked-root" / "data"
+    child_drive.mkdir(parents=True)
+    source = tmp_path / "owner-input.txt"
+    source.write_text("child-drive-readable", encoding="utf-8")
+    task = {
+        "id": "forked-root", "chat_id": chat_id, "root_task_id": "forked-root",
+        "delegation_role": "root", "drive_root": str(child_drive),
+        "child_drive_root": str(child_drive),
+    }
+    ctx = _ctx(tmp_path, running={"forked-root": {"task": task}})
+    notices = []
+    ctx.send_with_budget = lambda _chat, text, **_kwargs: notices.append(text)
+    metadata = {
+        "chat_attachment_uploads": [{"path": str(source), "label": "owner input"}],
+    }
+
+    assert server._route_project_chat_to_running_task(
+        ctx, chat_id, "use this", "owner-attachment", task_metadata=metadata,
+    ) == "forked-root"
+
+    manifest = metadata["_attachment_manifest"]
+    assert pathlib.Path(manifest[0]["abs_path"]).is_relative_to(child_drive)
+    tool_ctx = ToolContext(repo_dir=tmp_path, drive_root=child_drive, task_id="forked-root")
+    assert "child-drive-readable" in _read_file(
+        tool_ctx, manifest[0]["relpath"], root="artifact_store",
+    )
+    assert notices and "status=staged" in notices[-1]
 
 
 def test_project_swarm_bypasses_single_root_mailbox_for_new_managed_root(tmp_path, monkeypatch):

@@ -130,7 +130,6 @@ BAND_PATHS = {
     "ouroboros/agent.py": "Subagent message identity now lives in a shared helper; keep agent.py below the giant-file threshold rather than re-expanding it.",
     "ouroboros/agent_startup_checks.py": None,
     "ouroboros/extension_process_runner.py": None,
-    "ouroboros/gateway/contracts.py": None,
     "ouroboros/gateway/control.py": "Entered the band from 966 lines: the update-flow redesign added the shared stash-first prologue (_stash_local_work_fenced/_unwind_stashed_update) and the review-wave affordability floor to the update apply orchestration (update-flow-redesign sprint, Q9/Q10 owner decisions).",
     "ouroboros/gateway/extensions.py": None,
     "ouroboros/gateway/history.py": None,
@@ -202,7 +201,7 @@ BYTE_BASELINE_DEBT = {
 }
 
 BYTE_DEBT = {
-    "ouroboros/loop.py": 317162,
+    "ouroboros/loop.py": 316873,
     "tests/test_delegated_subagent_transport.py": 320571,
     "tests/test_devtools_benchmarks.py": 328282,
     "web/modules/chat.js": 228625,

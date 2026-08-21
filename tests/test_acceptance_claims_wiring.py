@@ -128,6 +128,7 @@ def test_child_contract_restates_claims_after_parent_spread():
         "acceptance_claims": [{"id": "p1", "claim": "parent-only claim"}],
         "success_criteria": ["parent criterion"],
         "deadline_at": "",
+        "context": "API_CONTEXT_" + "x" * 900 + "_DECISIVE_TAIL",
     }
     base_spec = {
         "tid": "child1", "objective": "do child work", "expected_output": "a result",
@@ -140,6 +141,7 @@ def test_child_contract_restates_claims_after_parent_spread():
     bare = _build_child_subagent_contract(dict(base_spec))
     assert bare["acceptance_claims"] == []
     assert bare["success_criteria"] == []
+    assert bare["context"].endswith("_DECISIVE_TAIL")
 
     # Explicit child claims land normalized with positional ids.
     claimed = _build_child_subagent_contract(
@@ -240,7 +242,7 @@ def test_success_criteria_is_an_input_alias_not_a_second_carrier():
 def test_wave_freeze_and_bind_preserve_reviewed_claim_whitespace():
     """G3-6: the review panel sees the normalized spec — per-item strip with internal
     whitespace PRESERVED. The frozen v2 wave (the whole reviewed spec) and the read-time
-    binder must carry that text byte-for-byte (apart from the DISCLOSED truncation bound);
+    binder must carry that text byte-for-byte, including decisive tails beyond the old cap;
     the historical ``" ".join(split())`` rewrite made acceptance bind an exact-output
     claim DIFFERENT from what the panel reviewed."""
     from ouroboros.task_results import closed_plan_review_wave, load_plan_review_state
@@ -260,12 +262,13 @@ def test_wave_freeze_and_bind_preserve_reviewed_claim_whitespace():
     assert source == "plan_review"
     assert [c["claim"] for c in claims] == [raw]  # bound text == reviewed text
 
-    # Over-cap claims keep a byte-exact prefix plus the DISCLOSED marker.
+    # Review/acceptance authority is not a preview: the old 600-char cut cannot
+    # certify a prefix as the complete claim.
     long_claim = "line with    significant\tspacing\n" * 40
     bounded_spec, _ = normalize_spec({"goal": "g", "acceptance_claims": [long_claim]})
     bounded = bounded_spec["acceptance_claims"][0]["claim"]
-    assert bounded.startswith(long_claim.strip()[:600])
-    assert "OMISSION NOTE" in bounded
+    assert bounded == long_claim.strip()
+    assert "OMISSION NOTE" not in bounded
 
 
 def test_packet_open_plan_wave_binds_no_claims():

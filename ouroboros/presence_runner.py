@@ -322,7 +322,15 @@ def _build_task(
     if manifest:
         from ouroboros.gateway.tasks import _render_attachment_lines
 
-        task["attachment_images"] = [item for item in manifest if item.get("is_image")]
+        # The manifest is task authority, not merely presentation prose.  Keep
+        # every staged/rejected declaration on the canonical carrier before the
+        # task contract is normalized so a later promotion or child can inherit
+        # and materialize the exact inputs.
+        task["attachments"] = [dict(item) for item in manifest]
+        task["attachment_images"] = [
+            dict(item) for item in manifest
+            if str(item.get("status") or "staged") == "staged" and item.get("is_image")
+        ]
         rendered = _render_attachment_lines(manifest)
         if rendered:
             task["text"] = f"{task['text']}\n\n[ATTACHMENTS]\n{rendered}\n[END_ATTACHMENTS]".strip()
