@@ -628,8 +628,12 @@ def _task_result_ground_truth(row: Dict[str, Any]) -> Dict[str, Any]:
     meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
     preflight = meta.get("workspace_preflight") if isinstance(meta.get("workspace_preflight"), dict) else {}
     git = preflight.get("git") if isinstance(preflight.get("git"), dict) else {}
+    task_id = str(row.get("task_id") or row.get("id") or "")
+    human_label = _clip_marked(
+        row.get("title") or row.get("objective") or row.get("description") or task_id, 120,
+    )
     out = {
-        "task_id": str(row.get("task_id") or row.get("id") or ""),
+        "task_id": task_id,
         "status": str(row.get("status") or ""),
         "title": _clip_marked(row.get("title"), 120),
         "objective": _clip_marked(row.get("objective") or row.get("description"), 300),
@@ -642,6 +646,13 @@ def _task_result_ground_truth(row: Dict[str, Any]) -> Dict[str, Any]:
             str(item.get("path") or item.get("name") or "")
             for item in artifacts[:8] if isinstance(item, dict)
         ],
+        "authority_source": {
+            "kind": "task_result",
+            "task_id": task_id,
+            "human_label": human_label,
+            "tool": "get_task_result",
+            "arguments": {"task_id": task_id, "include_authority": True},
+        },
     }
     if git:
         out["workspace_git_at_start"] = {

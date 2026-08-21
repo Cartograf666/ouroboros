@@ -40,6 +40,16 @@ def _consolidation_route() -> Tuple[str, bool]:
 CONSOLIDATION_REASONING_EFFORT = "medium"
 
 
+def _ordered_chat_generation_paths(source_path: pathlib.Path) -> List[pathlib.Path]:
+    """Return the consolidator-owned physical chat chain, oldest to live."""
+    archive_dir = source_path.parent.parent / "archive"
+    try:
+        archives = sorted(archive_dir.glob("chat_*.jsonl"), key=lambda p: p.name)
+    except OSError:
+        archives = []
+    return [*archives, source_path]
+
+
 def _resolve_generation_segments(
     meta: Dict[str, Any], source_path: pathlib.Path,
 ) -> Tuple[List[pathlib.Path], int, bool]:
@@ -58,11 +68,7 @@ def _resolve_generation_segments(
     stored_sig = meta.get("chat_log_signature") or {}
     stored_first = str(stored_sig.get("first_line_sha256") or "") if isinstance(stored_sig, dict) else ""
     live_sig = _chat_log_signature(source_path)
-    archive_dir = source_path.parent.parent / "archive"
-    try:
-        archives = sorted(archive_dir.glob("chat_*.jsonl"), key=lambda p: p.name)
-    except OSError:
-        archives = []
+    archives = _ordered_chat_generation_paths(source_path)[:-1]
     if not stored_first:
         # Uninitialized cursor. Any archives that already exist rotated BEFORE
         # the first consolidation ever ran — they are unconsolidated by

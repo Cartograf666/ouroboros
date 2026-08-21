@@ -31,6 +31,23 @@ def test_recent_tasks_empty_drive(tmp_path):
     assert data == {"running": [], "tasks": [], "unreadable_tasks": []}
 
 
+def test_recent_tasks_uses_canonical_budget_root_from_fork(tmp_path):
+    canonical = tmp_path / "canonical"
+    child = tmp_path / "child"
+    child.mkdir()
+    _write_task(canonical, "owner-task", result="canonical-result")
+    ctx = SimpleNamespace(
+        drive_root=child,
+        budget_drive_root=str(canonical),
+        task_metadata={},
+    )
+
+    data = json.loads(_handle_recent_tasks(ctx, include_results=True))
+
+    assert data["tasks"][0]["task_id"] == "owner-task"
+    assert data["tasks"][0]["result"] == "canonical-result"
+
+
 def test_recent_tasks_returns_preview_by_default(tmp_path):
     _write_task(tmp_path, "abc123", result="hello world")
 

@@ -8,6 +8,7 @@ interprets whether the objective was met.
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Dict, Mapping
 
 
@@ -96,14 +97,14 @@ def _opt_nonneg_int(value: Any) -> Any:
         return None
 
 
-def _bounded_intent_note(value: Any, limit: int = 500) -> str:
-    """Bound a delegation intent_note to one line, with a VISIBLE omission marker
-    rather than a silent clip of the cognitive hint (BIBLE P1). Delegates to the
-    shared truncation primitive (marker + floor SSOT); single-line rendering."""
-    from ouroboros.utils import truncate_review_artifact
+def _normalized_intent_note(value: Any) -> str:
+    """Preserve the complete delegation intent in the durable authority.
 
-    text = str(value or "").strip()
-    return truncate_review_artifact(text, limit=limit).replace("\n", " ")
+    Cutting or flattening it here used to make
+    the normalized contract and every descendant fingerprint certify a prefix
+    as the parent's complete nesting/review constraint.
+    """
+    return str(value or "").strip()
 
 
 def normalize_delegation_budget(value: Any) -> Dict[str, Any]:
@@ -123,7 +124,7 @@ def normalize_delegation_budget(value: Any) -> Dict[str, Any]:
         "may_fan_out": normalize_bool(v.get("may_fan_out", True)),
         "depth_remaining": _opt_nonneg_int(v.get("depth_remaining")),
         "max_children": _opt_nonneg_int(v.get("max_children")),
-        "intent_note": _bounded_intent_note(v.get("intent_note")),
+        "intent_note": _normalized_intent_note(v.get("intent_note")),
     }
 
 
@@ -195,17 +196,9 @@ def normalize_budget_profile(value: Any) -> Dict[str, Any]:
     }
 
 
-def _bounded_claim_text(value: Any, limit: int = 600) -> str:
-    """Strip + disclosed truncation ONLY — internal whitespace is preserved.
-
-    This is the read-time binder for acceptance claims (ingress and plan-wave
-    alike); a lossy ``" ".join(split())`` here rewrote exact-output claims
-    (quoted code/expected spacing) between review and binding — the same
-    collapsed-quoted-whitespace class the receipt module bans outright."""
-    from ouroboros.utils import truncate_review_artifact
-
-    text = str(value or "").strip()
-    return truncate_review_artifact(text, limit=limit)
+def _claim_text(value: Any) -> str:
+    """Strip edges while preserving the complete claim and internal bytes."""
+    return str(value or "").strip()
 
 
 _ANSWER_PROTOCOLS = ("", "final_answer_line")
@@ -255,13 +248,13 @@ def normalize_acceptance_claims(value: Any) -> list[Dict[str, str]]:
     seen: set[str] = set()
     for idx, item in enumerate(items, start=1):
         if isinstance(item, Mapping):
-            claim = _bounded_claim_text(item.get("claim"))
-            surface = _bounded_claim_text(item.get("surface"), limit=300)
-            support = _bounded_claim_text(item.get("support"), limit=500)
+            claim = _claim_text(item.get("claim"))
+            surface = _claim_text(item.get("surface"))
+            support = _claim_text(item.get("support"))
             priority = str(item.get("priority") or "must").strip().lower() or "must"
             raw_id = str(item.get("id") or item.get("criterion_id") or f"claim_{idx}").strip()
         else:
-            claim = _bounded_claim_text(item)
+            claim = _claim_text(item)
             surface = ""
             support = ""
             priority = "must"
@@ -407,6 +400,12 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
         or metadata.get("constraints")
         or ""
     ).strip()
+    context_value = (
+        merged.get("context")
+        if merged.get("context") is not None
+        else (task.get("context") if task.get("context") is not None else metadata.get("context") or "")
+    )
+    context = "" if context_value is None else str(context_value)
     deadline_at = str(
         merged.get("deadline_at")
         or task.get("deadline_at")
@@ -418,14 +417,17 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
         if merged.get("disabled_tools") is not None
         else (task.get("disabled_tools") or metadata.get("disabled_tools"))
     )
+    normalized_workspace = merged.get("workspace") if isinstance(merged.get("workspace"), Mapping) else {}
     workspace_root = str(
         merged.get("workspace_root")
+        or normalized_workspace.get("root")
         or task.get("workspace_root")
         or metadata.get("workspace_root")
         or ""
     ).strip()
     workspace_mode = str(
         merged.get("workspace_mode")
+        or normalized_workspace.get("mode")
         or task.get("workspace_mode")
         or metadata.get("workspace_mode")
         or ""
@@ -438,6 +440,7 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
         else (merged.get("success_criteria") or task.get("acceptance_claims") or metadata.get("acceptance_claims"))
     )
 
+    normalized_lineage = merged.get("lineage") if isinstance(merged.get("lineage"), Mapping) else {}
     contract = {
         "schema_version": 1,
         "status": str(merged.get("status") or "draft"),
@@ -446,6 +449,9 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
         "objective": objective,
         "expected_output": expected_output,
         "constraints": constraints,
+        # Exact caller/parent authority.  This used to live only on the task row,
+        # outside the contract rendered to the model and inherited by children.
+        "context": context,
         # (W2) success_criteria is an INPUT ALIAS: it already feeds
         # normalize_acceptance_claims above when no claims were given, so once
         # acceptance_claims is populated the raw list is NOT double-persisted —
@@ -474,10 +480,10 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
             "mode": workspace_mode,
         },
         "lineage": {
-            "parent_task_id": str(task.get("parent_task_id") or metadata.get("parent_task_id") or ""),
-            "root_task_id": str(task.get("root_task_id") or metadata.get("root_task_id") or task.get("id") or ""),
-            "session_id": str(task.get("session_id") or metadata.get("session_id") or ""),
-            "delegation_role": str(task.get("delegation_role") or metadata.get("delegation_role") or "root"),
+            "parent_task_id": str(task.get("parent_task_id") or metadata.get("parent_task_id") or normalized_lineage.get("parent_task_id") or ""),
+            "root_task_id": str(task.get("root_task_id") or metadata.get("root_task_id") or normalized_lineage.get("root_task_id") or task.get("id") or ""),
+            "session_id": str(task.get("session_id") or metadata.get("session_id") or normalized_lineage.get("session_id") or ""),
+            "delegation_role": str(task.get("delegation_role") or metadata.get("delegation_role") or normalized_lineage.get("delegation_role") or "root"),
         },
         "delegation_budget": normalize_delegation_budget(
             merged.get("delegation_budget")
@@ -499,6 +505,18 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
             else (task.get("answer_protocol") or metadata.get("answer_protocol"))
         ),
     }
+    predecessor_authority = (
+        merged.get("predecessor_authority")
+        if isinstance(merged.get("predecessor_authority"), Mapping)
+        else task.get("predecessor_authority")
+        if isinstance(task.get("predecessor_authority"), Mapping)
+        else metadata.get("predecessor_authority")
+    )
+    if isinstance(predecessor_authority, Mapping) and predecessor_authority:
+        # The predecessor is additive authority, not prose to merge into the new
+        # objective.  Preserve its materialized envelope so the ordinary parent
+        # contract spread carries it through direct starts and nested work orders.
+        contract["predecessor_authority"] = copy.deepcopy(dict(predecessor_authority))
     for key in ("notes", "review_notes"):
         if merged.get(key):
             contract[key] = merged.get(key)

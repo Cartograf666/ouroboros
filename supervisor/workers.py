@@ -562,6 +562,8 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         task["origin_message_ref"] = dict(evt["source_ref"])
         if isinstance(evt.get("source_text"), str) and evt.get("source_text"):
             task["origin_message_text"] = evt["source_text"]
+    if isinstance(evt.get("predecessor_authority_source"), dict):
+        task["predecessor_authority_source"] = dict(evt["predecessor_authority_source"])
     # Owner Surface Fact: the promoting turn's sending-surface fact lands in
     # METADATA (the renderer reads task["metadata"]["client_surface"]), never a
     # top-level key — and metadata may not exist yet (only force_plan creates it).

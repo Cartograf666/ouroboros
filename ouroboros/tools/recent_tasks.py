@@ -114,8 +114,15 @@ def _handle_recent_tasks(
     include_traces: bool = False,
     **_kwargs: Any,
 ) -> str:
-    """Return recent completed task summaries from the current drive."""
-    drive_root = pathlib.Path(ctx.drive_root)
+    """Return recent completed task summaries from the canonical task root."""
+    metadata = getattr(ctx, "task_metadata", {}) if isinstance(
+        getattr(ctx, "task_metadata", {}), dict
+    ) else {}
+    drive_root = pathlib.Path(str(
+        metadata.get("budget_drive_root")
+        or getattr(ctx, "budget_drive_root", "")
+        or ctx.drive_root
+    ))
     task_dir = drive_root / "task_results"
     task_limit = _coerce_limit(limit)
     tasks: List[Dict[str, Any]] = []
@@ -149,7 +156,7 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("recent_tasks", {
             "name": "recent_tasks",
             "description": (
-                "Read recent task results from this drive. Use when prior work, "
+                "Read recent task results from the canonical task root. Use when prior work, "
                 "continuations, retries, or incomplete current context may matter."
             ),
             "parameters": {

@@ -23,6 +23,7 @@ def test_agent_context_budget_values_pinned():
     assert cb.BG_STATE_JSON_WARN_CHARS == 200_000
     assert cb.LARGE_CONTEXT_SECTION_CHARS == 200_000
     assert cb.MAX_RECENT_CHAT_TAIL == 1000
+    assert cb.CHAT_ARCHIVE_SCAN_WARN_BYTES == 100_000_000
     assert not hasattr(cb, "CONTEXT_SOFT_CAP_TOKENS")
 
 

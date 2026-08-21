@@ -169,6 +169,94 @@ def test_uncredentialed_api_actor_stops_before_the_llm_loop(monkeypatch, tmp_pat
     assert any(event.get("type") == "task_done" for event in events)
 
 
+def test_unreadable_named_owner_source_refuses_before_model_or_tool_work(monkeypatch, tmp_path):
+    from ouroboros import agent as agent_module
+    from ouroboros.agent import Env, OuroborosAgent
+    from ouroboros.project_dialogue import build_owner_message_ref
+
+    repo, drive = tmp_path / "repo", tmp_path / "drive"
+    repo.mkdir()
+    drive.mkdir()
+    missing_text = "owner directive that no surviving source can resolve"
+    ref = build_owner_message_ref(
+        chat_id=1, client_message_id="missing-owner", ts="2026-08-21T00:00:00Z",
+        text=missing_text,
+    )
+    monkeypatch.setattr(OuroborosAgent, "_log_worker_boot_once", lambda self: None)
+    model_calls, tool_context_calls = [], []
+    monkeypatch.setattr(
+        agent_module, "run_llm_loop",
+        lambda **kwargs: model_calls.append(kwargs) or ("unexpected", {}, {}),
+    )
+    agent = OuroborosAgent(Env(repo_dir=repo, drive_root=drive))
+    monkeypatch.setattr(
+        agent.tools, "set_context", lambda ctx: tool_context_calls.append(ctx),
+    )
+
+    events = agent._handle_task_scoped({
+        "id": "missing-authority",
+        "type": "task",
+        "chat_id": 1,
+        "text": "continue",
+        "origin_message_ref": ref,
+    })
+
+    assert model_calls == []
+    assert tool_context_calls == []
+    result = json.loads(
+        (drive / "task_results" / "missing-authority.json").read_text(encoding="utf-8")
+    )
+    assert result["reason_code"] == "authority_source_unavailable"
+    assert result["outcome_axes"]["execution"]["status"] == "infra_failed"
+    assert result["trace_summary"].count("authority_source_unavailable") == 1
+    assert any(event.get("type") == "task_done" for event in events)
+
+
+def test_malformed_named_authority_shapes_refuse_before_model_or_tool_work(monkeypatch, tmp_path):
+    from ouroboros import agent as agent_module
+    from ouroboros.agent import Env, OuroborosAgent
+    from ouroboros.project_dialogue import _text_sha256
+
+    repo, drive = tmp_path / "repo", tmp_path / "drive"
+    repo.mkdir()
+    (drive / "task_results").mkdir(parents=True)
+    (drive / "task_results" / "old-root.json").write_text(json.dumps({
+        "task_id": "old-root", "status": "completed", "objective": "old authority",
+    }), encoding="utf-8")
+    monkeypatch.setattr(OuroborosAgent, "_log_worker_boot_once", lambda self: None)
+    model_calls, tool_context_calls = [], []
+    monkeypatch.setattr(
+        agent_module, "run_llm_loop",
+        lambda **kwargs: model_calls.append(kwargs) or ("unexpected", {}, {}),
+    )
+    agent = OuroborosAgent(Env(repo_dir=repo, drive_root=drive))
+    monkeypatch.setattr(agent.tools, "set_context", lambda ctx: tool_context_calls.append(ctx))
+    tasks = [{
+        "id": "malformed-origin", "type": "task", "chat_id": 1, "text": "continue",
+        "origin_message_ref": {
+            "chat_id": 1, "client_message_id": "owner-1",
+            "text_sha256": _text_sha256("exact retained text"),
+        },
+        "origin_message_text": "exact retained text",
+    }, {
+        "id": "malformed-predecessor", "type": "task", "chat_id": 1, "text": "continue",
+        "predecessor_authority_source": {
+            "kind": "task_result", "task_id": "old-root", "tool": "get_task_result",
+            "arguments": {"task_id": "old-root", "include_authority": False},
+        },
+    }]
+
+    for task in tasks:
+        events = agent._handle_task_scoped(task)
+        result = json.loads(
+            (drive / "task_results" / f"{task['id']}.json").read_text(encoding="utf-8")
+        )
+        assert result["reason_code"] == "authority_source_unavailable"
+        assert any(event.get("type") == "task_done" for event in events)
+    assert model_calls == []
+    assert tool_context_calls == []
+
+
 def test_context_build_exception_propagates_after_exact_leaf_bootstrap(monkeypatch, tmp_path):
     from ouroboros import agent as agent_module
     import ouroboros.claudexor_daemon as daemon

@@ -4,8 +4,8 @@ import json
 import logging
 import os
 import pathlib
-from collections import Counter
-from typing import Any, Dict, List, Optional
+from collections import Counter, deque
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros.utils import append_jsonl, iter_jsonl_objects, read_json_dict, read_text, short, utc_now_iso, write_text
@@ -16,6 +16,9 @@ from ouroboros.platform_layer import (
 )
 
 log = logging.getLogger(__name__)
+_AUTOMATIC_CHAT_GENERATIONS = 3
+_AUTOMATIC_CHAT_TAIL_BYTES = 512 * 1024
+_AUTOMATIC_CHAT_MAX_SCAN_ROWS = 5_000
 
 _SCRATCHPAD_MAX_BLOCKS = 10
 
@@ -254,7 +257,8 @@ class Memory:
 
     def chat_history(self, count: int = 100, offset: int = 0, search: str = "") -> str:
         chat_path = self.logs_path("chat.jsonl")
-        if not chat_path.exists():
+        archive_dir = self.drive_root / "archive"
+        if not chat_path.exists() and not archive_dir.exists():
             return "(chat history is empty)"
 
         try:
@@ -264,24 +268,300 @@ class Memory:
             # only A2A virtual transport is excluded. The project-task FOCUS lives
             # in the passive default context (build_recent_sections), NOT in this
             # explicit recall tool — the one mind can deliberately recall anything.
-            entries = self._read_jsonl_entries("chat.jsonl", exclude_a2a=True)
+            entries, coverage = self.read_chat_generations(exclude_a2a=True)
 
             if search:
                 search_lower = search.lower()
                 entries = [e for e in entries if search_lower in str(e.get("text", "")).lower()]
 
+            total = len(entries)
             if offset > 0:
                 entries = entries[:-offset] if offset < len(entries) else []
 
             entries = entries[-count:] if count < len(entries) else entries
 
+            remaining = max(0, total - max(0, int(offset)) - len(entries))
+            gaps = [str(gap.get("kind") or "unknown") for gap in coverage.get("gaps") or []]
+            gap_note = f" Gaps: {', '.join(gaps)}." if gaps else ""
             if not entries:
-                return "(no messages matching query)"
-
+                return "(no messages matching query)." + gap_note
             lines = [self._format_chat_line(e, compact=False) for e in entries]
-            return f"Showing {len(entries)} messages:\n\n" + "\n".join(lines)
+            return (
+                f"Showing {len(entries)} of {total} messages; {remaining} older remain."
+                f" Continue with offset={max(0, int(offset)) + len(entries)}.{gap_note}\n\n"
+                + "\n".join(lines)
+            )
         except Exception as e:
             return f"(error reading history: {e})"
+
+    def _ordered_chat_generation_paths(self) -> List[pathlib.Path]:
+        """Existing canonical chat generations, oldest archive through live.
+
+        This is deliberately a chat-specific Memory primitive, not a generic
+        history framework.  Consolidation owns cursor semantics; this reader
+        gives ordinary cognition and ``chat_history`` the same physical
+        generation horizon instead of silently treating the mutable live file
+        as the whole biography.
+        """
+        from ouroboros.consolidator import _ordered_chat_generation_paths
+
+        live = self.logs_path("chat.jsonl")
+        return _ordered_chat_generation_paths(live)
+
+    def read_chat_generations(
+        self,
+        *,
+        exclude_a2a: bool = False,
+        predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Read the archive/live chat chain with truthful coverage facts.
+
+        Filtering happens while traversing the complete existing chain and
+        therefore before any caller applies a recent-window bound.  A rotation
+        racing the capture is retried; a persistently moving chain is returned
+        as a known-partial snapshot with an explicit gap rather than certified
+        complete.
+        """
+        from ouroboros.utils import jsonl_generation_signature
+
+        last_entries: List[Dict[str, Any]] = []
+        last_coverage: Dict[str, Any] = {}
+        for attempt in range(3):
+            paths = self._ordered_chat_generation_paths()
+            before = [jsonl_generation_signature(path) for path in paths]
+            entries: List[Dict[str, Any]] = []
+            gaps: List[Dict[str, Any]] = []
+            generations: List[Dict[str, Any]] = []
+            for path, signature in zip(paths, before):
+                if not path.exists():
+                    # A live file can be absent before the first append or in the
+                    # short interval after rotation.  A genuinely missing cursor
+                    # generation is detected by the consolidator-owned resolver.
+                    continue
+                generation_rows, parse_gaps = self._read_chat_generation(path)
+                gaps.extend(parse_gaps)
+                generations.append({
+                    "path": str(path),
+                    "first_line_sha256": str(signature.get("first_line_sha256") or ""),
+                    "size": int(signature.get("size") or 0),
+                    "rows": len(generation_rows),
+                })
+                for entry in generation_rows:
+                    if exclude_a2a and is_a2a_chat_id(entry.get("chat_id")):
+                        continue
+                    if predicate is not None and not predicate(entry):
+                        continue
+                    entries.append(entry)
+
+            after_paths = self._ordered_chat_generation_paths()
+            after = [jsonl_generation_signature(path) for path in after_paths]
+            stable_paths = [str(path) for path in paths] == [str(path) for path in after_paths]
+            stable_generations = stable_paths and all(
+                str(left.get("first_line_sha256") or "")
+                == str(right.get("first_line_sha256") or "")
+                and int(right.get("size") or 0) >= int(left.get("size") or 0)
+                for left, right in zip(before, after)
+            )
+            coverage = {
+                "generations": generations,
+                "matched_rows": len(entries),
+                "gaps": gaps,
+                "capture_attempts": attempt + 1,
+                "snapshot_changed_during_read": bool(
+                    stable_generations
+                    and any(
+                        int(right.get("size") or 0) > int(left.get("size") or 0)
+                        for left, right in zip(before, after)
+                    )
+                ),
+                "reader": "chat_history(count, offset, search)",
+            }
+            last_entries, last_coverage = entries, coverage
+            if stable_generations:
+                return entries, coverage
+        last_coverage = dict(last_coverage)
+        last_coverage.setdefault("gaps", []).append({
+            "kind": "generation_chain_changed_during_capture",
+            "detail": "archive/live generation ordering did not stabilize after 3 attempts",
+        })
+        return last_entries, last_coverage
+
+    @staticmethod
+    def _read_chat_generation(
+        path: pathlib.Path, *, tail_bytes: Optional[int] = None, max_rows: Optional[int] = None,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Read one physical generation without hiding malformed durable rows."""
+        rows: List[Dict[str, Any]] = []
+        gaps: List[Dict[str, Any]] = []
+        try:
+            with path.open("rb") as handle:
+                if tail_bytes is not None:
+                    size = path.stat().st_size
+                    if size > tail_bytes:
+                        handle.seek(size - tail_bytes - 1)
+                        if handle.read(1) != b"\n":
+                            handle.readline()
+                        gaps.append({
+                            "kind": "generation_prefix_unscanned", "path": str(path),
+                            "omitted_bytes_at_least": size - tail_bytes,
+                        })
+                if max_rows is not None:
+                    buffered = deque(maxlen=max_rows)
+                    seen = 0
+                    for raw in handle:
+                        seen += 1
+                        buffered.append((seen, raw))
+                    if seen > max_rows:
+                        gaps.append({
+                            "kind": "generation_tail_rows_unscanned", "path": str(path),
+                            "omitted_rows": seen - max_rows,
+                        })
+                    source = buffered
+                else:
+                    source = enumerate(handle, start=1)
+                for line_number, raw in source:
+                    if not raw.strip():
+                        continue
+                    try:
+                        decoded = raw.decode("utf-8")
+                        value = json.loads(decoded)
+                    except UnicodeDecodeError:
+                        gaps.append({"kind": "jsonl_decode_error", "path": str(path), "line": line_number})
+                        continue
+                    except (json.JSONDecodeError, ValueError):
+                        gaps.append({"kind": "jsonl_malformed", "path": str(path), "line": line_number})
+                        continue
+                    if not isinstance(value, dict):
+                        gaps.append({"kind": "jsonl_non_object", "path": str(path), "line": line_number})
+                        continue
+                    rows.append(value)
+        except OSError as exc:
+            gaps.append({"kind": "generation_unreadable", "path": str(path), "error": type(exc).__name__})
+        return rows, gaps
+
+    def read_unconsolidated_chat(
+        self,
+        meta: Dict[str, Any],
+        max_entries: int,
+        *,
+        predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Read the exact generation-aware suffix owned by consolidation."""
+        from ouroboros.consolidator import _resolve_generation_segments
+
+        live = self.logs_path("chat.jsonl")
+        scan_rows = max(100, min(
+            _AUTOMATIC_CHAT_MAX_SCAN_ROWS, max(1, int(max_entries)) * 4,
+        ))
+        segments, offset, gap_detected = _resolve_generation_segments(meta, live)
+        gaps: List[Dict[str, Any]] = []
+        if gap_detected:
+            gaps.append({
+                "kind": "consolidation_cursor_generation_missing",
+                "first_line_sha256": str(
+                    (meta.get("chat_log_signature") or {}).get("first_line_sha256") or ""
+                ),
+                "offset": int(meta.get("last_consolidated_offset") or 0),
+                "detail": (
+                    "Older unconsolidated coverage is unknown. Use explicit "
+                    "chat_history(count, offset, search) to inspect surviving generations."
+                ),
+            })
+            # Never repair a missing cursor by replaying the entire archive in
+            # the automatic per-turn path.  The live generation is rotation-
+            # bounded; older surviving generations remain available through the
+            # explicit paginated chat_history reader named above.
+            entries, live_gaps = self._read_chat_generation(
+                live, tail_bytes=_AUTOMATIC_CHAT_TAIL_BYTES, max_rows=scan_rows,
+            )
+            gaps.extend(live_gaps)
+            entries = [entry for entry in entries if not is_a2a_chat_id(entry.get("chat_id"))]
+            if predicate is not None:
+                entries = [entry for entry in entries if predicate(entry)]
+            limit = max(1, int(max_entries))
+            shown = entries[-limit:]
+            return shown, {
+                "generations": [{"kind": "live_bounded_suffix"}],
+                "matched_rows": len(entries),
+                "shown_rows": len(shown),
+                "omitted_matching_rows": max(0, len(entries) - len(shown)),
+                "omitted_matching_rows_unknown": True,
+                "gaps": gaps,
+                "reader": "chat_history(count, offset, search)",
+            }
+
+        from ouroboros.utils import jsonl_generation_signature
+
+        omitted_generations = max(0, len(segments) - _AUTOMATIC_CHAT_GENERATIONS)
+        selected = segments[-_AUTOMATIC_CHAT_GENERATIONS:]
+        segment_sigs: List[Dict[str, Any]] = []
+        segment_entries: List[List[Dict[str, Any]]] = []
+        stable = False
+        for _attempt in range(3):
+            segment_sigs = [jsonl_generation_signature(path) for path in selected]
+            segment_entries = []
+            parse_gaps: List[Dict[str, Any]] = []
+            for path in selected:
+                rows, row_gaps = self._read_chat_generation(
+                    path, tail_bytes=_AUTOMATIC_CHAT_TAIL_BYTES, max_rows=scan_rows,
+                )
+                segment_entries.append(rows)
+                parse_gaps.extend(row_gaps)
+            after = [jsonl_generation_signature(path) for path in selected]
+            stable = len(after) == len(segment_sigs) and all(
+                str(before.get("first_line_sha256") or "")
+                == str(current.get("first_line_sha256") or "")
+                and int(current.get("size") or 0) >= int(before.get("size") or 0)
+                for before, current in zip(segment_sigs, after)
+            )
+            if stable:
+                gaps.extend(parse_gaps)
+                break
+        if not stable:
+            gaps.extend(parse_gaps)
+            gaps.append({
+                "kind": "generation_capture_unstable",
+                "detail": "bounded archive/live suffix changed during capture",
+            })
+        all_entries = [
+            entry for rows in segment_entries for entry in rows
+            if not is_a2a_chat_id(entry.get("chat_id"))
+        ]
+        bounded_prefix = any(
+            gap.get("kind") in {
+                "generation_prefix_unscanned", "generation_tail_rows_unscanned",
+            }
+            for gap in gaps
+        )
+        captured_offset = offset if omitted_generations == 0 and not bounded_prefix else 0
+        suffix = [
+            entry for entry in all_entries[captured_offset:]
+            if predicate is None or predicate(entry)
+        ]
+        limit = max(1, int(max_entries))
+        shown = suffix[-limit:]
+        if omitted_generations:
+            gaps.append({
+                "kind": "unscanned_unconsolidated_generations",
+                "count": omitted_generations,
+                "detail": "Automatic context reads a bounded physical suffix; use chat_history for older raw rows.",
+            })
+        return shown, {
+            "generations": [
+                {
+                    "path": str(path),
+                    "first_line_sha256": str(sig.get("first_line_sha256") or ""),
+                    "rows": len(rows),
+                }
+                for path, sig, rows in zip(selected, segment_sigs, segment_entries)
+            ],
+            "matched_rows": len(suffix),
+            "shown_rows": len(shown),
+            "omitted_matching_rows": max(0, len(suffix) - len(shown)),
+            "omitted_matching_rows_unknown": bool(omitted_generations or bounded_prefix),
+            "gaps": gaps,
+            "reader": "chat_history(count, offset, search)",
+        }
 
     def _read_jsonl_entries(
         self,
