@@ -12,7 +12,7 @@ import time
 import uuid
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.config import (
     apply_settings_to_env,
@@ -1523,11 +1523,17 @@ def _inherited_workspace_from_active_repo(
 
 def _materialize_child_attachment_manifest(
     parent_contract: Dict[str, Any], target_root: Path, task_id: str,
+    *, owner_drive: Optional[Path] = None, owner_task_id: str = "",
 ) -> tuple[list[dict], str]:
     """Copy inherited task inputs into the child's own artifact store."""
 
-    inherited = parent_contract.get("attachment_manifest") if parent_contract else []
-    if not isinstance(inherited, list) or not inherited:
+    initial = parent_contract.get("attachment_manifest") if parent_contract else []
+    inherited = list(initial) if isinstance(initial, list) else []
+    if owner_drive is not None and owner_task_id:
+        from ouroboros.owner_mailbox import owner_attachment_manifest
+
+        inherited.extend(owner_attachment_manifest(owner_drive, owner_task_id))
+    if not inherited:
         return [], ""
     from ouroboros.artifacts import materialize_inherited_attachment_manifest
 
@@ -1869,6 +1875,7 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         return _drive_err
     child_attachment_manifest, attachment_error = _materialize_child_attachment_manifest(
         parent_contract, child_drive or status_drive_root, tid,
+        owner_drive=Path(ctx.drive_root), owner_task_id=parent_task_id,
     )
     if attachment_error:
         shutil.rmtree(task_state_dir(status_drive_root, tid), ignore_errors=True)
@@ -2242,15 +2249,9 @@ def _get_task_result(ctx: ToolContext, task_id: str, include_authority: bool = F
     if not data:
         return f"Task {task_id}: unknown or not yet registered"
     if bool(include_authority):
-        authority = {
-            key: data.get(key)
-            for key in (
-                "task_id", "title", "objective", "description", "context",
-                "task_contract", "origin_message_ref", "origin_message_text",
-                "predecessor_authority_source", "plan_review_state",
-            )
-            if data.get(key) not in (None, "")
-        }
+        from ouroboros.agent_startup_checks import task_result_authority_projection
+
+        authority = task_result_authority_projection(data)
         return json.dumps({
             "status": "available", "authority": authority,
             "source": {"tool": "get_task_result", "task_id": str(task_id)},
@@ -3021,7 +3022,7 @@ def get_tools() -> List[ToolEntry]:
             "parameters": {"type": "object", "required": ["task_id"], "properties": {
                 "task_id": {"type": "string", "description": "Task ID returned by scheduling or exposed by the host routing manifest."},
                 "include_authority": {"type": "boolean", "default": False,
-                                      "description": "Return exact task contract/origin/current plan-review authority."},
+                                      "description": "Return the exact selected result, task contract, origin, artifact references, and current plan-review authority."},
             }},
         }, _get_task_result),
         ToolEntry("wait_task", {

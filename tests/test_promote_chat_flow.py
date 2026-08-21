@@ -64,7 +64,11 @@ def test_cat_router_preview_promote_first_request_and_direct_harness_keep_full_a
     from ouroboros.memory import Memory
     from ouroboros.projects_registry import create_project
     from ouroboros.subagent_work_order import assignment_instructions, compile_external_work_order
-    from ouroboros.tools.control import _build_child_subagent_contract, _promote_chat_to_task
+    from ouroboros.tools.control import (
+        _build_child_subagent_contract,
+        _get_task_result,
+        _promote_chat_to_task,
+    )
     from ouroboros.tools.registry import ToolContext
 
     monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
@@ -72,11 +76,13 @@ def test_cat_router_preview_promote_first_request_and_direct_harness_keep_full_a
     project = create_project(tmp_path, "cat-tower", name="Cat Tower Builder")
     predecessor_id = "cat-old-root"
     tail = "CLAUDEXOR_ONLY; L1 MUST ASK L2 TO SPAWN L3"
+    result_tail = "KEEP_EXISTING_TOWER_ASSET; DO_NOT_REBUILD_FROM_SCRATCH"
     predecessor = {
         "task_id": predecessor_id,
         "status": "cancelled",
         "title": "Cat Tower Builder",
         "objective": "o" * 700 + tail,
+        "result": "completed implementation evidence\n" + "r" * 700 + result_tail,
         "project_id": "cat-tower",
         "task_contract": {
             "objective": "o" * 700 + tail,
@@ -149,6 +155,7 @@ def test_cat_router_preview_promote_first_request_and_direct_harness_keep_full_a
         task_contract=task["task_contract"], task_metadata=task["metadata"],
     )
     direct_harness = assignment_instructions(tool_ctx)
+    retrieved = _get_task_result(tool_ctx, predecessor_id, include_authority=True)
     child_contract = _build_child_subagent_contract({
         "tid": "cat-nested", "objective": "Inspect the Cat implementation",
         "expected_output": "Report", "constraints": "Use the inherited authority",
@@ -163,10 +170,14 @@ def test_cat_router_preview_promote_first_request_and_direct_harness_keep_full_a
     assert child_contract["predecessor_authority"] == task["predecessor_authority"]
 
     assert tail in rendered
+    assert result_tail in rendered
     assert "never use native/API fallback" in rendered
+    assert result_tail in retrieved
     assert tail in direct_harness
+    assert result_tail in direct_harness
     assert "L1 asks L2 to spawn L3" in direct_harness
     assert tail in nested_work_order
+    assert result_tail in nested_work_order
     assert "never use native/API fallback" in nested_work_order
 
 
@@ -243,10 +254,26 @@ def test_main_promotion_selects_only_manifested_canonical_predecessor(tmp_path, 
 
 
 def test_presence_promotion_preserves_ceiling_and_cannot_choose_new_scope(tmp_path, monkeypatch):
-    from ouroboros.tools.control import _promote_chat_to_task
+    from ouroboros.presence_authority import PresenceCapabilityCeiling, presence_ceiling_payload
+    from ouroboros.tools.control import _build_child_subagent_contract, _promote_chat_to_task
 
     _confirm_promote(monkeypatch)
-    contract = {"capability_ceiling": {"digest": "a" * 64}}
+    capability_ceiling = presence_ceiling_payload(PresenceCapabilityCeiling(
+        skill_name="project-helper", skill_content_hash="a" * 64,
+        profile_fingerprint="b" * 64, state_fingerprint="c" * 64,
+        selection_fingerprint="d" * 64, model_slot="main", inline_max_rounds=8,
+        tool_grants=(), resource_grants=(), digest="0" * 64,
+    ))
+    contract = {
+        "capability_ceiling": capability_ceiling,
+        "context": "preserve exact owner context",
+        "predecessor_authority": {"result": "preserve completed predecessor"},
+        "attachment_manifest": [{
+            "ordinal": 0, "status": "staged", "reason": "", "label": "authority",
+            "root": "artifact_store", "relpath": "attachments/authority.txt",
+            "abs_path": str(tmp_path / "parent" / "attachments" / "authority.txt"),
+        }],
+    }
     ctx = types.SimpleNamespace(
         pending_events=[],
         event_queue=None,
@@ -268,6 +295,13 @@ def test_presence_promotion_preserves_ceiling_and_cannot_choose_new_scope(tmp_pa
     assert event["task_contract"] == contract
     assert event["project_id"] == event["project_name"] == ""
     assert event["workspace_root"] == event["workspace"] == event["source"] == ""
+    child = _build_child_subagent_contract({
+        "tid": "presence-child", "objective": "Inspect", "expected_output": "Report",
+        "parent_contract": event["task_contract"],
+        "attachment_manifest": event["task_contract"]["attachment_manifest"],
+    })
+    for key in ("capability_ceiling", "context", "predecessor_authority", "attachment_manifest"):
+        assert child[key] == contract[key]
 
 
 def _swarm_ctx(tmp_path, **overrides):

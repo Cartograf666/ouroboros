@@ -373,14 +373,13 @@ class Memory:
             gaps = [str(gap.get("kind") or "unknown") for gap in coverage.get("gaps") or []]
             gap_note = f" Gaps: {', '.join(gaps)}." if gaps else ""
             if not entries:
+                if total:
+                    return (
+                        f"Showing 0 of {total} messages; matching history is exhausted "
+                        f"at offset={max(0, int(offset))}.{gap_note}"
+                    )
                 return "(no messages matching query)." + gap_note
             lines = [self._format_chat_line(e, compact=False) for e in entries]
-            # Preserve the established exact filtered-search response when the
-            # generation capture is complete.  Unfiltered recall keeps the
-            # explicit continuation pointer added for full-biography paging;
-            # any known gap also uses that truthful form rather than hiding it.
-            if (search or any(str(value or "").strip() for value in filters.values())) and not gaps:
-                return f"Showing {len(entries)} messages:\n\n" + "\n".join(lines)
             return (
                 f"Showing {len(entries)} of {total} messages; {remaining} older remain."
                 f" Continue with offset={max(0, int(offset)) + len(entries)}.{gap_note}\n\n"

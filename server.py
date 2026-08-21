@@ -516,6 +516,7 @@ def _route_project_chat_to_running_task(
                     if isinstance(task_metadata, dict) and isinstance(task_metadata.get("client_surface"), dict)
                     else None
                 ),
+                attachment_manifest=staged_manifest if staged_manifest else None,
             ):
                 return ""
             message_written = True

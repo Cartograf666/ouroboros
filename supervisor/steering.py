@@ -248,6 +248,7 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
                     if isinstance(evt.get("client_surface"), dict) and evt.get("client_surface")
                     else None
                 ),
+                attachment_manifest=staged_manifest if uploads else None,
             ):
                 raise OSError("owner mailbox append was not durable")
             if direct_active:

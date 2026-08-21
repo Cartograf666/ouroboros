@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import pathlib
@@ -13,6 +14,33 @@ from typing import Any, Dict, Tuple
 from ouroboros.utils import atomic_write_json, utc_now_iso, read_text, append_jsonl, read_json_dict, update_json_locked
 
 log = logging.getLogger(__name__)
+
+_TASK_RESULT_AUTHORITY_FIELDS = (
+    "task_id", "status", "title", "objective", "description", "expected_output",
+    "context", "result", "trace_summary", "reason_code", "outcome_axes",
+    "project_id", "workspace_root", "workspace_mode", "artifact_status",
+    "artifact_bundle", "artifacts", "trace_refs", "verification_receipts",
+    "origin_message_ref", "origin_message_text", "predecessor_authority_source",
+    "plan_review_state",
+)
+
+
+def task_result_authority_projection(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Exact decision-bearing result/contract bytes named by a router pointer."""
+
+    authority = {
+        key: copy.deepcopy(row[key])
+        for key in _TASK_RESULT_AUTHORITY_FIELDS
+        if key in row
+    }
+    contract = row.get("task_contract")
+    if isinstance(contract, dict):
+        authority["task_contract"] = copy.deepcopy(contract)
+    else:
+        from ouroboros.contracts.task_contract import build_task_contract
+
+        authority["task_contract"] = build_task_contract(row)
+    return authority
 
 
 def valid_task_result_authority_source(source: Any, task_id: Any) -> bool:
@@ -102,13 +130,9 @@ def validate_task_authority_sources(env: Any, task: Dict[str, Any]) -> Dict[str,
         )
         if not isinstance(predecessor_row, dict):
             return _unavailable(predecessor, "named predecessor task result is missing or unreadable")
-        from ouroboros.contracts.task_contract import build_task_contract
-
         task["predecessor_authority"] = {
             "source": dict(predecessor),
-            "task_contract": build_task_contract(predecessor_row),
-            "objective": predecessor_row.get("objective") or predecessor_row.get("description") or "",
-            "context": predecessor_row.get("context") or "",
+            **task_result_authority_projection(predecessor_row),
         }
     else:
         metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}

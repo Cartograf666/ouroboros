@@ -84,8 +84,12 @@ def test_chat_history_old_call_keeps_search_offset_count_result(tmp_path):
     ])
 
     assert Memory(tmp_path).chat_history(count=1, offset=1, search="MATCH") == (
-        "Showing 1 messages:\n\n← [2026-08-21T09:02] [User] match two"
+        "Showing 1 of 3 messages; 1 older remain. Continue with offset=2.\n\n"
+        "← [2026-08-21T09:02] [User] match two"
     )
+    exhausted = Memory(tmp_path).chat_history(count=1, offset=99, search="MATCH")
+    assert exhausted.startswith("Showing 0 of 3 messages; matching history is exhausted at offset=99.")
+    assert "no messages matching query" not in exhausted
 
 
 def test_chat_history_tool_exposes_only_exact_filter_fields():

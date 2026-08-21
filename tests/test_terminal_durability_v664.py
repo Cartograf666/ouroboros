@@ -271,6 +271,7 @@ def test_top_level_retry_preserves_logical_root_and_typed_attempt_lineage(
         f"exact owner correction\n\n[ATTACHMENTS]\n{later_report}\n[END_ATTACHMENTS]",
         "old-root",
         msg_id="owner-1",
+        attachment_manifest=later_manifest,
     )
     write_owner_message(
         tmp_path, "owner_hurry", "old-root", msg_id="hurry-1", kind=KIND_HURRY,
@@ -321,11 +322,13 @@ def test_top_level_retry_preserves_logical_root_and_typed_attempt_lineage(
     assert len(retry_entries) == 1
     assert retry_entries[0]["text"].startswith("exact owner correction")
     assert retry_entries[0]["msg_id"] == "owner-1"
+    assert retry_entries[0]["attachment_manifest"][0]["label"] == "later"
     old_attachment_root = str(
         tmp_path / "task_results" / "artifacts" / "old-root" / "attachments"
     )
     assert old_attachment_root not in queued["text"]
     assert old_attachment_root not in retry_entries[0]["text"]
+    assert old_attachment_root not in json.dumps(retry_entries[0]["attachment_manifest"])
     assert old_attachment_root not in json.dumps(queued["task_contract"])
     from ouroboros.tools.core import _read_file
     from ouroboros.tools.registry import ToolContext

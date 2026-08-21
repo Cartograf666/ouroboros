@@ -153,6 +153,7 @@ def write_owner_message(
     msg_id: Optional[str] = None,
     kind: str = KIND_OWNER_TEXT,
     client_surface: Optional[Dict[str, Any]] = None,
+    attachment_manifest: Optional[List[Dict[str, Any]]] = None,
 ) -> bool:
     """Write an owner message or typed control entry to a task's mailbox."""
     path = _mailbox_path(drive_root, task_id)
@@ -167,6 +168,10 @@ def write_owner_message(
         # Owner Surface Fact (additive, like ``ts``): which client surface sent
         # this follow-up, so the loop can note a mid-task device change.
         entry["client_surface"] = dict(client_surface)
+    if isinstance(attachment_manifest, list):
+        entry["attachment_manifest"] = [
+            dict(item) for item in attachment_manifest if isinstance(item, dict)
+        ]
     try:
         if not append_jsonl(path, entry):
             log.warning("Failed to durably append owner message for task %s", task_id)
@@ -208,6 +213,35 @@ def write_task_message(
     except Exception:
         log.warning("Failed to write task message for task %s", task_id, exc_info=True)
         return False
+
+
+def owner_attachment_manifest(drive_root: pathlib.Path, task_id: str) -> List[Dict[str, Any]]:
+    """Return every durable owner-text attachment row, including acknowledged mail."""
+
+    path = _mailbox_path(drive_root, task_id)
+    if not path.exists():
+        return []
+    manifests: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                entry = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(entry, dict) or str(entry.get("kind") or KIND_OWNER_TEXT) != KIND_OWNER_TEXT:
+                continue
+            msg_id = str(entry.get("msg_id") or "")
+            if msg_id and msg_id in seen_ids:
+                continue
+            if msg_id:
+                seen_ids.add(msg_id)
+            manifest = entry.get("attachment_manifest")
+            if isinstance(manifest, list):
+                manifests.extend(dict(item) for item in manifest if isinstance(item, dict))
+    except OSError:
+        log.warning("Failed to read owner attachment manifest for %s", task_id, exc_info=True)
+    return manifests
 
 
 def deliver_task_message(
@@ -446,6 +480,11 @@ def drain_owner_entries(
                 # dead-wire class this sprint closes).
                 if isinstance(entry.get("client_surface"), dict) and entry.get("client_surface"):
                     drained["client_surface"] = dict(entry["client_surface"])
+                if isinstance(entry.get("attachment_manifest"), list):
+                    drained["attachment_manifest"] = [
+                        dict(item) for item in entry["attachment_manifest"]
+                        if isinstance(item, dict)
+                    ]
                 if attempt_key is not None and kind == KIND_OWNER_TEXT:
                     drained["_owner_attempt_key"] = attempt_key
                 if kind == KIND_TASK_MESSAGE:
