@@ -138,6 +138,7 @@ BAND_PATHS = {
     "ouroboros/launcher_bootstrap.py": None,
     "ouroboros/loop_llm_call.py": None,
     "ouroboros/loop_tool_execution.py": None,
+    "ouroboros/observability.py": "Entered the band from 820 lines: child task copy-back now promotes only promised observability CAS manifests/blobs and task-owned source handles into canonical storage before headless GC, with typed unavailable gaps and retry metadata.",
     "ouroboros/outcomes.py": None,
     "ouroboros/platform_layer.py": None,
     "ouroboros/preflight_runner.py": None,

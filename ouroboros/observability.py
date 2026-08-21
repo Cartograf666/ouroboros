@@ -7,6 +7,7 @@ point to those blobs.
 
 from __future__ import annotations
 
+import copy
 import gzip
 import hashlib
 import logging
@@ -16,9 +17,9 @@ import pathlib
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from ouroboros.utils import atomic_write_json, replace_atomic, utc_now_iso
+from ouroboros.utils import atomic_write_json, replace_atomic, utc_now_iso, write_bytes_atomic
 
 
 OBSERVABILITY_DIR = "observability"
@@ -347,6 +348,412 @@ def read_blob_ref(
     if kind == "json":
         return json.loads(raw.decode("utf-8"))
     return raw.decode("utf-8", errors="replace")
+
+
+class ObservabilityPromotionSourceError(ValueError):
+    """A child observability ref cannot be verified for canonical promotion."""
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = str(reason)
+
+
+def _promotion_source_error(exc: Exception) -> ObservabilityPromotionSourceError:
+    message = str(exc)
+    if isinstance(exc, FileNotFoundError):
+        reason = "source_missing"
+    elif "size or sha256 verification" in message:
+        reason = "digest_mismatch"
+    elif "outside its drive" in message:
+        reason = "invalid_scope"
+    elif (
+        "unexpected kind or encoding" in message
+        or "no valid size" in message
+        or "no sha256" in message
+    ):
+        reason = "invalid_ref"
+    else:
+        reason = "source_unreadable"
+    return ObservabilityPromotionSourceError(reason, message or type(exc).__name__)
+
+
+def promote_blob_ref(
+    source_drive_root: pathlib.Path,
+    canonical_drive_root: pathlib.Path,
+    ref: Dict[str, Any],
+    *,
+    transform_json: Optional[Callable[[Any], Any]] = None,
+) -> Dict[str, Any]:
+    """Verify one child CAS ref and write the same payload into canonical CAS.
+
+    ``transform_json`` is the narrow hook used by headless copy-back to rebase
+    task-owned refs embedded in a JSON payload before the new content identity
+    is minted. Source verification happens first; destination write failures
+    remain ordinary I/O errors so the caller can retry without calling a
+    corrupt/missing source live.
+    """
+
+    kind = str((ref or {}).get("kind") or "")
+    try:
+        payload = read_blob_ref(
+            pathlib.Path(source_drive_root),
+            ref,
+            expected_kind=kind,
+        )
+    except Exception as exc:
+        raise _promotion_source_error(exc) from exc
+    if kind == "json" and transform_json is not None:
+        payload = transform_json(payload)
+    promoted = write_blob(pathlib.Path(canonical_drive_root), payload, kind=kind)
+    # Re-read through the public verifier: a successful write alone is not
+    # enough to publish a durable ref.
+    read_blob_ref(pathlib.Path(canonical_drive_root), promoted, expected_kind=kind)
+    return promoted
+
+
+def promote_call_manifest_ref(
+    source_drive_root: pathlib.Path,
+    canonical_drive_root: pathlib.Path,
+    ref: Dict[str, Any],
+    *,
+    task_id: str,
+    transform_json: Optional[Callable[[Any], Any]] = None,
+) -> Dict[str, Any]:
+    """Verify, close over, and atomically rebase one persisted call manifest."""
+
+    source_root = _observability_root(pathlib.Path(source_drive_root)).resolve(strict=False)
+    calls_root = (source_root / "calls").resolve(strict=False)
+    try:
+        path = pathlib.Path(str((ref or {}).get("path") or "")).resolve(strict=True)
+        path.relative_to(calls_root)
+        raw = path.read_bytes()
+        expected_sha = str((ref or {}).get("sha256") or "")
+        if not expected_sha:
+            raise ValueError("observability call manifest ref has no sha256")
+        if hashlib.sha256(raw).hexdigest() != expected_sha:
+            raise ValueError("observability call manifest ref failed sha256 verification")
+        manifest = json.loads(raw.decode("utf-8"))
+        if not isinstance(manifest, dict):
+            raise ValueError("observability call manifest is not an object")
+        manifest_task = str(manifest.get("task_id") or "")
+        call_id = str(manifest.get("call_id") or (ref or {}).get("call_id") or "")
+        if manifest_task != str(task_id) or not call_id:
+            raise ValueError("observability call manifest task/call identity mismatch")
+    except Exception as exc:
+        if isinstance(exc, ObservabilityPromotionSourceError):
+            raise
+        message = str(exc)
+        if isinstance(exc, FileNotFoundError):
+            reason = "source_missing"
+        elif "sha256 verification" in message:
+            reason = "digest_mismatch"
+        elif "relative_to" in message or "not in the subpath" in message:
+            reason = "invalid_scope"
+        elif "outside" in message:
+            reason = "invalid_scope"
+        else:
+            reason = "invalid_ref" if isinstance(exc, (TypeError, ValueError)) else "source_unreadable"
+        raise ObservabilityPromotionSourceError(reason, message or type(exc).__name__) from exc
+
+    for key in ("full_payload_ref", "redacted_projection_ref"):
+        nested = manifest.get(key)
+        if isinstance(nested, dict) and nested:
+            manifest[key] = promote_blob_ref(
+                pathlib.Path(source_drive_root),
+                pathlib.Path(canonical_drive_root),
+                nested,
+                transform_json=transform_json,
+            )
+    promoted = write_call_manifest(
+        pathlib.Path(canonical_drive_root),
+        task_id=str(task_id),
+        call_id=call_id,
+        manifest=manifest,
+    )
+    promoted_path = pathlib.Path(str(promoted.get("path") or ""))
+    if not promoted_path.is_file() or hashlib.sha256(
+        promoted_path.read_bytes()
+    ).hexdigest() != str(promoted.get("sha256") or ""):
+        raise OSError("canonical observability call manifest verification failed")
+    return promoted
+
+
+_PUBLISHED_CHILD_REF_FIELDS = frozenset(
+    {
+        "trace_refs",
+        "review_evidence",
+        "review_projection",
+        "verification_ledger",
+        "root_phase_checkpoint",
+        "plan_review_state",
+        "artifacts",
+        "artifact_bundle",
+    }
+)
+_SOURCE_HANDLES_SUBDIR = "source_handles"
+_SOURCE_HANDLE_DIGEST_RE = re.compile(r"-([0-9a-f]{64})\.[A-Za-z0-9]+$")
+_SERVICE_REF_TOOLS = frozenset({"service_logs", "stop_service"})
+
+
+def _promotion_fact(ref: Any, reason: str = "") -> Dict[str, Any]:
+    item = ref if isinstance(ref, dict) else {}
+    fact = {
+        key: item[key]
+        for key in ("kind", "call_id", "sha256", "size", "path")
+        if item.get(key) not in (None, "")
+    }
+    if reason:
+        fact["reason"] = str(reason)
+    return fact
+
+
+def _append_promotion_fact(rows: List[Dict[str, Any]], fact: Dict[str, Any]) -> None:
+    identity = json.dumps(fact, ensure_ascii=False, sort_keys=True, default=str)
+    if all(json.dumps(row, ensure_ascii=False, sort_keys=True, default=str) != identity for row in rows):
+        rows.append(fact)
+
+
+def _typed_unavailable_ref(ref: Any, reason: str) -> Dict[str, Any]:
+    item = ref if isinstance(ref, dict) else {}
+    return {
+        "availability": "unavailable",
+        "reason": str(reason),
+        "source": "child_task_storage",
+        **{
+            key: item[key]
+            for key in ("kind", "call_id", "sha256", "size", "encoding", "root")
+            if item.get(key) not in (None, "")
+        },
+    }
+
+
+def _is_blob_ref(value: Any) -> bool:
+    return bool(
+        isinstance(value, dict)
+        and value.get("path")
+        and value.get("sha256")
+        and value.get("kind") in {"json", "txt"}
+        and value.get("encoding") == "gzip"
+    )
+
+
+def _is_manifest_ref(value: Any) -> bool:
+    return bool(
+        isinstance(value, dict)
+        and value.get("path")
+        and value.get("sha256")
+        and value.get("call_id")
+        and str(value.get("path") or "").endswith(".json")
+    )
+
+
+def _is_task_source_ref(value: Any) -> bool:
+    return bool(
+        isinstance(value, dict)
+        and value.get("kind") == "task_source"
+        and value.get("root") == "artifact_store"
+        and pathlib.PurePosixPath(str(value.get("path") or "")).parts[:1]
+        == (_SOURCE_HANDLES_SUBDIR,)
+    )
+
+
+def _promote_known_observability_ref(
+    parent_root: pathlib.Path,
+    child_root: pathlib.Path,
+    task_id: str,
+    ref: Dict[str, Any],
+    state: Dict[str, Any],
+) -> Dict[str, Any]:
+    def transform_json(payload: Any) -> Any:
+        before = len(state["pending_refs"])
+        rewritten = _rewrite_service_payload(payload, parent_root, child_root, task_id, state)
+        if len(state["pending_refs"]) != before:
+            raise OSError("embedded child observability ref promotion is pending")
+        return rewritten
+
+    try:
+        promoted = (
+            promote_blob_ref(child_root, parent_root, ref, transform_json=transform_json)
+            if _is_blob_ref(ref)
+            else promote_call_manifest_ref(
+                child_root, parent_root, ref, task_id=task_id,
+                transform_json=transform_json,
+            )
+        )
+        state["promoted_ref_count"] += 1
+        return promoted
+    except ObservabilityPromotionSourceError as exc:
+        _append_promotion_fact(state["unavailable_refs"], _promotion_fact(ref, exc.reason))
+        return _typed_unavailable_ref(ref, exc.reason)
+    except Exception as exc:
+        _append_promotion_fact(
+            state["pending_refs"],
+            _promotion_fact(ref, f"{type(exc).__name__}: {exc}"),
+        )
+        state["status"] = "incomplete"
+        return dict(ref)
+
+
+def _rewrite_service_result(
+    text: str,
+    parent_root: pathlib.Path,
+    child_root: pathlib.Path,
+    task_id: str,
+    state: Dict[str, Any],
+) -> str:
+    start = str(text).find("{")
+    if start < 0:
+        return text
+    prefix, encoded = str(text)[:start], str(text)[start:]
+    try:
+        parsed = json.loads(encoded)
+    except (TypeError, ValueError):
+        return text
+    rewritten = _rewrite_child_ref_tree(parsed, parent_root, child_root, task_id, state)
+    return prefix + json.dumps(rewritten, ensure_ascii=False, indent=2)
+
+
+def _rewrite_service_payload(
+    payload: Any,
+    parent_root: pathlib.Path,
+    child_root: pathlib.Path,
+    task_id: str,
+    state: Dict[str, Any],
+) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+    rewritten = copy.deepcopy(payload)
+    if str(rewritten.get("tool") or "") in _SERVICE_REF_TOOLS and isinstance(
+        rewritten.get("result"), str
+    ):
+        rewritten["result"] = _rewrite_service_result(
+            rewritten["result"], parent_root, child_root, task_id, state,
+        )
+    return _rewrite_child_ref_tree(rewritten, parent_root, child_root, task_id, state)
+
+
+def _task_artifact_dir(root: pathlib.Path, task_id: str, *, create: bool) -> pathlib.Path:
+    from ouroboros.artifacts import task_artifact_dir_path
+
+    return task_artifact_dir_path(root, task_id, create=create)
+
+
+def _rewrite_child_ref_tree(
+    value: Any,
+    parent_root: pathlib.Path,
+    child_root: pathlib.Path,
+    task_id: str,
+    state: Dict[str, Any],
+) -> Any:
+    if _is_blob_ref(value) or _is_manifest_ref(value):
+        return _promote_known_observability_ref(parent_root, child_root, task_id, value, state)
+    if _is_task_source_ref(value):
+        rel = pathlib.PurePosixPath(str(value.get("path") or ""))
+        try:
+            expected_size = int(value["size"])
+        except (KeyError, TypeError, ValueError):
+            expected_size = -1
+        expected_sha = str(value.get("sha256") or "")
+        if expected_size < 0 or not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+            _append_promotion_fact(
+                state["unavailable_refs"], _promotion_fact(value, "invalid_ref")
+            )
+            return _typed_unavailable_ref(value, "invalid_ref")
+        source = _task_artifact_dir(child_root, task_id, create=False).joinpath(*rel.parts)
+        target = _task_artifact_dir(parent_root, task_id, create=False).joinpath(*rel.parts)
+        if target.is_file():
+            raw = target.read_bytes()
+            if (
+                len(raw) == expected_size
+                and hashlib.sha256(raw).hexdigest() == expected_sha
+            ):
+                return dict(value)
+        if source.is_file():
+            try:
+                raw = source.read_bytes()
+            except OSError as exc:
+                reason = f"source_unreadable:{type(exc).__name__}"
+                _append_promotion_fact(
+                    state["unavailable_refs"], _promotion_fact(value, reason)
+                )
+                return _typed_unavailable_ref(value, reason)
+            match = _SOURCE_HANDLE_DIGEST_RE.search(source.name)
+            if (
+                len(raw) != expected_size
+                or hashlib.sha256(raw).hexdigest() != expected_sha
+                or match is None
+                or match.group(1) != expected_sha
+            ):
+                _append_promotion_fact(
+                    state["unavailable_refs"],
+                    _promotion_fact(value, "digest_mismatch"),
+                )
+                return _typed_unavailable_ref(value, "digest_mismatch")
+            try:
+                write_bytes_atomic(target, raw)
+                copied = target.read_bytes()
+                if (
+                    len(copied) != expected_size
+                    or hashlib.sha256(copied).hexdigest() != expected_sha
+                ):
+                    raise OSError("canonical task source verification failed")
+                state["promoted_source_handle_count"] += 1
+                return dict(value)
+            except Exception as exc:
+                _append_promotion_fact(
+                    state["pending_refs"],
+                    _promotion_fact(
+                        {**value, "path": str(source)},
+                        f"{type(exc).__name__}: {exc}",
+                    ),
+                )
+                state["status"] = "incomplete"
+                return dict(value)
+        _append_promotion_fact(
+            state["unavailable_refs"], _promotion_fact(value, "source_missing")
+        )
+        return _typed_unavailable_ref(value, "source_missing")
+    if isinstance(value, dict):
+        return {
+            key: _rewrite_child_ref_tree(
+                item, parent_root, child_root, task_id, state
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _rewrite_child_ref_tree(item, parent_root, child_root, task_id, state)
+            for item in value
+        ]
+    return value
+
+
+def promote_child_task_refs(
+    parent_drive_root: pathlib.Path,
+    child_drive_root: pathlib.Path,
+    task_id: str,
+    child_result: Dict[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Promote the bounded, task-owned ref closure published by child copy-back."""
+    parent_root = pathlib.Path(parent_drive_root)
+    child_root = pathlib.Path(child_drive_root)
+    rewritten = copy.deepcopy(child_result)
+    state: Dict[str, Any] = {
+        "schema_version": 1,
+        "status": "complete",
+        "promoted_ref_count": 0,
+        "promoted_source_handle_count": 0,
+        "pending_refs": [],
+        "unavailable_refs": [],
+    }
+    for key in _PUBLISHED_CHILD_REF_FIELDS:
+        if key in rewritten:
+            rewritten[key] = _rewrite_child_ref_tree(
+                rewritten[key], parent_root, child_root, task_id, state,
+            )
+    if state["pending_refs"]:
+        state["status"] = "incomplete"
+    return rewritten, state
 
 
 def write_call_manifest(
