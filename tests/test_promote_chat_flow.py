@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import queue
 import pathlib
+import threading
 import types
 
 import pytest
@@ -2426,6 +2427,113 @@ def test_steering_delivers_text_and_identical_typed_attachment_report(
         "staged", "rejected",
     ]
     assert annotation["detail"] == report
+
+
+def test_direct_root_steering_uses_live_human_identity_for_receipt_and_notice(
+    tmp_path, monkeypatch,
+):
+    import supervisor.queue as queue
+    from ouroboros.projects_registry import create_project
+    from supervisor.events import _handle_steer_task
+
+    monkeypatch.setattr(queue, "DRIVE_ROOT", str(tmp_path))
+    project = create_project(tmp_path, "tower-project", name="Tower Defence")
+    attachment = tmp_path / "map.txt"
+    attachment.write_text("map", encoding="utf-8")
+    direct_agent = types.SimpleNamespace(
+        _owner_message_admission_lock=threading.RLock(),
+        _busy=True,
+        _accepting_owner_messages=True,
+        _current_task_id="direct-live-opaque-id",
+        _current_chat_id=project["chat_id"],
+        _current_task_metadata={
+            "project_id": project["id"],
+            "title": "Fix nested delegation",
+        },
+        _current_task_text="Continue the Tower Defence task",
+        _owner_message_generation=0,
+    )
+    acks = []
+    notices = []
+    ctx = types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path,
+        RUNNING={},
+        PENDING=[],
+        get_chat_agent=lambda: direct_agent,
+        bridge=types.SimpleNamespace(
+            send_routing_ack=lambda _chat_id, **payload: acks.append(payload),
+        ),
+        send_with_budget=lambda _chat_id, text, *args, **kwargs: notices.append(text),
+        persist_queue_snapshot=lambda **_kwargs: None,
+    )
+
+    _handle_steer_task(
+        {
+            "type": "steer_task",
+            "target_task_id": "direct-live-opaque-id",
+            "message": "Use the attached map",
+            "chat_id": project["chat_id"],
+            "client_message_id": "cm-direct-title",
+            "routing_token": "route-direct-title",
+            "allow_global_root": True,
+            "attachment_uploads": [{"path": str(attachment), "label": "map"}],
+        },
+        ctx,
+    )
+
+    assert acks[-1]["target"] == "direct-live-opaque-id"
+    assert acks[-1]["target_label"] == "Tower Defence › Fix nested delegation"
+    assert notices[-1].splitlines()[0] == (
+        "📎 Attachment staging report for Tower Defence › Fix nested delegation:"
+    )
+
+
+def test_direct_project_followup_carries_same_live_human_identity(tmp_path):
+    import server
+    from ouroboros.projects_registry import create_project
+
+    project = create_project(tmp_path, "tower-project", name="Tower Defence")
+    attachment = tmp_path / "map.txt"
+    attachment.write_text("map", encoding="utf-8")
+    direct_agent = types.SimpleNamespace(
+        _owner_message_admission_lock=threading.RLock(),
+        _busy=True,
+        _accepting_owner_messages=True,
+        _current_task_id="direct-live-opaque-id",
+        _current_chat_id=project["chat_id"],
+        _current_task_metadata={
+            "project_id": project["id"],
+            "title": "Fix nested delegation",
+        },
+        _current_task_text="Continue the Tower Defence task",
+        _owner_message_generation=0,
+    )
+    notices = []
+    ctx = types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path,
+        RUNNING={},
+        PENDING=[],
+        get_chat_agent=lambda: direct_agent,
+        send_with_budget=lambda _chat_id, text, *args, **kwargs: notices.append(text),
+    )
+    metadata = {
+        "project_id": project["id"],
+        "chat_attachment_uploads": [{"path": str(attachment), "label": "map"}],
+    }
+
+    routed = server._route_project_chat_to_running_task(
+        ctx,
+        project["chat_id"],
+        "Use the attached map",
+        "cm-project-direct-title",
+        task_metadata=metadata,
+    )
+
+    assert routed == "direct-live-opaque-id"
+    assert metadata["_routing_target_label"] == "Tower Defence › Fix nested delegation"
+    assert notices[-1].splitlines()[0] == (
+        "📎 Attachment staging report for Tower Defence › Fix nested delegation:"
+    )
 
 
 def test_handle_steer_task_stale_target_notifies_visibly(tmp_path, monkeypatch):

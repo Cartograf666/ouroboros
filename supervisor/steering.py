@@ -19,7 +19,13 @@ log = logging.getLogger(__name__)
 
 
 def _refuse_steering_while_cancelling(
-    ctx: Any, evt: Dict[str, Any], target: str, chat_id: int, *, notify: bool = True,
+    ctx: Any,
+    evt: Dict[str, Any],
+    target: str,
+    chat_id: int,
+    *,
+    target_label: str = "",
+    notify: bool = True,
 ) -> bool:
     """Whether a cancellation owns this task — refuse the steering write if so.
 
@@ -40,14 +46,16 @@ def _refuse_steering_while_cancelling(
         log.debug("steer_task cancel-pending check failed", exc_info=True)
         return False
     _emit_routing_receipt(
-        ctx, evt, action="steer_task", target=target, status="rejected",
+        ctx, evt, action="steer_task", target=target, target_label=target_label,
+        status="rejected",
         reason="cancel_pending",
     )
     if notify and chat_id:
         try:
             ctx.send_with_budget(
                 chat_id,
-                f"⚠️ Couldn't steer task {target} — its cancellation is pending "
+                f"⚠️ Couldn't steer task {target_label or '(no longer available)'} — "
+                "its cancellation is pending "
                 "(the supervisor is tearing it down). Wait for the settled "
                 "outcome or start a new task.",
             )
@@ -74,13 +82,6 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
         chat_id = 0
     if not target or not message.strip():
         return
-    # Phase A: refuse NEW steering writes while a cancellation is pending —
-    # steering a task mid-teardown would race the kill and imply the task will
-    # act on the message. BOTH carriers are consulted (durable intent + the
-    # legacy ``cancel_requested`` status latch of pre-migration files). Typed
-    # refusal, owner-visible.
-    if _refuse_steering_while_cancelling(ctx, evt, target, chat_id):
-        return
     direct_agent = None
     direct_lock = None
     direct_active = False
@@ -101,6 +102,9 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
                         "id": target,
                         "chat_id": int(getattr(direct_agent, "_current_chat_id", 0) or 0),
                         "project_id": str(direct_metadata.get("project_id") or ""),
+                        "title": str(direct_metadata.get("title") or ""),
+                        "suggested_name": str(direct_metadata.get("suggested_name") or ""),
+                        "objective": str(getattr(direct_agent, "_current_task_text", "") or ""),
                         "_is_direct_chat": True,
                     }
     except Exception:
@@ -117,6 +121,26 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
             (row for row in list(pending or []) if isinstance(row, dict) and str(row.get("id") or "") == target),
             None,
         )
+
+    target_label = ""
+    if isinstance(task, dict):
+        from ouroboros.project_dialogue import routing_target_label
+
+        target_label = routing_target_label(
+            ctx.DRIVE_ROOT,
+            "steer_task",
+            target,
+            task=task,
+            project_id=str(task.get("project_id") or ""),
+        )
+
+    # Refuse before staging, but only after the active task identity has been
+    # resolved so the durable receipt and owner notice use the same event-time
+    # human label as a successful delivery.
+    if _refuse_steering_while_cancelling(
+        ctx, evt, target, chat_id, target_label=target_label,
+    ):
+        return
 
     def _matches_chat(t: Dict[str, Any]) -> bool:
         try:
@@ -145,14 +169,16 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
         # this chat. Tell the owner so the agent/owner can answer or spawn instead.
         client_message_id = str(evt.get("client_message_id") or "").strip()
         _emit_routing_receipt(
-            ctx, evt, action="steer_task", target=target, status="needs_manual_target",
+            ctx, evt, action="steer_task", target=target, target_label=target_label,
+            status="needs_manual_target",
             reason="target_not_steerable",
         )
         if not client_message_id and chat_id:
             try:
                 ctx.send_with_budget(
                     chat_id,
-                    f"⚠️ Couldn't steer task {target} — it isn't running in this chat anymore "
+                    f"⚠️ Couldn't steer task {target_label or '(no longer available)'} — it isn't running "
+                    "in this chat anymore "
                     "(it may have finished). I'll answer here or start a new task instead.",
                 )
             except Exception:
@@ -183,7 +209,8 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
                 and str(getattr(direct_agent, "_current_task_id", "") or "") == target
             ):
                 _emit_routing_receipt(
-                    ctx, evt, action="steer_task", target=target, status="needs_manual_target",
+                    ctx, evt, action="steer_task", target=target, target_label=target_label,
+                    status="needs_manual_target",
                     reason="target_closed",
                 )
                 return
@@ -214,7 +241,8 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
             )
             if live_meta is None and not still_pending:
                 _emit_routing_receipt(
-                    ctx, evt, action="steer_task", target=target, status="needs_manual_target",
+                    ctx, evt, action="steer_task", target=target, target_label=target_label,
+                    status="needs_manual_target",
                     reason="target_finished",
                 )
                 return
@@ -222,7 +250,8 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
             active_fence = ACCEPTANCE_FENCES.get(fence_root)
             if isinstance(active_fence, dict) and str(active_fence.get("status") or "") == "sealed":
                 _emit_routing_receipt(
-                    ctx, evt, action="steer_task", target=target, status="needs_manual_target",
+                    ctx, evt, action="steer_task", target=target, target_label=target_label,
+                    status="needs_manual_target",
                     reason="acceptance_fence_sealed",
                 )
                 return
@@ -234,7 +263,9 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
         # notice run AFTER the lock is released (a chat send is not something
         # to hold the global queue lock for — and the old `return` skipped the
         # notice entirely).
-        if _refuse_steering_while_cancelling(ctx, evt, target, chat_id, notify=False):
+        if _refuse_steering_while_cancelling(
+            ctx, evt, target, chat_id, target_label=target_label, notify=False,
+        ):
             cancel_pending_refused = True
         else:
             if not write_owner_message(
@@ -265,7 +296,8 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
     except Exception:
         log.warning("steer_task delivery failed for task %s", target, exc_info=True)
         _emit_routing_receipt(
-            ctx, evt, action="steer_task", target=target, status="needs_manual_target",
+            ctx, evt, action="steer_task", target=target, target_label=target_label,
+            status="needs_manual_target",
             reason="mailbox_write_failed",
         )
     finally:
@@ -287,7 +319,8 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
             try:
                 ctx.send_with_budget(
                     chat_id,
-                    f"⚠️ Couldn't steer task {target} — its cancellation is pending "
+                    f"⚠️ Couldn't steer task {target_label or '(no longer available)'} — "
+                    "its cancellation is pending "
                     "(the supervisor is tearing it down). Wait for the settled "
                     "outcome or start a new task.",
                 )
@@ -302,6 +335,7 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
             evt,
             action="steer_task",
             target=target,
+            target_label=target_label,
             status="delivered",
             detail=attachment_report,
             attachment_manifest=staged_manifest if uploads else None,
@@ -310,7 +344,8 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
             try:
                 ctx.send_with_budget(
                     chat_id,
-                    f"📎 Attachment staging report for task {target}:\n{attachment_report}",
+                    f"📎 Attachment staging report for {target_label or 'Task'}:\n"
+                    f"{attachment_report}",
                 )
             except Exception:
                 log.debug("steer_task attachment report notice failed", exc_info=True)

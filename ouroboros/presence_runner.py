@@ -20,9 +20,18 @@ from ouroboros.utils import append_jsonl, read_json_dict, utc_now_iso
 
 
 class PresenceTurnError(ValueError):
-    def __init__(self, code: str, field: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        field: str,
+        *,
+        attachment_manifest: Sequence[Mapping[str, Any]] = (),
+    ) -> None:
         self.code = str(code or "presence_turn_failed")
         self.field = str(field or "presence_turn")
+        self.attachment_manifest = [
+            dict(row) for row in attachment_manifest if isinstance(row, Mapping)
+        ]
         super().__init__(f"{self.code}: {self.field}")
 
 
@@ -319,6 +328,23 @@ def _build_task(
         task_id,
         [{"path": str(path), "label": path.name} for path in staged_files],
     )
+    if manifest:
+        from ouroboros.artifacts import (
+            attachment_manifest_has_rejections,
+            remove_staged_attachments,
+        )
+
+        if attachment_manifest_has_rejections(manifest):
+            # Presence is an initial-task ingress, so its default is the same
+            # atomic admission as gateway-created roots.  Keep the complete
+            # ordinal-preserving report, but remove every sibling copied by
+            # this failed admission before dialogue or model execution begins.
+            remove_staged_attachments(manifest)
+            raise PresenceTurnError(
+                "presence_attachment_admission_rejected",
+                "staged_files",
+                attachment_manifest=manifest,
+            )
     if manifest:
         from ouroboros.gateway.tasks import _render_attachment_lines
 

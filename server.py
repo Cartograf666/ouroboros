@@ -414,6 +414,15 @@ def _route_project_chat_to_running_task(
                 (row for row in list(getattr(ctx, "PENDING", []) or []) if str(row.get("id") or "") == tid),
                 {},
             )
+        from ouroboros.project_dialogue import routing_target_label
+
+        target_label = routing_target_label(
+            ctx.DRIVE_ROOT,
+            "mailbox_delivery",
+            tid,
+            task=task_obj or candidate,
+            project_id=str((task_obj or candidate).get("project_id") or ""),
+        )
         from ouroboros.owner_mailbox import write_owner_message
         from supervisor.queue import (
             ACCEPTANCE_FENCES,
@@ -548,11 +557,14 @@ def _route_project_chat_to_running_task(
                 dict(item) for item in staged_manifest if isinstance(item, dict)
             ]
             task_metadata["_attachment_report"] = attachment_report
+        if isinstance(task_metadata, dict):
+            task_metadata["_routing_target_label"] = target_label
         if attachment_report:
             try:
                 ctx.send_with_budget(
                     chat_id,
-                    f"📎 Attachment staging report for task {tid}:\n{attachment_report}",
+                    f"📎 Attachment staging report for {target_label or 'Task'}:\n"
+                    f"{attachment_report}",
                 )
             except Exception:
                 log.debug("Mailbox attachment report notice failed for %s", tid, exc_info=True)
@@ -1479,6 +1491,10 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
                 client_message_id=client_message_id,
                 action="mailbox_delivery",
                 target=routed_to_task,
+                target_label=(
+                    str(task_metadata.get("_routing_target_label") or "")
+                    if isinstance(task_metadata, dict) else ""
+                ),
                 status="delivered",
                 detail=(
                     str(task_metadata.get("_attachment_report") or "")

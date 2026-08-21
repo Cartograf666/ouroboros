@@ -478,10 +478,13 @@ async def _api_presence_turn(request: Request) -> JSONResponse:
     except json.JSONDecodeError:
         return _json_error("invalid json", 400)
     except (PresenceAdmissionError, PresenceTurnError) as exc:
-        return JSONResponse(
-            {"ok": False, "error": str(exc), "code": exc.code, "field": exc.field},
-            status_code=409,
-        )
+        payload = {"ok": False, "error": str(exc), "code": exc.code, "field": exc.field}
+        attachment_manifest = getattr(exc, "attachment_manifest", None)
+        if isinstance(attachment_manifest, list):
+            payload["attachment_manifest"] = [
+                dict(row) for row in attachment_manifest if isinstance(row, dict)
+            ]
+        return JSONResponse(payload, status_code=409)
     except (OSError, ValueError) as exc:
         return _json_error(str(exc), 400)
     except Exception as exc:
