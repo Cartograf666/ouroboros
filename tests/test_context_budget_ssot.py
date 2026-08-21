@@ -77,7 +77,8 @@ def test_call_sites_import_the_ssot_names():
 
     ctx_recent_src = _src("ouroboros/context.py")
     assert "MAX_RECENT_CHAT_TAIL" in ctx_recent_src
-    assert "consolidated_offset > 0" in ctx_recent_src
+    assert "read_unconsolidated_chat" in ctx_recent_src
+    assert "last_consolidated_offset" in _src("ouroboros/memory.py")
 
     consc_src = _src("ouroboros/consciousness.py")
     for name in ("BG_CONTEXT_MAX_CHARS", "BG_CONTEXT_WARN_CHARS", "BG_STATE_JSON_WARN_CHARS"):

@@ -1070,7 +1070,7 @@ def _route_to_project(
     from ouroboros.projects_registry import get_project
 
     msg = str(message or "")
-    if not msg:
+    if not msg.strip():
         return "⚠️ TOOL_ARG_ERROR (route_to_project): message is required"
     cached = _cached_swarm_handoff(ctx)
     if cached:
