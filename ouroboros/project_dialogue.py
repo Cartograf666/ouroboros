@@ -1,9 +1,10 @@
-"""Small read model for canonical Project dialogue and routing annotations.
+"""Canonical Project dialogue projections and routing annotations.
 
 Project conversion stores a reference to the original owner row on the immutable
 task binding. A Project room projects that row instead of copying it into
-``chat.jsonl``. ``chat_annotations.jsonl`` is presentation-only: it never owns a
-routing decision or Project state.
+``chat.jsonl``. Terminal task projections append to that same canonical biography;
+``chat_annotations.jsonl`` remains presentation-only and never owns routing or
+Project state.
 """
 
 from __future__ import annotations
@@ -413,6 +414,140 @@ def completion_status_label(result: Dict[str, Any], event: Dict[str, Any]) -> st
     return status.replace("_", " ").title() or "Finished"
 
 
+def task_summary_exists(drive_root: Any, summary_id: str) -> bool:
+    """Whether one canonical summary identity already exists in live/archive chat."""
+    sid = str(summary_id or "").strip()
+    if not sid:
+        return False
+    root = pathlib.Path(drive_root)
+    paths = [*sorted((root / "archive").glob("chat_*.jsonl")), root / "logs" / "chat.jsonl"]
+    legacy_task_id = sid.removeprefix("task-summary:") if sid.startswith("task-summary:") else ""
+    return any(
+        str(row.get("summary_id") or "") == sid
+        or bool(legacy_task_id and row.get("type") == "task_summary"
+                and str(row.get("task_id") or "") == legacy_task_id)
+        for path in paths for row in iter_jsonl_objects(path)
+    )
+
+
+def append_canonical_task_summary(drive_root: Any, row: Dict[str, Any]) -> bool:
+    """Append one idempotent task-summary row to the canonical biography."""
+    summary_id = str(row.get("summary_id") or "").strip()
+    if not summary_id:
+        return False
+    path = pathlib.Path(drive_root) / "logs" / "chat.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = jsonl_append_lock_path(path)
+    lock_fd = acquire_exclusive_file_lock(lock_path, timeout_sec=2.0, stale_sec=10.0)
+    if lock_fd is None:
+        return False
+    try:
+        if task_summary_exists(drive_root, summary_id):
+            return False
+        data = (json.dumps(dict(row), ensure_ascii=False) + "\n").encode("utf-8")
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return True
+    finally:
+        release_exclusive_file_lock(lock_path, lock_fd)
+
+
+def _append_terminal_task_projection(
+    drive_root: Any, task_id: str, task: Dict[str, Any], result: Dict[str, Any],
+    task_done_event: Dict[str, Any],
+) -> bool:
+    """Project one terminal child result into canonical cognition, without an LLM."""
+    from ouroboros.task_results import resolve_task_lineage
+    from ouroboros.task_status import SETTLED_STATUSES
+
+    tid = str(task_id or "").strip()
+    task = task if isinstance(task, dict) else {}
+    result = result if isinstance(result, dict) else {}
+    event = task_done_event if isinstance(task_done_event, dict) else {}
+    if not tid or any(bool(row.get("_ephemeral") or row.get("ephemeral_decision"))
+                      for row in (task, result, event)):
+        return False
+    lineage = resolve_task_lineage(
+        tid,
+        metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
+        root_task_id=result.get("root_task_id") or task.get("root_task_id"),
+        parent_task_id=result.get("parent_task_id") or task.get("parent_task_id"),
+        delegation_role=result.get("delegation_role") or task.get("delegation_role"),
+        original_task_id=result.get("original_task_id") or task.get("original_task_id"),
+        timeout_retry_from=result.get("timeout_retry_from") or task.get("timeout_retry_from"),
+    )
+    status = str(result.get("status") or event.get("status") or "").strip().lower()
+    if status not in SETTLED_STATUSES:
+        return False
+    is_root = bool(lineage["is_root_task"])
+    if is_root:
+        from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
+
+        checkpoint = result.get("root_phase_checkpoint")
+        phase = str(checkpoint.get("post_task_synthesis") or "") if isinstance(checkpoint, dict) else ""
+        summary_id = f"task-summary:{tid}"
+        # A normal root's existing authored summary owns this identity. While
+        # its async synthesis is pending/running, do not pre-empt the LLM call.
+        if task_summary_exists(drive_root, summary_id) or post_task_synthesis_is_open(phase):
+            return False
+        summary_kind = "terminal_root_projection"
+    else:
+        summary_id = f"task-terminal:{tid}"
+        summary_kind = "terminal_result_projection"
+    parent_id = str(lineage.get("parent_task_id") or "")
+    root_id = str(lineage.get("root_task_id") or tid)
+    from ouroboros.project_facts import resolve_project_id
+
+    project_id = resolve_project_id({**task, **result})
+    role = str(result.get("role") or task.get("role") or "child")
+    reason = str(result.get("reason_code") or event.get("reason_code") or "")
+    outcome = completion_status_label(result, event)
+    excerpt = _completion_excerpt(result)
+    details = f'Details: get_task_result(task_id="{tid}")'
+    text = (
+        f"{outcome}. role={role}; parent={parent_id or 'unknown'}; "
+        f"root={root_id}; project={project_id or 'none'}."
+    )
+    if excerpt:
+        text += f" {excerpt}"
+    if reason:
+        text += f" Reason: {reason}."
+    text += f" {details}"
+    result_ref = {"kind": "task_result", "task_id": tid, "reader": "get_task_result"}
+    return append_canonical_task_summary(drive_root, {
+        "ts": str(event.get("ts") or result.get("ts") or utc_now_iso()),
+        "direction": "system", "type": "task_summary",
+        "summary_kind": summary_kind,
+        "summary_id": summary_id, "task_id": tid,
+        "parent_task_id": parent_id, "root_task_id": root_id,
+        "project_id": project_id, "chat_id": int(event.get("chat_id") or task.get("chat_id") or 0),
+        "delegation_role": str(result.get("delegation_role") or task.get("delegation_role") or ""),
+        "role": role, "status": status, "outcome": outcome,
+        "outcome_axes": result.get("outcome_axes") or event.get("outcome_axes") or {},
+        "reason_code": reason, "result_ref": result_ref, "text": text,
+    })
+
+
+def append_terminal_task_projection(
+    drive_root: Any, task_id: str, task: Dict[str, Any], result: Dict[str, Any],
+    task_done_event: Dict[str, Any],
+) -> bool:
+    """Fail-soft terminal projection; lifecycle cleanup must always continue."""
+    try:
+        return _append_terminal_task_projection(
+            drive_root, task_id, task, result, task_done_event,
+        )
+    except Exception:
+        log.warning("Failed to append canonical terminal projection for %s", task_id, exc_info=True)
+        return False
+
+
 def _completion_excerpt(result: Dict[str, Any]) -> str:
     for key in ("summary", "result", "error"):
         text = " ".join(str(result.get(key) or "").split())
@@ -480,6 +615,8 @@ def enqueue_project_completion_summary(
 
 __all__ = [
     "append_chat_annotation",
+    "append_canonical_task_summary",
+    "append_terminal_task_projection",
     "build_owner_message_ref",
     "chat_annotation_receipt",
     "entry_matches_source_ref",
@@ -493,4 +630,5 @@ __all__ = [
     "routing_target_label",
     "resolve_owner_message_source",
     "source_refs_for_project",
+    "task_summary_exists",
 ]

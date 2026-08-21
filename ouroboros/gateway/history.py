@@ -673,6 +673,11 @@ def _make_thread_filter(
             isinstance(entry, dict)
             and str(entry.get("type") or "") == "project_completion_summary"
         )
+        is_cognitive_projection = bool(
+            isinstance(entry, dict)
+            and str(entry.get("summary_kind") or "")
+            in {"terminal_result_projection", "terminal_root_projection"}
+        )
         if thread_id in project_chat_ids:
             # The compact host-stamped completion belongs only to Main; the
             # Project thread already owns the complete task timeline/result.
@@ -688,6 +693,8 @@ def _make_thread_filter(
         # child traffic, ordinary summaries and raw dialogue stay in Project.
         if is_root_completion:
             return entry_chat not in project_chat_ids
+        if is_cognitive_projection:
+            return False
         if entry_chat in project_chat_ids or bound_chat > 0:
             return False
         return entry_chat not in project_chat_ids

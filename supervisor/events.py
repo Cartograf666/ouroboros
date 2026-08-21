@@ -1690,7 +1690,14 @@ def _finish_task_done_dispatch(
 ) -> None:
     """Notify lineage, release queue state, and preserve terminal compatibility."""
 
-    from ouroboros.project_dialogue import enqueue_project_completion_summary
+    from ouroboros.project_dialogue import (
+        append_terminal_task_projection,
+        enqueue_project_completion_summary,
+    )
+
+    append_terminal_task_projection(
+        ctx.DRIVE_ROOT, str(task_id or ""), task, final_task_result, task_done_event,
+    )
 
     enqueue_project_completion_summary(
         ctx.DRIVE_ROOT, evt, str(task_id or ""), task, final_task_result, task_done_event,
