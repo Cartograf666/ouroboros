@@ -284,6 +284,7 @@ def append_chat_annotation(
     reason: str = "",
     detail: str = "",
     options: Any = None,
+    attachment_manifest: Any = None,
 ) -> bool:
     """Append one compact UI annotation; no semantic routing state is stored."""
     message_id = str(client_message_id or "").strip()
@@ -305,6 +306,10 @@ def append_chat_annotation(
         row["detail"] = str(detail)[:1000]
     if isinstance(options, list):
         row["options"] = [dict(item) for item in options[:100] if isinstance(item, dict)]
+    if isinstance(attachment_manifest, list):
+        row["attachment_manifest"] = [
+            dict(item) for item in attachment_manifest if isinstance(item, dict)
+        ]
     path = pathlib.Path(drive_root) / "logs" / _ANNOTATIONS_NAME
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = jsonl_append_lock_path(path)

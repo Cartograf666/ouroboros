@@ -268,16 +268,17 @@ def retry_reset(task_drive: Any, canonical_drive_root: Any, task_id: str, *, rea
     """The ONE shared same-id requeue reset (§19.7.2 item 11).
 
     EVERY same-id requeue producer — the reaper timeout path AND the
-    ``supervisor/workers.py`` crash-requeue — calls this: delete the task
-    mailbox (the executable control carrier) and archive the current
-    ``owner_hurry`` block into history. Fail-soft; never raises.
+    ``supervisor/workers.py`` crash-requeue — calls this.  Attempt-local
+    mailbox controls are revoked, while durable owner text and its ack ledger
+    survive for canonical/replay continuity.  The current ``owner_hurry``
+    block is archived into history. Fail-soft; never raises.
     """
     try:
-        from ouroboros.owner_mailbox import cleanup_task_mailbox
+        from ouroboros.owner_mailbox import reset_attempt_controls_for_retry
 
-        cleanup_task_mailbox(pathlib.Path(task_drive), task_id)
+        reset_attempt_controls_for_retry(pathlib.Path(task_drive), task_id)
     except Exception:
-        log.debug("owner_hurry retry-reset mailbox cleanup failed for %s", task_id, exc_info=True)
+        log.debug("owner_hurry retry-reset control reset failed for %s", task_id, exc_info=True)
     try:
         archive_current(pathlib.Path(canonical_drive_root), task_id, reason=reason)
     except Exception:

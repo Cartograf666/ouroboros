@@ -69,6 +69,7 @@ def _render_external_work_order(task: Mapping[str, Any]) -> str:
         context_sections.append("INHERITED CALLER AUTHORITY CONTEXT\n" + inherited_context)
     represented_keys = {
         "objective", "context", "expected_output", "constraints", "acceptance_claims",
+        "attachment_manifest",
     }
     remaining_contract = {
         key: value for key, value in contract.items() if key not in represented_keys
@@ -80,6 +81,7 @@ def _render_external_work_order(task: Mapping[str, Any]) -> str:
         ("CONSTRAINTS / NON-GOALS", task.get("constraints") or contract.get("constraints")),
         ("ACCEPTANCE CLAIMS", contract.get("acceptance_claims")),
         ("TASK CONTRACT AUTHORITY", remaining_contract),
+        ("INHERITED TASK INPUTS", contract.get("attachment_manifest")),
     ]
     authority = {
         "task_id": str(task.get("id") or ""),

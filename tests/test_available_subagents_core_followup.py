@@ -333,6 +333,62 @@ def test_awake_loop_durably_acks_injected_mailbox_before_next_sleep(tmp_path, me
     assert expected in rendered
 
 
+def test_delegate_owner_wake_ack_replays_on_fresh_physical_attempt(tmp_path):
+    import ouroboros.delegate_supervision as supervision
+    from ouroboros.owner_mailbox import write_owner_message
+
+    exact = "delegate owner bytes  \n"
+    assert write_owner_message(tmp_path, exact, "child1", msg_id="owner-1")
+    first_ctx = SimpleNamespace(
+        task_id="child1", task_attempt=1, drive_root=tmp_path,
+        budget_drive_root=str(tmp_path), task_metadata={},
+    )
+    wake = json.loads(supervision.supervised_wait(
+        first_ctx, "run-1",
+        wait_once=lambda *_a, **_k: json.dumps({
+            "status": "no_progress", "run_id": "run-1", "last_seq": 0,
+        }),
+    ))
+    assert wake["wake_events"][0]["text"] == exact
+    assert supervision.acknowledge_pending_wake(first_ctx, wake)
+    assert supervision._addressed_wakes(first_ctx, supervision.supervision_checkpoint(first_ctx)) == []
+
+    successor = SimpleNamespace(**{**first_ctx.__dict__, "task_attempt": 2})
+    replay = supervision._addressed_wakes(
+        successor, supervision.supervision_checkpoint(successor),
+    )
+    assert [(row["msg_id"], row["text"]) for row in replay] == [
+        ("owner-1", exact),
+    ]
+
+
+def test_unacknowledged_delegate_wake_replays_before_successor_poll(tmp_path):
+    import ouroboros.delegate_supervision as supervision
+    from ouroboros.owner_mailbox import write_owner_message
+
+    assert write_owner_message(tmp_path, "pending exact", "child1", msg_id="owner-pending")
+    first_ctx = SimpleNamespace(
+        task_id="child1", task_attempt=1, drive_root=tmp_path,
+        budget_drive_root=str(tmp_path), task_metadata={},
+    )
+    first = json.loads(supervision.supervised_wait(
+        first_ctx, "run-1",
+        wait_once=lambda *_a, **_k: json.dumps({
+            "status": "no_progress", "run_id": "run-1", "last_seq": 0,
+        }),
+    ))
+    successor = SimpleNamespace(**{**first_ctx.__dict__, "task_attempt": 2})
+    assert supervision.acknowledge_pending_wake(successor)
+    replay = json.loads(supervision.supervised_wait(
+        successor, "run-1",
+        wait_once=lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("successor must replay before polling the harness")
+        ),
+    ))
+    assert replay["supervision_wake_id"] == first["supervision_wake_id"]
+    assert replay["wake_events"][0]["text"] == "pending exact"
+
+
 @pytest.mark.parametrize("control_kind", ["finalize_now", "hurry"])
 def test_sleeping_control_wakes_then_loop_routes_without_supervision_ack(tmp_path, control_kind):
     import ouroboros.delegate_supervision as supervision
@@ -361,6 +417,9 @@ def test_sleeping_control_wakes_then_loop_routes_without_supervision_ack(tmp_pat
     assert supervision.supervision_checkpoint(ctx)["pending_wake"]["mailbox_ids"] == []
     assert supervision.acknowledge_pending_wake(ctx, wake)
     assert acknowledged_task_message_ids(tmp_path, "child1") == set()
+    assert supervision._addressed_wakes(
+        ctx, supervision.supervision_checkpoint(ctx),
+    ) == []
 
     controls = _drain_incoming_messages(
         [], queue.Queue(), tmp_path, "child1", None, set(), owner_ctx=ctx,
@@ -434,3 +493,38 @@ def test_crash_handoff_does_not_replay_attempt_local_loop_controls(tmp_path):
     assert recovery._successor_pending_wake({
         "payload": {"status": "no_progress", "wake_events": [{"kind": KIND_HURRY}]},
     }) == {}
+
+
+def test_planned_restart_retry_reset_preserves_owner_not_controls(monkeypatch, tmp_path):
+    from ouroboros.owner_mailbox import (
+        KIND_HURRY,
+        drain_owner_entries,
+        write_owner_message,
+    )
+    from supervisor import queue as task_queue
+    from supervisor import workers
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    workers.init(repo, tmp_path, 1, 600, 1800, 100.0)
+    workers.WORKERS.clear()
+    workers.PENDING.clear()
+    workers.RUNNING.clear()
+    task = {"id": "child", "parent_task_id": "parent", "root_task_id": "parent"}
+    workers.RUNNING["child"] = {"task": task, "attempt": 1}
+    assert write_owner_message(tmp_path, "exact owner", "child", msg_id="owner-1")
+    assert write_owner_message(
+        tmp_path, "owner_hurry", "child", msg_id="hurry-1", kind=KIND_HURRY,
+    )
+    monkeypatch.setattr(task_queue, "persist_queue_snapshot", lambda *_a, **_k: True)
+
+    workers.kill_workers(
+        preserve_pending=True, preserve_running_task_ids={"child"},
+    )
+
+    assert [row["_attempt"] for row in workers.PENDING] == [2]
+    assert [(row["msg_id"], row["text"]) for row in drain_owner_entries(
+        tmp_path, "child", attempt_key=2,
+    )] == [("owner-1", "exact owner")]
+    workers.PENDING.clear()
+    workers.RUNNING.clear()

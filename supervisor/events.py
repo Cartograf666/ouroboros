@@ -65,6 +65,7 @@ def _emit_routing_receipt(
     reason: str = "",
     detail: str = "",
     options: Optional[list] = None,
+    attachment_manifest: Optional[list] = None,
     publish: bool = True,
 ) -> Dict[str, Any]:
     """Persist and publish one token-bound routing annotation receipt."""
@@ -87,6 +88,7 @@ def _emit_routing_receipt(
                     reason=reason,
                     detail=detail,
                     options=options,
+                    attachment_manifest=attachment_manifest,
                 )
                 else "failed"
             )
@@ -108,6 +110,10 @@ def _emit_routing_receipt(
         "annotation_status": annotation_status,
         "routing_token": routing_token,
     }
+    if attachment_manifest is not None:
+        receipt["attachment_manifest"] = [
+            dict(item) for item in attachment_manifest if isinstance(item, dict)
+        ]
     if not receipt["persisted"]:
         return receipt
     if publish:
@@ -118,6 +124,7 @@ def _emit_routing_receipt(
             target=target,
             status=effective_status,
             options=options,
+            attachment_manifest=attachment_manifest,
         )
     return receipt
 
@@ -130,6 +137,7 @@ def _publish_routing_ack(
     target: str,
     status: str,
     options: Optional[list] = None,
+    attachment_manifest: Optional[list] = None,
 ) -> None:
     """Publish a live non-bubble acknowledgement after durable authority exists."""
     try:
@@ -149,6 +157,8 @@ def _publish_routing_ack(
             }
             if options is not None:
                 ack_kwargs["options"] = options
+            if attachment_manifest is not None:
+                ack_kwargs["attachment_manifest"] = attachment_manifest
             ack(
                 chat_id,
                 **ack_kwargs,
@@ -1828,6 +1838,19 @@ def _finish_task_done_dispatch(
             )
     except Exception as exc:
         log.warning("Failed to store task result in events: %s", exc)
+    if task_id:
+        try:
+            from ouroboros.owner_mailbox import cleanup_task_mailbox
+            from ouroboros.task_status import SETTLED_STATUSES
+            from supervisor.queue import _task_drive_for_task
+
+            durable = load_task_result(ctx.DRIVE_ROOT, str(task_id)) or {}
+            if str(durable.get("status") or "") in SETTLED_STATUSES:
+                cleanup_task_mailbox(
+                    _task_drive_for_task(task or durable, str(task_id)), str(task_id),
+                )
+        except Exception:
+            log.warning("Failed to cleanup terminal owner mailbox for %s", task_id, exc_info=True)
 
 
 def _resolve_lifecycle_fault(
@@ -3138,6 +3161,10 @@ def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> Dict[str, Any
                 target=str(outcome.get("task_id") or task_id),
                 status="scheduled",
                 detail=str(outcome.get("source_note") or ""),
+                attachment_manifest=(
+                    list(outcome.get("attachment_manifest") or [])
+                    if isinstance(outcome.get("attachment_manifest"), list) else None
+                ),
                 publish=False,
             )
             admission_status = (
@@ -3168,6 +3195,7 @@ def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> Dict[str, Any
                     if admission_status == "scheduled"
                     else "Task is scheduled, but its owner-facing routing receipt was not confirmed."
                 ),
+                attachment_manifest=list(outcome.get("attachment_manifest") or []),
             )
             admission = stored.get("promotion_admission") if isinstance(stored, dict) else {}
             if (
@@ -3189,6 +3217,10 @@ def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> Dict[str, Any
                 action=receipt_action,
                 target=str(outcome.get("task_id") or task_id),
                 status="scheduled",
+                attachment_manifest=(
+                    list(outcome.get("attachment_manifest") or [])
+                    if isinstance(outcome.get("attachment_manifest"), list) else None
+                ),
             )
             if title:
                 _broadcast_task_named(
@@ -3215,7 +3247,18 @@ def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> Dict[str, Any
             reason="promote_chat_to_task_rejected",
         )
         supervisor_queue.release_task_admission(task_id, routing_token)
-        _persist_promote_rejection(ctx, evt, outcome)
+        if str(outcome.get("reason") or "") == "attachment_admission_rejected":
+            try:
+                from ouroboros.headless import remove_subagent_task_drive
+
+                remove_subagent_task_drive(
+                    ctx.DRIVE_ROOT,
+                    str(outcome.get("task_id") or task_id),
+                )
+            except Exception:
+                log.debug("Failed to clean rejected attachment task drive", exc_info=True)
+        else:
+            _persist_promote_rejection(ctx, evt, outcome)
         _emit_routing_receipt(
             ctx,
             evt,
@@ -3224,6 +3267,10 @@ def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> Dict[str, Any
             status="needs_manual_target",
             reason=str(outcome.get("reason") or "admission_rejected"),
             detail=str(outcome.get("detail") or ""),
+            attachment_manifest=(
+                list(outcome.get("attachment_manifest") or [])
+                if isinstance(outcome.get("attachment_manifest"), list) else None
+            ),
         )
         ctx.append_jsonl(
             ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",

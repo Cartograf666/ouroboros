@@ -1251,6 +1251,7 @@ def test_task_create_request_declares_executor_ref_contract():
         "memory_mode",
         "project_id",
         "attachments",
+        "allow_partial_attachments",
         "acceptance_claims",
         "allowed_resources",
         "resource_policy",
@@ -1270,6 +1271,16 @@ def test_task_create_request_declares_executor_ref_contract():
     ):
         assert required in request_keys
     assert TaskCreateRequest.__required_keys__ == frozenset({"description"})
+
+    from ouroboros.gateway.contracts import AttachmentManifestEntry, TaskCreateResponse
+
+    assert {
+        "ordinal", "status", "reason", "label", "root", "relpath",
+        "abs_path", "mime", "is_image",
+    } <= set(AttachmentManifestEntry.__annotations__)
+    assert {"ok", "task_id", "status", "reason_code", "error", "attachment_manifest"} <= set(
+        TaskCreateResponse.__annotations__
+    )
 
     executor_keys = set(ExecutorRef.__annotations__.keys())
     for required in ("type", "workspace_host_path", "workspace_backend_path", "network", "container_name", "path_mappings"):

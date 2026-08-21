@@ -311,13 +311,14 @@ def _addressable_root_tasks(ctx: Any, chat_id: Optional[int] = None) -> list:
 
 def _stage_mailbox_attachments(
     ctx: Any,
+    task_drive: pathlib.Path,
     task_id: str,
     task_metadata: Any,
     image_data: Any = None,
-) -> tuple[str, list]:
+) -> tuple[str, list, str]:
     """Stage one routed turn's files into the existing task artifact store.
 
-    Returns ``(attachment_note, staged_manifest)`` — the manifest is kept so a
+    Returns ``(attachment_note, staged_manifest, rendered_report)`` — the manifest is kept so a
     refused admission (the cancel-pending re-check inside the mailbox
     transaction) can remove exactly the files this call staged (GR2-9).
     """
@@ -344,14 +345,14 @@ def _stage_mailbox_attachments(
             log.warning("Unable to stage routed inline image for task %s", task_id, exc_info=True)
     try:
         if not uploads:
-            return "", []
+            return "", [], ""
         from ouroboros.artifacts import stage_task_attachments
         from ouroboros.gateway.tasks import _render_attachment_lines
 
-        manifest = stage_task_attachments(ctx.DRIVE_ROOT, task_id, uploads)
+        manifest = stage_task_attachments(task_drive, task_id, uploads)
         rendered = _render_attachment_lines(manifest)
         note = f"\n\n[ATTACHMENTS]\n{rendered}\n[END_ATTACHMENTS]" if rendered else ""
-        return note, manifest
+        return note, manifest, rendered
     finally:
         if temp_source is not None:
             try:
@@ -445,6 +446,8 @@ def _route_project_chat_to_running_task(
         task_drive = pathlib.Path(ctx.DRIVE_ROOT) if direct_lock_held else _task_drive_for_task(task_obj, tid)
         msg_id = f"{client_message_id}:{tid}" if client_message_id else None
         staged_manifest: list = []
+        attachment_report = ""
+        message_written = False
         cancel_refused_in_txn = False
 
         def _drop_staged_inputs() -> None:
@@ -470,8 +473,8 @@ def _route_project_chat_to_running_task(
             if cancel_pending(ctx.DRIVE_ROOT, tid):
                 log.info("Mailbox follow-up refused for %s: cancel pending (pre-staging)", tid)
                 return ""
-            attachment_note, staged_manifest = _stage_mailbox_attachments(
-                ctx, tid, task_metadata, image_data,
+            attachment_note, staged_manifest, attachment_report = _stage_mailbox_attachments(
+                ctx, task_drive, tid, task_metadata, image_data,
             )
             if direct_lock_held:
                 # AR2-6 (fable): the direct-agent lane used to skip the
@@ -515,6 +518,7 @@ def _route_project_chat_to_running_task(
                 ),
             ):
                 return ""
+            message_written = True
             if direct_lock_held:
                 direct_agent._owner_message_generation = int(
                     getattr(direct_agent, "_owner_message_generation", 0) or 0
@@ -534,8 +538,23 @@ def _route_project_chat_to_running_task(
                 # After the lock release: unlinking staged files is file I/O the
                 # global queue lock should not wait on.
                 _drop_staged_inputs()
+            elif staged_manifest and not message_written:
+                _drop_staged_inputs()
         if fence_generation_changed:
             persist_queue_snapshot(reason="acceptance_fence_owner_message")
+        if isinstance(task_metadata, dict) and staged_manifest:
+            task_metadata["_attachment_manifest"] = [
+                dict(item) for item in staged_manifest if isinstance(item, dict)
+            ]
+            task_metadata["_attachment_report"] = attachment_report
+        if attachment_report:
+            try:
+                ctx.send_with_budget(
+                    chat_id,
+                    f"📎 Attachment staging report for task {tid}:\n{attachment_report}",
+                )
+            except Exception:
+                log.debug("Mailbox attachment report notice failed for %s", tid, exc_info=True)
         return tid
     except Exception:
         log.debug("Mailbox follow-up routing failed; falling back to direct lane", exc_info=True)
@@ -1247,6 +1266,8 @@ def _record_routing_receipt(
     status: str,
     persist: bool = True,
     options: Optional[list] = None,
+    detail: str = "",
+    attachment_manifest: Optional[list] = None,
 ) -> None:
     """Emit a typed bubble-free ack and optionally persist its presentation state."""
     if persist:
@@ -1259,6 +1280,8 @@ def _record_routing_receipt(
                 action=action,
                 target=target,
                 status=status,
+                detail=detail,
+                attachment_manifest=attachment_manifest,
             )
         except Exception:
             log.debug("Routing annotation append failed", exc_info=True)
@@ -1273,6 +1296,8 @@ def _record_routing_receipt(
             }
             if options is not None:
                 ack_kwargs["options"] = options
+            if attachment_manifest is not None:
+                ack_kwargs["attachment_manifest"] = attachment_manifest
             ack(
                 chat_id,
                 **ack_kwargs,
@@ -1292,6 +1317,8 @@ def _record_routing_receipt(
                 }
                 if options is not None:
                     payload["options"] = options
+                if attachment_manifest is not None:
+                    payload["attachment_manifest"] = attachment_manifest
                 broadcast(payload)
     except Exception:
         log.debug("Routing receipt broadcast failed", exc_info=True)
@@ -1438,6 +1465,14 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
                 action="mailbox_delivery",
                 target=routed_to_task,
                 status="delivered",
+                detail=(
+                    str(task_metadata.get("_attachment_report") or "")
+                    if isinstance(task_metadata, dict) else ""
+                ),
+                attachment_manifest=(
+                    list(task_metadata.get("_attachment_manifest") or [])
+                    if isinstance(task_metadata, dict) else None
+                ),
             )
             return
 

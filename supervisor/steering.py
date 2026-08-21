@@ -67,12 +67,12 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
     from supervisor.events import _emit_routing_receipt
 
     target = str(evt.get("target_task_id") or "").strip()
-    message = str(evt.get("message") or "").strip()
+    message = str(evt.get("message") or "")
     try:
         chat_id = int(evt.get("chat_id") or 0)
     except (TypeError, ValueError):
         chat_id = 0
-    if not target or not message:
+    if not target or not message.strip():
         return
     # Phase A: refuse NEW steering writes while a cancellation is pending —
     # steering a task mid-teardown would race the kill and imply the task will
@@ -170,6 +170,7 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
     cancel_pending_refused = False
     active_fence = None
     staged_manifest: list = []
+    attachment_report = ""
     try:
         from supervisor.queue import ACCEPTANCE_FENCES, _queue_lock, _task_drive_for_task
         from ouroboros.owner_mailbox import write_owner_message, KIND_OWNER_TEXT
@@ -201,6 +202,7 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
             staged_manifest = stage_task_attachments(drive, target, uploads)
             rendered = _render_attachment_lines(staged_manifest)
             if rendered:
+                attachment_report = rendered
                 attachment_note = f"\n\n[ATTACHMENTS]\n{rendered}\n[END_ATTACHMENTS]"
         if not direct_active:
             _queue_lock.acquire()
@@ -270,16 +272,16 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
             _queue_lock.release()
         if direct_lock_held:
             direct_lock.release()
-    if cancel_pending_refused:
-        # GR2-9: the message was refused, so the inputs staged for it must not
-        # linger in the dying task's artifact store.
-        if staged_manifest:
+        if staged_manifest and not delivered:
             try:
                 from ouroboros.artifacts import remove_staged_attachments
 
                 remove_staged_attachments(staged_manifest)
             except Exception:
                 log.debug("staged-attachment cleanup failed for %s", target, exc_info=True)
+    if cancel_pending_refused:
+        # GR2-9: the message was refused, so the inputs staged for it must not
+        # linger in the dying task's artifact store.
         if chat_id:
             try:
                 ctx.send_with_budget(
@@ -294,4 +296,20 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
         if fence_generation_changed:
             ctx.persist_queue_snapshot(reason="acceptance_fence_owner_message")
         log.info("steer_task: delivered to task %s (chat %s) on drive %s", target, chat_id, drive)
-        _emit_routing_receipt(ctx, evt, action="steer_task", target=target, status="delivered")
+        _emit_routing_receipt(
+            ctx,
+            evt,
+            action="steer_task",
+            target=target,
+            status="delivered",
+            detail=attachment_report,
+            attachment_manifest=staged_manifest if uploads else None,
+        )
+        if attachment_report and chat_id:
+            try:
+                ctx.send_with_budget(
+                    chat_id,
+                    f"📎 Attachment staging report for task {target}:\n{attachment_report}",
+                )
+            except Exception:
+                log.debug("steer_task attachment report notice failed", exc_info=True)

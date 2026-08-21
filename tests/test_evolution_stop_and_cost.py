@@ -214,17 +214,30 @@ def _drive_hard_timeout(tmp_path, monkeypatch, *, evolution_enabled):
     return enqueued, emitted, written
 
 
-def test_hard_timeout_cleans_owner_mailbox(tmp_path, monkeypatch):
-    """Block 5 (v6.29.0 scope advisory): a hard-killed worker never reaches the
-    loop's mailbox cleanup, so the kill path must remove the task mailbox —
-    otherwise finalize_now files accumulate and a stale control would instantly
-    force-finalize a subagent retry reusing the same task id."""
+def test_hard_timeout_cleans_owner_mailbox_at_terminal_dispatch(tmp_path, monkeypatch):
+    """A hard kill preserves authority until its durable terminal is dispatched."""
     from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, _mailbox_path, write_owner_message
+    from supervisor import events as events_mod
 
     write_owner_message(tmp_path, "hard_timeout", "evo1", kind=KIND_FINALIZE_NOW)
     assert _mailbox_path(tmp_path, "evo1").exists()
 
-    _drive_hard_timeout(tmp_path, monkeypatch, evolution_enabled=False)
+    _enqueued, emitted, written = _drive_hard_timeout(
+        tmp_path, monkeypatch, evolution_enabled=False,
+    )
+    assert _mailbox_path(tmp_path, "evo1").exists()
+    done = next(evt for evt in emitted if evt.get("type") == "task_done")
+    task = {"id": "evo1", "type": "evolution", "chat_id": 7, "_attempt": 1}
+    ctx = SimpleNamespace(
+        DRIVE_ROOT=tmp_path, RUNNING={}, PENDING=[], WORKERS={},
+        send_with_budget=lambda *_a, **_k: None,
+        persist_queue_snapshot=lambda **_k: True,
+        bridge=SimpleNamespace(push_log=lambda _evt: None),
+    )
+    events_mod._finish_task_done_dispatch(
+        {}, ctx, task_id="evo1", worker_id=0, task=task,
+        final_task_result=written, task_done_event=done,
+    )
 
     assert not _mailbox_path(tmp_path, "evo1").exists()
 

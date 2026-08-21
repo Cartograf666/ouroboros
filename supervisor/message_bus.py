@@ -402,6 +402,7 @@ class LocalChatBridge:
         target: str = "",
         status: str = "accepted",
         options: Optional[List[Dict[str, Any]]] = None,
+        attachment_manifest: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Emit a typed routing receipt without creating an assistant bubble.
 
@@ -423,6 +424,10 @@ class LocalChatBridge:
         }
         if options is not None:
             payload["options"] = [dict(row) for row in options if isinstance(row, dict)]
+        if attachment_manifest is not None:
+            payload["attachment_manifest"] = [
+                dict(row) for row in attachment_manifest if isinstance(row, dict)
+            ]
         if self._broadcast_fn and not is_a2a_chat_id(chat_id):
             self._broadcast_fn(payload)
         if not is_a2a_chat_id(chat_id):

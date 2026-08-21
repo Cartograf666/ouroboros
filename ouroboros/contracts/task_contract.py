@@ -87,6 +87,37 @@ def normalize_bool(value: Any) -> bool:
     return bool(value)
 
 
+def normalize_attachment_manifest(value: Any) -> list[Dict[str, Any]]:
+    """Copy the additive complete attachment manifest into task authority.
+
+    The staging owner already sanitizes labels and rejection reasons.  This
+    normalizer keeps only the closed manifest vocabulary so a caller cannot use
+    the frozen task contract as an arbitrary metadata bag.
+    """
+
+    if not isinstance(value, list):
+        return []
+    rows: list[Dict[str, Any]] = []
+    allowed = (
+        "ordinal", "status", "reason", "label", "root", "relpath",
+        "abs_path", "mime", "is_image",
+    )
+    for index, item in enumerate(value):
+        if not isinstance(item, Mapping):
+            continue
+        row = {key: item[key] for key in allowed if key in item}
+        try:
+            row["ordinal"] = max(0, int(row.get("ordinal", index)))
+        except (TypeError, ValueError):
+            row["ordinal"] = index
+        status = str(row.get("status") or "staged")
+        row["status"] = status if status in {"staged", "rejected"} else "rejected"
+        row["reason"] = str(row.get("reason") or "")
+        row["label"] = str(row.get("label") or f"attachment {index + 1}")
+        rows.append(row)
+    return rows
+
+
 def _opt_nonneg_int(value: Any) -> Any:
     """A non-negative int, or None when unset/blank (meaning 'use the config cap')."""
     if value is None or (isinstance(value, str) and not value.strip()):
@@ -475,6 +506,11 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
             if "context_requires_self_body_docs" in merged
             else task.get("context_requires_self_body_docs", metadata.get("context_requires_self_body_docs"))
         ),
+        "attachment_manifest": normalize_attachment_manifest(
+            merged.get("attachment_manifest")
+            if merged.get("attachment_manifest") is not None
+            else task.get("attachments")
+        ),
         "workspace": {
             "root": workspace_root,
             "mode": workspace_mode,
@@ -532,4 +568,4 @@ def attach_task_contract(task: Dict[str, Any]) -> Dict[str, Any]:
     return task
 
 
-__all__ = ["answer_protocol_active", "attach_task_contract", "build_task_contract", "effective_acceptance_claims", "normalize_acceptance_claims", "normalize_allowed_resources", "normalize_answer_protocol", "normalize_bool", "normalize_budget_profile", "normalize_delegation_budget", "normalize_disabled_tools", "normalize_resource_policy"]
+__all__ = ["answer_protocol_active", "attach_task_contract", "build_task_contract", "effective_acceptance_claims", "normalize_acceptance_claims", "normalize_allowed_resources", "normalize_answer_protocol", "normalize_attachment_manifest", "normalize_bool", "normalize_budget_profile", "normalize_delegation_budget", "normalize_disabled_tools", "normalize_resource_policy"]

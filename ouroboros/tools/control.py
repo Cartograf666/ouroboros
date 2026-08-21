@@ -1069,7 +1069,7 @@ def _route_to_project(
     from ouroboros.project_facts import explicit_project_id_ok, sanitize_project_id
     from ouroboros.projects_registry import get_project
 
-    msg = str(message or "").strip()
+    msg = str(message or "")
     if not msg:
         return "⚠️ TOOL_ARG_ERROR (route_to_project): message is required"
     cached = _cached_swarm_handoff(ctx)
@@ -1213,13 +1213,21 @@ def _steer_task(ctx: ToolContext, task_id: str, message: str) -> str:
             "⚠️ TOOL_ARG_ERROR (steer_task): task_id is required — pick one from "
             "current_chat.running_tasks (or promote_chat_to_task to start new work)."
         )
-    if not msg:
+    if not msg.strip():
         return "⚠️ TOOL_ARG_ERROR (steer_task): message is required."
     try:
         current_chat_id = int(getattr(ctx, "current_chat_id", None) or 0)
     except (TypeError, ValueError):
         current_chat_id = 0
     _md = getattr(ctx, "task_metadata", None)
+    # The model chooses the target, but the host transports the exact owner
+    # bytes captured at ingress.  A model-authored paraphrase must not replace
+    # the owner's steering text.  Non-owner/internal calls have no origin text
+    # and retain the explicit tool argument.
+    if isinstance(_md, dict) and isinstance(_md.get("origin_message_text"), str):
+        exact_owner_text = str(_md.get("origin_message_text") or "")
+        if exact_owner_text.strip():
+            msg = exact_owner_text
     client_message_id = str((_md.get("client_message_id") if isinstance(_md, dict) else "") or "").strip()
     routing_contract = (
         _md.get("routing_contract")
@@ -1245,10 +1253,14 @@ def _steer_task(ctx: ToolContext, task_id: str, message: str) -> str:
     mode, receipt = _emit_and_wait_for_routing(ctx, evt)
     status = str(receipt.get("status") or "unconfirmed")
     if status == "delivered":
-        return (
+        confirmation = (
             f"✉️ Steering task {target}: mailbox delivery is durably confirmed ({mode}). "
             "The task receives it at its next checkpoint."
         )
+        detail = str(receipt.get("detail") or "")
+        if detail:
+            confirmation += f"\n\n[ATTACHMENTS]\n{detail}\n[END_ATTACHMENTS]"
+        return confirmation
     if status in {"rejected", "needs_manual_target"}:
         return (
             f"⚠️ STEER_REJECTED: task {target} was not steered "
@@ -1446,6 +1458,7 @@ def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
                 # requested child deadline whenever the parent carried one of its own.
                 "deadline_at": narrowed_deadline_at,
                 "delegation_budget": delegation_budget,
+                "attachment_manifest": spec.get("attachment_manifest") or [],
                 # Same lesson for the criteria carriers, re-stated even when EMPTY:
                 # without these, the parent's claims/criteria leak into every child and
                 # child verify receipts would "support" claims the child never owned.
@@ -1454,6 +1467,7 @@ def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
             } if isinstance(parent_contract, dict) else {
                 "delegation_budget": delegation_budget,
                 "acceptance_claims": child_claims,
+                "attachment_manifest": spec.get("attachment_manifest") or [],
             },
         },
     })
@@ -1813,6 +1827,20 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         tid, status_drive_root, memory_mode, parent_project_id)
     if _drive_err:
         return _drive_err
+    inherited_manifest = (
+        parent_contract.get("attachment_manifest")
+        if isinstance(parent_contract, dict) else []
+    )
+    child_attachment_manifest: list[dict] = []
+    if isinstance(inherited_manifest, list) and inherited_manifest:
+        from ouroboros.artifacts import materialize_inherited_attachment_manifest
+
+        child_attachment_manifest, attachment_error = materialize_inherited_attachment_manifest(
+            inherited_manifest, child_drive or status_drive_root, tid,
+        )
+        if attachment_error:
+            shutil.rmtree(task_state_dir(status_drive_root, tid), ignore_errors=True)
+            return f"⚠️ SUBTASK_ATTACHMENT_ERROR: {attachment_error}"
 
     # C3.1: propagate and narrow the parent's typed delegation intent.
     child_delegation_budget = child_budget_for_schedule(
@@ -1830,6 +1858,7 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         "parent_task_id": parent_task_id, "root_task_id": root_task_id, "session_id": session_id,
         "child_delegation_budget": child_delegation_budget, "deadline_at": str(deadline_at or ""),
         "acceptance_claims": fields["acceptance_claims"],
+        "attachment_manifest": child_attachment_manifest,
     })
     # The requested-status envelope carries the REQUEST. Its derived half stays
     # empty until dispatch fills it, so a queued child's public description never
