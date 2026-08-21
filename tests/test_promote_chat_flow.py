@@ -85,11 +85,23 @@ def test_cat_router_preview_promote_first_request_and_direct_harness_keep_full_a
     verification_ledger = "VERIFICATION_LEDGER_BLOCKER"
     verification_receipt = "CANONICAL_RECEIPT_FAILED"
     future_terminal_fact = "FUTURE_TERMINAL_AUTHORITY_FIELD"
+    final_answer = "FINAL_ANSWER_TERMINAL_FACT"
+    non_final_rows = "NON_FINAL_ROWS_TERMINAL_FACT"
+    mutation_evidence = "MUTATION_EVIDENCE_TERMINAL_FACT"
+    plan_review_state = "PLAN_REVIEW_STATE_TERMINAL_FACT"
     process_evidence = (
         "RAW_LOOP_TRANSCRIPT_MUST_NOT_BE_INHERITED",
         "UNRELATED_ROUTING_METADATA_MUST_NOT_BE_INHERITED",
         "RAW_LLM_TRACE_MUST_NOT_BE_INHERITED",
+        "RAW_REVIEW_EVIDENCE_MUST_NOT_BE_INHERITED",
+        "RAW_REVIEW_PROJECTION_MUST_NOT_BE_INHERITED",
+        "RAW_TRACE_REFS_MUST_NOT_BE_INHERITED",
+        "RAW_ROOT_PHASE_CHECKPOINT_MUST_NOT_BE_INHERITED",
     )
+    excluded_process_fields = (
+        "review_evidence", "review_projection", "trace_refs", "root_phase_checkpoint",
+    )
+    process_padding = "P" * 12_000
     predecessor = {
         "task_id": predecessor_id,
         "status": "cancelled",
@@ -103,9 +115,25 @@ def test_cat_router_preview_promote_first_request_and_direct_harness_keep_full_a
         "delegated_runs_unreconciled": [delegated_custody],
         "verification_ledger": {"entries": [{"evidence": verification_ledger}]},
         "future_terminal_fact": {"detail": future_terminal_fact},
+        "final_answer": final_answer,
+        "non_final_rows": [{"reason": non_final_rows}],
+        "mutation_evidence": {"summary": mutation_evidence},
+        "plan_review_state": {
+            "schema_version": 2,
+            "current_attempt": {"status": "closed", "decision": plan_review_state},
+            "waves": [],
+        },
         "loop_outcome": {"final_text": process_evidence[0] * 500},
         "metadata": {"main_routing_manifest": {"raw": process_evidence[1]}},
         "llm_trace": {"reasoning_notes": [process_evidence[2]]},
+        "review_evidence": {"reasoning_notes": [process_evidence[3] + process_padding]},
+        "review_projection": {
+            "panels": [{"raw_response": process_evidence[4] + process_padding}],
+        },
+        "trace_refs": {"tool_log": process_evidence[5] + process_padding},
+        "root_phase_checkpoint": {
+            "post_task_synthesis": {"raw_output": process_evidence[6] + process_padding},
+        },
         "project_id": "cat-tower",
         "task_contract": {
             "objective": "o" * 700 + tail,
@@ -119,6 +147,13 @@ def test_cat_router_preview_promote_first_request_and_direct_harness_keep_full_a
     (result_dir / f"{predecessor_id}.json").write_text(
         json.dumps(predecessor), encoding="utf-8",
     )
+    assert len(json.dumps(predecessor["plan_review_state"])) < 1_000
+    assert len(json.dumps({
+        key: predecessor[key]
+        for key in (
+            "loop_outcome", "metadata", "llm_trace", *excluded_process_fields,
+        )
+    })) > 40_000
     append_verification_receipt(tmp_path, predecessor_id, {
         "criterion_id": "canonical-receipt", "status": "fail",
         "evidence": verification_receipt,
@@ -194,6 +229,7 @@ def test_cat_router_preview_promote_first_request_and_direct_harness_keep_full_a
         "id": "cat-nested", "objective": "Inspect the Cat implementation",
         "task_contract": child_contract,
     })
+    assert len(nested_work_order) < 40_000
     assert child_contract["predecessor_authority"] == task["predecessor_authority"]
 
     surfaces = (rendered, retrieved, direct_harness, nested_work_order)
@@ -201,11 +237,14 @@ def test_cat_router_preview_promote_first_request_and_direct_harness_keep_full_a
         for marker in (
             tail, result_tail, artifact_error, artifact_finalized_at, capability_delta,
             delegated_custody, verification_ledger, verification_receipt,
-            future_terminal_fact,
+            future_terminal_fact, final_answer, non_final_rows,
+            mutation_evidence, plan_review_state,
         ):
             assert marker in surface
         for marker in process_evidence:
             assert marker not in surface
+        for field in excluded_process_fields:
+            assert field not in surface
     assert "never use native/API fallback" in rendered
     assert "L1 asks L2 to spawn L3" in direct_harness
     assert "never use native/API fallback" in nested_work_order
