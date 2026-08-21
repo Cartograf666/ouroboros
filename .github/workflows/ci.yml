@@ -1338,7 +1338,9 @@ jobs:
             release-artifacts/release-evidence.json
           body_path: release-notes.md
           fail_on_unmatched_files: true
-          target_commitish: ${{ github.sha }}
+          # The existing annotated tag is exact-SHA verified above. Passing an
+          # explicit target would make GitHub require Workflows:write, which
+          # the Actions GITHUB_TOKEN cannot receive.
           draft: true
           prerelease: ${{ needs.release-preflight.outputs.is_prerelease == 'true' }}
 

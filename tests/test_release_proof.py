@@ -520,7 +520,11 @@ def test_release_workflow_orders_smoke_sbom_attestation_and_draft_verification()
     assert workflow.count('git ls-remote --exit-code origin "$TAG_REF" "$PEELED_REF"') == 2
     assert workflow.count('test "$(git cat-file -t "$TAG_REF")" = "tag"') == 2
     assert workflow.count('[ "$PEELED_SHA" != "$GITHUB_SHA" ]') == 2
-    assert 'target_commitish: ${{ github.sha }}' in workflow
+    create_release_step = workflow[
+        workflow.index("- name: Create draft GitHub Release") :
+        workflow.index("- name: Verify uploaded draft")
+    ]
+    assert "target_commitish:" not in create_release_step
     assert '--source-digest "$GITHUB_SHA"' in workflow
     assert '--source-ref "$GITHUB_REF"' in workflow
     assert '--signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ci.yml"' in workflow
