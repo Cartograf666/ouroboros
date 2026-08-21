@@ -541,7 +541,11 @@ def test_background_preserves_receipt_and_aggregates_round_disclosures(
 
     monkeypatch.setattr(observed, "chat_observed", chat_observed)
     monkeypatch.setattr(consciousness, "get_consciousness_model", lambda: "anthropic/claude-future")
-    monkeypatch.setattr(consciousness, "append_jsonl", lambda _path, row: events.append(row))
+    monkeypatch.setattr(
+        consciousness,
+        "append_jsonl",
+        lambda _path, row: (events.append(row) or True),
+    )
     monkeypatch.setattr(consciousness.BackgroundConsciousness, "_build_context", lambda _self: "ctx")
     monkeypatch.setattr(consciousness.BackgroundConsciousness, "_tool_schemas", lambda _self: [])
     monkeypatch.setattr(consciousness.BackgroundConsciousness, "_check_budget", lambda _self: True)
