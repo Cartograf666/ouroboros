@@ -2379,8 +2379,9 @@ def test_handle_steer_task_delivers_once_to_running_task(tmp_path, monkeypatch):
     assert [e["text"] for e in entries] == ["steer me"]  # delivered exactly once
 
 
+@pytest.mark.parametrize("chat_id", [1, 0, None])
 def test_steering_delivers_text_and_identical_typed_attachment_report(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, chat_id,
 ):
     import supervisor.queue as queue
     from ouroboros.owner_mailbox import drain_owner_entries
@@ -2397,7 +2398,7 @@ def test_steering_delivers_text_and_identical_typed_attachment_report(
     )
     ctx = types.SimpleNamespace(
         DRIVE_ROOT=tmp_path,
-        RUNNING={"t-report": {"task": {"id": "t-report", "chat_id": 1}}},
+        RUNNING={"t-report": {"task": {"id": "t-report", "chat_id": chat_id or 0}}},
         send_with_budget=lambda _cid, text, *a, **k: notices.append(text),
         bridge=bridge,
     )
@@ -2406,7 +2407,7 @@ def test_steering_delivers_text_and_identical_typed_attachment_report(
         "type": "steer_task",
         "target_task_id": "t-report",
         "message": exact,
-        "chat_id": 1,
+        "chat_id": chat_id,
         "client_message_id": "cm-report",
         "routing_token": "route-report",
         "attachment_uploads": [
@@ -2420,7 +2421,10 @@ def test_steering_delivers_text_and_identical_typed_attachment_report(
     delivered = drain_owner_entries(tmp_path, "t-report")[0]["text"]
     assert delivered.startswith(exact)
     report = delivered.split("[ATTACHMENTS]\n", 1)[1].split("\n[END_ATTACHMENTS]", 1)[0]
-    assert report in notices[-1]
+    if chat_id is None:
+        assert notices == []
+    else:
+        assert report in notices[-1]
     annotation = latest_chat_annotations(tmp_path)["cm-report"]
     assert annotation["attachment_manifest"] == acks[-1]["attachment_manifest"]
     assert [row["status"] for row in annotation["attachment_manifest"]] == [

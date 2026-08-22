@@ -76,6 +76,7 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
 
     target = str(evt.get("target_task_id") or "").strip()
     message = str(evt.get("message") or "")
+    raw_chat_id = evt.get("chat_id")
     try:
         chat_id = int(evt.get("chat_id") or 0)
     except (TypeError, ValueError):
@@ -340,12 +341,16 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
             detail=attachment_report,
             attachment_manifest=staged_manifest if uploads else None,
         )
-        if attachment_report and chat_id:
-            try:
-                ctx.send_with_budget(
-                    chat_id,
-                    f"📎 Attachment staging report for {target_label or 'Task'}:\n"
-                    f"{attachment_report}",
-                )
-            except Exception:
-                log.debug("steer_task attachment report notice failed", exc_info=True)
+        if attachment_report:
+            from supervisor.message_bus import notification_chat_route
+
+            notice_chat = notification_chat_route(raw_chat_id)
+            if notice_chat is not None:
+                try:
+                    ctx.send_with_budget(
+                        notice_chat,
+                        f"📎 Attachment staging report for {target_label or 'Task'}:\n"
+                        f"{attachment_report}",
+                    )
+                except Exception:
+                    log.debug("steer_task attachment report notice failed", exc_info=True)
