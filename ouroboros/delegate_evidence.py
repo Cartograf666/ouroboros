@@ -94,6 +94,7 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
     evidence_read_failed = False
     nudge_recorded = False
     start_attempted = False
+    partial_work_order_seen = False
     _log_path = custody.event_log_path(drive_root)
     try:
         if _log_path.exists():
@@ -120,6 +121,9 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
         kind = str(row.get("type") or "")
         if kind == custody.STARTED:
             started.add(run_id)
+            partial_work_order_seen = partial_work_order_seen or (
+                str(row.get("work_order_coverage") or "") == "partial"
+            )
         elif kind == custody.CLOSED_ABSENT and run_id not in settled:
             # Closed-without-settlement is still TERMINAL: leaving it in the
             # started-minus-settled gap would read as "still executing" to the
@@ -151,6 +155,23 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
             model = str(row.get("model") or "")
             if model and model not in models:
                 models.append(model)
+    # A partial work-order run is not a successful delegated substrate until the
+    # durable verified-range union covers the complete canonical brief. Reuse the
+    # custody replay (the same SSOT used by wait/apply) so a restart cannot turn a
+    # prompt-only claim into ``harness_used``.
+    source_unresolved = 0
+    if partial_work_order_seen:
+        try:
+            for entry in custody.replay(drive_root).values():
+                if entry.task_id != tid or not entry.settled:
+                    continue
+                if custody.work_order_source_verification(entry).get("status") == "cannot_verify":
+                    source_unresolved += 1
+                    succeeded.discard(entry.run_id)
+                    if "source_incomplete" not in failure_states:
+                        failure_states.append("source_incomplete")
+        except Exception:
+            evidence_read_failed = True
     return {
         # A settled row whose started row fell out of the log is still a run that ran.
         "delegated_runs_started": len(started | settled),
@@ -166,6 +187,7 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
         # closed-absent. Counts are delegated-run facts only — the NATIVE (metered)
         # contribution beside them is unknown, and no share/ratio is derivable here.
         "delegated_runs_failed": len(settled) - len(succeeded),
+        "delegated_runs_source_unresolved": source_unresolved,
         "delegated_run_failure_states": sorted(set(failure_states)),
         # True only when the canonical log EXISTS but could not be opened —
         # zero counts are then "unknown", not "established" (additive key).

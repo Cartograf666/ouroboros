@@ -5,7 +5,38 @@ import {
     computeDerivedChatStatus,
     computeHydratedDirectActivities,
 } from '../modules/chat.js';
-import { createStateSnapshotSequencer } from '../modules/chat_activity.js';
+import {
+    createStateSnapshotSequencer,
+    routingAnnotationText,
+} from '../modules/chat_activity.js';
+
+test('routing receipts display the event-time label while keeping raw target metadata', () => {
+    const annotation = {
+        action: 'steer_task',
+        status: 'delivered',
+        target: 'opaque-task-id',
+        target_label: 'Launch 🚀 › Ship release',
+    };
+    assert.equal(routingAnnotationText(annotation), 'Steered task · Launch 🚀 › Ship release');
+    assert.equal(annotation.target, 'opaque-task-id');
+});
+
+test('legacy routing receipts and manual choices use neutral labels, never raw ids', () => {
+    assert.equal(routingAnnotationText({
+        action: 'steer_task', status: 'delivered', target: 'opaque-task-id',
+    }), 'Steered task · Task');
+    assert.equal(routingAnnotationText({
+        action: 'project_route', status: 'delivered', target: 'opaque-project-id',
+    }), 'Project routing · Project');
+    const manual = routingAnnotationText({
+        action: 'manual', status: 'needs_manual_target', options: [
+            { action: 'steer_task', task_id: 'opaque-option-id' },
+            { action: 'project_route', project_id: 'opaque-project-id' },
+        ],
+    });
+    assert.equal(manual, 'Choose a target · Task / Project');
+    assert.equal(manual.includes('opaque-'), false);
+});
 
 test('state snapshots and failure authority stay monotonic across reversed completion', () => {
     const applied = [];

@@ -130,13 +130,18 @@ def _waiting_on_user_note(pending: List[Dict[str, Any]]) -> str:
         "already hold. A question ABOVE your authority (spending money, "
         "changing scope, external actions) is not yours to guess: surface it "
         "to your human via a progress message and keep waiting with "
-        "delegate_wait. Do not cancel a run merely because it asked a question."
+        "delegate_wait. If the question carries a source-request envelope, answer "
+        "with source_response={schema:1, kind:'source_response', complete_sha256, "
+        "source, start_char, end_char, text}; the host verifies the exact canonical "
+        "range before delivering it. Do not promote a partial preview to complete "
+        "authority. Do not cancel a run merely because it asked a question."
     )
 
 
 def _waiting_on_user_payload(ctx: ToolContext, run_id: str, state: str,
                              last_seq: int, pending: List[Dict[str, Any]],
-                             seen: Any = None) -> str:
+                             seen: Any = None, source_request: Any = None,
+                             source_verification: Any = None) -> str:
     """The IMMEDIATE typed return for a run that is waiting on an answer.
 
     The full question text rides inline when it fits the tool budget; otherwise
@@ -159,13 +164,24 @@ def _waiting_on_user_payload(ctx: ToolContext, run_id: str, state: str,
         "pending_interactions": pending,
         "note": _waiting_on_user_note(pending),
     }
+    if isinstance(source_request, dict) and source_request:
+        full["work_order_source_request"] = dict(source_request)
+    if isinstance(source_verification, dict) and source_verification:
+        full["work_order_verification"] = dict(source_verification)
     if seen is not None and getattr(seen, "advances", None):
         full["advances"] = seen.rows(_WAITING_ADVANCES_BUDGET_CHARS)
     budget = tool_result_limit("delegate_wait")
     text = json.dumps(full, ensure_ascii=False, indent=2)
     if len(text) <= budget - _PAYLOAD_ENVELOPE_HEADROOM:
         return text
-    spill = json.dumps({"run_id": run_id, "pending_interactions": pending},
+    spill = json.dumps({
+        "run_id": run_id,
+        "pending_interactions": pending,
+        **({"work_order_source_request": source_request}
+           if isinstance(source_request, dict) and source_request else {}),
+        **({"work_order_verification": source_verification}
+           if isinstance(source_verification, dict) and source_verification else {}),
+    },
                        ensure_ascii=False, indent=2)
     spill_sha = hashlib.sha256(spill.encode("utf-8", "replace")).hexdigest()[:12]
     artifact = _stage_full_output(ctx, run_id, spill,
@@ -237,7 +253,9 @@ _ANSWER_NOTES = {
 }
 
 
-def _normalized_answers(answers: Any) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+def _normalized_answers(
+    answers: Any, source_response: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[List[Dict[str, Any]]], str]:
     """The wire-shaped answer rows, or a typed argument refusal.
 
     Model-facing snake_case in, engine camelCase out — one translation, here.
@@ -256,6 +274,13 @@ def _normalized_answers(answers: Any) -> Tuple[Optional[List[Dict[str, Any]]], s
             "benignly at the engine timeout; timeout_at=null waits until answered).",
         )
     wire: List[Dict[str, Any]] = []
+    source_text = ""
+    source_attached = False
+    if isinstance(source_response, dict):
+        source_text = json.dumps(
+            {"schema": 1, "kind": "source_response", **source_response},
+            ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+        )
     for row in answers:
         if not isinstance(row, dict) or not str(row.get("question_id") or "").strip():
             return None, _fail(
@@ -289,10 +314,17 @@ def _normalized_answers(answers: Any) -> Tuple[Optional[List[Dict[str, Any]]], s
                 "benignly at the engine timeout; timeout_at=null waits until "
                 "answered).",
             )
+        encoded_free_text = free_text if isinstance(free_text, str) and free_text else None
+        if source_text and not source_attached:
+            encoded_free_text = (
+                f"{encoded_free_text}\n\n[SOURCE_RESPONSE]\n{source_text}"
+                if encoded_free_text else source_text
+            )
+            source_attached = True
         wire.append({
             "questionId": str(row.get("question_id")).strip(),
             "selectedLabels": list(labels),
-            "freeText": free_text if isinstance(free_text, str) and free_text else None,
+            "freeText": encoded_free_text,
         })
     return wire, ""
 
@@ -368,8 +400,10 @@ _ANSWER_DEADLINE_SEC = 100.0
 _ANSWER_HANDSHAKE_MAX_SEC = 30.0
 
 
-def _delegate_answer(ctx: ToolContext, run_id: str, interaction_id: str,
-                     answers: Any) -> str:
+def _delegate_answer(
+    ctx: ToolContext, run_id: str, interaction_id: str, answers: Any,
+    source_response: Optional[Dict[str, Any]] = None,
+) -> str:
     """Answer a delegated run's pending interactive question (B4, owner 7=A).
 
     Custody-gated like cancel: the bearer token reaches every run, so only the
@@ -400,13 +434,34 @@ def _delegate_answer(ctx: ToolContext, run_id: str, interaction_id: str,
     if not iid:
         return _fail("delegate_answer", "missing_interaction_id",
                      "interaction_id is required (from the waiting_on_user payload)")
-    wire, arg_error = _normalized_answers(answers)
-    if arg_error or wire is None:
-        return arg_error
     not_mine, entry = _owned_run(ctx, "delegate_answer", rid)
     if not_mine or entry is None:
         return not_mine or _fail("delegate_answer", "run_ownership_unknown",
                                  "custody unresolved", run_id=rid)
+    verified_source = None
+    if source_response is not None:
+        from ouroboros.subagent_work_order import validate_work_order_source_response
+
+        if str(entry.work_order_coverage or "") != "partial":
+            return _fail(
+                "delegate_answer", "source_response_not_required",
+                "This delegated run has no partial work-order source request; do not "
+                "send source_response metadata for it.", run_id=rid,
+            )
+        verified_source, source_error = validate_work_order_source_response(
+            ctx, entry.work_order_source_request, source_response,
+        )
+        if source_error or verified_source is None:
+            return _fail(
+                "delegate_answer", "source_response_invalid",
+                "The source response was NOT delivered: "
+                f"{source_error or 'verification_failed'}. Read the canonical source "
+                "and retry the same interaction with an exact selector, digest and "
+                "character range.", run_id=rid,
+            )
+    wire, arg_error = _normalized_answers(answers, source_response)
+    if arg_error or wire is None:
+        return arg_error
     deadline = time.monotonic() + _ANSWER_DEADLINE_SEC
 
     def _left() -> float:
@@ -485,6 +540,47 @@ def _delegate_answer(ctx: ToolContext, run_id: str, interaction_id: str,
             return _answer_delivery_unknown(gateway, rid, iid, exc,
                                             seconds_left=_left())
         status = str(body.get("status") or "")
+        source_receipt = None
+        source_delivery_proven = status == "delivered"
+        if status == "already_resolved" and verified_source is not None:
+            from ouroboros.delegate_source_coverage import source_delivery_confirmed
+
+            source_delivery_proven = source_delivery_confirmed(
+                entry, iid, verified_source,
+            )
+        if source_delivery_proven and verified_source is not None:
+            from ouroboros import delegate_custody as custody
+
+            if status == "delivered":
+                from ouroboros.delegate_source_coverage import record_source_delivery_confirmed
+
+                record_source_delivery_confirmed(
+                    custody.custody_root(ctx), entry,
+                    interaction_id=iid, verified_source=verified_source,
+                )
+            source_landed = custody.record_source_range_verified(
+                custody.custody_root(ctx), entry,
+                start_char=verified_source["start_char"],
+                end_char=verified_source["end_char"],
+                complete_sha256=verified_source["complete_sha256"],
+                source=verified_source["source"],
+                text_sha256=verified_source["text_sha256"],
+                text_chars=verified_source["text_chars"],
+            )
+            source_receipt = (
+                custody.work_order_source_verification(entry)
+                if source_landed else {
+                    "status": "cannot_verify",
+                    "reason": "source_receipt_unwritten",
+                    "can_authorize": False,
+                }
+            )
+        elif verified_source is not None:
+            source_receipt = {
+                "status": "cannot_verify",
+                "reason": "source_delivery_unconfirmed",
+                "can_authorize": False,
+            }
         if status in ("delivered", "already_resolved"):
             # F6 (gemini #2): the reported-question memo is stale the moment the
             # engine resolves an interaction — pop it so the NEXT wait re-reports
@@ -495,14 +591,17 @@ def _delegate_answer(ctx: ToolContext, run_id: str, interaction_id: str,
             "run_id": rid, "interaction_id": iid, "status": status,
             "questions_answered": len(wire),
         })
-        return json.dumps({
+        result = {
             "status": status,
             "run_id": rid,
             "interaction_id": iid,
             "accepted": bool(body.get("accepted")),
             "detail": str(body.get("message") or ""),
             "note": _ANSWER_NOTES.get(status, ""),
-        }, ensure_ascii=False, indent=2)
+        }
+        if source_receipt is not None:
+            result["work_order_verification"] = source_receipt
+        return json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as exc:  # noqa: BLE001 — F7: never a raw traceback to the model
         # F7 (gemini #3): an unexpected failure around the gateway call or the
         # body handling is an AMBIGUOUS delivery, typed — the POST may or may

@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
 
-from ouroboros.gateway._helpers import coerce_int, json_error, json_exception, request_drive_root, request_json_or, request_repo_dir
+from ouroboros.gateway._helpers import coerce_int, json_error, json_exception, request_drive_root, request_json_or, request_repo_dir, stage_initial_task_attachments
 # Re-exported SSE surface (split out by the 1600-line module gate): route
 # wiring, the CLI, and long-standing monkeypatch pins address these names on
 # gateway.tasks; task_events resolves its patched collaborators back through
@@ -313,6 +313,7 @@ def _complete_api_task_admission(
         "artifacts": artifacts,
         "artifact_status": ARTIFACT_STATUS_PENDING if workspace_root else "",
         "metadata": metadata,
+        "attachment_manifest": list(task.get("attachments") or []),
         "result": "Task accepted and durably scheduled.",
     }
     try:
@@ -380,7 +381,12 @@ def _complete_api_task_admission(
             drive_root, task_id, admission_token, child_drive
         )
         return json_exception(exc, 503)
-    return JSONResponse({"ok": True, "task_id": task_id, "status": STATUS_SCHEDULED})
+    return JSONResponse({
+        "ok": True,
+        "task_id": task_id,
+        "status": STATUS_SCHEDULED,
+        "attachment_manifest": list(task.get("attachments") or []),
+    })
 
 
 async def api_tasks_create(request: Request) -> JSONResponse:
@@ -549,19 +555,19 @@ async def api_tasks_create(request: Request) -> JSONResponse:
     # runtime — the child drive when forked/empty, else the shared drive (matches the
     # task['drive_root'] set at the end of this handler). The returned manifest renders
     # READY read_file(root='artifact_store', ...) lines and feeds native image blocks.
-    from ouroboros.artifacts import stage_task_attachments
-
     effective_drive = child_drive or drive_root
-    try:
-        attachment_manifest = stage_task_attachments(
-            effective_drive, task_id, _normalize_attachments(body.get("attachments"))
-        )
-    except Exception as exc:
-        _cleanup_api_admission_attempt(
-            drive_root, task_id, admission_token, child_drive
-        )
-        return json_exception(exc, 503)
-    attachment_images = [m for m in attachment_manifest if m.get("is_image")]
+    attachment_manifest, attachment_error = stage_initial_task_attachments(
+        effective_drive, task_id, _normalize_attachments(body.get("attachments")),
+        allow_partial=body.get("allow_partial_attachments") is True,
+    )
+    if attachment_error is not None:
+        _cleanup_api_admission_attempt(drive_root, task_id, admission_token, child_drive)
+        return attachment_error
+    attachment_manifest = [dict(row) for row in attachment_manifest]
+    attachment_images = [
+        m for m in attachment_manifest
+        if str(m.get("status") or "staged") == "staged" and m.get("is_image")
+    ]
     metadata.setdefault("session_id", str(body.get("session_id") or uuid.uuid4().hex))
     metadata.setdefault("actor_id", str(body.get("actor_id") or "cli"))
     metadata.setdefault("source", str(body.get("source") or "api_task"))
@@ -1329,12 +1335,15 @@ def _normalize_attachments(value: Any) -> List[Dict[str, str]]:
     for item in value:
         if isinstance(item, dict):
             path = str(item.get("path") or "").strip()
-            label = str(item.get("label") or item.get("display_name") or pathlib.Path(path).name).strip()
+            label = str(
+                item.get("label") or item.get("display_name") or pathlib.Path(path).name
+            ).strip()
         else:
             path = str(item or "").strip()
             label = pathlib.Path(path).name
-        if path:
-            out.append({"path": path, "label": label})
+        # Preserve one row per declaration, including an empty/invalid path.
+        # ``stage_task_attachments`` owns the typed rejection reason.
+        out.append({"path": path, "label": label})
     return out
 
 
@@ -1372,21 +1381,32 @@ def _compose_task_text(
 
 
 def _render_attachment_lines(attachments: Any) -> str:
-    """Render READY attachment lines from a staged manifest.
+    """Render the complete staged/rejected attachment report.
 
     v6.52.0 (P1): each line is a ready-to-use read_file call against the canonical
     artifact_store root — NEVER a bare absolute host path. ``attachments`` is the
-    manifest returned by ``stage_task_attachments`` (entries with root/relpath/mime/
-    is_image)."""
+    manifest returned by ``stage_task_attachments``.  Legacy staged-only rows
+    remain readable; new rows carry ordinal/status/reason and rejected rows are
+    rendered without source paths or secret contents."""
     if not isinstance(attachments, list):
         return ""
     lines: List[str] = []
     for item in attachments:
         if not isinstance(item, dict):
             continue
+        try:
+            ordinal = int(item.get("ordinal"))
+        except (TypeError, ValueError):
+            ordinal = len(lines)
+        status = str(item.get("status") or "staged")
+        label = str(item.get("label") or f"attachment {ordinal + 1}").strip()
+        if status == "rejected":
+            reason = str(item.get("reason") or "staging_failed").strip()
+            lines.append(f"- {label}: rejected (reason={reason}, ordinal={ordinal})")
+            continue
         relpath = str(item.get("relpath") or "").strip()
         root = str(item.get("root") or "artifact_store").strip() or "artifact_store"
-        label = str(item.get("label") or pathlib.Path(relpath).name).strip()
+        label = label or pathlib.Path(relpath).name
         if not relpath:
             continue
         kind = "image" if item.get("is_image") else (str(item.get("mime") or "").strip() or "file")
@@ -1398,7 +1418,8 @@ def _render_attachment_lines(attachments: Any) -> str:
         abs_path = str(item.get("abs_path") or "").strip()
         script_hint = f" | script/process path: {abs_path}" if abs_path else ""
         lines.append(
-            f"- {label} ({kind}): read_file(root='{root}', path='{relpath}'){script_hint}"
+            f"- {label} ({kind}): read_file(root='{root}', path='{relpath}')"
+            f"{script_hint} [status=staged, ordinal={ordinal}]"
         )
     return "\n".join(lines)
 

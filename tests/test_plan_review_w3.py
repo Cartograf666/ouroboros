@@ -64,10 +64,10 @@ def test_reviewer_requested_locator_still_obeys_the_deny_policy(harness):
     sub = harness.install({"s1": ask, "s2": CLEAN, "s3": CLEAN})
     _call(harness.make_ctx())
     sub = harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
-    _call(harness.make_ctx())
-    second_user = _user_text(sub.calls[-1]["request"].messages[1]["content"])
-    assert f"| {denied} [reviewer-requested] | denied_path |" in second_user
-    assert "sk-live-x" not in second_user
+    out = _call(harness.make_ctx())
+    assert "cannot_verify" in out and "denied_path" in out
+    assert sub.calls == []
+    assert "sk-live-x" not in out
 
 
 
@@ -151,7 +151,12 @@ def test_need_evidence_memory_is_bounded_per_task(harness):
     assert per_wave < MAX_NEED_EVIDENCE_MEMORY < 2 * per_wave  # the second wave crosses the cap
     harness.install(_answers(1))
     _call(harness.make_ctx())
-    assert len(_state(harness)["need_evidence_seen"]) == per_wave
+    first_seen = _state(harness)["need_evidence_seen"]
+    assert len(first_seen) == per_wave
+    for locator in first_seen:
+        path = harness.workspace / locator
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("evidence\n", encoding="utf-8")
     harness.install(_answers(2))
     _call(harness.make_ctx())  # same spec, new fingerprint (host-attached requests), second paid wave
     state = _state(harness)

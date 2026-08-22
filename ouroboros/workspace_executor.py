@@ -77,7 +77,12 @@ class _ExecutorService:
     local_proc: subprocess.Popen | None = None
     backend_pid: str = ""
     backend_log_path: str = ""
+    readiness: dict[str, Any] = field(default_factory=dict)
     ready: bool = False
+    ready_observed_at: str = ""
+    readiness_log_offset: int = 0
+    readiness_log_carry: bytes = b""
+    readiness_log_identity: tuple[int, int] | None = None
     durable_record_path: pathlib.Path | None = None
 
 
@@ -85,6 +90,7 @@ _SERVICES: dict[str, _ExecutorService] = {}
 _FOREGROUND: dict[str, pathlib.Path] = {}
 _STATE_LOCK = threading.RLock()
 _MAX_SERVICE_LOG_TAIL_CHARS = 80_000
+_READINESS_SCAN_CHUNK_BYTES = 64 * 1024
 _PROCESS_STATE_DIR = "workspace_executor_processes"
 _PROCESS_RECORD_OWNER = "ouroboros_workspace_executor"
 _PROCESS_RECORD_SCHEMA_VERSION = 1
@@ -392,6 +398,7 @@ def _docker_exec_pidfile_stop_shell(pidfile: str) -> str:
         "kill -TERM -$pid 2>/dev/null || kill -TERM $pid 2>/dev/null || true; "
         "sleep 0.5; "
         "kill -KILL -$pid 2>/dev/null || kill -KILL $pid 2>/dev/null || true; "
+        "if kill -0 -$pid 2>/dev/null || kill -0 $pid 2>/dev/null; then exit 1; fi; "
         f"rm -f {quoted_pidfile}"
     )
 
@@ -417,7 +424,15 @@ def _dispatch_docker_record_cleanup(record: dict[str, Any]) -> bool:
             errors="replace",
             timeout=5,
         )
-        return proc.returncode == 0
+        if proc.returncode != 0:
+            return False
+        # The bounded shell dispatch is only an attempt.  Service records carry
+        # a backend PID, so panic/``wait=False`` cleanup performs the same
+        # explicit terminal probe before allowing the durable record to go.
+        backend_pid = str(record.get("backend_pid") or "").strip()
+        if backend_pid:
+            return _docker_pid_state(container, backend_pid) == "exited"
+        return True
     except Exception:
         return False
 
@@ -655,7 +670,46 @@ def _kill_docker_record(record: dict[str, Any], *, wait: bool = True) -> bool:
             return False
         if proc.returncode != 0:
             return False
+        if _docker_pid_state(container, backend_pid) != "exited":
+            return False
     return True
+
+
+def _docker_pid_state(container_name: str, backend_pid: str) -> str:
+    """Probe Docker and preserve ``unknown`` when the probe is inconclusive."""
+
+    pid = str(backend_pid or "").strip()
+    if not pid:
+        return "unknown"
+    try:
+        bootstrap_process_path()
+        proc = subprocess.run(
+            [
+                "docker",
+                "exec",
+                str(container_name),
+                "sh",
+                "-lc",
+                f"kill -0 {shlex.quote(pid)} 2>/dev/null && echo running || echo exited",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return "unknown"
+    if proc.returncode != 0:
+        return "unknown"
+    raw_output = proc.stdout or ""
+    if isinstance(raw_output, bytes):
+        raw_output = raw_output.decode("utf-8", errors="replace")
+    output = str(raw_output).strip()
+    if output == "running":
+        return "running"
+    if output == "exited":
+        return "exited"
+    return "unknown"
 
 
 def kill_all_foreground(drive_root: pathlib.Path | None = None, *, wait: bool = True) -> list[dict[str, Any]]:
@@ -769,6 +823,7 @@ def start_service(
         outputs=list(outputs),
         before_outputs=before_outputs,
         keep_alive=bool(keep_alive),
+        readiness=dict(readiness or {}),
     )
     if executor.kind == "local":
         log_path = pathlib.Path(getattr(ctx, "drive_root")) / "services" / record.task_id / f"{name}.executor.log"
@@ -858,6 +913,8 @@ def stop_service(ctx: Any, name: str) -> dict[str, Any] | None:
             )
         except Exception as exc:
             payload = _service_payload(record)
+            if record.executor.kind == "docker_exec":
+                payload["cleanup_dispatched"] = False
             payload["stop_failed"] = True
             payload["stop_error"] = f"{type(exc).__name__}: {exc}"
             return payload
@@ -865,6 +922,18 @@ def stop_service(ctx: Any, name: str) -> dict[str, Any] | None:
             payload = _service_payload(record)
             payload["stop_failed"] = True
             payload["stop_error"] = proc.stderr.strip() or proc.stdout.strip() or "docker service stop failed"
+            return payload
+        # A successful shell dispatch is not custody settlement by itself.
+        # Confirm the backend PID is no longer observable before dropping the
+        # in-memory handle and durable process record.
+        probe_state = _safe_service_state(record)
+        if probe_state != "exited":
+            payload = _service_payload(record)
+            payload["stop_failed"] = True
+            payload["stop_error"] = (
+                "docker service stop returned success but kill-0 confirmation is "
+                f"{probe_state}"
+            )
             return payload
     with _STATE_LOCK:
         _SERVICES.pop(key, None)
@@ -877,7 +946,7 @@ def stop_service(ctx: Any, name: str) -> dict[str, Any] | None:
 def stop_task_services(ctx: Any) -> list[dict[str, Any]]:
     task_id = str(getattr(ctx, "task_id", "") or "manual")
     kept = [
-        _service_payload(record, state=_service_state(record), note="keep_alive")
+        _service_payload(record, state=_safe_service_state(record), note="keep_alive")
         for record in _services_snapshot()
         if record.task_id == task_id
         and bool(getattr(record, "keep_alive", False))
@@ -931,18 +1000,26 @@ def kill_all_services(
                     text=True,
                     timeout=10 if wait else 5,
                 )
-                payload = _service_payload(record, state="stopped" if proc.returncode == 0 else _service_state(record))
-                payload["cleanup_dispatched"] = proc.returncode == 0
-                if proc.returncode == 0:
+                probe_state = _safe_service_state(record) if proc.returncode == 0 else "unknown"
+                terminal = proc.returncode == 0 and probe_state == "exited"
+                payload = _service_payload(record, state="stopped" if terminal else probe_state)
+                payload["cleanup_dispatched"] = terminal
+                if terminal:
                     with _STATE_LOCK:
                         _SERVICES.pop(record.service_id, None)
                     _forget_process(record.durable_record_path)
                 else:
                     payload["stop_failed"] = True
-                    payload["stop_error"] = proc.stderr.strip() or proc.stdout.strip() or "docker service stop failed"
+                    payload["stop_error"] = (
+                        proc.stderr.strip()
+                        or proc.stdout.strip()
+                        or f"docker service stop confirmation is {probe_state}"
+                    )
                 stopped.append(payload)
         except Exception as exc:
             payload = _service_payload(record)
+            if record.executor.kind == "docker_exec":
+                payload["cleanup_dispatched"] = False
             payload["stop_failed"] = True
             payload["stop_error"] = f"{type(exc).__name__}: {exc}"
             stopped.append(payload)
@@ -1054,20 +1131,35 @@ def _docker_service_stop_shell(backend_pid: str) -> str:
             f"pid={pid}; "
             "kill -TERM -$pid 2>/dev/null || kill -TERM $pid 2>/dev/null || true; "
             "sleep 0.5; "
-            "kill -KILL -$pid 2>/dev/null || kill -KILL $pid 2>/dev/null || true"
+            "kill -KILL -$pid 2>/dev/null || kill -KILL $pid 2>/dev/null || true; "
+            "if kill -0 -$pid 2>/dev/null || kill -0 $pid 2>/dev/null; then exit 1; fi"
         )
     quoted_pid = shlex.quote(pid)
-    return f"kill -TERM {quoted_pid} 2>/dev/null || true"
+    return (
+        f"kill -TERM {quoted_pid} 2>/dev/null || true; "
+        f"if kill -0 {quoted_pid} 2>/dev/null; then exit 1; fi"
+    )
 
 
 def _service_payload(record: _ExecutorService, *, state: str | None = None, note: str = "") -> dict[str, Any]:
-    actual_state = state or _service_state(record)
+    actual_state = state if state is not None else _safe_service_state(record)
+    if actual_state == "running":
+        _refresh_executor_service_readiness(record)
+        # Readiness scanning and the state probe are separate operations.  A
+        # process can settle during the scan, so re-poll before serializing a
+        # running+ready claim (for both local and Docker backends).
+        actual_state = _safe_service_state(record)
+    else:
+        record.ready = False
+    if actual_state != "running":
+        record.ready = False
     payload = {
         "service_id": record.service_id,
         "name": record.name,
         "task_id": record.task_id,
         "state": actual_state,
         "ready": bool(record.ready),
+        "ready_observed_at": getattr(record, "ready_observed_at", "") or None,
         "executor": {
             "id": record.executor.executor_id,
             "type": record.executor.kind,
@@ -1095,15 +1187,43 @@ def _service_payload(record: _ExecutorService, *, state: str | None = None, note
 def _service_state(record: _ExecutorService) -> str:
     if record.executor.kind == "local":
         proc = record.local_proc
-        return "running" if proc is not None and proc.poll() is None else "exited"
-    proc = subprocess.run(
-        ["docker", "exec", record.executor.container_name, "sh", "-lc", f"kill -0 {shlex.quote(record.backend_pid)} 2>/dev/null && echo running || echo exited"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=10,
-    )
-    return "running" if "running" in (proc.stdout or "") else "exited"
+        if proc is None:
+            return "exited"
+        try:
+            return "running" if proc.poll() is None else "exited"
+        except Exception:
+            return "unknown"
+    try:
+        proc = subprocess.run(
+            ["docker", "exec", record.executor.container_name, "sh", "-lc", f"kill -0 {shlex.quote(record.backend_pid)} 2>/dev/null && echo running || echo exited"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return "unknown"
+    if proc.returncode != 0:
+        return "unknown"
+    raw_output = proc.stdout or ""
+    if isinstance(raw_output, bytes):
+        raw_output = raw_output.decode("utf-8", errors="replace")
+    output = str(raw_output).strip()
+    if output == "running":
+        return "running"
+    if output == "exited":
+        return "exited"
+    return "unknown"
+
+
+def _safe_service_state(record: _ExecutorService) -> str:
+    """Never let an inconclusive state probe discard cleanup custody."""
+
+    try:
+        state = _service_state(record)
+    except Exception:
+        return "unknown"
+    return state if state in {"running", "exited", "unknown"} else "unknown"
 
 
 def _read_service_tail(record: _ExecutorService, chars: int) -> str:
@@ -1131,12 +1251,127 @@ def _wait_readiness(record: _ExecutorService, readiness: dict[str, Any]) -> None
     timeout = min(max(float(readiness.get("timeout_sec") or 0), 0.0), 25.0)
     if not contains:
         record.ready = True
+        record.ready_observed_at = getattr(record, "ready_observed_at", "") or utc_now_iso()
         return
     deadline = time.time() + timeout
     while time.time() <= deadline:
-        if contains in _read_service_tail(record, 20_000):
+        if _executor_readiness_marker_observed(record, contains):
             record.ready = True
+            record.ready_observed_at = getattr(record, "ready_observed_at", "") or utc_now_iso()
             return
         if _service_state(record) != "running":
             return
         time.sleep(0.2)
+
+
+def _executor_readiness_marker_observed(record: _ExecutorService, marker: str) -> bool:
+    if record.executor.kind == "local":
+        return _read_local_service_marker(record, pathlib.Path(record.backend_log_path), marker)
+    return _read_docker_service_marker(record, marker)
+
+
+def _refresh_executor_service_readiness(record: _ExecutorService) -> None:
+    """Refresh a pending readiness probe without rereading the display tail."""
+
+    if record.ready:
+        return
+    contains = str(record.readiness.get("log_contains") or record.readiness.get("stdout_contains") or "").strip()
+    if not contains:
+        record.ready = True
+        record.ready_observed_at = record.ready_observed_at or utc_now_iso()
+        return
+    if _executor_readiness_marker_observed(record, contains):
+        record.ready = True
+        record.ready_observed_at = record.ready_observed_at or utc_now_iso()
+
+
+def _read_docker_service_marker(record: _ExecutorService, marker: str) -> bool:
+    """Read one bounded unseen remote-log chunk and scan it with carry bytes."""
+
+    needle = str(marker).encode("utf-8")
+    if not needle:
+        return True
+    offset = int(getattr(record, "readiness_log_offset", 0) or 0)
+    identity = getattr(record, "readiness_log_identity", None)
+    carry = bytes(getattr(record, "readiness_log_carry", b"") or b"")
+    for attempt in range(2):
+        path = shlex.quote(record.backend_log_path)
+        shell = (
+            f"meta=$(stat -c '%d:%i:%s' {path} 2>/dev/null) || exit 2; "
+            "printf '%s\\n' \"$meta\"; "
+            f"tail -c +{offset + 1} {path} 2>/dev/null | head -c {_READINESS_SCAN_CHUNK_BYTES}"
+        )
+        try:
+            proc = subprocess.run(
+                ["docker", "exec", record.executor.container_name, "sh", "-lc", shell],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
+        except Exception:
+            return False
+        if proc.returncode != 0:
+            return False
+        output = bytes(proc.stdout or b"")
+        header, sep, chunk = output.partition(b"\n")
+        if not sep:
+            return False
+        try:
+            dev_text, ino_text, size_text = header.decode("ascii").split(":", 2)
+            remote_identity = (int(dev_text), int(ino_text))
+            remote_size = int(size_text)
+        except (ValueError, UnicodeDecodeError):
+            return False
+        if identity != remote_identity or remote_size < offset:
+            # Rotation/truncation is a new stream.  Same-inode same-size rewrites
+            # remain advisory, as they are not distinguishable from ordinary
+            # append-only logs without imposing a second state machine.
+            identity = remote_identity
+            offset = 0
+            carry = b""
+            record.readiness_log_identity = identity
+            record.readiness_log_offset = 0
+            record.readiness_log_carry = b""
+            if attempt == 0:
+                continue
+        record.readiness_log_identity = remote_identity
+        record.readiness_log_offset = offset + len(chunk)
+        window = carry + chunk
+        carry_size = max(0, len(needle) - 1)
+        record.readiness_log_carry = window[-carry_size:] if carry_size else b""
+        return needle in window
+    return False
+
+
+def _read_local_service_marker(record: Any, path: pathlib.Path, marker: str) -> bool:
+    """Incrementally scan a local service log, preserving marker-boundary bytes."""
+
+    needle = str(marker).encode("utf-8")
+    if not needle:
+        return True
+    try:
+        file_stat = path.stat()
+        identity = (int(file_stat.st_dev), int(file_stat.st_ino))
+        offset = int(getattr(record, "readiness_log_offset", 0) or 0)
+        if getattr(record, "readiness_log_identity", None) != identity or file_stat.st_size < offset:
+            record.readiness_log_identity = identity
+            record.readiness_log_offset = 0
+            record.readiness_log_carry = b""
+        with path.open("rb") as fh:
+            fh.seek(int(getattr(record, "readiness_log_offset", 0) or 0))
+            carry = bytes(getattr(record, "readiness_log_carry", b"") or b"")
+            carry_size = max(0, len(needle) - 1)
+            while True:
+                chunk = fh.read(64 * 1024)
+                if not chunk:
+                    break
+                record.readiness_log_offset = int(getattr(record, "readiness_log_offset", 0) or 0) + len(chunk)
+                window = carry + chunk
+                if needle in window:
+                    record.readiness_log_carry = window[-carry_size:] if carry_size else b""
+                    return True
+                carry = window[-carry_size:] if carry_size else b""
+            record.readiness_log_carry = carry
+    except OSError:
+        return False
+    return False

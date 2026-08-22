@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import pathlib
 import queue as _stdqueue
+import shutil
 import threading
 import uuid
 from typing import Any, Dict, Optional
@@ -308,6 +309,61 @@ def _enqueue_retry(
     retried["_attempt"] = attempt + 1
     retried["timeout_retry_from"] = task_id
     retried["timeout_retry_at"] = utc_now_iso()
+    if retry_task_id and retry_task_id != task_id:
+        from ouroboros.artifacts import (
+            handoff_task_attachments_for_retry,
+            task_artifact_dir_path,
+        )
+        from ouroboros.owner_mailbox import cleanup_task_mailbox, copy_owner_mailbox_for_retry
+
+        task_drive = q._task_drive_for_task(task, task_id)
+        replacements, attachment_error = handoff_task_attachments_for_retry(
+            task_drive, task_id, retry_task_id, retried,
+        )
+        mailbox_ok = not attachment_error and copy_owner_mailbox_for_retry(
+            task_drive, task_id, retry_task_id, path_replacements=replacements,
+        )
+        if not mailbox_ok:
+            failure = "attachment" if attachment_error else "mailbox"
+            blocked_reason = f"{terminal_reason}_retry_{failure}_handoff_failed"
+            message = (
+                "Retry refused because durable task inputs could not be carried "
+                "to the new physical task id."
+            )
+            log.error(
+                "Reaper: %s handoff failed for retry %s -> %s: %s",
+                failure, task_id, retry_task_id, attachment_error,
+            )
+            shutil.rmtree(
+                task_artifact_dir_path(task_drive, retry_task_id), ignore_errors=True,
+            )
+            cleanup_task_mailbox(task_drive, retry_task_id)
+            outcome = terminal_outcome_axes(
+                lifecycle=STATUS_FAILED,
+                execution=EXECUTION_INFRA_FAILED,
+                reason_code=blocked_reason,
+                review_trigger="supervisor_terminal",
+            )
+            write_task_result(
+                q.DRIVE_ROOT,
+                task_id,
+                STATUS_FAILED,
+                reason_code=blocked_reason,
+                outcome_axes=outcome,
+                **recon_fields,
+                result=message,
+            )
+            write_task_result(
+                q.DRIVE_ROOT,
+                retry_task_id,
+                STATUS_FAILED,
+                reason_code=blocked_reason,
+                outcome_axes=outcome,
+                supersedes_task_id=task_id,
+                original_task_id=task_id,
+                result=message,
+            )
+            return False, attempt, blocked_reason
     admitted = q.enqueue_task(retried, front=True)
     admission_block = (
         str(admitted.get("_admission_blocked") or "")
@@ -315,6 +371,14 @@ def _enqueue_retry(
     )
     if not admission_block:
         return True, attempt + 1, terminal_reason
+    if retry_task_id and retry_task_id != task_id:
+        cleanup_task_mailbox(q._task_drive_for_task(task, task_id), retry_task_id)
+        shutil.rmtree(
+            task_artifact_dir_path(
+                q._task_drive_for_task(task, task_id), retry_task_id,
+            ),
+            ignore_errors=True,
+        )
 
     blocked_reason = f"{terminal_reason}_retry_admission_blocked"
     outcome = terminal_outcome_axes(
@@ -691,11 +755,8 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
         except Exception:
             log.debug("Reaper: failed to salvage last LLM response for %s", task_id, exc_info=True)
 
-        # A killed worker never reaches the loop's mailbox cleanup — the ONE
-        # shared retry-reset (§19.7.2 item 11) removes the mailbox (so a
-        # subagent retry on the same id/drive is not instantly force-finalized
-        # and starts with NO executable hurry latch) and archives the current
-        # owner_hurry block into owner_hurry_history[]. Fail-soft inside.
+        # The shared retry reset revokes attempt controls while preserving exact
+        # owner text for the fresh physical attempt, and archives owner_hurry.
         try:
             from ouroboros.owner_hurry import retry_reset
 

@@ -144,6 +144,8 @@ def project_root_post_task_checkpoint_fields(
 
 def is_root_post_task(task: Dict[str, Any]) -> bool:
     """Structural root test for the single global post-task synthesis authority."""
+    if bool(task.get("_skip_post_task_synthesis")):
+        return False
     meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
     task_id = str(task.get("id") or task.get("task_id") or "")
     return bool(resolve_task_lineage(
@@ -298,6 +300,36 @@ def set_root_post_task_checkpoint(
                     bridge.push_log(finalized_event)
             except Exception:
                 log.debug("Live push of finalized task cost skipped for %s", task_id, exc_info=True)
+    pending_projection = (
+        stored.get("canonical_terminal_projection_ready")
+        if isinstance(stored, dict) else None
+    )
+    if (
+        isinstance(pending_projection, dict)
+        and post_task_synthesis_is_terminal(stored_post_task)
+        and not isinstance((stored or {}).get("canonical_terminal_projection"), dict)
+    ):
+        try:
+            from ouroboros.project_dialogue import append_terminal_task_projection
+
+            projection_task = {**task, **(stored or {}), "id": task_id}
+            append_terminal_task_projection(
+                authority_root,
+                task_id,
+                projection_task,
+                stored or {},
+                {
+                    "ts": str(pending_projection.get("task_done_ts") or utc_now_iso()),
+                    "chat_id": int(pending_projection.get("chat_id") or 0),
+                    "status": str((stored or {}).get("status") or STATUS_COMPLETED),
+                },
+            )
+        except Exception:
+            log.warning(
+                "Failed to settle canonical terminal projection for %s",
+                task_id,
+                exc_info=True,
+            )
     return stored
 
 

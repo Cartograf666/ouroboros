@@ -152,14 +152,14 @@ def test_subagent_cannot_escalate_mutation():
     assert child["may_mutate"] is False
 
 
-def test_intent_note_truncation_is_visible():
-    """A delegation intent_note over the cap carries a VISIBLE omission marker, not a
-    silent clip (BIBLE P1)."""
+def test_intent_note_preserves_complete_delegation_authority():
+    """The normalized contract cannot bind a prefix as the complete nesting intent."""
     from ouroboros.contracts.task_contract import normalize_delegation_budget
 
-    b = normalize_delegation_budget({"intent_note": "x" * 800})
-    assert "OMISSION NOTE" in b["intent_note"]
-    assert b["intent_note"].startswith("x" * 100)
+    intent = "x" * 800 + "THREE_LEVEL_DECISIVE_TAIL"
+    b = normalize_delegation_budget({"intent_note": intent})
+    assert b["intent_note"] == intent
+    assert "OMISSION NOTE" not in b["intent_note"]
 
 
 def test_child_budget_strict_boolean_parsing():

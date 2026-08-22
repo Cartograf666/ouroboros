@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import pathlib
 import re
 import tempfile
@@ -166,6 +167,40 @@ def test_task_contract_normalizes_observable_acceptance_claims():
             "priority": "must",
         },
     ]
+
+
+def test_task_contract_preserves_long_authority_fields_without_prefix_binding():
+    claim_tail = "CLAIM_DECISIVE_TAIL"
+    support_tail = "SUPPORT_DECISIVE_TAIL"
+    intent_tail = "THREE_LEVEL_NESTED_DELEGATION"
+    context_tail = "NEVER_DEPLOY_USE_PROFILE_X"
+    contract = build_task_contract({
+        "context": "c" * 900 + context_tail,
+        "delegation_budget": {"intent_note": "i" * 900 + intent_tail},
+        "acceptance_claims": [{
+            "id": "long",
+            "claim": "x" * 900 + claim_tail,
+            "support": "y" * 900 + support_tail,
+        }],
+    })
+
+    assert contract["context"].endswith(context_tail)
+    assert contract["delegation_budget"]["intent_note"].endswith(intent_tail)
+    assert contract["acceptance_claims"][0]["claim"].endswith(claim_tail)
+    assert contract["acceptance_claims"][0]["support"].endswith(support_tail)
+    assert "chars omitted" not in json.dumps(contract)
+
+
+def test_api_context_preserves_boundary_whitespace_byte_for_byte():
+    context = " \nnever deploy; use profile X\n "
+    assert build_task_contract({"context": context})["context"] == context
+
+
+def test_delegation_intent_preserves_internal_newlines_as_authority_bytes():
+    intent = "Delegate only through Claudexor.\n\nL1 must ask L2 to spawn L3."
+    contract = build_task_contract({"delegation_budget": {"intent_note": intent}})
+
+    assert contract["delegation_budget"]["intent_note"] == intent
 
 
 # ---------------------------------------------------------------------------
@@ -1217,6 +1252,7 @@ def test_task_create_request_declares_executor_ref_contract():
         "memory_mode",
         "project_id",
         "attachments",
+        "allow_partial_attachments",
         "acceptance_claims",
         "allowed_resources",
         "resource_policy",
@@ -1236,6 +1272,16 @@ def test_task_create_request_declares_executor_ref_contract():
     ):
         assert required in request_keys
     assert TaskCreateRequest.__required_keys__ == frozenset({"description"})
+
+    from ouroboros.gateway.contracts import AttachmentManifestEntry, TaskCreateResponse
+
+    assert {
+        "ordinal", "status", "reason", "label", "root", "relpath",
+        "abs_path", "mime", "is_image",
+    } <= set(AttachmentManifestEntry.__annotations__)
+    assert {"ok", "task_id", "status", "reason_code", "error", "attachment_manifest"} <= set(
+        TaskCreateResponse.__annotations__
+    )
 
     executor_keys = set(ExecutorRef.__annotations__.keys())
     for required in ("type", "workspace_host_path", "workspace_backend_path", "network", "container_name", "path_mappings"):

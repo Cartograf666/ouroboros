@@ -272,6 +272,258 @@ def test_presence_turn_resolves_binding_and_returns_typed_result(tmp_path: pathl
     assert captured["event"].conversation_key == "telegram:bot-1:room-1:topic-1"
 
 
+def test_presence_turn_attachment_refusal_returns_complete_typed_manifest(
+    tmp_path: pathlib.Path,
+) -> None:
+    from ouroboros.presence_runner import PresenceTurnGate, run_presence_turn
+
+    _seed_token(
+        tmp_path,
+        skill="telegram-bot",
+        token="presence-token",
+        permissions=["presence"],
+        manifest_permissions=["presence"],
+    )
+    binding_id = _seed_presence_behavior(tmp_path)
+    skill_state = tmp_path / "state" / "skills" / "telegram-bot"
+    available = skill_state / "available.txt"
+    available.write_text("available", encoding="utf-8")
+    rejected = skill_state / ".env"
+    rejected.write_text("must not be staged", encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    agent_calls = []
+
+    class Agent:
+        def handle_task(self, task):
+            agent_calls.append(task)
+            raise AssertionError("Presence refusal must happen before the agent")
+
+    def run_real_presence(**kwargs):
+        return run_presence_turn(
+            repo_dir=repo,
+            drive_root=tmp_path,
+            agent_factory=lambda **_kwargs: Agent(),
+            gate=PresenceTurnGate(1),
+            **kwargs,
+        )
+
+    client = TestClient(create_host_service_app(tmp_path, presence_runner=run_real_presence))
+    response = client.post(
+        "/presence/turn",
+        headers={"X-Skill-Token": "presence-token"},
+        json={
+            "binding_id": binding_id,
+            "event": {
+                "source_event_id": "telegram:bot-1:42",
+                "provider": "telegram",
+                "account_id": "bot-1",
+                "conversation_id": "room-1",
+                "thread_id": "topic-1",
+                "conversation_key": "ignored",
+                "actor": {"platform_actor_id": "user-7"},
+                "conversation": {"title": "Community"},
+                "message": {"message_id": "42"},
+                "text": "Hello",
+            },
+            "staged_files": [str(available), str(rejected)],
+        },
+    )
+
+    assert response.status_code == 409
+    payload = response.json()
+    assert payload["ok"] is False
+    assert payload["code"] == "presence_attachment_admission_rejected"
+    assert payload["field"] == "staged_files"
+    manifest = payload["attachment_manifest"]
+    assert [row["status"] for row in manifest] == ["staged", "rejected"]
+    assert manifest[1]["reason"] == "secret_source"
+    assert not pathlib.Path(manifest[0]["abs_path"]).exists()
+    assert agent_calls == []
+    assert not (tmp_path / "logs" / "chat.jsonl").exists()
+
+
+def test_presence_turn_host_passes_attachment_limit_to_canonical_staging_owner(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Host shape/confinement validation must not discard ordinal staging rows."""
+    from ouroboros.presence_runner import PresenceTurnGate, run_presence_turn
+
+    _seed_token(
+        tmp_path,
+        skill="telegram-bot",
+        token="presence-token",
+        permissions=["presence"],
+        manifest_permissions=["presence"],
+    )
+    binding_id = _seed_presence_behavior(tmp_path)
+    skill_state = tmp_path / "state" / "skills" / "telegram-bot"
+    files = []
+    for index in range(26):
+        path = skill_state / f"input-{index}.txt"
+        path.write_text(str(index), encoding="utf-8")
+        files.append(str(path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    agent_calls = []
+
+    class Agent:
+        def handle_task(self, task):
+            agent_calls.append(task)
+            raise AssertionError("Presence refusal must happen before the agent")
+
+    def run_real_presence(**kwargs):
+        return run_presence_turn(
+            repo_dir=repo,
+            drive_root=tmp_path,
+            agent_factory=lambda **_kwargs: Agent(),
+            gate=PresenceTurnGate(1),
+            **kwargs,
+        )
+
+    response = TestClient(
+        create_host_service_app(tmp_path, presence_runner=run_real_presence)
+    ).post(
+        "/presence/turn",
+        headers={"X-Skill-Token": "presence-token"},
+        json={
+            "binding_id": binding_id,
+            "event": {
+                "source_event_id": "telegram:bot-1:42",
+                "provider": "telegram",
+                "account_id": "bot-1",
+                "conversation_id": "room-1",
+                "thread_id": "topic-1",
+                "conversation_key": "ignored",
+                "actor": {"platform_actor_id": "user-7"},
+                "conversation": {"title": "Community"},
+                "message": {"message_id": "42"},
+                "text": "Hello",
+            },
+            "staged_files": files,
+        },
+    )
+
+    assert response.status_code == 409
+    payload = response.json()
+    assert payload["code"] == "presence_attachment_admission_rejected"
+    manifest = payload["attachment_manifest"]
+    assert len(manifest) == 26
+    assert [row["ordinal"] for row in manifest] == list(range(26))
+    assert manifest[-1]["reason"] == "attachment_limit_exceeded"
+    assert all(row["status"] == "rejected" for row in manifest[25:])
+    assert agent_calls == []
+
+
+def test_presence_turn_host_passes_internal_missing_and_directory_to_staging_owner(
+    tmp_path: pathlib.Path,
+) -> None:
+    from ouroboros.presence_runner import PresenceTurnGate, run_presence_turn
+
+    _seed_token(
+        tmp_path,
+        skill="telegram-bot",
+        token="presence-token",
+        permissions=["presence"],
+        manifest_permissions=["presence"],
+    )
+    binding_id = _seed_presence_behavior(tmp_path)
+    skill_state = tmp_path / "state" / "skills" / "telegram-bot"
+    missing = skill_state / "missing.txt"
+    directory = skill_state / "directory"
+    directory.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    agent_calls = []
+
+    class Agent:
+        def handle_task(self, task):
+            agent_calls.append(task)
+            raise AssertionError("Presence refusal must happen before the agent")
+
+    def run_real_presence(**kwargs):
+        return run_presence_turn(
+            repo_dir=repo,
+            drive_root=tmp_path,
+            agent_factory=lambda **_kwargs: Agent(),
+            gate=PresenceTurnGate(1),
+            **kwargs,
+        )
+
+    response = TestClient(
+        create_host_service_app(tmp_path, presence_runner=run_real_presence)
+    ).post(
+        "/presence/turn",
+        headers={"X-Skill-Token": "presence-token"},
+        json={
+            "binding_id": binding_id,
+            "event": {
+                "source_event_id": "telegram:bot-1:42",
+                "provider": "telegram",
+                "account_id": "bot-1",
+                "conversation_id": "room-1",
+                "thread_id": "topic-1",
+                "conversation_key": "ignored",
+                "actor": {"platform_actor_id": "user-7"},
+                "conversation": {"title": "Community"},
+                "message": {"message_id": "42"},
+                "text": "Hello",
+            },
+            "staged_files": [str(missing), str(directory)],
+        },
+    )
+
+    assert response.status_code == 409
+    payload = response.json()
+    assert payload["code"] == "presence_attachment_admission_rejected"
+    manifest = payload["attachment_manifest"]
+    assert [row["ordinal"] for row in manifest] == [0, 1]
+    assert [row["reason"] for row in manifest] == ["source_missing", "source_not_file"]
+    assert agent_calls == []
+
+
+def test_presence_turn_host_rejects_symlink_escape_before_staging(
+    tmp_path: pathlib.Path,
+) -> None:
+    _seed_token(
+        tmp_path,
+        skill="telegram-bot",
+        token="presence-token",
+        permissions=["presence"],
+        manifest_permissions=["presence"],
+    )
+    binding_id = _seed_presence_behavior(tmp_path)
+    skill_state = tmp_path / "state" / "skills" / "telegram-bot"
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    escaped = skill_state / "escaped.txt"
+    escaped.symlink_to(outside)
+    called = []
+    app = create_host_service_app(tmp_path, presence_runner=lambda **kwargs: called.append(kwargs))
+    response = TestClient(app).post(
+        "/presence/turn",
+        headers={"X-Skill-Token": "presence-token"},
+        json={
+            "binding_id": binding_id,
+            "event": {
+                "source_event_id": "telegram:bot-1:43",
+                "provider": "telegram",
+                "account_id": "bot-1",
+                "conversation_id": "room-1",
+                "thread_id": "topic-1",
+                "conversation_key": "ignored",
+                "actor": {"platform_actor_id": "user-7"},
+                "conversation": {"title": "Community"},
+                "message": {"message_id": "43"},
+                "text": "Hello",
+            },
+            "staged_files": [str(escaped)],
+        },
+    )
+    assert response.status_code == 400
+    assert called == []
+
+
 def test_presence_turn_rejects_event_outside_binding(tmp_path: pathlib.Path) -> None:
     _seed_token(
         tmp_path,

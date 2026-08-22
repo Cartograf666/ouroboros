@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import pathlib
 import copy
 from types import SimpleNamespace
 
@@ -413,7 +412,7 @@ def test_measurement_density_must_be_finite_and_positive(measurement_density):
 
 
 def test_real_checkpoint_manifest_binds_complete_selected_transcript(tmp_path):
-    from ouroboros.observability import read_blob_ref
+    from ouroboros.artifacts import read_actor_source_bytes
 
     messages = _unit("checkpoint", "x")
     request = _request(messages, 100)
@@ -435,11 +434,10 @@ def test_real_checkpoint_manifest_binds_complete_selected_transcript(tmp_path):
     )
 
     assert checkpoint_ref is not None
-    manifest_path = pathlib.Path(checkpoint_ref["path"])
-    manifest_bytes = manifest_path.read_bytes()
-    assert hashlib.sha256(manifest_bytes).hexdigest() == checkpoint_ref["sha256"]
-    manifest = json.loads(manifest_bytes)
-    payload = read_blob_ref(tmp_path, manifest["full_payload_ref"])
+    assert checkpoint_ref["root"] == "artifact_store"
+    payload = json.loads(read_actor_source_bytes(
+        tmp_path, "checkpoint-task", checkpoint_ref,
+    ))
     assert payload["messages"] == messages
     assert payload["request"]["transcript_sha256"] == request.transcript_sha256
     assert payload["selection_fingerprint"] == selection.fingerprint
@@ -483,10 +481,17 @@ def test_checkpoint_requests_exact_private_payload_and_binds_capsule(monkeypatch
     assert observed["keep_raw"] is True
     assert observed["payload"]["messages"] == messages
     assert token_shaped_value in json.dumps(observed["payload"], ensure_ascii=False)
-    assert receipt.checkpoint_ref == exact_ref
+    assert receipt.checkpoint_ref != exact_ref
+    assert receipt.checkpoint_ref["root"] == "artifact_store"
+    from ouroboros.artifacts import read_actor_source_bytes
+    actor_payload = json.loads(read_actor_source_bytes(
+        tmp_path, "context_compaction", receipt.checkpoint_ref,
+    ))
+    assert actor_payload["messages"] == messages
+    assert token_shaped_value in json.dumps(actor_payload, ensure_ascii=False)
     capsule = rebuilt[0]["content"][0]["_context_capsule"]
-    assert capsule["checkpoint_ref"] == exact_ref
-    assert exact_ref in capsule["source_refs"]
+    assert capsule["checkpoint_ref"] == receipt.checkpoint_ref
+    assert receipt.checkpoint_ref in capsule["source_refs"]
 
 
 def test_selection_is_minimum_oldest_prefix_toward_deficit(monkeypatch):

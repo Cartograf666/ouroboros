@@ -346,7 +346,18 @@ def test_real_checkpoint_cas_keeps_private_raw_and_projects_receipt_metadata(tmp
         task_id="native-checkpoint-cas",
     )
     assert checkpoint_ref is not None
-    manifest = _manifest(checkpoint_ref)
+    assert checkpoint_ref["root"] == "artifact_store"
+    from ouroboros.artifacts import read_actor_source_bytes
+
+    actor_payload = json.loads(read_actor_source_bytes(
+        tmp_path, "native-checkpoint-cas", checkpoint_ref,
+    ))
+    assert actor_payload["messages"] == messages
+    manifests = sorted(
+        (tmp_path / "observability" / "calls" / "native-checkpoint-cas").glob("*.json")
+    )
+    assert len(manifests) == 1
+    manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
     assert manifest["full_payload_redacted"] is False
     assert manifest["full_payload_custody"] == "private_unredacted_cas"
     assert manifest["full_payload_ref"] != manifest["redacted_projection_ref"]
@@ -530,7 +541,11 @@ def test_background_preserves_receipt_and_aggregates_round_disclosures(
 
     monkeypatch.setattr(observed, "chat_observed", chat_observed)
     monkeypatch.setattr(consciousness, "get_consciousness_model", lambda: "anthropic/claude-future")
-    monkeypatch.setattr(consciousness, "append_jsonl", lambda _path, row: events.append(row))
+    monkeypatch.setattr(
+        consciousness,
+        "append_jsonl",
+        lambda _path, row: (events.append(row) or True),
+    )
     monkeypatch.setattr(consciousness.BackgroundConsciousness, "_build_context", lambda _self: "ctx")
     monkeypatch.setattr(consciousness.BackgroundConsciousness, "_tool_schemas", lambda _self: [])
     monkeypatch.setattr(consciousness.BackgroundConsciousness, "_check_budget", lambda _self: True)

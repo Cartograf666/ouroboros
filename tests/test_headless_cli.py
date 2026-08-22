@@ -158,6 +158,90 @@ def test_task_api_enqueue_workspace_creates_child_drive(tmp_path, monkeypatch):
     assert "target workspace, not the Ouroboros system repo" in captured[0]["text"]
 
 
+def test_task_api_attachment_admission_is_atomic_by_default(tmp_path, monkeypatch):
+    import supervisor.queue as queue
+    from ouroboros.task_results import load_task_result
+
+    data = tmp_path / "data"
+    repo = tmp_path / "repo"
+    data.mkdir()
+    repo.mkdir()
+    good = tmp_path / "good.txt"
+    good.write_text("ok", encoding="utf-8")
+    captured = []
+    monkeypatch.setattr(queue, "enqueue_task", lambda task: captured.append(task) or task)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
+    app = Starlette(routes=[Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"])])
+    app.state.drive_root = data
+    app.state.repo_dir = repo
+
+    response = TestClient(app).post(
+        "/api/tasks",
+        json={
+            "task_id": "atomic-attachments",
+            "description": "needs both",
+            "attachments": [
+                {"path": str(good), "label": "good"},
+                {"path": str(tmp_path / "missing.txt"), "label": "missing"},
+            ],
+        },
+    )
+
+    assert response.status_code == 422
+    payload = response.json()
+    assert payload["reason_code"] == "attachment_admission_rejected"
+    assert [row["status"] for row in payload["attachment_manifest"]] == ["staged", "rejected"]
+    assert payload["attachment_manifest"][1]["reason"] == "source_missing"
+    assert captured == []
+    assert load_task_result(data, "atomic-attachments") is None
+    assert "atomic-attachments" not in queue.ADMISSION_RESERVATIONS
+    assert not task_artifacts_dir(data, "atomic-attachments", create=False).exists()
+
+
+def test_task_api_explicit_partial_attachments_reaches_caller_contract_and_actor(
+    tmp_path, monkeypatch,
+):
+    import supervisor.queue as queue
+
+    data = tmp_path / "data"
+    repo = tmp_path / "repo"
+    data.mkdir()
+    repo.mkdir()
+    good = tmp_path / "good.txt"
+    good.write_text("ok", encoding="utf-8")
+    captured = []
+    monkeypatch.setattr(queue, "enqueue_task", lambda task: captured.append(task) or task)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
+    app = Starlette(routes=[Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"])])
+    app.state.drive_root = data
+    app.state.repo_dir = repo
+
+    response = TestClient(app).post(
+        "/api/tasks",
+        json={
+            "task_id": "partial-attachments",
+            "description": "work with what arrived",
+            "allow_partial_attachments": True,
+            "attachments": [
+                {"path": str(good), "label": "good"},
+                {"path": str(tmp_path / "missing.txt"), "label": "missing"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    manifest = response.json()["attachment_manifest"]
+    assert [row["status"] for row in manifest] == ["staged", "rejected"]
+    task = captured[0]
+    assert task["attachments"] == manifest
+    assert task["task_contract"]["attachment_manifest"] == manifest
+    assert "reason=source_missing" in task["text"]
+    result = json.loads(
+        (data / "task_results" / "partial-attachments.json").read_text(encoding="utf-8")
+    )
+    assert result["attachment_manifest"] == manifest
+
+
 def test_task_api_admission_refusal_is_terminal_not_scheduled_phantom(tmp_path, monkeypatch):
     from ouroboros.task_results import STATUS_FAILED, load_task_result
 

@@ -11,6 +11,7 @@ Parallel-safe: every test isolates state under tmp_path; no shared global state.
 from __future__ import annotations
 
 import base64
+import pathlib
 
 import pytest
 
@@ -43,6 +44,9 @@ class TestStageTaskAttachments:
 
         assert len(manifest) == 1
         entry = manifest[0]
+        assert entry["ordinal"] == 0
+        assert entry["status"] == "staged"
+        assert entry["reason"] == ""
         assert entry["root"] == "artifact_store"
         assert entry["relpath"].startswith("attachments/")
         assert entry["label"] == "Report"
@@ -99,10 +103,13 @@ class TestStageTaskAttachments:
         manifest = stage_task_attachments(
             drive, "task03", [{"path": str(secret)}, {"path": str(good)}]
         )
-        labels = {m["label"] for m in manifest}
+        labels = {m["label"] for m in manifest if m["status"] == "staged"}
         assert "ok.txt" in labels
         assert "credentials.json" not in labels
-        assert len(manifest) == 1
+        assert len(manifest) == 2
+        assert manifest[0]["status"] == "rejected"
+        assert manifest[0]["reason"] == "secret_source"
+        assert manifest[0]["ordinal"] == 0
 
     def test_secret_source_skipped_ssh_dir(self, tmp_path):
         from ouroboros.artifacts import stage_task_attachments
@@ -114,7 +121,12 @@ class TestStageTaskAttachments:
         key.write_text("PRIVATE", encoding="utf-8")
 
         manifest = stage_task_attachments(drive, "task04", [{"path": str(key)}])
-        assert manifest == []
+        assert manifest == [{
+            "ordinal": 0,
+            "status": "rejected",
+            "reason": "secret_source",
+            "label": "id_rsa",
+        }]
 
     def test_image_source_marked_is_image(self, tmp_path):
         from ouroboros.artifacts import stage_task_attachments
@@ -137,7 +149,8 @@ class TestStageTaskAttachments:
         manifest = stage_task_attachments(
             drive, "task06", [{"path": str(tmp_path / "nope.txt")}, {"path": str(adir)}]
         )
-        assert manifest == []
+        assert [row["reason"] for row in manifest] == ["source_missing", "source_not_file"]
+        assert [row["ordinal"] for row in manifest] == [0, 1]
 
     def test_large_file_skipped(self, tmp_path, monkeypatch):
         import ouroboros.artifacts as art
@@ -147,7 +160,8 @@ class TestStageTaskAttachments:
         big.write_bytes(b"\0" * 1024)
         monkeypatch.setattr(art, "_MAX_STAGED_ATTACHMENT_BYTES", 512)
         manifest = art.stage_task_attachments(drive, "task07", [{"path": str(big)}])
-        assert manifest == []
+        assert manifest[0]["status"] == "rejected"
+        assert manifest[0]["reason"] == "file_too_large"
 
     def test_max_count_bound(self, tmp_path, monkeypatch):
         import ouroboros.artifacts as art
@@ -160,7 +174,74 @@ class TestStageTaskAttachments:
             f.write_text(str(i), encoding="utf-8")
             items.append({"path": str(f)})
         manifest = art.stage_task_attachments(drive, "task08", items)
-        assert len(manifest) == 2
+        assert len(manifest) == 5
+        assert [row["status"] for row in manifest] == [
+            "staged", "staged", "rejected", "rejected", "rejected",
+        ]
+        assert {row["reason"] for row in manifest[2:]} == {"attachment_limit_exceeded"}
+
+    def test_copy_failure_is_a_typed_row(self, tmp_path, monkeypatch):
+        import ouroboros.artifacts as art
+
+        drive = _drive(tmp_path)
+        source = tmp_path / "copy-me.txt"
+        source.write_text("payload", encoding="utf-8")
+        monkeypatch.setattr(
+            art.shutil,
+            "copy2",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+        )
+
+        manifest = art.stage_task_attachments(drive, "copy-fail", [{"path": str(source)}])
+
+        assert manifest == [{
+            "ordinal": 0,
+            "status": "rejected",
+            "reason": "copy_failed",
+            "label": "copy-me.txt",
+        }]
+
+    def test_retry_reuses_staged_file_without_duplicate(self, tmp_path):
+        from ouroboros.artifacts import remove_staged_attachments, stage_task_attachments
+
+        drive = _drive(tmp_path)
+        source = tmp_path / "same.txt"
+        source.write_text("same bytes", encoding="utf-8")
+        first = stage_task_attachments(drive, "retry-stage", [{"path": str(source)}])
+        second = stage_task_attachments(drive, "retry-stage", [{"path": str(source)}])
+
+        assert first[0]["relpath"] == second[0]["relpath"]
+        assert len(list(_attach_dir(drive, "retry-stage").iterdir())) == 1
+        # Rejecting/cancelling the repeated call cannot unlink the already
+        # admitted file owned by the first call.
+        assert remove_staged_attachments(second) == 0
+        assert pathlib.Path(first[0]["abs_path"]).is_file()
+        assert not any(key.startswith("_") for row in second for key in row)
+        assert remove_staged_attachments(first) == 1
+
+    def test_changed_source_versions_never_overwrite_prior_delivery(self, tmp_path):
+        from ouroboros.artifacts import remove_staged_attachments, stage_task_attachments
+
+        drive = _drive(tmp_path)
+        source = tmp_path / "mutable.txt"
+        source.write_text("version one", encoding="utf-8")
+        first = stage_task_attachments(drive, "versioned-stage", [{"path": str(source)}])
+        first_path = pathlib.Path(first[0]["abs_path"])
+        source.write_text("version two", encoding="utf-8")
+        second = stage_task_attachments(drive, "versioned-stage", [{"path": str(source)}])
+        second_path = pathlib.Path(second[0]["abs_path"])
+        assert second_path != first_path
+        assert second_path.read_text(encoding="utf-8") == "version two"
+
+        source.write_text("version three", encoding="utf-8")
+        third = stage_task_attachments(drive, "versioned-stage", [{"path": str(source)}])
+        third_path = pathlib.Path(third[0]["abs_path"])
+        assert third_path != second_path
+        assert second_path.read_text(encoding="utf-8") == "version two"
+        assert third_path.read_text(encoding="utf-8") == "version three"
+
+        assert remove_staged_attachments(third) == 1
+        assert second_path.read_text(encoding="utf-8") == "version two"
 
     def test_distinct_sources_no_clobber(self, tmp_path):
         from ouroboros.artifacts import stage_task_attachments
@@ -179,6 +260,68 @@ class TestStageTaskAttachments:
         assert len(manifest) == 2
         rels = {m["relpath"] for m in manifest}
         assert len(rels) == 2  # distinct destinations
+
+    @pytest.mark.parametrize("memory_mode", ["shared", "forked"])
+    def test_inherited_inputs_materialize_in_child_artifact_store(
+        self, tmp_path, memory_mode,
+    ):
+        from ouroboros.artifacts import (
+            materialize_inherited_attachment_manifest,
+            stage_task_attachments,
+        )
+        from ouroboros.tools.core import _read_file
+        from ouroboros.tools.registry import ToolContext
+
+        parent_drive = _drive(tmp_path)
+        source = tmp_path / "authority.txt"
+        source.write_text("inherited-readable", encoding="utf-8")
+        parent_manifest = stage_task_attachments(
+            parent_drive, "parent-task", [{"path": str(source), "label": "authority"}],
+        )
+        child_drive = (
+            parent_drive if memory_mode == "shared" else tmp_path / "forked-child"
+        )
+        child_drive.mkdir(parents=True, exist_ok=True)
+
+        child_manifest, error = materialize_inherited_attachment_manifest(
+            parent_manifest, child_drive, "child-task",
+        )
+
+        assert error == ""
+        assert str(parent_manifest[0]["abs_path"]) not in str(child_manifest)
+        ctx = ToolContext(repo_dir=tmp_path, drive_root=child_drive, task_id="child-task")
+        assert "inherited-readable" in _read_file(
+            ctx, child_manifest[0]["relpath"], root="artifact_store",
+        )
+
+    def test_child_contract_and_external_work_order_use_materialized_manifest(self, tmp_path):
+        from ouroboros.subagent_work_order import compile_external_work_order
+        from ouroboros.tools.control import _build_child_subagent_contract
+
+        parent_path = str(tmp_path / "parent" / "attachments" / "authority.txt")
+        child_path = str(tmp_path / "child" / "attachments" / "authority.txt")
+        parent_contract = {
+            "objective": "parent",
+            "attachment_manifest": [{
+                "ordinal": 0, "status": "staged", "reason": "", "label": "authority",
+                "root": "artifact_store", "relpath": "attachments/authority.txt",
+                "abs_path": parent_path, "mime": "text/plain", "is_image": False,
+            }],
+        }
+        child_manifest = [{**parent_contract["attachment_manifest"][0], "abs_path": child_path}]
+        contract = _build_child_subagent_contract({
+            "tid": "child", "objective": "inspect input", "expected_output": "report",
+            "parent_contract": parent_contract, "attachment_manifest": child_manifest,
+        })
+
+        assert contract["attachment_manifest"] == child_manifest
+        assert parent_path not in str(contract)
+        work_order = compile_external_work_order({
+            "id": "child", "objective": "inspect input", "task_contract": contract,
+        })
+        assert "INHERITED TASK INPUTS" in work_order
+        assert child_path in work_order
+        assert parent_path not in work_order
 
 
 class TestComposeTaskTextManifestLines:
@@ -202,6 +345,7 @@ class TestComposeTaskTextManifestLines:
         assert "[ATTACHMENTS]" in text
         assert "- Pic (image): read_file(root='artifact_store', path='attachments/pic.png')" in text
         assert "read_file(root='artifact_store', path='attachments/doc.txt')" in text
+        assert "status=staged, ordinal=0" in text
         # Never a bare absolute path.
         assert "/attachments/pic.png:" not in text
 
@@ -415,6 +559,42 @@ class TestDesktopChatFullSetStaging:
         assert "attachment_images" not in task
         assert "[ATTACHMENTS]" not in task["text"]
 
+    def test_initial_ui_turn_is_atomic_on_staging_rejection(self, tmp_path, monkeypatch):
+        import supervisor.workers as workers
+
+        drive = _drive(tmp_path)
+        monkeypatch.setattr(workers, "DRIVE_ROOT", drive)
+        notices = []
+        monkeypatch.setattr(
+            workers, "send_with_budget", lambda _chat_id, text, **_kwargs: notices.append(text),
+        )
+        import ouroboros.projects_registry as projects_registry
+
+        bindings = []
+        monkeypatch.setattr(
+            projects_registry,
+            "bind_task_to_project",
+            lambda *args, **kwargs: bindings.append((args, kwargs)),
+        )
+        agent = _FakeChatAgent()
+
+        workers._run_chat_task(
+            agent,
+            1,
+            "must have the file",
+            task_metadata={
+                "project_id": "project-one",
+                "chat_attachment_uploads": [
+                    {"path": str(tmp_path / "missing.txt"), "label": "missing.txt"},
+                ],
+            },
+        )
+
+        assert agent.task is None
+        assert bindings == []
+        assert notices and "source_missing" in notices[-1]
+        assert not (drive / "task_results" / "artifacts").exists()
+
 
 class TestChatAttachmentUploads:
     """ws._chat_attachment_uploads: confine to validated data/uploads/ basenames."""
@@ -455,9 +635,10 @@ class TestChatAttachmentUploads:
             {"filename": "missing.txt", "display_name": "z"},          # not on disk
             {"filename": "present.txt", "display_name": "present"},    # the only valid one
         ])
-        assert len(specs) == 1
-        assert specs[0]["label"] == "present"
-        assert specs[0]["path"] == str((uploads / "present.txt").resolve(strict=False))
+        assert len(specs) == 4
+        assert [row["path"] for row in specs[:3]] == ["", "", ""]
+        assert specs[3]["label"] == "present"
+        assert specs[3]["path"] == str((uploads / "present.txt").resolve(strict=False))
 
     def test_non_list_returns_empty(self, tmp_path, monkeypatch):
         ws, _ = self._setup(tmp_path, monkeypatch)

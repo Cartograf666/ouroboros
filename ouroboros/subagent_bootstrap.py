@@ -5,7 +5,12 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping
 
-from ouroboros.subagent_work_order import WorkOrderBudgetExceeded, compile_external_work_order
+from ouroboros.subagent_work_order import (
+    WorkOrderBudgetExceeded,
+    build_work_order_source_request,
+    compile_external_work_order,
+    route_source_request_channel,
+)
 
 
 def bootstrap_before_context(ctx: Any, task: Mapping[str, Any], dispatch: Any) -> str:
@@ -115,14 +120,107 @@ def bootstrap_session_leaf(ctx: Any, task: Mapping[str, Any], dispatch: Any) -> 
     try:
         work_order = compile_external_work_order(task)
     except WorkOrderBudgetExceeded as exc:
-        return json.dumps({
-            "status": "configured_session_start_wake",
-            "startup": {
-                "status": "refused", "reason": "work_order_budget_exceeded",
-                "complete_chars": exc.chars, "wire_budget_chars": exc.limit,
+        source_prompt, source_request = build_work_order_source_request(task, exc)
+        route = getattr(getattr(dispatch, "executor_resolution", None), "route", None)
+        route_id = str(getattr(route, "route_id", "") or "")
+        channel = {"status": "unverified", "reason": "route_missing", "route": route_id}
+        gateway = None
+        try:
+            from ouroboros.claudexor_daemon import ensure_owned_gateway
+
+            gateway = ensure_owned_gateway()
+            channel = route_source_request_channel(gateway, route_id)
+        except Exception as channel_error:  # noqa: BLE001 - fail closed on unknown capability
+            channel = {
+                "status": "unverified",
+                "reason": "capability_probe_failed",
+                "detail": type(channel_error).__name__,
+                "route": route_id,
+            }
+        finally:
+            if gateway is not None:
+                try:
+                    gateway.close()
+                except Exception:
+                    pass
+
+        if channel.get("status") != "available":
+            reason = (
+                "work_order_source_channel_unavailable"
+                if channel.get("status") == "unavailable"
+                else "work_order_source_channel_unverified"
+            )
+            startup = {
+                "status": "refused",
+                "reason": reason,
+                "complete_chars": exc.chars,
+                "wire_budget_chars": exc.limit,
                 "complete_sha256": exc.sha256,
-                "detail": "The complete brief was not truncated or sent. Narrow the child brief explicitly.",
-            },
+                "source_request": source_request,
+                "source_channel": channel,
+                "detail": (
+                    "The complete brief was not truncated or sent. A live interactive "
+                    "question channel is required to resolve its named source ranges."
+                ),
+            }
+            from ouroboros import delegate_custody as custody
+
+            custody.emit(custody.custody_root(ctx), "configured_subagent_work_order_refused", {
+                "task_id": str(getattr(ctx, "task_id", "") or ""),
+                **startup,
+            })
+            return json.dumps({
+                "status": "configured_session_start_wake", "startup": startup,
+            }, ensure_ascii=False, indent=2)
+
+        from ouroboros import delegate_custody as custody
+
+        custody.emit(custody.custody_root(ctx), "configured_subagent_work_order_source_request", {
+            "task_id": str(getattr(ctx, "task_id", "") or ""),
+            "route": route_id,
+            **source_request,
+        })
+        started_raw = exact_start(ctx, source_prompt, {
+            "snapshot": snapshot,
+            "compiled_work_order": True,
+            "work_order_fingerprint": exc.sha256,
+            "work_order_source_request": source_request,
+        })
+        try:
+            started = json.loads(started_raw)
+        except (TypeError, ValueError):
+            return json.dumps({
+                "status": "startup_fault",
+                "reason": "unparseable_exact_start_result",
+                "detail": str(started_raw or ""),
+                "work_order_source_request": source_request,
+            }, ensure_ascii=False, indent=2)
+        if not isinstance(started, dict):
+            started = {"status": "startup_fault", "detail": str(started)}
+        started["work_order_source_request"] = source_request
+        if str(started.get("status") or "") != "started":
+            return json.dumps({
+                "status": "configured_session_start_wake",
+                "startup": started,
+            }, ensure_ascii=False, indent=2)
+        run_id = str(started.get("run_id") or "")
+        if not run_id:
+            return json.dumps({
+                "status": "configured_session_start_wake",
+                "startup": started,
+                "reason": "started_without_run_id",
+            }, ensure_ascii=False, indent=2)
+        from ouroboros.delegate_supervision import supervised_wait
+
+        wake_raw = supervised_wait(ctx, run_id)
+        try:
+            wake = json.loads(wake_raw)
+        except (TypeError, ValueError):
+            wake = {"status": "wake_fault", "detail": wake_raw}
+        return json.dumps({
+            "status": "configured_session_wake",
+            "startup": started,
+            "wake": wake,
         }, ensure_ascii=False, indent=2)
     started_raw = exact_start(ctx, work_order, {
         "snapshot": snapshot,

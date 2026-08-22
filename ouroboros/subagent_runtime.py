@@ -574,6 +574,10 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
     selected_id = str(options.pop("subagent_id", "") or "").strip()
     selected_snapshot = options.pop("snapshot", None)
     compiled_work_order = bool(options.pop("compiled_work_order", False))
+    canonical_work_order_fingerprint = str(
+        options.pop("work_order_fingerprint", "") or ""
+    ).strip()
+    work_order_source_request = options.pop("work_order_source_request", None)
     try:
         if str(options.get("retry_of") or "").strip() and (
             selected_id or selected_snapshot is not None
@@ -618,6 +622,8 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
             root=options.pop("root", None), bucket=options.pop("bucket", None),
             skill_name=options.pop("skill_name", None),
             _resolved_binding=options.pop("_resolved_binding", None),
+            _canonical_work_order_fingerprint=canonical_work_order_fingerprint,
+            _work_order_source_request=work_order_source_request,
         )
         try:
             payload = json.loads(result)
@@ -630,6 +636,8 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
             payload["config_fingerprint"] = str(
                 selected_snapshot.get("config_fingerprint") or ""
             )
+        if isinstance(work_order_source_request, dict):
+            payload["work_order_source_request"] = dict(work_order_source_request)
         return json.dumps(payload, ensure_ascii=False, indent=2)
     except SubagentSelectionError as exc:
         from ouroboros.delegate_shared import _fail

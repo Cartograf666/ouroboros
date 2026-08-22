@@ -89,21 +89,25 @@ def _chat_attachment_uploads(attachments: Any) -> list[dict]:
 
     uploads_dir = (pathlib.Path(DATA_DIR) / "uploads").resolve(strict=False)
     specs: list[dict] = []
-    for item in attachments:
+    for ordinal, item in enumerate(attachments):
         if not isinstance(item, dict):
+            specs.append({"path": "", "label": f"attachment {ordinal + 1}", "mime": ""})
             continue
         name = _os.path.basename(str(item.get("filename") or "").strip())
+        label = str(item.get("display_name") or item.get("label") or name).strip()
         if not name or name in {".", ".."}:
+            specs.append({"path": "", "label": label or f"attachment {ordinal + 1}", "mime": str(item.get("mime") or "")})
             continue
         path = (uploads_dir / name).resolve(strict=False)
         try:
             path.relative_to(uploads_dir)
         except ValueError:
+            specs.append({"path": "", "label": label or name, "mime": str(item.get("mime") or "")})
             continue
         if not path.is_file():
+            specs.append({"path": "", "label": label or name, "mime": str(item.get("mime") or "")})
             continue
-        label = str(item.get("display_name") or item.get("label") or name).strip() or name
-        specs.append({"path": str(path), "label": label, "mime": str(item.get("mime") or "")})
+        specs.append({"path": str(path), "label": label or name, "mime": str(item.get("mime") or "")})
     return specs
 
 

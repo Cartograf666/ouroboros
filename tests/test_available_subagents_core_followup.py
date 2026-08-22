@@ -169,6 +169,94 @@ def test_uncredentialed_api_actor_stops_before_the_llm_loop(monkeypatch, tmp_pat
     assert any(event.get("type") == "task_done" for event in events)
 
 
+def test_unreadable_named_owner_source_refuses_before_model_or_tool_work(monkeypatch, tmp_path):
+    from ouroboros import agent as agent_module
+    from ouroboros.agent import Env, OuroborosAgent
+    from ouroboros.project_dialogue import build_owner_message_ref
+
+    repo, drive = tmp_path / "repo", tmp_path / "drive"
+    repo.mkdir()
+    drive.mkdir()
+    missing_text = "owner directive that no surviving source can resolve"
+    ref = build_owner_message_ref(
+        chat_id=1, client_message_id="missing-owner", ts="2026-08-21T00:00:00Z",
+        text=missing_text,
+    )
+    monkeypatch.setattr(OuroborosAgent, "_log_worker_boot_once", lambda self: None)
+    model_calls, tool_context_calls = [], []
+    monkeypatch.setattr(
+        agent_module, "run_llm_loop",
+        lambda **kwargs: model_calls.append(kwargs) or ("unexpected", {}, {}),
+    )
+    agent = OuroborosAgent(Env(repo_dir=repo, drive_root=drive))
+    monkeypatch.setattr(
+        agent.tools, "set_context", lambda ctx: tool_context_calls.append(ctx),
+    )
+
+    events = agent._handle_task_scoped({
+        "id": "missing-authority",
+        "type": "task",
+        "chat_id": 1,
+        "text": "continue",
+        "origin_message_ref": ref,
+    })
+
+    assert model_calls == []
+    assert tool_context_calls == []
+    result = json.loads(
+        (drive / "task_results" / "missing-authority.json").read_text(encoding="utf-8")
+    )
+    assert result["reason_code"] == "authority_source_unavailable"
+    assert result["outcome_axes"]["execution"]["status"] == "infra_failed"
+    assert result["trace_summary"].count("authority_source_unavailable") == 1
+    assert any(event.get("type") == "task_done" for event in events)
+
+
+def test_malformed_named_authority_shapes_refuse_before_model_or_tool_work(monkeypatch, tmp_path):
+    from ouroboros import agent as agent_module
+    from ouroboros.agent import Env, OuroborosAgent
+    from ouroboros.project_dialogue import _text_sha256
+
+    repo, drive = tmp_path / "repo", tmp_path / "drive"
+    repo.mkdir()
+    (drive / "task_results").mkdir(parents=True)
+    (drive / "task_results" / "old-root.json").write_text(json.dumps({
+        "task_id": "old-root", "status": "completed", "objective": "old authority",
+    }), encoding="utf-8")
+    monkeypatch.setattr(OuroborosAgent, "_log_worker_boot_once", lambda self: None)
+    model_calls, tool_context_calls = [], []
+    monkeypatch.setattr(
+        agent_module, "run_llm_loop",
+        lambda **kwargs: model_calls.append(kwargs) or ("unexpected", {}, {}),
+    )
+    agent = OuroborosAgent(Env(repo_dir=repo, drive_root=drive))
+    monkeypatch.setattr(agent.tools, "set_context", lambda ctx: tool_context_calls.append(ctx))
+    tasks = [{
+        "id": "malformed-origin", "type": "task", "chat_id": 1, "text": "continue",
+        "origin_message_ref": {
+            "chat_id": 1, "client_message_id": "owner-1",
+            "text_sha256": _text_sha256("exact retained text"),
+        },
+        "origin_message_text": "exact retained text",
+    }, {
+        "id": "malformed-predecessor", "type": "task", "chat_id": 1, "text": "continue",
+        "predecessor_authority_source": {
+            "kind": "task_result", "task_id": "old-root", "tool": "get_task_result",
+            "arguments": {"task_id": "old-root", "include_authority": False},
+        },
+    }]
+
+    for task in tasks:
+        events = agent._handle_task_scoped(task)
+        result = json.loads(
+            (drive / "task_results" / f"{task['id']}.json").read_text(encoding="utf-8")
+        )
+        assert result["reason_code"] == "authority_source_unavailable"
+        assert any(event.get("type") == "task_done" for event in events)
+    assert model_calls == []
+    assert tool_context_calls == []
+
+
 def test_context_build_exception_propagates_after_exact_leaf_bootstrap(monkeypatch, tmp_path):
     from ouroboros import agent as agent_module
     import ouroboros.claudexor_daemon as daemon
@@ -245,6 +333,62 @@ def test_awake_loop_durably_acks_injected_mailbox_before_next_sleep(tmp_path, me
     assert expected in rendered
 
 
+def test_delegate_owner_wake_ack_replays_on_fresh_physical_attempt(tmp_path):
+    import ouroboros.delegate_supervision as supervision
+    from ouroboros.owner_mailbox import write_owner_message
+
+    exact = "delegate owner bytes  \n"
+    assert write_owner_message(tmp_path, exact, "child1", msg_id="owner-1")
+    first_ctx = SimpleNamespace(
+        task_id="child1", task_attempt=1, drive_root=tmp_path,
+        budget_drive_root=str(tmp_path), task_metadata={},
+    )
+    wake = json.loads(supervision.supervised_wait(
+        first_ctx, "run-1",
+        wait_once=lambda *_a, **_k: json.dumps({
+            "status": "no_progress", "run_id": "run-1", "last_seq": 0,
+        }),
+    ))
+    assert wake["wake_events"][0]["text"] == exact
+    assert supervision.acknowledge_pending_wake(first_ctx, wake)
+    assert supervision._addressed_wakes(first_ctx, supervision.supervision_checkpoint(first_ctx)) == []
+
+    successor = SimpleNamespace(**{**first_ctx.__dict__, "task_attempt": 2})
+    replay = supervision._addressed_wakes(
+        successor, supervision.supervision_checkpoint(successor),
+    )
+    assert [(row["msg_id"], row["text"]) for row in replay] == [
+        ("owner-1", exact),
+    ]
+
+
+def test_unacknowledged_delegate_wake_replays_before_successor_poll(tmp_path):
+    import ouroboros.delegate_supervision as supervision
+    from ouroboros.owner_mailbox import write_owner_message
+
+    assert write_owner_message(tmp_path, "pending exact", "child1", msg_id="owner-pending")
+    first_ctx = SimpleNamespace(
+        task_id="child1", task_attempt=1, drive_root=tmp_path,
+        budget_drive_root=str(tmp_path), task_metadata={},
+    )
+    first = json.loads(supervision.supervised_wait(
+        first_ctx, "run-1",
+        wait_once=lambda *_a, **_k: json.dumps({
+            "status": "no_progress", "run_id": "run-1", "last_seq": 0,
+        }),
+    ))
+    successor = SimpleNamespace(**{**first_ctx.__dict__, "task_attempt": 2})
+    assert supervision.acknowledge_pending_wake(successor)
+    replay = json.loads(supervision.supervised_wait(
+        successor, "run-1",
+        wait_once=lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("successor must replay before polling the harness")
+        ),
+    ))
+    assert replay["supervision_wake_id"] == first["supervision_wake_id"]
+    assert replay["wake_events"][0]["text"] == "pending exact"
+
+
 @pytest.mark.parametrize("control_kind", ["finalize_now", "hurry"])
 def test_sleeping_control_wakes_then_loop_routes_without_supervision_ack(tmp_path, control_kind):
     import ouroboros.delegate_supervision as supervision
@@ -273,6 +417,9 @@ def test_sleeping_control_wakes_then_loop_routes_without_supervision_ack(tmp_pat
     assert supervision.supervision_checkpoint(ctx)["pending_wake"]["mailbox_ids"] == []
     assert supervision.acknowledge_pending_wake(ctx, wake)
     assert acknowledged_task_message_ids(tmp_path, "child1") == set()
+    assert supervision._addressed_wakes(
+        ctx, supervision.supervision_checkpoint(ctx),
+    ) == []
 
     controls = _drain_incoming_messages(
         [], queue.Queue(), tmp_path, "child1", None, set(), owner_ctx=ctx,
@@ -292,7 +439,10 @@ def test_refused_bootstrap_receipt_never_claims_a_live_leaf(monkeypatch):
         SimpleNamespace(), messages,
         json.dumps({
             "status": "configured_session_start_wake",
-            "startup": {"status": "refused", "reason": "work_order_budget_exceeded"},
+            "startup": {
+                "status": "refused",
+                "reason": "work_order_source_channel_unavailable",
+            },
         }),
     )
     receipt = messages[0]["content"]
@@ -346,3 +496,38 @@ def test_crash_handoff_does_not_replay_attempt_local_loop_controls(tmp_path):
     assert recovery._successor_pending_wake({
         "payload": {"status": "no_progress", "wake_events": [{"kind": KIND_HURRY}]},
     }) == {}
+
+
+def test_planned_restart_retry_reset_preserves_owner_not_controls(monkeypatch, tmp_path):
+    from ouroboros.owner_mailbox import (
+        KIND_HURRY,
+        drain_owner_entries,
+        write_owner_message,
+    )
+    from supervisor import queue as task_queue
+    from supervisor import workers
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    workers.init(repo, tmp_path, 1, 600, 1800, 100.0)
+    workers.WORKERS.clear()
+    workers.PENDING.clear()
+    workers.RUNNING.clear()
+    task = {"id": "child", "parent_task_id": "parent", "root_task_id": "parent"}
+    workers.RUNNING["child"] = {"task": task, "attempt": 1}
+    assert write_owner_message(tmp_path, "exact owner", "child", msg_id="owner-1")
+    assert write_owner_message(
+        tmp_path, "owner_hurry", "child", msg_id="hurry-1", kind=KIND_HURRY,
+    )
+    monkeypatch.setattr(task_queue, "persist_queue_snapshot", lambda *_a, **_k: True)
+
+    workers.kill_workers(
+        preserve_pending=True, preserve_running_task_ids={"child"},
+    )
+
+    assert [row["_attempt"] for row in workers.PENDING] == [2]
+    assert [(row["msg_id"], row["text"]) for row in drain_owner_entries(
+        tmp_path, "child", attempt_key=2,
+    )] == [("owner-1", "exact owner")]
+    workers.PENDING.clear()
+    workers.RUNNING.clear()

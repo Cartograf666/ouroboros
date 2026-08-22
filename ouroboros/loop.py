@@ -3243,16 +3243,15 @@ def _drain_incoming_messages(
 
         if owner_ctx:
             owner_ctx._loop_mailbox_seen_ids = _owner_msg_seen
-        for entry in drain_owner_entries(drive_root, task_id=task_id, seen_ids=_owner_msg_seen):
+        attempt = getattr(owner_ctx, "task_attempt", None) or (1 if owner_ctx is not None else None)
+        for entry in drain_owner_entries(drive_root, task_id, _owner_msg_seen, attempt):
             kind = entry.get("kind") or KIND_OWNER_TEXT
             if kind == KIND_FINALIZE_NOW:
                 text = str(entry.get("text") or "deadline")
                 controls["finalize_now"] = text
                 first_line = text.splitlines()[0].strip() if text else ""
                 if first_line == REASON_OWNER_REQUESTED_FINALIZATION:
-                    # Owner-stop budget starts at DELIVERY (1=A): stamp the drain
-                    # so the custody sweep budgets the final turn from here, not
-                    # the button press. First drain wins; fail-soft.
+                    # Owner-stop budget starts at delivery; first drain wins.
                     _mark_owner_stop_control_drained(owner_ctx, drive_root, task_id)
                 continue
             if kind == KIND_HURRY:
@@ -6575,7 +6574,7 @@ def _cleanup_loop_resources(
     stateful_executor: Any,
     ctx: _LoopExitContext,
 ) -> None:
-    """Release executor, task services, and mailbox after every loop exit."""
+    """Release attempt-scoped executors, services, and delegated runs."""
     if stateful_executor:
         try:
             from ouroboros.tools.browser import cleanup_browser
@@ -6606,14 +6605,6 @@ def _cleanup_loop_resources(
         release_task_runs(custody_root(ctx.tools._ctx), ctx.task_id)
     except Exception:
         log.debug("Failed to release delegated runs for task %s", ctx.task_id, exc_info=True)
-    try:
-        from ouroboros.owner_mailbox import cleanup_task_mailbox
-
-        cleanup_task_mailbox(ctx.drive_root, ctx.task_id)
-    except Exception:
-        log.debug("Failed to cleanup task mailbox", exc_info=True)
-
-
 def _service_identity_projection(service: Dict[str, Any]) -> Dict[str, Any]:
     """Bounded identity used to deduplicate idempotent teardown observations."""
 
