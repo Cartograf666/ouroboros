@@ -600,6 +600,10 @@ def _promote_task_source_ref(
         )
 
         read_actor_source_bytes(parent_root, task_id, ref)
+        # The destination already contains this exact verified handle.  Count
+        # the idempotent resolution just like a fresh promotion so concurrent
+        # copy-back callers publish the same deterministic custody projection.
+        state["promoted_source_handle_count"] += 1
         return dict(ref)
     except Exception:
         pass
