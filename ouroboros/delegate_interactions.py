@@ -541,7 +541,7 @@ def _delegate_answer(
                                             seconds_left=_left())
         status = str(body.get("status") or "")
         source_receipt = None
-        if status == "delivered" and verified_source is not None:
+        if status in ("delivered", "already_resolved") and verified_source is not None:
             from ouroboros import delegate_custody as custody
 
             source_landed = custody.record_source_range_verified(

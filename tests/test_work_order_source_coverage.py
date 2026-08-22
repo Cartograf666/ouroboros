@@ -268,6 +268,48 @@ def test_source_answer_is_verified_before_delivery_and_replayed(tmp_path, monkey
     )["status"] == "complete"
 
 
+def test_source_receipt_retries_after_delivery_when_first_append_fails(tmp_path, monkeypatch):
+    import ouroboros.tools.delegate as delegate
+    from ouroboros import delegate_custody as custody
+    from ouroboros.gateways import claudexor as gateway_module
+
+    ctx, request, full_text, _prompt = _fixture(tmp_path)
+    entry = _started_entry(tmp_path, request, request["complete_sha256"])
+    midpoint = len(full_text) // 2
+    response = _source_response(request, full_text[:midpoint], 0, midpoint)
+    statuses = iter(("delivered", "already_resolved"))
+    append_results = iter((False, True))
+
+    class Gateway:
+        def handshake(self, **_kwargs):
+            return {}
+
+        def answer_interaction(self, _run_id, _interaction_id, _answers):
+            return {"accepted": True, "status": next(statuses)}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(gateway_module, "ClaudexorGateway", lambda: Gateway())
+    monkeypatch.setattr(
+        custody,
+        "record_source_range_verified",
+        lambda *_args, **_kwargs: next(append_results),
+    )
+    first = json.loads(delegate._delegate_answer(
+        ctx, entry.run_id, "interaction-retry",
+        [{"question_id": "q1", "free_text": "range"}], response,
+    ))
+    assert first["status"] == "delivered"
+    assert first["work_order_verification"]["status"] == "cannot_verify"
+    second = json.loads(delegate._delegate_answer(
+        ctx, entry.run_id, "interaction-retry",
+        [{"question_id": "q1", "free_text": "range"}], response,
+    ))
+    assert second["status"] == "already_resolved"
+    assert next(append_results, None) is None
+
+
 def test_invalid_source_answer_never_posts_to_engine(tmp_path, monkeypatch):
     import ouroboros.tools.delegate as delegate
     from ouroboros.gateways import claudexor as gateway_module
