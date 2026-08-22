@@ -678,11 +678,18 @@ export function loginStatusUnknown(row) {
 export function rowLoginAction(row, payload) {
     const runtime = runtimeActionLabel(payload);
     if (runtime !== 'Connect') return { label: runtime, disabled: false };
-    if (loginStatusUnknown(row)) return { label: 'Check status', disabled: true };
+    if (loginStatusUnknown(row)) {
+        // Keep recovery available for every harness.  An unknown probe is not
+        // proof of logout, but it also must not strand a profile whose next
+        // status read may become a clean login verdict.  The click handler
+        // below runs the shared Refresh path instead of starting OAuth.
+        return { label: 'Check status', disabled: false, refresh: true };
+    }
     return {
         label: String(row?.status?.verification || '') === 'passed'
             ? 'Sign in again' : 'Sign in',
         disabled: false,
+        refresh: false,
     };
 }
 
@@ -1034,7 +1041,17 @@ function renderRows() {
         button.addEventListener('click', () => {
             if (!state.initialized) return;
             const row = button.closest('[data-harness]');
-            startLogin(row?.dataset.harness, row?.dataset.profile);
+            const rowData = row?.dataset || {};
+            const rowModel = accountRows(payload).find((candidate) =>
+                String(candidate?.harness || '') === String(rowData.harness || '')
+                && String(candidate?.profile_id || '') === String(rowData.profile || '')
+            );
+            const action = rowLoginAction(rowModel, payload);
+            if (action.refresh) {
+                state.store.refresh();
+                return;
+            }
+            startLogin(rowData.harness, rowData.profile);
         });
     });
     host.querySelectorAll('[data-harness-remove]').forEach((button) => {

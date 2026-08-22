@@ -314,18 +314,29 @@ test('an explicit auth probe failure does not turn into a re-login button', () =
     assert.equal(loginStatusUnknown(unknown), true);
     assert.equal(rowActionLabel(unknown, payload()), 'Check status');
     assert.deepEqual(rowLoginAction(unknown, payload()),
-        { label: 'Check status', disabled: true });
+        { label: 'Check status', disabled: false, refresh: true });
     // The compatibility wire has no availability field, so an older engine's
     // existing action stays unchanged.
     const legacy = { ...unknown, status: { verification: 'not_run' } };
     assert.equal(loginStatusUnknown(legacy), false);
     assert.deepEqual(rowLoginAction(legacy, payload()),
-        { label: 'Sign in', disabled: false });
+        { label: 'Sign in', disabled: false, refresh: false });
     // Runtime repair remains actionable even while the row's auth probe is
     // unknown: Connect must be able to install/update the pinned engine.
     const broken = { daemon: { state: 'stale', runtime: { state: 'error' } } };
     assert.deepEqual(rowLoginAction(unknown, broken),
         { label: 'Fix & connect', disabled: false });
+});
+
+test('the unknown-status refresh action preserves recovery for every profile harness', () => {
+    for (const harness of ['claude', 'codex', 'cursor', 'agy']) {
+        const row = {
+            harness, profile_id: 'work', kind: 'profile',
+            status: { availability: 'unknown', verification: 'not_run' },
+        };
+        assert.deepEqual(rowLoginAction(row, payload()),
+            { label: 'Check status', disabled: false, refresh: true }, harness);
+    }
 });
 
 // ---------------------------------------------------------------------------
