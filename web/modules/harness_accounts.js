@@ -677,18 +677,17 @@ export function loginStatusUnknown(row) {
 
 export function rowLoginAction(row, payload) {
     const runtime = runtimeActionLabel(payload);
-    if (runtime !== 'Connect') return { label: runtime, disabled: false };
+    if (runtime !== 'Connect') return { label: runtime, refresh: false };
     if (loginStatusUnknown(row)) {
         // Keep recovery available for every harness.  An unknown probe is not
         // proof of logout, but it also must not strand a profile whose next
         // status read may become a clean login verdict.  The click handler
         // below runs the shared Refresh path instead of starting OAuth.
-        return { label: 'Check status', disabled: false, refresh: true };
+        return { label: 'Check status', refresh: true };
     }
     return {
         label: String(row?.status?.verification || '') === 'passed'
             ? 'Sign in again' : 'Sign in',
-        disabled: false,
         refresh: false,
     };
 }
@@ -967,7 +966,7 @@ function rowHtml(row, payload, facets = {}) {
             </div>
             <div class="harness-account-meta muted">${escapeHtml(meta)}</div>
             <div class="harness-account-actions">
-                <button type="button" class="btn btn-default" data-harness-login${loginAction.disabled ? ' disabled title="Refresh to retry the auth check"' : ''}>${escapeHtml(loginAction.label)}</button>${rowActions}
+                <button type="button" class="btn btn-default" data-harness-login>${escapeHtml(loginAction.label)}</button>${rowActions}
             </div>
         </div>
     `;

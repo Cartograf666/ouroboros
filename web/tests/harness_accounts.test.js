@@ -1386,6 +1386,28 @@ function mountSection() {
     return { elements, doc, win };
 }
 
+function mountInteractiveAccountsSection() {
+    const mounted = mountSection();
+    const loginButton = {
+        listeners: [],
+        addEventListener(type, fn) { loginButton.listeners.push([type, fn]); },
+    };
+    const row = {
+        dataset: { harness: 'claude', profile: 'work' },
+    };
+    loginButton.closest = () => row;
+    const groups = {
+        _html: '',
+        set innerHTML(value) { groups._html = String(value); },
+        get innerHTML() { return groups._html; },
+        querySelectorAll(selector) {
+            return selector === '[data-harness-login]' ? [loginButton] : [];
+        },
+    };
+    mounted.elements['harness-accounts-groups'] = groups;
+    return { ...mounted, loginButton };
+}
+
 function captureCardControls(element) {
     const controls = new Map();
     element.querySelector = (selector) => {
@@ -1875,6 +1897,67 @@ test('the refresh button routes the click through the same predicate as its labe
         store.dispose();
         globalThis.document = priorDoc;
         globalThis.window = priorWin;
+    }
+});
+
+test('an unknown auth row refreshes status on the real click, never starts login', async () => {
+    const { elements, doc, win, loginButton } = mountInteractiveAccountsSection();
+    const priorDoc = globalThis.document;
+    const priorWin = globalThis.window;
+    const priorFetch = globalThis.fetch;
+    globalThis.document = doc;
+    globalThis.window = win;
+    const requests = [];
+    const snapshot = {
+        daemon: { state: 'running', engine_version: '3.3.13', runtime: { state: 'ready' } },
+        harnesses: [{ id: 'claude', display_name: 'Claude Code' }],
+        profiles: {
+            profiles: [{
+                profile: { harness_id: 'claude', profile_id: 'work', display_name: 'Work', enabled: true },
+                status: { availability: 'unknown', verification: 'not_run' },
+                identity: {},
+            }],
+            harnessAccounts: [],
+        },
+        quota: [],
+    };
+    const store = createClaudexorStatusStore({
+        fetchImpl: async (url, init = {}) => {
+            requests.push(`${init.method || 'GET'} ${url}`);
+            return fakeResponse(200, snapshot);
+        },
+        doc,
+    });
+    const originalRefresh = store.refresh.bind(store);
+    let refreshCalls = 0;
+    let refreshPromise;
+    store.refresh = (...args) => {
+        refreshCalls += 1;
+        refreshPromise = originalRefresh(...args);
+        return refreshPromise;
+    };
+    try {
+        assert.equal(await initHarnessAccounts({ store }), true);
+        await refreshPromise;
+        refreshCalls = 0;
+        requests.length = 0;
+        const click = loginButton.listeners
+            .filter(([type]) => type === 'click').map(([, fn]) => fn).at(-1);
+        assert.ok(click, 'the account row lost its login listener');
+        click();
+        await refreshPromise;
+        assert.equal(refreshCalls, 1, 'unknown status did not use the shared Refresh path');
+        assert.ok(requests.some((request) => request.startsWith('GET ')),
+            'Refresh did not re-read status');
+        assert.ok(requests.every((request) => !request.startsWith('POST /api/claudexor/login')),
+            'unknown status incorrectly started OAuth login');
+        assert.match(elements['harness-accounts-groups'].innerHTML, /Login status unknown/);
+    } finally {
+        destroyHarnessAccounts();
+        store.dispose();
+        globalThis.document = priorDoc;
+        globalThis.window = priorWin;
+        globalThis.fetch = priorFetch;
     }
 });
 
