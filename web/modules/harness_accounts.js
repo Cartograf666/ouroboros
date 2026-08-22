@@ -81,6 +81,7 @@ export function verificationBadge(profile, { known = true } = {}) {
     const status = profile?.status || profile || {};
     const source = String(status.verification_source || '');
     const verification = String(status.verification || '');
+    const availability = String(status.availability || '');
     const badge = () => {
         if (source === 'vendor' && verification === 'passed') {
             return { tone: 'ok', label: 'Verified live' };
@@ -92,7 +93,15 @@ export function verificationBadge(profile, { known = true } = {}) {
         }
         if (verification === 'not_run') {
             // No probe ran, so this is unknown rather than a failed login.
-            return { tone: 'muted', label: 'Not verified' };
+            // A typed `availability=unknown` is stronger evidence: the engine
+            // tried the auth-status probe but could not get a verdict (timeout,
+            // malformed output, etc.). Keep that distinct from a clean
+            // not-yet-verified profile so the owner is not nudged into a
+            // needless re-login.
+            return {
+                tone: 'muted',
+                label: availability === 'unknown' ? 'Login status unknown' : 'Not verified',
+            };
         }
         if (verification) {
             return { tone: 'error', label: `Verification ${verification}` };
@@ -650,9 +659,31 @@ export function rowActionLabel(row, payload) {
     // what it is really offering: an account that HAS a session signs in again,
     // one that does not simply signs in. ("Connect" belongs to a family with no
     // account yet, where it is the first step rather than a repeat.)
+    return rowLoginAction(row, payload).label;
+}
+
+/**
+ * The engine's explicit auth-probe-unknown state is not permission to start a
+ * new login. `availability=unknown` + `verification=not_run` means that the
+ * probe could not decide; only an explicit `unavailable`/`failed` verdict may
+ * offer the sign-in action. Older engines omit `availability`, so they retain
+ * the legacy behavior. The top-level Refresh action re-runs the status probe.
+ */
+export function loginStatusUnknown(row) {
+    const status = row?.status || {};
+    return String(status.availability || '') === 'unknown'
+        && String(status.verification || '') === 'not_run';
+}
+
+export function rowLoginAction(row, payload) {
     const runtime = runtimeActionLabel(payload);
-    if (runtime !== 'Connect') return runtime;
-    return String(row?.status?.verification || '') === 'passed' ? 'Sign in again' : 'Sign in';
+    if (runtime !== 'Connect') return { label: runtime, disabled: false };
+    if (loginStatusUnknown(row)) return { label: 'Check status', disabled: true };
+    return {
+        label: String(row?.status?.verification || '') === 'passed'
+            ? 'Sign in again' : 'Sign in',
+        disabled: false,
+    };
 }
 
 // "agents", "agents and limits", "agents, accounts and limits".
@@ -912,6 +943,7 @@ export function accountRowFacts(row, payload,
 
 function rowHtml(row, payload, facets = {}) {
     const { badge, quota, name, meta } = accountRowFacts(row, payload, facets);
+    const loginAction = rowLoginAction(row, payload);
     // Row ACTIONS follow the engine's own routes, never the row's looks: a
     // named registry row (every row on a unified engine, the named profiles on
     // a legacy one) has the PATCH Enabled toggle and DELETE Remove; the legacy
@@ -928,7 +960,7 @@ function rowHtml(row, payload, facets = {}) {
             </div>
             <div class="harness-account-meta muted">${escapeHtml(meta)}</div>
             <div class="harness-account-actions">
-                <button type="button" class="btn btn-default" data-harness-login>${escapeHtml(rowActionLabel(row, payload))}</button>${rowActions}
+                <button type="button" class="btn btn-default" data-harness-login${loginAction.disabled ? ' disabled title="Refresh to retry the auth check"' : ''}>${escapeHtml(loginAction.label)}</button>${rowActions}
             </div>
         </div>
     `;
