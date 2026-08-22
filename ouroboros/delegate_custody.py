@@ -1226,7 +1226,6 @@ def _cancel_result(drive_root: Any, custody: RunCustody, outcome: str, *, accept
         result["terminal_detail"] = terminal_detail
     return result
 
-
 # -- reconciliation ------------------------------------------------------------
 
 
@@ -1249,7 +1248,6 @@ def pending_invocations(drive_root: Any,
 
     return replay_pending(drive_root, rows)
 
-
 def release_task_runs(drive_root: Any, task_id: str, *,
                       gateway_factory: Optional[Callable[[], Any]] = None) -> List[Dict[str, Any]]:
     """Run the one non-panic terminal custody boundary for a normal loop exit."""
@@ -1263,7 +1261,6 @@ def release_task_runs(drive_root: Any, task_id: str, *,
     )
     record_terminal_reconciliation(drive_root, task_id, result)
     return list(result.get("outcomes") or [])
-
 
 def reconcile_task_runs(drive_root: Any, task_id: str, *,
                         gateway_factory: Optional[Callable[[], Any]] = None) -> List[Dict[str, Any]]:
@@ -1284,7 +1281,6 @@ def reconcile_task_runs(drive_root: Any, task_id: str, *,
     if not held and not stray:
         return []
     return _reconcile_each(drive_root, held, gateway_factory, pending=stray)
-
 
 def reconcile_orphaned_runs(
     drive_root: Any,
