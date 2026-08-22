@@ -477,6 +477,85 @@ def test_bgc_observation_gap_blocks_direct_identity_update(tmp_path):
         bc._tool_executor.shutdown(wait=False, cancel_futures=True)
 
 
+def test_bgc_omitted_observation_rows_block_direct_identity_update(tmp_path):
+    bc = _bg_fixture(tmp_path, backlog_count=0)
+    try:
+        for index in range(11):
+            assert bc.inject_observation(
+                f"observation-{index}", observation_id=f"omitted-{index}"
+            )
+        context = bc._build_context()
+        assert "omitted=1" in context
+        assert "source_complete=False" in context
+        assert "background-observations" in context
+        result = bc._execute_tool(
+            _tool_call(
+                "update_identity",
+                {"content": "Do not rewrite identity from omitted observations."},
+                "u1",
+            ),
+            [],
+        )
+        assert "IDENTITY_UPDATE_ABSTAINED" in result
+        assert "background-observations" in result
+        assert not (tmp_path / "memory" / "identity_journal.jsonl").exists()
+    finally:
+        bc._tool_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_bgc_payload_truncation_blocks_direct_identity_update(tmp_path):
+    bc = _bg_fixture(tmp_path, backlog_count=0)
+    try:
+        assert bc.inject_observation(
+            "p" * 2_000, observation_id="payload-truncated"
+        )
+        context = bc._build_context()
+        assert "payload omitted" in context
+        assert "source_complete=False" in context
+        assert "background-observations" in context
+        result = bc._execute_tool(
+            _tool_call(
+                "update_identity",
+                {"content": "Do not rewrite identity from a truncated payload."},
+                "u1",
+            ),
+            [],
+        )
+        assert "IDENTITY_UPDATE_ABSTAINED" in result
+        assert "background-observations" in result
+        assert not (tmp_path / "memory" / "identity_journal.jsonl").exists()
+    finally:
+        bc._tool_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_bgc_aggregate_projection_truncation_blocks_direct_identity_update(tmp_path):
+    bc = _bg_fixture(tmp_path, backlog_count=0)
+    try:
+        for index in range(10):
+            assert bc.inject_observation(
+                "small",
+                observation_id=f"aggregate-{index}",
+                source="s" * 1_400,
+            )
+        context = bc._build_context()
+        assert "projection truncated" in context
+        assert "source_complete=False" in context
+        assert "background-observations" in context
+        result = bc._execute_tool(
+            _tool_call(
+                "update_identity",
+                {"content": "Do not rewrite identity from an aggregate projection."},
+                "u1",
+            ),
+            [],
+        )
+        assert "IDENTITY_UPDATE_ABSTAINED" in result
+        assert "background-observations" in result
+        assert not (tmp_path / "memory" / "identity_journal.jsonl").exists()
+    finally:
+        bc._tool_executor.shutdown(wait=False, cancel_futures=True)
+
+
 def test_bgc_complete_observation_source_keeps_direct_identity_update_available(tmp_path):
     bc = _bg_fixture(tmp_path, backlog_count=0)
     try:

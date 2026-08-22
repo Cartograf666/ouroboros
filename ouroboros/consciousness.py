@@ -543,22 +543,25 @@ class BackgroundConsciousness:
         source = _OBSERVATION_SOURCE_REF
         with self._observation_lock_for_instance():
             gaps = list((self._read_observation_state().get("gap_reasons") or ()))
+        projection_incomplete = bool(omitted)
         lines = [
             f"## Pending observations (total={total}; showing={len(shown)}; "
             f"omitted={omitted}; source={source}; "
-            f"source_complete={not bool(gaps)}; gaps={len(gaps)})",
+            f"source_complete=False; gaps={len(gaps)})",
         ]
-        for row in shown:
+        for index, row in enumerate(shown):
             payload = json.dumps(row.get("payload"), ensure_ascii=False, sort_keys=True)
             if len(payload) > 800:
+                projection_incomplete = True
                 payload = payload[:700] + f"…[payload omitted; read source id={row.get('id')}]"
             item_line = (
                 f"- id={row.get('id')} source={row.get('source')} kind={row.get('kind')} "
                 f"time={row.get('time')}: {payload}"
             )
             if len("\n".join(lines)) + len(item_line) + 1 > _OBSERVATION_RENDER_CHARS:
+                projection_incomplete = True
                 lines.append(
-                    f"- [projection truncated; omitted={len(shown) - shown.index(row)} "
+                    f"- [projection truncated; omitted={len(shown) - index} "
                     f"more; read source={source} from id={row.get('id')}]"
                 )
                 break
@@ -567,6 +570,22 @@ class BackgroundConsciousness:
                 ref_line = f"  ref={json.dumps(row.get('ref'), ensure_ascii=False, sort_keys=True)}"
                 if len("\n".join(lines)) + len(ref_line) + 1 <= _OBSERVATION_RENDER_CHARS:
                     lines.append(ref_line)
+                else:
+                    projection_incomplete = True
+                    lines.append(
+                        f"  ref=[projection truncated; read source={source} from id={row.get('id')}]"
+                    )
+        # The source is complete only when the actor saw every row and every
+        # rendered field in the bounded projection.  Keep the existing durable
+        # source reference usable for materialization, and expose this result
+        # through the same identity-completeness envelope as malformed gaps.
+        source_complete = not gaps and not projection_incomplete
+        lines[0] = (
+            f"## Pending observations (total={total}; showing={len(shown)}; "
+            f"omitted={omitted}; source={source}; source_complete={source_complete}; "
+            f"gaps={len(gaps)})"
+        )
+        self._observation_projection_incomplete = not source_complete
         return "\n".join(lines)
 
     def _emit_live_log(self, event_type: str, **fields: Any) -> None:
@@ -1115,6 +1134,16 @@ class BackgroundConsciousness:
             # Reuse the existing identity completeness envelope rather than
             # adding a second approval or policy gate.
             self._identity_unresolved_sources.add("background-observations")
+
+        observation_rendered = ""
+        if observations or observation_gaps:
+            observation_rendered = self._render_observations(observations)
+            if getattr(self, "_observation_projection_incomplete", False):
+                # A bounded projection is useful for thought, but it is not a
+                # complete source for a destructive identity rewrite.  The
+                # existing actor-readable ref above is the recovery seam.
+                self._identity_unresolved_sources.add("background-observations")
+
         if self._identity_unresolved_sources:
             parts.append(
                 "## Identity update completeness\n\n"
@@ -1124,8 +1153,8 @@ class BackgroundConsciousness:
                 "prove complete unchanged sources; direct update_identity must abstain."
             )
 
-        if observations or observation_gaps:
-            parts.append(self._render_observations(observations))
+        if observation_rendered:
+            parts.append(observation_rendered)
 
         bg_info_lines = [
             f"BG budget spent: ${self._bg_spent_usd:.4f}",
