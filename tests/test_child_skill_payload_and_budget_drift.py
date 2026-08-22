@@ -205,12 +205,19 @@ class TestChildDriveSkillPayload:
         assert "secret" not in read.replace("⚠️", "")
         assert "⚠️" in read
 
-    def test_native_bucket_stays_rejected(self, tmp_path):
-        """resolve_skill_payload_target keeps native out of the data-plane
-        resolver (native skills are git-tracked; read them via system_repo)."""
+    def test_native_bucket_is_readable_but_mutation_stays_rejected(self, tmp_path):
+        """Read-only children may inspect native payload code, never mutate it."""
         repo = tmp_path / "repo"
         repo.mkdir()
         canonical = _make_canonical_root(tmp_path)
+        native = canonical / "skills" / "native" / "alpha"
+        (native / "node_modules" / "dep").mkdir(parents=True)
+        (native / "SKILL.md").write_text("# native alpha\n", encoding="utf-8")
+        (native / ".seed-origin").write_text("launcher-seed\n", encoding="utf-8")
+        (native / ".clawhub.json").write_text('{"origin":"catalog"}\n', encoding="utf-8")
+        (native / "node_modules" / "dep" / "index.js").write_text(
+            "export const nativeDependency = true;\n", encoding="utf-8"
+        )
         child = _make_child_drive(canonical)
         registry = _readonly_child_registry(repo, child, canonical)
 
@@ -218,7 +225,41 @@ class TestChildDriveSkillPayload:
             "root": "skill_payload", "bucket": "native", "skill_name": "alpha",
             "path": "SKILL.md",
         })
-        assert "⚠️" in read
+        marker = registry.execute("read_file", {
+            "root": "skill_payload", "bucket": "native", "skill_name": "alpha",
+            "path": ".seed-origin",
+        })
+        dependency = registry.execute("read_file", {
+            "root": "skill_payload", "bucket": "native", "skill_name": "alpha",
+            "path": "node_modules/dep/index.js",
+        })
+        listing = registry.execute("list_files", {
+            "root": "skill_payload", "bucket": "native", "skill_name": "alpha",
+            "path": ".",
+        })
+        search = registry.execute("search_code", {
+            "root": "skill_payload", "bucket": "native", "skill_name": "alpha",
+            "query": "native alpha",
+        })
+        control = registry.execute("read_file", {
+            "root": "skill_payload", "bucket": "native", "skill_name": "alpha",
+            "path": ".clawhub.json",
+        })
+
+        assert "native alpha" in read
+        assert "launcher-seed" in marker
+        assert "nativeDependency" in dependency
+        assert "node_modules/" in listing and ".seed-origin" in listing
+        assert ".clawhub.json" not in listing
+        assert "BLOCKED" in control
+        assert "SKILL.md" in search
+
+        write = registry.execute("write_file", {
+            "root": "skill_payload", "bucket": "native", "skill_name": "alpha",
+            "path": "new.txt", "content": "must not write\n",
+        })
+        assert "⚠️" in write
+        assert not (native / "new.txt").exists()
 
 
 # ---------------------------------------------------------------------------

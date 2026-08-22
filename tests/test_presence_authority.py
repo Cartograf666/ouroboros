@@ -114,6 +114,37 @@ def test_resolved_binding_must_fit_root_operation_and_prefix(tmp_path):
     assert not presence_ceiling_allows_binding(ceiling, wrong_operation)
 
 
+def test_resolved_skill_binding_must_fit_granted_bucket(tmp_path):
+    ceiling = build_presence_capability_ceiling(
+        skill_name="moderator",
+        skill_content_hash="c" * 64,
+        state_fingerprint="d" * 64,
+        resolution=_resolution(
+            PresenceResourceTarget(
+                "skill_payload",
+                ("read",),
+                ".",
+                bucket="external",
+                skill_name="alpha",
+            )
+        ),
+    )
+    allowed = ResolvedResourceBinding(
+        profile="operator_control",  # type: ignore[arg-type]
+        root="skill_payload",
+        operation="read",
+        base_path=tmp_path,
+        target_path=tmp_path / "SKILL.md",
+        source="external",
+        skill_name="alpha",
+        state_drive_root=Path(tmp_path),
+    )
+    wrong_bucket = ResolvedResourceBinding(**{**allowed.__dict__, "source": "native"})
+
+    assert presence_ceiling_allows_binding(ceiling, allowed)
+    assert not presence_ceiling_allows_binding(ceiling, wrong_bucket)
+
+
 def test_mutative_descendants_require_matching_selected_surface_root(tmp_path):
     ceiling = build_presence_capability_ceiling(
         skill_name="moderator",

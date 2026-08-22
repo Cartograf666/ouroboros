@@ -189,6 +189,17 @@ def map_host_path(executor: ExecutorRef, path: pathlib.Path) -> str:
 
 
 def map_backend_path(executor: ExecutorRef, path_text: str) -> pathlib.Path:
+    return map_backend_path_lexical(executor, path_text).resolve(strict=False)
+
+
+def map_backend_path_lexical(executor: ExecutorRef, path_text: str) -> pathlib.Path:
+    """Map a backend path without resolving descendant symlinks.
+
+    Policy callers need the lexical spelling to detect a path that originated
+    under a configured output root before canonicalization can move it into a
+    different allowed root.  Execution and ordinary path consumers continue to
+    use ``map_backend_path`` and receive the resolved host path.
+    """
     normalized = str(path_text or "").replace("\\", "/").rstrip("/")
     if not normalized.startswith("/"):
         raise ValueError(f"backend path is not absolute: {path_text}")
@@ -202,7 +213,7 @@ def map_backend_path(executor: ExecutorRef, path_text: str) -> pathlib.Path:
         rel_parts = [part for part in rel_text.split("/") if part and part != "."]
         if any(part == ".." for part in rel_parts):
             raise ValueError(f"backend path escapes executor mapping: {path_text}")
-        return (mapping.host_path.joinpath(*rel_parts)).resolve(strict=False)
+        return mapping.host_path.joinpath(*rel_parts)
     raise ValueError(f"path is outside executor backend mappings: {path_text}")
 
 

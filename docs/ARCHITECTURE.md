@@ -221,9 +221,12 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── shell_parse.py       ← Shared shell argv/inline-command parser helpers used by guardrails without importing the tools package; (v6.51.0) `recover_stringified_argv` (the SSOT JSON/AST stringified-argv recovery shared by run_command + verify_and_record) and `normalize_check_argv` (the verify check→argv SSOT that the shell guard AND execution both call, so the guard inspects exactly what runs; string → non-login `sh -c`); (v6.78.0) `shell_tokens_typed` (THE tokenizer of the module — tokens paired with whether each is real SYNTAX rather than a literal argument that spells like one, a distinction `shlex` destroys when it strips quotes; `_normalize_shell_source` marks quoted/escaped punctuation on the way in and the mark never leaves), its text view `shell_tokens` (what `shell_segments` and the guards read — a quoted `&&` still reads as a separator there, which over-splits and is the fail-safe direction) and `canonical_command_text` (the comparison-stable form of a command: one space BETWEEN tokens, token contents and control operators verbatim, nothing dropped and nothing re-classified — the seam `_outcome_receipts` derives a verification's check identity from, so neither collapsing whitespace inside a quoted argument nor stripping a literal `'&&'` argument as if it were syntax can make two different checks compare equal)
       ├── argv_budget.py       ← Byte-accurate argv/env admission — the E2BIG hygiene SSOT (C5): counts the ENCODED bytes of the argv strings AND the environment block together against POSIX ARG_MAX (with pointer/bookkeeping headroom), enforces the Linux per-string MAX_ARG_STRLEN cap (128 KiB) portably plus the Windows ~32 767-unit command-line cap, and is the single helper every subprocess-building surface (skill_exec, the benchmark CLI adapters) asks before exec — the prior char-count-only check under-counted UTF-8 by up to 4x and ignored the environment
       ├── workspace_executor.py ← Host-owned local/docker_exec workspace process backend, path mapping, executor traces, and executor service lifecycle
+      ├── deliverables_paths.py ← Shared lexical and case-folded path views for the configured Deliverables container
       ├── tool_capabilities.py ← SSOT for tool sets (core, parallel-safe, truncation, browser)
       ├── tool_access.py       ← Tool API v2 policy matrix: ToolProfile × ResourceRoot × Operation; also projects the side-effect-free filesystem affordance map injected into runtime context and checks closed-enum subagent required_capabilities against the selected profile
-      ├── skill_payload_binding.py ← Exact payload binding projection: preserves the physical package root while `.seed-origin` distinguishes launcher-owned native from markerless user-managed logical `external`, and reuses selected-candidate inventory for bounded manifestless `skill_publish` recovery
+      ├── tools/deliverables_shell.py ← Direct cp/mv/ln Deliverables target and symlink-payload checks, before generic workspace-root admission
+      ├── tools/shell_audit.py ← Post-execution user_files/Deliverables custody audit and declared-output root projection used by process tools
+      ├── skill_payload_binding.py ← Exact payload binding projection: preserves the physical package root while `.seed-origin` distinguishes launcher-owned native from markerless user-managed logical `external`, admits native `read`/`list`/`search` only for the settled direct/read-only profiles, and reuses selected-candidate inventory for bounded manifestless `skill_publish` recovery
       ├── tool_policy.py       ← Round-one tool visibility policy (tool sets live in tool_capabilities)
       ├── utils.py             ← Shared utilities; v5.8.3-rc.2 SSOT for JSON atomic writes/reads, UTC timestamps, hashes, log sanitization, and subprocess helpers
       ├── world_profiler.py    ← System profile generator (WORLD.md)
@@ -985,6 +988,14 @@ The three web paths differ in who chooses the query, which model reasons, which 
 2. **`web_search` function tool.** `ToolRegistry` executes a separate search call through the configured web-search route or a keyless retrieval backend. A provider-backed call can therefore introduce a second model and its own cost. Arguments and bounded results are recorded in `tools.jsonl`; they do not become native-search usage on the answering call.
 3. **Browser tools.** `browse_page` and `browser_action` drive a local stateful Playwright session and can fetch or act on arbitrary pages. Their arguments and result previews are tool evidence. Browser state and local action semantics are not equivalent to either provider-native retrieval path.
 
+For delegated profiles, the URL, route, private-range, and control-plane
+guards apply to both local-readonly and acting children. JavaScript `evaluate`
+is intentionally exposed only to a valid acting child on its current page;
+local-readonly execution and schema remain blocked, while the shared
+owner/self-lowering checks still run for acting evaluation. Acting children
+retain the pre-existing shell-to-loopback `/ws` route; this change does not add
+WebSocket authentication or broaden that route to local-readonly children.
+
 This separation is methodological authority: an evaluation or acceptance claim must name the path actually used instead of treating provider-native search, a separate search model, and a local browser as interchangeable.
 
 #### Context fitting, retry, and compaction
@@ -1077,7 +1088,30 @@ artifacts. Two READ-ONLY orchestrator roots complete the set: `subagent_projects
 and `deliverables` are granted `read`/`list`/`search` only to orchestrator
 profiles (never write/shell/cwd, never handed to a subagent) so a parent can
 inspect a child-task project tree or a finished deliverable when synthesizing its
-work.
+work. That logical `deliverables` root stays read-only; a top-level task may
+write the separately configured physical Deliverables container through the
+existing `user_files`-authorized paths, including the narrow shell seam, with declared `outputs` and the existing
+undeclared-output diagnostic/custody flow still applying. That audit remains
+best-effort rather than a full shell parser; relative writes after an in-command
+`cd`, shell-variable/indirect destinations, and arbitrary inline-code path
+construction remain deferred parser residuals. Direct `cp`/`mv`/`ln` directory
+destinations derive their immediate child target (including attached `-tDIR` /
+`-Ssuffix` forms, `cp --parents`, and symbolic-link creation via `cp -s` /
+`--symbolic-link`); `ln --relative` resolves its source from the command cwd
+before the payload is checked,
+but recursive directory/archive copies are not walked for nested symlinks or
+hidden descendants. For argv-visible targets, the
+shell guard checks the lexical Deliverables origin before generic workspace or
+executor roots, then checks the symlink-resolved destination, so hidden,
+credential-like, protected, and symlink-escaping descendants do not inherit a
+broader root's admission; the same target-first rule applies to declared-output
+custody and Presence ceilings. Presence ceilings keep their logical
+`user_files`-relative prefix when the physical Deliverables binding is remapped,
+so a narrow prefix cannot become whole-container authority. Declared outputs
+still use the normal custody path; a successful dynamic undeclared write may
+lack the nudge. Inode aliases
+(hardlinks) are a disclosed filesystem residual, not a new Deliverables
+authority check in this change.
 
 ### Safety and runtime mode
 

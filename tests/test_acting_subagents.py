@@ -1180,7 +1180,53 @@ def test_acting_schema_narrows_write_root_and_browser(tmp_path):
     if ba:
         action_enum = ba["parameters"]["properties"].get("action", {}).get("enum")
         if isinstance(action_enum, list):
-            assert "evaluate" not in action_enum
+            assert "evaluate" in action_enum
+
+
+def test_acting_browser_evaluate_runs_and_keeps_owner_guards(tmp_path, monkeypatch):
+    """Acting children may inspect their current page, but owner/self-lowering
+    browser guards remain in the shared execution path."""
+    from ouroboros.tools import browser as browser_mod
+
+    repo = tmp_path / "repo"; repo.mkdir()
+    drive = tmp_path / "data"; drive.mkdir()
+    worktree = tmp_path / "wt"; worktree.mkdir()
+    ctx = ToolContext(
+        repo_dir=repo,
+        drive_root=drive,
+        workspace_root=str(worktree),
+        workspace_mode="self_worktree",
+        task_constraint=TaskConstraint(
+            mode="acting_subagent", surface="self_worktree", write_root=str(worktree),
+        ),
+    )
+    calls = []
+
+    class FakePage:
+        # Use a literal public address so the URL guard does not perform a
+        # network DNS lookup (which can be unresolved or remapped in CI).
+        url = "https://1.1.1.1/"
+
+        def evaluate(self, script):
+            calls.append(script)
+            return 2
+
+    page = FakePage()
+    monkeypatch.setattr(browser_mod, "_ensure_browser", lambda *_args, **_kwargs: page)
+    registry = ToolRegistry(repo_dir=repo, drive_root=drive)
+    registry.set_context(ctx)
+
+    assert registry.execute("browser_action", {"action": "evaluate", "value": "1 + 1"}) == "2"
+    assert calls == ["1 + 1"]
+
+    blocked = registry.execute(
+        "browser_action",
+        {
+            "action": "evaluate",
+            "value": "fetch('/api/owner/context-mode', {method:'POST', body: JSON.stringify({mode:'low'})})",
+        },
+    )
+    assert "CONTEXT_MODE_SELF_LOWERING_BLOCKED" in blocked
 
 
 def test_no_workspace_acting_integrate_blocked(tmp_path):

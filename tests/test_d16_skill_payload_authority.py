@@ -9,6 +9,14 @@ import sys
 import pytest
 
 from ouroboros.contracts.task_constraint import TaskConstraint
+from ouroboros.presence_authority import build_presence_capability_ceiling, presence_ceiling_payload
+from ouroboros.presence_capabilities import (
+    PresenceProfileResolution,
+    PresenceResourceTarget,
+    PresenceSelection,
+    PresenceToolTarget,
+)
+from ouroboros.presence_runtime import ResolvedPresenceRuntime
 from ouroboros.tool_access import (
     build_resolved_resource_binding,
     filesystem_affordance_map,
@@ -51,6 +59,16 @@ def _registry(
         lambda *_a, **_kw: (True, ""),
     )
     return ToolRegistry(repo_dir=repo, drive_root=data), repo, data
+
+
+def _seeded_native_payload(data: pathlib.Path, name: str = "seeded-native") -> pathlib.Path:
+    payload = _skill(data, name, seeded=True)
+    (payload / ".clawhub.json").write_text('{"origin":"catalog"}\n', encoding="utf-8")
+    (payload / "node_modules" / "dep").mkdir(parents=True)
+    (payload / "node_modules" / "dep" / "index.js").write_text(
+        "export const dependency = true;\n", encoding="utf-8"
+    )
+    return payload
 
 
 @pytest.mark.parametrize("mode", ["light", "advanced", "pro"])
@@ -181,6 +199,141 @@ def test_markerless_native_is_user_managed_in_every_runtime_mode(
         assert "read/review only" in result, result
     assert not (seeded_payload / "bad.txt").exists()
     assert (seeded_payload / "notes.txt").read_text(encoding="utf-8") == "old\n"
+
+
+def test_direct_operator_can_read_native_payload_but_not_mutate_or_forge_sidecars(
+    tmp_path,
+    monkeypatch,
+):
+    registry, repo, data = _registry(tmp_path, monkeypatch, mode="advanced")
+    payload = _seeded_native_payload(data)
+    registry._ctx = ToolContext(
+        repo_dir=repo,
+        drive_root=data,
+        is_direct_chat=True,
+    )
+    selector = {
+        "root": "skill_payload",
+        "bucket": "native",
+        "skill_name": "seeded-native",
+    }
+
+    read = registry.execute("read_file", {**selector, "path": ".seed-origin"})
+    dependency = registry.execute(
+        "read_file",
+        {**selector, "path": "node_modules/dep/index.js"},
+    )
+    listing = registry.execute("list_files", {**selector, "path": "."})
+    search = registry.execute(
+        "search_code",
+        {**selector, "path": ".", "query": "seeded-native"},
+    )
+
+    assert "launcher-seed" in read
+    assert "dependency" in dependency
+    assert "node_modules/" in listing and ".seed-origin" in listing
+    assert "SKILL.md" in search
+
+    ordinary_write = registry.execute(
+        "write_file",
+        {**selector, "path": "new.txt", "content": "must not write\n"},
+    )
+    sidecar_write = registry.execute(
+        "write_file",
+        {**selector, "path": ".seed-origin", "content": "forged\n"},
+    )
+    assert "BLOCKED" in ordinary_write
+    assert "BLOCKED" in sidecar_write
+    assert not (payload / "new.txt").exists()
+    assert (payload / ".seed-origin").read_text(encoding="utf-8") == "launcher-seed\n"
+
+
+def test_presence_bucket_ceiling_cannot_be_bypassed_by_native_read_overlay(tmp_path, monkeypatch):
+    registry, repo, data = _registry(tmp_path, monkeypatch, mode="advanced")
+    _seeded_native_payload(data, "seeded-native")
+    resolution = PresenceProfileResolution(
+        active=(
+            PresenceSelection("1" * 64, PresenceToolTarget("builtin", "read_file")),
+            PresenceSelection(
+                "2" * 64,
+                PresenceResourceTarget(
+                    "skill_payload",
+                    ("read",),
+                    ".",
+                    bucket="external",
+                    skill_name="seeded-native",
+                ),
+            ),
+        ),
+        missing_required=(),
+        missing_optional=(),
+        orphaned=(),
+        runtime=ResolvedPresenceRuntime("main", 10, 10, False),
+        profile_fingerprint="a" * 64,
+        selection_fingerprint="b" * 64,
+        required_selections_present=True,
+    )
+    ceiling = build_presence_capability_ceiling(
+        skill_name="presence-native-overlay-test",
+        skill_content_hash="c" * 64,
+        state_fingerprint="d" * 64,
+        resolution=resolution,
+    )
+    registry.set_context(
+        ToolContext(
+            repo_dir=repo,
+            drive_root=data,
+            task_constraint=TaskConstraint(mode="local_readonly_subagent"),
+            task_contract={"capability_ceiling": presence_ceiling_payload(ceiling)},
+        )
+    )
+
+    result = registry.execute(
+        "read_file",
+        {
+            "root": "skill_payload",
+            "bucket": "native",
+            "skill_name": "seeded-native",
+            "path": "SKILL.md",
+        },
+    )
+    assert "PRESENCE_RESOURCE_BLOCKED" in result
+
+
+@pytest.mark.parametrize(
+    "constraint",
+    [
+        TaskConstraint(mode="skill_repair", skill_name="seeded-native", payload_root="skills/native/seeded-native"),
+        TaskConstraint(mode="acting_subagent", surface="external_workspace", write_root="/tmp/acting-native"),
+    ],
+)
+def test_repair_and_acting_profiles_cannot_select_native_payload(
+    constraint,
+    tmp_path,
+):
+    repo = tmp_path / "repo"
+    data = tmp_path / "data"
+    repo.mkdir()
+    _seeded_native_payload(data)
+    if constraint.mode == "acting_subagent":
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        constraint = TaskConstraint(
+            mode="acting_subagent",
+            surface="external_workspace",
+            write_root=str(workspace),
+        )
+    ctx = ToolContext(repo_dir=repo, drive_root=data, task_constraint=constraint)
+
+    with pytest.raises(ValueError):
+        build_resolved_resource_binding(
+            ctx,
+            root="skill_payload",
+            operation="read",
+            path="SKILL.md",
+            bucket="native",
+            skill_name="seeded-native",
+        )
 
 
 @pytest.mark.parametrize("mode", ["advanced", "pro"])

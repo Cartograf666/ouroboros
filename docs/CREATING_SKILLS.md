@@ -354,9 +354,11 @@ write_file(root="skill_payload", path="plugin.py", content=..., bucket="external
 ```
 
 Control-plane sidecars (`.clawhub.json`, `.ouroboroshub.json`,
-`.self_authored.json`, `.seed-origin`, `SKILL.openclaw.md`) stay blocked
-either way — the bucket+skill_name short form does not weaken sidecar
-protection.
+`.self_authored.json`, `SKILL.openclaw.md`) stay blocked for writes and edits
+either way — the bucket+skill_name short form does not weaken mutation-sidecar
+protection. The payload-local `.seed-origin` marker is likewise never writable;
+the settled direct/read-only native `read`/`list`/`search` contract may inspect
+ordinary payload markers, while control-state mutation remains closed.
 
 ### Writing large payload files
 
