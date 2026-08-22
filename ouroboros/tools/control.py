@@ -2244,21 +2244,54 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
     return f"OK: switching to {', '.join(changes)} on next round."
 
 
-def _get_task_result(ctx: ToolContext, task_id: str, include_authority: bool = False) -> str:
-    """Read the effective result of a registered subtask."""
+def _get_task_result(
+    ctx: ToolContext, task_id: str, include_authority: bool = False,
+    include_work_order_source: bool = False, source_start_char: Any = None,
+    source_end_char: Any = None,
+) -> str:
+    """Read a task result, or one bounded canonical work-order source range."""
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
     status_drive_root = Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
     data = load_effective_task_result(status_drive_root, task_id)
     if not data:
         return f"Task {task_id}: unknown or not yet registered"
-    if bool(include_authority):
+    if bool(include_authority) or bool(include_work_order_source):
         from ouroboros.agent_startup_checks import task_result_authority_projection
 
         authority = task_result_authority_projection(data, drive_root=status_drive_root)
-        return json.dumps({
+        payload: Dict[str, Any] = {
             "status": "available", "authority": authority,
             "source": {"tool": "get_task_result", "task_id": str(task_id)},
-        }, ensure_ascii=False, sort_keys=True)
+        }
+        if bool(include_work_order_source):
+            from ouroboros.subagent_work_order import (
+                _source_task_from_context,
+                work_order_source_projection,
+            )
+
+            projection, reason = work_order_source_projection(
+                _source_task_from_context(ctx, str(task_id)),
+                source_start_char,
+                source_end_char,
+            )
+            source = {
+                "kind": "task_result",
+                "task_id": str(task_id),
+                "tool": "get_task_result",
+                "arguments": {
+                    "task_id": str(task_id),
+                    "include_authority": True,
+                    "include_work_order_source": True,
+                },
+                "projection": "canonical_work_order",
+            }
+            payload["source"] = source
+            payload["work_order_source"] = projection or {
+                "schema": 1, "kind": "canonical_work_order", "status": "unavailable",
+            }
+            if reason:
+                payload["work_order_source"]["reason"] = reason
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
     status = data.get("status", "unknown")
     result = data.get("result", "")
     trace = data.get("trace_summary", "")
@@ -2724,6 +2757,9 @@ def _wait_for_tasks(
                         _ee["delegated_runs_settled"] = int(_evidence.get("delegated_runs_settled") or 0)
                         _ee["delegated_runs_succeeded"] = int(_evidence.get("delegated_runs_succeeded") or 0)
                         _ee["delegated_runs_failed"] = int(_evidence.get("delegated_runs_failed") or 0)
+                        _ee["delegated_runs_source_unresolved"] = int(
+                            _evidence.get("delegated_runs_source_unresolved") or 0
+                        )
                     # The substrate claim rides only when the envelope made one.
                     _substrate = str(data.get("actual_substrate") or _envelope.get("actual_substrate") or "")
                     if _substrate:
@@ -3022,11 +3058,15 @@ def get_tools() -> List[ToolEntry]:
         }, _switch_model),
         ToolEntry("get_task_result", {
             "name": "get_task_result",
-            "description": "Read the effective result or exact authority of a task, including child-drive output when available.",
+            "description": "Read the effective result or exact authority of a task, including one bounded canonical work-order source range when requested.",
             "parameters": {"type": "object", "required": ["task_id"], "properties": {
                 "task_id": {"type": "string", "description": "Task ID returned by scheduling or exposed by the host routing manifest."},
                 "include_authority": {"type": "boolean", "default": False,
                                       "description": "Return the exact selected result, task contract, origin, artifact references, and current plan-review authority."},
+                "include_work_order_source": {"type": "boolean", "default": False,
+                                               "description": "Return the canonical work-order source projection; provide both source_start_char and source_end_char for the exact bounded range."},
+                "source_start_char": {"type": "integer", "description": "Inclusive character offset for the requested canonical work-order source range."},
+                "source_end_char": {"type": "integer", "description": "Exclusive character offset for the requested canonical work-order source range."},
             }},
         }, _get_task_result),
         ToolEntry("wait_task", {

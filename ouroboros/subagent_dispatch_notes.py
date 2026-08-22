@@ -85,7 +85,9 @@ def dispatch_executor_note(decision: Optional[SubagentExecutorResolution],
             "delegate_start/delegate_wait; your own run_command/read_file rounds are for "
             "verification, integration, and acceptance. The parent's step-by-step context "
             "is the WORK ORDER for your delegated run's prompt, not a script for you to "
-            "execute natively."
+            "execute natively. If a child asks for an omitted source range, answer from "
+            "the canonical task context with the exact range, source selector, and digest; "
+            "a disclosed partial preview is never complete authority."
         )
         if lane is not None and lane.provenance == "policy" and lane.effective_lane == "light":
             note += (

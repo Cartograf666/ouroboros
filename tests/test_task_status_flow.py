@@ -816,6 +816,7 @@ def test_wait_for_tasks_projects_execution_evidence_for_harness_children(tmp_pat
             "execution_evidence": {
                 "delegated_runs_started": 0, "delegated_runs_settled": 0,
                 "delegated_runs_succeeded": 0, "delegated_run_failure_states": [],
+                "delegated_runs_source_unresolved": 0,
                 "evidence_read_failed": False, "subscription_cost_usd": None,
                 "subscription_cost_estimated": False, "harness_models": [],
             },
@@ -834,6 +835,7 @@ def test_wait_for_tasks_projects_execution_evidence_for_harness_children(tmp_pat
         "actual_substrate": "native_only",
         "delegated_runs_started": 0,
         "delegated_runs_succeeded": 0,
+        "delegated_runs_source_unresolved": 0,
     }
     # A native child with no custody evidence stays compact — no evidence block.
     assert "execution_evidence" not in payload["tasks"]["nativekid"]

@@ -865,10 +865,18 @@ def adopt_handoff(ctx: Any, task: Mapping[str, Any]) -> dict[str, Any]:
         if not _holder_matches(row, pending[0], pending=True):
             veto_handoff(drive, task_id, "invocation_binding_mismatch")
             return {"status": "recovery_required", "reason": "invocation_binding_mismatch"}
-        from ouroboros.subagent_work_order import compile_external_work_order
         from ouroboros.tools.delegate import exact_start
 
-        result = exact_start(ctx, compile_external_work_order(task), {"retry_of": pending_id})
+        request = pending[0].get("request") if isinstance(pending[0], dict) else None
+        replay_prompt = request.get("prompt") if isinstance(request, dict) else None
+        if not isinstance(replay_prompt, str) or not replay_prompt:
+            veto_handoff(drive, task_id, "pending_request_prompt_missing")
+            return {"status": "recovery_required", "reason": "pending_request_prompt_missing"}
+        retry_spec = {"retry_of": pending_id}
+        source_request = pending[0].get("work_order_source_request")
+        if isinstance(source_request, dict) and source_request:
+            retry_spec["work_order_source_request"] = source_request
+        result = exact_start(ctx, replay_prompt, retry_spec)
         try:
             parsed = json.loads(result)
         except (TypeError, ValueError):

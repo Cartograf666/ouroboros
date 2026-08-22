@@ -161,6 +161,7 @@ BAND_PATHS = {
     "supervisor/terminal_delivery.py": None,
     "tests/test_acting_subagents.py": None,
     "tests/test_advisory_observability.py": None,
+    "tests/test_available_subagents_runtime.py": "Configured-session bootstrap and durable oversized-work-order source-channel and recovery coverage grew past the existing band in one reviewed transport change.",
     "tests/test_build_scripts.py": None,
     "tests/test_claude_code_gateway.py": None,
     "tests/test_commit_gate.py": None,

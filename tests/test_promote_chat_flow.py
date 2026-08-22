@@ -230,7 +230,7 @@ def test_cat_router_preview_promote_first_request_and_direct_harness_keep_full_a
         "id": "cat-nested", "objective": "Inspect the Cat implementation",
         "task_contract": child_contract,
     })
-    assert len(nested_work_order) < 40_000
+    assert len(nested_work_order) < 250_000
     assert child_contract["predecessor_authority"] == task["predecessor_authority"]
 
     surfaces = (rendered, retrieved, direct_harness, nested_work_order)

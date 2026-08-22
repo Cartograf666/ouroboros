@@ -1312,6 +1312,19 @@ def integrate_payload_patch(
     touched = [str(p) for p in (manifest.get("tracked_changed") or [])]
     snapshot_key = entry.snapshot_id or entry.run_id
 
+    if decision == "apply":
+        from ouroboros import delegate_custody as custody
+
+        source_gate = custody.work_order_source_verification(entry)
+        if source_gate.get("status") == "cannot_verify":
+            return (
+                f"⚠️ INTEGRATE_DELEGATED_SOURCE_UNRESOLVED: run {rid}'s external "
+                "work order was only partially delivered and its canonical source "
+                "ranges are not fully verified. The payload was NOT changed; reject "
+                "the captured result or complete the existing source interaction "
+                "first."
+            )
+
     def _dispose(disposition: str, cleanup: bool) -> Tuple[bool, str]:
         return _dispose_delegated(drive, entry, snapshot_key, reason, disposition, cleanup)
 

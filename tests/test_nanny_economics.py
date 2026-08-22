@@ -713,7 +713,7 @@ def test_work_order_preserves_complete_fields_and_refuses_over_one_total_budget(
     from ouroboros.tools.delegate import _ASSIGNMENT_FIELD_CHARS
 
     limit = _ASSIGNMENT_FIELD_CHARS
-    assert limit == 40_000
+    assert limit == 250_000
     ordinary = "яё𐍈🚀" * 2_000
     rendered = compile_external_work_order({"id": "child", "objective": ordinary})
     assert ordinary in rendered and "OMISSION NOTE" not in rendered
@@ -721,6 +721,38 @@ def test_work_order_preserves_complete_fields_and_refuses_over_one_total_budget(
         compile_external_work_order({"id": "child", "objective": "a" * (limit + 1)})
     assert refused.value.chars > limit
     assert len(refused.value.sha256) == 64
+
+
+def test_over_budget_source_request_is_a_small_partial_lens_without_a_prefix():
+    from ouroboros.subagent_work_order import (
+        WorkOrderBudgetExceeded,
+        build_work_order_source_request,
+        compile_external_work_order,
+    )
+
+    marker = "DECISIVE_SOURCE_MARKER"
+    task = {
+        "id": "child-source",
+        "objective": ("x" * 250_100) + marker,
+        "origin_message_ref": {"kind": "chat_message", "message_id": "m-1"},
+    }
+    with pytest.raises(WorkOrderBudgetExceeded) as refused:
+        compile_external_work_order(task)
+    prompt, envelope = build_work_order_source_request(task, refused.value)
+
+    assert len(prompt) < 10_000
+    assert marker not in prompt
+    assert envelope["coverage"] == "partial"
+    assert envelope["complete_chars"] == refused.value.chars
+    assert envelope["complete_sha256"] == refused.value.sha256
+    assert envelope["source"]["kind"] == "task_result"
+    assert envelope["source"]["tool"] == "get_task_result"
+    assert envelope["source"]["arguments"] == {
+        "task_id": "child-source", "include_authority": True,
+        "include_work_order_source": True,
+    }
+    assert envelope["source"]["projection"] == "canonical_work_order"
+    assert "cannot_verify" in prompt
 
 
 def test_an_ordinary_contract_field_reaches_the_run_instructions_complete(tmp_path, monkeypatch):

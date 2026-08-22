@@ -327,6 +327,175 @@ def test_atomic_bootstrap_starts_before_wait_and_zero_nanny_rounds(monkeypatch, 
     assert out["status"] == "configured_session_wake"
 
 
+@pytest.mark.parametrize(
+    ("interactive", "expected_reason"),
+    [
+        (True, ""),
+        (False, "work_order_source_channel_unavailable"),
+    ],
+)
+def test_over_budget_bootstrap_uses_only_a_live_interaction_channel(
+    monkeypatch, tmp_path, interactive, expected_reason,
+):
+    import ouroboros.claudexor_daemon as daemon
+    import ouroboros.subagent_bootstrap as bootstrap
+    from ouroboros.subagent_work_order import work_order_fingerprint
+    import ouroboros.tools.delegate as delegate
+    import ouroboros.delegate_supervision as supervision
+
+    class Gateway:
+        def harnesses(self):
+            return [{
+                "id": "codex",
+                "manifest": {"capabilities": {"interactive": interactive}},
+            }]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda: Gateway())
+    calls = []
+    monkeypatch.setattr(delegate, "exact_start", lambda ctx, prompt, spec: (
+        calls.append((prompt, spec))
+        or json.dumps({"status": "started", "run_id": "run-source", "custody_durable": True})
+    ))
+    monkeypatch.setattr(
+        supervision, "supervised_wait",
+        lambda _ctx, run_id: json.dumps({"status": "completed", "run_id": run_id}),
+    )
+    snapshot = _snapshot(_settings(_session_row(target="codex=gpt-5.6-sol")), "session-builder")
+    dispatch = SimpleNamespace(
+        executor="harness",
+        executor_resolution=SimpleNamespace(route=SimpleNamespace(route_id="codex")),
+    )
+    ctx = SimpleNamespace(
+        task_id="child-source", drive_root=tmp_path, budget_drive_root=str(tmp_path),
+        task_metadata={},
+    )
+    task = {
+        "id": "child-source",
+        "objective": ("THIS MUST NOT BE SENT AS A PREFIX " + ("x" * 250_100)),
+        "configured_subagent": snapshot,
+        "task_contract": {"objective": "THIS MUST NOT BE SENT AS A PREFIX " + ("x" * 250_100)},
+    }
+    full_sha = work_order_fingerprint(task)
+    out = json.loads(bootstrap.bootstrap_session_leaf(ctx, task, dispatch))
+
+    if interactive:
+        assert out["status"] == "configured_session_wake"
+        assert len(calls) == 1
+        prompt, spec = calls[0]
+        assert "WORK ORDER SOURCE REQUEST" in prompt
+        assert "THIS MUST NOT BE SENT AS A PREFIX" not in prompt
+        assert spec["compiled_work_order"] is True
+        assert spec["work_order_fingerprint"] == full_sha
+        assert out["startup"]["work_order_source_request"]["complete_sha256"] == full_sha
+    else:
+        assert out["startup"]["reason"] == expected_reason
+        assert out["startup"]["complete_sha256"] == full_sha
+        assert calls == []
+
+
+def test_route_source_request_channel_fails_closed_on_unknown_manifest():
+    from ouroboros.subagent_work_order import route_source_request_channel
+
+    class Gateway:
+        def harnesses(self):
+            return [{"id": "route", "manifest": {"capabilities": {}}}]
+
+    assert route_source_request_channel(Gateway(), "route") == {
+        "status": "unverified",
+        "reason": "interactive_capability_missing",
+        "route": "route",
+    }
+
+
+def test_pending_over_budget_recovery_replays_compact_body_and_full_fingerprint(
+    monkeypatch, tmp_path,
+):
+    from ouroboros import delegate_custody as custody
+    import ouroboros.delegate_recovery as recovery
+    import ouroboros.subagent_work_order as work_order
+    import ouroboros.tools.delegate as delegate
+    from ouroboros.tools.registry import ToolContext
+
+    custody._CUSTODY.clear()
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    task = {
+        "id": "child-source-recovery",
+        "_attempt": 2,
+        "configured_subagent": snapshot,
+        "drive_root": str(tmp_path),
+        "task_constraint": {},
+        "task_contract": {"objective": "x" * 250_100},
+    }
+    authority = recovery.authority_fingerprint_from_task(task)
+    full_fingerprint = work_order.work_order_fingerprint(task)
+    source_request = {
+        "schema": 1,
+        "kind": "complete_work_order",
+        "coverage": "partial",
+        "complete_sha256": full_fingerprint,
+    }
+    compact_prompt = "WORK ORDER SOURCE REQUEST\ncoverage=partial"
+    assert custody.record_start_requested(
+        tmp_path,
+        run_id="",
+        task_id=task["id"],
+        invocation_id="inv-source-recovery",
+        idempotency_key="inv-source-recovery",
+        max_seconds=60,
+        request={"prompt": compact_prompt},
+        project_id="",
+        project_owned=False,
+        route="codex",
+        selected_subagent_id=snapshot["selected_subagent_id"],
+        config_fingerprint=snapshot["config_fingerprint"],
+        work_order_fingerprint=full_fingerprint,
+        authority_fingerprint=authority,
+        work_order_source_request=source_request,
+    )
+    handoff = recovery.prepare_handoff(
+        tmp_path, task, cause=recovery.CAUSE_WORKER_CRASH,
+        old_attempt=1, new_attempt=2, worker_id=1, exitcode=1,
+    )
+    assert handoff["pending_invocation_id"] == "inv-source-recovery"
+
+    monkeypatch.setattr(
+        work_order, "compile_external_work_order",
+        lambda _task: (_ for _ in ()).throw(
+            AssertionError("pending recovery must replay the stored prompt")
+        ),
+    )
+    calls = []
+    monkeypatch.setattr(
+        delegate, "exact_start",
+        lambda _ctx, prompt, spec: (
+            calls.append((prompt, spec))
+            or json.dumps({"status": "started", "run_id": "run-source-recovered"})
+        ),
+    )
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id=task["id"])
+    ctx.budget_drive_root = str(tmp_path)
+    out = recovery.adopt_handoff(ctx, task)
+
+    assert out["status"] == "adopted"
+    assert calls == [(
+        compact_prompt,
+        {
+            "retry_of": "inv-source-recovery",
+            "work_order_source_request": source_request,
+        },
+    )]
+    from ouroboros.delegate_source_coverage import prepare_work_order_start_binding
+
+    rebound = prepare_work_order_start_binding(
+        ctx, tmp_path, "inv-source-recovery", "", compact_prompt, None,
+    )
+    assert rebound["fingerprint"] == full_fingerprint
+    custody._CUSTODY.clear()
+
+
 def test_real_task_context_bootstraps_before_context_and_any_llm(monkeypatch, tmp_path):
     from ouroboros import agent as agent_module
     import ouroboros.claudexor_daemon as daemon

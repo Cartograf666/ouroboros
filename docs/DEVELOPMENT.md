@@ -1106,9 +1106,29 @@ Before every commit, verify the following:
 - A configured session child must start or recover its exact external leaf before
   its first LLM call. Compile one complete work order from the immutable child brief
   and authority, reuse `subagent_runtime.exact_start`, and inject the custody-durable
-  startup/fault receipt. `started_uncustodied` is a fault with a possibly live run:
+  startup/fault receipt. started_uncustodied is a fault with a possibly live run:
   do not enter quiet sleep or start a replacement until verified settlement, and
   replay the original pending invocation/idempotency key after worker loss.
+  The complete external work-order wire budget is one total 250,000-character
+  limit, not a model-context claim and not a per-field prefix rule. A brief that
+  fits is sent byte-complete. A brief above that limit is never silently prefixed:
+  the bootstrap may send only a compact coverage=partial source-request lens
+  when the selected route's live manifest positively declares an interactive
+  question channel. The lens carries the full brief SHA/size and an
+  actor-resolvable `get_task_result` canonical-work-order selector; the child must
+  request exact character ranges through the existing interaction seam before
+  substantive work. The reader and validator share one renderer, so the bytes and
+  offsets the actor sees are exactly the bytes the host verifies.
+  A route whose channel is unavailable or unknown receives a typed cannot_verify
+  refusal before any external start. Pending recovery replays the stored compact
+  request body and the full canonical fingerprint, never a fresh reconstruction
+  from the oversized task. The source request and its host-verified character
+  intervals are part of durable delegate custody and replay. `delegate_answer`
+  accepts a typed `source_response`; the host re-renders the canonical complete
+  brief and compares the selector, digest, bounds, and exact bytes before recording
+  an interval. Until the union covers the whole brief, terminal delivery carries
+  `work_order_verification.status=cannot_verify`, and `integrate_delegated_patch`
+  may reject the captured result but may not apply it.
 - `delegate_wait` is an event-only model sleep. Renew bounded transport windows in
   `delegate_supervision` with zero LLM calls; journal progress may stream to the
   owner but is not a wake. Wake only for terminal/interaction/fault, an addressed

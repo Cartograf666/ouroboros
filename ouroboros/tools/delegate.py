@@ -42,7 +42,11 @@ from ouroboros.subagent_work_order import (  # noqa: F401 - compatibility re-exp
     _FIELD_CHARS as _ASSIGNMENT_FIELD_CHARS,
     assignment_instructions as _assignment_instructions,
 )
-from ouroboros.subagent_work_order import start_binding_fingerprints
+from ouroboros.delegate_source_coverage import (
+    add_terminal_source_verification,
+    prepare_work_order_start_binding,
+    record_started_custody,
+)
 from ouroboros.delegate_supervision import delegate_wait_entry as _delegate_wait_entry
 from ouroboros.subagent_runtime import (  # noqa: F401 - shared primitive re-export
     delegate_start_entry as _delegate_start_entry,
@@ -532,6 +536,8 @@ def _delivered_terminal_payload(ctx: ToolContext, run_id: str, detail: Dict[str,
     a truncated preview delivers 256 KiB wearing the whole result's name.
     """
     full = _terminal_payload(run_id, detail, authority)
+    if entry is not None:
+        add_terminal_source_verification(full, entry)
     # Requested-vs-applied model, the review lane's own lexicon and rule
     # (AgentSessionReviewExecutor): compared only when BOTH are non-empty —
     # the engine writes aliases ('sonnet' beside 'claude-opus-5'), so a
@@ -655,7 +661,10 @@ def _start_request(ctx: ToolContext, route: Any, authority: "DelegatedRunShape",
 
 def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = None,
                     retry_of: Optional[str] = None, root: Optional[str] = None,
-                    bucket: Optional[str] = None, skill_name: Optional[str] = None, _resolved_binding: Any = None) -> str:
+                    bucket: Optional[str] = None, skill_name: Optional[str] = None,
+                    _resolved_binding: Any = None,
+                    _canonical_work_order_fingerprint: str = "",
+                    _work_order_source_request: Any = None) -> str:
     from ouroboros.claudexor_daemon import ensure_owned_gateway
     from ouroboros.delegate_evidence import record_start_blocked
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
@@ -687,9 +696,16 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     resource_ref: Dict[str, Any] = {}
     selected_subagent_id = ""
     config_fingerprint = ""
-    work_order_fingerprint, authority_fingerprint = start_binding_fingerprints(ctx, text)
     retry_token = str(retry_of or "").strip()
-    recovering = bool(retry_token)
+    source_binding = prepare_work_order_start_binding(
+        ctx, drive, retry_token, _canonical_work_order_fingerprint, text,
+        _work_order_source_request,
+    )
+    work_order_source_request = source_binding["request"]
+    work_order_coverage = source_binding["coverage"]
+    authority_fingerprint = source_binding["authority_fingerprint"]
+    work_order_fingerprint = source_binding["fingerprint"]
+    recovering = source_binding["recovering"]
     actor, actor_refusal = prepare_delegate_start_actor(
         ctx, drive, recovering=recovering, invocation_id=retry_token,
         work_order_fingerprint=work_order_fingerprint, authority_fingerprint=authority_fingerprint,
@@ -819,7 +835,10 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             selected_subagent_id=selected_subagent_id,
             config_fingerprint=config_fingerprint,
             work_order_fingerprint=work_order_fingerprint,
-            authority_fingerprint=authority_fingerprint)
+            work_order_coverage=work_order_coverage,
+            authority_fingerprint=authority_fingerprint,
+            work_order_source_request=work_order_source_request,
+        )
         if claim_holder:
             return _fail(
                 "delegate_start", "payload_delegation_busy",
@@ -901,52 +920,21 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     finally:
         gateway.close()
 
-    metadata = getattr(ctx, "task_metadata", {}) or {}
-    metadata = metadata if isinstance(metadata, dict) else {}
     # A start whose custody row did not land does not wear the plain name: the run
     # is live and only THIS process knows it exists (the uncustodied-run leak).
-    durable = custody.record_started(drive, _RunCustody(
-        run_id=run_id,
-        task_id=str(getattr(ctx, "task_id", "") or ""),
-        route_id=route.route_id,
-        model=route.model,
-        profile_id=route.profile_id,  # requested account pin, beside the requested model it mirrors
-        project_id=project_id,
-        project_owned=bool(owned_project_id),
-        root_task_id=str(metadata.get("root_task_id") or ""),
-        parent_task_id=str(metadata.get("parent_task_id") or ""),
-        # The CANONICAL (budget) root, the same one the custody rows themselves live
-        # on — never ctx.drive_root, which on a split-root task is the disposable
-        # child drive: a ledger row written there misses every budget fence and is
-        # erased with the child drive's pruning (P34R.1).
-        ledger_root=str(drive),
-        idempotency_key=key,
-        invocation_id=invocation_id,
-        selected_subagent_id=selected_subagent_id,
-        config_fingerprint=config_fingerprint,
-        work_order_fingerprint=work_order_fingerprint,
-        authority_fingerprint=authority_fingerprint,
-        snapshot_id=snapshot_id,
-        execution_root=(root if snapshot_id else ""),
-        baseline_sha=baseline_sha,
-        target_root=target_root,
-        authority_source=authority_source,
-        resource_ref=resource_ref,
-        # The GRANTED shape on the custody OBJECT too, not only the row: the
-        # in-process memo answers the same lookups the replay does (R1 item 2).
-        access=access,
-        mode=authority.mode,
-        isolation=authority.isolation,
-        delegated=authority.delegated,
-    ), shape={
-        # The shape rides on the SAME durable row as custody, so a forensic reader never
-        # has to join two events to learn what authority a run was started with.
-        # `max_seconds` rides too: delegate_wait reports elapsed-vs-cap from this row.
-        "effort": route.effort, "access": access, "mode": authority.mode,
-        "isolation": authority.isolation, "delegated": authority.delegated, "root": root,
-        "max_seconds": seconds,
-        "capture_mode": (_CAPTURE_DELEGATED_SNAPSHOT if snapshot_id else ""),
-    })
+    durable = record_started_custody(
+        drive, run_id, ctx, route, authority,
+        key=key, access=access, root=root, seconds=seconds,
+        invocation_id=invocation_id, project_id=project_id,
+        project_owned=bool(owned_project_id), selected_subagent_id=selected_subagent_id,
+        config_fingerprint=config_fingerprint, work_order_fingerprint=work_order_fingerprint,
+        work_order_coverage=work_order_coverage,
+        work_order_source_request=work_order_source_request,
+        authority_fingerprint=authority_fingerprint, snapshot_id=snapshot_id,
+        target_root=target_root, baseline_sha=baseline_sha,
+        authority_source=authority_source, resource_ref=resource_ref,
+        capture_mode=(_CAPTURE_DELEGATED_SNAPSHOT if snapshot_id else ""),
+    )
     return _started_payload(handle, run_id, route, access, authority, root,
                             durable=durable, recovering=recovering,
                             invocation_id=invocation_id,
@@ -1336,7 +1324,12 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                 # human keeps holding windows instead of busy-looping, and the
                 # engine timeout stays the backstop.
                 return _waiting_on_user_payload(ctx, rid, state, last_seq, pending,
-                                                seen=seen)
+                                                seen=seen,
+                                                source_request=entry.work_order_source_request,
+                                                source_verification=(
+                                                    custody.work_order_source_verification(entry)
+                                                    if entry.work_order_source_request else {}
+                                                ))
             def _expired() -> str:
                 rendered = progress.rendered_window(
                     run_id=rid, state=state, last_seq=last_seq, window=window,
@@ -1571,6 +1564,9 @@ def get_tools() -> List[ToolEntry]:
                 "delegate_start(subagent_id=..., prompt=...) whose prompt carries the "
                 "assignment plus the answers "
                 "— there is no rerun/decision verb, and custody stays with you."
+                " For an over-budget work order, pass the host-verified "
+                "source_response envelope alongside the ordinary answer; the host "
+                "checks its exact canonical range before recording coverage."
             ),
             "parameters": {"type": "object",
                            "required": ["run_id", "interaction_id", "answers"],
@@ -1587,9 +1583,14 @@ def get_tools() -> List[ToolEntry]:
                         "Free-text answer; omit when options were selected."},
                 }, "required": ["question_id"]}, "description":
                     "One row per question you are answering."},
+                "source_response": {"type": "object", "description":
+                    "Only for a partial work-order run: exact canonical source range "
+                    "receipt. The host verifies schema=1, kind=source_response, the "
+                    "full brief SHA, canonical selector, and text at start_char:end_char "
+                    "before delivering it."},
             }},
-        }, lambda ctx, run_id, interaction_id, answers: _delegate_answer(
-            ctx, run_id, interaction_id, answers), timeout_sec=120),
+        }, lambda ctx, run_id, interaction_id, answers, source_response=None: _delegate_answer(
+            ctx, run_id, interaction_id, answers, source_response), timeout_sec=120),
     ]
 
 

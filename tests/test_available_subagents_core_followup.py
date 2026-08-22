@@ -439,7 +439,10 @@ def test_refused_bootstrap_receipt_never_claims_a_live_leaf(monkeypatch):
         SimpleNamespace(), messages,
         json.dumps({
             "status": "configured_session_start_wake",
-            "startup": {"status": "refused", "reason": "work_order_budget_exceeded"},
+            "startup": {
+                "status": "refused",
+                "reason": "work_order_source_channel_unavailable",
+            },
         }),
     )
     receipt = messages[0]["content"]

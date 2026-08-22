@@ -656,6 +656,8 @@ class OuroborosAgent:
                 drive_root=task.get("drive_root"),
                 child_drive_root=task.get("child_drive_root") or task.get("drive_root"),
                 budget_drive_root=task.get("budget_drive_root"),
+                workspace_root=task.get("workspace_root"),
+                workspace_mode=task.get("workspace_mode"),
                 task_constraint=task.get("task_constraint"),
                 task_contract=task.get("task_contract"),
                 model_lane=task.get("model_lane"),
@@ -812,6 +814,10 @@ class OuroborosAgent:
             # passes the start-message identity to the next binding.
             "origin_message_ref",
             "origin_message_text",
+            # The complete work-order source reader needs the original typed
+            # constraint mapping, not the normalized dataclass repr, to rebuild
+            # the exact canonical serializer bytes during a source-range answer.
+            "task_constraint",
         ):
             if task.get(key) not in (None, ""):
                 task_metadata[key] = task.get(key)

@@ -1413,6 +1413,9 @@ def substrate_result_fields(envelope: Mapping[str, Any]) -> Dict[str, Any]:
         "delegated_runs_settled": int(ev.get("delegated_runs_settled") or 0),
         "delegated_runs_succeeded": int(ev.get("delegated_runs_succeeded") or 0),
         "delegated_runs_failed": int(ev.get("delegated_runs_failed") or 0),
+        "delegated_runs_source_unresolved": int(
+            ev.get("delegated_runs_source_unresolved") or 0
+        ),
         # C3: delegated-run facts only — the native contribution is unknown and
         # no share is derivable (owner-approved replacement for harness_share).
         "native_contribution": "unknown",
