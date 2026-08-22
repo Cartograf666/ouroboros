@@ -1,6 +1,14 @@
 import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { applyMasonry } from './masonry.js';
+import { moduleBridgeScript, moduleResizeScript } from './widget_frame.js';
+import {
+    classifyWidgetJobStatus,
+    isRetryableWidgetError,
+    readWidgetJobStatus,
+    WIDGET_REQUEST_TIMEOUT_MS,
+    withWidgetRequestTimeout,
+} from './widget_job.js';
 import {
     apiClient,
     apiFetch,
@@ -616,14 +624,30 @@ function renderComponent(tab, component, view, treePath, inheritedTarget = '') {
 }
 
 const widgetDisposers = new Map();
+const widgetMountControllers = new Set();
 const widgetMessageHandlers = new Set();
 const widgetSessionState = new Map();
 let widgetsWsBridgeBound = false;
-
+export const WIDGET_FRAME_DEFAULT_HEIGHT = 320;
+export const WIDGET_FRAME_MAX_HEIGHT = 8192;
+const WIDGET_FRAME_BORDER_RESERVE = 2;
 function boundedNumber(value, fallback, min, max) {
     const parsed = Number(value);
     const safe = Number.isFinite(parsed) ? parsed : fallback;
     return Math.max(min, Math.min(safe, max));
+}
+
+function frameHeight(render, fallback = WIDGET_FRAME_DEFAULT_HEIGHT) {
+    return boundedNumber(render?.height, fallback, WIDGET_FRAME_DEFAULT_HEIGHT, WIDGET_FRAME_MAX_HEIGHT);
+}
+
+function frameMaxHeight(render) {
+    return boundedNumber(render?.max_height, WIDGET_FRAME_MAX_HEIGHT, WIDGET_FRAME_DEFAULT_HEIGHT, WIDGET_FRAME_MAX_HEIGHT);
+}
+
+function setFrameHeight(iframe, height) {
+    if (!iframe) return;
+    iframe.style.setProperty('--widget-frame-height', `${Math.ceil(height)}px`);
 }
 
 async function callWidgetRoute(tab, spec, values, signal) {
@@ -643,13 +667,23 @@ async function callWidgetRoute(tab, spec, values, signal) {
             body: JSON.stringify(values || {}),
             signal,
         };
-    const resp = await apiFetch(url, init);
-    const contentType = resp.headers.get('content-type') || '';
-    const data = contentType.includes('application/json')
-        ? await resp.json().catch(() => ({}))
-        : { text: await resp.text() };
-    if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
-    return data;
+    try {
+        const resp = await apiFetch(url, init);
+        const contentType = resp.headers.get('content-type') || '';
+        const data = contentType.includes('application/json')
+            ? await resp.json().catch(() => ({}))
+            : { text: await resp.text() };
+        if (!resp.ok || data?.error || data === null) {
+            const error = new Error(data?.error || `HTTP ${resp.status}`);
+            error.status = resp.status;
+            error.retryable = resp.status === 408 || resp.status === 429 || (resp.status >= 500 && resp.status <= 599);
+            throw error;
+        }
+        return data;
+    } catch (error) {
+        if (error?.name === 'TypeError' && typeof error.retryable !== 'boolean') error.retryable = true;
+        throw error;
+    }
 }
 
 async function mountDeclarativeWidget(mount, tab, render) {
@@ -723,7 +757,10 @@ async function mountDeclarativeWidget(mount, tab, render) {
         const controller = new AbortController();
         controllers.add(controller);
         try {
-            return await callWidgetRoute(tab, spec, values, controller.signal);
+            return await withWidgetRequestTimeout(
+                (signal) => callWidgetRoute(tab, spec, values, signal),
+                controller,
+            );
         } finally {
             controllers.delete(controller);
         }
@@ -823,8 +860,17 @@ async function mountDeclarativeWidget(mount, tab, render) {
             try {
                 const data = await callRoute({ route: statusRoute, method: 'GET' }, { job_id: jobId });
                 if (disposed) return;
-                const currentStatus = String(data.status || data.state || '').toLowerCase();
-                if (currentStatus === 'done' || currentStatus === 'succeeded' || currentStatus === 'success') {
+                if (!data || typeof data !== 'object' || Array.isArray(data)) {
+                    state[target] = { error: 'invalid job status response' };
+                    status[target] = 'error';
+                    delete componentState[`job:${key}`];
+                    activeJobs.delete(key);
+                    renderAll();
+                    return;
+                }
+                const currentStatus = readWidgetJobStatus(data);
+                const statusKind = classifyWidgetJobStatus(currentStatus);
+                if (statusKind === 'success') {
                     state[target] = data.result && typeof data.result === 'object' ? data.result : data;
                     status[target] = 'success';
                     delete componentState[`job:${key}`];
@@ -832,8 +878,16 @@ async function mountDeclarativeWidget(mount, tab, render) {
                     renderAll();
                     return;
                 }
-                if (currentStatus === 'error' || currentStatus === 'failed') {
+                if (statusKind === 'failure') {
                     state[target] = { error: data.error || 'job failed' };
+                    status[target] = 'error';
+                    delete componentState[`job:${key}`];
+                    activeJobs.delete(key);
+                    renderAll();
+                    return;
+                }
+                if (statusKind === 'invalid') {
+                    state[target] = { error: 'invalid job status response' };
                     status[target] = 'error';
                     delete componentState[`job:${key}`];
                     activeJobs.delete(key);
@@ -860,6 +914,15 @@ async function mountDeclarativeWidget(mount, tab, render) {
                     renderAll();
                 }
             } catch (err) {
+                if (disposed) return;
+                if (isRetryableWidgetError(err) && ticks < maxTicks) {
+                    // Keep the durable job id and any useful progress while a
+                    // transient transport/server failure is retried.
+                    status[target] = 'loading';
+                    renderAll();
+                    schedule(pollJob, intervalMs);
+                    return;
+                }
                 state[target] = { error: err.message || String(err) };
                 status[target] = 'error';
                 delete componentState[`job:${key}`];
@@ -1141,7 +1204,7 @@ async function mountDeclarativeWidget(mount, tab, render) {
     return dispose;
 }
 
-async function mountTab(card, tab) {
+async function mountTab(card, tab, mountSignal = null) {
     const mount = card.querySelector('[data-widget-mount]');
     const render = tab.render || {};
     if (!mount) return;
@@ -1149,7 +1212,14 @@ async function mountTab(card, tab) {
         const src = extensionRoutePath(tab.skill, render.route);
         if (!src) throw new Error('invalid widget iframe route');
         mount.innerHTML = `<iframe class="widgets-frame" sandbox="" src="${src}"></iframe>`;
-        return;
+        const iframe = mount.querySelector('iframe');
+        setFrameHeight(iframe, frameHeight(render));
+        let disposed = false;
+        return () => {
+            if (disposed) return;
+            disposed = true;
+            if (iframe?.parentNode === mount) iframe.remove();
+        };
     }
     if (render.kind === 'declarative') {
         return mountDeclarativeWidget(mount, tab, render);
@@ -1159,8 +1229,33 @@ async function mountTab(card, tab) {
         // this skill's extension route prefix, preserving route IO without cookies.
         const entryName = String(render.entry).replace(/[^A-Za-z0-9._-]/g, '');
         const entryUrl = `${extensionRoutePrefix(tab.skill)}module/${encodeURIComponent(entryName)}`;
-        const resp = await apiFetch(entryUrl, { cache: 'no-store' });
-        const moduleSource = await resp.text();
+        const sourceController = new AbortController();
+        const relayAbort = () => sourceController.abort();
+        if (mountSignal?.aborted) sourceController.abort();
+        else mountSignal?.addEventListener('abort', relayAbort, { once: true });
+        let sourceTimedOut = false;
+        const sourceTimeout = setTimeout(() => {
+            sourceTimedOut = true;
+            sourceController.abort();
+        }, WIDGET_REQUEST_TIMEOUT_MS);
+        let resp;
+        let moduleSource;
+        try {
+            resp = await apiFetch(entryUrl, { cache: 'no-store', signal: sourceController.signal });
+            moduleSource = await resp.text();
+        } catch (error) {
+            if (sourceTimedOut) {
+                const timeoutError = new Error('widget module request timed out');
+                timeoutError.code = 'WIDGET_REQUEST_TIMEOUT';
+                timeoutError.retryable = true;
+                throw timeoutError;
+            }
+            throw error;
+        } finally {
+            clearTimeout(sourceTimeout);
+            mountSignal?.removeEventListener('abort', relayAbort);
+        }
+        if (mountSignal?.aborted) return;
         if (!resp.ok) {
             mount.innerHTML = `<div class="skills-load-error">module load failed: ${escapeHtml(moduleSource || `HTTP ${resp.status}`)}</div>`;
             return;
@@ -1176,53 +1271,34 @@ async function mountTab(card, tab) {
         const escapeScript = (value) => String(value || '')
             .replace(/<\/script/gi, '<\\/script')
             .replace(/<!--/g, '<\\!--');
-        const bridge = `
-            (() => {
-                const nonce = ${JSON.stringify(nonce)};
-                let seq = 0;
-                const pending = new Map();
-                window.addEventListener('message', (event) => {
-                    const msg = event.data || {};
-                    if (msg.type !== 'ouro-widget-fetch-result' || msg.nonce !== nonce) return;
-                    const item = pending.get(msg.id);
-                    if (!item) return;
-                    pending.delete(msg.id);
-                    if (msg.error) {
-                        item.reject(new Error(msg.error));
-                        return;
-                    }
-                    item.resolve(new Response(msg.body || '', {
-                        status: msg.status || 200,
-                        headers: msg.headers || {},
-                    }));
-                });
-                window.fetch = (url, init = {}) => {
-                    const id = ++seq;
-                    return new Promise((resolve, reject) => {
-                        pending.set(id, { resolve, reject });
-                        window.parent.postMessage({
-                            type: 'ouro-widget-fetch',
-                            nonce,
-                            id,
-                            url: String(url || ''),
-                            init: {
-                                method: init.method || 'GET',
-                                headers: init.headers || {},
-                                body: init.body || null,
-                            },
-                        }, '*');
-                    });
-                };
-                window.OuroborosWidget = { fetch: window.fetch };
-            })();
-        `;
-        const srcdoc = `<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="${csp}"></head><body><div id="root"></div><script>${bridge}</script><script>${escapeScript(moduleSource)}</script></body></html>`;
+        const autoHeight = render.height === undefined || render.height === null;
+        const maxHeight = frameMaxHeight(render);
+        const bridge = moduleBridgeScript(nonce);
+        const resizeBridge = autoHeight ? moduleResizeScript(nonce) : '';
+        const srcdoc = `<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="${csp}"></head><body><div id="root"></div><script>${bridge}</script><script>${resizeBridge}</script><script>${escapeScript(moduleSource)}</script></body></html>`;
         mount.innerHTML = `<iframe class="widgets-frame" sandbox="allow-scripts" srcdoc="${escapeHtml(srcdoc)}"></iframe>`;
         const iframe = mount.querySelector('iframe');
+        let appliedHeight = frameHeight(render);
+        setFrameHeight(iframe, appliedHeight);
+        const pendingRequests = new Map();
+        let disposed = false;
         const onMessage = async (event) => {
-            if (event.source !== iframe.contentWindow) return;
+            if (disposed || !iframe || event.source !== iframe.contentWindow) return;
             const msg = event.data || {};
-            if (msg.type !== 'ouro-widget-fetch' || msg.nonce !== nonce) return;
+            if (msg.nonce !== nonce) return;
+            if (msg.type === 'ouro-widget-resize') {
+                if (!autoHeight) return;
+                const measured = Number(msg.height);
+                if (!Number.isFinite(measured) || measured <= 0) return;
+                const nextHeight = Math.min(maxHeight, Math.max(WIDGET_FRAME_DEFAULT_HEIGHT, measured + WIDGET_FRAME_BORDER_RESERVE));
+                if (nextHeight === appliedHeight) return;
+                appliedHeight = nextHeight;
+                setFrameHeight(iframe, appliedHeight);
+                return;
+            }
+            if (msg.type !== 'ouro-widget-fetch') return;
+            const controller = new AbortController();
+            pendingRequests.set(msg.id, controller);
             try {
                 const parsed = new URL(String(msg.url || ''), window.location.origin);
                 if (parsed.origin !== window.location.origin || !parsed.pathname.startsWith(expectedPrefix)) {
@@ -1233,8 +1309,10 @@ async function mountTab(card, tab) {
                     headers: msg.init?.headers || {},
                     body: msg.init?.body || undefined,
                     credentials: 'same-origin',
+                    signal: controller.signal,
                 });
                 const body = await r.text();
+                if (disposed) return;
                 iframe.contentWindow?.postMessage({
                     type: 'ouro-widget-fetch-result',
                     nonce,
@@ -1244,22 +1322,35 @@ async function mountTab(card, tab) {
                     body,
                 }, '*');
             } catch (err) {
+                if (disposed) return;
                 iframe.contentWindow?.postMessage({
                     type: 'ouro-widget-fetch-result',
                     nonce,
                     id: msg.id,
                     error: err.message || String(err),
                 }, '*');
+            } finally {
+                pendingRequests.delete(msg.id);
             }
         };
         window.addEventListener('message', onMessage);
-        return () => window.removeEventListener('message', onMessage);
+        return () => {
+            if (disposed) return;
+            disposed = true;
+            pendingRequests.forEach((controller) => controller.abort());
+            pendingRequests.clear();
+            iframe?.contentWindow?.postMessage({ type: 'ouro-widget-dispose', nonce }, '*');
+            window.removeEventListener('message', onMessage);
+            if (iframe?.parentNode === mount) iframe.remove();
+        };
     }
     mount.innerHTML = `<div class="muted">Widget render kind <code>${escapeHtml(render.kind || 'unknown')}</code> is not supported yet.</div>`;
     return null;
 }
 
 function disposeMountedWidgets() {
+    widgetMountControllers.forEach((controller) => controller.abort());
+    widgetMountControllers.clear();
     widgetDisposers.forEach((dispose) => {
         try {
             dispose();
@@ -1270,17 +1361,26 @@ function disposeMountedWidgets() {
     widgetDisposers.clear();
 }
 
-async function mountTrackedTab(card, tab) {
+async function mountTrackedTab(card, tab, isCurrent = () => true) {
     const key = tab.key || `${tab.skill}:${tab.tab_id}`;
     const existing = widgetDisposers.get(key);
     if (existing) {
         existing();
         widgetDisposers.delete(key);
     }
-    const dispose = await mountTab(card, tab);
-    if (typeof dispose === 'function') {
-        widgetDisposers.set(key, dispose);
-        return;
+    const mountController = new AbortController();
+    widgetMountControllers.add(mountController);
+    try {
+        const dispose = await mountTab(card, tab, mountController.signal);
+        if (typeof dispose === 'function') {
+            if (!isCurrent()) {
+                dispose();
+                return;
+            }
+            widgetDisposers.set(key, dispose);
+        }
+    } finally {
+        widgetMountControllers.delete(mountController);
     }
 }
 
@@ -1344,9 +1444,10 @@ export function initWidgets(ctx = {}) {
                 const card = list.querySelector(`[data-widget-key="${CSS.escape(key)}"]`);
                 if (!card) continue;
                 try {
-                    await mountTrackedTab(card, tab);
+                    await mountTrackedTab(card, tab, () => widgetsVisible && generation === renderGeneration);
                     applyMasonry(list);
                 } catch (err) {
+                    if (!widgetsVisible || generation !== renderGeneration) return;
                     const mount = card.querySelector('[data-widget-mount]');
                     if (mount) mount.innerHTML = `<div class="skills-load-error">widget failed: ${escapeHtml(err.message || err)}</div>`;
                     applyMasonry(list);

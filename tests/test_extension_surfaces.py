@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 
 from ouroboros import extension_loader
+from ouroboros.contracts.plugin_api import ExtensionRegistrationError
+from ouroboros.extension_ui_validation import validate_ui_render
 from ouroboros.skill_loader import (
     SkillReviewState,
     compute_content_hash,
@@ -302,6 +304,58 @@ def test_register_ui_tab_promotes_render_span_metadata(tmp_path):
     assert snap["ui_tabs"][0]["render"]["span"] == 2
 
     extension_loader.unload_extension("wideui")
+
+
+def test_register_ui_tab_promotes_bounded_frame_geometry(tmp_path):
+    loaded, _, drive_root = _prepare_extension(
+        tmp_path,
+        "frameui",
+        "def register(api):\n"
+        "    api.register_ui_tab('quota', 'Quota', render={'kind': 'module', 'entry': 'widget.js', 'height': 640.4, 'max_height': 4096})\n",
+        permissions=["widget"],
+    )
+    err = extension_loader.load_extension(loaded, lambda: {}, drive_root=drive_root)
+    assert err is None, err
+    tab = extension_loader.snapshot()["ui_tabs"][0]
+    assert tab["height"] == 640
+    assert tab["max_height"] == 4096
+    assert tab["render"]["height"] == 640
+    assert tab["render"]["max_height"] == 4096
+    extension_loader.unload_extension("frameui")
+
+
+def test_register_ui_tab_promotes_legacy_iframe_geometry(tmp_path):
+    loaded, _, drive_root = _prepare_extension(
+        tmp_path,
+        "legacyframeui",
+        "def register(api):\n"
+        "    api.register_ui_tab('view', 'View', render={'kind': 'iframe', 'route': 'view', 'height': 640})\n",
+        permissions=["widget"],
+    )
+    err = extension_loader.load_extension(loaded, lambda: {}, drive_root=drive_root)
+    assert err is None, err
+    tab = extension_loader.snapshot()["ui_tabs"][0]
+    assert tab["height"] == 640
+    assert tab["render"]["height"] == 640
+    extension_loader.unload_extension("legacyframeui")
+
+
+@pytest.mark.parametrize(
+    "render,expected",
+    [
+        ({"kind": "module", "entry": "widget.js", "height": 319}, "height"),
+        ({"kind": "module", "entry": "widget.js", "max_height": 8193}, "max_height"),
+        ({"kind": "module", "entry": "widget.js", "height": True}, "height"),
+        ({"kind": "module", "entry": "widget.js", "height": 900, "max_height": 800}, "cannot exceed"),
+        ({"kind": "iframe", "route": "view", "max_height": 1000}, "module widgets only"),
+        ({"kind": "declarative", "schema_version": 1, "components": [], "height": 640}, "framed widgets only"),
+        ({"kind": "declarative", "schema_version": 1, "components": [], "max_height": 640}, "framed widgets only"),
+    ],
+    ids=["below-min", "above-max", "bool", "contradictory", "legacy-max", "declarative-height", "declarative-max"],
+)
+def test_frame_geometry_validation_rejects_ambiguous_values(render, expected):
+    with pytest.raises(ExtensionRegistrationError, match=expected):
+        validate_ui_render(render)
 
 
 _UI_TAB_REJECTION_CASES = [

@@ -27,6 +27,8 @@ _SETTINGS_COMPONENTS = {"form", "action", "markdown", "json"}
 _DECLARATIVE_MAX_DEPTH = 8
 _DECLARATIVE_MAX_NODES = 256
 _GRID_COLUMNS_MAX = 4
+WIDGET_FRAME_MIN_HEIGHT = 320
+WIDGET_FRAME_MAX_HEIGHT = 8192
 
 
 def _text(value: Any) -> str:
@@ -87,6 +89,33 @@ def _validate_grid_columns(value: Any, *, path: str) -> None:
         raise ExtensionRegistrationError(
             f"{path} must be an integer from 1 to {_GRID_COLUMNS_MAX}"
         )
+
+
+def _validate_frame_geometry(render: Dict[str, Any], *, kind: str) -> None:
+    """Normalize the bounded geometry shared by framed widget renderers."""
+    for key in ("height", "max_height"):
+        if key not in render:
+            continue
+        value = render.get(key)
+        if not _is_finite_number(value):
+            raise ExtensionRegistrationError(
+                f"ui render {key} must be a finite number from "
+                f"{WIDGET_FRAME_MIN_HEIGHT} to {WIDGET_FRAME_MAX_HEIGHT}"
+            )
+        numeric = float(value)
+        if not WIDGET_FRAME_MIN_HEIGHT <= numeric <= WIDGET_FRAME_MAX_HEIGHT:
+            raise ExtensionRegistrationError(
+                f"ui render {key} must be from {WIDGET_FRAME_MIN_HEIGHT} "
+                f"to {WIDGET_FRAME_MAX_HEIGHT}"
+            )
+        normalized = int(round(numeric))
+        render[key] = normalized
+    if kind == "iframe" and "max_height" in render:
+        raise ExtensionRegistrationError("ui render max_height is supported for module widgets only")
+    height = render.get("height")
+    maximum = render.get("max_height")
+    if height is not None and maximum is not None and height > maximum:
+        raise ExtensionRegistrationError("ui render height cannot exceed max_height")
 
 
 def _validate_form_fields(component: Dict[str, Any], *, path: str) -> None:
@@ -332,6 +361,8 @@ def validate_ui_render(render: Dict[str, Any]) -> Dict[str, Any]:
     kind = _text(clean.get("kind"))
     if kind not in _UI_RENDER_KINDS:
         raise ExtensionRegistrationError(f"ui render kind {kind!r} is unsupported; expected one of {sorted(_UI_RENDER_KINDS - {''})}")
+    if kind in {"iframe", "module"}:
+        _validate_frame_geometry(clean, kind=kind)
     if kind == "module":
         entry = _text(clean.get("entry"))
         if not entry:
@@ -342,6 +373,10 @@ def validate_ui_render(render: Dict[str, Any]) -> Dict[str, Any]:
             raise ExtensionRegistrationError("module widget entry must be a .js / .mjs file")
         return clean
     if kind == "declarative":
+        if "height" in clean or "max_height" in clean:
+            raise ExtensionRegistrationError(
+                "ui render height/max_height are supported for framed widgets only"
+            )
         try:
             schema_version = int(clean.get("schema_version", 1))
         except (TypeError, ValueError) as exc:
@@ -386,4 +421,9 @@ def validate_settings_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
     })
 
 
-__all__ = ["validate_settings_schema", "validate_ui_render"]
+__all__ = [
+    "WIDGET_FRAME_MAX_HEIGHT",
+    "WIDGET_FRAME_MIN_HEIGHT",
+    "validate_settings_schema",
+    "validate_ui_render",
+]

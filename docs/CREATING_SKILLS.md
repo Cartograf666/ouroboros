@@ -677,6 +677,18 @@ embeds it in an opaque-origin iframe (`sandbox="allow-scripts"`, no
 `/api/extensions/<skill>/...` paths. The `widget_module_safety` review item still
 checks the source; do not rely on the sandbox alone.
 
+Framed render declarations may add a bounded `height` (320–8,192 pixels).
+When a module omits `height`, the host starts at 320px and measures its
+existing `#root` through a nonce-bound resize message. The host
+integer-deduplicates and clamps that value to 8,192px by default; an optional
+module-only `max_height` lowers the ceiling. A fixed `height` disables
+auto-growth. Legacy route iframes accept explicit `height` only because the
+host cannot inspect their opaque document. The parent owns iframe removal and
+the module bootstrap rejects pending fetch promises on disposal, so module
+code must not invent a second resize or teardown protocol.
+These geometry keys are valid only for framed `iframe` and `module` renders;
+declarative renders remain content-driven and reject them.
+
 For everything else, prefer declarative components (`form`, `action`, `poll`,
 `subscription`, `stream`, `table`, `chart`, `markdown`, `json`, `kv`, `status`,
 `tabs`, `progress`, media/file/gallery, map/calendar/kanban, `group`, `metric`,
@@ -697,9 +709,11 @@ Nested composition still has one strict passive boundary:
 `subscription.render` cannot contain `form`, `action`, `poll`, `stream`, another
 `subscription`, or mutating `kanban`, even through nested groups or tabs. One
 widget-level disposer owns timers, streams, abort controllers, charts, and
-snapshots, and inactive tabs do not restart lifecycle work. Skill declarations
-cannot supply arbitrary HTML/JavaScript/CSS, raw chart options, colors,
-selectors, or cross-widget bindings.
+snapshots, and inactive tabs do not restart lifecycle work. Job widgets keep
+their `job_id` across bounded retryable transport/server failures and request
+timeouts; explicit terminal states clear it. Skill declarations cannot supply
+arbitrary HTML/JavaScript/CSS, raw chart options, colors, selectors, or
+cross-widget bindings.
 
 The additive schema-v1 composition components are intentionally small:
 
@@ -724,10 +738,14 @@ your declared `loading` label is reused unless you declare a `refreshing` one.
 ### Async job error contract
 
 Long-running widget actions follow the declarative async job contract: start
-route returns `job_id`; status route returns `queued`, `running`, `done`, or
-`error`; the host resumes polling by `job_id` after tab switches. If you use
-`asyncio.gather(..., return_exceptions=True)`, convert exceptions into an
-explicit job failure instead of only logging them:
+route returns `job_id`; status route normally returns `queued`, `running`,
+`done`, or `error`; the host resumes polling by `job_id` after tab switches.
+Transport/408/429/5xx failures and the host's bounded request timeout retain
+the job id and retry on the existing interval. A missing or malformed status
+envelope is shown as an immediate protocol error; a non-empty vendor-specific
+in-progress status remains pending until the existing `max_ticks` bound. If
+you use `asyncio.gather(..., return_exceptions=True)`, convert exceptions into
+an explicit job failure instead of only logging them:
 
 ```python
 results = await asyncio.gather(*tasks, return_exceptions=True)
