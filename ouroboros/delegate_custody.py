@@ -1417,6 +1417,11 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
         selected_subagent_id=str(record.get("selected_subagent_id") or ""),
         config_fingerprint=str(record.get("config_fingerprint") or ""),
         work_order_fingerprint=str(record.get("work_order_fingerprint") or ""),
+        work_order_coverage=str(record.get("work_order_coverage") or ""),
+        work_order_source_request=(
+            dict(record.get("work_order_source_request"))
+            if isinstance(record.get("work_order_source_request"), dict) else {}
+        ),
         authority_fingerprint=str(record.get("authority_fingerprint") or ""),
         # The C1 isolation binding survives recovery VERBATIM: the recovered run
         # executes in the snapshot the original attempt provisioned (the replayed

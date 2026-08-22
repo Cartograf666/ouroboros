@@ -150,6 +150,40 @@ def test_started_replay_keeps_partial_request_and_verified_ranges(tmp_path):
     assert custody.work_order_source_verification(replayed)["status"] == "complete"
 
 
+def test_orphaned_pending_recovery_preserves_partial_source_gate(tmp_path, monkeypatch):
+    from ouroboros import delegate_custody as custody
+
+    _ctx, request, _full_text, _prompt = _fixture(tmp_path)
+    assert custody.record_start_requested(
+        tmp_path,
+        run_id="",
+        task_id="source-child",
+        invocation_id="source-invocation",
+        idempotency_key="source-invocation",
+        max_seconds=60,
+        request={"prompt": "WORK ORDER SOURCE REQUEST", "access": "readonly"},
+        project_id="",
+        project_owned=False,
+        route="claude",
+        work_order_fingerprint=request["complete_sha256"],
+        work_order_coverage="partial",
+        work_order_source_request=request,
+    )
+    record = custody.pending_invocations(tmp_path)[0]
+    monkeypatch.setattr(custody, "_reconcile_one", lambda *_args, **_kwargs: {"ok": True})
+
+    class Gateway:
+        def start_run(self, _request, *, idempotency_key=""):
+            assert idempotency_key == "source-invocation"
+            return {"runId": "source-recovered"}
+
+    assert custody._recover_pending_invocation(tmp_path, Gateway(), record) == {"ok": True}
+    recovered = custody.replay(tmp_path)["source-recovered"]
+    assert recovered.work_order_coverage == "partial"
+    assert recovered.work_order_source_request == request
+    assert custody.work_order_source_verification(recovered)["status"] == "cannot_verify"
+
+
 def test_existing_task_result_reader_returns_the_same_canonical_range(tmp_path):
     from ouroboros.task_results import task_result_path, write_task_result
     from ouroboros.subagent_work_order import canonical_work_order_source
