@@ -33,6 +33,8 @@ import {
     removeAccount,
     removeAccountConfirmBody,
     rowActionLabel,
+    rowLoginAction,
+    loginStatusUnknown,
     serviceBannerLine,
     setAccountEnabled,
     vendorCredentialRetainedNotice,
@@ -301,6 +303,40 @@ test('a row offers what it can actually do, and runtime work outranks it', () =>
     // work happens first whatever the row wants.
     const broken = { daemon: { state: 'not_provisioned', runtime: { state: 'error' } } };
     assert.equal(rowActionLabel(live, broken), 'Fix & connect');
+});
+
+test('an explicit auth probe failure does not turn into a re-login button', () => {
+    const unknown = {
+        harness: 'claude', profile_id: 'work', kind: 'profile',
+        status: { availability: 'unknown', verification: 'not_run',
+            detail: 'auth-status probe failed: timeout' },
+    };
+    assert.equal(loginStatusUnknown(unknown), true);
+    assert.equal(rowActionLabel(unknown, payload()), 'Check status');
+    assert.deepEqual(rowLoginAction(unknown, payload()),
+        { label: 'Check status', refresh: true });
+    // The compatibility wire has no availability field, so an older engine's
+    // existing action stays unchanged.
+    const legacy = { ...unknown, status: { verification: 'not_run' } };
+    assert.equal(loginStatusUnknown(legacy), false);
+    assert.deepEqual(rowLoginAction(legacy, payload()),
+        { label: 'Sign in', refresh: false });
+    // Runtime repair remains actionable even while the row's auth probe is
+    // unknown: Connect must be able to install/update the pinned engine.
+    const broken = { daemon: { state: 'stale', runtime: { state: 'error' } } };
+    assert.deepEqual(rowLoginAction(unknown, broken),
+        { label: 'Fix & connect', refresh: false });
+});
+
+test('the unknown-status refresh action preserves recovery for every profile harness', () => {
+    for (const harness of ['claude', 'codex', 'cursor', 'agy']) {
+        const row = {
+            harness, profile_id: 'work', kind: 'profile',
+            status: { availability: 'unknown', verification: 'not_run' },
+        };
+        assert.deepEqual(rowLoginAction(row, payload()),
+            { label: 'Check status', refresh: true }, harness);
+    }
 });
 
 // ---------------------------------------------------------------------------
