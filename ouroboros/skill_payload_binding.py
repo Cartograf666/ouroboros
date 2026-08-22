@@ -21,6 +21,32 @@ from ouroboros.skill_loader import (
 
 _MANIFEST_NAMES = ("SKILL.md", "skill.json")
 
+# Native payloads are a readable skill-code surface for the two profiles that
+# already have direct/read-only inspection authority.  This is deliberately an
+# operation- and selector-specific overlay at the binding seam, not a broader
+# profile predicate or a change to the generic payload-path resolver.  Native
+# mutation, repair, and acting-child selection continue through the existing
+# top-level/operation guards below.
+_NATIVE_PAYLOAD_READ_OPERATIONS = frozenset({"read", "list", "search"})
+_NATIVE_PAYLOAD_READ_PROFILES = frozenset({
+    "local_readonly_subagent",
+    "operator_control",
+})
+
+
+def _native_payload_read_allowed(
+    *,
+    profile: str,
+    operation: str,
+    requested: str,
+) -> bool:
+    """Admit only explicit native read/list/search selectors for read profiles."""
+    return (
+        requested == "native"
+        and operation in _NATIVE_PAYLOAD_READ_OPERATIONS
+        and profile in _NATIVE_PAYLOAD_READ_PROFILES
+    )
+
 
 def selected_skill_publish_name(ctx: object) -> str:
     """Return the host-bound publication target from the active task context."""
@@ -162,7 +188,16 @@ def resolve_skill_payload_base(
         raise ValueError(
             "root=skill_payload requires bucket/location in external|clawhub|ouroboroshub|native|user_repo"
         )
-    if requested in {"native", "user_repo"} and not top_level:
+    native_read_allowed = _native_payload_read_allowed(
+        profile=profile,
+        operation=operation,
+        requested=requested,
+    )
+    if (
+        requested in {"native", "user_repo"}
+        and not top_level
+        and not native_read_allowed
+    ):
         raise ValueError(f"profile={profile} cannot select skill location={requested}")
     selected, source = select_effective_skill_location(
         drive_root,
@@ -172,7 +207,11 @@ def resolve_skill_payload_base(
         selected_manifestless_name=selected_manifestless,
     )
     if selected is not None:
-        if selected.location in {"native", "user_repo"} and not top_level:
+        if (
+            selected.location in {"native", "user_repo"}
+            and not top_level
+            and not native_read_allowed
+        ):
             raise ValueError(f"profile={profile} cannot select skill location={selected.location}")
         if (
             not requested

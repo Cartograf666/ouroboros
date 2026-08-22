@@ -18,8 +18,13 @@ from ouroboros.artifacts import (delegated_capture_read_target,
                                  task_artifact_dir_path, task_id_for_artifacts)
 from ouroboros.tool_capabilities import ACTING_SUBAGENT_MODE, LOCAL_READONLY_SUBAGENT_MODE
 from ouroboros.contracts.task_constraint import VALID_WRITE_SURFACES, normalize_task_constraint
+from ouroboros import deliverables_paths as _deliverables_paths
 from ouroboros.shell_parse import is_absolute_path_text
 from ouroboros.utils import safe_relpath
+
+_deliverables_root_lexical = _deliverables_paths._deliverables_root_lexical
+_deliverables_root_lexical_alias = _deliverables_paths._deliverables_root_lexical_alias
+_lexical_path_is_relative_to_casefold = _deliverables_paths._lexical_path_is_relative_to_casefold
 
 
 def _user_files_root() -> pathlib.Path:
@@ -122,6 +127,7 @@ class ResolvedResourceBinding:
     source: str
     skill_name: str
     state_drive_root: pathlib.Path
+    logical_base_path: pathlib.Path | None = None
 
 
 _ALL_ROOTS: frozenset[str] = frozenset({
@@ -1542,6 +1548,20 @@ def build_resolved_resource_binding(
         path=path,
         operation=operation,
     )
+    # An absolute user_files target may intentionally land in the configured
+    # Deliverables container outside the user's ordinary home.  The binding's
+    # physical base must follow that selected container; otherwise an exact
+    # Presence path-prefix check treats a valid deliverable as outside the
+    # binding merely because the default user_files home is a sibling.
+    logical_base_path = None
+    if normalized == "user_files":
+        try:
+            deliverables = _deliverables_root()
+            if path_is_relative_to(target, deliverables) or _path_is_relative_to_casefold(target, deliverables):
+                logical_base_path = pathlib.Path(base).resolve(strict=False)
+                base = deliverables
+        except (OSError, TypeError, ValueError, RuntimeError):
+            pass
     return ResolvedResourceBinding(
         profile=profile,
         root=normalized,
@@ -1551,6 +1571,7 @@ def build_resolved_resource_binding(
         source=source,
         skill_name=selected_name,
         state_drive_root=canonical_data_root(ctx),
+        logical_base_path=logical_base_path,
     )
 def resolve_resource_path(
     ctx: Any,

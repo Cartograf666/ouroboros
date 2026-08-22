@@ -463,14 +463,38 @@ def presence_ceiling_allows_binding(ceiling: PresenceCapabilityCeiling, binding:
     """Intersect an already-resolved registry target with the positive ceiling."""
 
     try:
-        relative = Path(binding.target_path).resolve(strict=False).relative_to(
-            Path(binding.base_path).resolve(strict=False)
-        )
+        target = Path(binding.target_path).resolve(strict=False)
+        base = Path(binding.base_path).resolve(strict=False)
+        logical_base = getattr(binding, "logical_base_path", None)
+        if logical_base is not None:
+            physical_relative = target.relative_to(base)
+            logical_root = Path(logical_base).resolve(strict=False)
+            # Preserve the configured container's actual logical location. A
+            # default install uses ``~/Ouroboros/Deliverables`` (so the prefix
+            # is ``Ouroboros/Deliverables``). An explicitly external container
+            # has no user-files-relative spelling, so retain the established
+            # logical resource name ``Deliverables`` rather than deriving a
+            # potentially arbitrary physical basename. Do not turn either
+            # shape into a hard-coded alias that widens or narrows a grant.
+            try:
+                logical_container = base.relative_to(logical_root)
+            except ValueError:
+                logical_container = Path("Deliverables")
+            relative = logical_container / physical_relative
+        else:
+            relative = target.relative_to(base)
     except (AttributeError, OSError, TypeError, ValueError):
         return False
     relative_parts = PurePosixPath(relative.as_posix() or ".").parts
     for grant in ceiling.resource_grants:
         if grant.root != str(binding.root) or str(binding.operation) not in grant.operations:
+            continue
+        # Skill-payload bindings carry the effective physical authority in
+        # ``source`` (native, external, clawhub, ...).  A non-empty bucket on a
+        # presence grant is an exact selector, not a wildcard; otherwise a
+        # native-read overlay could turn a ceiling for one bucket into access
+        # to another while the logical root/path still matched.
+        if grant.bucket and grant.bucket != str(getattr(binding, "source", "") or ""):
             continue
         if grant.skill_name and grant.skill_name != str(getattr(binding, "skill_name", "") or ""):
             continue
