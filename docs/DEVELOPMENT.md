@@ -513,6 +513,25 @@ ones.
 
 ---
 
+### Invariant: Embedded surfaces declare geometry and refresh semantics
+
+Every owner-visible embedded or framed surface has an explicit host-owned
+geometry/overflow contract, a paired disposer for every long-lived resource,
+declared refresh/stream/error semantics, and a named real-consumer visual
+verification path. Intentional omissions record why they are safe to defer.
+For Widgets, framed `height` values are bounded and module auto-height is
+host-controlled; module source loading and declarative requests have a bounded
+host timeout; declarative job widgets keep their `job_id` and bounded
+retry/timeout behavior visible in the refresh contract rather than hiding them
+in an author script.
+Missing or malformed job status is an immediate protocol error, while unknown
+non-empty in-progress labels remain bounded pending states for producer
+compatibility.
+Repo Commit Checklist item 24 points lifecycle changes here instead of
+re-deriving a second domain-specific rule.
+
+---
+
 ## Core Governance Artifacts
 
 `BIBLE.md`, `docs/ARCHITECTURE.md`, and `docs/DEVELOPMENT.md` are **core governance artifacts**.

@@ -4982,7 +4982,9 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 
 .widgets-frame {
     width: 100%;
+    height: var(--widget-frame-height, 320px);
     min-height: 320px;
+    display: block;
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: var(--radius);
     background: rgba(13, 11, 15, 0.88);

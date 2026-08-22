@@ -13,6 +13,10 @@ def _widgets_js() -> str:
     )
 
 
+def _framed_widget_sources() -> str:
+    return _widgets_js() + _read("web/modules/widget_frame.js")
+
+
 def _read(rel: str) -> str:
     return (REPO_ROOT / rel).read_text(encoding="utf-8")
 
@@ -108,7 +112,7 @@ def test_widgets_keep_iframe_sandbox_locked_down():
        ``allow-same-origin`` (the only token that would re-expose
        parent storage).
     """
-    source = _widgets_js()
+    source = _framed_widget_sources()
     assert 'sandbox=""' in source
     # ``allow-scripts`` is now legitimately present, but only inside the
     # ``kind === 'module'`` branch. The dangerous combined sandbox token
@@ -124,6 +128,36 @@ def test_widgets_keep_iframe_sandbox_locked_down():
     assert "script-src 'unsafe-inline'" in source
     assert "OuroborosWidget = { fetch: window.fetch }" in source
     assert "module widget fetch outside extension route prefix" in source
+
+
+def test_widgets_frame_geometry_and_teardown_contract():
+    source = _framed_widget_sources()
+    style = _read("web/style.css")
+    assert "--widget-frame-height" in source
+    assert "height: var(--widget-frame-height, 320px);" in style
+    assert "type: 'ouro-widget-resize'" in source
+    assert "new ResizeObserver(report)" in source
+    assert "box.bottom - bodyTop" in source
+    assert "fixedViewportBody" in source
+    assert "ouro-widget-dispose" in source
+    assert "if (iframe?.parentNode === mount) iframe.remove();" in source
+    assert "pendingRequests.forEach((controller) => controller.abort());" in source
+    assert "if (!isCurrent())" in source
+    assert "WIDGET_FRAME_MAX_HEIGHT = 8192" in source
+    assert "widget module request timed out" in source
+    assert source.index("moduleSource = await resp.text();") < source.index("clearTimeout(sourceTimeout);")
+    assert "widgetMountControllers.forEach((controller) => controller.abort());" in source
+
+
+def test_widgets_job_poll_retries_transient_transport_without_dropping_id():
+    source = _widgets_js()
+    assert "error.retryable = resp.status === 408" in source
+    assert "isRetryableWidgetError(err) && ticks < maxTicks" in source
+    assert "classifyWidgetJobStatus" in source
+    assert "invalid job status response" in source
+    assert "status[target] = 'loading';" in source
+    assert "schedule(pollJob, intervalMs);" in source
+    assert "delete componentState[`job:${key}`];" in source
 
 
 def test_widgets_use_design_radius_tokens():

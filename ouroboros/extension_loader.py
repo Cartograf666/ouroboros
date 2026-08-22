@@ -43,6 +43,8 @@ from ouroboros.event_bus import get_global_event_bus
 from ouroboros.extension_companion import CompanionDescriptor, get_global_supervisor, is_server_process
 from ouroboros.extension_ui_validation import (
     _assert_ws_message_type,
+    WIDGET_FRAME_MAX_HEIGHT,
+    WIDGET_FRAME_MIN_HEIGHT,
     validate_settings_schema as _validate_settings_schema,
     validate_ui_render as _validate_ui_render,
 )
@@ -245,6 +247,7 @@ def _validate_child_ui_descriptor(skill_name: str, item: Dict[str, Any]) -> Dict
     span = _widget_span_from_render(render)
     item["span"] = span
     item["grid_span"] = span
+    item.update(_widget_geometry_from_render(render))
     return item
 
 
@@ -539,6 +542,21 @@ def _widget_span_from_render(render: Dict[str, Any]) -> int:
     return 2 if value >= 2 else 1
 
 
+def _widget_geometry_from_render(render: Dict[str, Any]) -> Dict[str, int]:
+    """Promote normalized framed geometry into the host tab descriptor."""
+    geometry: Dict[str, int] = {}
+    for key in ("height", "max_height"):
+        value = render.get(key)
+        if value is None:
+            continue
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError):
+            continue
+        geometry[key] = max(WIDGET_FRAME_MIN_HEIGHT, min(numeric, WIDGET_FRAME_MAX_HEIGHT))
+    return geometry
+
+
 def set_ws_broadcaster(broadcaster: Callable[[dict], None] | None) -> None:
     """Install the host WebSocket broadcaster used by PluginAPI.send_ws_message."""
     global _ws_broadcaster
@@ -794,6 +812,7 @@ class PluginAPIImpl:
                 "render": validated_render,
                 "span": span,
                 "grid_span": span,
+                **_widget_geometry_from_render(validated_render),
                 "ui_host_pending": True,
             }, "ui_tabs", "ui tab")
 
