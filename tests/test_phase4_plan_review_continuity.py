@@ -277,6 +277,70 @@ def test_api_chat_continuation_uses_exact_slot_transcript() -> None:
     assert executor._kwargs()["model"] == "m/a"
 
 
+@pytest.mark.parametrize(
+    "prior_messages",
+    [[], [{}], [{"role": "user"}], [{"role": "", "content": "prior"}]],
+)
+def test_api_chat_continuation_refuses_partial_or_invalid_transcript(
+    tmp_path, prior_messages,
+) -> None:
+    from ouroboros.review_substrate import ReviewSlot
+    from ouroboros.tools.plan_review_artifacts import continuation_inputs, persist_wave, slot_row
+
+    slot = ReviewSlot(slot_id="s1", model="model-s1")
+    exact = {
+        "schema_version": 1,
+        "cycle_index": 1,
+        "request_fingerprint": "d" * 64,
+        "slots": [slot_row(slot)],
+        "reviewer_outputs": [{
+            "slot_id": "s1", "request_messages": prior_messages, "text": "need evidence",
+        }],
+    }
+    ref = persist_wave(tmp_path, "task-1", exact)
+
+    _slots, messages, threads, error = continuation_inputs(
+        tmp_path, "task-1", {"wave_artifact": ref}, [slot], user_content="continue",
+    )
+
+    assert error == "prior_api_transcript_invalid:s1"
+    assert messages == {} and threads == {}
+
+
+def test_exact_wave_preserves_an_explicit_empty_slot_transcript() -> None:
+    from ouroboros.tools.plan_review_artifacts import exact_wave
+
+    result = exact_wave(
+        {"cycle_index": 1}, plan_prose="plan", manifest={}, slots=[], rows=[{
+            "slot_id": "s1", "route": "api_chat", "model": "m",
+        }], system_prompt="system", user_content="user", session_task="",
+        slot_messages={"s1": []},
+    )
+
+    assert result["reviewer_outputs"][0]["request_messages"] == []
+
+
+def test_review_thread_receipt_requires_run_and_turn_to_match() -> None:
+    from ouroboros.review_thread_continuity import review_thread_receipt
+    from ouroboros.review_execution import ReviewRouteUnavailable
+
+    class Gateway:
+        def get_thread(self, _thread_id):
+            return {
+                "thread": {"headRunId": "other-run"},
+                "turns": [{"id": "turn-1", "runId": "other-run"}],
+                "sessions": [],
+            }
+
+        def get_run_artifact(self, _run_id, _path):
+            return b""
+
+    with pytest.raises(ReviewRouteUnavailable) as excinfo:
+        review_thread_receipt(Gateway(), "thread-1", "target-run", "turn-1")
+
+    assert excinfo.value.code == "review_thread_receipt_missing"
+
+
 def test_claudexor_gateway_thread_turn_contract(monkeypatch) -> None:
     from ouroboros.gateways.claudexor import ClaudexorGateway, DaemonEndpoint
 

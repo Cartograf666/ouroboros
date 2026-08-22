@@ -124,8 +124,10 @@ def review_thread_receipt(
     turns = [row for row in (detail.get("turns") or []) if isinstance(row, dict)]
     turn = next(
         (row for row in reversed(turns)
-         if str(row.get("runId") or "") == run_id
-         or (turn_id and str(row.get("id") or "") == turn_id)),
+         if (
+             str(row.get("runId") or "") == run_id
+             and (not turn_id or str(row.get("id") or "") == turn_id)
+         )),
         None,
     )
     if turn is None:

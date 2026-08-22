@@ -217,10 +217,19 @@ def continuation_inputs(
             )
         else:
             prior_messages = output.get("request_messages")
-            if not isinstance(prior_messages, list):
-                return slots, {}, {}, f"prior_api_transcript_missing:{sid}"
+            if (
+                not isinstance(prior_messages, list)
+                or not prior_messages
+                or any(
+                    not isinstance(row, dict)
+                    or not str(row.get("role") or "").strip()
+                    or "content" not in row
+                    for row in prior_messages
+                )
+            ):
+                return slots, {}, {}, f"prior_api_transcript_invalid:{sid}"
             slot_messages[sid] = [
-                *[dict(row) for row in prior_messages if isinstance(row, dict)],
+                *[dict(row) for row in prior_messages],
                 {"role": "assistant", "content": str(output.get("text") or "")},
                 {"role": "user", "content": user_content},
             ]
@@ -243,7 +252,9 @@ def exact_wave(
             "slot_id": sid, "model": str(row.get("model") or ""),
             "request_model": str(row.get("request_model") or ""), "route": route,
             "text": str(row.get("text") or ""), "error": str(row.get("error") or ""),
-            "request_messages": list(slot_messages.get(sid) or common) if route == "api_chat" else [],
+            "request_messages": (
+                list(slot_messages[sid]) if sid in slot_messages else common
+            ) if route == "api_chat" else [],
             "session_task": session_task if route == "agent_session" else "",
             "review_thread_id": str(row.get("review_thread_id") or ""),
             "review_turn_id": str(row.get("review_turn_id") or ""),
