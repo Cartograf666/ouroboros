@@ -536,11 +536,11 @@ def test_validate_findings_never_drops_a_blocking_finding_without_summary():
     assert plan_spec.aggregate([_slot("1", normalized)])["aggregate"] == "REVISE_PLAN"
 
 
-def test_validate_findings_caps_per_slot_with_disclosure():
+def test_validate_findings_keeps_every_finding_for_aggregation():
     raw = [{"id": f"f{i}", "class": "note", "summary": "s"} for i in range(plan_spec.MAX_FINDINGS_PER_SLOT + 5)]
     normalized, disclosures, _ = plan_spec.validate_findings(raw, spec_ids=(), seen_locators=())
-    assert len(normalized) == plan_spec.MAX_FINDINGS_PER_SLOT
-    assert disclosures[0].startswith(f"findings_capped:{plan_spec.MAX_FINDINGS_PER_SLOT}/{plan_spec.MAX_FINDINGS_PER_SLOT + 5}")
+    assert len(normalized) == plan_spec.MAX_FINDINGS_PER_SLOT + 5
+    assert disclosures == []
 
 
 def _slot(slot: str, findings, ok=True, error=None):

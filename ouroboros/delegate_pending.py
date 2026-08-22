@@ -40,7 +40,12 @@ def pending_invocations(
                 "selected_subagent_id": str(row.get("selected_subagent_id") or ""),
                 "config_fingerprint": str(row.get("config_fingerprint") or ""),
                 "work_order_fingerprint": str(row.get("work_order_fingerprint") or ""),
+                "work_order_coverage": str(row.get("work_order_coverage") or ""),
                 "authority_fingerprint": str(row.get("authority_fingerprint") or ""),
+                "work_order_source_request": (
+                    row.get("work_order_source_request")
+                    if isinstance(row.get("work_order_source_request"), dict) else {}
+                ),
             }
         elif kind == c.STARTED:
             state[invocation_id] = "started"

@@ -13,8 +13,10 @@ raises on agent-controlled input (every failure is a typed omission).
 from __future__ import annotations
 
 import codecs
+import ast
 from hashlib import sha256
 import pathlib
+import re
 import stat
 from typing import Any, Callable, Iterable, Mapping, Optional
 
@@ -35,6 +37,116 @@ from ouroboros.tools.review_helpers import (
 EVIDENCE_PER_ITEM_BYTES = 40_000
 EVIDENCE_TOTAL_BYTES = 120_000
 EVIDENCE_HASH_BYTES_LIMIT = 8 * 1024 * 1024  # never stream/hash a source above this (too_large)
+
+_SELECTOR_RE = re.compile(
+    r"^(?P<locator>.+)::(?:(?:lines=(?P<line_start>[1-9][0-9]*)-(?P<line_end>[1-9][0-9]*))|"
+    r"(?:bytes=(?P<byte_start>[0-9]+)-(?P<byte_end>[0-9]+))|"
+    r"(?:tail=(?P<tail>[1-9][0-9]*))|(?:symbol=(?P<symbol>[A-Za-z_][A-Za-z0-9_.]*)))$"
+)
+
+
+def _split_selector(locator: str) -> tuple[str, Optional[dict], Optional[str]]:
+    """Parse the additive exact-selector suffix carried by a locator.
+
+    Line and byte endpoints are inclusive. Byte offsets are zero-based. A
+    selector-looking suffix with an invalid range is a typed omission rather
+    than a path that happens not to exist.
+    """
+    match = _SELECTOR_RE.fullmatch(locator)
+    if match:
+        base = match.group("locator")
+        if match.group("line_start"):
+            start, end = int(match.group("line_start")), int(match.group("line_end"))
+            return base, {"kind": "line_range", "start": start, "end": end}, None if end >= start else "invalid_selector"
+        if match.group("byte_start"):
+            start, end = int(match.group("byte_start")), int(match.group("byte_end"))
+            return base, {"kind": "byte_range", "start": start, "end": end}, None if end >= start else "invalid_selector"
+        if match.group("tail"):
+            return base, {"kind": "tail", "bytes": int(match.group("tail"))}, None
+        return base, {"kind": "symbol", "name": str(match.group("symbol"))}, None
+    if "::" in locator and locator.rsplit("::", 1)[-1].split("=", 1)[0] in {"lines", "bytes", "tail", "symbol"}:
+        return locator, None, "invalid_selector"
+    return locator, None, None
+
+
+def _selected_payload(raw: bytes, selector: dict, path: Optional[pathlib.Path] = None) -> tuple[Optional[dict], Optional[str]]:
+    digest = sha256(raw).hexdigest()
+    kind = selector["kind"]
+    selected: bytes
+    if kind == "byte_range":
+        start, end = int(selector["start"]), int(selector["end"])
+        if start >= len(raw) or end >= len(raw):
+            return None, "selector_out_of_range"
+        selected = raw[start:end + 1]
+    elif kind == "tail":
+        count = int(selector["bytes"])
+        selected = raw[-count:]
+    else:
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None, "binary"
+        lines = text.splitlines(keepends=True)
+        if kind == "line_range":
+            start, end = int(selector["start"]), int(selector["end"])
+            if start > len(lines) or end > len(lines):
+                return None, "selector_out_of_range"
+            selected = "".join(lines[start - 1:end]).encode("utf-8")
+        else:
+            if path is None or path.suffix != ".py":
+                return None, "symbol_selector_unsupported"
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                return None, "symbol_source_invalid"
+            parts = str(selector["name"]).split(".")
+            scope: Any = tree
+            node = None
+            for part in parts:
+                body = getattr(scope, "body", [])
+                node = next(
+                    (item for item in body
+                     if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                     and item.name == part),
+                    None,
+                )
+                if node is None:
+                    break
+                scope = node
+            if node is None:
+                return None, "symbol_not_found"
+            start = int(getattr(node, "lineno", 0) or 0)
+            end = int(getattr(node, "end_lineno", 0) or 0)
+            if not start or not end:
+                return None, "symbol_range_unavailable"
+            selector.update({"start_line": start, "end_line": end})
+            selected = "".join(lines[start - 1:end]).encode("utf-8")
+    try:
+        selected_text = selected.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, "binary"
+    return {
+        "sha256": digest,
+        "bytes": len(raw),
+        "text": selected_text,
+        "selection_sha256": sha256(selected).hexdigest(),
+        "selection_bytes": len(selected),
+        "selector": selector,
+    }, None
+
+
+def _read_selected_evidence(
+    path: pathlib.Path, selector: dict, read_text: Optional[Callable[[pathlib.Path], str]], hash_limit: int,
+) -> tuple[Optional[dict], Optional[str]]:
+    try:
+        raw = (str(read_text(path)).encode("utf-8") if read_text is not None else path.read_bytes())
+    except UnicodeError:
+        return None, "binary"
+    except OSError:
+        return None, "unreadable"
+    if len(raw) > hash_limit:
+        return None, f"too_large:{len(raw)}"
+    return _selected_payload(raw, selector, path)
 
 
 def _decode_head(head: bytes, *, complete: bool) -> str:
@@ -172,10 +284,13 @@ def resolve_evidence(
             "locator": locator, "kind": kind, "sha256": payload["sha256"],
             "bytes": payload["bytes"], "attached_bytes": head_bytes, "text": payload["text"],
         }
+        for key in ("selector", "selection_sha256", "selection_bytes"):
+            if key in payload:
+                row[key] = payload[key]
         if redacted:
             row["secrets_redacted"] = True
         attached.append(row)
-        if payload["bytes"] > per_item:
+        if "selector" not in payload and payload["bytes"] > per_item:
             omissions.append({"locator": locator, "reason": f"truncated_to_{per_item}"})
 
     for raw in locators or []:
@@ -186,21 +301,30 @@ def resolve_evidence(
             omissions.append({"locator": locator, "reason": "duplicate_locator"})
             continue
         declared.append(locator)
-        if _is_url(locator):
+        source_locator, selector, selector_error = _split_selector(locator)
+        if selector_error:
+            omissions.append({"locator": locator, "reason": selector_error})
+            continue
+        if _is_url(source_locator):
             omissions.append({"locator": locator, "reason": "url_not_fetched"})
             continue
-        if locator.startswith(_TASK_LOCATOR_PREFIX):
+        if source_locator.startswith(_TASK_LOCATOR_PREFIX):
             if resolve_task is None:
                 omissions.append({"locator": locator, "reason": "unsupported_locator"})
                 continue
-            text = resolve_task(locator[len(_TASK_LOCATOR_PREFIX):].strip())
-            payload, reason = (None, "task_not_found") if text is None else _payload_from_text(str(text), per_item)
+            text = resolve_task(source_locator[len(_TASK_LOCATOR_PREFIX):].strip())
+            if text is None:
+                payload, reason = None, "task_not_found"
+            elif selector:
+                payload, reason = _selected_payload(str(text).encode("utf-8"), selector)
+            else:
+                payload, reason = _payload_from_text(str(text), per_item)
             if payload is None:
                 omissions.append({"locator": locator, "reason": reason})
             else:
                 attach(locator, "task", payload)
             continue
-        path, reason = _resolve_locator_path(locator, active)
+        path, reason = _resolve_locator_path(source_locator, active)
         if path is None:
             omissions.append({"locator": locator, "reason": reason})
             continue
@@ -210,14 +334,17 @@ def resolve_evidence(
         if not any(_under(path, root) for root in roots):
             omissions.append({"locator": locator, "reason": "outside_allowed_roots"})
             continue
-        if _sensitive(path) or _sensitive(pathlib.PurePosixPath(locator.replace("\\", "/"))):
+        if _sensitive(path) or _sensitive(pathlib.PurePosixPath(source_locator.replace("\\", "/"))):
             omissions.append({"locator": locator, "reason": "sensitive"})  # lexical AND resolved name
             continue
         kind = _path_kind(path)
         if kind != "file":
             omissions.append({"locator": locator, "reason": kind})
             continue
-        payload, reason = _read_evidence(path, read_text, per_item, hash_bytes_limit)
+        payload, reason = (
+            _read_selected_evidence(path, selector, read_text, hash_bytes_limit)
+            if selector else _read_evidence(path, read_text, per_item, hash_bytes_limit)
+        )
         if payload is None:
             omissions.append({"locator": locator, "reason": reason or "unreadable"})
             continue
@@ -245,5 +372,3 @@ def evidence_manifest_hash(manifest: Mapping[str, Any]) -> str:
             for o in manifest.get("omissions") or []
         ],
     })
-
-

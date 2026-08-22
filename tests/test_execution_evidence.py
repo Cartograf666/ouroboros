@@ -62,6 +62,7 @@ class TestCustodyAggregation:
             "delegated_runs_settled": 0,
             "delegated_runs_succeeded": 0,
             "delegated_runs_failed": 0,
+            "delegated_runs_source_unresolved": 0,
             "delegated_run_failure_states": [],
             "evidence_read_failed": False,
             "nanny_nudge_recorded": False,
@@ -157,6 +158,7 @@ class TestEnvelopeReconciliation:
             "delegated_runs_settled": 0,
             "delegated_runs_succeeded": 0,
             "delegated_runs_failed": 0,
+            "delegated_runs_source_unresolved": 0,
             "delegated_run_failure_states": [],
             "evidence_read_failed": False,
             "nanny_nudge_recorded": False,
@@ -273,6 +275,7 @@ class TestActualSubstrate:
             "delegated_runs_settled": 0,
             "delegated_runs_succeeded": 0,
             "delegated_runs_failed": 0,
+            "delegated_runs_source_unresolved": 0,
             "native_contribution": "unknown",
         }
         assert substrate_result_fields({}) == {}  # no substrate claim, no fields

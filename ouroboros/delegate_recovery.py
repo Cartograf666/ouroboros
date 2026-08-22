@@ -36,8 +36,9 @@ def _canonical_hash(value: Any) -> str:
 
 def authority_fingerprint_from_task(task: Mapping[str, Any]) -> str:
     from ouroboros.contracts.task_constraint import normalize_task_constraint
+    from ouroboros.contracts.task_contract import build_task_contract
 
-    contract = task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {}
+    contract = build_task_contract(task)
     normalized_constraint = normalize_task_constraint(task.get("task_constraint"))
     constraint = asdict(normalized_constraint) if normalized_constraint is not None else {}
 
@@ -51,7 +52,7 @@ def authority_fingerprint_from_task(task: Mapping[str, Any]) -> str:
         "workspace_mode": str(task.get("workspace_mode") or ""),
         "drive_root": _root(task.get("drive_root")),
         "task_constraint": constraint,
-        "allowed_resources": contract.get("allowed_resources") if isinstance(contract.get("allowed_resources"), dict) else {},
+        "task_contract": contract,
         "executor_ref": task.get("executor_ref") if isinstance(task.get("executor_ref"), dict) else {},
     })
 
@@ -864,10 +865,18 @@ def adopt_handoff(ctx: Any, task: Mapping[str, Any]) -> dict[str, Any]:
         if not _holder_matches(row, pending[0], pending=True):
             veto_handoff(drive, task_id, "invocation_binding_mismatch")
             return {"status": "recovery_required", "reason": "invocation_binding_mismatch"}
-        from ouroboros.subagent_work_order import compile_external_work_order
         from ouroboros.tools.delegate import exact_start
 
-        result = exact_start(ctx, compile_external_work_order(task), {"retry_of": pending_id})
+        request = pending[0].get("request") if isinstance(pending[0], dict) else None
+        replay_prompt = request.get("prompt") if isinstance(request, dict) else None
+        if not isinstance(replay_prompt, str) or not replay_prompt:
+            veto_handoff(drive, task_id, "pending_request_prompt_missing")
+            return {"status": "recovery_required", "reason": "pending_request_prompt_missing"}
+        retry_spec = {"retry_of": pending_id}
+        source_request = pending[0].get("work_order_source_request")
+        if isinstance(source_request, dict) and source_request:
+            retry_spec["work_order_source_request"] = source_request
+        result = exact_start(ctx, replay_prompt, retry_spec)
         try:
             parsed = json.loads(result)
         except (TypeError, ValueError):

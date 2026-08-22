@@ -311,13 +311,14 @@ def _addressable_root_tasks(ctx: Any, chat_id: Optional[int] = None) -> list:
 
 def _stage_mailbox_attachments(
     ctx: Any,
+    task_drive: pathlib.Path,
     task_id: str,
     task_metadata: Any,
     image_data: Any = None,
-) -> tuple[str, list]:
+) -> tuple[str, list, str]:
     """Stage one routed turn's files into the existing task artifact store.
 
-    Returns ``(attachment_note, staged_manifest)`` — the manifest is kept so a
+    Returns ``(attachment_note, staged_manifest, rendered_report)`` — the manifest is kept so a
     refused admission (the cancel-pending re-check inside the mailbox
     transaction) can remove exactly the files this call staged (GR2-9).
     """
@@ -344,14 +345,14 @@ def _stage_mailbox_attachments(
             log.warning("Unable to stage routed inline image for task %s", task_id, exc_info=True)
     try:
         if not uploads:
-            return "", []
+            return "", [], ""
         from ouroboros.artifacts import stage_task_attachments
         from ouroboros.gateway.tasks import _render_attachment_lines
 
-        manifest = stage_task_attachments(ctx.DRIVE_ROOT, task_id, uploads)
+        manifest = stage_task_attachments(task_drive, task_id, uploads)
         rendered = _render_attachment_lines(manifest)
         note = f"\n\n[ATTACHMENTS]\n{rendered}\n[END_ATTACHMENTS]" if rendered else ""
-        return note, manifest
+        return note, manifest, rendered
     finally:
         if temp_source is not None:
             try:
@@ -413,6 +414,15 @@ def _route_project_chat_to_running_task(
                 (row for row in list(getattr(ctx, "PENDING", []) or []) if str(row.get("id") or "") == tid),
                 {},
             )
+        from ouroboros.project_dialogue import routing_target_label
+
+        target_label = routing_target_label(
+            ctx.DRIVE_ROOT,
+            "mailbox_delivery",
+            tid,
+            task=task_obj or candidate,
+            project_id=str((task_obj or candidate).get("project_id") or ""),
+        )
         from ouroboros.owner_mailbox import write_owner_message
         from supervisor.queue import (
             ACCEPTANCE_FENCES,
@@ -445,6 +455,8 @@ def _route_project_chat_to_running_task(
         task_drive = pathlib.Path(ctx.DRIVE_ROOT) if direct_lock_held else _task_drive_for_task(task_obj, tid)
         msg_id = f"{client_message_id}:{tid}" if client_message_id else None
         staged_manifest: list = []
+        attachment_report = ""
+        message_written = False
         cancel_refused_in_txn = False
 
         def _drop_staged_inputs() -> None:
@@ -470,8 +482,8 @@ def _route_project_chat_to_running_task(
             if cancel_pending(ctx.DRIVE_ROOT, tid):
                 log.info("Mailbox follow-up refused for %s: cancel pending (pre-staging)", tid)
                 return ""
-            attachment_note, staged_manifest = _stage_mailbox_attachments(
-                ctx, tid, task_metadata, image_data,
+            attachment_note, staged_manifest, attachment_report = _stage_mailbox_attachments(
+                ctx, task_drive, tid, task_metadata, image_data,
             )
             if direct_lock_held:
                 # AR2-6 (fable): the direct-agent lane used to skip the
@@ -513,8 +525,10 @@ def _route_project_chat_to_running_task(
                     if isinstance(task_metadata, dict) and isinstance(task_metadata.get("client_surface"), dict)
                     else None
                 ),
+                attachment_manifest=staged_manifest if staged_manifest else None,
             ):
                 return ""
+            message_written = True
             if direct_lock_held:
                 direct_agent._owner_message_generation = int(
                     getattr(direct_agent, "_owner_message_generation", 0) or 0
@@ -534,8 +548,26 @@ def _route_project_chat_to_running_task(
                 # After the lock release: unlinking staged files is file I/O the
                 # global queue lock should not wait on.
                 _drop_staged_inputs()
+            elif staged_manifest and not message_written:
+                _drop_staged_inputs()
         if fence_generation_changed:
             persist_queue_snapshot(reason="acceptance_fence_owner_message")
+        if isinstance(task_metadata, dict) and staged_manifest:
+            task_metadata["_attachment_manifest"] = [
+                dict(item) for item in staged_manifest if isinstance(item, dict)
+            ]
+            task_metadata["_attachment_report"] = attachment_report
+        if isinstance(task_metadata, dict):
+            task_metadata["_routing_target_label"] = target_label
+        if attachment_report:
+            try:
+                ctx.send_with_budget(
+                    chat_id,
+                    f"📎 Attachment staging report for {target_label or 'Task'}:\n"
+                    f"{attachment_report}",
+                )
+            except Exception:
+                log.debug("Mailbox attachment report notice failed for %s", tid, exc_info=True)
         return tid
     except Exception:
         log.debug("Mailbox follow-up routing failed; falling back to direct lane", exc_info=True)
@@ -628,8 +660,12 @@ def _task_result_ground_truth(row: Dict[str, Any]) -> Dict[str, Any]:
     meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
     preflight = meta.get("workspace_preflight") if isinstance(meta.get("workspace_preflight"), dict) else {}
     git = preflight.get("git") if isinstance(preflight.get("git"), dict) else {}
+    task_id = str(row.get("task_id") or row.get("id") or "")
+    human_label = _clip_marked(
+        row.get("title") or row.get("objective") or row.get("description") or task_id, 120,
+    )
     out = {
-        "task_id": str(row.get("task_id") or row.get("id") or ""),
+        "task_id": task_id,
         "status": str(row.get("status") or ""),
         "title": _clip_marked(row.get("title"), 120),
         "objective": _clip_marked(row.get("objective") or row.get("description"), 300),
@@ -642,6 +678,13 @@ def _task_result_ground_truth(row: Dict[str, Any]) -> Dict[str, Any]:
             str(item.get("path") or item.get("name") or "")
             for item in artifacts[:8] if isinstance(item, dict)
         ],
+        "authority_source": {
+            "kind": "task_result",
+            "task_id": task_id,
+            "human_label": human_label,
+            "tool": "get_task_result",
+            "arguments": {"task_id": task_id, "include_authority": True},
+        },
     }
     if git:
         out["workspace_git_at_start"] = {
@@ -1000,9 +1043,9 @@ _LAST_CANCEL_INTENT_SWEEP = [0.0]
 
 def _periodic_supervisor_maintenance(last_custody_reap: list, last_review_reconcile: list) -> None:
     """Throttled periodic upkeep extracted from the supervisor loop: cancel-intent
-    watchdog (every 20s), custody reap of orphaned task-scoped processes (every
-    600s) + review-job zombie reconcile (every 300s). Each cadence gates itself
-    via its own last-run marker."""
+    watchdog and pending child-ref promotion replay (every 20s), custody reap of
+    orphaned task-scoped processes (every 600s) + review-job zombie reconcile
+    (every 300s). Each cadence gates itself via its own last-run marker."""
     if time.time() - _LAST_CANCEL_INTENT_SWEEP[0] > 20:
         _LAST_CANCEL_INTENT_SWEEP[0] = time.time()
         try:
@@ -1025,6 +1068,12 @@ def _periodic_supervisor_maintenance(last_custody_reap: list, last_review_reconc
             replay_pending_deliveries(DATA_DIR)
         except Exception:
             log.debug("Pending terminal-delivery replay failed", exc_info=True)
+        try:
+            from ouroboros.observability import retry_pending_child_ref_promotions
+
+            retry_pending_child_ref_promotions(DATA_DIR)
+        except Exception:
+            log.debug("Pending child-ref promotion retry failed", exc_info=True)
     if time.time() - last_custody_reap[0] > 600:
         last_custody_reap[0] = time.time()
         try:
@@ -1233,11 +1282,18 @@ def _record_routing_receipt(
     client_message_id: str,
     action: str,
     target: str = "",
+    target_label: str = "",
     status: str,
     persist: bool = True,
     options: Optional[list] = None,
+    detail: str = "",
+    attachment_manifest: Optional[list] = None,
 ) -> None:
     """Emit a typed bubble-free ack and optionally persist its presentation state."""
+    if target and not str(target_label or "").strip():
+        from ouroboros.project_dialogue import routing_target_label
+
+        target_label = routing_target_label(ctx.DRIVE_ROOT, action, target)
     if persist:
         try:
             from ouroboros.project_dialogue import append_chat_annotation
@@ -1247,7 +1303,10 @@ def _record_routing_receipt(
                 client_message_id,
                 action=action,
                 target=target,
+                target_label=target_label,
                 status=status,
+                detail=detail,
+                attachment_manifest=attachment_manifest,
             )
         except Exception:
             log.debug("Routing annotation append failed", exc_info=True)
@@ -1258,10 +1317,13 @@ def _record_routing_receipt(
                 "client_message_id": client_message_id,
                 "action": action,
                 "target": target,
+                "target_label": target_label,
                 "status": status,
             }
             if options is not None:
                 ack_kwargs["options"] = options
+            if attachment_manifest is not None:
+                ack_kwargs["attachment_manifest"] = attachment_manifest
             ack(
                 chat_id,
                 **ack_kwargs,
@@ -1276,11 +1338,14 @@ def _record_routing_receipt(
                     "client_message_id": str(client_message_id or ""),
                     "action": action,
                     "target": target,
+                    "target_label": target_label,
                     "status": status,
                     "suppress_bubble": True,
                 }
                 if options is not None:
                     payload["options"] = options
+                if attachment_manifest is not None:
+                    payload["attachment_manifest"] = attachment_manifest
                 broadcast(payload)
     except Exception:
         log.debug("Routing receipt broadcast failed", exc_info=True)
@@ -1426,7 +1491,19 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
                 client_message_id=client_message_id,
                 action="mailbox_delivery",
                 target=routed_to_task,
+                target_label=(
+                    str(task_metadata.get("_routing_target_label") or "")
+                    if isinstance(task_metadata, dict) else ""
+                ),
                 status="delivered",
+                detail=(
+                    str(task_metadata.get("_attachment_report") or "")
+                    if isinstance(task_metadata, dict) else ""
+                ),
+                attachment_manifest=(
+                    list(task_metadata.get("_attachment_manifest") or [])
+                    if isinstance(task_metadata, dict) else None
+                ),
             )
             return
 

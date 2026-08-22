@@ -325,6 +325,9 @@
  * @property {Object=} transport
  * @property {number=} telegram_chat_id
  * @property {string=} system_type
+ * @property {string=} target_label
+ * @property {string=} project_id
+ * @property {string=} project_name
  * @property {number=} chat_id
  */
 
@@ -418,8 +421,10 @@
  * @property {string} client_message_id
  * @property {string} action
  * @property {string=} target
+ * @property {string=} target_label
  * @property {string} status
  * @property {Array<Object>=} options
+ * @property {AttachmentManifestEntry[]=} attachment_manifest
  * @property {boolean} suppress_bubble
  * @property {string=} ts
  */
@@ -679,6 +684,7 @@
  * @property {"forked"|"empty"|"shared"=} memory_mode
  * @property {string=} project_id Per-project facts scope id (else derived from the workspace path).
  * @property {Object[]=} attachments
+ * @property {boolean=} allow_partial_attachments Explicit raw-API opt-in; browser/UI task admission remains atomic.
  * @property {Object[]=} acceptance_claims Advisory Observable Acceptance Claims (`claim`/`surface`/`support`/`priority`).
  * @property {string=} answer_protocol  // "" | "final_answer_line" — machine-extractable answer line (v6.60.0)
  * @property {Object=} allowed_resources
@@ -703,6 +709,22 @@
  * @property {boolean} ok
  * @property {string} task_id
  * @property {string} status
+ * @property {string=} reason_code
+ * @property {string=} error
+ * @property {AttachmentManifestEntry[]=} attachment_manifest
+ */
+
+/**
+ * @typedef {Object} AttachmentManifestEntry
+ * @property {number} ordinal
+ * @property {"staged"|"rejected"} status
+ * @property {string} reason
+ * @property {string} label
+ * @property {string=} root
+ * @property {string=} relpath
+ * @property {string=} abs_path
+ * @property {string=} mime
+ * @property {boolean=} is_image
  */
 
 /**

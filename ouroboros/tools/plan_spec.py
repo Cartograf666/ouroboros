@@ -18,8 +18,8 @@ SSOT ``utils.truncate_review_artifact`` marker):
   acceptance_claims); ``MAX_REJECTED_PER_DECISION`` — nested ``decision.rejected``.
 * ``MAX_ITEM_CHARS`` / ``MAX_GOAL_CHARS`` — per-string bounds (same 600-char
   default as ``task_contract._bounded_claim_text``).
-* ``MAX_FINDINGS_PER_SLOT`` / ``MAX_FINDING_TEXT_CHARS`` — reviewer findings
-  kept per slot and per summary/recommendation.
+* ``MAX_FINDINGS_PER_SLOT`` is the rendered page size, never an authority or
+  aggregation cap; ``MAX_FINDING_TEXT_CHARS`` bounds each finding string.
 * ``PACKET_*_CHARS`` — reviewer-packet section bounds (objective, plan prose,
   root exploration log; SPEC and prior cycles are bounded STRUCTURALLY by
   ``bounded_json`` — whole items with disclosed counts + full-set hash).
@@ -633,7 +633,8 @@ def validate_findings(
     the host never re-attaches it, but the finding stays in the aggregate so a
     re-asked question cannot close the wave by disappearing; ids are
     minted ``f{slot}_{n}`` when missing; the slot is capped at
-    ``MAX_FINDINGS_PER_SLOT`` with an omission disclosure. ``seen_after`` is the
+    Findings are never capped before aggregation. ``MAX_FINDINGS_PER_SLOT`` is
+    retained as the rendered page size only. ``seen_after`` is the
     updated locator memory for the caller to persist; the input is not mutated.
     The engine validates the slots of ONE wave sequentially against the CUMULATIVE
     memory (it passes the running ``seen_after`` back in), so the per-task memory
@@ -647,11 +648,6 @@ def validate_findings(
     normalized: list[dict] = []
     local_ids: set[str] = set()
     items = [item for item in findings]
-    if len(items) > MAX_FINDINGS_PER_SLOT:
-        disclosures.append(
-            f"findings_capped:{MAX_FINDINGS_PER_SLOT}/{len(items)} (bound MAX_FINDINGS_PER_SLOT)"
-        )
-        items = items[:MAX_FINDINGS_PER_SLOT]
     for index, item in enumerate(items, start=1):
         if not isinstance(item, Mapping):
             disclosures.append(f"finding_{index}_not_object")
@@ -884,4 +880,3 @@ def closure_after_disposition(
             "blocking_enforcement: the wave must close before the work starts"
         )
     return {"closed": closed, "open_ids": open_ids, "notes": notes}
-

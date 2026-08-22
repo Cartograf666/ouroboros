@@ -82,6 +82,11 @@ PATCH_DISPOSED = "delegate_run_patch_disposed"
 # refuse typed instead of pretending "not applied" over a modified tree.
 PATCH_APPLY_STARTED = "delegate_run_patch_apply_started"
 PATCH_APPLY_RESOLVED = "delegate_run_patch_apply_resolved"
+# Q31: a partial external work order earns authority only through exact, host-
+# verified source ranges. These append-only receipts survive worker restart and
+# are merged by the same custody replay that owns every other run fact.
+SOURCE_RANGE_VERIFIED = "delegate_run_work_order_source_range_verified"
+SOURCE_RANGE_DELIVERY_CONFIRMED = "delegate_run_work_order_source_delivery_confirmed"
 
 # Cheap prefilter: every custody row's type starts with this, so a multi-hundred-MB
 # event log is scanned without JSON-parsing the 99.9% of lines that are not ours.
@@ -128,6 +133,9 @@ class RunCustody:
     selected_subagent_id: str = ""
     config_fingerprint: str = ""
     work_order_fingerprint: str = ""
+    work_order_coverage: str = ""
+    work_order_source_request: Dict[str, Any] = field(default_factory=dict)
+    verified_source_ranges: List[Tuple[int, int]] = field(default_factory=list)
     authority_fingerprint: str = ""
     ledger_recorded: bool = False
     settled: bool = False
@@ -192,10 +200,8 @@ _CUSTODY: Dict[str, RunCustody] = {}
 
 # -- durable record ------------------------------------------------------------
 
-
 def event_log_path(drive_root: Any) -> pathlib.Path:
     return pathlib.Path(drive_root) / "logs" / "events.jsonl"
-
 
 def custody_root(ctx: Any) -> pathlib.Path:
     """The drive whose event log is the custody authority for this context.
@@ -206,7 +212,6 @@ def custody_root(ctx: Any) -> pathlib.Path:
     from ouroboros.tool_access import canonical_data_root
 
     return canonical_data_root(ctx)
-
 
 def emit(drive_root: Any, kind: str, payload: Dict[str, Any]) -> bool:
     """Append one custody row and REPORT whether it landed. Never raises.
@@ -225,7 +230,6 @@ def emit(drive_root: Any, kind: str, payload: Dict[str, Any]) -> bool:
         log.warning("delegate custody row was rejected by the event log (%s)", kind)
     return written
 
-
 def daemon_says_absent(exc: Any) -> bool:
     """True when the daemon ANSWERED that the named resource does not exist.
 
@@ -239,7 +243,6 @@ def daemon_says_absent(exc: Any) -> bool:
     nothing about whether the resource is there.
     """
     return int(getattr(exc, "status_code", 0) or 0) == 404
-
 
 def custody_log_unreadable(drive_root: Any) -> bool:
     """Whether the custody event log EXISTS but cannot be opened (GR6-4).
@@ -261,7 +264,6 @@ def custody_log_unreadable(drive_root: Any) -> bool:
     except OSError:
         return True
     return False
-
 
 def _iter_rows(path: pathlib.Path, tail_bytes: Optional[int] = None) -> Iterator[Dict[str, Any]]:
     try:
@@ -292,7 +294,7 @@ _STARTED_STR_FIELDS: Tuple[Tuple[str, str], ...] = tuple(
         "snapshot_id", "execution_root", "baseline_sha", "target_root",
         "authority_source", "access", "mode", "isolation",
         "selected_subagent_id", "config_fingerprint", "work_order_fingerprint",
-        "authority_fingerprint",
+        "work_order_coverage", "authority_fingerprint",
     )
 )
 # Progress carried forward from a previous row: an idempotent re-start writes a
@@ -308,8 +310,17 @@ _STARTED_PROGRESS_FLAGS: Tuple[str, ...] = (
 _STARTED_FIRST_WINS_FACTS: Tuple[str, ...] = (
     "snapshot_id", "execution_root", "baseline_sha", "target_root",
     "authority_source", "resource_ref", "selected_subagent_id",
-    "config_fingerprint", "work_order_fingerprint", "authority_fingerprint")
+    "config_fingerprint", "work_order_fingerprint", "work_order_coverage",
+    "authority_fingerprint", "work_order_source_request")
 
+from ouroboros.delegate_source_coverage import (
+    apply_source_delivery_confirmation,
+    _merge_verified_source_range,
+    merge_source_delivery_confirmations,
+    _source_range_receipt_valid,
+    record_source_range_verified,
+    work_order_source_verification,
+)
 
 def _merge_started_into(entry: RunCustody, previous: RunCustody) -> None:
     """Project a duplicate STARTED fact set onto an existing run — the ONE
@@ -328,6 +339,11 @@ def _merge_started_into(entry: RunCustody, previous: RunCustody) -> None:
         prior = getattr(previous, attr)
         if prior:
             setattr(entry, attr, prior)
+    if previous.work_order_source_request:
+        entry.work_order_source_request = dict(previous.work_order_source_request)
+    for start, end in previous.verified_source_ranges:
+        _merge_verified_source_range(entry, start, end)
+    merge_source_delivery_confirmations(entry, previous)
     if previous.access:
         entry.access, entry.mode = previous.access, previous.mode
         entry.isolation, entry.delegated = previous.isolation, previous.delegated
@@ -341,14 +357,19 @@ def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
     kind = str(row.get("type") or "")
     if kind == STARTED:
         ref = row.get("resource_ref")
+        source_request = row.get("work_order_source_request")
         entry = RunCustody(
             run_id=run_id,
             project_owned=bool(row.get("project_owned")),
             delegated=row.get("delegated") is True,
             resource_ref=dict(ref) if isinstance(ref, dict) else {},
+            work_order_source_request=(
+                dict(source_request) if isinstance(source_request, dict) else {}
+            ),
             **{attr: str(row.get(key) or "") for attr, key in _STARTED_STR_FIELDS},
         )
         previous = state.get(run_id)
+        setattr(entry, "_source_delivery_confirmations", [])
         if previous is not None:
             _merge_started_into(entry, previous)
         state[run_id] = entry
@@ -394,6 +415,19 @@ def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
         custody.patch_apply_pending = True
     elif kind == PATCH_APPLY_RESOLVED:
         custody.patch_apply_pending = False
+    elif kind == SOURCE_RANGE_VERIFIED:
+        if _source_range_receipt_valid(
+            custody,
+            start_char=row.get("start_char"),
+            end_char=row.get("end_char"),
+            complete_sha256=row.get("complete_sha256"),
+            source=row.get("source"),
+            text_sha256=row.get("text_sha256"),
+            text_chars=row.get("text_chars"),
+        ):
+            _merge_verified_source_range(custody, row.get("start_char"), row.get("end_char"))
+    elif kind == SOURCE_RANGE_DELIVERY_CONFIRMED:
+        apply_source_delivery_confirmation(custody, row)
     elif kind == PATCH_DISPOSED:
         disposition = str(row.get("disposition") or "")
         if disposition:
@@ -422,7 +456,6 @@ def replay(drive_root: Any,
     for row in rows if rows is not None else _iter_rows(event_log_path(drive_root)):
         _apply(state, row)
     return state
-
 
 def lookup(drive_root: Any, task_id: str, run_id: str) -> Tuple[str, Optional[RunCustody]]:
     """Answer OWNED / FOREIGN / UNKNOWN for ``run_id`` as seen by ``task_id``."""
@@ -641,7 +674,12 @@ def invocation_record(drive_root: Any, invocation_id: str) -> Optional[Dict[str,
                 "selected_subagent_id": str(row.get("selected_subagent_id") or ""),
                 "config_fingerprint": str(row.get("config_fingerprint") or ""),
                 "work_order_fingerprint": str(row.get("work_order_fingerprint") or ""),
+                "work_order_coverage": str(row.get("work_order_coverage") or ""),
                 "authority_fingerprint": str(row.get("authority_fingerprint") or ""),
+                "work_order_source_request": (
+                    row.get("work_order_source_request")
+                    if isinstance(row.get("work_order_source_request"), dict) else {}
+                ),
             }
         elif kind == STARTED:
             state, run_id = "started", str(row.get("run_id") or "")
@@ -690,6 +728,7 @@ def record_started(drive_root: Any, custody: RunCustody,
         "run_id": custody.run_id,
         "project_owned": custody.project_owned,
         "resource_ref": custody.resource_ref or {},
+        "work_order_source_request": custody.work_order_source_request or {},
         **{key: getattr(custody, attr) for attr, key in _STARTED_STR_FIELDS},
         **(shape or {}),
     })
@@ -698,46 +737,18 @@ def record_started(drive_root: Any, custody: RunCustody,
 def record_output_consumed(drive_root: Any, custody: RunCustody, *,
                            artifact: str, byte_length: int, sha256: str,
                            chars: int, lines: int) -> bool:
-    """The canonical D7 acknowledgement: the staged artifact was read whole.
+    from ouroboros.delegate_output import record_output_consumed as _record
 
-    Once per STAGED CONTENT (hash-bound; a re-stage of different bytes resets it),
-    written when the read windows covered the artifact start-to-EOF — never at
-    delivery. Refused when the staging was not verified full content or the hash
-    is not the currently staged content's: an ack names bytes, never a path.
-    """
-    if not custody.output_complete:
-        return False
-    if custody.output_sha and str(sha256 or "") != custody.output_sha:
-        return False
-    if custody.output_consumed:
-        return True
-    landed = emit(drive_root, OUTPUT_CONSUMED, {
-        "run_id": custody.run_id,
-        "task_id": custody.task_id,
-        "artifact": str(artifact or ""),
-        "bytes": int(byte_length),
-        "sha256": str(sha256 or ""),
-        "chars": int(chars),
-        "lines": int(lines),
-    })
-    if landed:
-        custody.output_consumed = True
-    return landed
+    return _record(
+        drive_root, custody, artifact=artifact, byte_length=byte_length,
+        sha256=sha256, chars=chars, lines=lines,
+    )
 
 
 def output_disposition(custody: RunCustody) -> Dict[str, Any]:
-    """The staged-output facts a terminal disposition must carry. Empty when inline.
+    from ouroboros.delegate_output import output_disposition as _disposition
 
-    A run whose whole payload fit inline staged nothing and owes nothing; a run whose
-    payload was staged either has the EOF acknowledgement or it does not, and the
-    reader of a settlement/reconciliation row can now tell "collected" from "launched
-    and never collected" without trusting anyone's ledger discipline.
-    """
-    if not custody.output_artifact:
-        return {}
-    return {"staged_output": custody.output_artifact,
-            "staged_output_complete": custody.output_complete,
-            "staged_output_consumed": custody.output_consumed}
+    return _disposition(custody)
 
 
 # -- money and terminal state --------------------------------------------------
@@ -1214,7 +1225,6 @@ def _cancel_result(drive_root: Any, custody: RunCustody, outcome: str, *, accept
         result["terminal_detail"] = terminal_detail
     return result
 
-
 # -- reconciliation ------------------------------------------------------------
 
 
@@ -1237,7 +1247,6 @@ def pending_invocations(drive_root: Any,
 
     return replay_pending(drive_root, rows)
 
-
 def release_task_runs(drive_root: Any, task_id: str, *,
                       gateway_factory: Optional[Callable[[], Any]] = None) -> List[Dict[str, Any]]:
     """Run the one non-panic terminal custody boundary for a normal loop exit."""
@@ -1251,7 +1260,6 @@ def release_task_runs(drive_root: Any, task_id: str, *,
     )
     record_terminal_reconciliation(drive_root, task_id, result)
     return list(result.get("outcomes") or [])
-
 
 def reconcile_task_runs(drive_root: Any, task_id: str, *,
                         gateway_factory: Optional[Callable[[], Any]] = None) -> List[Dict[str, Any]]:
@@ -1272,7 +1280,6 @@ def reconcile_task_runs(drive_root: Any, task_id: str, *,
     if not held and not stray:
         return []
     return _reconcile_each(drive_root, held, gateway_factory, pending=stray)
-
 
 def reconcile_orphaned_runs(
     drive_root: Any,
@@ -1405,6 +1412,11 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
         selected_subagent_id=str(record.get("selected_subagent_id") or ""),
         config_fingerprint=str(record.get("config_fingerprint") or ""),
         work_order_fingerprint=str(record.get("work_order_fingerprint") or ""),
+        work_order_coverage=str(record.get("work_order_coverage") or ""),
+        work_order_source_request=(
+            dict(record.get("work_order_source_request"))
+            if isinstance(record.get("work_order_source_request"), dict) else {}
+        ),
         authority_fingerprint=str(record.get("authority_fingerprint") or ""),
         # The C1 isolation binding survives recovery VERBATIM: the recovered run
         # executes in the snapshot the original attempt provisioned (the replayed
@@ -1542,6 +1554,7 @@ __all__ = [
     "FOREIGN",
     "OWNED",
     "RunCustody",
+    "SOURCE_RANGE_DELIVERY_CONFIRMED",
     "TERMINAL_STATES",
     "UNKNOWN",
     "cancel_and_verify",
@@ -1582,4 +1595,6 @@ __all__ = [
     "summary_of",
     "task_execution_evidence",
     "undisposed_patches",
+    "work_order_source_verification",
+    "record_source_range_verified",
 ]

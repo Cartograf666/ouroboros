@@ -143,7 +143,7 @@ Return ONLY a JSON object:
 Rules: set promote=true ONLY when there is a concrete, high-value, self-contained code/process improvement worth a reviewed cycle right now. Prefer items already in the backlog, and weigh the solve-capability history: objective classes that historically got ABSORBED are better bets than classes that kept ending no_op/abandoned. Bias toward SMALL, TARGETED objectives that directly improve the ability to solve tasks (a sharper tool, a fixed failure mode, a removed bottleneck) over broad refactors or speculative platform work — small reviewed wins absorb; sprawling objectives historically die as no_op. Do NOT propose anything in the CLOSED / DROPPED list, or a restatement of the ACTIVE CAMPAIGN OBJECTIVE — those are already handled; if the only candidates are closed/active, return promote=false. If nothing is clearly worthwhile, return promote=false. {force_note}"""
 
 
-def _closed_objectives_digest(drive_root: pathlib.Path, *, limit: int = 12, max_entries: int = 200) -> str:
+def _closed_objectives_digest(drive_root: pathlib.Path) -> Optional[str]:
     """BUG3 Layer A: the objectives the chooser must NOT re-propose.
 
     Built from the STRUCTURED ledger (state/evolution_checkpoints.jsonl), not patterns.md prose,
@@ -157,19 +157,21 @@ def _closed_objectives_digest(drive_root: pathlib.Path, *, limit: int = 12, max_
     from ouroboros.evolution_fingerprint import canonical_objective_fingerprint
 
     path = pathlib.Path(drive_root) / "state" / "evolution_checkpoints.jsonl"
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()[-max_entries:]
-    except Exception:
+    if not path.exists():
         return ""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return None
     by_task: Dict[str, Dict[str, Any]] = {}
     order: list = []
     for line in lines:
         try:
             row = _json.loads(line)
         except Exception:
-            continue
+            return None
         if not isinstance(row, dict):
-            continue
+            return None
         task_id = str(row.get("task_id") or "")
         if not task_id:
             continue
@@ -204,11 +206,7 @@ def _closed_objectives_digest(drive_root: pathlib.Path, *, limit: int = 12, max_
             continue
         seen.add(fp)
         tag = "BLOCKED" if blocked else (str(info.get("cycle_outcome") or "DROPPED").upper())
-        if len(objective) > 110:
-            objective = objective[:110] + " …[truncated; full objective in the ledger]"
         out.append(f"- [{tag}] {objective}")
-        if len(out) >= limit:
-            break
     return "\n".join(out)
 
 
@@ -238,7 +236,10 @@ def _decide_promotion(env: Any, task: Dict[str, Any], reflection_entry: Optional
     # BUG3 Layer A: give the chooser the objectives it must NOT re-propose (the missing input
     # that let a CLOSED objective be re-suggested 4-5x). Sourced from the structured ledger
     # (not patterns.md prose) plus the campaign-local dropped set, deduped by fingerprint.
-    closed = truncate_review_artifact(_closed_objectives_digest(drive_root), 1500)
+    closed = _closed_objectives_digest(drive_root)
+    if closed is None:
+        log.warning("post_task_evolution: closed-objective history unavailable; abstaining")
+        return None
     active_objective = _active_campaign_objective()
     force_note = (
         "The cadence already decided WHEN to evolve; choose the single most valuable "

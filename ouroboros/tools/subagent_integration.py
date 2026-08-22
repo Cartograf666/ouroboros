@@ -58,9 +58,7 @@ def _record_integration_disposition(
     default_reason: str,
 ) -> str:
     """Stamp only a genuinely completed apply/verify/reject operation."""
-
     from ouroboros.tools.join_ledger import _record_current_child_result_disposition
-
     recorded = _record_current_child_result_disposition(
         ctx,
         child_task_id,
@@ -1177,7 +1175,7 @@ def _integrate_delegated_patch(
     crash state: it resolves the stale intent durably and re-runs this normal
     flow, whose own guards re-verify the tree. A no-op when nothing is pending.
     """
-    from ouroboros import delegate_custody as custody
+    from ouroboros import delegate_custody as custody, delegate_source_coverage
 
     rid = str(run_id or "").strip()
     if not rid:
@@ -1190,6 +1188,9 @@ def _integrate_delegated_patch(
     refusal = _delegated_disposition_refusal(status, entry, rid, acknowledge_ambiguous)
     if refusal:
         return refusal
+    if decision == "apply" and entry is not None:
+        if refusal := delegate_source_coverage.source_apply_refusal(entry, rid):
+            return refusal
     if entry.patch_apply_pending and acknowledge_ambiguous:
         _resolve_acknowledged_intent(drive, entry)
     snapshot_key = entry.snapshot_id or entry.run_id

@@ -29,7 +29,8 @@ def test_run_plan_review_script_runs_the_engine_on_the_new_envelope(monkeypatch,
     captured = {}
 
     async def fake_run_slots(ctx, slots, *, system_prompt, user_content, session_task="",
-                             session_root="", output_contract=""):
+                             session_root="", output_contract="", slot_messages=None,
+                             session_threads=None):
         captured["task_id"] = ctx.task_id
         captured["slots"] = [s.slot_id for s in slots]
         captured["system_prompt"] = system_prompt

@@ -294,7 +294,7 @@ def test_bounded_wave_history_compacts_older_waves_and_counts_omissions(tmp_path
     assert len(full) == tr._PLAN_REVIEW_FULL_WAVES
     assert all(w.get("compact") for w in state["waves"][:-tr._PLAN_REVIEW_FULL_WAVES])
     assert set(state["waves"][0]) == {"compact", "cycle_index", "request_fingerprint", "aggregate",
-                                      "counts", "closed", "paid"}
+                                      "counts", "closed", "paid", "wave_artifact"}
     # the current pointer follows the newest wave
     assert state["current_attempt"]["fingerprint"] == f"{total - 1:064x}"
 

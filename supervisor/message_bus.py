@@ -401,8 +401,10 @@ class LocalChatBridge:
         client_message_id: str,
         action: str,
         target: str = "",
+        target_label: str = "",
         status: str = "accepted",
         options: Optional[List[Dict[str, Any]]] = None,
+        attachment_manifest: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Emit a typed routing receipt without creating an assistant bubble.
 
@@ -422,8 +424,14 @@ class LocalChatBridge:
             "suppress_bubble": True,
             "ts": utc_now_iso(),
         }
+        if str(target_label or ""):
+            payload["target_label"] = str(target_label)
         if options is not None:
             payload["options"] = [dict(row) for row in options if isinstance(row, dict)]
+        if attachment_manifest is not None:
+            payload["attachment_manifest"] = [
+                dict(row) for row in attachment_manifest if isinstance(row, dict)
+            ]
         if self._broadcast_fn and not is_a2a_chat_id(chat_id):
             self._broadcast_fn(payload)
         if not is_a2a_chat_id(chat_id):
@@ -891,6 +899,10 @@ def log_chat(
         for key in SUBAGENT_MESSAGE_FIELDS:
             if key in meta:
                 record[key] = meta[key]
+        if record_type == "project_completion_summary":
+            for key in ("project_id", "project_name", "target_label", "status"):
+                if key in meta:
+                    record[key] = meta[key]
         if filename:
             record["filename"] = filename
         if mime:

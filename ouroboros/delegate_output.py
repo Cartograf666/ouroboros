@@ -108,6 +108,45 @@ _READ_COVERAGE: Dict[str, List[List[int]]] = {}
 _READ_COVERAGE_MAX_KEYS = 128
 
 
+def record_output_consumed(drive_root: Any, custody: _RunCustody, *,
+                           artifact: str, byte_length: int, sha256: str,
+                           chars: int, lines: int) -> bool:
+    """Record the D7 acknowledgement for one fully read staged artifact."""
+
+    if not custody.output_complete:
+        return False
+    if custody.output_sha and str(sha256 or "") != custody.output_sha:
+        return False
+    if custody.output_consumed:
+        return True
+    from ouroboros import delegate_custody as custody_module
+
+    landed = custody_module.emit(drive_root, custody_module.OUTPUT_CONSUMED, {
+        "run_id": custody.run_id,
+        "task_id": custody.task_id,
+        "artifact": str(artifact or ""),
+        "bytes": int(byte_length),
+        "sha256": str(sha256 or ""),
+        "chars": int(chars),
+        "lines": int(lines),
+    })
+    if landed:
+        custody.output_consumed = True
+    return landed
+
+
+def output_disposition(custody: _RunCustody) -> Dict[str, Any]:
+    """Return the staged-output facts carried by terminal custody rows."""
+
+    if not custody.output_artifact:
+        return {}
+    return {
+        "staged_output": custody.output_artifact,
+        "staged_output_complete": custody.output_complete,
+        "staged_output_consumed": custody.output_consumed,
+    }
+
+
 def _covered_whole(key: str, start: int, end: int, total: int) -> bool:
     """Merge one DELIVERED char range [start, end) into the ledger; True when
     [0, total) is covered.
