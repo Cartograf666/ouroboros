@@ -87,6 +87,238 @@ def test_max_mode_inlines_architecture_and_development_in_full():
     assert "## DEVELOPMENT.md" in text
 
 
+def test_forked_task_captures_canonical_memory_and_exact_api_context():
+    import json
+
+    from ouroboros.context import build_llm_messages
+    from ouroboros.contracts.task_contract import attach_task_contract
+    from ouroboros.memory import Memory
+
+    tmpdir = pathlib.Path(tempfile.mkdtemp())
+    env, canonical_memory = _make_env_and_memory(tmpdir)
+    child = tmpdir / "child"
+    (child / "logs").mkdir(parents=True)
+    (child / "memory").mkdir(parents=True)
+    canonical_memory.logs_path("chat.jsonl").write_text(
+        '{"chat_id": 1, "direction": "in", "text": "CANONICAL_OWNER_DIRECTIVE"}\n',
+        encoding="utf-8",
+    )
+    (child / "logs" / "chat.jsonl").write_text(
+        '{"chat_id": 1, "direction": "in", "text": "CHILD_ONLY_NOISE"}\n',
+        encoding="utf-8",
+    )
+    task = attach_task_contract({
+        "id": "forked-root",
+        "type": "task",
+        "text": "continue",
+        "context": "never deploy; use profile X",
+        "drive_root": str(child),
+        "budget_drive_root": str(env.drive_root),
+    })
+    messages, _ = build_llm_messages(
+        env=env,
+        memory=Memory(child, repo_dir=env.repo_dir),
+        task=task,
+    )
+    rendered = json.dumps(messages, ensure_ascii=False)
+
+    assert "CANONICAL_OWNER_DIRECTIVE" in rendered
+    assert "CHILD_ONLY_NOISE" not in rendered
+    assert "never deploy; use profile X" in rendered
+    assert task["task_contract"]["context"] == "never deploy; use profile X"
+
+
+def test_forked_context_uses_canonical_global_cognition_not_child_noise():
+    import json
+
+    from ouroboros.agent import Env
+    from ouroboros.context import build_llm_messages
+    from ouroboros.memory import Memory
+
+    tmpdir = pathlib.Path(tempfile.mkdtemp())
+    canonical_env, _memory = _make_env_and_memory(tmpdir)
+    canonical = canonical_env.drive_root
+    child = tmpdir / "child-cognition"
+    for root in (canonical, child):
+        (root / "memory" / "knowledge").mkdir(parents=True, exist_ok=True)
+        (root / "logs").mkdir(parents=True, exist_ok=True)
+        (root / "state").mkdir(parents=True, exist_ok=True)
+    (canonical / "memory" / "knowledge" / "patterns.md").write_text(
+        "CANONICAL_PATTERN_REGISTER", encoding="utf-8",
+    )
+    (child / "memory" / "knowledge" / "patterns.md").write_text(
+        "CHILD_PATTERN_NOISE", encoding="utf-8",
+    )
+    (canonical / "memory" / "deep_review.md").write_text(
+        "CANONICAL_DEEP_REVIEW", encoding="utf-8",
+    )
+    (child / "memory" / "deep_review.md").write_text("CHILD_DEEP_NOISE", encoding="utf-8")
+    env = Env(repo_dir=canonical_env.repo_dir, drive_root=child, budget_drive_root=canonical)
+
+    messages, _ = build_llm_messages(
+        env=env,
+        memory=Memory(child, repo_dir=env.repo_dir),
+        task={"id": "fork-cognition", "text": "continue", "budget_drive_root": str(canonical)},
+    )
+    rendered = json.dumps(messages, ensure_ascii=False)
+
+    assert "CANONICAL_PATTERN_REGISTER" in rendered
+    assert "CANONICAL_DEEP_REVIEW" in rendered
+    assert "CHILD_PATTERN_NOISE" not in rendered
+    assert "CHILD_DEEP_NOISE" not in rendered
+
+
+def test_current_plan_and_open_dispositions_enter_actual_model_request():
+    import json
+
+    from ouroboros.context import build_llm_messages
+
+    tmpdir = pathlib.Path(tempfile.mkdtemp())
+    env, memory = _make_env_and_memory(tmpdir)
+    task_id = "reviewed-task"
+    fingerprint = "a" * 64
+    result_dir = env.drive_root / "task_results"
+    result_dir.mkdir(parents=True)
+    (result_dir / f"{task_id}.json").write_text(json.dumps({
+        "task_id": task_id,
+        "status": "running",
+        "plan_review_state": {
+            "schema_version": 2,
+            "series_id": "series-1",
+            "cycles_paid": 1,
+            "need_evidence_seen": [],
+            "current_attempt": {
+                "fingerprint": fingerprint,
+                "status": "open",
+                "reason": "",
+            },
+            "waves": [{
+                "cycle_index": 1,
+                "request_fingerprint": fingerprint,
+                "aggregate": "REVISE_PLAN",
+                "closed": False,
+                "paid": True,
+                "spec": {"prose": "PLAN_DECISIVE_TAIL"},
+                "findings": [{"id": "F1", "summary": "OPEN_FINDING_TAIL"}],
+                "dispositions": [{"finding_id": "F1", "decision": "open"}],
+            }],
+            "waves_omitted": 0,
+        },
+    }), encoding="utf-8")
+
+    messages, _ = build_llm_messages(
+        env=env,
+        memory=memory,
+        task={"id": task_id, "type": "task", "text": "continue"},
+    )
+    rendered = json.dumps(messages, ensure_ascii=False)
+
+    assert "PLAN_DECISIVE_TAIL" in rendered
+    assert "OPEN_FINDING_TAIL" in rendered
+    assert "get_task_result" in rendered
+
+
+def test_valid_named_predecessor_materializes_into_first_model_request_and_actor_read():
+    import json
+
+    from ouroboros.agent_startup_checks import validate_task_authority_sources
+    from ouroboros.context import build_llm_messages
+    from ouroboros.tools.control import _get_task_result
+    from ouroboros.tools.registry import ToolContext
+
+    tmpdir = pathlib.Path(tempfile.mkdtemp())
+    env, memory = _make_env_and_memory(tmpdir)
+    predecessor_id = "cat-predecessor"
+    tail = "CLAUDEXOR_ONLY_AND_L1_L2_L3"
+    result_dir = env.drive_root / "task_results"
+    result_dir.mkdir(parents=True)
+    (result_dir / f"{predecessor_id}.json").write_text(json.dumps({
+        "task_id": predecessor_id,
+        "status": "completed",
+        "objective": "o" * 700 + tail,
+        "task_contract": {
+            "objective": "o" * 700 + tail,
+            "context": "never use native API",
+            "delegation_budget": {"intent_note": "L1 asks L2 to spawn L3"},
+        },
+    }), encoding="utf-8")
+    source = {
+        "kind": "task_result", "task_id": predecessor_id,
+        "human_label": "Cat Tower Builder",
+        "tool": "get_task_result",
+        "arguments": {"task_id": predecessor_id, "include_authority": True},
+    }
+    task = {
+        "id": "cat-next", "type": "task", "text": "continue",
+        "predecessor_authority_source": source,
+        "budget_drive_root": str(env.drive_root),
+    }
+
+    assert validate_task_authority_sources(env, task) == {}
+    messages, _ = build_llm_messages(env=env, memory=memory, task=task)
+    rendered = json.dumps(messages, ensure_ascii=False)
+    actor_read = json.loads(_get_task_result(
+        ToolContext(repo_dir=env.repo_dir, drive_root=env.drive_root),
+        predecessor_id, include_authority=True,
+    ))
+
+    assert tail in rendered
+    assert "L1 asks L2 to spawn L3" in rendered
+    assert actor_read["status"] == "available"
+    assert actor_read["authority"]["task_contract"]["objective"].endswith(tail)
+
+
+def test_unreadable_current_plan_review_source_returns_typed_startup_refusal():
+    from ouroboros.agent_startup_checks import validate_task_authority_sources
+
+    tmpdir = pathlib.Path(tempfile.mkdtemp())
+    env, _memory = _make_env_and_memory(tmpdir)
+    result_dir = env.drive_root / "task_results"
+    result_dir.mkdir(parents=True)
+    (result_dir / "plan-broken.json").write_text("{broken", encoding="utf-8")
+
+    refusal = validate_task_authority_sources(
+        env, {"id": "plan-broken", "title": "Cat plan", "text": "continue"},
+    )
+
+    assert refusal["reason_code"] == "authority_source_unavailable"
+    assert refusal["source"]["kind"] == "plan_review_state"
+    assert refusal["human_label"] == "Cat plan"
+
+
+def test_named_owner_source_resolves_beyond_automatic_recent_generations():
+    import json
+
+    from ouroboros.agent_startup_checks import validate_task_authority_sources
+    from ouroboros.project_dialogue import build_owner_message_ref
+
+    tmpdir = pathlib.Path(tempfile.mkdtemp())
+    env, _memory = _make_env_and_memory(tmpdir)
+    archive = env.drive_root / "archive"
+    logs = env.drive_root / "logs"
+    archive.mkdir(parents=True)
+    logs.mkdir(parents=True, exist_ok=True)
+    text = "old but exact owner authority"
+    ref = build_owner_message_ref(
+        chat_id=1, client_message_id="old-owner", ts="2026-08-01T00:00:00Z", text=text,
+    )
+    (archive / "chat_0001.jsonl").write_text(
+        json.dumps({**ref, "direction": "in", "text": text}) + "\n", encoding="utf-8",
+    )
+    for index in range(2, 6):
+        (archive / f"chat_000{index}.jsonl").write_text(
+            json.dumps({"direction": "in", "text": f"newer-{index}"}) + "\n",
+            encoding="utf-8",
+        )
+    (logs / "chat.jsonl").write_text(
+        json.dumps({"direction": "in", "text": "live"}) + "\n", encoding="utf-8",
+    )
+    task = {"id": "legacy-source", "origin_message_ref": ref}
+
+    assert validate_task_authority_sources(env, task) == {}
+    assert task["origin_message_text"] == text
+
+
 def test_max_mode_external_workspace_keeps_arch_full_but_drops_development():
     """D-ARCH: ARCHITECTURE is full-resident in max for EVERY class, including
     the external-surface class; DEVELOPMENT (the self-engineering handbook)

@@ -29,13 +29,17 @@ def _text(value: Any) -> str:
 
 
 def assignment_instructions(ctx: Any) -> str:
-    """Host-authored immutable objective/output block for every delegate start."""
+    """Host-authored complete normalized contract for every direct delegate start."""
 
     contract = getattr(ctx, "task_contract", None)
     if not isinstance(contract, dict) or not contract:
         meta = getattr(ctx, "task_metadata", {})
         raw = meta.get("task_contract") if isinstance(meta, dict) else None
         contract = raw if isinstance(raw, dict) else {}
+    if contract:
+        from ouroboros.contracts.task_contract import build_task_contract
+
+        contract = build_task_contract({"task_contract": contract})
     parts: list[str] = []
     objective = _text(contract.get("objective"))
     expected = _text(contract.get("expected_output"))
@@ -46,17 +50,38 @@ def assignment_instructions(ctx: Any) -> str:
         )
     if expected:
         parts.append("HOST EXPECTED OUTPUT: " + expected)
+    if contract:
+        parts.append(
+            "HOST TASK CONTRACT AUTHORITY (complete normalized JSON; exact strings are authority):\n"
+            + json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
     return "\n\n".join(parts)
 
 
 def _render_external_work_order(task: Mapping[str, Any]) -> str:
     contract = task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {}
+    assignment_context = "" if task.get("context") is None else str(task.get("context"))
+    inherited_context = "" if contract.get("context") is None else str(contract.get("context"))
+    context_sections = []
+    if assignment_context:
+        context_sections.append("DELEGATED ASSIGNMENT CONTEXT\n" + assignment_context)
+    if inherited_context and inherited_context != assignment_context:
+        context_sections.append("INHERITED CALLER AUTHORITY CONTEXT\n" + inherited_context)
+    represented_keys = {
+        "objective", "context", "expected_output", "constraints", "acceptance_claims",
+        "attachment_manifest",
+    }
+    remaining_contract = {
+        key: value for key, value in contract.items() if key not in represented_keys
+    }
     sections: list[tuple[str, Any]] = [
         ("OBJECTIVE", task.get("objective") or contract.get("objective") or task.get("description")),
-        ("PARENT CONTEXT / REFERENCES", task.get("context")),
+        ("PARENT CONTEXT / REFERENCES", "\n\n".join(context_sections)),
         ("EXPECTED OUTPUT", task.get("expected_output") or contract.get("expected_output")),
         ("CONSTRAINTS / NON-GOALS", task.get("constraints") or contract.get("constraints")),
         ("ACCEPTANCE CLAIMS", contract.get("acceptance_claims")),
+        ("TASK CONTRACT AUTHORITY", remaining_contract),
+        ("INHERITED TASK INPUTS", contract.get("attachment_manifest")),
     ]
     authority = {
         "task_id": str(task.get("id") or ""),
@@ -67,12 +92,16 @@ def _render_external_work_order(task: Mapping[str, Any]) -> str:
         "task_constraint": task.get("task_constraint") if isinstance(task.get("task_constraint"), dict) else {},
         "allowed_resources": contract.get("allowed_resources") if isinstance(contract.get("allowed_resources"), dict) else {},
         "deadline_at": str(contract.get("deadline_at") or ""),
+        "origin_message_ref": task.get("origin_message_ref") if isinstance(task.get("origin_message_ref"), dict) else {},
     }
-    rendered = [
-        f"{title}\n{body}"
-        for title, value in sections
-        if (body := _text(value))
-    ]
+    rendered = []
+    for title, value in sections:
+        body = (
+            str(value) if title == "PARENT CONTEXT / REFERENCES" and isinstance(value, str)
+            else _text(value)
+        )
+        if body:
+            rendered.append(f"{title}\n{body}")
     rendered.append(
         "HOST AUTHORITY BINDING (facts, not instructions to widen)\n"
         + _text(json.dumps(authority, ensure_ascii=False, sort_keys=True))

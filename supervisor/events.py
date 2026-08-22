@@ -56,19 +56,29 @@ _GIT_UNBORN_HEAD = "(unborn)"
 HOST_NARRATION = "host_narration"
 
 
+def _routing_attachments(value: Any) -> Optional[list]:
+    return [dict(item) for item in value if isinstance(item, dict)] if isinstance(value, list) else None
+
+
 def _emit_routing_receipt(
     ctx: Any,
     evt: Dict[str, Any],
     *,
     action: str,
     target: str = "",
+    target_label: str = "",
     status: str,
     reason: str = "",
     detail: str = "",
     options: Optional[list] = None,
+    attachment_manifest: Optional[list] = None,
     publish: bool = True,
 ) -> Dict[str, Any]:
     """Persist and publish one token-bound routing annotation receipt."""
+    if target and not str(target_label or "").strip():
+        from ouroboros.project_dialogue import routing_target_label
+
+        target_label = routing_target_label(ctx.DRIVE_ROOT, action, target, task=evt, project_id=str(evt.get("project_id") or ""))
     client_message_id = str(evt.get("client_message_id") or "").strip()
     routing_token = str(evt.get("routing_token") or "").strip()
     annotation_status = "not_applicable"
@@ -83,11 +93,13 @@ def _emit_routing_receipt(
                     client_message_id,
                     action=action,
                     target=target,
+                    target_label=target_label,
                     status=status,
                     routing_token=routing_token,
                     reason=reason,
                     detail=detail,
                     options=options,
+                    attachment_manifest=attachment_manifest,
                 )
                 else "failed"
             )
@@ -108,7 +120,10 @@ def _emit_routing_receipt(
         "detail": str(detail or ""),
         "annotation_status": annotation_status,
         "routing_token": routing_token,
+        "target_label": str(target_label or ""),
     }
+    if attachment_manifest is not None:
+        receipt["attachment_manifest"] = _routing_attachments(attachment_manifest) or []
     if not receipt["persisted"]:
         return receipt
     if publish:
@@ -117,8 +132,10 @@ def _emit_routing_receipt(
             evt,
             action=action,
             target=target,
+            target_label=target_label,
             status=effective_status,
             options=options,
+            attachment_manifest=attachment_manifest,
         )
     return receipt
 
@@ -129,11 +146,17 @@ def _publish_routing_ack(
     *,
     action: str,
     target: str,
+    target_label: str = "",
     status: str,
     options: Optional[list] = None,
+    attachment_manifest: Optional[list] = None,
 ) -> None:
     """Publish a live non-bubble acknowledgement after durable authority exists."""
     try:
+        if target and not str(target_label or "").strip():
+            from ouroboros.project_dialogue import routing_target_label
+
+            target_label = routing_target_label(ctx.DRIVE_ROOT, action, target, task=evt, project_id=str(evt.get("project_id") or ""))
         client_message_id = str(evt.get("client_message_id") or "").strip()
         try:
             chat_id = int(evt.get("chat_id") or 0)
@@ -146,10 +169,13 @@ def _publish_routing_ack(
                 "client_message_id": client_message_id,
                 "action": action,
                 "target": target,
+                "target_label": target_label,
                 "status": status,
             }
             if options is not None:
                 ack_kwargs["options"] = options
+            if attachment_manifest is not None:
+                ack_kwargs["attachment_manifest"] = attachment_manifest
             ack(
                 chat_id,
                 **ack_kwargs,
@@ -1007,25 +1033,12 @@ def _handle_typing_start(evt: Dict[str, Any], ctx: Any) -> None:
         pass
 
 
-# Delivered final-answer dedupe (mirror of the already_done terminal dedupe, for
-# this one event kind): the worker sends the final send_message BOTH over the
-# live queue (before blocking post-task) AND in the buffered return — queue.put
-# is not a delivery receipt, so neither copy is dropped worker-side; instead
-# both carry the same delivery_id and the second one is suppressed here. The
-# in-memory deque is a fast-path cache; the durable registry
-# (``supervisor.terminal_delivery``, phase A2) is the LOGICAL dedupe shared by
-# the natural, cancel, and reap delivery paths and survives a restart.
+# Durable terminal registry dedupes successful sends across restarts.
 _DELIVERED_MESSAGE_IDS: "deque[str]" = deque(maxlen=256)
 
 
 def _register_delivered(ctx: Any, delivery_id: str) -> None:
-    """Durably mark one delivery id as delivered — and clear what it owed.
-
-    Both halves of the same fact: the id joins the restart-surviving registry AND
-    leaves the pending outbox in one write, so a replay can never re-send an
-    answer that landed (phase A2/F7). Fail-soft: a registry write must never cost
-    a delivery that already happened.
-    """
+    """Atomically mark one id delivered and clear its pending-outbox row."""
     try:
         from supervisor.terminal_delivery import register_delivery
 
@@ -1085,19 +1098,7 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
                     progress_meta = dict(child_meta)
                     progress_meta.update(event_meta)
             if is_progress and isinstance(_m, dict):
-                # v6.82 (P5): host-attested cancelable marker. RUNNING membership is
-                # the supervisor's own truth that this frame belongs to a queue task
-                # that /api/tasks/{id}/cancel can force-cancel. An in-process
-                # direct-chat turn is never in RUNNING, so its card never shows a
-                # dead "Cancel run" button. Covers pooled roots that skip the
-                # scheduled notice (e.g. promote_chat_to_task). The marker is
-                # LINEAGE-GATED here and carries the RUNNING row's authoritative
-                # lineage: only a resolved ROOT is stamped (a timeout-retry root
-                # counts — its root_task_id names the original, which is exactly
-                # why the frontend must trust this attestation rather than
-                # re-deriving rootness from frame shape), and a subagent's
-                # narration never mints a root-shaped card with a live Cancel.
-                # Copy-on-write: the worker's own event dict is never mutated.
+                # Host-attested RUNNING lineage is the cancel authority.
                 progress_meta = dict(progress_meta or {})
                 for lineage_key in ("root_task_id", "parent_task_id", "delegation_role"):
                     value = str(task_row.get(lineage_key) or "").strip()
@@ -1137,7 +1138,9 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             meta.get("parent_task_id") or evt.get("parent_task_id"),
             meta.get("root_task_id") or evt.get("root_task_id"),
         )
-        chat_id = bound_chat or int(evt["chat_id"])
+        system_type = str(evt.get("system_type") or "")
+        # Project completion summaries target cognitive Main; other messages keep lineage routing.
+        chat_id = int(evt["chat_id"]) if system_type == "project_completion_summary" else bound_chat or int(evt["chat_id"])
         ctx.send_with_budget(
             chat_id,
             str(evt.get("text") or ""),
@@ -1149,12 +1152,9 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             ts=(str(raw_ts) if raw_ts else None),
             # S3 (Q4): a typed system receipt keeps its role/type end to end.
             role=str(evt.get("role") or ""),
-            system_type=str(evt.get("system_type") or ""),
+            system_type=system_type,
         )
-        # Registered only AFTER a successful send: if the live copy's send
-        # raises, the buffered copy must NOT be suppressed later — "never
-        # lost" outranks "never doubled". The durable registration is the
-        # restart-surviving half of the same rule.
+        # Register only after send; a failed first copy must not suppress retry.
         if delivery_id:
             _DELIVERED_MESSAGE_IDS.append(delivery_id)
             _register_delivered(ctx, delivery_id)
@@ -1681,6 +1681,19 @@ def _finish_task_done_dispatch(
 ) -> None:
     """Notify lineage, release queue state, and preserve terminal compatibility."""
 
+    from ouroboros.project_dialogue import (
+        append_terminal_task_projection,
+        enqueue_project_completion_summary,
+    )
+
+    append_terminal_task_projection(
+        ctx.DRIVE_ROOT, str(task_id or ""), task, final_task_result, task_done_event,
+    )
+
+    enqueue_project_completion_summary(
+        ctx.DRIVE_ROOT, evt, str(task_id or ""), task, final_task_result, task_done_event,
+    )
+
     if task_id and str(task.get("delegation_role") or "") == "subagent":
         try:
             raw_chat = int(task.get("chat_id") or 0)
@@ -1859,6 +1872,13 @@ def _finish_task_done_dispatch(
             )
     except Exception as exc:
         log.warning("Failed to store task result in events: %s", exc)
+    if task_id:
+        try:
+            from supervisor.terminal_delivery import cleanup_settled_owner_mailbox
+
+            cleanup_settled_owner_mailbox(ctx.DRIVE_ROOT, str(task_id), task)
+        except Exception:
+            log.warning("Failed to cleanup terminal owner mailbox for %s", task_id, exc_info=True)
 
 
 def _resolve_lifecycle_fault(
@@ -3169,6 +3189,7 @@ def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> Dict[str, Any
                 target=str(outcome.get("task_id") or task_id),
                 status="scheduled",
                 detail=str(outcome.get("source_note") or ""),
+                attachment_manifest=_routing_attachments(outcome.get("attachment_manifest")),
                 publish=False,
             )
             admission_status = (
@@ -3199,6 +3220,7 @@ def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> Dict[str, Any
                     if admission_status == "scheduled"
                     else "Task is scheduled, but its owner-facing routing receipt was not confirmed."
                 ),
+                attachment_manifest=list(outcome.get("attachment_manifest") or []),
             )
             admission = stored.get("promotion_admission") if isinstance(stored, dict) else {}
             if (
@@ -3219,7 +3241,9 @@ def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> Dict[str, Any
                 evt,
                 action=receipt_action,
                 target=str(outcome.get("task_id") or task_id),
+                target_label=str(receipt.get("target_label") or ""),
                 status="scheduled",
+                attachment_manifest=_routing_attachments(outcome.get("attachment_manifest")),
             )
             if title:
                 _broadcast_task_named(
@@ -3246,7 +3270,8 @@ def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> Dict[str, Any
             reason="promote_chat_to_task_rejected",
         )
         supervisor_queue.release_task_admission(task_id, routing_token)
-        _persist_promote_rejection(ctx, evt, outcome)
+        if str(outcome.get("reason") or "") != "attachment_admission_rejected":
+            _persist_promote_rejection(ctx, evt, outcome)
         _emit_routing_receipt(
             ctx,
             evt,
@@ -3255,6 +3280,7 @@ def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> Dict[str, Any
             status="needs_manual_target",
             reason=str(outcome.get("reason") or "admission_rejected"),
             detail=str(outcome.get("detail") or ""),
+            attachment_manifest=_routing_attachments(outcome.get("attachment_manifest")),
         )
         ctx.append_jsonl(
             ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
@@ -3325,10 +3351,9 @@ def _handle_ensure_project_scope(evt: Dict[str, Any], ctx: Any) -> None:
 
 def _handle_routing_manual_target(evt: Dict[str, Any], ctx: Any) -> None:
     """Publish the decision actor's typed abstention without routing work."""
-    options = [
-        dict(row) for row in list(evt.get("options") or [])[:100]
-        if isinstance(row, dict)
-    ]
+    from ouroboros.project_dialogue import routing_options_with_labels
+
+    options = routing_options_with_labels(ctx.DRIVE_ROOT, evt.get("options"))
     _emit_routing_receipt(
         ctx,
         evt,

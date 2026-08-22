@@ -3149,6 +3149,7 @@ def test_ui_owner_context_mode_and_scope_review_ack(direct_server_with_data):
                 page.goto(url, wait_until="domcontentloaded", timeout=60_000)
                 toggle = page.locator("#chat-context-mode")
                 toggle.wait_for(state="visible", timeout=60_000)
+                page.wait_for_function("() => document.querySelector('#chat-context-mode')?.dataset.contextMode === 'low'", timeout=30_000)
                 assert toggle.get_attribute("data-context-mode") == "low"
                 page.screenshot(path=str(evidence_dir / "context-mode-low-before.png"))
 

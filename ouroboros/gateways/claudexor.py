@@ -486,6 +486,41 @@ class ClaudexorGateway:
             raise ClaudexorUnavailable("malformed_response", "run start returned no handle")
         return body
 
+    def create_thread(self, request: Dict[str, Any], *, idempotency_key: str) -> Dict[str, Any]:
+        """Create one durable v3 conversation thread.
+
+        Claudexor owns continuity and profile routing. This client only carries
+        the strict request and the caller's stable idempotency identity.
+        """
+        body = self._request(
+            "POST", "/v2/threads", json_body=dict(request),
+            headers={"Idempotency-Key": str(idempotency_key)},
+        )
+        if not isinstance(body, dict) or not str(body.get("id") or ""):
+            raise ClaudexorUnavailable("malformed_response", "thread create returned no id")
+        return body
+
+    def start_thread_turn(
+        self, thread_id: str, request: Dict[str, Any], *, idempotency_key: str,
+    ) -> Dict[str, Any]:
+        """Append one turn through the public v3 thread pipeline."""
+        from urllib.parse import quote
+
+        body = self._request(
+            "POST", f"/v2/threads/{quote(str(thread_id), safe='')}/turns",
+            json_body=dict(request), headers={"Idempotency-Key": str(idempotency_key)},
+        )
+        if not isinstance(body, dict):
+            raise ClaudexorUnavailable("malformed_response", "thread turn returned no handle")
+        return body
+
+    def get_thread(self, thread_id: str) -> Dict[str, Any]:
+        """Read turns, native-session bindings, and continuity receipts."""
+        from urllib.parse import quote
+
+        body = self._request("GET", f"/v2/threads/{quote(str(thread_id), safe='')}")
+        return body if isinstance(body, dict) else {}
+
     def get_run(self, run_id: str, *, timeout_sec: Optional[float] = None) -> Dict[str, Any]:
         body = self._request("GET", f"/v2/runs/{run_id}", timeout_sec=timeout_sec)
         return body if isinstance(body, dict) else {}

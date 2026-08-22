@@ -2817,6 +2817,8 @@ export function createChatInstance({
         const source = opts.source || '';
         const systemType = opts.systemType || '';
         const taskId = opts.taskId || '';
+        const projectId = opts.projectId || '';
+        const projectName = opts.projectName || '';
         const ts = timestamp || new Date().toISOString();
         const messageKey = buildMessageKey(role, text, ts, {
             clientMessageId,
@@ -2841,6 +2843,8 @@ export function createChatInstance({
                 senderSessionId,
                 clientMessageId,
                 taskId,
+                projectId,
+                projectName,
                 skillReview: opts.skillReview || null,
             });
             // Mirror the sessionStorage slice(-200): the in-memory copy exists
@@ -2877,6 +2881,18 @@ export function createChatInstance({
             ${pendingHtml}
             ${timeHtml}
         `;
+        if (systemType === 'project_completion_summary' && projectId) {
+            const projectLink = document.createElement('button');
+            projectLink.type = 'button';
+            projectLink.className = 'chat-live-project-btn';
+            projectLink.textContent = 'Open Project ↗';
+            projectLink.addEventListener('click', () => {
+                window.dispatchEvent(new CustomEvent('ouro:open-project', {
+                    detail: { project: { id: projectId, name: projectName || 'Project' } },
+                }));
+            });
+            bubble.querySelector('.message')?.append(document.createElement('br'), projectLink);
+        }
         wireSkillReviewDisclosure(bubble, () => requestAnimationFrame(() => !destroyed && updateMessagesPadding({ preserveStickiness: true })));
         stampNodeTimestamp(bubble, ts);
         insertMessageNode(bubble, { forceStick: !!opts.forceStick });
@@ -2957,24 +2973,14 @@ export function createChatInstance({
         addMessage('Ouroboros has awakened', 'assistant', false, null, false, { ephemeral: true });
     }
 
-    // perf2 P4.1 [GPT#12 + Fable#1]: sticky single-flight for HYDRATION
-    // triggers ONLY — bootstrap IIFE, the first non-reconnect socket open, and
-    // refreshHistory without a new revision. scheduleHistorySync (the 700ms
-    // post-completion resync) and the reconnect path NEVER short-circuit here:
-    // a lost task_done is healed only by a real refetch (their coalescence is
-    // historySyncPromise). Any failed sync resets the sticky promise so the
-    // next trigger fetches for real.
+    // Hydration triggers share one sticky request; reconnect/resync still refetch.
     function awaitInitialHydration({ includeUser = false } = {}) {
         if (initialHydrationPromise) return initialHydrationPromise;
         initialHydrationPromise = syncHistory({ includeUser });
         return initialHydrationPromise;
     }
 
-    // perf2 P4.2: Main's first hydration waits for an idle slot and yields to
-    // an opening project panel, but only within an UNCONDITIONAL upper bound
-    // [GPT#16] — an hour-open panel must not defer hydration forever. Project
-    // instances hydrate immediately. One-shot: live frames rendered before
-    // hydration are rebuilt by the first rebuildAll replay.
+    // Main briefly yields hydration to an opening Project, with a hard bound.
     const MAIN_HYDRATION_MAX_DEFER_MS = 3500;
     function waitForHydrationWindow() {
         if (!isMain) return Promise.resolve();
@@ -3002,9 +3008,7 @@ export function createChatInstance({
         return hydrationGatePromise;
     }
 
-    // perf2 P4.3: the deferred per-card finals, applied exactly once after the
-    // batch mount — meta/count/layout per touched card, typing and composer
-    // status once per batch, ONE sessionStorage persist for the whole replay.
+    // Apply deferred card/status/storage work once after the replay batch mounts.
     function finalizeRebuildBatch(batch) {
         for (const record of batch.touched) {
             renderLiveCardMeta(record);
@@ -3024,14 +3028,11 @@ export function createChatInstance({
 
     async function syncHistory({ includeUser = false, fromReconnect = false, forceRebuild = false } = {}) {
         if (historySyncPromise) {
-            // Preserve reconnect intent so retiredTaskIds is cleared after this sync.
+            // Preserve reconnect intent across an in-flight ordinary sync.
             if (fromReconnect) {
                 pendingReconnectSync = true;
                 return historySyncPromise.then(() => {
-                    // The first reconnect waiter consumes the queued rebuild; any
-                    // concurrent waiter sees and awaits the newly installed global
-                    // promise. No caller may render its Reconnected banner against
-                    // the intermediate (non-rebuilt) DOM.
+                    // One waiter consumes the queued rebuild; peers await it.
                     if (pendingReconnectSync) {
                         pendingReconnectSync = false;
                         return syncHistory({ includeUser: false, fromReconnect: true });
@@ -3043,9 +3044,7 @@ export function createChatInstance({
         }
         historySyncPromise = (async () => {
             try {
-                // Default request sends NO quota params — the server's window
-                // constants govern the first-load window (perf2 P3). A Load-
-                // older escalation adds explicit n_human/n_progress (perf2 P4).
+                // Server defaults own first-load quotas; Load older overrides them.
                 let historyUrl = `/api/chat/history${isMain ? '' : `?chat_id=${chatId}`}`;
                 if (historyQuotaOverride) {
                     const sep = historyUrl.includes('?') ? '&' : '?';
@@ -3197,6 +3196,15 @@ export function createChatInstance({
                         continue;
                     }
                     if (msg.system_type === 'task_summary') continue;
+                    if (msg.system_type === 'project_completion_summary') {
+                        addMessage(msg.text, 'system', !!msg.markdown, msg.ts || null, false, {
+                            systemType: msg.system_type,
+                            taskId,
+                            projectId: msg.project_id || '',
+                            projectName: msg.project_name || '',
+                        });
+                        continue;
+                    }
                     // Delivered media is a bubble, not a task-final
                     // message — render it BEFORE the taskId/finishLiveCard block so
                     // a mid-task delivery replayed while its task is still
@@ -3479,6 +3487,8 @@ export function createChatInstance({
                     senderSessionId: msg.senderSessionId || '',
                     clientMessageId: msg.clientMessageId || '',
                     taskId: msg.taskId || '',
+                    projectId: msg.projectId || '',
+                    projectName: msg.projectName || '',
                     skillReview: msg.skillReview || null,
                 });
             }
@@ -4178,8 +4188,7 @@ export function createChatInstance({
     function incrementUnreadIfNeeded(msg) {
         if (!isMain) return;  // the global unread badge tracks the main chat
         // Project visible_revision is the sole unread authority for a Project.
-        // Main may mirror its summary/progress/log into the штаб live card, but
-        // that presentation mirror must not create a second Main unread.
+        // Project-owned frames never create a second Main unread.
         if (isKnownProjectFrame(msg)) return;
         if (state.activePage === 'chat') return;
         state.unreadCount++;
@@ -4199,28 +4208,16 @@ export function createChatInstance({
         });
     });
 
-    // Main mirrors project status, never raw project chat.
-    const isProjectMirrorFrame = (msg) => {
-        if (!msg) return false;
-        if (msg.type === 'log') return true;
-        if (msg.is_progress) return true;
-        if (msg.system_type === 'task_summary' || msg.system_type === 'project_digest') return true;
-        return false;
-    };
-
-    const isMyThread = (msg, { mirrorProject = false } = {}) => {
+    const isMyThread = (msg) => {
         const cid = Number(msg?.chat_id ?? 1);
         if (isMain) {
-            if (isKnownProjectFrame(msg)) {
-                return mirrorProject && isProjectMirrorFrame(msg);
-            }
-            return true;
+            return !isKnownProjectFrame(msg);
         }
         return cid === chatId;
     };
 
     onWs('chat', (msg) => {
-        if (!isMyThread(msg, { mirrorProject: true })) return;
+        if (!isMyThread(msg)) return;
         if (msg.role === 'user') {
             const clientMessageId = msg.client_message_id || '';
             const senderSessionId = msg.sender_session_id || '';
@@ -4247,12 +4244,20 @@ export function createChatInstance({
 
         if (msg.role === 'assistant' || msg.role === 'system') {
             const explicitTaskId = msg.task_id || '';
+            if (msg.system_type === 'project_completion_summary') {
+                addMessage(msg.content, 'system', msg.markdown, msg.ts || null, false, {
+                    systemType: msg.system_type,
+                    taskId: explicitTaskId,
+                    projectId: msg.project_id || '',
+                    projectName: msg.project_name || '',
+                });
+                incrementUnreadIfNeeded(msg);
+                syncChatStatus();
+                return;
+            }
             learnSubagentLineage(msg);
             const ephemeralDecision = registerEphemeralDecisionFrame(msg);
-            // 3A: Main mirrors Project frames as штаб presentation only — a
-            // mirrored ephemeral turn never enters THIS instance's active set.
-            const isMirror = isMain && isKnownProjectFrame(msg);
-            if (ephemeralDecision && explicitTaskId && !isMirror) {
+            if (ephemeralDecision && explicitTaskId) {
                 const existing = activeDirectActivities.get(explicitTaskId) || {};
                 activeDirectActivities.set(explicitTaskId, {
                     activityId: explicitTaskId,
@@ -4268,7 +4273,6 @@ export function createChatInstance({
                 if (
                     msg.cancelable === true
                     && explicitTaskId
-                    && !isMirror
                     && !msg.subagent_event
                     && !subagentChildParents.has(explicitTaskId)
                 ) {
@@ -4276,7 +4280,7 @@ export function createChatInstance({
                         kind: 'managed_task', phase: msg.phase || 'working',
                     });
                 }
-                updateLiveCardFromProgressMessage(msg, { grantCancelAuthority: !isMirror });
+                updateLiveCardFromProgressMessage(msg, { grantCancelAuthority: true });
                 syncChatStatus();
                 return;
             }
@@ -4284,7 +4288,7 @@ export function createChatInstance({
             // An early final (post-task still running) is NOT the turn's
             // conclusion; task_done or the queue snapshot concludes it.
             const finalizing = Boolean(explicitTaskId) && msg.task_phase === 'finalizing';
-            if (!isMirror && !finalizing) {
+            if (!finalizing) {
                 if (explicitTaskId) {
                     // 4A (active set): a keyed final concludes ITS OWN turn —
                     // the finished activity + its linked pending — never a
@@ -4357,12 +4361,10 @@ export function createChatInstance({
 
     onWs('log', (msg) => {
         if (!msg?.data) return;
-        // Log frames now carry the task's chat_id (backend stamps it), so the
-        // per-thread fan-out routes the full live card to its own column: a
-        // project panel builds/animates/finalizes ITS card, while the main
-        // chat mirrors project progress as штаб. Legacy frames without chat_id
-        // default to the main chat.
-        if (!isMyThread(msg, { mirrorProject: true })) return;
+        // Log frames carry the task's canonical Project chat_id, so the
+        // Project panel alone builds/animates/finalizes that card. Legacy
+        // frames without chat_id default to the main chat.
+        if (!isMyThread(msg)) return;
         updateLiveCardFromLogEvent(msg.data);
     });
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import queue
+import pathlib
+import threading
 import types
 
 import pytest
@@ -49,11 +51,299 @@ def test_promote_tool_emits_event_with_chat_and_project(tmp_path, monkeypatch):
     assert ctx._typed_routing_action_emitted == "promote_chat_to_task"
 
 
-def test_presence_promotion_preserves_ceiling_and_cannot_choose_new_scope(tmp_path, monkeypatch):
+def test_cat_router_preview_promote_first_request_and_direct_harness_keep_full_authority(
+    tmp_path, monkeypatch,
+):
+    import json
+
+    import server
+    import supervisor.workers as workers
+    from ouroboros.agent import Env
+    from ouroboros.agent_startup_checks import validate_task_authority_sources
+    from ouroboros.contracts.task_contract import attach_task_contract
+    from ouroboros.context import build_llm_messages
+    from ouroboros.memory import Memory
+    from ouroboros.outcomes import append_verification_receipt
+    from ouroboros.projects_registry import create_project
+    from ouroboros.subagent_work_order import assignment_instructions, compile_external_work_order
+    from ouroboros.tools.control import (
+        _build_child_subagent_contract,
+        _get_task_result,
+        _promote_chat_to_task,
+    )
+    from ouroboros.tools.registry import ToolContext
+
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
+    _confirm_promote(monkeypatch)
+    project = create_project(tmp_path, "cat-tower", name="Cat Tower Builder")
+    predecessor_id = "cat-old-root"
+    tail = "CLAUDEXOR_ONLY; L1 MUST ASK L2 TO SPAWN L3"
+    result_tail = "KEEP_EXISTING_TOWER_ASSET; DO_NOT_REBUILD_FROM_SCRATCH"
+    artifact_error = "ARTIFACT_CAPTURE_FAILED_AFTER_PARTIAL_COPY"
+    artifact_finalized_at = "2026-08-21T00:00:00Z"
+    capability_delta = "HARNESS_ROUTE_REDUCED_TO_NATIVE_ONLY"
+    delegated_custody = "DELEGATED_RUN_STILL_OPEN"
+    verification_ledger = "VERIFICATION_LEDGER_BLOCKER"
+    verification_receipt = "CANONICAL_RECEIPT_FAILED"
+    future_terminal_fact = "FUTURE_TERMINAL_AUTHORITY_FIELD"
+    final_answer = "FINAL_ANSWER_TERMINAL_FACT"
+    non_final_rows = "NON_FINAL_ROWS_TERMINAL_FACT"
+    mutation_evidence = "MUTATION_EVIDENCE_TERMINAL_FACT"
+    plan_review_state = "PLAN_REVIEW_STATE_TERMINAL_FACT"
+    process_evidence = (
+        "RAW_LOOP_TRANSCRIPT_MUST_NOT_BE_INHERITED",
+        "UNRELATED_ROUTING_METADATA_MUST_NOT_BE_INHERITED",
+        "RAW_LLM_TRACE_MUST_NOT_BE_INHERITED",
+        "RAW_REVIEW_EVIDENCE_MUST_NOT_BE_INHERITED",
+        "RAW_REVIEW_PROJECTION_MUST_NOT_BE_INHERITED",
+        "RAW_TRACE_REFS_MUST_NOT_BE_INHERITED",
+        "RAW_ROOT_PHASE_CHECKPOINT_MUST_NOT_BE_INHERITED",
+    )
+    excluded_process_fields = (
+        "review_evidence", "review_projection", "trace_refs", "root_phase_checkpoint",
+    )
+    process_padding = "P" * 12_000
+    predecessor = {
+        "task_id": predecessor_id,
+        "status": "cancelled",
+        "title": "Cat Tower Builder",
+        "objective": "o" * 700 + tail,
+        "result": "completed implementation evidence\n" + "r" * 700 + result_tail,
+        "artifact_status": "failed",
+        "artifact_error": artifact_error,
+        "artifact_finalized_at": artifact_finalized_at,
+        "capability_delta": {"reduced": True, "detail": capability_delta},
+        "delegated_runs_unreconciled": [delegated_custody],
+        "verification_ledger": {"entries": [{"evidence": verification_ledger}]},
+        "future_terminal_fact": {"detail": future_terminal_fact},
+        "final_answer": final_answer,
+        "non_final_rows": [{"reason": non_final_rows}],
+        "mutation_evidence": {"summary": mutation_evidence},
+        "plan_review_state": {
+            "schema_version": 2,
+            "current_attempt": {"status": "closed", "decision": plan_review_state},
+            "waves": [],
+        },
+        "loop_outcome": {"final_text": process_evidence[0] * 500},
+        "metadata": {"main_routing_manifest": {"raw": process_evidence[1]}},
+        "llm_trace": {"reasoning_notes": [process_evidence[2]]},
+        "review_evidence": {"reasoning_notes": [process_evidence[3] + process_padding]},
+        "review_projection": {
+            "panels": [{"raw_response": process_evidence[4] + process_padding}],
+        },
+        "trace_refs": {"tool_log": process_evidence[5] + process_padding},
+        "root_phase_checkpoint": {
+            "post_task_synthesis": {"raw_output": process_evidence[6] + process_padding},
+        },
+        "project_id": "cat-tower",
+        "task_contract": {
+            "objective": "o" * 700 + tail,
+            "context": "never use native/API fallback",
+            "constraints": "Claudexor harness only",
+            "delegation_budget": {"intent_note": "L1 asks L2 to spawn L3"},
+        },
+    }
+    result_dir = tmp_path / "task_results"
+    result_dir.mkdir()
+    (result_dir / f"{predecessor_id}.json").write_text(
+        json.dumps(predecessor), encoding="utf-8",
+    )
+    assert len(json.dumps(predecessor["plan_review_state"])) < 1_000
+    assert len(json.dumps({
+        key: predecessor[key]
+        for key in (
+            "loop_outcome", "metadata", "llm_trace", *excluded_process_fields,
+        )
+    })) > 40_000
+    append_verification_receipt(tmp_path, predecessor_id, {
+        "criterion_id": "canonical-receipt", "status": "fail",
+        "evidence": verification_receipt,
+    })
+    preview = server._task_result_ground_truth(predecessor)
+    assert preview["objective"].endswith("chars omitted]")
+    assert preview["authority_source"]["arguments"] == {
+        "task_id": predecessor_id, "include_authority": True,
+    }
+    router_ctx = _swarm_ctx(
+        tmp_path,
+        project_id="cat-tower",
+        current_chat_id=int(project["chat_id"]),
+        task_metadata={
+            "force_plan": True,
+            "force_plan_source": "swarm",
+            "project_last_task_result": preview,
+        },
+    )
+
+    assert _promote_chat_to_task(
+        router_ctx, "Continue the Cat build", predecessor_task_id=predecessor_id,
+    ).startswith("OK: task")
+    event = router_ctx.pending_events[0]
+    assert event["predecessor_authority_source"] == preview["authority_source"]
+    fresh_router = _swarm_ctx(
+        tmp_path, project_id="cat-tower", current_chat_id=int(project["chat_id"]),
+        task_metadata={
+            "force_plan": True, "force_plan_source": "swarm",
+            "project_last_task_result": preview,
+        },
+    )
+    assert _promote_chat_to_task(fresh_router, "Build a fresh Cat demo").startswith("OK: task")
+    assert "predecessor_authority_source" not in fresh_router.pending_events[0]
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    admitted = []
+    outcome = workers.promote_chat_to_task(event, types.SimpleNamespace(
+        enqueue_task=lambda task: admitted.append(task),
+        persist_queue_snapshot=lambda **_kwargs: True,
+        load_state=lambda: {"owner_chat_id": 1},
+    ))
+    assert outcome["status"] == "scheduled"
+    task = admitted[0]
+    task["budget_drive_root"] = str(tmp_path)
+    repo = tmp_path / "repo"
+    (repo / "prompts").mkdir(parents=True)
+    (repo / "docs").mkdir()
+    (repo / "prompts" / "SYSTEM.md").write_text("You are Ouroboros.", encoding="utf-8")
+    (repo / "BIBLE.md").write_text("# BIBLE", encoding="utf-8")
+    (repo / "docs" / "ARCHITECTURE.md").write_text("# Architecture", encoding="utf-8")
+    (repo / "docs" / "DEVELOPMENT.md").write_text("# Development", encoding="utf-8")
+    env = Env(repo_dir=repo, drive_root=tmp_path, budget_drive_root=tmp_path)
+
+    assert validate_task_authority_sources(env, task) == {}
+    attach_task_contract(task)
+    assert task["task_contract"]["predecessor_authority"] == task["predecessor_authority"]
+    messages, _ = build_llm_messages(env=env, memory=Memory(tmp_path, repo_dir=repo), task=task)
+    rendered = json.dumps(messages, ensure_ascii=False)
+    tool_ctx = ToolContext(
+        repo_dir=repo, drive_root=tmp_path, budget_drive_root=str(tmp_path),
+        task_contract=task["task_contract"], task_metadata=task["metadata"],
+    )
+    direct_harness = assignment_instructions(tool_ctx)
+    retrieved = _get_task_result(tool_ctx, predecessor_id, include_authority=True)
+    child_contract = _build_child_subagent_contract({
+        "tid": "cat-nested", "objective": "Inspect the Cat implementation",
+        "expected_output": "Report", "constraints": "Use the inherited authority",
+        "parent_contract": task["task_contract"], "child_delegation_budget": {
+            **task["task_contract"]["delegation_budget"], "depth_remaining": 1,
+        },
+    })
+    nested_work_order = compile_external_work_order({
+        "id": "cat-nested", "objective": "Inspect the Cat implementation",
+        "task_contract": child_contract,
+    })
+    assert len(nested_work_order) < 40_000
+    assert child_contract["predecessor_authority"] == task["predecessor_authority"]
+
+    surfaces = (rendered, retrieved, direct_harness, nested_work_order)
+    for surface in surfaces:
+        for marker in (
+            tail, result_tail, artifact_error, artifact_finalized_at, capability_delta,
+            delegated_custody, verification_ledger, verification_receipt,
+            future_terminal_fact, final_answer, non_final_rows,
+            mutation_evidence, plan_review_state,
+        ):
+            assert marker in surface
+        for marker in process_evidence:
+            assert marker not in surface
+        for field in excluded_process_fields:
+            assert field not in surface
+    assert "never use native/API fallback" in rendered
+    assert "L1 asks L2 to spawn L3" in direct_harness
+    assert "never use native/API fallback" in nested_work_order
+
+
+def test_main_promotion_selects_only_manifested_canonical_predecessor(tmp_path, monkeypatch):
+    import json
+
+    import server
     from ouroboros.tools.control import _promote_chat_to_task
 
     _confirm_promote(monkeypatch)
-    contract = {"capability_ceiling": {"digest": "a" * 64}}
+    result_dir = tmp_path / "task_results"
+    result_dir.mkdir()
+    rows = [
+        {"task_id": "old-a", "status": "completed", "title": "First project"},
+        {"task_id": "old-b", "status": "completed", "title": "Chosen project"},
+    ]
+    for row in rows:
+        (result_dir / f"{row['task_id']}.json").write_text(
+            json.dumps(row), encoding="utf-8",
+        )
+    manifest = {"final_results": [server._task_result_ground_truth(row) for row in rows]}
+    selected = _swarm_ctx(tmp_path, task_metadata={
+        "force_plan": True, "force_plan_source": "swarm",
+        "main_routing_manifest": manifest,
+    })
+
+    out = _promote_chat_to_task(
+        selected, "Continue the chosen work", predecessor_task_id="old-b",
+    )
+
+    assert out.startswith("OK: task")
+    assert selected.pending_events[0]["predecessor_authority_source"] == (
+        manifest["final_results"][1]["authority_source"]
+    )
+
+    fresh = _swarm_ctx(tmp_path, task_metadata={
+        "force_plan": True, "force_plan_source": "swarm",
+        "main_routing_manifest": manifest,
+    })
+    assert _promote_chat_to_task(fresh, "Start unrelated work").startswith("OK: task")
+    assert "predecessor_authority_source" not in fresh.pending_events[0]
+
+    selected_source = manifest["final_results"][1]["authority_source"]
+    forged_sources = [
+        manifest["final_results"][0]["authority_source"],
+        {**selected_source, "kind": "other"},
+        {**selected_source, "tool": "other"},
+        {**selected_source, "arguments": {"task_id": "other", "include_authority": True}},
+        {**selected_source, "arguments": {"task_id": "old-b", "include_authority": False}},
+    ]
+    for forged_source in forged_sources:
+        forged_manifest = json.loads(json.dumps(manifest))
+        forged_manifest["final_results"][1]["authority_source"] = forged_source
+        forged = _swarm_ctx(tmp_path, task_metadata={
+            "force_plan": True, "force_plan_source": "swarm",
+            "main_routing_manifest": forged_manifest,
+        })
+        refused_forgery = _promote_chat_to_task(
+            forged, "Continue mismatched work", predecessor_task_id="old-b",
+        )
+        assert refused_forgery.startswith("⚠️ AUTHORITY_SOURCE_UNAVAILABLE")
+        assert forged.pending_events == []
+
+    missing = _swarm_ctx(tmp_path, task_metadata={
+        "force_plan": True, "force_plan_source": "swarm",
+        "main_routing_manifest": manifest,
+    })
+    (result_dir / "old-b.json").unlink()
+    refused = _promote_chat_to_task(
+        missing, "Continue missing work", predecessor_task_id="old-b",
+    )
+    assert refused.startswith("⚠️ AUTHORITY_SOURCE_UNAVAILABLE")
+    assert missing.pending_events == []
+
+
+def test_presence_promotion_preserves_ceiling_and_cannot_choose_new_scope(tmp_path, monkeypatch):
+    from ouroboros.presence_authority import PresenceCapabilityCeiling, presence_ceiling_payload
+    from ouroboros.tools.control import _build_child_subagent_contract, _promote_chat_to_task
+
+    _confirm_promote(monkeypatch)
+    capability_ceiling = presence_ceiling_payload(PresenceCapabilityCeiling(
+        skill_name="project-helper", skill_content_hash="a" * 64,
+        profile_fingerprint="b" * 64, state_fingerprint="c" * 64,
+        selection_fingerprint="d" * 64, model_slot="main", inline_max_rounds=8,
+        tool_grants=(), resource_grants=(), digest="0" * 64,
+    ))
+    contract = {
+        "capability_ceiling": capability_ceiling,
+        "context": "preserve exact owner context",
+        "predecessor_authority": {"result": "preserve completed predecessor"},
+        "attachment_manifest": [{
+            "ordinal": 0, "status": "staged", "reason": "", "label": "authority",
+            "root": "artifact_store", "relpath": "attachments/authority.txt",
+            "abs_path": str(tmp_path / "parent" / "attachments" / "authority.txt"),
+        }],
+    }
     ctx = types.SimpleNamespace(
         pending_events=[],
         event_queue=None,
@@ -75,6 +365,160 @@ def test_presence_promotion_preserves_ceiling_and_cannot_choose_new_scope(tmp_pa
     assert event["task_contract"] == contract
     assert event["project_id"] == event["project_name"] == ""
     assert event["workspace_root"] == event["workspace"] == event["source"] == ""
+    child = _build_child_subagent_contract({
+        "tid": "presence-child", "objective": "Inspect", "expected_output": "Report",
+        "parent_contract": event["task_contract"],
+        "attachment_manifest": event["task_contract"]["attachment_manifest"],
+    })
+    for key in ("capability_ceiling", "context", "predecessor_authority", "attachment_manifest"):
+        assert child[key] == contract[key]
+
+
+def test_real_presence_promotion_rebases_root_and_materializes_all_attachments(
+    tmp_path, monkeypatch,
+):
+    import supervisor.workers as workers
+    from ouroboros.presence_runner import _build_task
+    from ouroboros.subagent_work_order import compile_external_work_order
+    from ouroboros.tools.control import (
+        _build_child_subagent_contract,
+        _materialize_child_attachment_manifest,
+        _promote_chat_to_task,
+    )
+    from tests.test_presence_runner import _admission, _event
+
+    inherited_source = tmp_path / "presence-input.txt"
+    inherited_source.write_text("presence authority bytes", encoding="utf-8")
+    upload_source = tmp_path / "promotion-input.txt"
+    upload_source.write_text("promotion authority bytes", encoding="utf-8")
+    presence_task = _build_task(
+        _admission(), _event(), drive_root=tmp_path, staged_files=(inherited_source,),
+    )
+    presence_task["task_contract"]["context"] = "preserve exact presence context"
+    presence_task["task_contract"]["predecessor_authority"] = {
+        "result": "preserve predecessor result",
+    }
+    assert presence_task["attachments"] == presence_task["task_contract"]["attachment_manifest"]
+
+    _confirm_promote(monkeypatch)
+    tool_ctx = types.SimpleNamespace(
+        pending_events=[], event_queue=None, current_chat_id=4242,
+        drive_root=tmp_path,
+        task_metadata={
+            **presence_task["metadata"],
+            "chat_attachment_uploads": [{"path": str(upload_source), "label": "promotion input"}],
+        },
+        task_contract=presence_task["task_contract"],
+    )
+    result = _promote_chat_to_task(
+        tool_ctx,
+        "Research the new question deeply",
+        expected_output="A grounded report",
+        project_name="forbidden scope",
+        workspace_root="/tmp/forbidden",
+    )
+    assert result.startswith("OK: task")
+    event = tool_ctx.pending_events[0]
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    enqueued = []
+    worker_ctx = types.SimpleNamespace(
+        enqueue_task=lambda task: enqueued.append(task) or task,
+        persist_queue_snapshot=lambda **_kwargs: True,
+        load_state=lambda: {"owner_chat_id": 1},
+    )
+    outcome = workers.promote_chat_to_task(event, worker_ctx)
+
+    assert outcome["status"] == "scheduled"
+    promoted = enqueued[0]
+    contract = promoted["task_contract"]
+    assert promoted["type"] == contract["task_type"] == "task"
+    assert promoted["objective"] == contract["objective"] == "Research the new question deeply"
+    assert promoted["expected_output"] == contract["expected_output"] == "A grounded report"
+    assert contract["lineage"]["root_task_id"] == promoted["id"]
+    assert contract["context"] == "preserve exact presence context"
+    assert contract["predecessor_authority"]["result"] == "preserve predecessor result"
+    assert contract["capability_ceiling"] == presence_task["task_contract"]["capability_ceiling"]
+    assert promoted["attachments"] == contract["attachment_manifest"]
+    assert len(promoted["attachments"]) == 2
+    assert all(pathlib.Path(row["abs_path"]).is_file() for row in promoted["attachments"])
+    assert all(
+        pathlib.Path(row["abs_path"]).is_relative_to(
+            tmp_path / "task_results" / "artifacts" / promoted["id"] / "attachments"
+        )
+        for row in promoted["attachments"]
+    )
+
+    child_root = tmp_path / "child-drive"
+    child_manifest, attachment_error = _materialize_child_attachment_manifest(
+        contract, child_root, "presence-child",
+    )
+    assert attachment_error == ""
+    child = _build_child_subagent_contract({
+        "tid": "presence-child", "objective": "Inspect both inputs",
+        "expected_output": "Report", "parent_contract": contract,
+        "root_task_id": promoted["id"], "parent_task_id": promoted["id"],
+        "attachment_manifest": child_manifest,
+    })
+    work_order = compile_external_work_order({
+        "id": "presence-child", "objective": "Inspect both inputs",
+        "expected_output": "Report", "task_contract": child,
+        "parent_task_id": promoted["id"], "root_task_id": promoted["id"],
+    })
+    assert child["capability_ceiling"] == contract["capability_ceiling"]
+    assert len(child["attachment_manifest"]) == 2
+    assert "presence authority bytes" not in work_order
+    assert "presence-input.txt" in work_order and "promotion-input.txt" in work_order
+
+
+def test_real_presence_promotion_rejection_cleans_promoted_attachment_copy(
+    tmp_path, monkeypatch,
+):
+    import supervisor.workers as workers
+    from ouroboros.presence_runner import _build_task
+    from ouroboros.tools.control import _promote_chat_to_task
+    from tests.test_presence_runner import _admission, _event
+
+    inherited_source = tmp_path / "presence-input.txt"
+    inherited_source.write_text("presence authority bytes", encoding="utf-8")
+    presence_task = _build_task(
+        _admission(), _event(), drive_root=tmp_path, staged_files=(inherited_source,),
+    )
+    original_path = pathlib.Path(presence_task["attachments"][0]["abs_path"])
+    assert original_path.is_file()
+
+    _confirm_promote(monkeypatch)
+    tool_ctx = types.SimpleNamespace(
+        pending_events=[], event_queue=None, current_chat_id=4242,
+        drive_root=tmp_path,
+        task_metadata={
+            **presence_task["metadata"],
+            "chat_attachment_uploads": [{
+                "path": str(tmp_path / "missing-upload.txt"), "label": "missing",
+            }],
+        },
+        task_contract=presence_task["task_contract"],
+    )
+    assert _promote_chat_to_task(tool_ctx, "Long work").startswith("OK: task")
+    event = tool_ctx.pending_events[0]
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    enqueued = []
+    worker_ctx = types.SimpleNamespace(
+        enqueue_task=lambda task: enqueued.append(task) or task,
+        persist_queue_snapshot=lambda **_kwargs: True,
+        load_state=lambda: {"owner_chat_id": 1},
+    )
+    outcome = workers.promote_chat_to_task(event, worker_ctx)
+
+    assert outcome["status"] == "needs_manual_target"
+    assert outcome["reason"] == "attachment_admission_rejected"
+    assert enqueued == []
+    promoted_dir = (
+        tmp_path / "task_results" / "artifacts" / event["task_id"] / "attachments"
+    )
+    assert not promoted_dir.exists()
+    assert original_path.is_file()
 
 
 def _swarm_ctx(tmp_path, **overrides):
@@ -513,6 +957,155 @@ def test_promote_event_enqueues_first_class_task(tmp_path, monkeypatch):
     assert all_task_bindings(tmp_path).get("abc12345") == project["chat_id"]
 
 
+def test_promote_initial_task_is_atomic_on_attachment_rejection(tmp_path, monkeypatch):
+    import supervisor.workers as workers
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    enqueued = []
+    ctx = types.SimpleNamespace(
+        enqueue_task=lambda task: enqueued.append(task) or task,
+        persist_queue_snapshot=lambda **_kwargs: True,
+        load_state=lambda: {"owner_chat_id": 1},
+    )
+
+    outcome = workers.promote_chat_to_task({
+        "type": "promote_chat_to_task",
+        "task_id": "attach-reject",
+        "objective": "must use the input",
+        "chat_id": 1,
+        "project_id": "attachment-project",
+        "project_name": "Attachment Project",
+        "attachment_uploads": [
+            {"path": str(tmp_path / "missing.txt"), "label": "missing"},
+        ],
+    }, ctx)
+
+    assert outcome["status"] == "needs_manual_target"
+    assert outcome["reason"] == "attachment_admission_rejected"
+    assert outcome["attachment_manifest"][0]["reason"] == "source_missing"
+    assert enqueued == []
+    from ouroboros.projects_registry import all_task_bindings, get_reserved_project
+    from ouroboros.task_results import load_task_result
+
+    assert get_reserved_project(tmp_path, "attachment-project") is None
+    assert "attach-reject" not in all_task_bindings(tmp_path)
+    assert load_task_result(tmp_path, "attach-reject") is None
+    assert not (tmp_path / "task_results" / "artifacts" / "attach-reject").exists()
+
+
+def test_promote_success_relocates_pre_admitted_attachment_to_child_drive(
+    tmp_path, monkeypatch,
+):
+    import supervisor.workers as workers
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    source = tmp_path / "input.txt"
+    source.write_text("input", encoding="utf-8")
+    enqueued = []
+    ctx = types.SimpleNamespace(
+        enqueue_task=lambda task: enqueued.append(task) or task,
+        persist_queue_snapshot=lambda **_kwargs: True,
+        load_state=lambda: {"owner_chat_id": 1},
+    )
+
+    outcome = workers.promote_chat_to_task({
+        "type": "promote_chat_to_task",
+        "task_id": "attach-success",
+        "objective": "use the input",
+        "chat_id": 1,
+        "project_id": "attachment-success-project",
+        "project_name": "Attachment Success Project",
+        "attachment_uploads": [{"path": str(source), "label": "input"}],
+    }, ctx)
+
+    assert outcome["status"] == "scheduled"
+    assert len(enqueued) == 1
+    task = enqueued[0]
+    assert task["drive_root"] != str(tmp_path)
+    staged_path = pathlib.Path(task["attachments"][0]["abs_path"])
+    assert staged_path.is_file()
+    assert staged_path.is_relative_to(pathlib.Path(task["drive_root"]))
+    assert str(staged_path) in task["text"]
+    old_staged_path = (
+        tmp_path / "task_results" / "artifacts" / "attach-success"
+        / "attachments" / source.name
+    )
+    assert str(old_staged_path) not in task["text"]
+    assert not (
+        tmp_path / "task_results" / "artifacts" / "attach-success" / "attachments"
+    ).exists()
+
+
+def test_promote_post_stage_lookup_failure_cleans_attachment(tmp_path, monkeypatch):
+    import ouroboros.projects_registry as projects_registry
+    import supervisor.workers as workers
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    source = tmp_path / "input.txt"
+    source.write_text("input", encoding="utf-8")
+    monkeypatch.setattr(
+        projects_registry,
+        "get_reserved_project",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("registry unavailable")),
+    )
+    ctx = types.SimpleNamespace(
+        enqueue_task=lambda task: task,
+        persist_queue_snapshot=lambda **_kwargs: True,
+        load_state=lambda: {"owner_chat_id": 1},
+    )
+
+    outcome = workers.promote_chat_to_task({
+        "task_id": "attach-lookup-fail",
+        "objective": "use input",
+        "project_id": "lookup-project",
+        "attachment_uploads": [{"path": str(source), "label": "input"}],
+    }, ctx)
+
+    assert outcome["reason"] == "project_routing_fence_lookup_failed"
+    assert not (
+        tmp_path / "task_results" / "artifacts" / "attach-lookup-fail"
+    ).exists()
+
+
+@pytest.mark.parametrize("failure", ["enqueue", "snapshot"])
+def test_promote_queue_failure_cleans_pre_staged_attachment(
+    tmp_path, monkeypatch, failure,
+):
+    import supervisor.workers as workers
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    source = tmp_path / f"{failure}.txt"
+    source.write_text("input", encoding="utf-8")
+    captured = []
+
+    def enqueue(task):
+        captured.append(task)
+        if failure == "enqueue":
+            return {"_admission_blocked": "project_routing_fence"}
+        return task
+
+    ctx = types.SimpleNamespace(
+        enqueue_task=enqueue,
+        persist_queue_snapshot=lambda **_kwargs: failure != "snapshot",
+        load_state=lambda: {"owner_chat_id": 1},
+    )
+    tid = f"attach-{failure}-fail"
+
+    outcome = workers.promote_chat_to_task({
+        "task_id": tid,
+        "objective": "use input",
+        "workspace": "none",
+        "attachment_uploads": [{"path": str(source), "label": "input"}],
+    }, ctx)
+
+    expected = "project_routing_fence" if failure == "enqueue" else "queue_snapshot_persist_failed"
+    assert outcome["reason"] == expected
+    assert captured
+    staged_path = pathlib.Path(captured[0]["attachments"][0]["abs_path"])
+    assert not staged_path.exists()
+    assert not (tmp_path / "task_results" / "artifacts" / tid).exists()
+
+
 def test_promote_worker_persists_swarm_intent_on_managed_root(tmp_path, monkeypatch):
     import supervisor.workers as workers
 
@@ -812,6 +1405,39 @@ def test_chat_history_tool_spans_all_threads_full_awareness(tmp_path):
     view = mem.chat_history(count=50)
     assert "main-msg" in view and "alpha-msg" in view and "beta-msg" in view  # all threads
     assert "a2a-noise" not in view  # only A2A virtual transport excluded
+
+
+def test_chat_history_tool_uses_canonical_budget_root_and_archive_pagination(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    from ouroboros.tools.control import _chat_history
+
+    canonical = tmp_path / "canonical"
+    child = tmp_path / "child"
+    (canonical / "logs").mkdir(parents=True)
+    (canonical / "archive").mkdir()
+    child.mkdir()
+    (canonical / "archive" / "chat_20260820T010000.jsonl").write_text(
+        "\n".join(json.dumps({"direction": "in", "text": f"old-{i}"}) for i in range(3)) + "\n",
+        encoding="utf-8",
+    )
+    (canonical / "logs" / "chat.jsonl").write_text(
+        json.dumps({"direction": "in", "text": "new-live"}) + "\n",
+        encoding="utf-8",
+    )
+    ctx = SimpleNamespace(
+        drive_root=child,
+        budget_drive_root=str(canonical),
+        task_metadata={},
+    )
+
+    first = _chat_history(ctx, count=2)
+    second = _chat_history(ctx, count=2, offset=2)
+
+    assert "new-live" in first and "old-2" in first
+    assert "Continue with offset=2" in first
+    assert "old-0" in second and "old-1" in second
 
 
 def test_recent_context_full_awareness_and_project_focus_with_bindings(tmp_path):
@@ -1182,6 +1808,43 @@ def test_project_from_task_auto_names_from_objective(tmp_path):
     assert get_project(tmp_path, "task-obj01")["name"] == name
 
 
+def test_project_from_task_reuses_explicit_title_without_inline_light_call(tmp_path, monkeypatch):
+    """An already-authored title is the Project name; conversion must not buy a
+    second naming request while a complete human title already exists."""
+    import asyncio
+    import json
+
+    from ouroboros.gateway.projects import api_project_from_task
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+
+    write_task_result(
+        tmp_path,
+        "named01",
+        STATUS_RUNNING,
+        title="Ракетный стенд 🚀",
+        suggested_name="Ненужный запасной вариант",
+        objective="Длинное описание задачи",
+    )
+
+    async def _forbidden(*_args, **_kwargs):
+        raise AssertionError("LIGHT naming must not run for an explicit task title")
+
+    import ouroboros.project_naming as naming
+    monkeypatch.setattr(naming, "llm_project_name_async", _forbidden)
+
+    class _Req:
+        def __init__(self):
+            self.app = types.SimpleNamespace(
+                state=types.SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path)
+            )
+
+        async def json(self):
+            return {"task_id": "named01", "id": "task-named01"}
+
+    payload = json.loads(asyncio.run(api_project_from_task(_Req())).body)
+    assert payload["project"]["name"] == "Ракетный стенд 🚀"
+
+
 def test_project_from_task_uses_neutral_name_when_nothing_derivable(tmp_path):
     """Nothing derivable (no title/objective/description) → a NEUTRAL 'New project'
     name, never the bare task id (the owner explicitly rejects task-… names)."""
@@ -1338,10 +2001,7 @@ def test_bound_project_history_backfills_task_progress(tmp_path):
 
     main_resp = json.loads(asyncio.run(api(_Req({}))).body)
     main_texts = [m["text"] for m in main_resp["messages"]]
-    assert "working" in main_texts  # main mirrors sanitized progress
-    main_progress = next(m for m in main_resp["messages"] if m["text"] == "working")
-    assert main_progress["cancelable"] is True
-    assert main_progress["project_mirror"] is True
+    assert "working" not in main_texts
     assert "raw project chat" not in main_texts
     # The bound task's RAW final-answer row (still stored with main chat_id 1) is
     # project-owned via the binding and must NOT leak into the штаб's main history.
@@ -1467,7 +2127,7 @@ def test_chat_history_filters_by_thread(tmp_path):
     assert "legacy row (no chat_id)" in main_texts  # legacy rows are main-chat
     assert "transport mirror" in main_texts  # non-project transport stays visible
     assert "project hello" not in main_texts  # registered project partitions out
-    assert "project summary" in main_texts  # штаб mirrors project summaries/progress
+    assert "project summary" not in main_texts
     assert "a2a noise" not in main_texts
 
     proj_resp = json.loads(asyncio.run(api(_Req({"chat_id": str(project_chat)}))).body)
@@ -1542,6 +2202,27 @@ def test_steer_task_tool_emits_event_with_target_and_client_id(tmp_path):
     assert evt["client_message_id"] == "cm-42"
     assert evt["allow_global_root"] is False
     assert ctx._typed_routing_action_emitted == "steer_task"
+
+
+def test_steer_task_uses_exact_ingress_owner_text(tmp_path):
+    from ouroboros.tools.control import _steer_task
+
+    events = []
+    exact = "  exact owner text\nwith trailing space  "
+    ctx = types.SimpleNamespace(
+        pending_events=events,
+        event_queue=None,
+        current_chat_id=1,
+        drive_root=tmp_path,
+        task_metadata={
+            "client_message_id": "cm-exact",
+            "origin_message_text": exact,
+        },
+    )
+
+    _steer_task(ctx, "target-task", "model paraphrase")
+
+    assert events[0]["message"] == exact
 
 
 def test_main_steer_can_address_project_bound_root_from_host_manifest(tmp_path, monkeypatch):
@@ -1696,6 +2377,167 @@ def test_handle_steer_task_delivers_once_to_running_task(tmp_path, monkeypatch):
     _handle_steer_task(evt, ctx)  # retry — same client id + target -> stable msg_id
     entries = drain_owner_entries(tmp_path, "t1")  # dedups by msg_id
     assert [e["text"] for e in entries] == ["steer me"]  # delivered exactly once
+
+
+@pytest.mark.parametrize("chat_id", [1, 0, None])
+def test_steering_delivers_text_and_identical_typed_attachment_report(
+    tmp_path, monkeypatch, chat_id,
+):
+    import supervisor.queue as queue
+    from ouroboros.owner_mailbox import drain_owner_entries
+    from ouroboros.project_dialogue import latest_chat_annotations
+    from supervisor.events import _handle_steer_task
+
+    monkeypatch.setattr(queue, "DRIVE_ROOT", str(tmp_path))
+    good = tmp_path / "good.txt"
+    good.write_text("ok", encoding="utf-8")
+    notices = []
+    acks = []
+    bridge = types.SimpleNamespace(
+        send_routing_ack=lambda _chat_id, **payload: acks.append(payload),
+    )
+    ctx = types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path,
+        RUNNING={"t-report": {"task": {"id": "t-report", "chat_id": chat_id or 0}}},
+        send_with_budget=lambda _cid, text, *a, **k: notices.append(text),
+        bridge=bridge,
+    )
+    exact = "urgent owner text  \n"
+    evt = {
+        "type": "steer_task",
+        "target_task_id": "t-report",
+        "message": exact,
+        "chat_id": chat_id,
+        "client_message_id": "cm-report",
+        "routing_token": "route-report",
+        "attachment_uploads": [
+            {"path": str(good), "label": "good"},
+            {"path": str(tmp_path / "missing.txt"), "label": "missing"},
+        ],
+    }
+
+    _handle_steer_task(evt, ctx)
+
+    delivered = drain_owner_entries(tmp_path, "t-report")[0]["text"]
+    assert delivered.startswith(exact)
+    report = delivered.split("[ATTACHMENTS]\n", 1)[1].split("\n[END_ATTACHMENTS]", 1)[0]
+    if chat_id is None:
+        assert notices == []
+    else:
+        assert report in notices[-1]
+    annotation = latest_chat_annotations(tmp_path)["cm-report"]
+    assert annotation["attachment_manifest"] == acks[-1]["attachment_manifest"]
+    assert [row["status"] for row in annotation["attachment_manifest"]] == [
+        "staged", "rejected",
+    ]
+    assert annotation["detail"] == report
+
+
+def test_direct_root_steering_uses_live_human_identity_for_receipt_and_notice(
+    tmp_path, monkeypatch,
+):
+    import supervisor.queue as queue
+    from ouroboros.projects_registry import create_project
+    from supervisor.events import _handle_steer_task
+
+    monkeypatch.setattr(queue, "DRIVE_ROOT", str(tmp_path))
+    project = create_project(tmp_path, "tower-project", name="Tower Defence")
+    attachment = tmp_path / "map.txt"
+    attachment.write_text("map", encoding="utf-8")
+    direct_agent = types.SimpleNamespace(
+        _owner_message_admission_lock=threading.RLock(),
+        _busy=True,
+        _accepting_owner_messages=True,
+        _current_task_id="direct-live-opaque-id",
+        _current_chat_id=project["chat_id"],
+        _current_task_metadata={
+            "project_id": project["id"],
+            "title": "Fix nested delegation",
+        },
+        _current_task_text="Continue the Tower Defence task",
+        _owner_message_generation=0,
+    )
+    acks = []
+    notices = []
+    ctx = types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path,
+        RUNNING={},
+        PENDING=[],
+        get_chat_agent=lambda: direct_agent,
+        bridge=types.SimpleNamespace(
+            send_routing_ack=lambda _chat_id, **payload: acks.append(payload),
+        ),
+        send_with_budget=lambda _chat_id, text, *args, **kwargs: notices.append(text),
+        persist_queue_snapshot=lambda **_kwargs: None,
+    )
+
+    _handle_steer_task(
+        {
+            "type": "steer_task",
+            "target_task_id": "direct-live-opaque-id",
+            "message": "Use the attached map",
+            "chat_id": project["chat_id"],
+            "client_message_id": "cm-direct-title",
+            "routing_token": "route-direct-title",
+            "allow_global_root": True,
+            "attachment_uploads": [{"path": str(attachment), "label": "map"}],
+        },
+        ctx,
+    )
+
+    assert acks[-1]["target"] == "direct-live-opaque-id"
+    assert acks[-1]["target_label"] == "Tower Defence › Fix nested delegation"
+    assert notices[-1].splitlines()[0] == (
+        "📎 Attachment staging report for Tower Defence › Fix nested delegation:"
+    )
+
+
+def test_direct_project_followup_carries_same_live_human_identity(tmp_path):
+    import server
+    from ouroboros.projects_registry import create_project
+
+    project = create_project(tmp_path, "tower-project", name="Tower Defence")
+    attachment = tmp_path / "map.txt"
+    attachment.write_text("map", encoding="utf-8")
+    direct_agent = types.SimpleNamespace(
+        _owner_message_admission_lock=threading.RLock(),
+        _busy=True,
+        _accepting_owner_messages=True,
+        _current_task_id="direct-live-opaque-id",
+        _current_chat_id=project["chat_id"],
+        _current_task_metadata={
+            "project_id": project["id"],
+            "title": "Fix nested delegation",
+        },
+        _current_task_text="Continue the Tower Defence task",
+        _owner_message_generation=0,
+    )
+    notices = []
+    ctx = types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path,
+        RUNNING={},
+        PENDING=[],
+        get_chat_agent=lambda: direct_agent,
+        send_with_budget=lambda _chat_id, text, *args, **kwargs: notices.append(text),
+    )
+    metadata = {
+        "project_id": project["id"],
+        "chat_attachment_uploads": [{"path": str(attachment), "label": "map"}],
+    }
+
+    routed = server._route_project_chat_to_running_task(
+        ctx,
+        project["chat_id"],
+        "Use the attached map",
+        "cm-project-direct-title",
+        task_metadata=metadata,
+    )
+
+    assert routed == "direct-live-opaque-id"
+    assert metadata["_routing_target_label"] == "Tower Defence › Fix nested delegation"
+    assert notices[-1].splitlines()[0] == (
+        "📎 Attachment staging report for Tower Defence › Fix nested delegation:"
+    )
 
 
 def test_handle_steer_task_stale_target_notifies_visibly(tmp_path, monkeypatch):

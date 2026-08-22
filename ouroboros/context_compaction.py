@@ -745,39 +745,42 @@ def _persist_reclaim_checkpoint(
     task_id: str,
 ) -> Optional[Dict[str, Any]]:
     from ouroboros.observability import new_call_id, persist_call
-
+    payload = {"messages": list(messages), "request": {
+            "route_fp": request.route_fp, "round_id": request.round_id,
+            "transcript_sha256": request.transcript_sha256,
+            "measurement_basis": request.measurement_basis, "measurement_density": float(request.measurement_density),
+            "reclaim_goal_tokens": int(request.reclaim_goal_tokens),
+        },
+        "selection_fingerprint": selection.fingerprint, "selected_unit_ids": [item.unit.unit_id for item in selection.units],
+    }
     try:
         persisted = persist_call(
             pathlib.Path(drive_root).resolve(strict=False),
             task_id=str(task_id or "context_compaction"),
             call_id=new_call_id("context_reclaim_checkpoint"),
             call_type="context_reclaim_checkpoint",
-            payload={
-                "messages": list(messages),
-                "request": {
-                    "route_fp": request.route_fp,
-                    "round_id": request.round_id,
-                    "transcript_sha256": request.transcript_sha256,
-                    "measurement_basis": request.measurement_basis,
-                    "measurement_density": float(request.measurement_density),
-                    "reclaim_goal_tokens": int(request.reclaim_goal_tokens),
-                },
-                "selection_fingerprint": selection.fingerprint,
-                "selected_unit_ids": [item.unit.unit_id for item in selection.units],
-            },
+            payload=payload,
             manifest={
-                "route_fp": request.route_fp,
-                "round_id": request.round_id,
-                "selection_fingerprint": selection.fingerprint,
-                "selected_unit_ids": [item.unit.unit_id for item in selection.units],
+                "route_fp": request.route_fp, "round_id": request.round_id,
+                "selection_fingerprint": selection.fingerprint, "selected_unit_ids": [item.unit.unit_id for item in selection.units],
             },
             keep_raw=True,
         )
     except Exception:
         log.debug("Failed to persist selected context-reclaim checkpoint", exc_info=True)
         return None
-    manifest_ref = persisted.get("manifest_ref") if isinstance(persisted, Mapping) else None
-    return dict(manifest_ref) if isinstance(manifest_ref, Mapping) and manifest_ref else None
+    if not isinstance(persisted, Mapping) or not persisted.get("manifest_ref"): return None
+    try:
+        from ouroboros.artifacts import store_actor_source_bytes
+        return store_actor_source_bytes(
+            pathlib.Path(drive_root), str(task_id or "context_compaction"),
+            category="context_checkpoints", source_id=selection.fingerprint,
+            data=json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+            extension="json",
+        )
+    except Exception:
+        log.debug("Failed to persist actor-readable context-reclaim checkpoint", exc_info=True)
+        return None
 
 
 def _capsule_message(
