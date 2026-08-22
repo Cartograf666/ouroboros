@@ -285,7 +285,8 @@ def test_source_receipt_retries_after_delivery_when_first_append_fails(tmp_path,
             return {}
 
         def answer_interaction(self, _run_id, _interaction_id, _answers):
-            return {"accepted": True, "status": next(statuses)}
+            status = next(statuses)
+            return {"accepted": status == "delivered", "status": status}
 
         def close(self):
             pass
@@ -302,12 +303,44 @@ def test_source_receipt_retries_after_delivery_when_first_append_fails(tmp_path,
     ))
     assert first["status"] == "delivered"
     assert first["work_order_verification"]["status"] == "cannot_verify"
+    custody._CUSTODY.clear()
     second = json.loads(delegate._delegate_answer(
         ctx, entry.run_id, "interaction-retry",
         [{"question_id": "q1", "free_text": "range"}], response,
     ))
     assert second["status"] == "already_resolved"
     assert next(append_results, None) is None
+
+
+def test_already_resolved_without_prior_delivery_keeps_source_unverified(tmp_path, monkeypatch):
+    import ouroboros.tools.delegate as delegate
+    from ouroboros.gateways import claudexor as gateway_module
+
+    ctx, request, full_text, _prompt = _fixture(tmp_path)
+    entry = _started_entry(tmp_path, request, request["complete_sha256"])
+    midpoint = len(full_text) // 2
+    response = _source_response(request, full_text[:midpoint], 0, midpoint)
+    calls = []
+
+    class Gateway:
+        def handshake(self, **_kwargs):
+            return {}
+
+        def answer_interaction(self, _run_id, _interaction_id, _answers):
+            calls.append(True)
+            return {"accepted": False, "status": "already_resolved"}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(gateway_module, "ClaudexorGateway", lambda: Gateway())
+    out = json.loads(delegate._delegate_answer(
+        ctx, entry.run_id, "interaction-timeout",
+        [{"question_id": "q1", "free_text": "range"}], response,
+    ))
+    assert calls == [True]
+    assert out["status"] == "already_resolved"
+    assert out["work_order_verification"]["status"] == "cannot_verify"
 
 
 def test_invalid_source_answer_never_posts_to_engine(tmp_path, monkeypatch):

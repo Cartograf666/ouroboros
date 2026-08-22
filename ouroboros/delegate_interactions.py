@@ -541,9 +541,23 @@ def _delegate_answer(
                                             seconds_left=_left())
         status = str(body.get("status") or "")
         source_receipt = None
-        if status in ("delivered", "already_resolved") and verified_source is not None:
+        source_delivery_proven = status == "delivered"
+        if status == "already_resolved" and verified_source is not None:
+            from ouroboros.delegate_source_coverage import source_delivery_confirmed
+
+            source_delivery_proven = source_delivery_confirmed(
+                entry, iid, verified_source,
+            )
+        if source_delivery_proven and verified_source is not None:
             from ouroboros import delegate_custody as custody
 
+            if status == "delivered":
+                from ouroboros.delegate_source_coverage import record_source_delivery_confirmed
+
+                record_source_delivery_confirmed(
+                    custody.custody_root(ctx), entry,
+                    interaction_id=iid, verified_source=verified_source,
+                )
             source_landed = custody.record_source_range_verified(
                 custody.custody_root(ctx), entry,
                 start_char=verified_source["start_char"],
@@ -561,6 +575,12 @@ def _delegate_answer(
                     "can_authorize": False,
                 }
             )
+        elif verified_source is not None:
+            source_receipt = {
+                "status": "cannot_verify",
+                "reason": "source_delivery_unconfirmed",
+                "can_authorize": False,
+            }
         if status in ("delivered", "already_resolved"):
             # F6 (gemini #2): the reported-question memo is stale the moment the
             # engine resolves an interaction — pop it so the NEXT wait re-reports

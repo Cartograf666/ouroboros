@@ -86,6 +86,7 @@ PATCH_APPLY_RESOLVED = "delegate_run_patch_apply_resolved"
 # verified source ranges. These append-only receipts survive worker restart and
 # are merged by the same custody replay that owns every other run fact.
 SOURCE_RANGE_VERIFIED = "delegate_run_work_order_source_range_verified"
+SOURCE_RANGE_DELIVERY_CONFIRMED = "delegate_run_work_order_source_delivery_confirmed"
 
 # Cheap prefilter: every custody row's type starts with this, so a multi-hundred-MB
 # event log is scanned without JSON-parsing the 99.9% of lines that are not ours.
@@ -199,10 +200,8 @@ _CUSTODY: Dict[str, RunCustody] = {}
 
 # -- durable record ------------------------------------------------------------
 
-
 def event_log_path(drive_root: Any) -> pathlib.Path:
     return pathlib.Path(drive_root) / "logs" / "events.jsonl"
-
 
 def custody_root(ctx: Any) -> pathlib.Path:
     """The drive whose event log is the custody authority for this context.
@@ -213,7 +212,6 @@ def custody_root(ctx: Any) -> pathlib.Path:
     from ouroboros.tool_access import canonical_data_root
 
     return canonical_data_root(ctx)
-
 
 def emit(drive_root: Any, kind: str, payload: Dict[str, Any]) -> bool:
     """Append one custody row and REPORT whether it landed. Never raises.
@@ -232,7 +230,6 @@ def emit(drive_root: Any, kind: str, payload: Dict[str, Any]) -> bool:
         log.warning("delegate custody row was rejected by the event log (%s)", kind)
     return written
 
-
 def daemon_says_absent(exc: Any) -> bool:
     """True when the daemon ANSWERED that the named resource does not exist.
 
@@ -246,7 +243,6 @@ def daemon_says_absent(exc: Any) -> bool:
     nothing about whether the resource is there.
     """
     return int(getattr(exc, "status_code", 0) or 0) == 404
-
 
 def custody_log_unreadable(drive_root: Any) -> bool:
     """Whether the custody event log EXISTS but cannot be opened (GR6-4).
@@ -268,7 +264,6 @@ def custody_log_unreadable(drive_root: Any) -> bool:
     except OSError:
         return True
     return False
-
 
 def _iter_rows(path: pathlib.Path, tail_bytes: Optional[int] = None) -> Iterator[Dict[str, Any]]:
     try:
@@ -319,12 +314,13 @@ _STARTED_FIRST_WINS_FACTS: Tuple[str, ...] = (
     "authority_fingerprint", "work_order_source_request")
 
 from ouroboros.delegate_source_coverage import (
+    apply_source_delivery_confirmation,
     _merge_verified_source_range,
+    merge_source_delivery_confirmations,
     _source_range_receipt_valid,
     record_source_range_verified,
     work_order_source_verification,
 )
-
 
 def _merge_started_into(entry: RunCustody, previous: RunCustody) -> None:
     """Project a duplicate STARTED fact set onto an existing run — the ONE
@@ -347,6 +343,7 @@ def _merge_started_into(entry: RunCustody, previous: RunCustody) -> None:
         entry.work_order_source_request = dict(previous.work_order_source_request)
     for start, end in previous.verified_source_ranges:
         _merge_verified_source_range(entry, start, end)
+    merge_source_delivery_confirmations(entry, previous)
     if previous.access:
         entry.access, entry.mode = previous.access, previous.mode
         entry.isolation, entry.delegated = previous.isolation, previous.delegated
@@ -372,6 +369,7 @@ def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
             **{attr: str(row.get(key) or "") for attr, key in _STARTED_STR_FIELDS},
         )
         previous = state.get(run_id)
+        setattr(entry, "_source_delivery_confirmations", [])
         if previous is not None:
             _merge_started_into(entry, previous)
         state[run_id] = entry
@@ -428,6 +426,8 @@ def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
             text_chars=row.get("text_chars"),
         ):
             _merge_verified_source_range(custody, row.get("start_char"), row.get("end_char"))
+    elif kind == SOURCE_RANGE_DELIVERY_CONFIRMED:
+        apply_source_delivery_confirmation(custody, row)
     elif kind == PATCH_DISPOSED:
         disposition = str(row.get("disposition") or "")
         if disposition:
@@ -456,7 +456,6 @@ def replay(drive_root: Any,
     for row in rows if rows is not None else _iter_rows(event_log_path(drive_root)):
         _apply(state, row)
     return state
-
 
 def lookup(drive_root: Any, task_id: str, run_id: str) -> Tuple[str, Optional[RunCustody]]:
     """Answer OWNED / FOREIGN / UNKNOWN for ``run_id`` as seen by ``task_id``."""
@@ -1555,6 +1554,7 @@ __all__ = [
     "FOREIGN",
     "OWNED",
     "RunCustody",
+    "SOURCE_RANGE_DELIVERY_CONFIRMED",
     "TERMINAL_STATES",
     "UNKNOWN",
     "cancel_and_verify",

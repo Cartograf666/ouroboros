@@ -1126,7 +1126,9 @@ Before every commit, verify the following:
   intervals are part of durable delegate custody and replay. `delegate_answer`
   accepts a typed `source_response`; the host re-renders the canonical complete
   brief and compares the selector, digest, bounds, and exact bytes before recording
-  an interval. Until the union covers the whole brief, terminal delivery carries
+  an interval. If the engine answers `already_resolved`, the host records an interval
+  only when a durable prior delivery receipt binds that same interaction and exact
+  source selector; timeout or another resolution remains incomplete. Until the union covers the whole brief, terminal delivery carries
   `work_order_verification.status=cannot_verify`, and `integrate_delegated_patch`
   may reject the captured result but may not apply it.
 - `delegate_wait` is an event-only model sleep. Renew bounded transport windows in

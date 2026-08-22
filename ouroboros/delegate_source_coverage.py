@@ -113,6 +113,73 @@ def record_source_range_verified(
     return landed
 
 
+def _source_delivery_record(interaction_id: str, source: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "interaction_id": str(interaction_id or ""),
+        "complete_sha256": str(source.get("complete_sha256") or ""),
+        "source": source.get("source") or {},
+        "start_char": _strict_int(source.get("start_char")),
+        "end_char": _strict_int(source.get("end_char")),
+        "text_sha256": str(source.get("text_sha256") or ""),
+        "text_chars": _strict_int(source.get("text_chars")),
+    }
+
+
+def record_source_delivery_confirmed(
+    drive_root: Any, custody: Any, *, interaction_id: str,
+    verified_source: Mapping[str, Any],
+) -> bool:
+    """Persist positive delivery evidence before a source receipt is retried."""
+    from ouroboros import delegate_custody as custody_module
+
+    record = _source_delivery_record(interaction_id, verified_source)
+    if not record["interaction_id"] or not _source_range_receipt_valid(
+            custody, start_char=record["start_char"], end_char=record["end_char"],
+            complete_sha256=record["complete_sha256"], source=record["source"],
+            text_sha256=record["text_sha256"], text_chars=record["text_chars"]):
+        return False
+    landed = custody_module.emit(
+        drive_root, custody_module.SOURCE_RANGE_DELIVERY_CONFIRMED,
+        {"run_id": custody.run_id, "task_id": custody.task_id, **record},
+    )
+    if landed:
+        confirmations = getattr(custody, "_source_delivery_confirmations", [])
+        if record not in confirmations:
+            confirmations.append(record)
+        custody._source_delivery_confirmations = confirmations
+    return landed
+
+
+def source_delivery_confirmed(
+    custody: Any, interaction_id: str, verified_source: Mapping[str, Any],
+) -> bool:
+    """True only for a durable confirmation of this exact interaction and bytes."""
+    expected = {
+        **_source_delivery_record(interaction_id, verified_source),
+    }
+    return expected in getattr(custody, "_source_delivery_confirmations", [])
+
+
+def merge_source_delivery_confirmations(entry: Any, previous: Any) -> None:
+    confirmations = list(getattr(entry, "_source_delivery_confirmations", []) or [])
+    for record in getattr(previous, "_source_delivery_confirmations", []) or []:
+        if record not in confirmations:
+            confirmations.append(dict(record))
+    entry._source_delivery_confirmations = confirmations
+
+
+def apply_source_delivery_confirmation(entry: Any, row: Mapping[str, Any]) -> None:
+    record = _source_delivery_record(str(row.get("interaction_id") or ""), row)
+    if record["interaction_id"] and _source_range_receipt_valid(
+            entry, start_char=record["start_char"], end_char=record["end_char"],
+            complete_sha256=record["complete_sha256"], source=record["source"],
+            text_sha256=record["text_sha256"], text_chars=record["text_chars"]):
+        confirmations = getattr(entry, "_source_delivery_confirmations", [])
+        if record not in confirmations:
+            confirmations.append(record)
+        entry._source_delivery_confirmations = confirmations
+
+
 def _source_range_receipt_valid(
     custody: Any, *, start_char: Any, end_char: Any, complete_sha256: Any,
     source: Any, text_sha256: Any, text_chars: Any,
@@ -199,6 +266,10 @@ __all__ = [
     "prepare_work_order_start_binding",
     "record_started_custody",
     "record_source_range_verified",
+    "record_source_delivery_confirmed",
+    "source_delivery_confirmed",
+    "merge_source_delivery_confirmations",
+    "apply_source_delivery_confirmation",
     "source_apply_refusal",
     "work_order_source_verification",
 ]
