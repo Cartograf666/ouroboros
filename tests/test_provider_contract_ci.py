@@ -382,7 +382,7 @@ def test_malformed_native_arguments_fail_closed_with_bounded_evidence():
                     "type": "function",
                     "function": {"name": CANARY_TOOL_NAME, "arguments": raw},
                 }],
-            }, _fake_usage(canary, self.sends)
+            }, {**_fake_usage(canary, self.sends), "provider_error": {"code": "insufficient_quota"}}
 
     client = MalformedNativeClient()
     with pytest.raises(AssertionError) as caught:
@@ -396,6 +396,7 @@ def test_malformed_native_arguments_fail_closed_with_bounded_evidence():
     assert evidence["arguments_bytes"] == len(("{\"prompt\":\"" + secret).encode())
     assert len(evidence["arguments_sha256"]) == 64
     assert secret not in str(caught.value)
+    assert skip_on_provider_environmental_error(canary.canary_id, caught.value) is None
     assert client.sends == 1
 
 

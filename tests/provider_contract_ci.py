@@ -216,6 +216,8 @@ def skip_on_provider_environmental_error(
     exc: BaseException,
 ) -> None:
     """Skip only classifier-approved typed inconclusive provider outcomes."""
+    if isinstance(exc, AssertionError):
+        return
     import sys
 
     classification = classify_provider_failure(provider_id, exc)
