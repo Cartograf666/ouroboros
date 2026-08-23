@@ -867,7 +867,12 @@ def test_normalize_remote_response_preserves_reasoning_and_response_id():
                     "reasoning_details": [{"type": "reasoning.text", "text": "look up the file"}],
                 },
             }],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "response_finish_reason": "provider-fake",
+                "response_provider": "provider-secret",
+            },
         },
         target,
         skip_cost_fetch=True,
@@ -877,6 +882,8 @@ def test_normalize_remote_response_preserves_reasoning_and_response_id():
     assert message["reasoning"] == "look up the file"
     assert message["reasoning_details"] == [{"type": "reasoning.text", "text": "look up the file"}]
     assert usage["provider"] == "openrouter"
+    assert "response_finish_reason" not in usage
+    assert "response_provider" not in usage
 
 
 def test_build_anthropic_messages_rejects_tool_result_without_tool_call_id(monkeypatch):

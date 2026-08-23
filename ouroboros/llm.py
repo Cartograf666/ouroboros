@@ -48,7 +48,7 @@ from ouroboros.usage_accounting import (
     last_physical_attempt_capture,
     usage_scope,
 )
-from ouroboros.utils import in_worker_process
+from ouroboros.utils import in_worker_process, sanitize_tool_result_for_log
 
 log = logging.getLogger(__name__)
 
@@ -59,10 +59,29 @@ _VALID_CACHE_TTLS = frozenset({"5m", "1h"})
 
 # Only explicit wire tiers have a knowable horizon; bare "default" does not.
 _CACHE_TTL_SECONDS = {"5m": 300, "1h": 3600}
+
 from ouroboros.context_budget import (
     CONTEXT_OVERFLOW_CODES,
     context_overflow_message,
 )
+
+# Response-only labels are diagnostic facts, not canonical assistant fields. Keep
+# provider-supplied values bounded and printable before they enter usage custody.
+_RESPONSE_METADATA_LABEL_MAX_CHARS = 160
+
+
+def _bounded_response_metadata_label(value: Any) -> Optional[str]:
+    """Return a small printable response label, or omit an unsafe/unknown value."""
+    if not isinstance(value, str):
+        return None
+    label = value.strip()
+    if not label or len(label) > _RESPONSE_METADATA_LABEL_MAX_CHARS:
+        return None
+    if not label.isprintable():
+        return None
+    if sanitize_tool_result_for_log(label) != label:
+        return None
+    return label
 
 
 def _structured_error_values(payload: Any) -> Set[str]:
@@ -3707,6 +3726,11 @@ class LLMClient:
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Normalize an OpenAI-compatible response; skip_cost_fetch keeps no_proxy pure."""
         usage = resp_dict.get("usage") or {}
+        if isinstance(usage, dict):
+            # These keys are host-owned projections of designated outer fields;
+            # provider usage extensions must not spoof their provenance.
+            usage.pop("response_finish_reason", None)
+            usage.pop("response_provider", None)
         # An HTTP-200 that carried a provider body-error (OpenRouter passes
         # 429/5xx through the body) reaches here only when a same-model reroute
         # was unavailable or also errored. Surface it as a typed marker so the
@@ -3722,7 +3746,22 @@ class LLMClient:
                 else ("provider_transient" if self._is_transient_body_error(_body_err) else "provider_error"),
             }
         choices = resp_dict.get("choices") or [{}]
-        msg = dict((choices[0] if choices else {}).get("message") or {})
+        first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+        msg = dict(first_choice.get("message") or {})
+        # ``finish_reason`` belongs to the response choice, not the assistant
+        # message. Preserve it as an observational usage fact so diagnostics can
+        # distinguish a provider-selected stop/length from an absent marker. Do
+        # not put it into canonical history: strict providers reject response-only
+        # fields when that history is replayed.
+        if "finish_reason" in first_choice:
+            usage["response_finish_reason"] = _bounded_response_metadata_label(
+                first_choice.get("finish_reason"),
+            )
+        response_provider = _bounded_response_metadata_label(resp_dict.get("provider"))
+        if response_provider is not None:
+            # This optional upstream serving label never replaces the accounting
+            # provider assigned below.
+            usage["response_provider"] = response_provider
         if resp_dict.get("id") and "response_id" not in msg:
             msg["response_id"] = resp_dict["id"]
 

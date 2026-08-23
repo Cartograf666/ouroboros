@@ -1018,6 +1018,22 @@ Direct Anthropic tool turns retain a private route-bound receipt containing the 
 
 Retry budgets are failure-class specific. Empty/incomplete responses and transient 429/5xx/overload failures may retry the same model with deadline-bounded backoff; auth, quota, permanent bad requests, and already-confirmed oversize fail fast. Same-route request-wire recovery stays under the existing physical-attempt authority, and exhausted compatibility returns to the already configured model fallback chain rather than becoming a second router. `LLMClient` keeps leading system messages authoritative and demotes later notices to visibly marked user notices while preserving assistant-tool-result adjacency.
 
+OpenAI-compatible response choices keep their outer `finish_reason` as the
+bounded per-call usage fact `response_finish_reason` (and may retain a bounded
+upstream `response_provider` label when the response supplies one). These are
+observational fields only: their reserved usage keys are host-owned and any
+provider-supplied values are discarded unless the designated outer response
+field supplies them; they never enter canonical assistant history and do not
+change the empty-response classifier or retry policy. The trusted provider
+canary accepts a schema-valid native tool call even when the assistant also
+returns text, recording only its length and hash as warning telemetry; the
+trusted integration consumer emits that bounded record through the test
+warning stream so it remains visible on a passing CI run; that list is
+host-owned and provider extension fields are discarded before emission. A
+malformed native argument, invalid schema, or missing call remains a red
+contract failure; no prose parser, salvage, provider hop, or unbounded retry is
+introduced, and diagnostics omit raw provider content and reasoning payloads.
+
 Prompt caching is stable-first. Governance and task-stable contracts precede mutable evidence; review builders disclose the stable/dynamic boundary and keep untrusted payloads outside the governance cache block. Provider-specific cache hints are sent only where supported and receive one exact retry without the rejected hint. Rejection evidence is durable and route-specific. Cache identity must not weaken exact review bindings or create a second review authority.
 
 Gateway response-cache recovery is narrower and reactive. The first call remains
@@ -2556,7 +2572,11 @@ inconclusive, while contract/auth/model/tool/reasoning 4xx are red. One logical 
 turn may make one same-route second physical send only when the normalized response is
 runtime-classified semantic-empty; the second send bypasses response caches where the
 route supports that control. A repeated empty response, a permanent body/context error,
-or any non-empty malformed/schema response remains red.
+or any non-empty malformed/schema response remains red. The outer choice
+termination marker is retained in host-owned usage as `response_finish_reason`
+for bounded diagnostics only. A valid native call may carry assistant text, which is a
+bounded warning rather than a failure; malformed raw arguments are reported by
+type/position and argument hash without copying the provider payload.
 
 Quick pull-request jobs are read-only, receive no provider secrets, and never use
 `pull_request_target`; there is no scheduled paid run. `release-preflight` depends on
