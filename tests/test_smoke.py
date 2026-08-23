@@ -621,12 +621,25 @@ def test_no_module_defines_the_same_top_level_name_twice():
     import ast
     import collections
     import pathlib
+    import subprocess
 
     root = pathlib.Path(__file__).resolve().parents[1]
+    # ASK GIT what this repo authors, instead of walking the filesystem behind an
+    # exclusion list. The list was already wrong twice over: a packaged install
+    # keeps a 1.1 GB bundled CPython at `python-standalone/`, and `.claude/worktrees/`
+    # holds whole extra checkouts of this same repo — so the sweep reported
+    # `enum.py: Enum defined 2x` from the standard library and every finding
+    # twice from the worktree copy. Both are gitignored, and so is the next one
+    # nobody has added yet; a list of exclusions has to keep growing, while the
+    # tracked set is exactly the question this test is asking (BIBLE P2).
+    tracked = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "-z", "*.py"],
+        capture_output=True, text=True, check=True,
+    ).stdout.split("\0")
     offenders = []
-    for path in sorted(root.rglob("*.py")):
-        parts = set(path.parts)
-        if parts & {".git", "node_modules", "venv", ".venv", "build", "dist"}:
+    for rel in sorted(name for name in tracked if name):
+        path = root / rel
+        if not path.is_file():
             continue
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"))
