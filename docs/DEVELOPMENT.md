@@ -300,6 +300,19 @@ complete registry; trusted integration CI sends that same registry in one bounde
 tool canary per supported provider family/API surface, while pull-request CI
 remains secretless.
 
+The trusted canary keeps the response choice's outer `finish_reason` as the
+bounded per-call usage fact `response_finish_reason`; it is observational and
+the reserved usage keys are host-owned, so provider-supplied extensions are
+discarded unless the designated outer response supplies the value. It must not
+be copied into canonical assistant history or used to change retry
+classification. A schema-valid native call remains usable when a provider also
+returns assistant text, with only a length/hash warning emitted on the trusted
+integration test's warning stream; the warning list is host-owned and provider
+extension fields are discarded before emission. Malformed native
+arguments and invalid schemas stay red, with diagnostics limited to structural
+facts, hashes, and parse position. Do not add a prose parser, provider hop, or
+unbounded retry to make that contract green.
+
 When adding or changing a provider, update one coherent route contract:
 
 1. credential/readiness detection and exact model-id migration;

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import time
@@ -286,62 +287,183 @@ def _named_tool_choice():
     return {"type": "function", "function": {"name": CANARY_TOOL_NAME}}
 
 
+_CANARY_DIAGNOSTIC_MAX_CHARS = 160
+_CANARY_DIAGNOSTIC_MAX_KEYS = 32
+
+
+def _bounded_diagnostic_label(value, limit=_CANARY_DIAGNOSTIC_MAX_CHARS):
+    if value is None or not isinstance(value, (str, int, float, bool)):
+        return None
+    try:
+        value = str(value).strip()
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not value or len(value) > limit or not value.isprintable():
+        return None
+    return value if sanitize_tool_result_for_log(value) == value else None
+
+
+def _safe_nonnegative_int(value, maximum=10**12):
+    try:
+        return max(0, min(int(value or 0), maximum))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _text_facts(value):
+    encoded = value.encode("utf-8", errors="replace")
+    return len(encoded), hashlib.sha256(encoded).hexdigest()
+
+
+def _canary_evidence(canary_or_model, message, usage, *, call=None, call_index=None, parse_error=None):
+    """Return bounded structural evidence; never copy provider payloads."""
+    canary_id = canary_or_model.canary_id if isinstance(canary_or_model, ProviderCanary) else ""
+    model = canary_or_model.model if isinstance(canary_or_model, ProviderCanary) else canary_or_model
+    message = message if isinstance(message, dict) else {}
+    usage = usage if isinstance(usage, dict) else {}
+    keys = []
+    message_keys_omitted = max(0, len(message) - _CANARY_DIAGNOSTIC_MAX_KEYS)
+    for index, key in enumerate(message):
+        if index >= _CANARY_DIAGNOSTIC_MAX_KEYS:
+            break
+        safe_key = _bounded_diagnostic_label(key)
+        if safe_key is None:
+            message_keys_omitted += 1
+            continue
+        keys.append(safe_key)
+    keys.sort()
+    message_finish = message.get("finish_reason") or message.get("stop_reason")
+    response_finish_present = "response_finish_reason" in usage
+    response_finish = usage.get("response_finish_reason") if response_finish_present else None
+    finish = message_finish if message_finish is not None else response_finish
+    evidence = {
+        "canary_id": _bounded_diagnostic_label(canary_id),
+        "model": _bounded_diagnostic_label(model),
+        "response_id": _bounded_diagnostic_label(message.get("response_id")),
+        "provider": _bounded_diagnostic_label(usage.get("provider")),
+        "resolved_model": _bounded_diagnostic_label(usage.get("resolved_model")),
+        "response_provider": _bounded_diagnostic_label(usage.get("response_provider")),
+        "finish_reason": _bounded_diagnostic_label(finish),
+        "response_finish_reason": _bounded_diagnostic_label(response_finish),
+        "stop_reason": _bounded_diagnostic_label(message.get("stop_reason")),
+        "message_keys": keys,
+        "message_keys_omitted": message_keys_omitted,
+        "prompt_tokens": _safe_nonnegative_int(usage.get("prompt_tokens")),
+        "completion_tokens": _safe_nonnegative_int(usage.get("completion_tokens")),
+        "ledger_attempts": len(usage.get("ledger_attempt_ids")) if isinstance(usage.get("ledger_attempt_ids"), list) else 0,
+    }
+    content = message.get("content")
+    if isinstance(content, str):
+        evidence["content_bytes"], evidence["content_sha256"] = _text_facts(content)
+    elif content is not None:
+        evidence["content_type"] = type(content).__name__
+    if call_index is not None:
+        evidence["call_index"] = _safe_nonnegative_int(call_index, 10**6)
+    if isinstance(call, dict):
+        function = call.get("function")
+        if isinstance(function, dict):
+            evidence["call_name"] = _bounded_diagnostic_label(function.get("name"))
+            raw_arguments = function.get("arguments")
+            if isinstance(raw_arguments, str):
+                evidence["arguments_bytes"], evidence["arguments_sha256"] = _text_facts(raw_arguments)
+            elif raw_arguments is not None:
+                evidence["arguments_type"] = type(raw_arguments).__name__
+        else:
+            evidence["function_type"] = type(function).__name__
+    if parse_error is not None:
+        evidence["parse_error"] = {"type": type(parse_error).__name__}
+        for field in ("pos", "lineno", "colno"):
+            value = getattr(parse_error, field, None)
+            if isinstance(value, int) and value >= 0:
+                evidence["parse_error"][field] = min(value, 10**12)
+    provider_error = usage.get("provider_error")
+    if isinstance(provider_error, dict):
+        evidence["provider_error"] = {
+            key: _bounded_diagnostic_label(provider_error.get(key))
+            for key in ("kind", "code", "type") if provider_error.get(key) is not None
+        }
+        if provider_error.get("message"):
+            raw_provider_message = str(provider_error["message"])
+            safe_provider_message = sanitize_tool_result_for_log(raw_provider_message)
+            evidence["provider_error_message_bytes"], evidence["provider_error_message_sha256"] = (
+                _text_facts(raw_provider_message)
+            )
+            if safe_provider_message != raw_provider_message:
+                evidence["provider_error_message"] = "***REDACTED***"
+    return evidence
+
+
+def _canary_failure_payload(canary_or_model, message, usage, violation, **kwargs):
+    evidence = _canary_evidence(canary_or_model, message, usage, **kwargs)
+    evidence["violation"] = violation
+    return {"provider_contract_violation": evidence}
+
+
+def _canary_failure(canary_or_model, message, usage, violation, **kwargs):
+    return AssertionError(_canary_failure_payload(
+        canary_or_model, message, usage, violation, **kwargs,
+    ))
+
+
 def assert_openai_canary_usage(usage, model):
-    assert isinstance(usage, dict), usage
-    assert usage.get("provider") == "openai", usage
-    assert usage.get("resolved_model") == normalize_model_identity(model), usage
-    assert int(usage.get("prompt_tokens") or 0) > 0, usage
-    assert int(usage.get("completion_tokens") or 0) > 0, usage
-    assert usage.get("reasoning_effort_clamped") is None, usage
+    def failure(code):
+        return _canary_failure_payload(model, None, usage, code)
+    assert isinstance(usage, dict), failure("usage_not_mapping")
+    assert usage.get("provider") == "openai", failure("unexpected_accounting_provider")
+    assert usage.get("resolved_model") == normalize_model_identity(model), failure("unexpected_accounting_model")
+    assert _safe_nonnegative_int(usage.get("prompt_tokens")) > 0, failure("missing_prompt_tokens")
+    assert _safe_nonnegative_int(usage.get("completion_tokens")) > 0, failure("missing_completion_tokens")
+    assert usage.get("reasoning_effort_clamped") is None, failure("reasoning_effort_clamped")
 
     disclosure = usage.get("request_wire")
-    assert isinstance(disclosure, dict), (
-        "Public direct-OpenAI request-wire disclosure is missing from usage; "
-        f"usage={usage}"
-    )
-    assert disclosure["requested_effort"] == "medium"
-    assert disclosure["applied_effort"] == "medium"
-    assert disclosure["requested_tool_dialect"] == "function"
-    assert disclosure["applied_tool_dialect"] == "openai_chat_custom"
-    assert disclosure["reason_code"] == "requested_wire_form"
-    assert disclosure["ladder_ordinal"] == 1
-    assert disclosure["task_local"] is False
+    assert isinstance(disclosure, dict), failure("missing_request_wire_disclosure")
+    for key, expected in (("requested_effort", "medium"), ("applied_effort", "medium"),
+                          ("requested_tool_dialect", "function"), ("applied_tool_dialect", "openai_chat_custom"),
+                          ("reason_code", "requested_wire_form"), ("ladder_ordinal", 1)):
+        assert disclosure.get(key) == expected, failure(f"request_wire_{key}")
+    assert disclosure.get("task_local") is False, failure("request_wire_task_local")
     actions = disclosure.get("applied_actions")
-    assert isinstance(actions, list)
+    assert isinstance(actions, list), failure("request_wire_actions_not_list")
     for applied in actions:
-        assert isinstance(applied, dict) and applied.get("source") != "task_local"
+        assert isinstance(applied, dict) and applied.get("source") != "task_local", failure(
+            "request_wire_task_local_action",
+        )
         action = applied.get("action")
-        assert isinstance(action, dict)
-        assert action.get("kind") != "replace_dialect"
-        assert not (action.get("kind") == "set_value" and action.get("field") == "effort")
+        assert isinstance(action, dict), failure("request_wire_action_not_mapping")
+        assert action.get("kind") != "replace_dialect", failure("request_wire_dialect_replaced")
+        assert not (
+            action.get("kind") == "set_value" and action.get("field") == "effort"
+        ), failure("request_wire_effort_changed")
         assert not set(action.get("fields") or ()).intersection({
             "reasoning_effort", "thinking", "output_config", "extra_body.reasoning",
-        })
-    assert disclosure["attempt_id"]
+        }), failure("request_wire_reasoning_changed")
+    assert disclosure.get("attempt_id"), failure("request_wire_attempt_missing")
     for key in (
         "source_profile_fingerprint",
         "accepted_profile_fingerprint",
         "candidate_sha256",
     ):
         value = str(disclosure.get(key) or "")
-        assert len(value) == 64 and not (
-            set(value.lower()) - set("0123456789abcdef")
+        assert len(value) == 64 and not set(value.lower()) - set("0123456789abcdef"), failure(
+            f"request_wire_{key}",
         )
     return disclosure
 
 
 def assert_canary_usage(usage, canary: ProviderCanary):
-    assert isinstance(usage, dict), usage
-    assert usage.get("provider") == canary.expected_provider, usage
-    assert usage.get("resolved_model") == normalize_model_identity(canary.model), usage
-    assert int(usage.get("prompt_tokens") or 0) > 0, usage
-    assert int(usage.get("completion_tokens") or 0) > 0, usage
+    def failure(code):
+        return _canary_failure_payload(canary, None, usage, code)
+    assert isinstance(usage, dict), failure("usage_not_mapping")
+    assert usage.get("provider") == canary.expected_provider, failure("unexpected_accounting_provider")
+    assert usage.get("resolved_model") == normalize_model_identity(canary.model), failure("unexpected_accounting_model")
+    assert _safe_nonnegative_int(usage.get("prompt_tokens")) > 0, failure("missing_prompt_tokens")
+    assert _safe_nonnegative_int(usage.get("completion_tokens")) > 0, failure("missing_completion_tokens")
     if canary.reasoning_effort == "medium":
-        assert usage.get("reasoning_effort_clamped") is None, usage
+        assert usage.get("reasoning_effort_clamped") is None, failure("reasoning_effort_clamped")
         disclosure = usage.get("request_wire")
-        assert isinstance(disclosure, dict), usage
-        assert disclosure.get("requested_effort") == "medium", disclosure
-        assert disclosure.get("applied_effort") == "medium", disclosure
+        assert isinstance(disclosure, dict), failure("missing_request_wire_disclosure")
+        assert disclosure.get("requested_effort") == "medium", failure("request_wire_requested_effort")
+        assert disclosure.get("applied_effort") == "medium", failure("request_wire_applied_effort")
     if canary.expected_provider == "openai":
         return assert_openai_canary_usage(usage, canary.model)
     return usage.get("request_wire")
@@ -356,32 +478,50 @@ def _semantic_empty_canary_message(message) -> bool:
 
 
 def _safe_empty_canary_diagnostic(canary: ProviderCanary, message, usage, attempts: int):
-    provider_error = usage.get("provider_error") if isinstance(usage, dict) else None
-    safe_provider_error = ""
-    if provider_error:
-        try:
-            raw_provider_error = json.dumps(
-                provider_error, ensure_ascii=False, sort_keys=True,
-            )
-        except (TypeError, ValueError):
-            raw_provider_error = str(provider_error)
-        safe_provider_error = sanitize_tool_result_for_log(
-            raw_provider_error,
-        )[:500]
-    return {
-        "canary_id": canary.canary_id,
-        "model": canary.model,
-        "attempts": attempts,
-        "message_keys": sorted(str(key) for key in message) if isinstance(message, dict) else [],
-        "finish_reason": message.get("finish_reason") if isinstance(message, dict) else None,
-        "stop_reason": message.get("stop_reason") if isinstance(message, dict) else None,
-        "provider": usage.get("provider") if isinstance(usage, dict) else None,
-        "resolved_model": usage.get("resolved_model") if isinstance(usage, dict) else None,
-        "prompt_tokens": int(usage.get("prompt_tokens") or 0) if isinstance(usage, dict) else 0,
-        "completion_tokens": int(usage.get("completion_tokens") or 0) if isinstance(usage, dict) else 0,
-        "provider_error": safe_provider_error,
-        "ledger_attempts": len(usage.get("ledger_attempt_ids") or []) if isinstance(usage, dict) else 0,
-    }
+    diagnostic = _canary_evidence(canary, message, usage)
+    diagnostic["attempts"] = _safe_nonnegative_int(attempts, 10**6)
+    return diagnostic
+
+
+def _record_canary_response_warnings(canary: ProviderCanary, message, usage):
+    """Record tolerated response-shape drift without copying provider text."""
+    if not isinstance(usage, dict):
+        return
+    # The usage mapping can contain provider-controlled extension fields. Never
+    # preserve a provider-supplied warning list for the host-owned CI emitter.
+    warnings = []
+    usage["canary_warnings"] = warnings
+    if not isinstance(message, dict):
+        return
+    calls = message.get("tool_calls")
+    content = message.get("content")
+    if not isinstance(calls, list) or not calls or not isinstance(content, str) or not content.strip():
+        return
+    warning = _canary_evidence(canary, message, usage)
+    warning["code"] = "native_tool_call_with_assistant_text"
+    if len(warnings) < 4:
+        warnings.append(warning)
+
+
+def _emit_canary_response_warnings(usage):
+    """Expose bounded mixed-content warnings on the trusted CI test surface."""
+    import warnings
+
+    if not isinstance(usage, dict):
+        return
+    entries = usage.get("canary_warnings")
+    if not isinstance(entries, list):
+        return
+    for warning in entries[:4]:
+        if not isinstance(warning, dict):
+            continue
+        warnings.warn(
+            "provider_canary_warning " + json.dumps(
+                warning, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ),
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def _chat_canary_turn(client, *, canary: ProviderCanary, chat_kwargs):
@@ -414,32 +554,93 @@ def _chat_canary_turn(client, *, canary: ProviderCanary, chat_kwargs):
     })
 
 
-def assert_normalized_canary_call(message, tools, required_arguments):
+def assert_normalized_canary_call(
+    message,
+    tools,
+    required_arguments,
+    *,
+    canary=None,
+    usage=None,
+):
     from jsonschema import validators
 
     calls = message.get("tool_calls") if isinstance(message, dict) else None
-    assert isinstance(calls, list) and calls, message
+    if not isinstance(calls, list) or not calls:
+        raise _canary_failure(canary or "", message, usage, "missing_tool_calls")
     schema = _delegate_start_tool(tools)["function"]["parameters"]
     validator_class = validators.validator_for(schema)
     validator_class.check_schema(schema)
     seen_ids = set()
-    for call in calls:
-        assert isinstance(call, dict), call
-        assert call.get("type") == "function", call
+    for call_index, call in enumerate(calls):
+        if not isinstance(call, dict):
+            raise _canary_failure(
+                canary or "", message, usage, "tool_call_not_mapping",
+                call_index=call_index,
+            )
+        if call.get("type") != "function":
+            raise _canary_failure(
+                canary or "", message, usage, "tool_call_type",
+                call=call, call_index=call_index,
+            )
         call_id = call.get("id")
-        assert isinstance(call_id, str) and call_id and call_id == call_id.strip(), call
-        assert call_id not in seen_ids, calls
+        if not isinstance(call_id, str) or not call_id or call_id != call_id.strip():
+            raise _canary_failure(
+                canary or "", message, usage, "tool_call_id",
+                call=call, call_index=call_index,
+            )
+        if call_id in seen_ids:
+            raise _canary_failure(
+                canary or "", message, usage, "duplicate_tool_call_id",
+                call=call, call_index=call_index,
+            )
         seen_ids.add(call_id)
         function = call.get("function")
-        assert isinstance(function, dict), call
-        assert function.get("name") == CANARY_TOOL_NAME, call
+        if not isinstance(function, dict):
+            raise _canary_failure(
+                canary or "", message, usage, "function_not_mapping",
+                call=call, call_index=call_index,
+            )
+        if function.get("name") != CANARY_TOOL_NAME:
+            raise _canary_failure(
+                canary or "", message, usage, "unexpected_tool_name",
+                call=call, call_index=call_index,
+            )
         raw_arguments = function.get("arguments")
-        assert isinstance(raw_arguments, str), call
-        arguments = json.loads(raw_arguments)
-        assert not list(validator_class(schema).iter_errors(arguments))
-        assert set(arguments) <= set((schema.get("properties") or {}).keys()), arguments
+        if not isinstance(raw_arguments, str):
+            raise _canary_failure(
+                canary or "", message, usage, "arguments_not_string",
+                call=call, call_index=call_index,
+            )
+        try:
+            arguments = json.loads(raw_arguments)
+        except (TypeError, ValueError) as error:
+            raise _canary_failure(
+                canary or "", message, usage, "malformed_arguments_json",
+                call=call, call_index=call_index, parse_error=error,
+            ) from error
+        schema_errors = list(validator_class(schema).iter_errors(arguments))
+        if schema_errors:
+            raise _canary_failure(
+                canary or "", message, usage, "arguments_schema",
+                call=call, call_index=call_index,
+            )
+        if not isinstance(arguments, dict):
+            raise _canary_failure(
+                canary or "", message, usage, "arguments_not_object",
+                call=call, call_index=call_index,
+            )
+        unknown_keys = set(arguments) - set((schema.get("properties") or {}).keys())
+        if unknown_keys:
+            raise _canary_failure(
+                canary or "", message, usage, "arguments_unknown_keys",
+                call=call, call_index=call_index,
+            )
         for key, expected in required_arguments.items():
-            assert arguments.get(key) == expected, arguments
+            if arguments.get(key) != expected:
+                raise _canary_failure(
+                    canary or "", message, usage, f"arguments_{key}",
+                    call=call, call_index=call_index,
+                )
     return calls
 
 
@@ -486,10 +687,18 @@ def run_provider_contract_canary(
         },
     )
     # This is a provider schema-admission canary, not a duplicate of the
-    # runtime selector gate.  The provider must preserve the nonce-bearing
-    # prompt and return only declared, schema-valid fields; subagent_id versus
-    # retry_of is enforced by the existing typed runtime refusal tests.
-    calls = assert_normalized_canary_call(message, tools, required_arguments)
+    # runtime selector gate. The provider must preserve the nonce-bearing prompt
+    # and return declared, schema-valid native calls. Valid assistant text beside
+    # those calls is tolerated and recorded as bounded warning telemetry;
+    # subagent_id versus retry_of is enforced by the existing typed runtime tests.
+    calls = assert_normalized_canary_call(
+        message,
+        tools,
+        required_arguments,
+        canary=canary,
+        usage=usage,
+    )
+    _record_canary_response_warnings(canary, message, usage)
     first_disclosure = assert_canary_usage(usage, canary)
     if not canary.continue_to_final:
         return message, usage, None, None
@@ -526,9 +735,27 @@ def run_provider_contract_canary(
     )
     final_disclosure = assert_canary_usage(final_usage, canary)
     if isinstance(first_disclosure, dict) and isinstance(final_disclosure, dict):
-        assert final_disclosure.get("candidate_sha256") != first_disclosure.get(
+        if final_disclosure.get("candidate_sha256") == first_disclosure.get(
             "candidate_sha256"
+        ):
+            raise _canary_failure(
+                canary,
+                final_message,
+                final_usage,
+                "continuation_candidate_binding",
+            )
+    if not isinstance(final_message, dict) or final_message.get("tool_calls"):
+        raise _canary_failure(
+            canary,
+            final_message,
+            final_usage,
+            "unexpected_continuation_tool_calls",
         )
-    assert not final_message.get("tool_calls"), final_message
-    assert str(final_message.get("content") or "").strip() == final_marker, final_message
+    if str(final_message.get("content") or "").strip() != final_marker:
+        raise _canary_failure(
+            canary,
+            final_message,
+            final_usage,
+            "continuation_marker",
+        )
     return message, usage, final_message, final_usage

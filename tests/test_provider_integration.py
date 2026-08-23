@@ -14,6 +14,7 @@ import uuid
 import pytest
 
 from tests.provider_contract_ci import (
+    _emit_canary_response_warnings,
     full_registry_canary_tools,
     provider_canary_matrix,
     require_provider_canary_credential,
@@ -47,12 +48,13 @@ def test_full_registry_provider_contract(canary, shipped_builtin_tools):
     """Exercise one bounded public-chat canary per physical provider surface."""
     require_provider_canary_credential(canary)
     try:
-        run_provider_contract_canary(
+        _message, usage, _final_message, _final_usage = run_provider_contract_canary(
             _get_llm_client(),
             canary=canary,
             tools=shipped_builtin_tools,
             nonce=uuid.uuid4().hex,
         )
+        _emit_canary_response_warnings(usage)
     except Exception as exc:  # noqa: BLE001
         skip_on_provider_environmental_error(canary.canary_id, exc)
         raise

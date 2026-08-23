@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import io
 import json
 
 import pytest
@@ -24,6 +26,7 @@ from tests.provider_contract_ci import (
     ProviderCanary,
     ProviderFailureClassification,
     ProviderFailureKind,
+    _emit_canary_response_warnings,
     assert_normalized_canary_call,
     assert_openai_canary_usage,
     classify_provider_failure,
@@ -329,6 +332,197 @@ def _canonical_canary_call(call_id, arguments):
             "arguments": json.dumps(arguments, sort_keys=True),
         },
     }
+
+
+@pytest.mark.parametrize("finish_reason", ["stop", "length", None])
+def test_remote_normalizer_keeps_outer_finish_reason_as_usage_fact(finish_reason):
+    from ouroboros.llm import LLMClient
+
+    client = LLMClient(api_key="test")
+    message, usage = client._normalize_remote_response(
+        {
+            "id": "response-finish-fact",
+            "provider": "openrouter/upstream-a",
+            "choices": [{
+                "finish_reason": finish_reason,
+                "message": {"role": "assistant", "content": "ok"},
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+        },
+        {
+            "provider": "openrouter",
+            "usage_model": "x-ai/grok-4.6",
+            "supports_openrouter_extensions": False,
+        },
+        skip_cost_fetch=True,
+    )
+
+    assert usage["response_finish_reason"] == finish_reason
+    assert usage["response_provider"] == "openrouter/upstream-a"
+    assert message["response_id"] == "response-finish-fact"
+    assert "finish_reason" not in message
+
+
+def test_malformed_native_arguments_fail_closed_with_bounded_evidence():
+    canary = next(row for row in provider_canary_matrix() if row.canary_id == "openrouter_grok")
+    nonce = "malformed-native"
+    secret = "sk-or-v1-" + "A" * 40
+
+    class MalformedNativeClient:
+        def __init__(self):
+            self.sends = 0
+
+        def chat(self, **kwargs):
+            self.sends += 1
+            raw = '{"prompt":"' + secret
+            return {
+                "content": "provider explanation",
+                "tool_calls": [{
+                    "id": "bad-native",
+                    "type": "function",
+                    "function": {"name": CANARY_TOOL_NAME, "arguments": raw},
+                }],
+            }, _fake_usage(canary, self.sends)
+
+    client = MalformedNativeClient()
+    with pytest.raises(AssertionError) as caught:
+        run_provider_contract_canary(
+            client, canary=canary, tools=full_registry_canary_tools(), nonce=nonce,
+        )
+
+    evidence = caught.value.args[0]["provider_contract_violation"]
+    assert evidence["violation"] == "malformed_arguments_json"
+    assert evidence["parse_error"]["type"] == "JSONDecodeError"
+    assert evidence["arguments_bytes"] == len(("{\"prompt\":\"" + secret).encode())
+    assert len(evidence["arguments_sha256"]) == 64
+    assert secret not in str(caught.value)
+    assert client.sends == 1
+
+
+def test_native_call_with_text_is_tolerated_and_warns_without_copying_text():
+    canary = next(row for row in provider_canary_matrix() if row.canary_id == "openrouter_grok")
+    nonce = "mixed-native-text"
+    expected = delegate_start_canary_arguments(nonce)
+    prose = "provider explanation " + ("P" * 5000)
+
+    class MixedClient:
+        def chat(self, **kwargs):
+            return {
+                "content": prose,
+                "tool_calls": [_canonical_canary_call("mixed-native", expected)],
+            }, _fake_usage(canary, 1)
+
+    _message, usage, _final, _final_usage = run_provider_contract_canary(
+        MixedClient(), canary=canary, tools=full_registry_canary_tools(), nonce=nonce,
+    )
+    warning = usage["canary_warnings"][0]
+    assert warning["code"] == "native_tool_call_with_assistant_text"
+    assert warning["content_bytes"] == len(prose.encode())
+    assert warning["content_sha256"]
+    assert prose not in str(warning)
+
+
+def test_empty_canary_diagnostic_uses_usage_finish_reason():
+    import tests.provider_contract_ci as contract
+
+    canary = next(row for row in provider_canary_matrix() if row.canary_id == "openrouter_grok")
+    diagnostic = contract._safe_empty_canary_diagnostic(
+        canary,
+        {"content": "", "tool_calls": []},
+        {**_fake_usage(canary, 1), "response_finish_reason": "length"},
+        1,
+    )
+    assert diagnostic["finish_reason"] == "length"
+    assert diagnostic["response_finish_reason"] == "length"
+    distinct = contract._safe_empty_canary_diagnostic(
+        canary,
+        {"content": "", "tool_calls": [], "finish_reason": "message-stop"},
+        {**_fake_usage(canary, 1), "response_finish_reason": "outer-length"},
+        1,
+    )
+    assert (distinct["finish_reason"], distinct["response_finish_reason"]) == ("message-stop", "outer-length")
+
+
+def test_canary_diagnostics_redact_labels_and_omit_provider_prose():
+    import tests.provider_contract_ci as contract
+
+    canary = next(row for row in provider_canary_matrix() if row.canary_id == "openrouter_grok")
+    secret = "sk-or-v1-" + "B" * 40
+    diagnostic = contract._safe_empty_canary_diagnostic(
+        canary,
+        {
+            "content": "",
+            "tool_calls": [],
+            secret: "provider-controlled key name",
+            "safe_extra": "provider-controlled but safe key",
+        },
+        {
+            **_fake_usage(canary, 1),
+            "response_provider": secret,
+            "provider_error": {
+                "kind": "provider_error",
+                "code": "400",
+                "message": "ordinary provider detail " + ("Q" * 500),
+            },
+        },
+        1,
+    )
+    assert diagnostic["response_provider"] is None
+    assert "provider_error_message" not in diagnostic
+    assert diagnostic["provider_error_message_bytes"] > 200
+    assert len(diagnostic["provider_error_message_sha256"]) == 64
+    assert secret not in str(diagnostic)
+    assert secret not in diagnostic["message_keys"]
+    assert "safe_extra" in diagnostic["message_keys"]
+    assert diagnostic["message_keys_omitted"] == 1
+
+
+def test_canary_warning_emission_is_bounded_and_observable():
+    warning = {
+        "code": "native_tool_call_with_assistant_text",
+        "content_bytes": 5000,
+        "content_sha256": "a" * 64,
+    }
+    with pytest.warns(RuntimeWarning, match="provider_canary_warning") as caught:
+        _emit_canary_response_warnings({"canary_warnings": [warning]})
+    assert len(caught) == 1 and "5000" in str(caught[0].message)
+    assert "provider explanation" not in str(caught[0].message)
+
+
+def test_provider_warning_extension_is_not_emitted_as_host_telemetry():
+    import tests.provider_contract_ci as contract
+
+    canary = next(row for row in provider_canary_matrix() if row.canary_id == "openrouter_grok")
+    secret = "provider-secret-" + ("X" * 600)
+    usage = {"canary_warnings": [{"raw": secret}]}
+    contract._record_canary_response_warnings(
+        canary,
+        {"content": "", "tool_calls": []},
+        usage,
+    )
+    output = io.StringIO()
+    with contextlib.redirect_stderr(output):
+        _emit_canary_response_warnings(usage)
+    assert secret not in output.getvalue()
+    assert usage["canary_warnings"] == []
+
+
+def test_malformed_openai_usage_assertions_keep_bounded_violation_evidence():
+    canary = next(row for row in provider_canary_matrix() if row.expected_provider == "openai")
+    usage = _fake_usage(canary, 1)
+    usage["request_wire"]["applied_actions"] = [{
+        "source": "task_local",
+        "action": {"kind": "drop_field", "fields": []},
+    }]
+    with pytest.raises(AssertionError) as caught:
+        assert_openai_canary_usage(usage, canary.model)
+    evidence = caught.value.args[0]["provider_contract_violation"]
+    assert evidence["violation"] == "request_wire_task_local_action"
+    usage["request_wire"]["task_local"] = 0
+    with pytest.raises(AssertionError) as caught:
+        assert_openai_canary_usage(usage, canary.model)
+    evidence = caught.value.args[0]["provider_contract_violation"]
+    assert evidence["violation"] == "request_wire_task_local"
 
 
 def test_custom_call_normalizes_and_replays_role_tool_continuation():
