@@ -106,6 +106,10 @@ TOOL_POLICY: Dict[str, str] = {
 
     # Control / messaging / internal side effects.
     "schedule_subagent": POLICY_SKIP,
+    # Asks the OWNER where work should run and waits. It spends nothing, reaches
+    # nothing outside this task, and its only durable effect is the allocation the
+    # owner themselves approved.
+    "propose_execution_plan": POLICY_SKIP,
     # Delegated sessions: the access profile is derived HOST-SIDE from the calling
     # task's own authority and cannot be widened by the model, so the nanny verbs add
     # no reach beyond what the task already has (same reasoning as schedule_subagent).

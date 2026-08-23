@@ -20,6 +20,10 @@ import {
     loginCardHtml,
     loginReleaseProven,
     reconcileLoginJob,
+    loginDeadlineNote,
+    loginTimeoutHelp,
+    deviceCodeDisclosure,
+    loginInputSupport,
 } from '../modules/harness_login_cards.js';
 
 const json = (status, body) => ({ ok: status >= 200 && status < 300, status, json: async () => body });
@@ -997,4 +1001,68 @@ test('compact mode drops the terminal fallback, the paste-code entry and Close, 
         999999, { mode: LOGIN_CARD_COMPACT });
     assert.ok(verified.includes('Connected.'));
     assert.ok(!verified.includes('data-login-retry'), 'nothing to retry once verified');
+});
+
+
+test('a short vendor window is announced; a roomy one stays quiet', () => {
+    // Antigravity's sign-in code expires 60 seconds after the link opens — the
+    // vendor's own limit, no flag to extend. The card ran that clock in total
+    // silence and then reported a bare "timed out"; two live sign-ins died on
+    // it before anyone could see why.
+    const at = (iso) => Date.parse(iso);
+    const envelope = (deadlineAt) => ({
+        job: {
+            state: 'waiting_for_input', phase: 'awaiting_user',
+            startedAt: '2026-08-23T06:11:11.000Z', deadlineAt,
+        },
+    });
+    const short = envelope('2026-08-23T06:12:11.000Z');
+    assert.match(loginDeadlineNote(short, at('2026-08-23T06:11:26.000Z')), /About 45s left/);
+    assert.match(loginDeadlineNote(short, at('2026-08-23T06:12:20.000Z')), /window has closed/);
+
+    // The WINDOW decides, not the time left, or every ordinary login would
+    // start shouting near its end.
+    const roomy = envelope('2026-08-23T06:21:11.000Z');
+    assert.equal(loginDeadlineNote(roomy, at('2026-08-23T06:21:05.000Z')), '');
+});
+
+test('the deadline note is silent on a terminal job and on a job without one', () => {
+    const at = Date.parse('2026-08-23T06:11:26.000Z');
+    assert.equal(loginDeadlineNote({
+        job: {
+            state: 'timed_out', startedAt: '2026-08-23T06:11:11.000Z',
+            deadlineAt: '2026-08-23T06:12:11.000Z',
+        },
+    }, at), '');
+    assert.equal(loginDeadlineNote({ job: { state: 'waiting_for_input' } }, at), '');
+    assert.equal(loginDeadlineNote({}, at), '');
+});
+
+test('a timed-out login explains the clock instead of only naming it', () => {
+    assert.match(loginTimeoutHelp({ job: { outcome: { reason: 'timed_out' } } }),
+        /expires about a minute/);
+    assert.equal(loginTimeoutHelp({ job: { outcome: { reason: 'auth_not_ready' } } }), '');
+    assert.equal(loginTimeoutHelp({}), '');
+});
+
+test('the LIVE Antigravity disclosure shape is read off the envelope', () => {
+    // Captured from a real 3.8.0 daemon mid-sign-in: the job carries nothing and
+    // the disclosure is an envelope SIBLING. `oauth_url_input` is exactly the
+    // flow that turns the paste-code field on, so this pins the shape that made
+    // the difference between a completable Antigravity login and a dead card.
+    const envelope = {
+        cursor: 'eyJ2IjoxfQ',
+        sequence: 210,
+        job: { jobId: 'setup-x', harness: 'agy', state: 'waiting_for_input', phase: 'awaiting_user' },
+        deviceCode: {
+            flow: 'oauth_url_input',
+            verificationUrl: 'https://accounts.google.com/o/oauth2/auth?client_id=1',
+            userCode: '',
+        },
+    };
+    const disclosure = deviceCodeDisclosure(envelope);
+    assert.ok(disclosure);
+    assert.equal(disclosure.flow, 'oauth_url_input');
+    assert.equal(disclosure.url, 'https://accounts.google.com/o/oauth2/auth?client_id=1');
+    assert.equal(loginInputSupport(envelope), true);
 });

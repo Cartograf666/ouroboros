@@ -295,6 +295,42 @@ export function jobStateSummary(envelope) {
     return { state, phase, terminal, succeeded: state === 'succeeded' };
 }
 
+// A short vendor paste window, said out loud. Antigravity's sign-in code
+// expires 60 seconds after the link opens — the vendor's own limit
+// (`AGY_LOGIN_WINDOW_MS`, "no flag to extend") — and the card used to run that
+// clock in total silence: no countdown while it ran, and a bare "timed out"
+// once it had. Two live sign-ins died on it before anyone could see why.
+//
+// Only a NARROW deadline is announced. Every job carries one, and a routine
+// several-minute budget is not news; a minute is, because it changes what the
+// owner should do next (have the browser tab ready before clicking).
+export const NARROW_LOGIN_WINDOW_MS = 150_000;
+
+export function loginDeadlineNote(envelope, nowMs) {
+    const summary = jobStateSummary(envelope || {});
+    if (summary.terminal) return '';
+    const job = envelope?.job;
+    const deadline = Date.parse(String(job?.deadlineAt || ''));
+    const started = Date.parse(String(job?.startedAt || ''));
+    if (!Number.isFinite(deadline)) return '';
+    // The WINDOW decides whether this is worth saying, not the time left: a
+    // roomy job that happens to be nearly spent must not start shouting.
+    const window = Number.isFinite(started) ? deadline - started : NaN;
+    if (Number.isFinite(window) && window > NARROW_LOGIN_WINDOW_MS) return '';
+    const left = Math.round((deadline - Number(nowMs)) / 1000);
+    if (!Number.isFinite(left)) return '';
+    if (left <= 0) return 'The sign-in window has closed — start again.';
+    return `About ${left}s left to paste the code — this vendor's window is short.`;
+}
+
+export function loginTimeoutHelp(envelope) {
+    // The typed timeout, EXPLAINED rather than merely named, beside the verdict
+    // so a second attempt is an informed one.
+    if (String(envelope?.job?.outcome?.reason || '') !== 'timed_out') return '';
+    return 'The sign-in code expires about a minute after the link opens. '
+        + 'Start again and keep this window open — the code goes in the field here.';
+}
+
 export const LOGIN_CUSTODY_RELEASED = 'released';
 export const LOGIN_CUSTODY_RETAINED = 'retained';
 export const LOGIN_CUSTODY_UNKNOWN = 'unknown';
@@ -441,6 +477,12 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
             ? 'Installing or checking Claudexor…'
             : loginStatusLine(active.envelope || {});
         if (line) bits.push(`<div class="settings-inline-status" data-tone="muted" data-login-state>${escapeHtml(line)}</div>`);
+        // Beside it, the clock — but only when the vendor's window is short
+        // enough to change what the owner should do (see loginDeadlineNote).
+        const deadline = loginDeadlineNote(active.envelope || {}, nowMs);
+        if (deadline) {
+            bits.push(`<div class="settings-inline-status" data-tone="warn" data-login-deadline>${escapeHtml(deadline)}</div>`);
+        }
     }
     // Shape 2: the ALWAYS-VISIBLE paste-code entry for a job whose disclosure
     // flow is `oauth_url_input`. Claude's CLI prompts for the code only when
@@ -515,6 +557,12 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
         const detail = String(active.verdict?.detail || '').trim() || jobDetail(active.envelope || {});
         if (detail) {
             bits.push(`<div class="settings-inline-note" data-login-detail>${escapeHtml(detail)}</div>`);
+        }
+        // "agy login timed_out." names the outcome without explaining it. The
+        // owner's next attempt should know the clock is a vendor minute.
+        const help = loginTimeoutHelp(active.envelope || {});
+        if (help) {
+            bits.push(`<div class="settings-inline-note" data-login-timeout-help>${escapeHtml(help)}</div>`);
         }
     }
     // The demoted attach fallback: a collapsed Advanced affordance, only when

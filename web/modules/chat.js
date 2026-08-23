@@ -2963,38 +2963,6 @@ export function createChatInstance({
         return bubble;
     }
 
-    function routingAnnotationText(annotation) {
-        if (!annotation || typeof annotation !== 'object') return '';
-        const action = String(annotation.action || '');
-        const status = String(annotation.status || '');
-        const target = String(annotation.target || '');
-        if (status === 'pending') return 'Choosing the right destination…';
-        if (status === 'needs_manual_target') {
-            const optionLabels = (Array.isArray(annotation.options) ? annotation.options : [])
-                .map(option => {
-                    if (!option || typeof option !== 'object') return '';
-                    if (option.label) return String(option.label);
-                    if (option.action === 'new_task_in_project') {
-                        return `New task in ${String(option.project_name || 'Project')}`;
-                    }
-                    return String(option.title || option.task_id || option.project_name || option.project_id || '');
-                })
-                .filter(Boolean);
-            if (optionLabels.length) return `Choose a target · ${optionLabels.join(' / ')}`;
-            return target ? `Choose a target · ${target}` : 'Choose a target';
-        }
-        if (status === 'project_unavailable') return 'Project is unavailable';
-        const labels = {
-            mailbox_delivery: 'Delivered to task',
-            steer_task: 'Steered task',
-            promote_chat_to_task: 'Started task',
-            route_to_project: 'Routed to project',
-            project_route: 'Project routing',
-        };
-        const label = labels[action] || status.replaceAll('_', ' ') || action.replaceAll('_', ' ');
-        return target && label ? `${label} · ${target}` : label;
-    }
-
     function renderRoutingAnnotation(bubble, annotation) {
         if (!bubble) return false;
         const text = routingAnnotationText(annotation);
@@ -4251,6 +4219,15 @@ export function createChatInstance({
 
     onWs('log', (msg) => {
         if (!msg?.data) return;
+        // A CONTROL, not a progress line: handled before the grouped-event
+        // pipeline so it is never summarized into a note nobody can answer.
+        if (String(msg.data.type || '') === 'execution_plan_proposal') {
+            if (isMyThread(msg, { mirrorProject: true })) {
+                import('./execution_plan_card.js').then((m) => m.mountExecutionPlanProposal(
+                    msg.data, { insert: insertMessageNode, stamp: stampNodeTimestamp }));
+            }
+            return;
+        }
         // Log frames now carry the task's chat_id (backend stamps it), so the
         // per-thread fan-out routes the full live card to its own column: a
         // project panel builds/animates/finalizes ITS card, while the main

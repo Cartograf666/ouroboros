@@ -91,13 +91,18 @@ const HARNESS_CHIP_ICON = {
     codex: '◇',
     claude: '✳',
     cursor: '▸',
+    agy: '✦',
 };
 
 // Presentation names only, never behavior: the route id stays the opaque
 // Claudexor spelling; the owner knows the `claude` harness as the Claude Code
-// product, so that is what the chip prints.
+// product, so that is what the chip prints. `agy` earns an entry for a stronger
+// reason than polish: unlike the others its id is not a word the owner has ever
+// seen, so without one the chip would print a three-letter abbreviation for a
+// product called Antigravity.
 const HARNESS_CHIP_NAME = {
     claude: 'Claude Code',
+    agy: 'Antigravity',
 };
 
 export function executorChip(evt) {
@@ -1109,4 +1114,40 @@ export function isGroupedTaskEvent(evt) {
         || t === 'context_building_finished'
         || t === 'send_message'
     );
+}
+
+// The routing annotation's one sentence, moved out of chat.js: this module
+// already owns event classification and task presentation shared by Chat and
+// Logs, and this is presentation over a typed status — pure, DOM-free, and
+// testable without a browser. chat.js keeps only the element that renders it.
+export function routingAnnotationText(annotation) {
+    if (!annotation || typeof annotation !== 'object') return '';
+    const action = String(annotation.action || '');
+    const status = String(annotation.status || '');
+    const target = String(annotation.target || '');
+    if (status === 'pending') return 'Choosing the right destination…';
+    if (status === 'needs_manual_target') {
+        const optionLabels = (Array.isArray(annotation.options) ? annotation.options : [])
+            .map(option => {
+                if (!option || typeof option !== 'object') return '';
+                if (option.label) return String(option.label);
+                if (option.action === 'new_task_in_project') {
+                    return `New task in ${String(option.project_name || 'Project')}`;
+                }
+                return String(option.title || option.task_id || option.project_name || option.project_id || '');
+            })
+            .filter(Boolean);
+        if (optionLabels.length) return `Choose a target · ${optionLabels.join(' / ')}`;
+        return target ? `Choose a target · ${target}` : 'Choose a target';
+    }
+    if (status === 'project_unavailable') return 'Project is unavailable';
+    const labels = {
+        mailbox_delivery: 'Delivered to task',
+        steer_task: 'Steered task',
+        promote_chat_to_task: 'Started task',
+        route_to_project: 'Routed to project',
+        project_route: 'Project routing',
+    };
+    const label = labels[action] || status.replaceAll('_', ' ') || action.replaceAll('_', ' ');
+    return target && label ? `${label} · ${target}` : label;
 }

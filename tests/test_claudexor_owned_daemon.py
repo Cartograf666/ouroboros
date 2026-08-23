@@ -2108,3 +2108,66 @@ def test_the_proxy_count_in_the_docs_matches_the_handlers_that_exist(tmp_path):
         # two-segment removal route; compare on the stable prefix.
         prefix = re.split(r"\{", path)[0].rstrip("/")
         assert prefix in line, f"{path} is registered but the gateway map never names it"
+
+
+def test_default_login_capability_is_read_from_the_engines_own_readiness():
+    """A family with no engine-default credential must not offer Connect.
+
+    Antigravity signs in only through NAMED profiles, and the engine says so in
+    the harness's own readiness — a `default_credential` check that FAILS with
+    "accounts are named profiles". A Connect there posts a login with no
+    profileId, the engine refuses it by design, and the owner sees a button that
+    does nothing at all.
+
+    The discriminator is presence of that failing check, never a harness name: a
+    logged-OUT codex fails its `native_session` check and would be caught by any
+    rule keyed on "some auth check failed", so the rule is keyed on the check the
+    engine only emits for profile-only families. Shapes are copied from a live
+    3.8.0 `/v2/harnesses`.
+    """
+    from ouroboros.gateway.claudexor_accounts import _default_login_capable
+
+    rows = [
+        {"id": "codex", "checks": [
+            {"id": "installed", "status": "pass"},
+            {"id": "native_session", "status": "pass"},
+            {"id": "stored_key", "status": "fail", "detail": "no openai key fallback"},
+        ]},
+        {"id": "agy", "checks": [
+            {"id": "installed", "status": "pass", "detail": "1.1.13"},
+            {"id": "default_credential", "status": "fail",
+             "detail": "agy has no engine-default credential by design; accounts are named profiles"},
+            {"id": "version_pin", "status": "pass"},
+        ]},
+        {"id": "claude", "checks": [
+            {"id": "native_session", "status": "pass"},
+            {"id": "stored_key", "status": "fail"},
+        ]},
+        {"id": "no-checks-row"},
+        "not-a-dict",
+    ]
+    answer = _default_login_capable(rows)
+    assert answer == {"codex": True, "agy": False, "claude": True}
+
+
+def test_a_logged_out_codex_keeps_its_connect():
+    """The rule must not fire on an ordinary signed-out family: codex declares
+    `native_session`, never `default_credential`, so a failing session check is
+    "sign in", not "this family has no default login"."""
+    from ouroboros.gateway.claudexor_accounts import _default_login_capable
+
+    rows = [{"id": "codex", "checks": [
+        {"id": "installed", "status": "pass"},
+        {"id": "native_session", "status": "fail", "detail": "no native session"},
+    ]}]
+    assert _default_login_capable(rows) == {"codex": True}
+
+
+def test_an_unreadable_manifest_fails_open_onto_todays_connect():
+    """None, so the projection keeps `default_login_available: True` and the
+    panel shows the Connect it has always shown. Turning every family into an
+    add-a-name flow on a blip is the expensive direction."""
+    from ouroboros.gateway.claudexor_accounts import _default_login_capable
+
+    assert _default_login_capable([]) is None
+    assert _default_login_capable([{"id": "codex"}, "junk"]) is None

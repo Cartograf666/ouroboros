@@ -191,6 +191,7 @@ BAND_PATHS = {
     "web/modules/onboarding_wizard.js": None,
     "web/modules/settings.js": None,
     "web/modules/widgets.js": None,
+    "web/tests/harness_login_cards.test.js": "Login-card behaviour is pinned case by case, and the Antigravity work added four: the vendor sixty-second paste window (announced, and silent when the window is roomy), the timed-out explanation, and the LIVE envelope-level disclosure shape captured off a real 3.8.0 daemon. Splitting the file would separate those pins from the sibling cases they are only meaningful beside.",
 }
 
 BYTE_BASELINE_DEBT = {
@@ -203,8 +204,8 @@ BYTE_BASELINE_DEBT = {
 }
 
 BYTE_DEBT = {
-    "ouroboros/loop.py": 321046,
+    "ouroboros/loop.py": 318517,
     "tests/test_delegated_subagent_transport.py": 320623,
     "tests/test_devtools_benchmarks.py": 328786,
-    "web/modules/chat.js": 225961,
+    "web/modules/chat.js": 224733,
 }

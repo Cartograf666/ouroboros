@@ -659,6 +659,13 @@ def _start_request(ctx: ToolContext, route: Any, authority: "DelegatedRunShape",
         request["model"] = route.model
     if route.effort:
         request["effort"] = route.effort
+    if getattr(route, "profile_id", ""):
+        # The manual credential pin, which until now only the REVIEW path sent
+        # (`review_execution`). A delegated subagent run never carried it, so a
+        # route whose account is a named profile started with no account at all
+        # and the engine refused it as unroutable. Empty stays empty: the
+        # daemon's own rotation is the documented default (D28).
+        request["credentialProfileId"] = route.profile_id
     if seconds:
         request["maxSeconds"] = seconds
     return request

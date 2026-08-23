@@ -339,3 +339,38 @@ def test_the_reviewer_disclosure_stopped_advising_against_the_default() -> None:
     lanes = _read("reviewer_slots.js")
     assert "keep at least one API row" not in lanes
     assert "never fall back to API spend" in lanes
+
+
+def test_owner_facing_copy_never_enumerates_the_harness_families() -> None:
+    """Discovery owns the family list, so prose must not carry a second copy of it.
+
+    `familyLabel()` deliberately prefers the engine's own `display_name` — the
+    fix for a renamed or fourth family reaching the owner spelled `claude`. The
+    Accounts blurb then hardcoded "(Claude Code, Codex, Cursor)" directly above
+    the discovered rows, which is the same defect one layer up: it went stale the
+    moment the engine grew an Antigravity adapter, and it would go stale again
+    for the family after that. The rows below are the authority; a parenthetical
+    that repeats them can only disagree with them.
+
+    Scoped to owner-facing PROSE. Comments and code (BOOTSTRAP_LABELS, chip
+    names) legitimately name families — first paint has no discovery to read,
+    and a comment explaining the rule must be able to spell it.
+    """
+    families = re.compile(r"Claude Code|Codex|Cursor|Antigravity", re.IGNORECASE)
+    offenders: list[str] = []
+    for label, text, comment in _swept_sources(with_tests=False):
+        if not label.endswith("harness_accounts.js"):
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
+            stripped = line.lstrip()
+            if comment and stripped.startswith(comment):
+                continue
+            # Code that MAPS an id to a product name is the sanctioned carrier;
+            # only free prose is swept.
+            if ":" in stripped or "=" in stripped or "`" in stripped:
+                continue
+            if len(families.findall(line)) >= 2:
+                offenders.append(f"{label}:{lineno}: {stripped}")
+    assert not offenders, (
+        "owner-facing prose enumerates harness families instead of letting "
+        "discovery name them\n" + "\n".join(offenders))

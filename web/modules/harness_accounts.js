@@ -527,7 +527,30 @@ export function familyActionLabel(group, payload) {
     // The repair is a PREREQUISITE, not the destination: the login card
     // performs it in the foreground and reports it there, and the tab's service
     // banner already names the fault above.
+    //
+    // "An empty family connects its default CLI login first" is only true of a
+    // family that HAS one. Antigravity does not — the engine reports a failing
+    // `default_credential` check ("accounts are named profiles"), and a Connect
+    // there posts a login with no profileId that the engine refuses by design,
+    // so the button silently does nothing. Such a family must ask for a name on
+    // its FIRST account, exactly as every family does on its second.
+    if (!group.rows.length && !familyHasDefaultLogin(group.harness, payload)) {
+        return 'Add account';
+    }
     return group.rows.length ? 'Add account' : runtimeActionLabel(payload);
+}
+
+// Reads the engine's own declaration, projected by the status endpoint. Absent
+// (an older backend, an unreadable manifest) means TRUE: the panel keeps the
+// Connect it has always shown rather than inventing a name step.
+export function familyHasDefaultLogin(harnessId, payload) {
+    const id = String(harnessId || '');
+    for (const harness of payload?.harnesses || []) {
+        if (String(harness?.id || '') === id) {
+            return harness.default_login_available !== false;
+        }
+    }
+    return true;
 }
 
 export function rowActionLabel(row, payload) {
@@ -727,7 +750,7 @@ export function renderAgentAccountsSection() {
         <div class="form-section" id="harness-accounts-section">
             <h3>Accounts</h3>
             <div class="settings-section-copy">
-                Agent subscriptions (Claude Code, Codex, Cursor) used by delegated subagents and
+                Agent subscriptions used by delegated subagents and
                 review lanes. Every account of a family is equivalent — work rotates across all of
                 them. Accounts live in Ouroboros's own agent home; your personal logins are never
                 read or imported.
@@ -859,7 +882,11 @@ function renderRows() {
             const card = button.closest('[data-family]');
             const harness = card?.dataset.family;
             const hasRows = Boolean(card?.querySelector('[data-harness]'));
-            if (!hasRows) { startLogin(harness, ''); return; }
+            // The SAME predicate the label reads: a family with no default
+            // login needs a name even for its first account, and a button that
+            // said "Add account" must not then post a nameless login.
+            const canConnect = familyHasDefaultLogin(harness, state.store.snapshot || {});
+            if (!hasRows && canConnect) { startLogin(harness, ''); return; }
             const profile = await promptProfileName({ family: familyLabel(harness, state.store.snapshot || {}) });
             if (profile) startLogin(harness, profile);
         });

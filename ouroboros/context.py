@@ -1323,6 +1323,18 @@ def _capture_context_core(
     except Exception:
         log.debug("Failed to build improvement backlog digest", exc_info=True)
 
+    try:
+        from ouroboros.route_evidence import format_route_evidence_digest
+
+        # What each execution target has really cost and taken here. Omitted
+        # entirely on an install with no history, so a cold start pays no context
+        # for an axis it cannot yet say anything true about.
+        route_digest = format_route_evidence_digest(env.drive_root)
+        if route_digest:
+            dynamic_parts.append(route_digest)
+    except Exception:
+        log.debug("Failed to build route evidence digest", exc_info=True)
+
     review_section = ""
     if review_context_builder is not None:
         try:

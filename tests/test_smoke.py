@@ -108,6 +108,9 @@ EXPECTED_TOOLS = [
     # C1: the explicit acceptance seam for a delegated run's captured patch —
     # a first-class tool, so the registry contract must name it.
     "integrate_delegated_patch", "cancel_task",
+    # The owner's per-task execution allocation: proposed by the agent, answered
+    # by the owner, and only then turned into children via plan_item_id.
+    "propose_execution_plan",
     "peek_task", "discard_child_result", "override_delegation_constraint",
     "request_deep_self_review", "chat_history", "update_scratchpad",
     "send_user_message", "update_identity", "toggle_evolution",

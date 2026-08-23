@@ -1469,6 +1469,10 @@ def schedule_subagent_properties() -> Dict[str, Any]:
         # parent asking `low` against a route pinned to `xhigh` had no rule for who
         # wins. Effort is derived at dispatch from `config.resolve_effort(task_type)`
         # — the owner's control over it is exactly what it was before the knob.
+        "plan_item_id": {
+            "type": "string",
+            "description": "Optional: the id of the work item in the OWNER-APPROVED execution plan (propose_execution_plan) that THIS child is. Not a fourth axis and not a way to pick a machine — you still declare the work, and the destination comes from the owner's approved allocation exactly as the configured harness supplies it today. Use it after the owner approves a plan, so each child lands where they said that piece of work should run. An id no approved plan carries falls back to the owner's standing policy and the fallback is disclosed in capability_delta.",
+        },
         "deadline_at": {
             "type": "string",
             "description": "Optional ISO-8601 UTC instant after which this child's work is worthless to you (e.g. a scout whose handoff you can only consume inside a narrow window). NARROWING ONLY: the earlier of this and the parent's deadline wins, so it can tighten your own deadline but never extend it. Omit it to simply inherit the parent's.",
@@ -1579,6 +1583,7 @@ def _validated_schedule_fields(params: Dict[str, Any]) -> tuple[Dict[str, Any], 
         "memory_mode": memory_mode, "may_mutate": params.get("may_mutate", False),
         "model_lane": model_lane, "executor": executor,
         "acceptance_claims": acceptance_claims,
+        "plan_item_id": str(params.get("plan_item_id") or "").strip(),
     }, ""
 
 
@@ -1749,11 +1754,39 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         executor=requested_executor,
         status=STATUS_REQUESTED,
     )
+    # The owner's allocation is resolved HERE, once, and frozen onto the child.
+    # Not at dispatch, unlike route health: health is a live fact that can change
+    # while a child waits, but an approved decision is not — re-reading the plan
+    # later would let an edit silently re-route children the owner had already
+    # signed off on. A plan that will not parse REFUSES the schedule rather than
+    # falling back: falling back would spend on a destination nobody approved,
+    # which is the whole failure this record exists to prevent.
+    plan_item_id = fields["plan_item_id"]
+    routing_pin: Dict[str, Any] = {}
+    if plan_item_id:
+        from ouroboros.routing_plan import plan_pin_for_item
+
+        try:
+            pin = plan_pin_for_item(root_task_id, plan_item_id)
+        except ValueError as exc:
+            return (
+                "⚠️ TOOL_ARG_ERROR (schedule_subagent): the approved execution plan "
+                f"for this task tree cannot be read ({exc}). Nothing was scheduled — "
+                "re-approve the allocation with propose_execution_plan, or drop "
+                "plan_item_id to use the owner's standing policy."
+            )
+        if pin is not None:
+            routing_pin = pin.as_dict()
     intent_fields = {
         "model_lane": requested_model_lane,
         "requested_model_lane": requested_model_lane,
         "parent_model_lane": parent_model_lane,
         "requested_executor": requested_executor,
+        # Both halves ride: the id the parent NAMED (kept even when no plan
+        # carries it, so the disclosed fallback can say which item was meant)
+        # and the destination it RESOLVED TO ({} = none applied).
+        "routing_plan_item": plan_item_id,
+        "routing_pin": routing_pin,
     }
     evt = {
         "type": "schedule_subagent",

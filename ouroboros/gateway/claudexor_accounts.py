@@ -122,6 +122,44 @@ def _login_capable_harness_ids(rows: List[Dict[str, Any]]) -> "set | None":
     return capable if readable else None
 
 
+def _default_login_capable(rows: List[Dict[str, Any]]) -> "dict | None":
+    """Per harness: is there a DEFAULT login to connect, or only named profiles?
+
+    Codex and Claude sign in once and that session IS the account, so an empty
+    family's first action is a plain Connect. Antigravity has no such thing —
+    the engine says so itself, in the harness's own readiness: a
+    ``default_credential`` check that FAILS with "accounts are named profiles".
+    Offering Connect there posts a login with no ``profileId``, which the engine
+    refuses by design, and the button does nothing at all.
+
+    The discriminator is the engine's declaration, never a harness name: only a
+    harness that CARRIES a failing ``default_credential`` check is reported as
+    profile-only. Codex and Claude do not declare that check (they declare
+    ``native_session``), so a logged-OUT codex — whose native_session check also
+    fails — keeps its Connect exactly as before.
+
+    ``None`` when nothing readable came back, so callers fail open onto today's
+    behaviour instead of turning every family into an add-a-name flow.
+    Pure for unit tests."""
+    answer: Dict[str, bool] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        harness_id = str(row.get("id") or "")
+        if not harness_id:
+            continue
+        checks = row.get("checks")
+        if not isinstance(checks, list):
+            continue
+        answer[harness_id] = not any(
+            isinstance(check, dict)
+            and str(check.get("id") or "") == "default_credential"
+            and str(check.get("status") or "") == "fail"
+            for check in checks
+        )
+    return answer or None
+
+
 def _account_row_visible(harness_id: str, row: Dict[str, Any], capable) -> bool:
     """Account-surface row predicate: manifest-declared login capability OR the
     daemon vouching an actual login on the row itself (``native_login_detected``)
@@ -220,9 +258,12 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
             # deliberately NOT a facet: it is a filter input, and its failure is
             # already absorbed rather than reported.
             try:
-                capable = _login_capable_harness_ids(manifests_call.result())
+                manifest_rows = manifests_call.result()
+                capable = _login_capable_harness_ids(manifest_rows)
+                default_login = _default_login_capable(manifest_rows)
             except ClaudexorUnavailable:
                 capable = None
+                default_login = None
             rows: List[Dict[str, Any]] = []
             for row in catalog.get("harnesses") or []:
                 if not isinstance(row, dict):
@@ -238,6 +279,13 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
                     "access_profiles_supported": [
                         str(v) for v in row.get("accessProfilesSupported") or []
                     ],
+                    # Whether an empty family has a default login to Connect to,
+                    # or routes only through named profiles (see
+                    # _default_login_capable). True on an unreadable manifest:
+                    # the UI must fail open onto the Connect it has always shown.
+                    "default_login_available": bool(
+                        (default_login or {}).get(str(row.get("id") or ""), True)
+                    ),
                 }
                 if include_models and projected["id"]:
                     try:

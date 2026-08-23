@@ -359,150 +359,21 @@ def resolve_subagent_executor(
     return SubagentExecutorResolution(executor, "harness", route, "harness_ready")
 
 
-def route_health(
-    gateway: Any, route_id: str, shape: DelegatedRunShape, *, route_model: str = "",
-) -> tuple[str, str]:
-    """Return ``(unavailable_reason, reset_at)`` for a route about to run ``shape``.
-
-    One reader, so the answer the DISPATCHER acts on and the answer the nanny's own
-    ``delegate_start`` gets cannot drift into disagreeing about the same route. Health
-    is asked about the SHAPE, not about a route in the abstract: a route that can only
-    read is not a usable substrate for a child that must write, and an ENGINE that
-    would reject the delegated marker outright is not a usable substrate for one either.
-
-    ``route_model`` is the route's pinned model (``DelegationRoute.model``): quota
-    windows scoped to OTHER models must not take this route offline, so exhaustion is
-    judged against the model the run would actually use. A full-window exhaustion that
-    names no reset instant still reports ``subscription_window_exhausted`` — as the
-    REASON with an empty ``reset_at``, since an unknown healing time is not health.
-    """
-    from ouroboros.config import CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION
-    from ouroboros.gateways.claudexor import engine_at_least
-
-    catalog = gateway.agent_capabilities()
-    entry = None
-    for row in catalog.get("harnesses") or []:
-        if isinstance(row, dict) and str(row.get("id") or "") == route_id:
-            entry = row
-            break
-    if entry is None:
-        return "route_not_in_capability_catalog", ""
-    if not entry.get("enabled") or str(entry.get("status") or "") != "ok":
-        return f"route_status_{entry.get('status') or 'disabled'}", ""
-    supported = [str(v) for v in entry.get("accessProfilesSupported") or []]
-    # A DELEGATED run is externally confined, and the engine rewrites its access to
-    # `external_sandbox_full` before admitting it (`RequestRequirementsResolver.adapterAccess`)
-    # — so the profile the route must declare is that one, not the literal the request
-    # carries. Comparing the literal refused every route whose adapter stands its own
-    # sandbox down in favour of the engine's boundary and therefore declares only the
-    # confined profile: today opencode, which was given `external_sandbox_full` for
-    # exactly this run. Refusing what the engine would admit turned `executor="harness"`
-    # into a typed blocker and `auto` into a silent, metered drop to a native child.
-    if shape.access not in supported and not (
-        shape.delegated and "external_sandbox_full" in supported
-    ):
-        return f"access_profile_unsupported:{shape.access}", ""
-    # An engine below the marker floor REJECTS `execution.delegated` outright — the field
-    # is absent from a `.strict()` schema, so the start is a 400 and no run exists. That
-    # is the only thing this version answers, and it is asked here so the refusal is typed
-    # and arrives before a token is spent instead of as an opaque HTTP error mid-dispatch.
-    # It says NOTHING about whether an admitted engine applies an OS boundary: that is a
-    # per-attempt fact, read back from the run's own artifacts by
-    # `tools.delegate._containment_evidence` and DISCLOSED rather than refused. The floor
-    # cannot be a capability probe either — the marker is nested under `execution`, and
-    # the catalog derives its key list from TOP-LEVEL request keys only.
-    if shape.delegated and not engine_at_least(
-        str(getattr(gateway, "engine_version", "") or ""),
-        CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION,
-    ):
-        return "engine_rejects_delegated_marker", ""
-    exhausted, reset_at = _exhausted_window(gateway, route_id, route_model)
-    if exhausted and not reset_at:
-        # Spent with no named healing instant: still spent. The old shape carried
-        # exhaustion ONLY in a non-empty reset, so a window the harness reports as
-        # fully used but undated read back as a healthy route and the child was
-        # dispatched onto a substrate that was going to refuse it.
-        return "subscription_window_exhausted", ""
-    return "", reset_at
-
-
-def _model_scope_matches(route_model: str, applies_to_models: Any) -> bool:
-    """Does a quota constraint's model scope cover the route's pinned model?
-
-    An empty/absent scope is a GLOBAL window — it always applies. An unpinned route
-    (no model in ``OUROBOROS_SUBAGENT_HARNESS``) can land on any model, so every
-    scoped window applies to it too. Otherwise the scope's aliases are matched by
-    case-insensitive containment either way ("opus" ↔ "claude-opus-5"): the harness
-    names windows by its own alias vocabulary, which this module must not enumerate.
-    """
-    aliases = [str(a).strip().lower() for a in (applies_to_models or []) if str(a).strip()]
-    if not aliases:
-        return True
-    model = str(route_model or "").strip().lower()
-    if not model:
-        return True
-    return any(a == model or a in model or model in a for a in aliases)
-
-
-def _exhausted_window(gateway: Any, route_id: str, route_model: str = "") -> tuple[bool, str]:
-    """``(exhausted, reset_at)`` for a route judged against its OWN model.
-
-    A window counts as spent when the harness reports it fully used or explicitly
-    cooling down AND its model scope covers the route's model — a window scoped to a
-    model this route never uses (the live incident: a Fable-only weekly window taking
-    an opus-pinned route offline for days) is someone else's exhaustion, not this
-    route's. Stale snapshots are ignored — an old reading must not block a lane.
-
-    ANY LIVE SNAPSHOT MEANS THE LANE IS USABLE (D28). And exhaustion needs POSITIVE
-    evidence for the WHOLE route: a profile whose quota could not be read at all
-    (absent — a 429 on the usage endpoint, a failed refresh) is UNKNOWN, not spent,
-    so it fail-opens the route: the daemon owns rotation and answers a genuinely
-    empty route with its own typed refusal at start time, which costs nothing here.
-    Only when every readable profile is spent and none is unreadable is there
-    something to wait for; the honest instant is the EARLIEST named reset (possibly
-    none — spent windows are not obliged to carry one).
-
-    A snapshot with an applicable spent constraint counts as spent even if another of
-    ITS OWN constraints has room: a 5-hour window at 100% blocks that profile now,
-    whatever its weekly window says. WHICH profile a run lands on is Claudexor's
-    business — rotation stays there and no profile identity is interpreted here.
-    """
-    resets: List[str] = []
-    any_live = False
-    any_spent = False
-    for snapshot in gateway.quota_snapshots():
-        subject = snapshot.get("subject") if isinstance(snapshot.get("subject"), dict) else {}
-        if str(subject.get("harness") or "") != route_id:
-            continue
-        if str(snapshot.get("freshness") or "") != "fresh":
-            continue
-        spent_here = [
-            (str(c.get("cooldown_until") or "") or str(c.get("resets_at") or ""))
-            for c in (snapshot.get("constraints") or [])
-            if isinstance(c, dict)
-            and (bool(c.get("cooldown_until"))
-                 or (isinstance(c.get("used_ratio"), (int, float))
-                     and float(c.get("used_ratio")) >= 1.0))
-            and _model_scope_matches(route_model, c.get("applies_to_models"))
-        ]
-        if spent_here:
-            any_spent = True
-            resets.extend(reset for reset in spent_here if reset)
-        else:
-            any_live = True
-    if any_live or not any_spent:
-        return False, ""
-    absences = getattr(gateway, "quota_absences", None)
-    if callable(absences):
-        for row in absences() or []:
-            subject = row.get("subject") if isinstance(row, dict) else None
-            if isinstance(subject, dict) and str(subject.get("harness") or "") == route_id:
-                return False, ""
-    return True, min(resets) if resets else ""
+# Route usability lives in ``ouroboros/route_health.py`` (extracted at this
+# module's size gate). Re-exported so every existing caller and test still
+# finds these names here; that module never imports this one back.
+from ouroboros.route_health import (  # noqa: E402,F401
+    _exhausted_window,
+    _model_scope_matches,
+    _pinned_for_profile_only_route,
+    routable_profile,
+    route_health,
+)
 
 
 def probe_subagent_executor(
     requested: Any = "auto", *, shape: DelegatedRunShape | None = None,
+    route: "DelegationRoute | None" = None,
 ) -> SubagentExecutorResolution:
     """Impure companion to the pure table: gather the health facts, then apply it.
 
@@ -510,8 +381,14 @@ def probe_subagent_executor(
     route configured means no daemon call at all — the ordinary install pays nothing
     for an axis it does not use. ``shape`` defaults to the read-only shape: a caller
     that states nothing is asking for the narrowest run there is.
+
+    ``route`` overrides the install-wide setting with a route the OWNER approved for
+    this particular piece of work (``routing_plan``). It is the same authority
+    ``OUROBOROS_SUBAGENT_HARNESS`` carries, only scoped to one task tree — so it
+    enters at the same seam and is health-checked by the same reader, rather than
+    bypassing either.
     """
-    route = get_subagent_harness()
+    route = route if route is not None else get_subagent_harness()
     if route is None:
         return resolve_subagent_executor(requested, route=None)
     from ouroboros.claudexor_daemon import ensure_owned_gateway
@@ -524,6 +401,8 @@ def probe_subagent_executor(
         unavailable, reset_at = route_health(
             gateway, route.route_id, run_shape, route_model=route.model,
         )
+        if not unavailable and not route.profile_id:
+            route = _pinned_for_profile_only_route(gateway, route)
     except ClaudexorUnavailable as exc:
         return resolve_subagent_executor(
             requested, route=route, unavailable_reason=exc.code,
@@ -537,6 +416,58 @@ def probe_subagent_executor(
     )
 
 
+ROUTING_PIN_FIELD = "routing_pin"
+# A stored pin that will not parse. Distinguishable from "no pin" because the two
+# demand OPPOSITE answers: absence means "use the install-wide policy", while a
+# corrupt pin means the owner's decision for this work cannot be honoured — and
+# guessing at it would spend money on a destination nobody approved.
+_PIN_UNREADABLE = object()
+
+
+def routing_pin_from_task(task: Mapping[str, Any]) -> Any:
+    """The owner-approved destination stamped on this child, if any.
+
+    Returns a ``RoutePin``, ``None`` (no allocation applies), or the private
+    unreadable sentinel. The pin is written by the schedule path from an
+    already-validated plan, so an unparseable one is corruption, not stale
+    schema — and it is refused rather than absorbed.
+    """
+    raw = task.get(ROUTING_PIN_FIELD)
+    if not raw:
+        return None
+    if not isinstance(raw, Mapping):
+        return _PIN_UNREADABLE
+    from ouroboros.routing_plan import parse_route_pin
+
+    try:
+        return parse_route_pin(dict(raw), "routing pin")
+    except ValueError:
+        log.warning("Unreadable routing pin on task %s", task.get("id"), exc_info=True)
+        return _PIN_UNREADABLE
+
+
+def pinned_route_of(pin: Any) -> "DelegationRoute | None":
+    """The delegated route a pin names, or None when it names an API model.
+
+    An ``api_chat`` allocation is not a route at all — it is a model the child
+    runs NATIVELY on, so it deliberately produces no ``DelegationRoute``: the
+    executor table must see "no route" and answer native, exactly as it does for
+    an install with delegation off.
+    """
+    if pin is None or pin is _PIN_UNREADABLE or not getattr(pin, "is_session", False):
+        return None
+    return DelegationRoute(
+        route_id=pin.target_id, model=pin.model, profile_id=pin.profile_id,
+    )
+
+
+def pinned_model_of(pin: Any) -> str:
+    """The model an ``api_chat`` allocation pins for a native child ('' otherwise)."""
+    if pin is None or pin is _PIN_UNREADABLE or getattr(pin, "is_session", True):
+        return ""
+    return str(getattr(pin, "target_id", "") or "")
+
+
 def dispatch_executor_resolution(task: Mapping[str, Any]) -> SubagentExecutorResolution:
     """The executor axis of ONE dispatch: the typed rule table fed with live health.
 
@@ -546,19 +477,37 @@ def dispatch_executor_resolution(task: Mapping[str, Any]) -> SubagentExecutorRes
     string reassembled by the caller. `native` asks the daemon nothing. Tolerant
     of stored garbage: the schema refused anything invalid at schedule time, so an
     unknown STORED executor is stale data, not an argument error.
+
+    An owner-approved ALLOCATION (``routing_pin``) supplies the route in place of
+    the install-wide setting. It does not reach the rule table as a new case: an
+    `agent_session` allocation is simply THE route the table already takes, and an
+    `api_chat` one is "no route", which the table already answers with native.
     """
     requested = str(task.get("requested_executor") or "auto").strip().lower() or "auto"
     if requested not in SUBAGENT_EXECUTORS:
         requested = "auto"
+    pin = routing_pin_from_task(task)
+    if pin is _PIN_UNREADABLE:
+        return SubagentExecutorResolution(
+            requested, "blocked", None, "routing_pin_unreadable",
+        )
     if requested == "native":
         return resolve_subagent_executor("native")  # nothing to ask the daemon
+    if pin is not None and not pin.is_session:
+        # The owner allocated this work to an API model. That is an answer, not an
+        # absence, so it must not fall through to the install-wide harness — and a
+        # parent that pinned `harness` loses to it, disclosed as an executor
+        # reduction by the delta the caller builds.
+        return SubagentExecutorResolution(
+            requested, "native", None, "routing_pin_api_model",
+        )
     from ouroboros.contracts.task_constraint import normalize_task_constraint
     from ouroboros.tool_access import predicted_subagent_profile
 
     constraint = normalize_task_constraint(task.get("task_constraint"))
     surface = str(getattr(constraint, "surface", "") or "")
     shape = delegated_run_shape(predicted_subagent_profile(write_surface=surface) == "acting_subagent")
-    return probe_subagent_executor(requested, shape=shape)
+    return probe_subagent_executor(requested, shape=shape, route=pinned_route_of(pin))
 
 
 @dataclass(frozen=True)
@@ -586,6 +535,14 @@ class SubagentLaneResolution:
     # names the DECISION source, never the slot outcome, so the two facts stay
     # separately readable on the durable delta.
     provenance: str = ""
+    # WHERE THE MODEL came from — "lane_slot" (the owner's configured slot for the
+    # effective lane, the ordinary case) or "allocation" (the owner pinned this
+    # exact model for this piece of work in an approved routing plan). Its own
+    # field because it is a different question from `provenance`, which is about
+    # the LANE: an allocation answers "which model", never "how strong", and a
+    # record that conflated them could not say that a Heavy child ran on a model
+    # the owner chose by hand rather than on an unconfigured slot's fallback.
+    model_source: str = "lane_slot"
 
     @property
     def reduced(self) -> bool:
@@ -699,6 +656,7 @@ def resolve_subagent_lane(
     *,
     parent_lane: str = "",
     policy_default_lane: str = "",
+    pinned_model: str = "",
 ) -> SubagentLaneResolution:
     """Resolve a subagent's effective lane + model.
 
@@ -750,12 +708,19 @@ def resolve_subagent_lane(
     else:
         resolved_from, provenance = intended_lane(requested, parent_lane), "inherited"
     effective = resolved_from
-    model = _lane_model(effective)
-    if lane_ran_on_main(effective, model):
+    pinned = str(pinned_model or "").strip()
+    model = pinned or _lane_model(effective)
+    if not pinned and lane_ran_on_main(effective, model):
         # Report the slot the model ACTUALLY came from. Asking for Heavy on an
         # install with no Heavy slot gets the Main model, and calling that
         # `effective_lane="heavy"` made the record claim a strength nobody
         # configured — the reduction `capability_delta` now announces.
+        #
+        # An ALLOCATION model is exempt, and must be: that predicate reads
+        # "differs from this lane's slot" as "the slot was empty, so Main
+        # answered", which is false for a model the owner named by hand. Left in,
+        # every pinned child would have reported a lane reduction that never
+        # happened.
         effective = "main"
     return SubagentLaneResolution(
         requested_lane=requested,
@@ -764,6 +729,7 @@ def resolve_subagent_lane(
         use_local_model=_use_local_for_lane(effective, model),
         resolved_from=resolved_from,
         provenance=provenance,
+        model_source="allocation" if pinned else "lane_slot",
     )
 
 
@@ -877,6 +843,15 @@ class CapabilityDelta:
     # meaning anything is the same class of defect as a reduction nobody announces.
     # Not a reduction: nothing was taken away, the field simply no longer exists.
     legacy_note: str = ""
+    # The owner-approved allocation this child ran under, if any: the plan item it
+    # named, and whether the model came from that plan or from the lane slot.
+    # DISCLOSURE ONLY — an allocation takes nothing away from the parent's request
+    # (the parent never asked for a model), so it never sets `reduced`. It is
+    # recorded because "who chose this destination" is otherwise unanswerable from
+    # the record: a Heavy child on an unexpected model looks identical whether the
+    # owner pinned it or a slot was empty.
+    allocation_item: str = ""
+    model_source: str = "lane_slot"
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -891,6 +866,8 @@ class CapabilityDelta:
             "reason": self.reason,
             "reduced": bool(self.reduced),
             "legacy_note": self.legacy_note,
+            "allocation_item": self.allocation_item,
+            "model_source": self.model_source,
         }
 
 
@@ -973,6 +950,13 @@ SUBAGENT_INTENT_FIELDS: tuple[str, ...] = (
     # policy-overridden between admission and dispatch.
     "required_model_lane",
     "requested_executor",
+    # The OWNER's allocation for this child, resolved at schedule time from the
+    # tree's approved routing plan: the item the parent named, and the frozen
+    # destination it mapped to. Frozen deliberately — a plan the owner edits
+    # mid-run must not silently re-route children already scheduled under the
+    # decision they approved before it.
+    "routing_plan_item",
+    ROUTING_PIN_FIELD,
 )
 
 # Fields a stored subagent record may still carry from a schema that no longer
@@ -1114,18 +1098,30 @@ def resolve_subagent_dispatch(
     required_lane = str(task.get("required_model_lane") or "").strip().lower()
     if required_lane not in SUBAGENT_MODEL_LANES or required_lane == "auto":
         required_lane = ""
+    # An `api_chat` allocation names the MODEL this child runs on. It does not
+    # touch the lane: strength stays the parent's declaration, and the owner's
+    # pin answers only "on what". A session allocation pins nothing here — its
+    # model rides the route spec and is the harness's to apply.
+    pin = routing_pin_from_task(task)
     lane = resolve_subagent_lane(
         requested_lane, parent_lane=str(task.get("parent_model_lane") or ""),
         policy_default_lane=(
             "light" if executor == "harness" and not required_lane else ""),
+        pinned_model=pinned_model_of(pin),
     )
     # Only a REDUCTION belongs in the delta. The table also names the ordinary
     # outcomes (`requested_native`, `harness_ready`) and the no-preference case
     # (`auto` with no route configured, D28: nothing was asked for, no delta) —
     # none of which took anything away from the request.
+    #
+    # `routing_pin_api_model` joins the no-preference case for the same reason:
+    # against `auto` the owner's allocation IS the answer and took nothing away,
+    # while against an explicit `harness` pin it overrode a stated refusal to
+    # spend metered money — which the parent must be told.
     executor_reason = executor_resolution.reason
     if executor_reason in ("requested_native", "harness_ready") or (
-        requested_executor == "auto" and executor_reason == "harness_not_configured"
+        requested_executor == "auto"
+        and executor_reason in ("harness_not_configured", "routing_pin_api_model")
     ):
         executor_reason = ""
     from ouroboros.config import effort_rank, resolve_effort
@@ -1140,6 +1136,13 @@ def resolve_subagent_dispatch(
         reasons.append(f"lane_slot_unavailable={lane.resolved_from}")
     if executor_reason:
         reasons.append(executor_reason)
+    named_item = str(task.get("routing_plan_item") or "").strip()
+    if named_item and pin is None:
+        # The parent named a plan item no approved plan carries, so this child ran
+        # on the standing policy instead of where the owner allocated it. A quiet
+        # fallback here is the expensive kind: the work lands on a destination the
+        # owner did not choose, and the record would show nothing unusual.
+        reasons.append(f"routing_plan_item_unknown={named_item}")
 
     # A record that carries its own capability_delta was ALREADY resolved once:
     # the stored reasoning_effort is the residue record_fields() wrote — which now
@@ -1168,6 +1171,8 @@ def resolve_subagent_dispatch(
         reason="; ".join(reasons),
         reduced=bool(reasons),
         legacy_note="; ".join(sorted(legacy_ignored.values())),
+        allocation_item=str(task.get("routing_plan_item") or ""),
+        model_source=lane.model_source,
     )
     from ouroboros.tools.control_delegation import profile_from_task_constraint
 

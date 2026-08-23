@@ -74,45 +74,7 @@ class _CompactionRoundContext:
     emit_progress: Callable[[str], None]
 
 
-def _provider_failure_hint(accumulated_usage: Dict[str, Any]) -> str:
-    detail = " ".join(str(accumulated_usage.get("_last_llm_error") or "").split()).strip()
-    if not detail:
-        return ""
-    return f" Last provider error: {detail}"
-
-
-def _provider_recovery_hint(accumulated_usage: Dict[str, Any]) -> str:
-    """Explain whether retrying later is likely to help."""
-    kind = str(accumulated_usage.get("_last_llm_error_kind") or "").strip()
-    if kind == "subscription_window_exhausted":
-        reset_at = str(accumulated_usage.get("_last_llm_reset_at") or "").strip()
-        when = f" It resets at {reset_at}." if reset_at else ""
-        return (
-            " The subscription window for the delegated route is spent. This is "
-            f"TRANSIENT, not a billing refusal — waiting cures it.{when} Retrying is "
-            "scheduled against that reset time, not the ordinary short backoff."
-        )
-    if kind in {"quota_exhausted", "auth_error", "request_too_large", "bad_request", "context_overflow"}:
-        guidance = {
-            "quota_exhausted": "The provider rejected the request for quota/billing reasons; retrying the same request will not help until the key/account limit changes.",
-            "auth_error": "The provider rejected authentication/authorization; retrying the same request will not help until the configured key or provider access is fixed.",
-            "request_too_large": "The provider rejected the request size/output-token shape; retrying the same request will not help without reducing context/output demand or changing model capacity.",
-            "bad_request": "The provider rejected the request shape; retrying the same request will not help until the transcript/tool payload is fixed.",
-            "context_overflow": "The context overflowed the model window; retrying the same request will not help without reducing context or changing model capacity.",
-        }.get(kind, "Retrying the same provider request will not help until the underlying request/account issue changes.")
-        return f" {guidance}"
-    detail = str(accumulated_usage.get("_last_llm_error") or "").lower()
-    if "prefill" in detail or "conversation must end with a user message" in detail:
-        return (
-            " This looks like a client-side transcript-shape error, not a "
-            "provider outage; retrying the same input will not help."
-        )
-    if "provider returned incomplete response" in detail or "finish_reason=null" in detail:
-        return (
-            " The provider returned incomplete responses repeatedly; this may "
-            "be transient, but it can also indicate malformed client input."
-        )
-    return " If background consciousness is running, it will retry when the provider recovers."
+from ouroboros.provider_hints import _provider_failure_hint, _provider_recovery_hint  # noqa: E402
 
 
 def _handle_text_response(
@@ -3330,7 +3292,7 @@ def _drain_incoming_messages(
             break
 
     if drive_root is not None and task_id:
-        from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_TEXT, drain_owner_entries
+        from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_TEXT, KIND_ROUTING_DECISION, drain_owner_entries
         for entry in drain_owner_entries(drive_root, task_id=task_id, seen_ids=_owner_msg_seen):
             kind = entry.get("kind") or KIND_OWNER_TEXT
             if kind == KIND_FINALIZE_NOW:
@@ -3352,6 +3314,8 @@ def _drain_incoming_messages(
                 apply_latch(owner_ctx, entry, event_queue=event_queue)
                 controls["hurry"] = str(entry.get("msg_id") or "hurry")
                 continue
+            if kind == KIND_ROUTING_DECISION:
+                continue  # its own waiting tool reads it (owner_mailbox states why)
             dmsg = entry.get("text") or ""
             _record_owner_directive(
                 owner_ctx,

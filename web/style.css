@@ -1535,6 +1535,81 @@ body.resizing-panels { user-select: none; }
     margin-right: 20%;
 }
 
+/* Execution-plan proposal: a control the owner answers, not a progress note, so
+   it reads as a decision card rather than another system line. */
+.exec-plan-card {
+    margin-right: 8%;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.exec-plan-head {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.exec-plan-title {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.exec-plan-headline {
+    font-size: 12px;
+    color: var(--text-secondary, #888);
+}
+
+.exec-plan-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.exec-plan-row {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.exec-plan-row-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    align-items: baseline;
+}
+
+.exec-plan-row-title {
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.exec-plan-row-estimate,
+.exec-plan-row-why,
+.exec-plan-note {
+    font-size: 11px;
+    color: var(--text-secondary, #888);
+}
+
+.exec-plan-select {
+    width: 100%;
+    font-size: 12px;
+}
+
+.exec-plan-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.exec-plan-card[data-exec-plan-approved="1"] .exec-plan-select {
+    pointer-events: none;
+    opacity: 0.6;
+}
+
 .chat-bubble .sender {
     font-size: 11px;
     font-weight: 600;

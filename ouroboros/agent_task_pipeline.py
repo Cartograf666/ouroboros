@@ -691,6 +691,14 @@ def emit_task_results(
         except Exception:
             log.warning("Failed to log task eval event", exc_info=True)
             pass
+        # THE one writer of route evidence, at the one seam where the wall clock,
+        # the reconstructed cost and the outcome are all known at once.
+        from ouroboros.route_evidence import fold_task_outcome
+
+        fold_task_outcome(
+            env.drive_root, task, outcome_axes, duration_sec, task_cost_fields,
+            ok=execution_status not in {EXECUTION_FAILED, EXECUTION_INFRA_FAILED},
+        )
 
     pending_events.append({
         "type": "task_metrics",

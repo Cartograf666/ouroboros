@@ -70,6 +70,10 @@ def collect_routes(
         api_claudexor_status,
         api_claudexor_wake,
     )
+    from ouroboros.gateway.execution_plan import (
+        api_execution_plan_decision,
+        api_execution_targets,
+    )
     from ouroboros.gateway.onboarding import api_onboarding_complete
     from ouroboros.gateway.settings import api_reviewer_slots
     from ouroboros.gateway.mcp import api_mcp_refresh, api_mcp_status, api_mcp_test
@@ -276,6 +280,14 @@ def collect_routes(
         # Agent accounts (D30): thin proxies of the owned Claudexor daemon's
         # own account surface; zero auth logic on this side.
         Route("/api/reviewer-slots", endpoint=api_reviewer_slots, methods=["GET"]),
+        # Per-task execution allocation: what the work can run on, and the
+        # owner's answer to a proposal waiting on it.
+        Route("/api/execution-targets", endpoint=api_execution_targets, methods=["GET"]),
+        Route(
+            "/api/execution-plan/decision",
+            endpoint=api_execution_plan_decision,
+            methods=["POST"],
+        ),
         Route("/api/claudexor/status", endpoint=api_claudexor_status, methods=["GET"]),
         Route("/api/claudexor/wake", endpoint=api_claudexor_wake, methods=["POST"]),
         Route("/api/claudexor/login", endpoint=api_claudexor_login, methods=["POST"]),

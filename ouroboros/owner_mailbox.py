@@ -22,6 +22,12 @@ KIND_FINALIZE_NOW = "finalize_now"
 # re-drain must restore the attempt latch; only terminal cleanup removes it).
 # Its ``text`` is the parser-required internal reason ("owner_hurry"), not prose.
 KIND_HURRY = "hurry"
+# The owner's decision on a proposed execution allocation. Its payload is the
+# approved plan as JSON text, and like every control kind it is routed
+# STRUCTURALLY: delivered as owner prose it would reach the model as a wall of
+# JSON to interpret, when the one thing that must not be re-interpreted is which
+# destination the owner approved.
+KIND_ROUTING_DECISION = "routing_decision"
 # The mailbox is append-only, so a sender that changes its mind cannot delete the
 # control it already wrote — it appends this retraction naming the target msg_id.
 # Revocations are resolved by the READER over the whole mailbox, so a control that

@@ -17,6 +17,8 @@ import {
     daemonAnswered,
     daemonStatusLine,
     destroyHarnessAccounts,
+    familyActionLabel,
+    familyHasDefaultLogin,
     initHarnessAccounts,
     normalizeProfileName,
     promptProfileName,
@@ -1879,4 +1881,41 @@ test('a login seen online is not un-seen by the re-check running out', () => {
         'a positive confirmation no longer wins on its own');
     assert.match(body, /active\.verdict = confirmed/,
         'the monotone predicate does not decide the verdict');
+});
+
+test('a family with no default login asks for a name on its FIRST account', () => {
+    // Antigravity has no engine-default credential — the engine says so with a
+    // failing `default_credential` check. Connect there posts a login with no
+    // profileId, which the engine refuses by design, so the button did nothing
+    // at all. Such a family must ask for a name up front.
+    const payload = {
+        harnesses: [
+            { id: 'codex', display_name: 'Codex CLI', default_login_available: true },
+            { id: 'agy', display_name: 'Antigravity', default_login_available: false },
+        ],
+    };
+    const empty = (harness) => ({ harness, label: harness, rows: [], status: {} });
+    assert.equal(familyActionLabel(empty('agy'), payload), 'Add account');
+    assert.equal(familyActionLabel(empty('codex'), payload), 'Connect');
+    assert.equal(familyHasDefaultLogin('agy', payload), false);
+    assert.equal(familyHasDefaultLogin('codex', payload), true);
+});
+
+test('an absent or unreadable declaration keeps the Connect the panel always had', () => {
+    // Fail OPEN: an older backend that never projects the field, or a manifest
+    // nobody could read, must not turn every family into an add-a-name flow.
+    const empty = { harness: 'codex', label: 'Codex CLI', rows: [], status: {} };
+    assert.equal(familyActionLabel(empty, { harnesses: [{ id: 'codex' }] }), 'Connect');
+    assert.equal(familyActionLabel(empty, {}), 'Connect');
+    assert.equal(familyHasDefaultLogin('codex', {}), true);
+    assert.equal(familyHasDefaultLogin('unknown-family', { harnesses: [] }), true);
+});
+
+test('a family that already has accounts adds a named one either way', () => {
+    const populated = (harness) => ({
+        harness, label: harness, rows: [{ profile_id: 'default' }], status: {},
+    });
+    const payload = { harnesses: [{ id: 'agy', default_login_available: false }] };
+    assert.equal(familyActionLabel(populated('agy'), payload), 'Add account');
+    assert.equal(familyActionLabel(populated('codex'), payload), 'Add account');
 });

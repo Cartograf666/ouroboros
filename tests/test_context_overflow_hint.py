@@ -5,7 +5,7 @@ import json
 import pytest
 
 from ouroboros.llm import LocalContextTooLargeError
-from ouroboros.loop import _provider_recovery_hint
+from ouroboros.provider_hints import _provider_recovery_hint
 from ouroboros.loop_llm_call import (
     _LlmErrorContext,
     _is_context_overflow_error,

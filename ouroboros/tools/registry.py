@@ -1502,7 +1502,8 @@ class ToolRegistry:
 
     _FROZEN_TOOL_MODULES = [
         "antigravity", "browser", "ci", "claude_advisory_review", "compact_context", "control",
-        "core", "delegate", "edit_ops", "evolution_stats", "git", "git_pr", "git_rollback", "github",
+        "core", "delegate", "edit_ops", "evolution_stats", "execution_plan",
+        "git", "git_pr", "git_rollback", "github",
         "health", "join_ledger", "knowledge", "media", "memory_tools", "plan_review", "project_journal",
         "recent_tasks",
         "query_code", "review", "search", "services", "shell", "skill_exec", "skill_publish",

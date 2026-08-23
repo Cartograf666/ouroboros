@@ -4080,7 +4080,10 @@ def _handle_log_event(evt: Dict[str, Any], ctx: Any) -> None:
         ctx.bridge.push_log(payload)
     except Exception:
         log.debug("Failed to forward live log event", exc_info=True)
-    if data.get("type") == "task_checkpoint":
+    # An execution-plan proposal is persisted for the same reason a checkpoint is:
+    # it is a QUESTION still awaiting an answer, so a page reload that lost it
+    # would leave the task parked on a card the owner can no longer see.
+    if data.get("type") in ("task_checkpoint", "execution_plan_proposal"):
         try:
             ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", payload)
         except Exception:

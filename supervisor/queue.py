@@ -736,6 +736,12 @@ def persist_queue_snapshot(reason: str = "") -> bool:
                 "model_lane": t.get("model_lane"), "parent_model_lane": t.get("parent_model_lane"),
                 "requested_model_lane": t.get("requested_model_lane"),
                 "required_model_lane": t.get("required_model_lane"), "requested_executor": t.get("requested_executor"),
+                # The owner's approved allocation for this child. A PENDING child
+                # has nothing else naming its destination, so dropping it here
+                # would silently re-route the work to the install-wide policy
+                # across a restart — after the owner had already approved it.
+                "routing_plan_item": t.get("routing_plan_item"),
+                "routing_pin": t.get("routing_pin"),
                 "effective_model_lane": t.get("effective_model_lane"),
                 "model": t.get("model"), "use_local_model": t.get("use_local_model"),
                 "effective_executor": t.get("effective_executor"), "tool_profile": t.get("tool_profile"),
