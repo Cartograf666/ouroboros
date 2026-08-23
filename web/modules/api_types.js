@@ -380,11 +380,21 @@
  */
 
 /**
+ * POST /api/projects/{project_id}/update body. `name` renames; `model` sets this
+ * project's own reasoning model and an EMPTY string legally clears it back to the
+ * global Main slot, so the key's PRESENCE selects what the call updates.
+ * @typedef {Object} ProjectUpdateRequest
+ * @property {string=} name
+ * @property {string=} model
+ */
+
+/**
  * @typedef {Object} ProjectEntry
  * @property {string} id
  * @property {string=} name
  * @property {number=} chat_id
  * @property {string=} working_dir
+ * @property {string=} model        // per-project route; empty = inherit the Main slot
  * @property {string=} provenance   // attached | cloned | genesis | none (historical fact)
  * @property {string=} clone_url
  * @property {string=} trusted_at

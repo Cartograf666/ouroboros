@@ -8,8 +8,9 @@
 // (notification model — attaching IS the grant; no second confirmation).
 import { openConfirmDialog } from './confirm_dialog.js';
 
-// Mirrored from the frozen backend PROJECT_NAME_MAX contract.
+// Mirrored from the frozen backend PROJECT_NAME_MAX / PROJECT_MODEL_MAX contracts.
 const PROJECT_NAME_MAX = 80;
+const PROJECT_MODEL_MAX = 200;
 
 export function openNewProjectDialog({ apiClient, onCreated }) {
     const maxNameLength = PROJECT_NAME_MAX;
@@ -197,9 +198,21 @@ export function openNewProjectDialog({ apiClient, onCreated }) {
     });
 }
 
+// Pure decision behind the "Model…" dialog. Unlike rename, an EMPTY confirmed
+// value is a real edit here — it clears the project's model back to the global
+// Main slot — so cancel and empty must not collapse into the same outcome.
+export function decideProjectModelChange({ current = '', dialogResult = null, max = PROJECT_MODEL_MAX } = {}) {
+    if (!dialogResult?.confirmed) return { action: 'skip' };
+    const model = String(dialogResult.value || '').trim();
+    if (model.length > max) return { action: 'error', error: `Model ids are limited to ${max} characters.` };
+    if (/\s/.test(model)) return { action: 'error', error: 'A model id cannot contain spaces.' };
+    if (model === String(current || '').trim()) return { action: 'skip' };
+    return { action: 'save', model };
+}
+
 let closeOpenProjectRowMenu = null;
 
-// Accessible row menu: Rename/Delete only. `project` is a sidebar read model;
+// Accessible row menu: Rename/Model/Delete. `project` is a sidebar read model;
 // callbacks refresh the authoritative registry projection.
 export async function openProjectRowMenu(project, { apiClient, anchorEl, onChanged }) {
     const maxNameLength = PROJECT_NAME_MAX;
@@ -210,6 +223,7 @@ export async function openProjectRowMenu(project, { apiClient, anchorEl, onChang
     menu.setAttribute('aria-label', `Actions for ${project.name || project.id}`);
     menu.innerHTML = `
         <button type="button" role="menuitem" data-prm="rename">Rename…</button>
+        <button type="button" role="menuitem" data-prm="model">Model…</button>
         <button type="button" role="menuitem" class="danger" data-prm="delete">Delete project…</button>
     `;
     const rect = anchorEl.getBoundingClientRect();
@@ -259,11 +273,37 @@ export async function openProjectRowMenu(project, { apiClient, anchorEl, onChang
                     alert: true,
                 });
             } else if (newName && newName !== project.name) {
-                try { await apiClient.projectUpdate(project.id, newName); onChanged?.(); }
+                try { await apiClient.projectUpdate(project.id, { name: newName }); onChanged?.(); }
                 catch (e) {
                     await openConfirmDialog({
                         title: 'Rename failed',
                         body: `Rename failed: ${e?.body?.error || e?.message || e}`,
+                        alert: true,
+                    });
+                }
+            }
+            if (anchorEl.isConnected) anchorEl.focus();
+        } else if (action === 'model') {
+            const decision = decideProjectModelChange({
+                current: project.model || '',
+                dialogResult: await openConfirmDialog({
+                    title: 'Project model',
+                    body: `Model id for “${project.name || project.id}” (e.g. anthropic/claude-opus-5). `
+                        + `Leave empty to inherit the global Main model. `
+                        + `This routes the project's own turns; subagent lanes stay global.`,
+                    input: true,
+                    initialValue: project.model || '',
+                    confirmLabel: 'Save',
+                }),
+            });
+            if (decision.action === 'error') {
+                await openConfirmDialog({ title: 'Project model', body: decision.error, alert: true });
+            } else if (decision.action === 'save') {
+                try { await apiClient.projectUpdate(project.id, { model: decision.model }); onChanged?.(); }
+                catch (e) {
+                    await openConfirmDialog({
+                        title: 'Model change failed',
+                        body: `Model change failed: ${e?.body?.error || e?.message || e}`,
                         alert: true,
                     });
                 }

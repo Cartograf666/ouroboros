@@ -392,6 +392,9 @@ function renderProjectsNav(projects, projectChatIds) {
     }
     const json = JSON.stringify(rows.map(p => [
         p.id, p.name, p.chat_id, p.lifecycle, p.visible_revision, p._unread, p.delete_error,
+        // v6.101.0: without `model` in the identity, a model-only change from
+        // another client repaints nothing and the row menu reopens on a stale value.
+        p.model,
     ]));
     if (json === knownProjectsJson) return;
     knownProjectsJson = json;
