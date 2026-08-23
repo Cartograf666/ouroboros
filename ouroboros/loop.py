@@ -19,6 +19,7 @@ from ouroboros.config import adaptive_quorum, get_context_mode, get_light_model,
 from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_BYPASS_REASONS, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, REASON_DELIVERY_CONTROL_DEGRADED, REASON_OWNER_REQUESTED_FINALIZATION, RESULT_INFRA_FAILED, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
 from ouroboros.observability import new_execution_id
 from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools, swarm_router_turn
+from ouroboros import task_activity
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.context import build_user_content
 from ouroboros.context_budget import ContextReclaimRequest
@@ -2294,6 +2295,13 @@ def _run_task_acceptance_review_once(
                 mode == "required" and get_review_enforcement() == "blocking"
             ), workspace=task_pacing._workspace_delivery(tools._ctx),
         ),
+    )
+    # Ticker fact: the panel is the longest non-model block a finalizing task has,
+    # and until now it was silent — the owner saw the task stop narrating right at
+    # the moment it looked finished.
+    task_activity.mark(
+        task_id, task_activity.PHASE_REVIEW,
+        detail=f"acceptance panel, pass {passes_done + 1}",
     )
     try:
         from types import SimpleNamespace
@@ -4755,6 +4763,43 @@ def _run_forced_children_acceptance(
         tools_ctx._forced_undispositioned_children = None
 
 
+# How many times a Swarm routing turn may be told to route before the host stops
+# asking. The routing turn's entire job is ONE tool call, so a model that has
+# ignored the intent this many times is not going to emit it on the next round.
+_SWARM_ROUTING_NUDGE_BUDGET = 3
+
+
+def _swarm_routing_nudges(ctx: Any) -> int:
+    return int(getattr(ctx, "_swarm_routing_nudge_count", 0) or 0)
+
+
+def _swarm_routing_exhausted_rail(
+    limit_ctx: "_RoundLimitContext",
+    tools: ToolRegistry,
+    llm_trace: Dict[str, Any],
+) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
+    """End a routing turn that keeps answering inline instead of routing.
+
+    ``_enforce_swarm_actions`` holds finalization for another model round, and
+    nothing bounded that hold: a model that never emits the routing tool call
+    re-earned the reminder every round until MAX_ROUNDS (200). Each round also
+    re-sends a transcript that the reminder just grew, so a slow route degrades
+    rather than converges — on a local GGUF at minutes per round that is hours of
+    nudging, and the owner sees only a repeating progress line. Past the budget
+    the honest outcome is the typed ``not_attempted`` routing rail, which already
+    says no inline work was published, not one more reminder."""
+    ctx = tools._ctx
+    if not swarm_router_turn(ctx) or _swarm_handoff_attempt(ctx):
+        return None
+    if _swarm_routing_nudges(ctx) < _SWARM_ROUTING_NUDGE_BUDGET:
+        return None
+    llm_trace["reasoning_notes"].append(
+        f"Swarm routing turn ended after {_SWARM_ROUTING_NUDGE_BUDGET} unfulfilled "
+        "routing reminders; no managed root was admitted."
+    )
+    return _forced_swarm_router_result(limit_ctx, llm_trace, "swarm_routing_unfulfilled")
+
+
 def _enforce_swarm_actions(
     content: str,
     messages: List[Dict[str, Any]],
@@ -4774,6 +4819,7 @@ def _enforce_swarm_actions(
         )
         _append_or_merge_user_message(messages, reminder)
         llm_trace["reasoning_notes"].append(reminder)
+        tools._ctx._swarm_routing_nudge_count = _swarm_routing_nudges(tools._ctx) + 1
         emit_progress("Swarm routing action required before final response.")
         return True
 
@@ -4826,6 +4872,9 @@ def _no_tool_final_answer(
         if isinstance(candidate, DeliveryCandidate):
             content = candidate.full_text
 
+    routing_rail = _swarm_routing_exhausted_rail(limit_ctx, tools, llm_trace)
+    if routing_rail is not None:
+        return routing_rail
     if _enforce_swarm_actions(
         str(content or ""), messages, tools, llm_trace, emit_progress,
     ):
@@ -6979,6 +7028,7 @@ def run_llm_loop(
                 emit_progress=emit_progress, tools=tools, event_queue=event_queue, task_id=task_id,
                 drive_logs=drive_logs, budget_remaining_usd=budget_remaining_usd, cost_ceiling=cost_ceiling)
 
+            task_activity.mark(task_id, task_activity.PHASE_COMPACTION, round_idx=round_idx, max_rounds=MAX_ROUNDS)
             messages, _compaction_usage = _run_round_compaction(
                 messages,
                 _CompactionRoundContext(
@@ -6999,6 +7049,13 @@ def run_llm_loop(
 
             seal_task_transcript(messages)
 
+            # The owner-facing ticker's fact source: this is where the round goes
+            # quiet, and on a slow route it stays quiet for minutes.
+            task_activity.mark(
+                task_id, task_activity.PHASE_MODEL,
+                round_idx=round_idx, max_rounds=MAX_ROUNDS,
+                model=f"{active_model}{' (local)' if active_use_local else ''}",
+            )
             msg, cost, active_context_mode = _call_round_model(
                 _RoundModelCallContext(
                     llm=llm,
@@ -7095,4 +7152,5 @@ def run_llm_loop(
     except BudgetExceeded as exc:
         return _handle_budget_exceeded(exc, exit_ctx, limit_ctx=limit_ctx)
     finally:
+        task_activity.clear(task_id)
         _cleanup_loop_resources(stateful_executor, exit_ctx)

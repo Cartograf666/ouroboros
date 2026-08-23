@@ -2416,6 +2416,22 @@ def _wait_for_tasks(
     # wait and gets the rest of the requested window.
     _phantom_only = bool(entry_unknown_ids) and len(entry_unknown_ids) == len(normalized_ids)
     first_window = min(float(timeout), _UNMINTED_WAIT_GRACE_SEC) if _phantom_only else float(timeout)
+    # Ticker fact: this is where a swarm parent parks — up to 7200s of a tool call
+    # that emits nothing of its own. The generic "running wait_tasks" stamp from
+    # handle_tool_calls is true but says nothing about the wait SET; name it here.
+    try:
+        from ouroboros import task_activity
+
+        task_activity.mark(
+            str(getattr(ctx, "task_id", "") or ""),
+            task_activity.PHASE_CHILDREN,
+            detail=(
+                f"waiting on {len(normalized_ids)} subagent(s) "
+                f"({normalized_mode.replace('_', ' ')})"
+            ),
+        )
+    except Exception:
+        log.debug("Failed to stamp wait_tasks activity for the progress ticker", exc_info=True)
     waited = wait_for_effective_tasks(
         status_drive_root, normalized_ids, timeout_sec=first_window, mode=normalized_mode,
         on_poll=_wait_attention_poll(ctx, _wait_since), poll_interval_sec=2.0,
