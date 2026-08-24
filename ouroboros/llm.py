@@ -2312,6 +2312,16 @@ class LLMClient:
                     b.get("text", "") for b in content
                     if isinstance(b, dict) and b.get("type") == "text"
                 )
+            elif content is None:
+                # A tool-calling assistant turn carries `content: null` — legal on the
+                # OpenAI wire and what every hosted provider returns. llama-cpp-python's
+                # request model types assistant content as a bare `str`, so the null
+                # matches NONE of the five message variants and the whole request dies
+                # as `7 validation errors` on that one index — a 500 the loop can only
+                # read as the provider being down. The turn IS contentless; say so with
+                # the empty string the server accepts rather than dropping the message
+                # and losing which tools the assistant asked for.
+                msg["content"] = ""
 
         clean_tools = None
         if tools:
