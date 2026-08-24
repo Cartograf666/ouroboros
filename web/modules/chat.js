@@ -7,6 +7,8 @@ import {
     captureVisibleTimelineAnchor as captureAnchor,
     restoreVisibleTimelineAnchor as restoreAnchor,
 } from './timeline_anchor.js';
+import { buildTimelineItemHtml, isLiveLineExpandable } from './live_timeline_item.js';
+import { initChatModelControl } from './chat_model_control.js';
 import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
@@ -294,6 +296,26 @@ export function createChatInstance({
                 <div class="chat-toolbar-row">
                     <div class="chat-composer-pills" id="chat-composer-pills">
                         <button class="chat-swarm" id="chat-swarm" type="button" data-armed="false" title="Swarm: route your next message into a new managed task, run a deep plan review with plan_task, then delegate when parallel work helps. Auto-disarms after sending.">Swarm</button>
+                        ${isMain ? `
+                        <details class="chat-model-control" id="chat-model-control">
+                            <summary title="Choose the main model for new tasks and inspect observed limits">
+                                <span class="chat-model-dot" aria-hidden="true"></span>
+                                <span data-model-summary>Model · Loading…</span>
+                            </summary>
+                            <div class="chat-model-menu">
+                                <label class="chat-model-field">
+                                    <span>Main model for new tasks</span>
+                                    <select data-model-select aria-label="Main model for new tasks"></select>
+                                </label>
+                                <div class="chat-model-state-row">
+                                    <span class="chat-model-state" data-model-status data-state="loading">Checking…</span>
+                                    <button type="button" class="chat-model-refresh" data-model-refresh>Refresh</button>
+                                </div>
+                                <p class="chat-model-detail" data-model-detail>Reading recent provider results…</p>
+                                <div class="chat-harness-quota" data-harness-quota>Claude Code / Codex · checking subscription limits…</div>
+                                <p class="chat-model-note">Claude Code and Codex are delegated agents, not main-chat models.</p>
+                            </div>
+                        </details>` : ''}
                         <div class="chat-context-mode" id="chat-context-mode" data-context-mode="max" role="group" aria-label="Context size mode" title="Context mode (owner setting). Low fits ~200K / local models; Max is full. Saves immediately; lowering to Low requires Ouroboros to be idle.">
                             <button class="chat-seg" type="button" data-mode="low">Low</button>
                             <button class="chat-seg" type="button" data-mode="max">Max</button>
@@ -351,6 +373,21 @@ export function createChatInstance({
     // Every ws.on subscription's disposer, released together in destroy().
     const wsDisposers = [];
     const onWs = (event, fn) => wsDisposers.push(ws.on(event, fn));
+
+    // The main model selector. Main chat only: a project panel runs on the
+    // project's own model or inherits this slot, so offering the global choice
+    // there would let a panel silently repoint every other surface.
+    const modelControl = page.querySelector('.chat-model-control');
+    let disposeModelControl = () => {};
+    if (modelControl) {
+        disposeModelControl = initChatModelControl({
+            root: modelControl,
+            showToast,
+            onModelChanged: (modelLabel) => {
+                addMessage(`🔄 Модель переключена на: **${modelLabel}**`, 'system', true);
+            },
+        });
+    }
 
     async function loadUiPreferences() {
         try {
@@ -1717,16 +1754,6 @@ export function createChatInstance({
         return record?.root?.isConnected ? withStableViewport(mutate) : mutate();
     }
 
-    function isLiveLineExpandable(item) {
-        return Boolean(
-            (item.fullHeadline && item.fullHeadline !== item.headline)
-            || (item.fullBody && item.fullBody !== item.body)
-            // P3: even when the preview equals the capped body, a server-truncated line
-            // with a fetch ref has MORE to show (the genuinely-full output on demand).
-            || (item.truncated && item.fullRef)
-        );
-    }
-
     function syncLiveCardToggle(record) {
         if (!record?.toggleEl) return;
         const expanded = record.root.dataset.expanded === '1';
@@ -1799,49 +1826,6 @@ export function createChatInstance({
         }
     };
     document.addEventListener('visibilitychange', handleVisibilityChange);
-
-    function buildTimelineItemHtml(item, record) {
-        const expandable = isLiveLineExpandable(item);
-        const expanded = expandable && record.expandedLineKeys.has(item.lineKey);
-        const displayHeadline = expanded && item.fullHeadline ? item.fullHeadline : item.headline;
-        // P3: when expanded, prefer the genuinely-full fetched output, then the capped
-        // fullBody, then the preview body. A server-truncated line shows the fetched full
-        // text in a bounded-scroll box so a huge research output never grows the chat.
-        const displayBody = expanded ? (item.fetchedFull || item.fullBody || item.body) : item.body;
-        const showingFetched = expanded && Boolean(item.fetchedFull);
-        const loadingFull = expanded && Boolean(item.truncated && item.fullRef && !item.fetchedFull);
-        const isProgressLine = item.phase === 'working' || item.phase === 'thinking';
-        const bodyId = `chat-live-line-body-${String(record.groupId || 'task').replace(/[^A-Za-z0-9_-]/g, '-')}-${String(item.lineKey || '').replace(/[^A-Za-z0-9_-]/g, '-')}`;
-        const headContent = `
-            <span class="chat-live-line-title">${isProgressLine ? renderMarkdown(displayHeadline) : escapeHtml(displayHeadline)}</span>
-            <span class="chat-live-line-repeat" ${item.count > 1 ? '' : 'hidden'}>${item.count > 1 ? `${item.count}x` : ''}</span>
-            ${item.ts ? `<span class="chat-live-line-time">${escapeHtml(item.ts)}</span>` : ''}
-        `;
-        const headHtml = expandable
-            ? `
-                <button
-                    type="button"
-                    class="chat-live-line-toggle"
-                    data-live-line-toggle="${escapeHtmlAttr(item.lineKey)}"
-                    aria-expanded="${expanded ? 'true' : 'false'}"
-                    ${displayBody ? `aria-controls="${escapeHtmlAttr(bodyId)}"` : ''}
-                >
-                    <span class="chat-live-line-head">${headContent}</span>
-                    <span class="chat-live-line-expand-label">${expanded ? 'Collapse' : ((item.truncated && item.fullRef) ? 'Show full' : 'Expand')}</span>
-                </button>
-            `
-            : `<div class="chat-live-line-head">${headContent}</div>`;
-        return `
-            <div
-                class="chat-live-line ${item.phase || 'working'}${expandable ? ' expandable' : ''}"
-                data-live-line-key="${escapeHtmlAttr(item.lineKey || '')}"
-                data-expanded="${expanded ? '1' : '0'}"
-            >
-                ${headHtml}
-                ${displayBody ? `<div class="chat-live-line-body${showingFetched ? ' chat-live-line-body-full' : ''}" id="${escapeHtmlAttr(bodyId)}">${renderMarkdown(displayBody)}${loadingFull ? '<div class="chat-live-line-loading">Loading full output…</div>' : ''}</div>` : ''}
-            </div>
-        `;
-    }
 
     function isTimelinePinnedToBottom(record) {
         const el = record?.timelineEl;
@@ -4449,6 +4433,10 @@ export function createChatInstance({
             if (!entry.kind) activeDirectActivities.delete(aid);
         }
         refreshHeaderControlState(true);
+        // A restart can happen while the selector's initial discovery calls
+        // are in flight. Re-read once the socket confirms the server is alive
+        // again; the control's loader is single-flight, so this is harmless.
+        void disposeModelControl.refresh?.();
         syncChatStatus();
         // perf2 P4.1 [Gemini#3]: reconnect truth comes from the ws CLIENT
         // (previouslyConnected rides the open event) — a project instance
@@ -4526,6 +4514,7 @@ export function createChatInstance({
             for (const dispose of wsDisposers) {
                 try { dispose(); } catch {}
             }
+            try { disposeModelControl(); } catch {}
             wsDisposers.length = 0;
             window.removeEventListener('ouro:page-shown', handlePageShown);
             document.removeEventListener('visibilitychange', handleVisibilityChange);
