@@ -19,6 +19,10 @@ from ouroboros.platform_layer import (
 log = logging.getLogger(__name__)
 
 _LOCAL_MODEL_DEFAULT_PORT = 8766
+# Last resort when the launched value, the server and the owner's setting are ALL
+# silent. Deliberately small: guessing high would ship an over-window prompt and
+# fail inside the model instead of before it.
+_CONTEXT_LENGTH_LAST_RESORT = 4096
 
 def _get_install_command() -> list:
     """Return the llama-cpp-python pip install command."""
@@ -868,15 +872,60 @@ class LocalModelManager:
             return {"ok": False, "error": str(e)}
 
     def get_context_length(self) -> int:
-        """Return cached context length, querying the server if needed."""
+        """The window the RUNNING server actually has, by decreasing authority.
+
+        1. What THIS process launched the server with. Exact, and the only source
+           that cannot be wrong.
+        2. What the server reports. llama-cpp-python's `/v1/models` does not carry
+           `meta.n_ctx_train` at all, so this usually answers nothing — kept
+           because a different OpenAI-compatible server may fill it in.
+        3. The owner's declared `LOCAL_MODEL_CONTEXT_LENGTH`, which is what the
+           launcher passed as `--n_ctx`. Read only when this process did not do
+           the launching — a subagent worker never does.
+
+        Only when all three are silent does the conservative 4096 apply. It used
+        to apply on step 2 alone, which is how a 65k model became a 4k one for
+        every worker: the server was fine, the probe simply had nothing to read,
+        and a task with a 17k-char core failed as "context too large" against a
+        window that did not exist. A floor that quiet is worse than no floor, so
+        the fallback now says so in the log.
+        """
         if self._context_length > 0:
             return self._context_length
         try:
-            info = self.health_check()
-            self._context_length = info.get("context_length", 4096)
+            reported = int(self.health_check().get("context_length") or 0)
         except Exception:
-            self._context_length = 4096
+            reported = 0
+        if reported > 0:
+            self._context_length = reported
+            return self._context_length
+        declared = self._owner_declared_context_length()
+        if declared > 0:
+            log.info(
+                "Local server reports no context length; using the owner's "
+                "LOCAL_MODEL_CONTEXT_LENGTH=%d (what the launcher passed as --n_ctx).",
+                declared,
+            )
+            self._context_length = declared
+            return self._context_length
+        log.warning(
+            "Local context length is unknown from every source; assuming %d. "
+            "Prompts larger than that will be refused as too large even if the "
+            "running server has a bigger window.",
+            _CONTEXT_LENGTH_LAST_RESORT,
+        )
+        self._context_length = _CONTEXT_LENGTH_LAST_RESORT
         return self._context_length
+
+    @staticmethod
+    def _owner_declared_context_length() -> int:
+        """`LOCAL_MODEL_CONTEXT_LENGTH` as an int, or 0 when unset/unreadable."""
+        try:
+            from ouroboros.config import load_settings
+
+            return max(0, int(load_settings().get("LOCAL_MODEL_CONTEXT_LENGTH") or 0))
+        except Exception:
+            return 0
 
     def test_tool_calling(self) -> Dict[str, Any]:
         """Run basic chat and tool-call checks against the local server."""
