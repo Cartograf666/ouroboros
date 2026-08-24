@@ -518,6 +518,26 @@ def supports_vision(model_id: str) -> bool:
 # / local health, or route-fingerprinted owner-ack), fail-closed when unknown.
 
 
+
+def compatible_lane_messages(messages):
+    """Messages reshaped for the `openai-compatible` lane: no null content.
+
+    That lane is the one for a server we do not know — a local llama-cpp-python,
+    a self-hosted gateway, someone's proxy. A contentless assistant turn
+    (``content: null`` beside ``tool_calls``) is legal OpenAI and every
+    first-party provider takes it, but llama-cpp-python types that field as a
+    bare ``str``: the null matches none of its message variants and the WHOLE
+    request comes back as a 500 the loop can only read as an outage. The turn
+    really is contentless, so ``""`` says the same thing in a shape every server
+    on this lane accepts, and the ``tool_calls`` beside it survive untouched —
+    they are the only thing that turn carries. Named lanes keep the null: they
+    take it correctly, and rewriting what we send them buys nothing.
+    """
+    return [
+        {**msg, "content": ""} if msg.get("content") is None else msg
+        for msg in messages
+    ]
+
 def normalize_model_identity(model: str) -> str:
     text = str(model or "").strip()
     if text.endswith(" (local)"):

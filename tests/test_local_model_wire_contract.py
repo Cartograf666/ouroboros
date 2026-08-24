@@ -66,3 +66,64 @@ def test_the_local_path_normalizes_null_content_before_it_is_sent():
     source = inspect.getsource(LLMClient._chat_local)
     assert "elif content is None:" in source
     assert 'msg["content"] = ""' in source
+
+
+# --- the same rejection reached us through the OTHER lane -----------------------
+#
+# `USE_LOCAL_FALLBACK` points the fallback at a local model, but the fallback ROW
+# itself can name an `openai-compatible::` model, and that lane does not go through
+# `_chat_local` at all. So the identical null-content request went out a second way
+# — to whatever server the owner's compatible base URL names, which is very often
+# another llama-cpp-python. Fixing only the local path left the failure looking
+# unchanged: same 500, same "provider outage", one round later.
+
+def _remote_target(provider):
+    return {
+        "provider": provider, "model": "m", "resolved_model": "m",
+        "base_url": "https://example.invalid/v1", "api_key": "x",
+        "supports_openrouter_extensions": provider == "openrouter",
+        "supports_generation_cost": False, "default_headers": {}, "verify_ssl_certs": True,
+    }
+
+
+def _built_messages(provider):
+    from ouroboros.llm import LLMClient
+
+    client = LLMClient.__new__(LLMClient)
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "read_file", "arguments": "{}"},
+        }]},
+    ]
+    return client._build_remote_kwargs(
+        _remote_target(provider), messages, "medium", 512, "auto", None, None,
+        skip_capability_fetch=True,
+    )["messages"]
+
+
+def test_the_compatible_lane_sends_no_null_content():
+    built = _built_messages("openai-compatible")
+    assert [m for m in built if m.get("content") is None] == []
+    assert built[2]["content"] == ""
+
+
+def test_the_tool_calls_survive_the_rewrite():
+    """The empty string replaces the content, never the message: which tools the
+    assistant asked for is the only thing that turn carries."""
+    built = _built_messages("openai-compatible")
+    assert built[2]["tool_calls"][0]["function"]["name"] == "read_file"
+
+
+def test_a_named_lane_still_sends_the_null():
+    """OpenRouter and the first-party providers accept `content: null` correctly.
+    Rewriting what we send them buys nothing and would hide a real difference."""
+    assert _built_messages("openrouter")[2]["content"] is None
+
+
+def test_what_the_compatible_lane_now_sends_passes_the_strict_schema():
+    """End to end against the real validator: the exact payload shape that used to
+    come back as `7 validation errors`."""
+    _validate(_built_messages("openai-compatible"))

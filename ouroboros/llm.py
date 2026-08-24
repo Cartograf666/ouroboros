@@ -3451,6 +3451,10 @@ class LLMClient:
         from ouroboros.provider_models import supports_vision
         if not supports_vision(resolved_model):
             messages = self._replace_image_blocks_with_placeholder(messages)
+        if provider == "openai-compatible":
+            from ouroboros.provider_models import compatible_lane_messages
+
+            messages = compatible_lane_messages(messages)
         # Official direct OpenAI Chat uses the current completion-token carrier:
         # provider-wide; model names are not capability authority across routes.
         direct_openai = provider == "openai"
